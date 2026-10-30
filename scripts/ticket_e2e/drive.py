@@ -1642,6 +1642,82 @@ def link_relay() -> None:
 
 
 
+# --- a VPN exit, paid as it is used --------------------------------------------------------------------------
+
+VPN_SAT_GB = 500_000  # 500 sat a GiB: a 10 MiB download is a few tickets
+VPN_FILES = ["http://speed.cloudflare.com/__down?bytes=10485760", "http://ipv4.download.thinkbroadband.com/10MB.zip"]
+VPN_BYTES = 10_485_760
+
+
+def vpn() -> None:
+    """A VPN exit sold as a Stream service (docs/VPN-EXITS.md): the exit's VPN service (`xbt-vpn serve`,
+    offering a private exit at a price) behind the seller's gateway, which sells `/vpn/` as WebSockets
+    priced per byte both ways; and a buyer's paid tunnel opened by the wallet (`xbt-vpn fetch --tunnel`,
+    as the buyer's VPN service opens it), carrying a 10 MiB download from the internet. The exit refuses
+    this machine's own networks, so the file is a public one. The download comes whole through the
+    tunnel; the wallet pays as the bytes pass and checks the exit's interim receipts as it runs, with no
+    fault; every ticket the seller took is booked once and the money agrees."""
+    stop_sessions()
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    tun_port, wg_port, gw_port = BASE + 17, BASE + 18, BASE + 19
+    origin = f"http://127.0.0.1:{gw_port}"
+    vdir = f"{RUN}/vpn"
+    os.makedirs(vdir, exist_ok=True)
+    with open(f"{vdir}/exit.json", "w") as f:
+        json.dump({"offer": True, "kind": "private", "sat_per_gb": VPN_SAT_GB, "country": "XX", "tunnel_url": f"{origin}/vpn/tunnel"}, f)
+    with open(f"{RUN}/vpn.log", "ab") as log:
+        PROCS["vpn"] = subprocess.Popen([f"{BIN}/xbt-vpn", "serve", "--dir", vdir, "--wg-listen", f"127.0.0.1:{wg_port}", "--tunnel-listen", f"127.0.0.1:{tun_port}"],
+                                        env=dict(os.environ, XBT_VPN_GEO_URL="", XBT_VPN_GEO_BUNDLED="/nonexistent"), stdout=log, stderr=log)
+    lab.wait("the exit's tunnel endpoint", 60, lambda: socket.create_connection(("127.0.0.1", tun_port), timeout=1).close() is None, every=0.2)
+    path = gateway_config("gateway-vpn", gw_port, origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["routes"].append({"path": "/vpn/", "upstream": f"http://127.0.0.1:{tun_port}", "methods": ["GET"], "websocket": True, "service": "vpn-exit",
+                          "price": {"byte_msat": VPN_SAT_GB * 1000, "per_bytes": 1 << 30}})
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("gateway-vpn", gw_port)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    restart_signer()
+    faults0 = len([e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_interim_fault"])
+    out, url = None, ""
+    t0 = time.monotonic()
+    for url in VPN_FILES:
+        r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", url, "--once", "--secs", "180"],
+                           env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="40000"),
+                           capture_output=True, text=True, timeout=300)
+        line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+        out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
+        if out.get("bytes") == VPN_BYTES:
+            break
+    took = time.monotonic() - t0
+    # the tunnel ended as the fetch did: its last receipt closed it
+    time.sleep(3)
+    stop_sessions()
+    faults = len([e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_interim_fault"]) - faults0
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
+    exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
+    mbit = round(VPN_BYTES * 8 / took / 1e6, 1) if took else None
+    measured("vpn_10mib_mbit_s", mbit)
+    whole = bool(out) and out.get("bytes") == VPN_BYTES
+    check("vpn: a VPN exit sold as a Stream service: a 10 MiB download came whole through a paid tunnel the wallet opened, paid as its bytes passed "
+          "with the exit's interim receipts checked and no fault; every ticket the seller took is booked once and the money agrees",
+          whole and faults == 0 and len(paid) > 0 and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {"fetch": out, "file": url, "seconds": round(took, 1), "mbit_s": mbit, "interim_faults": faults, "exit": {k: exit_status.get(k) for k in ("offered", "paid", "down_bytes", "up_bytes")},
+           "tickets": len(paid), **inv, "money": m})
+    for name in ("gateway-vpn", "vpn"):
+        PROCS[name].terminate()
+        PROCS[name].wait(10)
+
+
 # --- a seller's whole web app: Jellyfin, through the app port, paid for on these nodes -----------------------
 
 JF_URL = os.environ.get("JELLYFIN_URL", "")
@@ -1853,13 +1929,15 @@ def jellyfin(link: str = "") -> None:
 
 
 CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "pruned": pruned, "jellyfin": jellyfin,
+          "vpn": vpn,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
     # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "jellyfin", "jellyfin_link", "jellyfin_relay")])
+    # (vpn downloads a public file through the exit: run by name only)
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

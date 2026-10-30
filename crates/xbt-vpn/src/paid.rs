@@ -35,14 +35,15 @@ pub struct Wallet {
 }
 
 impl Wallet {
-    /// From `B2_SIGNER_SOCK`, `B2_STREAM_DIR`, `XBT_VPN_TASK` (default `vpn`) and
-    /// `XBT_VPN_TUNNEL_MAX_SATS` (default 10,000).
+    /// From `B2_SIGNER_SOCK`, `B2_STREAM_DIR`, `XBT_VPN_TASK` and
+    /// `XBT_VPN_TUNNEL_MAX_SATS` (default 10,000). The task is the starter policy's `default` unless set,
+    /// so a box set up before VPN exits existed pays them within the budget it already has.
     pub fn from_env() -> Option<Wallet> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Some(Wallet {
             signer: var("B2_SIGNER_SOCK")?.into(),
             stream_dir: var("B2_STREAM_DIR")?.into(),
-            task: var("XBT_VPN_TASK").unwrap_or_else(|| "vpn".into()),
+            task: var("XBT_VPN_TASK").unwrap_or_else(|| "default".into()),
             max_sats: var("XBT_VPN_TUNNEL_MAX_SATS").and_then(|v| v.parse().ok()).unwrap_or(10_000),
         })
     }

@@ -127,8 +127,10 @@ FROM base AS xbt-vpn
 ARG TARGETARCH
 ARG TARGETVARIANT
 COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-vpn /usr/bin/xbt-vpn
+# the country table exits' regions are checked against, shipped so a box needs no download (CC BY 4.0)
+COPY --chmod=0444 geo/dbip-country-lite.csv.gz geo/ATTRIBUTION /usr/share/xbt-vpn/
 USER xbt-vpn
-ENV XBT_VPN_DIR=/data/run/vpn XBT_VPN_STATUS=/data/run/vpn-status XBT_VPN_KEYS=/data/vpn XBT_VPN_WG_LISTEN=0.0.0.0:51820 RUST_LOG=warn NO_COLOR=1
+ENV XBT_VPN_DIR=/data/run/vpn XBT_VPN_STATUS=/data/run/vpn-status XBT_VPN_KEYS=/data/vpn XBT_VPN_WG_LISTEN=0.0.0.0:51820 XBT_VPN_TUNNEL_LISTEN=0.0.0.0:51880 RUST_LOG=warn NO_COLOR=1
 ENTRYPOINT ["/usr/bin/xbt-vpn", "serve"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-vpn", "healthcheck"]
 

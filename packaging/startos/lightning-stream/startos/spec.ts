@@ -28,6 +28,8 @@ export const PORTS = {
   vpn: 51820,
   /** where devices reach it on the LAN (51820 is left to WireGuard packages) */
   vpnExternal: 51830,
+  // the exit's tunnel endpoint: the gateway beside it joins buyers' paid tunnels here (never published)
+  vpnTunnel: 51880,
 } as const
 
 export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui' | 'gateway' | 'connector' | 'hashlink' | 'vpn'
@@ -332,6 +334,8 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_VPN_DIR: '/data/run/vpn',
         XBT_UI_VPN_STATUS_DIR: '/data/run/vpn-status',
         ...(cfg.lanHost ? { XBT_UI_VPN_ENDPOINT: `${cfg.lanHost}:${PORTS.vpnExternal}` } : {}),
+        // where the shop's gateway reaches the VPN service's tunnel endpoint, to sell this box's exit
+        XBT_UI_VPN_TUNNEL_UPSTREAM: `http://${local(PORTS.vpnTunnel)}`,
       },
       // the UI owns the MCP token and rotates it on its Agents page; its pages write run/ln, run/gateway and
       // run/hashrate (the shop's and the hashrate settings)
@@ -484,8 +488,14 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_VPN_KEYS: '/data/vpn',
         XBT_VPN_WG_LISTEN: `0.0.0.0:${PORTS.vpn}`,
         XBT_VPN_NOSTR_RELAYS: relays,
+        // priced exits are paid through the owner's wallet; this box's exit's tunnel endpoint, for the gateway beside it
+        B2_SIGNER_SOCK: '/data/run/signer/signer.sock',
+        B2_STREAM_DIR: '/data/run/signer/streams',
+        XBT_SHOPS_FILE: '/data/run/shops/shops.json',
+        XBT_VPN_TUNNEL_LISTEN: local(PORTS.vpnTunnel),
       },
-      mounts: [vol('vpn', '/data/vpn'), vol('run/vpn', '/data/run/vpn', true), vol('run/vpn-status', '/data/run/vpn-status')],
+      mounts: [vol('vpn', '/data/vpn'), vol('run/vpn', '/data/run/vpn', true), vol('run/vpn-status', '/data/run/vpn-status'),
+               vol('run/signer', '/data/run/signer', true), vol('run/signer/streams', '/data/run/signer/streams'), vol('run/shops', '/data/run/shops', true)],
       requires: ['init'],
     },
   ]

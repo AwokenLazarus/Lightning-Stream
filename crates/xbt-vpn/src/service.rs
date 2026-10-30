@@ -85,6 +85,9 @@ pub struct ExitSettings {
     pub buyer_mbit: Option<u64>,
     pub max_connections: usize,
     pub blocked_ports: Vec<u16>,
+    /// Where buyers' wallets open paid tunnels to this exit (`https://<shop>/vpn/tunnel`), as the
+    /// exit page found it from the owner's shop; announced with the exit.
+    pub tunnel_url: Option<String>,
 }
 
 /// The exit's settings, if `exit.json` offers one.
@@ -103,6 +106,7 @@ pub fn exit_from(v: &Value) -> Option<ExitSettings> {
         buyer_mbit: v["buyer_mbit"].as_u64().filter(|n| *n > 0),
         max_connections: v["max_connections"].as_u64().filter(|n| *n > 0).map(|n| n as usize).unwrap_or(512),
         blocked_ports: v["blocked_ports"].as_array().map(|a| a.iter().filter_map(|p| p.as_u64().and_then(|p| u16::try_from(p).ok())).collect()).unwrap_or_else(|| vec![25]),
+        tunnel_url: v["tunnel_url"].as_str().filter(|u| (u.starts_with("https://") || u.starts_with("http://")) && u.len() <= 512).map(str::to_string),
     })
 }
 

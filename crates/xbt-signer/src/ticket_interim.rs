@@ -64,6 +64,7 @@ pub fn slack(own: u64) -> u64 {
 /// of the answer: `own_up` bytes it sent, `own_down` it received. `head` is what the answer's head
 /// charged (the request's price); `max_msat` the call's limit. `Ok(true)`: a newer part, now held
 /// in `last`; `Ok(false)`: not newer (already seen, or another answer's); `Err`: the fault.
+#[allow(clippy::too_many_arguments)]
 pub fn check(
     r: &Receipt,
     seq: u64,

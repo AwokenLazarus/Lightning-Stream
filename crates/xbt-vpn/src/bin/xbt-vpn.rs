@@ -39,6 +39,10 @@
 //!     the path, the bytes and the throughput. A tool for measuring: it looks the host name up
 //!     itself; the app's buyer side does DNS through the tunnel. With `--hop`, every flow is sealed for
 //!     the exit and goes through that first hop (two hops).
+//! xbt-vpn fetch --tunnel URL --url http://HOST/PATH [--flows N] [--secs S] [--once]
+//!     The same through a priced exit's paid tunnel at URL, opened by the wallet of B2_SIGNER_SOCK
+//!     and B2_STREAM_DIR (as the app's buyer side opens it). `--once`: each flow downloads the URL
+//!     once, to its end.
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,6 +220,8 @@ fn hop(relay: String) -> std::io::Result<()> {
 #[derive(Clone)]
 enum Way {
     Straight(LinkConnection),
+    /// A priced exit's paid tunnel, opened by the wallet.
+    Tunnel(xbt_vpn::flow::Carrier),
     Sealed { hop: LinkConnection, exit: [u8; 32], relays: Vec<String>, tls: Arc<rustls::ClientConfig> },
 }
 
@@ -224,6 +230,10 @@ impl Way {
         match self {
             Way::Straight(conn) => match open_tcp(conn, to).await.ok()? {
                 (Opened::Yes, send, recv) => Some(Box::new(tokio::io::join(recv, send))),
+                _ => None,
+            },
+            Way::Tunnel(c) => match c.open_tcp(to).await.ok()? {
+                (Opened::Yes, Some(s)) => Some(Box::new(s) as Box<dyn Duplex>),
                 _ => None,
             },
             Way::Sealed { hop, exit, relays, tls } => {
@@ -235,8 +245,13 @@ impl Way {
 }
 
 fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
-    let exit_id = arg(args, "--exit").expect("--exit KEY");
-    let hints: serde_json::Value = serde_json::from_str(&arg(args, "--hints").expect("--hints JSON")).map_err(std::io::Error::other)?;
+    let once = args.iter().any(|a| a == "--once");
+    let tunnel = arg(args, "--tunnel");
+    let exit_id = arg(args, "--exit").or_else(|| tunnel.as_ref().map(|_| String::new())).expect("--exit KEY, or --tunnel URL");
+    let hints: serde_json::Value = match &tunnel {
+        Some(_) => serde_json::json!({}),
+        None => serde_json::from_str(&arg(args, "--hints").expect("--hints JSON")).map_err(std::io::Error::other)?,
+    };
     let url = arg(args, "--url").expect("--url http://host/path");
     let flows: usize = arg(args, "--flows").and_then(|s| s.parse().ok()).unwrap_or(1);
     let secs: u64 = arg(args, "--secs").and_then(|s| s.parse().ok()).unwrap_or(15);
@@ -246,10 +261,23 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
     let link = Link::start_alpn(secret(), Options { relays: Relays::Ours(vec![relay]), serving: false, private, lookup: None }, ALPN_VPN)?;
     let strings = |k: &str| hints[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
     let direct = if private { vec![] } else { strings("direct").iter().filter_map(|s| s.parse().ok()).collect() };
-    link.learn(&exit_id, Hints { relays: strings("relays"), direct })?;
+    if tunnel.is_none() {
+        link.learn(&exit_id, Hints { relays: strings("relays"), direct })?;
+    }
     let hop_id = arg(args, "--hop");
-    let (way, via) = match &hop_id {
-        Some(hop_id) => {
+    let (way, via) = match (&tunnel, &hop_id) {
+        (Some(url), _) => {
+            let w = xbt_vpn::paid::Wallet::from_env().ok_or_else(|| std::io::Error::other("--tunnel needs B2_SIGNER_SOCK and B2_STREAM_DIR"))?;
+            let t = link.runtime().block_on(xbt_vpn::paid::open(&w, url))?;
+            // what the wallet says when the tunnel ends, printed once it does
+            std::thread::spawn(move || {
+                if let Ok(r) = t.done.recv() {
+                    eprintln!("the wallet: {}", r.map(|v| v.to_string()).unwrap_or_else(|e| e));
+                }
+            });
+            (Way::Tunnel(xbt_vpn::flow::Carrier::Tunnel(t.mux)), String::new())
+        }
+        (None, Some(hop_id)) => {
             let hh: serde_json::Value = serde_json::from_str(&arg(args, "--hop-hints").expect("--hop-hints JSON")).map_err(std::io::Error::other)?;
             let hs = |k: &str| hh[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
             let hdirect = if private { vec![] } else { hs("direct").iter().filter_map(|s| s.parse().ok()).collect() };
@@ -259,7 +287,7 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
             let tls = sealed::buyer_config(&secret(), &exit);
             (Way::Sealed { hop, exit, relays: strings("relays"), tls }, hop_id.clone())
         }
-        None => (Way::Straight(link.connect_conn(&exit_id)?), exit_id.clone()),
+        (None, None) => (Way::Straight(link.connect_conn(&exit_id)?), exit_id.clone()),
     };
     let report = link.runtime().block_on(async {
         let to = tokio::net::lookup_host(format!("{host}:80")).await?.find(|a| a.is_ipv4()).ok_or_else(|| std::io::Error::other("no IPv4 address"))?;
@@ -285,6 +313,9 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
                                 total.fetch_add(n as u64, Ordering::Relaxed);
                             }
                         }
+                    }
+                    if once {
+                        return;
                     }
                 }
             }));
@@ -345,7 +376,7 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
     let region = arg_or_env(args, "--region", &["XBT_VPN_REGION"]).map(|r| r.trim().to_ascii_uppercase()).filter(|r| r.len() == 2);
     // a priced exit is one of the owner's Stream services: buyers' wallets open paid tunnels at this
     // address on the owner's shop, which the shop's gateway joins to this endpoint
-    let tunnel_url = arg_or_env(args, "--tunnel-url", &["XBT_VPN_TUNNEL_URL"]);
+    let mut tunnel_url = arg_or_env(args, "--tunnel-url", &["XBT_VPN_TUNNEL_URL"]);
     let tunnel_listen = arg_or_env(args, "--tunnel-listen", &["XBT_VPN_TUNNEL_LISTEN"]).unwrap_or_else(|| "0.0.0.0:51880".into());
     let (devices_path, exit_path) = (dir.join("devices.json"), dir.join("exit.json"));
     let started = (mtime(&devices_path), mtime(&exit_path));
@@ -376,6 +407,10 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         let cfg = Arc::new(exit_config(&settings, live));
         // a priced exit is reached only through paid tunnels: its link carries no flows for free
         let priced = settings.sat_per_gb > 0;
+        // the address the exit page found from the owner's shop, unless the service was given one
+        if tunnel_url.is_none() {
+            tunnel_url = settings.tunnel_url.clone();
+        }
         if priced {
             let (cfg, m) = (cfg.clone(), exit_meter.clone());
             let listener = link.runtime().block_on(tokio::net::TcpListener::bind(&tunnel_listen))?;

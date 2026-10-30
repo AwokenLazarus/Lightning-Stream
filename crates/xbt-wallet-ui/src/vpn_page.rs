@@ -180,6 +180,19 @@ impl App {
                      <tbody>{rows}</tbody></table></div><p class=\"small\">Removing a device stops its traffic at once.</p>")
         };
         b.push_str(&format!("<section class=\"card\"><h2>Devices</h2>{list}</section>"));
+        // each exit's country, checked against where its traffic really comes out
+        let exits: Vec<&Value> = status["exits"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        if !exits.is_empty() {
+            let rows: String = exits.iter().map(|e| {
+                let id = e["exit"].as_str().unwrap_or("");
+                let tag = if e["verified"] == true { "<span class=\"tag ok\">checked</span>" } else { "<span class=\"tag\">not used for its country</span>" };
+                format!("<tr><td><code>{}…</code></td><td>{}</td><td>{tag} <span class=\"small\">{}</span></td></tr>",
+                        esc(&id.chars().take(12).collect::<String>()), esc(e["region"].as_str().unwrap_or("")), esc(e["region_check"].as_str().unwrap_or("")))
+            }).collect();
+            b.push_str(&format!("<section class=\"card\"><h2>Exits found</h2><p class=\"small\">An exit's country is checked, not taken on its word: \
+                its traffic's address is read through it from several independent sites and looked up in a country table that comes with the app.</p>\
+                <div class=\"scroll\"><table><thead><tr><th>Exit</th><th>Says</th><th>Check</th></tr></thead><tbody>{rows}</tbody></table></div></section>"));
+        }
         if ready {
             b.push_str(&format!(
                 "<section class=\"card\"><h2>Add a device</h2><form method=\"post\" action=\"./vpn\" class=\"stack\">{}\
@@ -318,13 +331,52 @@ impl App {
             "max_connections": g("max_connections").parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(512),
             "blocked_ports": ports,
         });
-        match write(&self.cfg.vpn.dir.join("exit.json"), &v) {
-            Ok(()) => self.flash(ctx, true, if offer { "Saved: your exit is offered." } else { "Saved: your exit isn't offered." }),
-            Err(e) => self.flash(ctx, false, format!("The exit's settings cannot be written: {e}")),
+        let mut v = v;
+        // buyers pay for the exit as one of the shop's services: where their wallets open its tunnels
+        let tunnel = self.vpn_tunnel_url();
+        v["tunnel_url"] = json!(tunnel);
+        let r = write(&self.cfg.vpn.dir.join("exit.json"), &v).map_err(|e| format!("The exit's settings cannot be written: {e}")).and_then(|()| {
+            if self.cfg.vpn.tunnel_upstream.is_none() {
+                return Ok(if offer { "Saved. Selling the exit is off in this install, so buyers can't pay for it yet.".to_string() } else { "Saved: your exit isn't offered.".into() });
+            }
+            // the shop sells the exit: its route follows these settings
+            let words = self.commit(&self.shop(), "").map_err(|e| format!("Saved, but your shop could not be updated: {e}"))?;
+            Ok(match (offer, tunnel.is_some()) {
+                (false, _) => "Saved: your exit isn't offered.".to_string(),
+                (true, true) => format!("Saved: your exit is offered, paid as buyers use it. {}", words.trim()),
+                (true, false) => "Saved. Your exit is announced once your shop is reachable: set it up on the Sell page.".to_string(),
+            })
+        });
+        match r {
+            Ok(m) => self.flash(ctx, true, m),
+            Err(e) => self.flash(ctx, false, e),
         }
         Resp::redirect("./sell-vpn")
     }
+
+    /// Where buyers' wallets open paid tunnels to this box's exit: [`VPN_PATH`] on its shop (its https
+    /// address, or its shop key's address for a shop reached by its key). `None` until the shop has one.
+    fn vpn_tunnel_url(&self) -> Option<String> {
+        let shop = self.shop();
+        if shop.public_url.starts_with("https://") {
+            return Some(format!("{}{VPN_PATH}tunnel", shop.public_url.trim_end_matches('/')));
+        }
+        let npub = self.link_status()?.get("npub")?.as_str()?.to_string();
+        Some(format!("{}{VPN_PATH}tunnel", xbt402::shop::origin_for(&xbt402::shop::from_npub(&npub)?)))
+    }
+
+    /// The shop's route that sells this box's exit, while one is offered: each tunnel a WebSocket the
+    /// gateway joins to the VPN service, paid per byte both ways at the exit's price a GB.
+    pub(crate) fn vpn_route(&self) -> Option<Value> {
+        let upstream = self.cfg.vpn.tunnel_upstream.clone()?;
+        let s = xbt_vpn::service::exit_from(&read(&self.cfg.vpn.dir.join("exit.json")))?;
+        Some(json!({"path": VPN_PATH, "upstream": upstream, "methods": ["GET"], "websocket": true, "service": "vpn-exit",
+                    "price": {"byte_msat": s.sat_per_gb.saturating_mul(1000), "per_bytes": 1u64 << 30}}))
+    }
 }
+
+/// The path a shop sells its VPN exit under.
+pub const VPN_PATH: &str = "/vpn/";
 
 #[cfg(test)]
 mod tests {

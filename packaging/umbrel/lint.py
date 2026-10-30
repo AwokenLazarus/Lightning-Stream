@@ -54,8 +54,8 @@ LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
 # the connector, xbt-hashlink and xbt-vpn have no line in images.lock yet. oci_build.sh --load tags them
 # <image>:0.1.0. A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
 UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink|xbt-vpn):0\.1\.0$")
-# the stream directory the connector writes, inside the signer's socket dir. Read-write, and the
-# only extra mount it may have. It does not get the signer's state.
+# the stream directory the connector (and the VPN service, for paid tunnels) writes, inside the signer's
+# socket dir. Read-write, and the only extra mount either may have. Neither gets the signer's state.
 # Umbrel's shared Downloads (the Files app's Downloads), read-only, for the wallet's Files service only.
 # umbrelOS 1.x rewrites this compatibility path to ${UMBREL_ROOT}/home/Downloads; the app must declare
 # the STORAGE_DOWNLOADS permission (umbrel-apps .agents/skills/umbrel-package-app/SKILL.md).
@@ -86,8 +86,10 @@ AGENTPAY = {
     # the hasher and the renter: their keys and state; the settings and token read-only; the renter
     # also the signer's socket, read-only
     "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),
-    # the VPN service: its keys and lists; the settings read-only; its status for the UI
-    "xbt-vpn": ("vpn", {"vpn-status"}, {"vpn"}),
+    # the VPN service: its keys and lists; the settings read-only; its status for the UI. Priced exits
+    # are paid through the owner's wallet: the signer's socket and the shops read-only, and the stream
+    # sockets are STREAM_MOUNT (each paid tunnel's socket is made there)
+    "xbt-vpn": ("vpn", {"vpn-status"}, {"vpn", "signer", "shops"}),
 }
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
@@ -324,7 +326,7 @@ def main() -> int:
                 allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"} if comp else set()
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{r}:/data/run/{r}" for r in own_runs}
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{p}:/data/run/{p}:ro" for p in peers}
-                if base == "lightning-stream":
+                if base in ("lightning-stream", "xbt-vpn"):
                     allowed.add(STREAM_MOUNT)
                 if base in DOWNLOADS_IMAGES:
                     allowed.add(DOWNLOADS_MOUNT)

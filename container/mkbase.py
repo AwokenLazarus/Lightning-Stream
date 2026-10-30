@@ -27,6 +27,10 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
   /data/run/vpn     0750 xbt-wallet-ui:xbt-vpn, the devices and exit the UI's VPN pages write
   /data/run/vpn-status 0750 xbt-vpn:xbt-vpn-status, the VPN service's status for the UI; the group
                     (10019, a group only) has the service and the UI in it
+  /data/run/signer/streams 0770 xbt-signer:xbt-streams where the VPN service is installed (else 0750, the
+                    signer's): the sockets streamed answers go to; the VPN service (in xbt-signer's group, to
+                    reach the signer's socket) makes each paid tunnel's there. The group (10020, a group only)
+                    has the signer and the VPN service in it
   /data/run/ai      0770 xbt-wallet-ui:xbt-ai, the AI endpoint's files: the credential store (AI keys and local links)
                     both the UI and the connector (which runs as the signer's user) write, the sellers the UI's AI
                     page writes, and the sellers' health the endpoint writes; the group (10014, a group only; 10011 to 10013 are reserved for xbt-compute) has
@@ -43,13 +47,14 @@ USERS = [("xbt-signer", 10001), ("xbt-anchor-witness", 10002), ("xbt-wallet-mcp"
 HOME = {"xbt-signer": "/data/signer", "xbt-anchor-witness": "/data/witness", "xbt-wallet-mcp": "/data/mcp",
         "xbt-wallet-ui": "/data/ui", "xbt-work-relay": "/data/relay", "xbt-gateway": "/data/gateway", "xbt-hashrate": "/data/hashrate",
         "xbt-stream-relay": "/data/stream-relay", "xbt-vpn": "/data/vpn"}
-MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui,xbt-hashrate", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
+MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui,xbt-hashrate,xbt-vpn", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
            "xbt-gateway": "xbt-wallet-ui", "xbt-hashrate": "xbt-wallet-ui", "xbt-stream-relay": "xbt-wallet-ui", "xbt-vpn": "xbt-wallet-ui"}
 # groups with no user of their own
 GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui"),
           ("xbt-relay-status", 10017, "xbt-stream-relay,xbt-wallet-ui"),
           ("xbt-vpn-status", 10019, "xbt-vpn,xbt-wallet-ui"),
-          ("xbt-ai", 10014, "xbt-signer,xbt-wallet-ui")]
+          ("xbt-ai", 10014, "xbt-signer,xbt-wallet-ui"),
+          ("xbt-streams", 10020, "xbt-signer,xbt-vpn")]
 
 passwd = "root:x:0:0:root:/:/nonexistent\n" + "".join(f"{n}:x:{u}:{u}:{n}:{HOME[n]}:/nonexistent\n" for n, u in USERS)
 group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in USERS)

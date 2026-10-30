@@ -152,6 +152,8 @@ services:
       XBT_UI_RELAY_STATUS: /data/run/relay-status/status.json
       XBT_UI_VPN_DIR: /data/run/vpn
       XBT_UI_VPN_STATUS_DIR: /data/run/vpn-status
+      # where the shop's gateway reaches the VPN service's tunnel endpoint (published on this machine's loopback only)
+      XBT_UI_VPN_TUNNEL_UPSTREAM: http://127.0.0.1:${LS_VPN_TUNNEL_PORT:-51880}
       XBT_UI_VPN_ENDPOINT: ${LS_VPN_ENDPOINT:-}
       XBT_UI_RELAY_START_HINT: "in the folder you installed it to, run: docker compose --profile relay up -d (or run install.sh again and answer 1 to the relay)"
       # AI: the address programs use (served by the connector) and the files the AI page shares with it
@@ -310,11 +312,21 @@ services:
     network_mode: bridge
     ports:
       - "${LS_VPN_PORT:-51820}:51820/udp"
+      # the exit's tunnel endpoint, for the shop's gateway on this machine only
+      - "127.0.0.1:${LS_VPN_TUNNEL_PORT:-51880}:51880/tcp"
     stop_grace_period: 10s
     environment:
       XBT_VPN_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
       XBT_VPN_REGION: ${LS_VPN_REGION:-}
+      # priced exits are paid through the owner's wallet: its socket, and the dir paid tunnels are streamed through
+      B2_SIGNER_SOCK: /data/run/signer/signer.sock
+      B2_STREAM_DIR: /data/run/signer/streams
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
+      XBT_VPN_TUNNEL_LISTEN: 0.0.0.0:51880
     volumes:
       - ${LS_DATA_DIR}/vpn:/data/vpn
       - ${LS_DATA_DIR}/run/vpn:/data/run/vpn:ro
       - ${LS_DATA_DIR}/run/vpn-status:/data/run/vpn-status
+      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/signer/streams:/data/run/signer/streams
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro

@@ -215,6 +215,9 @@ pub struct VpnSetup {
     /// `XBT_UI_VPN_ENDPOINT`: where devices reach this box's WireGuard endpoint (`192.168.1.20:51830`),
     /// put in each device's config. Unset: the box does not run the buyer's VPN, and the page says so.
     pub endpoint: Option<String>,
+    /// `XBT_UI_VPN_TUNNEL_UPSTREAM`: where the shop's gateway reaches the VPN service's tunnel endpoint
+    /// (`http://vpn:51880`), to sell this box's exit. Unset: the exit can't be sold from this install.
+    pub tunnel_upstream: Option<String>,
 }
 
 /// Renting out this box's miners (the hasher service) and renting other people's (the renter).
@@ -320,6 +323,7 @@ impl Config {
             status_dir: env("XBT_UI_VPN_STATUS_DIR").map(PathBuf::from).unwrap_or_else(|| vpn_dir.clone()),
             dir: vpn_dir,
             endpoint: env("XBT_UI_VPN_ENDPOINT").filter(|e| !e.is_empty()),
+            tunnel_upstream: env("XBT_UI_VPN_TUNNEL_UPSTREAM").filter(|u| u.starts_with("http://")),
         };
         let hash_settings = env("XBT_UI_HASHER_SETTINGS").map(PathBuf::from).unwrap_or_else(|| run_dir("hashrate").join("settings.json"));
         let secure_cookie = match env("XBT_UI_SECURE_COOKIE").as_deref() {
@@ -433,7 +437,7 @@ impl Config {
                restart_hint: RESTART_HINT.into(), local_services: vec![],
                ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),
                              state: PathBuf::from("/nonexistent/ai/state.json") },
-               vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), status_dir: PathBuf::from("/nonexistent/vpn"), endpoint: None },
+               vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), status_dir: PathBuf::from("/nonexistent/vpn"), endpoint: None, tunnel_upstream: None },
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
     }
 }

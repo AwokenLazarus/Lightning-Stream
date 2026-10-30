@@ -117,17 +117,21 @@ the service renews it every 6 hours and looks for exits every 10 minutes. An exi
 once its owner sets its country on the exit page.
 
 An announced exit's country is checked, not taken on its word. The buyer's app reads the exit's
-egress address through the exit itself (a trace page, 1.1.1.1's `/cdn-cgi/trace`, which sees only
-the exit's address, never the buyer's) and looks it up in an offline geo-IP table: DB-IP's "IP to
-Country Lite" (CC BY 4.0, <https://db-ip.com>), fetched once a month into the service's keys dir, so
-no lookup about an exit or a buyer leaves the box. If the owner gives their own country
+egress address through the exit itself, from several HTTPS pages run by different operators
+(Cloudflare's trace, AWS's checkip, ifconfig.co, ipify; each sees only the exit's address, never the
+buyer's). Over TLS the exit can't change what they say, as it could a plain page or a STUN answer.
+The address is believed only when at least two answer and every one that answers agrees. It is then
+looked up in an offline geo-IP table: DB-IP's "IP to Country Lite" (CC BY 4.0, <https://db-ip.com>),
+which ships with the app (`/usr/share/xbt-vpn`, refreshed at each release), so a box checks regions
+from install with no download and no service of anyone's. Newer months are fetched into the
+service's keys dir only where a source is set (`XBT_VPN_GEO_URL`, DB-IP's by default; empty for
+none). No lookup about an exit or a buyer leaves the box. If the owner gives their own country
 (`--home-country` / `XBT_VPN_HOME_COUNTRY`), a round trip faster than the distance to the claimed
 country allows is caught too; the app never looks the owner's country up from the network. An exit
 whose region does not check out is not offered for that region, and is checked again every 6 hours.
 Until the table has loaded, no region is verified, and a device whose rules name a country is told
-no exit qualifies rather than sent to one that may be elsewhere.
-
-Not yet: a device's limit in sats applies once exits are paid.
+no exit qualifies rather than sent to one that may be elsewhere. Each exit's result is in
+`status.json` (`exits`), in plain words, and on the VPN page.
 
 ## Measured
 
@@ -151,81 +155,85 @@ state transducer) on disk and memory-mapped, so it costs memory only for the pag
 A name is checked, with each of its parent domains, in 1.1–1.6 µs. While a list is fetched and
 compiled the service peaks at 49 MiB (adult) and 114 MiB (malware), where it was 137 and 286 MiB.
 
-## Paying (designed, not built)
+## Paying
 
-An exit is a Stream seller whose price is per GB, and it is paid with the same tickets as any other
-service, so a buyer's spending rules (per-seller and daily caps, the approval threshold) apply.
+An exit is one of its operator's Stream services, priced per GB both ways, and it is paid with the
+same tickets as any other service, so a buyer's spending rules (per-seller and daily caps, the
+approval threshold) apply.
 
-### What exists today, and what is missing
+### How a tunnel is paid
 
-A long-lived flow already has a seam: one `xbt402_pay` call with `stream_to` (a socket the flow's
-bytes cross) and `upgrade` on a route that carries WebSockets. The signer meters bytes both ways and
-pays the next ticket ahead in its watcher. Each such call is bounded by its `max_sats` and
-`max_answer_s` (at most 86,400 s). But the seller signs **one receipt, at the call's end**. A VPN
-session lives for hours and carries many flows, so the buyer must be able to check the exit's
-charges while it runs, not only at the end. That needs a new piece on both sides: **interim
-receipts** for an answer still open, issued by the gateway and checked by the signer.
+- **The exit's side.** Offering an exit on the Sell → VPN exit page adds a route to the owner's shop,
+  `/vpn/` (the `vpn-exit` service), that carries WebSockets and is priced at the exit's sats a GB
+  (`byte_msat` per GiB). The shop's gateway joins each paid tunnel to the VPN service's tunnel
+  endpoint (`XBT_VPN_TUNNEL_LISTEN`, 51880, never published to the LAN), which serves the buyer's
+  flows on it as it serves a link connection. The exit announces the tunnel's address on its shop
+  (`https://<shop>/vpn/tunnel`, the announcement's `tunnel` tag). A priced exit carries no flows over
+  its link, so nothing reaches it unpaid; two hops (which reach an exit over the link) are for free
+  exits only.
+- **The buyer's side.** For each device and priced exit, the buyer's VPN service asks the owner's
+  wallet to open the tunnel: the signer's `xbt402_pay` with `upgrade` and `stream_to`, the call a web
+  app's WebSocket makes (`xbt_vpn::paid`). The wallet pays as the tunnel's bytes pass, under the
+  owner's rules (the task `default` unless `XBT_VPN_TASK` says otherwise) and the tunnel's own
+  `max_sats` (`XBT_VPN_TUNNEL_MAX_SATS`, 10,000 by default), for at most `tickets.max_socket_s` (6 h by
+  default). The device's flows are carried on the tunnel's one byte stream by a multiplexer
+  (`xbt_vpn::mux`): each TCP flow a stream with its own window, so one slow flow never holds up the
+  others; UDP in datagram frames, dropped as UDP is when the way out is backed up. A tunnel that ends
+  (its limit, the session's, a fault, the exit gone) ends its flows, and the device's next flow opens
+  a new one, so the owner's rules are asked again. Without a wallet, priced exits are not used.
 
 ### Interim receipts
 
-The same signed receipt as today (`xbt402::ticket::receipt_message`, the receipt key of the
-seller's terms, the same `scheme` and `session`), with these fields added:
+The seller signs one receipt for an answer at its end; a tunnel lives for hours, so the buyer checks
+the exit's charges while it runs too, with **interim receipts**.
 
-| Field | Meaning |
-| --- | --- |
-| `interim` | `true`: the answer is still open. The final receipt has no `interim`, exactly as today. |
-| `seq` | The call's sequence number (the same one the final receipt carries). |
-| `part` | 1, 2, 3…: one more for each interim receipt of this call. |
-| `bytesUp`, `bytesDown` | Bytes carried each way on this call so far, as the seller counts them. |
-| `charged` | What this call has cost so far, in msat (the field the final receipt already has). |
-| `releasedMsat`, `spentMsat` | The session's totals, as today. |
+### Interim receipts
 
-**Cadence:** the gateway sends one on the call's control stream each time `charged` grows by the
-price of 1 MiB, or every 10 s while bytes flow, whichever comes first; none while the call is idle.
+The same signed receipt as any other (`xbt402::ticket::receipt_message`, the receipt key of the
+seller's terms, the same `scheme`, `session` and `seq`, the session's `releasedMsat` and
+`spentMsat`, and `charged`: what the call has cost so far). Its `bodyHash` is
+`interim:<part>:<bytesUp>:<bytesDown>`: `part` counts 1, 2, 3… for each interim receipt of the
+call, and the byte counts are what the seller passed each way so far. It is signed as any receipt's
+`bodyHash` is, and can never be taken for a finished body's hash (64 hex) or a head's (empty).
+
+**Cadence:** the gateway signs one each time `charged` grows by the price of 1 MiB, or every 10 s
+while bytes flow, whichever comes first; none while the call is idle. The latest one of each open
+answer is listed in `status`, under `interim` (apart from `responses`, the answers that ended), and
+the wallet reads it every 10 s (`B2_INTERIM_POLL_MS`). Old buyers ignore it.
 
 ### What the signer checks on each one
 
 Everything it checks on a final receipt today (the signature, the session, `spentMsat` never above
 `releasedMsat`, `releasedMsat` never above what the wallet released and never falling), and also:
 
-1. **Order:** `part` is exactly one more than the last; `charged`, `bytesUp` and `bytesDown` never fall.
+1. **Order:** `part` is later than the last one seen (the wallet polls, so it may skip parts);
+   `charged`, `bytesUp` and `bytesDown` never fall.
 2. **The ceiling:** `charged` never exceeds the call's own `max_sats`. This is the same per-call
    ceiling the concurrent-session fix enforces across concurrent calls (its must-fix #2): the sum of
    all open calls' `charged` stays within what the session may spend.
-3. **The seller's count against the buyer's:** `charged` is at most the price of the bytes the
-   buyer's own side counted for this call (`Device::meter` for a VPN flow), plus a tolerance for
-   framing (2% plus 64 KiB). Over that, it is a seller fault.
-4. **Liveness:** if bytes keep flowing and no interim receipt arrives for 30 s (three periods), the
-   wallet treats it as a seller fault too.
+3. **The seller's count against the buyer's:** the bytes it says it passed each way are no more
+   than the wallet counted on the call, plus 2% and 4 MiB for bytes on their way when the receipt
+   was signed; and `charged` is no more than its own byte counts cost at the call's price. Over
+   either, it is a seller fault.
+4. **Liveness:** once a seller has sent one, bytes that keep flowing (2 MiB or more) with no newer
+   one for 30 s (`B2_INTERIM_STALE_MS`) are a seller fault too. A seller that never sends any (one
+   from before interim receipts) is held to the rules every answer has: its spend never passes what
+   was released.
 
-A seller fault stops the session at once, for all its calls (the rule the web-app work already
-applies), keeps the receipts as evidence, and tells the owner in plain words. The final receipt then
-closes the call as today, and must agree with the last interim one.
+A seller fault ends the call, and the session takes no more releases (the rule the web-app work
+already applies); the receipt goes into the wallet's audit log as evidence (`ticket_interim_fault`).
+The final receipt then closes the call as any answer's does.
 
 ### Fitting the concurrent-session ceiling
 
 The signer change that lets one session carry many paid calls keeps every call in its book of open
 calls from send until its last receipt, and admits a receipt's session totals only within what the
 open calls and the closed answers allow. Interim receipts fit it as follows:
-- an interim receipt's session totals go through the same check as any receipt's (older ones are
-  passed over by value, so order is checked by `part`, not by the totals);
+- an interim receipt's session totals are not taken as the session's: the wallet checks only that
+  its spend is within what it says was released, and orders interim receipts by `part`, not by the
+  totals (the session's totals still come from ordinary receipts, as before);
 - its `charged` is checked against the call's own maximum (check 2) and the buyer's count (check 3);
   as long as it never exceeds the call's maximum, the session ceiling already allows it;
 - the call is closed only by its **final** receipt, which adds what the seller charged beyond the
   wallet's own count; interim receipts are never counted as a closed answer's charge.
 
-### How a VPN session uses it
-
-1. **One session per buyer at each exit,** keyed to the key the buyer shows the exit (its link key,
-   or its sealed key behind a first hop).
-2. **One long-lived call per device,** carrying all that device's flows to that exit, priced as
-   `byteMsat` per `perBytes` both ways.
-3. **Paid as you use it, with no pause:** the wallet keeps one small ticket in hand and pays the next
-   just before it runs out. At most one ticket is ever at risk with an exit.
-4. **A clean stop at a limit:** when a device's or the wallet's limit is reached, new flows are
-   refused and live ones end; the exit stops carrying a buyer whose credit is gone, after a short
-   grace for a refill in flight.
-
-**Build order:** after the concurrent-session must-fixes land on `fix/concurrent-session`: the
-interim receipt in `xbt402` (format, signing, verification); the gateway issuing them on an open
-answer; the signer's four checks; then the VPN exit as a seller and the buyer's call per device.
