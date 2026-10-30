@@ -16,6 +16,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - The relay is built into Stream, off by default. Shops announce the relays they use, and buyers
   choose among them.
 - A shop reached only by its key can list web apps and Files from the Sell page.
+- A web app such as Jellyfin works through a relay over a slow path (a VPN, a far-away buyer); the
+  wallet keeps a buyer signed in and re-asks a price only when needed.
 - A shop reached through relays serves on four keys, each with its own relay connection, so its
   relayed buyers share several connections instead of one.
 
