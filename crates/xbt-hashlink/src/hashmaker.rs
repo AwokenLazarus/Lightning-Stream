@@ -117,6 +117,9 @@ struct Conn {
     close_at: Option<Instant>,
     /// A placement or switch is under way for this connection.
     busy: bool,
+    /// Placed, before it was named, where miners asked to connect again from its address were
+    /// going: not offered to another rental until it says its name.
+    hinted: bool,
 }
 
 #[derive(Default)]
@@ -247,8 +250,12 @@ struct Hub {
     next: u64,
     rails: Rails,
     methods: BTreeMap<String, u64>,
-    /// Miners asked to connect again, by address: the next connection from there is that miner.
-    returning: HashMap<String, (String, Instant)>,
+    /// Miners asked to connect again, by address: where they go (a rental, or the fallback), how
+    /// many are still to come back, and when they were asked. A miner says its name only once its
+    /// subscribe is answered, so it is placed before it is named, and several miners behind one
+    /// address can't be told apart then. So all miners asked back from one address at a time go
+    /// to the same place, and each connection from there takes it until they have all come back.
+    returning: HashMap<String, (Option<String>, u32, Instant)>,
     shutdown: bool,
 }
 
@@ -322,7 +329,8 @@ impl Hub {
                 if r.want > 0 && r.units.len() as u32 >= r.want {
                     break;
                 }
-                let free = self.units.iter().find(|(_, u)| u.rental.is_none() && u.conn.is_some_and(|c| self.conns.get(&c).is_some_and(|c| c.close_at.is_none())))
+                let free = self.units.iter()
+                    .find(|(_, u)| u.rental.is_none() && u.conn.is_some_and(|c| self.conns.get(&c).is_some_and(|c| c.close_at.is_none() && !(c.hinted && u.provisional))))
                     .map(|(k, _)| k.clone());
                 let Some(name) = free else { break };
                 self.units.get_mut(&name).unwrap().rental = Some(id.clone());
@@ -910,6 +918,8 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
             g.allocate();
             // every miner where it belongs
             let now = Instant::now();
+            // where miners that must connect again are sent from each address this round
+            let mut sending: HashMap<String, Option<String>> = HashMap::new();
             let conn_ids: Vec<u64> = g.conns.keys().copied().collect();
             for c in conn_ids {
                 let conn = g.conns.get(&c).unwrap();
@@ -922,10 +932,24 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                 }
                 let Some(unit) = conn.unit.clone() else { continue };
                 let Some(active) = conn.active else { continue };
+                // a connection not yet named is left where it was placed until it says who it is
+                if conn.authorize.is_none() {
+                    continue;
+                }
                 let want = g.target(&unit);
                 let have = g.slot_rental(c, active);
                 if want == have {
                     continue;
+                }
+                // a miner that must connect again waits while others from its address are on their way elsewhere
+                let reconnects = !(conn.extranonce && conn.subscribe.is_some());
+                if reconnects {
+                    let elsewhere = g.returning.get(&conn.peer).is_some_and(|(t, n, at)| *n > 0 && at.elapsed() < RETURN_WAIT && *t != want)
+                        || sending.get(&conn.peer).is_some_and(|t| *t != want);
+                    if elsewhere {
+                        continue;
+                    }
+                    sending.insert(conn.peer.clone(), want.clone());
                 }
                 if want.is_some() || g.fallback.is_some() {
                     g.conns.get_mut(&c).unwrap().busy = true;
@@ -1003,6 +1027,7 @@ fn serve_miner(conn: TcpStream, hub: Shared) {
             fb_meter: Meter::default(),
             close_at: None,
             busy: true,
+            hinted: false,
         });
         id
     };
@@ -1186,7 +1211,8 @@ fn drop_slot(g: &mut Hub, id: u64, slot: u64) {
     if c.active == Some(slot) {
         // the miner's own upstream went away: the miner connects again and is placed afresh
         c.active = None;
-        ask_reconnect(g, id);
+        let target = c.unit.clone().and_then(|u| g.target(&u));
+        ask_reconnect(g, id, target);
     }
 }
 
@@ -1212,15 +1238,22 @@ fn release_slot(g: &mut Hub, id: u64, slot: u64) {
     }
 }
 
-fn ask_reconnect(g: &mut Hub, id: u64) {
+fn ask_reconnect(g: &mut Hub, id: u64, target: Option<String>) {
     let Some(c) = g.conns.get_mut(&id) else { return };
     let (host, port) = c.local.rsplit_once(':').map(|(h, p)| (h.trim_matches(['[', ']']).to_string(), p.parse::<u64>().unwrap_or(0))).unwrap_or_default();
     let m = json!({"id": null, "method": "client.reconnect", "params": [host, port, 0]});
     let _ = send_line(&mut c.w, &m.to_string());
     c.close_at = Some(Instant::now() + RECONNECT_CLOSE);
-    let (peer, unit) = (c.peer.clone(), c.unit.clone());
-    if let Some(u) = unit.filter(|u| g.units.get(u).is_some_and(|x| !x.provisional)) {
-        g.returning.insert(peer, (u, Instant::now()));
+    let peer = c.peer.clone();
+    let now = Instant::now();
+    match g.returning.get_mut(&peer) {
+        Some((t, n, at)) if *t == target && *n > 0 && at.elapsed() < RETURN_WAIT => {
+            *n += 1;
+            *at = now;
+        }
+        _ => {
+            g.returning.insert(peer, (target, 1, now));
+        }
     }
 }
 
@@ -1281,25 +1314,36 @@ fn name_unit(g: &mut Hub, id: u64, worker: &str) {
     g.conns.get_mut(&id).unwrap().unit = Some(name);
 }
 
-/// Place a new connection at once: a miner asked to connect again is the one it was; any other is
-/// named by its address until it authorizes. Then give it its upstream.
+/// Place a new connection at once. A miner says its name only once its subscribe is answered, so
+/// its first upstream is chosen before it is named: where the miners asked to connect again from its
+/// address are going (a rental, or the fallback), else where its own record sends it if it
+/// authorized already, else the fallback. It is named by its address until it authorizes, and then
+/// takes over its own record (its work, earnings and rental).
 fn place(hub: &Shared, id: u64) {
+    // where this connection goes first, if it is a miner coming back from a move
+    let mut hint: Option<Option<String>> = None;
     {
         let mut g = lock(hub);
         let Some(c) = g.conns.get(&id) else { return };
         let peer = c.peer.clone();
-        let back = g.returning.remove(&peer).filter(|(_, t)| t.elapsed() < RETURN_WAIT).map(|(u, _)| u)
-            .filter(|u| g.units.get(u).is_some_and(|x| x.conn.is_none_or(|o| o == id || g.conns.get(&o).is_none_or(|c| c.close_at.is_some()))));
-        let (name, provisional) = match back {
-            Some(u) => (u, false),
-            None => (format!("{peer} #{id}"), true),
-        };
+        if let Some((t, n, at)) = g.returning.get_mut(&peer) {
+            if *n > 0 && at.elapsed() < RETURN_WAIT {
+                *n -= 1;
+                hint = Some(t.clone());
+            }
+            if *n == 0 || at.elapsed() >= RETURN_WAIT {
+                g.returning.remove(&peer);
+            }
+        }
+        let name = format!("{peer} #{id}");
         let unit = g.units.entry(name.clone()).or_default();
-        unit.provisional = provisional;
+        unit.provisional = true;
         unit.conn = Some(id);
         unit.peer = peer;
         unit.seen_ms = now_ms();
-        g.conns.get_mut(&id).unwrap().unit = Some(name);
+        let c = g.conns.get_mut(&id).unwrap();
+        c.unit = Some(name);
+        c.hinted = hint.is_some();
         // a miner that authorized already (a stand-in sends it at once) is named now
         if let Some(w) = g.conns.get(&id).and_then(|c| c.authorize.as_ref().and_then(sv1::authorize_user)) {
             name_unit(&mut g, id, &w);
@@ -1315,7 +1359,10 @@ fn place(hub: &Shared, id: u64) {
         let (target, fallback) = {
             let g = lock(hub);
             let Some(c) = g.conns.get(&id) else { return };
-            (g.target(c.unit.as_deref().unwrap_or("")), g.fallback.clone())
+            // the hint, while the rental it names still takes miners
+            let hinted = hint.clone().flatten().filter(|r| g.rentals.get(r).is_some_and(|r| r.ready && r.closing.is_none() && r.suspended.is_none() && r.stopped.is_none()));
+            let own = g.target(c.unit.as_deref().unwrap_or(""));
+            (if c.authorize.is_some() { own } else { hinted.or(own) }, g.fallback.clone())
         };
         let ok = match (&target, &fallback) {
             (Some(r), _) => attach(hub, id, Some(r.clone()), false),
@@ -1445,14 +1492,14 @@ fn switch(hub: &Shared, id: u64, target: Option<String>) {
         if !(c.extranonce && c.subscribe.is_some()) {
             // ask the miner to connect again; it is placed where it belongs when it does
             c.busy = false;
-            ask_reconnect(&mut g, id);
+            ask_reconnect(&mut g, id, target);
             return;
         }
     }
-    let ok = attach(hub, id, target, true);
+    let ok = attach(hub, id, target.clone(), true);
     let mut g = lock(hub);
     if !ok {
-        ask_reconnect(&mut g, id);
+        ask_reconnect(&mut g, id, target);
     }
     if let Some(c) = g.conns.get_mut(&id) {
         c.busy = false;

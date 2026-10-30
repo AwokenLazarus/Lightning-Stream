@@ -151,6 +151,7 @@ fn miner(addr: &str, name: &str, secs: u64, rate: f64, reconnect: bool, ext: boo
             duration: Some(Duration::from_secs(secs)),
             reconnect,
             extranonce_subscribe: ext,
+            bind: None,
         })
         .unwrap()
     })

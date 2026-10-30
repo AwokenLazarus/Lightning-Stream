@@ -108,6 +108,12 @@ struct Rig {
 /// The hashmaker with its fallback, and `n` miners (`ext`: those that take a new extranonce) running
 /// `secs` seconds at up to `rate` shares a second. Returns once every miner hashes for the fallback.
 fn rig(n: usize, ext: &[bool], secs: u64, rate: f64) -> Rig {
+    rig_from(n, ext, secs, rate, false)
+}
+
+/// [`rig`], each miner connecting from an address of its own (127.0.0.2, 127.0.0.3, ...) with `own`,
+/// as miners on a LAN do, or all from one address as behind one router.
+fn rig_from(n: usize, ext: &[bool], secs: u64, rate: f64, own: bool) -> Rig {
     let dir = tempdir();
     let fallback = Pool::start(&dir, "fallback");
     let [link, miners_a] = ports::<2>();
@@ -140,6 +146,7 @@ fn rig(n: usize, ext: &[bool], secs: u64, rate: f64) -> Rig {
                     duration: Some(Duration::from_secs(secs)),
                     reconnect: true,
                     extranonce_subscribe: e,
+                    bind: own.then(|| std::net::IpAddr::from([127, 0, (2 + i / 250) as u8, (2 + i % 250) as u8])),
                 })
                 .unwrap()
             })
@@ -161,6 +168,11 @@ fn rig(n: usize, ext: &[bool], secs: u64, rate: f64) -> Rig {
 
 /// A hashtaker taking `miners` miners into its own pool for `secs`, paying (or stopping after a slice).
 fn hashtaker(rig: &Rig, name: &str, miners: u32, secs: u64, stop_paying_after: Option<u64>) -> (Pool, thread::JoinHandle<Value>) {
+    hashtaker_idle(rig, name, miners, secs, stop_paying_after, Duration::from_secs(4))
+}
+
+/// [`hashtaker`], ending the rental after `idle` without accepted work.
+fn hashtaker_idle(rig: &Rig, name: &str, miners: u32, secs: u64, stop_paying_after: Option<u64>, idle: Duration) -> (Pool, thread::JoinHandle<Value>) {
     let pool = Pool::start(&rig.dir, name);
     let cfg = hashtaker::Config {
         hashmaker: rig.link.clone(),
@@ -172,7 +184,7 @@ fn hashtaker(rig: &Rig, name: &str, miners: u32, secs: u64, stop_paying_after: O
         rental: name.into(),
         listing: "lab".into(),
         stop_paying_after,
-        idle: Duration::from_secs(4),
+        idle,
         duration: Some(Duration::from_secs(secs)),
         report: None,
         payer: None,
@@ -337,4 +349,99 @@ fn moving_a_miner_leaves_no_gap_longer_than_one_job() {
         assert!(m.max_gap_ms < JOB_MS, "a gap of {} ms between accepted shares, a job is {JOB_MS} ms: {m:?}", m.max_gap_ms);
         assert!(m.rejected * 10 <= m.accepted, "few rejected shares around the switches: {m:?}");
     }
+}
+
+/// Miners behind one address (a farm behind one router, or containers) that are moved into rentals
+/// together each connect again once to go in and once to come back, and the rentals get their work:
+/// a returning miner is placed by its worker name, not by whichever miner from that address asked first.
+#[test]
+fn miners_behind_one_address_move_once_each_way() {
+    let _s = serial();
+    let secs = 12;
+    let rig = rig(8, &[], secs + 25, 6.0);
+    let hashtakers: Vec<_> = (0..2).map(|i| hashtaker_idle(&rig, &format!("one{i}"), 4, secs, None, Duration::from_secs(20))).collect();
+    let mut got = Vec::new();
+    for (i, (pool, b)) in hashtakers.into_iter().enumerate() {
+        let b = b.join().unwrap();
+        let r = finished(&rig.hashmaker, &format!("one{i}"));
+        assert_eq!(rented_names(&r).len(), 4, "{r}");
+        check_paid(&r, &b);
+        got.push(pool.users()[&format!("one{i}.rented")]);
+    }
+    rig.hashmaker.shutdown();
+    let res: Vec<standin::MinerResult> = rig.miners.into_iter().map(|m| m.join().unwrap()).collect();
+    for m in &res {
+        // the first connection, one into the rental, one back to the fallback, and one more when the
+        // app stops at the end and the miner tries again
+        assert!(m.sessions <= 4, "a miner connected {} times: {res:?}", m.sessions);
+    }
+    // 4 miners at 6 shares a second; the rental's first seconds go to taking a ticket
+    for g in got {
+        assert!(g * 10 >= 4 * secs * 6 * 6, "a rental's pool got {g} shares of {} at most", 4 * secs * 6);
+    }
+}
+
+/// CPU seconds this process has used, from /proc (Linux).
+fn cpu_secs() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let f: Vec<&str> = s.rsplit_once(')').map(|(_, r)| r.split_whitespace().collect()).unwrap_or_default();
+    let tick = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+    (tick(11) + tick(12)) / 100.0
+}
+
+/// A load test, run by name only (`--ignored`): HASH_LOAD_TAKERS hashtakers (default 10) take
+/// HASH_LOAD_EACH miners each (default 3) from one hashmaker at once, for HASH_LOAD_SECS seconds
+/// (default 30). Each rental is paid in full with receipts that agree, no miner is rented twice,
+/// and no miner's shares stop for longer than a job. Prints one line of JSON: the rentals, the
+/// slices paid, the shares, the largest gap and the CPU this process used.
+#[test]
+#[ignore]
+fn many_hashtakers_at_once_on_one_hashmaker() {
+    let _s = serial();
+    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (n, each, secs) = (env("HASH_LOAD_TAKERS", 10) as usize, env("HASH_LOAD_EACH", 3) as u32, env("HASH_LOAD_SECS", 30));
+    let miners = n * each as usize + 2;
+    // miners each with an address of their own, as on a LAN (behind one address, see the test above)
+    let rig = rig_from(miners, &[], secs + 40, 6.0, true);
+    let (c0, t0) = (cpu_secs(), Instant::now());
+    // the binary's own idle time (60 s), not the 4 s of the tests above: with many rentals starting at once, a
+    // miner's first share at its new pool can take longer than 4 s on a loaded machine
+    let hashtakers: Vec<_> = (0..n).map(|i| hashtaker_idle(&rig, &format!("load{i}"), each, secs, None, Duration::from_secs(60))).collect();
+    let mut taken = Vec::new();
+    let mut paid = 0;
+    let mut rental_shares = Vec::new();
+    for (i, (pool, b)) in hashtakers.into_iter().enumerate() {
+        let b = b.join().unwrap();
+        let r = finished(&rig.hashmaker, &format!("load{i}"));
+        let names = rented_names(&r);
+        assert_eq!(names.len(), each as usize, "{each} miners for load{i}: {r}");
+        check_paid(&r, &b);
+        paid += r["paid"].as_u64().unwrap();
+        let got = pool.users()[&format!("load{i}.rented")];
+        assert!(got > 0, "load{i}'s pool got shares");
+        rental_shares.push(got);
+        taken.extend(names);
+    }
+    let fallback_shares: u64 = rig.fallback.users().values().sum();
+    let (cpu, wall) = (cpu_secs() - c0, t0.elapsed().as_secs_f64());
+    let rented = taken.len();
+    taken.sort();
+    taken.dedup();
+    assert_eq!(taken.len(), rented, "no miner rented twice: {taken:?}");
+    rig.hashmaker.shutdown();
+    let res: Vec<standin::MinerResult> = rig.miners.into_iter().map(|m| m.join().unwrap()).collect();
+    let gap = res.iter().map(|m| m.max_gap_ms).max().unwrap_or(0);
+    let (acc, rej) = (res.iter().map(|m| m.accepted).sum::<u64>(), res.iter().map(|m| m.rejected).sum::<u64>());
+    // what a rental's pool would get if each rented miner hashed for it the whole rental, at the miners' rate
+    let expected = each as u64 * secs * 6;
+    let sessions = res.iter().map(|m| m.sessions).max().unwrap_or(0);
+    println!(
+        "{}",
+        serde_json::json!({"hashtakers": n, "miners": miners, "rented": rented, "slices_paid": paid, "shares_accepted": acc, "shares_rejected": rej,
+                           "max_gap_ms": gap, "job_ms": JOB_MS,
+                           "rental_shares_min": rental_shares.iter().min(), "rental_shares_max": rental_shares.iter().max(),
+                           "rental_shares_expected": expected, "fallback_shares": fallback_shares, "max_miner_sessions": sessions, "cpu_s": (cpu * 100.0).round() / 100.0, "wall_s": wall.round(), "cores": (cpu / wall * 100.0).round() / 100.0})
+    );
+    assert!(gap < JOB_MS, "a miner's shares stopped for {gap} ms, a job is {JOB_MS} ms");
+    assert!(rej * 10 <= acc, "few rejected shares: {rej} of {acc}");
 }

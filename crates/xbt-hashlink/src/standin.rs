@@ -195,6 +195,19 @@ pub struct MinerConfig {
     pub reconnect: bool,
     /// Ask for `mining.set_extranonce` (`mining.extranonce.subscribe`), as some firmware does.
     pub extranonce_subscribe: bool,
+    /// Connect from this local address (e.g. one of 127.0.0.0/8), as a miner with its own address
+    /// on a LAN does; `None`: whichever the system picks, shared by every stand-in on this machine.
+    pub bind: Option<std::net::IpAddr>,
+}
+
+/// Connect to `addr`, from `bind` when given.
+fn connect_from(addr: &str, bind: Option<std::net::IpAddr>) -> std::io::Result<TcpStream> {
+    let Some(ip) = bind else { return TcpStream::connect(addr) };
+    let to = std::net::ToSocketAddrs::to_socket_addrs(addr)?.next().ok_or_else(|| std::io::Error::other("no address"))?;
+    let s = socket2::Socket::new(socket2::Domain::for_address(to), socket2::Type::STREAM, None)?;
+    s.bind(&std::net::SocketAddr::new(ip, 0).into())?;
+    s.connect(&to.into())?;
+    Ok(s.into())
 }
 
 /// What a stand-in miner did.
@@ -257,7 +270,7 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
         if over(t0) {
             break;
         }
-        let c = match TcpStream::connect(&cfg.pool) {
+        let c = match connect_from(&cfg.pool, cfg.bind) {
             Ok(c) => c,
             Err(e) if res.sessions == 0 => return Err(format!("miner connect {}: {e}", cfg.pool)),
             Err(_) if cfg.reconnect => {

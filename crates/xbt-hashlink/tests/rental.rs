@@ -231,6 +231,7 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
                     // miners whose rental waits for its hashtaker are let go in the lab (no fallback) and connect again
                     reconnect: cut_after.is_some(),
                     extranonce_subscribe: false,
+                    bind: None,
                 })
             })
         })
