@@ -54,6 +54,8 @@
 //! | `XBT_UI_AI_STATE` | `$XBT_DATA_DIR/run/ai/state.json` | the endpoint's record of the sellers' health, shown on the AI page |
 //! | `XBT_UI_RELAY_LINK_S` | `21600` (6 hours) | how long a link for the buyer's own player (VLC, mpv, a TV app) made on a Files service's page lives (60 s to 7 days) |
 //! | `XBT_UI_FILES_DIR` | `<data dir>/files` | the folder a Files service shares (Sell, "Files"): the UI serves it to the shop's gateway only (`docs/FILES.md`) |
+//! | `XBT_UI_FILES_ROOT_WORDS` | "the folder this box shares with the app" | what the Sell page calls `XBT_UI_FILES_ROOT` ("the Downloads folder in Umbrel's Files app") |
+//! | `XBT_UI_FILES_ROOT` | unset | a folder the box shares with the app (Umbrel's Downloads, read-only): the owner chooses the shared folder under it on the Sell page, instead of `XBT_UI_FILES_DIR` |
 //! | `XBT_UI_FILES_BIND` | `127.0.0.1:8486` | where the UI serves that folder; on a platform whose gateway runs in another container, the app's private network |
 //! | `XBT_UI_FILES_UPSTREAM` | `http://<XBT_UI_FILES_BIND>` | how the gateway reaches the folder, as its container sees the UI |
 //! | `XBT_UI_DATUM_GUIDE` | the project's guide | where a renter without a DATUM Gateway is sent to set one up |
@@ -168,8 +170,15 @@ pub struct GatewaySetup {
 /// The folder a Files service shares (`docs/FILES.md`).
 #[derive(Debug, Clone, Default)]
 pub struct FilesSetup {
-    /// `XBT_UI_FILES_DIR`: the shared folder.
+    /// `XBT_UI_FILES_DIR`: the shared folder, when the owner has no folder to choose from ([`Self::root`] unset).
     pub dir: PathBuf,
+    /// `XBT_UI_FILES_ROOT`: a folder the box shares with the app (Umbrel's Downloads, mounted read-only),
+    /// under which the owner chooses the shared folder on the Sell page ([`crate::files::shared_dir`]).
+    pub root: Option<PathBuf>,
+    /// Where that choice is kept (`<data dir>/files-folder`): a path relative to [`Self::root`].
+    pub choice: PathBuf,
+    /// `XBT_UI_FILES_ROOT_WORDS`: what the owner calls [`Self::root`] ("the Downloads folder in Umbrel's Files app").
+    pub root_words: String,
     /// `XBT_UI_FILES_BIND`: where the UI serves it (`127.0.0.1:0` in tests: any free port).
     pub bind: String,
     /// `XBT_UI_FILES_UPSTREAM`: how the gateway reaches it. Empty: the address the UI bound.
@@ -239,6 +248,7 @@ impl Config {
             .or_else(|| env("XBT_DATA_DIR").map(|d| PathBuf::from(d).join("ui")))
             .unwrap_or_else(|| PathBuf::from("xbt-wallet-ui"));
         let files_default = data_dir.join("files");
+        let files_choice = data_dir.join("files-folder");
         let mut password = None;
         if let Some(f) = env("XBT_UI_PASSWORD_FILE") {
             password = Some(std::fs::read_to_string(&f).map_err(|e| format!("XBT_UI_PASSWORD_FILE {f}: {e}"))?.trim_end_matches(['\r', '\n']).to_string());
@@ -324,6 +334,10 @@ impl Config {
             files: {
                 let bind = env("XBT_UI_FILES_BIND").unwrap_or_else(|| "127.0.0.1:8486".into());
                 FilesSetup { dir: env("XBT_UI_FILES_DIR").map(PathBuf::from).unwrap_or_else(|| files_default.clone()),
+                             root: env("XBT_UI_FILES_ROOT").filter(|s| !s.trim().is_empty()).map(PathBuf::from),
+                             choice: files_choice,
+                             root_words: env("XBT_UI_FILES_ROOT_WORDS").filter(|s| !s.trim().is_empty())
+                                 .unwrap_or_else(|| "the folder this box shares with the app".into()),
                              upstream: env("XBT_UI_FILES_UPSTREAM").unwrap_or_else(|| format!("http://{bind}")), bind }
             },
             nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
@@ -381,13 +395,14 @@ impl Config {
     /// A test or embedding configuration.
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         let files_dir = data_dir.join("files");
+        let files_choice = data_dir.join("files-folder");
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),
                session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, cmp_url: None,
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), app_ports: vec![],
                relay_ttl: Duration::from_secs(6 * 3600),
-               files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), upstream: String::new() },
+               files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), choice: files_choice, ..Default::default() },
                nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), relay_dir: None, relay_status: None,
                relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
                restart_hint: RESTART_HINT.into(), local_services: vec![],

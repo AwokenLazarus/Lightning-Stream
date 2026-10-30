@@ -21,11 +21,22 @@ listed, four folders deep.
 | Platform | The folder |
 |---|---|
 | Linux | `XBT_UI_FILES_DIR`, by default `<the UI's data dir>/files`: point it at any folder |
-| Umbrel | `/data/ui/files` in the app, which is `<app data>/data/ui/files` on the box |
+| Umbrel | a folder the owner chooses on the Sell page, under the **Downloads** folder of Umbrel's Files app |
 | StartOS | `<the UI's data dir>/files` in the package's volume |
 
-On Umbrel an app may mount only its own data. So the folder is inside the app's data until Umbrel gives
-apps a way to share a folder of the box's own files.
+**Umbrel.** The app mounts Umbrel's shared Downloads **read-only** (`/downloads` in the app; the
+`STORAGE_DOWNLOADS` permission), as media apps on Umbrel do. The owner puts files in Downloads with
+Umbrel's Files app, then picks the folder to share under **Which folder** on the Sell page: all of
+Downloads, or one folder in it. Stream only reads it and never changes or deletes a file. The choice
+is kept in `<the UI's data dir>/files-folder` and read for every request, so a new choice applies at
+once. A choice is held to Downloads as the files are: no `..`, no hidden names, no link that leads out
+of it; a choice that leads out (written by hand, say) shares nothing at all.
+
+Any Linux box can do the same: set `XBT_UI_FILES_ROOT` to a folder (mounted read-only if you like) and
+`XBT_UI_FILES_ROOT_WORDS` to what the page should call it; the owner then chooses under it.
+
+**StartOS** has no shared folder of the box's files that a package can read, so the folder stays in
+the package's own volume, reached with StartOS's file tools.
 
 ### How it is served
 

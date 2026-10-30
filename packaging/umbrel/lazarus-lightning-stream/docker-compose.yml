@@ -213,10 +213,17 @@ services:
       # Files (Sell): the shared folder, served by the UI to the gateway only, on the app's private
       # network (not published), with the files key the gateway's route adds (docs/FILES.md)
       XBT_UI_FILES_DIR: /data/ui/files
+      # the owner picks the shared folder under Umbrel's Downloads (what the Files app shows),
+      # which the app only reads (mounted read-only below)
+      XBT_UI_FILES_ROOT: /downloads
+      XBT_UI_FILES_ROOT_WORDS: the Downloads folder in Umbrel's Files app
       XBT_UI_FILES_BIND: 0.0.0.0:8486
       XBT_UI_FILES_UPSTREAM: http://lazarus-lightning-stream_ui_1:8486
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
+      # Umbrel's shared Downloads, read-only, for Files (umbrelOS 1.x rewrites this path to
+      # ${UMBREL_ROOT}/home/Downloads; the STORAGE_DOWNLOADS permission covers it)
+      - ${UMBREL_ROOT}/data/storage/downloads:/downloads:ro
       # the AI page's files, shared by group with the connector (the credential store both write)
       - ${APP_DATA_DIR}/data/run/ai:/data/run/ai
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro

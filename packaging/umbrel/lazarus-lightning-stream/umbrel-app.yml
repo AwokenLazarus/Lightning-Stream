@@ -139,6 +139,9 @@ dependencies:
   # which is in its author's community store: umbrelOS resolves dependencies by installed app id
   - bitcoin
   - paulscode-lightning-fork
+# Files reads a folder the owner picks under Umbrel's shared Downloads, read-only
+permissions:
+  - STORAGE_DOWNLOADS
 path: ""
 defaultUsername: ""
 deterministicPassword: true
