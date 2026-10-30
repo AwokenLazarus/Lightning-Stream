@@ -375,6 +375,18 @@ pub trait TicketWire: Send + Sync {
     }
 }
 
+/// With `XBT_TRACE_WIRE` set, one line on stderr per request to a seller: the method, the path, its
+/// status (or `err`) and how long its head took. For finding which steps a slow link makes slow.
+fn wire_trace(method: &str, url: &str, status: Option<u16>, t0: Instant) {
+    if std::env::var_os("XBT_TRACE_WIRE").is_none() {
+        return;
+    }
+    let path = url.split_once("://").and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..])).unwrap_or("/");
+    let path: String = path.split('?').next().unwrap_or("/").chars().take(60).collect();
+    let status = status.map_or_else(|| "err".to_string(), |s| s.to_string());
+    eprintln!("wire: {method} {path} {status} {} ms", t0.elapsed().as_millis());
+}
+
 /// [`TicketWire`] over ureq. No overall deadline (an answer may be long); a connect, a read and a
 /// write each have one.
 #[derive(Default)]
@@ -1955,7 +1967,10 @@ impl Signer {
 
     pub(crate) fn wire(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer> {
         let tls = self.seller_tls_for(url);
-        self.ticket_wire.send_with(method, url, body, headers, read_timeout, tls.as_ref())
+        let t0 = Instant::now();
+        let r = self.ticket_wire.send_with(method, url, body, headers, read_timeout, tls.as_ref());
+        wire_trace(method, url, r.as_ref().map(|a| a.status).ok(), t0);
+        r
     }
 
     /// [`Signer::wire`], the whole request held to `overall` ([`TicketWire::send_by`]).
@@ -1970,6 +1985,64 @@ impl Signer {
     /// owner has since taken off the list is not sent another byte.
     fn ticket_may_reach(&self, origin: &str, task: &str) -> bool {
         self.engine.allowlist().iter().any(|a| a == origin) || self.ticket_policy().tasks.get(task).is_some_and(|t| t.admit == Admit::Any)
+    }
+
+    /// Keep the terms of a seller's 402 for the route it names, where its gateway checks them
+    /// (`termsChecked`): every ticket entry names the same route, and there is no draw entry (draws
+    /// are always asked for). At most 64 routes a seller and 64 sellers.
+    fn route_terms_keep(&self, origin: &str, pr: &Value) {
+        let entries: Vec<&Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten().collect();
+        // a seller that offers draws on a route: what was kept of its other routes may leave out the draw entry they
+        // are offered now, and none of it is used again until each is asked
+        if entries.iter().any(|e| e.get("scheme").and_then(Value::as_str) == Some(xbt402::lottery::SCHEME)) {
+            lock(&self.route_terms).remove(origin);
+            return;
+        }
+        if entries.iter().any(|e| e.get("scheme").and_then(Value::as_str) != Some(xbt402::ticket::SCHEME)) {
+            return;
+        }
+        let routes: HashSet<&str> = entries.iter().filter(|e| e["extra"]["termsChecked"] == true).filter_map(|e| e["extra"]["route"].as_str()).collect();
+        let [route] = routes.into_iter().collect::<Vec<_>>()[..] else { return };
+        if !route.starts_with('/') || entries.iter().any(|e| e["extra"]["termsChecked"] != true || e["extra"]["route"] != route) {
+            return;
+        }
+        let mut all = lock(&self.route_terms);
+        if all.len() >= 64 && !all.contains_key(origin) {
+            all.clear();
+        }
+        let mine = all.entry(origin.to_string()).or_default();
+        if mine.len() >= 64 && !mine.contains_key(route) {
+            mine.clear();
+        }
+        mine.insert(route.to_string(), pr.clone());
+    }
+
+    /// Whether terms kept for a route of `origin` are those of the session open with it: the same node,
+    /// receipt key, ticket and endpoints. Terms kept from before the session was opened again on others
+    /// would stop it as a seller whose terms changed; the price is asked instead.
+    fn route_terms_fit(&self, origin: &str, pr: &Value, lightning: &str) -> bool {
+        let Some(slot) = lock(&self.ticket_http).get(origin).cloned() else { return false };
+        let Ok(open) = slot.open.try_lock() else { return false };
+        let Some(h) = open.as_ref() else { return false };
+        offers(pr, lightning).into_iter().any(|o| match o {
+            Offer::Ticket(acc, prepaid) => {
+                let prepaid = prepaid.and_then(|a| PayTerms::parse(&a, lightning).ok()).map(|p| p.terms);
+                PayTerms::parse(&acc, lightning).is_ok_and(|t| h.terms.same_seller(&t)) && prepaid == h.prepaid
+            }
+            _ => false,
+        })
+    }
+
+    /// The terms kept for the route of `url` at `origin`, the route the seller's gateway would take
+    /// it on among those it has stated: the longest whose path ends in `/` and starts the URL's path,
+    /// or that is the whole path.
+    fn route_terms_for(&self, origin: &str, url: &str) -> Option<Value> {
+        let path = url.split_once("://").and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..])).unwrap_or("/");
+        let path = path.split(['?', '#']).next().unwrap_or("/");
+        let all = lock(&self.route_terms);
+        all.get(origin)?.iter()
+            .filter(|(r, _)| if r.ends_with('/') { path.starts_with(r.as_str()) } else { path == r.as_str() })
+            .max_by_key(|(r, _)| r.len()).map(|(_, pr)| pr.clone())
     }
 
     // --- the entry: one function chooses the rail ---------------------------------------------------
@@ -2001,6 +2074,52 @@ impl Signer {
     /// sends the page's own request headers (`headers`, [`caller_headers`]) and, with
     /// `head_headers`, gets the seller's response headers in the head line ([`passed_headers`]).
     pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
+        let origin = p.get("url").and_then(Value::as_str).and_then(|u| origin_of(u).ok()).map(|o| normalize_dest(&o));
+        let forget = || {
+            if let Some(o) = &origin {
+                lock(&self.route_terms).remove(o);
+            }
+        };
+        // a session stopped because the seller's terms changed: what was kept of its routes' terms is not its terms now either
+        let stopped_on_new_terms = |v: &Value| v.get("rule").and_then(Value::as_str) == Some("ticket_terms_changed");
+        // only a caller that asks for it (`known_terms`: a page of a web app, many small reads) is paid on terms it
+        // was told before; any other call asks the seller's price first, and sees there what the seller says now
+        let known = p.get("known_terms").and_then(Value::as_bool) == Some(true);
+        let first = self.xbt402_pay_as(p, known);
+        if stopped_on_new_terms(&first) {
+            forget();
+        }
+        // paid on terms the seller stated for another of its routes, and refused unpaid: asked properly, once
+        if first.get("seller_code").and_then(Value::as_str) != Some("terms_changed") {
+            return first;
+        }
+        forget();
+        // what the first try booked (a ticket released to make up the balance, say) is this call's too: the second
+        // may spend only what is left of the call's limit, and the answer counts both
+        let booked = py_int(first.get("charged_sats")).unwrap_or(0).max(0);
+        let released = first.get("tickets_released").and_then(Value::as_u64).unwrap_or(0);
+        let mut again = p.clone();
+        if booked > 0 {
+            if let Some(m) = py_int(p.get("max_sats").filter(|v| !v.is_null())) {
+                again["max_sats"] = (m - booked).max(0).into();
+            }
+        }
+        let mut v = self.xbt402_pay_as(&again, false);
+        if stopped_on_new_terms(&v) {
+            forget();
+        }
+        if booked > 0 {
+            v["charged_sats"] = (py_int(v.get("charged_sats")).unwrap_or(0) + booked).into();
+        }
+        if released > 0 || v.get("tickets_released").is_some() {
+            v["tickets_released"] = (v.get("tickets_released").and_then(Value::as_u64).unwrap_or(0) + released).into();
+        }
+        v
+    }
+
+    /// [`Signer::xbt402_pay`]; `known_terms`: a request on a route whose terms the seller stated in this
+    /// session may be paid without asking its price first ([`Signer::route_terms`]).
+    fn xbt402_pay_as(&self, p: &Value, known_terms: bool) -> Value {
         let tp = self.ticket_policy();
         let cfg = self.config();
         let max_sats = match p.get("max_sats").filter(|v| !v.is_null()) {
@@ -2110,62 +2229,77 @@ impl Signer {
         };
         // the session open with this seller, named in the ask of the price: a seller whose route is full
         // goes on serving a buyer it serves there (docs/CAPACITY.md)
-        let mut named = self.ticket_seller_sid(&origin, false);
-        let mut probe = loop {
-            let mut headers = range_headers.clone();
-            if let Some(sid) = &named {
-                headers.push(("PAYMENT-SESSION".into(), sid.clone()));
-            }
-            let probe = if upgrade {
-                // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
-                match self.wire_upgrade(&url, &headers, Self::ticket_read_timeout(&tp)) {
-                    Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
-                    Ok(u) => Ok(u.answer),
-                    Err(e) => Err(e),
+        let named0 = self.ticket_seller_sid(&origin, false);
+        // a plain read on a route whose terms this seller stated, with a session open: paid without asking
+        let known = (known_terms && named0.is_some() && matches!(method.as_str(), "GET" | "HEAD") && raw.is_empty() && !upgrade)
+            .then(|| self.route_terms_for(&origin, &url)).flatten()
+            .filter(|pr| self.route_terms_fit(&origin, pr, &lightning));
+        let pr = match known {
+            Some(pr) => pr,
+            None => {
+                let mut named = named0;
+                let mut probe = loop {
+                    let mut headers = range_headers.clone();
+                    if let Some(sid) = &named {
+                        headers.push(("PAYMENT-SESSION".into(), sid.clone()));
+                    }
+                    let probe = if upgrade {
+                        // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
+                        match self.wire_upgrade(&url, &headers, Self::ticket_read_timeout(&tp)) {
+                            Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
+                            Ok(u) => Ok(u.answer),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        self.wire(&method, &url, &raw, &headers, Self::ticket_read_timeout(&tp))
+                    };
+                    let probe = match probe {
+                        Ok(a) => a,
+                        Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
+                    };
+                    // busy while another call was opening the session with this seller (a page's first parts at
+                    // once): asked again as that session's buyer, once it is open
+                    if probe.status == 503 && named.is_none() {
+                        named = self.ticket_seller_sid(&origin, true);
+                        if named.is_some() {
+                            continue;
+                        }
+                    }
+                    break probe;
+                };
+                // a seller whose service is full turns a new visit away before it is sold anything
+                if probe.status == 503 {
+                    let v: Value = probe.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                    if let Some(d) = seller_busy(&v) {
+                        return d;
+                    }
+                    return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"), json!({"status": 503, "charged_sats": 0}));
                 }
-            } else {
-                self.wire(&method, &url, &raw, &headers, Self::ticket_read_timeout(&tp))
-            };
-            let probe = match probe {
-                Ok(a) => a,
-                Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
-            };
-            // busy while another call was opening the session with this seller (a page's first parts at
-            // once): asked again as that session's buyer, once it is open
-            if probe.status == 503 && named.is_none() {
-                named = self.ticket_seller_sid(&origin, true);
-                if named.is_some() {
-                    continue;
+                if probe.status != 402 {
+                    let status = probe.status;
+                    // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
+                    let mut sink = Sink::streaming_to(stream_to.as_deref());
+                    let (head, refused) = head_to(&mut probe, range, stream_head, head_headers, &mut sink);
+                    let ended = match refused {
+                        Some(why) => Some(format!("not read: {why}")),
+                        None => read_all(probe, &mut sink),
+                    };
+                    let (_, stored, text) = sink.done();
+                    return with(with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": status, "charged_sats": 0, "note": "no 402 (already free or error)",
+                                                 "complete": ended.is_none(), UNTRUSTED_KEY: untrusted(&text, Value::Null)}), stored),
+                                     json!({"ended": ended})), head);
                 }
+                let Some(pr) = probe.header("PAYMENT-REQUIRED").and_then(|h| unb64json(h).ok()) else {
+                    return deny("xbt402", "402 without a readable PAYMENT-REQUIRED");
+                };
+                drop(probe);
+                // a GET's terms only: a HEAD's leave out the draw entry a GET would be offered
+                if method == "GET" {
+                    self.route_terms_keep(&origin, &pr);
+                }
+                pr
             }
-            break probe;
         };
-        // a seller whose service is full turns a new visit away before it is sold anything
-        if probe.status == 503 {
-            let v: Value = probe.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-            if let Some(d) = seller_busy(&v) {
-                return d;
-            }
-            return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"), json!({"status": 503, "charged_sats": 0}));
-        }
-        if probe.status != 402 {
-            let status = probe.status;
-            // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
-            let mut sink = Sink::streaming_to(stream_to.as_deref());
-            let (head, refused) = head_to(&mut probe, range, stream_head, head_headers, &mut sink);
-            let ended = match refused {
-                Some(why) => Some(format!("not read: {why}")),
-                None => read_all(probe, &mut sink),
-            };
-            let (_, stored, text) = sink.done();
-            return with(with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": status, "charged_sats": 0, "note": "no 402 (already free or error)",
-                                         "complete": ended.is_none(), UNTRUSTED_KEY: untrusted(&text, Value::Null)}), stored),
-                             json!({"ended": ended})), head);
-        }
-        let Some(pr) = probe.header("PAYMENT-REQUIRED").and_then(|h| unb64json(h).ok()) else {
-            return deny("xbt402", "402 without a readable PAYMENT-REQUIRED");
-        };
-        drop(probe);
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
@@ -3551,7 +3685,7 @@ impl Signer {
             };
             let seq_deadline = Instant::now() + SEQ_WAIT;
             let mut sent_epoch;
-            let (ans, receipt) = loop {
+            let (mut ans, receipt) = loop {
                 let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
                 let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
                 let mut headers = c.headers();
@@ -3560,6 +3694,9 @@ impl Signer {
                 if c.max_sats > 0 {
                     headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.max_sats as u64).saturating_mul(1000).to_string()));
                 }
+                // the price the wallet counts this request at: a seller that checks it refuses another unpaid
+                headers.push((xbt402::ticket::PRICE_HEADER.into(),
+                              xbt402::ticket::price_line(price.request_msat, price.byte_msat, price.per_bytes, price.second_msat, &price.tokens)));
                 sent_epoch = lock_money(hs).epoch;
                 let sent = if c.upgrade {
                     self.wire_upgrade(c.url, &headers, Self::ticket_read_timeout(&tp)).map(|u| {
@@ -3661,14 +3798,22 @@ impl Signer {
             }
             // a seller that gives accounts and has not been told who this wallet is (it restarted, say): told, and asked again, once
             if ans.status == 403 && !identified_again && self.identify_wanted(hs) {
-                let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                let headers = ans.headers.clone();
+                // an answer that cannot be read may be the seller asking who this wallet is: not handed on as an empty one
+                let Ok(body) = ans.read_small(SMALL_BODY) else {
+                    return fail(hs, &spent, with(refusal("ticket_refused", "the seller refused the request (HTTP 403) and its answer could not be read: \
+                                                                           whether it asks to know who this wallet is first is not known"), json!({"status": 403})));
+                };
+                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 if v.get("error").and_then(Value::as_str) == Some("identify_first") {
                     identified_again = true;
                     if self.ticket_identify(hs).is_ok() {
                         continue;
                     }
+                    return fail(hs, &spent, with(refusal("ticket_refused", "the seller asks to know who this wallet is first, and could not be told"), json!({"status": 403})));
                 }
-                return fail(hs, &spent, with(refusal("ticket_refused", "the seller asks to know who this wallet is first, and could not be told"), json!({"status": 403})));
+                // any other refusal the seller signed (a path it does not serve, say) is its answer, handed on as it is
+                ans = WireAnswer { status: 403, length: Some(body.len() as u64), headers, body: Box::new(std::io::Cursor::new(body)) };
             }
             if matches!(ans.status, 402 | 503) {
                 let status = ans.status;
@@ -4112,6 +4257,9 @@ impl Signer {
         });
         // the connection is closed here: a seller that was still sending stops within what the balance covers
         drop(body);
+        // and the reader's socket too: its client has the whole body now, not after the seller's last receipt is
+        // fetched below, a round trip or more on a slow link (the call's reply still says what the answer cost)
+        sink.out = None;
         *spent = std::mem::take(&mut lock(&spent_cell));
         let stopped = lock(&state).1.clone();
         let complete = stopped.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);

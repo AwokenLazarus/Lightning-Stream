@@ -43,7 +43,8 @@ step("open the visit"); await cdp("Page.navigate", { url: ENTER });
 await waitFor("document.readyState==='complete' && location.pathname.startsWith('/web')", 30000);
 await sleep(6000); await shot("01-first-page");
 step(`page: ${await ev("location.href")} title=${await ev("document.title")}`);
-const loginForm = await waitFor("!!document.querySelector('#txtManualName, .manualLoginForm, input[type=password]')", 15000);
+// over a slow link the web client takes a while to load all its parts: a viewer waits for the login page
+const loginForm = await waitFor("!!document.querySelector('#txtManualName, .manualLoginForm, input[type=password]')", Number(process.env.JF_LOGIN_WAIT_MS || 90000));
 step(`login form shown: ${loginForm}`);
 if (loginForm && TAP) {
   // the login page lists the users once it has asked the server for them: on a slow link, seconds after the form
@@ -63,16 +64,31 @@ if (loginForm && TAP) {
   await ev(`(()=>{const f=document.querySelector('form.manualLoginForm'); const b=f&&f.querySelector('button[type=submit]'); if(b){b.click(); return true} return false})()`);
   await sleep(6000);
 }
+// signed in once the web client has a user: over a slow link, seconds after the tap or the submit
+const signedIn = await waitFor("(()=>{try{return !!(window.ApiClient && window.ApiClient.getCurrentUserId())}catch(e){return false}})()", Number(process.env.JF_LOGIN_WAIT_MS || 90000));
+step(`signed in: ${signedIn}`);
 await shot("02-after-login");
 res.after_login = await ev("location.href"); step(`after login: ${res.after_login}`);
 const home = await waitFor("!!document.querySelector('.card, .itemsContainer .card')", 20000);
 res.home = home; step(`home shows cards: ${home}`); await shot("03-home");
-step("open the 4K film"); await ev(`location.hash = '#/details?id=${ITEM}'`); await sleep(6000); await shot("04-details");
-const play = await ev(`(()=>{const b=document.querySelector('.btnPlay, button[data-action=resume], button[data-action=play]'); if(b){b.click(); return true} return false})()`);
+// Each run starts the film from the beginning: an earlier run with the same buyer's account left a
+// resume point (or a "watched" mark), and Play would resume there, near the end of a short clip.
+res.reset_progress = await ev(`(async()=>{try{const a=window.ApiClient; await a.markUnplayed(a.getCurrentUserId(), '${ITEM}'); return true}catch(e){return String(e)}})()`);
+step(`progress reset: ${res.reset_progress}`);
+step("open the 4K film"); await ev(`location.hash = '#/details?id=${ITEM}'`);
+// the details page fills in once its item has arrived: over a slow link, seconds after it opens. A viewer waits for its
+// title and play button, not a fixed time
+const shown = await waitFor(`(()=>{const pg=[...document.querySelectorAll('.itemDetailPage')].find(p=>!p.classList.contains('hide')&&p.offsetParent!==null); return !!(pg && pg.querySelector('.mainDetailButtons .btnPlay:not(.hide), .mainDetailButtons button[data-action=resume]:not(.hide)') && pg.querySelector('.itemName, h1, h3.itemName'))})()`, Number(process.env.JF_PAGE_WAIT_MS || 60000));
+step(`details shown: ${shown}`); await sleep(1000); await shot("04-details");
+// The play button of the details page on show: Jellyfin keeps earlier pages (home, with its
+// "Continue watching" cards) in the document, hidden, so the first .btnPlay may be another film's.
+const play = await ev(`(()=>{const pg=[...document.querySelectorAll('.itemDetailPage')].find(p=>!p.classList.contains('hide')&&p.offsetParent!==null); const b=pg&&pg.querySelector('.mainDetailButtons .btnPlay, .mainDetailButtons button[data-action=resume], .mainDetailButtons button[data-action=play]'); if(b){b.click(); return true} return false})()`);
 step(`play pressed: ${play}`);
 const t1 = Date.now();
 const started = await waitFor("(()=>{const v=document.querySelector('video'); return !!(v && v.currentTime>0.5)})()", 60000);
-const startup = ((Date.now() - t1) / 1000).toFixed(1); res.started = started; step(`playback started: ${started} after ${startup}s`);
+const startup = ((Date.now() - t1) / 1000).toFixed(1); res.started = started;
+res.playing_item = await ev(`(()=>{const v=document.querySelector('video'); const m=v&&/[/]videos[/]([0-9a-f-]+)[/]/i.exec(v.currentSrc||v.src||''); return m?m[1].replace(/-/g,''):null})()`);
+res.played_requested = res.playing_item === ITEM.replace(/-/g, ""); step(`playing ${res.playing_item}, the requested film: ${res.played_requested}`); step(`playback started: ${started} after ${startup}s`);
 await ev(`(()=>{const v=document.querySelector('video'); if(!v) return; window.__stalls=0; window.__waitT=0; let w=0; v.addEventListener('waiting',()=>{window.__stalls++; w=performance.now()}); v.addEventListener('playing',()=>{ if(w){window.__waitT+=performance.now()-w; w=0} });})()`);
 const samples = []; for (let i = 0; i < 12; i++) { await sleep(5000);
   samples.push(await ev(`(()=>{const v=document.querySelector('video'); if(!v) return null; const q=v.getVideoPlaybackQuality? v.getVideoPlaybackQuality():{}; return {t:+v.currentTime.toFixed(1), w:v.videoWidth, h:v.videoHeight, rs:v.readyState, dropped:q.droppedVideoFrames, total:q.totalVideoFrames, stalls:window.__stalls, waitMs:Math.round(window.__waitT), src:(v.currentSrc||'').slice(0,140)}})()`)); }

@@ -891,6 +891,11 @@ impl Gateway {
                     if *settle == SETTLE_ON_USE && self.cfg.caps.held_after_paid {
                         e["extra"]["heldAfterPaid"] = true.into();
                     }
+                    // the route these terms are for, and that a paid request repeating another route's terms is
+                    // refused unpaid ([`Refusal::TermsChanged`]): a buyer may then pay its next request on this route
+                    // without asking the price first
+                    e["extra"]["route"] = r.path.clone().into();
+                    e["extra"]["termsChecked"] = true.into();
                     // a route that gives buyers accounts asks to know who the buyer is (docs/BUYER-ACCOUNTS.md)
                     if r.accounts.is_some() {
                         e["extra"]["identify"] = true.into();
@@ -1623,8 +1628,23 @@ impl Gateway {
             Ok(p) => p,
             Err(why) => return Reply::Whole(error(400, "bad_target", why)),
         };
+        // A request that carries a payment is answered with a receipt whatever happens to it: one
+        // sent without asking the price first (a buyer that knows the route's terms) may be for a
+        // path that is refused, unknown or free, and an answer to a payment nobody signed is the
+        // seller's fault to its buyer. Refused here, it is charged nothing.
+        // A payment that does not authenticate (a seq used already, a session the book does not hold) is
+        // answered with that refusal, as on a path that is sold: the buyer learns what is wrong with it.
+        let signed = |r: Response| -> Reply {
+            if let Ok(Some(pay)) = self.pay_header(&req) {
+                return Reply::Whole(match self.authenticate(&req, &pay, None) {
+                    Ok(a) => self.answered(&a, r, 0),
+                    Err(refused) => refused,
+                });
+            }
+            Reply::Whole(r)
+        };
         let Some(route) = self.cfg.route(&path) else {
-            return Reply::Whole(error(
+            return signed(error(
                 404,
                 "no_route",
                 "nothing is sold or served at this path",
@@ -1632,7 +1652,19 @@ impl Gateway {
         };
         if route.path_refused(&path) {
             // before payment and before the service: nothing is charged, and the service never sees it
-            return Reply::Whole(error(403, "path_refused", "the seller does not serve this path to buyers"));
+            return signed(error(403, "path_refused", "the seller does not serve this path to buyers"));
+        }
+        // a paid request for what is free here (a list of models, a free route) that names the price it
+        // took this path to have (a buyer that paid without asking): not served as paid, nothing charged,
+        // and the buyer asks again as anyone does. One that names no price is served free, as it always was
+        let free_here = Self::model_list(&req, &path, route) || route.free;
+        if free_here && req.header(xbt402::ticket::PRICE_HEADER).is_some() {
+            if let Ok(Some(pay)) = self.pay_header(&req) {
+                return Reply::Whole(match self.authenticate(&req, &pay, None) {
+                    Ok(a) => self.refused(&a, &self.req_url(&req), None, Refusal::TermsChanged),
+                    Err(refused) => refused,
+                });
+            }
         }
         // An AI model's list of models is free to read: a buyer needs it to choose a model before
         // paying, and it costs the service nothing.
@@ -1640,7 +1672,7 @@ impl Gateway {
             return self.free(&req, route);
         }
         if !route.methods.iter().any(|m| m == &req.method) {
-            return Reply::Whole(error(
+            return signed(error(
                 405,
                 "method_not_allowed",
                 "this route does not take that method",
@@ -1676,6 +1708,14 @@ impl Gateway {
             Ok(a) => a,
             Err(r) => return Reply::Whole(r),
         };
+        // a price the buyer took this route to have that is not its own (a buyer that paid without asking
+        // this path's price, from terms of another route): not served, nothing charged, this route's terms stated
+        let p = &route.price;
+        if req.header(xbt402::ticket::PRICE_HEADER)
+            .is_some_and(|h| h.trim() != xbt402::ticket::price_line(p.request_msat, p.byte_msat, p.per_bytes, p.second_msat, &p.tokens))
+        {
+            return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), Refusal::TermsChanged));
+        }
         let on_pledge = route.release == Release::AfterVerify;
         if let Some(hash) = &a.ticket {
             if !on_pledge {
@@ -2384,12 +2424,12 @@ mod tests {
         // a compile error here until it is listed
         let tickets = [Refusal::SessionUnknown, Refusal::BadAuth, Refusal::BadSeq(0), Refusal::TicketUnknown, Refusal::TicketNotLocked, Refusal::TicketUsed,
                        Refusal::TicketExpiring, Refusal::BalanceShort, Refusal::TooManyTickets, Refusal::TooManySessions, Refusal::SlotsShort(1),
-                       Refusal::HeightUnknown, Refusal::PledgeOutstanding, Refusal::PrepaidFirst];
+                       Refusal::HeightUnknown, Refusal::PledgeOutstanding, Refusal::PrepaidFirst, Refusal::TermsChanged];
         for r in tickets {
             match r {
                 Refusal::SessionUnknown | Refusal::BadAuth | Refusal::BadSeq(_) | Refusal::TicketUnknown | Refusal::TicketNotLocked | Refusal::TicketUsed
                 | Refusal::TicketExpiring | Refusal::BalanceShort | Refusal::TooManyTickets | Refusal::TooManySessions | Refusal::SlotsShort(_)
-                | Refusal::HeightUnknown | Refusal::PledgeOutstanding | Refusal::PrepaidFirst => codes.push(r.code().into()),
+                | Refusal::HeightUnknown | Refusal::PledgeOutstanding | Refusal::PrepaidFirst | Refusal::TermsChanged => codes.push(r.code().into()),
             }
         }
         // every refusal of the lottery's book, and every refusal of a value the seller's draw can give

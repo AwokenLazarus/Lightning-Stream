@@ -335,6 +335,37 @@ fn no_ticket_is_settled_without_a_fresh_block_height() {
     assert_eq!(rig.node.settles().len(), 1);
 }
 
+/// A paid request that does not authenticate is told why, wherever it is sent: to a path with no
+/// route, to a method the route does not take, or to a free route it names a price for. Not an
+/// unsigned answer as if it had not paid, nor the free body. A paid request for a free route that
+/// names no price (a wallet of before the price header) is served free, as it always was.
+#[test]
+fn a_payment_that_does_not_authenticate_is_refused_as_such_where_nothing_is_sold() {
+    let (rig, _d) = start(&|_| {});
+    let mut a = Buyer::new(&rig, 1);
+    let s = a.lock(&rig, 1);
+    assert_eq!(a.get("/api", Some(&s[0])).status, 200);
+    let price = (xbt402::ticket::PRICE_HEADER, "0 0/1 0/s 0/0/0");
+    for (method, target, extra) in [("GET", "/nowhere", None), ("DELETE", "/api", None), ("GET", "/files/free/100", Some(price))] {
+        // a seq already used
+        let sig = a.sign_at(0, method, target, b"", None, None);
+        let mut headers = vec![("PAYMENT-SIGNATURE", sig.as_str())];
+        headers.extend(extra);
+        let got = http(&rig.addr, method, target, &headers, b"", None);
+        assert_eq!((got.status, got.error().as_str(), got.json()["nextSeq"].as_u64()), (402, "bad_seq", Some(a.seq)), "{method} {target}");
+    }
+    // a seq that is next, on the free route with a price named: refused unpaid, with a receipt
+    let sig = a.sign("GET", "/files/free/100", b"", None, None);
+    let got = http(&rig.addr, "GET", "/files/free/100", &[("PAYMENT-SIGNATURE", &sig), price], b"", None);
+    assert_eq!((got.status, got.error().as_str()), (402, "terms_changed"));
+    assert_eq!(got.receipt(&rig.gw.terms().receipt_key)["charged"], "0");
+    // with no price named: served free
+    let sig = a.sign("GET", "/files/free/100", b"", None, None);
+    let got = http(&rig.addr, "GET", "/files/free/100", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+    a.used(&got);
+    assert_eq!((got.status, got.body.len()), (200, 100));
+}
+
 #[test]
 fn a_hostile_buyer_gets_nothing_it_did_not_pay_for() {
     let (rig, _d) = start(&|_| {});

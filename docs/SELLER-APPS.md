@@ -147,6 +147,31 @@ for long viewing is about 1 sat/MiB: 4K for about 3,600 sat an hour, 1080p for a
 900-sat ticket lasts about 90 s of 4K. The starter rules' 10,000 sat a day allow a little under
 three hours of 4K at that price, and a seller that charges by the MiB should say so in its terms.
 
+### 4K and HDR from a media server: what the seller's box has to do
+
+Stream carries what the media server sends; it does not change the picture. Whether a 4K or HDR film
+plays well is decided mostly by the media server and the buyer's player, measured in the lab with six
+4K clips (HDR10, Dolby Vision, HDR10+ and SDR, 26 to 100 Mbit/s) against the same Jellyfin with no
+Stream in the path (Research note "4K and HDR through Stream", 2026-10-30):
+
+- **In a web browser, 4K HEVC is converted on the seller's box.** Browsers generally can't decode
+  HEVC, HDR or Dolby Vision, so Jellyfin turns them into 4K H.264 as the buyer watches. On the lab's
+  CPU that took 8 to 11 cores to stay ahead of the film (38 to 76 frames a second). **A 2 to 4 core box
+  (a typical Umbrel or StartOS machine) cannot convert 4K as it plays.** Turn on hardware transcoding
+  in Jellyfin (Dashboard, Playback: Intel Quick Sync, NVIDIA NVENC, AMD or VA-API, whichever the box
+  has), or offer a 1080p version for browsers.
+- **Turn on tone mapping with it.** Without it, HDR converted for a browser looks washed out.
+- **For real HDR, buyers use a player that decodes it directly:** the Jellyfin apps for TVs and
+  phones, or mpv or VLC, through a local link (docs/LOCAL-LINKS.md). Then the film passes through
+  untouched, at its own bitrate, and the seller's box only sends bytes.
+- **Bitrate decides the link.** A streaming-quality 4K film needs about 15 to 25 Mbit/s, a full-disc
+  copy 40 to 100. Direct links carry that easily. Through a relay, the seller's upload and the relay
+  path are the limit: a shop serves on four link keys, so relayed buyers don't share one relay
+  connection (docs/RUN-A-RELAY.md).
+- **A seek costs what it costs without Stream:** a seek restarts Jellyfin's conversion, a few
+  seconds on the lab's CPU. Over a direct link or https, Stream added under 1.5 s at start and under
+  0.5 s at a seek in those runs.
+
 ## WebSockets
 
 A web app's live connection (Jellyfin's sync and remote control, a game, a chat) is a WebSocket:

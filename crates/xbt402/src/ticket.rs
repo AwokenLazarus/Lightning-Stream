@@ -25,7 +25,18 @@ pub const SESSION_PATH: &str = "/x402/ticket";
 /// bytes a buyer never reads (in a proxy's or tunnel's buffers) cannot cost more than the buyer's
 /// own limit for the call. A seller that ignores it charges as before.
 pub const MAX_MSAT_HEADER: &str = "X-Xbt402-Max-Msat";
+/// A paid request's optional header: the price the buyer takes this request's route to have, as
+/// [`price_line`] writes it. A seller that states `termsChecked` in its terms refuses a request whose
+/// line is not its route's (`terms_changed`), unpaid, so a buyer may pay a read on a route whose terms
+/// it already knows without asking its price first. A seller that ignores it charges as before.
+pub const PRICE_HEADER: &str = "X-Xbt402-Price";
 pub const RECEIPT_TAG: &str = "xbt402/ticket-receipt/v0";
+
+/// One route's price as one line, the same on both sides ([`PRICE_HEADER`]): msat per request, per
+/// `per_bytes` bytes and per second, and per 1,000 tokens in and out, with the most tokens out.
+pub fn price_line(request_msat: u64, byte_msat: u64, per_bytes: u64, second_msat: u64, tokens: &crate::tokens::TokenRule) -> String {
+    format!("{request_msat} {byte_msat}/{per_bytes} {second_msat}/s {}/{}/{}", tokens.input_per_1k_msat, tokens.output_per_1k_msat, tokens.max_output)
+}
 /// How many blocks before a held invoice's HTLC expires the seller's node cancels it, unless its
 /// runner set otherwise: lnd's `invoices.holdexpirydelta`, which is 18 on the Lightning Fork node
 /// this was built against (upstream lnd's default is 12). A runner's node may differ; the gateway
@@ -237,10 +248,10 @@ impl Terms {
 /// The error codes of the ticket scheme and of the lottery beside it ([`crate::lottery`]): what a
 /// gateway answers a payer with. Every code the gateway in this tree can answer with is here (a
 /// test there holds it to that), so that a payer can name each.
-pub const PROTOCOL_CODES: [&str; 39] = [
+pub const PROTOCOL_CODES: [&str; 40] = [
     "accounts_unavailable", "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "busy", "chain_spent",
     "draw_out_of_order", "draw_used", "hash_refused", "identify_first", "internal", "journal", "method_not_allowed", "no_route", "node_unavailable", "path_refused",
-    "piece_unknown", "pledge_outstanding", "prepaid_first", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
+    "piece_unknown", "pledge_outstanding", "prepaid_first", "session_unknown", "slots_short", "terms_changed", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
     "too_many_sessions", "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused",
     "win_size", "win_unpaid",
 ];

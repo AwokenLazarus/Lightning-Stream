@@ -255,7 +255,8 @@ fn routes() -> Value {
         {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
         {"path": "/wsfree/", "free": true, "websocket": true},
         // a buyer's own account (docs/BUYER-ACCOUNTS.md), made by the seller's hook: its headers say who the buyer is
-        {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK}},
+        {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK},
+         "deny_paths": ["/acct/admin"]},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
@@ -1095,6 +1096,11 @@ impl Rig {
         self.call("xbt402_pay", json!({"url": self.shop.url(path), "max_sats": max_sats, "task": "film"}))
     }
 
+    /// [`Rig::pay`] as a page of a web app asks: on terms the seller stated for the route, if it stated them.
+    fn pay_known(&self, path: &str, max_sats: i64) -> Value {
+        self.call("xbt402_pay", json!({"url": self.shop.url(path), "max_sats": max_sats, "task": "film", "known_terms": true}))
+    }
+
     fn status(&self) -> Value {
         self.call("ticket_status", json!({}))
     }
@@ -1294,6 +1300,274 @@ fn the_balance_a_session_leaves_with_the_seller_is_always_under_one_ticket() {
         assert_eq!(balance, released * TICKET - spent, "{path}: {v}");
         assert!(balance < TICKET, "{path}: {balance} msat left, a ticket or more: {v}");
     }
+}
+
+/// A second plain read on a route whose terms the seller stated, with the session open, is paid
+/// without asking its price first: one round trip a request saved, which over a slow link is most of
+/// what a page's many small requests cost.
+#[test]
+fn a_read_on_a_route_whose_terms_are_known_is_paid_without_asking_the_price_again() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay_known("/page/100", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let second = r.pay_known("/page/200", CALL);
+    assert_eq!((second["status"].as_u64(), second["price_msat"].as_str()), (Some(200), Some("2500")), "{second}");
+    let sent: Vec<bool> = r.tap.seen("/page/200").iter().map(|s| s.paid).collect();
+    assert_eq!(sent, vec![true], "the second page was asked for {sent:?} (paid or not)");
+    // a call that does not ask for it (an agent's, say) asks the price first, as always, and sees what the seller says now
+    assert_eq!(r.pay("/page/300", CALL)["status"].as_u64(), Some(200));
+    assert_eq!(r.tap.seen("/page/300").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![false, true], "asked, then paid");
+    assert!(r.status()["sellers"][0]["seller_fault"].is_null(), "{}", r.status());
+}
+
+/// Terms kept for one route and used on a path the seller serves on another: the seller refuses the
+/// request unpaid (`terms_changed`), and the wallet asks the price and pays the right one, with no
+/// fault. Here the seller's 402 for `/page/` is made to claim every path (route `/`), so the wallet
+/// pays `/tiny/` (0.5 sat) on `/page/`'s terms (2.5 sat) first.
+#[test]
+fn terms_kept_for_another_route_are_refused_unpaid_and_the_price_is_asked() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid || !seen.path.starts_with("/page/") {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["extra"]["route"] = "/".into();
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    assert_eq!(r.pay_known("/page/100", CALL)["status"].as_u64(), Some(200));
+    r.tap.clear();
+    let v = r.pay_known("/tiny/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some("500")), "{v}");
+    let sent: Vec<bool> = r.tap.seen("/tiny/1").iter().map(|s| s.paid).collect();
+    assert_eq!(sent, vec![true, false, true], "paid on the kept terms, refused, asked, paid: {sent:?}");
+    // the kept terms claim the whole shop again: a path the seller has no route for, and a free one, are
+    // answered as anyone's would be, signed and charged nothing, and the session goes on
+    let claim_all = |r: &Rig, page: &str| {
+        r.tap.set(Box::new(|seen, real| {
+            if seen.paid || !seen.path.starts_with("/page/") {
+                return None;
+            }
+            let (status, mut headers, body) = whole(real().ok()?);
+            if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+                let mut pr = unb64json(v).unwrap();
+                for e in pr["accepts"].as_array_mut().unwrap() {
+                    e["extra"]["route"] = "/".into();
+                }
+                *v = b64json(&pr);
+            }
+            Some(Ok(answer(status, headers, body)))
+        }));
+        let v = r.pay_known(page, CALL);
+        r.tap.clear();
+        v["session"].as_str().unwrap().to_string()
+    };
+    let session = claim_all(&r, "/page/300");
+    let nowhere = r.pay_known("/nowhere", CALL);
+    assert_eq!((nowhere["status"].as_u64(), nowhere.get("seller_fault")), (Some(404), None), "{nowhere}");
+    assert_eq!(r.tap.seen("/nowhere").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![true], "sent paid, answered with a receipt");
+    assert_eq!(claim_all(&r, "/page/500"), session, "the session goes on");
+    let free = r.pay_known("/free/10", CALL);
+    assert_eq!((free["status"].as_u64(), free["charged_sats"].as_i64(), free.get("seller_fault")), (Some(200), Some(0), None), "{free}");
+    assert_eq!(r.tap.seen("/free/10").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![true, false], "paid, refused unpaid, asked: free");
+    assert_eq!(r.pay_known("/page/400", CALL)["session"].as_str(), Some(session.as_str()), "the session goes on");
+}
+
+/// On a route that gives each buyer an account, a path the seller does not serve is answered as it
+/// is (403, signed, nothing charged), not taken for the seller asking who the buyer is. A web app
+/// asks for such paths (Jellyfin's `/System/Info`), and refusing them as "identify first" sent its
+/// buyers back to the login page.
+#[test]
+fn a_refused_path_on_a_route_with_accounts_is_answered_as_it_is() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::new(json!({}));
+    let first = r.pay_known("/acct/echo", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let v = r.pay_known("/acct/admin", CALL);
+    assert_eq!((v["status"].as_u64(), v["charged_sats"].as_i64(), v.get("seller_fault"), v["rule"].as_str()), (Some(403), Some(0), None, Some("ok")), "{v}");
+    assert!(v["untrusted_provider_response"]["body"].as_str().is_some_and(|b| b.contains("path_refused")), "the seller's own answer: {v}");
+    assert_eq!(r.pay_known("/acct/echo", CALL)["session"], first["session"], "the session goes on");
+    // a refusal whose body cannot be read (cut short) is not handed on as an empty answer: the wallet cannot
+    // tell whether the seller asks who it is, and says so
+    r.tap.set(Box::new(|seen, real| {
+        if !seen.paid || seen.path != "/acct/admin" {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let n = body.len() as u64 + 10;
+        Some(Ok(WireAnswer { length: Some(n), ..answer(status, headers, body) }))
+    }));
+    let v = r.pay_known("/acct/admin", CALL);
+    r.tap.clear();
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["status"].as_u64()), (Some("deny"), Some("ticket_refused"), Some(403)), "{v}");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// A call whose first try was refused unpaid as on another route's terms (`terms_changed`), and that
+/// asked and paid again, says what both tries booked: here the first released a ticket to make up a
+/// balance for the price it was wrongly told, and the second spent from that balance.
+#[test]
+fn a_call_asked_again_after_terms_changed_counts_what_its_first_try_booked() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/100", CALL)["status"].as_u64(), Some(200));
+    // the first 402 of /api says it costs 998 sat (it is 2.5): more than the balance left, so a ticket is released for it
+    let mut once = true;
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || seen.path != "/api" || !std::mem::take(&mut once) {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["amount"] = "998000".into();
+                e["extra"]["price"]["requestMsat"] = "998000".into();
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let v = r.pay("/api", CALL);
+    r.tap.clear();
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some("2500")), "{v}");
+    assert_eq!(r.tap.seen("/api").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![false, true, false, true], "asked, refused, asked, paid");
+    assert_eq!(v["tickets_released"].as_u64(), Some(1), "{v}");
+    assert!(v["charged_sats"].as_i64().is_some_and(|c| c >= 1000), "the ticket the first try released: {v}");
+}
+
+/// Terms kept for a route before the session with the seller was opened, on terms that are not the
+/// session's, are not used: the price is asked, not the session stopped as one whose seller changed.
+#[test]
+fn terms_kept_that_are_not_the_open_sessions_are_not_used() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let other = node_id(&SecretKey::from_slice(&[0x44; 32]).unwrap());
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || !seen.path.starts_with("/page/") {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        for (_, v) in headers.iter_mut().filter(|(k, _)| k == "PAYMENT-REQUIRED") {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["payTo"] = other.clone().into();
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    // another node than the one the owner named: nothing is paid, and the terms of /page/ are kept as told
+    assert_eq!(r.pay("/page/10", CALL)["rule"], "no_rail");
+    r.tap.clear();
+    let api = r.pay("/api", CALL);
+    assert_eq!(api["status"].as_u64(), Some(200), "{api}");
+    let v = r.pay("/page/20", CALL);
+    assert_eq!((v["status"].as_u64(), v["session"].as_str()), (Some(200), api["session"].as_str()), "{v}");
+    assert_eq!(r.tap.seen("/page/20").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![false, true], "asked, then paid");
+}
+
+/// A session stopped because the seller's terms changed takes the terms kept for its routes with it:
+/// the next session asks each route's price again before it pays on it.
+#[test]
+fn a_session_stopped_on_new_terms_forgets_the_routes_it_knew() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    let other = node_id(&SecretKey::from_slice(&[0x44; 32]).unwrap());
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || seen.path.starts_with("/x402/") {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        for (_, v) in headers.iter_mut().filter(|(k, _)| k == "PAYMENT-REQUIRED") {
+            let mut pr = unb64json(v).unwrap();
+            pr["accepts"][0]["payTo"] = other.clone().into();
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    assert_eq!(r.pay("/api", CALL)["rule"], "ticket_terms_changed");
+    r.tap.clear();
+    // the seller's terms are its own again: a new session, and /page/ is asked before it is paid
+    assert_eq!(r.pay("/api", CALL)["status"].as_u64(), Some(200));
+    assert_eq!(r.pay("/page/20", CALL)["status"].as_u64(), Some(200));
+    assert_eq!(r.tap.seen("/page/20").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![false, true], "asked, then paid");
+}
+
+/// A seller whose 402 offers draws on a route has every route asked again: what was kept of the
+/// others may leave out a draw entry they are offered now.
+#[test]
+fn a_402_that_offers_draws_drops_the_terms_kept_for_the_seller() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid || seen.path != "/api" {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        for (_, v) in headers.iter_mut().filter(|(k, _)| k == "PAYMENT-REQUIRED") {
+            let mut pr = unb64json(v).unwrap();
+            pr["accepts"].as_array_mut().unwrap().push(json!({"scheme": xbt402::lottery::SCHEME, "network": "elsewhere"}));
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    assert_eq!(r.pay("/api", CALL)["status"].as_u64(), Some(200));
+    r.tap.clear();
+    assert_eq!(r.pay("/page/20", CALL)["status"].as_u64(), Some(200));
+    assert_eq!(r.tap.seen("/page/20").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![false, true], "asked, then paid");
+}
+
+/// The reader of a streamed body has all of it, and its end, once the body has arrived: not after
+/// the wallet has fetched the seller's last receipt, which over a slow link (a relay far away) is
+/// another round trip or more. Here the seller's status takes 1.5 s; the reader is not kept waiting.
+#[test]
+fn a_streamed_body_ends_for_its_reader_before_the_sellers_last_receipt_is_fetched() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // a first call opens the session, so the second's status is the only slow step
+    r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{MIB}")), "max_sats": CALL, "task": "film"}));
+    r.tap.set(Box::new(|seen, _| {
+        if seen.path.ends_with("/x402/ticket/status") {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+        None
+    }));
+    let l = UnixListener::bind(dir.path().join("page-slow")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        s.read_to_end(&mut all).unwrap();
+        (all.len(), Instant::now())
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{MIB}")), "max_sats": CALL, "task": "film", "stream_to": "page-slow"}));
+    let returned = Instant::now();
+    r.tap.clear();
+    let (got, ended) = reader.join().unwrap();
+    let statuses = r.tap.seen("").iter().filter(|s| s.path.ends_with("/x402/ticket/status")).count();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), got), (Some(200), Some(true), MIB), "{v}");
+    assert!(statuses > 0, "the seller's status was never asked: {:?}", r.tap.seen(""));
+    assert!(returned.duration_since(ended) >= Duration::from_millis(1000),
+            "the reader's body ended only {:?} before the call returned: it waited for the seller's status", returned.duration_since(ended));
 }
 
 /// A body streamed on as it is paid for (`stream_to`), as a local player needs it: the reader at
@@ -1934,6 +2208,7 @@ fn terms_that_change_under_an_open_session_stop_it_and_pay_nothing_more() {
         }
         Some(Ok(answer(status, headers, body)))
     }));
+    // a call that does not ask to be paid on known terms asks the price, and sees the change
     let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["stopped"]["cancel_sent"].as_bool()), (Some("deny"), Some("ticket_terms_changed"), Some(true)), "{v}");
     assert_eq!(r.tap.secrets().len(), 1, "no secret after the terms changed");

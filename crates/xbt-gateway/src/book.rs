@@ -101,6 +101,10 @@ pub enum Refusal {
     PledgeOutstanding,
     /// Held tickets are issued only to a session that has paid something: buy a prepaid one first.
     PrepaidFirst,
+    /// The request repeats terms (`accepted`) that are not its route's: a buyer that paid without
+    /// asking the price first, from terms it saw for another route. Nothing is charged; the 402
+    /// states the route's terms.
+    TermsChanged,
 }
 
 impl Refusal {
@@ -120,6 +124,7 @@ impl Refusal {
             Self::HeightUnknown => "node_unavailable",
             Self::PledgeOutstanding => "pledge_outstanding",
             Self::PrepaidFirst => "prepaid_first",
+            Self::TermsChanged => "terms_changed",
         }
     }
 }
