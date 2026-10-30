@@ -2425,6 +2425,55 @@ fn a_reply_cut_before_its_counts_is_believed_only_its_quote() {
     assert!(price <= 50_000, "believed {price} msat for a reply quoted under 50 sat: {v}");
 }
 
+/// A reply by the token cut before its counts (quoted under 50 sat, the call's limit 5,000 sat),
+/// whose seller never lists the reply's last receipt and meanwhile signs a spend raised to all the
+/// credit it holds: the reply ended, so it may add to the seller's spend no more than its quote,
+/// already counted. The raised spend is the seller's fault as the wallet takes it, and no ticket
+/// more is released to it.
+///
+/// FAILS before: an answer that had ended still lent the seller's spend all that was left of its
+/// call's limit until it was closed, so the raised spend was taken without a fault and the wallet,
+/// counting the seller's balance gone, went on to release tickets into it.
+#[test]
+fn a_cut_reply_left_unclosed_lends_the_seller_no_room_to_raise_its_spend() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let raised = Arc::new(AtomicBool::new(false));
+    let r2 = raised.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path.ends_with("/chat/completions") {
+            // the first three events of the reply, then the connection drops: before its counts
+            let (status, headers, body) = whole(real().ok()?);
+            let text = String::from_utf8_lossy(&body).to_string();
+            let at = text.match_indices("\n\n").nth(2).map(|(i, _)| i + 2)?;
+            let (full, cut) = (body.len() as u64, body[..at].to_vec());
+            return Some(Ok(WireAnswer { status, length: Some(full), headers, body: Box::new(std::io::Cursor::new(cut)) }));
+        }
+        if !seen.path.ends_with("/x402/ticket/status") {
+            return None;
+        }
+        // the reply's last receipt is never listed, and the totals say all that was released is spent
+        let (status, mut headers, body) = whole(real().ok()?);
+        let mut v: Value = serde_json::from_slice(&body).ok()?;
+        v["responses"] = json!([]);
+        resign(&mut headers, &|r| r["spentMsat"] = r["releasedMsat"].clone());
+        r2.store(true, Ordering::SeqCst);
+        Some(Ok(answer(status, headers, v.to_string().into_bytes())))
+    }));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/dear/v1/chat/completions"), "method": "POST", "max_sats": CALL, "task": "film",
+        "body": json!({"messages": [], "stream": true, "x_n": 20, "max_tokens": 30}).to_string()}));
+    assert!(raised.load(Ordering::SeqCst), "the seller's status was asked: {v}");
+    assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
+    let fault = v["seller_fault"].as_str().map(str::to_string).or_else(|| r.audit("ticket_seller_fault").first().map(|e| e.to_string())).unwrap_or_default();
+    assert!(fault.contains("account for"), "the raised spend is the seller's fault as it is taken: {v}");
+    r.tap.clear();
+    // that session is stopped: nothing more is released into it (a later call starts a new one, from nothing)
+    let sid = v["session"].as_str().unwrap_or_default().to_string();
+    let st = r.status();
+    let s = st["sessions"].as_array().into_iter().flatten().find(|s| s["session"] == sid.as_str()).cloned().unwrap_or_default();
+    assert_ne!(s["state"], "open", "{st}");
+}
+
 /// A service that states its counts on every chunk (vLLM's `continuous_usage_stats`), cut short in
 /// the middle: those counts are not the reply's cost, so the wallet does not hold its honest seller,
 /// which charged the whole reply it pushed, to them. No seller fault.

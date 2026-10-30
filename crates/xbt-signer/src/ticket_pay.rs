@@ -291,6 +291,28 @@ impl WireAnswer {
         }
         Ok(out)
     }
+
+    /// [`WireAnswer::read_small`], the whole of it read by `deadline`: past it, the answer is cut
+    /// off however slowly its bytes still come.
+    fn read_small_by(self, cap: u64, deadline: Instant) -> Result<Vec<u8>> {
+        let WireAnswer { status, headers, length, body } = self;
+        WireAnswer { status, headers, length, body: Box::new(ByDeadline { inner: body, deadline }) }.read_small(cap)
+    }
+}
+
+/// A body read no later than its deadline: a read that would start past it fails as a timeout.
+struct ByDeadline {
+    inner: Box<dyn Read + Send>,
+    deadline: Instant,
+}
+
+impl Read for ByDeadline {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the answer took longer than its deadline"));
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// How the ticket payer talks HTTP: one request, answered as soon as its head has arrived, the
@@ -325,6 +347,17 @@ pub trait TicketWire: Send + Sync {
         self.send(method, url, body, headers, read_timeout)
     }
 
+    /// [`TicketWire::send_with`], the whole request (its head included) held to `overall`, where
+    /// each read alone is held only to `read_timeout`: a seller that sends a byte at a time does not
+    /// hold the call past it. A wire that cannot do this sends as [`TicketWire::send_with`] does;
+    /// the body is held to the same deadline as it is read ([`WireAnswer::read_small_by`]).
+    #[allow(clippy::too_many_arguments)]
+    fn send_by(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>,
+               overall: Duration) -> Result<WireAnswer> {
+        let _ = overall;
+        self.send_with(method, url, body, headers, read_timeout, tls)
+    }
+
     /// Learns that `origin` is reached over an iroh link (`link`, from the seller's checked
     /// transport document), believing where the link is from Nostr only from `nostr_author`. A
     /// wire that has no links refuses: the seller is then not reached at all.
@@ -352,6 +385,62 @@ pub struct UreqWire {
 const LINK_LOOKUP_RELAYS: [&str; 3] = ["wss://relay.kilombino.com", "wss://nos.lol", "wss://relay.damus.io"];
 
 impl UreqWire {
+    /// One request, as [`TicketWire::send_with`] sends it; `overall`: a deadline for the whole of
+    /// it, head and body, where each read alone is held only to `read_timeout`.
+    #[allow(clippy::too_many_arguments)]
+    fn send_req(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>,
+                overall: Option<Duration>) -> Result<WireAnswer> {
+        // ureq parses the string again, so it is given only what `request_url` read
+        let url = sendable_url(url)?;
+        let secs = read_timeout.as_secs().clamp(1, 3600);
+        let (key, roots) = match tls {
+            Some(t) => seller_tls_key(t)?,
+            None => (String::new(), vec![]),
+        };
+        // a seller reached by key: its name resolves to the link's loopback port, and the link
+        // carries the bytes end to end encrypted (an http URL: no TLS on top of it)
+        let link = if link_host(&url) { Some(self.link()?) } else { None };
+        let key = if link.is_some() { "link".to_string() } else { key };
+        let tls_config = match tls {
+            Some(t) if link.is_none() && !lock(&self.agents).contains_key(&(secs, key.clone())) => Some(seller_tls_config(t, roots)?),
+            _ => None,
+        };
+        let agent = lock(&self.agents).entry((secs, key)).or_insert_with(|| {
+            let b = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(secs)).timeout_write(Duration::from_secs(secs))
+                .redirects(0);
+            let b = match link {
+                Some(l) => b.resolver(move |hp: &str| match l.resolve(hp) {
+                    Some(r) => r,
+                    None => std::net::ToSocketAddrs::to_socket_addrs(hp).map(|a| a.collect()),
+                }),
+                None => b,
+            };
+            match tls_config {
+                Some(c) => b.tls_config(c).build(),
+                None => b.build(),
+            }
+        }).clone();
+        let mut req = agent.request(method, &url).set("Accept-Encoding", "identity");
+        if let Some(t) = overall {
+            req = req.timeout(t);
+        }
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        let resp = match if body.is_empty() && matches!(method, "GET" | "HEAD") { req.call() } else { req.send_bytes(body) } {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            // a fixed wording: ureq's own quotes the URL (the seller's session path) and a malformed status
+            Err(e) => return Err(err("transport_error", xbt402::http::transport_words(&e))),
+        };
+        let status = resp.status();
+        let headers: Vec<(String, String)> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_uppercase(), v.to_string()))).collect();
+        let bodiless = method.eq_ignore_ascii_case("HEAD") || matches!(status, 100..=199 | 204 | 304);
+        let length = if bodiless { Some(0) } else { resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()) };
+        let body: Box<dyn Read + Send> = if bodiless { Box::new(std::io::empty()) } else { Box::new(resp.into_reader()) };
+        Ok(WireAnswer { status, headers, length, body })
+    }
+
     /// A TCP connection to a seller's `host`:`port`, as ureq's own calls reach it: a seller's link
     /// host (one reached by key) through the iroh link's local port, any other host as named.
     fn connect(&self, host: &str, port: u16) -> Result<std::net::TcpStream> {
@@ -659,52 +748,12 @@ impl TicketWire for UreqWire {
 
     fn send_with(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>)
                  -> Result<WireAnswer> {
-        // ureq parses the string again, so it is given only what `request_url` read
-        let url = sendable_url(url)?;
-        let secs = read_timeout.as_secs().clamp(1, 3600);
-        let (key, roots) = match tls {
-            Some(t) => seller_tls_key(t)?,
-            None => (String::new(), vec![]),
-        };
-        // a seller reached by key: its name resolves to the link's loopback port, and the link
-        // carries the bytes end to end encrypted (an http URL: no TLS on top of it)
-        let link = if link_host(&url) { Some(self.link()?) } else { None };
-        let key = if link.is_some() { "link".to_string() } else { key };
-        let tls_config = match tls {
-            Some(t) if link.is_none() && !lock(&self.agents).contains_key(&(secs, key.clone())) => Some(seller_tls_config(t, roots)?),
-            _ => None,
-        };
-        let agent = lock(&self.agents).entry((secs, key)).or_insert_with(|| {
-            let b = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(secs)).timeout_write(Duration::from_secs(secs))
-                .redirects(0);
-            let b = match link {
-                Some(l) => b.resolver(move |hp: &str| match l.resolve(hp) {
-                    Some(r) => r,
-                    None => std::net::ToSocketAddrs::to_socket_addrs(hp).map(|a| a.collect()),
-                }),
-                None => b,
-            };
-            match tls_config {
-                Some(c) => b.tls_config(c).build(),
-                None => b.build(),
-            }
-        }).clone();
-        let mut req = agent.request(method, &url).set("Accept-Encoding", "identity");
-        for (k, v) in headers {
-            req = req.set(k, v);
-        }
-        let resp = match if body.is_empty() && matches!(method, "GET" | "HEAD") { req.call() } else { req.send_bytes(body) } {
-            Ok(r) => r,
-            Err(ureq::Error::Status(_, r)) => r,
-            // a fixed wording: ureq's own quotes the URL (the seller's session path) and a malformed status
-            Err(e) => return Err(err("transport_error", xbt402::http::transport_words(&e))),
-        };
-        let status = resp.status();
-        let headers: Vec<(String, String)> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_uppercase(), v.to_string()))).collect();
-        let bodiless = method.eq_ignore_ascii_case("HEAD") || matches!(status, 100..=199 | 204 | 304);
-        let length = if bodiless { Some(0) } else { resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()) };
-        let body: Box<dyn Read + Send> = if bodiless { Box::new(std::io::empty()) } else { Box::new(resp.into_reader()) };
-        Ok(WireAnswer { status, headers, length, body })
+        self.send_req(method, url, body, headers, read_timeout, tls, None)
+    }
+
+    fn send_by(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>,
+               overall: Duration) -> Result<WireAnswer> {
+        self.send_req(method, url, body, headers, read_timeout, tls, Some(overall))
     }
 
     fn learn_link(&self, origin: &str, link: &xbt402::transport::Link, nostr_author: Option<&str>) -> Result<()> {
@@ -924,10 +973,22 @@ impl Money {
     /// limit), where the wallet counted `counted` for it. A charge above the count (bytes the seller
     /// sent of an answer the wallet stopped reading, or a request whose answer was lost) is the
     /// seller's word for what it spent, and goes into the count.
-    fn close(&mut self, rid: u64, charged: u64, counted: u64) {
-        if self.open.remove(&rid).is_some() {
+    fn close(&mut self, rid: u64, charged: u64, counted: u64) -> bool {
+        let open = self.open.remove(&rid).is_some();
+        if open {
             self.accepted = self.accepted.saturating_add(charged);
             self.consumed = self.consumed.saturating_add(charged.saturating_sub(counted));
+        }
+        open
+    }
+
+    /// [`Money::close`] for an answer judged by `bound`: a reply by the token cut before its counts
+    /// was counted at all it held ([`Money::end_hold`]); where its seller's last receipt charges
+    /// less, the rest comes back to the answers beside it ([`Money::freed`]), as for a reply that
+    /// ended.
+    fn close_by(&mut self, rid: u64, charged: u64, counted: u64, bound: &Bound) {
+        if self.close(rid, charged, counted) && bound.quoted.is_some() {
+            self.freed = self.freed.saturating_add(counted.saturating_sub(charged));
         }
     }
 
@@ -1052,7 +1113,7 @@ impl Money {
             let t = self.tails.remove(i);
             let left = self.open.get(&t.rid).copied().unwrap_or(0);
             let most = t.bound.most(self);
-            self.close(t.rid, t.counted.saturating_add(left).min(most.max(t.counted)), t.counted);
+            self.close_by(t.rid, t.counted.saturating_add(left).min(most.max(t.counted)), t.counted, &t.bound);
             gone += 1;
         }
         gone
@@ -1867,6 +1928,12 @@ impl Signer {
         self.ticket_wire.send_with(method, url, body, headers, read_timeout, tls.as_ref())
     }
 
+    /// [`Signer::wire`], the whole request held to `overall` ([`TicketWire::send_by`]).
+    fn wire_by(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, overall: Duration) -> Result<WireAnswer> {
+        let tls = self.seller_tls_for(url);
+        self.ticket_wire.send_by(method, url, body, headers, read_timeout, tls.as_ref(), overall)
+    }
+
     /// Whether the owner's policy, as it is now, lets a request leave for `origin` under `task`: the
     /// origin is on the allowlist, or the task pays any seller. Asked before every request this
     /// module sends: the first of a call, and each one of a session after it, so that a seller the
@@ -2595,6 +2662,12 @@ impl Signer {
     /// the payment, then `release` with the preimage the wallet's node got for it. Called with the
     /// session's `paying` lock held, so one is bought at a time.
     fn ticket_buy_prepaid(&self, hs: &HttpSession, spent: &mut Spent) -> std::result::Result<(), Value> {
+        // nothing is paid to a seller found at fault, by this answer or one beside it: asked here, after the node's own
+        // check, and again just before the payment
+        let at_fault = || hs.fault().map(|why| self.ticket_fault(hs, &why));
+        if let Some(d) = at_fault() {
+            return Err(d);
+        }
         // the call's max_sats bounds what leaves for it, a whole ticket included: a smaller ticket is asked for where
         // the seller's own does not fit and its terms allow one that does, and the call is refused before anything
         // is asked of the seller where none fits
@@ -2603,6 +2676,9 @@ impl Signer {
         let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
         self.ticket_can_lock(&hs.terms.terms.payee)?;
+        if let Some(d) = at_fault() {
+            return Err(d);
+        }
         // by the seller's offer first, where its terms name one: nothing is asked of the seller but its session
         let by_offer = match &hs.offer {
             Some(offer) if self.ticket_policy().offers => self.ticket_prepay_by_offer(hs, offer, asked),
@@ -2623,6 +2699,9 @@ impl Signer {
                 let mut p = json!({"session": hs.sid, "hash": first.get("hash"), "invoice": first.get("invoice")});
                 if let Some(m) = asked {
                     p["ticket_msat"] = m.to_string().into();
+                }
+                if let Some(d) = at_fault() {
+                    return Err(d);
                 }
                 self.ticket_prepay(&p)
             }
@@ -2668,6 +2747,10 @@ impl Signer {
         };
         if seller_session.is_empty() {
             self.ticket_offer_passed(hs, "ticket_seller", "the seller's lock by offer named no session".into());
+            return None;
+        }
+        // a seller found at fault meanwhile is paid nothing: the caller asks again and refuses
+        if hs.fault().is_some() {
             return None;
         }
         let by = crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session };
@@ -2780,7 +2863,8 @@ impl Signer {
     }
 
     /// [`Signer::ticket_call_at`], waiting for the seller's answer no longer than `within`
-    /// where given (else the owner's `tickets.read_timeout_s`).
+    /// where given (else the owner's `tickets.read_timeout_s`): for the whole of it, head and body,
+    /// not only for each read, so a seller that sends a byte at a time is cut off by then.
     fn ticket_call_within(&self, hs: &HttpSession, what: &str, body: &Value, absorb: bool, within: Option<Duration>)
                           -> Result<(u16, Value, std::result::Result<Receipt, String>, u64)> {
         if !self.ticket_may_reach(&hs.origin, &hs.task) {
@@ -2798,10 +2882,12 @@ impl Signer {
             let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
             let sent_epoch = lock_money(hs).epoch;
-            let read = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], timeout)
+            // each request whole, head and body, by `timeout` from when it leaves
+            let by = Instant::now() + timeout;
+            let read = self.wire_by("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], timeout, timeout)
                 .and_then(|ans| {
                     let (status, pr) = (ans.status, ans.header("PAYMENT-RESPONSE").map(str::to_string));
-                    ans.read_small(SMALL_BODY).map(|b| (status, pr, serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null)))
+                    ans.read_small_by(SMALL_BODY, by).map(|b| (status, pr, serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null)))
                 });
             let (status, payment_response, v) = match read {
                 Ok(x) => x,
@@ -2936,7 +3022,7 @@ impl Signer {
                     if wrong.is_none() {
                         wrong = why;
                     }
-                    m.close(t.rid, charged, t.counted);
+                    m.close_by(t.rid, charged, t.counted, &t.bound);
                 }
                 let over = over.or(wrong).map(|why| m.fault.get_or_insert(why).clone());
                 // the tickets' states as of this status: only where it is no older than the totals the wallet holds (another
@@ -3909,6 +3995,17 @@ impl Signer {
                                 read: price.cost(read.saturating_add(CUT_SLACK), secs).unwrap_or(u64::MAX), slack };
             Bound { most: st.cut_bound(read, secs, credit), max_msat, whole: None, share: Some(share), quoted: None }
         };
+        // what the request may still add to the seller's spend, now that it has ended: no more than the wallet believes of
+        // any charge for it, not what is left of its call's limit ([`Money::take`]). Nothing, for one that arrived whole
+        // or a reply held at its quote; what was read and could be on its way, for one cut short
+        {
+            let mut m = lock_money(hs);
+            let counted = head.charged.saturating_add(own.load(Ordering::SeqCst));
+            let left = bound.most(&m).saturating_sub(counted);
+            if let Some(l) = m.open.get_mut(&rid) {
+                *l = left;
+            }
+        }
         // the last receipt of this answer, from the seller's signed status. One that arrived whole is waited for longer
         // before it is left unclosed: the seller has sent all of it, and an unclosed answer holds up the session's releases
         let deadline = Instant::now() + if complete { FINAL_WAIT_WHOLE } else { FINAL_WAIT };
@@ -3935,7 +4032,7 @@ impl Signer {
                         if let Some(r) = &found {
                             let (believed, why) = bound.judge(r, &m);
                             wrong = if r.charged > max_msat { Some(self.over_cap(hs, r.charged, max_msat, &r.raw)) } else { why };
-                            m.close(rid, believed, head.charged.saturating_add(own.load(Ordering::SeqCst)));
+                            m.close_by(rid, believed, head.charged.saturating_add(own.load(Ordering::SeqCst)), &bound);
                             believed_at = Some(believed);
                         }
                         // the seller's fault is the session's at once, under the same lock: no answer beside this one
@@ -4244,6 +4341,59 @@ fn read_all(ans: WireAnswer, sink: &mut Sink) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A seller that sends its answer's head a byte every 200 ms: each read is quick, so only a
+    /// deadline for the whole request ends it.
+    fn dribbling_seller() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                for b in b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n" {
+                    if s.write_all(&[*b]).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        });
+        port
+    }
+
+    /// FAILS before: a status call was held only to each read, so a seller dribbling its head a byte at a
+    /// time held it for as long as it liked (here, about 18 s) while the session's order lock waited.
+    #[test]
+    fn a_seller_dribbling_its_answer_is_cut_off_at_the_calls_deadline() {
+        let port = dribbling_seller();
+        let started = Instant::now();
+        let r = UreqWire::default().send_by("POST", &format!("http://127.0.0.1:{port}/x402/ticket/status"), b"{}", &[], Duration::from_secs(5), None,
+                                            Duration::from_secs(1));
+        assert!(r.is_err(), "the answer never finished, so the call fails");
+        assert!(started.elapsed() < Duration::from_secs(3), "cut off near its deadline, not after {:?}", started.elapsed());
+    }
+
+    /// A body that comes a byte every 200 ms is cut off at its deadline, however short each read.
+    #[test]
+    fn a_body_dribbled_past_its_deadline_is_cut_off() {
+        struct Slow(usize);
+        impl Read for Slow {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 || buf.is_empty() {
+                    return Ok(0);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                self.0 -= 1;
+                buf[0] = b' ';
+                Ok(1)
+            }
+        }
+        let ans = WireAnswer { status: 200, headers: vec![], length: None, body: Box::new(Slow(100)) };
+        let started = Instant::now();
+        assert!(ans.read_small_by(1 << 20, Instant::now() + Duration::from_secs(1)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
 
     struct Flag(AtomicBool);
 
@@ -4686,6 +4836,20 @@ mod tests {
         k.reserved = 600_000;
         assert_eq!(k.end_hold(600_000, 0, 10_000, false), 10_000);
         assert_eq!((k.reserved, k.freed), (0, 590_000));
+    }
+
+    /// A reply cut before its counts, held as drawn at its quote, whose seller's last receipt then
+    /// charges it less: the rest comes back to the answers beside it, as for a reply that ended.
+    #[test]
+    fn a_quoted_reply_closed_below_its_quote_frees_the_rest() {
+        let mut m = money(1_000_000);
+        let a = Bound { most: 600_000, max_msat: 5_000_000, whole: None, share: None, quoted: Some(600_000) };
+        m.open.insert(1, 0);
+        m.close_by(1, 40_000, 600_000, &a);
+        assert_eq!(m.freed, 560_000);
+        // closed once only: a second word for it frees nothing more
+        m.close_by(1, 0, 600_000, &a);
+        assert_eq!(m.freed, 560_000);
     }
 
     /// A reply by the token cut before its counts is believed up to what its terms quote for it, not
