@@ -942,6 +942,9 @@ def stream() -> None:
 def lie(name: str, what: str, act: Any, expect: Any, most_tickets: int) -> None:
     """One lie: `act` makes the paid calls with the proxy in mode `name`; `expect` judges the last reply."""
     stop_sessions()
+    # each case starts clean: a seller the last case caught over-charging is blocked, and the owner lifts it
+    for b in signer("seller_blocks").get("blocked", []):
+        signer("seller_unblock", {"node": b["node"]})
     before = money()
     paid_before = set(buyer_payments())
     Lies.mode, Lies.kept_receipt = None, None
