@@ -31,6 +31,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Several requests to one seller run side by side in one session, each exactly accounted, so a busy
   page no longer waits on itself. Whatever way an answer ends (whole, cut short, or reported late),
   the wallet believes the seller's charge by one rule, and a charge above it is a seller fault.
+- Several answers to one seller, cut or reported late, and AI replies cut short, are believed no
+  more than they could have delivered; an AI reply never past its quoted price.
 - A busy service refuses new buyers before they pay; buyers it is already serving stay served, and
   a refused buyer is sold nothing.
 - WebSockets (for example a web app's live updates) stay open for up to six hours, paid as their
