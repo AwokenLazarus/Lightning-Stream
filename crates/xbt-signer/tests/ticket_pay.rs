@@ -1046,6 +1046,7 @@ impl Rig {
         let mut pol = json!({"allowlist": named_origins,
                              "counterparties": origins.iter().map(|o| ((*o).clone(), json!({"ln_node": shop.id()}))).collect::<serde_json::Map<String, Value>>(),
                              "max_per_tx_sats": 50_000, "daily_budget_sats": 60_000, "weekly_budget_sats": 90_000, "per_counterparty_cap_sats": 60_000,
+                             "per_counterparty_daily_sats": 60_000,
                              "human_threshold_sats": 40_000, "velocity_max": 1_000, "human_pubkey": human_pub(),
                              "ln": {"enabled": true, "split_height": 6000, "max_fee_base_sats": 2, "max_fee_ppm": 1000},
                              "tickets": {"enabled": true, "tasks": {"film": {"budget_sats": 40_000}, "swarm": {"budget_sats": 5_000, "admit": "any"}}}});

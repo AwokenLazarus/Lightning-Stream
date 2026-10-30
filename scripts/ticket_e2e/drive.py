@@ -165,6 +165,7 @@ class Wallet:
             "daily_budget_sats": 4_000_000,
             "weekly_budget_sats": 8_000_000,
             "per_counterparty_cap_sats": 4_000_000,
+            "per_counterparty_daily_sats": 4_000_000,
             "velocity_max": 1_000,
             "velocity_window_s": 3600,
             "human_threshold_sats": 40_000,
