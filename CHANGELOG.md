@@ -40,8 +40,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A hashtaker can buy a short paid test slice before renting, and a hashmaker publishes a signed
   history of what it delivered.
 - Miners behind one address (a home router, or Docker on Umbrel and StartOS) move between rentals
-  once each way, instead of bouncing between connections under load. Buyers are charged only for
-  work that reaches their pool.
+  once each way, instead of bouncing between connections under load. In a test of 25 rentals of 3
+  miners each at once, every rental received 98–99% of the work its miners could do in that time.
+  Buyers are charged only for work that reaches their pool.
 
 ## 0.1.19 (2026-10-29)
 
