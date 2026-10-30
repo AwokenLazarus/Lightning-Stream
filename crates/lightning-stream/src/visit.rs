@@ -354,7 +354,9 @@ impl Connector {
             Some(base64::engine::general_purpose::STANDARD.encode(&req.body))
         };
         let call = |max_sats: i64| -> Result<Started, Failed> {
-            let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true});
+            // a page's many reads are paid on the terms the seller stated for their route, without asking each one's price
+            let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true,
+                                    "known_terms": true});
             if let Some(b) = &body {
                 params["body_b64"] = b.clone().into();
             }

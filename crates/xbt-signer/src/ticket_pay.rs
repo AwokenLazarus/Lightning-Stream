@@ -1924,7 +1924,10 @@ impl Signer {
         };
         // a session stopped because the seller's terms changed: what was kept of its routes' terms is not its terms now either
         let stopped_on_new_terms = |v: &Value| v.get("rule").and_then(Value::as_str) == Some("ticket_terms_changed");
-        let first = self.xbt402_pay_as(p, true);
+        // only a caller that asks for it (`known_terms`: a page of a web app, many small reads) is paid on terms it
+        // was told before; any other call asks the seller's price first, and sees there what the seller says now
+        let known = p.get("known_terms").and_then(Value::as_bool) == Some(true);
+        let first = self.xbt402_pay_as(p, known);
         if stopped_on_new_terms(&first) {
             forget();
         }
