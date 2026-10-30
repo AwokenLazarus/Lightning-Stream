@@ -56,6 +56,16 @@ LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
 UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink):0\.1\.0$")
 # the stream directory the connector writes, inside the signer's socket dir. Read-write, and the
 # only extra mount it may have. It does not get the signer's state.
+# Umbrel's shared Downloads (the Files app's Downloads), read-only, for the wallet's Files service only.
+# umbrelOS 1.x rewrites this compatibility path to ${UMBREL_ROOT}/home/Downloads; the app must declare
+# the STORAGE_DOWNLOADS permission (umbrel-apps .agents/skills/umbrel-package-app/SKILL.md).
+DOWNLOADS_MOUNT = "${UMBREL_ROOT}/data/storage/downloads:/downloads:ro"
+DOWNLOADS_IMAGES = {"xbt-wallet-ui"}
+
+def base_of(img):
+    """An image reference's name: `<registry>/<name>:<tag>@<digest>` or a local `<name>:<tag>`."""
+    m = REF.match(img)
+    return m["name"] if m else img.split("/")[-1].split(":")[0]
 STREAM_MOUNT = "${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams"
 # image -> (component sub-dir or None, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
@@ -238,6 +248,12 @@ def main() -> int:
         if slot and not providers:
             used -= {fb for _, fb in re.findall(r"\$\{([A-Z0-9_]+):-\$\{([A-Z0-9_]+)\}\}", text_nc)}
             used -= set(re.findall(r"\$\{([A-Z0-9_]+):-\}", text_nc))
+        # ${UMBREL_ROOT} only in the one shared mount the app may have, with its permission
+        downloads = DOWNLOADS_MOUNT in text_nc
+        if downloads and "STORAGE_DOWNLOADS" not in (m.get("permissions") or []):
+            bad(f"{folder}: mounts Umbrel's Downloads without the STORAGE_DOWNLOADS permission")
+        if downloads and text_nc.count("${UMBREL_ROOT}") == text_nc.count(DOWNLOADS_MOUNT):
+            used.discard("UMBREL_ROOT")
         for v in sorted(used - UMBREL_VARS - set(own) - set(dep)):
             bad(f"{folder}: ${{{v}}} is not set by umbrelOS, this app's exports or a dependency's")
         if "APP_PASSWORD" in used and not m.get("deterministicPassword"):
@@ -265,6 +281,8 @@ def main() -> int:
                         bad(f"{folder}/{name}: a long-form mount is only the Lightning node's tls.cert, read-only, never created: {v}")
                     continue
                 src = str(v).split(":")[0]
+                if str(v) == DOWNLOADS_MOUNT and base_of(img) in DOWNLOADS_IMAGES:
+                    continue
                 if not src.startswith("${APP_DATA_DIR}/"):
                     bad(f"{folder}/{name}: volume {v} is not under ${{APP_DATA_DIR}}")
                 if "macaroon" in str(v) or "LIGHTNING" in src:
@@ -305,6 +323,8 @@ def main() -> int:
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{p}:/data/run/{p}:ro" for p in peers}
                 if base == "lightning-stream":
                     allowed.add(STREAM_MOUNT)
+                if base in DOWNLOADS_IMAGES:
+                    allowed.add(DOWNLOADS_MOUNT)
                 vols = [v for v in (s.get("volumes") or []) if not isinstance(v, dict)]
                 for v in vols:
                     if v not in allowed:

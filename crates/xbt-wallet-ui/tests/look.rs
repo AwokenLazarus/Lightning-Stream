@@ -122,6 +122,16 @@ fn the_look_in_headless_chrome() {
     cfg.gw.dir = data.path().join("gateway");
     std::fs::create_dir_all(&cfg.gw.dir).unwrap();
     cfg.gw.node_rest = Some("https://10.21.21.66:8180".into());
+    // Files on Umbrel: the box's Downloads, which the owner chooses a folder under
+    let downloads = data.path().join("downloads");
+    for d in ["Films", "Films/4K", "Books", "Music"] {
+        std::fs::create_dir_all(downloads.join(d)).unwrap();
+    }
+    std::fs::write(downloads.join("Films/Sintel.mkv"), vec![0u8; 4096]).unwrap();
+    cfg.files.root = Some(downloads);
+    cfg.files.root_words = "the Downloads folder in Umbrel's Files app".into();
+    std::fs::create_dir_all(cfg.files.choice.parent().unwrap()).unwrap();
+    std::fs::write(&cfg.files.choice, "Films\n").unwrap();
     cfg.mcp_urls = vec!["http://umbrel.local:33511/mcp".into()];
     // the AI page: its address, a key, and the sellers file as the page wrote it
     let ai = data.path().join("ai");
@@ -155,7 +165,7 @@ fn the_look_in_headless_chrome() {
         ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
         ["browse-apps", apps.clone()], ["browse-files", "/browse?cat=files"],
         ["service-files", format!("/service?seller={}&name={}", enc("https://files.example"), enc("Open films and books"))], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
-        ["sell", "/sell"], ["sell-reach", "/sell#shop-reach"], ["sell-capacity", "/sell#capacity"], ["wallet", "/wallet"],
+        ["sell", "/sell"], ["sell-files", "/sell#service-form"], ["sell-reach", "/sell#shop-reach"], ["sell-capacity", "/sell#capacity"], ["wallet", "/wallet"],
         ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"], ["ai", "/ai"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)

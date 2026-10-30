@@ -888,7 +888,7 @@ impl App {
             // a Files service lists what is in its folder now, each file with its size
             if let (Kind::Files, Some(p)) = (o.kind, o.paths.first()) {
                 let at = if p.ends_with('/') { p.clone() } else { format!("{p}/") };
-                items = crate::files::list(&self.cfg.files.dir).into_iter().map(|(rel, size)| {
+                items = crate::files::shared_dir(&self.cfg.files).map(|d| crate::files::list(&d)).unwrap_or_default().into_iter().map(|(rel, size)| {
                     json!({"title": rel, "url": format!("{base}{at}{}", crate::files::url_path(&rel)), "credit": crate::files::size_words(size)})
                 }).collect();
             }
@@ -1241,7 +1241,7 @@ impl App {
                 <p>{} &middot; <strong>{}</strong>{}</p>{}<div class=\"row\"><a class=\"button-link\" href=\"./sell?edit={}#service-form\">Edit</a>{}{}</div></section>",
                 esc(&o.name), s.class, esc(&s.headline), o.kind.words(), o.price_words(),
                 if o.kind == Kind::Files {
-                    let n = crate::files::list(&self.cfg.files.dir).len();
+                    let n = crate::files::shared_dir(&self.cfg.files).map(|d| crate::files::list(&d).len()).unwrap_or(0);
                     format!(" &middot; {n} file{} in the folder", if n == 1 { "" } else { "s" })
                 } else if o.titles.is_empty() { String::new() } else { format!(" &middot; {} to choose from", o.titles.len()) },
                 next_hint,
@@ -1312,7 +1312,26 @@ impl App {
             format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>{what}suggested {} sat {}</small></span></label>",
                     k.id(), if *k == kind { " checked" } else { "" }, k.words(), p, u.short())
         }).collect();
-        let files_dir = esc(&self.cfg.files.dir.display().to_string());
+        // Files: where the folder is. With a folder the box shares with the app (Umbrel's Downloads,
+        // read-only), the owner picks one under it; otherwise it is the app's own folder.
+        let files_where = match &self.cfg.files.root {
+            Some(root) => {
+                let now = std::fs::read_to_string(&self.cfg.files.choice).unwrap_or_default().trim().trim_matches('/').to_string();
+                let options: String = crate::files::folders(root).iter().map(|f| {
+                    let label = if f.is_empty() { "All of it".to_string() } else { f.clone() };
+                    format!("<option value=\"{}\"{}>{}</option>", esc(f), if *f == now { " selected" } else { "" }, esc(&label))
+                }).collect();
+                let words = esc(&self.cfg.files.root_words);
+                if options.is_empty() {
+                    format!("<p class=\"hint\">Files reads {words}, which this box doesn't share with the app right now.</p>")
+                } else {
+                    format!("<p class=\"hint\">Put files in {words}, then choose the folder here. Stream only reads it: \
+                        it never changes or deletes your files.</p><label>Which folder <small>(for Files)</small>\
+                        <select name=\"files_folder\">{options}</select></label>")
+                }
+            }
+            None => format!("<p class=\"hint\">Put files in the folder, <code>{}</code>.</p>", esc(&self.cfg.files.dir.display().to_string())),
+        };
         let units: String = [Unit::Mib, Unit::Gb, Unit::Request, Unit::Second, Unit::Tokens].iter()
             .map(|u| format!("<option value=\"{}\"{}>{}</option>", u.id(), if *u == unit { " selected" } else { "" }, u.words())).collect();
         let titles = editing.map(|o| o.titles.iter().map(|(t, u)| format!("{t} | {u}")).collect::<Vec<_>>().join("\n")).unwrap_or_default();
@@ -1321,9 +1340,9 @@ impl App {
             <fieldset class=\"choices\"><legend>What is it?</legend>{kinds}</fieldset>\
             <p class=\"hint\">A media server is shared as its own web app: buyers use your Jellyfin or Plex in their browser or app, \
             each with their own account if you like, up to 4K, like a streaming service. They pay your price for what it loads.</p>\
-            <p class=\"hint\">Files shares a folder on this box, <code>{files_dir}</code>, with no media server: buyers see each file's name, size \
+            <p class=\"hint\">Files shares a folder on this box with no media server: buyers see each file's name, size \
             and price, and download it or open it in their own player (VLC, mpv, a TV app), paid as it arrives. Price it per GB. \
-            Put files in the folder, then save the service (or press Update the file list) to list them.</p>\
+            Save the service (or press Update the file list) to list what is in the folder.</p>{files_where}\
             <label>Its address on this box <small>(not for Files)</small><input name=\"address\" value=\"{}\" pattern=\"http://[^ ?#@]+\" inputmode=\"url\" class=\"mono\" \
             list=\"found-services\" title=\"The http:// address other apps on this box use, like {}\" placeholder=\"{}\"></label>{}\
             <div class=\"price-row\"><label>Price in sats<input name=\"price\" value=\"{}\" required inputmode=\"decimal\" pattern=\"[0-9][0-9,]*(\\.[0-9]{{1,3}})?|\\.[0-9]{{1,3}}\" \
@@ -1454,6 +1473,10 @@ impl App {
                 let kind = Kind::parse(&g("kind")).ok_or("Pick what it is: a media server, files, an AI model, or another web service.")?;
                 // a folder is served by the app itself: its address is the app's, never typed
                 let address = if kind == Kind::Files { self.files_upstream() } else { check_address(&g("address"), kind)? };
+                // the folder the owner picked under the box's shared one: held to it, kept for the server
+                if kind == Kind::Files && self.cfg.files.root.is_some() {
+                    crate::files::save_choice(&self.cfg.files, &g("files_folder"))?;
+                }
                 let price_msat = sats_to_msat(&g("price"))?;
                 let unit = Unit::parse(&g("unit")).ok_or("Pick what the price is for.")?;
                 let input_msat = if g("input_price").trim().is_empty() { 0 } else { sats_to_msat(&g("input_price"))? };

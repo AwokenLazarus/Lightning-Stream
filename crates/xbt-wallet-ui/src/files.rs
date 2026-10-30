@@ -11,6 +11,12 @@
 //! * Only regular files under the folder: no `..`, no hidden names, no link that leads out of it.
 //! * `GET /`: `204`, for the Sell page's "can it be reached" check.
 //!
+//! * On Umbrel the box shares its Downloads folder with the app, read-only (`XBT_UI_FILES_ROOT`): the
+//!   owner chooses a folder under it on the Sell page ([`folders`], [`choose`]), kept in
+//!   `<data dir>/files-folder`, and the server reads that choice for every request ([`shared_dir`]).
+//!   The choice is held to the shared folder as the files are: no `..`, no hidden names, and no link
+//!   that leads out of it.
+//!
 //! The listing names each file ([`list`]) with its size; buyers download a file, or open it in their
 //! own player (VLC, mpv, a TV app) through a link the wallet app makes ([`crate::relay`]).
 use std::io::{Read, Seek, SeekFrom};
@@ -106,6 +112,86 @@ pub fn resolve(dir: &Path, path: &str) -> Option<PathBuf> {
     (name == rel && std::fs::metadata(&p).ok()?.is_file()).then_some(p)
 }
 
+/// At most this many folders are offered to choose from.
+pub const MAX_FOLDERS: usize = 200;
+
+/// The folders under `root` the owner may choose to share, relative with `/`, sorted; `""` (the whole
+/// of `root`) first. Hidden names and links that lead out of `root` are left out.
+pub fn folders(root: &Path) -> Vec<String> {
+    fn walk(base: &Path, at: &Path, depth: usize, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(at) else { return };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if out.len() >= MAX_FOLDERS {
+                return;
+            }
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if !std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            // a folder is offered by its own name: a link to another folder under the root is not
+            // offered again, and one that leads out of the root is not offered at all
+            let named = match at.strip_prefix(base).ok().and_then(|p| p.to_str()) {
+                Some("") | None => e.file_name().to_string_lossy().to_string(),
+                Some(p) => format!("{p}/{}", e.file_name().to_string_lossy()),
+            };
+            let Some(rel) = inside(base, &e.path()) else { continue };
+            if rel != named {
+                continue;
+            }
+            out.push(rel);
+            if depth + 1 < MAX_DEPTH {
+                walk(base, &e.path(), depth + 1, out);
+            }
+        }
+    }
+    if !root.is_dir() {
+        return vec![];
+    }
+    let mut out = vec![String::new()];
+    walk(root, root, 0, &mut out);
+    out
+}
+
+/// The folder `rel` names under `root`, when it is one the owner may choose: `""` is `root` itself;
+/// otherwise plain names joined by `/` (no `..`, no hidden names, nothing absolute), naming a folder
+/// that is under `root` once links are followed.
+pub fn choose(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = rel.trim().trim_matches('/');
+    if rel.is_empty() {
+        return root.is_dir().then(|| root.to_path_buf());
+    }
+    if rel.split('/').any(|p| p.is_empty() || p.starts_with('.') || p.contains('\\') || p.contains('\0')) {
+        return None;
+    }
+    let p = root.join(rel);
+    (inside(root, &p)? == rel && std::fs::metadata(&p).ok()?.is_dir()).then_some(p)
+}
+
+/// The folder a Files service shares now: the owner's choice under [`crate::config::FilesSetup::root`]
+/// when the box shares one with the app, else `dir`. `None`: the choice is not a folder it may share
+/// (gone, or leading out of the root), so nothing is served or listed.
+pub fn shared_dir(setup: &crate::config::FilesSetup) -> Option<PathBuf> {
+    match &setup.root {
+        None => Some(setup.dir.clone()),
+        Some(root) => choose(root, &std::fs::read_to_string(&setup.choice).unwrap_or_default()),
+    }
+}
+
+/// Keeps the owner's choice of folder, once [`choose`] allows it.
+pub fn save_choice(setup: &crate::config::FilesSetup, rel: &str) -> Result<(), String> {
+    let root = setup.root.as_ref().ok_or("This box has no shared folder to choose from.")?;
+    let rel = rel.trim().trim_matches('/');
+    choose(root, rel).ok_or("That folder can't be shared: choose one from the list.")?;
+    if let Some(d) = setup.choice.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    std::fs::write(&setup.choice, format!("{rel}\n")).map_err(|e| format!("{}: {e}", setup.choice.display()))
+}
+
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("mp4" | "m4v") => "video/mp4",
@@ -153,7 +239,8 @@ fn range_of(h: Option<&str>, len: u64) -> Option<Result<(u64, u64), ()>> {
 
 /// The folder's server.
 pub struct Server {
-    pub dir: PathBuf,
+    /// Where the shared folder is: read for every request, so a new choice applies at once.
+    pub setup: crate::config::FilesSetup,
     pub key: String,
 }
 
@@ -178,7 +265,7 @@ impl xbt_svc::http::Handler for Server {
         if self.key.is_empty() || !crate::ct_eq(given.as_bytes(), self.key.as_bytes()) {
             return Reply::Whole(Response::text(403, "text/plain", "forbidden"));
         }
-        let Some(path) = resolve(&self.dir, req.path()) else {
+        let Some(path) = shared_dir(&self.setup).and_then(|dir| resolve(&dir, req.path())) else {
             return Reply::Whole(Response::text(404, "text/plain", "no such file"));
         };
         let Ok(mut f) = std::fs::File::open(&path) else {
@@ -258,6 +345,75 @@ mod tests {
             assert!(resolve(d.path(), bad).is_none(), "{bad}");
         }
         assert_eq!(url_path("Books/a b.pdf"), "Books/a%20b.pdf");
+    }
+
+    fn setup(root: &Path, choice: &Path) -> crate::config::FilesSetup {
+        crate::config::FilesSetup { dir: PathBuf::from("/nonexistent"), root: Some(root.to_path_buf()), choice: choice.to_path_buf(), ..Default::default() }
+    }
+
+    #[test]
+    fn the_owner_chooses_only_a_folder_under_the_shared_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("Films/4K")).unwrap();
+        std::fs::create_dir(root.path().join(".hidden")).unwrap();
+        std::fs::write(root.path().join("Films/4K/Sintel.mkv"), b"film").unwrap();
+        std::fs::write(root.path().join("notes.txt"), b"x").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::create_dir(out.path().join("private")).unwrap();
+        std::fs::write(out.path().join("private/wallet.dat"), b"secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(out.path().join("private"), root.path().join("escape")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.path().join("Films"), root.path().join("alias")).unwrap();
+
+        // what the picker offers: the whole root, its folders, never a hidden one or a link out of it
+        let offered = folders(root.path());
+        assert_eq!(offered[0], "");
+        assert!(offered.contains(&"Films".to_string()) && offered.contains(&"Films/4K".to_string()), "{offered:?}");
+        assert!(!offered.iter().any(|f| f.contains("escape") || f.contains(".hidden") || f.contains("private") || f.contains("alias")), "{offered:?}");
+        assert_eq!(offered.iter().filter(|f| *f == "Films").count(), 1, "a link to a folder is not offered twice");
+        assert!(!offered.iter().any(|f| f == "notes.txt"), "files are not folders");
+
+        assert_eq!(choose(root.path(), "Films/4K"), Some(root.path().join("Films/4K")));
+        assert_eq!(choose(root.path(), "/Films/"), Some(root.path().join("Films")));
+        assert_eq!(choose(root.path(), ""), Some(root.path().to_path_buf()));
+        for bad in ["escape", "escape/..", "..", "../x", "Films/../..", ".hidden", "Films//4K", "notes.txt", "Missing", "alias",
+                    "/etc", "Films\\4K", "Films/\0"] {
+            assert_eq!(choose(root.path(), bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_server_serves_the_chosen_folder_and_nothing_once_the_choice_leads_out() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Films")).unwrap();
+        std::fs::write(root.path().join("Films/Sintel.mkv"), b"film").unwrap();
+        std::fs::write(root.path().join("top.txt"), b"top").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(out.path().join("wallet.dat"), b"secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(out.path(), root.path().join("escape")).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let s = setup(root.path(), &data.path().join("files-folder"));
+
+        // no choice yet: the whole shared root
+        assert_eq!(shared_dir(&s), Some(root.path().to_path_buf()));
+        save_choice(&s, "Films").unwrap();
+        let dir = shared_dir(&s).unwrap();
+        assert_eq!(list(&dir), [("Sintel.mkv".to_string(), 4)]);
+        assert!(resolve(&dir, "/../top.txt").is_none(), "nothing above the chosen folder");
+
+        // a choice that leads out is refused, and one written behind the page's back shares nothing
+        assert!(save_choice(&s, "escape").is_err());
+        assert!(save_choice(&s, "../").is_err());
+        std::fs::write(&s.choice, "escape\n").unwrap();
+        assert_eq!(shared_dir(&s), None);
+        std::fs::write(&s.choice, "../../\n").unwrap();
+        assert_eq!(shared_dir(&s), None);
+        // without a shared root the owner has nothing to choose
+        let plain = crate::config::FilesSetup { dir: root.path().to_path_buf(), ..Default::default() };
+        assert!(save_choice(&plain, "Films").is_err());
+        assert_eq!(shared_dir(&plain), Some(root.path().to_path_buf()));
     }
 
     #[test]
