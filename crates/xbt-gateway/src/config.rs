@@ -644,6 +644,7 @@ impl Config {
                     "first_use_secs",
                     "idle_secs",
                     "keep_secs",
+                    "seq_window",
                 ],
             )?,
             None => &empty,
@@ -721,7 +722,11 @@ impl Config {
             first_use_secs: num(c, "first_use_secs", 60)?,
             idle_secs: num(c, "idle_secs", 300)?,
             keep_secs: num(c, "keep_secs", 86_400)?,
+            seq_window: num(c, "seq_window", crate::book::SEQ_WINDOW_MAX)?,
         };
+        if !(1..=crate::book::SEQ_WINDOW_MAX).contains(&caps.seq_window) {
+            return Err(format!("caps.seq_window is from 1 to {}: how many seqs ahead of a session's next one a request may carry", crate::book::SEQ_WINDOW_MAX));
+        }
         if caps.unpaid_secs < u64::from(xbt402::ticket::INVOICE_EXPIRY_S) {
             return Err(format!(
                 "caps.unpaid_secs is at least the invoice's own {} seconds",

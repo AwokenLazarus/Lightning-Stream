@@ -56,7 +56,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
  "extra": {"version": "ticket/0", "layer": "lightning", "features": [512],
            "ticketMsat": "1000000", "maxTickets": 2, "ticketBlocks": 40,
            "release": "with-request", "settle": "on-use",
-           "receiptKey": "<33-byte public key>", "session": "/x402/ticket",
+           "receiptKey": "<33-byte public key>", "session": "/x402/ticket", "seqWindow": 64,
            "price": {"requestMsat": "2500", "byteMsat": "0", "perBytes": "1", "secondMsat": "0"}}}
 ```
 
@@ -231,12 +231,17 @@ its ticket**, since its hash is the ticket's payment hash.
 
 Every request of a session is authenticated this way: a paid request for a resource, and the
 session's own `lock`, `release`, `cancel` and `status` (section 4), whose JSON bodies the digest
-covers. A `seq` is used up by a request whose `auth` was good and whose `seq` was the next one,
-whether it was then served or refused; its answer carries a receipt. A request that was not
-authenticated uses up nothing and gets no receipt: `401 bad_auth`, or `402 bad_seq` with the
-`nextSeq` the seller expects, which a buyer adopts (a seller can lose its last half second of
-counters in a power cut). The buyer sends the requests of one session one after another, the next
-when the head of the last answer has arrived: two sent together can arrive out of order.
+covers. A `seq` is used up by a request whose `auth` was good and whose `seq` the seller takes, whether
+it was then served or refused; its answer carries a receipt. A seller takes each `seq` once: the
+next one, or, where its terms state `seqWindow` (`extra.seqWindow`, a whole number from 2 to 64),
+any one not taken yet from the next one up to `seqWindow - 1` past it; its next `seq` then moves
+past every one taken from it on. A request that was not authenticated uses up nothing and gets no
+receipt: `401 bad_auth`, or `402 bad_seq` with the `nextSeq` the seller expects (for a `seq` below
+it, taken already, or past the window), which a buyer adopts (a seller can lose its last half
+second of counters in a power cut). Requests sent together can arrive out of order. With a window,
+the buyer sends up to `seqWindow` requests of one session at once, each `seq` within the window of
+the lowest one still on its way; without one, one after another, the next when the head of the
+last answer has arrived.
 
 The session has a balance in msat. Each secret released adds `ticketMsat`; each request served
 subtracts its price.
@@ -257,8 +262,10 @@ covers both; no field of the terms says which a seller takes.
 In both places the seller does steps 2 and 3 below with the secret. The seller, for each
 request, in this order:
 
-1. Checks `auth` and that `seq` is the next one. Without `auth` anyone who sees a session id spends
-   its balance. Without `seq` a replayed request is served twice.
+1. Checks `auth` and that it takes `seq`: the next one, or one not taken yet within its window.
+   Without `auth` anyone who sees a session id spends its balance. Without `seq` a replayed
+   request is served twice. The seqs taken past the next one are kept with the session's other
+   counters, so a seller that starts again takes none of them again.
 2. If there is a secret: hashes it and finds that ticket in this session. The ticket MUST be
    `ACCEPTED` on the seller's own node for the full `ticketMsat` (by a lookup, or from the node's
    invoice subscription), not used before, and MUST have more than 24 blocks left before its HTLC
@@ -281,7 +288,10 @@ request, in this order:
    signature is ECDSA on secp256k1, strict DER, low S (`xbt402::ticket::receipt_message`). `releasedMsat` is the sum of the
    tickets settled in this session and `spentMsat` the running total of what was served.
    `releasedMsat` only rises. `spentMsat` rises as pieces are served, and falls only by what the
-   seller charged ahead of sending and then did not send (an answer the buyer stopped reading).
+   seller charged ahead of sending and then did not send (an answer the buyer stopped reading), or
+   charged past what an answer came to (a model's reply settled on its counts). A buyer orders
+   receipts by its own requests, not by their figures: a receipt for a request sent after the buyer
+   took a receipt is the newer of the two, though its `spentMsat` is lower (section 17).
 
 The step-2 height is the seller's node's, and the seller's macaroon of section 7 cannot read it:
 with `invoices:read` and `invoices:write` the node answers `permission denied` to `GetInfo` and to
@@ -378,17 +388,26 @@ a new session is no new start (section 14).
 **An answer priced as it goes.** A body priced per byte or per second (section 1, `price`) is paid
 for while it is sent: the seller takes the price of each piece of the body from the balance before
 it sends that piece, and of each second as it starts. When the balance runs out it stops sending
-and waits a few seconds for more; then it ends the answer, cut short where the buyer can see it
+and waits for more (15 s by default); then it ends the answer, cut short where the buyer can see it
 (a body shorter than its `Content-Length`, or a chunked body with no last chunk). The buyer keeps
 such an answer going with `POST <session>/release {"secrets": ["<s1>", ...]}`: each secret is
 taken as in section 3, steps 2 and 3, and the answer names the hashes `released` and those
 `refused`, each with its code. A buyer that releases one ticket when the last is used up is never
 more than one ticket ahead of what it has received; what it has not used stays its balance.
+This wallet releases the next ticket a little before the last is used up, so that a payment that
+takes a moment does not hold the body up: when what has arrived comes within a lead of what is
+paid for. The lead is twice what arrived while the last ticket's release took, at most half of
+what one ticket pays for; before the answer's first release is timed, 3 s of the body at the
+rate it came, at most half of what is paid for. So right after a release the seller holds up to
+about 1.5 tickets of unspent credit for the answer, falling to nothing as the body arrives
+(answers side by side each draw on the same balance, and each releases only as it needs). The
+seller's wait for a release before it ends an answer is `times.refill_wait_ms`.
 
 The head of such an answer carries a receipt for what was charged before the body (`bodyHash`
 empty, and `"stream": true` beside the receipt). The receipt for the whole answer, with the bytes
 sent, their hash and their price, is in the answer to `POST <session>/status {}`, under
-`responses`, signed for the request's own `seq`; `status` also lists the session's tickets with
+`responses`, signed for the request's own `seq` (the last 128 such receipts of the session: twice
+the widest window, so that every answer of a window that ran at once is found); `status` also lists the session's tickets with
 their state and expiry height. On the lab a 100 MB file at 200,000 msat per MiB, fetched through
 a hop with one ticket released each time the last was used up, stopped after the tenth ticket at
 52,428,800 bytes: what ten tickets pay for, to the byte (`scripts/gateway_regtest.sh fetch`).
@@ -1570,7 +1589,7 @@ the last ticket.
 | A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use. |
 | The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
 | The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | The part of the last released ticket that paid for nothing. |
-| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its 3 s wait for a refill), then releases. | Up to 3 s of waiting. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
+| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its wait for a refill, 15 s by default), then releases. | Up to that wait. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
 | The seller never shows a ticket `ACCEPTED`, and the wallet's own node calls its payment in flight and carries it on no channel (a node killed as it sent it). | The session is stopped (`ticket_session_ended`); the next call opens a new one, with a pool inside what the owner's cap for that seller has left. | Nothing: no secret was released. The ticket counts as locked until the node gives it up. |
@@ -1853,3 +1872,99 @@ the shop, or the address it moved from) is stopped first, unless a call is using
 seller session, and shows a balance, the new session takes over its seller side; otherwise it starts
 fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
 counts as paid.
+
+## 17. Requests side by side in one session (2026-10-29)
+
+A seller's web app asks for many things at once: a page's scripts and pictures together, a film
+that plays for an hour, a WebSocket that stays open as long as the page does. Until 0.1.20 the
+wallet sent one paid request at a time in a session, so a film or a socket held up every other
+request to that seller until the read timeout. Now requests in one session run side by side.
+
+- **Order at the seller.** A request holds the session's link only to take its `seq`; it is sent
+  and its head read with nothing held, so a request slow to be answered (a long poll, a model slow
+  to its first word) holds up nothing. The requests go out on their own connections and arrive in
+  another order than they left, so this needs a seller that states `seqWindow` (section 3): it takes
+  each seq where it falls in its window. The wallet takes a seq only within the window of the
+  lowest one still on its way. A seq the seller refuses as taken goes again as a fresh one; one
+  past the window goes again once the seqs before it have arrived, or takes over a seq that no
+  request holds any more (one given up when its connection failed). With a seller that states no
+  window, which takes only the next seq, a request holds the session's `order` from its seq to its
+  head: one at a time, as before 0.1.20. Without a window, requests side by side arrived out of
+  order and went again, a round trip each: over a relay a web app's page loaded in ten seconds.
+- **Receipts out of order.** Receipts come back in another order than the seller signed them. The
+  wallet orders them by its own steps: a request it sent after it last took the seller's totals is
+  answered by a receipt the seller signed after those totals, so that receipt is newer, whatever its
+  figures say. Its spend is taken even where it is lower: the seller gives back a charge that bought
+  nothing (a page the browser dropped, a model's reply that came to fewer tokens than it ran up), and
+  the given-back credit is credit again, and the tickets it names ready are ready. A newer receipt
+  that says less was released than before is a seller fault. A receipt for a request sent before the
+  totals held were taken may be older: one with less than the wallet holds, released or spent, is
+  passed over (its own charge is still checked against its price), and what it says was released
+  still confirms the releases it names. A head signed while a released ticket is on its way
+  rightly says less was released than the wallet sent.
+- **What the seller may have spent.** Every request may be charged from the moment it leaves until
+  its answer's last receipt is read, and at most its call's limit. Each is held by an id of its own,
+  not by its seq (a seq can pass from one request to another). A request whose connection failed
+  after it left may still be served and charged from the seller's queue: it is held at its call's
+  limit, and no quiet point is taken, for two minutes. An answer the wallet cut short is believed
+  charged up to what it read and what could have been on its way when it stopped (16 MiB and a
+  proxy's slack, priced), or up to the credit it had then where that is more (a seller pushes ahead
+  as far as the credit goes, and a proxy between them can hold all of it), not up to its call's
+  limit. That holds where its last receipt is listed late, and where it is never listed and the
+  wallet closes it after 30 s; a late receipt that charges past the call's limit is a seller fault,
+  as one read at once is. A receipt's spend is taken only
+  inside the spend at the last quiet point (nothing open, nothing unclosed), plus what the wallet
+  counted since, plus what the requests still open may add. Where nothing is open, it is taken only
+  inside what the seller's own receipts charged the answers closed since. A seller that marks the
+  balance spent while a WebSocket of the page stays open is a seller fault: the socket may add at
+  most its own call's limit, and every answer at most its own.
+- **One balance.** Every answer counts what it draws into one count for the session: its head, its
+  body as it arrives, its seconds as they start. An answer priced by the token holds back the most it
+  may cost until it ends, apart from that count, and draws what it cost at its end: what was drawn
+  never falls, so an answer that started beside it never counts on credit the reply gave back
+  before it was drawn. An answer finds a ticket due on what is left for it after what the others
+  drew since it started. One that closes with a charge above the wallet's count (bytes the seller
+  sent of an answer the wallet stopped reading) adds the difference to the count, so the answers
+  beside it do not count on credit the seller has spent.
+- **One release for one need.** Two answers can find a ticket due at the same moment. Releases
+  stay one at a time, and each asks again whether it is still due once it holds the session's
+  release lock, against the credit it found the ticket due on: the second finds the first's ticket
+  covers it, and releases nothing.
+- **An answer the seller has not closed.** No ticket is released into a session while an answer the
+  wallet stopped reading is unclosed, as before, but only for the answers that open after it was
+  left, and the wait is not inside the release lock: the answers already open beside it (a page's
+  WebSocket while the viewer leaves a video) go on paying within their own calls' limits. An answer
+  that arrived whole waits longer for its last receipt before it is counted unclosed. The seller
+  keeps the last receipts of twice as many answers as its window lets run at once. One the wallet
+  never finds closed in 30 s is closed by the wallet itself, as charged the most its call allowed
+  (audited as `ticket_answer_given_up`); the session goes on.
+- **Why one session and not one per request.** A session per request would lock a ticket for each
+  request in flight, spread the credit thin across them, and use up the per-seller caps on a page
+  with a dozen pictures. One session lets one ticket's credit serve the whole page.
+- **A visit's limit.** In the app, each request of a seller's page holds a share of the visit's
+  limit while it runs (at most 1,000 sat, as a WebSocket does), and may buy within it, before its
+  head or as its body arrives; the shares running at once never add up to more than the limit. A
+  range is asked for in parts of at most 4 MiB, so that a film segment is never cut for want of a
+  ticket mid-body. A call that ends before its answer starts (no head within a minute, or the
+  stream failed) keeps its share spent until the signer says what it charged; none said, all of it.
+  A request refused because a ticket does not fit in its share asks again with a share that has
+  room for the ticket the refusal named, and only then waits to run alone with all that is left;
+  while it waits, no new share is handed out, so a busy page cannot starve it.
+
+Tests (crates/xbt-signer/tests/ticket_pay.rs): `requests_side_by_side_in_one_session_are_each_charged_exactly`,
+`a_websocket_open_does_not_hold_up_other_requests_to_the_seller`,
+`films_side_by_side_share_one_balance_and_each_pays_its_own_bytes`,
+`side_by_side_each_answer_stops_at_its_own_limit`, `a_stop_ends_every_answer_open_in_the_session`,
+`many_rounds_side_by_side_keep_the_counts_exact`, `a_request_slow_to_answer_does_not_hold_up_the_others`,
+`an_older_receipt_read_after_a_newer_one_is_passed_over`,
+`a_seller_that_drains_the_balance_while_a_websocket_is_open_is_caught`,
+`a_websocket_open_before_a_video_is_left_keeps_paying`,
+`a_spend_lowered_by_a_refund_is_taken_and_the_next_tickets_still_release`,
+`many_answers_cut_short_side_by_side_do_not_stop_the_session`,
+`a_cut_answer_never_listed_closed_is_given_up_without_stopping_the_session`,
+`an_answer_beside_a_reply_priced_by_the_token_is_paid_in_time`,
+`a_cut_answer_charged_past_what_could_have_arrived_is_a_seller_fault`,
+`a_seller_charging_a_request_whose_answer_was_lost_is_no_fault`; the unit tests of `Money` in
+crates/xbt-signer/src/ticket_pay.rs; and `a_range_goes_in_parts_each_within_a_share_of_the_limit`,
+`a_call_that_ends_before_its_head_keeps_its_share_until_the_signer_says_what_it_charged`,
+`a_request_that_must_run_alone_gets_its_turn_on_a_busy_page` (crates/lightning-stream/tests/visits.rs).

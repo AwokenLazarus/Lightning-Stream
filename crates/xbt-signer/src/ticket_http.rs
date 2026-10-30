@@ -150,7 +150,14 @@ pub struct PayTerms {
     pub release: String,
     /// The entry as the seller sent it: what `accepted` in PAYMENT-SIGNATURE repeats.
     pub accepted: Value,
+    /// How many seqs from its next one the seller takes a request with (`seqWindow`, at most
+    /// [`SEQ_WINDOW_MAX`] here): that many of the session's requests may be on their way at once.
+    /// 1, a seller that does not state it: one at a time, each sent once the one before is answered.
+    pub seq_window: u64,
 }
+
+/// The widest seq window the wallet uses, whatever a seller states.
+pub const SEQ_WINDOW_MAX: u64 = 64;
 
 impl PayTerms {
     pub fn parse(acc: &Value, lightning: &str) -> Result<Self, Refusal> {
@@ -163,7 +170,11 @@ impl PayTerms {
             None => xbt402::ticket::SESSION_PATH.to_string(),
             Some(v) => v.as_str().map(str::to_string).ok_or(("ticket_terms", "session is not a path".to_string()))?,
         };
-        Ok(Self { terms, receipt_key, session_path, price: Price::parse(acc)?, release: str_or_empty(x.get("release")), accepted: acc.clone() })
+        let seq_window = match x.get("seqWindow").filter(|v| !v.is_null()) {
+            None => 1,
+            Some(v) => v.as_u64().filter(|&w| w >= 1).ok_or(("ticket_terms", "seqWindow is not a whole number of 1 or more".to_string()))?.min(SEQ_WINDOW_MAX),
+        };
+        Ok(Self { terms, receipt_key, session_path, price: Price::parse(acc)?, release: str_or_empty(x.get("release")), accepted: acc.clone(), seq_window })
     }
 
     /// Whether `other` (the terms of a later 402 from the same origin) is the same seller on the
@@ -399,6 +410,23 @@ mod tests {
         for bad in [json!({"requestMsat": "2501"}), json!({"requestMsat": "2500", "perBytes": 0}), json!({"requestMsat": "2500", "byteMsat": "1e3"}),
                     json!({"requestMsat": "2500", "secondMsat": -5}), json!([1]), json!("free")] {
             assert_eq!(Price::parse(&accepts(bad.clone())).map_err(|e| e.0), Err("ticket_terms"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn terms_name_the_seq_window_the_wallet_sends_within() {
+        let a = |w: Value| {
+            let mut a = accepts(json!({"requestMsat": "2500"}));
+            a["extra"]["seqWindow"] = w;
+            PayTerms::parse(&a, NET).map(|t| t.seq_window).map_err(|e| e.0)
+        };
+        // not stated: the next seq only, one request at a time
+        assert_eq!(PayTerms::parse(&accepts(json!({"requestMsat": "2500"})), NET).unwrap().seq_window, 1);
+        assert_eq!(a(Value::Null), Ok(1));
+        assert_eq!(a(json!(4)), Ok(4));
+        assert_eq!(a(json!(1000)), Ok(SEQ_WINDOW_MAX), "no wider than the wallet's own");
+        for bad in [json!(0), json!(-1), json!("64"), json!(1.5)] {
+            assert_eq!(a(bad.clone()), Err("ticket_terms"), "{bad}");
         }
     }
 

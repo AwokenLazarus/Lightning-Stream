@@ -173,6 +173,10 @@ pub struct Terms {
     pub receipt_key: String,
     /// Path of the session endpoints.
     pub session: String,
+    /// How many seqs from a session's next one the seller takes a request with (`seqWindow`),
+    /// each once: a buyer may send that many side by side. 1 (not stated): the next one only, so
+    /// a buyer sends one request at a time.
+    pub seq_window: u64,
 }
 
 impl Terms {
@@ -195,6 +199,9 @@ impl Terms {
         extra.insert("settle".into(), settle.into());
         extra.insert("receiptKey".into(), self.receipt_key.clone().into());
         extra.insert("session".into(), self.session.clone().into());
+        if self.seq_window > 1 {
+            extra.insert("seqWindow".into(), self.seq_window.into());
+        }
         extra.insert("price".into(), price.clone());
         let mut m = Map::new();
         m.insert("scheme".into(), SCHEME.into());
@@ -304,7 +311,7 @@ mod tests {
     #[test]
     fn the_accepts_entry_is_the_one_the_draft_shows() {
         let t = Terms { network: "bip122:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, min_ticket_msat: None, max_tickets: 2, ticket_blocks: 40,
-                        receipt_key: "03".repeat(33), session: SESSION_PATH.into() };
+                        receipt_key: "03".repeat(33), session: SESSION_PATH.into(), seq_window: 64 };
         let a = t.accepts(2500, "with-request", SETTLE_ON_USE, &json!({"requestMsat": "2500"}));
         assert_eq!(a["scheme"], "ticket");
         assert_eq!(a["amount"], "2500");
@@ -315,6 +322,10 @@ mod tests {
         assert_eq!(a["extra"]["maxTickets"], 2);
         let b = t.accepts(2500, "with-request", SETTLE_ON_ARRIVAL, &json!({"requestMsat": "2500"}));
         assert_eq!(b["extra"]["settle"], "on-arrival");
+        // the seq window is stated where the seller takes more than the next seq
+        assert_eq!(a["extra"]["seqWindow"], 64);
+        let one = Terms { seq_window: 1, ..t };
+        assert!(one.accepts(2500, "with-request", SETTLE_ON_USE, &json!({"requestMsat": "2500"}))["extra"].get("seqWindow").is_none());
     }
 
     #[test]

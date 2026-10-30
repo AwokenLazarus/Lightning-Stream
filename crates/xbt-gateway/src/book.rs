@@ -70,7 +70,14 @@ pub struct Caps {
     pub idle_secs: u64,
     /// A session with nothing locked is forgotten, its unused balance with it, after this long.
     pub keep_secs: u64,
+    /// How many seqs from a session's next one a request may carry, 1 to [`SEQ_WINDOW_MAX`]: a
+    /// buyer's requests side by side reach the gateway in another order than they left, and each
+    /// is taken once, whatever its place in the window. 1 takes the next seq only.
+    pub seq_window: u64,
 }
+
+/// The widest seq window: the seqs taken ahead of a session's next one are one 64-bit word.
+pub const SEQ_WINDOW_MAX: u64 = 64;
 
 /// Why a request is not served. The wire names are the draft's (`docs/TICKETS.md`, section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +172,11 @@ const USED_KEPT: usize = 64;
 pub struct Session {
     pub key: [u8; 32],
     pub addr: String,
+    /// The lowest seq not taken yet. Seqs below it are taken.
     pub next_seq: u64,
+    /// The seqs taken above `next_seq`, within the window: bit `i` is `next_seq + i` (bit 0 is
+    /// always clear, as `next_seq` is not taken).
+    pub seqs_ahead: u64,
     /// The sum of this session's settled tickets. Only rises.
     pub released_msat: u64,
     /// The running total of what was served. Refunds of a charge that bought nothing aside, only rises.
@@ -225,6 +236,8 @@ pub enum Rec {
     Mark {
         session: String,
         next_seq: u64,
+        /// [`Session::seqs_ahead`]: absent (0) in a journal written before the window.
+        seqs_ahead: u64,
         spent_msat: u64,
         pledge: Option<Hash>,
     },
@@ -261,10 +274,15 @@ impl crate::store::Record for Rec {
             Self::Mark {
                 session,
                 next_seq,
+                seqs_ahead,
                 spent_msat,
                 pledge,
             } => {
-                json!({"t": "mark", "session": session, "seq": next_seq, "spent": spent_msat, "pledge": pledge.map(hex::encode)})
+                let mut v = json!({"t": "mark", "session": session, "seq": next_seq, "spent": spent_msat, "pledge": pledge.map(hex::encode)});
+                if *seqs_ahead != 0 {
+                    v["ahead"] = (*seqs_ahead).into();
+                }
+                v
             }
             Self::Drop { session } => json!({"t": "drop", "session": session}),
         }
@@ -301,6 +319,10 @@ impl crate::store::Record for Rec {
             "mark" => Self::Mark {
                 session: s("session")?.to_string(),
                 next_seq: n("seq")?,
+                seqs_ahead: match v.get("ahead") {
+                    None => 0,
+                    Some(a) => a.as_u64().filter(|a| a & 1 == 0)?,
+                },
                 spent_msat: n("spent")?,
                 pledge: match v.get("pledge")? {
                     Value::Null => None,
@@ -357,6 +379,11 @@ impl Book {
             dirty: HashSet::new(),
             seen_now: 0,
         }
+    }
+
+    /// The seq window the terms name ([`Caps::seq_window`]).
+    pub fn seq_window(&self) -> u64 {
+        self.caps.seq_window.clamp(1, SEQ_WINDOW_MAX)
     }
 
     pub fn caps(&self) -> &Caps {
@@ -514,6 +541,7 @@ impl Book {
                     key,
                     addr: addr.to_string(),
                     next_seq: 0,
+                    seqs_ahead: 0,
                     released_msat: 0,
                     spent_msat: 0,
                     pledge: None,
@@ -640,6 +668,7 @@ impl Book {
                 key,
                 addr: addr.to_string(),
                 next_seq: 0,
+                seqs_ahead: 0,
                 released_msat: 0,
                 spent_msat: 0,
                 pledge: None,
@@ -710,7 +739,7 @@ impl Book {
     /// told to nobody who could use it.
     pub fn forget_unused(&mut self, session: &str) -> Option<Rec> {
         let s = self.sessions.get(session)?;
-        if s.live > 0 || s.released_msat > 0 || s.next_seq > 0 {
+        if s.live > 0 || s.released_msat > 0 || s.next_seq > 0 || s.seqs_ahead != 0 {
             return None;
         }
         self.sessions.remove(session);
@@ -737,13 +766,17 @@ impl Book {
         if !verify(&s.key) {
             return Err(Refusal::BadAuth);
         }
-        if seq != s.next_seq {
+        // a seq below the next one, past the window, or taken already: refused, the next one named
+        let off = seq.wrapping_sub(s.next_seq);
+        if seq < s.next_seq || off >= self.caps.seq_window.clamp(1, SEQ_WINDOW_MAX) || s.seqs_ahead >> off & 1 == 1 {
             return Err(Refusal::BadSeq(s.next_seq));
         }
-        s.next_seq = s
-            .next_seq
-            .checked_add(1)
-            .ok_or(Refusal::BadSeq(s.next_seq))?;
+        s.seqs_ahead |= 1 << off;
+        // the next seq moves past every one taken from it on
+        let taken = s.seqs_ahead.trailing_ones();
+        let Some(next) = s.next_seq.checked_add(u64::from(taken)) else { return Err(Refusal::BadSeq(s.next_seq)) };
+        s.next_seq = next;
+        s.seqs_ahead = s.seqs_ahead.checked_shr(taken).unwrap_or(0);
         self.dirty.insert(session.to_string());
         Ok(())
     }
@@ -1074,6 +1107,7 @@ impl Book {
         Some(Rec::Mark {
             session: id.to_string(),
             next_seq: s.next_seq,
+            seqs_ahead: s.seqs_ahead,
             spent_msat: s.spent_msat,
             pledge: s.pledge,
         })
@@ -1138,6 +1172,7 @@ impl Book {
                             key: *key,
                             addr: addr.clone(),
                             next_seq: 0,
+                            seqs_ahead: 0,
                             released_msat: 0,
                             spent_msat: 0,
                             pledge: None,
@@ -1197,11 +1232,13 @@ impl Book {
                 Rec::Mark {
                     session,
                     next_seq,
+                    seqs_ahead,
                     spent_msat,
                     pledge,
                 } => {
                     if let Some(s) = b.sessions.get_mut(session) {
                         s.next_seq = *next_seq;
+                        s.seqs_ahead = *seqs_ahead;
                         s.spent_msat = *spent_msat;
                         s.pledge = pledge
                             .filter(|p| b.tickets.get(p).is_some_and(|t| &t.session == session));
@@ -1234,6 +1271,7 @@ mod tests {
 
     pub(crate) fn caps() -> Caps {
         Caps {
+            seq_window: SEQ_WINDOW_MAX,
             ticket_msat: 1_000_000,
             max_tickets: 8,
             max_sessions: 4,
@@ -1564,7 +1602,8 @@ mod tests {
 
     #[test]
     fn requests_are_authenticated_and_in_order() {
-        let mut b = Book::new(caps());
+        // a gateway that takes the next seq only, as before the window
+        let mut b = Book::new(Caps { seq_window: 1, ..caps() });
         let s = open(&mut b, 1, &[1]);
         assert_eq!(
             b.authenticate("nobody", 0, |_| true),
@@ -1579,6 +1618,62 @@ mod tests {
         // a bad MAC uses up nothing
         assert_eq!(b.authenticate(&s, 2, |_| false), Err(Refusal::BadAuth));
         assert_eq!(b.session(&s).unwrap().next_seq, 2);
+    }
+
+    #[test]
+    fn a_seq_is_taken_once_anywhere_in_the_window() {
+        let mut b = Book::new(caps());
+        let s = open(&mut b, 1, &[1]);
+        // requests side by side arrive out of order: each is taken where it falls in the window
+        for seq in [3, 1, 0] {
+            assert_eq!(b.authenticate(&s, seq, |_| true), Ok(()), "seq {seq}");
+        }
+        assert_eq!((b.session(&s).unwrap().next_seq, b.session(&s).unwrap().seqs_ahead), (2, 0b10));
+        // a seq taken already, above the next one or below it, is refused, the next one named
+        assert_eq!(b.authenticate(&s, 3, |_| true), Err(Refusal::BadSeq(2)));
+        assert_eq!(b.authenticate(&s, 0, |_| true), Err(Refusal::BadSeq(2)));
+        assert_eq!(b.authenticate(&s, 2, |_| true), Ok(()));
+        assert_eq!((b.session(&s).unwrap().next_seq, b.session(&s).unwrap().seqs_ahead), (4, 0));
+        // the window is 64 seqs from the next one: past it, refused
+        assert_eq!(b.authenticate(&s, 4 + SEQ_WINDOW_MAX, |_| true), Err(Refusal::BadSeq(4)));
+        assert_eq!(b.authenticate(&s, 3 + SEQ_WINDOW_MAX, |_| true), Ok(()));
+        assert_eq!(b.authenticate(&s, 3 + SEQ_WINDOW_MAX, |_| true), Err(Refusal::BadSeq(4)), "taken at the window's last place");
+        // a bad MAC uses up nothing in the window either
+        assert_eq!(b.authenticate(&s, 5, |_| false), Err(Refusal::BadAuth));
+        assert_eq!(b.authenticate(&s, 5, |_| true), Ok(()));
+        let sess = b.session(&s).unwrap();
+        assert_eq!((sess.next_seq, sess.seqs_ahead), (4, 1 << 1 | 1 << 63));
+    }
+
+    #[test]
+    fn the_seqs_taken_in_the_window_are_kept_across_a_restart() {
+        let mut b = Book::new(caps());
+        let s = open(&mut b, 1, &[1]);
+        for seq in [0, 2, 5] {
+            assert_eq!(b.authenticate(&s, seq, |_| true), Ok(()));
+        }
+        // the journal: the session, then its counters; and a compacted one
+        let mut journal = vec![Rec::Session { id: s.clone(), key: [1u8; 32], addr: "a".into() }];
+        journal.extend(b.take_marks());
+        let journal: Vec<Rec> = journal.iter().map(|r| Rec::from_json(&r.to_json()).unwrap()).collect();
+        for (label, recs) in [("journal", journal), ("snapshot", b.snapshot())] {
+            let mut r = Book::restore(caps(), &recs, 1000).unwrap();
+            assert_eq!((r.session(&s).unwrap().next_seq, r.session(&s).unwrap().seqs_ahead), (1, 0b10010), "{label}");
+            // what was taken before the restart is not taken again
+            for seq in [0, 2, 5] {
+                assert_eq!(r.authenticate(&s, seq, |_| true), Err(Refusal::BadSeq(1)), "{label}: seq {seq} replayed");
+            }
+            for seq in [1, 3, 4, 6] {
+                assert_eq!(r.authenticate(&s, seq, |_| true), Ok(()), "{label}: seq {seq}");
+            }
+            assert_eq!(r.session(&s).unwrap().next_seq, 7, "{label}");
+        }
+        // a journal written before the window has no `ahead`: nothing above the next seq was taken
+        let old = json!({"t": "mark", "session": s, "seq": 3, "spent": 0, "pledge": null});
+        assert!(matches!(Rec::from_json(&old), Some(Rec::Mark { next_seq: 3, seqs_ahead: 0, .. })));
+        // one that names the next seq itself as taken is not this gateway's
+        let bad = json!({"t": "mark", "session": s, "seq": 3, "spent": 0, "pledge": null, "ahead": 1});
+        assert_eq!(Rec::from_json(&bad), None);
     }
 
     #[test]

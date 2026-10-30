@@ -26,8 +26,9 @@ use crate::config::{num, num32, obj};
 use crate::node::Hash;
 use crate::price::Price;
 
-/// Final receipts of streamed answers kept per session, for `status`.
-const FINALS_KEPT: usize = 8;
+/// Final receipts of streamed answers kept per session, for `status`: as many as a ticket session
+/// keeps ([`crate::gateway`]), for the same reason (a full window of answers side by side).
+const FINALS_KEPT: usize = 2 * crate::book::SEQ_WINDOW_MAX as usize;
 /// The shortest life of a win's invoice: the wallet of this tree refuses an invoice that expires
 /// within 5 s, and the payment itself takes some of what is left.
 pub const MIN_INVOICE_SECS: u32 = 15;

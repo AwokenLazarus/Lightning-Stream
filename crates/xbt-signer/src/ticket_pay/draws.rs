@@ -264,7 +264,7 @@ impl Signer {
         let sid = str_or_empty(o.get("session"));
         let win_msat = crate::ticket::outside_u64(o.get("win_msat")).unwrap_or(0);
         let ds = Arc::new(DrawSession { origin: c.origin.into(), sid: sid.clone(), task, terms: terms.clone(), win_msat, base, busy: Mutex::new(()),
-                                        link: Mutex::new(Link { seller_sid: String::new(), key: Zeroizing::new([0u8; 32]), next_seq: 0 }),
+                                        link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                         state: Mutex::new(State::default()), used: Mutex::new(self.engine.now()) });
         let give_up = |why: String| {
             let stopped = self.draw_stop(&ds, &why, false);
@@ -298,7 +298,7 @@ impl Signer {
         if let Err(e) = self.lottery_bind(&sid, &seller_sid, &hex::encode(anchor)) {
             return Err(give_up(e.msg));
         }
-        *lock(&ds.link) = Link { seller_sid, key: Zeroizing::new(key), next_seq: 0 };
+        *lock(&ds.link) = Link::new(seller_sid, key, 0);
         lock(&ds.state).buyer = Some(buyer);
         let mut map = lock(&self.draw_http);
         if map.contains_key(c.origin) {
