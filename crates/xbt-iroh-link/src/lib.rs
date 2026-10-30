@@ -237,6 +237,13 @@ impl Link {
         }
     }
 
+    /// Whether this link is connected to its home relay now: what a seller checks before it names
+    /// the key, so that buyers are not sent to a key no relay can reach yet.
+    pub fn relay_connected(&self) -> bool {
+        use iroh::Watcher;
+        self.ep.home_relay_status().get().iter().any(|s| s.is_connected())
+    }
+
     /// A seller's link: every stream a buyer opens is joined to a new TCP connection to `upstream`.
     pub fn serve(self: &Arc<Self>, upstream: SocketAddr) {
         let ep = self.ep.clone();
@@ -375,23 +382,47 @@ impl Link {
         let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
         self.rt.spawn(async move {
             let conns: Arc<Vec<tokio::sync::Mutex<Option<Connection>>>> = Arc::new(addrs.iter().map(|_| tokio::sync::Mutex::new(None)).collect());
-            // the key in use: the first in order until it fails, then the next that answers
+            // the key in use: the first in order until another answers first
             let at = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let addrs = Arc::new(addrs);
             while let Ok((tcp, _)) = listener.accept().await {
                 let (ep, addrs, conns, paths, at) = (ep.clone(), addrs.clone(), conns.clone(), paths.clone(), at.clone());
                 tokio::spawn(async move {
                     let _ = tcp.set_nodelay(true);
+                    // the key in use first; the next joins in when no stream has come within
+                    // RACE_AFTER, or at once when one fails. The first stream wins; an attempt that
+                    // ends later still leaves its connection ready for the next request
                     let start = at.load(Ordering::Relaxed);
-                    for k in 0..addrs.len() {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    let launch = |k: usize| {
                         let i = (start + k) % addrs.len();
-                        let last = k + 1 == addrs.len();
-                        let tried = open(&ep, &addrs[i], &conns[i], &paths, detail, alpn);
-                        let got = if last { tried.await } else { tokio::time::timeout(FAILOVER_AFTER, tried).await.ok().flatten() };
-                        if let Some((send, recv)) = got {
-                            at.store(i, Ordering::Relaxed);
-                            join(tcp, send, recv).await;
-                            return;
+                        let (ep, addrs, conns, paths, tx) = (ep.clone(), addrs.clone(), conns.clone(), paths.clone(), tx.clone());
+                        tokio::spawn(async move {
+                            let got = open(&ep, &addrs[i], &conns[i], &paths, detail, alpn).await;
+                            let _ = tx.send((i, got));
+                        });
+                    };
+                    launch(0);
+                    let (mut launched, mut running) = (1usize, 1usize);
+                    while running > 0 {
+                        let more = launched < addrs.len();
+                        let got = if more { tokio::time::timeout(RACE_AFTER, rx.recv()).await.ok() } else { Some(rx.recv().await) };
+                        match got {
+                            Some(Some((i, Some((send, recv))))) => {
+                                at.store(i, Ordering::Relaxed);
+                                join(tcp, send, recv).await;
+                                return;
+                            }
+                            // a key that failed is passed over at once
+                            Some(Some((_, None))) => running -= 1,
+                            Some(None) => return,
+                            // slow: the next key joins in beside it
+                            None => {}
+                        }
+                        if launched < addrs.len() {
+                            launch(launched);
+                            launched += 1;
+                            running += 1;
                         }
                     }
                 });
@@ -432,8 +463,8 @@ impl Link {
     }
 }
 
-/// How long a buyer waits for a shop's link key before trying its next one.
-const FAILOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long a buyer waits for a stream on a shop's link key before trying its next one beside it.
+const RACE_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A shop's link keys in the order this buyer (`me`) tries them: by the hash of the buyer's key, the
 /// shop and the link key (rendezvous hashing), so buyers spread evenly over a shop's keys, each

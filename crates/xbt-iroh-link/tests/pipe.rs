@@ -164,3 +164,34 @@ fn many_requests_at_once_reach_a_shop_on_several_keys() {
     }
     assert!(t.elapsed() < Duration::from_secs(30), "300 requests took {:?}", t.elapsed());
 }
+
+#[test]
+fn a_shop_key_that_hangs_costs_a_buyer_half_a_second_not_the_whole_wait() {
+    let size = 1 << 20;
+    let upstream = service(size);
+    let live = Link::start(secret(), Relays::None, true).unwrap();
+    live.serve(([127, 0, 0, 1], upstream).into());
+    // a key whose address takes packets and never answers: dialing it hangs
+    let sink = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let hung = Link::start(secret(), Relays::None, true).unwrap().endpoint_id();
+    let id = |h: &str| iroh::EndpointId::from_bytes(&<[u8; 32]>::try_from(hex::decode(h).unwrap()).unwrap()).unwrap();
+    let shop = format!("{}{}", "d".repeat(52), xbt_iroh_link::SHOP_SUFFIX);
+    // a buyer for whom the hung key comes first
+    let buyer = loop {
+        let b = Link::start(secret(), Relays::None, false).unwrap();
+        if xbt_iroh_link::order(&id(&b.endpoint_id()), &shop, vec![id(&hung), id(&live.endpoint_id())])[0] == id(&hung) {
+            break b;
+        }
+    };
+    buyer.learn(&hung, Hints { relays: vec![], direct: vec![sink.local_addr().unwrap()] }).unwrap();
+    buyer.learn(&live.endpoint_id(), Hints { relays: vec![], direct: live.hints(Duration::from_millis(200)).direct }).unwrap();
+    buyer.bind_shop_links(&shop, &[hung.clone(), live.endpoint_id()]).unwrap();
+    let port = buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port();
+    let t = std::time::Instant::now();
+    get(port, &shop, size);
+    assert!(t.elapsed() < Duration::from_secs(3), "the first answer took {:?}", t.elapsed());
+    // and the next goes straight to the key that answered
+    let t = std::time::Instant::now();
+    get(port, &shop, size);
+    assert!(t.elapsed() < Duration::from_millis(400), "the next answer took {:?}", t.elapsed());
+}

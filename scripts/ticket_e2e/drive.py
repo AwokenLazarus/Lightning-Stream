@@ -1547,8 +1547,9 @@ def offers() -> None:
 # --- a shop reached by key, over its iroh link (docs/DIRECT-LINKS.md) --------------------------------
 
 
-# the link keys a gateway serves on by default (xbt-gateway's link.endpoints), each named in its document
-LINK_KEYS = 4
+# the link keys a gateway serves on by default (xbt-gateway's link.endpoints), each named in its document;
+# TICKET_E2E_LINK_KEYS sets another number for the link and jellyfin_link/_relay checks, to compare
+LINK_KEYS = int(os.environ.get("TICKET_E2E_LINK_KEYS", "4"))
 
 
 def link_check(relay: bool) -> None:
@@ -1571,6 +1572,7 @@ def link_check(relay: bool) -> None:
     with open(path) as f:
         cfg = json.load(f)
     cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if relay else [], "private": relay}
+    cfg["link"]["endpoints"] = LINK_KEYS
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
     if "gateway-link" in PROCS and PROCS["gateway-link"].poll() is None:
@@ -1583,9 +1585,10 @@ def link_check(relay: bool) -> None:
         code, _, body = send("GET", "/.well-known/lightning-stream-transport.json", GW_LINK_PORT)
         if code == 200:
             doc.update(json.loads(body))
-        return code == 200 and bool(doc.get("transport"))
+        # every key named: the gateway names a key once its relay connection is up
+        return code == 200 and len(doc.get("transport") or []) == LINK_KEYS
 
-    lab.wait("the link's transport document, signed by the seller's node", 60, signed, every=0.5)
+    lab.wait(f"the link's transport document, signed by the seller's node, naming all {LINK_KEYS} keys", 60, signed, every=0.5)
     origin = str(doc.get("seller") or "")
     if not origin.startswith("http"):
         status_code, _, status_body = send("GET", "/.well-known/lightning-stream-link.json", GW_LINK_PORT)
@@ -1694,6 +1697,7 @@ def jellyfin(link: str = "") -> None:
     cfg["times"]["upstream_wait_secs"] = 30
     if link:
         cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if link == "relay" else [], "private": link == "relay"}
+        cfg["link"]["endpoints"] = LINK_KEYS
     cfg["routes"] = [{
         "path": "/", "upstream": JF_URL, "price": {"byte_msat": JF_PRICE_MSAT, "per_bytes": PER_BYTES},
         "methods": ["GET", "HEAD", "POST", "DELETE"], "max_body": 1_048_576, "websocket": True, "accept_gzip": True,
