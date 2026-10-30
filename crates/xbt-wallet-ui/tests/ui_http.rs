@@ -2786,6 +2786,45 @@ fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     assert_eq!(c["public_url"], "https://films.example");
 }
 
+/// The order the Sell page leads a seller through: the shop saved first, with nothing to sell, then
+/// its first service. With nothing to list, publishing is left out (off), not written off, so the
+/// first service puts the shop on Nostr; a shop reached directly is found nowhere else.
+#[cfg(unix)]
+#[test]
+fn a_shop_saved_before_its_first_service_is_published_once_it_has_one() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.nostr_relays = vec!["wss://relay.one.example".into()];
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    let config = || -> Value { serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap() };
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct")]);
+    let c = config();
+    assert!(c.get("listing").is_none(), "{c}");
+    assert!(c.get("nostr").is_none_or(|n| n.get("publish").is_none()), "nothing to list: publishing left out, not written off: {c}");
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", &format!("http://{media}")), ("price", "1"), ("unit", "request")]);
+    assert!(br.flash_after(&r).contains("Added"));
+    assert_eq!(config()["nostr"]["publish"], true, "the first service puts the shop on Nostr");
+    // paused, nothing is listed and publishing goes off; resumed, it comes back
+    let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    let id = shop["offers"][0]["id"].as_str().unwrap().to_string();
+    br.act("/sell", "/sell", &[("action", "pause"), ("id", &id)]);
+    assert!(config()["nostr"].get("publish").is_none());
+    br.act("/sell", "/sell", &[("action", "resume"), ("id", &id)]);
+    assert_eq!(config()["nostr"]["publish"], true);
+}
+
 /// Files: a folder on this box, shared with no media server. The Sell page writes a route to the
 /// folder the app serves, with the files key and GET/HEAD only, priced per GB; the listing names each
 /// file with its size; the folder answers only with the key, and serves a range. A buyer's app reads

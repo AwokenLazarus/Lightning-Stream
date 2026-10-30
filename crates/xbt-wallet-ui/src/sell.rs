@@ -940,8 +940,12 @@ impl App {
             }
             nostr = Some(n);
         } else if let Some(n) = nostr.as_mut().filter(|_| !listed) {
-            // nothing to publish: the gateway refuses publish without a listing
-            n["publish"] = json!(false);
+            // nothing to publish: the gateway refuses publish without a listing. Left out, not written
+            // false: absent is off to the gateway, and a false here would read as written off by hand,
+            // so a shop saved before its first service would never be published once it had one
+            if let Some(m) = n.as_object_mut() {
+                m.remove("publish");
+            }
         }
         match nostr {
             Some(n) => c.insert("nostr".into(), n),
