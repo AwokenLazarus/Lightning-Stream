@@ -2411,12 +2411,12 @@ mod tests {
         // a compile error here until it is listed
         let tickets = [Refusal::SessionUnknown, Refusal::BadAuth, Refusal::BadSeq(0), Refusal::TicketUnknown, Refusal::TicketNotLocked, Refusal::TicketUsed,
                        Refusal::TicketExpiring, Refusal::BalanceShort, Refusal::TooManyTickets, Refusal::TooManySessions, Refusal::SlotsShort(1),
-                       Refusal::HeightUnknown, Refusal::PledgeOutstanding, Refusal::PrepaidFirst];
+                       Refusal::HeightUnknown, Refusal::PledgeOutstanding, Refusal::PrepaidFirst, Refusal::TermsChanged];
         for r in tickets {
             match r {
                 Refusal::SessionUnknown | Refusal::BadAuth | Refusal::BadSeq(_) | Refusal::TicketUnknown | Refusal::TicketNotLocked | Refusal::TicketUsed
                 | Refusal::TicketExpiring | Refusal::BalanceShort | Refusal::TooManyTickets | Refusal::TooManySessions | Refusal::SlotsShort(_)
-                | Refusal::HeightUnknown | Refusal::PledgeOutstanding | Refusal::PrepaidFirst => codes.push(r.code().into()),
+                | Refusal::HeightUnknown | Refusal::PledgeOutstanding | Refusal::PrepaidFirst | Refusal::TermsChanged => codes.push(r.code().into()),
             }
         }
         // every refusal of the lottery's book, and every refusal of a value the seller's draw can give
