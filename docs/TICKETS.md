@@ -1578,9 +1578,10 @@ the last ticket.
 **The most a dishonest seller can take, in one place.** A seller is never paid more than the
 tickets the wallet released to it: its receipts may not say it spent more than that, and nothing
 else moves money. So the most a seller can take without delivering is **the credit the app has
-with that seller right then** (what it released and the seller has not yet earned), and, while
-answers are still running, **at most what is left of each running call's own limit** (`max_sats`)
-on top. The session's pool of tickets locked but not released costs nothing until released. How
+with that seller right then** (what it released and the seller has not yet earned), and on top of
+it **at most what is left of each running call's own limit** (`max_sats`) while answers are still
+running, and **a lost request's whole limit, once** (below). The session's pool of tickets locked
+but not released costs nothing until released. How
 much of that a seller can claim without delivering depends on what it sells and whether the answer
 has ended:
 
@@ -1597,10 +1598,16 @@ has ended:
 - **While an answer is still running**, the wallet cannot yet tell bytes or tokens still to come
   from a spend the seller inflated: the seller's signed spend may run ahead of the wallet's count by
   what is left of that call's limit, and the wallet may release tickets on that word, inside the
-  call's limit. As the answer ends, what it may still add to the seller's spend narrows to the
-  bounds above (nothing, for one that arrived whole or a reply held at its quote), so a spend past
-  them is a seller fault at the next receipt the wallet takes. Keep `max_sats` near what a call
+  call's limit. As the answer ends, what it may still add to the seller's spend narrows to the most
+  the wallet could believe of its charge: nothing, for one that arrived whole or a reply held at
+  its quote; for one cut short by its size, its own bound above (the credit it could draw, with 16
+  MiB priced), until it is closed and judged together with the answers cut beside it. A spend past
+  that is a seller fault at the next receipt the wallet takes. Keep `max_sats` near what a call
   should cost: it is the most a running call can lose.
+- **A request whose answer is lost** (the connection fails after the request has left, which a
+  seller can cause) can cost up to its whole `max_sats`, once: the seller may still have served it,
+  so the wallet allows its spend up to that limit until a quiet point after `LOST_GRACE` (two
+  minutes), and checks it no tighter than that there.
 - **Never past a call's own limit** (`max_sats`), whatever it is.
 
 A seller that cheats inside those bounds gets it once: the wallet says the answer was cut short, and
@@ -1614,7 +1621,7 @@ leaving the book at that moment, at most, still goes), and the receipt is kept a
 |---|---|---|
 | The answer to a `release` is lost. | It asks `status`. Credited: it goes on. Not credited: the same secret again, never another. | Nothing more: the ticket was booked when its secret left. |
 | The seller says a released ticket is `ticket_not_locked`. | The same secret again, five times within about a second; then the call is refused and the next call sends it first. | The ticket, if the seller never takes it and never cancels it: booked until the wallet's node shows it failed. |
-| The answer to a paid request is lost. | The call says so. No secret travels with a request. | What the seller charged the balance for it. |
+| The answer to a paid request is lost. | The call says so. No secret travels with a request. | What the seller charged the balance for it: up to the call's whole limit, once (see above). |
 | An answer carries a receipt for another request (a replay), a receipt signed by another key, or none. | It is not believed. A 5xx without a receipt is reported and the session kept; any other answer nobody signed stops the session. | The session's balance. |
 | A refusal that is not signed (a forged `balance_short`, or `session_unknown` from a seller that lost its records). | Nothing is released on its word. The session is stopped; the next call opens a new one. | The session's balance. |
 | `session_unknown`, unsigned, to a `lock` or a `status` (the seller forgot a session that held nothing and was quiet for its `idle_secs`). | The session is stopped (`ticket_session_ended`); the next call opens a new one. | Nothing: the seller forgets only a session with no balance, or with one that was not used for a day. |
@@ -1979,7 +1986,8 @@ request to that seller until the read timeout. Now requests in one session run s
   one whose secret is already leaving the book (at most one) still goes. The wallet waits for an
   answer's last receipt at most 2 s (10 s for one that arrived whole) and a second more: each
   `status` call, head and body, is cut to what is left of that wait. Every call to a session
-  endpoint is held to the read timeout as a whole, not only for each read, so a seller that answers
+  endpoint, the first `lock` included, is held to the read timeout as a whole (its resends after a
+  `bad_seq` too), not only for each read, so a seller that answers
   a byte at a time cannot hold the session's order or payment lock past it.
 - **What an ended answer may still add.** Once an answer has ended, what its request may still add
   to the seller's spend is no more than the wallet believes of any charge for it, past what it

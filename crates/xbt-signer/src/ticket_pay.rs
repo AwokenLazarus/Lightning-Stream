@@ -1195,6 +1195,14 @@ impl Bound {
         }
     }
 
+    /// What the answer's request may still add to the seller's spend once it has ended, where the
+    /// wallet counted `counted` for it ([`Money::open`]): its fixed bound past that count. Fixed, not
+    /// its share of the session's credit as it stands when it ends: that grows as answers beside it
+    /// end, and an honest charge believed as it is closed must still have been allowed before.
+    fn allowance(&self, counted: u64) -> u64 {
+        self.most.saturating_sub(counted)
+    }
+
     /// The charge believed of the answer's last receipt `r`, and the seller's fault in it other
     /// than the call's limit (which `over_cap` words, keeping the receipt as evidence).
     fn judge(&self, r: &Receipt, m: &Money) -> (u64, Option<String>) {
@@ -2573,8 +2581,11 @@ impl Signer {
         }
         let url = format!("{}/lock", hs.base);
         let raw = body.to_string().into_bytes();
-        let sent = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
-        let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small(SMALL_BODY)?))) {
+        // the read timeout for the whole of it, head and body, as every session call ([`Signer::ticket_call_within`])
+        let timeout = Self::ticket_read_timeout(&self.ticket_policy());
+        let by = Instant::now() + timeout;
+        let sent = self.wire_by("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], timeout, timeout);
+        let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small_by(SMALL_BODY, by)?))) {
             Ok((status, raw)) => (status, serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null)),
             Err(e) => return Err(refusal("ticket_seller", format!("the seller gave no answer to the first lock: {}", e.msg))),
         };
@@ -2878,13 +2889,14 @@ impl Signer {
         let _order = lock_order(hs);
         let (mut seq, sid, key) = self.seq_take(hs)?;
         let deadline = Instant::now() + SEQ_WAIT;
+        // the whole call, head and body and any resend after a bad_seq, by `timeout` from when it first leaves
+        let by = Instant::now() + timeout;
         loop {
             let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
             let sent_epoch = lock_money(hs).epoch;
-            // each request whole, head and body, by `timeout` from when it leaves
-            let by = Instant::now() + timeout;
-            let read = self.wire_by("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], timeout, timeout)
+            let left = by.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let read = self.wire_by("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], timeout, left)
                 .and_then(|ans| {
                     let (status, pr) = (ans.status, ans.header("PAYMENT-RESPONSE").map(str::to_string));
                     ans.read_small_by(SMALL_BODY, by).map(|b| (status, pr, serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null)))
@@ -2898,7 +2910,7 @@ impl Signer {
                 }
             };
             let receipt = Receipt::read(payment_response.as_deref(), &hs.terms.receipt_key, &sid, seq, &digest, status);
-            if receipt.is_err() && status == 402 && v.get("error").and_then(Value::as_str) == Some("bad_seq") && Instant::now() < deadline {
+            if receipt.is_err() && status == 402 && v.get("error").and_then(Value::as_str) == Some("bad_seq") && Instant::now() < deadline.min(by) {
                 if let Some(n) = v.get("nextSeq").and_then(Value::as_u64) {
                     match self.seq_bad(hs, seq, n) {
                         Some(s) => seq = s,
@@ -3995,13 +4007,15 @@ impl Signer {
                                 read: price.cost(read.saturating_add(CUT_SLACK), secs).unwrap_or(u64::MAX), slack };
             Bound { most: st.cut_bound(read, secs, credit), max_msat, whole: None, share: Some(share), quoted: None }
         };
-        // what the request may still add to the seller's spend, now that it has ended: no more than the wallet believes of
-        // any charge for it, not what is left of its call's limit ([`Money::take`]). Nothing, for one that arrived whole
-        // or a reply held at its quote; what was read and could be on its way, for one cut short
+        // what the request may still add to the seller's spend, now that it has ended: no more than the most the wallet
+        // could believe of any charge for it, not what is left of its call's limit ([`Money::take`]). Nothing, for one
+        // that arrived whole or a reply held at its quote; for one cut short, its fixed bound (`most`), never below what
+        // its share of the session's credit allows as it is closed ([`Bound::most`]), so an honest charge believed then
+        // was inside it
         {
             let mut m = lock_money(hs);
             let counted = head.charged.saturating_add(own.load(Ordering::SeqCst));
-            let left = bound.most(&m).saturating_sub(counted);
+            let left = bound.allowance(counted);
             if let Some(l) = m.open.get_mut(&rid) {
                 *l = left;
             }
@@ -4836,6 +4850,34 @@ mod tests {
         k.reserved = 600_000;
         assert_eq!(k.end_hold(600_000, 0, 10_000, false), 10_000);
         assert_eq!((k.reserved, k.freed), (0, 590_000));
+    }
+
+    /// An answer by its size cut short while a reply by the token beside it still held 600 sat back:
+    /// its share of the credit was 400 sat then, and grows as the reply ends drawing 10. Its seller,
+    /// behind a proxy that took more than [`CUT_SLACK`] ahead, honestly spent 900 sat on it: inside
+    /// the share as it is closed, so its spend must have been allowed meanwhile too. No fault.
+    ///
+    /// FAILS before: the allowance was the share frozen as the answer ended (400 sat), and the spend
+    /// was taken for the seller's fault.
+    #[test]
+    fn a_cut_answer_beside_a_running_reply_is_allowed_its_whole_bound() {
+        let mut m = money(1_000_000);
+        m.reserved = 600_000;
+        let b = Bound { most: 5_000_000, max_msat: 5_000_000, whole: None,
+                        share: Some(Share { base_spent: 0, mark_consumed: 0, own: 0, read: 10, slack: 10 }), quoted: None };
+        assert_eq!(b.most(&m), 400_010, "its share while the reply holds");
+        m.open.insert(1, b.allowance(0));
+        // the reply ends, having drawn 10 sat
+        m.reserved = 0;
+        m.consumed = 10_000;
+        assert!(b.most(&m) >= 900_000, "its share once the reply ended: {}", b.most(&m));
+        let epoch = Some(m.epoch);
+        // the share frozen as the answer ended would have called the honest spend a fault
+        let mut frozen = money(1_000_000);
+        frozen.consumed = 10_000;
+        frozen.open.insert(1, 400_010);
+        assert!(frozen.take(&receipt(9, 1_000_000, 900_000, 0), u64::MAX, false, Some(frozen.epoch)).is_err());
+        assert_eq!(m.take(&receipt(9, 1_000_000, 900_000, 0), u64::MAX, false, epoch), Ok(true));
     }
 
     /// A reply cut before its counts, held as drawn at its quote, whose seller's last receipt then
