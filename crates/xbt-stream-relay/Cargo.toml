@@ -21,6 +21,10 @@ getrandom = "0.2"
 # logs: warnings and errors, never from inside a client's connection (RUST_LOG=warn,[conn]=off)
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 
+[dev-dependencies]
+# examples/relay_scale.rs: sellers and buyers reached through a relay, for measuring it
+xbt-iroh-link = { path = "../xbt-iroh-link" }
+
 [[bin]]
 name = "xbt-stream-relay"
 path = "src/main.rs"
