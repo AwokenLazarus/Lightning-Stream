@@ -29,6 +29,8 @@ pub mod flow;
 pub mod hop;
 pub mod lists;
 pub mod meter;
+pub mod mux;
+pub mod paid;
 pub mod region;
 pub mod router;
 pub mod sealed;

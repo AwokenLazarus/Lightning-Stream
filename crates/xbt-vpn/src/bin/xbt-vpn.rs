@@ -343,6 +343,10 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         .map(|v| v.split(',').map(str::trim).filter(|r| r.starts_with("wss://")).map(String::from).collect())
         .unwrap_or_default();
     let region = arg_or_env(args, "--region", &["XBT_VPN_REGION"]).map(|r| r.trim().to_ascii_uppercase()).filter(|r| r.len() == 2);
+    // a priced exit is one of the owner's Stream services: buyers' wallets open paid tunnels at this
+    // address on the owner's shop, which the shop's gateway joins to this endpoint
+    let tunnel_url = arg_or_env(args, "--tunnel-url", &["XBT_VPN_TUNNEL_URL"]);
+    let tunnel_listen = arg_or_env(args, "--tunnel-listen", &["XBT_VPN_TUNNEL_LISTEN"]).unwrap_or_else(|| "0.0.0.0:51880".into());
     let (devices_path, exit_path) = (dir.join("devices.json"), dir.join("exit.json"));
     let started = (mtime(&devices_path), mtime(&exit_path));
 
@@ -358,6 +362,7 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
     let mut _exit_link = None;
     let mut announced = false;
     let mut exit_region = None;
+    let mut exit_priced = false;
     if let Some(settings) = exit_from(&read_json(&exit_path)) {
         // the country the owner set on the exit page, else the one the service was started with
         exit_region = settings.country.clone().or(region.clone());
@@ -369,10 +374,20 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             lists::keep_updated(settings.categories.clone(), keys_dir.join("lists"), live.clone(), lists::UPDATE_EVERY, lists::catalogue_url);
         }
         let cfg = Arc::new(exit_config(&settings, live));
+        // a priced exit is reached only through paid tunnels: its link carries no flows for free
+        let priced = settings.sat_per_gb > 0;
+        if priced {
+            let (cfg, m) = (cfg.clone(), exit_meter.clone());
+            let listener = link.runtime().block_on(tokio::net::TcpListener::bind(&tunnel_listen))?;
+            link.runtime().spawn(xbt_vpn::paid::serve_tunnel_endpoint(listener, move |c| xbt_vpn::exit::serve(c, cfg.clone(), m.clone())));
+        }
         let (m, buyers, tls) = (exit_meter.clone(), Arc::new(SealedBuyers::default()), sealed::exit_config(&exit_secret));
         link.accept_with(move |conn| {
             let (cfg, m, b, tls) = (cfg.clone(), m.clone(), buyers.clone(), tls.clone());
             async move {
+                if priced {
+                    return;
+                }
                 if conn.alpn() == ALPN_VPN_SEALED {
                     serve_sealed(conn, cfg, m, tls, b).await
                 } else {
@@ -381,12 +396,14 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             }
         });
         let id = link.endpoint_id();
-        if let (Some(region), false) = (&region, nostr.is_empty()) {
+        if let (Some(region), false, true) = (&region, nostr.is_empty(), !priced || tunnel_url.is_some()) {
             let keys = xbt_nostr::event::Keys::from_hex(&hex::encode(service::secret_in(&keys_dir.join("nostr.key"))?)).ok_or_else(|| std::io::Error::other("a Nostr key that is not a key"))?;
             let offer = ExitOffer {
                 exit: id.clone(), region: region.clone(), filtered: settings.filtered, categories: settings.categories.clone(),
-                logs: false, blocked_ports: settings.blocked_ports.clone(), two_hop: true,
-                price_msat_per_gb: settings.sat_per_gb.saturating_mul(1000), relay: Some(relay.clone()), note: String::new(), ttl_s: announce::MAX_TTL_S,
+                // two hops reach an exit over the link, which a priced exit keeps for paid tunnels: free exits only
+                logs: false, blocked_ports: settings.blocked_ports.clone(), two_hop: !priced,
+                price_msat_per_gb: settings.sat_per_gb.saturating_mul(1000), relay: Some(relay.clone()),
+                tunnel: if priced { tunnel_url.clone() } else { None }, note: String::new(), ttl_s: announce::MAX_TTL_S,
             };
             let ev = announce::announcement_event(&keys, &exit_secret, &offer, xbt_nostr::now()).map_err(std::io::Error::other)?;
             announced = true;
@@ -399,6 +416,7 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             });
         }
         own_exit = Some(id);
+        exit_priced = priced;
         _exit_link = Some(link);
     }
 
@@ -412,6 +430,8 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         .collect();
     let peers: Vec<WgPeer> = entries.iter().map(|e| WgPeer { public: e.public, tunnel_ip: e.tunnel_ip }).collect();
     let buyer = Buyer::new(buyer_link.clone(), Router::with_requirements(Requirements::default()), devices, Some(EncryptedDns::quad9()));
+    // the owner's wallet pays for priced exits; without one, only free exits are used
+    buyer.set_wallet(xbt_vpn::paid::Wallet::from_env());
     let wg = WgEndpoint::new(wg_secret, &peers);
     let sock = rt.block_on(tokio::net::UdpSocket::bind(&wg_listen))?;
     let (to_stack, from_devices) = tokio::sync::mpsc::channel(4096);
@@ -419,13 +439,17 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
     rt.spawn(buyer.clone().run(from_devices, to_devices));
     rt.spawn(wg.run(sock, to_stack, from_stack));
 
-    // exits' regions are checked against an offline geo-IP table (DB-IP country lite, fetched once a
-    // month into the keys dir) and, if the owner gave their own country, a round-trip bound
+    // exits' regions are checked against an offline geo-IP table (DB-IP country lite: the one the app
+    // shipped with, or a newer month fetched into the keys dir where a source is set) and, if the owner
+    // gave their own country, a round-trip bound
     {
         let (buyer, geo_dir) = (buyer.clone(), keys_dir.join("geo"));
         buyer.set_home_country(arg_or_env(args, "--home-country", &["XBT_VPN_HOME_COUNTRY"]).map(|c| c.trim().to_string()).filter(|c| c.len() == 2));
+        let bundled = std::path::PathBuf::from(std::env::var("XBT_VPN_GEO_BUNDLED").unwrap_or_else(|_| xbt_vpn::region::BUNDLED.into()));
+        // where newer months are fetched from; set it empty to never fetch
+        let geo_url = std::env::var("XBT_VPN_GEO_URL").unwrap_or_else(|_| xbt_vpn::region::DBIP_URL.into());
         std::thread::spawn(move || loop {
-            match xbt_vpn::region::load_or_fetch(&geo_dir, xbt_vpn::region::DBIP_URL) {
+            match xbt_vpn::region::load(&geo_dir, Some(&bundled), Some(&geo_url)) {
                 Ok(t) => buyer.set_geo(t),
                 Err(e) => eprintln!("geo-IP table not available ({e}): exits' regions stay unverified"),
             }
@@ -442,7 +466,9 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
                 if !nostr.is_empty() {
                     let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
                     let (found, _) = announce::collect(&events, xbt_nostr::now());
-                    for mut a in found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref()) {
+                    // a priced exit that names no tunnel can't be paid: not used
+                    for mut a in found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref() && (a.exit.price_msat_per_gb == 0 || a.tunnel.is_some())) {
+                        buyer.set_tunnel(&a.exit.id, a.tunnel.clone());
                         let relays = vec![a.relay.clone().unwrap_or_else(|| relay.clone())];
                         if link.learn(&a.exit.id, Hints { relays, direct: Vec::new() }).is_err() {
                             continue;
@@ -476,11 +502,24 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
                 device_status(e, c.as_ref().map_or(0, |c| c.up_bytes), c.as_ref().map_or(0, |c| c.down_bytes), why)
             })
             .collect();
-        let _ = write_json(&status_dir.join("status.json"), &serde_json::json!({ "devices": rows }));
+        // each exit's region check, in plain words, for the page
+        let exits: Vec<serde_json::Value> = buyer.region_results().into_iter().map(|(id, region, r, at)| {
+            let words = match &r {
+                xbt_vpn::region::RegionCheck::Verified => format!("Checked: its traffic comes out in {region}."),
+                xbt_vpn::region::RegionCheck::Elsewhere(cc) => format!("Its traffic comes out in {cc}, not {region}: not used for {region}."),
+                xbt_vpn::region::RegionCheck::TooFast => format!("It answers faster than {region} is from here: not used for {region}."),
+                xbt_vpn::region::RegionCheck::Unknown => "Not checked yet: no country table, or the address checks didn't agree.".to_string(),
+            };
+            let secs = at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            serde_json::json!({ "exit": id, "region": region, "verified": r == xbt_vpn::region::RegionCheck::Verified, "region_check": words, "checked_at": secs })
+        }).collect();
+        let _ = write_json(&status_dir.join("status.json"), &serde_json::json!({ "devices": rows, "exits": exits }));
         let c = exit_meter.counts();
         let exit_status = match &own_exit {
             Some(id) => serde_json::json!({ "offered": true, "exit": id, "announced": announced, "up_bytes": c.up_bytes, "down_bytes": c.down_bytes, "refused": c.dropped, "blocked": c.blocked,
-                "not_announced_because": if announced { None } else if exit_region.is_none() { Some("its country isn't set") } else { Some("no Nostr relays are set") } }),
+                "paid": exit_priced,
+                "not_announced_because": if announced { None } else if exit_region.is_none() { Some("its country isn't set") }
+                    else if exit_priced && tunnel_url.is_none() { Some("the shop's address for paid tunnels isn't set") } else { Some("no Nostr relays are set") } }),
             None => serde_json::json!({ "offered": false }),
         };
         let _ = write_json(&status_dir.join("exit-status.json"), &exit_status);

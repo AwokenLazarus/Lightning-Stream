@@ -175,7 +175,10 @@ async fn phone_fetch(s: &Setup, to: SocketAddr, deadline: Duration, want: usize)
     let h = sockets.add(tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 1 << 20]), tcp::SocketBuffer::new(vec![0; 1 << 16])));
     let IpAddr::V4(v4) = to.ip() else { panic!() };
     let o = v4.octets();
-    sockets.get_mut::<tcp::Socket>(h).connect(iface.context(), (IpAddress::v4(o[0], o[1], o[2], o[3]), to.port()), 40000).unwrap();
+    // each connection from its own port, as a phone's are: a second one is not taken for the first
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(40000);
+    let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sockets.get_mut::<tcp::Socket>(h).connect(iface.context(), (IpAddress::v4(o[0], o[1], o[2], o[3]), to.port()), port).unwrap();
     let (start, mut got, mut buf) = (Instant::now(), 0usize, vec![0u8; 1 << 16]);
     let (mut seen_open, mut fin) = (false, false);
     while start.elapsed() < deadline {
@@ -440,4 +443,170 @@ fn a_phones_flow_takes_two_hops_and_the_exit_never_sees_the_buyer() {
     // the exit was reached only by the first hop's link: the buyer's link never connected to it
     assert_eq!(*exit_saw.lock().unwrap(), vec![hop_id]);
     assert_eq!(s.rt.block_on(s.buyer.why_blocked(IpAddr::V4(PHONE_IP))), None);
+}
+
+// --- paid tunnels -------------------------------------------------------------------------------
+
+/// A wallet that pays nothing but joins tunnels as the signer does: asked for an `xbt402_pay` with
+/// `upgrade`, it opens the upgrade at the exit's tunnel endpoint, hands the stream to the buyer's
+/// socket (its head line first), and carries the bytes both ways. With `cut_after`, it ends a tunnel
+/// once that many bytes have passed (a limit reached, a seller fault). Counts the tunnels it opened.
+struct FakeWallet {
+    wallet: xbt_vpn::paid::Wallet,
+    opened: Arc<std::sync::atomic::AtomicUsize>,
+    carried: Arc<std::sync::atomic::AtomicU64>,
+    _dir: tempdir_lite::Dir,
+}
+
+mod tempdir_lite {
+    pub struct Dir(pub std::path::PathBuf);
+    impl Dir {
+        pub fn new(tag: &str) -> Dir {
+            let d = std::env::temp_dir().join(format!("xbt-vpn-{tag}-{}-{:?}", std::process::id(), std::time::Instant::now()));
+            let d = std::path::PathBuf::from(d.to_string_lossy().replace([' ', '{', '}', ':', ','], ""));
+            std::fs::create_dir_all(&d).unwrap();
+            Dir(d)
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn fake_wallet(exit_at: SocketAddr, cut_after: Option<u64>) -> FakeWallet {
+    use std::io::{BufRead, Read, Write};
+    use std::sync::atomic::Ordering;
+    let dir = tempdir_lite::Dir::new("wallet");
+    let (sock, streams) = (dir.0.join("signer.sock"), dir.0.join("streams"));
+    std::fs::create_dir_all(&streams).unwrap();
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let carried = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let (o, c, sdir) = (opened.clone(), carried.clone(), streams.clone());
+    std::thread::spawn(move || {
+        for conn in l.incoming().flatten() {
+            let (o, c, sdir) = (o.clone(), c.clone(), sdir.clone());
+            std::thread::spawn(move || {
+                let mut rd = std::io::BufReader::new(conn.try_clone().unwrap());
+                let mut line = String::new();
+                rd.read_line(&mut line).unwrap();
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let p = &req["params"];
+                assert_eq!(p["upgrade"], true, "{p}");
+                let mut up = std::net::TcpStream::connect(exit_at).unwrap();
+                up.write_all(b"GET /vpn/tunnel HTTP/1.1\r\nHost: shop\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    up.read_exact(&mut b).unwrap();
+                    head.push(b[0]);
+                }
+                assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+                assert!(String::from_utf8_lossy(&head).contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+                o.fetch_add(1, Ordering::SeqCst);
+                let mut to_buyer = std::os::unix::net::UnixStream::connect(sdir.join(p["stream_to"].as_str().unwrap())).unwrap();
+                to_buyer.write_all(b"{\"status\":101,\"headers\":[]}\n").unwrap();
+                // this tunnel's own count, for where it is cut; `c` counts every tunnel's bytes
+                let mine = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let pipe = move |mut from: Box<dyn Read + Send>, mut to: Box<dyn Write + Send>, c: Arc<std::sync::atomic::AtomicU64>, mine: Arc<std::sync::atomic::AtomicU64>, stop: Box<dyn Fn() + Send>| {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = match from.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if to.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        c.fetch_add(n as u64, Ordering::SeqCst);
+                        let total = mine.fetch_add(n as u64, Ordering::SeqCst) + n as u64;
+                        if cut_after.is_some_and(|cut| total >= cut) {
+                            break;
+                        }
+                    }
+                    stop();
+                };
+                let (u2, b2) = (up.try_clone().unwrap(), to_buyer.try_clone().unwrap());
+                let (u3, b3) = (up.try_clone().unwrap(), to_buyer.try_clone().unwrap());
+                let stop = move || {
+                    let _ = u3.shutdown(std::net::Shutdown::Both);
+                    let _ = b3.shutdown(std::net::Shutdown::Both);
+                };
+                let (u4, b4) = (up.try_clone().unwrap(), to_buyer.try_clone().unwrap());
+                let stop2 = move || {
+                    let _ = u4.shutdown(std::net::Shutdown::Both);
+                    let _ = b4.shutdown(std::net::Shutdown::Both);
+                };
+                let (c2, m2) = (c.clone(), mine.clone());
+                let t = std::thread::spawn(move || pipe(Box::new(b2), Box::new(u2), c2, m2, Box::new(stop2)));
+                pipe(Box::new(up), Box::new(to_buyer), c, mine, Box::new(stop));
+                let _ = t.join();
+                let mut conn = conn;
+                let _ = conn.write_all(b"{\"id\":1,\"result\":{\"status\":101,\"ended\":\"the tunnel ended\"}}\n");
+            });
+        }
+    });
+    let wallet = xbt_vpn::paid::Wallet { signer: sock, stream_dir: streams, task: "vpn".into(), max_sats: 10_000 };
+    FakeWallet { wallet, opened, carried, _dir: dir }
+}
+
+/// A priced exit's tunnel endpoint, as its shop's gateway would reach it.
+fn paid_exit(rt: &tokio::runtime::Handle, meter: Arc<Meter>) -> SocketAddr {
+    let cfg = Arc::new(ExitConfig { policy: Policy { allow_non_public: true, ..Policy::default() }, ..ExitConfig::default() });
+    let l = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let at = l.local_addr().unwrap();
+    rt.spawn(xbt_vpn::paid::serve_tunnel_endpoint(l, move |c| xbt_vpn::exit::serve(c, cfg.clone(), meter.clone())));
+    at
+}
+
+fn priced(id: &str) -> ExitInfo {
+    ExitInfo { id: id.into(), region: "XX".into(), price_msat_per_gb: 2_000_000, healthy: true, ..ExitInfo::default() }
+}
+
+#[test]
+fn a_phone_downloads_through_a_paid_tunnel_its_wallet_opens() {
+    let n = 2 << 20;
+    let to = tcp_server(n);
+    let s = setup(83, false, None);
+    let meter = Arc::new(Meter::default());
+    let at = paid_exit(&s.rt, meter.clone());
+    let w = fake_wallet(at, None);
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")));
+    s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
+    let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(60)));
+    assert_eq!(got, n, "every byte arrived through the tunnel");
+    assert_eq!(meter.counts().down_bytes, n as u64, "metered at the exit");
+    assert_eq!(w.opened.load(std::sync::atomic::Ordering::SeqCst), 1, "one tunnel for the device");
+    assert!(w.carried.load(std::sync::atomic::Ordering::SeqCst) >= n as u64, "and the wallet carried (and would pay for) every byte");
+}
+
+#[test]
+fn a_paid_tunnel_that_ends_is_opened_again_for_the_next_flow() {
+    let to = tcp_server(4 << 20);
+    let s = setup(84, false, None);
+    let at = paid_exit(&s.rt, Arc::new(Meter::default()));
+    // the wallet ends the first tunnel part way (its limit, say)
+    let w = fake_wallet(at, Some(1 << 20));
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")));
+    s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
+    let first = s.rt.block_on(phone_download(&s, to, Duration::from_secs(20)));
+    assert!(first > 0 && first < 4 << 20, "the first download is cut where its tunnel ended: {first}");
+    let again = s.rt.block_on(phone_download_until(&s, to, Duration::from_secs(30), 512 << 10));
+    assert!(again >= 512 << 10, "the next flow gets a new tunnel: {again}");
+    assert_eq!(w.opened.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_priced_exit_is_not_used_without_a_wallet_to_pay_it() {
+    let to = tcp_server(1 << 20);
+    let s = setup(85, false, None);
+    let at = paid_exit(&s.rt, Arc::new(Meter::default()));
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")));
+    s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
+    let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(8)));
+    assert_eq!(got, 0, "nothing gets out unpaid");
 }

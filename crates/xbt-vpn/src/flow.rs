@@ -157,6 +157,86 @@ pub async fn recv_udp(conn: &LinkConnection) -> io::Result<(u32, Bytes)> {
     }
 }
 
+/// A flow's two-way stream to its exit.
+pub trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
+
+/// What carries a buyer's flows to one exit: the link connection itself (a free exit, or a test),
+/// or a **paid tunnel** ([`crate::mux`] on the byte stream the buyer's wallet pays for). Both carry
+/// the same flows: a TCP flow as a stream with this module's header, UDP as datagrams.
+#[derive(Clone)]
+pub enum Carrier {
+    Link(LinkConnection),
+    Tunnel(crate::mux::Mux),
+}
+
+impl Carrier {
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Carrier::Link(c) => c.close_reason().is_some(),
+            Carrier::Tunnel(m) => m.is_closed(),
+        }
+    }
+
+    /// Opens a TCP flow to `to` through the exit. `None` stream unless it opened.
+    pub async fn open_tcp(&self, to: SocketAddr) -> io::Result<(Opened, Option<Box<dyn Duplex>>)> {
+        match self {
+            Carrier::Link(c) => {
+                let (o, send, recv) = open_tcp(c, to).await?;
+                Ok((o, (o == Opened::Yes).then(|| Box::new(tokio::io::join(recv, send)) as Box<dyn Duplex>)))
+            }
+            Carrier::Tunnel(m) => {
+                let mut s = m.open()?;
+                let o = open_tcp_on(&mut s, to).await?;
+                Ok((o, (o == Opened::Yes).then(|| Box::new(s) as Box<dyn Duplex>)))
+            }
+        }
+    }
+
+    /// The exit's side: the next flow the buyer opened; `None` once the buyer's connection is gone.
+    pub async fn accept(&self) -> Option<Box<dyn Duplex>> {
+        match self {
+            Carrier::Link(c) => c.accept_bi().await.ok().map(|(send, recv)| Box::new(tokio::io::join(recv, send)) as Box<dyn Duplex>),
+            Carrier::Tunnel(m) => m.accept().await.map(|s| Box::new(s) as Box<dyn Duplex>),
+        }
+    }
+
+    pub fn send_datagram(&self, d: Bytes) -> io::Result<()> {
+        match self {
+            Carrier::Link(c) => c.send_datagram(d).map_err(io_err),
+            Carrier::Tunnel(m) => m.send_datagram(d),
+        }
+    }
+
+    pub async fn read_datagram(&self) -> io::Result<Bytes> {
+        match self {
+            Carrier::Link(c) => c.read_datagram().await.map_err(io_err),
+            Carrier::Tunnel(m) => m.read_datagram().await,
+        }
+    }
+
+    /// Sends one UDP datagram of flow `flow` to `to` through the exit.
+    pub fn send_udp(&self, flow: u32, to: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        let mut d = BytesMut::with_capacity(payload.len() + 24);
+        d.put_u8(KIND_UDP_OUT);
+        d.put_u32(flow);
+        put_addr(&mut d, to);
+        d.put_slice(payload);
+        self.send_datagram(d.freeze())
+    }
+
+    /// The next UDP datagram the exit sent back: its flow number and payload.
+    pub async fn recv_udp(&self) -> io::Result<(u32, Bytes)> {
+        loop {
+            let d = self.read_datagram().await?;
+            if d.len() >= 5 && d[0] == KIND_UDP_BACK {
+                let flow = u32::from_be_bytes([d[1], d[2], d[3], d[4]]);
+                return Ok((flow, d.slice(5..)));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

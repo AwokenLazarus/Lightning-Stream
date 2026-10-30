@@ -27,9 +27,9 @@ use bytes::Bytes;
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
-use xbt_iroh_link::{Link, LinkConnection, ALPN_VPN_HOP};
+use xbt_iroh_link::{Link, ALPN_VPN_HOP};
 
-use crate::flow::{open_tcp, open_tcp_on, recv_udp, send_udp, Opened};
+use crate::flow::{open_tcp_on, Carrier, Duplex, Opened};
 use crate::hop::open_sealed;
 use crate::sealed;
 use rustls::pki_types::ServerName;
@@ -120,7 +120,8 @@ pub const PROBE_EVERY: Duration = Duration::from_secs(15);
 
 /// An exit the buyer is connected to, and where its UDP answers go.
 struct ExitConn {
-    conn: LinkConnection,
+    /// The link connection (a free exit, or the first hop), or a paid tunnel through the wallet.
+    conn: Carrier,
     udp: Arc<Mutex<HashMap<u32, mpsc::Sender<Bytes>>>>,
     /// Through a first hop (two hops): `conn` is to the hop, and each flow is sealed for the exit.
     sealed: Option<Sealed>,
@@ -133,9 +134,6 @@ struct Sealed {
     tls: Arc<rustls::ClientConfig>,
 }
 
-/// A flow's stream to its exit, straight or sealed through a first hop.
-trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
 /// The buyer's devices, router and exit connections.
 pub struct Buyer {
@@ -161,13 +159,17 @@ pub struct Buyer {
     /// The owner's own country, if they gave it: a lower bound on the distance to an exit's region,
     /// so a round trip too fast for the claimed region is caught. Never looked up from the network.
     home_country: RwLock<Option<String>>,
-    /// Where an exit's egress address is read: a trace page through the exit (address, Host, path).
-    egress_echo: RwLock<(SocketAddr, String, String)>,
+    /// A plain trace page to read exits' egress address from instead of [`region::EGRESS_SOURCES`]
+    /// (address, Host, path): tests only.
+    egress_echo: RwLock<Option<(SocketAddr, String, String)>>,
+    /// What each exit's last region check found, for the status page: (announced, result, when).
+    regions: RwLock<HashMap<String, (String, RegionCheck, std::time::SystemTime)>>,
+    /// The owner's wallet, which pays for priced exits; none: only free exits are used.
+    wallet: RwLock<Option<Arc<crate::paid::Wallet>>>,
+    /// Where each priced exit's paid tunnel opens (its announced `tunnel`), by exit id.
+    tunnels: RwLock<HashMap<String, String>>,
 }
 
-/// The trace page an exit's egress address is read from, through that exit: 1.1.1.1 prints the
-/// address the request came from. Only the exit's address reaches it, never the buyer's.
-pub const EGRESS_ECHO: (&str, &str, &str) = ("1.1.1.1:80", "one.one.one.one", "/cdn-cgi/trace");
 
 impl Buyer {
     /// `devices`: each device's tunnel address and its state. `dns`: the resolver the buyer's app asks
@@ -198,8 +200,41 @@ impl Buyer {
             refused: AtomicU64::new(0),
             geo: RwLock::new(None),
             home_country: RwLock::new(None),
-            egress_echo: RwLock::new((EGRESS_ECHO.0.parse().expect("an address"), EGRESS_ECHO.1.into(), EGRESS_ECHO.2.into())),
+            egress_echo: RwLock::new(None),
+            regions: RwLock::new(HashMap::new()),
+            wallet: RwLock::new(None),
+            tunnels: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// The wallet that pays for priced exits ([`crate::paid`]).
+    pub fn set_wallet(&self, w: Option<crate::paid::Wallet>) {
+        *self.wallet.write().unwrap_or_else(|e| e.into_inner()) = w.map(Arc::new);
+    }
+
+    /// Where `id`'s paid tunnel opens; `None`: the exit is reached straight (a free exit).
+    pub fn set_tunnel(&self, id: &str, url: Option<String>) {
+        let mut t = self.tunnels.write().unwrap_or_else(|e| e.into_inner());
+        match url {
+            Some(u) => t.insert(id.to_string(), u),
+            None => t.remove(id),
+        };
+    }
+
+    fn tunnel_of(&self, id: &str) -> Option<String> {
+        self.tunnels.read().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+    }
+
+    /// What carries flows to `id` for a one-off use (a region check): its paid tunnel, or the link.
+    async fn carrier_once(&self, id: &str) -> Option<Carrier> {
+        match self.tunnel_of(id) {
+            Some(url) => {
+                let w = self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+                let t = tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, &url)).await.ok()?.ok()?;
+                Some(Carrier::Tunnel(t.mux))
+            }
+            None => self.link.connect_conn_async(id).await.ok().map(Carrier::Link),
+        }
     }
 
     /// The geo-IP table regions are checked against (see [`crate::region::load_or_fetch`]).
@@ -212,9 +247,40 @@ impl Buyer {
         *self.home_country.write().unwrap_or_else(|e| e.into_inner()) = cc.map(|c| c.to_ascii_uppercase());
     }
 
-    /// Reads exits' egress addresses from another trace page (tests).
+    /// Reads exits' egress addresses from one plain trace page instead of the HTTPS sources (tests).
     pub fn set_egress_echo(&self, addr: SocketAddr, host: &str, path: &str) {
-        *self.egress_echo.write().unwrap_or_else(|e| e.into_inner()) = (addr, host.into(), path.into());
+        *self.egress_echo.write().unwrap_or_else(|e| e.into_inner()) = Some((addr, host.into(), path.into()));
+    }
+
+    /// The last region check of each exit: (exit id, announced region, result, when).
+    pub fn region_results(&self) -> Vec<(String, String, RegionCheck, std::time::SystemTime)> {
+        self.regions.read().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, (r, c, t))| (k.clone(), r.clone(), c.clone(), *t)).collect()
+    }
+
+    /// One source's answer: the address it saw, read through `conn` (over TLS unless `tls` is None).
+    async fn egress_from(conn: &Carrier, to: SocketAddr, host: &str, path: &str, trace: bool, tls: Option<&Arc<rustls::ClientConfig>>) -> Option<std::net::IpAddr> {
+        let (Opened::Yes, Some(s)) = conn.open_tcp(to).await.ok()? else { return None };
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: lightning-stream\r\nConnection: close\r\n\r\n");
+        let mut body = Vec::new();
+        match tls {
+            Some(cfg) => {
+                let name = ServerName::try_from(host.to_string()).ok()?;
+                let mut t = TlsConnector::from(cfg.clone()).connect(name, s).await.ok()?;
+                t.write_all(req.as_bytes()).await.ok()?;
+                let _ = (&mut t).take(16 * 1024).read_to_end(&mut body).await;
+            }
+            None => {
+                let mut s = s;
+                s.write_all(req.as_bytes()).await.ok()?;
+                let _ = (&mut s).take(16 * 1024).read_to_end(&mut body).await;
+            }
+        }
+        let text = String::from_utf8_lossy(&body);
+        let (head, rest) = text.split_once("\r\n\r\n").unwrap_or(("", &text));
+        if !head.is_empty() && !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+            return None;
+        }
+        region::parse_egress(rest, trace)
     }
 
     /// Checks the region an exit announced: its egress address, read through the exit itself, must
@@ -223,23 +289,46 @@ impl Buyer {
     /// page sees only the exit's address.
     pub async fn verify_region(self: &Arc<Self>, id: &str, announced: &str) -> RegionCheck {
         let Some(geo) = self.geo.read().unwrap_or_else(|e| e.into_inner()).clone() else { return RegionCheck::Unknown };
-        let (echo, host, path) = self.egress_echo.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let test_echo = self.egress_echo.read().unwrap_or_else(|e| e.into_inner()).clone();
         let read = async {
-            let conn = self.link.connect_conn_async(id).await.ok()?;
-            let (Opened::Yes, mut send, mut recv) = open_tcp(&conn, echo).await.ok()? else { return None };
-            let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-            send.write_all(req.as_bytes()).await.ok()?;
-            let mut body = Vec::new();
-            (&mut recv).take(16 * 1024).read_to_end(&mut body).await.ok()?;
-            region::parse_trace(&String::from_utf8_lossy(&body))
+            let conn = self.carrier_once(id).await?;
+            let egress = match test_echo {
+                Some((echo, host, path)) => Self::egress_from(&conn, echo, &host, &path, true, None).await,
+                None => {
+                    // the sources' names are looked up here, by the buyer's own resolver; the requests go through the exit
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                    let tls = Arc::new(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                        .with_safe_default_protocol_versions().ok()?.with_root_certificates(roots).with_no_client_auth());
+                    let ask = |i: usize| {
+                        let (at, host, path, trace) = region::EGRESS_SOURCES[i];
+                        let (conn, tls) = (&conn, &tls);
+                        async move {
+                            let to = tokio::net::lookup_host(at).await.ok()?.find(SocketAddr::is_ipv4)?;
+                            tokio::time::timeout(Duration::from_secs(15), Self::egress_from(conn, to, host, path, trace, Some(tls))).await.ok().flatten()
+                        }
+                    };
+                    let (a, b, c, d) = tokio::join!(ask(0), ask(1), ask(2), ask(3));
+                    region::egress_quorum(&[a, b, c, d], 2)
+                }
+            };
+            if let Carrier::Tunnel(m) = &conn {
+                m.close();
+            }
+            egress
         };
-        let Some(egress) = tokio::time::timeout(Duration::from_secs(20), read).await.ok().flatten() else { return RegionCheck::Unknown };
+        let Some(egress) = tokio::time::timeout(Duration::from_secs(30), read).await.ok().flatten() else { return self.noted(id, announced, RegionCheck::Unknown) };
         let rtt = self.link.path(id).map(|p| match p {
             xbt_iroh_link::Path::Direct { rtt_ms, .. } | xbt_iroh_link::Path::Relay { rtt_ms, .. } => rtt_ms as f64,
         });
         let home = self.home_country.read().unwrap_or_else(|e| e.into_inner()).clone();
         let km = home.and_then(|h| region::km_between(&h, announced));
-        region::check(&geo, announced, egress, rtt, km)
+        self.noted(id, announced, region::check(&geo, announced, egress, rtt, km))
+    }
+
+    fn noted(&self, id: &str, announced: &str, r: RegionCheck) -> RegionCheck {
+        self.regions.write().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), (announced.to_string(), r.clone(), std::time::SystemTime::now()));
+        r
     }
 
     /// The router that decides for this device: its own policy's, or the buyer's default.
@@ -369,15 +458,44 @@ impl Buyer {
     /// the router.
     async fn exit(self: &Arc<Self>, device: IpAddr, id: &str) -> Option<Arc<ExitConn>> {
         let hop = self.router_for(device).lock().await.first_hop_for(id);
-        let key = match &hop {
-            Some(h) => format!("{}>{id}", h.id),
-            None => id.to_string(),
+        let tunnel = self.tunnel_of(id);
+        let key = match (&hop, &tunnel) {
+            (Some(h), _) => format!("{}>{id}", h.id),
+            // a priced exit: one paid tunnel for each device, so each device's own limit holds
+            (None, Some(_)) => format!("{device}#{id}"),
+            (None, None) => id.to_string(),
         };
         let mut ex = self.exits.lock().await;
         if let Some(e) = ex.get(&key) {
-            if e.conn.close_reason().is_none() {
+            if !e.conn.is_closed() {
                 return Some(e.clone());
             }
+        }
+        if let (None, Some(url)) = (&hop, tunnel) {
+            let wallet = self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone();
+            let opened = match wallet {
+                Some(w) => tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, &url)).await.ok().and_then(Result::ok),
+                // a priced exit with no wallet to pay it: not usable
+                None => None,
+            };
+            let Some(t) = opened else {
+                drop(ex);
+                self.fail_exit(id).await;
+                return None;
+            };
+            let conn = Carrier::Tunnel(t.mux);
+            // what the wallet said when the tunnel ended (charged, or why it stopped), for the log
+            std::thread::spawn(move || {
+                if let Ok(Ok(v)) = t.done.recv() {
+                    if let Some(why) = v.get("ended").and_then(serde_json::Value::as_str) {
+                        eprintln!("a paid tunnel ended: {why}");
+                    }
+                }
+            });
+            let e = Arc::new(ExitConn { conn: conn.clone(), udp: Arc::new(Mutex::new(HashMap::new())), sealed: None });
+            spawn_udp_routes(conn, e.udp.clone());
+            ex.insert(key, e.clone());
+            return Some(e);
         }
         if let Some(h) = hop {
             // two hops: a connection to the first hop; each flow is sealed for the exit
@@ -392,7 +510,7 @@ impl Buyer {
             };
             let tls = sealed::buyer_config(&self.sealed_secret, &exit);
             let exit_relays = self.link.hints_for(id).relays;
-            let e = Arc::new(ExitConn { conn, udp: Arc::new(Mutex::new(HashMap::new())), sealed: Some(Sealed { exit, exit_relays, tls }) });
+            let e = Arc::new(ExitConn { conn: Carrier::Link(conn), udp: Arc::new(Mutex::new(HashMap::new())), sealed: Some(Sealed { exit, exit_relays, tls }) });
             ex.insert(key, e.clone());
             return Some(e);
         }
@@ -404,16 +522,9 @@ impl Buyer {
                 return None;
             }
         };
+        let conn = Carrier::Link(conn);
         let e = Arc::new(ExitConn { conn: conn.clone(), udp: Arc::new(Mutex::new(HashMap::new())), sealed: None });
-        // the exit's UDP answers, to the flow each belongs to
-        let routes = e.udp.clone();
-        tokio::spawn(async move {
-            while let Ok((flow, payload)) = recv_udp(&conn).await {
-                if let Some(tx) = routes.lock().await.get(&flow) {
-                    let _ = tx.try_send(payload);
-                }
-            }
-        });
+        spawn_udp_routes(conn, e.udp.clone());
         ex.insert(key, e.clone());
         Some(e)
     }
@@ -440,11 +551,15 @@ impl Buyer {
         let suffix = format!(">{id}");
         let gone: Vec<Arc<ExitConn>> = {
             let mut ex = self.exits.lock().await;
-            let keys: Vec<String> = ex.keys().filter(|k| *k == id || k.ends_with(&suffix)).cloned().collect();
+            let paid = format!("#{id}");
+            let keys: Vec<String> = ex.keys().filter(|k| *k == id || k.ends_with(&suffix) || k.ends_with(&paid)).cloned().collect();
             keys.iter().filter_map(|k| ex.remove(k)).collect()
         };
         for e in gone {
-            e.conn.close(0u32.into(), b"exit not answering");
+            match &e.conn {
+                Carrier::Link(c) => c.close(0u32.into(), b"exit not answering"),
+                Carrier::Tunnel(m) => m.close(),
+            }
         }
     }
 
@@ -489,7 +604,7 @@ impl Buyer {
             match tokio::time::timeout(OPEN_WAIT, open_flow(&exit, dst)).await {
                 Ok(Some(flow)) => return Some((exit_id, flow)),
                 // the exit answered and refused (its policy, or `dst` unreachable from it): not its fault
-                Ok(None) if exit.conn.close_reason().is_none() => {
+                Ok(None) if !exit.conn.is_closed() => {
                     self.router_for(device).lock().await.flow_ended(&exit_id);
                     return None;
                 }
@@ -571,7 +686,7 @@ impl Buyer {
                             if dev.over_limit() {
                                 return;
                             }
-                            if send_udp(&conn, flow, dst, &buf[..n]).is_ok() {
+                            if conn.send_udp(flow, dst, &buf[..n]).is_ok() {
                                 dev.meter.up(n);
                             }
                         }
@@ -619,14 +734,26 @@ impl Buyer {
 async fn open_flow(exit: &ExitConn, dst: SocketAddr) -> Option<Box<dyn Duplex>> {
     match &exit.sealed {
         Some(s) => {
-            let mut flow = open_sealed(&exit.conn, &s.exit, &s.exit_relays, s.tls.clone()).await.ok()?;
+            let Carrier::Link(conn) = &exit.conn else { return None };
+            let mut flow = open_sealed(conn, &s.exit, &s.exit_relays, s.tls.clone()).await.ok()?;
             (open_tcp_on(&mut flow, dst).await.ok()? == Opened::Yes).then(|| Box::new(flow) as Box<dyn Duplex>)
         }
-        None => match open_tcp(&exit.conn, dst).await.ok()? {
-            (Opened::Yes, send, recv) => Some(Box::new(tokio::io::join(recv, send))),
+        None => match exit.conn.open_tcp(dst).await.ok()? {
+            (Opened::Yes, s) => s,
             _ => None,
         },
     }
+}
+
+/// The exit's UDP answers, to the flow each belongs to.
+fn spawn_udp_routes(conn: Carrier, routes: Arc<Mutex<HashMap<u32, mpsc::Sender<Bytes>>>>) {
+    tokio::spawn(async move {
+        while let Ok((flow, payload)) = conn.recv_udp().await {
+            if let Some(tx) = routes.lock().await.get(&flow) {
+                let _ = tx.try_send(payload);
+            }
+        }
+    });
 }
 
 /// A fresh random key, from the operating system.

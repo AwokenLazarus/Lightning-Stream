@@ -55,6 +55,9 @@ pub struct ExitOffer {
     pub two_hop: bool,
     pub price_msat_per_gb: u64,
     pub relay: Option<String>,
+    /// Where a buyer's wallet opens the paid tunnel to this exit: a URL on the operator's Stream
+    /// shop (`https://<shop>/vpn/tunnel`), paid as it is used like any of the shop's services.
+    pub tunnel: Option<String>,
     pub note: String,
     /// How long the announcement lives, capped at [`MAX_TTL_S`].
     pub ttl_s: u64,
@@ -105,6 +108,12 @@ pub fn announcement_event(keys: &Keys, exit_secret: &[u8; 32], offer: &ExitOffer
     if let Some(r) = &offer.relay {
         tags.push(tag("relay", r));
     }
+    if let Some(t) = &offer.tunnel {
+        if !(t.starts_with("https://") || t.starts_with("http://")) || t.len() > 512 {
+            return Err("the tunnel is an http(s) URL on the operator's shop".into());
+        }
+        tags.push(tag("tunnel", t));
+    }
     let note: String = offer.note.trim().chars().take(MAX_NOTE).collect();
     Ok(Event::sign(keys, now, KIND_APP_DATA, tags, note))
 }
@@ -120,6 +129,9 @@ pub struct Announced {
     pub exit: ExitInfo,
     /// The iroh relay the exit is reachable through, if it says.
     pub relay: Option<String>,
+    /// Where the buyer's wallet opens the paid tunnel ([`ExitOffer::tunnel`]); `None`: the exit
+    /// is reached straight over the link, which only a free exit is.
+    pub tunnel: Option<String>,
     pub author: String,
     pub created_at: u64,
 }
@@ -192,7 +204,8 @@ pub fn read_event(ev: &Event, now: u64) -> Result<Announced, String> {
         blocked_ports: ports,
         two_hop: ev.tag("two_hop") == Some("1"),
     };
-    Ok(Announced { exit: info, relay: ev.tag("relay").map(str::to_string), author: ev.pubkey.clone(), created_at: ev.created_at })
+    let tunnel = ev.tag("tunnel").filter(|t| (t.starts_with("https://") || t.starts_with("http://")) && t.len() <= 512).map(str::to_string);
+    Ok(Announced { exit: info, relay: ev.tag("relay").map(str::to_string), tunnel, author: ev.pubkey.clone(), created_at: ev.created_at })
 }
 
 /// Every good announcement among `events`, the newest per exit (an exit is announced by whoever its

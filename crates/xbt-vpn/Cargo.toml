@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 xbt-iroh-link = { path = "../xbt-iroh-link" }
+# a priced exit is reached through the buyer's own wallet (the signer), which pays as the tunnel's bytes pass
+xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
 # exits announce themselves on Nostr, and buyers find them there
 xbt-nostr.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util", "net"] }

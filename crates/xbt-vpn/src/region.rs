@@ -37,6 +37,11 @@ impl GeoTable {
         t
     }
 
+    /// Whether it holds no ranges (a file that was not a table).
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+
     /// The country code of an address, if the table has it.
     pub fn country(&self, ip: IpAddr) -> Option<String> {
         fn find<T: Ord + Copy>(ranges: &[(T, T, [u8; 2])], x: T) -> Option<[u8; 2]> {
@@ -92,6 +97,35 @@ pub fn parse_trace(body: &str) -> Option<IpAddr> {
     body.lines().find_map(|l| l.strip_prefix("ip=")).and_then(|v| v.trim().parse().ok())
 }
 
+/// Where an exit's egress address is read, through the exit: HTTPS pages run by different
+/// operators, each printing the address the request came from. Over TLS, so the exit can't
+/// change what they say (a plain page, or STUN, it could). Each: address, TLS name, path, and
+/// whether the body is a trace (`ip=` line) or the bare address.
+pub const EGRESS_SOURCES: &[(&str, &str, &str, bool)] = &[
+    ("1.1.1.1:443", "one.one.one.one", "/cdn-cgi/trace", true),
+    ("checkip.amazonaws.com:443", "checkip.amazonaws.com", "/", false),
+    ("ifconfig.co:443", "ifconfig.co", "/ip", false),
+    ("api.ipify.org:443", "api.ipify.org", "/", false),
+];
+
+/// The address the sources agree on: at least `need` of them answered, and every one that
+/// answered said the same. Sources that disagree mean nothing is believed (one of them was lied
+/// to, or the exit's traffic leaves by more than one address).
+pub fn egress_quorum(answers: &[Option<IpAddr>], need: usize) -> Option<IpAddr> {
+    let got: Vec<IpAddr> = answers.iter().flatten().copied().collect();
+    let first = *got.first()?;
+    (got.len() >= need.max(1) && got.iter().all(|a| *a == first)).then_some(first)
+}
+
+/// An address from a source's body: a trace's `ip=` line, or the bare address.
+pub fn parse_egress(body: &str, trace: bool) -> Option<IpAddr> {
+    if trace {
+        parse_trace(body)
+    } else {
+        body.trim().parse().ok()
+    }
+}
+
 /// Rough centres of countries (latitude, longitude), for a lower bound on the distance to a region.
 /// Countries not listed get no round-trip check; their egress address is still checked.
 const CENTRES: &[(&str, f64, f64)] = &[
@@ -130,6 +164,29 @@ pub const DBIP_URL: &str = "https://download.db-ip.com/free/dbip-country-lite-{Y
 
 /// How long a downloaded table is used before a newer month is fetched.
 pub const TABLE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(35 * 86400);
+
+/// Where the image keeps the table it ships with (refreshed at each release).
+pub const BUNDLED: &str = "/usr/share/xbt-vpn/dbip-country-lite.csv.gz";
+
+/// The geo-IP table: a copy fetched into `dir` while it is under [`TABLE_MAX_AGE`]; else a newer
+/// month fetched from `url`, if one is set; else the copy in `dir` however old; else the table
+/// the app shipped with (`bundled`, gzipped). Nothing here needs the network: a box that never
+/// reaches `url` (or has none set) uses the bundled table from install.
+pub fn load(dir: &std::path::Path, bundled: Option<&std::path::Path>, url: Option<&str>) -> std::io::Result<GeoTable> {
+    use std::io::Read;
+    let path = dir.join("dbip-country-lite.csv");
+    let fetched = match url.filter(|u| !u.trim().is_empty()) {
+        Some(u) => load_or_fetch(dir, u).ok(),
+        None => std::fs::read_to_string(&path).ok().map(|t| GeoTable::from_csv(&t)),
+    };
+    if let Some(t) = fetched.filter(|t| !t.is_empty()) {
+        return Ok(t);
+    }
+    let b = bundled.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no geo-IP table: none fetched and none bundled"))?;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(b)?).take(512 << 20).read_to_string(&mut text)?;
+    Ok(GeoTable::from_csv(&text))
+}
 
 /// The geo-IP table kept in `dir` (`dbip-country-lite.csv`), fetched when missing or older than
 /// [`TABLE_MAX_AGE`] (this month's file, else last month's). A failed fetch keeps the old copy.
@@ -191,6 +248,19 @@ mod tests {
     }
 
     #[test]
+    fn the_egress_address_is_believed_only_where_independent_sources_agree() {
+        let (a, b) = (Some(ip("203.0.113.7")), Some(ip("198.51.100.9")));
+        assert_eq!(egress_quorum(&[a, a, None], 2), a);
+        assert_eq!(egress_quorum(&[a, None, None], 2), None, "one source is not enough");
+        assert_eq!(egress_quorum(&[a, b, a], 2), None, "sources that disagree: nothing is believed");
+        assert_eq!(egress_quorum(&[None, None], 2), None);
+        assert_eq!(egress_quorum(&[a], 1), a, "a single configured source (a test) needs one");
+        assert_eq!(parse_egress("203.0.113.7\n", false), a);
+        assert_eq!(parse_egress("ip=203.0.113.7\n", true), a);
+        assert_eq!(parse_egress("<html>", false), None);
+    }
+
+    #[test]
     fn a_distance_bound_is_below_the_true_distance_and_zero_nearby() {
         let us_jp = km_between("US", "JP").unwrap();
         assert!(us_jp > 5000.0 && us_jp < 10_500.0, "{us_jp}");
@@ -219,6 +289,30 @@ bad line
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_table_shipped_with_the_app_is_used_with_no_network() {
+        use std::io::Write;
+        let dir = tempfile_dir();
+        let bundled = dir.join("bundled.csv.gz");
+        let mut gz = flate2::write::GzEncoder::new(std::fs::File::create(&bundled).unwrap(), flate2::Compression::fast());
+        gz.write_all(CSV.as_bytes()).unwrap();
+        gz.finish().unwrap();
+        // no download source set: the bundled table, and nothing fetched
+        let t = load(&dir.join("geo"), Some(&bundled), None).unwrap();
+        assert_eq!(t.country(ip("5.9.1.2")).as_deref(), Some("DE"));
+        // a source that can't be reached: the bundled table still
+        let t = load(&dir.join("geo"), Some(&bundled), Some("http://127.0.0.1:9/{YYYY-MM}.csv.gz")).unwrap();
+        assert_eq!(t.country(ip("8.8.8.8")).as_deref(), Some("US"));
+        assert!(load(&dir.join("geo"), None, None).is_err(), "no table at all is said, not guessed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("xbt-vpn-geo-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]

@@ -29,7 +29,7 @@ use xbt_iroh_link::LinkConnection;
 
 use crate::content::{dns_nxdomain, dns_question, http_host, tls_sni, ContentFilter};
 use crate::filter::Policy;
-use crate::flow::{self, Opened, KIND_UDP_BACK, KIND_UDP_OUT};
+use crate::flow::{self, Carrier, Opened, KIND_UDP_BACK, KIND_UDP_OUT};
 use crate::meter::Meter;
 
 /// How an exit treats its buyers.
@@ -140,25 +140,32 @@ where
 /// Serves one buyer's connection until it closes: each TCP flow out as an ordinary connection, and
 /// UDP flows as sockets of their own.
 pub async fn serve_buyer(conn: LinkConnection, cfg: Arc<ExitConfig>, meter: Arc<Meter>) {
+    serve(Carrier::Link(conn), cfg, meter).await
+}
+
+/// [`serve_buyer`] on what carries the buyer's flows: the link connection, or a paid tunnel.
+pub async fn serve(conn: Carrier, cfg: Arc<ExitConfig>, meter: Arc<Meter>) {
     let (up, down) = match cfg.buyer_bytes_per_sec {
         Some(r) => (Some(Arc::new(Mutex::new(Bucket::new(r)))), Some(Arc::new(Mutex::new(Bucket::new(r))))),
         None => (None, None),
     };
     let udp = tokio::spawn(serve_udp(conn.clone(), cfg.clone(), meter.clone()));
     let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    while let Ok((mut send, recv)) = conn.accept_bi().await {
+    while let Some(mut s) = conn.accept().await {
         let (cfg, meter, up, down) = (cfg.clone(), meter.clone(), up.clone(), down.clone());
         // operators always have content-blind protections, private exit or not
         if open.load(std::sync::atomic::Ordering::Relaxed) >= cfg.max_tcp_flows {
             meter.drop_one();
-            let _ = send.write_all(&[Opened::Refused.byte()]).await;
-            let _ = send.finish();
+            tokio::spawn(async move {
+                let _ = s.write_all(&[Opened::Refused.byte()]).await;
+                let _ = s.shutdown().await;
+            });
             continue;
         }
         let guard = FlowCount::new(open.clone());
         tokio::spawn(async move {
             let _guard = guard;
-            tcp_flow(tokio::io::join(recv, send), &cfg, &meter, up, down).await;
+            tcp_flow(s, &cfg, &meter, up, down).await;
         });
     }
     udp.abort();
@@ -266,7 +273,7 @@ struct UdpFlow {
 }
 
 /// The buyer's UDP datagrams: one socket per flow, answers sent back with the flow's number.
-async fn serve_udp(conn: LinkConnection, cfg: Arc<ExitConfig>, meter: Arc<Meter>) {
+async fn serve_udp(conn: Carrier, cfg: Arc<ExitConfig>, meter: Arc<Meter>) {
     let flows: Shared<HashMap<u32, UdpFlow>> = Arc::new(Mutex::new(HashMap::new()));
     // close flows that have been idle
     let sweeper = {

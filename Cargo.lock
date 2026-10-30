@@ -5877,6 +5877,7 @@ dependencies = [
  "webpki-roots 1.0.9",
  "xbt-iroh-link",
  "xbt-nostr",
+ "xbt-wallet-mcp",
 ]
 
 [[package]]
