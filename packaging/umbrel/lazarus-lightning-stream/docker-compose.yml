@@ -210,6 +210,11 @@ services:
       XBT_UI_AI_SELLERS: /data/run/ai/sellers.json
       XBT_UI_CREDENTIALS: /data/run/ai/credentials.json
       XBT_UI_AI_STATE: /data/run/ai/state.json
+      # Files (Sell): the shared folder, served by the UI to the gateway only, on the app's private
+      # network (not published), with the files key the gateway's route adds (docs/FILES.md)
+      XBT_UI_FILES_DIR: /data/ui/files
+      XBT_UI_FILES_BIND: 0.0.0.0:8486
+      XBT_UI_FILES_UPSTREAM: http://lazarus-lightning-stream_ui_1:8486
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       # the AI page's files, shared by group with the connector (the credential store both write)

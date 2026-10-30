@@ -22,11 +22,14 @@ use crate::server::Resp;
 pub const SELL_FILE: &str = "sell.json";
 pub const MAX_SERVICES: usize = 16;
 const MIB: u64 = 1_048_576;
+const GB: u64 = 1_000_000_000;
 
 /// The kinds an owner picks from, with the words, the listing's kind, and the suggested price.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Media,
+    /// A folder on this box, served by the app itself ([`crate::files`]).
+    Files,
     Ai,
     Web,
     Other,
@@ -36,6 +39,7 @@ impl Kind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "media" => Some(Kind::Media),
+            "files" => Some(Kind::Files),
             "ai" => Some(Kind::Ai),
             "web" => Some(Kind::Web),
             "other" => Some(Kind::Other),
@@ -45,6 +49,7 @@ impl Kind {
     pub fn id(self) -> &'static str {
         match self {
             Kind::Media => "media",
+            Kind::Files => "files",
             Kind::Ai => "ai",
             Kind::Web => "web",
             Kind::Other => "other",
@@ -53,6 +58,7 @@ impl Kind {
     pub fn words(self) -> &'static str {
         match self {
             Kind::Media => "Media server",
+            Kind::Files => "Files",
             Kind::Ai => "AI model",
             Kind::Web => "Web service or API",
             Kind::Other => "Something else",
@@ -62,6 +68,7 @@ impl Kind {
     fn thing(self) -> &'static str {
         match self {
             Kind::Media => "your media server",
+            Kind::Files => "your shared folder",
             Kind::Ai => "your AI model",
             Kind::Web | Kind::Other => "your service",
         }
@@ -69,6 +76,7 @@ impl Kind {
     fn listing_kind(self) -> &'static str {
         match self {
             Kind::Media => "video",
+            Kind::Files => "files",
             Kind::Ai => "ai",
             Kind::Web | Kind::Other => "api",
         }
@@ -77,7 +85,7 @@ impl Kind {
         match k {
             "video" => Kind::Media,
             "ai" => Kind::Ai,
-            "files" => Kind::Other,
+            "files" => Kind::Files,
             _ => Kind::Web,
         }
     }
@@ -85,6 +93,8 @@ impl Kind {
     pub fn suggested(self) -> (&'static str, Unit) {
         match self {
             Kind::Media => ("20", Unit::Mib),
+            // a film of a few GB for a few thousand sats
+            Kind::Files => ("1000", Unit::Gb),
             // a few sats for a reply of a few hundred tokens
             Kind::Ai => ("10", Unit::Tokens),
             Kind::Web | Kind::Other => ("1", Unit::Request),
@@ -93,6 +103,7 @@ impl Kind {
     fn example(self) -> &'static str {
         match self {
             Kind::Media => "http://jellyfin:8096",
+            Kind::Files => "nothing: the app serves the folder itself",
             Kind::Ai => "http://ollama:11434",
             Kind::Web | Kind::Other => "http://my-app:8080",
         }
@@ -102,6 +113,8 @@ impl Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     Mib,
+    /// 1,000,000,000 bytes sent.
+    Gb,
     Request,
     Second,
     /// 1,000 tokens an AI model writes (an OpenAI-compatible service).
@@ -112,6 +125,7 @@ impl Unit {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "mib" => Some(Unit::Mib),
+            "gb" => Some(Unit::Gb),
             "request" => Some(Unit::Request),
             "second" => Some(Unit::Second),
             "tokens" => Some(Unit::Tokens),
@@ -121,6 +135,7 @@ impl Unit {
     pub fn id(self) -> &'static str {
         match self {
             Unit::Mib => "mib",
+            Unit::Gb => "gb",
             Unit::Request => "request",
             Unit::Second => "second",
             Unit::Tokens => "tokens",
@@ -129,6 +144,7 @@ impl Unit {
     fn words(self) -> &'static str {
         match self {
             Unit::Mib => "a MiB of data sent",
+            Unit::Gb => "a GB of data sent",
             Unit::Request => "a request",
             Unit::Second => "a second",
             Unit::Tokens => "1,000 tokens the model writes",
@@ -137,6 +153,7 @@ impl Unit {
     fn short(self) -> &'static str {
         match self {
             Unit::Mib => "a MiB",
+            Unit::Gb => "a GB",
             Unit::Request => "a request",
             Unit::Second => "a second",
             Unit::Tokens => "per 1,000 tokens",
@@ -516,6 +533,8 @@ impl Shop {
             let input_msat = n("per_1k_input_msat");
             let (unit, msat) = if n("per_1k_output_msat") > 0 || input_msat > 0 {
                 (Unit::Tokens, n("per_1k_output_msat"))
+            } else if n("byte_msat") > 0 && n("per_bytes") == GB {
+                (Unit::Gb, n("byte_msat"))
             } else if n("byte_msat") > 0 {
                 // to the msat a MiB
                 (Unit::Mib, n("byte_msat").saturating_mul(MIB) / n("per_bytes").max(1))
@@ -777,10 +796,13 @@ impl App {
         }
         let mut routes = vec![];
         let mut sections = vec![];
+        // the shared folder's key: the route of a Files service adds it to every request ([`crate::files`])
+        let files_key = if active.iter().any(|o| o.kind == Kind::Files) { Some(crate::files::key(&self.cfg.data_dir.join("secrets"))?) } else { None };
         for o in &active {
             let key_file = gw.dir.join(app_key_name(&o.id)).display().to_string();
             let price = match o.unit {
                 Unit::Mib => json!({"byte_msat": o.price_msat, "per_bytes": MIB}),
+                Unit::Gb => json!({"byte_msat": o.price_msat, "per_bytes": GB}),
                 Unit::Request => json!({"request_msat": o.price_msat}),
                 Unit::Second => json!({"second_msat": o.price_msat}),
                 Unit::Tokens if o.input_msat > 0 => json!({"per_1k_output_msat": o.price_msat, "per_1k_input_msat": o.input_msat}),
@@ -791,7 +813,7 @@ impl App {
                 // what the page does not show of a route (methods, headers, body size) is kept
                 let mut r = old_routes.iter().find(|r| r.get("path").and_then(Value::as_str) == Some(p.as_str())).cloned()
                     .filter(Value::is_object).unwrap_or_else(|| match o.kind {
-                        Kind::Media => json!({}),
+                        Kind::Media | Kind::Files => json!({}),
                         // a model or a web service is asked with a body
                         Kind::Ai | Kind::Web | Kind::Other => json!({"methods": ["GET", "HEAD", "POST"], "max_body": MIB}),
                     });
@@ -811,6 +833,14 @@ impl App {
                     m.remove("strip_prefix");
                 }
                 app_route(m, o.app.as_ref().filter(|a| a.base == *p), &key_file);
+                if let (Kind::Files, Some(k)) = (o.kind, &files_key) {
+                    // the folder answers GET and HEAD of a file, only with the key, and sees paths from its own root
+                    m.insert("methods".into(), json!(["GET", "HEAD"]));
+                    m.insert("upstream_headers".into(), json!({crate::files::KEY_HEADER: k}));
+                    if p != "/" {
+                        m.insert("strip_prefix".into(), json!(true));
+                    }
+                }
                 route_capacity(m, &o.capacity, free);
                 // one service to a buyer, however many routes: counted once over them (docs/CAPACITY.md)
                 if (1..=64).contains(&o.id.len()) {
@@ -846,13 +876,22 @@ impl App {
                 routes.push(r);
             }
             let base = public_url.clone();
-            let items: Vec<Value> = o.titles.iter().map(|(t, u)| {
+            // deprecated for a media server: its films were listed for the app's built-in player, which is gone. A
+            // media server saved before keeps its list for a release, for older buyers' apps; saving it again clears it
+            let mut items: Vec<Value> = o.titles.iter().map(|(t, u)| {
                 // an item at one of the shop's earlier addresses is listed at its address now
                 let moved = aliases.iter().any(|a| crate::services::same_origin(u, a));
                 let url = if u.starts_with('/') { format!("{base}{u}") }
                           else if moved { crate::services::rebase(u, &base).unwrap_or_else(|| u.clone()) } else { u.clone() };
                 json!({"title": t, "url": url})
             }).collect();
+            // a Files service lists what is in its folder now, each file with its size
+            if let (Kind::Files, Some(p)) = (o.kind, o.paths.first()) {
+                let at = if p.ends_with('/') { p.clone() } else { format!("{p}/") };
+                items = crate::files::list(&self.cfg.files.dir).into_iter().map(|(rel, size)| {
+                    json!({"title": rel, "url": format!("{base}{at}{}", crate::files::url_path(&rel)), "credit": crate::files::size_words(size)})
+                }).collect();
+            }
             if let Some(p) = o.paths.first() {
                 sections.push(json!({"name": o.name, "kind": o.kind.listing_kind(), "path": p, "items": items}));
             }
@@ -1028,6 +1067,17 @@ impl App {
         }
     }
 
+    /// How the gateway reaches the shared folder of a Files service ([`crate::files`]).
+    pub(crate) fn files_upstream(&self) -> String {
+        if !self.cfg.files.upstream.is_empty() {
+            return self.cfg.files.upstream.trim_end_matches('/').to_string();
+        }
+        match *self.files_addr.lock().unwrap_or_else(|p| p.into_inner()) {
+            Some(a) => format!("http://{a}"),
+            None => format!("http://{}", self.cfg.files.bind),
+        }
+    }
+
     /// The shop's one status, and each offer's (by id).
     pub fn shop_status(&self, shop: &Shop, chain: &str) -> (Status, HashMap<String, Status>) {
         let st = |class: &'static str, h: &str, n: &str| Status { class, headline: h.into(), next: n.into() };
@@ -1179,16 +1229,25 @@ impl App {
             let s = each.get(&o.id).cloned().unwrap_or(Status { class: "warn", headline: "Unknown".into(), next: String::new() });
             let now = o.paths.first().and_then(|p| live.get(p)).map(capacity_words).unwrap_or_default();
             let mut next_hint = if s.next.is_empty() { String::new() } else { format!("<p class=\"hint {}\">{}</p>", s.class, esc(&s.next)) };
+            // the app's built-in player is gone: a media server is used through its own web app
+            if o.kind == Kind::Media && (o.app.is_none() || !o.titles.is_empty()) {
+                next_hint.push_str("<p class=\"hint warn\">Buyers' apps no longer have a player of their own: they use your media server's own web app. \
+                    Edit this service and save it to share it that way. A list of films is no longer needed.</p>");
+            }
             next_hint.push_str(&now);
             let btn = |action: &str, label: &str, class: &str| format!("<form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                 <input type=\"hidden\" name=\"id\" value=\"{}\"><button{class}>{label}</button></form>", esc(&o.id));
             b.push_str(&format!("<section class=\"card offer\"><div class=\"offer-head\"><h3>{}</h3><span class=\"pill {}\">{}</span></div>\
                 <p>{} &middot; <strong>{}</strong>{}</p>{}<div class=\"row\"><a class=\"button-link\" href=\"./sell?edit={}#service-form\">Edit</a>{}{}</div></section>",
                 esc(&o.name), s.class, esc(&s.headline), o.kind.words(), o.price_words(),
-                if o.titles.is_empty() { String::new() } else { format!(" &middot; {} to choose from", o.titles.len()) },
+                if o.kind == Kind::Files {
+                    let n = crate::files::list(&self.cfg.files.dir).len();
+                    format!(" &middot; {n} file{} in the folder", if n == 1 { "" } else { "s" })
+                } else if o.titles.is_empty() { String::new() } else { format!(" &middot; {} to choose from", o.titles.len()) },
                 next_hint,
                 crate::services::urlenc(&o.id),
-                if o.paused { btn("resume", "Resume", "") } else { btn("pause", "Pause", " class=\"secondary\"") },
+                if o.paused { btn("resume", "Resume", "") } else { btn("pause", "Pause", " class=\"secondary\"") }
+                    + &if o.kind == Kind::Files { btn("files_refresh", "Update the file list", " class=\"secondary\"") } else { String::new() },
                 btn("remove", "Remove", " class=\"danger\"")));
         }
 
@@ -1242,18 +1301,30 @@ impl App {
         let kind = Kind::parse(&fv("kind", editing.map(|o| o.kind.id().to_string()).unwrap_or_else(|| "media".into()))).unwrap_or(Kind::Media);
         let (sug_price, sug_unit) = kind.suggested();
         let unit = Unit::parse(&fv("unit", editing.map(|o| o.unit).unwrap_or(sug_unit).id().to_string())).unwrap_or(sug_unit);
-        let kinds: String = [Kind::Media, Kind::Ai, Kind::Web, Kind::Other].iter().map(|k| {
+        let kinds: String = [Kind::Media, Kind::Files, Kind::Ai, Kind::Web, Kind::Other].iter().map(|k| {
             let (p, u) = k.suggested();
-            format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>suggested {} sat {}</small></span></label>",
+            // a media server is named by the apps it means: it is shared as its own web app
+            let what = match k {
+                Kind::Media => "Jellyfin, Plex: shared as a web app · ",
+                Kind::Files => "a folder on this box, to download or open in a player · ",
+                _ => "",
+            };
+            format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>{what}suggested {} sat {}</small></span></label>",
                     k.id(), if *k == kind { " checked" } else { "" }, k.words(), p, u.short())
         }).collect();
-        let units: String = [Unit::Mib, Unit::Request, Unit::Second, Unit::Tokens].iter()
+        let files_dir = esc(&self.cfg.files.dir.display().to_string());
+        let units: String = [Unit::Mib, Unit::Gb, Unit::Request, Unit::Second, Unit::Tokens].iter()
             .map(|u| format!("<option value=\"{}\"{}>{}</option>", u.id(), if *u == unit { " selected" } else { "" }, u.words())).collect();
         let titles = editing.map(|o| o.titles.iter().map(|(t, u)| format!("{t} | {u}")).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         b.push_str(&format!("<section class=\"card primary\" id=\"service-form\"><h2>{}</h2><form method=\"post\" action=\"./sell\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"service\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
             <fieldset class=\"choices\"><legend>What is it?</legend>{kinds}</fieldset>\
-            <label>Its address on this box<input name=\"address\" value=\"{}\" required pattern=\"http://[^ ?#@]+\" inputmode=\"url\" class=\"mono\" \
+            <p class=\"hint\">A media server is shared as its own web app: buyers use your Jellyfin or Plex in their browser or app, \
+            each with their own account if you like, up to 4K, like a streaming service. They pay your price for what it loads.</p>\
+            <p class=\"hint\">Files shares a folder on this box, <code>{files_dir}</code>, with no media server: buyers see each file's name, size \
+            and price, and download it or open it in their own player (VLC, mpv, a TV app), paid as it arrives. Price it per GB. \
+            Put files in the folder, then save the service (or press Update the file list) to list them.</p>\
+            <label>Its address on this box <small>(not for Files)</small><input name=\"address\" value=\"{}\" pattern=\"http://[^ ?#@]+\" inputmode=\"url\" class=\"mono\" \
             list=\"found-services\" title=\"The http:// address other apps on this box use, like {}\" placeholder=\"{}\"></label>{}\
             <div class=\"price-row\"><label>Price in sats<input name=\"price\" value=\"{}\" required inputmode=\"decimal\" pattern=\"[0-9][0-9,]*(\\.[0-9]{{1,3}})?|\\.[0-9]{{1,3}}\" \
             title=\"A number of sats, like 20 or 0.5\"></label><label>for each<select name=\"unit\">{units}</select></label></div>\
@@ -1277,7 +1348,7 @@ impl App {
             <p class=\"hint\">Paths as the page sees them. Where a path is under entries of both lists, the longer one decides: \
             <code>/</code> in the second list and <code>/Users</code> in the first refuse <code>/Users</code> but serve the rest.</p></details>\
             <details><summary>Advanced</summary>\
-            <label>Items to list for buyers (films, files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
+            <label>Items to list for buyers (files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
             <p class=\"hint\">A link may start with <code>/</code>: it is then on your shop's address.</p>\
             <label>Paths it is sold under, comma-separated (empty: chosen for you)<input name=\"paths\" value=\"{}\" class=\"mono\"></label>\
             <label class=\"check\"><input type=\"checkbox\" name=\"strip\" value=\"1\"{}> Pass requests on without that path</label></details>\
@@ -1380,8 +1451,9 @@ impl App {
             }
             "check_public" => self.check_public(&shop),
             "service" => (|| {
-                let kind = Kind::parse(&g("kind")).ok_or("Pick what it is: a media server, an AI model, or another web service.")?;
-                let address = check_address(&g("address"), kind)?;
+                let kind = Kind::parse(&g("kind")).ok_or("Pick what it is: a media server, files, an AI model, or another web service.")?;
+                // a folder is served by the app itself: its address is the app's, never typed
+                let address = if kind == Kind::Files { self.files_upstream() } else { check_address(&g("address"), kind)? };
                 let price_msat = sats_to_msat(&g("price"))?;
                 let unit = Unit::parse(&g("unit")).ok_or("Pick what the price is for.")?;
                 let input_msat = if g("input_price").trim().is_empty() { 0 } else { sats_to_msat(&g("input_price"))? };
@@ -1397,6 +1469,11 @@ impl App {
                         return Err(format!("Line {} of the list: write it as name | link, where the link starts with https:// or /.", i + 1));
                     }
                     titles.push((t.to_string(), u.to_string()));
+                }
+                // films listed for the built-in player, which buyers' apps no longer have: a media server is its web app;
+                // a folder lists what is in it, read again each time the shop is saved
+                if matches!(kind, Kind::Media | Kind::Files) {
+                    titles.clear();
                 }
                 let id = g("id");
                 if id.is_empty() && shop.offers.len() >= MAX_SERVICES {
@@ -1419,7 +1496,11 @@ impl App {
                     };
                 }
                 let mut accounts_key: Option<String> = None;
-                let app = if g("app") == "1" {
+                // a media server is sold as its own web app: buyers use it as they would at home, with no player of
+                // the app's own
+                let app = if kind == Kind::Files {
+                    None
+                } else if g("app") == "1" || kind == Kind::Media {
                     // a media server's page uses paths all over the service (Jellyfin: /web/, /Users/, /Items/…); an AI model's or a web app's, its own path
                     let base = match g("app_base").trim() {
                         "" if kind == Kind::Media => "/".to_string(),
@@ -1481,7 +1562,8 @@ impl App {
                     max_streams_per_buyer: limit("cap_streams_buyer", "Most streams for one buyer")?,
                     max_mbit: limit("cap_mbit", "Most Mbit/s together")?,
                 };
-                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip: g("strip") == "1", titles, app, capacity };
+                let strip = g("strip") == "1" || kind == Kind::Files;
+                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip, titles, app, capacity };
                 match shop.offers.iter_mut().find(|o| o.id == new_id) {
                     Some(o) => {
                         let paused = o.paused;
@@ -1500,6 +1582,7 @@ impl App {
                 }
                 self.commit(&shop, if id.is_empty() { "Added." } else { "Changes saved." })
             })(),
+            "files_refresh" => self.commit(&shop, "The file list is updated: buyers see what is in the folder now."),
             "pause" | "resume" | "remove" => {
                 let id = g("id");
                 match shop.offers.iter().position(|o| o.id == id) {

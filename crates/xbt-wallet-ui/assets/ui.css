@@ -199,15 +199,6 @@ ol.steps { list-style: none; padding: 0; margin: 0; counter-reset: step; }
 .approval.pending { border-left: 4px solid var(--warn); }
 .approval.approved { border-left: 4px solid var(--ok); }
 
-/* the player */
-video { display: block; width: 100%; max-height: 70vh; background: #000; border-radius: var(--radius); margin: 0 0 14px;
-        box-shadow: 0 0 0 1px var(--card-edge), 0 18px 48px color-mix(in srgb, var(--river-a) 18%, transparent); }
-/* the player: a message over the bottom of the video while it starts, waits or fails */
-.player { position: relative; }
-.player .player-msg { position: absolute; left: 12px; right: 12px; bottom: 28px; margin: 0; display: flex; flex-wrap: wrap; gap: 10px;
-  align-items: center; backdrop-filter: blur(6px); }
-.player .player-msg .button-link { padding: 6px 12px; }
-
 /* Sell and Services: a status in words and colour, a card per service, one main action */
 .lead { font-size: 1.06rem; margin: 0 0 18px; max-width: 65ch; }
 .status { background: var(--card); border: 1px solid var(--card-edge); border-left: 6px solid var(--line); border-radius: var(--radius);
@@ -271,11 +262,12 @@ a.service-card:hover { border-color: var(--accent); transform: translateY(-1px);
 a.service-card h2 { margin: 4px 0 0; font-size: 1.1rem; }
 a.service-card p { margin: 0; }
 a.service-card .pill { align-self: flex-start; }
-.pill.cat-media { color: var(--river-b); background: color-mix(in srgb, var(--river-b) 14%, transparent); border-color: transparent; }
+.pill.cat-media, .pill.cat-apps { color: var(--river-b); background: color-mix(in srgb, var(--river-b) 14%, transparent); border-color: transparent; }
 .pill.cat-ai { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 .pill.cat-data { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+.pill.cat-files { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
 .pill.cat-hashrate { color: var(--river-a); background: color-mix(in srgb, var(--river-a) 14%, transparent); border-color: transparent; }
-.pill.cat-media::before, .pill.cat-ai::before, .pill.cat-hashrate::before, .pill.cat-data::before { display: none; }
+.pill.cat-media::before, .pill.cat-apps::before, .pill.cat-files::before, .pill.cat-ai::before, .pill.cat-hashrate::before, .pill.cat-data::before { display: none; }
 form.suggested { margin: 10px 0 0; justify-content: space-between; }
 .empty-card { text-align: center; }
 .empty-card .row { justify-content: center; }
@@ -320,5 +312,16 @@ header nav a, nav.tabs a, nav.chips a { border-radius: 8px; }
 header nav a[aria-current=page] { box-shadow: none; }
 .card, .step, .status { box-shadow: var(--shadow); }
 h1 { font-weight: 650; letter-spacing: -0.02em; }
-video { box-shadow: 0 0 0 1px var(--card-edge); }
 .empty::before { background: radial-gradient(circle, var(--accent-soft) 60%, transparent 61%); opacity: 1; }
+
+/* a Files service's list: one row a file; at phone width each file is a block, its size and price on one line */
+table.files td:nth-child(2), table.files td:nth-child(3) { white-space: nowrap; }
+table.files td:last-child .row { justify-content: flex-end; }
+@media (max-width: 640px) {
+  table.files thead { display: none; }
+  table.files, table.files tbody, table.files tr, table.files td { display: block; width: auto; }
+  table.files tr { padding: 12px 0; border-bottom: 1px solid var(--line); }
+  table.files td { border: 0; padding: 2px 0; }
+  table.files td:nth-child(2), table.files td:nth-child(3) { display: inline-block; margin-right: 12px; color: var(--muted); }
+  table.files td:last-child .row { justify-content: flex-start; margin-top: 6px; }
+}

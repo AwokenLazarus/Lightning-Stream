@@ -114,8 +114,7 @@ pub fn strip_base(path: &str, base: &str) -> Option<String> {
     path.strip_prefix(b).filter(|r| r.starts_with('/')).map(str::to_string).or_else(|| Some(path.to_string()))
 }
 
-/// The security headers of every answer. Video plays from this page's own origin: the UI relays
-/// the connector (`/s/…`).
+/// The security headers of every answer.
 pub fn security_headers(r: &mut Resp) {
     // a page that frames a seller's own app sets its own policy, the same one with its frame-src
     if !r.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Content-Security-Policy")) {
@@ -151,7 +150,7 @@ fn authority(url: &str) -> Option<&str> {
 /// judged by `Origin`, then `Referer`, against `Host` (or `X-Forwarded-Host` behind a proxy): an
 /// action whose page is elsewhere is refused, and a page opened from elsewhere is the home page. A
 /// request that says nothing at all passes here: an action still needs the session's CSRF token,
-/// and a stream the session's stream token ([`App::stream_token`]), which no other page can read.
+/// and a download the session's stream token ([`App::stream_token`]), which no other page can read.
 fn foreign_refused(method: &str, target: &str, base: &str, headers: &[(String, String)]) -> Option<Resp> {
     let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.trim()).unwrap_or("");
     let read_only = matches!(method, "GET" | "HEAD");
@@ -199,9 +198,11 @@ impl xbt_svc::http::Handler for Ui {
         xbt_svc::http::Response::new(resp.status, resp.headers, resp.body)
     }
 
-    /// A paid video: `GET /s/<seller URL>` for the page's player, past the same checks as every
-    /// page, or `GET /r/<token>` for an external player's link ([`crate::relay`]), relayed from the
-    /// connector as it streams, with the player's `Range`. Everything else is [`Self::handle`].
+    /// A paid file: `GET /s/~<stream token>/<file URL>` for a download from the page, past the same
+    /// checks as every page, or `GET /r/<token>` for the buyer's own player ([`crate::relay`]),
+    /// relayed from the connector as it streams, with the reader's `Range`. Everything else is
+    /// [`Self::handle`]. A seller's media server is a web app ([`crate::seller_app`]): this UI has no
+    /// player of its own.
     fn reply(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Reply {
         if let Some(mut r) = foreign_refused(&rq.method.to_uppercase(), &rq.target, &self.0.cfg.base_path, &rq.headers) {
             security_headers(&mut r);
@@ -211,16 +212,6 @@ impl xbt_svc::http::Handler for Ui {
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
         let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: vec![], peer };
-        // the owner's free preview of an item of their own shop, straight from the service on the box
-        if let Some(gate) = self.0.preview_gate(&req) {
-            return match gate {
-                Err(mut resp) => {
-                    security_headers(&mut resp);
-                    xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(resp.status, resp.headers, resp.body))
-                }
-                Ok(url) => relay(&url, req.headers.get("range").map(String::as_str), &|_, _| {}),
-            };
-        }
         match self.0.relay_gate(&req) {
             None => xbt_svc::http::Reply::Whole(self.handle(rq)),
             Some(Err(mut resp)) => {
@@ -234,26 +225,26 @@ impl xbt_svc::http::Handler for Ui {
                     after.strip_prefix('~').and_then(|t| t.split_once('/')).map(|(_, u)| u.to_string()).unwrap_or_default()
                 });
                 let url = format!("{}/s/{item}", self.0.cfg.connector.trim_end_matches('/'));
-                let app = self.0.clone();
-                // a paid answer is asked for in pieces of at most PLAYER_CHUNK, whatever the player asked
-                let range = bounded_range(req.headers.get("range").map(String::as_str), PLAYER_CHUNK);
-                relay(&url, range.as_deref(), &move |code, body| app.note_play_error(&item, code, body))
+                // a range is asked for in parts of at most READ_CHUNK, whatever the reader asked
+                let range = bounded_range(req.headers.get("range").map(String::as_str), READ_CHUNK);
+                relay(&url, range.as_deref())
             }
         }
     }
 }
 
-/// The most one request of a player buys at once: 4 MiB.
+/// The most one ranged request of a reader buys at once: 4 MiB.
 ///
-/// A browser's `<video>` reads ahead of the picture, and a paused one goes on filling its buffer,
-/// tens of MiB, and every byte of it is paid for. So the relay never asks the connector for more
-/// than this in one answer: a `Range` that is open (`bytes=N-`) or longer is cut to this length,
-/// and the seller answers `206` with that part. The browser asks for the next part when it needs it,
-/// as it does for any server that answers in parts. However a player stops (its page closed, the
-/// network gone), what it is charged beyond what it received is at most one such part.
-pub const PLAYER_CHUNK: u64 = 4 << 20;
+/// A player (VLC, mpv, a TV app) reads ahead of the picture, and a paused one may go on filling its
+/// buffer, and every byte of it is paid for. So the relay never asks the connector for more than
+/// this in one ranged answer: a `Range` that is open (`bytes=N-`) or longer is cut to this length,
+/// and the seller answers `206` with that part. The player asks for the next part when it needs it,
+/// as it does for any server that answers in parts. However it stops, what it is charged beyond
+/// what it received is at most one such part. A download asks for no range: the whole file, paid as
+/// it arrives, and stopped when the download is.
+pub const READ_CHUNK: u64 = 4 << 20;
 
-/// A player's `Range` with its length bounded to `chunk`: `bytes=N-` and `bytes=N-M` longer than
+/// A reader's `Range` with its length bounded to `chunk`: `bytes=N-` and `bytes=N-M` longer than
 /// `chunk` become `bytes=N-(N+chunk-1)`. A suffix range (`bytes=-N`), several ranges, a header that is
 /// not one plain byte range, or none at all are passed on as they are (the connector asks for the
 /// whole body then, as HTTP lets it).
@@ -278,11 +269,9 @@ pub fn bounded_range(range: Option<&str>, chunk: u64) -> Option<String> {
 /// The headers of a relayed answer that are passed on from the connector.
 const RELAYED: [&str; 3] = ["Content-Type", "Content-Range", "Accept-Ranges"];
 
-/// Stream the answer at `url` (the connector's for a seller URL, or the owner's own service for a
-/// preview) to the player, with the player's `Range` (the connector takes one plain byte range and
-/// ignores any other). An answer that is not a success is handed whole to `failed` first, so the
-/// player page can say why.
-fn relay(url: &str, range: Option<&str>, failed: &dyn Fn(u16, &[u8])) -> xbt_svc::http::Reply {
+/// Stream the connector's answer for a seller URL to the reader, with the reader's `Range` (the
+/// connector takes one plain byte range and ignores any other).
+fn relay(url: &str, range: Option<&str>) -> xbt_svc::http::Reply {
     let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).redirects(0).build();
     let mut rq = agent.get(url);
     if let Some(r) = range.map(str::trim).filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
@@ -296,7 +285,6 @@ fn relay(url: &str, range: Option<&str>, failed: &dyn Fn(u16, &[u8])) -> xbt_svc
         Err(ureq::Error::Status(code, r)) => {
             let headers = passed(&r).into_iter().filter(|(k, _)| k != "Content-Type").collect::<Vec<_>>();
             let body = r.into_string().unwrap_or_default().into_bytes();
-            failed(code, &body);
             let mut whole = Resp::text(code, "application/json", body);
             whole.headers.extend(headers);
             security_headers(&mut whole);
@@ -304,7 +292,6 @@ fn relay(url: &str, range: Option<&str>, failed: &dyn Fn(u16, &[u8])) -> xbt_svc
         }
         Err(e) => {
             let v = serde_json::json!({"error": format!("the connector: {e}")});
-            failed(502, v.to_string().as_bytes());
             let mut whole = Resp::json(502, &v);
             security_headers(&mut whole);
             return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
@@ -330,7 +317,7 @@ fn relay(url: &str, range: Option<&str>, failed: &dyn Fn(u16, &[u8])) -> xbt_svc
                 if n == 0 {
                     return Ok(());
                 }
-                // a player that has gone: the connection to the connector closes, and the wallet stops paying
+                // a reader that has gone: the connection to the connector closes, and the wallet stops paying
                 out.send(&buf[..n])?;
             }
         }),
@@ -344,6 +331,8 @@ pub struct Running {
     /// The app ports and their servers ([`crate::seller_app`]).
     pub app_ports: Vec<(u16, std::net::SocketAddr)>,
     apps: Vec<xbt_svc::http::Stop>,
+    /// Where the shared folder is served ([`crate::files`]), when the box sells.
+    pub files_addr: Option<std::net::SocketAddr>,
 }
 
 impl Drop for Running {
@@ -369,10 +358,33 @@ pub fn spawn(app: Arc<App>) -> Result<Running, String> {
     let threads = app.cfg.threads;
     // strict for a test (`XBT_UI_APP_PORTS_STRICT`), which tries a port taken in between again on another
     let apps = crate::seller_app::spawn(&app, std::env::var_os("XBT_UI_APP_PORTS_STRICT").is_some())?;
-    let run = xbt_svc::http::serve(Arc::new(Ui(app)), listener, threads).map_err(|e| format!("serve: {e}"))?;
+    let run = xbt_svc::http::serve(Arc::new(Ui(app.clone())), listener, threads).map_err(|e| format!("serve: {e}"))?;
     let app_ports = apps.iter().map(|(p, r)| (*p, r.addr)).collect();
-    let apps = apps.iter().map(|(_, r)| r.stopper()).collect();
-    Ok(Running { addr: run.addr, stop: run.stopper(), app_ports, apps })
+    let mut apps: Vec<xbt_svc::http::Stop> = apps.iter().map(|(_, r)| r.stopper()).collect();
+    // the shared folder of a Files service: served to the gateway only, with the files key
+    let files_addr = match files_server(&app) {
+        Ok(Some(f)) => {
+            apps.push(f.stopper());
+            Some(f.addr)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("xbt-wallet-ui: the shared folder is not served: {e}");
+            None
+        }
+    };
+    Ok(Running { addr: run.addr, stop: run.stopper(), app_ports, apps, files_addr })
+}
+
+fn files_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String> {
+    if !app.cfg.sell || app.cfg.role == crate::config::Role::Gateway {
+        return Ok(None);
+    }
+    let key = crate::files::key(&app.cfg.data_dir.join("secrets"))?;
+    let l = std::net::TcpListener::bind(&app.cfg.files.bind).map_err(|e| format!("bind {}: {e}", app.cfg.files.bind))?;
+    *app.files_addr.lock().unwrap_or_else(|p| p.into_inner()) = l.local_addr().ok();
+    let server = crate::files::Server { dir: app.cfg.files.dir.clone(), key };
+    xbt_svc::http::serve(Arc::new(server), l, 4).map(Some).map_err(|e| format!("serve: {e}"))
 }
 
 #[cfg(test)]
@@ -380,7 +392,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_players_range_is_cut_to_one_part() {
+    fn a_readers_range_is_cut_to_one_part() {
         let c = 4 << 20;
         assert_eq!(bounded_range(Some("bytes=0-"), c).as_deref(), Some("bytes=0-4194303"));
         assert_eq!(bounded_range(Some("bytes=1000-"), c).as_deref(), Some("bytes=1000-4195303"));

@@ -27,7 +27,7 @@
 //! | `XBT_UI_GW_HEALTH_URL` | | the gateway's `/x402/ticket/health`, read server-side for the page (plain http on the box network) |
 //! | `XBT_UI_GW_PROXIES` | | the addresses of the box's own proxy in front of the gateway (StartOS), offered as the default for the forwarded-address setting |
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
-//! | `XBT_UI_SERVICES` | `<data dir>/services.json` | path of the services JSON Browse and the player read (a list of `{name, kind, seller, price_text, items}`); the Services page writes it |
+//! | `XBT_UI_SERVICES` | `<data dir>/services.json` | path of the services JSON Browse reads (a list of `{name, kind, seller, price_text, items}`); the Services page writes it |
 //! | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page (`/sell`), which sets up the gateway beside it (the `XBT_UI_GW_*` settings); the app is then branded Lightning Stream |
 //! | `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (`https://`, comma-separated) the Sellers page and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one |
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
@@ -36,7 +36,7 @@
 //! | `XBT_UI_RELAY_UNAVAILABLE` | | why this platform can't run the built-in relay, shown instead of the switch |
 //! | `XBT_UI_RELAY_START_HINT` | | how to start the relay service, shown when it is switched on but isn't running |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
-//! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
+//! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector a seller's web app opens through (`<connector>/visits`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
 //! | `XBT_UI_APP_PORTS` | | ports (comma-separated) a seller's own web page is served on, one origin each, when the owner opens it inside the app (docs/SELLER-APPS.md); empty: off. The browser must reach them on the same host as this page |
 //! | `XBT_UI_PLATFORM_LOGIN` | | the host name of the platform's own login proxy (Umbrel: `<app id>_app_proxy_1`). A request from that peer is the owner's, already logged in by the platform: no app password is asked. Every other peer still needs the password. Set it only where no other app can take that name on the network: umbrelOS 2.0 runs no app-proxy container, so the Umbrel package leaves it unset |
 //! | `XBT_UI_ENROLL_CODE_FILE` | | the signer's one-time enrolment code, where the signer writes a copy for the UI (`B2_ENROLL_CODE_COPY`): the setup page fills it in, so the owner reads no log |
@@ -52,8 +52,11 @@
 //! | `XBT_UI_AI_SELLERS` | `$XBT_DATA_DIR/run/ai/sellers.json` | the AI sellers and the owner's pins and blocks, written by the AI page, read by the endpoint |
 //! | `XBT_UI_CREDENTIALS` | `$XBT_DATA_DIR/run/ai/credentials.json` | the store of AI keys and local links (hashed secrets, limits, spend), shared with the connector |
 //! | `XBT_UI_AI_STATE` | `$XBT_DATA_DIR/run/ai/state.json` | the endpoint's record of the sellers' health, shown on the AI page |
+//! | `XBT_UI_RELAY_LINK_S` | `21600` (6 hours) | how long a link for the buyer's own player (VLC, mpv, a TV app) made on a Files service's page lives (60 s to 7 days) |
+//! | `XBT_UI_FILES_DIR` | `<data dir>/files` | the folder a Files service shares (Sell, "Files"): the UI serves it to the shop's gateway only (`docs/FILES.md`) |
+//! | `XBT_UI_FILES_BIND` | `127.0.0.1:8486` | where the UI serves that folder; on a platform whose gateway runs in another container, the app's private network |
+//! | `XBT_UI_FILES_UPSTREAM` | `http://<XBT_UI_FILES_BIND>` | how the gateway reaches the folder, as its container sees the UI |
 //! | `XBT_UI_DATUM_GUIDE` | the project's guide | where a renter without a DATUM Gateway is sent to set one up |
-//! | `XBT_UI_RELAY_LINK_S` | `21600` (6 hours) | how long a link for an external player (VLC, mpv) made on the Player page lives (60 s to 7 days) |
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -83,7 +86,7 @@ pub struct Config {
     pub role: Role,
     pub ln: LnSetup,
     pub gw: GatewaySetup,
-    /// `XBT_UI_SERVICES`: the services file, read on each Browse and player request. `None`:
+    /// `XBT_UI_SERVICES`: the services file, read on each Browse request. `None`:
     /// `services.json` in the data dir ([`Config::services_path`]).
     pub services_file: Option<PathBuf>,
     /// `XBT_UI_SELL=1`: the wallet's UI also sets up the gateway, on the Sell page.
@@ -92,8 +95,10 @@ pub struct Config {
     pub connector: String,
     /// The ports sellers' own web pages are served on, one origin each (`XBT_UI_APP_PORTS`).
     pub app_ports: Vec<u16>,
-    /// `XBT_UI_RELAY_LINK_S`: how long a link for an external player lives.
+    /// `XBT_UI_RELAY_LINK_S`: how long a link for the buyer's own player lives.
     pub relay_ttl: Duration,
+    /// The folder a Files service shares, where the UI serves it, and how the gateway reaches it.
+    pub files: FilesSetup,
     /// `XBT_UI_NWC_SOCK`: the NWC wallet service's admin socket, when the box runs it.
     pub nwc_sock: Option<PathBuf>,
     /// `XBT_UI_NOSTR_RELAYS`: where Browse's Nostr page reads listings; empty: it reads none.
@@ -160,6 +165,17 @@ pub struct GatewaySetup {
     pub proxies: Vec<String>,
 }
 
+/// The folder a Files service shares (`docs/FILES.md`).
+#[derive(Debug, Clone, Default)]
+pub struct FilesSetup {
+    /// `XBT_UI_FILES_DIR`: the shared folder.
+    pub dir: PathBuf,
+    /// `XBT_UI_FILES_BIND`: where the UI serves it (`127.0.0.1:0` in tests: any free port).
+    pub bind: String,
+    /// `XBT_UI_FILES_UPSTREAM`: how the gateway reaches it. Empty: the address the UI bound.
+    pub upstream: String,
+}
+
 /// The AI endpoint the connector serves (`LS_AI_LISTEN`), as the AI page sees it.
 #[derive(Debug, Clone, Default)]
 pub struct AiSetup {
@@ -222,6 +238,7 @@ impl Config {
         let data_dir = env("XBT_UI_DATA_DIR").map(PathBuf::from)
             .or_else(|| env("XBT_DATA_DIR").map(|d| PathBuf::from(d).join("ui")))
             .unwrap_or_else(|| PathBuf::from("xbt-wallet-ui"));
+        let files_default = data_dir.join("files");
         let mut password = None;
         if let Some(f) = env("XBT_UI_PASSWORD_FILE") {
             password = Some(std::fs::read_to_string(&f).map_err(|e| format!("XBT_UI_PASSWORD_FILE {f}: {e}"))?.trim_end_matches(['\r', '\n']).to_string());
@@ -304,6 +321,11 @@ impl Config {
             app_ports: env("XBT_UI_APP_PORTS").map(|v| v.split(',').filter_map(|p| p.trim().parse::<u16>().ok()).filter(|p| *p > 0).take(16).collect())
                 .unwrap_or_default(),
             relay_ttl: Duration::from_secs(secs("XBT_UI_RELAY_LINK_S", 6 * 3600).clamp(60, 7 * 86_400)),
+            files: {
+                let bind = env("XBT_UI_FILES_BIND").unwrap_or_else(|| "127.0.0.1:8486".into());
+                FilesSetup { dir: env("XBT_UI_FILES_DIR").map(PathBuf::from).unwrap_or_else(|| files_default.clone()),
+                             upstream: env("XBT_UI_FILES_UPSTREAM").unwrap_or_else(|| format!("http://{bind}")), bind }
+            },
             nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
             nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
             relay_dir: env("XBT_UI_RELAY_DIR").map(PathBuf::from),
@@ -358,11 +380,14 @@ impl Config {
 
     /// A test or embedding configuration.
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
+        let files_dir = data_dir.join("files");
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),
                session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, cmp_url: None,
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
-               services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), app_ports: vec![], relay_ttl: Duration::from_secs(6 * 3600),
+               services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), app_ports: vec![],
+               relay_ttl: Duration::from_secs(6 * 3600),
+               files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), upstream: String::new() },
                nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), relay_dir: None, relay_status: None,
                relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
                restart_hint: RESTART_HINT.into(), local_services: vec![],

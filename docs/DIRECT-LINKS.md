@@ -102,7 +102,7 @@ The gateway serves them over its link as it serves them over https.
 Sellers → **Seller's address or shop key**: a web address or an `npub`. With a key, the app asks
 its Nostr relays for that key's listings only, checks them, and keeps the shop's `transport/1`
 beside its services. **Allow this seller to be paid** reads the shop's node from its link. Shops
-are shown by their key with a **Direct link** mark. Paying, playing and the player are unchanged.
+are shown by their key with a **Direct link** mark. Paying, and a seller's web app opened through the link, are unchanged.
 
 ## Privacy
 

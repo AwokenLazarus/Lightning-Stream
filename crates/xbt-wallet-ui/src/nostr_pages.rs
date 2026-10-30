@@ -7,7 +7,6 @@ use super::{App, Ctx};
 use crate::html::esc;
 use crate::nostr::{self, Snapshot};
 use crate::server::Resp;
-use crate::services::{self, Kind};
 
 impl App {
     pub(crate) fn nostr_page(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
@@ -63,16 +62,12 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot) -> String {
                             esc(&n.listing.name), esc(&n.listing.seller), esc(&n.author), esc(&n.listing.receipt_key),
                             esc(&ctx.csrf), esc(&n.event_id)));
         for s in nostr::to_services(n) {
-            b.push_str(&format!("<h3>{} <span class=\"pill cat-{}\">{}</span></h3><p class=\"price\">{}</p>", esc(&s.name), s.kind.category(),
-                                esc(s.kind.category_words()), esc(&s.price_text)));
+            b.push_str(&format!("<h3>{} <span class=\"pill cat-{}\">{}</span></h3><p class=\"price\">{}</p>", esc(&s.name), s.category(),
+                                esc(s.category_words()), esc(&s.price_text)));
             if !s.items.is_empty() {
                 b.push_str("<div class=\"grid\">");
                 for item in &s.items {
-                    let open = if s.kind == Kind::Video {
-                        format!("<p><a href=\"./play?item={}\">Play</a></p>", services::urlenc(&item.url))
-                    } else {
-                        format!("<p class=\"small\"><code>{}</code></p>", esc(&item.url))
-                    };
+                    let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&item.url));
                     b.push_str(&format!("<article class=\"card\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>{open}</article>",
                                         esc(&item.title), esc(&item.year), esc(&item.credit)));
                 }

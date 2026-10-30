@@ -1,18 +1,17 @@
-//! Links for an external player (VLC, mpv, a TV app): `GET <UI>/r/<token>`, relayed to the
-//! connector like the in-page player's `/s/<seller URL>`, without the login cookie a player does
-//! not have.
+//! Links for the buyer's own player (VLC, mpv, a TV app): `GET <UI>/r/<token>`, relayed to the
+//! connector like a download's `/s/<file URL>`, without the login cookie a player does not have.
 //!
-//! * A link is made by a POST from the logged-in Player page (CSRF-checked like every POST), for
-//!   one item of the services file, and is bound to that item's URL here: the token names the item,
-//!   the request cannot name another, and an item taken out of the services file stops playing.
+//! * A link is made by a POST from the logged-in page of a Files service (CSRF-checked like every
+//!   POST), for one file of the services file, and is bound to that file's URL here: the token names
+//!   the file, the request cannot name another, and a file taken out of the services file stops.
 //! * The token is 32 random bytes (64 hex characters), compared in constant time.
 //! * It expires a fixed time after it was made (`XBT_UI_RELAY_LINK_S`, 6 hours by default), can be
-//!   revoked on the Player page, and lives in memory only: a restart of the UI revokes every link.
+//!   revoked on that page, and lives in memory only: a restart of the UI revokes every link.
 //! * At most [`MAX_LINKS`] are live; a new one past that replaces the oldest.
 //!
-//! What a link can spend is what the connector spends for that one item: each request through it
+//! What a link can spend is what the connector spends for that one file: each request through it
 //! is one paid call under the connector's task and per-call cap, within the owner's budgets. It
-//! cannot reach any page of the UI, any other item, or the signer.
+//! cannot reach any page of the UI, any other file, or the signer.
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,7 +30,7 @@ pub struct RelayLinks {
     ttl: Duration,
 }
 
-/// A live link, as the Player page lists it.
+/// A live link, as a Files service's page lists it.
 pub struct Shown {
     pub token: String,
     pub left: Duration,

@@ -1,7 +1,7 @@
 // The look of the app in a real headless Chrome: screenshots of the main pages in light, dark and
 // at phone width, the cost of the river background (CPU and frame time, with and without it), and
 // the contrast of text over the brightest point the river reaches.
-//   node look_test.mjs WALLET_BASE SETUP_CODE GATEWAY_BASE GATEWAY_SETUP_CODE OUT PLAY_PATH SECONDS PAGES
+//   node look_test.mjs WALLET_BASE SETUP_CODE GATEWAY_BASE GATEWAY_SETUP_CODE OUT APPS_PATH SECONDS PAGES
 // PAGES: a JSON list of [name, path] for the wallet's pages to shoot.
 // Prints one JSON line starting "LOOK " with the measurements.
 import { spawn } from "node:child_process";
@@ -111,7 +111,7 @@ try {
   await scheme("light"); await go(BASE + "/"); await shot("setup-first-run-light", 1280); await shot("setup-first-run-phone-light", 390);
   await set("[name=code]", CODE); await set("[name=password]", "look box password"); await set("[name=password2]", "look box password");
   await submitAndWait("document.querySelector('form').submit()");
-  const pages = PAGES ? JSON.parse(PAGES) : [["setup", "/setup"], ["browse", "/browse"], ["player", PLAY], ["connections", "/connections"]];
+  const pages = PAGES ? JSON.parse(PAGES) : [["setup", "/setup"], ["browse", "/browse"], ["browse-apps", PLAY], ["connections", "/connections"]];
   for (const [page, path] of pages) {
     for (const s of ["dark", "light"]) { await scheme(s); await go(BASE + path); await shot(`${page}-${s}`, 1280); await shot(`${page}-phone-${s}`, 390); }
   }

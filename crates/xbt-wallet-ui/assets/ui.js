@@ -453,89 +453,11 @@
     ask();
   });
 
-  // The player never sits black: a short message while the first part is paid for and the seller
-  // answers, and, when the play fails, why in plain words with the next step (the UI keeps the
-  // connector's reason: ./api/play-error).
-  $$("[data-player]").forEach(function (box) {
-    var v = $("video", box), out = $(".player-msg", box);
-    if (!v || !out) return;
-    var preview = box.hasAttribute("data-preview"), item = box.getAttribute("data-item") || "", done = false, timers = [];
-    function show(text, cls, link, href) {
-      out.hidden = false;
-      out.className = "player-msg flash " + cls;
-      out.textContent = text + (link ? " " : "");
-      if (link) { var a = document.createElement("a"); a.href = href; a.textContent = link; a.className = "button-link"; out.appendChild(a); }
-    }
-    function clear() { timers.forEach(clearTimeout); timers = []; }
-    function failed() {
-      if (done) return;
-      done = true; clear();
-      if (preview) { show("Your service on this box didn't answer. Check that it is running, then try again.", "bad", "Your services", "./sell"); return; }
-      fetch("./api/play-error?item=" + encodeURIComponent(item), { credentials: "same-origin" })
-        .then(function (r) { return r.json(); })
-        .then(function (j) {
-          if (j && j.failed) show(j.words, "bad", j.link, j.href);
-          else show("This didn't play. Try again, or see what is open.", "bad", "Live connections", "./connections");
-        })
-        .catch(function () { show("This didn't play, and the app could not say why. Try again.", "bad", null, null); });
-    }
-    timers.push(setTimeout(function () { if (!done) show(preview ? "Starting the preview…" : "Starting: paying for the first part…", "ok"); }, 1500));
-    timers.push(setTimeout(function () { if (!done) show(preview ? "Still waiting for your service…" : "Still waiting for the seller to answer…", "warn"); }, 8000));
-    timers.push(setTimeout(function () { if (!done && v.readyState < 2) failed(); }, 30000));
-    v.addEventListener("playing", function () { done = true; clear(); out.hidden = true; });
-    v.addEventListener("loadeddata", function () { done = true; clear(); out.hidden = true; });
-    v.addEventListener("error", function () { if (!parked) failed(); });
-
-    // A paused video goes on downloading to fill its buffer, and on a paid stream every byte of that
-    // is paid for. So a video paused for a few seconds lets go of its source (the connection closes
-    // and the wallet stops paying), and gets it back where it was when it plays again. Leaving the
-    // page does the same at once.
-    if (preview) return;
-    var src = v.getAttribute("src"), parked = false, at = 0, park = null;
-    function letGo() {
-      if (parked || !src) return;
-      parked = true; at = v.currentTime || 0;
-      v.removeAttribute("src");
-      try { v.load(); } catch (e) { /* already gone */ }
-    }
-    v.addEventListener("pause", function () {
-      if (v.ended) return;
-      clearTimeout(park);
-      park = setTimeout(function () { if (v.paused) letGo(); }, 3000);
-    });
-    v.addEventListener("play", function () {
-      clearTimeout(park);
-      if (!parked) return;
-      parked = false;
-      v.setAttribute("src", src);
-      v.load();
-      v.addEventListener("loadedmetadata", function back() {
-        v.removeEventListener("loadedmetadata", back);
-        try { v.currentTime = at; } catch (e) { /* the start, then */ }
-        v.play().catch(function () { /* the user presses play again */ });
-      });
-    });
-    v.addEventListener("ended", letGo);
-    window.addEventListener("pagehide", letGo);
-  });
-
   // A service found on this box fills the address field in one click (the Sell page).
   $$("[data-fill]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var form = btn.closest("form"), field = form && form.querySelector("[name='" + btn.getAttribute("data-fill") + "']");
       if (field) { field.value = btn.getAttribute("data-value"); field.focus(); }
-    });
-  });
-
-  // The player's Stop button: drop the video's source before the form posts, so the connector
-  // sees the reader go away at once. The POST still asks the signer to stop the session.
-  $$("form[data-stop-player]").forEach(function (form) {
-    form.addEventListener("submit", function () {
-      $$("video").forEach(function (v) {
-        try { v.pause(); } catch (e) { /* already gone */ }
-        v.removeAttribute("src");
-        try { v.load(); } catch (e2) { /* already gone */ }
-      });
     });
   });
 
