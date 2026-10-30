@@ -264,14 +264,15 @@ impl Buyer {
     /// Opens a paid tunnel to `id` at `url`, paying no more than its announced price (and, for a
     /// one-off check, no more than `max_sats`). An exit whose terms are above its announcement is
     /// held off for a day.
-    async fn open_paid(&self, id: &str, url: &str, price: u64, max_sats: Option<u64>) -> Option<crate::paid::Tunnel> {
+    /// `cap`: what the day's openings are counted by (a device and the exit, or a region check of it).
+    async fn open_paid(&self, id: &str, cap: &str, url: &str, price: u64, max_sats: Option<u64>) -> Option<crate::paid::Tunnel> {
         let mut w = (*self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone()?).clone();
         // held off, or opened enough today: each opening pays its head, so none more
         let op = self.operator_of(id);
         {
             let mut h = self.holds();
             let now = Instant::now();
-            if h.held(id, &op, now) || !h.may_open(id, now) {
+            if h.held(id, &op, now) || !h.may_open(cap, now) {
                 return None;
             }
         }
@@ -279,7 +280,11 @@ impl Buyer {
             w.max_sats = w.max_sats.min(m);
         }
         match tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, url, Some(crate::paid::ceiling(price)))).await {
-            Ok(Ok(t)) => Some(t),
+            Ok(Ok(t)) => {
+                // its opening was paid: only now does it count toward the day's cap
+                self.holds().opened(cap, Instant::now());
+                Some(t)
+            }
             Ok(Err(e)) => {
                 if e.to_string().contains("price_ceiling") {
                     eprintln!("exit {}…: its terms are above the price it announced; not used for a day", &id[..12.min(id.len())]);
@@ -296,7 +301,7 @@ impl Buyer {
     async fn carrier_once(&self, id: &str) -> Option<Carrier> {
         match self.tunnel_of(id) {
             Some(_) if self.is_held_off(id) => None,
-            Some((url, price, _)) => Some(Carrier::Tunnel(self.open_paid(id, &url, price, Some(REGION_CHECK_MAX_SATS)).await?.mux)),
+            Some((url, price, _)) => Some(Carrier::Tunnel(self.open_paid(id, &format!("check#{id}"), &url, price, Some(REGION_CHECK_MAX_SATS)).await?.mux)),
             None => self.link.connect_conn_async(id).await.ok().map(Carrier::Link),
         }
     }
@@ -565,7 +570,7 @@ impl Buyer {
             if let Some(e) = self.exits.lock().await.get(&key).filter(|e| !e.conn.is_closed()) {
                 return Some(e.clone());
             }
-            let Some(t) = self.open_paid(id, &url, price, None).await else {
+            let Some(t) = self.open_paid(id, &key, &url, price, None).await else {
                 // a priced exit with no wallet to pay it, or one the wallet would not pay: not usable
                 self.fail_exit(id).await;
                 return None;

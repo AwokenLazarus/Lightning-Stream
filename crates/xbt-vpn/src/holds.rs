@@ -19,7 +19,9 @@ pub const YOUNG_MAX: Duration = Duration::from_secs(3600);
 pub const MISPRICED_HOLD: Duration = DAY;
 /// Exits of one operator that died young in a day before the operator is held off as a whole.
 pub const OPERATOR_YOUNG: u32 = 3;
-/// The most paid tunnels opened to one exit in a day: each opening pays its head.
+/// The most paid tunnels opened to one exit for one device in a day: each opening pays its head.
+/// Only openings that succeeded count: a wallet that refused, or an exit that didn't answer, costs
+/// nothing and uses none.
 pub const OPENS_PER_DAY: u32 = 48;
 
 #[derive(Debug, Clone)]
@@ -41,7 +43,7 @@ pub struct Holds {
     operators: HashMap<String, Hold>,
     /// An operator's exits that died young today: (since, how many).
     young_by_operator: HashMap<String, (Instant, u32)>,
-    /// Paid tunnels opened to an exit today: (since, how many).
+    /// Paid tunnels opened today, by device and exit: (since, how many).
     opens: HashMap<String, (Instant, u32)>,
 }
 
@@ -111,14 +113,15 @@ impl Holds {
         }
     }
 
-    /// Whether another paid tunnel may be opened to `id` today ([`OPENS_PER_DAY`]); counts it if so.
-    pub fn may_open(&mut self, id: &str, now: Instant) -> bool {
-        let n = today(self.opens.entry(id.to_string()).or_insert((now, 0)), now);
-        if *n >= OPENS_PER_DAY {
-            return false;
-        }
-        *n += 1;
-        true
+    /// Whether another paid tunnel may be opened for `key` (a device and an exit) today
+    /// ([`OPENS_PER_DAY`]). Asking counts nothing: [`Self::opened`] counts one that opened.
+    pub fn may_open(&mut self, key: &str, now: Instant) -> bool {
+        self.opens.get_mut(key).is_none_or(|slot| *today(slot, now) < OPENS_PER_DAY)
+    }
+
+    /// A paid tunnel opened for `key`: its opening was paid, so it counts toward the day's cap.
+    pub fn opened(&mut self, key: &str, now: Instant) {
+        *today(self.opens.entry(key.to_string()).or_insert((now, 0)), now) += 1;
     }
 }
 
@@ -216,10 +219,23 @@ mod tests {
     fn an_exit_is_opened_at_most_so_often_a_day() {
         let (mut h, now) = (Holds::default(), Instant::now());
         for _ in 0..OPENS_PER_DAY {
-            assert!(h.may_open("x", now));
+            assert!(h.may_open("phone#x", now));
+            h.opened("phone#x", now);
         }
-        assert!(!h.may_open("x", now));
-        assert!(h.may_open("x", now + DAY), "a new day");
+        assert!(!h.may_open("phone#x", now));
+        assert!(h.may_open("laptop#x", now), "another device's openings are its own");
+        assert!(h.may_open("phone#x", now + DAY), "a new day");
+    }
+
+    /// Openings that failed (the wallet refused, restarting, out of budget; the exit didn't answer)
+    /// paid nothing, so they don't use up the day: a while of wallet trouble doesn't lock an
+    /// honest exit out until tomorrow.
+    #[test]
+    fn openings_that_failed_dont_use_up_the_day() {
+        let (mut h, now) = (Holds::default(), Instant::now());
+        for i in 0..(OPENS_PER_DAY * 4) {
+            assert!(h.may_open("phone#x", now + Duration::from_secs(u64::from(i) * 15)), "attempt {i}");
+        }
     }
 
     #[test]
