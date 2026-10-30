@@ -342,6 +342,18 @@ pub trait TicketWire: Send + Sync {
     }
 }
 
+/// With `XBT_TRACE_WIRE` set, one line on stderr per request to a seller: the method, the path, its
+/// status (or `err`) and how long its head took. For finding which steps a slow link makes slow.
+fn wire_trace(method: &str, url: &str, status: Option<u16>, t0: Instant) {
+    if std::env::var_os("XBT_TRACE_WIRE").is_none() {
+        return;
+    }
+    let path = url.split_once("://").and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..])).unwrap_or("/");
+    let path: String = path.split('?').next().unwrap_or("/").chars().take(60).collect();
+    let status = status.map_or_else(|| "err".to_string(), |s| s.to_string());
+    eprintln!("wire: {method} {path} {status} {} ms", t0.elapsed().as_millis());
+}
+
 /// [`TicketWire`] over ureq. No overall deadline (an answer may be long); a connect, a read and a
 /// write each have one.
 #[derive(Default)]
@@ -1803,7 +1815,10 @@ impl Signer {
 
     pub(crate) fn wire(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer> {
         let tls = self.seller_tls_for(url);
-        self.ticket_wire.send_with(method, url, body, headers, read_timeout, tls.as_ref())
+        let t0 = Instant::now();
+        let r = self.ticket_wire.send_with(method, url, body, headers, read_timeout, tls.as_ref());
+        wire_trace(method, url, r.as_ref().map(|a| a.status).ok(), t0);
+        r
     }
 
     /// Whether the owner's policy, as it is now, lets a request leave for `origin` under `task`: the

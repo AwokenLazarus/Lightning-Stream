@@ -331,6 +331,7 @@ impl Connector {
 
     /// One request of a page, paid for within a share of the visit's limit.
     fn visit_call(&self, visit: Arc<Visit>, path: &str, req: &Request) -> Reply {
+        let t0 = Instant::now();
         if req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
             return self.visit_socket(visit, path, req);
         }
@@ -421,6 +422,10 @@ impl Connector {
         };
         let Started { head, first, src, done } = started;
         let status = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).unwrap_or(502);
+        if std::env::var_os("XBT_TRACE_WIRE").is_some() {
+            let p: String = path.split('?').next().unwrap_or("/").chars().take(60).collect();
+            eprintln!("visit: {} {p} {status} {} ms", req.method, t0.elapsed().as_millis());
+        }
         let mut out_headers: Vec<(String, String)> = vec![];
         for h in head.get("headers").and_then(Value::as_array).into_iter().flatten() {
             if let (Some(k), Some(v)) = (h.get(0).and_then(Value::as_str), h.get(1).and_then(Value::as_str)) {
