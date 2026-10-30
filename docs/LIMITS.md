@@ -557,8 +557,10 @@ wallet) and against a stand-in node in its tests.
   ticket has neither; the node is asked about it when its preimage is presented and at the sweep.
 - A buyer's balance, the part of its released tickets it has not used, is trusted to the seller:
   it is kept for 24 hours after the session's last paid request and then forgotten.
-- The gateway takes 64 connections in all and 48 from one address, one request per connection,
-  and an answer that is being sent holds its connection: 64 answers at once. A client that takes
+- The gateway takes 512 connections in all and 48 from one address, one request per connection,
+  and an answer that is being sent holds its connection: 512 answers at once. The reverse proxies
+  named in `http.forwarded_address` are held to the total only, since every buyer comes over their
+  address; the Sell page turns the cap per address off behind a proxy it was not told about. A client that takes
   no byte for 30 seconds is cut, and no answer stays open for more than 6 hours.
 - A body priced per byte is charged when the gateway hands the bytes to the operating system,
   not when the buyer has them: a buyer that disappears in the middle paid for what was in the
@@ -923,7 +925,8 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - An answer priced as it goes is cut by the wallet after 50 s (`tickets.max_answer_s`), because
   whoever calls the signer's socket waits 60 s by default. An owner who streams longer raises
   both; if the caller's wait ends first, the caller sees an error while the signer goes on paying
-  for the answer until `max_sats` or `max_answer_s`.
+  for the answer until `max_sats` or `max_answer_s`. A WebSocket has its own limit,
+  `tickets.max_socket_s` (6 hours, as the gateway's): a web app keeps one open while its page is.
 - An answer priced by the second is paid up to a fifth of a second early, and the wallet counts
   its seconds from before it sent the request, so it can pay for one second the seller did not
   charge.

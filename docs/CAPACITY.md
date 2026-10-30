@@ -12,13 +12,22 @@ On the Sell page, under a service, "How many buyers at once". In the gateway's c
 
 | Setting | On the Sell page | What it counts |
 |---|---|---|
-| `max_buyers` | Most buyers at once | Buyers (sessions) that used the route in the last 5 minutes, or have one of its answers open. Priced routes only: a free route has no buyers to count. |
+| `max_buyers` | Most buyers at once | Buyers (sessions) that used any route of the service in the last 5 minutes, or have one of its answers open. Counted once per service, however many of its routes a buyer uses. Priced routes only: a free route has no buyers to count. |
 | `max_streams` | Most streams at once | Long answers open at once, over all buyers: a film, a WebSocket, an event stream, any body longer than 8 MiB or of no stated length that is not a page's ordinary part (not text, JSON, script or an image). |
 | `max_streams_per_buyer` | Advanced: most streams for one buyer | Long answers open at once for one buyer. |
 | `max_mbit` | Advanced: most Mbit/s together | The route's answers' rate over the last 10 seconds; above it, no new long answer starts. |
 
+**A buyer is counted once per service.** A web app's page, its API and its live socket are one
+service to a buyer, so a buyer let in is never refused on the service's other routes for the
+count of buyers, and a new buyer is refused on any of them once the service is full. Routes are
+one service when they name the same `service` (a name of up to 64 characters), or, naming none,
+the same `upstream` (the config's own, for routes that name none). The routes of one service take
+one `max_buyers`; a config that gives them two is refused. `max_streams`, `max_streams_per_buyer`
+and `max_mbit` stay each route's own. The Sell page names each of its services, so two services
+on one server are counted apart.
+
 A service's web page (docs/SELLER-APPS.md) counts with its service: both routes get the same
-`capacity`. For a media server such as Jellyfin on a small box, 5 buyers and 3 streams is a good
+`capacity` and `service`. For a media server such as Jellyfin on a small box, 5 buyers and 3 streams is a good
 start; each 4K film the server converts can use several processor cores.
 
 ```json
@@ -37,7 +46,11 @@ A `503` with `Retry-After: 30` and this body:
 `scope` is `buyers`, `streams`, `buyer_streams` or `bandwidth`.
 
 - **A new buyer is turned away before buying or paying anything.** A new visit asking the price gets
-  the 503 instead of the 402, so it gets no terms to buy a ticket with. A paid request from a buyer
+  the 503 instead of the 402, so it gets no terms to buy a ticket with. A wallet's first lock names
+  the address it wants (`"path"` in the lock's body): if the route there is full by then (other
+  buyers came between the 402 and the lock), the lock is answered with the same 503, no invoice
+  is made, and the session it would have opened is forgotten. A lock the route has room for counts
+  the new buyer at once, before it pays, so the place is its own when it comes back with a ticket. A paid request from a buyer
   the route does not serve yet is authenticated (its sequence number used, so the buyer's count
   stays in step) and turned away before a ticket's secret it carries is taken: the ticket stays
   held, then is cancelled or expires as any unused one, and nothing of it is the seller's. A buyer
@@ -45,7 +58,12 @@ A `503` with `Retry-After: 30` and this body:
 - **A long answer over a stream limit is not started.** The service's answer is closed unread, and
   what the request had reserved from the buyer's credit is given back: nothing is charged.
 - **No buyer already served is cut off to make room.** A buyer the route serves goes on, its page's
-  ordinary parts included; only a new long answer can be refused for a stream limit.
+  ordinary parts included; only a new long answer can be refused for a stream limit. A wallet asks
+  the price of every new address before it pays for it, and names its session in that ask
+  (`PAYMENT-SESSION: <session id>`): a session the gateway holds is taken for that buyer, so a
+  full route answers the 402 to the buyers it serves and the 503 only to new ones. The header is
+  not authenticated and needs not be: it only lets in a session that its paid request, which is
+  authenticated, would be let in for.
 
 The wallet tells it in its own words, with the counts read as bounded numbers and never the seller's
 text: the rule `seller_busy`, `charged_sats` 0, and `busy` with the scope and counts, for an agent

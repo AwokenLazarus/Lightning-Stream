@@ -100,6 +100,9 @@ pub struct Route {
     pub accounts: Option<Accounts>,
     /// How many buyers and streams the service takes at once (`capacity`, docs/CAPACITY.md).
     pub capacity: Capacity,
+    /// The service the route is part of (`service`, else its upstream; "" for the config's): the
+    /// routes of one service count a buyer once over all of them (`capacity.max_buyers`).
+    pub service: String,
 }
 
 /// A route's `capacity`: what the seller lets the service carry at once, so that one buyer too many
@@ -265,7 +268,7 @@ pub struct Config {
 /// node vouches for the link key itself, at start (`sign.macaroon` beside `node.macaroon`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
-    /// `https://` (or `http://` for a lab) relay URLs; empty: iroh's public relays.
+    /// `https://` relay URLs (buyers refuse any other); empty: iroh's public relays.
     pub relays: Vec<String>,
     /// Relays only: buyers never learn the seller's address.
     pub private: bool,
@@ -285,7 +288,12 @@ impl LinkConfig {
             Some(Value::Array(a)) => a
                 .iter()
                 .map(|r| match r.as_str() {
-                    Some(r) if r.starts_with("https://") || r.starts_with("http://") => Ok(r.trim_end_matches('/').to_string()),
+                    Some(r) if r.starts_with("https://") => Ok(r.trim_end_matches('/').to_string()),
+                    // buyers' wallets reach a seller's relays over https only: a shop with any other
+                    // would be one no buyer can reach
+                    Some(r) if r.starts_with("http://") => Err(format!(
+                        "link.relays: {r} is plain http, which buyers' wallets refuse: give the relay's https:// URL"
+                    )),
                     _ => Err("link.relays is a list of https:// relay URLs".to_string()),
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -649,7 +657,8 @@ impl Config {
             )?,
             None => &empty,
         };
-        let max_sessions = num32(c, "max_sessions", 30)?;
+        // measured: 100 buyers at once used a sixth of one core and 61 MiB (docs/CAPACITY.md)
+        let max_sessions = num32(c, "max_sessions", 100)?;
         if max_sessions == 0 {
             return Err("caps.max_sessions is at least 1".into());
         }
@@ -746,7 +755,8 @@ impl Config {
             _ => Err(format!("http.{k} is from {least} to 4096")),
         };
         let http = Http {
-            connections: small("connections", 64, 1)?,
+            // a buyer's film or live connection holds one for as long as it is open
+            connections: small("connections", 512, 1)?,
             per_address: small("per_address", 48, 0)?,
             threads: small("threads", 16, 1)?,
         };
@@ -763,6 +773,9 @@ impl Config {
                 let mut proxies = vec![];
                 for p in f.get("proxies").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or(bad)? {
                     proxies.push(p.as_str().and_then(|a| a.parse::<std::net::IpAddr>().ok()).ok_or(bad)?.to_canonical());
+                }
+                if proxies.len() > xbt_svc::http::MAX_PROXIES {
+                    return Err(format!("http.forwarded_address.proxies: at most {}", xbt_svc::http::MAX_PROXIES));
                 }
                 Some(Forwarded { header, proxies })
             }
@@ -800,6 +813,12 @@ impl Config {
             routes.push(route(r)?);
         }
         for (i, r) in routes.iter().enumerate() {
+            // a service counts its buyers once over its routes: one number of them
+            if let Some(o) = routes[..i].iter().find(|o| o.service == r.service && o.capacity.max_buyers.is_some() && r.capacity.max_buyers.is_some()
+                                                       && o.capacity.max_buyers != r.capacity.max_buyers) {
+                return Err(format!("routes {} and {}: one service counts its buyers once over all its routes, so they take one capacity.max_buyers",
+                                   o.path, r.path));
+            }
             if r.upstream.is_none() && up.is_none() {
                 return Err(format!("route {}: no upstream, and the config names none for every route", r.path));
             }
@@ -926,6 +945,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "websocket",
             "accounts",
             "capacity",
+            "service",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -1141,6 +1161,11 @@ fn route(v: &Value) -> Result<Route, String> {
     if free && capacity.max_buyers.is_some() {
         return Err(bad("a free route has no buyers to count: capacity.max_buyers is for a priced route"));
     }
+    let service = match r.get("service") {
+        None | Some(Value::Null) => upstream.clone().unwrap_or_default(),
+        Some(Value::String(s)) if (1..=64).contains(&s.len()) => s.clone(),
+        Some(_) => return Err(bad("service is a name of 1 to 64 characters")),
+    };
     Ok(Route {
         path,
         methods,
@@ -1158,6 +1183,7 @@ fn route(v: &Value) -> Result<Route, String> {
         websocket,
         accounts,
         capacity,
+        service,
     })
 }
 
@@ -1335,6 +1361,45 @@ mod tests {
         assert!(Config::from_json(&v).is_err(), "a shop by key without a link section is refused");
     }
 
+    /// A buyer's wallet reaches a seller's relays over https only (its transport check refuses any
+    /// other): a plain-http relay here would make the shop one no buyer can reach, so it is refused.
+    #[test]
+    fn a_link_relay_is_https_only_as_buyers_require() {
+        let mut v = base();
+        v["link"] = json!({"relays": ["https://relay.example/"]});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().relays, vec!["https://relay.example".to_string()]);
+        v["link"] = json!({"relays": ["http://127.0.0.1:3340"]});
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("https://") && e.contains("refuse"), "{e}");
+    }
+
+    /// Routes are one service where they name the same `service`, or, naming none, the same
+    /// upstream; such routes take one count of buyers, so they cannot give it two limits.
+    #[test]
+    fn routes_of_one_service_share_its_count_of_buyers() {
+        let mut v = base();
+        v["routes"] = json!([{"path": "/app/", "price": {"request_msat": 100}, "capacity": {"max_buyers": 20}},
+                             {"path": "/api/", "price": {"request_msat": 100}, "capacity": {"max_buyers": 20}},
+                             {"path": "/films/", "upstream": "http://127.0.0.1:8096", "price": {"request_msat": 100}, "capacity": {"max_buyers": 5}},
+                             {"path": "/shows/", "upstream": "http://127.0.0.1:8096", "service": "shows", "price": {"request_msat": 100}, "capacity": {"max_buyers": 3}}]);
+        let c = Config::from_json(&v).unwrap();
+        let svc = |p: &str| c.route(p).unwrap().service.clone();
+        assert_eq!((svc("/app/x"), svc("/api/x")), (String::new(), String::new()));
+        assert_eq!((svc("/films/x").as_str(), svc("/shows/x").as_str()), ("http://127.0.0.1:8096", "shows"));
+        v["routes"][1]["capacity"]["max_buyers"] = json!(10);
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("one service") && e.contains("max_buyers"), "{e}");
+    }
+
+    #[test]
+    fn a_proxy_list_longer_than_the_server_keeps_is_refused() {
+        let mut v = base();
+        let many: Vec<String> = (1..=9).map(|i| format!("10.0.0.{i}")).collect();
+        v["http"] = json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": many}});
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("at most 8"), "{e}");
+    }
+
     #[test]
     fn the_defaults_are_the_drafts_numbers() {
         let c = Config::from_json(&base()).unwrap();
@@ -1374,7 +1439,7 @@ mod tests {
                 c.caps.max_kept_sessions,
                 c.caps.max_held
             ),
-            (30, 2, 10_000, 15)
+            (100, 2, 10_000, 15)
         );
         assert_eq!(
             (
@@ -1387,7 +1452,7 @@ mod tests {
         );
         assert_eq!(
             (c.http.connections, c.http.per_address, c.http.threads),
-            (64, 48, 16)
+            (512, 48, 16)
         );
         assert!(!c.mainnet());
     }

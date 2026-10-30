@@ -55,6 +55,68 @@ fn a_route_full_of_buyers_turns_a_new_one_away_before_it_buys_or_pays_anything()
     assert_eq!(again.status, 200, "{}", again.error());
 }
 
+/// A buyer's wallet asks the price of every new address before it pays for it. A buyer the route
+/// already serves names its session in that ask (`PAYMENT-SESSION`), and a full route lets it go on;
+/// a session it does not serve, or one that does not exist, is a new buyer and is turned away.
+#[test]
+fn a_full_route_goes_on_answering_the_buyers_it_serves_at_new_addresses() {
+    let (rig, _dir) = rig_with("/whole/", json!({"max_buyers": 1}));
+    let mut a = Buyer::new(&rig, 1);
+    let sa = a.lock(&rig, 2);
+    assert_eq!(a.get("/whole/100", Some(&sa[0])).status, 200);
+    let mut b = Buyer::new(&rig, 2);
+    b.lock(&rig, 1);
+
+    // the buyer served, at another address of the route
+    let known = http(&rig.addr, "GET", "/whole/200", &[("PAYMENT-SESSION", &a.session)], b"", None);
+    assert_eq!(known.status, 402, "{}", String::from_utf8_lossy(&known.body));
+    assert!(known.header("PAYMENT-REQUIRED").is_some());
+    let paid = a.get("/whole/200", Some(&sa[1]));
+    assert_eq!(paid.status, 200, "{}", paid.error());
+
+    // a session the route does not serve, and one nobody has, are new buyers of a full route
+    for other in [b.session.as_str(), "not-a-session"] {
+        let refused = http(&rig.addr, "GET", "/whole/200", &[("PAYMENT-SESSION", other)], b"", None);
+        assert_eq!(refused.status, 503, "{other}");
+        assert_eq!(refused.json()["busy"]["scope"], "buyers");
+    }
+}
+
+/// Between a new buyer's ask of the price and its first paid request, other buyers can fill the
+/// route. A wallet names the address it wants in its first lock (`path`), and the buyer takes its
+/// place there before anything is sold to it: a full route sells it no ticket, and a buyer with a
+/// place is counted before it pays, so the next new one is the one turned away.
+#[test]
+fn a_new_buyer_is_sold_no_ticket_by_a_route_that_cannot_serve_it() {
+    let (rig, _dir) = rig_with("/whole/", json!({"max_buyers": 1}));
+    // the route has room: the first lock that names it takes the place, before any ticket is paid
+    let mut a = Buyer::new(&rig, 1);
+    let first = a.lock_prepaid_with(1, &json!({"path": "/whole/100"}));
+    assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
+    let unpaid = http(&rig.addr, "GET", "/whole/100", &[], b"", None);
+    assert_eq!(unpaid.status, 503, "the place is taken before its ticket is paid");
+
+    // the route is full: a new buyer's first lock is sold nothing, and leaves no session behind
+    for prepaid in [true, false] {
+        let mut b = Buyer::new(&rig, 2);
+        let got = if prepaid {
+            b.lock_prepaid_with(1, &json!({"path": "/whole/100"}))
+        } else {
+            let s = b.fresh_secrets(1);
+            b.lock_with(&s, &json!({"path": "/whole/100"}))
+        };
+        assert_eq!(got.status, 503, "{}", String::from_utf8_lossy(&got.body));
+        let v = got.json();
+        assert_eq!((v["error"].as_str(), v["busy"]["scope"].as_str()), (Some("busy"), Some("buyers")));
+        assert!(v.get("tickets").is_none() && v.get("session").is_none(), "{v}");
+        assert!(b.session.is_empty());
+    }
+
+    // a lock naming a path no capacity limits, or none, is a lock as before
+    let mut c = Buyer::new(&rig, 3);
+    assert_eq!(c.lock_prepaid_with(1, &json!({"path": "/files/x"})).status, 200);
+}
+
 #[test]
 fn a_route_carrying_as_many_streams_as_it_takes_starts_no_new_one_and_charges_nothing_for_it() {
     let (rig, _dir) = rig_with("/timed/", json!({"max_streams": 1}));

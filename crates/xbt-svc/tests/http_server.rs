@@ -282,6 +282,27 @@ fn one_address_cannot_hold_every_connection() {
     run.stopper().stop();
 }
 
+/// A reverse proxy or tunnel in front of the server brings every client over its own address: the
+/// addresses named in `Limits::proxies` are held to the total cap only, not to the cap per address.
+#[test]
+fn a_named_proxy_is_held_to_the_total_cap_only() {
+    let limits = xbt_svc::http::Limits { connections: 16, per_address: 2, ..Default::default() }
+        .with_proxies(&["127.0.0.1".parse().unwrap()]);
+    let run = xbt_svc::http::serve_with(Arc::new(T), TcpListener::bind("127.0.0.1:0").unwrap(), 2, limits).unwrap();
+    let a = run.addr.to_string();
+    let held = hold(&a, 5);
+    std::thread::sleep(Duration::from_millis(300));
+    let r = raw(&a, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "the proxy was held to the cap per address: {r:?}");
+    // the total cap still holds
+    let more = hold(&a, 11);
+    std::thread::sleep(Duration::from_millis(300));
+    let r = raw(&a, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 503 "), "{r:?}");
+    drop((held, more));
+    run.stopper().stop();
+}
+
 /// AGP-081 (review T2): a request target with a `#` is refused before any handler sees it.
 #[test]
 fn a_target_with_a_fragment_is_refused() {

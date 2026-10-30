@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use xbt_gateway::config::{Config as GatewayConfig, MAINNET_ACK, MAINNET_NOTICE, MAX_NOSTR_RELAYS};
 use xbt_gateway::node::{checked_macaroon, INFO_OPS, INVOICE_OPS};
 
-use crate::setup::{decode_macaroon, pin_card, pin_cert, write_shared, GW_CONFIG, GW_INFO, GW_INVOICES, MAINNET_CAPS, TEST_CAPS};
+use crate::setup::{decode_macaroon, pin_card, pin_cert, write_shared, GATEWAY_CONNECTIONS, GW_CONFIG, GW_INFO, GW_INVOICES, MAINNET_CAPS, TEST_CAPS};
 use super::{App, Ctx};
 use crate::html::{esc, json_block};
 use crate::server::Resp;
@@ -766,7 +766,11 @@ impl App {
             tickets["min_ticket_msat"] = json!(546_000u64.min(size));
         }
         c.insert("tickets".into(), tickets);
-        if proxies.is_empty() {
+        if proxies.is_empty() && public_url.starts_with("https://") {
+            // as for the sessions above: the proxy's connections are every buyer's, so the gateway's cap on
+            // connections from one address is off, and its total is the bound
+            c.insert("http".into(), json!({"per_address": 0}));
+        } else if proxies.is_empty() {
             c.remove("http");
         } else {
             c.insert("http".into(), json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": proxies}}));
@@ -808,6 +812,10 @@ impl App {
                 }
                 app_route(m, o.app.as_ref().filter(|a| a.base == *p), &key_file);
                 route_capacity(m, &o.capacity, free);
+                // one service to a buyer, however many routes: counted once over them (docs/CAPACITY.md)
+                if (1..=64).contains(&o.id.len()) {
+                    m.insert("service".into(), json!(o.id));
+                }
                 routes.push(r);
             }
             // the service's own web page, under a route of its own where its base is not one of the service's paths
@@ -831,6 +839,10 @@ impl App {
                 }
                 app_route(m, Some(a), &key_file);
                 route_capacity(m, &o.capacity, free);
+                // one service to a buyer, however many routes: counted once over them (docs/CAPACITY.md)
+                if (1..=64).contains(&o.id.len()) {
+                    m.insert("service".into(), json!(o.id));
+                }
                 routes.push(r);
             }
             let base = public_url.clone();
@@ -1199,6 +1211,11 @@ impl App {
         };
         // how many buyers and streams at once: off unless set; a hint for a media server
         let cap = editing.map(|o| o.capacity).unwrap_or_default();
+        // the whole shop's limits, which a seller meets before any service's: said in plain words beside them
+        let shop_buyers = shop.caps.map(|c| c.0).unwrap_or(u64::from(if main { MAINNET_CAPS.0 } else { TEST_CAPS.0 }));
+        let shop_conns = self.gateway_now().and_then(|c| c.pointer("/http/connections").and_then(Value::as_u64)).unwrap_or(GATEWAY_CONNECTIONS);
+        let shop_limits = format!("Your whole shop serves up to {shop_buyers} buyers at once and {shop_conns} open connections (each film, download or live \
+            connection holds one while it is open), whatever you set here. Change the buyers under Advanced settings below.");
         let cap_val = |k: &str, v: Option<u32>| esc(&fv(k, v.map(|n| n.to_string()).unwrap_or_default()));
         let capacity_html = format!("<details class=\"capacity\" id=\"capacity\"{}><summary>How many buyers at once</summary>\
             <p class=\"hint\">So that one buyer too many does not slow everyone down. Leave a box empty for no limit. A buyer turned away pays nothing, \
@@ -1208,10 +1225,11 @@ impl App {
             <details><summary>Advanced</summary>\
             <label>Most streams for one buyer<input name=\"cap_streams_buyer\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"no limit\"></label>\
             <label>Most Mbit/s together <small>(no new stream starts above it)</small><input name=\"cap_mbit\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"no limit\"></label></details>\
-            <p class=\"hint\">For a media server such as Jellyfin on a small box, 5 buyers and 3 streams is a good start; each 4K film your server has to convert can use several processor cores.</p></details>",
+            <p class=\"hint\">For a media server such as Jellyfin on a small box, 5 buyers and 3 streams is a good start; each 4K film your server has to convert can use several processor cores.</p>\
+            <p class=\"hint\">{}</p></details>",
             if cap.is_set() { " open" } else { "" },
             cap_val("cap_buyers", cap.max_buyers), cap_val("cap_streams", cap.max_streams),
-            cap_val("cap_streams_buyer", cap.max_streams_per_buyer), cap_val("cap_mbit", cap.max_mbit));
+            cap_val("cap_streams_buyer", cap.max_streams_per_buyer), cap_val("cap_mbit", cap.max_mbit), shop_limits);
         let accounts_html = format!("<label class=\"check\"><input type=\"checkbox\" name=\"app_accounts\" value=\"1\"{}> Each buyer gets their own Jellyfin account: \
             their own watch history, and where they stopped</label>\
             <details{}><summary>Buyers' accounts</summary>\

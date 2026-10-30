@@ -1073,6 +1073,9 @@ pub(crate) struct HttpSession {
     offer: Option<String>,
     /// The URL of the session endpoints: the origin and the terms' path.
     base: String,
+    /// The address the session was opened for (its path and query), named in the first lock so that a
+    /// seller whose route there is full sells nothing to a buyer it would not serve.
+    visit: String,
     /// Held shared by every paid request in progress, so that requests run side by side; taken
     /// alone (and never waited for) by what may only happen with none in progress: moving the
     /// session to another address, stopping it as idle.
@@ -1343,8 +1346,10 @@ struct Stream {
     /// Before the request was sent, so that the seconds counted here are never fewer than the seller's.
     started: Instant,
     max_msat: u64,
-    /// The longest the answer stays open (the owner's `tickets.max_answer_s`).
+    /// The longest the answer stays open (the owner's `tickets.max_answer_s`, or `tickets.max_socket_s`
+    /// for a WebSocket), and which of the two it is.
     max_open: Duration,
+    limit: &'static str,
 }
 
 impl Stream {
@@ -1355,7 +1360,7 @@ impl Stream {
         if self.price.metered() && self.cost(bytes) >= self.max_msat {
             return Some("max_sats: the call's limit is used up".into());
         }
-        (self.started.elapsed() >= self.max_open).then(|| format!("max_answer_s: the answer has been open for {} s", self.max_open.as_secs()))
+        (self.started.elapsed() >= self.max_open).then(|| format!("{}: the answer has been open for {} s", self.limit, self.max_open.as_secs()))
     }
 
     /// Seconds of the answer that have started, by this clock.
@@ -1882,19 +1887,37 @@ impl Signer {
             (Ok(l), Ok(c)) => (l, c),
             (Err(e), _) | (_, Err(e)) => return deny("xbt402", e.msg),
         };
-        let probe = if upgrade {
-            // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
-            match self.wire_upgrade(&url, &range_headers, Self::ticket_read_timeout(&tp)) {
-                Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
-                Ok(u) => Ok(u.answer),
-                Err(e) => Err(e),
+        // the session open with this seller, named in the ask of the price: a seller whose route is full
+        // goes on serving a buyer it serves there (docs/CAPACITY.md)
+        let mut named = self.ticket_seller_sid(&origin, false);
+        let mut probe = loop {
+            let mut headers = range_headers.clone();
+            if let Some(sid) = &named {
+                headers.push(("PAYMENT-SESSION".into(), sid.clone()));
             }
-        } else {
-            self.wire(&method, &url, &raw, &range_headers, Self::ticket_read_timeout(&tp))
-        };
-        let mut probe = match probe {
-            Ok(a) => a,
-            Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
+            let probe = if upgrade {
+                // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
+                match self.wire_upgrade(&url, &headers, Self::ticket_read_timeout(&tp)) {
+                    Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
+                    Ok(u) => Ok(u.answer),
+                    Err(e) => Err(e),
+                }
+            } else {
+                self.wire(&method, &url, &raw, &headers, Self::ticket_read_timeout(&tp))
+            };
+            let probe = match probe {
+                Ok(a) => a,
+                Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
+            };
+            // busy while another call was opening the session with this seller (a page's first parts at
+            // once): asked again as that session's buyer, once it is open
+            if probe.status == 503 && named.is_none() {
+                named = self.ticket_seller_sid(&origin, true);
+                if named.is_some() {
+                    continue;
+                }
+            }
+            break probe;
         };
         // a seller whose service is full turns a new visit away before it is sold anything
         if probe.status == 503 {
@@ -2147,7 +2170,7 @@ impl Signer {
                     }
                     .map(str::to_string);
                     let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(),
-                                                   prepaid: prepaid_terms.clone(), offer, base, calls: RwLock::new(()),
+                                                   prepaid: prepaid_terms.clone(), offer, base, visit: c.url.strip_prefix(c.origin).unwrap_or("/").to_string(), calls: RwLock::new(()),
                                                    paying: Mutex::new(()), order: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                                    money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
@@ -2161,6 +2184,11 @@ impl Signer {
                     let prepaid_now = self.ticket_session(&h.sid).is_some_and(|s| s.prepaid_now(self.engine.now()));
                     match filled {
                         Ok(n) if n > 0 => {}
+                        // the seller's route is full: it sells this new buyer nothing, and the session ends unused
+                        Err(d) if d["rule"] == "seller_busy" => {
+                            let stopped = self.ticket_http_stop(&h, "the seller is busy", Duration::ZERO);
+                            break 'open Err(Tried::Done(with(d, json!({"stopped": stopped}))));
+                        }
                         _ if prepaid_now => {}
                         Ok(_) => {
                             // nothing was locked. Where the session waits (a lock found no slot, now or in the session
@@ -2352,6 +2380,15 @@ impl Signer {
     /// (its id and key are written to the book before anything is paid), or a later, authenticated
     /// one. `Ok`: the seller's answer. A seller that answers `slots_short` is not failing: the
     /// session locks nothing until its `retryAfter` has passed, and the refusal says so.
+    /// The seller's id of the session open with `origin`, if one is. While a call is opening one: none,
+    /// or with `wait`, the one it opened.
+    fn ticket_seller_sid(&self, origin: &str, wait: bool) -> Option<String> {
+        let slot = lock(&self.ticket_http).get(origin).cloned()?;
+        let open = if wait { lock(&slot.open) } else { slot.open.try_lock().ok()? };
+        let sid = lock_link(open.as_ref()?).seller_sid.clone();
+        (!sid.is_empty()).then_some(sid)
+    }
+
     fn ticket_lock_call(&self, hs: &HttpSession, mut body: Value) -> std::result::Result<Value, Value> {
         if !self.ticket_may_reach(&hs.origin, &hs.task) {
             return Err(deny("allowlist", format!("destination not on allowlist: {}", hs.origin)));
@@ -2379,6 +2416,10 @@ impl Signer {
                     Err(e) => refusal("ticket", e.msg),
                 };
             }
+            // the seller's service is full: nothing was sold
+            if let Some(d) = (status == 503).then(|| seller_busy(v)).flatten() {
+                return d;
+            }
             refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
         };
         if !lock_link(hs).seller_sid.is_empty() {
@@ -2390,6 +2431,7 @@ impl Signer {
             };
         }
         let url = format!("{}/lock", hs.base);
+        body["path"] = hs.visit.clone().into();
         let raw = body.to_string().into_bytes();
         let sent = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
         let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small(SMALL_BODY)?))) {
@@ -3399,7 +3441,10 @@ impl Signer {
         let event_stream = ans.header("content-type").is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"));
         let mut sse = xbt402::tokens::Sse::default();
         let (mut counted, mut usage, mut whole_body) = (0u64, xbt402::tokens::Usage::default(), Vec::new());
-        let st = Stream { price: *price, base_spent: mark.base_spent, started, max_msat, max_open: Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64) };
+        // a WebSocket is open for as long as its page keeps it, paid as its bytes pass: its own limit
+        let tp = self.ticket_policy();
+        let (open_s, limit) = if up_writer.is_some() { (tp.max_socket_s, "max_socket_s") } else { (tp.max_answer_s, "max_answer_s") };
+        let st = Stream { price: *price, base_spent: mark.base_spent, started, max_msat, max_open: Duration::from_secs(open_s.clamp(1, 86_400) as u64), limit };
         // what this answer has drawn past its head, by this count: added to the session's as it grows, and taken off
         // what the request may still add to the seller's spend ([`Money::open`])
         let own = AtomicU64::new(0);
@@ -4108,7 +4153,7 @@ mod tests {
     #[test]
     fn a_ticket_is_due_only_when_the_balance_does_not_cover_the_next_piece() {
         let per_mib = Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
-        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50) };
+        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         // one ticket of 1,000 sat credited on top of the 10 sat spent before: 1,000,000 - 2,500 msat of bytes
         let credited = 1_010_000;
         let limit = per_mib.bytes_for(1_000_000 - 2500);
@@ -4128,20 +4173,20 @@ mod tests {
         assert_eq!(st.cost(1 << 20), 202_500);
         // by the second: due when the next second is not covered
         let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: 100_000, tokens: xbt402::tokens::TokenRule::NONE };
-        let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50) };
+        let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert_eq!(st.seconds(), 1, "the first second has started");
         assert!(st.due_time(100_000), "one second paid, the second is not");
         assert!(!st.due_time(200_000) && !st.due_bytes(100_000, 1 << 30, None));
         // a price that does not fit is due at once and costs the most there is
-        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50) };
+        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert_eq!(huge.cost(1), u64::MAX);
         assert!(huge.due_bytes(1_000_000, 0, None));
         assert!(huge.over(0).is_some_and(|w| w.starts_with("max_sats")), "and is over any limit");
         // a long body paid for at its head is not cut where the call's limit equals its price
         let flat = Stream { price: Price { request_msat: 5_000, byte_msat: 0, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5_000,
-                            max_open: Duration::from_secs(50) };
+                            max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert!(flat.over(1 << 30).is_none());
-        let long = Stream { price: per_mib, base_spent: 0, started: Instant::now() - Duration::from_secs(3), max_msat: u64::MAX, max_open: Duration::from_secs(2) };
+        let long = Stream { price: per_mib, base_spent: 0, started: Instant::now() - Duration::from_secs(3), max_msat: u64::MAX, max_open: Duration::from_secs(2), limit: "max_answer_s" };
         assert!(long.over(0).is_some_and(|w| w.starts_with("max_answer_s")) && st.over(0).is_none());
     }
 
@@ -4405,7 +4450,7 @@ mod tests {
     fn a_cut_answer_may_be_charged_up_to_the_credit_it_had() {
         // 20 sat a MiB, 10 sat spent before the answer
         let per_mib = Price { request_msat: 0, byte_msat: 20_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
-        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: 5_000_000, max_open: Duration::from_secs(50) };
+        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: 5_000_000, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         let slack = per_mib.cost((1 << 20) + CUT_SLACK, 0).unwrap();
         assert!(slack < 400_000, "{slack}");
         // 1 MiB read with a ticket of 1,000 sat credited: all of that credit

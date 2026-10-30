@@ -429,7 +429,18 @@ fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
            "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"], "offers": conf["offers"],
            "times": {"refill_wait_ms": REFILL_WAIT_MS.load(Ordering::SeqCst), "upstream_wait_secs": 2, "tick_ms": 50},
-           "routes": routes()})
+           "routes": routes_with(conf)})
+}
+
+/// [`routes`], with the `capacity` that `conf["capacity"]` gives a route, by its path.
+fn routes_with(conf: &Value) -> Value {
+    let mut r = routes();
+    for route in r.as_array_mut().unwrap() {
+        if let Some(c) = conf["capacity"].get(route["path"].as_str().unwrap()) {
+            route["capacity"] = c.clone();
+        }
+    }
+    r
 }
 
 /// [`shop_config`], answering under a second name too (`public_aliases`): the same gateway at
@@ -2776,6 +2787,94 @@ fn rival_lock(shop: &Shop, tag: u8, n: usize) -> (u16, Value) {
     }
 }
 
+/// Another buyer's first lock that names `path` (`docs/CAPACITY.md`): it takes a place on that
+/// route, if one is free, before it pays anything.
+fn rival_seat(origin: &str, path: &str) -> u16 {
+    let body = json!({"version": "ticket/0", "settle": "on-arrival", "count": 1, "path": path}).to_string();
+    match ureq::post(&format!("{origin}/x402/ticket/lock")).set("Content-Type", "application/json").send_string(&body) {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => panic!("the shop gave no answer: {e}"),
+    }
+}
+
+/// A route that serves as many buyers as it takes goes on serving the ones it has, at every
+/// address of it: the wallet's ask of a new address's price names its session, and the seller
+/// knows it for a buyer it serves.
+#[test]
+fn a_full_route_goes_on_serving_this_wallet_at_new_addresses() {
+    let _g = env_lock();
+    let r = Rig::with(json!({}), true, false, 483, json!({"tickets": {"max_tickets": 8}, "caps": {"sessions_per_address": 0, "inbound_slots": 483},
+                                                         "capacity": {"/page/": {"max_buyers": 2}}}));
+    let first = r.pay("/page/100", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    assert_eq!(rival_seat(&r.shop.origin, "/page/"), 200, "the second place");
+    assert_eq!(rival_seat(&r.shop.origin, "/page/"), 503, "the route is full");
+    for n in 1..=3 {
+        let v = r.pay(&format!("/page/{}", 100 + n), CALL);
+        assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+    }
+}
+
+/// A page's first parts go out at once: one call opens the session while the others ask the price.
+/// One that a route just filled by that very session turns away is asked again, once the session is
+/// open, as that session's buyer, and is served.
+#[test]
+fn the_first_parts_of_a_page_are_served_while_their_session_opens_on_a_route_it_fills() {
+    let _g = env_lock();
+    let r = Arc::new(Rig::with(json!({}), true, false, 483, json!({"tickets": {"max_tickets": 8}, "caps": {"sessions_per_address": 0, "inbound_slots": 483},
+                                                                  "capacity": {"/page/": {"max_buyers": 2}}})));
+    assert_eq!(rival_seat(&r.shop.origin, "/page/"), 200, "one place of two taken");
+    // the session's first lock takes the last place, then the session takes a while to open
+    let mut slow = true;
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path == "/x402/ticket/lock" && !seen.paid && std::mem::take(&mut slow) {
+            let got = real();
+            std::thread::sleep(Duration::from_millis(800));
+            return Some(got);
+        }
+        None
+    }));
+    let first = { let r = r.clone(); std::thread::spawn(move || r.pay("/page/100", CALL)) };
+    std::thread::sleep(Duration::from_millis(300));
+    let second = r.pay("/page/101", CALL);
+    let first = first.join().unwrap();
+    for v in [&first, &second] {
+        assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+    }
+    assert_eq!(first["session"], second["session"]);
+}
+
+/// Between this wallet's ask of the price and its first lock, other buyers can fill the route: the
+/// first lock names the address, the seller sells nothing to a buyer it would not serve, and the
+/// wallet says the shop is busy, having paid nothing and kept no session.
+#[test]
+fn a_shop_that_fills_before_this_wallet_buys_sells_it_nothing() {
+    let _g = env_lock();
+    for shop in [json!({"tickets": {"max_tickets": 8}, "caps": {"sessions_per_address": 0, "inbound_slots": 483}, "capacity": {"/page/": {"max_buyers": 1}}}),
+                 json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true}, "capacity": {"/page/": {"max_buyers": 1}}})] {
+        let r = Rig::with(json!({}), true, false, 483, shop);
+        let rival = r.shop.origin.clone();
+        let mut filled = false;
+        r.tap.set(Box::new(move |seen, _| {
+            if seen.path == "/x402/ticket/lock" && !seen.paid && !filled {
+                filled = true;
+                assert_eq!(rival_seat(&rival, "/page/"), 200);
+            }
+            None
+        }));
+        let v = r.pay("/page/100", CALL);
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("seller_busy"), Some(0)), "{v}");
+        let lock = r.tap.seen("/x402/ticket/lock");
+        assert_eq!(serde_json::from_str::<Value>(&lock[0].body).unwrap()["path"], "/page/100", "the first lock names the address");
+        assert_eq!((r.ln.paid_msat(), r.shop.settled(), r.shop.held()), (0, 0, 0), "nothing sold");
+        assert!(r.tap.secrets().is_empty());
+        // no session with the seller is left: none, or one the seller never made, holding nothing
+        let st = r.status();
+        assert!(st["paying"].as_array().unwrap().iter().all(|p| p["seller_session"] == "" && p["released_msat"] == "0"), "{st}");
+    }
+}
+
 /// A gateway that offers held tickets only, with the shipped caps.
 fn held_only_shop() -> Value {
     json!({"tickets": {"settle": ["on-use"]}, "caps": {"sessions_per_address": 0}})
@@ -2830,10 +2929,10 @@ fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a
     let s = session_of(&r, &first);
     assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(0), Some("ticket_slots")), "the session holds nothing, and says why: {s}");
     assert_eq!(r.status()["locked"]["tickets"], 0);
-    // the lock for it named a count and no hash; the hash was the seller's
+    // the lock for it named a count and no hash (the hash was the seller's), and the address it is for
     let locks = r.tap.seen("/x402/ticket/lock");
     assert_eq!(locks.len(), 1, "{locks:?}", locks = locks.iter().map(|l| l.body.clone()).collect::<Vec<_>>());
-    assert_eq!(serde_json::from_str::<Value>(&locks[0].body).unwrap(), json!({"version": "ticket/0", "settle": "on-arrival", "count": 1}));
+    assert_eq!(serde_json::from_str::<Value>(&locks[0].body).unwrap(), json!({"version": "ticket/0", "settle": "on-arrival", "count": 1, "path": "/page/1000"}));
     // the balance pays the next pages: no ticket is bought ahead
     let v = r.pay("/page/300", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(0)), "{v}");
@@ -4663,6 +4762,64 @@ fn a_websocket_is_carried_both_ways_and_every_byte_paid() {
             assert_eq!(v["receipt"]["signed"], true, "{v}");
         } else {
             assert_eq!((v["rule"].as_str(), v["charged_sats"].as_u64()), (Some("free"), Some(0)), "{v}");
+        }
+    }
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A web app's WebSocket stays open for as long as the page keeps it (a media server's live
+/// updates, say), not for the owner's `max_answer_s` of an answer: it has its own limit,
+/// `tickets.max_socket_s`, and is paid as its bytes pass all the while. `SOCKET_HOLD_S` sets how
+/// long it is held (6 s by default; 300 for the launch check).
+#[test]
+fn a_websocket_outlives_the_limit_of_an_answer_and_ends_at_its_own() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let hold = std::env::var("SOCKET_HOLD_S").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
+    for (limit, held) in [(hold * 4, true), (2, false)] {
+        let r = Rig::new(json!({"tickets": {"max_answer_s": 2, "max_socket_s": limit}}));
+        let name = format!("ws-hold-{limit}");
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        // the caller: a frame of 100 bytes a second, each echoed, for `hold` seconds, then it hangs up
+        let caller = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            let mut w = s;
+            let start = Instant::now();
+            let mut echoed = 0u64;
+            while start.elapsed() < Duration::from_secs(hold) {
+                let out = [echoed as u8; 100];
+                if w.write_all(&out).is_err() {
+                    break;
+                }
+                let mut back = [0u8; 100];
+                if rd.read_exact(&mut back).is_err() || back != out {
+                    break;
+                }
+                echoed += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let _ = w.shutdown(std::net::Shutdown::Both);
+            (echoed, start.elapsed())
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/chat"), "max_sats": 5_000, "task": "film", "stream_to": name, "stream_head": true,
+                                           "head_headers": true, "upgrade": true, "headers": [["Sec-WebSocket-Key", "k1"], ["Sec-WebSocket-Version", "13"]]}));
+        let (echoed, took) = caller.join().unwrap();
+        assert_eq!(v["status"], 101, "{v}");
+        if held {
+            assert!(echoed >= hold - 1, "the socket was cut after {took:?} and {echoed} frames: {v}");
+            assert!(!v["ended"].as_str().unwrap_or("").contains("max_"), "{v}");
+            // paid for every byte, as it passed: 2,500 msat to open and 1,000 msat a KiB either way
+            let want = 2_500 + (echoed * 200).div_ceil(1024) * 1_000;
+            assert!(v["price_msat"].as_str().unwrap().parse::<u64>().unwrap() >= want - 1_000, "{v}");
+        } else {
+            assert!(took < Duration::from_secs(hold) && v["ended"].as_str().unwrap_or("").contains("max_socket_s"), "{took:?} {v}");
         }
     }
     std::env::remove_var("B2_STREAM_DIR");
