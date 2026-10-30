@@ -100,6 +100,8 @@ impl Pool {
 struct Rig {
     hashmaker: Hashmaker,
     link: String,
+    /// Where the miners connect.
+    miners_addr: String,
     hpub: PublicKey,
     fallback: Pool,
     dir: PathBuf,
@@ -164,7 +166,7 @@ fn rig_from(n: usize, ext: &[bool], secs: u64, rate: f64, own: bool) -> Rig {
         assert!(t0.elapsed() < Duration::from_secs(20), "miners never all hashed at the fallback: {s}");
         thread::sleep(Duration::from_millis(100));
     }
-    Rig { hashmaker, link, hpub, fallback, dir, miners }
+    Rig { hashmaker, link, miners_addr: miners_a, hpub, fallback, dir, miners }
 }
 
 /// A hashtaker taking `miners` miners into its own pool for `secs`, paying (or stopping after a slice).
@@ -349,6 +351,33 @@ fn moving_a_miner_leaves_no_gap_longer_than_one_job() {
     for m in &res {
         assert!(m.max_gap_ms < JOB_MS, "a gap of {} ms between accepted shares, a job is {JOB_MS} ms: {m:?}", m.max_gap_ms);
         assert!(m.rejected * 10 <= m.accepted, "few rejected shares around the switches: {m:?}");
+    }
+}
+
+/// A connection to the miners' port that never says its name (a health check, a port scanner, a
+/// miner stuck before it authorizes) is not a miner a rental can take: the rental gets the miner
+/// that hashes, and is paid for its work.
+#[test]
+fn a_connection_that_never_authorizes_is_not_rented() {
+    let _s = serial();
+    let rig = rig(1, &[], 15, 6.0);
+    // silent, and open for the whole rental
+    let silent = TcpStream::connect(&rig.miners_addr).unwrap();
+    let t0 = Instant::now();
+    while rig.hashmaker.status()["miners"].as_array().is_none_or(|m| m.len() < 2) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the silent connection was never seen: {}", rig.hashmaker.status());
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (pool, b) = hashtaker(&rig, "one", 1, 6, None);
+    let b = b.join().unwrap();
+    let r = finished(&rig.hashmaker, "one");
+    assert_eq!(rented_names(&r), ["m0"], "{r}");
+    check_paid(&r, &b);
+    assert!(pool.users()["one.rented"] > 0, "the rental's pool got the miner's work");
+    drop(silent);
+    rig.hashmaker.shutdown();
+    for m in rig.miners {
+        let _ = m.join();
     }
 }
 
