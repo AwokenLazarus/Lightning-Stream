@@ -83,6 +83,43 @@ the Sell page says why its link is not reachable.
 On StartOS, Lightning Fork's app grant gives the wallet its key and no gateway keys; the gateway's
 keys, the sign key among them, are pasted on the Sell page until the node package grants them.
 
+### One shop, several link keys
+
+A gateway serves on several link keys at once (`link.endpoints`, 4 unless set; 1 to 8), all
+leading to the same gateway, and the transport document names each, each vouched for by the node
+the same way. The reason is relays: a relay carries each key over one connection and limits each
+connection on its own (our relay: 6 MB/s, about 48 Mbit/s). A shop on one key that buyers can only
+reach through a relay shares that one connection among all of them; on four keys it has four.
+
+- **A buyer** checks every link in the document (the receipt key's signature, then the node's word
+  for each key) before it sends a byte, then orders the keys by a hash of its own key, the shop
+  and each link key, and uses the first. Buyers spread evenly; each keeps to the same key; a key
+  that does not answer within 8 seconds is passed over for the next. Adding or removing a key
+  moves only the buyers it takes or had.
+- **Relays:** with no relays named, every key uses ours (four connections there). With relays
+  named, each key has another one of them first, as its home.
+- **Keys** are kept in the state directory: `link.key` (the key a gateway on one key always had,
+  so it stays the first) and `link-2.key` onward.
+- **Apps from before** take the first link of the document, which still works.
+- **Cost:** a few hundred bytes of the document per key, one Nostr event per key, one node
+  signature per key every 20 days, and one relay connection per key.
+
+What it does not raise: the seller's own upload. When the home link is full, more keys do not help.
+
+### The seller's side of the relay connection (BBR)
+
+The bytes a shop sends through a relay leave over its own TCP connection to the relay, so the
+congestion control on the seller's machine decides how fast that leg goes, not the relay's. Most
+systems use cubic, which slows down on long or lossy paths. The app cannot change it (it is a
+setting of the whole system, and the app runs without the right to), so it is the owner's choice:
+
+- **Linux:** the same commands as for a relay server (`docs/RUN-A-RELAY.md`, "Faster single
+  connections"). They apply to every program on the machine.
+- **Umbrel:** the same, over SSH to the Umbrel box. An Umbrel update may undo it.
+- **StartOS:** not offered; leave it as it is.
+
+Several keys help either way: each is a connection of its own, with its own congestion window.
+
 ## What the seller sees
 
 Sell → Your shop → **How buyers reach you**:

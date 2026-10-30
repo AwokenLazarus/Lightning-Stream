@@ -1547,6 +1547,11 @@ def offers() -> None:
 # --- a shop reached by key, over its iroh link (docs/DIRECT-LINKS.md) --------------------------------
 
 
+# the link keys a gateway serves on by default (xbt-gateway's link.endpoints), each named in its document;
+# TICKET_E2E_LINK_KEYS sets another number for the link and jellyfin_link/_relay checks, to compare
+LINK_KEYS = int(os.environ.get("TICKET_E2E_LINK_KEYS", "4"))
+
+
 def link_check(relay: bool) -> None:
     """The lab's seller as a shop with no web address: its gateway reached only over its iroh link,
     found by its transport document (which the MCP hands to the signer from the shops file). The
@@ -1567,6 +1572,7 @@ def link_check(relay: bool) -> None:
     with open(path) as f:
         cfg = json.load(f)
     cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if relay else [], "private": relay}
+    cfg["link"]["endpoints"] = LINK_KEYS
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
     if "gateway-link" in PROCS and PROCS["gateway-link"].poll() is None:
@@ -1579,9 +1585,10 @@ def link_check(relay: bool) -> None:
         code, _, body = send("GET", "/.well-known/lightning-stream-transport.json", GW_LINK_PORT)
         if code == 200:
             doc.update(json.loads(body))
-        return code == 200 and bool(doc.get("transport"))
+        # every key named: the gateway names a key once its relay connection is up
+        return code == 200 and len(doc.get("transport") or []) == LINK_KEYS
 
-    lab.wait("the link's transport document, signed by the seller's node", 60, signed, every=0.5)
+    lab.wait(f"the link's transport document, signed by the seller's node, naming all {LINK_KEYS} keys", 60, signed, every=0.5)
     origin = str(doc.get("seller") or "")
     if not origin.startswith("http"):
         status_code, _, status_body = send("GET", "/.well-known/lightning-stream-link.json", GW_LINK_PORT)
@@ -1620,8 +1627,8 @@ def link_check(relay: bool) -> None:
     ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
           and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
     check(f"link ({mode}): a shop with no web address, reached over its iroh link{' through a relay only' if relay else ''}: the 100 MB file came whole, paid as it arrived with 20 tickets released one at a time, the last receipt signs its hash and its exact price, every ticket the seller took is booked once and the money agrees",
-          ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
-          {**brief(r), "rails_passed_over": r.get("rails_passed_over"), "origin": origin, "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
+          ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False) and len(doc.get("transport") or []) == LINK_KEYS,
+          {**brief(r), "rails_passed_over": r.get("rails_passed_over"), "origin": origin, "link_keys": len(doc.get("transport") or []), "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
     PROCS["gateway-link"].terminate()
     PROCS["gateway-link"].wait(10)
 
@@ -1690,6 +1697,7 @@ def jellyfin(link: str = "") -> None:
     cfg["times"]["upstream_wait_secs"] = 30
     if link:
         cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if link == "relay" else [], "private": link == "relay"}
+        cfg["link"]["endpoints"] = LINK_KEYS
     cfg["routes"] = [{
         "path": "/", "upstream": JF_URL, "price": {"byte_msat": JF_PRICE_MSAT, "per_bytes": PER_BYTES},
         "methods": ["GET", "HEAD", "POST", "DELETE"], "max_body": 1_048_576, "websocket": True, "accept_gzip": True,

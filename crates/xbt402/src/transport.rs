@@ -182,6 +182,13 @@ pub fn verified_iroh(doc: &Value, seller: &str, receipt_key: &str, node_pubkey: 
     verify(doc, seller, receipt_key, node_pubkey, now).ok()?.links.into_iter().next()
 }
 
+/// Every iroh link of `doc` that `node_pubkey` vouches for: one gateway serving on several keys, so
+/// that buyers relayed to it do not all share one relay connection. A buyer spreads over them in its
+/// own order (`xbt_iroh_link::order`) and falls back to the next. Empty when there is none.
+pub fn verified_iroh_links(doc: &Value, seller: &str, receipt_key: &str, node_pubkey: &str, now: u64) -> Vec<Link> {
+    verify(doc, seller, receipt_key, node_pubkey, now).map(|t| t.links).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,7 +225,8 @@ mod tests {
         let l = link(seller, 2_000, &nk);
         let (doc, pk) = signed(seller, std::slice::from_ref(&l));
         assert_eq!(verify(&doc, seller, &pk, &np, 1_000).unwrap().links, vec![l.clone()]);
-        assert_eq!(verified_iroh(&doc, seller, &pk, &np, 1_000), Some(l));
+        assert_eq!(verified_iroh(&doc, seller, &pk, &np, 1_000), Some(l.clone()));
+        assert_eq!(verified_iroh_links(&doc, seller, &pk, &np, 1_000), vec![l]);
         assert_eq!(node_of(&doc, seller, &pk, 1_000), Some(np));
     }
 
@@ -250,6 +258,23 @@ mod tests {
         extra["port"] = json!(1);
         assert!(verify(&extra, seller, &pk, &np, 1_000).is_err());
         assert_eq!(node_of(&changed, seller, &pk, 1_000), None);
+    }
+
+    #[test]
+    fn a_shop_on_several_keys_gives_every_key_its_node_vouches_for() {
+        let seller = "http://abc.shop.invalid";
+        let (nk, np) = node();
+        let (other, _) = keypair(8);
+        let keyed = |ep: &str, signer: &SecretKey| Link {
+            endpoint_id: ep.into(),
+            node_sig: claim::sign(claim::claim_text(ep, seller, 2_000).as_bytes(), signer),
+            ..link(seller, 2_000, &nk)
+        };
+        let (a, b, c) = (keyed(&"1".repeat(64), &nk), keyed(&"2".repeat(64), &other), keyed(&"3".repeat(64), &nk));
+        let (doc, pk) = signed(seller, &[a.clone(), b, c.clone()]);
+        assert_eq!(verified_iroh_links(&doc, seller, &pk, &np, 1_000), vec![a.clone(), c]);
+        assert_eq!(verified_iroh(&doc, seller, &pk, &np, 1_000), Some(a), "an app before several keys takes the first");
+        assert!(verified_iroh_links(&doc, seller, &pk, &np, 3_000).is_empty());
     }
 
     #[test]

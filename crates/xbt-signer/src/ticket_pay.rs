@@ -332,6 +332,14 @@ pub trait TicketWire: Send + Sync {
         let _ = (origin, link, nostr_author);
         Err(err("transport_error", "this wallet reaches sellers by web address only"))
     }
+
+    /// [`TicketWire::learn_link`] for a seller on several link keys (all from its checked document):
+    /// a wire that can spreads its buyers over them, with the others as fallbacks; one that cannot
+    /// uses the first.
+    fn learn_links(&self, origin: &str, links: &[xbt402::transport::Link], nostr_author: Option<&str>) -> Result<()> {
+        let first = links.first().ok_or_else(|| err("transport_error", "the seller's transport document names no link"))?;
+        self.learn_link(origin, first, nostr_author)
+    }
 }
 
 /// [`TicketWire`] over ureq. No overall deadline (an answer may be long); a connect, a read and a
@@ -708,17 +716,23 @@ impl TicketWire for UreqWire {
     }
 
     fn learn_link(&self, origin: &str, link: &xbt402::transport::Link, nostr_author: Option<&str>) -> Result<()> {
+        self.learn_links(origin, std::slice::from_ref(link), nostr_author)
+    }
+
+    fn learn_links(&self, origin: &str, links: &[xbt402::transport::Link], nostr_author: Option<&str>) -> Result<()> {
         let l = self.link()?;
-        let direct = link.direct.iter().filter_map(|a| a.parse().ok()).collect();
-        let hints = xbt_iroh_link::Hints { relays: link.relays.clone(), direct };
         let bad = |e: std::io::Error| err("transport_error", format!("link: {e}"));
-        l.learn(&link.endpoint_id, hints).map_err(bad)?;
-        if let Some(a) = nostr_author {
-            l.expect_author(&link.endpoint_id, a).map_err(bad)?;
+        for link in links {
+            let direct = link.direct.iter().filter_map(|a| a.parse().ok()).collect();
+            l.learn(&link.endpoint_id, xbt_iroh_link::Hints { relays: link.relays.clone(), direct }).map_err(bad)?;
+            if let Some(a) = nostr_author {
+                l.expect_author(&link.endpoint_id, a).map_err(bad)?;
+            }
         }
         let host = xbt402::wire::request_url(origin).host;
         if host.to_ascii_lowercase().ends_with(xbt_iroh_link::SHOP_SUFFIX) {
-            l.bind_shop(&host, &link.endpoint_id).map_err(bad)?;
+            let ids: Vec<String> = links.iter().map(|k| k.endpoint_id.clone()).collect();
+            l.bind_shop_links(&host, &ids).map_err(bad)?;
         }
         Ok(())
     }
@@ -1909,11 +1923,12 @@ impl Signer {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let node = cfg.counterparties.get(&origin).and_then(|c| c.get("ln_node")).and_then(Value::as_str).map(str::to_string)
                 .or_else(|| xbt402::transport::node_of(doc, &origin, &rk, now));
-            let Some(link) = node.and_then(|n| xbt402::transport::verified_iroh(doc, &origin, &rk, &n, now)) else {
+            let links = node.map(|n| xbt402::transport::verified_iroh_links(doc, &origin, &rk, &n, now)).unwrap_or_default();
+            if links.is_empty() {
                 return deny("transport", "the seller's transport document does not check out (its receipt key, its node's signature, or its expiry)");
-            };
+            }
             let author = xbt402::shop::key_of(&origin).map(hex::encode);
-            if let Err(e) = self.ticket_wire.learn_link(&origin, &link, author.as_deref()) {
+            if let Err(e) = self.ticket_wire.learn_links(&origin, &links, author.as_deref()) {
                 return deny("transport", e.msg);
             }
         } else if xbt402::shop::is_shop(&origin) {

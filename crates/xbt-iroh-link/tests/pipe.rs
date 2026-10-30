@@ -113,3 +113,85 @@ fn a_key_that_is_not_32_bytes_is_refused() {
     assert!(buyer.local_port("abcd").is_err());
     assert!(buyer.resolve("tooshort.link.invalid:80").unwrap().is_err());
 }
+
+#[test]
+fn a_shop_on_several_keys_is_reached_through_one_that_answers() {
+    let size = 1 << 20;
+    let upstream = service(size);
+    // one gateway on two keys; a third key the shop's document names is gone (never started)
+    let a = Link::start(secret(), Relays::None, true).unwrap();
+    let b = Link::start(secret(), Relays::None, true).unwrap();
+    for l in [&a, &b] {
+        l.serve(([127, 0, 0, 1], upstream).into());
+    }
+    let gone = Link::start(secret(), Relays::None, true).unwrap().endpoint_id();
+    let shop = format!("{}{}", "b".repeat(52), xbt_iroh_link::SHOP_SUFFIX);
+    for _ in 0..4 {
+        let buyer = Link::start(secret(), Relays::None, false).unwrap();
+        for l in [&a, &b] {
+            buyer.learn(&l.endpoint_id(), Hints { relays: vec![], direct: l.hints(Duration::from_millis(200)).direct }).unwrap();
+        }
+        buyer.bind_shop_links(&shop, &[gone.clone(), a.endpoint_id(), b.endpoint_id()]).unwrap();
+        let port = buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port();
+        get(port, &shop, size);
+        get(port, &shop, size);
+        // the same keys keep the port; another list is a new binding
+        buyer.bind_shop_links(&shop, &[b.endpoint_id(), gone.clone(), a.endpoint_id()]).unwrap();
+        assert_eq!(buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port(), port);
+        assert!(buyer.bind_shop_links(&shop, &[]).is_err());
+    }
+}
+
+#[test]
+fn many_requests_at_once_reach_a_shop_on_several_keys() {
+    let size = 256 << 10;
+    let upstream = service(size);
+    let keys: Vec<_> = (0..4).map(|_| Link::start(secret(), Relays::None, true).unwrap()).collect();
+    for l in &keys {
+        l.serve(([127, 0, 0, 1], upstream).into());
+    }
+    let buyer = Link::start(secret(), Relays::None, false).unwrap();
+    for l in &keys {
+        buyer.learn(&l.endpoint_id(), Hints { relays: vec![], direct: l.hints(Duration::from_millis(200)).direct }).unwrap();
+    }
+    let shop = format!("{}{}", "c".repeat(52), xbt_iroh_link::SHOP_SUFFIX);
+    buyer.bind_shop_links(&shop, &keys.iter().map(|l| l.endpoint_id()).collect::<Vec<_>>()).unwrap();
+    let port = buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port();
+    let t = std::time::Instant::now();
+    let hs: Vec<_> = (0..300).map(|_| { let shop = shop.clone(); std::thread::spawn(move || get(port, &shop, size)) }).collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    assert!(t.elapsed() < Duration::from_secs(30), "300 requests took {:?}", t.elapsed());
+}
+
+#[test]
+fn a_shop_key_that_hangs_costs_a_buyer_half_a_second_not_the_whole_wait() {
+    let size = 1 << 20;
+    let upstream = service(size);
+    let live = Link::start(secret(), Relays::None, true).unwrap();
+    live.serve(([127, 0, 0, 1], upstream).into());
+    // a key whose address takes packets and never answers: dialing it hangs
+    let sink = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let hung = Link::start(secret(), Relays::None, true).unwrap().endpoint_id();
+    let id = |h: &str| iroh::EndpointId::from_bytes(&<[u8; 32]>::try_from(hex::decode(h).unwrap()).unwrap()).unwrap();
+    let shop = format!("{}{}", "d".repeat(52), xbt_iroh_link::SHOP_SUFFIX);
+    // a buyer for whom the hung key comes first
+    let buyer = loop {
+        let b = Link::start(secret(), Relays::None, false).unwrap();
+        if xbt_iroh_link::order(&id(&b.endpoint_id()), &shop, vec![id(&hung), id(&live.endpoint_id())])[0] == id(&hung) {
+            break b;
+        }
+    };
+    buyer.learn(&hung, Hints { relays: vec![], direct: vec![sink.local_addr().unwrap()] }).unwrap();
+    buyer.learn(&live.endpoint_id(), Hints { relays: vec![], direct: live.hints(Duration::from_millis(200)).direct }).unwrap();
+    buyer.bind_shop_links(&shop, &[hung.clone(), live.endpoint_id()]).unwrap();
+    let port = buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port();
+    let t = std::time::Instant::now();
+    get(port, &shop, size);
+    assert!(t.elapsed() < Duration::from_secs(3), "the first answer took {:?}", t.elapsed());
+    // and the next goes straight to the key that answered
+    let t = std::time::Instant::now();
+    get(port, &shop, size);
+    assert!(t.elapsed() < Duration::from_millis(400), "the next answer took {:?}", t.elapsed());
+}
