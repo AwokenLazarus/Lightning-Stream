@@ -265,8 +265,9 @@ a.service-card .pill { align-self: flex-start; }
 .pill.cat-media, .pill.cat-apps { color: var(--river-b); background: color-mix(in srgb, var(--river-b) 14%, transparent); border-color: transparent; }
 .pill.cat-ai { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 .pill.cat-data { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+.pill.cat-files { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
 .pill.cat-hashrate { color: var(--river-a); background: color-mix(in srgb, var(--river-a) 14%, transparent); border-color: transparent; }
-.pill.cat-media::before, .pill.cat-apps::before, .pill.cat-ai::before, .pill.cat-hashrate::before, .pill.cat-data::before { display: none; }
+.pill.cat-media::before, .pill.cat-apps::before, .pill.cat-files::before, .pill.cat-ai::before, .pill.cat-hashrate::before, .pill.cat-data::before { display: none; }
 form.suggested { margin: 10px 0 0; justify-content: space-between; }
 .empty-card { text-align: center; }
 .empty-card .row { justify-content: center; }
@@ -312,3 +313,15 @@ header nav a[aria-current=page] { box-shadow: none; }
 .card, .step, .status { box-shadow: var(--shadow); }
 h1 { font-weight: 650; letter-spacing: -0.02em; }
 .empty::before { background: radial-gradient(circle, var(--accent-soft) 60%, transparent 61%); opacity: 1; }
+
+/* a Files service's list: one row a file; at phone width each file is a block, its size and price on one line */
+table.files td:nth-child(2), table.files td:nth-child(3) { white-space: nowrap; }
+table.files td:last-child .row { justify-content: flex-end; }
+@media (max-width: 640px) {
+  table.files thead { display: none; }
+  table.files, table.files tbody, table.files tr, table.files td { display: block; width: auto; }
+  table.files tr { padding: 12px 0; border-bottom: 1px solid var(--line); }
+  table.files td { border: 0; padding: 2px 0; }
+  table.files td:nth-child(2), table.files td:nth-child(3) { display: inline-block; margin-right: 12px; color: var(--muted); }
+  table.files td:last-child .row { justify-content: flex-start; margin-top: 6px; }
+}

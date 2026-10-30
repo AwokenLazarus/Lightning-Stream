@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use super::{ok_of, reason_of, App, Ctx};
 use crate::html::{self, esc, int, sats};
-use crate::server::Resp;
+use crate::server::{Req, Resp};
 use crate::services::{self, Kind, Service, Sort};
 
 const REFRESH: &str = "<meta http-equiv=\"refresh\" content=\"4\">";
@@ -46,13 +46,18 @@ impl App {
     }
 
     /// `GET /service?seller=…&name=…`: one service, as its category needs.
-    pub(crate) fn service_page(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
+    pub(crate) fn service_page(&self, ctx: &Ctx, req: &Req) -> Resp {
+        let q = &req.query;
         let seller = q.get("seller").map(String::as_str).unwrap_or("");
         let name = q.get("name").map(String::as_str).unwrap_or("");
         let found = self.services().ok().and_then(|all| all.into_iter().find(|s| services::same_origin(&s.seller, seller) && s.name == name));
         match found {
             Some(svc) => {
-                let body = service_html(&svc, self.is_own_shop(&svc.seller));
+                let own = self.is_own_shop(&svc.seller);
+                let mut body = service_html(&svc, own);
+                if svc.has_files() {
+                    body.push_str(&files_html(ctx, &svc, own, &self.link_base(req), &|item| self.relays.of_item(item)));
+                }
                 self.html_page("Service", &svc.name, ctx, &body, "")
             }
             None => self.html_page("Service", "Service", ctx, &format!("{}<p><a href=\"./browse\">Back to Browse</a></p>",
@@ -95,6 +100,44 @@ impl App {
         };
         self.flash_stops(ctx, &ids, "");
         Resp::redirect("./connections")
+    }
+
+    /// `POST /file-link`: a link for the buyer's own player for one file of the services file
+    /// (`action=create`), or revoke one (`action=revoke`, `token`). The CSRF token was checked with
+    /// every POST. Back to the file's service page.
+    pub(crate) fn file_link(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let item_url = f.get("item").map(|s| s.trim().to_string()).unwrap_or_default();
+        let all = self.services().unwrap_or_default();
+        let Some((svc, _)) = services::find_item(&all, &item_url).filter(|(s, _)| s.has_files()) else {
+            self.flash(ctx, false, "That file is not in your list of services.");
+            return Resp::redirect("./browse?cat=files");
+        };
+        let back = format!("./service?seller={}&name={}", services::urlenc(&svc.seller), services::urlenc(&svc.name));
+        match f.get("action").map(String::as_str) {
+            Some("create") => {
+                self.relays.create(&item_url);
+                self.flash(ctx, true, format!("Link made: copy it into your player. It plays this file only, and stops working in {}.", lasts(self.cfg.relay_ttl)));
+            }
+            Some("revoke") => {
+                let token = f.get("token").map(|s| s.trim().to_string()).unwrap_or_default();
+                if self.relays.revoke(&token) {
+                    self.flash(ctx, true, "Link revoked: it plays nothing now.");
+                } else {
+                    self.flash(ctx, false, "No such link: it had expired or was revoked already.");
+                }
+            }
+            _ => self.flash(ctx, false, "Unknown action."),
+        }
+        Resp::redirect(&back)
+    }
+
+    /// The address of this UI as the browser reached it, for a link another device opens:
+    /// `http(s)://<Host><base path>`. The Host was checked against the allowed names already.
+    fn link_base(&self, req: &Req) -> String {
+        let https = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
+        let host = req.header("host").trim();
+        let base = if self.cfg.base_path.ends_with('/') { self.cfg.base_path.clone() } else { format!("{}/", self.cfg.base_path) };
+        format!("{}://{host}{base}", if https { "https" } else { "http" })
     }
 
     /// What a service page and a seller's app may open: the services file, and the sellers the
@@ -156,10 +199,11 @@ fn empty_how(suggested: &str) -> String {
 
 fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dyn Fn(&str) -> bool) -> String {
     let cat = cat.trim().to_ascii_lowercase();
-    // a kind or an older category (`video`, `media`) names its category
+    // a kind or an older category names its category: films (`video`) are files, a media server (`media`) a web app
     let cat = match cat.as_str() {
-        "video" | "media" => "apps".to_string(),
-        "files" | "api" => "data".to_string(),
+        "video" => "files".to_string(),
+        "media" => "apps".to_string(),
+        "api" => "data".to_string(),
         c if services::CATEGORIES.iter().any(|(id, _)| *id == c) => cat,
         _ => String::new(),
     };
@@ -185,14 +229,13 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     }
     b.push_str("<div class=\"grid services\">");
     for s in &shown {
+        let n = s.items.len();
         let what = match s.kind {
-            Kind::Video if s.app.is_empty() => "An older media listing: nothing to open yet".into(),
             _ if s.category() == "apps" => "A web app: open it inside Lightning Stream".into(),
-            Kind::Video => "A web app: open it inside Lightning Stream".into(),
+            _ if s.has_files() => format!("{n} file{}: download, or open in your player", if n == 1 { "" } else { "s" }),
+            Kind::Video | Kind::Files => "No files listed yet".into(),
             Kind::Ai => "Ask it from your apps and agents".into(),
             Kind::Api => "Use it from your apps and agents".into(),
-            Kind::Files if !s.items.is_empty() => format!("{} file{}", s.items.len(), if s.items.len() == 1 { "" } else { "s" }),
-            Kind::Files => "Files".into(),
             Kind::Hashrate => "Rent miners by the piece of work".into(),
         };
         let mine = own(&s.seller);
@@ -252,13 +295,11 @@ fn service_html(s: &Service, own: bool) -> String {
     match s.kind {
         // a media server is the seller's own web app, opened above; an older listing names films for a
         // player this app no longer has
-        Kind::Video => {
-            if s.app.is_empty() {
-                b.push_str("<section class=\"status warn\"><p class=\"status-head\">This shop uses an older media listing</p>\
-                    <p>Ask the seller to share their media server as a web app. Lightning Stream opens a seller's own app (Jellyfin, \
-                    Plex) and pays for what it loads; it has no player of its own.</p></section>");
-            }
-        }
+        Kind::Video | Kind::Files if s.has_files() || !s.app.is_empty() => {}
+        Kind::Files => b.push_str("<p class=\"empty\">This seller lists no files yet.</p>"),
+        Kind::Video => b.push_str("<section class=\"status warn\"><p class=\"status-head\">This shop uses an older media listing</p>\
+            <p>It names nothing to download or open. Ask the seller to share their media server as a web app: Lightning Stream opens \
+            a seller's own app (Jellyfin, Plex) and pays for what it loads.</p></section>"),
         Kind::Hashrate => b.push_str("<section class=\"card primary\"><h2>Rent miners</h2>\
             <p>This seller rents out its miners: they hash for your own pool, and you pay for each piece of work as it is done.</p>\
             <div class=\"row\"><a class=\"button-link primary\" href=\"./hashrate\">Rent hashrate</a></div></section>"),
@@ -281,6 +322,115 @@ fn service_html(s: &Service, own: bool) -> String {
             }
         }
     }
+    b
+}
+
+/// A size as a Files listing words it (`850 KB`, `1.4 GB`, `850 bytes`): bytes.
+fn size_of(words: &str) -> Option<f64> {
+    let (n, unit) = words.trim().split_once(' ')?;
+    let n: f64 = n.parse().ok()?;
+    let mult = match unit {
+        "bytes" => 1.0,
+        "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        _ => return None,
+    };
+    Some(n * mult)
+}
+
+/// The sats a byte costs, from a price as Browse words it (`1000 sat a GB`, `20 sat a MiB`).
+fn sat_a_byte(price: &str) -> Option<f64> {
+    let (n, rest) = price.trim().split_once(" sat a ")?;
+    let n: f64 = n.replace(',', "").parse().ok()?;
+    match rest {
+        "GB" => Some(n / 1e9),
+        "MiB" => Some(n / 1_048_576.0),
+        _ => None,
+    }
+}
+
+/// About what a file costs: `about 1,400 sat`, `under 1 sat`.
+fn about_sats(bytes: f64, per_byte: f64) -> String {
+    let sats = bytes * per_byte;
+    if sats < 1.0 {
+        return "under 1 sat".into();
+    }
+    let n = sats.round() as u64;
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("about {out} sat")
+}
+
+/// `6 hours`, `90 minutes`, `45 seconds`.
+fn lasts(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (n, unit) = if s >= 7200 { (s / 3600, "hour") } else if s >= 120 { (s / 60, "minute") } else { (s, "second") };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// A Files service's list: each file's name, size and price, a Download (paid as it arrives, from
+/// this page's own address: [`crate::server`]), and Open in your player: a link VLC, mpv or a TV app
+/// opens on any device that reaches this app ([`crate::relay`]). `own`: this box's own shop, which it
+/// cannot buy from.
+fn files_html(ctx: &Ctx, s: &Service, own: bool, base: &str, links: &dyn Fn(&str) -> Vec<crate::relay::Shown>) -> String {
+    let per_byte = sat_a_byte(&s.price_text);
+    let token = crate::app::stream_token(&ctx.csrf);
+    let csrf = App::csrf_input(ctx);
+    let mut b = String::from("<section class=\"card\"><h2>Files</h2>");
+    b.push_str(if own {
+        "<p class=\"hint\">Your box can't buy from its own shop: buyers see this list, and the files are in your shared folder.</p>"
+    } else {
+        "<p class=\"hint\">Download a file, or open it in your own player (VLC, mpv, a TV app). Either way you pay as it arrives, \
+          within your spending rules, and stop paying when it stops.</p>"
+    });
+    b.push_str("<table class=\"files\"><thead><tr><th>Name</th><th>Size</th><th>Price</th><th></th></tr></thead><tbody>");
+    for (i, item) in s.items.iter().enumerate() {
+        let bytes = size_of(&item.credit);
+        let size = if bytes.is_some() { esc(&item.credit) } else { String::new() };
+        let note = if bytes.is_none() && !item.credit.is_empty() { format!("<br><span class=\"small\">{}</span>", esc(&item.credit)) } else { String::new() };
+        let price = match (bytes, per_byte) {
+            (Some(n), Some(p)) => about_sats(n, p),
+            _ => esc(&s.price_text),
+        };
+        let actions = if own {
+            String::new()
+        } else {
+            let dl = match services::download_src(&token, &item.url) {
+                Ok(src) => format!("<a class=\"button-link\" href=\"{}\" download>Download</a>", esc(&src)),
+                Err(_) => String::new(),
+            };
+            let shown = links(&item.url);
+            let mut l = String::new();
+            for (j, x) in shown.iter().enumerate() {
+                let id = format!("link-{i}-{j}");
+                l.push_str(&format!("<div class=\"row\"><input id=\"{id}\" readonly class=\"mono relay-link\" aria-label=\"Link for your player\" value=\"{}\">\
+                    <button type=\"button\" class=\"secondary\" data-copy=\"{id}\">Copy</button><span class=\"small\">{} left</span>\
+                    <form method=\"post\" action=\"./file-link\" class=\"inline\">{csrf}<input type=\"hidden\" name=\"action\" value=\"revoke\">\
+                    <input type=\"hidden\" name=\"item\" value=\"{}\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
+                    <button class=\"link\" type=\"submit\">Revoke</button></form></div>",
+                    esc(&format!("{base}r/{}", x.token)), lasts(x.left), esc(&item.url), esc(&x.token)));
+            }
+            format!("<div class=\"row\">{dl}<form method=\"post\" action=\"./file-link\" class=\"inline\">{csrf}\
+                <input type=\"hidden\" name=\"action\" value=\"create\"><input type=\"hidden\" name=\"item\" value=\"{}\">\
+                <button class=\"secondary\" type=\"submit\">Open in your player</button></form></div>{l}", esc(&item.url))
+        };
+        b.push_str(&format!("<tr><td><strong>{}</strong>{note}</td><td>{size}</td><td>{price}</td><td>{actions}</td></tr>", esc(&item.title)));
+    }
+    b.push_str("</tbody></table>");
+    if !own {
+        b.push_str("<p class=\"hint\">Open in your player makes a link: paste it into VLC (Media, Open Network Stream), run \
+            <code>mpv '&lt;link&gt;'</code>, or add it in a TV app. It plays this one file, seeking included, from any device that reaches this app, \
+            until it expires or you revoke it.</p>");
+    }
+    b.push_str("</section>");
     b
 }
 

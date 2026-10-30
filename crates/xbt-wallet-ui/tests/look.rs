@@ -101,6 +101,11 @@ fn the_look_in_headless_chrome() {
          "app": "https://media.example/web/", "app_base": "https://media.example/"},
         {"name": "Local model", "kind": "ai", "seller": "https://box.example", "address": "https://box.example/ai/", "price_text": "10 sat a request",
          "items": []},
+        // a shared folder: files to download or open in the buyer's own player
+        {"name": "Open films and books", "kind": "files", "seller": "https://files.example", "price_text": "1000 sat a GB",
+         "items": [{"title": "Big Buck Bunny (1080p).mp4", "url": "https://files.example/Big%20Buck%20Bunny%20(1080p).mp4", "credit": "1.4 GB"},
+                   {"title": "Sintel (4K).mkv", "url": "https://files.example/Sintel%20(4K).mkv", "credit": "6.2 GB"},
+                   {"title": "Books/Alice in Wonderland.epub", "url": "https://files.example/Books/Alice%20in%20Wonderland.epub", "credit": "190 KB"}]},
         {"name": "Weather data", "kind": "api", "seller": "https://weather.example", "price_text": "1 sat a request", "items": []},
         {"name": "Open lectures", "kind": "video", "seller": "https://lectures.example", "price_text": "12 sat a MiB",
          "items": [{"title": "Tears of Steel", "year": 2012, "url": "https://lectures.example/v/4", "credit": "(c) Blender Foundation, CC BY 3.0"}]},
@@ -148,7 +153,8 @@ fn the_look_in_headless_chrome() {
     let pages = json!([["home", "/"], ["browse", "/browse"], ["browse-ai", "/browse?cat=ai"],
         ["service-ai", format!("/service?seller={}&name={}", enc("https://box.example"), enc("Local model"))],
         ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
-        ["browse-apps", apps.clone()], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
+        ["browse-apps", apps.clone()], ["browse-files", "/browse?cat=files"],
+        ["service-files", format!("/service?seller={}&name={}", enc("https://files.example"), enc("Open films and books"))], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
         ["sell", "/sell"], ["sell-reach", "/sell#shop-reach"], ["sell-capacity", "/sell#capacity"], ["wallet", "/wallet"],
         ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"], ["ai", "/ai"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());

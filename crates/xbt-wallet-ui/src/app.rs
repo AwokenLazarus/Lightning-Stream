@@ -42,6 +42,10 @@ pub struct App {
     pub cfg: Config,
     pub auth: Auth,
     pub signer: SignerLink,
+    /// The links buyers' own players open one file through ([`crate::relay`]).
+    pub relays: crate::relay::RelayLinks,
+    /// Where the shared folder of a Files service is served, once it is ([`crate::files`]).
+    pub files_addr: std::sync::Mutex<Option<std::net::SocketAddr>>,
     /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
     pub nostr: crate::nostr::NostrCache,
     /// Stream relays: the owner's choices, those announced on Nostr, and their probes ([`crate::relaynet`]).
@@ -101,6 +105,14 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
 /// The height the XBT chain split from the SHA-256 chain at: a Lightning channel funded only from
 /// coins older than this exists on both chains, and the rail refuses it.
 pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
+
+/// The stream token of a login session whose CSRF token is `csrf`: a download's URL carries
+/// it (`./s/~<token>/<seller URL>`), and the relay plays nothing without it. Derived, so the URL
+/// (which may be logged) never carries the CSRF token itself.
+pub fn stream_token(csrf: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(format!("xbt-wallet-ui/stream|{csrf}").as_bytes())[..16])
+}
 
 /// The least `ln.exposure_cap_sats` the starter rules set on mainnet.
 pub const STARTER_EXPOSURE_CAP_SATS: i64 = 100_000;
@@ -195,7 +207,8 @@ impl App {
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
         let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
-        Ok(Arc::new(Self { cfg, auth, signer, nostr, relay_net, platform,
+        let relays = crate::relay::RelayLinks::new(cfg.relay_ttl);
+        Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None), nostr, relay_net, platform,
                          apps: Default::default() }))
     }
 
@@ -215,6 +228,47 @@ impl App {
 
     fn peer_allowed(&self, peer: &str) -> bool {
         self.cfg.allow_ips.is_empty() || self.cfg.allow_ips.iter().any(|p| peer == p || (p.ends_with('.') || p.ends_with(':')) && peer.starts_with(p.as_str()))
+    }
+
+    /// For `GET /s/<file URL>` (a download from the page), the same checks as a page of the wallet;
+    /// for `GET /r/<token>` (a link for the buyer's own player), the same checks less the login, and
+    /// a live token for a file still in the services file. `Some(Ok(url))`: relay the seller URL `url`
+    /// (for `/s/`, `None`: the caller takes it from the request target); `Some(Err)`: the answer
+    /// that refuses it; `None` for anything else.
+    pub fn relay_gate(&self, req: &Req) -> Option<Result<Option<String>, Resp>> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        let link = path.strip_prefix("/r/");
+        if req.method != "GET" || !(path.starts_with("/s/") || link.is_some()) || self.cfg.role == Role::Gateway {
+            return None;
+        }
+        if !self.peer_allowed(&req.peer) {
+            return Some(Err(Resp::text(403, "text/plain", "forbidden")));
+        }
+        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
+            return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
+        }
+        if !self.auth.has_password() && !self.platform_owner(req) {
+            return Some(Err(Resp::text(401, "text/plain", "login required")));
+        }
+        if let Some(token) = link {
+            // the link alone: no cookie, and only the one item it was made for
+            let in_file = |item: &str| self.services().is_ok_and(|all| crate::services::find_item(&all, item).is_some());
+            return Some(match self.relays.item_of(token) {
+                Some(item) if in_file(&item) => Ok(Some(item)),
+                _ => Err(Resp::text(404, "text/plain", "no such link: it expired, was revoked, or its item is gone")),
+            });
+        }
+        let sid = req.cookie(COOKIE).unwrap_or_default();
+        let Some(csrf) = self.auth.with_session(&sid, |s| s.csrf.clone()) else {
+            return Some(Err(Resp::text(401, "text/plain", "login required")));
+        };
+        // the session's stream token: only a page of the wallet's own knows it (another page of the box sends
+        // the cookie with what it asks for, but cannot read the token), so only the wallet's own page pays
+        let token = path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).map(|(t, _)| t).unwrap_or("");
+        if !crate::ct_eq(token.as_bytes(), stream_token(&csrf).as_bytes()) {
+            return Some(Err(Resp::text(403, "text/plain", "refused: a stream this page did not ask for")));
+        }
+        Some(Ok(None))
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {
@@ -313,7 +367,7 @@ impl App {
             "/" => self.home(&ctx),
             "/wallet" => self.overview(&ctx),
             "/browse" => self.browse(&ctx, &req.query),
-            "/service" => self.service_page(&ctx, &req.query),
+            "/service" => self.service_page(&ctx, &req),
             "/services" => self.services_page(&ctx),
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
@@ -486,6 +540,7 @@ impl App {
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),
             "/hashrate" => self.hashrate_post(ctx, f),
             "/ai" => self.ai_post(ctx, f),
+            "/file-link" => self.file_link(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
             "/relays-prefs" => self.relays_prefs(ctx, f),
             "/relays-publish" => self.relays_publish(ctx, f),

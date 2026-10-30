@@ -30,8 +30,9 @@ pub enum Kind {
 }
 
 /// The categories Browse sorts services into. A media server (Jellyfin, Plex) is a web app: the
-/// seller's own app, opened inside Lightning Stream. The app has no player of its own.
-pub const CATEGORIES: [(&str, &str); 4] = [("apps", "Web apps"), ("ai", "AI"), ("hashrate", "Hashrate"), ("data", "Data & APIs")];
+/// seller's own app, opened inside Lightning Stream. Files are a seller's shared folder, downloaded or
+/// opened in the buyer's own player. The app has no player of its own.
+pub const CATEGORIES: [(&str, &str); 5] = [("apps", "Web apps"), ("files", "Files"), ("ai", "AI"), ("hashrate", "Hashrate"), ("data", "Data & APIs")];
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
@@ -50,7 +51,8 @@ impl Kind {
             Kind::Video => "apps",
             Kind::Ai => "ai",
             Kind::Hashrate => "hashrate",
-            Kind::Files | Kind::Api => "data",
+            Kind::Files => "files",
+            Kind::Api => "data",
         }
     }
 
@@ -114,12 +116,19 @@ pub struct Service {
 
 impl Service {
     /// The category Browse shows it under: a service with its own web app is a web app (a media
-    /// server among them), whatever its listing's kind; an AI model and hashrate keep their own.
+    /// server among them), whatever its listing's kind; an older media listing that names films
+    /// (no app) is files, to download or open in a player; an AI model and hashrate keep their own.
     pub fn category(&self) -> &'static str {
         match self.kind {
             Kind::Video | Kind::Api | Kind::Files if !self.app.is_empty() => "apps",
+            Kind::Video if !self.items.is_empty() => "files",
             k => k.category(),
         }
+    }
+
+    /// Whether its page lists files to download or open in a player.
+    pub fn has_files(&self) -> bool {
+        self.app.is_empty() && !self.items.is_empty() && matches!(self.kind, Kind::Files | Kind::Video)
     }
 
     pub fn category_words(&self) -> &'static str {
@@ -354,7 +363,9 @@ pub fn price_words(prices: &Value) -> String {
     if n("request_msat") > 0 {
         parts.push(format!("{} sat a request", sat(u128::from(n("request_msat")), 1)));
     }
-    if n("byte_msat") > 0 {
+    if n("byte_msat") > 0 && n("per_bytes") == 1_000_000_000 {
+        parts.push(format!("{} sat a GB", sat(u128::from(n("byte_msat")), 1)));
+    } else if n("byte_msat") > 0 {
         let per = u128::from(n("per_bytes").max(1));
         parts.push(format!("{} sat a MiB", sat(u128::from(n("byte_msat")) * 1_048_576, per)));
     }
@@ -473,6 +484,23 @@ fn price_key(s: &str) -> (u8, u64) {
     }
 }
 
+/// The service and the item a file URL is, among `services`.
+pub fn find_item<'a>(services: &'a [Service], url: &str) -> Option<(&'a Service, &'a Item)> {
+    let url = url.trim();
+    if url.is_empty() || url.len() > MAX_URL {
+        return None;
+    }
+    services.iter().find_map(|s| s.items.iter().find(|i| i.url == url).map(|i| (s, i)))
+}
+
+/// `./s/~<stream token>/` + the file URL ([`crate::app::stream_token`]): where the page downloads a
+/// file from. The UI relays it to the connector ([`crate::server`]), so a browser on another device
+/// of the network reaches it too (the connector itself listens on loopback only).
+pub fn download_src(token: &str, item_url: &str) -> Result<String, String> {
+    http_url(item_url, "file url")?;
+    Ok(format!("./s/~{token}/{item_url}"))
+}
+
 /// Percent-encoding for a query value.
 pub fn urlenc(s: &str) -> String {
     let mut o = String::new();
@@ -575,7 +603,8 @@ mod tests {
         assert_eq!(by_price.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["alpha", "Zebra", "Mid"]);
         assert_eq!(by_price[1].items[0].title, "B", "a price sort leaves the seller's item order");
         let files = arrange(parse(raw).unwrap(), Some("FILES"), Sort::Name);
-        assert_eq!(files.len(), 1);
+        assert_eq!(files.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["alpha", "Zebra"], "an older film listing is files too");
+        assert_eq!(arrange(parse(raw).unwrap(), Some("video"), Sort::Name).len(), 1, "a kind still names its own");
         assert!(arrange(parse(raw).unwrap(), Some("nope"), Sort::Name).is_empty());
         assert_eq!(price_num("20 sat a MiB"), Some(20));
         assert_eq!(price_num("about 1,200 sat"), Some(1200));

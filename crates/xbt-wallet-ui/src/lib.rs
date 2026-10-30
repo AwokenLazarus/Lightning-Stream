@@ -11,17 +11,21 @@
 //! * [`html`]: escaping, the page layout, formatting.
 //! * [`app`]: the routes and pages; [`server`]: the HTTP server.
 //! * [`services`]: the services file Browse reads (`XBT_UI_SERVICES`).
+//! * [`relay`]: the links a buyer's own player (VLC, mpv, a TV app) opens one file through.
+//! * [`files`]: the folder a Files service shares, served to the shop's gateway.
 //! * [`setup`]: the Lightning rail page (wallet) and the seller gateway's page (`XBT_UI_ROLE=gateway`).
 pub mod app;
 pub mod services;
 pub mod auth;
 pub mod config;
+pub mod files;
 pub mod html;
 pub mod link;
 pub mod node_keys;
 pub mod own_shop;
 pub mod msg;
 pub mod nostr;
+pub mod relay;
 pub mod relaynet;
 pub mod server;
 pub mod seller_app;

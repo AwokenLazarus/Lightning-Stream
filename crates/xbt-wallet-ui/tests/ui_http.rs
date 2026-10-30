@@ -974,30 +974,44 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     assert!(page.body.contains("aria-current=\"page\">Browse") && page.body.contains("aria-current=\"page\">Services"));
     assert!(page.body.contains("href=\"./services\"") && page.body.contains("href=\"./connections\""));
     assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
-    assert!(page.body.contains(">Web apps <") && page.body.contains(">Data &amp; APIs <"), "the categories: a media server is a web app");
+    assert!(page.body.contains(">Web apps <") && page.body.contains(">Files <") && page.body.contains(">Data &amp; APIs <"), "the categories");
     assert!(!page.body.contains(">Media <"), "no media category of its own");
     assert!(!page.body.contains("Big Buck Bunny"), "Browse lists services, not what a media service has inside");
     assert!(page.headers.get("content-security-policy").is_some_and(|v| v.contains("media-src 'self'")));
-    // an older media listing (films for a player, no web app): said plainly, with nothing to play
+    // an older film listing (no web app) is files: each to download or open in the buyer's own player, no player here
     let media = br.get(&format!("/service?seller={}&name={}", enc("https://stream.lazarus-xbt.xyz"), enc("Alpha films"))).body;
-    assert!(media.contains("This shop uses an older media listing") && media.contains("as a web app"), "{media}");
+    let token = xbt_wallet_ui::app::stream_token(&field(&media, "csrf"));
+    assert!(media.contains("Big Buck Bunny") && media.contains(&format!("href=\"./s/~{token}/{FILM}\" download>Download</a>")), "{media}");
+    assert!(media.contains("Open in your player") && media.contains("20 sat a MiB"), "{media}");
     assert!(!media.contains("./play?") && !media.contains("<video"), "the app has no player: {media}");
     assert_eq!(br.get(&format!("/play?item={}", enc(FILM))).status, 404, "no player page");
-    // any other service's page: its address for apps and agents, no player
+    // a link for the buyer's own player: made by a logged-in POST, shown with a copy button, revoked
+    let back = format!("/service?seller={}&name={}", enc("https://stream.lazarus-xbt.xyz"), enc("Alpha films"));
+    let r = br.act(&back, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let page = br.get(&back).body;
+    let link = page.split("value=\"").find(|v| v.contains("/r/")).map(|v| v.split('"').next().unwrap().to_string()).expect("a link");
+    assert!(link.contains("/r/") && page.contains("data-copy=\"link-0-0\""), "{page}");
+    let tok = link.rsplit("/r/").next().unwrap().to_string();
+    let r = br.act(&back, "/file-link", &[("action", "revoke"), ("item", FILM), ("token", &tok)]);
+    assert!(br.flash_after(&r).contains("Link revoked"));
+    let r = br.act(&back, "/file-link", &[("action", "create"), ("item", "https://elsewhere.example/x")]);
+    assert!(br.flash_after(&r).contains("not in your list"));
+    // a files service: its files to download, the item's text escaped
     let files = br.get(&format!("/service?seller={}&name={}", enc("https://files.example"), enc("Zebra files"))).body;
     assert!(files.contains("&lt;b&gt;notes&lt;/b&gt;") && !files.contains("<b>notes</b>"));
-    assert!(files.contains("notes?a=1&amp;b=2") && files.contains("Connect an AI agent") && !files.contains("./play?"), "{files}");
+    assert!(files.contains("notes?a=1&amp;b=2") && files.contains(">Download</a>") && !files.contains("./play?"), "{files}");
     assert!(br.get("/service?seller=https://x.example&name=x").body.contains("not in your list"));
 
     let by_price = br.get("/browse?sort=price").body;
     assert!(by_price.find("Zebra files").unwrap() < by_price.find("Alpha films").unwrap(), "price sort");
     assert!(by_price.contains("aria-current=\"true\">price"));
-    let data = br.get("/browse?cat=data").body;
-    assert!(data.contains("Zebra files") && !data.contains("Alpha films"));
+    let data = br.get("/browse?cat=files").body;
+    assert!(data.contains("Zebra files") && data.contains("Alpha films"), "files, and an older film listing");
     let old_link = br.get("/browse?kind=video").body;
-    assert!(old_link.contains("Alpha films") && !old_link.contains("Zebra files"), "a kind names its category");
+    assert!(old_link.contains("Alpha films") && old_link.contains("aria-current=\"page\">Files"), "an older films link is files");
     let old_cat = br.get("/browse?cat=media").body;
-    assert!(old_cat.contains("Alpha films") && old_cat.contains("aria-current=\"page\">Web apps"), "the older media category is web apps");
+    assert!(old_cat.contains("aria-current=\"page\">Web apps"), "the older media category is web apps");
     assert!(br.get("/browse?cat=ai").body.contains("No services in this category yet"));
 
     let conn = br.get("/connections");
@@ -1081,6 +1095,43 @@ fn the_owner_pins_the_node_certificate_on_a_platform_that_cannot_mount_it() {
     assert!(br2.flash_after(&r).contains("gives the node's certificate itself"));
 }
 
+/// A download comes from the page's own origin: the UI relays `/s/<file URL>` to the connector
+/// (which listens on loopback only), for a logged-in owner only, so a browser on another device of the
+/// network can download it.
+#[test]
+fn the_ui_relays_a_download_from_the_connector_to_a_logged_in_owner() {
+    use std::io::{Read, Write};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..200_000u32).map(|i| (i % 251) as u8)).collect();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connector = format!("http://{}", l.local_addr().unwrap());
+    let body = film.clone();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut head = [0u8; 4096];
+            let n = s.read(&mut head).unwrap_or(0);
+            let asked = String::from_utf8_lossy(&head[..n]).to_string();
+            if asked.starts_with("GET /s/https://stream.lazarus-xbt.xyz/v?static=true ") {
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            } else {
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    });
+    let b = start(json!({}), false, move |c| c.connector = connector);
+    let mut anon = B::new(&b.base);
+    assert_eq!(anon.get("/s/https://stream.lazarus-xbt.xyz/v?static=true").status, 401, "not logged in");
+    let br = logged_in(&b);
+    let mut br = br;
+    let token = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let resp = br.agent.get(&format!("{}/s/~{token}/https://stream.lazarus-xbt.xyz/v?static=true", b.base)).set("Cookie", &br.cookie).call().unwrap();
+    assert_eq!(resp.header("Content-Type"), Some("video/mp4"));
+    let mut got = vec![];
+    resp.into_reader().read_to_end(&mut got).unwrap();
+    assert_eq!(got, film);
+}
+
 /// A page on another port of this host (another app of the box) is of the same site: the browser
 /// sends the wallet's cookie with what it asks, `SameSite=Strict` notwithstanding. It must not be
 /// able to have the wallet stream, and pay for, what it names, nor act with the owner's session:
@@ -1132,6 +1183,205 @@ fn a_page_on_another_port_of_the_box_cannot_make_the_wallet_pay_or_act() {
     let own = b.base.clone();
     assert_eq!(br.send("GET", "/browse", None, &[("Referer", &format!("{own}/"))]).status, 200);
     assert_eq!(br.send("POST", "/logout", Some(&form), &[("Sec-Fetch-Site", "same-origin"), ("Origin", &own)]).status, 303);
+}
+
+/// Each request a connector got: its path and its `Range`.
+type Seen = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+/// A connector on loopback that answers `/s/<FILM>` with the film, or the part a `Range` names as a
+/// 206, and records each request's path and `Range`.
+fn range_connector(film: Vec<u8>) -> (String, Seen) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connector = format!("http://{}", l.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut head = [0u8; 8192];
+            let n = s.read(&mut head).unwrap_or(0);
+            let asked = String::from_utf8_lossy(&head[..n]).to_string();
+            let path = asked.split(' ').nth(1).unwrap_or("").to_string();
+            let range = asked.lines().find_map(|l| l.strip_prefix("Range: ").or_else(|| l.strip_prefix("range: "))).map(str::to_string);
+            log.lock().unwrap().push((path.clone(), range.clone()));
+            if path != format!("/s/{FILM}") {
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                continue;
+            }
+            // `bytes=N-` or `bytes=N-M`, the end held to the film's last byte
+            let from = range.as_deref().and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-')).and_then(|(a, e)| {
+                let a = a.parse::<usize>().ok()?;
+                let e = if e.is_empty() { film.len() - 1 } else { e.parse::<usize>().ok()?.min(film.len() - 1) };
+                Some((a, e))
+            });
+            match from {
+                Some((a, e)) => {
+                    let _ = write!(s, "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {a}-{e}/{}\r\n\
+                                       Content-Length: {}\r\nConnection: close\r\n\r\n", film.len(), e + 1 - a);
+                    let _ = s.write_all(&film[a..=e]);
+                }
+                None => {
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", film.len());
+                    let _ = s.write_all(&film);
+                }
+            }
+        }
+    });
+    (connector, seen)
+}
+
+/// A player that reads a little of a long film and goes away is charged at most one part beyond
+/// what it read: the relay asks for an open range one READ_CHUNK at a time, and asks for no more once
+/// the player has gone. The connector is what the wallet pays through, so
+/// what it was asked for bounds what the seller can meter.
+#[test]
+fn a_reader_that_goes_away_early_is_asked_for_at_most_one_part() {
+    use std::io::{Read, Write};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..(10u32 << 20)).map(|i| (i % 251) as u8)).collect();
+    let (connector, seen) = range_connector(film.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}}]"#)).unwrap();
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+    });
+    let mut br = logged_in(&b);
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    // a player's first request for a film: an open range from the start
+    let addr = b.base.trim_start_matches("http://").split('/').next().unwrap().to_string();
+    let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+    let prefix = b.base.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
+    write!(sock, "GET {prefix}/s/~{st}/{FILM} HTTP/1.1\r\nHost: {addr}\r\nCookie: {}\r\nRange: bytes=0-\r\n\r\n", br.cookie).unwrap();
+    let mut got = vec![0u8; 256 << 10];
+    let mut have = 0;
+    while have < got.len() {
+        let n = sock.read(&mut got[have..]).unwrap();
+        if n == 0 { break; }
+        have += n;
+    }
+    drop(sock); // the player is closed
+    std::thread::sleep(Duration::from_millis(500));
+    let asked = seen.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "one request reached the connector: {asked:?}");
+    assert_eq!(asked[0].1.as_deref(), Some("bytes=0-4194303"), "an open range is asked for one part (4 MiB) at a time");
+    let head = String::from_utf8_lossy(&got[..have.min(1024)]).to_string();
+    assert!(head.starts_with("HTTP/1.1 206") && head.contains(&format!("bytes 0-4194303/{}", film.len())), "{head}");
+}
+
+/// Seeking through the relay, and the links for the buyer's own player (VLC, mpv, a TV app): the
+/// reader's `Range` reaches the connector and its 206 comes back with its range; a link is made by a
+/// logged-in POST with the CSRF token, plays its one file without a cookie, names no other, and
+/// stops when it is revoked or expires.
+#[test]
+fn the_relay_passes_range_and_a_players_link_plays_its_one_file_until_it_expires() {
+    use std::io::Read;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..200_000u32).map(|i| (i % 251) as u8)).collect();
+    let (connector, seen) = range_connector(film.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[
+        {{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}},
+        {{"name": "Files", "kind": "files", "seller": "https://files.example", "price_text": "5 sat a file",
+         "items": [{{"title": "notes", "year": 2020, "url": "{NOTES}", "credit": "CC0"}}]}}
+    ]"#)).unwrap();
+    let ttl = Duration::from_secs(3);
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+        c.relay_ttl = ttl;
+    });
+    let mut br = logged_in(&b);
+    let mut anon = B::new(&b.base);
+    let get_range = |url: &str, cookie: Option<&str>, range: Option<&str>| {
+        let mut rq = ureq::AgentBuilder::new().redirects(0).build().get(url);
+        if let Some(c) = cookie {
+            rq = rq.set("Cookie", c);
+        }
+        if let Some(r) = range {
+            rq = rq.set("Range", r);
+        }
+        let resp = match rq.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("{url}: {e}"),
+        };
+        let headers: HashMap<String, String> = resp.headers_names().iter().map(|n| (n.to_ascii_lowercase(), resp.header(n).unwrap_or("").to_string())).collect();
+        let status = resp.status();
+        let mut body = vec![];
+        resp.into_reader().read_to_end(&mut body).unwrap();
+        (status, headers, body)
+    };
+
+    // a download that resumes: the Range goes to the connector, the 206 comes back with its headers
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let (status, h, body) = get_range(&format!("{}/s/~{st}/{FILM}", b.base), Some(&br.cookie), Some("bytes=1000-"));
+    assert_eq!(status, 206);
+    assert_eq!((h.get("content-range").map(String::as_str), h.get("accept-ranges").map(String::as_str), h.get("content-type").map(String::as_str)),
+               (Some(format!("bytes 1000-{}/{}", film.len() - 1, film.len()).as_str()), Some("bytes"), Some("video/mp4")));
+    assert_eq!(h.get("content-length").map(String::as_str), Some((film.len() - 1000).to_string().as_str()));
+    assert_eq!(body, film[1000..]);
+    // an open range is asked for as one part of at most READ_CHUNK; this film is shorter than that
+    assert_eq!(seen.lock().unwrap().last().unwrap(), &(format!("/s/{FILM}"), Some("bytes=1000-4195303".to_string())));
+    let (status, _, body) = get_range(&format!("{}/s/~{st}/{FILM}", b.base), Some(&br.cookie), None);
+    assert_eq!((status, body.len()), (200, film.len()));
+    assert_eq!(seen.lock().unwrap().last().unwrap().1, None, "no Range where the download sent none");
+
+    // a link is made only by a logged-in POST with the CSRF token, for a file of the services file
+    let play = format!("/service?seller={}&name={}", enc("https://stream.lazarus-xbt.xyz"), enc("Films"));
+    assert!(br.get(&play).body.contains("Open in your player"));
+    assert_eq!(anon.post("/file-link", &[("action", "create"), ("item", FILM)]).location(), "./login");
+    assert_eq!(br.post("/file-link", &[("action", "create"), ("item", FILM)]).status, 403, "no CSRF token");
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", "https://stream.lazarus-xbt.xyz/not-listed")]);
+    assert!(br.flash_after(&r).contains("not in your list"));
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let page = br.get(&play).body;
+    let at = page.find("/r/").expect("the page shows the link");
+    let token = page[at + 3..at + 3 + 64].to_string();
+    assert!(token.bytes().all(|c| c.is_ascii_hexdigit()));
+    assert!(page.contains(&format!("value=\"{}/r/{token}\"", b.base)), "the exact address to paste");
+    assert!(page.contains("Revoke"));
+
+    // the link plays its item with no cookie, seeking included
+    let link = format!("{}/r/{token}", b.base);
+    let (status, h, body) = get_range(&link, None, Some("bytes=5000-"));
+    assert_eq!((status, h.get("content-range").cloned()), (206, Some(format!("bytes 5000-{}/{}", film.len() - 1, film.len()))));
+    assert_eq!(body, film[5000..]);
+    assert_eq!(seen.lock().unwrap().last().unwrap().0, format!("/s/{FILM}"));
+    // and only that item: the request names no other, another token is nothing, and nothing else of the UI opens with it
+    let n = seen.lock().unwrap().len();
+    let (status, _, body) = get_range(&format!("{link}?item={}", enc(NOTES)), None, None);
+    assert_eq!((status, body.len()), (200, film.len()));
+    assert_eq!(seen.lock().unwrap()[n].0, format!("/s/{FILM}"), "the token's item, whatever the request says");
+    let other = format!("{}{}", &token[..63], if token.ends_with('0') { "1" } else { "0" });
+    for refused in [format!("{}/r/{other}", b.base), format!("{link}/x"), format!("{}/r/", b.base), format!("{}/s/{NOTES}", b.base), format!("{}/s/{FILM}", b.base)] {
+        let (status, _, _) = get_range(&refused, None, None);
+        assert!(status == 404 || status == 401, "{refused}: {status}");
+    }
+    assert_eq!(seen.lock().unwrap().len(), n + 1, "nothing refused reached the connector");
+    assert_eq!(anon.get("/browse").location(), "./login", "the link is no login");
+
+    // revoked: it plays nothing
+    let r = br.act(&play, "/file-link", &[("action", "revoke"), ("item", FILM), ("token", &token)]);
+    assert!(br.flash_after(&r).contains("revoked"));
+    assert_eq!(get_range(&link, None, None).0, 404);
+    // a new one expires on its own
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let page = br.get(&play).body;
+    let at = page.find("/r/").unwrap();
+    let fresh = format!("{}/r/{}", b.base, &page[at + 3..at + 3 + 64]);
+    assert_eq!(get_range(&fresh, None, None).0, 200);
+    std::thread::sleep(ttl + Duration::from_millis(300));
+    assert_eq!(get_range(&fresh, None, None).0, 404, "expired");
+    assert!(!br.get(&play).body.contains("/r/"), "an expired link is not shown");
 }
 
 /// Connected apps: a connection made on the NWC service's admin socket, its URI shown once (in the
@@ -1674,11 +1924,11 @@ fn a_seller_added_by_address_shows_its_services_on_browse() {
     assert!(page.contains("Mike&#39;s box: Films") && page.contains("20 sat a MiB") && page.contains("0.5 sat a request"), "{page}");
     let browse = br.get("/browse").body;
     assert!(browse.contains("Mike&#39;s box: Films") && browse.contains("Mike&#39;s box: Model") && browse.contains("cat-ai"), "{browse}");
-    // the model's page gives the address apps and agents use it at; the films (an older media listing) play nowhere
+    // the model's page gives the address apps and agents use it at; the films (an older listing) are files
     let model = br.get(&format!("/service?seller={}&name={}", enc(origin), enc("Mike's box: Model"))).body;
     assert!(model.contains("value=\"https://seller.example/ai/\"") && model.contains("0.5 sat a request") && !model.contains("<video"), "{model}");
     let films = br.get(&format!("/service?seller={}&name={}", enc(origin), enc("Mike's box: Films"))).body;
-    assert!(films.contains("older media listing") && !films.contains("./play?item="), "{films}");
+    assert!(films.contains("Sintel") && films.contains(">Download</a>") && !films.contains("./play?item="), "{films}");
     // again: replaced, not doubled
     assert!(bx._app.add_seller(&format!("{origin}/"), get(&pk)).unwrap().starts_with("Updated"));
     let all = xbt_wallet_ui::services::load(&bx.data.path().join("ui/services.json")).unwrap();
@@ -2209,8 +2459,8 @@ fn the_enrolment_code_the_box_gives_is_filled_in() {
 }
 
 
-/// A box cannot buy from its own shop: its services are marked as the owner's. There is no player to
-/// preview films in: an older media listing says to share the media server as a web app.
+/// A box cannot buy from its own shop: its services are marked as the owner's, and its files are
+/// listed with nothing to buy. There is no player to preview films in.
 #[test]
 fn your_own_shop_is_marked_and_has_no_player() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2238,7 +2488,7 @@ fn your_own_shop_is_marked_and_has_no_player() {
     let browse = br.get("/browse").body;
     assert_eq!(browse.matches("Your shop</span>").count(), 1, "{browse}");
     let page = br.get(&format!("/service?seller={}&name={}", enc("https://media.example"), enc("My films"))).body;
-    assert!(page.contains("This is your shop") && page.contains("older media listing") && !page.contains("./play?"), "{page}");
+    assert!(page.contains("This is your shop") && page.contains("Sintel") && !page.contains(">Download</a>") && !page.contains("./play?"), "{page}");
     let theirs = br.get(&format!("/service?seller={}&name={}", enc("https://other.example"), enc("Their films"))).body;
     assert!(!theirs.contains("This is your shop"));
     // the old preview of an item is gone with the player, and never streams the film
@@ -2531,6 +2781,85 @@ fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     assert!(br.flash_after(&r).contains("restarts"));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     assert_eq!(c["public_url"], "https://films.example");
+}
+
+/// Files: a folder on this box, shared with no media server. The Sell page writes a route to the
+/// folder the app serves, with the files key and GET/HEAD only, priced per GB; the listing names each
+/// file with its size; the folder answers only with the key, and serves a range. A buyer's app reads
+/// the price per GB.
+#[test]
+fn a_shared_folder_is_sold_per_gb_with_each_file_listed_and_served_only_to_the_gateway() {
+    use std::io::Read;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let shared = tempfile::tempdir().unwrap();
+    std::fs::write(shared.path().join("Sintel.mp4"), vec![7u8; 2_500_000]).unwrap();
+    std::fs::create_dir(shared.path().join("Books")).unwrap();
+    std::fs::write(shared.path().join("Books/A book.epub"), b"epub").unwrap();
+    std::fs::write(shared.path().join(".hidden"), b"no").unwrap();
+    let sdir = shared.path().to_path_buf();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.files.dir = sdir.clone();
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    let page = br.get("/sell").body;
+    assert!(page.contains("value=\"files\"") && page.contains("Files shares a folder") && page.contains("Jellyfin or Plex"), "{page}");
+    // no address to type: the app serves the folder
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "files"), ("address", ""), ("price", "1000"), ("unit", "gb"), ("name", "My files")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    let route = &cfg.routes[0];
+    let files_addr = bx._srv.files_addr.expect("the folder is served");
+    assert_eq!(route.upstream.as_deref(), Some(format!("http://{files_addr}").as_str()));
+    assert_eq!((route.price.byte_msat, route.price.per_bytes), (1_000_000, 1_000_000_000));
+    assert_eq!(route.methods, ["GET", "HEAD"]);
+    let (hk, key) = route.upstream_headers[0].clone();
+    assert_eq!(hk, xbt_wallet_ui::files::KEY_HEADER);
+    let l = cfg.listing.unwrap();
+    assert_eq!(l.services[0].kind, "files");
+    let items: Vec<(&str, &str, Option<&str>)> = l.services[0].items.iter().map(|i| (i.title.as_str(), i.url.as_str(), i.credit.as_deref())).collect();
+    assert_eq!(items, [("Books/A book.epub", "https://seller.example/Books/A%20book.epub", Some("4 bytes")),
+                       ("Sintel.mp4", "https://seller.example/Sintel.mp4", Some("2.5 MB"))], "each file with its size, no hidden ones");
+    let page = br.get("/sell").body;
+    assert!(page.contains("2 files in the folder") && page.contains("Update the file list"), "{page}");
+    // a new file shows once the list is updated
+    std::fs::write(shared.path().join("New.txt"), b"hi").unwrap();
+    let r = br.act("/sell", "/sell", &[("action", "files_refresh")]);
+    assert!(br.flash_after(&r).contains("file list is updated"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(xbt_gateway::config::Config::from_json(&c).unwrap().listing.unwrap().services[0].items.len(), 3);
+    // the folder: nothing without the key, a range with it
+    let get = |path: &str, key: Option<&str>, range: Option<&str>| {
+        let mut rq = ureq::get(&format!("http://{files_addr}{path}"));
+        if let Some(k) = key { rq = rq.set(xbt_wallet_ui::files::KEY_HEADER, k); }
+        if let Some(r) = range { rq = rq.set("Range", r); }
+        match rq.call() { Ok(r) => r, Err(ureq::Error::Status(_, r)) => r, Err(e) => panic!("{e}") }
+    };
+    assert_eq!(get("/Sintel.mp4", None, None).status(), 403);
+    assert_eq!(get("/Sintel.mp4", Some("wrong"), None).status(), 403);
+    assert_eq!(get("/.hidden", Some(&key), None).status(), 404);
+    assert_eq!(get("/../etc/passwd", Some(&key), None).status(), 404);
+    let r = get("/Sintel.mp4", Some(&key), Some("bytes=100-199"));
+    assert_eq!((r.status(), r.header("Content-Range").map(str::to_string), r.header("Content-Type").map(str::to_string)),
+               (206, Some("bytes 100-199/2500000".into()), Some("video/mp4".into())));
+    let mut body = vec![];
+    r.into_reader().read_to_end(&mut body).unwrap();
+    assert_eq!(body.len(), 100);
+    assert_eq!(get("/", None, None).status(), 204, "the Sell page's reachability check");
+    // a buyer reads the price per GB
+    assert_eq!(xbt_wallet_ui::services::price_words(&json!({"byte_msat": "1000000", "per_bytes": "1000000000"})), "1000 sat a GB");
 }
 
 /// A direct shop (no web address, reached by its key) sharing its media server as a web app: the
