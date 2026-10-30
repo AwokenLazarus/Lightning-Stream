@@ -67,6 +67,10 @@ await shot("02-after-login");
 res.after_login = await ev("location.href"); step(`after login: ${res.after_login}`);
 const home = await waitFor("!!document.querySelector('.card, .itemsContainer .card')", 20000);
 res.home = home; step(`home shows cards: ${home}`); await shot("03-home");
+// Each run starts the film from the beginning: an earlier run with the same buyer's account left a
+// resume point (or a "watched" mark), and Play would resume there, near the end of a short clip.
+res.reset_progress = await ev(`(async()=>{try{const a=window.ApiClient; await a.markUnplayed(a.getCurrentUserId(), '${ITEM}'); return true}catch(e){return String(e)}})()`);
+step(`progress reset: ${res.reset_progress}`);
 step("open the 4K film"); await ev(`location.hash = '#/details?id=${ITEM}'`); await sleep(6000); await shot("04-details");
 // The play button of the details page on show: Jellyfin keeps earlier pages (home, with its
 // "Continue watching" cards) in the document, hidden, so the first .btnPlay may be another film's.
