@@ -10,6 +10,8 @@
 #     (keep it on the LAN) and hashtakers' apps on 23341 (a port forward or tunnel makes it public);
 #   * the built-in Stream relay (profile "relay", off unless LS_RELAY=1): public TCP 443 and UDP 7842,
 #     on its own network (not the host's), and idle until the owner switches it on in the app.
+#   * the VPN service (profile "vpn", off unless LS_VPN=1): UDP 51820 for the owner's devices'
+#     WireGuard (keep it on the LAN), on its own network (not the host's);
 #   * the AI endpoint (33540), only if the owner sets LS_AI_BIND to a LAN address in .env: programs
 #     on the LAN then use AI sellers through it, each with a key made on the AI page.
 # The UI asks for the password in .env (LS_UI_PASSWORD), set at install. Of the Lightning node's files
@@ -56,7 +58,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay,vpn
       XBT_INIT_NODE_RPC_USER: ${LS_NODE_RPC_USER:?set LS_NODE_RPC_USER in .env, the XBT node's RPC user}
       XBT_INIT_NODE_RPC_PASS: ${LS_NODE_RPC_PASS:?set LS_NODE_RPC_PASS in .env, the XBT node's RPC password}
       XBT_INIT_UI_PASSWORD: ${LS_UI_PASSWORD:?set LS_UI_PASSWORD in .env, the app's login password}
@@ -148,6 +150,11 @@ services:
       # the built-in Stream relay's settings and status (Settings → Stream relays)
       XBT_UI_RELAY_DIR: /data/run/relay
       XBT_UI_RELAY_STATUS: /data/run/relay-status/status.json
+      XBT_UI_VPN_DIR: /data/run/vpn
+      XBT_UI_VPN_STATUS_DIR: /data/run/vpn-status
+      # where the shop's gateway reaches the VPN service's tunnel endpoint (published on this machine's loopback only)
+      XBT_UI_VPN_TUNNEL_UPSTREAM: http://127.0.0.1:${LS_VPN_TUNNEL_PORT:-51880}
+      XBT_UI_VPN_ENDPOINT: ${LS_VPN_ENDPOINT:-}
       XBT_UI_RELAY_START_HINT: "in the folder you installed it to, run: docker compose --profile relay up -d (or run install.sh again and answer 1 to the relay)"
       # AI: the address programs use (served by the connector) and the files the AI page shares with it
       XBT_UI_AI_ENDPOINT: ${LS_AI_ADDRESS:-http://127.0.0.1:33540/v1}
@@ -166,6 +173,8 @@ services:
       - ${LS_DATA_DIR}/run/enroll:/data/run/enroll:ro
       - ${LS_DATA_DIR}/run/relay:/data/run/relay
       - ${LS_DATA_DIR}/run/relay-status:/data/run/relay-status:ro
+      - ${LS_DATA_DIR}/run/vpn:/data/run/vpn
+      - ${LS_DATA_DIR}/run/vpn-status:/data/run/vpn-status:ro
       - *lightning-cert
 
   # One-shot, run by install.sh (`docker compose --profile setup run --rm -T node-keys < admin.macaroon`): has the
@@ -288,3 +297,36 @@ services:
       - ${LS_DATA_DIR}/stream-relay:/data/stream-relay
       - ${LS_DATA_DIR}/run/relay:/data/run/relay:ro
       - ${LS_DATA_DIR}/run/relay-status:/data/run/relay-status
+
+  # The VPN service (docs/VPN-EXITS.md): the WireGuard endpoint the owner's devices pair with (UDP
+  # 51820, LS_VPN_PORT), and this box's exit if the owner offers one on the VPN page. Profile "vpn":
+  # started only with LS_VPN=1. Userspace WireGuard and TCP/IP: no TUN device and no capabilities. It
+  # runs on Docker's own network, so the exit never reaches this machine's own services, and restarts
+  # itself when the owner changes the devices or the exit. Exits are found on, and an offered exit is
+  # announced to, the Nostr relays of LS_RELAYS; an exit is announced only with its country set
+  # (LS_VPN_REGION, two letters).
+  vpn:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-vpn:local
+    profiles: ["vpn"]
+    network_mode: bridge
+    ports:
+      - "${LS_VPN_PORT:-51820}:51820/udp"
+      # the exit's tunnel endpoint, for the shop's gateway on this machine only
+      - "127.0.0.1:${LS_VPN_TUNNEL_PORT:-51880}:51880/tcp"
+    stop_grace_period: 10s
+    environment:
+      XBT_VPN_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
+      XBT_VPN_REGION: ${LS_VPN_REGION:-}
+      # priced exits are paid through the owner's wallet: its socket, and the dir paid tunnels are streamed through
+      B2_SIGNER_SOCK: /data/run/signer/signer.sock
+      B2_STREAM_DIR: /data/run/signer/streams
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
+      XBT_VPN_TUNNEL_LISTEN: 0.0.0.0:51880
+    volumes:
+      - ${LS_DATA_DIR}/vpn:/data/vpn
+      - ${LS_DATA_DIR}/run/vpn:/data/run/vpn:ro
+      - ${LS_DATA_DIR}/run/vpn-status:/data/run/vpn-status
+      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/signer/streams:/data/run/signer/streams
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro

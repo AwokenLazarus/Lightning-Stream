@@ -43,6 +43,10 @@
 #            and the progress is the buyer's. Needs JELLYFIN_URL, JF_ADMIN_KEY_FILE, JF_LIBRARY,
 #            JF_ITEM, node and google-chrome. jellyfin_link and jellyfin_relay: the same, the shop
 #            reached only over its iroh link, directly or through our relay
+#   vpn      (by name only) a VPN exit sold as a Stream service: the exit's VPN service behind the
+#            seller's gateway (/vpn/, WebSockets priced per byte), and a buyer's paid tunnel opened by
+#            the wallet carrying a 10 MiB public download: whole, interim receipts checked with no
+#            fault, the money agreeing. Ports BASE+17 to BASE+19
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab
@@ -113,6 +117,8 @@ nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer 
 case " $* " in *" jellyfin"*)
   nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p lightning-stream --bin lightning-stream ;;
 esac
+# a VPN exit sold as a service (the vpn check, run by name only) needs the VPN service
+case " $* " in *" vpn "*|*" vpn") nice -n 19 cargo build -q -j4 --release --locked -p xbt-vpn --bin xbt-vpn ;; esac
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 # the lab and the node binaries: cloned and built when missing

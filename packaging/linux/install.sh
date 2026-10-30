@@ -112,6 +112,22 @@ else
 fi
 
 echo
+echo "VPN: your devices (phone, laptop, TV) send their traffic through VPN exits other people offer,"
+echo "paid as you use it, with a WireGuard config the app makes for each one; you can also offer this"
+echo "box as an exit. Devices reach it on UDP ${LS_VPN_PORT:-51820} on your LAN (docs/VPN-EXITS.md)."
+ask LS_VPN "Install it? 1 for yes, 0 for no" "0"
+if [ "$LS_VPN" = 1 ]; then
+  COMPOSE_PROFILES=${COMPOSE_PROFILES:+$COMPOSE_PROFILES,}vpn
+  LS_VPN_PORT=${LS_VPN_PORT:-51820}
+  lan=${LS_LAN_HOST:-$(hostname -I 2>/dev/null | awk '{print $1}')}
+  ask LS_VPN_ENDPOINT "The address your devices reach this machine on (LAN address:port)" "${lan:-127.0.0.1}:$LS_VPN_PORT"
+  ask LS_VPN_REGION "To offer this box as an exit later, its country (two letters; empty: not announced)" ""
+else
+  # shellcheck disable=SC2034  # written to .env by name, below
+  LS_VPN=0 LS_VPN_ENDPOINT='' LS_VPN_REGION=''
+fi
+
+echo
 echo "Stream relay: help other people's apps connect when their routers block it (docs/RUN-A-RELAY.md)."
 echo "It takes this machine's public port 443, so it suits a server with a public address. You switch it"
 echo "on, with your domain name, in the app afterwards (Settings → Stream relays); this only installs it."
@@ -143,7 +159,7 @@ mkdir -p "$LS_DATA_DIR"
   {
     echo "# Lightning Stream: written by install.sh on $(date -u +%Y-%m-%d). It holds passwords: keep it private."
     for k in COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT LS_NODE_RPC_USER \
-             LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER \
+             LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_VPN LS_VPN_PORT LS_VPN_ENDPOINT LS_VPN_REGION LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER \
              LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_APP_PORTS LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS; do
       v=${!k:-}
       case $v in *"'"*) die "$k may not contain a single quote" ;; esac
@@ -164,7 +180,7 @@ docker compose config -q || die "the settings do not work together (docker compo
 # --- 4. the images, the keys, the start ---------------------------------------------------------------
 if [ "${LS_SKIP_PULL:-0}" != 1 ]; then
   say "downloading the app's images (pinned by digest)"
-  docker compose --profile setup --profile hashmaker --profile relay pull -q
+  docker compose --profile setup --profile hashmaker --profile relay --profile vpn pull -q
 fi
 
 # the admin macaroon is offered where lnd keeps it; empty skips this step (the app's pages take narrow ones later)

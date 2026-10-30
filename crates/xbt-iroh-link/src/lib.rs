@@ -39,6 +39,24 @@ pub const ALPN: &[u8] = b"xbt-stream/http/1";
 /// handshake and messages) between a hashtaker's app and a hashmaker's app.
 pub const ALPN_HASHLINK: &[u8] = b"xbt-stream/hashlink/0";
 
+/// The VPN exit's protocol: IP packets in QUIC datagrams (a length-prefixed stream when the path
+/// carries no datagrams) between a buyer's app and a seller's exit.
+pub const ALPN_VPN: &[u8] = b"xbt-stream/vpn/0";
+
+/// A VPN first hop's protocol (two hops): each stream names an exit, and the hop joins it to a
+/// stream on its own connection to that exit, carrying bytes it cannot read.
+pub const ALPN_VPN_HOP: &[u8] = b"xbt-stream/vpn-hop/0";
+
+/// An exit's protocol for flows that come through a first hop: each stream is a TLS session between
+/// the buyer and the exit (each authenticated by its link key), inside which runs one flow.
+pub const ALPN_VPN_SEALED: &[u8] = b"xbt-stream/vpn-sealed/0";
+
+/// A connection on the link, for a protocol that uses it directly (datagrams) rather than through
+/// TCP ports.
+pub use iroh::endpoint::Connection as LinkConnection;
+/// The streams of a [`LinkConnection`].
+pub use iroh::endpoint::{RecvStream as LinkRecvStream, SendDatagramError, SendStream as LinkSendStream};
+
 /// The suffix of a seller's link host name. `.invalid` never resolves through DNS.
 pub const HOST_SUFFIX: &str = ".link.invalid";
 
@@ -159,6 +177,12 @@ fn watch(conn: Connection, paths: Arc<Mutex<HashMap<EndpointId, Path>>>, detail:
     });
 }
 
+/// [`watch`], on the link's own runtime (for a caller on another runtime).
+fn watch_on(rt: &tokio::runtime::Runtime, conn: Connection, paths: Arc<Mutex<HashMap<EndpointId, Path>>>, detail: bool) {
+    let _guard = rt.enter();
+    watch(conn, paths, detail);
+}
+
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -177,6 +201,12 @@ impl Link {
     /// Starts a link for another protocol than HTTP (e.g. [`ALPN_HASHLINK`]): its streams are still
     /// joined to TCP connections, but a peer speaking another protocol is refused in the handshake.
     pub fn start_alpn(secret: [u8; 32], opts: Options, alpn: &'static [u8]) -> io::Result<Arc<Link>> {
+        Self::start_alpns(secret, opts, alpn, &[alpn])
+    }
+
+    /// Like [`Link::start_alpn`], serving several protocols on one endpoint (each accepted
+    /// connection's [`LinkConnection::alpn`] says which); `alpn` is the one it opens by default.
+    pub fn start_alpns(secret: [u8; 32], opts: Options, alpn: &'static [u8], serve: &[&'static [u8]]) -> io::Result<Arc<Link>> {
         let Options { relays, serving, private, lookup } = opts;
         if private && matches!(relays, Relays::None) {
             return Err(io_err("private mode needs a relay"));
@@ -197,7 +227,7 @@ impl Link {
         };
         let mut b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&secret)).relay_mode(relay_mode);
         if serving {
-            b = b.alpns(vec![alpn.to_vec()]);
+            b = b.alpns(serve.iter().map(|a| a.to_vec()).collect());
         }
         if private {
             b = b.clear_ip_transports();
@@ -275,6 +305,65 @@ impl Link {
             l.expect(parse_id(endpoint_id_hex)?, nostr_pubkey_hex);
         }
         Ok(())
+    }
+
+    /// The runtime the link runs on, for a protocol that drives connections itself.
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
+    }
+
+    /// A seller's link that hands each accepted connection to `handler` (after recording its path),
+    /// for a protocol that uses the connection directly, such as [`ALPN_VPN`].
+    pub fn accept_with<F, Fut>(self: &Arc<Self>, handler: F)
+    where
+        F: Fn(Connection) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let ep = self.ep.clone();
+        let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
+        let handler = Arc::new(handler);
+        self.rt.spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let (paths, handler) = (paths.clone(), handler.clone());
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    watch(conn.clone(), paths, detail);
+                    handler(conn).await;
+                });
+            }
+        });
+    }
+
+    /// A connection to the peer with this key, for the link's protocol, using the hints learned for
+    /// it ([`Link::learn`]) and the address lookup.
+    pub fn connect_conn(self: &Arc<Self>, endpoint_id_hex: &str) -> io::Result<Connection> {
+        let addr = self.addr_of(parse_id(endpoint_id_hex)?);
+        let (ep, alpn) = (self.ep.clone(), self.alpn);
+        let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
+        self.rt.block_on(async move {
+            let conn = ep.connect(addr, alpn).await.map_err(io_err)?;
+            watch(conn.clone(), paths, detail);
+            Ok(conn)
+        })
+    }
+
+    /// Like [`Link::connect_conn`], from inside a task (it does not block a runtime thread).
+    pub async fn connect_conn_async(self: &Arc<Self>, endpoint_id_hex: &str) -> io::Result<Connection> {
+        self.connect_conn_alpn(endpoint_id_hex, self.alpn).await
+    }
+
+    /// A connection speaking `alpn` (another of the protocols the peer serves).
+    pub async fn connect_conn_alpn(self: &Arc<Self>, endpoint_id_hex: &str, alpn: &[u8]) -> io::Result<Connection> {
+        let addr = self.addr_of(parse_id(endpoint_id_hex)?);
+        let conn = self.ep.connect(addr, alpn).await.map_err(io_err)?;
+        watch_on(&self.rt, conn.clone(), self.paths.clone(), self.detail.load(Ordering::Relaxed));
+        Ok(conn)
+    }
+
+    /// Where this link was told a peer can be found ([`Link::learn`]), for a first hop that has to
+    /// find it too.
+    pub fn hints_for(&self, endpoint_id_hex: &str) -> Hints {
+        parse_id(endpoint_id_hex).ok().and_then(|id| lock(&self.hints).get(&id).cloned()).unwrap_or_default()
     }
 
     /// Remembers where a seller can be found, from its checked listing.

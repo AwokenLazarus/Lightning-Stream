@@ -38,6 +38,7 @@ tmpfs `/tmp`.
   gateway/         agp  uid 10007  0700  the seller gateway's state: receipt.key, sessions, the journal
   hashrate/        agp  uid 10010  0700  p2p-hash: the hasher's link and Nostr keys, the renter's key and its saved DATUM Gateway address
   stream-relay/    agp  uid 10016  0700  the built-in Stream relay: its Let's Encrypt certificates (certs/) and attempt log
+  vpn/             agp  uid 10018  0700  the VPN service: its keys (WireGuard, the exit's link, Nostr) and category lists (lists/)
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
   cmpd/            cmp  uid 10012  0700  device runtime state, secrets/
   cmpd-cache/      cmp  uid 10012  0700  the model span cache: LARGE, its own mount (CMP_CACHE_DIR), safe to prune
@@ -62,6 +63,10 @@ tmpfs `/tmp`.
                    written by the UI's Stream relays page, read by the built-in relay
   run/relay-status/ uid 10016, gid 10017 (xbt-relay-status), 0750: status.json (0640), written by the relay,
                    read by the UI; the group has the relay and the UI in it
+  run/vpn/         uid 10005, gid 10018 (xbt-vpn), 0750: devices.json and exit.json (0640), written by the UI's
+                   VPN pages, read by the VPN service
+  run/vpn-status/  uid 10018, gid 10019 (xbt-vpn-status), 0750: endpoint.json, status.json, exit-status.json
+                   (0640), written by the VPN service, read by the UI; the group has the service and the UI in it
   run/ai/          uid 10005, gid 10014 (xbt-ai), 0770: the AI endpoint's files (docs/INFERENCE.md):
                    credentials.json (0660), the store of AI keys and local links, edited by the UI's AI page and
                    booked by the connector; sellers.json (0640), written by the AI page; state.json (0640), the
@@ -123,6 +128,8 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10010 | xbt-hashrate | xbt-hashlink (the hasher's and the renter's services; in xbt-signer's group for the renter's payments) |
 | 10016 | xbt-stream-relay | xbt-stream-relay (the built-in Stream relay, off until switched on) |
 | 10017 | (group xbt-relay-status only) | |
+| 10018 | xbt-vpn | xbt-vpn (the VPN service: the owner's devices' WireGuard endpoint, and an exit if offered) |
+| 10019 | (group xbt-vpn-status only) | |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |

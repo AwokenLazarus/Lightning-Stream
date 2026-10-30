@@ -8,11 +8,18 @@
 //! the balance stops covering the next byte and no refill comes, both connections are closed. The
 //! last receipt, kept with the session's finals, counts what was charged; its body hash is that of
 //! the bytes the service sent.
+//!
+//! While it is open, the seller signs **interim receipts** (`xbt402::ticket::interim_body_hash`):
+//! one each time what it charged grows by the price of [`INTERIM_BYTES`], or every
+//! [`INTERIM_EVERY`] while bytes pass, none while it is idle. Each counts the bytes passed each
+//! way and what they cost so far. The latest one of each open answer is listed in `status`
+//! (`interim`), so the buyer can check the seller's count against its own as the answer runs, not
+//! only at its end (docs/VPN-EXITS.md).
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use xbt_svc::http::{Reply, Request, Response, Upgraded};
@@ -29,6 +36,21 @@ pub(super) fn asks_upgrade(req: &Request) -> bool {
         req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).any(|(_, v)| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
     };
     req.method == "GET" && has("upgrade", "websocket") && has("connection", "upgrade")
+}
+
+/// An interim receipt goes each time the answer's charge grows by the price of this many bytes,
+pub(crate) const INTERIM_BYTES: u64 = 1 << 20;
+/// or this long after the last one while bytes pass.
+pub(crate) const INTERIM_EVERY: Duration = Duration::from_secs(10);
+
+/// An open answer's count for its interim receipts.
+struct Counted {
+    part: u64,
+    up: u64,
+    down: u64,
+    /// What the last interim receipt charged, and when it was signed.
+    charged: u64,
+    at: Instant,
 }
 
 /// The service's headers of a `101` that go to the buyer.
@@ -134,6 +156,8 @@ impl Gateway {
     fn carry_paid(&self, m: Metered, buyer: TcpStream, early: Vec<u8>, up: TcpStream, up_early: Vec<u8>, _open: OpenResponse) {
         let meter = Mutex::new(Meter::new(m.route.price));
         let hash = Mutex::new(Sha256::new());
+        let step = m.route.price.for_bytes(INTERIM_BYTES).unwrap_or(u64::MAX).max(1);
+        let mut counted = Counted { part: 0, up: 0, down: 0, charged: m.at_head, at: Instant::now() };
         // how many of `want` bytes may go now, paid for; None: none, the stream ends
         let pay = |want: u64| -> Option<u64> {
             let mut mt = meter.lock().unwrap_or_else(|p| p.into_inner());
@@ -147,12 +171,36 @@ impl Gateway {
         let ended = join(buyer, early, up, up_early, &pay, &mut |from_service, bytes| {
             if from_service {
                 hash.lock().unwrap_or_else(|p| p.into_inner()).update(bytes);
+                counted.down = counted.down.saturating_add(bytes.len() as u64);
+            } else {
+                counted.up = counted.up.saturating_add(bytes.len() as u64);
+            }
+            // signed for the bytes counted here, never for a chunk paid for and still being written
+            // (the other direction's write may be blocked on it): the buyer checks the charge against
+            // these counts
+            let paid = m.at_head.saturating_add(meter.lock().unwrap_or_else(|p| p.into_inner()).charged());
+            let counted_cost = m.at_head.saturating_add(m.route.price.for_bytes(counted.up.saturating_add(counted.down)).unwrap_or(u64::MAX));
+            let charged = paid.min(counted_cost);
+            if charged > counted.charged && (charged - counted.charged >= step || counted.at.elapsed() >= INTERIM_EVERY) {
+                counted.part += 1;
+                (counted.charged, counted.at) = (charged, Instant::now());
+                let body = xbt402::ticket::interim_body_hash(counted.part, counted.up, counted.down);
+                if let Some(r) = self.receipt(&m.session, m.seq, charged, &m.digest, m.status, &body) {
+                    self.lock().interim.entry(m.session.clone()).or_default().insert(m.seq, r);
+                }
             }
         });
         let charged = m.at_head.saturating_add(meter.lock().unwrap_or_else(|p| p.into_inner()).charged());
         let digest = hex::encode(hash.into_inner().unwrap_or_else(|p| p.into_inner()).finalize());
         let last = self.receipt(&m.session, m.seq, charged, &m.digest, m.status, &digest);
         let mut st = self.lock();
+        // closed: its last receipt replaces the interim ones
+        if let Some(open) = st.interim.get_mut(&m.session) {
+            open.remove(&m.seq);
+            if open.is_empty() {
+                st.interim.remove(&m.session);
+            }
+        }
         if let Some(mut r) = last {
             r["bytes"] = meter.lock().unwrap_or_else(|p| p.into_inner()).bytes().into();
             r["complete"] = ended.is_ok().into();

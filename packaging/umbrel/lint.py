@@ -51,11 +51,9 @@ REGISTRY = "ghcr.io/awokenlazarus"
 # the one image of this store that is not published: the stand-in XBT node (lazarus-xbt-knots), amd64-only, which
 # a box with Paul's Knots BLAKE2b Companion never installs
 LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
-# the connector and xbt-hashlink have no line in images.lock yet. oci_build.sh --load tags them
+# the connector, xbt-hashlink and xbt-vpn have no line in images.lock yet. oci_build.sh --load tags them
 # <image>:0.1.0. A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
-UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink):0\.1\.0$")
-# the stream directory the connector writes, inside the signer's socket dir. Read-write, and the
-# only extra mount it may have. It does not get the signer's state.
+UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink|xbt-vpn):0\.1\.0$")
 # Umbrel's shared Downloads (the Files app's Downloads), read-only, for the wallet's Files service only.
 # umbrelOS 1.x rewrites this compatibility path to ${UMBREL_ROOT}/home/Downloads; the app must declare
 # the STORAGE_DOWNLOADS permission (umbrel-apps .agents/skills/umbrel-package-app/SKILL.md).
@@ -66,6 +64,9 @@ def base_of(img):
     """An image reference's name: `<registry>/<name>:<tag>@<digest>` or a local `<name>:<tag>`."""
     m = REF.match(img)
     return m["name"] if m else img.split("/")[-1].split(":")[0]
+
+# the stream directory the connector (and the VPN service, for paid tunnels) writes, inside the signer's
+# socket dir. Read-write, and the only extra mount either may have. Neither gets the signer's state.
 STREAM_MOUNT = "${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams"
 # image -> (component sub-dir or None, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
@@ -77,7 +78,8 @@ AGENTPAY = {
     "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui", "shops"}),
     # the setup pages write run/ln (the rail macaroon), run/gateway (the gateway's config and macaroons)
     # and run/hashrate (the hasher's settings); the AI page writes run/ai (keys, sellers)
-    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "shops", "ai"}, {"signer", "enroll"}),
+    # and run/vpn (the devices and exit the VPN pages set), reading the VPN service's status
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "shops", "ai", "vpn"}, {"signer", "enroll", "vpn-status"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
     # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT. The AI
     # endpoint books the keys' spend and the sellers' health in run/ai, shared by group with the UI
@@ -85,6 +87,10 @@ AGENTPAY = {
     # the hasher and the renter: their keys and state; the settings and token read-only; the renter
     # also the signer's socket, read-only
     "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),
+    # the VPN service: its keys and lists; the settings read-only; its status for the UI. Priced exits
+    # are paid through the owner's wallet: the signer's socket and the shops read-only, and the stream
+    # sockets are STREAM_MOUNT (each paid tunnel's socket is made there)
+    "xbt-vpn": ("vpn", {"vpn-status"}, {"vpn", "signer", "shops"}),
 }
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
@@ -321,7 +327,7 @@ def main() -> int:
                 allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"} if comp else set()
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{r}:/data/run/{r}" for r in own_runs}
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{p}:/data/run/{p}:ro" for p in peers}
-                if base == "lightning-stream":
+                if base in ("lightning-stream", "xbt-vpn"):
                     allowed.add(STREAM_MOUNT)
                 if base in DOWNLOADS_IMAGES:
                     allowed.add(DOWNLOADS_MOUNT)

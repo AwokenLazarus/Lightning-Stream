@@ -42,6 +42,7 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::GATEWAY, user: "xbt-gateway", uid: 10007 },
     Component { name: crate::HASHRATE, user: "xbt-hashrate", uid: 10010 },
     Component { name: crate::STREAM_RELAY, user: "xbt-stream-relay", uid: STREAM_RELAY_UID },
+    Component { name: crate::VPN, user: "xbt-vpn", uid: VPN_UID },
 ];
 
 /// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
@@ -78,15 +79,34 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     // the built-in Stream relay: the owner's settings in, its status out
     SharedDir { dir: crate::RUN_RELAY, writer: crate::UI, reader: crate::STREAM_RELAY, gid: STREAM_RELAY_UID, mode: 0o750 },
     SharedDir { dir: crate::RUN_RELAY_STATUS, writer: crate::STREAM_RELAY, reader: crate::UI, gid: RELAY_STATUS_GID, mode: 0o750 },
+    // the VPN service: the devices and exit the owner sets in, its status out
+    SharedDir { dir: crate::RUN_VPN, writer: crate::UI, reader: crate::VPN, gid: VPN_UID, mode: 0o750 },
+    SharedDir { dir: crate::RUN_VPN_STATUS, writer: crate::VPN, reader: crate::UI, gid: VPN_STATUS_GID, mode: 0o750 },
     // both write here: the credential store is booked by the endpoint and edited by the UI's AI page
     SharedDir { dir: crate::RUN_AI, writer: crate::UI, reader: crate::SIGNER, gid: AI_GID, mode: 0o770 },
+    // the stream sockets: the VPN service makes the socket each paid tunnel is streamed to here, and the
+    // signer (whose dir it is) connects to it. Only where the VPN is installed; else the signer's alone (0750)
+    SharedDir { dir: crate::RUN_STREAMS, writer: crate::SIGNER, reader: crate::VPN, gid: STREAMS_GID, mode: 0o770 },
 ];
+
+/// A group only: the signer and the VPN service, for the stream sockets' dir (`run/signer/streams`).
+pub const STREAMS_GID: u32 = 10020;
+
+/// Whether `dir` is a shared dir with both its writer and its reader installed (its owners and mode
+/// are then the shared dir's, not a socket dir's).
+fn shared_here(dir: &str, has: &dyn Fn(&str) -> bool) -> bool {
+    SHARED_DIRS.iter().any(|sd| sd.dir == dir && has(sd.writer) && has(sd.reader))
+}
 
 /// The built-in Stream relay's user and group (10011 to 10013 are xbt-compute's, 10014 is the AI
 /// endpoint's group).
 pub const STREAM_RELAY_UID: u32 = 10016;
 /// A group only: the relay and the UI, for the relay's status file.
 pub const RELAY_STATUS_GID: u32 = 10017;
+/// The VPN service's user and group.
+pub const VPN_UID: u32 = 10018;
+/// A group only: the VPN service and the UI, for the service's status files.
+pub const VPN_STATUS_GID: u32 = 10019;
 
 /// The group `run/shops/` is read by: the signer's own, whose user the connector runs as and whose
 /// group the MCP is in.
@@ -361,6 +381,7 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
     }
     for (dir, server) in RUN_DIRS {
         if let Some(c) = comps.iter().find(|c| c.name == *server) {
+            // made here either way (a socket dir's parent first); a shared one gets its group and mode below
             dirs.push(own_dir(&run.join(dir), uid_of(c), 0o750, true)?);
         }
     }
@@ -458,7 +479,7 @@ pub fn check(root: &Path, names: &[String]) -> Value {
             }
         }
         for (dir, server) in RUN_DIRS {
-            if *server == c.name {
+            if *server == c.name && !shared_here(dir, &|n: &str| names.iter().any(|x| x == n)) {
                 want(root.join("run").join(dir), c.uid, 0o750);
             }
         }
@@ -481,7 +502,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016), ("vpn", 10018)]);
     }
 
     #[test]
@@ -526,6 +547,14 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(root.join("run/signer")).unwrap().mode() & 0o777, 0o750);
         assert_eq!(std::fs::metadata(root.join("run/signer/streams")).unwrap().mode() & 0o777, 0o750, "the stream sockets' dir, the signer's");
+        // with the VPN service installed, it makes its paid tunnels' sockets there too: the dir is the
+        // signer's and the stream group's (the signer and the VPN service only)
+        let with_vpn: Vec<String> = ["signer", "mcp", "ui", "vpn"].iter().map(|s| s.to_string()).collect();
+        let rv = init_as(&root, &with_vpn, &prov, uid).unwrap();
+        assert_eq!(rv["ok"], true, "{rv}");
+        assert_eq!(std::fs::metadata(root.join("run/signer/streams")).unwrap().mode() & 0o777, 0o770);
+        assert_eq!(std::fs::metadata(root.join("run/signer")).unwrap().mode() & 0o777, 0o750, "the signer's socket dir stays its own");
+        init_as(&root, &names, &prov, uid).unwrap();
         // a second run keeps the token and rewrites nothing
         let r2 = init_as(&root, &names, &prov, uid).unwrap();
         assert!(r2["secrets"].as_array().unwrap().iter().all(|s| s["result"] == "unchanged"), "{r2}");

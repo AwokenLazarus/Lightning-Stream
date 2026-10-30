@@ -47,7 +47,8 @@ PKGS = {
     "lightning-stream": (["main", "startos"], {"init": ("xbt-init", "0:0"), "signer": ("xbt-signer", "xbt-signer"),
                                                "witness": ("xbt-anchor-witness", "xbt-anchor-witness"), "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"),
                                                "ui": ("xbt-wallet-ui", "xbt-wallet-ui"), "gateway": ("xbt-gateway", "xbt-gateway"),
-                                               "connector": ("lightning-stream", "xbt-signer"), "hashlink": ("xbt-hashlink", "xbt-hashrate")}),
+                                               "connector": ("lightning-stream", "xbt-signer"), "hashlink": ("xbt-hashlink", "xbt-hashrate"),
+                                               "vpn": ("xbt-vpn", "xbt-vpn")}),
 }
 probs, rep = [], {}
 for (pkg, (volumes, IMAGES)) in PKGS.items():

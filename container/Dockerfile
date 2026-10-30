@@ -119,6 +119,21 @@ ENTRYPOINT ["/usr/bin/xbt-init"]
 CMD ["init"]
 HEALTHCHECK NONE
 
+# The VPN service (docs/VPN-EXITS.md): the WireGuard endpoint the owner's devices pair with, and this
+# box's exit if the owner offers one. Userspace WireGuard and a userspace TCP/IP stack: no TUN device,
+# no extra capabilities. It reads the devices and exit the UI's VPN pages write and writes its status
+# for them.
+FROM base AS xbt-vpn
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-vpn /usr/bin/xbt-vpn
+# the country table exits' regions are checked against, shipped so a box needs no download (CC BY 4.0)
+COPY --chmod=0444 geo/dbip-country-lite.csv.gz geo/ATTRIBUTION /usr/share/xbt-vpn/
+USER xbt-vpn
+ENV XBT_VPN_DIR=/data/run/vpn XBT_VPN_STATUS=/data/run/vpn-status XBT_VPN_KEYS=/data/vpn XBT_VPN_WG_LISTEN=0.0.0.0:51820 XBT_VPN_TUNNEL_LISTEN=0.0.0.0:51880 RUST_LOG=warn NO_COLOR=1
+ENTRYPOINT ["/usr/bin/xbt-vpn", "serve"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-vpn", "healthcheck"]
+
 # `--build-arg IMAGE=<name>` without `--target` builds that one image (the ARG is at the top): for a
 # builder with no target option. scripts/oci_build.sh uses --target.
 FROM ${IMAGE} AS selected

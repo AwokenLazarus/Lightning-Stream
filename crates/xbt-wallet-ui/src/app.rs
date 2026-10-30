@@ -33,6 +33,8 @@ mod relay_pages;
 pub(crate) mod hashrate;
 #[path = "inference_page.rs"]
 pub(crate) mod inference_page;
+#[path = "vpn_page.rs"]
+pub(crate) mod vpn_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -208,6 +210,13 @@ impl App {
         let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
         let relays = crate::relay::RelayLinks::new(cfg.relay_ttl);
+        // a tunnel secret an older build wrote owner-only is given to the VPN service's group, so an
+        // exit offered before this upgrade isn't left refusing every buyer
+        match vpn_page::migrate_tunnel_secret(&cfg.vpn.dir) {
+            Ok(true) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret is now readable by the VPN service"),
+            Ok(false) => {}
+            Err(e) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret was left as it was: {e}"),
+        }
         Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None), nostr, relay_net, platform,
                          apps: Default::default() }))
     }
@@ -373,6 +382,8 @@ impl App {
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
             "/ai" => self.ai_page(&ctx),
+            "/vpn" => self.vpn_page(&ctx),
+            "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/relays" => self.relays_page(&ctx, &req.query),
             "/app" => self.app_page(&ctx, &req.query),
@@ -541,6 +552,8 @@ impl App {
             "/hashrate" => self.hashrate_post(ctx, f),
             "/ai" => self.ai_post(ctx, f),
             "/file-link" => self.file_link(ctx, f),
+            "/vpn" => self.vpn_post(ctx, f),
+            "/sell-vpn" if self.cfg.sell => self.sell_vpn_post(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
             "/relays-prefs" => self.relays_prefs(ctx, f),
             "/relays-publish" => self.relays_publish(ctx, f),

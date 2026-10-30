@@ -5,6 +5,7 @@
 #   lightning-stream (the connector; not in packaging/images.lock until scripts/oci_publish.sh records it),
 #   xbt-hashlink (p2p-hash: the hasher's and the renter's services; likewise)
 #   xbt-stream-relay (the built-in Stream relay, off until the owner switches it on; likewise)
+#   xbt-vpn (the VPN service: the owner's devices' WireGuard endpoint, and an exit if offered)
 #   (xbt-supervise is not an image: it is copied into the signer and gateway images)
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
@@ -45,7 +46,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay xbt-gateway lightning-stream xbt-hashlink xbt-stream-relay)
+IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay xbt-gateway lightning-stream xbt-hashlink xbt-stream-relay xbt-vpn)
 [ -n "$ONLY" ] && IMAGES=(${ONLY//,/ })
 TGT=${CARGO_TARGET_DIR:-target}
 want() { [[ " ${IMAGES[*]} " == *" $1 "* ]]; }
@@ -92,6 +93,7 @@ if [ $CARGO = 1 ]; then
     if want lightning-stream; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p lightning-stream --bin lightning-stream; fi
     if want xbt-hashlink; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-hashlink --bin xbt-hashlink; fi
     if want xbt-stream-relay; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-stream-relay --bin xbt-stream-relay; fi
+    if want xbt-vpn; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-vpn --bin xbt-vpn; fi
   done
 fi
 for t in "${!ARCH[@]}"; do
@@ -123,6 +125,25 @@ if [ $BIN_ONLY = 1 ]; then
 fi
 python3 container/mkbase.py "$CTX/base.tar"
 cp container/Dockerfile "$CTX/Dockerfile"
+# the VPN service ships the country table exits' regions are checked against (DB-IP's IP to Country Lite,
+# CC BY 4.0), so a box needs no download to check them. XBT_GEO_FILE: a copy already fetched (.csv.gz);
+# else this month's, or last month's, from DB-IP
+mkdir -p "$CTX/geo"
+if want xbt-vpn; then
+  if [ -n "${XBT_GEO_FILE:-}" ]; then
+    cp "$XBT_GEO_FILE" "$CTX/geo/dbip-country-lite.csv.gz"
+    month=$(basename "$XBT_GEO_FILE" | grep -oE '[0-9]{4}-[0-9]{2}' || echo "unknown")
+  else
+    month=
+    for m in "$(date -u +%Y-%m)" "$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m)"; do
+      if curl -fsSL --max-time 300 "https://download.db-ip.com/free/dbip-country-lite-$m.csv.gz" -o "$CTX/geo/dbip-country-lite.csv.gz"; then month=$m; break; fi
+    done
+    [ -n "$month" ] || { echo "oci_build: the DB-IP country table could not be fetched (set XBT_GEO_FILE)" >&2; exit 1; }
+  fi
+  gzip -t "$CTX/geo/dbip-country-lite.csv.gz" || { echo "oci_build: the country table is not gzip" >&2; exit 1; }
+  printf 'IP to Country Lite by DB-IP (https://db-ip.com), %s, licensed under CC BY 4.0\n(https://creativecommons.org/licenses/by/4.0/).\n' "$month" > "$CTX/geo/ATTRIBUTION"
+  echo "== country table: DB-IP $month, $(stat -c %s "$CTX/geo/dbip-country-lite.csv.gz") bytes, sha256 $(sha256sum "$CTX/geo/dbip-country-lite.csv.gz" | cut -c1-16)"
+fi
 
 SRC=https://github.com/AwokenLazarus/Lightning-Stream
 LABELS=(--label "org.opencontainers.image.source=$SRC" --label "org.opencontainers.image.revision=$REV$DIRTY"

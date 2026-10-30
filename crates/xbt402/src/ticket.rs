@@ -141,6 +141,26 @@ pub fn receipt_message(r: &Value) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// The `bodyHash` of an **interim receipt**: a seller's signed count of an answer that is still
+/// open (a WebSocket, a VPN tunnel), `interim:<part>:<bytesUp>:<bytesDown>`. It is signed like any
+/// receipt's `bodyHash`, and never looks like a finished body's hash (64 hex) or a head's (empty),
+/// so it cannot be taken for either. `part` counts from 1 for each answer; `bytesUp` and
+/// `bytesDown` are the bytes the seller passed each way so far, and `charged` (the receipt's own
+/// field) what they cost with the request's price.
+pub fn interim_body_hash(part: u64, bytes_up: u64, bytes_down: u64) -> String {
+    format!("{INTERIM_PREFIX}{part}:{bytes_up}:{bytes_down}")
+}
+
+const INTERIM_PREFIX: &str = "interim:";
+
+/// `(part, bytesUp, bytesDown)` of an interim receipt's `bodyHash`; `None` for any other.
+pub fn parse_interim(body_hash: &str) -> Option<(u64, u64, u64)> {
+    let mut it = body_hash.strip_prefix(INTERIM_PREFIX)?.split(':');
+    let num = |s: Option<&str>| s.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse().ok());
+    let (part, up, down) = (num(it.next())?, num(it.next())?, num(it.next())?);
+    (it.next().is_none() && part > 0).then_some((part, up, down))
+}
+
 /// The hash a secret names: the ticket's payment hash.
 pub fn ticket_hash(secret: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(secret).into()
@@ -345,5 +365,13 @@ mod tests {
         assert_eq!((held_budget(DEFAULT_CHANNEL_SLOTS), held_budget(MAX_CHANNEL_SLOTS), held_budget(1), held_budget(0)), (15, 241, 0, 0));
         assert_eq!(held_budget(u32::MAX), 241, "no channel has more than the protocol's ceiling");
         assert_eq!(MIN_HELD_TICKET_MSAT, 546_000);
+    }
+
+    #[test]
+    fn an_interim_receipts_body_hash_reads_back_and_nothing_else_does() {
+        assert_eq!(parse_interim(&interim_body_hash(3, 1024, 9_000_000)), Some((3, 1024, 9_000_000)));
+        for bad in ["", &"ab".repeat(32), "interim:0:1:1", "interim:1:2", "interim:1:2:3:4", "interim:1:-2:3", "interim:x:1:1", "Interim:1:1:1"] {
+            assert_eq!(parse_interim(bad), None, "{bad}");
+        }
     }
 }

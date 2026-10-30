@@ -907,6 +907,11 @@ impl App {
             sections.push(json!({"name": name, "kind": "hashrate", "path": r["path"], "items": []}));
             routes.push(r);
         }
+        // this box's VPN exit, when it is offered: buyers' wallets open paid tunnels here (announced on Nostr with the exit)
+        if let Some(r) = self.vpn_route() {
+            routes.retain(|x| x.get("path") != r.get("path"));
+            routes.push(r);
+        }
         c.insert("routes".into(), Value::Array(routes));
         if sections.is_empty() {
             c.remove("listing");

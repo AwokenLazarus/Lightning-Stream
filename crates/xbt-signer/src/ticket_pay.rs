@@ -88,7 +88,7 @@ use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::signer::{deny, with, Signer};
 use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, ROUTE_FULL};
-use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, Receipt};
+use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, PriceCeiling, Receipt};
 use crate::{err, Result};
 
 mod draws;
@@ -790,7 +790,8 @@ impl TicketWire for UreqWire {
 // --- where an answer's body goes ----------------------------------------------------------------------
 
 /// The body of an answer as it arrives: counted, hashed, its first bytes kept for the agent, and
-/// all of it written to `B2_BODY_DIR` when that is set and the body is longer than the preview.
+/// all of it written to `B2_BODY_DIR` when that is set and the body is longer than the preview,
+/// unless it is streamed to a caller (`stream_to`: a tunnel, a film), who keeps what it wants.
 struct Sink {
     hash: Sha256,
     bytes: u64,
@@ -860,7 +861,9 @@ impl Sink {
         self.bytes += chunk.len() as u64;
         let room = self.cap.saturating_sub(self.preview.len());
         let over = chunk.len() > room;
-        if over && self.file.is_none() && self.file_error.is_none() {
+        // a body streamed to a caller is the caller's: a tunnel's hours of traffic are never written to disk here
+        let streamed = self.out.is_some() || self.gone;
+        if over && !streamed && self.file.is_none() && self.file_error.is_none() {
             if let Ok(dir) = std::env::var("B2_BODY_DIR") {
                 let path = PathBuf::from(dir).join(format!("ticket-{}.bin", crate::policy::token_urlsafe()));
                 let made = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).and_then(|()| std::fs::File::create(&path))
@@ -2053,6 +2056,11 @@ impl Signer {
             Err(why) => return deny("headers", why),
         };
         let head_headers = stream_head && p.get("head_headers").and_then(Value::as_bool) == Some(true);
+        // the price the buyer was shown where it chose this seller: terms above it are paid nothing
+        let ceiling = match PriceCeiling::parse(p.get("price_ceiling")) {
+            Ok(c) => c,
+            Err(why) => return deny("price_ceiling", why),
+        };
         let upgrade = p.get("upgrade").and_then(Value::as_bool) == Some(true);
         let credit_only = p.get("credit_only").and_then(Value::as_bool) == Some(true);
         if upgrade && (stream_to.is_none() || method != "GET" || range.is_some()) {
@@ -2171,8 +2179,14 @@ impl Signer {
                 ways.insert(0, l);
             }
         }
+        let mut above: Option<String> = None;
         for offer in ways {
             let rail = offer.rail();
+            if let Some(why) = ceiling.as_ref().and_then(|c| offer.entries().into_iter().find_map(|a| c.over(a))) {
+                passed.push(json!({"rail": rail, "why": format!("price_ceiling: {why}")}));
+                above.get_or_insert(why);
+                continue;
+            }
             let tried = match &offer {
                 Offer::Ticket(..) | Offer::Lottery(_) if !tp.enabled => Tried::Next(tp.mainnet_off.clone().unwrap_or_else(|| "stream tickets are off in this policy (tickets.enabled)".into())),
                 Offer::Lottery(acc) => self.lottery_pay(&call, acc, &lightning),
@@ -2189,6 +2203,11 @@ impl Signer {
                 }
                 Tried::Next(why) => passed.push(json!({"rail": rail, "why": why})),
             }
+        }
+        // a seller asking more than the buyer was shown is refused as that, not as having no way to be paid
+        if let Some(why) = above {
+            return with(deny("price_ceiling", format!("the seller's terms are above the price the buyer was shown ({why}): nothing was paid")),
+                        json!({"charged_sats": 0, "rails_passed_over": passed}));
         }
         // what the 402 offers, in the wallet's words: a scheme it knows by name, and whether the network is one of its own
         let offered: Vec<Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
@@ -3132,6 +3151,42 @@ impl Signer {
         }
     }
 
+    /// The seller's interim receipt of an open answer (a WebSocket) against the wallet's own count of it
+    /// ([`crate::ticket_interim`]). `own` is read once the seller's answer is in, so the bytes that passed while it was
+    /// asked are counted on the wallet's side too. `Some`: the seller's fault, recorded in the session (nothing more is
+    /// released to it) with the receipt in the wallet's log. A status that could not be had, or a receipt that does not
+    /// check out, is no newer count: a seller that sent one and then none (by any means) while bytes flow is stale.
+    #[allow(clippy::too_many_arguments)]
+    fn ticket_interim(&self, hs: &HttpSession, seq: u64, digest: &str, own: &dyn Fn() -> (u64, u64), price: &Price, max_msat: u64,
+                      last: &mut Option<crate::ticket_interim::Seen>, polls: &mut crate::ticket_interim::Polls) -> Option<String> {
+        let v = self.ticket_status_of(hs, false).ok();
+        let (own_up, own_down) = own();
+        let sid = lock_link(hs).seller_sid.clone();
+        let before = last.as_ref().map(|l| l.part);
+        let mut found = None;
+        for raw in v.as_ref().and_then(|v| v.get("interim")).and_then(Value::as_array).into_iter().flatten() {
+            let Ok(r) = Receipt::verify(raw, &hs.terms.receipt_key, &sid) else { continue };
+            if let Err(why) = crate::ticket_interim::check(&r, seq, digest, 101, own_up, own_down, price, max_msat, last) {
+                found = Some((why, r.raw));
+                break;
+            }
+        }
+        // how the seller answered: a newer count, an answer with none newer, or no answer the wallet could take
+        let now = Instant::now();
+        if last.as_ref().map(|l| l.part) != before {
+            polls.counted();
+        } else if v.is_some() {
+            polls.answered();
+        } else {
+            polls.failed(now);
+        }
+        let found = found.or_else(|| crate::ticket_interim::stale(last, polls, own_up.saturating_add(own_down), now, crate::ticket_interim::stale_after()).map(|w| (w, Value::Null)));
+        let (why, receipt) = found?;
+        self.ticket_audit("ticket_interim_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
+                                                         "reason": why, "receipt": receipt, "own_up": own_up, "own_down": own_down}));
+        Some(lock_money(hs).fault.get_or_insert(why).clone())
+    }
+
     /// Mark the session faulty and stop it: nothing more is released to this seller in it.
     /// A seller's signed charge for one answer above the call's limit: the receipt goes into the audit log as
     /// evidence, and the words for the fault (which stops the session).
@@ -3807,9 +3862,51 @@ impl Signer {
                     None => drop(w),
                 }
                 let (pay, credited, state, wake, up, stopper, st, account) = (&pay, &credited, &state, &wake, &up, &stopper, &st, &account);
+                // the stream stops: both ways end, and the reading of the way back with them, quiet or not
+                let stop = move || {
+                    if let Some(st) = stopper {
+                        let _ = st.shutdown(std::net::Shutdown::Both);
+                    }
+                };
+                // the seller's signed count of this open answer, checked against the wallet's as it runs: on its own
+                // thread, so a slow `status` never holds up the paying of the bytes. A fault found here ends the
+                // socket at once, so the buyer's side sees it close (a VPN fails over) even while nothing flows
+                scope.spawn(move || {
+                    let mut last: Option<crate::ticket_interim::Seen> = None;
+                    let mut polls = crate::ticket_interim::Polls::default();
+                    let mut next = Instant::now() + crate::ticket_interim::poll_every();
+                    loop {
+                        {
+                            let mut s = lock(state);
+                            loop {
+                                if s.2 || s.1.is_some() {
+                                    return;
+                                }
+                                let now = Instant::now();
+                                if now >= next {
+                                    break;
+                                }
+                                s = wake.wait_timeout(s, next - now).unwrap_or_else(|p| p.into_inner()).0;
+                            }
+                        }
+                        next = Instant::now() + crate::ticket_interim::poll_every();
+                        let own = || (up.load(Ordering::SeqCst), lock(state).0);
+                        if let Some(why) = self.ticket_interim(hs, seq, digest, &own, price, st.max_msat, &mut last, &mut polls) {
+                            lock(state).1.get_or_insert(why);
+                            stop();
+                            wake.notify_all();
+                            return;
+                        }
+                    }
+                });
                 scope.spawn(move || loop {
                     let mut s = lock(state);
-                    if s.2 || s.1.is_some() {
+                    if s.2 {
+                        return;
+                    }
+                    if s.1.is_some() {
+                        // stopped elsewhere (a fault, a limit): the socket ends with it
+                        stop();
                         return;
                     }
                     let total = s.0.saturating_add(up.load(Ordering::SeqCst));
@@ -3828,10 +3925,7 @@ impl Signer {
                         }
                     }
                     if s.1.is_some() {
-                        // the stream stops: both ways end, and the reading of the way back with them
-                        if let Some(st) = stopper {
-                            let _ = st.shutdown(std::net::Shutdown::Both);
-                        }
+                        stop();
                         return;
                     }
                     let _ = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner());
@@ -4459,6 +4553,32 @@ pub(crate) fn seller_busy(v: &Value) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_body_streamed_to_a_caller_is_never_written_to_disk_by_the_wallet() {
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("B2_BODY_DIR", d.path());
+        let sock = d.path().join("reader.sock");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut all = vec![];
+            let _ = std::io::Read::read_to_end(&mut s, &mut all);
+            all.len()
+        });
+        let mut streamed = Sink::streaming_to(Some(&sock));
+        let chunk = vec![7u8; 1 << 20];
+        for _ in 0..4 {
+            streamed.put(&chunk);
+        }
+        let (_, fields, _) = streamed.done();
+        assert!(fields.get("saved_to").is_none_or(Value::is_null), "{fields}");
+        assert_eq!(reader.join().unwrap(), 4 << 20, "every byte went to the caller");
+        // a body the agent reads itself is still kept where B2_BODY_DIR says
+        let mut kept = Sink::new();
+        kept.put(&vec![1u8; kept.cap + 1]);
+        assert!(kept.done().1["saved_to"].is_string());
+        std::env::remove_var("B2_BODY_DIR");
+    }
 
     /// A seller that sends its answer's head a byte every 200 ms: each read is quick, so only a
     /// deadline for the whole request ends it.

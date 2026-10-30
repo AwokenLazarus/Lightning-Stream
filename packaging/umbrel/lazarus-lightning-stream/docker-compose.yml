@@ -90,7 +90,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,vpn
       XBT_INIT_NODE_RPC_USER: ${APP_BITCOIN_RPC_USER:-${APP_XBT_KNOTS_RPC_USER}}
       XBT_INIT_NODE_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-${APP_XBT_KNOTS_RPC_PASS}}
       XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
@@ -219,6 +219,13 @@ services:
       XBT_UI_FILES_ROOT_WORDS: the Downloads folder in Umbrel's Files app
       XBT_UI_FILES_BIND: 0.0.0.0:8486
       XBT_UI_FILES_UPSTREAM: http://lazarus-lightning-stream_ui_1:8486
+      # the VPN pages: the devices and exit they write for the vpn service, its status they read, and
+      # where devices reach its WireGuard endpoint on the LAN
+      XBT_UI_VPN_DIR: /data/run/vpn
+      XBT_UI_VPN_STATUS_DIR: /data/run/vpn-status
+      XBT_UI_VPN_ENDPOINT: ${DEVICE_DOMAIN_NAME}:51830
+      # where the shop's gateway reaches the VPN service's tunnel endpoint, to sell this box's exit
+      XBT_UI_VPN_TUNNEL_UPSTREAM: http://lazarus-lightning-stream_vpn_1:51880
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       # Umbrel's shared Downloads, read-only, for Files (umbrelOS 1.x rewrites this path to
@@ -226,6 +233,8 @@ services:
       - ${UMBREL_ROOT}/data/storage/downloads:/downloads:ro
       # the AI page's files, shared by group with the connector (the credential store both write)
       - ${APP_DATA_DIR}/data/run/ai:/data/run/ai
+      - ${APP_DATA_DIR}/data/run/vpn:/data/run/vpn
+      - ${APP_DATA_DIR}/data/run/vpn-status:/data/run/vpn-status:ro
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
       # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page
       - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
@@ -352,3 +361,30 @@ services:
       - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate:ro
       # the signer's socket, read-only: the renter pays each piece of work through it
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+
+  # The VPN service: the WireGuard endpoint the owner's devices pair with on the LAN (UDP 51830; 51820
+  # is left to WireGuard apps), and this box's exit if the owner offers one on the VPN page. Userspace
+  # WireGuard and TCP/IP: no TUN device and no capabilities. Idle until a device is added or an exit
+  # offered; it restarts itself when they change.
+  vpn:
+    <<: *service
+    image: xbt-vpn:0.1.0
+    stop_grace_period: 10s
+    environment:
+      XBT_VPN_NOSTR_RELAYS: wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol
+      # priced exits are paid through the owner's wallet: its socket, and the dir paid tunnels are streamed through
+      B2_SIGNER_SOCK: /data/run/signer/signer.sock
+      B2_STREAM_DIR: /data/run/signer/streams
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
+      # this box's exit's tunnel endpoint, which the shop's gateway joins buyers' paid tunnels to (not published)
+      XBT_VPN_TUNNEL_LISTEN: 0.0.0.0:51880
+    ports:
+      - "51830:51820/udp"
+    volumes:
+      - ${APP_DATA_DIR}/data/vpn:/data/vpn
+      - ${APP_DATA_DIR}/data/run/vpn:/data/run/vpn:ro
+      - ${APP_DATA_DIR}/data/run/vpn-status:/data/run/vpn-status
+      # the signer's socket, read-only, and the stream sockets (the same host dir the signer sees), read-write
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      - ${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams
+      - ${APP_DATA_DIR}/data/run/shops:/data/run/shops:ro

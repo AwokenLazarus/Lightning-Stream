@@ -4,7 +4,8 @@ import { PORTS } from './spec'
 
 /**
  * The web UI (for the owner), the MCP server (for agents: an API with a bearer token), the AI address
- * (for programs on the LAN, each with a key), the gateway (for buyers), and hashrate's two plain TCP ports: miners on the LAN, and the link hashtakers' apps reach.
+ * (for programs on the LAN, each with a key), the gateway (for buyers), hashrate's two plain TCP ports: miners on the LAN, and the link hashtakers' apps reach,
+ * and the VPN's WireGuard port (UDP) for the owner's devices on the LAN.
  * StartOS offers each on the LAN; the owner adds a public domain to the Gateway (and a port forward or a
  * tunnel for the link) to sell outside the LAN.
  */
@@ -119,6 +120,18 @@ export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
         query: {},
       }),
     ]),
+  )
+
+  // the VPN service's WireGuard endpoint, for the owner's devices on the LAN. WireGuard is UDP, and a
+  // range is how StartOS forwards UDP (it forwards both); the second port is unused
+  const vpn = await sdk.MultiHost.of(effects, 'vpn').bindPortRange({ internalStartPort: PORTS.vpn, externalStartPort: PORTS.vpnExternal, numberOfPorts: 2 })
+  // (a range's interface is registered by its export and gives no receipt)
+  await vpn.export(
+    sdk.createRangeInterface(effects, {
+      id: 'vpn',
+      name: i18n('VPN for your devices'),
+      description: i18n('Your devices connect here with the WireGuard config the VPN page makes for each one. Keep it on your LAN'),
+    }),
   )
 
   return receipts
