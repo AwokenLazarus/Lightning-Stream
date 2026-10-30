@@ -1048,6 +1048,15 @@ impl Gateway {
     }
 
     /// Steps 2 and 3: authenticate the request, then take the secret it carries.
+    /// The session a visit asking the price names (`PAYMENT-SESSION`), when the book holds it. Not
+    /// authenticated, and needs not be: it only lets a session in that a paid request of the same
+    /// route would let in, and that request is authenticated before it is served or charged.
+    fn session_named(&self, req: &Request) -> Option<String> {
+        let (_, sid) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SESSION"))?;
+        let sid = sid.trim();
+        (sid.len() <= 128 && self.lock().book.session(sid).is_some()).then(|| sid.to_string())
+    }
+
     fn authenticate(
         &self,
         req: &Request,
@@ -1291,6 +1300,19 @@ impl Gateway {
             }
             (Err(why), None) => return json_response(402, &json!({"error": why.code()})),
         };
+        // a first lock may name the address the buyer wants (`path`): where that route serves as many
+        // buyers as it takes, nothing is sold to a buyer it would not serve, and the session made for
+        // it is forgotten; where it has room, the new session takes its place there before it pays
+        if authed.is_none() {
+            let route = body.get("path").and_then(Value::as_str).and_then(|p| decoded_path(p).ok()).and_then(|p| self.cfg.route(&p));
+            if let Some(Err(b)) = route.map(|r| self.load.buyer(r, Some(&g.session), self.now())) {
+                let mut st = self.lock();
+                let mut recs: Vec<_> = g.issue.iter().filter_map(|h| st.book.issued(h, false)).collect();
+                recs.extend(st.book.forget_unused(&g.session));
+                self.journal(&mut st, &recs);
+                return busy(&b);
+            }
+        }
         // a first lock is nobody's yet: its invoices lapse sooner, so that unpaid ones give their places back
         let expiry = if g.key.is_some() {
             u32::try_from(self.cfg.caps.first_lock_secs).unwrap_or(INVOICE_EXPIRY_S).min(INVOICE_EXPIRY_S)
@@ -1623,9 +1645,13 @@ impl Gateway {
         let pay = match self.pay_header(&req) {
             Ok(Some(p)) => p,
             Ok(None) => {
-                // a new visit asking the price: turned away here, before it buys anything, when the
-                // route serves as many buyers as it takes
-                if let Err(b) = self.load.buyer(route, None, self.now()) {
+                // a visit asking the price: turned away here, before it buys anything, when the route
+                // serves as many buyers as it takes. A buyer's wallet names its session when it asks
+                // the price of a new address; one the book holds is a buyer, counted (or let on, if
+                // the route serves it already) like its paid requests, so that a buyer served is
+                // never turned away at a new address, and one let in has its place before it pays
+                let named = self.session_named(&req);
+                if let Err(b) = self.load.buyer(route, named.as_deref(), self.now()) {
                     return Reply::Whole(busy(&b));
                 }
                 return Reply::Whole(self.unpaid(&self.req_url(&req), route, req.method == "HEAD"));

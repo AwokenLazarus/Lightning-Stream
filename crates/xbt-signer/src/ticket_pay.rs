@@ -1073,6 +1073,9 @@ pub(crate) struct HttpSession {
     offer: Option<String>,
     /// The URL of the session endpoints: the origin and the terms' path.
     base: String,
+    /// The address the session was opened for (its path and query), named in the first lock so that a
+    /// seller whose route there is full sells nothing to a buyer it would not serve.
+    visit: String,
     /// Held shared by every paid request in progress, so that requests run side by side; taken
     /// alone (and never waited for) by what may only happen with none in progress: moving the
     /// session to another address, stopping it as idle.
@@ -1843,6 +1846,11 @@ impl Signer {
         }
         let mut range_headers: Vec<(String, String)> = range.iter().map(|r| ("Range".to_string(), r.header())).collect();
         range_headers.extend(extra.iter().cloned());
+        // the session open with this seller, named in the ask of the price: a seller whose route is full
+        // goes on serving a buyer it serves there (docs/CAPACITY.md)
+        if let Some(sid) = self.ticket_seller_sid(&origin) {
+            range_headers.push(("PAYMENT-SESSION".into(), sid));
+        }
         // the owner's word before any request leaves: an allowlisted origin, or a task that pays any seller
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
@@ -2147,7 +2155,7 @@ impl Signer {
                     }
                     .map(str::to_string);
                     let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(),
-                                                   prepaid: prepaid_terms.clone(), offer, base, calls: RwLock::new(()),
+                                                   prepaid: prepaid_terms.clone(), offer, base, visit: c.url.strip_prefix(c.origin).unwrap_or("/").to_string(), calls: RwLock::new(()),
                                                    paying: Mutex::new(()), order: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                                    money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
@@ -2161,6 +2169,11 @@ impl Signer {
                     let prepaid_now = self.ticket_session(&h.sid).is_some_and(|s| s.prepaid_now(self.engine.now()));
                     match filled {
                         Ok(n) if n > 0 => {}
+                        // the seller's route is full: it sells this new buyer nothing, and the session ends unused
+                        Err(d) if d["rule"] == "seller_busy" => {
+                            let stopped = self.ticket_http_stop(&h, "the seller is busy", Duration::ZERO);
+                            break 'open Err(Tried::Done(with(d, json!({"stopped": stopped}))));
+                        }
                         _ if prepaid_now => {}
                         Ok(_) => {
                             // nothing was locked. Where the session waits (a lock found no slot, now or in the session
@@ -2352,6 +2365,14 @@ impl Signer {
     /// (its id and key are written to the book before anything is paid), or a later, authenticated
     /// one. `Ok`: the seller's answer. A seller that answers `slots_short` is not failing: the
     /// session locks nothing until its `retryAfter` has passed, and the refusal says so.
+    /// The seller's id of the session open with `origin`, if one is and no call is opening one now.
+    fn ticket_seller_sid(&self, origin: &str) -> Option<String> {
+        let slot = lock(&self.ticket_http).get(origin).cloned()?;
+        let open = slot.open.try_lock().ok()?;
+        let sid = lock_link(open.as_ref()?).seller_sid.clone();
+        (!sid.is_empty()).then_some(sid)
+    }
+
     fn ticket_lock_call(&self, hs: &HttpSession, mut body: Value) -> std::result::Result<Value, Value> {
         if !self.ticket_may_reach(&hs.origin, &hs.task) {
             return Err(deny("allowlist", format!("destination not on allowlist: {}", hs.origin)));
@@ -2379,6 +2400,10 @@ impl Signer {
                     Err(e) => refusal("ticket", e.msg),
                 };
             }
+            // the seller's service is full: nothing was sold
+            if let Some(d) = (status == 503).then(|| seller_busy(v)).flatten() {
+                return d;
+            }
             refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
         };
         if !lock_link(hs).seller_sid.is_empty() {
@@ -2390,6 +2415,7 @@ impl Signer {
             };
         }
         let url = format!("{}/lock", hs.base);
+        body["path"] = hs.visit.clone().into();
         let raw = body.to_string().into_bytes();
         let sent = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
         let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small(SMALL_BODY)?))) {

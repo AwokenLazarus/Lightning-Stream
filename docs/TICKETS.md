@@ -115,6 +115,11 @@ lock for tickets settled on arrival may instead say `"by": "offer"` and name no 
 no invoice, and makes the session of a buyer that pays its prepaid tickets by the seller's offer
 (section 15).
 
+A first lock MAY name the address the buyer opens the session for, `"path": "<path and query>"`.
+A seller whose route there serves as many buyers as it takes (docs/CAPACITY.md) then answers
+`503 busy` and makes no invoice and no session; one with room counts the new buyer there before
+it pays. A seller that does not know the field ignores it.
+
 The first lock of a session carries no authentication and makes the session. Every later lock is
 a request of that session and carries `PAYMENT-SIGNATURE` as any paid request does (section 3):
 without it, anyone who learns a session id can fill that session's ticket places. A seller MAY

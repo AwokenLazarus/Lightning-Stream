@@ -37,7 +37,11 @@ A `503` with `Retry-After: 30` and this body:
 `scope` is `buyers`, `streams`, `buyer_streams` or `bandwidth`.
 
 - **A new buyer is turned away before buying or paying anything.** A new visit asking the price gets
-  the 503 instead of the 402, so it gets no terms to buy a ticket with. A paid request from a buyer
+  the 503 instead of the 402, so it gets no terms to buy a ticket with. A wallet's first lock names
+  the address it wants (`"path"` in the lock's body): if the route there is full by then (other
+  buyers came between the 402 and the lock), the lock is answered with the same 503, no invoice
+  is made, and the session it would have opened is forgotten. A lock the route has room for counts
+  the new buyer at once, before it pays, so the place is its own when it comes back with a ticket. A paid request from a buyer
   the route does not serve yet is authenticated (its sequence number used, so the buyer's count
   stays in step) and turned away before a ticket's secret it carries is taken: the ticket stays
   held, then is cancelled or expires as any unused one, and nothing of it is the seller's. A buyer
@@ -45,7 +49,12 @@ A `503` with `Retry-After: 30` and this body:
 - **A long answer over a stream limit is not started.** The service's answer is closed unread, and
   what the request had reserved from the buyer's credit is given back: nothing is charged.
 - **No buyer already served is cut off to make room.** A buyer the route serves goes on, its page's
-  ordinary parts included; only a new long answer can be refused for a stream limit.
+  ordinary parts included; only a new long answer can be refused for a stream limit. A wallet asks
+  the price of every new address before it pays for it, and names its session in that ask
+  (`PAYMENT-SESSION: <session id>`): a session the gateway holds is taken for that buyer, so a
+  full route answers the 402 to the buyers it serves and the 503 only to new ones. The header is
+  not authenticated and needs not be: it only lets in a session that its paid request, which is
+  authenticated, would be let in for.
 
 The wallet tells it in its own words, with the counts read as bounded numbers and never the seller's
 text: the rule `seller_busy`, `charged_sats` 0, and `busy` with the scope and counts, for an agent

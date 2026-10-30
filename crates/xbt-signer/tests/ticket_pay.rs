@@ -429,7 +429,18 @@ fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
            "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"], "offers": conf["offers"],
            "times": {"refill_wait_ms": REFILL_WAIT_MS.load(Ordering::SeqCst), "upstream_wait_secs": 2, "tick_ms": 50},
-           "routes": routes()})
+           "routes": routes_with(conf)})
+}
+
+/// [`routes`], with the `capacity` that `conf["capacity"]` gives a route, by its path.
+fn routes_with(conf: &Value) -> Value {
+    let mut r = routes();
+    for route in r.as_array_mut().unwrap() {
+        if let Some(c) = conf["capacity"].get(route["path"].as_str().unwrap()) {
+            route["capacity"] = c.clone();
+        }
+    }
+    r
 }
 
 /// [`shop_config`], answering under a second name too (`public_aliases`): the same gateway at
@@ -2776,6 +2787,65 @@ fn rival_lock(shop: &Shop, tag: u8, n: usize) -> (u16, Value) {
     }
 }
 
+/// Another buyer's first lock that names `path` (`docs/CAPACITY.md`): it takes a place on that
+/// route, if one is free, before it pays anything.
+fn rival_seat(origin: &str, path: &str) -> u16 {
+    let body = json!({"version": "ticket/0", "settle": "on-arrival", "count": 1, "path": path}).to_string();
+    match ureq::post(&format!("{origin}/x402/ticket/lock")).set("Content-Type", "application/json").send_string(&body) {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => panic!("the shop gave no answer: {e}"),
+    }
+}
+
+/// A route that serves as many buyers as it takes goes on serving the ones it has, at every
+/// address of it: the wallet's ask of a new address's price names its session, and the seller
+/// knows it for a buyer it serves.
+#[test]
+fn a_full_route_goes_on_serving_this_wallet_at_new_addresses() {
+    let _g = env_lock();
+    let r = Rig::with(json!({}), true, false, 483, json!({"tickets": {"max_tickets": 8}, "caps": {"sessions_per_address": 0, "inbound_slots": 483},
+                                                         "capacity": {"/page/": {"max_buyers": 2}}}));
+    let first = r.pay("/page/100", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    assert_eq!(rival_seat(&r.shop.origin, "/page/"), 200, "the second place");
+    assert_eq!(rival_seat(&r.shop.origin, "/page/"), 503, "the route is full");
+    for n in 1..=3 {
+        let v = r.pay(&format!("/page/{}", 100 + n), CALL);
+        assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+    }
+}
+
+/// Between this wallet's ask of the price and its first lock, other buyers can fill the route: the
+/// first lock names the address, the seller sells nothing to a buyer it would not serve, and the
+/// wallet says the shop is busy, having paid nothing and kept no session.
+#[test]
+fn a_shop_that_fills_before_this_wallet_buys_sells_it_nothing() {
+    let _g = env_lock();
+    for shop in [json!({"tickets": {"max_tickets": 8}, "caps": {"sessions_per_address": 0, "inbound_slots": 483}, "capacity": {"/page/": {"max_buyers": 1}}}),
+                 json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true}, "capacity": {"/page/": {"max_buyers": 1}}})] {
+        let r = Rig::with(json!({}), true, false, 483, shop);
+        let rival = r.shop.origin.clone();
+        let mut filled = false;
+        r.tap.set(Box::new(move |seen, _| {
+            if seen.path == "/x402/ticket/lock" && !seen.paid && !filled {
+                filled = true;
+                assert_eq!(rival_seat(&rival, "/page/"), 200);
+            }
+            None
+        }));
+        let v = r.pay("/page/100", CALL);
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("seller_busy"), Some(0)), "{v}");
+        let lock = r.tap.seen("/x402/ticket/lock");
+        assert_eq!(serde_json::from_str::<Value>(&lock[0].body).unwrap()["path"], "/page/100", "the first lock names the address");
+        assert_eq!((r.ln.paid_msat(), r.shop.settled(), r.shop.held()), (0, 0, 0), "nothing sold");
+        assert!(r.tap.secrets().is_empty());
+        // no session with the seller is left: none, or one the seller never made, holding nothing
+        let st = r.status();
+        assert!(st["paying"].as_array().unwrap().iter().all(|p| p["seller_session"] == "" && p["released_msat"] == "0"), "{st}");
+    }
+}
+
 /// A gateway that offers held tickets only, with the shipped caps.
 fn held_only_shop() -> Value {
     json!({"tickets": {"settle": ["on-use"]}, "caps": {"sessions_per_address": 0}})
@@ -2830,10 +2900,10 @@ fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a
     let s = session_of(&r, &first);
     assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(0), Some("ticket_slots")), "the session holds nothing, and says why: {s}");
     assert_eq!(r.status()["locked"]["tickets"], 0);
-    // the lock for it named a count and no hash; the hash was the seller's
+    // the lock for it named a count and no hash (the hash was the seller's), and the address it is for
     let locks = r.tap.seen("/x402/ticket/lock");
     assert_eq!(locks.len(), 1, "{locks:?}", locks = locks.iter().map(|l| l.body.clone()).collect::<Vec<_>>());
-    assert_eq!(serde_json::from_str::<Value>(&locks[0].body).unwrap(), json!({"version": "ticket/0", "settle": "on-arrival", "count": 1}));
+    assert_eq!(serde_json::from_str::<Value>(&locks[0].body).unwrap(), json!({"version": "ticket/0", "settle": "on-arrival", "count": 1, "path": "/page/1000"}));
     // the balance pays the next pages: no ticket is bought ahead
     let v = r.pay("/page/300", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(0)), "{v}");
