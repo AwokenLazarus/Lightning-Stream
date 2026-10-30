@@ -5,6 +5,42 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.1.20 (in progress, not yet released)
+
+**Shops without a web address**
+- A shop can be reached by its key alone, over an encrypted direct link, with no hostname,
+  Cloudflare or port forward. The shop's node vouches for the link, and buyers check that before
+  sending anything. Where the two ends can't connect directly, a relay carries the traffic, and it
+  never sees what is sent. In private mode a shop uses relays only, so buyers never learn its
+  address.
+- The relay is built into Stream, off by default. Shops announce the relays they use, and buyers
+  choose among them.
+
+**Sellers' own web apps**
+- A seller's whole web app, for example Jellyfin with its full interface, can be sold through
+  Stream, paid as it is used, with an account made for each buyer.
+- The built-in player is gone. A media server is shared as a web app, and a new **Files** service
+  shares a folder: buyers pay per GB to download a file or open it in their own player.
+
+**Paying**
+- Several requests to one seller run side by side in one session, each exactly accounted, so a busy
+  page no longer waits on itself. Whatever way an answer ends (whole, cut short, or reported late),
+  the wallet believes the seller's charge by one rule, and a charge above it is a seller fault.
+- A busy service refuses new buyers before they pay; buyers it is already serving stay served, and
+  a refused buyer is sold nothing.
+- WebSockets (for example a web app's live updates) stay open for up to six hours, paid as their
+  bytes pass, instead of ending with an ordinary answer's limit.
+- Higher default limits for a shop: 100 sessions and 512 connections. A shop behind a tunnel is
+  limited as a whole, not as if all its buyers were one address.
+
+**Hashrate**
+- Rentals run over the encrypted link.
+- A hashtaker can buy a short paid test slice before renting, and a hashmaker publishes a signed
+  history of what it delivered.
+- Miners behind one address (a home router, or Docker on Umbrel and StartOS) move between rentals
+  once each way. Before, they could bounce between connections under load and send their work to the
+  fallback pool; buyers were never charged for that work, but got less than they rented.
+
 ## 0.1.19 (2026-10-29)
 
 **Paying**
