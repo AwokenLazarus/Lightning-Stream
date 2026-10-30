@@ -55,6 +55,8 @@ pub struct Offer {
     pub route: String,
     pub input_per_1k_msat: u64,
     pub output_per_1k_msat: u64,
+    /// What the seller asks for each request, beside its tokens (its listing's `request_msat`).
+    pub request_msat: u64,
     /// The route's cap on output tokens.
     pub max_output: u64,
     pub context: Option<u64>,
@@ -63,11 +65,12 @@ pub struct Offer {
 }
 
 impl Offer {
-    /// What a request is expected to cost at most, in msat: input tokens and `max_tokens` of output.
+    /// What a request is expected to cost at most, in msat: the seller's price for the request,
+    /// input tokens, and `max_tokens` of output.
     pub fn bound_msat(&self, input_tokens: u64, max_tokens: u64) -> u64 {
         let out = max_tokens.min(if self.max_output == 0 { max_tokens } else { self.max_output });
         let per = |n: u64, rate: u64| (u128::from(n) * u128::from(rate)).div_ceil(1000);
-        u64::try_from(per(input_tokens, self.input_per_1k_msat) + per(out, self.output_per_1k_msat)).unwrap_or(u64::MAX)
+        u64::try_from(u128::from(self.request_msat) + per(input_tokens, self.input_per_1k_msat) + per(out, self.output_per_1k_msat)).unwrap_or(u64::MAX)
     }
 }
 
@@ -80,14 +83,14 @@ pub struct Catalogue {
 impl Catalogue {
     /// The offers of a seller's route, from its `GET /v1/models` answer and its listing's prices.
     pub fn add_seller(&mut self, seller: &str, route: &str, prices: &Value, max_output: u64, models: &Value) {
-        let n = |k: &str| prices.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0);
-        let (input, output) = (n("per_1k_input_msat"), n("per_1k_output_msat"));
+        let n = |k: &str| prices.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0);
+        let (input, output, request) = (n("per_1k_input_msat"), n("per_1k_output_msat"), n("request_msat"));
         self.offers.retain(|o| !(o.seller == seller && o.route == route));
         for m in models.get("data").and_then(Value::as_array).into_iter().flatten() {
             let Some(id) = m.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 200) else { continue };
             let context = ["context_length", "max_model_len", "context_window"].iter().find_map(|k| m.get(*k).and_then(Value::as_u64));
             self.offers.push(Offer { model: id.to_string(), seller: seller.to_string(), route: route.to_string(),
-                                     input_per_1k_msat: input, output_per_1k_msat: output, max_output, context,
+                                     input_per_1k_msat: input, output_per_1k_msat: output, request_msat: request, max_output, context,
                                      ceiling: xbt402::listing::price_ceiling(prices) });
         }
     }
@@ -102,7 +105,8 @@ impl Catalogue {
         let mut data = Vec::new();
         for id in ids {
             let sellers: Vec<Value> = self.offers.iter().filter(|o| o.model == id)
-                .map(|o| json!({"seller": o.seller, "per_1k_input_msat": o.input_per_1k_msat, "per_1k_output_msat": o.output_per_1k_msat}))
+                .map(|o| json!({"seller": o.seller, "per_1k_input_msat": o.input_per_1k_msat, "per_1k_output_msat": o.output_per_1k_msat,
+                                "request_msat": o.request_msat}))
                 .collect();
             data.push(json!({"id": id, "object": "model", "owned_by": "lightning-stream", "x_stream": {"sellers": sellers}}));
         }
@@ -234,6 +238,24 @@ pub fn request_bounds(body: &Value, raw_len: usize, default_max: u64) -> (u64, u
 
 #[cfg(test)]
 mod tests {
+    /// A seller's price for each request counts in its rank and is shown beside its token prices:
+    /// a seller cheap by the token but dear by the request is not taken for the cheapest. Prices
+    /// written with spaces around them are read.
+    #[test]
+    fn a_sellers_price_for_each_request_counts_in_its_rank_and_is_shown() {
+        let mut c = super::Catalogue::default();
+        let models = serde_json::json!({"data": [{"id": "llama-3.1-8b"}]});
+        c.add_seller("by-request", "https://a.example/ai/", &serde_json::json!({"per_1k_output_msat": "1000", "request_msat": " 50000 "}), 1024, &models);
+        c.add_seller("by-token", "https://b.example/ai/", &serde_json::json!({"per_1k_output_msat": " 2000 "}), 1024, &models);
+        let a = c.offers.iter().find(|o| o.seller == "by-request").unwrap();
+        let b = c.offers.iter().find(|o| o.seller == "by-token").unwrap();
+        assert_eq!((a.request_msat, b.output_per_1k_msat), (50_000, 2000), "trimmed");
+        assert!(a.bound_msat(100, 256) > b.bound_msat(100, 256), "the request's price counts: {} vs {}", a.bound_msat(100, 256), b.bound_msat(100, 256));
+        let shown = c.models_json();
+        let sellers = shown["data"][0]["x_stream"]["sellers"].as_array().unwrap();
+        assert!(sellers.iter().any(|s| s["seller"] == "by-request" && s["request_msat"] == 50_000), "{shown}");
+    }
+
     #[test]
     fn a_sellers_listed_prices_are_what_the_wallet_pays_it_at_most() {
         let mut c = super::Catalogue::default();
