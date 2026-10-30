@@ -61,6 +61,9 @@ group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in
          + "".join(f"{n}:x:{g}:{m}\n" for n, g, m in GROUPS))
 
 DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr/bin", 0, 0, 0o755), ("data", 0, 0, 0o755),
+        # made here, not by COPY: a COPY --chmod=0444 that creates its destination folder gives the folder 0444
+        # too, and the VPN service (uid 10018) could then not reach its country table (exits' regions unverified)
+        ("usr/share", 0, 0, 0o755), ("usr/share/xbt-vpn", 0, 0, 0o555),
         ("data/signer", 10001, 10001, 0o700), ("data/witness", 10002, 10002, 0o700), ("data/mcp", 10003, 10003, 0o700),
         ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/hashrate", 10010, 10010, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
