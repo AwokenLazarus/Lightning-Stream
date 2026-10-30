@@ -3149,16 +3149,18 @@ impl Signer {
     }
 
     /// The seller's interim receipt of an open answer (a WebSocket) against the wallet's own count of it
-    /// ([`crate::ticket_interim`]). `Some`: the seller's fault, recorded in the session (nothing more is released to it)
-    /// with the receipt in the wallet's log. A status that could not be had is no fault here: the answer goes on, within
-    /// what was released, as any answer does.
+    /// ([`crate::ticket_interim`]). `own` is read once the seller's answer is in, so the bytes that passed while it was
+    /// asked are counted on the wallet's side too. `Some`: the seller's fault, recorded in the session (nothing more is
+    /// released to it) with the receipt in the wallet's log. A status that could not be had, or a receipt that does not
+    /// check out, is no newer count: a seller that sent one and then none (by any means) while bytes flow is stale.
     #[allow(clippy::too_many_arguments)]
-    fn ticket_interim(&self, hs: &HttpSession, seq: u64, digest: &str, own_up: u64, own_down: u64, price: &Price, max_msat: u64,
+    fn ticket_interim(&self, hs: &HttpSession, seq: u64, digest: &str, own: &dyn Fn() -> (u64, u64), price: &Price, max_msat: u64,
                       last: &mut Option<crate::ticket_interim::Seen>) -> Option<String> {
-        let v = self.ticket_status_of(hs, false).ok()?;
+        let v = self.ticket_status_of(hs, false).ok();
+        let (own_up, own_down) = own();
         let sid = lock_link(hs).seller_sid.clone();
         let mut found = None;
-        for raw in v.get("interim").and_then(Value::as_array).into_iter().flatten() {
+        for raw in v.as_ref().and_then(|v| v.get("interim")).and_then(Value::as_array).into_iter().flatten() {
             let Ok(r) = Receipt::verify(raw, &hs.terms.receipt_key, &sid) else { continue };
             if let Err(why) = crate::ticket_interim::check(&r, seq, digest, 101, own_up, own_down, price, max_msat, last) {
                 found = Some((why, r.raw));
@@ -3847,22 +3849,38 @@ impl Signer {
                     None => drop(w),
                 }
                 let (pay, credited, state, wake, up, stopper, st, account) = (&pay, &credited, &state, &wake, &up, &stopper, &st, &account);
-                // the seller's signed count of this open answer, checked against the wallet's as it runs
-                let mut interim: (Option<crate::ticket_interim::Seen>, Instant) = (None, Instant::now() + crate::ticket_interim::poll_every());
+                // the seller's signed count of this open answer, checked against the wallet's as it runs: on its own
+                // thread, so a slow `status` never holds up the paying of the bytes
+                scope.spawn(move || {
+                    let mut last: Option<crate::ticket_interim::Seen> = None;
+                    let mut next = Instant::now() + crate::ticket_interim::poll_every();
+                    loop {
+                        {
+                            let mut s = lock(state);
+                            loop {
+                                if s.2 || s.1.is_some() {
+                                    return;
+                                }
+                                let now = Instant::now();
+                                if now >= next {
+                                    break;
+                                }
+                                s = wake.wait_timeout(s, next - now).unwrap_or_else(|p| p.into_inner()).0;
+                            }
+                        }
+                        next = Instant::now() + crate::ticket_interim::poll_every();
+                        let own = || (up.load(Ordering::SeqCst), lock(state).0);
+                        if let Some(why) = self.ticket_interim(hs, seq, digest, &own, price, st.max_msat, &mut last) {
+                            lock(state).1.get_or_insert(why);
+                            wake.notify_all();
+                            return;
+                        }
+                    }
+                });
                 scope.spawn(move || loop {
                     let mut s = lock(state);
                     if s.2 || s.1.is_some() {
                         return;
-                    }
-                    if Instant::now() >= interim.1 {
-                        let (down, out) = (s.0, up.load(Ordering::SeqCst));
-                        drop(s);
-                        interim.1 = Instant::now() + crate::ticket_interim::poll_every();
-                        let fault = self.ticket_interim(hs, seq, digest, out, down, price, st.max_msat, &mut interim.0);
-                        s = lock(state);
-                        if let Some(why) = fault {
-                            s.1.get_or_insert(why);
-                        }
                     }
                     let total = s.0.saturating_add(up.load(Ordering::SeqCst));
                     account(st.cost(total));

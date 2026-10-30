@@ -175,7 +175,12 @@ impl Gateway {
             } else {
                 counted.up = counted.up.saturating_add(bytes.len() as u64);
             }
-            let charged = m.at_head.saturating_add(meter.lock().unwrap_or_else(|p| p.into_inner()).charged());
+            // signed for the bytes counted here, never for a chunk paid for and still being written
+            // (the other direction's write may be blocked on it): the buyer checks the charge against
+            // these counts
+            let paid = m.at_head.saturating_add(meter.lock().unwrap_or_else(|p| p.into_inner()).charged());
+            let counted_cost = m.at_head.saturating_add(m.route.price.for_bytes(counted.up.saturating_add(counted.down)).unwrap_or(u64::MAX));
+            let charged = paid.min(counted_cost);
             if charged > counted.charged && (charged - counted.charged >= step || counted.at.elapsed() >= INTERIM_EVERY) {
                 counted.part += 1;
                 (counted.charged, counted.at) = (charged, Instant::now());

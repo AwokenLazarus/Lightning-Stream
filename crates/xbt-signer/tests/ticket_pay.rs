@@ -5974,6 +5974,12 @@ fn interim_socket(r: &Rig, dir: &std::path::Path, name: &str, out: usize, max_sa
         if let Some(edit) = edit {
             edit(&mut v, &mut state.lock().unwrap());
         }
+        // an edit that sets `"unsigned": true` drops the status's own signed receipt: an answer the
+        // wallet cannot take as the seller's
+        if v["unsigned"] == true {
+            let headers = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("PAYMENT-RESPONSE")).collect();
+            return Some(Ok(answer(500, headers, b"internal error".to_vec())));
+        }
         Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
     }));
     let caller = std::thread::spawn(move || {
@@ -6032,6 +6038,59 @@ fn an_open_sockets_interim_receipts_are_checked_as_it_runs() {
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+/// A socket busy both ways at once, its reader slower than its writer (a download through a VPN
+/// tunnel while the other way carries acknowledgements): the seller's writes block with a chunk paid
+/// for and not yet counted, while the other way signs. An honest seller's counts still pass.
+#[test]
+fn a_socket_busy_both_ways_at_once_is_counted_honestly() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    std::env::set_var("B2_INTERIM_POLL_MS", "50");
+    let r = Rig::new(json!({}));
+    let l = std::os::unix::net::UnixListener::bind(dir.path().join("busy")).unwrap();
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        // the writer as fast as it can go, the reader slow: the echo backs up both ways
+        let writer = std::thread::spawn(move || {
+            let piece: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+            for _ in 0..(6 << 20) / piece.len() {
+                if w.write_all(&piece).is_err() {
+                    break;
+                }
+            }
+            let _ = w.shutdown(std::net::Shutdown::Write);
+        });
+        let mut buf = vec![0u8; 4096];
+        let mut got = 0usize;
+        while let Ok(n) = rd.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got += n;
+            if got % (256 << 10) < 4096 {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        let _ = writer.join();
+        got
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/tunnel"), "max_sats": 40_000, "task": "film", "stream_to": "busy", "stream_head": true,
+                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]}));
+    let got = caller.join().unwrap();
+    assert_eq!(v["status"], 101, "{v}");
+    assert!(r.audit("ticket_interim_fault").is_empty(), "an honest seller was faulted: {:?}", r.audit("ticket_interim_fault"));
+    assert!(got > 0, "{v}");
+    std::env::remove_var("B2_INTERIM_POLL_MS");
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
 /// A seller whose signed count of an open socket charges more than the bytes it passed is caught
 /// while the socket runs: a seller fault, the socket ends, and the session with it.
 #[test]
@@ -6051,6 +6110,36 @@ fn a_seller_that_overcharges_an_open_socket_is_caught_while_it_runs() {
     assert!(faults[0]["reason"].as_str().unwrap().contains("cost"), "{faults:?}");
     let next = r.pay("/page/11", CALL);
     assert_ne!(next["session"], first["session"], "the faulty session is not used again: {next}");
+    std::env::remove_var("B2_INTERIM_POLL_MS");
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A seller that counted an open socket once, then answers `status` with errors while bytes go on
+/// flowing, gets nothing more: a status the wallet cannot take is no newer count (stale), and the next
+/// ticket is not released to it.
+#[test]
+fn a_seller_whose_status_fails_after_one_count_gets_nothing_more() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    std::env::set_var("B2_INTERIM_POLL_MS", "150");
+    std::env::set_var("B2_INTERIM_STALE_MS", "600");
+    let r = Rig::new(json!({}));
+    let (v, listed) = interim_socket(&r, dir.path(), "erring", 6 << 20, 20_000, Some(|v, shown| {
+        if v["interim"].as_array().is_some_and(|a| !a.is_empty()) {
+            *shown += 1;
+            if *shown > 1 {
+                // no longer a status the wallet can take: an error, with no signed receipt
+                *v = json!({"unsigned": true});
+            }
+        }
+    }));
+    assert!(listed >= 2, "{listed}");
+    assert_eq!(v["complete"], false, "the socket was stopped: {v}");
+    let stale = r.audit("ticket_interim_fault").iter().any(|f| f["reason"].as_str().is_some_and(|w| w.contains("no count")));
+    let refused = v["ended"].as_str().is_some_and(|w| w.contains("no secret was released"));
+    assert!(stale || refused, "{v}");
+    std::env::remove_var("B2_INTERIM_STALE_MS");
     std::env::remove_var("B2_INTERIM_POLL_MS");
     std::env::remove_var("B2_STREAM_DIR");
 }

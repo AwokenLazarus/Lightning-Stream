@@ -53,6 +53,11 @@ pub struct Seen {
     pub own_at: u64,
 }
 
+/// What a seller's interim charge may run ahead of the bytes it counted: a seller pays for a chunk
+/// before it writes it and counts it after, so one chunk (16 KiB) each way may be paid and not yet
+/// counted when the other way signs.
+pub const CHUNK_SLACK: u64 = 2 * 16 * 1024;
+
 /// What the seller may count past the wallet in one direction: bytes on their way (in the seller's
 /// and the link's buffers) when the receipt was signed and the wallet read its own count: 2% of
 /// the wallet's count and 4 MiB.
@@ -102,7 +107,7 @@ pub fn check(
             "the seller says it passed {up} bytes out and {down} back on an open answer; the wallet counted {own_up} and {own_down}"
         ));
     }
-    let worth = price.cost(up.saturating_add(down), 0).unwrap_or(u64::MAX);
+    let worth = price.cost(up.saturating_add(down).saturating_add(CHUNK_SLACK), 0).unwrap_or(u64::MAX);
     if r.charged > worth {
         return Err(format!("the seller charged {} msat for an open answer whose bytes, by its own count, cost {worth}", r.charged));
     }
@@ -181,6 +186,17 @@ mod tests {
     fn a_seller_that_charges_more_than_its_own_bytes_cost_is_a_fault() {
         let mut last = None;
         let r = receipt(1, 0, 1 << 20, cost(1 << 20) * 3);
+        assert!(check(&r, 7, "d", 101, 0, 1 << 20, &price(), u64::MAX, &mut last).unwrap_err().contains("cost"));
+    }
+
+    #[test]
+    fn a_chunk_paid_for_and_not_yet_counted_each_way_is_no_fault_and_more_is() {
+        // the seller paid for a chunk each way that it had not counted when it signed
+        let mut last = None;
+        let r = receipt(1, 0, 1 << 20, cost((1 << 20) + CHUNK_SLACK));
+        assert_eq!(check(&r, 7, "d", 101, 0, 1 << 20, &price(), u64::MAX, &mut last), Ok(true));
+        let mut last = None;
+        let r = receipt(1, 0, 1 << 20, cost((1 << 20) + CHUNK_SLACK) + 2);
         assert!(check(&r, 7, "d", 101, 0, 1 << 20, &price(), u64::MAX, &mut last).unwrap_err().contains("cost"));
     }
 
