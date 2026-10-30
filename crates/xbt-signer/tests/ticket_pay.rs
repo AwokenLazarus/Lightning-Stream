@@ -1275,6 +1275,53 @@ fn the_balance_a_session_leaves_with_the_seller_is_always_under_one_ticket() {
     }
 }
 
+/// A second plain read on a route whose terms the seller stated, with the session open, is paid
+/// without asking its price first: one round trip a request saved, which over a slow link is most of
+/// what a page's many small requests cost.
+#[test]
+fn a_read_on_a_route_whose_terms_are_known_is_paid_without_asking_the_price_again() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/100", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let second = r.pay("/page/200", CALL);
+    assert_eq!((second["status"].as_u64(), second["price_msat"].as_str()), (Some(200), Some("2500")), "{second}");
+    let sent: Vec<bool> = r.tap.seen("/page/200").iter().map(|s| s.paid).collect();
+    assert_eq!(sent, vec![true], "the second page was asked for {sent:?} (paid or not)");
+    assert!(r.status()["sellers"][0]["seller_fault"].is_null(), "{}", r.status());
+}
+
+/// Terms kept for one route and used on a path the seller serves on another: the seller refuses the
+/// request unpaid (`terms_changed`), and the wallet asks the price and pays the right one, with no
+/// fault. Here the seller's 402 for `/page/` is made to claim every path (route `/`), so the wallet
+/// pays `/tiny/` (0.5 sat) on `/page/`'s terms (2.5 sat) first.
+#[test]
+fn terms_kept_for_another_route_are_refused_unpaid_and_the_price_is_asked() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid || !seen.path.starts_with("/page/") {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["extra"]["route"] = "/".into();
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    assert_eq!(r.pay("/page/100", CALL)["status"].as_u64(), Some(200));
+    r.tap.clear();
+    let v = r.pay("/tiny/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some("500")), "{v}");
+    let sent: Vec<bool> = r.tap.seen("/tiny/1").iter().map(|s| s.paid).collect();
+    assert_eq!(sent, vec![true, false, true], "paid on the kept terms, refused, asked, paid: {sent:?}");
+    assert!(r.status()["sellers"][0]["seller_fault"].is_null(), "{}", r.status());
+}
+
 /// The reader of a streamed body has all of it, and its end, once the body has arrived: not after
 /// the wallet has fetched the seller's last receipt, which over a slow link (a relay far away) is
 /// another round trip or more. Here the seller's status takes 1.5 s; the reader is not kept waiting.

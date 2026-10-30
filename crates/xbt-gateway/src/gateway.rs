@@ -886,6 +886,11 @@ impl Gateway {
                     if *settle == SETTLE_ON_USE && self.cfg.caps.held_after_paid {
                         e["extra"]["heldAfterPaid"] = true.into();
                     }
+                    // the route these terms are for, and that a paid request repeating another route's terms is
+                    // refused unpaid ([`Refusal::TermsChanged`]): a buyer may then pay its next request on this route
+                    // without asking the price first
+                    e["extra"]["route"] = r.path.clone().into();
+                    e["extra"]["termsChecked"] = true.into();
                     // a route that gives buyers accounts asks to know who the buyer is (docs/BUYER-ACCOUNTS.md)
                     if r.accounts.is_some() {
                         e["extra"]["identify"] = true.into();
@@ -1668,6 +1673,14 @@ impl Gateway {
             Ok(a) => a,
             Err(r) => return Reply::Whole(r),
         };
+        // a price the buyer took this route to have that is not its own (a buyer that paid without asking
+        // this path's price, from terms of another route): not served, nothing charged, this route's terms stated
+        let p = &route.price;
+        if req.header(xbt402::ticket::PRICE_HEADER)
+            .is_some_and(|h| h.trim() != xbt402::ticket::price_line(p.request_msat, p.byte_msat, p.per_bytes, p.second_msat, &p.tokens))
+        {
+            return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), Refusal::TermsChanged));
+        }
         let on_pledge = route.release == Release::AfterVerify;
         if let Some(hash) = &a.ticket {
             if !on_pledge {

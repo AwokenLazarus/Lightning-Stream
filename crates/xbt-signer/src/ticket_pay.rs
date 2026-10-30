@@ -1829,6 +1829,42 @@ impl Signer {
         self.engine.allowlist().iter().any(|a| a == origin) || self.ticket_policy().tasks.get(task).is_some_and(|t| t.admit == Admit::Any)
     }
 
+    /// Keep the terms of a seller's 402 for the route it names, where its gateway checks them
+    /// (`termsChecked`): every ticket entry names the same route, and there is no draw entry (draws
+    /// are always asked for). At most 64 routes a seller and 64 sellers.
+    fn route_terms_keep(&self, origin: &str, pr: &Value) {
+        let entries: Vec<&Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten().collect();
+        if entries.iter().any(|e| e.get("scheme").and_then(Value::as_str) != Some(xbt402::ticket::SCHEME)) {
+            return;
+        }
+        let routes: HashSet<&str> = entries.iter().filter(|e| e["extra"]["termsChecked"] == true).filter_map(|e| e["extra"]["route"].as_str()).collect();
+        let [route] = routes.into_iter().collect::<Vec<_>>()[..] else { return };
+        if !route.starts_with('/') || entries.iter().any(|e| e["extra"]["termsChecked"] != true || e["extra"]["route"] != route) {
+            return;
+        }
+        let mut all = lock(&self.route_terms);
+        if all.len() >= 64 && !all.contains_key(origin) {
+            all.clear();
+        }
+        let mine = all.entry(origin.to_string()).or_default();
+        if mine.len() >= 64 && !mine.contains_key(route) {
+            mine.clear();
+        }
+        mine.insert(route.to_string(), pr.clone());
+    }
+
+    /// The terms kept for the route of `url` at `origin`, the route the seller's gateway would take
+    /// it on among those it has stated: the longest whose path ends in `/` and starts the URL's path,
+    /// or that is the whole path.
+    fn route_terms_for(&self, origin: &str, url: &str) -> Option<Value> {
+        let path = url.split_once("://").and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..])).unwrap_or("/");
+        let path = path.split(['?', '#']).next().unwrap_or("/");
+        let all = lock(&self.route_terms);
+        all.get(origin)?.iter()
+            .filter(|(r, _)| if r.ends_with('/') { path.starts_with(r.as_str()) } else { path == r.as_str() })
+            .max_by_key(|(r, _)| r.len()).map(|(_, pr)| pr.clone())
+    }
+
     // --- the entry: one function chooses the rail ---------------------------------------------------
 
     /// `xbt402_pay`. The signer asks the seller once without paying, and pays by the first of these
@@ -1858,6 +1894,20 @@ impl Signer {
     /// sends the page's own request headers (`headers`, [`caller_headers`]) and, with
     /// `head_headers`, gets the seller's response headers in the head line ([`passed_headers`]).
     pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
+        let v = self.xbt402_pay_as(p, true);
+        // paid on terms the seller stated for another of its routes, and refused unpaid: asked properly, once
+        if v.get("seller_code").and_then(Value::as_str) == Some("terms_changed") {
+            if let Some(o) = p.get("url").and_then(Value::as_str).and_then(|u| origin_of(u).ok()) {
+                lock(&self.route_terms).remove(&normalize_dest(&o));
+            }
+            return self.xbt402_pay_as(p, false);
+        }
+        v
+    }
+
+    /// [`Signer::xbt402_pay`]; `known_terms`: a request on a route whose terms the seller stated in this
+    /// session may be paid without asking its price first ([`Signer::route_terms`]).
+    fn xbt402_pay_as(&self, p: &Value, known_terms: bool) -> Value {
         let tp = self.ticket_policy();
         let cfg = self.config();
         let max_sats = match p.get("max_sats").filter(|v| !v.is_null()) {
@@ -1962,62 +2012,73 @@ impl Signer {
         };
         // the session open with this seller, named in the ask of the price: a seller whose route is full
         // goes on serving a buyer it serves there (docs/CAPACITY.md)
-        let mut named = self.ticket_seller_sid(&origin, false);
-        let mut probe = loop {
-            let mut headers = range_headers.clone();
-            if let Some(sid) = &named {
-                headers.push(("PAYMENT-SESSION".into(), sid.clone()));
-            }
-            let probe = if upgrade {
-                // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
-                match self.wire_upgrade(&url, &headers, Self::ticket_read_timeout(&tp)) {
-                    Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
-                    Ok(u) => Ok(u.answer),
-                    Err(e) => Err(e),
+        let named0 = self.ticket_seller_sid(&origin, false);
+        // a plain read on a route whose terms this seller stated, with a session open: paid without asking
+        let known = (known_terms && named0.is_some() && matches!(method.as_str(), "GET" | "HEAD") && raw.is_empty() && !upgrade)
+            .then(|| self.route_terms_for(&origin, &url)).flatten();
+        let pr = match known {
+            Some(pr) => pr,
+            None => {
+                let mut named = named0;
+                let mut probe = loop {
+                    let mut headers = range_headers.clone();
+                    if let Some(sid) = &named {
+                        headers.push(("PAYMENT-SESSION".into(), sid.clone()));
+                    }
+                    let probe = if upgrade {
+                        // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
+                        match self.wire_upgrade(&url, &headers, Self::ticket_read_timeout(&tp)) {
+                            Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
+                            Ok(u) => Ok(u.answer),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        self.wire(&method, &url, &raw, &headers, Self::ticket_read_timeout(&tp))
+                    };
+                    let probe = match probe {
+                        Ok(a) => a,
+                        Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
+                    };
+                    // busy while another call was opening the session with this seller (a page's first parts at
+                    // once): asked again as that session's buyer, once it is open
+                    if probe.status == 503 && named.is_none() {
+                        named = self.ticket_seller_sid(&origin, true);
+                        if named.is_some() {
+                            continue;
+                        }
+                    }
+                    break probe;
+                };
+                // a seller whose service is full turns a new visit away before it is sold anything
+                if probe.status == 503 {
+                    let v: Value = probe.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                    if let Some(d) = seller_busy(&v) {
+                        return d;
+                    }
+                    return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"), json!({"status": 503, "charged_sats": 0}));
                 }
-            } else {
-                self.wire(&method, &url, &raw, &headers, Self::ticket_read_timeout(&tp))
-            };
-            let probe = match probe {
-                Ok(a) => a,
-                Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
-            };
-            // busy while another call was opening the session with this seller (a page's first parts at
-            // once): asked again as that session's buyer, once it is open
-            if probe.status == 503 && named.is_none() {
-                named = self.ticket_seller_sid(&origin, true);
-                if named.is_some() {
-                    continue;
+                if probe.status != 402 {
+                    let status = probe.status;
+                    // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
+                    let mut sink = Sink::streaming_to(stream_to.as_deref());
+                    let (head, refused) = head_to(&mut probe, range, stream_head, head_headers, &mut sink);
+                    let ended = match refused {
+                        Some(why) => Some(format!("not read: {why}")),
+                        None => read_all(probe, &mut sink),
+                    };
+                    let (_, stored, text) = sink.done();
+                    return with(with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": status, "charged_sats": 0, "note": "no 402 (already free or error)",
+                                                 "complete": ended.is_none(), UNTRUSTED_KEY: untrusted(&text, Value::Null)}), stored),
+                                     json!({"ended": ended})), head);
                 }
+                let Some(pr) = probe.header("PAYMENT-REQUIRED").and_then(|h| unb64json(h).ok()) else {
+                    return deny("xbt402", "402 without a readable PAYMENT-REQUIRED");
+                };
+                drop(probe);
+                self.route_terms_keep(&origin, &pr);
+                pr
             }
-            break probe;
         };
-        // a seller whose service is full turns a new visit away before it is sold anything
-        if probe.status == 503 {
-            let v: Value = probe.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-            if let Some(d) = seller_busy(&v) {
-                return d;
-            }
-            return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"), json!({"status": 503, "charged_sats": 0}));
-        }
-        if probe.status != 402 {
-            let status = probe.status;
-            // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
-            let mut sink = Sink::streaming_to(stream_to.as_deref());
-            let (head, refused) = head_to(&mut probe, range, stream_head, head_headers, &mut sink);
-            let ended = match refused {
-                Some(why) => Some(format!("not read: {why}")),
-                None => read_all(probe, &mut sink),
-            };
-            let (_, stored, text) = sink.done();
-            return with(with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": status, "charged_sats": 0, "note": "no 402 (already free or error)",
-                                         "complete": ended.is_none(), UNTRUSTED_KEY: untrusted(&text, Value::Null)}), stored),
-                             json!({"ended": ended})), head);
-        }
-        let Some(pr) = probe.header("PAYMENT-REQUIRED").and_then(|h| unb64json(h).ok()) else {
-            return deny("xbt402", "402 without a readable PAYMENT-REQUIRED");
-        };
-        drop(probe);
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
@@ -3323,6 +3384,9 @@ impl Signer {
                 if c.max_sats > 0 {
                     headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.max_sats as u64).saturating_mul(1000).to_string()));
                 }
+                // the price the wallet counts this request at: a seller that checks it refuses another unpaid
+                headers.push((xbt402::ticket::PRICE_HEADER.into(),
+                              xbt402::ticket::price_line(price.request_msat, price.byte_msat, price.per_bytes, price.second_msat, &price.tokens)));
                 sent_epoch = lock_money(hs).epoch;
                 let sent = if c.upgrade {
                     self.wire_upgrade(c.url, &headers, Self::ticket_read_timeout(&tp)).map(|u| {
