@@ -21,6 +21,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   Stream, paid as it is used, with an account made for each buyer.
 - The built-in player is gone. A media server is shared as a web app, and a new **Files** service
   shares a folder: buyers pay per GB to download a file or open it in their own player.
+- On Umbrel, Files shares a folder from the box's Downloads, which the Files app shows; read-only.
 
 **Paying**
 - Several requests to one seller run side by side in one session, each exactly accounted, so a busy
