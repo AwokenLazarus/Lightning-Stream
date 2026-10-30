@@ -3378,7 +3378,7 @@ impl Signer {
             };
             let seq_deadline = Instant::now() + SEQ_WAIT;
             let mut sent_epoch;
-            let (ans, receipt) = loop {
+            let (mut ans, receipt) = loop {
                 let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
                 let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
                 let mut headers = c.headers();
@@ -3491,14 +3491,18 @@ impl Signer {
             }
             // a seller that gives accounts and has not been told who this wallet is (it restarted, say): told, and asked again, once
             if ans.status == 403 && !identified_again && self.identify_wanted(hs) {
-                let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                let headers = ans.headers.clone();
+                let body = ans.read_small(SMALL_BODY).unwrap_or_default();
+                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 if v.get("error").and_then(Value::as_str) == Some("identify_first") {
                     identified_again = true;
                     if self.ticket_identify(hs).is_ok() {
                         continue;
                     }
+                    return fail(hs, &spent, with(refusal("ticket_refused", "the seller asks to know who this wallet is first, and could not be told"), json!({"status": 403})));
                 }
-                return fail(hs, &spent, with(refusal("ticket_refused", "the seller asks to know who this wallet is first, and could not be told"), json!({"status": 403})));
+                // any other refusal the seller signed (a path it does not serve, say) is its answer, handed on as it is
+                ans = WireAnswer { status: 403, length: Some(body.len() as u64), headers, body: Box::new(std::io::Cursor::new(body)) };
             }
             if matches!(ans.status, 402 | 503) {
                 let status = ans.status;

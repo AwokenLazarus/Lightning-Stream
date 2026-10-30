@@ -255,7 +255,8 @@ fn routes() -> Value {
         {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
         {"path": "/wsfree/", "free": true, "websocket": true},
         // a buyer's own account (docs/BUYER-ACCOUNTS.md), made by the seller's hook: its headers say who the buyer is
-        {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK}},
+        {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK},
+         "deny_paths": ["/acct/admin"]},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
@@ -1349,6 +1350,28 @@ fn terms_kept_for_another_route_are_refused_unpaid_and_the_price_is_asked() {
     assert_eq!((free["status"].as_u64(), free["charged_sats"].as_i64(), free.get("seller_fault")), (Some(200), Some(0), None), "{free}");
     assert_eq!(r.tap.seen("/free/10").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![true, false], "paid, refused unpaid, asked: free");
     assert_eq!(r.pay("/page/400", CALL)["session"].as_str(), Some(session.as_str()), "the session goes on");
+}
+
+/// On a route that gives each buyer an account, a path the seller does not serve is answered as it
+/// is (403, signed, nothing charged), not taken for the seller asking who the buyer is. A web app
+/// asks for such paths (Jellyfin's `/System/Info`), and refusing them as "identify first" sent its
+/// buyers back to the login page.
+#[test]
+fn a_refused_path_on_a_route_with_accounts_is_answered_as_it_is() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::new(json!({}));
+    let first = r.pay("/acct/echo", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let v = r.pay("/acct/admin", CALL);
+    assert_eq!((v["status"].as_u64(), v["charged_sats"].as_i64(), v.get("seller_fault"), v["rule"].as_str()), (Some(403), Some(0), None, Some("ok")), "{v}");
+    assert!(v["untrusted_provider_response"]["body"].as_str().is_some_and(|b| b.contains("path_refused")), "the seller's own answer: {v}");
+    assert_eq!(r.pay("/acct/echo", CALL)["session"], first["session"], "the session goes on");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
 }
 
 /// The reader of a streamed body has all of it, and its end, once the body has arrived: not after
