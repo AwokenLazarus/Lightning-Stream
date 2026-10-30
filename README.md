@@ -1,11 +1,14 @@
 # Lightning Stream
 
-Buy and sell services over XBT Lightning, paid piece by piece as they arrive: a film by the
-megabyte, an AI model by the token, a miner's hashrate by the slice of work. XBT is Bitcoin on
-BLAKE2b proof of work.
+Buy and sell services over XBT Lightning, paid as you use them: a seller's own web app (Jellyfin
+and the like) or a folder of files by the megabyte, an AI model by the token, a miner's hashrate by
+the slice of work, a VPN exit by the gigabyte. XBT is Bitcoin on BLAKE2b proof of work.
 
-The buyer pays a small ticket ahead (about 900 sats), the seller counts what it delivers to the
-millisatoshi and signs a receipt for every answer, and the buyer can lose no more than one ticket.
+The buyer pays a small ticket ahead (about 900 sats), and the seller counts what it delivers to the
+millisatoshi and signs a receipt for every answer. A shop is paid no more than its listing shows. A
+dishonest shop can keep at most what the buyer's app paid it ahead (about one to two tickets for each
+answer it is sending) plus a small allowance per request; one that charges more is caught and
+blocked, and each shop has a daily cap (the exact bound is in [`docs/TICKETS.md`](docs/TICKETS.md)).
 It runs on ordinary XBT Lightning nodes. Lightning Stream never holds anyone's money: each person
 pays from, and is paid to, their own node.
 
@@ -39,12 +42,18 @@ money**, and allow a seller. Our test shop is `https://stream.lazarus-xbt.xyz`. 
 
 ## What it does
 
-- **Buy.** Browse sellers' signed listings (published on Nostr relays), play films as they arrive,
-  ask an AI model, or rent hashrate. Every payment stays within spending rules the owner signs:
+- **Buy.** Browse sellers' signed listings (published on Nostr relays), open a seller's own web app
+  (for example Jellyfin's full interface, up to 4K, with an account of your own), download files or
+  open them in your own player, ask an AI model, rent hashrate, or send your devices out through
+  another box's VPN exit. Every payment stays within spending rules the owner signs:
   budgets, caps per seller, allowed sellers only, and an approval above a threshold.
-- **Sell.** Put a price on the services already on your box (a media server, an AI model, any web
-  service). A gateway answers buyers with HTTP 402 and its terms, meters each answer per request,
-  byte, token or second, and signs a receipt.
+- **Sell.** Put a price on the services already on your box (a web app such as Jellyfin, a folder
+  of files, an AI model, a VPN exit from your own connection). A gateway answers buyers with HTTP 402
+  and its terms, meters each answer per request, byte, token or second, and signs a receipt. Buyers
+  can reach your shop by its key alone, over an encrypted link: no domain, certificate or port
+  forward. Where the two ends can't connect directly a relay carries the traffic without seeing it,
+  and in private mode buyers never learn your box's address. A relay is built in (off by default,
+  free); paid relays come in an update.
 - **Rent hashrate.** A *hashmaker* lists its miners and a *hashtaker* rents them into its own
   DATUM Gateway, paying for each slice of work after it is delivered. Only shares the hashtaker's
   own gateway accepted are counted. ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))

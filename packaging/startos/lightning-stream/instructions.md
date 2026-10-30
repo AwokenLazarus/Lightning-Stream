@@ -27,8 +27,11 @@ Agents connect to the *MCP server for agents* interface with the token from the 
 
 ## Selling
 
-Open **Sell**: name your shop, add a public domain to the *Gateway for buyers* interface and type that
-https address as the shop's address, then add each service you sell with its price.
+Open **Sell**: name your shop, then add each service you sell with its price: a web app such as Jellyfin
+(each buyer gets an account of their own), files, an AI model, a VPN exit from your own connection.
+Buyers reach your shop by its key over an encrypted link, so no domain or port forward is needed; if you
+want an https address too, add a public domain to the *Gateway for buyers* interface and type it as the
+shop's address.
 
 - **Share files** (Files): to share files you keep in File Browser, run the *Files folder* action and
   choose File Browser (install it first if StartOS asks). Then put files in File Browser and choose the
