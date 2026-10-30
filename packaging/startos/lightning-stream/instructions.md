@@ -30,6 +30,11 @@ Agents connect to the *MCP server for agents* interface with the token from the 
 Open **Sell**: name your shop, add a public domain to the *Gateway for buyers* interface and type that
 https address as the shop's address, then add each service you sell with its price.
 
+- **Share files** (Files): to share files you keep in File Browser, run the *Files folder* action and
+  choose File Browser (install it first if StartOS asks). Then put files in File Browser and choose the
+  folder on the Sell page. Stream only reads them: it never changes or deletes your files. Without File
+  Browser, Files shares a folder in this app's own storage.
+
 ## Hashrate
 
 - **Rent your miners out** (you are the hashmaker): Sell → Hashrate. Point your miners at the *Miners*

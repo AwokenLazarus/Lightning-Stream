@@ -18,8 +18,12 @@ const nodeShape = z.object({
   chain: z.enum(['main', 'test', 'regtest']).catch('main'),
 })
 
+/** Where the Files service's folder is: the package's own volume, or File Browser's files, read-only. */
+export const FILES_SOURCES = ['own', 'filebrowser'] as const
+
 const shape = z.object({
   node: nodeShape.catch(() => nodeShape.parse({})),
+  filesSource: z.enum(FILES_SOURCES).catch('own'),
 })
 
 export const storeJson = FileHelper.json({ base: sdk.volumes.startos, subpath: 'store.json' }, shape)

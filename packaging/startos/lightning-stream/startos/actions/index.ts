@@ -1,5 +1,6 @@
 import { sdk } from '../sdk'
 import { agentConnection } from './agentConnection'
+import { filesFolder } from './filesFolder'
 import { nodeConfig } from './nodeConfig'
 import { resetUiPassword } from './resetUiPassword'
 import { rotateAgentToken } from './rotateAgentToken'
@@ -11,3 +12,4 @@ export const actions = sdk.Actions.of()
   .addAction(agentConnection)
   .addAction(rotateAgentToken)
   .addAction(resetUiPassword)
+  .addAction(filesFolder)
