@@ -43,7 +43,8 @@ step("open the visit"); await cdp("Page.navigate", { url: ENTER });
 await waitFor("document.readyState==='complete' && location.pathname.startsWith('/web')", 30000);
 await sleep(6000); await shot("01-first-page");
 step(`page: ${await ev("location.href")} title=${await ev("document.title")}`);
-const loginForm = await waitFor("!!document.querySelector('#txtManualName, .manualLoginForm, input[type=password]')", 15000);
+// over a slow link the web client takes a while to load all its parts: a viewer waits for the login page
+const loginForm = await waitFor("!!document.querySelector('#txtManualName, .manualLoginForm, input[type=password]')", Number(process.env.JF_LOGIN_WAIT_MS || 90000));
 step(`login form shown: ${loginForm}`);
 if (loginForm && TAP) {
   // the login page lists the users once it has asked the server for them: on a slow link, seconds after the form
