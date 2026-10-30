@@ -265,7 +265,7 @@ pub struct Config {
 /// node vouches for the link key itself, at start (`sign.macaroon` beside `node.macaroon`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
-    /// `https://` (or `http://` for a lab) relay URLs; empty: iroh's public relays.
+    /// `https://` relay URLs (buyers refuse any other); empty: iroh's public relays.
     pub relays: Vec<String>,
     /// Relays only: buyers never learn the seller's address.
     pub private: bool,
@@ -285,7 +285,12 @@ impl LinkConfig {
             Some(Value::Array(a)) => a
                 .iter()
                 .map(|r| match r.as_str() {
-                    Some(r) if r.starts_with("https://") || r.starts_with("http://") => Ok(r.trim_end_matches('/').to_string()),
+                    Some(r) if r.starts_with("https://") => Ok(r.trim_end_matches('/').to_string()),
+                    // buyers' wallets reach a seller's relays over https only: a shop with any other
+                    // would be one no buyer can reach
+                    Some(r) if r.starts_with("http://") => Err(format!(
+                        "link.relays: {r} is plain http, which buyers' wallets refuse: give the relay's https:// URL"
+                    )),
                     _ => Err("link.relays is a list of https:// relay URLs".to_string()),
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -1333,6 +1338,18 @@ mod tests {
         let mut v = base();
         v["public_url"] = json!("link");
         assert!(Config::from_json(&v).is_err(), "a shop by key without a link section is refused");
+    }
+
+    /// A buyer's wallet reaches a seller's relays over https only (its transport check refuses any
+    /// other): a plain-http relay here would make the shop one no buyer can reach, so it is refused.
+    #[test]
+    fn a_link_relay_is_https_only_as_buyers_require() {
+        let mut v = base();
+        v["link"] = json!({"relays": ["https://relay.example/"]});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().relays, vec!["https://relay.example".to_string()]);
+        v["link"] = json!({"relays": ["http://127.0.0.1:3340"]});
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("https://") && e.contains("refuse"), "{e}");
     }
 
     #[test]
