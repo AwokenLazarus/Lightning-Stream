@@ -72,7 +72,11 @@ res.home = home; step(`home shows cards: ${home}`); await shot("03-home");
 // resume point (or a "watched" mark), and Play would resume there, near the end of a short clip.
 res.reset_progress = await ev(`(async()=>{try{const a=window.ApiClient; await a.markUnplayed(a.getCurrentUserId(), '${ITEM}'); return true}catch(e){return String(e)}})()`);
 step(`progress reset: ${res.reset_progress}`);
-step("open the 4K film"); await ev(`location.hash = '#/details?id=${ITEM}'`); await sleep(6000); await shot("04-details");
+step("open the 4K film"); await ev(`location.hash = '#/details?id=${ITEM}'`);
+// the details page fills in once its item has arrived: over a slow link, seconds after it opens. A viewer waits for its
+// title and play button, not a fixed time
+const shown = await waitFor(`(()=>{const pg=[...document.querySelectorAll('.itemDetailPage')].find(p=>!p.classList.contains('hide')&&p.offsetParent!==null); return !!(pg && pg.querySelector('.mainDetailButtons .btnPlay:not(.hide), .mainDetailButtons button[data-action=resume]:not(.hide)') && pg.querySelector('.itemName, h1, h3.itemName'))})()`, Number(process.env.JF_PAGE_WAIT_MS || 60000));
+step(`details shown: ${shown}`); await sleep(1000); await shot("04-details");
 // The play button of the details page on show: Jellyfin keeps earlier pages (home, with its
 // "Continue watching" cards) in the document, hidden, so the first .btnPlay may be another film's.
 const play = await ev(`(()=>{const pg=[...document.querySelectorAll('.itemDetailPage')].find(p=>!p.classList.contains('hide')&&p.offsetParent!==null); const b=pg&&pg.querySelector('.mainDetailButtons .btnPlay, .mainDetailButtons button[data-action=resume], .mainDetailButtons button[data-action=play]'); if(b){b.click(); return true} return false})()`);
