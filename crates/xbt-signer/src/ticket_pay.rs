@@ -1976,7 +1976,10 @@ impl Signer {
     /// [`Signer::wire`], the whole request held to `overall` ([`TicketWire::send_by`]).
     fn wire_by(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, overall: Duration) -> Result<WireAnswer> {
         let tls = self.seller_tls_for(url);
-        self.ticket_wire.send_by(method, url, body, headers, read_timeout, tls.as_ref(), overall)
+        let t0 = Instant::now();
+        let r = self.ticket_wire.send_by(method, url, body, headers, read_timeout, tls.as_ref(), overall);
+        wire_trace(method, url, r.as_ref().map(|a| a.status).ok(), t0);
+        r
     }
 
     /// Whether the owner's policy, as it is now, lets a request leave for `origin` under `task`: the
