@@ -6125,6 +6125,44 @@ fn a_seller_caught_over_charging_is_blocked_until_the_owner_unblocks_it() {
     assert_eq!(again["status"].as_u64(), Some(200), "unblocked, the seller is paid again: {again}");
 }
 
+/// An honest seller on a slow path (a buffering relay) whose answers come after the wallet stopped
+/// waiting for them, three times in a session, having sent and charged more than a ticket in all for
+/// them: those are requests the wallet timed out, held as ones still being answered, so they are
+/// not clipped by the cap on lost requests nor counted as lost requests charged. No fault, no block.
+///
+/// FAILS before: they shared the one-ticket cap of lost requests, and the seller's spend past it was
+/// taken for a fault (and three would have blocked it).
+#[test]
+fn an_honest_seller_answering_after_the_wallets_timeout_is_not_faulted_or_blocked() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid && seen.path.starts_with("/files/") {
+            // the seller serves it (a relay buffers what it sends, as much as its credit lets it), but the wallet's
+            // wait has run out before the head reaches it
+            let mut a = real().ok()?;
+            let mut buf = vec![0u8; 3 * MIB];
+            let _ = a.body.read_exact(&mut buf);
+            return Some(Err(xbt402::ChannelError::new("timeout", "the seller did not answer within the wallet's wait")));
+        }
+        None
+    }));
+    for i in 0..3 {
+        let p = r.pay(&format!("/page/{}", 20 + i), CALL);
+        assert_eq!((p["status"].as_u64(), p.get("seller_fault")), (Some(200), None), "page before slow request {i}: {p}");
+        let v = r.pay(&format!("/files/{}", 6 * MIB), CALL);
+        assert!(v.get("seller_fault").is_none(), "slow request {i}: {v}");
+    }
+    r.tap.clear();
+    for i in 0..3 {
+        let p = r.pay(&format!("/page/{}", 40 + i), CALL);
+        assert_eq!((p["status"].as_u64(), p.get("seller_fault")), (Some(200), None), "page after {i}: {p}");
+    }
+    assert!(r.audit("ticket_seller_fault").is_empty(), "{:?}", r.audit("ticket_seller_fault"));
+    assert!(r.call("seller_blocks", json!({}))["blocked"].as_array().is_none_or(Vec::is_empty));
+}
+
 /// A seller with a narrow window: the wallet keeps no more of its requests on their way than the
 /// window holds, and the seller takes them all.
 #[test]

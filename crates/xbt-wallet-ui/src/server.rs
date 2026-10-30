@@ -228,7 +228,7 @@ impl xbt_svc::http::Handler for Ui {
                 // a range is asked for in parts of at most READ_CHUNK, whatever the reader asked
                 let range = bounded_range(req.headers.get("range").map(String::as_str), READ_CHUNK);
                 // the file's service's listed prices: the most each part is paid at
-                let ceiling = self.0.services().ok().and_then(|all| crate::services::find_item(&all, &item).and_then(|(s, _)| s.price_ceiling()));
+                let ceiling = self.0.relay_ceiling(&req, &item);
                 relay(&url, range.as_deref(), ceiling.as_ref())
             }
         }

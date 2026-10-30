@@ -451,6 +451,9 @@ impl UreqWire {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
             // a fixed wording: ureq's own quotes the URL (the seller's session path) and a malformed status
+            // the wallet's own wait running out (its read timeout or the call's deadline) is said as its own kind: the
+            // seller may be slow, not gone, and is held as one still answering ([`WIRE_TIMEOUT`])
+            Err(e) if wire_timed_out(&e) => return Err(err(WIRE_TIMEOUT, "the seller did not answer within the wallet's wait")),
             Err(e) => return Err(err("transport_error", xbt402::http::transport_words(&e))),
         };
         let status = resp.status();
@@ -970,6 +973,9 @@ struct Money {
     /// What lost requests not priced by the token have been allowed in all this session: capped at
     /// [`LOST_CAP_TICKETS`] tickets, so losing many requests does not add up ([`Money::lose`]).
     lost_allowed: u64,
+    /// Lost requests the wallet stopped waiting for (its own timeout): an honest seller on a slow path
+    /// may still serve them, so they are neither clipped by the cap nor counted as lost requests charged.
+    lost_waited: HashSet<u64>,
     /// Quiet points at which the seller's spend had risen by what lost requests allowed: each a
     /// lost request it charged. [`LOST_CHARGED_MOST`] of them is over-charging.
     lost_charged: u32,
@@ -1101,7 +1107,8 @@ impl Money {
         // a lost request may have been charged up to what could have arrived of it ([`uncounted_most`]). All of that is
         // allowed here, once, even where the seller charged it less: the quiet point after it checks the spend no tighter
         let lost: u64 = self.lost.values().fold(0u64, |a, (m, _)| a.saturating_add(*m));
-        if quiet && !self.lost.is_empty() && r.spent_msat > self.quiet_spent.saturating_add(self.accepted) {
+        // only lost requests whose connection failed count: one the wallet stopped waiting for may be an honest slow seller's
+        if quiet && self.lost.keys().any(|k| !self.lost_waited.contains(k)) && r.spent_msat > self.quiet_spent.saturating_add(self.accepted) {
             // the seller charged lost requests: rare for an honest one, and counted
             self.lost_charged = self.lost_charged.saturating_add(1);
             if self.lost_charged >= LOST_CHARGED_MOST {
@@ -1117,6 +1124,7 @@ impl Money {
         self.epoch = self.epoch.saturating_add(1);
         if quiet {
             self.lost.clear();
+            self.lost_waited.clear();
             self.anchor();
         } else {
             self.absorbed();
@@ -1140,10 +1148,14 @@ impl Money {
     /// it up to `most` (what could have arrived of it, [`uncounted_most`]), as late as its own queue
     /// lets it. Kept in the bounds until a quiet point [`LOST_GRACE`] after; a spend past them then
     /// is the seller's fault.
-    fn lose(&mut self, rid: u64, most: u64, quoted: bool, ticket_msat: u64) {
+    fn lose(&mut self, rid: u64, most: u64, quoted: bool, waited: bool, ticket_msat: u64) {
         if self.open.remove(&rid).is_some() {
-            // a reply held at its quote keeps it; any other lost request shares the session's cap
-            let most = if quoted {
+            if waited {
+                self.lost_waited.insert(rid);
+            }
+            // a reply held at its quote keeps it, and so does one the wallet stopped waiting for; any other lost
+            // request shares the session's cap
+            let most = if quoted || waited {
                 most
             } else {
                 let room = ticket_msat.saturating_mul(LOST_CAP_TICKETS).saturating_sub(self.lost_allowed);
@@ -1316,6 +1328,23 @@ fn is_done_event(bytes: &[u8]) -> bool {
 /// what the wallet read and this much more, priced, or up to the credit the answer could have
 /// drawn and this much more, whichever is more ([`Stream::cut_bound`]).
 const CUT_SLACK: u64 = (16 << 20) + PROXY_SLACK;
+
+/// The error code of a request the wallet stopped waiting for (its own read timeout or deadline),
+/// as against one whose connection failed: an honest seller on a slow path may still serve it.
+pub(crate) const WIRE_TIMEOUT: &str = "timeout";
+
+/// Whether a failed request ended on the wallet's own wait: an I/O error of kind `TimedOut` (or
+/// `WouldBlock`, which a socket read timeout gives on some systems) under ureq's transport error.
+fn wire_timed_out(e: &ureq::Error) -> bool {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            return matches!(io.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock);
+        }
+        src = s.source();
+    }
+    false
+}
 
 /// How long a request whose answer was lost is held as one the seller may still charge: longer than
 /// any answer is waited for, so that the seller has served or dropped it by then.
@@ -3875,13 +3904,13 @@ impl Signer {
                         // a request the wallet stopped waiting for (its own timeout) may still be served late by an honest
                         // seller: held as one being answered, with what is paid ahead of it. One whose connection failed,
                         // to what could have arrived. Either within the session's cap on lost requests ([`Money::lose`])
-                        let timed_out = { let w = e.msg.to_ascii_lowercase(); w.contains("timed out") || w.contains("timeout") };
+                        let timed_out = e.code == WIRE_TIMEOUT;
                         let lost = if price.second_msat > 0 && !price.tokens.active() {
                             price.cost(CUT_SLACK, started.elapsed().as_secs().saturating_add(1)).unwrap_or(u64::MAX).min(max_msat)
                         } else {
                             uncounted_most(price, reserve, max_msat, ticket_msat, 0, timed_out)
                         };
-                        lock_money(hs).lose(rid, lost, price.tokens.active(), ticket_msat);
+                        lock_money(hs).lose(rid, lost, price.tokens.active(), timed_out, ticket_msat);
                         return fail(hs, &spent, with(refusal("ticket_seller", format!("the seller gave no answer to the paid request: {}", e.msg)), json!({"status": null})));
                     }
                 };
@@ -5244,7 +5273,7 @@ mod tests {
         let mut m = money(1_000_000);
         let rid = m.request_id();
         m.open.insert(rid, 40_000);
-        m.lose(rid, 40_000, false, 1_000_000);
+        m.lose(rid, 40_000, false, false, 1_000_000);
         assert!(m.open.is_empty());
         // the seller served it after all and charged 30 sat: inside what it may, and not a quiet point
         assert_eq!(m.take(&receipt(3, 1_000_000, 30_000, 0), 0, false, None), Ok(true));
@@ -5267,14 +5296,14 @@ mod tests {
         for _ in 0..5 {
             let rid = m.request_id();
             m.open.insert(rid, 600_000);
-            m.lose(rid, 600_000, false, 1_000_000);
+            m.lose(rid, 600_000, false, false, 1_000_000);
         }
         let allowed: u64 = m.lost.values().map(|(a, _)| *a).sum();
         assert_eq!(allowed, 1_000_000, "five lost requests of 600 sat each share one ticket");
         // a reply held at its quote keeps it
         let rid = m.request_id();
         m.open.insert(rid, 300_000);
-        m.lose(rid, 300_000, true, 1_000_000);
+        m.lose(rid, 300_000, true, false, 1_000_000);
         assert_eq!(m.lost[&rid].0, 300_000);
         // the seller charges lost requests at three quiet points: the third is over-charging
         let mut spent = 0;
@@ -5286,7 +5315,7 @@ mod tests {
                 assert_eq!(r, Ok(true), "round {i}");
                 let rid = m.request_id();
                 m.open.insert(rid, 600_000);
-                m.lose(rid, 600_000, true, 1_000_000);
+                m.lose(rid, 600_000, true, false, 1_000_000);
             } else {
                 assert!(r.is_err() && m.overcharged, "{r:?}");
             }

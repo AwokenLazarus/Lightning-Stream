@@ -122,6 +122,9 @@ impl Decision {
 }
 
 /// B2's `PolicyConfig` (policy.json), defaults included.
+/// What one seller is paid at most in 24 hours where policy.json does not say.
+pub const DEFAULT_PER_COUNTERPARTY_DAILY_SATS: i64 = 20_000;
+
 #[derive(Debug, Clone)]
 pub struct PolicyConfig {
     pub allowlist: Vec<String>,
@@ -129,8 +132,10 @@ pub struct PolicyConfig {
     pub daily_budget_sats: i64,
     pub weekly_budget_sats: i64,
     pub per_counterparty_cap_sats: i64,
-    /// What one seller may be paid in a day (the last 24 hours), beside its weekly cap: absent, no
-    /// daily cap (a policy written before the key keeps what it decided).
+    /// What one seller may be paid in a day (the last 24 hours), beside its weekly cap. Absent from
+    /// policy.json (one written before the key): [`DEFAULT_PER_COUNTERPARTY_DAILY_SATS`] for a wallet
+    /// that buys with stream tickets, so it gets a daily cap without its owner signing the policy
+    /// again; none for another (its decisions stay as they were).
     pub per_counterparty_daily_sats: i64,
     pub velocity_max: i64,
     pub velocity_window_s: i64,
@@ -202,6 +207,11 @@ impl PolicyConfig {
         }
         if let Some(Value::Object(m)) = raw.get("tickets") {
             c.tickets = m.clone();
+            // a wallet that buys with stream tickets and whose policy predates the daily cap gets one, without its owner
+            // signing the policy again (other wallets keep what they decided)
+            if raw.get("per_counterparty_daily_sats").is_none() && m.get("enabled").and_then(Value::as_bool) == Some(true) {
+                c.per_counterparty_daily_sats = DEFAULT_PER_COUNTERPARTY_DAILY_SATS;
+            }
         }
         if let Some(Value::Array(a)) = raw.get("allowlist") {
             c.allowlist = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
@@ -1135,6 +1145,14 @@ mod tests {
         assert!(e.evaluate_admitted(&to_b, 1_000).unwrap().allowed(), "another seller is not held back");
         let (errors, _) = validate_policy(&serde_json::json!({"per_counterparty_daily_sats": 5000}));
         assert!(!errors.iter().any(|e| e.contains("per_counterparty_daily")), "{errors:?}");
+        // a wallet that buys with tickets and whose policy.json predates the key gets the default daily cap at once;
+        // another wallet's policy keeps deciding as it did
+        let old = PolicyConfig::from_value(&serde_json::json!({"tickets": {"enabled": true}})).unwrap();
+        assert_eq!(old.per_counterparty_daily_sats, DEFAULT_PER_COUNTERPARTY_DAILY_SATS);
+        let set = PolicyConfig::from_value(&serde_json::json!({"tickets": {"enabled": true}, "per_counterparty_daily_sats": 7000})).unwrap();
+        assert_eq!(set.per_counterparty_daily_sats, 7000);
+        let plain = PolicyConfig::from_value(&serde_json::json!({})).unwrap();
+        assert_eq!(plain.per_counterparty_daily_sats, i64::MAX);
     }
 
     /// The starter rules (2,000 a payment, ask above 1,000; the day's budget raised here so the seller cap is what binds): a buyer plays a film and then asks the

@@ -275,10 +275,25 @@ impl App {
         // the session's stream token: only a page of the wallet's own knows it (another page of the box sends
         // the cookie with what it asks for, but cannot read the token), so only the wallet's own page pays
         let token = path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).map(|(t, _)| t).unwrap_or("");
+        // `<token>.<service id>`: the service is only which price applies, never what the token proves
+        let token = token.split_once('.').map_or(token, |(t, _)| t);
         if !crate::ct_eq(token.as_bytes(), stream_token(&csrf).as_bytes()) {
             return Some(Err(Resp::text(403, "text/plain", "refused: a stream this page did not ask for")));
         }
         Some(Ok(None))
+    }
+
+    /// The listing's prices of the service the buyer chose for the relayed `item`, as the call's
+    /// `price_ceiling`: from a player's link, the service it was made for; from a Download
+    /// (`/s/~<token>.<service id>/`), the service it names. `None`: that service lists no price.
+    pub fn relay_ceiling(&self, req: &Req, item: &str) -> Option<Value> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        let service = match path.strip_prefix("/r/") {
+            Some(token) => self.relays.service_of(token)?,
+            None => path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).and_then(|(t, _)| t.split_once('.')).map(|(_, s)| s.to_string())?,
+        };
+        let all = self.services().ok()?;
+        crate::services::find_item_of(&all, &service, item).and_then(|(s, _)| s.price_ceiling())
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {

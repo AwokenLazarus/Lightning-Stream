@@ -22,6 +22,8 @@ pub const MAX_LINKS: usize = 32;
 struct Link {
     token: String,
     item: String,
+    /// The service it was made for ([`crate::services::Service::id`]).
+    service: String,
     expires: Instant,
 }
 
@@ -50,12 +52,17 @@ impl RelayLinks {
 
     /// A new link for `item` (a URL of the services file): its token.
     pub fn create(&self, item: &str) -> String {
+        self.create_for(item, "")
+    }
+
+    /// A new link for `item` of the service `service` the buyer chose: its token.
+    pub fn create_for(&self, item: &str, service: &str) -> String {
         let token = hex::encode(random_bytes::<32>());
         let mut l = self.live();
         if l.len() >= MAX_LINKS {
             l.remove(0);
         }
-        l.push(Link { token: token.clone(), item: item.to_string(), expires: Instant::now() + self.ttl });
+        l.push(Link { token: token.clone(), item: item.to_string(), service: service.to_string(), expires: Instant::now() + self.ttl });
         token
     }
 
@@ -67,6 +74,15 @@ impl RelayLinks {
         let l = self.live();
         // every live link is compared, so that the time taken says nothing of which one matched
         l.iter().fold(None, |found, x| if ct_eq(x.token.as_bytes(), token.as_bytes()) { Some(x.item.clone()) } else { found })
+    }
+
+    /// The service a live token was made for (empty: none named).
+    pub fn service_of(&self, token: &str) -> Option<String> {
+        if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let l = self.live();
+        l.iter().fold(None, |found, x| if ct_eq(x.token.as_bytes(), token.as_bytes()) { Some(x.service.clone()) } else { found })
     }
 
     /// Revoke a link. True: it was live.

@@ -119,6 +119,13 @@ pub struct Service {
 }
 
 impl Service {
+    /// A short id of the service, from its seller and its name: which of several services listing the
+    /// same file the buyer chose, carried with a Download or a player's link.
+    pub fn id(&self) -> String {
+        use sha2::Digest as _;
+        hex::encode(&sha2::Sha256::digest(format!("{}\n{}", self.seller, self.name).as_bytes())[..8])
+    }
+
     /// The wallet's `price_ceiling` for this service: its listing's prices, the most the buyer agreed
     /// to pay. `None` where it was not chosen from a listing.
     pub fn price_ceiling(&self) -> Option<Value> {
@@ -506,6 +513,12 @@ fn price_key(s: &str) -> (u8, u64) {
 }
 
 /// The service and the item a file URL is, among `services`.
+/// The item `url` of the service `id` ([`Service::id`]): the one the buyer chose, where several list it.
+pub fn find_item_of<'a>(services: &'a [Service], id: &str, url: &str) -> Option<(&'a Service, &'a Item)> {
+    let url = url.trim();
+    services.iter().filter(|s| s.id() == id).find_map(|s| s.items.iter().find(|i| i.url == url).map(|i| (s, i)))
+}
+
 pub fn find_item<'a>(services: &'a [Service], url: &str) -> Option<(&'a Service, &'a Item)> {
     let url = url.trim();
     if url.is_empty() || url.len() > MAX_URL {
@@ -514,12 +527,13 @@ pub fn find_item<'a>(services: &'a [Service], url: &str) -> Option<(&'a Service,
     services.iter().find_map(|s| s.items.iter().find(|i| i.url == url).map(|i| (s, i)))
 }
 
-/// `./s/~<stream token>/` + the file URL ([`crate::app::stream_token`]): where the page downloads a
-/// file from. The UI relays it to the connector ([`crate::server`]), so a browser on another device
-/// of the network reaches it too (the connector itself listens on loopback only).
-pub fn download_src(token: &str, item_url: &str) -> Result<String, String> {
+/// `./s/~<stream token>.<service id>/` + the file URL ([`crate::app::stream_token`],
+/// [`Service::id`]): where the page downloads a file from, for the service the buyer chose. The UI
+/// relays it to the connector ([`crate::server`]), so a browser on another device of the network
+/// reaches it too (the connector itself listens on loopback only).
+pub fn download_src(token: &str, service: &str, item_url: &str) -> Result<String, String> {
     http_url(item_url, "file url")?;
-    Ok(format!("./s/~{token}/{item_url}"))
+    Ok(format!("./s/~{token}.{service}/{item_url}"))
 }
 
 /// Percent-encoding for a query value.

@@ -1585,9 +1585,10 @@ your app has paid it ahead (about one to two tickets for each answer it is sendi
 time; a ticket is 1,000 sat by default), and a small allowance for each request: 16 MiB of data
 at its own price, an AI reply's quoted price, or, for a request priced by the second, that
 request's limit. A shop that over-charges past that is caught and blocked. One that cheats inside
-it is not caught: it takes that much, once per request.** Requests whose answers never arrive add
-at most one ticket in all in a session, and a shop that charges for them three times is blocked.
-In detail:
+it is not caught: it takes that much, once per request.** Requests whose connection failed before
+their answer arrived add at most one ticket in all in a session (an AI reply's keeps its quote, and
+one the app stopped waiting for keeps what it was being paid ahead, outside that ticket); a shop
+that charges for them at three points in the same session is blocked. In detail:
 
 A seller is never paid more than the tickets the wallet released to it: its receipts may not say it
 spent more than that, and nothing else moves money. So the most a seller can take without
@@ -1613,10 +1614,12 @@ past what the wallet has counted of it** (`uncounted_most` in `ticket_pay.rs`):
   can cause) is held, until a quiet point after `LOST_GRACE` (two minutes), to what could have
   arrived of it: by size, its request and 16 MiB priced; by the token, its quote; by the second, the
   seconds since it was sent and 16 MiB priced. One the wallet stopped waiting for (its own timeout,
-  where an honest seller slow to answer may still serve it) is held as one being answered, with the
-  two tickets paid ahead. All lost requests not priced by the token share one ticket over the
-  session (`LOST_CAP_TICKETS`), and a seller whose spend rises by them at three quiet points
-  (`LOST_CHARGED_MOST`) is over-charging. A seller whose connection drops before its answer reaches
+  an error of its own kind, `timeout`, where an honest seller on a slow path may still serve it) is
+  held as one being answered, with the two tickets paid ahead. Lost requests whose connection failed
+  and that are not priced by the token share one ticket over the session (`LOST_CAP_TICKETS`); a
+  reply by the token keeps its quote, and one the wallet timed out keeps its own bound, outside that
+  ticket. A seller whose spend rises by lost requests whose connection failed at three quiet points
+  of one session (`LOST_CHARGED_MOST`) is over-charging; ones the wallet timed out are not counted. A seller whose connection drops before its answer reaches
   the wallet is paid only for what could have arrived: honest sellers lose that request's charge
   past it, which is the trade for not trusting a seller's word for a request nobody saw answered.
 - **Never past a call's own limit** (`max_sats`), whatever it is.
