@@ -1644,7 +1644,7 @@ def link_relay() -> None:
 
 # --- a VPN exit, paid as it is used --------------------------------------------------------------------------
 
-VPN_SAT_GB = 500_000  # 500,000 sat a GiB (about 4.9 sat a MiB): a 10 MiB download is several tickets
+VPN_SAT_GB = 500_000  # 500,000 sat a GiB (about 488 sat a MiB): a 10 MiB download is about 4,900 sat, five or six tickets
 VPN_FILES = ["http://speed.cloudflare.com/__down?bytes=10485760", "http://ipv4.download.thinkbroadband.com/10MB.zip"]
 VPN_BYTES = 10_485_760
 
