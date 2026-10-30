@@ -790,7 +790,8 @@ impl TicketWire for UreqWire {
 // --- where an answer's body goes ----------------------------------------------------------------------
 
 /// The body of an answer as it arrives: counted, hashed, its first bytes kept for the agent, and
-/// all of it written to `B2_BODY_DIR` when that is set and the body is longer than the preview.
+/// all of it written to `B2_BODY_DIR` when that is set and the body is longer than the preview,
+/// unless it is streamed to a caller (`stream_to`: a tunnel, a film), who keeps what it wants.
 struct Sink {
     hash: Sha256,
     bytes: u64,
@@ -860,7 +861,9 @@ impl Sink {
         self.bytes += chunk.len() as u64;
         let room = self.cap.saturating_sub(self.preview.len());
         let over = chunk.len() > room;
-        if over && self.file.is_none() && self.file_error.is_none() {
+        // a body streamed to a caller is the caller's: a tunnel's hours of traffic are never written to disk here
+        let streamed = self.out.is_some() || self.gone;
+        if over && !streamed && self.file.is_none() && self.file_error.is_none() {
             if let Ok(dir) = std::env::var("B2_BODY_DIR") {
                 let path = PathBuf::from(dir).join(format!("ticket-{}.bin", crate::policy::token_urlsafe()));
                 let made = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).and_then(|()| std::fs::File::create(&path))
@@ -4529,6 +4532,34 @@ pub(crate) fn seller_busy(v: &Value) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_body_streamed_to_a_caller_is_never_written_to_disk_by_the_wallet() {
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("B2_BODY_DIR", d.path());
+        let sock = d.path().join("reader.sock");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut all = vec![];
+            let _ = std::io::Read::read_to_end(&mut s, &mut all);
+            all.len()
+        });
+        let mut streamed = Sink::streaming_to(Some(&sock));
+        let chunk = vec![7u8; 1 << 20];
+        for _ in 0..4 {
+            streamed.put(&chunk);
+        }
+        let (_, fields, _) = streamed.done();
+        assert!(fields.get("saved_to").is_none_or(Value::is_null), "{fields}");
+        assert_eq!(reader.join().unwrap(), 4 << 20, "every byte went to the caller");
+        // a body the agent reads itself is still kept where B2_BODY_DIR says
+        let mut kept = Sink::new();
+        kept.put(&vec![1u8; kept.cap + 1]);
+        assert!(kept.done().1["saved_to"].is_string());
+        std::env::remove_var("B2_BODY_DIR");
+    }
 
     /// A seller that sends its answer's head a byte every 200 ms: each read is quick, so only a
     /// deadline for the whole request ends it.

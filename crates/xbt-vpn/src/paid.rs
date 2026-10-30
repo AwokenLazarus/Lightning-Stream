@@ -157,20 +157,40 @@ fn refused(d: &Result<Value, String>) -> String {
     }
 }
 
+/// The header the shop's gateway sends the tunnel endpoint, with the secret the two share
+/// ([`TUNNEL_SECRET_FILE`] in the VPN service's directory): only the gateway, which is paid, opens a
+/// tunnel. Another app on the same network cannot.
+pub const TUNNEL_HEADER: &str = "X-Stream-Tunnel";
+/// The shared secret's file, in the VPN service's directory (the wallet app writes it with the route).
+pub const TUNNEL_SECRET_FILE: &str = "tunnel.secret";
+
+/// A new secret for [`TUNNEL_SECRET_FILE`]: 32 random bytes, hex.
+pub fn new_tunnel_secret() -> String {
+    let mut b = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b).expect("the system's random source");
+    hex::encode(b)
+}
+
+/// The secret in `dir`'s [`TUNNEL_SECRET_FILE`], if there is one.
+pub fn tunnel_secret_in(dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(TUNNEL_SECRET_FILE)).ok().map(|s| s.trim().to_string()).filter(|s| s.len() >= 32)
+}
+
 /// The exit's tunnel endpoint: the shop's gateway joins each paid tunnel here. Answers the
 /// WebSocket upgrade the gateway passes on, then serves the buyer's flows on the joined stream
-/// with `serve` (the exit's own [`crate::exit::serve`]). Each tunnel is one buyer's device.
-pub async fn serve_tunnel_endpoint<F, Fut>(listener: tokio::net::TcpListener, serve: F)
+/// with `serve` (the exit's own [`crate::exit::serve`]). Each tunnel is one buyer's device. With a
+/// `secret`, an upgrade that does not carry it in [`TUNNEL_HEADER`] is refused.
+pub async fn serve_tunnel_endpoint<F, Fut>(listener: tokio::net::TcpListener, secret: Option<String>, serve: F)
 where
     F: Fn(crate::flow::Carrier) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let serve = Arc::new(serve);
+    let (serve, secret) = (Arc::new(serve), Arc::new(secret));
     while let Ok((s, _)) = listener.accept().await {
-        let serve = serve.clone();
+        let (serve, secret) = (serve.clone(), secret.clone());
         tokio::spawn(async move {
             let _ = s.set_nodelay(true);
-            if let Ok((s, early)) = answer_upgrade(s).await {
+            if let Ok((s, early)) = answer_upgrade(s, secret.as_deref()).await {
                 serve(crate::flow::Carrier::Tunnel(Mux::new(s, early, false))).await;
             }
         });
@@ -179,7 +199,7 @@ where
 
 /// Reads an HTTP/1.1 upgrade request and answers `101`; `Err` (answered 400) for anything else.
 /// Returns what followed the request's head.
-async fn answer_upgrade(mut s: tokio::net::TcpStream) -> io::Result<(tokio::net::TcpStream, Vec<u8>)> {
+async fn answer_upgrade(mut s: tokio::net::TcpStream, secret: Option<&str>) -> io::Result<(tokio::net::TcpStream, Vec<u8>)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::with_capacity(4096);
     let end = loop {
@@ -204,6 +224,14 @@ async fn answer_upgrade(mut s: tokio::net::TcpStream) -> io::Result<(tokio::net:
         let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
         return Err(io::Error::other("not a tunnel"));
     }
+    if let Some(want) = secret {
+        let name = format!("{}:", TUNNEL_HEADER.to_ascii_lowercase());
+        let given = raw.lines().find(|l| l.to_ascii_lowercase().starts_with(&name)).and_then(|l| l.split_once(':')).map(|(_, v)| v.trim()).unwrap_or("");
+        if ring::constant_time::verify_slices_are_equal(given.as_bytes(), want.as_bytes()).is_err() {
+            let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            return Err(io::Error::other("not from the shop's gateway"));
+        }
+    }
     let accept = websocket_accept(&key);
     s.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await?;
     Ok((s, buf[end..].to_vec()))
@@ -220,6 +248,27 @@ fn websocket_accept(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_the_gateway_with_the_secret_opens_a_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        let secret = "s".repeat(32);
+        tokio::spawn(serve_tunnel_endpoint(l, Some(secret.clone()), |_c| async {}));
+        let ask = |extra: String| async move {
+            let mut s = tokio::net::TcpStream::connect(at).await.unwrap();
+            s.write_all(format!("GET /vpn/tunnel HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n{extra}\r\n").as_bytes()).await.unwrap();
+            let mut b = [0u8; 12];
+            let _ = s.read_exact(&mut b).await;
+            String::from_utf8_lossy(&b).to_string()
+        };
+        // another app on the network, without the secret or with a wrong one: refused
+        assert_eq!(ask(String::new()).await, "HTTP/1.1 403");
+        assert_eq!(ask(format!("X-Stream-Tunnel: {}\r\n", "t".repeat(32))).await, "HTTP/1.1 403");
+        // the shop's gateway, with it: the tunnel opens
+        assert_eq!(ask(format!("x-stream-tunnel: {secret}\r\n")).await, "HTTP/1.1 101");
+    }
 
     #[test]
     fn the_websocket_accept_is_rfc_6455s() {

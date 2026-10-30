@@ -416,7 +416,12 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         if priced {
             let (cfg, m) = (cfg.clone(), exit_meter.clone());
             let listener = link.runtime().block_on(tokio::net::TcpListener::bind(&tunnel_listen))?;
-            link.runtime().spawn(xbt_vpn::paid::serve_tunnel_endpoint(listener, move |c| xbt_vpn::exit::serve(c, cfg.clone(), m.clone())));
+            // only the shop's gateway opens tunnels: it carries the secret the wallet app wrote with the route
+            let secret = xbt_vpn::paid::tunnel_secret_in(&dir);
+            if secret.is_none() {
+                eprintln!("no {} in {}: the tunnel endpoint answers anything that reaches it", xbt_vpn::paid::TUNNEL_SECRET_FILE, dir.display());
+            }
+            link.runtime().spawn(xbt_vpn::paid::serve_tunnel_endpoint(listener, secret, move |c| xbt_vpn::exit::serve(c, cfg.clone(), m.clone())));
         }
         let (m, buyers, tls) = (exit_meter.clone(), Arc::new(SealedBuyers::default()), sealed::exit_config(&exit_secret));
         link.accept_with(move |conn| {
@@ -483,8 +488,9 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         let (buyer, geo_dir) = (buyer.clone(), keys_dir.join("geo"));
         buyer.set_home_country(arg_or_env(args, "--home-country", &["XBT_VPN_HOME_COUNTRY"]).map(|c| c.trim().to_string()).filter(|c| c.len() == 2));
         let bundled = std::path::PathBuf::from(std::env::var("XBT_VPN_GEO_BUNDLED").unwrap_or_else(|_| xbt_vpn::region::BUNDLED.into()));
-        // where newer months are fetched from; set it empty to never fetch
-        let geo_url = std::env::var("XBT_VPN_GEO_URL").unwrap_or_else(|_| xbt_vpn::region::DBIP_URL.into());
+        // where newer months are fetched from: none unless the owner sets one (the table that comes with
+        // the app is refreshed at each release, so nothing depends on anyone's service)
+        let geo_url = std::env::var("XBT_VPN_GEO_URL").unwrap_or_default();
         std::thread::spawn(move || loop {
             match xbt_vpn::region::load(&geo_dir, Some(&bundled), Some(&geo_url)) {
                 Ok(t) => buyer.set_geo(t),

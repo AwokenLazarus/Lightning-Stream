@@ -124,8 +124,9 @@ The address is believed only when at least two answer and every one that answers
 looked up in an offline geo-IP table: DB-IP's "IP to Country Lite" (CC BY 4.0, <https://db-ip.com>),
 which ships with the app (`/usr/share/xbt-vpn`, refreshed at each release), so a box checks regions
 from install with no download and no service of anyone's. Newer months are fetched into the
-service's keys dir only where a source is set (`XBT_VPN_GEO_URL`, DB-IP's by default; empty for
-none). No lookup about an exit or a buyer leaves the box. If the owner gives their own country
+service's keys dir only where the owner sets a source (`XBT_VPN_GEO_URL`, empty by default: the
+app depends on no one's service). Where region results are shown, the page credits DB-IP with a
+link, as its licence asks. No lookup about an exit or a buyer leaves the box. If the owner gives their own country
 (`--home-country` / `XBT_VPN_HOME_COUNTRY`), a round trip faster than the distance to the claimed
 country allows is caught too; the app never looks the owner's country up from the network. An exit
 whose region does not check out is not offered for that region, and is checked again every 6 hours.
@@ -187,9 +188,7 @@ approval threshold) apply.
 The seller signs one receipt for an answer at its end; a tunnel lives for hours, so the buyer checks
 the exit's charges while it runs too, with **interim receipts**.
 
-### Interim receipts
-
-The same signed receipt as any other (`xbt402::ticket::receipt_message`, the receipt key of the
+**What one is:** the same signed receipt as any other (`xbt402::ticket::receipt_message`, the receipt key of the
 seller's terms, the same `scheme`, `session` and `seq`, the session's `releasedMsat` and
 `spentMsat`, and `charged`: what the call has cost so far). Its `bodyHash` is
 `interim:<part>:<bytesUp>:<bytesDown>`: `part` counts 1, 2, 3… for each interim receipt of the
@@ -203,20 +202,26 @@ the wallet reads it every 10 s (`B2_INTERIM_POLL_MS`). Old buyers ignore it.
 
 ### What the signer checks on each one
 
-Everything it checks on a final receipt today (the signature, the session, `spentMsat` never above
-`releasedMsat`, `releasedMsat` never above what the wallet released and never falling), and also:
+Its signature, its session, and `spentMsat` never above its own `releasedMsat` (the session's
+totals in it are not taken as the session's: those, and their check against what the wallet
+released, come from final receipts and `status`, as for any answer), and also:
 
 1. **Order:** `part` is later than the last one seen (the wallet polls, so it may skip parts);
    `charged`, `bytesUp` and `bytesDown` never fall.
 2. **The ceiling:** `charged` never exceeds the call's own `max_sats`. This is the same per-call
    ceiling the concurrent-session fix enforces across concurrent calls (its must-fix #2): the sum of
    all open calls' `charged` stays within what the session may spend.
-3. **The seller's count against the buyer's:** the bytes it says it passed each way are no more
-   than the wallet counted on the call, plus 2% and 4 MiB for bytes on their way when the receipt
-   was signed; and `charged` is no more than its own byte counts cost at the call's price. Over
-   either, it is a seller fault.
-4. **Liveness:** once a seller has sent one, bytes that keep flowing (2 MiB or more) with no newer
-   one for 30 s (`B2_INTERIM_STALE_MS`) are a seller fault too. A seller that never sends any (one
+3. **The seller's count against the buyer's:** the wallet reads its own count once the seller's
+   `status` answer is in. The bytes the seller says it passed each way are no more than the wallet
+   counted on the call, plus 2% and 4 MiB for bytes on their way when the receipt was signed; and
+   `charged` is no more than its own byte counts cost at the call's price, plus two 16 KiB chunks
+   (one paid for and still being written each way when the other way signed; the gateway signs
+   only for bytes it has counted). Over either, it is a seller fault.
+4. **The price shown:** the wallet opens the tunnel only if the shop's terms are within the price
+   the exit announced (`price_ceiling`: its price a GB, and nothing per request); an exit asking
+   more is paid nothing and not used for a day.
+5. **Liveness:** once a seller has sent one, bytes that keep flowing (2 MiB or more) with no newer
+   one (a `status` that fails or can't be taken counts as none) for 30 s (`B2_INTERIM_STALE_MS`) are a seller fault too. A seller that never sends any (one
    from before interim receipts) is held to the rules every answer has: its spend never passes what
    was released.
 

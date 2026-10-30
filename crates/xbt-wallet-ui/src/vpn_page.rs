@@ -190,8 +190,10 @@ impl App {
                         esc(&id.chars().take(12).collect::<String>()), esc(e["region"].as_str().unwrap_or("")), esc(e["region_check"].as_str().unwrap_or("")))
             }).collect();
             b.push_str(&format!("<section class=\"card\"><h2>Exits found</h2><p class=\"small\">An exit's country is checked, not taken on its word: \
-                its traffic's address is read through it from several independent sites and looked up in a country table that comes with the app.</p>\
-                <div class=\"scroll\"><table><thead><tr><th>Exit</th><th>Says</th><th>Check</th></tr></thead><tbody>{rows}</tbody></table></div></section>"));
+                its traffic's address is read through it from several independent sites and looked up in a country table that comes with the app. \
+                The check is best-effort: an exit could route those sites differently from your traffic.</p>\
+                <div class=\"scroll\"><table><thead><tr><th>Exit</th><th>Says</th><th>Check</th></tr></thead><tbody>{rows}</tbody></table></div>\
+                <p class=\"small\"><a href=\"https://db-ip.com\" rel=\"noopener\">IP geolocation by DB-IP</a> (CC BY 4.0).</p></section>"));
         }
         if ready {
             b.push_str(&format!(
@@ -367,16 +369,33 @@ impl App {
 
     /// The shop's route that sells this box's exit, while one is offered: each tunnel a WebSocket the
     /// gateway joins to the VPN service, paid per byte both ways at the exit's price a GB.
+    /// Only the shop's gateway reaches the exit's tunnel endpoint: each tunnel it joins carries the
+    /// secret the two share, written here beside the exit's settings.
     pub(crate) fn vpn_route(&self) -> Option<Value> {
         let upstream = self.cfg.vpn.tunnel_upstream.clone()?;
         let s = xbt_vpn::service::exit_from(&read(&self.cfg.vpn.dir.join("exit.json")))?;
+        let secret = tunnel_secret(&self.cfg.vpn.dir)?;
         Some(json!({"path": VPN_PATH, "upstream": upstream, "methods": ["GET"], "websocket": true, "service": "vpn-exit",
+                    "upstream_headers": {xbt_vpn::paid::TUNNEL_HEADER: secret},
                     "price": {"byte_msat": s.sat_per_gb.saturating_mul(1000), "per_bytes": 1u64 << 30}}))
     }
 }
 
 /// The path a shop sells its VPN exit under.
 pub const VPN_PATH: &str = "/vpn/";
+
+/// The secret the shop's gateway and the exit's tunnel endpoint share, made once (owner-only).
+fn tunnel_secret(dir: &std::path::Path) -> Option<String> {
+    if let Some(s) = xbt_vpn::paid::tunnel_secret_in(dir) {
+        return Some(s);
+    }
+    let secret = xbt_vpn::paid::new_tunnel_secret();
+    let path = dir.join(xbt_vpn::paid::TUNNEL_SECRET_FILE);
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).ok()?;
+    std::io::Write::write_all(&mut f, secret.as_bytes()).ok()?;
+    Some(secret)
+}
 
 #[cfg(test)]
 mod tests {
@@ -401,5 +420,16 @@ mod tests {
         assert_eq!(next_ip(&d), Some(Ipv4Addr::new(10, 66, 0, 4)));
         let full: Vec<Value> = (2..=250).map(|n| json!({"tunnel_ip": format!("10.66.0.{n}")})).collect();
         assert_eq!(next_ip(&full), None);
+    }
+
+    #[test]
+    fn the_tunnel_secret_is_made_once_and_kept_from_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let first = tunnel_secret(d.path()).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(tunnel_secret(d.path()).as_deref(), Some(first.as_str()), "the same secret every time the route is written");
+        let mode = std::fs::metadata(d.path().join(xbt_vpn::paid::TUNNEL_SECRET_FILE)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "only its owner reads it");
     }
 }

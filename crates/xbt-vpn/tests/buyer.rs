@@ -574,7 +574,7 @@ fn paid_exit(rt: &tokio::runtime::Handle, meter: Arc<Meter>) -> SocketAddr {
     let cfg = Arc::new(ExitConfig { policy: Policy { allow_non_public: true, ..Policy::default() }, ..ExitConfig::default() });
     let l = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let at = l.local_addr().unwrap();
-    rt.spawn(xbt_vpn::paid::serve_tunnel_endpoint(l, move |c| xbt_vpn::exit::serve(c, cfg.clone(), meter.clone())));
+    rt.spawn(xbt_vpn::paid::serve_tunnel_endpoint(l, None, move |c| xbt_vpn::exit::serve(c, cfg.clone(), meter.clone())));
     at
 }
 
