@@ -40,6 +40,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
+# the hashrate lab's stand-in miners and pools hash with BLAKE2b; unoptimised, dozens of them starve a
+# test machine's CPU and a load test measures that instead of the hashmaker
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

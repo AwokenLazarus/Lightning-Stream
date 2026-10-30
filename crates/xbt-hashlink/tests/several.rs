@@ -9,11 +9,12 @@
 //! * moving a miner (either way) leaves no gap in its shares longer than one job.
 
 use secp256k1::PublicKey;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use xbt_hashlink::hashmaker::{self, Hashmaker};
@@ -381,6 +382,77 @@ fn miners_behind_one_address_move_once_each_way() {
     }
 }
 
+/// Where the fallback's shares come from, miner by miner: sampled every 250 ms from the hashmaker's
+/// status (which rental a miner is taken by, and whether that rental is ready) and the fallback's
+/// report (accepted shares by worker), each share counted in the state its miner was in.
+struct Timeline {
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<Value>,
+}
+
+impl Timeline {
+    fn start(rig: &Rig) -> Timeline {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s, report, status) = (stop.clone(), rig.fallback.report.clone(), rig.hashmaker.status_fn());
+        let handle = thread::spawn(move || {
+            let read = || -> BTreeMap<String, u64> {
+                let v: Value = std::fs::read(&report).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+                v["users"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0))).collect()).unwrap_or_default()
+            };
+            let mut last = read();
+            let mut taken_at: BTreeMap<String, Instant> = BTreeMap::new();
+            let mut was_rented: BTreeSet<String> = BTreeSet::new();
+            let mut by: BTreeMap<&'static str, u64> = BTreeMap::new();
+            let mut mid: BTreeMap<String, u64> = BTreeMap::new();
+            let mut state: BTreeMap<String, &'static str> = BTreeMap::new();
+            while !s.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(250));
+                let st = status();
+                let ready: BTreeMap<String, bool> = st["rentals"].as_array().into_iter().flatten()
+                    .map(|r| (r["rental"].as_str().unwrap_or("").to_string(), r["ready"] == true && r["suspended"] != true)).collect();
+                // each miner's fallback shares since the last sample, in the state it was in then
+                let now = read();
+                for (m, n) in &now {
+                    let d = n.saturating_sub(last.get(m).copied().unwrap_or(0));
+                    let k = state.get(m).copied().unwrap_or("not_yet_rented");
+                    *by.entry(k).or_default() += d;
+                    if k == "rented_later" {
+                        *mid.entry(m.clone()).or_default() += d;
+                    }
+                }
+                last = now;
+                for m in st["miners"].as_array().into_iter().flatten() {
+                    let name = m["name"].as_str().unwrap_or("").to_string();
+                    let k = match m["rentedTo"].as_str() {
+                        Some(r) => {
+                            was_rented.insert(name.clone());
+                            let t = *taken_at.entry(name.clone()).or_insert_with(Instant::now);
+                            if !ready.get(r).copied().unwrap_or(false) {
+                                "taken_rental_not_ready"
+                            } else if t.elapsed() < Duration::from_secs(5) {
+                                "rented_first_5s"
+                            } else {
+                                "rented_later"
+                            }
+                        }
+                        None if was_rented.contains(&name) => "after_rental",
+                        None => "not_yet_rented",
+                    };
+                    state.insert(name, k);
+                }
+            }
+            let worst = mid.iter().max_by_key(|(_, n)| **n).map(|(m, n)| json!({"miner": m, "shares": n}));
+            json!({"states": by, "rented_later_worst": worst, "rented_later_miners": mid.len()})
+        });
+        Timeline { stop, handle }
+    }
+
+    fn stop(self) -> Value {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.join().unwrap()
+    }
+}
+
 /// CPU seconds this process has used, from /proc (Linux).
 fn cpu_secs() -> f64 {
     let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
@@ -389,20 +461,27 @@ fn cpu_secs() -> f64 {
     (tick(11) + tick(12)) / 100.0
 }
 
-/// A load test, run by name only (`--ignored`): HASH_LOAD_TAKERS hashtakers (default 10) take
-/// HASH_LOAD_EACH miners each (default 3) from one hashmaker at once, for HASH_LOAD_SECS seconds
-/// (default 30). Each rental is paid in full with receipts that agree, no miner is rented twice,
-/// and no miner's shares stop for longer than a job. Prints one line of JSON: the rentals, the
-/// slices paid, the shares, the largest gap and the CPU this process used.
+/// A load test, run by name only (`--ignored`), and with `--release`: the stand-in miners hash on
+/// this machine's CPU, and a debug build of dozens of them measures the CPU, not the hashmaker.
+/// HASH_LOAD_TAKERS hashtakers (default 10) take HASH_LOAD_EACH miners each (default 3) from one
+/// hashmaker at once, for HASH_LOAD_SECS seconds (default 30), the miners at up to HASH_LOAD_RATE
+/// shares a second (default 6). Each rental is paid in full with receipts that agree, no miner is
+/// rented twice, no rented miner's shares go to the fallback once its rental has run 5 s, and (in a
+/// release build) each rental gets at least 90% of the shares its miners make and no miner's shares
+/// stop for longer than a job. Prints one line of JSON: the rentals, the slices paid, the shares,
+/// where the fallback's shares came from, the largest gap and the CPU this process used.
 #[test]
 #[ignore]
 fn many_hashtakers_at_once_on_one_hashmaker() {
     let _s = serial();
     let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     let (n, each, secs) = (env("HASH_LOAD_TAKERS", 10) as usize, env("HASH_LOAD_EACH", 3) as u32, env("HASH_LOAD_SECS", 30));
+    // shares a second per stand-in miner (they hash on this machine's CPU: lower it for headroom)
+    let rate = env("HASH_LOAD_RATE", 6) as f64;
     let miners = n * each as usize + 2;
     // miners each with an address of their own, as on a LAN (behind one address, see the test above)
-    let rig = rig_from(miners, &[], secs + 40, 6.0, true);
+    let rig = rig_from(miners, &[], secs + 40, rate, true);
+    let timeline = Timeline::start(&rig);
     let (c0, t0) = (cpu_secs(), Instant::now());
     // the binary's own idle time (60 s), not the 4 s of the tests above: with many rentals starting at once, a
     // miner's first share at its new pool can take longer than 4 s on a loaded machine
@@ -423,6 +502,7 @@ fn many_hashtakers_at_once_on_one_hashmaker() {
         taken.extend(names);
     }
     let fallback_shares: u64 = rig.fallback.users().values().sum();
+    let breakdown = timeline.stop();
     let (cpu, wall) = (cpu_secs() - c0, t0.elapsed().as_secs_f64());
     let rented = taken.len();
     taken.sort();
@@ -433,15 +513,23 @@ fn many_hashtakers_at_once_on_one_hashmaker() {
     let gap = res.iter().map(|m| m.max_gap_ms).max().unwrap_or(0);
     let (acc, rej) = (res.iter().map(|m| m.accepted).sum::<u64>(), res.iter().map(|m| m.rejected).sum::<u64>());
     // what a rental's pool would get if each rented miner hashed for it the whole rental, at the miners' rate
-    let expected = each as u64 * secs * 6;
+    let expected = each as u64 * secs * rate as u64;
     let sessions = res.iter().map(|m| m.sessions).max().unwrap_or(0);
     println!(
         "{}",
         serde_json::json!({"hashtakers": n, "miners": miners, "rented": rented, "slices_paid": paid, "shares_accepted": acc, "shares_rejected": rej,
                            "max_gap_ms": gap, "job_ms": JOB_MS,
                            "rental_shares_min": rental_shares.iter().min(), "rental_shares_max": rental_shares.iter().max(),
-                           "rental_shares_expected": expected, "fallback_shares": fallback_shares, "max_miner_sessions": sessions, "cpu_s": (cpu * 100.0).round() / 100.0, "wall_s": wall.round(), "cores": (cpu / wall * 100.0).round() / 100.0})
+                           "rental_shares_expected": expected, "fallback_shares": fallback_shares, "max_miner_sessions": sessions,
+                           "fallback_by_state": breakdown, "cpu_s": (cpu * 100.0).round() / 100.0, "wall_s": wall.round(), "cores": (cpu / wall * 100.0).round() / 100.0})
     );
-    assert!(gap < JOB_MS, "a miner's shares stopped for {gap} ms, a job is {JOB_MS} ms");
+    assert_eq!(breakdown["states"]["rented_later"], 0, "a rented miner's shares went to the fallback mid-rental: {breakdown}");
+    if cfg!(debug_assertions) {
+        println!("a debug build: the shares a rental gets and the gaps measure this machine's CPU; run with --release to check them");
+    } else {
+        let low = rental_shares.iter().min().copied().unwrap_or(0);
+        assert!(low * 10 >= expected * 9, "a rental got {low} shares of {expected}");
+        assert!(gap < JOB_MS, "a miner's shares stopped for {gap} ms, a job is {JOB_MS} ms");
+    }
     assert!(rej * 10 <= acc, "few rejected shares: {rej} of {acc}");
 }
