@@ -44,7 +44,8 @@
 #            JF_ITEM, node and google-chrome. jellyfin_link and jellyfin_relay: the same, the shop
 #            reached only over its iroh link, directly or through our relay. JF_BASELINE=1 plays the
 #            film straight from Jellyfin first and judges playback against that, within JF_MARGIN_S
-#            (3 s) and JF_MARGIN_FRAMES (5); JF_GUEST_USER/JF_GUEST_PW name the user it watches as
+#            (3 s) and JF_MARGIN_FRAMES (5); JF_GUEST_USER and JF_GUEST_PW name the Jellyfin user
+#            that plays it there
 #   vpn      (by name only) a VPN exit sold as a Stream service: the exit's VPN service behind the
 #            seller's gateway (/vpn/, WebSockets priced per byte), and a buyer's paid tunnel opened by
 #            the wallet carrying a 10 MiB public download: whole, interim receipts checked with no
