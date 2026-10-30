@@ -1667,6 +1667,11 @@ def vpn() -> None:
     os.makedirs(vdir, exist_ok=True)
     with open(f"{vdir}/exit.json", "w") as f:
         json.dump({"offer": True, "kind": "private", "sat_per_gb": VPN_SAT_GB, "country": "XX", "tunnel_url": f"{origin}/vpn/tunnel"}, f)
+    # the secret the gateway and the exit's tunnel endpoint share, as the wallet app writes it with the
+    # route: without it the endpoint lets nobody in
+    tunnel_secret = os.urandom(32).hex()
+    with open(f"{vdir}/tunnel.secret", "w") as f:
+        f.write(tunnel_secret)
     with open(f"{RUN}/vpn.log", "ab") as log:
         PROCS["vpn"] = subprocess.Popen([f"{BIN}/xbt-vpn", "serve", "--dir", vdir, "--wg-listen", f"127.0.0.1:{wg_port}", "--tunnel-listen", f"127.0.0.1:{tun_port}"],
                                         env=dict(os.environ, XBT_VPN_GEO_URL="", XBT_VPN_GEO_BUNDLED="/nonexistent"), stdout=log, stderr=log)
@@ -1675,6 +1680,7 @@ def vpn() -> None:
     with open(path) as f:
         cfg = json.load(f)
     cfg["routes"].append({"path": "/vpn/", "upstream": f"http://127.0.0.1:{tun_port}", "methods": ["GET"], "websocket": True, "service": "vpn-exit",
+                          "upstream_headers": {"X-Stream-Tunnel": tunnel_secret},
                           "price": {"byte_msat": VPN_SAT_GB * 1000, "per_bytes": 1 << 30}})
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
