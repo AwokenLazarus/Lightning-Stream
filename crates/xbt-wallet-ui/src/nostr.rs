@@ -1,6 +1,6 @@
 //! Sellers found on Nostr (`XBT_UI_NOSTR_RELAYS`, `docs/NOSTR.md`): the listings the owner's relays
 //! hold, each checked by [`xbt_nostr::market`] (the event, the listing and the binding all verify),
-//! kept for a while, and turned into services the player can open.
+//! kept for a while, and turned into services a service page can open.
 //!
 //! The relays are asked only when the owner opens the Nostr page, never in the background, and
 //! never with no relays set (the default). A seller found here is unvetted: its listing is signed
@@ -59,8 +59,8 @@ impl NostrCache {
         s
     }
 
-    /// The services found the last time the page asked, without asking again: what the player and
-    /// the links for external players may open.
+    /// The services found the last time the page asked, without asking again: what a service page
+    /// may open.
     pub fn services(&self) -> Vec<Service> {
         self.snap.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|s| s.listings.iter().flat_map(to_services).collect()).unwrap_or_default()
     }

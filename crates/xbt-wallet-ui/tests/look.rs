@@ -92,15 +92,13 @@ fn the_look_in_headless_chrome() {
     let rig = Rig::new(json!({"human_pubkey": ""}), true);
     let sock_path = rig.dir.path().join("signer.sock");
     let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
-    let film = "https://media.example/Videos/1/stream?static=true";
     let data = tempfile::tempdir().unwrap();
     let services = data.path().join("services.json");
     let home_shop = xbt402::shop::origin_for(&[0x5a; 32]);
     std::fs::write(&services, json!([
-        {"name": "Creative Commons films", "kind": "video", "seller": "https://media.example", "price_text": "20 sat a MiB",
-         "items": [{"title": "Big Buck Bunny", "year": 2008, "url": film, "credit": "(c) Blender Foundation, CC BY 3.0"},
-                   {"title": "Elephants Dream", "year": 2006, "url": "https://media.example/Videos/2/stream", "credit": "(c) Blender Foundation, CC BY 2.5"},
-                   {"title": "Sintel", "year": 2010, "url": "https://media.example/Videos/3/stream", "credit": "(c) Blender Foundation, CC BY 3.0"}]},
+        // a media server, shared as its own web app (the app has no player of its own)
+        {"name": "Creative Commons films", "kind": "video", "seller": "https://media.example", "price_text": "20 sat a MiB", "items": [],
+         "app": "https://media.example/web/", "app_base": "https://media.example/"},
         {"name": "Local model", "kind": "ai", "seller": "https://box.example", "address": "https://box.example/ai/", "price_text": "10 sat a request",
          "items": []},
         {"name": "Weather data", "kind": "api", "seller": "https://weather.example", "price_text": "1 sat a request", "items": []},
@@ -146,17 +144,17 @@ fn the_look_in_headless_chrome() {
     let gcode = std::fs::read_to_string(gdata.path().join("ui/setup-code")).unwrap();
     let out = std::env::var("XBT_UI_LOOK_DIR").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/ui-look").into());
     let enc = |v: &str| v.replace('%', "%25").replace('/', "%2F").replace(':', "%3A").replace('?', "%3F").replace('=', "%3D").replace(' ', "%20").replace('&', "%26");
-    let play = format!("/play?item={}", enc(film));
+    let apps = "/browse?cat=apps".to_string();
     let pages = json!([["home", "/"], ["browse", "/browse"], ["browse-ai", "/browse?cat=ai"],
         ["service-ai", format!("/service?seller={}&name={}", enc("https://box.example"), enc("Local model"))],
         ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
-        ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
+        ["browse-apps", apps.clone()], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
         ["sell", "/sell"], ["sell-reach", "/sell#shop-reach"], ["sell-capacity", "/sell#capacity"], ["wallet", "/wallet"],
         ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"], ["ai", "/ai"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
         .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),
-               &format!("http://{}", gsrv.addr), gcode.trim(), &out, &play, &secs, &pages])
+               &format!("http://{}", gsrv.addr), gcode.trim(), &out, &apps, &secs, &pages])
         .output().unwrap();
     let text = String::from_utf8_lossy(&o.stdout);
     eprintln!("{text}{}", String::from_utf8_lossy(&o.stderr));

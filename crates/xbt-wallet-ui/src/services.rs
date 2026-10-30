@@ -1,4 +1,4 @@
-//! The services file (`XBT_UI_SERVICES`): what Browse lists and what the player may open.
+//! The services file (`XBT_UI_SERVICES`): what Browse lists and a service's page opens.
 //!
 //! A JSON list. Each service is `{name, kind, seller, price_text, items}`, with an optional
 //! `address`: where apps and agents reach that one service (the seller's origin plus the path it is
@@ -29,8 +29,9 @@ pub enum Kind {
     Hashrate,
 }
 
-/// The categories Browse sorts services into. Media is one of them, not the app's subject.
-pub const CATEGORIES: [(&str, &str); 4] = [("media", "Media"), ("ai", "AI"), ("hashrate", "Hashrate"), ("data", "Data & APIs")];
+/// The categories Browse sorts services into. A media server (Jellyfin, Plex) is a web app: the
+/// seller's own app, opened inside Lightning Stream. The app has no player of its own.
+pub const CATEGORIES: [(&str, &str); 4] = [("apps", "Web apps"), ("ai", "AI"), ("hashrate", "Hashrate"), ("data", "Data & APIs")];
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
@@ -46,7 +47,7 @@ impl Kind {
     /// The category's id, as Browse filters by it.
     pub fn category(self) -> &'static str {
         match self {
-            Kind::Video => "media",
+            Kind::Video => "apps",
             Kind::Ai => "ai",
             Kind::Hashrate => "hashrate",
             Kind::Files | Kind::Api => "data",
@@ -109,6 +110,21 @@ pub struct Service {
     pub app: String,
     /// That page's base: what the page sees as `/`. Empty with `app`.
     pub app_base: String,
+}
+
+impl Service {
+    /// The category Browse shows it under: a service with its own web app is a web app (a media
+    /// server among them), whatever its listing's kind; an AI model and hashrate keep their own.
+    pub fn category(&self) -> &'static str {
+        match self.kind {
+            Kind::Video | Kind::Api | Kind::Files if !self.app.is_empty() => "apps",
+            k => k.category(),
+        }
+    }
+
+    pub fn category_words(&self) -> &'static str {
+        CATEGORIES.iter().find(|(id, _)| *id == self.category()).map(|(_, w)| *w).unwrap_or("Other")
+    }
 }
 
 impl Service {
@@ -431,10 +447,12 @@ pub fn price_num(s: &str) -> Option<u64> {
 }
 
 /// Filter by kind (`None`, `""` or `"all"` keeps every kind) and sort.
-/// `kind`: a kind (`video`) or a category (`media`); empty or `all`: every service.
+/// `kind`: a kind (`video`) or a category (`apps`; `media`, from an older link, is `apps`); empty
+/// or `all`: every service.
 pub fn arrange(mut services: Vec<Service>, kind: Option<&str>, sort: Sort) -> Vec<Service> {
     if let Some(k) = kind.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty() && s != "all") {
-        services.retain(|s| s.kind.as_str() == k || s.kind.category() == k);
+        let k = if k == "media" { "apps".to_string() } else { k };
+        services.retain(|s| s.kind.as_str() == k || s.category() == k);
     }
     match sort {
         Sort::Name => services.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()).then(a.seller.cmp(&b.seller))),
@@ -453,39 +471,6 @@ fn price_key(s: &str) -> (u8, u64) {
         Some(n) => (0, n),
         None => (1, 0),
     }
-}
-
-pub fn find_item<'a>(services: &'a [Service], url: &str) -> Option<(&'a Service, &'a Item)> {
-    let url = url.trim();
-    if url.is_empty() || url.len() > MAX_URL {
-        return None;
-    }
-    services.iter().find_map(|s| s.items.iter().find(|i| i.url == url).map(|i| (s, i)))
-}
-
-/// Origins to match against `ticket_status`: the item's URL, then the service's seller when it
-/// differs. A session is keyed by the URL the connector paid.
-pub fn pay_origins(service: &Service, item: &Item) -> Vec<String> {
-    let mut out = Vec::new();
-    for u in [&item.url, &service.seller] {
-        if let Some(o) = http_origin(u) {
-            if !out.iter().any(|x| x == &o) {
-                out.push(o);
-            }
-        }
-    }
-    out
-}
-
-/// `./s/~<stream token>/` + the item URL ([`crate::app::stream_token`]), which the UI relays to
-/// `connector` (`XBT_UI_CONNECTOR`, no trailing slash kept).
-pub fn player_src(connector: &str, token: &str, item_url: &str) -> Result<String, String> {
-    let base = connector.trim().trim_end_matches('/');
-    http_url(base, "XBT_UI_CONNECTOR")?;
-    http_url(item_url, "item url")?;
-    // this page's own address: the UI relays it to the connector ([`crate::server`]), so a player on
-    // another device of the network reaches it too (the connector itself listens on loopback only)
-    Ok(format!("./s/~{token}/{item_url}"))
 }
 
 /// Percent-encoding for a query value.
@@ -560,7 +545,6 @@ mod tests {
         assert!(v[0].items[1].credit.contains("CC BY 2.5"));
         assert!(v[0].items[0].credit.contains("CC BY 3.0") && v[0].items[2].credit.contains("CC BY 3.0"));
         assert_eq!(v[0].items[0].year, "2008");
-        assert!(player_src("http://127.0.0.1:8480", "t", &v[0].items[0].url).unwrap().ends_with("/stream?static=true"));
     }
 
     #[test]

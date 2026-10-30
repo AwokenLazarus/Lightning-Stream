@@ -14,7 +14,6 @@ use crate::config::{Config, Role};
 use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, Section, GATEWAY_BRAND, GATEWAY_SECTIONS, STREAM_BRAND, STREAM_SECTIONS,
                   STREAM_SECTIONS_HASH, WALLET_BRAND, WALLET_SECTIONS, WALLET_SECTIONS_HASH};
 use crate::link::SignerLink;
-use crate::relay::RelayLinks;
 use crate::server::{strip_base, Req, Resp};
 use crate::{msg, now};
 
@@ -43,16 +42,12 @@ pub struct App {
     pub cfg: Config,
     pub auth: Auth,
     pub signer: SignerLink,
-    /// The links external players play one item through ([`crate::relay`]).
-    pub relays: RelayLinks,
     /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
     pub nostr: crate::nostr::NostrCache,
     /// Stream relays: the owner's choices, those announced on Nostr, and their probes ([`crate::relaynet`]).
     pub relay_net: crate::relaynet::RelayNet,
     /// The platform's login proxy, when it does the login ([`crate::auth::PlatformLogin`]).
     pub platform: Option<crate::auth::PlatformLogin>,
-    /// Why the last play of an item failed, by item URL, for the player page to say (a few minutes).
-    pub play_errors: std::sync::Mutex<HashMap<String, (std::time::Instant, u16, Value)>>,
     /// Sellers' own pages on the app ports ([`crate::seller_app`]).
     pub apps: crate::seller_app::AppOrigins,
 }
@@ -106,14 +101,6 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
 /// The height the XBT chain split from the SHA-256 chain at: a Lightning channel funded only from
 /// coins older than this exists on both chains, and the rail refuses it.
 pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
-
-/// The stream token of a login session whose CSRF token is `csrf`: the player's video URL carries
-/// it (`./s/~<token>/<seller URL>`), and the relay plays nothing without it. Derived, so the URL
-/// (which may be logged) never carries the CSRF token itself.
-pub fn stream_token(csrf: &str) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(&Sha256::digest(format!("xbt-wallet-ui/stream|{csrf}").as_bytes())[..16])
-}
 
 /// The least `ln.exposure_cap_sats` the starter rules set on mainnet.
 pub const STARTER_EXPOSURE_CAP_SATS: i64 = 100_000;
@@ -205,11 +192,10 @@ impl App {
     pub fn new(cfg: Config) -> Result<Arc<Self>, String> {
         let auth = Auth::open(&cfg.data_dir, cfg.password.as_deref(), cfg.setup_open, cfg.session_idle, cfg.session_max)?;
         let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90));
-        let relays = RelayLinks::new(cfg.relay_ttl);
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
         let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
-        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr, relay_net, platform, play_errors: std::sync::Mutex::new(HashMap::new()),
+        Ok(Arc::new(Self { cfg, auth, signer, nostr, relay_net, platform,
                          apps: Default::default() }))
     }
 
@@ -229,105 +215,6 @@ impl App {
 
     fn peer_allowed(&self, peer: &str) -> bool {
         self.cfg.allow_ips.is_empty() || self.cfg.allow_ips.iter().any(|p| peer == p || (p.ends_with('.') || p.ends_with(':')) && peer.starts_with(p.as_str()))
-    }
-
-    /// For `GET /s/<seller URL>` (the player's video), the same checks as a page of the wallet; for
-    /// `GET /r/<token>` (an external player's link), the same checks less the login, and a live
-    /// token for an item still in the services file. `Some(Ok(url))`: relay the seller URL `url`
-    /// (for `/s/`, `None`: the caller takes it from the request target); `Some(Err)`: the answer
-    /// that refuses it; `None` for anything else.
-    pub fn relay_gate(&self, req: &Req) -> Option<Result<Option<String>, Resp>> {
-        let path = strip_base(&req.path, &self.cfg.base_path)?;
-        let link = path.strip_prefix("/r/");
-        if req.method != "GET" || !(path.starts_with("/s/") || link.is_some()) || self.cfg.role == Role::Gateway {
-            return None;
-        }
-        if !self.peer_allowed(&req.peer) {
-            return Some(Err(Resp::text(403, "text/plain", "forbidden")));
-        }
-        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
-            return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
-        }
-        if !self.auth.has_password() && !self.platform_owner(req) {
-            return Some(Err(Resp::text(401, "text/plain", "login required")));
-        }
-        if let Some(token) = link {
-            // the link alone: no cookie, and only the one item it was made for
-            let in_file = |item: &str| self.services().is_ok_and(|all| crate::services::find_item(&all, item).is_some());
-            return Some(match self.relays.item_of(token) {
-                Some(item) if in_file(&item) => Ok(Some(item)),
-                _ => Err(Resp::text(404, "text/plain", "no such link: it expired, was revoked, or its item is gone")),
-            });
-        }
-        let sid = req.cookie(COOKIE).unwrap_or_default();
-        let Some(csrf) = self.auth.with_session(&sid, |s| s.csrf.clone()) else {
-            return Some(Err(Resp::text(401, "text/plain", "login required")));
-        };
-        // the session's stream token: only a page of the wallet's own knows it (another page of the box sends
-        // the cookie with a <video> it makes, but cannot read the token), so only the wallet's player pays
-        let token = path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).map(|(t, _)| t).unwrap_or("");
-        if !crate::ct_eq(token.as_bytes(), stream_token(&csrf).as_bytes()) {
-            return Some(Err(Resp::text(403, "text/plain", "refused: a stream this page did not ask for")));
-        }
-        Some(Ok(None))
-    }
-
-    /// For `GET /preview?item=<URL>`: the owner's free preview of an item of their own shop, past
-    /// the same checks as every page (login included: there is no link for it). `Some(Ok(url))`:
-    /// stream `url`, the service on this box; `None` for any other request.
-    pub fn preview_gate(&self, req: &Req) -> Option<Result<String, Resp>> {
-        let path = strip_base(&req.path, &self.cfg.base_path)?;
-        if req.method != "GET" || path != "/preview" || self.cfg.role == Role::Gateway {
-            return None;
-        }
-        if !self.peer_allowed(&req.peer) {
-            return Some(Err(Resp::text(403, "text/plain", "forbidden")));
-        }
-        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
-            return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
-        }
-        let sid = req.cookie(COOKIE).unwrap_or_default();
-        if self.auth.with_session(&sid, |_| ()).is_none() {
-            return Some(Err(Resp::text(401, "text/plain", "login required")));
-        }
-        let item = req.query.get("item").map(String::as_str).unwrap_or("");
-        Some(self.preview_upstream(item).map_err(|e| Resp::json(404, &json!({"error": e}))))
-    }
-
-    /// What stops any payment before a play is tried, in plain words with the next step: no
-    /// approval key enrolled, so no spending rules can be signed and nothing can be paid.
-    pub fn play_blocker(&self) -> Option<(String, String, String)> {
-        let ks = self.call("keystore_status", json!({})).ok()?;
-        txt(ks.get("human_pubkey")).is_empty()
-            .then(|| ("Your wallet isn't set up yet, so it can't pay for this.".into(), "Finish setup".into(), "./setup".into()))
-    }
-
-    /// A Lightning node that is not ready to pay: said above the player (the play is still tried;
-    /// if it fails, the player says why).
-    pub fn play_warning(&self) -> Option<String> {
-        let ln = self.call("ln_status", json!({})).ok()?;
-        (ln["ready"] != true).then(|| {
-            let why = txt(ln.get("reason").or(ln.get("config_error")));
-            if why.is_empty() { "Your wallet may not be able to pay yet: your Lightning node isn't ready.".into() }
-            else { format!("Your wallet may not be able to pay yet. {}", crate::setup::plain_reason(&why)) }
-        })
-    }
-
-    /// Keep why a play of `item` failed, for [`Self::play_error`].
-    pub fn note_play_error(&self, item: &str, status: u16, body: &[u8]) {
-        let v: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&body[..body.len().min(300)]).to_string()}));
-        let mut g = self.play_errors.lock().unwrap_or_else(|p| p.into_inner());
-        g.retain(|_, (t, _, _)| t.elapsed() < std::time::Duration::from_secs(600));
-        if g.len() < 256 {
-            g.insert(item.to_string(), (std::time::Instant::now(), status, v));
-        }
-    }
-
-    /// Why the last play of `item` failed, in plain words, with the next step: (headline, link text, link).
-    pub fn play_error(&self, item: &str) -> Option<(String, String, String)> {
-        let g = self.play_errors.lock().unwrap_or_else(|p| p.into_inner());
-        let (t, status, v) = g.get(item)?;
-        (t.elapsed() < std::time::Duration::from_secs(600)).then(|| play_error_words(*status, v))
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {
@@ -434,7 +321,6 @@ impl App {
             "/ai" => self.ai_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/relays" => self.relays_page(&ctx, &req.query),
-            "/play" => self.play(&ctx, &req),
             "/app" => self.app_page(&ctx, &req.query),
             "/api/visit" => self.api_visit(&req.query),
             "/connections" => self.connections(&ctx),
@@ -452,13 +338,6 @@ impl App {
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
-            "/api/play-error" => {
-                let item = req.query.get("item").map(String::as_str).unwrap_or("");
-                match self.play_error(item) {
-                    Some((words, link, href)) => Resp::json(200, &json!({"failed": true, "words": words, "link": link, "href": href})),
-                    None => Resp::json(200, &json!({"failed": false})),
-                }
-            }
             _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Home</a></p>")),
         }
     }
@@ -599,7 +478,6 @@ impl App {
             Resp::redirect(to)
         };
         match req.path.as_str() {
-            "/play" => self.play_stop(ctx, f),
             "/app" => self.app_open(ctx, f),
             "/app-stop" => self.app_stop(ctx, f),
             "/identity" => self.identity(ctx, f),
@@ -608,7 +486,6 @@ impl App {
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),
             "/hashrate" => self.hashrate_post(ctx, f),
             "/ai" => self.ai_post(ctx, f),
-            "/play-link" => self.play_link(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
             "/relays-prefs" => self.relays_prefs(ctx, f),
             "/relays-publish" => self.relays_publish(ctx, f),
@@ -709,7 +586,7 @@ impl App {
             o.dedup();
             o.len()
         };
-        let mut cats: Vec<String> = services.iter().map(|s| esc(s.kind.category_words())).collect();
+        let mut cats: Vec<String> = services.iter().map(|s| esc(s.category_words())).collect();
         cats.sort();
         cats.dedup();
         b.push_str("<section class=\"grid home\">");
@@ -1594,34 +1471,6 @@ impl App {
     }
 }
 
-/// A failed play in plain words and the next step: (what happened, link text, link). From the
-/// connector's answer: the wallet's refusal (`402`, with its `rule` and reason) or an error.
-pub fn play_error_words(status: u16, v: &Value) -> (String, String, String) {
-    let rule = v["rule"].as_str().unwrap_or("").to_ascii_lowercase();
-    let why = v["error"].as_str().unwrap_or("").to_ascii_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| rule.contains(w) || why.contains(w));
-    let (h, l, href) = if why.starts_with("the connector") {
-        ("The app's player part isn't answering. Restart the app from your box's dashboard.", "See live connections", "./connections")
-    } else if has(&["human_key", "enrol", "no policy", "policy is not"]) {
-        ("Your wallet isn't set up yet.", "Finish setup", "./setup")
-    } else if has(&["allowlist", "not named", "unlisted", "listed", "not allowed"]) {
-        ("Payment refused by your spending rules: this seller is not allowed yet.", "Allow this seller", "./services")
-    } else if has(&["budget", "cap", "velocity", "max_sats", "limit", "threshold"]) {
-        ("Payment refused: your spending limit is reached.", "See your spending rules", "./policy")
-    } else if has(&["balance", "liquidity", "insufficient", "no route", "no_route", "unable to find a path", "outbound"]) {
-        ("Not enough balance to pay: your node has no way to send this much.", "See your wallet", "./wallet")
-    } else if has(&["ln_unavailable", "ln_disabled", "ln_config", "ln_halted", "no_rail", "mainnet", "macaroon", "not ready"]) {
-        ("Your wallet can't pay yet: your Lightning node isn't ready.", "Check your node", "./lightning")
-    } else if status == 504 || has(&["sent nothing", "did not answer", "could not reach", "timed out", "unreachable", "connection refused"]) {
-        ("The seller didn't answer. Try again in a moment.", "See your sellers", "./services")
-    } else if status == 401 {
-        ("You were logged out. Log in and press play again.", "Log in", "./login")
-    } else {
-        return (format!("This didn't play: {}.", v["error"].as_str().unwrap_or("the payment did not go through").trim_end_matches('.')),
-                "See live connections".into(), "./connections".into());
-    };
-    (h.into(), l.into(), href.into())
-}
 
 /// `?k=v&...` for a redirect back to the same page (empty when there is no query).
 fn query_string(q: &HashMap<String, String>) -> String {

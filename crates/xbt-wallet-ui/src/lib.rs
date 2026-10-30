@@ -10,8 +10,7 @@
 //! * [`msg`]: the signed message formats (the same bytes as `xbt_signer::approval` and `ui.js`).
 //! * [`html`]: escaping, the page layout, formatting.
 //! * [`app`]: the routes and pages; [`server`]: the HTTP server.
-//! * [`services`]: the services file Browse and the player read (`XBT_UI_SERVICES`).
-//! * [`relay`]: the links an external player (VLC, mpv) plays one item through.
+//! * [`services`]: the services file Browse reads (`XBT_UI_SERVICES`).
 //! * [`setup`]: the Lightning rail page (wallet) and the seller gateway's page (`XBT_UI_ROLE=gateway`).
 pub mod app;
 pub mod services;
@@ -23,7 +22,6 @@ pub mod node_keys;
 pub mod own_shop;
 pub mod msg;
 pub mod nostr;
-pub mod relay;
 pub mod relaynet;
 pub mod server;
 pub mod seller_app;

@@ -846,6 +846,8 @@ impl App {
                 routes.push(r);
             }
             let base = public_url.clone();
+            // deprecated for a media server: its films were listed for the app's built-in player, which is gone. A
+            // media server saved before keeps its list for a release, for older buyers' apps; saving it again clears it
             let items: Vec<Value> = o.titles.iter().map(|(t, u)| {
                 // an item at one of the shop's earlier addresses is listed at its address now
                 let moved = aliases.iter().any(|a| crate::services::same_origin(u, a));
@@ -1179,6 +1181,11 @@ impl App {
             let s = each.get(&o.id).cloned().unwrap_or(Status { class: "warn", headline: "Unknown".into(), next: String::new() });
             let now = o.paths.first().and_then(|p| live.get(p)).map(capacity_words).unwrap_or_default();
             let mut next_hint = if s.next.is_empty() { String::new() } else { format!("<p class=\"hint {}\">{}</p>", s.class, esc(&s.next)) };
+            // the app's built-in player is gone: a media server is used through its own web app
+            if o.kind == Kind::Media && (o.app.is_none() || !o.titles.is_empty()) {
+                next_hint.push_str("<p class=\"hint warn\">Buyers' apps no longer have a player of their own: they use your media server's own web app. \
+                    Edit this service and save it to share it that way. A list of films is no longer needed.</p>");
+            }
             next_hint.push_str(&now);
             let btn = |action: &str, label: &str, class: &str| format!("<form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                 <input type=\"hidden\" name=\"id\" value=\"{}\"><button{class}>{label}</button></form>", esc(&o.id));
@@ -1244,7 +1251,9 @@ impl App {
         let unit = Unit::parse(&fv("unit", editing.map(|o| o.unit).unwrap_or(sug_unit).id().to_string())).unwrap_or(sug_unit);
         let kinds: String = [Kind::Media, Kind::Ai, Kind::Web, Kind::Other].iter().map(|k| {
             let (p, u) = k.suggested();
-            format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>suggested {} sat {}</small></span></label>",
+            // a media server is named by the apps it means: it is shared as its own web app
+            let what = if *k == Kind::Media { "Jellyfin, Plex: shared as a web app · " } else { "" };
+            format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>{what}suggested {} sat {}</small></span></label>",
                     k.id(), if *k == kind { " checked" } else { "" }, k.words(), p, u.short())
         }).collect();
         let units: String = [Unit::Mib, Unit::Request, Unit::Second, Unit::Tokens].iter()
@@ -1253,6 +1262,8 @@ impl App {
         b.push_str(&format!("<section class=\"card primary\" id=\"service-form\"><h2>{}</h2><form method=\"post\" action=\"./sell\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"service\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
             <fieldset class=\"choices\"><legend>What is it?</legend>{kinds}</fieldset>\
+            <p class=\"hint\">A media server is shared as its own web app: buyers use your Jellyfin or Plex in their browser or app, \
+            each with their own account if you like, up to 4K. They pay your price for what it loads, so a price per MiB (or per GB) suits it.</p>\
             <label>Its address on this box<input name=\"address\" value=\"{}\" required pattern=\"http://[^ ?#@]+\" inputmode=\"url\" class=\"mono\" \
             list=\"found-services\" title=\"The http:// address other apps on this box use, like {}\" placeholder=\"{}\"></label>{}\
             <div class=\"price-row\"><label>Price in sats<input name=\"price\" value=\"{}\" required inputmode=\"decimal\" pattern=\"[0-9][0-9,]*(\\.[0-9]{{1,3}})?|\\.[0-9]{{1,3}}\" \
@@ -1277,7 +1288,7 @@ impl App {
             <p class=\"hint\">Paths as the page sees them. Where a path is under entries of both lists, the longer one decides: \
             <code>/</code> in the second list and <code>/Users</code> in the first refuse <code>/Users</code> but serve the rest.</p></details>\
             <details><summary>Advanced</summary>\
-            <label>Items to list for buyers (films, files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
+            <label>Items to list for buyers (files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
             <p class=\"hint\">A link may start with <code>/</code>: it is then on your shop's address.</p>\
             <label>Paths it is sold under, comma-separated (empty: chosen for you)<input name=\"paths\" value=\"{}\" class=\"mono\"></label>\
             <label class=\"check\"><input type=\"checkbox\" name=\"strip\" value=\"1\"{}> Pass requests on without that path</label></details>\
@@ -1398,6 +1409,10 @@ impl App {
                     }
                     titles.push((t.to_string(), u.to_string()));
                 }
+                // films listed for the built-in player, which buyers' apps no longer have: a media server is its web app
+                if kind == Kind::Media {
+                    titles.clear();
+                }
                 let id = g("id");
                 if id.is_empty() && shop.offers.len() >= MAX_SERVICES {
                     return Err(format!("A shop sells at most {MAX_SERVICES} services."));
@@ -1419,7 +1434,9 @@ impl App {
                     };
                 }
                 let mut accounts_key: Option<String> = None;
-                let app = if g("app") == "1" {
+                // a media server is sold as its own web app: buyers use it as they would at home, with no player of
+                // the app's own
+                let app = if g("app") == "1" || kind == Kind::Media {
                     // a media server's page uses paths all over the service (Jellyfin: /web/, /Users/, /Items/…); an AI model's or a web app's, its own path
                     let base = match g("app_base").trim() {
                         "" if kind == Kind::Media => "/".to_string(),

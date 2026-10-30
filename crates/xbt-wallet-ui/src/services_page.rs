@@ -103,7 +103,7 @@ impl App {
                     for s in &list {
                         let n = s.items.len();
                         b.push_str(&format!("<li><span class=\"pill cat-{}\">{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
-                                            s.kind.category(), esc(s.kind.category_words()), esc(&s.name), esc(&s.price_text),
+                                            s.category(), esc(s.category_words()), esc(&s.name), esc(&s.price_text),
                                             if n > 0 { format!(" <span class=\"small\">{n} to choose from</span>") } else { String::new() }));
                     }
                     b.push_str("</ul>");

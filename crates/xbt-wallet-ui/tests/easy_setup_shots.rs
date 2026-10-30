@@ -49,11 +49,11 @@ fn easy_setup_screenshots() {
     let keys = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: ln.join("none"), grant: None,
                                                     rail_dir: Some(ln.clone()), gw_dir: None };
     xbt_wallet_ui::node_keys::make_keys(&keys, &mut |_, _| Ok(rail.clone())).unwrap();
-    let film = "https://stream.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true";
     let services = data.path().join("services.json");
     std::fs::write(&services, json!([
-        {"name": "Creative Commons films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
-         "items": [{"title": "Elephants Dream", "year": 2006, "url": film, "credit": "(c) Blender Foundation, CC BY 2.5"}]},
+        // a media server, shared as its own web app; the box's own shop below is an older media listing
+        {"name": "Creative Commons films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB", "items": [],
+         "app": "https://stream.lazarus-xbt.xyz/web/", "app_base": "https://stream.lazarus-xbt.xyz/"},
         {"name": "My films", "kind": "video", "seller": "https://shop.example", "price_text": "20 sat a MiB",
          "items": [{"title": "Sintel", "year": 2010, "url": "https://shop.example/Videos/abc/stream", "credit": "(c) Blender Foundation, CC BY 3.0"}]}
     ]).to_string()).unwrap();
@@ -83,43 +83,16 @@ fn easy_setup_screenshots() {
     cfg.gw.port = 8402;
     cfg.gw.node_rest = Some("https://10.21.21.66:8180".into());
     cfg.local_services = vec![("Jellyfin".into(), "http://127.0.0.1:9".into())];
-    // the connector is not running: a play fails, and the player says why
     cfg.connector = "http://127.0.0.1:9".into();
     let app = App::new(cfg).unwrap();
     let srv = xbt_wallet_ui::server::spawn(app).unwrap();
     let base = format!("http://{}", srv.addr);
     shoot(&chrome, &out, "setup-first-run", &format!("{base}/setup"));
     shoot(&chrome, &out, "node-connected-by-itself", &format!("{base}/lightning"));
-    shoot(&chrome, &out, "player-wallet-not-set-up", &format!("{base}/play?item={}", xbt_wallet_ui::services::urlenc(film)));
+    let page = |seller: &str, name: &str| format!("{base}/service?seller={}&name={}", xbt_wallet_ui::services::urlenc(seller), xbt_wallet_ui::services::urlenc(name));
+    shoot(&chrome, &out, "web-app-service", &page("https://stream.lazarus-xbt.xyz", "Creative Commons films"));
     shoot(&chrome, &out, "browse-your-shop", &format!("{base}/browse"));
-    shoot(&chrome, &out, "preview-your-shop", &format!("{base}/play?item={}", xbt_wallet_ui::services::urlenc("https://shop.example/Videos/abc/stream")));
+    shoot(&chrome, &out, "your-shop-older-listing", &page("https://shop.example", "My films"));
     shoot(&chrome, &out, "sell-found-and-https-help", &format!("{base}/sell"));
     shoot(&chrome, &out, "sellers-allow", &format!("{base}/services"));
-
-    // a box with a key: the player tries, and says why it failed
-    let rig2 = Rig::new(json!({}), false);
-    let sock2 = rig2.dir.path().join("signer.sock");
-    let _s2 = xbt_signer::server::spawn(rig2.s.clone(), &sock2, false).unwrap();
-    let data2 = tempfile::tempdir().unwrap();
-    let services2 = data2.path().join("services.json");
-    std::fs::write(&services2, json!([{"name": "Creative Commons films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz",
-        "price_text": "20 sat a MiB", "items": [{"title": "Elephants Dream", "year": 2006, "url": film, "credit": "CC BY 2.5"}]}]).to_string()).unwrap();
-    let mut cfg2 = Config::for_test(sock2, data2.path().join("ui"), "127.0.0.1:0");
-    cfg2.platform_login = Some("localhost".into());
-    cfg2.services_file = Some(services2);
-    // a connector that answers as the wallet does when the rules refuse the seller
-    struct Refuse;
-    impl xbt_svc::http::Handler for Refuse {
-        fn body_limit(&self, _: &str, _: &str) -> usize {
-            0
-        }
-        fn handle(&self, _: xbt_svc::http::Request) -> xbt_svc::http::Response {
-            xbt_svc::http::Response::text(402, "application/json", r#"{"error": "the seller is not on the allowlist", "rule": "allowlist"}"#)
-        }
-    }
-    let refuse = xbt_svc::http::serve(std::sync::Arc::new(Refuse), std::net::TcpListener::bind("127.0.0.1:0").unwrap(), 2).unwrap();
-    cfg2.connector = format!("http://{}", refuse.addr);
-    let app2 = App::new(cfg2).unwrap();
-    let srv2 = xbt_wallet_ui::server::spawn(app2).unwrap();
-    shoot(&chrome, &out, "player-says-why", &format!("http://{}/play?item={}", srv2.addr, xbt_wallet_ui::services::urlenc(film)));
 }
