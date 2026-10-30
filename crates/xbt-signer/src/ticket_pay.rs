@@ -32,23 +32,30 @@
 //!   seller takes seqs only in order, and requests go out on their own connections: one that
 //!   arrives before a seq it follows is answered `bad_seq` and sent again once that one is on its
 //!   way, or takes over a seq no request holds ([`Signer::seq_bad`]).
-//! * **Receipts out of order.** Receipts are read in another order than the seller signed them. Its
-//!   totals only grow, so one with less than the wallet holds is older: its own figures are checked
-//!   (its charge against its price) and its totals passed over ([`Money::take`]).
+//! * **Receipts out of order.** Receipts are read in another order than the seller signed them, and
+//!   the seller's spend can fall (it gives back a charge that bought nothing), so figures do not
+//!   order them. The wallet's own steps do: a receipt for a request sent after the wallet last took
+//!   the seller's totals is newer, and its spend is taken even where it is lower ([`Money::epoch`]).
+//!   One for a request sent before may be older: with less than the wallet holds, its own figures
+//!   are checked (its charge against its price) and its totals passed over ([`Money::take`]).
 //! * **What the seller may have spent.** Every request may be charged from the moment it is sent
-//!   until its answer's last receipt is read, at most its call's limit ([`Money::open`]). A
+//!   until its answer's last receipt is read, at most its call's limit ([`Money::open`], by the
+//!   request's own id); one whose answer was lost, for a while after ([`Money::lost`]); one cut
+//!   short, at most what was read and what could have been on its way ([`CUT_SLACK`]). A
 //!   receipt's spend is taken only inside the spend at the last quiet point, plus what the wallet
 //!   counted since, plus what the open requests may still add; and where nothing is open, only
 //!   inside what the seller's own receipts charged the answers closed since. A seller cannot drain
 //!   the balance behind a WebSocket kept open: it may add at most that call's limit.
 //! * **Credit.** Each answer counts what it draws into [`Money::consumed`] (its bytes, its seconds
-//!   as they start, an answer by the token the most it may cost until its end), and finds a ticket
+//!   as they start; an answer by the token holds back the most it may cost in [`Money::reserved`]
+//!   until its end, then draws what it cost), and finds a ticket
 //!   due on what is left after what the others drew since it started. An answer that closes with a
 //!   charge above the wallet's count (bytes the seller sent that nobody read) adds the difference.
 //! * **Releases.** A release re-asks whether it is still due once it holds `paying`: two answers
 //!   that find one due at once release one. It waits for an answer the seller has not closed
 //!   without holding `paying`, and only if that answer was left before the release's own answer
-//!   opened ([`Signer::ticket_release_one`]).
+//!   opened ([`Signer::ticket_release_one`]); one never found closed is closed by the wallet, as
+//!   charged the most it may, after [`TAIL_GIVE_UP`].
 //!
 //! One session rather than one per request: one ticket's credit serves the whole page, where a
 //! session per request would lock a ticket for each request in flight and spread the credit thin.
@@ -92,7 +99,8 @@ const FINAL_WAIT: Duration = Duration::from_secs(2);
 /// receipt is only slow to show (a status beside many other requests).
 const FINAL_WAIT_WHOLE: Duration = Duration::from_secs(10);
 /// How long a release waits for the seller to close an answer the wallet stopped reading, and how
-/// long after that stop the session is given up if the seller never closes it.
+/// long after that stop the wallet closes it itself, as charged the most its call allowed, if the
+/// seller never lists it closed.
 const TAIL_WAIT: Duration = Duration::from_secs(5);
 const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
@@ -862,10 +870,24 @@ struct Money {
     consumed: u64,
     /// `consumed` when the seller's totals were last taken ([`Money::take`]).
     absorbed_mark: u64,
-    /// Requests the seller may still charge, by seq: the most each may still add to the session's
-    /// spend (its call's limit, less what the wallet counted for it). From the moment the request
-    /// is sent until the seller's last receipt for its answer is read.
+    /// Requests the seller may still charge, by the request's own id ([`Money::request_id`], not
+    /// its seq: a seq can pass from one request to another): the most each may still add to the
+    /// session's spend (its call's limit, less what the wallet counted for it). From the moment the
+    /// request is sent until the seller's last receipt for its answer is read.
     open: HashMap<u64, u64>,
+    /// Requests whose answer was lost (the connection failed after the request left): the seller
+    /// may still charge each up to its limit, until a quiet point at least [`LOST_GRACE`] later.
+    lost: HashMap<u64, (u64, Instant)>,
+    /// The ids handed out to requests so far.
+    requests: u64,
+    /// What answers priced by the token hold back until their end: the most each may still cost
+    /// beyond its head. Kept apart from `consumed` (what was drawn), which never falls.
+    reserved: u64,
+    /// How many times the seller's totals were taken (or what it said was released rose). A request
+    /// sent while this was `e` is answered
+    /// by a receipt the seller signed after every receipt taken up to `e`: one for a request sent
+    /// at the current epoch is newer than the totals held, whatever its spend says ([`Money::take`]).
+    epoch: u64,
     /// The seller's `spentMsat` at the last quiet point (nothing open, no tail), `consumed` then,
     /// and what the seller's receipts charged the answers closed since: the bounds of
     /// [`Money::take`].
@@ -893,8 +915,8 @@ impl Money {
     /// limit), where the wallet counted `counted` for it. A charge above the count (bytes the seller
     /// sent of an answer the wallet stopped reading, or a request whose answer was lost) is the
     /// seller's word for what it spent, and goes into the count.
-    fn close(&mut self, seq: u64, charged: u64, counted: u64) {
-        if self.open.remove(&seq).is_some() {
+    fn close(&mut self, rid: u64, charged: u64, counted: u64) {
+        if self.open.remove(&rid).is_some() {
             self.accepted = self.accepted.saturating_add(charged);
             self.consumed = self.consumed.saturating_add(charged.saturating_sub(counted));
         }
@@ -912,7 +934,7 @@ impl Money {
     /// `charged_max`: the most this receipt may say its request was charged. `outstanding`: a secret
     /// has left whose taking the seller has not yet confirmed. `Err`: the seller's word contradicts
     /// the wallet's count; nothing of it is taken.
-    fn take(&mut self, r: &Receipt, charged_max: u64, outstanding: bool) -> std::result::Result<bool, String> {
+    fn take(&mut self, r: &Receipt, charged_max: u64, outstanding: bool, sent_epoch: Option<u64>) -> std::result::Result<bool, String> {
         if r.charged > charged_max {
             return Err(format!("the seller charged {} msat for a request whose price by its terms is at most {charged_max}", r.charged));
         }
@@ -922,30 +944,45 @@ impl Money {
         if r.released_msat > self.acct.sent_msat {
             return Err(format!("the seller says {} msat were released, the wallet released {}", r.released_msat, self.acct.sent_msat));
         }
-        if r.released_msat < self.acct.acked_msat || r.spent_msat < self.acct.spent_msat {
-            // the seller gives back a charge that bought nothing, so a newer receipt can say less was spent; what it
-            // says was released only rises, and confirms the tickets it names
-            self.acct.acked_msat = self.acct.acked_msat.max(r.released_msat);
+        // newer than the totals held, by the order of the wallet's own steps: the request it answers left after
+        // they were taken. Its spend is taken even where it is lower (the seller gave back a charge that bought nothing)
+        let newer = sent_epoch == Some(self.epoch);
+        if newer && r.released_msat < self.acct.acked_msat {
+            return Err(format!("the seller credited {} msat released and now {}", self.acct.acked_msat, r.released_msat));
+        }
+        if !newer && (r.released_msat < self.acct.acked_msat || r.spent_msat < self.acct.spent_msat) {
+            // no telling which the seller signed first: a lower spend may be the older receipt. What it says was
+            // released only rises, and confirms the tickets it names. A rise is a receipt that may be newer than a request
+            // already sent: that one's is no longer known to be newer
+            if r.released_msat > self.acct.acked_msat {
+                self.acct.acked_msat = r.released_msat;
+                self.epoch = self.epoch.saturating_add(1);
+            }
             return Ok(false);
         }
-        if !outstanding && r.released_msat != self.acct.sent_msat {
-            return Err(format!("the wallet released {} msat and the seller credits {}", self.acct.sent_msat, r.released_msat));
+        let acked = self.acct.acked_msat.max(r.released_msat);
+        if !outstanding && acked != self.acct.sent_msat {
+            return Err(format!("the wallet released {} msat and the seller credits {}", self.acct.sent_msat, acked));
         }
         let counted = self.consumed.saturating_sub(self.quiet_consumed);
-        let open: u64 = self.open.values().fold(0u64, |a, b| a.saturating_add(*b));
+        let open: u64 = self.open.values().chain(self.lost.values().map(|(m, _)| m)).fold(0u64, |a, b| a.saturating_add(*b));
         let ceiling = self.quiet_spent.saturating_add(counted).saturating_add(open);
         if r.spent_msat > ceiling {
             return Err(format!("the seller's spentMsat is {} msat, more than the {ceiling} the wallet can account for: {} at the last quiet point, {counted} counted \
                                 since, and at most {open} more for the requests still open", r.spent_msat, self.quiet_spent));
         }
-        let quiet = self.open.is_empty() && self.tails.is_empty();
-        if quiet && r.spent_msat > self.quiet_spent.saturating_add(self.accepted) {
+        let quiet = self.open.is_empty() && self.tails.is_empty() && self.lost.values().all(|(_, at)| at.elapsed() >= LOST_GRACE);
+        // a lost request may have been charged up to its limit
+        let lost: u64 = self.lost.values().fold(0u64, |a, (m, _)| a.saturating_add(*m));
+        if quiet && r.spent_msat > self.quiet_spent.saturating_add(self.accepted).saturating_add(lost) {
             return Err(format!("the seller's spentMsat rose by {} msat since the last quiet point, and its own receipts charged the answers closed since {}",
-                               r.spent_msat - self.quiet_spent, self.accepted));
+                               r.spent_msat.saturating_sub(self.quiet_spent), self.accepted));
         }
-        self.acct.acked_msat = r.released_msat;
+        self.acct.acked_msat = acked;
         self.acct.spent_msat = r.spent_msat;
+        self.epoch = self.epoch.saturating_add(1);
         if quiet {
+            self.lost.clear();
             self.anchor();
         } else {
             self.absorbed();
@@ -956,19 +993,46 @@ impl Money {
     /// What the seller holds for the session by the wallet's best count: its last signed balance,
     /// less what the answers drew since. Never more than the signed balance.
     fn est_balance(&self) -> u64 {
-        self.acct.balance().saturating_sub(self.consumed.saturating_sub(self.absorbed_mark))
+        self.acct.balance().saturating_sub(self.consumed.saturating_sub(self.absorbed_mark)).saturating_sub(self.reserved)
+    }
+
+    /// A new request's id, for [`Money::open`].
+    fn request_id(&mut self) -> u64 {
+        self.requests = self.requests.saturating_add(1);
+        self.requests
+    }
+
+    /// The request `rid` left and its answer was lost: the seller may have taken it, and may charge
+    /// it up to its limit, as late as its own queue lets it. Kept in the bounds until a quiet point
+    /// [`LOST_GRACE`] after.
+    fn lose(&mut self, rid: u64, most: u64) {
+        if self.open.remove(&rid).is_some() {
+            self.lost.insert(rid, (most, Instant::now()));
+        }
     }
 }
 
 /// An answer the seller has not closed: which request it answered, when the wallet stopped reading,
 /// and what the wallet counted for it.
 struct Tail {
+    /// The request's id ([`Money::open`]) and its seq, by which its last receipt is found.
+    rid: u64,
     seq: u64,
     digest: String,
     status: u16,
     since: Instant,
     counted: u64,
 }
+
+/// What may be on its way to the wallet when it stops reading an answer, past what it read: the
+/// seller's socket buffer and the wallet's (a few MiB each where they grow to fit a fast link), and
+/// a proxy's or relay's between them. A seller's charge for an answer cut short is believed up to
+/// what the wallet read and this much more, priced.
+const CUT_SLACK: u64 = (16 << 20) + PROXY_SLACK;
+
+/// How long a request whose answer was lost is held as one the seller may still charge: longer than
+/// any answer is waited for, so that the seller has served or dropped it by then.
+const LOST_GRACE: Duration = Duration::from_secs(120);
 
 /// A ticket session the wallet pays over HTTP. In memory only: a signer that starts again stops
 /// every session (the book's rule) and has the seller's id and key on disk for the cancel.
@@ -2548,6 +2612,12 @@ impl Signer {
     /// are taken into the wallet's count ([`Money::take`]). `link` is held only to take the seq: the
     /// request goes out beside the session's others.
     fn ticket_call(&self, hs: &HttpSession, what: &str, body: &Value, absorb: bool) -> Result<(u16, Value, std::result::Result<Receipt, String>)> {
+        self.ticket_call_at(hs, what, body, absorb).map(|(status, v, r, _)| (status, v, r))
+    }
+
+    /// [`Signer::ticket_call`], with the epoch of the wallet's count ([`Money::epoch`]) when the
+    /// request last left: what orders its receipt against the totals the wallet holds.
+    fn ticket_call_at(&self, hs: &HttpSession, what: &str, body: &Value, absorb: bool) -> Result<(u16, Value, std::result::Result<Receipt, String>, u64)> {
         if !self.ticket_may_reach(&hs.origin, &hs.task) {
             return Err(err("allowlist", format!("destination not on allowlist: {}", hs.origin)));
         }
@@ -2562,6 +2632,7 @@ impl Signer {
         loop {
             let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
+            let sent_epoch = lock_money(hs).epoch;
             let read = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], timeout)
                 .and_then(|ans| {
                     let (status, pr) = (ans.status, ans.header("PAYMENT-RESPONSE").map(str::to_string));
@@ -2592,11 +2663,11 @@ impl Signer {
             if let (true, Ok(r)) = (absorb, &receipt) {
                 let mut m = lock_money(hs);
                 let outstanding = m.pending.is_some();
-                if let Err(why) = m.take(r, 0, outstanding) {
+                if let Err(why) = m.take(r, 0, outstanding, Some(sent_epoch)) {
                     m.fault.get_or_insert(why);
                 }
             }
-            return Ok((status, v, receipt));
+            return Ok((status, v, receipt, sent_epoch));
         }
     }
 
@@ -2644,6 +2715,7 @@ impl Signer {
             Ok((200, _, Ok(r))) if r.released_msat == sent && r.spent_msat <= r.released_msat && r.released_msat > r.spent_msat => {
                 let mut m = lock_money(hs);
                 m.acct = Account { sent_msat: sent, acked_msat: r.released_msat, spent_msat: r.spent_msat };
+                m.epoch = m.epoch.saturating_add(1);
                 m.anchor();
                 Some(r.released_msat - r.spent_msat)
             }
@@ -2661,6 +2733,7 @@ impl Signer {
                 drop(link);
                 let mut m = lock_money(hs);
                 m.acct = Account::default();
+                m.epoch = m.epoch.saturating_add(1);
                 m.fault = None;
                 false
             }
@@ -2669,8 +2742,8 @@ impl Signer {
 
     /// The seller's signed `status`: its tickets by state into `ready`, and the body.
     fn ticket_status_of(&self, hs: &HttpSession, absorb: bool) -> std::result::Result<Value, String> {
-        match self.ticket_call(hs, "status", &json!({}), false) {
-            Ok((200, v, Ok(own))) => {
+        match self.ticket_call_at(hs, "status", &json!({}), false) {
+            Ok((200, v, Ok(own), sent_epoch)) => {
                 // the link before the money, as everywhere (`HttpSession`)
                 let sid = lock_link(hs).seller_sid.clone();
                 let mut m = lock_money(hs);
@@ -2679,14 +2752,15 @@ impl Signer {
                 let last: Vec<Receipt> = v.get("responses").and_then(Value::as_array).into_iter().flatten()
                     .filter_map(|r| Receipt::verify(r, &hs.terms.receipt_key, &sid).ok()).filter(|r| !r.body_hash.is_empty()).collect();
                 let closed: Vec<(u64, u64, u64)> = m.tails.iter()
-                    .filter_map(|t| last.iter().find(|r| r.for_request(t.seq, &t.digest, t.status).is_ok()).map(|r| (t.seq, r.charged, t.counted))).collect();
-                for (seq, charged, counted) in &closed {
-                    m.close(*seq, *charged, *counted);
+                    .filter_map(|t| last.iter().find(|r| r.for_request(t.seq, &t.digest, t.status).is_ok()).map(|r| (t.rid, r.charged, t.counted))).collect();
+                for (rid, charged, counted) in &closed {
+                    m.close(*rid, *charged, *counted);
                 }
-                m.tails.retain(|t| !closed.iter().any(|(s, _, _)| *s == t.seq));
+                m.tails.retain(|t| !closed.iter().any(|(r, _, _)| *r == t.rid));
                 // the tickets' states as of this status: only where it is no older than the totals the wallet holds (another
-                // answer's newer receipt may have been read first)
-                let fresh = own.released_msat >= m.acct.acked_msat && own.spent_msat >= m.acct.spent_msat;
+                // answer's newer receipt may have been read first). A status asked for after those totals were taken is
+                // newer, whatever its spend says (the seller may have given a charge back)
+                let fresh = sent_epoch == m.epoch || (own.released_msat >= m.acct.acked_msat && own.spent_msat >= m.acct.spent_msat);
                 if fresh {
                     for t in v.get("tickets").and_then(Value::as_array).into_iter().flatten() {
                         let hash = str_or_empty(t.get("hash"));
@@ -2699,14 +2773,14 @@ impl Signer {
                 }
                 if absorb {
                     let outstanding = m.pending.is_some();
-                    if let Err(why) = m.take(&own, 0, outstanding) {
+                    if let Err(why) = m.take(&own, 0, outstanding, Some(sent_epoch)) {
                         m.fault.get_or_insert(why);
                     }
                 }
                 Ok(v)
             }
-            Ok((status, _, Ok(_))) => Err(format!("the seller answered status with HTTP {status}")),
-            Ok((status, v, Err(why))) => Err(self.ticket_forgotten(hs, status, &v)
+            Ok((status, _, Ok(_), _)) => Err(format!("the seller answered status with HTTP {status}")),
+            Ok((status, v, Err(why), _)) => Err(self.ticket_forgotten(hs, status, &v)
                                                  .unwrap_or_else(|| format!("the seller's answer to status (HTTP {status}) has no valid receipt: {why}"))),
             Err(e) => Err(e.msg),
         }
@@ -2751,20 +2825,31 @@ impl Signer {
         // answers that opened after it was left (`opened`): one open before it was already drawing on the balance beside
         // it, and goes on within its own call's limit
         let blocking = |m: &Money| m.tails.iter().filter(|t| t.since <= opened).map(|t| t.since).min();
-        let open_since = blocking(&lock_money(hs));
-        if let Some(since) = open_since {
+        if blocking(&lock_money(hs)).is_some() {
             let deadline = Instant::now() + TAIL_WAIT;
             loop {
                 if let Err(why) = self.ticket_status_of(hs, true) {
                     return Err(refusal(Self::status_rule(hs), format!("{why}: no secret was released")));
                 }
-                if blocking(&lock_money(hs)).is_none() {
-                    break;
-                }
+                let Some(since) = blocking(&lock_money(hs)) else { break };
                 if since.elapsed() >= TAIL_GIVE_UP {
-                    let stopped = self.ticket_http_stop(hs, "the seller never closed the answer the wallet stopped reading", Duration::ZERO);
-                    return Err(with(refusal("ticket_answer_open", "the seller never closed the answer the wallet stopped reading: the session was stopped and no \
-                                                                   secret was released; call again"), json!({"session": hs.sid, "stopped": stopped})));
+                    // its last receipt can no longer be listed (a seller keeps a few, and many answers ran beside it), or
+                    // the seller never closed it: closed here as charged the most it may, by the wallet's count. The
+                    // seller's spend is bounded by that; its own word for the answer is not needed
+                    let given_up = {
+                        let mut m = lock_money(hs);
+                        let gone: Vec<(u64, u64)> = m.tails.iter().filter(|t| t.since.elapsed() >= TAIL_GIVE_UP).map(|t| (t.rid, t.counted)).collect();
+                        for (rid, counted) in &gone {
+                            let left = m.open.get(rid).copied().unwrap_or(0);
+                            m.close(*rid, counted.saturating_add(left), *counted);
+                        }
+                        m.tails.retain(|t| !gone.iter().any(|(r, _)| *r == t.rid));
+                        gone.len()
+                    };
+                    if given_up > 0 {
+                        self.ticket_audit("ticket_answer_given_up", json!({"session": hs.sid, "origin": hs.origin, "answers": given_up}));
+                    }
+                    continue;
                 }
                 if Instant::now() >= deadline {
                     return Err(with(refusal("ticket_answer_open", "the seller has not yet closed the answer the wallet stopped reading: no secret was released \
@@ -3032,7 +3117,7 @@ impl Signer {
         // the most a ticket of this seller adds to the balance: how many rounds of releases a head's reserve takes
         let ticket_msat = hs.terms.terms.ticket_msat.max(1);
         let most_rounds = reserve.div_ceil(ticket_msat).saturating_add(2).min(64);
-        let (seq, digest, ans, head, mark, streaming) = loop {
+        let (rid, seq, digest, ans, head, mark, streaming) = loop {
             // whole tickets until the seller's balance covers what it wants before it serves. The balance
             // by the wallet's count: answers open beside this one draw on it as they go
             let mut rounds = 0;
@@ -3059,8 +3144,14 @@ impl Signer {
                 Err(e) => return fail(hs, &spent, refusal("ticket_session", e.msg)),
             };
             // from the moment it leaves, the seller may charge this request up to its call's limit
-            lock_money(hs).open.insert(seq, max_msat);
+            let rid = {
+                let mut m = lock_money(hs);
+                let rid = m.request_id();
+                m.open.insert(rid, max_msat);
+                rid
+            };
             let seq_deadline = Instant::now() + SEQ_WAIT;
+            let mut sent_epoch;
             let (ans, receipt) = loop {
                 let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
                 let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
@@ -3070,6 +3161,7 @@ impl Signer {
                 if c.max_sats > 0 {
                     headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.max_sats as u64).saturating_mul(1000).to_string()));
                 }
+                sent_epoch = lock_money(hs).epoch;
                 let sent = if c.upgrade {
                     self.wire_upgrade(c.url, &headers, Self::ticket_read_timeout(&tp)).map(|u| {
                         up_writer = u.writer.filter(|_| u.answer.status == 101);
@@ -3084,7 +3176,9 @@ impl Signer {
                     // anything: at most what its price asks before it serves, which the count keeps as charged
                     Err(e) => {
                         self.seq_done(hs, seq);
-                        lock_money(hs).close(seq, price.request_msat.saturating_add(price.second_msat).min(max_msat), 0);
+                        // the seller may have it, queued, and charge it later: held as one it may still charge, up to its
+                        // limit, until a quiet point well after ([`Money::lose`])
+                        lock_money(hs).lose(rid, max_msat);
                         return fail(hs, &spent, with(refusal("ticket_seller", format!("the seller gave no answer to the paid request: {}", e.msg)), json!({"status": null})));
                     }
                 };
@@ -3096,12 +3190,7 @@ impl Signer {
                             // an earlier request has not reached the seller yet, or the seller's counters moved: the
                             // same request again, with the seq it takes. The open request moves with it
                             match self.seq_bad(hs, seq, n) {
-                                Some(s) => {
-                                    let mut m = lock_money(hs);
-                                    m.open.remove(&seq);
-                                    m.open.insert(s, max_msat);
-                                    seq = s;
-                                }
+                                Some(s) => seq = s,
                                 None => std::thread::sleep(Duration::from_millis(10)),
                             }
                             continue;
@@ -3118,7 +3207,7 @@ impl Signer {
                 Ok(r) => r,
                 Err(why) => {
                     // an answer nobody signed charged nothing the wallet can know of
-                    lock_money(hs).close(seq, 0, 0);
+                    lock_money(hs).close(rid, 0, 0);
                     let status = ans.status;
                     let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
                     let code = protocol_code(v.get("error"));
@@ -3148,21 +3237,21 @@ impl Signer {
                 m.consumed = m.consumed.saturating_add(head.charged);
                 if metered {
                     // what it may still add: its call's limit, less its head
-                    if let Some(left) = m.open.get_mut(&seq) {
+                    if let Some(left) = m.open.get_mut(&rid) {
                         *left = max_msat.saturating_sub(head.charged);
                     }
                 } else {
                     // a whole answer is paid for at its head: closed by its receipt
-                    m.close(seq, head.charged, head.charged);
+                    m.close(rid, head.charged, head.charged);
                 }
                 // a ticket another request released may be on its way: this head was signed before the seller took it
                 let outstanding = m.pending.is_some();
-                if let Err(why) = m.take(&head, charged_max, outstanding) {
+                if let Err(why) = m.take(&head, charged_max, outstanding, Some(sent_epoch)) {
                     m.fault.get_or_insert(why);
                 }
                 let metered = metered && m.fault.is_none();
                 if !metered {
-                    m.close(seq, head.charged, head.charged);
+                    m.close(rid, head.charged, head.charged);
                 }
                 // where this answer starts: the seller's spend before it, by this answer's own receipt, and the wallet's
                 // count with its head in
@@ -3194,7 +3283,7 @@ impl Signer {
                 return fail(hs, &spent, with(refusal("ticket_refused", format!("the seller refused the paid request: HTTP {status} {code}; nothing was charged for it")),
                                              json!({"status": status, "seller_code": code})));
             }
-            break (seq, digest, ans, head, mark, streaming);
+            break (rid, seq, digest, ans, head, mark, streaming);
         };
         let mut ans = ans;
         let status = ans.status;
@@ -3231,7 +3320,7 @@ impl Signer {
         } else {
             let tokens = Some(c.body).filter(|b| price.tokens.active() && !b.is_empty())
                 .and_then(|b| xbt402::tokens::prepare(b, price.tokens.max_output).ok().map(|p| (b.len() as u64, p.max_output)));
-            let (m, note, last) = self.ticket_stream(hs, price, &head, &mark, seq, &digest, ans, started, max_msat, &mut sink, &mut spent, not_read, tokens, reserve, up_writer);
+            let (m, note, last) = self.ticket_stream(hs, price, &head, &mark, rid, seq, &digest, ans, started, max_msat, &mut sink, &mut spent, not_read, tokens, reserve, up_writer);
             drop(streaming);
             seller_last = last;
             out = with(out, m);
@@ -3260,7 +3349,7 @@ impl Signer {
     /// and what the receipt check found. With `stop`, nothing of the body is read: the answer
     /// stopped at its head, for that reason.
     #[allow(clippy::too_many_arguments)]
-    fn ticket_stream(&self, hs: &Arc<HttpSession>, price: &Price, head: &Receipt, mark: &Mark, seq: u64, digest: &str, ans: WireAnswer, started: Instant, max_msat: u64,
+    fn ticket_stream(&self, hs: &Arc<HttpSession>, price: &Price, head: &Receipt, mark: &Mark, rid: u64, seq: u64, digest: &str, ans: WireAnswer, started: Instant, max_msat: u64,
                      sink: &mut Sink, spent: &mut Spent, stop: Option<String>, tokens: Option<(u64, u64)>, reserve: u64, up_writer: Option<Box<dyn Write + Send>>)
                      -> (Value, Value, Value) {
         // by the token: the answer counted here as the seller counts it, to check its last receipt
@@ -3271,11 +3360,15 @@ impl Signer {
         // what this answer has drawn past its head, by this count: added to the session's as it grows, and taken off
         // what the request may still add to the seller's spend ([`Money::open`])
         let own = AtomicU64::new(0);
+        // what was drawn only rises: the session's count never falls ([`Money::reserved`] holds what is not drawn yet)
         let set_own = |m: &mut Money, now: u64| {
             let had = own.load(Ordering::SeqCst);
-            m.consumed = m.consumed.saturating_sub(had).saturating_add(now);
+            if now <= had {
+                return;
+            }
+            m.consumed = m.consumed.saturating_add(now - had);
             own.store(now, Ordering::SeqCst);
-            if let Some(left) = m.open.get_mut(&seq) {
+            if let Some(left) = m.open.get_mut(&rid) {
                 *left = st.max_msat.saturating_sub(head.charged).saturating_sub(now);
             }
         };
@@ -3286,13 +3379,18 @@ impl Signer {
                 set_own(&mut m, add);
             }
         };
-        // an answer priced by the token costs what its tokens come to, known only at its end: until then it draws the most
-        // its request may cost, so that the answers beside it do not count on credit it is spending
-        if tokens.is_some() {
-            account(reserve);
+        // an answer priced by the token costs what its tokens come to, known only at its end: until then it holds back the
+        // most its request may cost past its head, so that the answers beside it do not count on credit it is spending.
+        // Held apart from what was drawn ([`Money::reserved`]): an answer that started after it sees it in full
+        let held = if tokens.is_some() { reserve.min(st.max_msat).saturating_sub(head.charged) } else { 0 };
+        if held > 0 {
+            let mut m = lock_money(hs);
+            m.reserved = m.reserved.saturating_add(held);
         }
-        // what the other answers of the session drew since this one started, by the wallet's count
-        let others = |m: &Money| m.consumed.saturating_sub(mark.consumed).saturating_sub(own.load(Ordering::SeqCst));
+        // what the other answers of the session drew since this one started, by the wallet's count, and what they hold
+        // back now
+        let others = |m: &Money| m.consumed.saturating_sub(mark.consumed).saturating_sub(own.load(Ordering::SeqCst))
+            .saturating_add(m.reserved.saturating_sub(held));
         let length = ans.length;
         let mut body = ans.body;
         // shared with the timer of an answer priced by the second: how far the body is, and why it stopped
@@ -3308,13 +3406,15 @@ impl Signer {
             m.acct.acked_msat.saturating_sub(others(&m))
         };
         // one more ticket for this answer, or the reason there is none
-        let pay = |bytes: u64| -> Option<String> {
+        // `seen`: the credit the caller found the ticket due on: what "still due" is measured against, so that a release
+        // landing between the two readings is not taken for this answer's need
+        let pay = |bytes: u64, seen: u64| -> Option<String> {
             if let Some(why) = st.over(bytes) {
                 return Some(why);
             }
             // released only if still due once the session's `paying` is held: another answer released one meanwhile
             // where what is left for this one has risen since it found one due (it only rises with credit)
-            let found = st.avail(credited());
+            let found = st.avail(seen);
             let still = || st.avail(credited()) <= found;
             match self.ticket_release_one(hs, &mut lock(&spent_cell), st.started, &still) {
                 Ok(()) => {
@@ -3357,12 +3457,13 @@ impl Signer {
                     let total = s.0.saturating_add(up.load(Ordering::SeqCst));
                     account(st.cost(total));
                     let rate = total as f64 / st.started.elapsed().as_secs_f64().max(0.001);
-                    let ahead = ((rate * FIRST_PAY_S) as u64).min(st.covered(credited()) / 2);
+                    let seen = credited();
+                    let ahead = ((rate * FIRST_PAY_S) as u64).min(st.covered(seen) / 2);
                     if let Some(why) = st.over(total) {
                         s.1.get_or_insert(why);
-                    } else if st.due_bytes_ahead(credited(), total, None, ahead) {
+                    } else if st.due_bytes_ahead(seen, total, None, ahead) {
                         drop(s);
-                        let r = pay(total);
+                        let r = pay(total, seen);
                         s = lock(state);
                         if let Some(why) = r {
                             s.1.get_or_insert(why);
@@ -3389,10 +3490,11 @@ impl Signer {
                     account(st.cost(s.0));
                     // paid for in the last fifth of the second before it
                     let into = u64::from(st.started.elapsed().subsec_millis());
-                    if into >= 800 && st.due_time(credited()) {
+                    let seen = credited();
+                    if into >= 800 && st.due_time(seen) {
                         let bytes = s.0;
                         drop(s);
-                        if let Some(why) = pay(bytes) {
+                        if let Some(why) = pay(bytes, seen) {
                             lock(&state).1.get_or_insert(why);
                             return;
                         }
@@ -3479,18 +3581,19 @@ impl Signer {
                 if unpaid.is_none() && price.second_msat == 0 && !paying.load(Ordering::SeqCst) {
                     let rate = bytes as f64 / st.started.elapsed().as_secs_f64().max(0.001);
                     // before any payment of this answer was timed: what arrives in [`FIRST_PAY_S`], within half of what is paid for
+                    let seen = credited();
                     let ahead = match *lock(&lead) {
                         _ if retry_at_due => 0,
-                        0 => ((rate * FIRST_PAY_S) as u64).min(st.covered(credited()) / 2),
+                        0 => ((rate * FIRST_PAY_S) as u64).min(st.covered(seen) / 2),
                         l => l,
                     };
-                    if st.due_bytes_ahead(credited(), bytes, length, ahead) {
+                    if st.due_bytes_ahead(seen, bytes, length, ahead) {
                         paying.store(true, Ordering::SeqCst);
-                        let early = !st.due_bytes(credited(), bytes, length);
-                        let (before, asked) = (st.covered(credited()), Instant::now());
+                        let early = !st.due_bytes(seen, bytes, length);
+                        let (before, asked) = (st.covered(seen), Instant::now());
                         let (pay, credited, paid, paying, lead_cell, st) = (&pay, &credited, &paid, &paying, &lead, &st);
                         scope.spawn(move || {
-                            let r = pay(bytes);
+                            let r = pay(bytes, seen);
                             let span = st.covered(credited()).saturating_sub(before);
                             // twice the body that arrived while this payment took, at most half a ticket's worth
                             *lock(lead_cell) = ((rate * asked.elapsed().as_secs_f64() * 2.0) as u64).min(span / 2);
@@ -3498,18 +3601,22 @@ impl Signer {
                             paying.store(false, Ordering::SeqCst);
                         });
                     }
-                } else if unpaid.is_none() && price.second_msat > 0 && st.due_bytes(credited(), bytes, length) {
-                    unpaid = pay(bytes);
+                } else if unpaid.is_none() && price.second_msat > 0 {
+                    let seen = credited();
+                    if st.due_bytes(seen, bytes, length) {
+                        unpaid = pay(bytes, seen);
+                    }
                 }
                 // a ticket due and still being paid is waited for here, not the seller's next bytes: the seller
                 // sends no more until it arrives, and one that cannot go (a session stopped meanwhile) ends the
                 // answer now rather than after the seller's own wait. One that could not go early goes again now
-                if unpaid.is_none() && price.second_msat == 0 && paying.load(Ordering::SeqCst) && st.due_bytes(credited(), bytes, length) {
+                let seen = credited();
+                if unpaid.is_none() && price.second_msat == 0 && paying.load(Ordering::SeqCst) && st.due_bytes(seen, bytes, length) {
                     while paying.load(Ordering::SeqCst) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     if let Some((r, early)) = lock(&paid).take() {
-                        unpaid = if r.is_some() && early { pay(bytes) } else { r };
+                        unpaid = if r.is_some() && early { pay(bytes, seen) } else { r };
                         retry_at_due = false;
                     }
                 }
@@ -3567,15 +3674,28 @@ impl Signer {
         let own_digest = hex::encode(sink.hash.clone().finalize());
         // what the answer drew is what it cost by the wallet's count now that it has ended (an answer by the token: its
         // tokens, where the most it could cost was drawn until now)
-        set_own(&mut lock_money(hs), own_cost.min(st.max_msat).saturating_sub(head.charged));
+        {
+            let mut m = lock_money(hs);
+            set_own(&mut m, own_cost.min(st.max_msat).saturating_sub(head.charged));
+            // what it held back is drawn now, as far as it cost
+            m.reserved = m.reserved.saturating_sub(held);
+        }
+        // the most the seller may charge this answer by the wallet's count: whole, its cost; cut short, what the wallet read
+        // and what could be on its way when it stopped ([`CUT_SLACK`]), priced; by the token, the call's limit (its tokens
+        // are counted only whole)
+        let charge_bound = if complete || tokens.is_some() {
+            st.max_msat
+        } else {
+            price.cost(sink.bytes.saturating_add(up.load(Ordering::SeqCst)).saturating_add(CUT_SLACK), secs).unwrap_or(u64::MAX).min(st.max_msat)
+        };
         // the last receipt of this answer, from the seller's signed status. One that arrived whole is waited for longer
         // before it is left unclosed: the seller has sent all of it, and an unclosed answer holds up the session's releases
         let deadline = Instant::now() + if complete { FINAL_WAIT_WHOLE } else { FINAL_WAIT };
         let mut last: Option<Receipt> = None;
         let mut why_none = String::from("the seller's status did not list it");
         loop {
-            match self.ticket_call(hs, "status", &json!({}), false) {
-                Ok((200, v, Ok(status_r))) => {
+            match self.ticket_call_at(hs, "status", &json!({}), false) {
+                Ok((200, v, Ok(status_r), sent_epoch)) => {
                     let sid = lock_link(hs).seller_sid.clone();
                     let found = v.get("responses").and_then(Value::as_array).into_iter().flatten()
                         .filter_map(|r| Receipt::verify(r, &hs.terms.receipt_key, &sid).ok())
@@ -3586,13 +3706,13 @@ impl Signer {
                         // the answer's last receipt closes it: what the seller charged it is its word, inside the call's
                         // limit (checked below), and the request adds nothing more to the seller's spend
                         if let Some(r) = &found {
-                            m.close(seq, r.charged.min(max_msat), head.charged.saturating_add(own.load(Ordering::SeqCst)));
+                            m.close(rid, r.charged.min(charge_bound), head.charged.saturating_add(own.load(Ordering::SeqCst)));
                         }
                         // then the status's totals, inside what the wallet can account for. Not where the answer's own
                         // receipt charges past its call's limit: that is the seller's fault, said with its numbers below
                         if found.as_ref().is_none_or(|r| r.charged <= max_msat) {
                             let outstanding = m.pending.is_some();
-                            if let Err(why) = m.take(&status_r, 0, outstanding) {
+                            if let Err(why) = m.take(&status_r, 0, outstanding, Some(sent_epoch)) {
                                 m.fault.get_or_insert(why);
                             }
                         }
@@ -3600,7 +3720,7 @@ impl Signer {
                         break;
                     }
                 }
-                Ok((status, _, _)) => {
+                Ok((status, _, _, _)) => {
                     why_none = format!("the seller answered status with HTTP {status} or no valid receipt");
                     if Instant::now() >= deadline {
                         break;
@@ -3618,7 +3738,7 @@ impl Signer {
             // what this answer drew, by the wallet's count, is now the seller's word (its receipt, taken above) or its
             // own last count: the session's count keeps it
             if last.is_none() {
-                m.tails.push(Tail { seq, digest: digest.to_string(), status: c_status(head), since: Instant::now(), counted: head.charged.saturating_add(own.load(Ordering::SeqCst)) });
+                m.tails.push(Tail { rid, seq, digest: digest.to_string(), status: c_status(head), since: Instant::now(), counted: head.charged.saturating_add(own.load(Ordering::SeqCst)) });
             }
         }
         let mut fault = hs.fault();
@@ -4046,14 +4166,14 @@ mod tests {
         m.open.insert(2, 50_000);
         m.consumed += 2500;
         m.close(2, 2500, 2500);
-        assert_eq!(m.take(&receipt(2, 1_000_000, 5000, 2500), 2500, false), Ok(true));
+        assert_eq!(m.take(&receipt(2, 1_000_000, 5000, 2500), 2500, false, None), Ok(true));
         m.consumed += 2500;
         m.close(1, 2500, 2500);
         // the first's receipt says less was spent: older, passed over, nothing goes backwards
-        assert_eq!(m.take(&receipt(1, 1_000_000, 2500, 2500), 2500, false), Ok(false));
+        assert_eq!(m.take(&receipt(1, 1_000_000, 2500, 2500), 2500, false, None), Ok(false));
         assert_eq!(m.acct.spent_msat, 5000);
         // its own charge is still held to its price
-        assert!(m.take(&receipt(1, 1_000_000, 2500, 9999), 2500, false).is_err());
+        assert!(m.take(&receipt(1, 1_000_000, 2500, 9999), 2500, false, None).is_err());
     }
 
     /// The seller gives a charge back when its answer could not be sent (a page the browser
@@ -4063,14 +4183,14 @@ mod tests {
     fn a_receipt_passed_over_for_its_spend_still_confirms_what_was_released() {
         let mut m = money(1_000_000);
         m.open.insert(1, 50_000);
-        assert_eq!(m.take(&receipt(1, 1_000_000, 30_000, 2500), 50_000, false), Ok(true));
+        assert_eq!(m.take(&receipt(1, 1_000_000, 30_000, 2500), 50_000, false, None), Ok(true));
         // a ticket released, and on its way
         m.acct.released(1_000_000);
         // the seller took it after giving back 20 sat of an answer it could not send
-        assert_eq!(m.take(&receipt(2, 2_000_000, 10_000, 0), 0, true), Ok(false));
+        assert_eq!(m.take(&receipt(2, 2_000_000, 10_000, 0), 0, true, None), Ok(false));
         assert_eq!((m.acct.acked_msat, m.acct.spent_msat), (2_000_000, 30_000), "released taken, the spend held");
         // a receipt from before the ticket was taken changes nothing
-        assert_eq!(m.take(&receipt(1, 1_000_000, 30_000, 2500), 50_000, false), Ok(false));
+        assert_eq!(m.take(&receipt(1, 1_000_000, 30_000, 2500), 50_000, false, None), Ok(false));
         assert_eq!(m.acct.acked_msat, 2_000_000);
     }
 
@@ -4081,9 +4201,9 @@ mod tests {
         m.open.insert(7, 40_000 - 2500);
         m.consumed += 2500;
         // inside: what was counted, and what it may still add
-        assert_eq!(m.take(&receipt(8, 1_000_000, 40_000, 0), 0, false), Ok(true));
+        assert_eq!(m.take(&receipt(8, 1_000_000, 40_000, 0), 0, false, None), Ok(true));
         // past it: the balance drained
-        let e = m.take(&receipt(9, 1_000_000, 1_000_000, 0), 0, false).unwrap_err();
+        let e = m.take(&receipt(9, 1_000_000, 1_000_000, 0), 0, false, None).unwrap_err();
         assert!(e.contains("spentMsat"), "{e}");
         assert_eq!(m.acct.spent_msat, 40_000, "nothing of a refused receipt is taken");
     }
@@ -4096,15 +4216,94 @@ mod tests {
         m.consumed += 40_000;
         m.close(3, 30_000, 40_000);
         // nothing open: the seller's spend since the last quiet point is what its receipts charged
-        assert!(m.take(&receipt(4, 1_000_000, 40_000, 0), 0, false).is_err(), "10 sat more than charged");
-        assert_eq!(m.take(&receipt(4, 1_000_000, 30_000, 0), 0, false), Ok(true));
+        assert!(m.take(&receipt(4, 1_000_000, 40_000, 0), 0, false, None).is_err(), "10 sat more than charged");
+        assert_eq!(m.take(&receipt(4, 1_000_000, 30_000, 0), 0, false, None), Ok(true));
         assert_eq!((m.quiet_spent, m.accepted), (30_000, 0), "a new quiet point");
         // a cut answer the seller charged past the wallet's count: the charge goes into the count
         m.open.insert(5, 100_000);
         m.consumed += 20_000;
         m.close(5, 60_000, 20_000);
         assert_eq!(m.consumed, 40_000 + 20_000 + 40_000);
-        assert_eq!(m.take(&receipt(6, 1_000_000, 90_000, 0), 0, false), Ok(true));
+        assert_eq!(m.take(&receipt(6, 1_000_000, 90_000, 0), 0, false, None), Ok(true));
+    }
+
+    /// A receipt for a request sent after the totals held were taken is newer, though its spend is
+    /// lower (the seller gave a charge back); one for a request sent before them is not.
+    ///
+    /// FAILS before: both were passed over for their lower spend.
+    #[test]
+    fn a_receipt_for_a_request_sent_after_the_totals_were_taken_is_newer_whatever_its_spend() {
+        let mut m = money(1_000_000);
+        m.open.insert(1, 600_000);
+        m.open.insert(2, 50_000);
+        let before = m.epoch;
+        // a page's head while a reply was charged as it ran
+        assert_eq!(m.take(&receipt(2, 1_000_000, 500_000, 2500), 2500, false, Some(before)), Ok(true));
+        m.close(2, 2500, 2500);
+        // a request sent before that, answered with less spent: no telling which came first
+        assert_eq!(m.take(&receipt(3, 1_000_000, 400_000, 0), 0, false, Some(before)), Ok(false));
+        // the reply settled at less than it ran up: a status asked for since is newer
+        let after = m.epoch;
+        assert_eq!(m.take(&receipt(4, 1_000_000, 10_000, 0), 0, false, Some(after)), Ok(true));
+        assert_eq!(m.acct.spent_msat, 10_000);
+        assert_eq!(m.acct.balance(), 990_000, "the charge given back is credit again");
+        // still bounded: what was released is never less than what the seller confirmed
+        let e = m.take(&receipt(5, 900_000, 10_000, 0), 0, false, Some(m.epoch)).unwrap_err();
+        assert!(e.contains("released"), "{e}");
+    }
+
+    /// The ids of open requests are their own: a seq taken over by another request leaves both
+    /// held, each closed by its own receipt.
+    ///
+    /// FAILS before (keyed by seq): the second request's entry replaced the first's, and closing
+    /// the first dropped what the second may still charge from the bound.
+    #[test]
+    fn open_requests_are_held_by_their_own_id_not_by_seq() {
+        let mut m = money(1_000_000);
+        let (a, b) = (m.request_id(), m.request_id());
+        assert_ne!(a, b);
+        m.open.insert(a, 40_000);
+        m.open.insert(b, 40_000);
+        m.consumed += 2500;
+        m.close(a, 2500, 2500);
+        assert_eq!(m.open.get(&b), Some(&40_000), "the other request is still open");
+        // the seller may still charge b its 40 sat: inside the bound, not a fault
+        assert_eq!(m.take(&receipt(9, 1_000_000, 42_500, 0), 0, false, None), Ok(true));
+    }
+
+    /// A request whose answer was lost may still be charged by the seller, up to its limit, for a
+    /// while after: no quiet point is taken, and a charge inside its limit is no seller fault.
+    ///
+    /// FAILS before: it was closed at once at its price, and the seller's later charge for it
+    /// was taken for a fault at the next quiet point.
+    #[test]
+    fn a_lost_request_is_held_as_one_the_seller_may_still_charge() {
+        let mut m = money(1_000_000);
+        let rid = m.request_id();
+        m.open.insert(rid, 40_000);
+        m.lose(rid, 40_000);
+        assert!(m.open.is_empty());
+        // the seller served it after all and charged 30 sat: inside what it may, and not a quiet point
+        assert_eq!(m.take(&receipt(3, 1_000_000, 30_000, 0), 0, false, None), Ok(true));
+        assert_eq!(m.quiet_spent, 0, "no quiet point while the lost request may be charged");
+        // past its limit: a fault
+        assert!(m.take(&receipt(4, 1_000_000, 50_000, 0), 0, false, None).is_err());
+        // once its grace is over, a quiet point is taken and it is forgotten
+        m.lost.values_mut().for_each(|(_, at)| *at -= LOST_GRACE);
+        assert_eq!(m.take(&receipt(5, 1_000_000, 30_000, 0), 0, false, None), Ok(true));
+        assert!(m.lost.is_empty() && m.quiet_spent == 30_000);
+    }
+
+    /// What an answer priced by the token holds back is not drawn: the estimate of the balance
+    /// leaves it out while it runs, and what the session counted as drawn never falls.
+    #[test]
+    fn a_token_answers_hold_is_apart_from_what_was_drawn() {
+        let mut m = money(1_000_000);
+        m.reserved += 600_000;
+        assert_eq!(m.est_balance(), 400_000);
+        m.consumed += 10_000;
+        m.reserved -= 600_000;
+        assert_eq!((m.est_balance(), m.consumed), (990_000, 10_000));
     }
 
     #[test]

@@ -78,8 +78,10 @@ const SESSION_BODY: usize = 16 << 10;
 const CHUNK: usize = 16 << 10;
 /// How often an answer waiting to be paid for looks whether its buyer is still there.
 const GONE_CHECK: Duration = Duration::from_millis(250);
-/// Final receipts of streamed responses kept per session, for `status`.
-const FINALS_KEPT: usize = 8;
+/// Final receipts of streamed responses kept per session, for `status`: twice as many as a session
+/// may have requests on their way at once ([`crate::book::SEQ_WINDOW_MAX`]), so that the buyer finds
+/// the last receipt of every answer that ran beside the others, however late it asks.
+const FINALS_KEPT: usize = 2 * crate::book::SEQ_WINDOW_MAX as usize;
 
 struct State {
     book: Book,

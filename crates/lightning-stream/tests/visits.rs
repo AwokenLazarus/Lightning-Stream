@@ -29,7 +29,8 @@ fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Session>>) {
 }
 
 /// The stand-in signer with tickets of `ticket` sat; a refusal names what one books, as the
-/// signer's does.
+/// signer's does. A request for `/dear/…` needs a limit of 2,500 sat; one for `/nohead/…` is
+/// charged a ticket and its answer never starts (the stream is closed before a head).
 fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
     let sock = dir.join("signer.sock");
     let l = UnixListener::bind(&sock).unwrap();
@@ -46,6 +47,20 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 let p = req["params"].clone();
                 let max = p["max_sats"].as_i64().unwrap();
+                let url = p["url"].as_str().unwrap_or("").to_string();
+                if url.contains("/dear/") && max < 2_500 {
+                    session.lock().unwrap().calls.push(p.clone());
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "max_sats", "reason": "a dear answer",
+                                                                            "charged_sats": 0, "ticket_booking_sats": ticket}}));
+                    return;
+                }
+                if url.contains("/nohead/") {
+                    session.lock().unwrap().charged += ticket;
+                    drop(UnixStream::connect(stream_dir.join(p["stream_to"].as_str().unwrap())));
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 502, "charged_sats": ticket, "complete": false}}));
+                    return;
+                }
                 // the session's credit, or a ticket where the call may spend one
                 let charged = {
                     let mut s = session.lock().unwrap();
@@ -245,4 +260,70 @@ fn a_ticket_dearer_than_a_share_is_bought_and_the_shares_after_it_have_room_for_
     let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert!(v["ended"].is_null(), "{v}");
+}
+
+/// A call whose answer never starts (no head came) may still have been charged: its share stays
+/// spent until the signer says what it charged, and the visit's limit holds.
+///
+/// FAILS before: the share went back as charged nothing, and the visit spent past its limit.
+#[test]
+fn a_call_that_ends_before_its_head_keeps_its_share_until_the_signer_says_what_it_charged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 1_000);
+    let (st, _, _) = ask(&addr, "GET", &format!("/v/{visit}/nohead/a.js"), "", b"");
+    assert_eq!(st, 502);
+    // the signer's answer comes after the refusal: what it charged is counted then
+    let t = std::time::Instant::now();
+    let spent = loop {
+        let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        if v["spent_sats"].as_i64() == Some(TICKET) || t.elapsed() > std::time::Duration::from_secs(5) {
+            break v["spent_sats"].as_i64();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(spent, Some(TICKET));
+    // what is left (400 sat) buys no second ticket: the next request is refused, nothing more is charged
+    let (st, _, _) = ask(&addr, "GET", &format!("/v/{visit}/b.js"), "", b"");
+    assert_eq!(st, 402);
+    assert_eq!(session.lock().unwrap().charged, TICKET);
+}
+
+/// A request that needs more than a share goes alone once the requests running have ended: new
+/// ones wait behind it, so it is not starved by a page that keeps asking.
+///
+/// FAILS before: it waited for a moment with nothing running, which a busy page never gives, and
+/// was refused after two minutes.
+#[test]
+fn a_request_that_must_run_alone_gets_its_turn_on_a_busy_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 100_000);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        // a page that keeps eight requests going
+        for w in 0..8 {
+            let (addr, visit, stop) = (addr.clone(), visit.clone(), &stop);
+            s.spawn(move || {
+                let mut i = 0;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let (st, _, _) = ask(&addr, "GET", &format!("/v/{visit}/busy/{w}-{i}.js"), "", b"");
+                    assert_eq!(st, 200);
+                    i += 1;
+                }
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let t = std::time::Instant::now();
+        let (st, _, b) = ask(&addr, "GET", &format!("/v/{visit}/dear/film.js"), "", b"");
+        let took = t.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    });
+    let calls = session.lock().unwrap().calls.clone();
+    assert!(calls.iter().any(|c| c["url"].as_str().unwrap().contains("/dear/") && c["max_sats"].as_i64().unwrap() >= 2_500), "{calls:?}");
 }
