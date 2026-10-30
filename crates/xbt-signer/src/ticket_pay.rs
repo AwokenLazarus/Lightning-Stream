@@ -1346,8 +1346,10 @@ struct Stream {
     /// Before the request was sent, so that the seconds counted here are never fewer than the seller's.
     started: Instant,
     max_msat: u64,
-    /// The longest the answer stays open (the owner's `tickets.max_answer_s`).
+    /// The longest the answer stays open (the owner's `tickets.max_answer_s`, or `tickets.max_socket_s`
+    /// for a WebSocket), and which of the two it is.
     max_open: Duration,
+    limit: &'static str,
 }
 
 impl Stream {
@@ -1358,7 +1360,7 @@ impl Stream {
         if self.price.metered() && self.cost(bytes) >= self.max_msat {
             return Some("max_sats: the call's limit is used up".into());
         }
-        (self.started.elapsed() >= self.max_open).then(|| format!("max_answer_s: the answer has been open for {} s", self.max_open.as_secs()))
+        (self.started.elapsed() >= self.max_open).then(|| format!("{}: the answer has been open for {} s", self.limit, self.max_open.as_secs()))
     }
 
     /// Seconds of the answer that have started, by this clock.
@@ -3425,7 +3427,10 @@ impl Signer {
         let event_stream = ans.header("content-type").is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"));
         let mut sse = xbt402::tokens::Sse::default();
         let (mut counted, mut usage, mut whole_body) = (0u64, xbt402::tokens::Usage::default(), Vec::new());
-        let st = Stream { price: *price, base_spent: mark.base_spent, started, max_msat, max_open: Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64) };
+        // a WebSocket is open for as long as its page keeps it, paid as its bytes pass: its own limit
+        let tp = self.ticket_policy();
+        let (open_s, limit) = if up_writer.is_some() { (tp.max_socket_s, "max_socket_s") } else { (tp.max_answer_s, "max_answer_s") };
+        let st = Stream { price: *price, base_spent: mark.base_spent, started, max_msat, max_open: Duration::from_secs(open_s.clamp(1, 86_400) as u64), limit };
         // what this answer has drawn past its head, by this count: added to the session's as it grows, and taken off
         // what the request may still add to the seller's spend ([`Money::open`])
         let own = AtomicU64::new(0);
@@ -4134,7 +4139,7 @@ mod tests {
     #[test]
     fn a_ticket_is_due_only_when_the_balance_does_not_cover_the_next_piece() {
         let per_mib = Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
-        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50) };
+        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         // one ticket of 1,000 sat credited on top of the 10 sat spent before: 1,000,000 - 2,500 msat of bytes
         let credited = 1_010_000;
         let limit = per_mib.bytes_for(1_000_000 - 2500);
@@ -4154,20 +4159,20 @@ mod tests {
         assert_eq!(st.cost(1 << 20), 202_500);
         // by the second: due when the next second is not covered
         let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: 100_000, tokens: xbt402::tokens::TokenRule::NONE };
-        let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50) };
+        let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert_eq!(st.seconds(), 1, "the first second has started");
         assert!(st.due_time(100_000), "one second paid, the second is not");
         assert!(!st.due_time(200_000) && !st.due_bytes(100_000, 1 << 30, None));
         // a price that does not fit is due at once and costs the most there is
-        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50) };
+        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert_eq!(huge.cost(1), u64::MAX);
         assert!(huge.due_bytes(1_000_000, 0, None));
         assert!(huge.over(0).is_some_and(|w| w.starts_with("max_sats")), "and is over any limit");
         // a long body paid for at its head is not cut where the call's limit equals its price
         let flat = Stream { price: Price { request_msat: 5_000, byte_msat: 0, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5_000,
-                            max_open: Duration::from_secs(50) };
+                            max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert!(flat.over(1 << 30).is_none());
-        let long = Stream { price: per_mib, base_spent: 0, started: Instant::now() - Duration::from_secs(3), max_msat: u64::MAX, max_open: Duration::from_secs(2) };
+        let long = Stream { price: per_mib, base_spent: 0, started: Instant::now() - Duration::from_secs(3), max_msat: u64::MAX, max_open: Duration::from_secs(2), limit: "max_answer_s" };
         assert!(long.over(0).is_some_and(|w| w.starts_with("max_answer_s")) && st.over(0).is_none());
     }
 
@@ -4431,7 +4436,7 @@ mod tests {
     fn a_cut_answer_may_be_charged_up_to_the_credit_it_had() {
         // 20 sat a MiB, 10 sat spent before the answer
         let per_mib = Price { request_msat: 0, byte_msat: 20_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
-        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: 5_000_000, max_open: Duration::from_secs(50) };
+        let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: 5_000_000, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         let slack = per_mib.cost((1 << 20) + CUT_SLACK, 0).unwrap();
         assert!(slack < 400_000, "{slack}");
         // 1 MiB read with a ticket of 1,000 sat credited: all of that credit

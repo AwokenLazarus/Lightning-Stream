@@ -4738,6 +4738,64 @@ fn a_websocket_is_carried_both_ways_and_every_byte_paid() {
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+/// A web app's WebSocket stays open for as long as the page keeps it (a media server's live
+/// updates, say), not for the owner's `max_answer_s` of an answer: it has its own limit,
+/// `tickets.max_socket_s`, and is paid as its bytes pass all the while. `SOCKET_HOLD_S` sets how
+/// long it is held (6 s by default; 300 for the launch check).
+#[test]
+fn a_websocket_outlives_the_limit_of_an_answer_and_ends_at_its_own() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let hold = std::env::var("SOCKET_HOLD_S").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
+    for (limit, held) in [(hold * 4, true), (2, false)] {
+        let r = Rig::new(json!({"tickets": {"max_answer_s": 2, "max_socket_s": limit}}));
+        let name = format!("ws-hold-{limit}");
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        // the caller: a frame of 100 bytes a second, each echoed, for `hold` seconds, then it hangs up
+        let caller = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            let mut w = s;
+            let start = Instant::now();
+            let mut echoed = 0u64;
+            while start.elapsed() < Duration::from_secs(hold) {
+                let out = [echoed as u8; 100];
+                if w.write_all(&out).is_err() {
+                    break;
+                }
+                let mut back = [0u8; 100];
+                if rd.read_exact(&mut back).is_err() || back != out {
+                    break;
+                }
+                echoed += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let _ = w.shutdown(std::net::Shutdown::Both);
+            (echoed, start.elapsed())
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/chat"), "max_sats": 5_000, "task": "film", "stream_to": name, "stream_head": true,
+                                           "head_headers": true, "upgrade": true, "headers": [["Sec-WebSocket-Key", "k1"], ["Sec-WebSocket-Version", "13"]]}));
+        let (echoed, took) = caller.join().unwrap();
+        assert_eq!(v["status"], 101, "{v}");
+        if held {
+            assert!(echoed >= hold - 1, "the socket was cut after {took:?} and {echoed} frames: {v}");
+            assert!(!v["ended"].as_str().unwrap_or("").contains("max_"), "{v}");
+            // paid for every byte, as it passed: 2,500 msat to open and 1,000 msat a KiB either way
+            let want = 2_500 + (echoed * 200).div_ceil(1024) * 1_000;
+            assert!(v["price_msat"].as_str().unwrap().parse::<u64>().unwrap() >= want - 1_000, "{v}");
+        } else {
+            assert!(took < Duration::from_secs(hold) && v["ended"].as_str().unwrap_or("").contains("max_socket_s"), "{took:?} {v}");
+        }
+    }
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
 /// A seller that gives each buyer an account asks to know who they are, and the wallet tells it on
 /// its own: a key for that seller alone, the same in every session of one wallet, another for
 /// another wallet. A wallet that stays anonymous there says nothing, and that seller refuses it.

@@ -99,6 +99,10 @@ pub const READY_WAIT_MS: i64 = 3_000;
 /// as it arrives open. Below the 60 seconds a caller of the signer's socket waits by default, so
 /// that a call ends, and says where it stopped, before its caller gives up on it.
 pub const MAX_ANSWER_S: i64 = 50;
+/// The default of `tickets.max_socket_s`: the longest the wallet keeps a WebSocket open, paid as its
+/// bytes pass. A web app keeps one open while its page is (live updates); the seller's gateway ends
+/// one after six hours too.
+pub const MAX_SOCKET_S: i64 = 21_600;
 /// The default of `tickets.read_timeout_s`: how long the wallet waits for the next byte of a
 /// seller's answer before it gives the answer up.
 pub const READ_TIMEOUT_S: i64 = 30;
@@ -375,6 +379,8 @@ pub struct TicketPolicy {
     pub read_timeout_s: i64,
     /// The longest an answer that is paid for as it arrives stays open, in seconds.
     pub max_answer_s: i64,
+    /// The longest a WebSocket stays open, in seconds.
+    pub max_socket_s: i64,
     /// The fee rate a held ticket's floor is sized for where a channel without anchors may be on
     /// its route, in sat per 1,000 weight units; 0: the chain's default ([`FEERATE_CAP_MAIN`],
     /// [`FEERATE_CAP_TEST`]).
@@ -421,7 +427,7 @@ impl Default for TicketPolicy {
                seller_max_locked_sats: POOL_FEW as i64 * 1_000, max_sellers: half,
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
-               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, feerate_cap_sat_per_kw: 0,
+               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, max_socket_s: MAX_SOCKET_S, feerate_cap_sat_per_kw: 0,
                lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, offers: true, seller_tls: BTreeMap::new(), mainnet_ack: false, mainnet_off: None,
                tasks: BTreeMap::new() }
     }
@@ -481,10 +487,10 @@ pub fn mainnet_ack_file() -> bool {
 pub const MAINNET_DEFAULTS: [(&str, i64); 5] = [("max_locked_tickets", 4), ("max_locked_sats", 4_000), ("max_sellers", 4), ("max_new_sellers_per_min", 4),
                                                ("max_sends_per_hour", 120)];
 
-pub const TICKET_INT_KEYS: [&str; 20] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
+pub const TICKET_INT_KEYS: [&str; 21] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
                                          "max_new_sellers_per_min", "max_sends_per_hour", "pool", "pool_many", "many_sellers", "floor_ticket_sats",
-                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "feerate_cap_sat_per_kw"];
+                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "max_socket_s", "feerate_cap_sat_per_kw"];
 pub const TASK_INT_KEYS: [&str; 8] = ["budget_sats", "window_s", "max_locked_sats", "max_locked_tickets", "max_sellers",
                                       "unlisted_max_spend_sats", "unlisted_max_tickets", "unlisted_max_locked_sats"];
 /// The longest window a task's budget can be read over: what the ledger keeps.
@@ -518,6 +524,7 @@ impl TicketPolicy {
                            },
                            http_idle_s: i(m, "http_idle_s", d.http_idle_s), ready_wait_ms: i(m, "ready_wait_ms", d.ready_wait_ms),
                            read_timeout_s: i(m, "read_timeout_s", d.read_timeout_s), max_answer_s: i(m, "max_answer_s", d.max_answer_s),
+                           max_socket_s: i(m, "max_socket_s", d.max_socket_s),
                            feerate_cap_sat_per_kw: i(m, "feerate_cap_sat_per_kw", d.feerate_cap_sat_per_kw),
                            // an entry that is not an object is no permission: the lottery is off
                            lottery: match m.get("lottery").filter(|v| !v.is_null()) {
