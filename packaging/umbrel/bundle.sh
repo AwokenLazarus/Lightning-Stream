@@ -24,7 +24,7 @@ cp packaging/umbrel/umbrel-app-store.yml "$OUT/lazarus-store/"
 for app in lazarus-xbt-knots lazarus-xbt-agent-wallet lazarus-lightning-stream-gateway lazarus-lightning-stream; do
   cp -r "packaging/umbrel/$app" "$OUT/lazarus-store/"
   if [ -n "${REGISTRY:-}" ]; then
-    sed -i -E "s#^(    image: )([a-z0-9.:/-]+/)?(xbt-[a-z0-9-]+:[A-Za-z0-9._-]+)(@sha256:[0-9a-f]{64})?\$#\1$REGISTRY/\3#" \
+    sed -i -E "s#^(    image: )([a-z0-9.:/-]+/)?((xbt-[a-z0-9-]+|lightning-stream):[A-Za-z0-9._-]+)(@sha256:[0-9a-f]{64})?\$#\1$REGISTRY/\3#" \
       "$OUT/lazarus-store/$app/docker-compose.yml"
   fi
 done
