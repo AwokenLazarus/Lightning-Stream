@@ -198,28 +198,47 @@ fn main() -> ExitCode {
     }
 }
 
-/// Starts the gateway's link and writes what the app needs to name it (`link.json` in the state
-/// directory: the key and where it is reached), then has the seller's node vouch for it, again
-/// before the node's word runs out, for as long as the gateway runs.
+/// Starts the gateway's link on `link.endpoints` keys and writes what the app needs to name it
+/// (`link.json` in the state directory: the keys and where they are reached), then has the seller's
+/// node vouch for each, again before the node's word runs out, for as long as the gateway runs.
+/// Every key leads to the same gateway; each keeps its own connection to its relay, so buyers who
+/// reach the shop through a relay do not all share one connection (and one relay's limit for it).
 #[allow(clippy::too_many_arguments)]
 fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, addr: std::net::SocketAddr,
               node: &Arc<LndRest>, seller: &str, sign_mac: &std::path::Path, gw: &Arc<Gateway>, nostr_pk: Option<[u8; 32]>,
               keys: Option<xbt_nostr::event::Keys>, nostr_relays: Vec<String>)
-              -> Result<std::sync::Arc<xbt_iroh_link::Link>, String> {
-    let secret = xbt402::provider::load_or_create_secret(&state_dir.join("link.key")).map_err(|e| e.to_string())?;
-    // no relays named: ours, with iroh's public relays beside it
-    let relays = if l.relays.is_empty() { xbt_iroh_link::Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()]) } else { xbt_iroh_link::Relays::Ours(l.relays.clone()) };
-    let lookup = Some(Arc::new(xbt_iroh_link::nostr_lookup::NostrLookup::new(keys, nostr_relays)));
-    let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private, lookup })
-        .map_err(|e| format!("link: {e}"))?;
+              -> Result<Vec<Arc<xbt_iroh_link::Link>>, String> {
     let upstream = if addr.ip().is_unspecified() { std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())) } else { addr };
-    link.serve(upstream);
-    let v = Vouch { link: link.clone(), private: l.private, state_dir: state_dir.to_path_buf(), node: node.clone(), seller: seller.to_string(),
+    let mut links = Vec::new();
+    for i in 0..l.endpoints {
+        // the first key is the one a gateway on one key always had
+        let file = if i == 0 { "link.key".to_string() } else { format!("link-{}.key", i + 1) };
+        let secret = xbt402::provider::load_or_create_secret(&state_dir.join(file)).map_err(|e| e.to_string())?;
+        // no relays named: ours, with iroh's public relays beside it. Relays named: each key has
+        // another of them first, as its home
+        let relays = if l.relays.is_empty() {
+            xbt_iroh_link::Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()])
+        } else {
+            let mut r = l.relays.clone();
+            let k = i % r.len();
+            r.rotate_left(k);
+            xbt_iroh_link::Relays::Ours(r)
+        };
+        let lookup = Some(Arc::new(xbt_iroh_link::nostr_lookup::NostrLookup::new(keys.clone(), nostr_relays.clone())));
+        let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private, lookup })
+            .map_err(|e| format!("link: {e}"))?;
+        link.serve(upstream);
+        links.push(link);
+    }
+    let v = Vouch { links: links.clone(), private: l.private, state_dir: state_dir.to_path_buf(), node: node.clone(), seller: seller.to_string(),
                     sign_mac: sign_mac.to_path_buf(), gw: gw.clone(), nostr_pk };
     let mut until = v.once()?;
     eprintln!(
-        "xbt-gateway: reached by key {} over {}{}",
-        link.endpoint_id(),
+        "xbt-gateway: reached by {} over {}{}",
+        match links.as_slice() {
+            [one] => format!("key {}", one.endpoint_id()),
+            many => format!("{} keys, {} first", many.len(), many[0].endpoint_id()),
+        },
         if l.private { "relays only" } else { "direct links and relays" },
         if until.is_some() { "; the node vouches for it" } else { "; the node has not vouched for it (see sign_error at /.well-known/lightning-stream-link.json), so buyers cannot check it and nothing names it" }
     );
@@ -240,7 +259,7 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
             }
         }
     }).map_err(|e| format!("link: {e}"))?;
-    Ok(link)
+    Ok(links)
 }
 
 /// How long the node's word for the link holds, and how long before its end it is asked again.
@@ -249,7 +268,7 @@ const VOUCH_AHEAD: u64 = 10 * 86_400;
 
 /// What it takes to have the node vouch for the link and to say so.
 struct Vouch {
-    link: Arc<xbt_iroh_link::Link>,
+    links: Vec<Arc<xbt_iroh_link::Link>>,
     private: bool,
     state_dir: std::path::PathBuf,
     node: Arc<LndRest>,
@@ -260,72 +279,89 @@ struct Vouch {
 }
 
 impl Vouch {
-    /// Asks the node to sign the link claim (with a macaroon that allows only SignMessage, where
-    /// the app baked one), checks the signature is the node's own, and publishes the result: the
-    /// transport document, the link's state, `link.json`. `Some(expiry)` when the node vouched.
+    /// Asks the node to sign the claim for each link key (with a macaroon that allows only
+    /// SignMessage, where the app baked one), checks each signature is the node's own, and publishes
+    /// the result: the transport document, the link's state, `link.json`. `Some(expiry)` when the
+    /// node vouched for at least one key; only the keys it vouched for are named.
     fn once(&self) -> Result<Option<u64>, String> {
-        let h = self.link.hints(Duration::from_secs(10));
-        let direct: Vec<String> = if self.private { vec![] } else { h.direct.iter().map(|a| a.to_string()).collect() };
+        let hints: Vec<xbt_iroh_link::Hints> = std::thread::scope(|sc| {
+            let hs: Vec<_> = self.links.iter().map(|l| sc.spawn(move || l.hints(Duration::from_secs(10)))).collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
         let expires = unix_now() + VOUCH_FOR;
         let mut sign_error: Option<String> = None;
-        let node_sig = match std::fs::read(&self.sign_mac) {
-            Ok(mac) => {
-                let text = xbt402::claim::claim_text(&self.link.endpoint_id(), &self.seller, expires);
-                match self.node.sign_message(&mac, text.as_bytes()) {
-                    Ok(sig) => match (self.node.info(), xbt402::claim::recover(text.as_bytes(), &sig)) {
-                        // the node's own key, checked before it is published
-                        (Ok(info), Ok(k)) if hex::encode(k.serialize()) == info.pubkey => Some(sig),
-                        _ => {
-                            eprintln!("xbt-gateway: link: the node's signature is not its own key's: not published");
-                            sign_error = Some("the node's signature did not check out against its own key".into());
+        let mac = std::fs::read(&self.sign_mac);
+        let mut each = Vec::new();
+        for (link, h) in self.links.iter().zip(&hints) {
+            let direct: Vec<String> = if self.private { vec![] } else { h.direct.iter().map(|a| a.to_string()).collect() };
+            let node_sig = match &mac {
+                Ok(mac) => {
+                    let text = xbt402::claim::claim_text(&link.endpoint_id(), &self.seller, expires);
+                    match self.node.sign_message(mac, text.as_bytes()) {
+                        Ok(sig) => match (self.node.info(), xbt402::claim::recover(text.as_bytes(), &sig)) {
+                            // the node's own key, checked before it is published
+                            (Ok(info), Ok(k)) if hex::encode(k.serialize()) == info.pubkey => Some(sig),
+                            _ => {
+                                eprintln!("xbt-gateway: link: the node's signature is not its own key's: not published");
+                                sign_error = Some("the node's signature did not check out against its own key".into());
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("xbt-gateway: link: the node did not sign the link key: {e}");
+                            sign_error = Some(format!("the node did not sign: {e}"));
                             None
                         }
-                    },
-                    Err(e) => {
-                        eprintln!("xbt-gateway: link: the node did not sign the link key: {e}");
-                        sign_error = Some(format!("the node did not sign: {e}"));
-                        None
                     }
                 }
-            }
-            Err(_) => {
-                sign_error = Some("no key to ask the node to sign with (sign.macaroon): buyers cannot check this link yet".into());
-                None
-            }
-        };
+                Err(_) => {
+                    sign_error = Some("no key to ask the node to sign with (sign.macaroon): buyers cannot check this link yet".into());
+                    None
+                }
+            };
+            each.push((link.endpoint_id(), h.relays.clone(), direct, node_sig));
+        }
+        let signed = |sig: &Option<String>| sig.as_ref().map(|_| expires);
+        // the first key's fields where a gateway on one key had them; every key under `links`
+        let (id0, relays0, direct0, sig0) = each.first().cloned().ok_or("the link has no key")?;
+        let all: Vec<_> = each.iter().map(|(id, relays, direct, sig)| serde_json::json!({
+            "endpoint_id": id, "relays": relays, "direct": direct, "signed_until": signed(sig),
+        })).collect();
         let doc = serde_json::json!({
-            "endpoint_id": self.link.endpoint_id(),
-            "relays": h.relays,
-            "direct": direct,
+            "endpoint_id": id0,
+            "relays": relays0,
+            "direct": direct0,
             "private": self.private,
             "seller": self.seller,
-            "node_sig": node_sig,
-            "expires": node_sig.as_ref().map(|_| expires),
+            "node_sig": sig0,
+            "expires": signed(&sig0),
+            "links": all,
         });
         std::fs::write(self.state_dir.join("link.json"), format!("{doc}\n")).map_err(|e| format!("link.json: {e}"))?;
+        let vouched: Vec<xbt402::transport::Link> = each.iter().filter_map(|(id, relays, direct, sig)| sig.as_ref().map(|sig| xbt402::transport::Link {
+            kind: "iroh".into(),
+            endpoint_id: id.clone(),
+            relays: relays.clone(),
+            direct: direct.clone(),
+            expires,
+            node_sig: sig.clone(),
+        })).collect();
         self.gw.set_link_status(serde_json::json!({
             "seller": self.seller,
             "npub": self.nostr_pk.map(|pk| xbt402::shop::npub(&pk)),
-            "endpoint_id": self.link.endpoint_id(),
-            "relays": h.relays,
-            "direct": direct,
-            "home_relay": h.relays.first(),
-            "signed_until": node_sig.as_ref().map(|_| expires),
+            "endpoint_id": id0,
+            "relays": relays0,
+            "direct": direct0,
+            "home_relay": relays0.first(),
+            "signed_until": signed(&sig0),
             "sign_error": sign_error,
             "private": self.private,
+            "links": all,
         }));
-        let Some(sig) = node_sig else { return Ok(None) };
-        self.gw.set_link(
-            xbt402::transport::Link {
-                kind: "iroh".into(),
-                endpoint_id: self.link.endpoint_id(),
-                relays: h.relays.clone(),
-                direct,
-                expires,
-                node_sig: sig,
-            },
-            &unix_now().to_string(),
-        );
+        if vouched.is_empty() {
+            return Ok(None);
+        }
+        self.gw.set_link(&vouched, &unix_now().to_string());
         Ok(Some(expires))
     }
 }

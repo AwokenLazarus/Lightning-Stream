@@ -113,3 +113,31 @@ fn a_key_that_is_not_32_bytes_is_refused() {
     assert!(buyer.local_port("abcd").is_err());
     assert!(buyer.resolve("tooshort.link.invalid:80").unwrap().is_err());
 }
+
+#[test]
+fn a_shop_on_several_keys_is_reached_through_one_that_answers() {
+    let size = 1 << 20;
+    let upstream = service(size);
+    // one gateway on two keys; a third key the shop's document names is gone (never started)
+    let a = Link::start(secret(), Relays::None, true).unwrap();
+    let b = Link::start(secret(), Relays::None, true).unwrap();
+    for l in [&a, &b] {
+        l.serve(([127, 0, 0, 1], upstream).into());
+    }
+    let gone = Link::start(secret(), Relays::None, true).unwrap().endpoint_id();
+    let shop = format!("{}{}", "b".repeat(52), xbt_iroh_link::SHOP_SUFFIX);
+    for _ in 0..4 {
+        let buyer = Link::start(secret(), Relays::None, false).unwrap();
+        for l in [&a, &b] {
+            buyer.learn(&l.endpoint_id(), Hints { relays: vec![], direct: l.hints(Duration::from_millis(200)).direct }).unwrap();
+        }
+        buyer.bind_shop_links(&shop, &[gone.clone(), a.endpoint_id(), b.endpoint_id()]).unwrap();
+        let port = buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port();
+        get(port, &shop, size);
+        get(port, &shop, size);
+        // the same keys keep the port; another list is a new binding
+        buyer.bind_shop_links(&shop, &[b.endpoint_id(), gone.clone(), a.endpoint_id()]).unwrap();
+        assert_eq!(buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port(), port);
+        assert!(buyer.bind_shop_links(&shop, &[]).is_err());
+    }
+}

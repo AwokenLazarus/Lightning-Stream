@@ -90,13 +90,18 @@ pub struct Link {
     ep: Endpoint,
     ports: Mutex<HashMap<EndpointId, u16>>,
     hints: Mutex<HashMap<EndpointId, Hints>>,
-    shops: Mutex<HashMap<String, String>>,
+    /// For each shop host, its link keys in this buyer's order, and the port that leads through
+    /// them once one is opened.
+    shops: Mutex<HashMap<String, ShopKeys>>,
     lookup: Option<Arc<nostr_lookup::NostrLookup>>,
     paths: Arc<Mutex<HashMap<EndpointId, Path>>>,
     detail: AtomicBool,
     /// The protocol this link serves and opens: [`ALPN`] unless started with [`Link::start_alpn`].
     alpn: &'static [u8],
 }
+
+/// A shop's link keys in a buyer's order, and the loopback port that leads through them once opened.
+type ShopKeys = (Vec<EndpointId>, Option<u16>);
 
 /// The path a connection to a peer runs over now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,7 +206,9 @@ impl Link {
             l.set_own(SecretKey::from_bytes(&secret).public());
             b = b.address_lookup(l.clone());
         }
-        if let Relays::OursThenPublic(urls) = &relays {
+        // the first relay named is home whenever it answers: a seller on several keys names its
+        // relays in another order for each, so that each key keeps its connection on another relay
+        if let Relays::OursThenPublic(urls) | Relays::Ours(urls) = &relays {
             if let Some(first) = urls.first().and_then(|u| u.parse::<RelayUrl>().ok()) {
                 let mut nr = iroh::NetReportConfig::default();
                 nr.preferred_relay = Some(first);
@@ -287,17 +294,7 @@ impl Link {
         let id = parse_id(endpoint_id_hex)?;
         let listener = self.rt.block_on(TcpListener::bind(listen))?;
         let bound = listener.local_addr()?;
-        let addr = {
-            let h = lock(&self.hints).get(&id).cloned().unwrap_or_default();
-            let mut a = EndpointAddr::new(id);
-            for r in h.relays.iter().filter_map(|r| r.parse::<RelayUrl>().ok()) {
-                a = a.with_relay_url(r);
-            }
-            for d in h.direct {
-                a = a.with_ip_addr(d);
-            }
-            a
-        };
+        let addr = self.addr_of(id);
         let (ep, alpn) = (self.ep.clone(), self.alpn);
         let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
         self.rt.spawn(async move {
@@ -327,13 +324,96 @@ impl Link {
     /// Records that the shop at `shop_host` (`<base32 key>.shop.invalid`) is reached through the link
     /// key `endpoint_id_hex`. Call it only after the shop's transport document has been verified.
     pub fn bind_shop(&self, shop_host: &str, endpoint_id_hex: &str) -> io::Result<()> {
-        parse_id(endpoint_id_hex)?;
+        self.bind_shop_links(shop_host, &[endpoint_id_hex.to_string()])
+    }
+
+    /// Records that the shop at `shop_host` is reached through any of these link keys: one gateway
+    /// serving on several keys, each with its own connection to its relay, so that the buyers
+    /// relayed to it do not all share one. This buyer uses the key [`order`] puts first and the
+    /// next when one cannot be reached. Call it only after the shop's transport document has been
+    /// verified: every key in it is the one gateway's, vouched for by the node the buyer pays.
+    pub fn bind_shop_links(&self, shop_host: &str, endpoint_ids_hex: &[String]) -> io::Result<()> {
+        let ids = endpoint_ids_hex.iter().map(|h| parse_id(h)).collect::<io::Result<Vec<_>>>()?;
+        if ids.is_empty() {
+            return Err(io_err("a shop needs a link key"));
+        }
         let host = shop_host.to_ascii_lowercase();
         if !host.ends_with(SHOP_SUFFIX) {
             return Err(io_err("not a shop host name"));
         }
-        lock(&self.shops).insert(host, endpoint_id_hex.to_string());
+        let ordered = order(&self.ep.id(), &host, ids);
+        let mut shops = lock(&self.shops);
+        // the same keys keep their port (and its connection); new keys get a new one
+        if shops.get(&host).is_none_or(|(had, _)| *had != ordered) {
+            shops.insert(host, (ordered, None));
+        }
         Ok(())
+    }
+
+    /// A loopback port that leads to the shop at `shop_host` through the first of its keys that
+    /// answers, in this buyer's order ([`Link::bind_shop_links`]).
+    fn shop_port(self: &Arc<Self>, host: &str) -> io::Result<u16> {
+        let ids = {
+            let shops = lock(&self.shops);
+            let (ids, port) = shops.get(host).ok_or_else(|| io_err("this shop's link is not known yet"))?;
+            if let Some(p) = port {
+                return Ok(*p);
+            }
+            ids.clone()
+        };
+        if let [one] = ids.as_slice() {
+            let port = self.local_port(&hex::encode(one.as_bytes()))?;
+            if let Some(e) = lock(&self.shops).get_mut(host).filter(|(had, _)| *had == ids) {
+                e.1 = Some(port);
+            }
+            return Ok(port);
+        }
+        let listener = self.rt.block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))?;
+        let port = listener.local_addr()?.port();
+        let addrs: Vec<EndpointAddr> = ids.iter().map(|id| self.addr_of(*id)).collect();
+        let (ep, alpn) = (self.ep.clone(), self.alpn);
+        let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
+        self.rt.spawn(async move {
+            let conns: Arc<Vec<tokio::sync::Mutex<Option<Connection>>>> = Arc::new(addrs.iter().map(|_| tokio::sync::Mutex::new(None)).collect());
+            // the key in use: the first in order until it fails, then the next that answers
+            let at = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let addrs = Arc::new(addrs);
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (ep, addrs, conns, paths, at) = (ep.clone(), addrs.clone(), conns.clone(), paths.clone(), at.clone());
+                tokio::spawn(async move {
+                    let _ = tcp.set_nodelay(true);
+                    let start = at.load(Ordering::Relaxed);
+                    for k in 0..addrs.len() {
+                        let i = (start + k) % addrs.len();
+                        let last = k + 1 == addrs.len();
+                        let tried = open(&ep, &addrs[i], &conns[i], &paths, detail, alpn);
+                        let got = if last { tried.await } else { tokio::time::timeout(FAILOVER_AFTER, tried).await.ok().flatten() };
+                        if let Some((send, recv)) = got {
+                            at.store(i, Ordering::Relaxed);
+                            join(tcp, send, recv).await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = lock(&self.shops).get_mut(host).filter(|(had, _)| *had == ids) {
+            e.1 = Some(port);
+        }
+        Ok(port)
+    }
+
+    /// The address to dial for `id`: its key, with the relays and direct addresses learned for it.
+    fn addr_of(&self, id: EndpointId) -> EndpointAddr {
+        let h = lock(&self.hints).get(&id).cloned().unwrap_or_default();
+        let mut a = EndpointAddr::new(id);
+        for r in h.relays.iter().filter_map(|r| r.parse::<RelayUrl>().ok()) {
+            a = a.with_relay_url(r);
+        }
+        for d in h.direct {
+            a = a.with_ip_addr(d);
+        }
+        a
     }
 
     /// For an HTTP client's resolver: a seller's link host name ([`host_for`]), or a shop host bound
@@ -341,15 +421,34 @@ impl Link {
     /// client's usual resolver. An unbound shop host is an error: it never goes to DNS.
     pub fn resolve(self: &Arc<Self>, host_port: &str) -> Option<io::Result<Vec<SocketAddr>>> {
         let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h).to_ascii_lowercase();
-        let hex = if let Some(label) = host.strip_suffix(HOST_SUFFIX) {
-            id_from_label(label)
+        let port = if let Some(label) = host.strip_suffix(HOST_SUFFIX) {
+            id_from_label(label).and_then(|hex| self.local_port(&hex))
         } else if host.ends_with(SHOP_SUFFIX) {
-            lock(&self.shops).get(&host).cloned().ok_or_else(|| io_err("this shop's link is not known yet"))
+            self.shop_port(&host)
         } else {
             return None;
         };
-        Some(hex.and_then(|hex| self.local_port(&hex)).map(|p| vec![SocketAddr::from((Ipv4Addr::LOCALHOST, p))]))
+        Some(port.map(|p| vec![SocketAddr::from((Ipv4Addr::LOCALHOST, p))]))
     }
+}
+
+/// How long a buyer waits for a shop's link key before trying its next one.
+const FAILOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// A shop's link keys in the order this buyer (`me`) tries them: by the hash of the buyer's key, the
+/// shop and the link key (rendezvous hashing), so buyers spread evenly over a shop's keys, each
+/// buyer keeps to the same one, and a key added or removed moves only the buyers it takes or had.
+pub fn order(me: &EndpointId, shop_host: &str, mut ids: Vec<EndpointId>) -> Vec<EndpointId> {
+    ids.sort_by_cached_key(|id| {
+        let mut h = sha2::Sha256::new();
+        h.update(b"lightning-stream/link-order/1");
+        h.update(me.as_bytes());
+        h.update(shop_host.to_ascii_lowercase().as_bytes());
+        h.update(id.as_bytes());
+        <[u8; 32]>::from(h.finalize())
+    });
+    ids.dedup();
+    ids
 }
 
 /// The host name under which a seller's link is addressed: its key in base32 (52 letters, one DNS
@@ -466,6 +565,27 @@ async fn join(tcp: TcpStream, mut send: SendStream, mut recv: RecvStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buyers_spread_evenly_over_a_shops_keys_and_each_keeps_its_own() {
+        let key = |b: u8| SecretKey::from_bytes(&[b; 32]).public();
+        let shop = "abc.shop.invalid";
+        let keys: Vec<EndpointId> = (1..=4).map(key).collect();
+        let mut firsts = [0usize; 4];
+        for b in 0..200u8 {
+            let me = SecretKey::from_bytes(&[b, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]).public();
+            let o = order(&me, shop, keys.clone());
+            assert_eq!(o.len(), 4);
+            assert_eq!(o, order(&me, &shop.to_ascii_uppercase(), keys.iter().rev().copied().collect()), "the order is the buyer's, not the document's");
+            firsts[keys.iter().position(|k| *k == o[0]).unwrap()] += 1;
+            // a key taken away moves only the buyers that had it
+            let fewer: Vec<EndpointId> = keys[..3].to_vec();
+            if o[0] != keys[3] {
+                assert_eq!(order(&me, shop, fewer)[0], o[0]);
+            }
+        }
+        assert!(firsts.iter().all(|n| (30..=70).contains(n)), "{firsts:?}");
+    }
 
     #[test]
     fn a_link_host_name_is_one_dns_label_and_maps_back_to_its_key() {

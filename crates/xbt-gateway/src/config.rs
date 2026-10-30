@@ -272,7 +272,16 @@ pub struct LinkConfig {
     pub relays: Vec<String>,
     /// Relays only: buyers never learn the seller's address.
     pub private: bool,
+    /// How many link keys the gateway serves on (1 to [`MAX_LINK_ENDPOINTS`]). Each key keeps its own
+    /// connection to its relay, and a relay limits each connection on its own, so buyers relayed
+    /// to the shop share several instead of one; buyers spread over them and fall back to another.
+    pub endpoints: usize,
 }
+
+/// The link keys a gateway serves on unless its `link.endpoints` says otherwise.
+pub const DEFAULT_LINK_ENDPOINTS: usize = 4;
+/// At most this many (a transport document names at most 8 links).
+pub const MAX_LINK_ENDPOINTS: usize = 8;
 
 /// `public_url` for a shop reached by key only: replaced at start by its shop origin.
 pub const LINK_ONLY: &str = "link";
@@ -282,7 +291,7 @@ pub const MAX_LINK_RELAYS: usize = 4;
 
 impl LinkConfig {
     fn parse(v: &Value) -> Result<Self, String> {
-        let m = obj(v, "link", &["relays", "private"])?;
+        let m = obj(v, "link", &["relays", "private", "endpoints"])?;
         let relays = match m.get("relays") {
             None => Vec::new(),
             Some(Value::Array(a)) => a
@@ -307,7 +316,14 @@ impl LinkConfig {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err("link.private is true or false".into()),
         };
-        Ok(Self { relays, private })
+        let endpoints = match m.get("endpoints") {
+            None => DEFAULT_LINK_ENDPOINTS,
+            Some(n) => match n.as_u64() {
+                Some(n) if (1..=MAX_LINK_ENDPOINTS as u64).contains(&n) => n as usize,
+                _ => return Err(format!("link.endpoints is a whole number from 1 to {MAX_LINK_ENDPOINTS}")),
+            },
+        };
+        Ok(Self { relays, private, endpoints })
     }
 }
 
@@ -1422,6 +1438,20 @@ mod tests {
         v["http"] = json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": many}});
         let e = Config::from_json(&v).unwrap_err().to_string();
         assert!(e.contains("at most 8"), "{e}");
+    }
+
+    #[test]
+    fn a_link_serves_on_several_keys_by_default_and_as_many_as_it_says() {
+        let mut v = base();
+        v["public_url"] = json!("link");
+        v["link"] = json!({});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().endpoints, DEFAULT_LINK_ENDPOINTS);
+        v["link"] = json!({"endpoints": 1});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().endpoints, 1);
+        for bad in [json!(0), json!(9), json!(2.5), json!("2")] {
+            v["link"] = json!({"endpoints": bad.clone()});
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
     }
 
     #[test]

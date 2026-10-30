@@ -438,10 +438,11 @@ impl Gateway {
         self.listing_doc()
     }
 
-    /// Names the iroh link that reaches this gateway by key, signed by the receipt key, for the
-    /// well-known transport URL and the Nostr listing. `link.node_sig` is the seller's node's.
-    pub fn set_link(&self, link: xbt402::transport::Link, updated: &str) {
-        let doc = xbt402::transport::document(&self.cfg.public_url, &self.terms.receipt_key, &[link], updated);
+    /// Names the iroh links that reach this gateway by key (one per key it serves on), signed by the
+    /// receipt key, for the well-known transport URL and the Nostr listing. Each `node_sig` is the
+    /// seller's node's.
+    pub fn set_link(&self, links: &[xbt402::transport::Link], updated: &str) {
+        let doc = xbt402::transport::document(&self.cfg.public_url, &self.terms.receipt_key, links, updated);
         *self.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(xbt402::transport::sign(&self.key, &doc));
     }
 

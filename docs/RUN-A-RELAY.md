@@ -139,6 +139,7 @@ accept_conn_burst = 50
 
 [limits.client.rx]
 # Per client: 6 MB/s steady (48 Mbit/s, about two high-bitrate 4K streams), 12 MB bursts.
+# A client is one link key: a shop on several keys (docs/DIRECT-LINKS.md) has this for each.
 bytes_per_second = 6000000
 max_burst_bytes = 12000000
 ```

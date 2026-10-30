@@ -1547,6 +1547,10 @@ def offers() -> None:
 # --- a shop reached by key, over its iroh link (docs/DIRECT-LINKS.md) --------------------------------
 
 
+# the link keys a gateway serves on by default (xbt-gateway's link.endpoints), each named in its document
+LINK_KEYS = 4
+
+
 def link_check(relay: bool) -> None:
     """The lab's seller as a shop with no web address: its gateway reached only over its iroh link,
     found by its transport document (which the MCP hands to the signer from the shops file). The
@@ -1620,8 +1624,8 @@ def link_check(relay: bool) -> None:
     ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
           and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
     check(f"link ({mode}): a shop with no web address, reached over its iroh link{' through a relay only' if relay else ''}: the 100 MB file came whole, paid as it arrived with 20 tickets released one at a time, the last receipt signs its hash and its exact price, every ticket the seller took is booked once and the money agrees",
-          ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
-          {**brief(r), "rails_passed_over": r.get("rails_passed_over"), "origin": origin, "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
+          ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False) and len(doc.get("transport") or []) == LINK_KEYS,
+          {**brief(r), "rails_passed_over": r.get("rails_passed_over"), "origin": origin, "link_keys": len(doc.get("transport") or []), "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
     PROCS["gateway-link"].terminate()
     PROCS["gateway-link"].wait(10)
 
