@@ -420,8 +420,8 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             let listener = link.runtime().block_on(tokio::net::TcpListener::bind(&tunnel_listen))?;
             // only the shop's gateway opens tunnels: it carries the secret the wallet app wrote with the
             // route, read again for each tunnel. Without a whole one, nobody is let in (fails closed)
-            if xbt_vpn::paid::tunnel_secret_in(&dir).is_none() {
-                eprintln!("no whole {} in {}: paid tunnels are refused until the wallet app writes one", xbt_vpn::paid::TUNNEL_SECRET_FILE, dir.display());
+            if let Some(why) = xbt_vpn::paid::tunnel_secret_problem(&dir) {
+                eprintln!("paid tunnels are refused ({}): {why}", dir.join(xbt_vpn::paid::TUNNEL_SECRET_FILE).display());
             }
             let secret_dir = dir.clone();
             link.runtime().spawn(xbt_vpn::paid::serve_tunnel_endpoint(listener, move || xbt_vpn::paid::tunnel_secret_in(&secret_dir), move |c| xbt_vpn::exit::serve(c, cfg.clone(), m.clone())));
@@ -581,9 +581,9 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
                 "paid": exit_priced,
                 "not_announced_because": if announced { None } else if exit_region.is_none() { Some("its country isn't set") }
                     else if exit_priced && tunnel_url.is_none() { Some("the shop's address for paid tunnels isn't set") }
-                    else if exit_priced && xbt_vpn::paid::tunnel_secret_in(&dir).is_none() { Some("the shop hasn't given this exit its tunnel secret yet (open the Sell page's VPN exit and save it)") }
+                    else if let Some(why) = xbt_vpn::paid::tunnel_secret_problem(&dir).filter(|_| exit_priced) { Some(why) }
                     else { Some("no Nostr relays are set") },
-                "paid_tunnels_closed_because": if exit_priced && xbt_vpn::paid::tunnel_secret_in(&dir).is_none() { Some("no tunnel secret from the wallet app: paid tunnels are refused") } else { None } }),
+                "paid_tunnels_closed_because": xbt_vpn::paid::tunnel_secret_problem(&dir).filter(|_| exit_priced) }),
             None => serde_json::json!({ "offered": false }),
         };
         let _ = write_json(&status_dir.join("exit-status.json"), &exit_status);

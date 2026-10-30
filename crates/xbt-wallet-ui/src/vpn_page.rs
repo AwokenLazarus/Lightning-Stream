@@ -392,6 +392,7 @@ pub const VPN_PATH: &str = "/vpn/";
 /// folder's group (the VPN service's) and mode 0640, so the service can read it and nobody else.
 /// A file that holds no whole secret (cut short, or garbled) is replaced.
 fn tunnel_secret(dir: &std::path::Path) -> Option<String> {
+    let _ = migrate_tunnel_secret(dir);
     if let Some(s) = xbt_vpn::paid::tunnel_secret_in(dir) {
         return Some(s);
     }
@@ -399,6 +400,23 @@ fn tunnel_secret(dir: &std::path::Path) -> Option<String> {
     std::fs::create_dir_all(dir).ok()?;
     crate::setup::write_shared(dir, xbt_vpn::paid::TUNNEL_SECRET_FILE, secret.as_bytes()).ok()?;
     Some(secret)
+}
+
+/// A whole tunnel secret written as an older build wrote it (owner-only, the app's own group) is
+/// written again, the same secret, as [`tunnel_secret`] writes one: the folder's group (the VPN
+/// service's) and 0640, whole. Without it an exit offered before the upgrade stays closed: the
+/// service can't read the file and lets nobody in. `Ok(true)`: it was rewritten.
+pub(crate) fn migrate_tunnel_secret(dir: &std::path::Path) -> Result<bool, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = dir.join(xbt_vpn::paid::TUNNEL_SECRET_FILE);
+    let Ok(md) = std::fs::metadata(&path) else { return Ok(false) };
+    let Some(secret) = xbt_vpn::paid::tunnel_secret_in(dir) else { return Ok(false) };
+    let folder = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if md.permissions().mode() & 0o777 == 0o640 && md.gid() == folder.gid() {
+        return Ok(false);
+    }
+    crate::setup::write_shared(dir, xbt_vpn::paid::TUNNEL_SECRET_FILE, secret.as_bytes())?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -435,6 +453,26 @@ mod tests {
         assert_eq!(tunnel_secret(d.path()).as_deref(), Some(first.as_str()), "the same secret every time the route is written");
         let md = std::fs::metadata(d.path().join(xbt_vpn::paid::TUNNEL_SECRET_FILE)).unwrap();
         assert_eq!(md.permissions().mode() & 0o777, 0o640, "its owner and the folder's group (the VPN service's) read it, nobody else");
+    }
+
+    /// A secret an older build wrote owner-only (0600) is written again, the same secret, 0640
+    /// with the folder's group, so an exit offered before the upgrade opens to its gateway again.
+    #[test]
+    fn a_secret_written_by_an_older_build_is_given_to_the_vpn_service() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(xbt_vpn::paid::TUNNEL_SECRET_FILE);
+        let old = xbt_vpn::paid::new_tunnel_secret();
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, old.as_bytes()).unwrap();
+        drop(f);
+        assert_eq!(migrate_tunnel_secret(d.path()), Ok(true));
+        let md = std::fs::metadata(&path).unwrap();
+        assert_eq!(md.permissions().mode() & 0o777, 0o640);
+        assert_eq!(md.gid(), std::fs::metadata(d.path()).unwrap().gid());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "the same secret: the gateway's route still matches");
+        assert_eq!(migrate_tunnel_secret(d.path()), Ok(false), "once is enough");
+        assert_eq!(tunnel_secret(d.path()).as_deref(), Some(old.as_str()));
     }
 
     /// The VPN service reads the secret by the folder's group: the file takes that group, so the

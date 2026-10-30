@@ -185,7 +185,9 @@ approval threshold) apply.
   `X-Stream-Tunnel`. The endpoint reads the file again for each tunnel and compares by digest. Until
   there is a whole one (none yet, or a short or garbled file) it lets **nobody** in (503): it fails
   closed. A priced exit without one is not announced, and the Sell page says why
-  (`exit-status.json`, `paid_tunnels_closed_because`); the service starts again when the file appears.
+  (`exit-status.json`, `paid_tunnels_closed_because`, which tells a missing secret from one the
+  service can't read); the service starts again when the file appears. A secret an older build
+  wrote owner-only is given to the service's group when the wallet app starts, the same secret.
 - **The buyer's side.** For each device and priced exit, the buyer's VPN service asks the owner's
   wallet to open the tunnel: the signer's `xbt402_pay` with `upgrade` and `stream_to`, the call a web
   app's WebSocket makes (`xbt_vpn::paid`). The wallet pays as the tunnel's bytes pass, under the
@@ -259,7 +261,8 @@ Each paid tunnel pays its opening, so the buyer holds off exits that would make 
   30 s, doubling to an hour, and an operator with three such exits in a day is held off as a whole.
   A tunnel that served well (lived longer, or carried more) starts its exit's doubling again;
 - an exit asking more than it announced is held off for a day, with its operator (above);
-- at most 48 paid tunnels are opened to one exit in a day;
+- at most 48 paid tunnels are opened to one exit for one device in a day; only openings that
+  succeeded (and were paid) count, so a while of wallet trouble doesn't lock an honest exit out;
 - every hold and the daily count are asked again once a tunnel's turn to open comes, not only
   before it waits.
 

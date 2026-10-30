@@ -177,6 +177,18 @@ pub fn is_tunnel_secret(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Why there is no usable secret in `dir`, in words for the owner; `None` if there is one.
+pub fn tunnel_secret_problem(dir: &std::path::Path) -> Option<&'static str> {
+    match std::fs::read_to_string(dir.join(TUNNEL_SECRET_FILE)) {
+        Ok(s) if is_tunnel_secret(s.trim()) => None,
+        Ok(_) => Some("the tunnel secret file is cut short or garbled: the wallet app writes it again when the exit is saved"),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            Some("the VPN service can't read the tunnel secret (written by an older version): restart the app, which gives it to the service")
+        }
+        Err(_) => Some("no tunnel secret from the wallet app yet: open the Sell page's VPN exit and save it"),
+    }
+}
+
 /// The secret in `dir`'s [`TUNNEL_SECRET_FILE`], if there is a whole one.
 pub fn tunnel_secret_in(dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(dir.join(TUNNEL_SECRET_FILE)).ok().map(|s| s.trim().to_string()).filter(|s| is_tunnel_secret(s))
@@ -328,6 +340,16 @@ mod tests {
         std::fs::write(d.path().join(TUNNEL_SECRET_FILE), &secret).unwrap();
         assert_eq!(ask(format!("{TUNNEL_HEADER}: {secret}\r\n")).await, "HTTP/1.1 101", "written after start, it holds at once");
         assert_eq!(ask(String::new()).await, "HTTP/1.1 403");
+    }
+
+    #[test]
+    fn why_there_is_no_secret_is_said_plainly() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(tunnel_secret_problem(d.path()).unwrap().contains("no tunnel secret"));
+        std::fs::write(d.path().join(TUNNEL_SECRET_FILE), "abc").unwrap();
+        assert!(tunnel_secret_problem(d.path()).unwrap().contains("cut short"));
+        std::fs::write(d.path().join(TUNNEL_SECRET_FILE), new_tunnel_secret()).unwrap();
+        assert_eq!(tunnel_secret_problem(d.path()), None);
     }
 
     #[test]

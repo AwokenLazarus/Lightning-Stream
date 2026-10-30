@@ -210,6 +210,13 @@ impl App {
         let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
         let relays = crate::relay::RelayLinks::new(cfg.relay_ttl);
+        // a tunnel secret an older build wrote owner-only is given to the VPN service's group, so an
+        // exit offered before this upgrade isn't left refusing every buyer
+        match vpn_page::migrate_tunnel_secret(&cfg.vpn.dir) {
+            Ok(true) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret is now readable by the VPN service"),
+            Ok(false) => {}
+            Err(e) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret was left as it was: {e}"),
+        }
         Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None), nostr, relay_net, platform,
                          apps: Default::default() }))
     }
