@@ -2292,6 +2292,52 @@ fn a_cut_answer_listed_late_and_charged_past_its_limit_is_a_seller_fault() {
     r.tap.clear();
 }
 
+/// An answer that arrived whole whose last receipt is listed only after the wallet stopped waiting
+/// for it, charging far more than the answer cost but inside the call's limit: the seller's fault,
+/// as where it is listed at once. The session is stopped and nothing more is released into it.
+///
+/// FAILS before: a whole answer closed late was believed up to its call's limit, and its late
+/// receipt was not checked against what it cost, so the next call went on buying tickets.
+#[test]
+fn a_whole_answer_listed_late_and_charged_past_its_cost_is_a_seller_fault() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    let hiding = Arc::new(AtomicBool::new(true));
+    let hidden = Arc::new(Mutex::new(vec![]));
+    let (h, gone) = (hiding.clone(), hidden.clone());
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.ends_with("/x402/ticket/status") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let mut v: Value = serde_json::from_slice(&body).ok()?;
+        let mut gone = gone.lock().unwrap();
+        let listed = v["responses"].as_array().cloned().unwrap_or_default();
+        let hiding = h.load(Ordering::SeqCst);
+        if hiding {
+            gone.extend(listed.iter().map(|r| r["seq"].clone()));
+        }
+        v["responses"] = listed.into_iter().filter(|r| !hiding || !gone.contains(&r["seq"])).map(|mut f| {
+            if gone.contains(&f["seq"]) {
+                f["charged"] = "4000000".into();
+                f["sig"] = hex::encode(ecdsa::sign(&receipt_secret(), &xbt402::ticket::receipt_message(&f))).into();
+            }
+            f
+        }).collect();
+        Some(Ok(answer(status, headers, v.to_string().into_bytes())))
+    }));
+    let whole_one = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(whole_one["complete"].as_bool(), Some(true), "{whole_one}");
+    assert!(whole_one.get("seller_fault").is_none(), "{whole_one}");
+    hiding.store(false, Ordering::SeqCst);
+    let v = r.pay(&format!("/files/{}", 8 * MIB), 5_000);
+    assert!(v["seller_fault"].as_str().unwrap_or_default().contains("for an answer that costs"), "{v}");
+    assert_eq!(v["tickets_released"].as_u64(), Some(0), "nothing more was released: {v}");
+    assert_ne!(r.status()["sessions"][0]["state"], "open");
+    r.tap.clear();
+}
+
 /// A seller that ignores the call's limit (`X-Xbt402-Max-Msat`, which a gateway of before 0.1.15 did
 /// not read) and charges for what it pushed past it: the wallet's own count stops reading at the limit
 /// and releases nothing more, and the seller's receipt above the limit is a seller fault. The session

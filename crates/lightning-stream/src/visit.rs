@@ -14,7 +14,7 @@
 //! limit, so answers running side by side cannot together spend past it; when one ends, only what
 //! it cost stays spent; where the signer has not said what it cost (an answer that never started),
 //! all of the share stays spent until it does (for good, where it says nothing within
-//! [`SETTLE_WAIT`]). A request that finds no share free waits for one; one that needs more than a
+//! [`SETTLE_WAIT`]), and where the signer could not be reached at all, none of it. A request that finds no share free waits for one; one that needs more than a
 //! share runs alone once the others have ended or stopped (an open WebSocket, or an answer whose cost
 //! the signer has yet to say, holds no answer it must wait for), and no new share is handed out
 //! while it waits. A range is asked for in
@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,9 +42,11 @@ pub const MAX_BODY: usize = 1 << 20;
 /// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
 /// How long a request whose answer has stopped waits for the signer to say what it cost, past which
-/// all of its share stays spent ([`Visit::settle`]): twice what the signer waits for a seller's
-/// first byte, by which it has ended a call whose answer is gone.
-const SETTLE_WAIT: Duration = Duration::from_secs(2 * FIRST_BYTE.as_secs());
+/// all of its share stays spent ([`Visit::settle`]): the longest the signer may wait for a seller's
+/// next byte (its `tickets.read_timeout_s`, at most an hour) before it ends a call whose answer is
+/// gone, and twice [`FIRST_BYTE`] for its last receipt and its reply. The share is counted apart
+/// while it waits, so nothing else waits for it; only the visit's budget is held.
+const SETTLE_WAIT: Duration = Duration::from_secs(3600 + 2 * FIRST_BYTE.as_secs());
 /// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
 /// ends, then only what it cost, with room for a ticket beside it as for [`ANSWER_SHARE`].
 const SOCKET_SHARE: i64 = 1_000;
@@ -518,8 +521,15 @@ impl Connector {
         params["stream_head"] = true.into();
         let (tx, done) = mpsc::channel::<Result<Value, String>>();
         let signer = self.cfg.signer.clone();
+        // the signer could not be reached: nothing was sent, and nothing charged
+        let unsent = Arc::new(AtomicBool::new(false));
+        let u = unsent.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(xbt_wallet_mcp::wallet::signer_call(&signer, LONGEST, "xbt402_pay", &params));
+            let r = xbt_wallet_mcp::wallet::signer_call_sent(&signer, LONGEST, "xbt402_pay", &params).map_err(|(sent, e)| {
+                u.store(!sent, Ordering::SeqCst);
+                e
+            });
+            let _ = tx.send(r);
         });
         let started = Instant::now();
         let src = loop {
@@ -533,7 +543,7 @@ impl Connector {
             }
             if let Ok(d) = done.try_recv() {
                 let _ = std::fs::remove_file(&path);
-                let unknown = d.is_err();
+                let unknown = d.is_err() && !unsent.load(Ordering::SeqCst);
                 return Err(Failed { v: d.unwrap_or_else(|e| json!({"error": e})), done: None, unknown });
             }
             if started.elapsed() > FIRST_BYTE {
@@ -713,5 +723,21 @@ mod tests {
         let other = v.reserve(ANSWER_SHARE).unwrap();
         v.refused(other, Failed { v: json!({"rule": "max_sats"}), done: None, unknown: false });
         assert_eq!(v.lock().spent, share);
+    }
+
+    /// A call that never reached the signer (its socket could not be reached) sent nothing and was
+    /// charged nothing: its share goes back.
+    ///
+    /// FAILS before: any failed call to the signer kept all of its share spent.
+    #[test]
+    fn a_call_that_never_reached_the_signer_gives_its_share_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connector::new(crate::Config { signer: dir.path().join("no-signer.sock"), stream_dir: dir.path().to_path_buf(), task: "t".into(), max_sats: 10 });
+        let Err(f) = c.start(json!({"url": "https://example.invalid/"})) else { panic!("the call went") };
+        assert!(!f.unknown, "{}", f.v);
+        let v = visit(10_000);
+        let share = v.reserve(ANSWER_SHARE).unwrap();
+        v.refused(share, f);
+        assert_eq!(v.lock().spent, 0);
     }
 }

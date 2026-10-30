@@ -1593,7 +1593,7 @@ the last ticket.
 | An unsigned `bad_seq` with `nextSeq`. | Adopted, twice at most: a `seq` only orders requests. | Nothing. |
 | A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use. |
 | The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
-| The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | The part of the last released ticket that paid for nothing. |
+| The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | What the answer could still draw when it stopped: the credit the session had for it when it started and the tickets its own call released, less what arrived, plus 16 MiB priced. Right after a release that is up to about 1.5 tickets; a seller that cuts every answer this way takes about that much per answer, and the answers show cut short. |
 | The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its wait for a refill, 15 s by default), then releases. | Up to that wait. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
@@ -1911,13 +1911,27 @@ request to that seller until the read timeout. Now requests in one session run s
   its answer's last receipt is read, and at most its call's limit. Each is held by an id of its own,
   not by its seq (a seq can pass from one request to another). A request whose connection failed
   after it left may still be served and charged from the seller's queue: it is held at its call's
-  limit, and no quiet point is taken, for two minutes. An answer the wallet cut short is believed
-  charged up to what it read and what could have been on its way when it stopped (16 MiB and a
-  proxy's slack, priced), or up to the credit it had then where that is more (a seller pushes ahead
-  as far as the credit goes, and a proxy between them can hold all of it), not up to its call's
-  limit. That holds where its last receipt is listed late, and where it is never listed and the
-  wallet closes it after 30 s; a late receipt that charges past the call's limit is a seller fault,
-  as one read at once is. A receipt's spend is taken only
+  limit, and no quiet point is taken, for two minutes.
+- **One rule for every way an answer closes.** What the wallet believes of a seller's charge for one
+  answer is the same whether its last receipt is read as the answer ends, listed later in `status`,
+  or never listed (the wallet closes it after 30 s):
+  - **arrived whole:** up to what it cost by the wallet's own count. Its receipt must sign the body
+    that arrived and charge no more than that, or it is a seller fault;
+  - **priced by the token and cut short:** up to the call's limit (its tokens are counted only
+    whole);
+  - **priced by its size and cut short:** up to what it read and what could have been on its way when
+    it stopped (16 MiB and a proxy's slack, priced), or up to the credit it could have drawn where that
+    is more: what the session had for it when it started and the tickets its own call released, with
+    the same 16 MiB priced on top. A seller pushes ahead as far as the credit goes, and a proxy between
+    them can hold all of it;
+  - **never past the call's limit;** a charge past that is a seller fault.
+
+  The trade-off in the last case: not the session's whole credit at the stop. A seller that held the
+  other answers back and cut this one would otherwise have it charged all their credit too, and then
+  be paid again as they released more. The cost is a possible false fault on an honest seller that,
+  behind a buffering proxy, pushed this answer ahead on credit another answer's ticket bought while
+  this one ran, by more than the 16 MiB of slack: possible only where a ticket buys more than 16 MiB.
+- **What the seller may have spent.** A receipt's spend is taken only
   inside the spend at the last quiet point (nothing open, nothing unclosed), plus what the wallet
   counted since, plus what the requests still open may add. Where nothing is open, it is taken only
   inside what the seller's own receipts charged the answers closed since. A seller that marks the

@@ -145,8 +145,18 @@ pub fn parse_py(s: &str) -> serde_json::Result<Value> {
 /// B2's `SignerClient.call`: one request per connection, `{"id": 1, "method", "params"}` + newline,
 /// one line back. Big integers survive both ways (`xbt402::json::parse`).
 pub fn signer_call(sock: &Path, timeout: Duration, method: &str, params: &Value) -> Result<Value, String> {
+    signer_call_sent(sock, timeout, method, params).map_err(|(_, e)| e)
+}
+
+/// [`signer_call`], saying with an error whether the request may have reached the signer: `false`
+/// only where the socket could not be reached, so that nothing was sent.
+pub fn signer_call_sent(sock: &Path, timeout: Duration, method: &str, params: &Value) -> Result<Value, (bool, String)> {
+    let mut s = Stream::connect(sock).map_err(|e| (false, format!("signer socket {}: {e}", sock.display())))?;
+    signer_exchange(&mut s, sock, timeout, method, params).map_err(|e| (true, e))
+}
+
+fn signer_exchange(s: &mut Stream, sock: &Path, timeout: Duration, method: &str, params: &Value) -> Result<Value, String> {
     let io = |e: std::io::Error| format!("signer socket {}: {e}", sock.display());
-    let mut s = Stream::connect(sock).map_err(io)?;
     s.set_timeouts(Some(timeout));
     let mut req = Map::new();
     req.insert("id".into(), 1.into());
