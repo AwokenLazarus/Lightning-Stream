@@ -402,6 +402,15 @@ pub struct Times {
 }
 
 impl Config {
+    /// Names a shop reached by key by its shop origin (main, at start), and lists the listing's
+    /// own addresses there.
+    pub fn name_shop(&mut self, origin: String) {
+        if let Some(l) = &mut self.listing {
+            l.rebase(xbt402::shop::UNNAMED, &origin);
+        }
+        self.public_url = origin;
+    }
+
     pub fn mainnet(&self) -> bool {
         self.chain == "main"
     }
@@ -869,7 +878,7 @@ impl Config {
         };
         let listing = match top.get("listing") {
             None | Some(Value::Null) => None,
-            Some(l) => Some(listing_draft(l, &routes)?),
+            Some(l) => Some(listing_draft(l, &routes, if by_key { xbt402::shop::UNNAMED } else { origin.trim_end_matches('/') })?),
         };
         let nostr = match top.get("nostr") {
             None | Some(Value::Null) => None,
@@ -1188,9 +1197,24 @@ fn route(v: &Value) -> Result<Route, String> {
 }
 
 /// The config's `listing`. A `listing/1` names a route per service: the route must exist, and a
-/// service that names no price is given its route's, so the listing cannot say another price.
-fn listing_draft(l: &Value, routes: &[Route]) -> Result<xbt402::listing::Draft, String> {
+/// service that names no price is given its route's, so the listing cannot say another price. An
+/// item's address from the shop's own root (`/files/a.mkv`) is listed at `origin`: the shop's web
+/// address, or for a shop reached by key [`xbt402::shop::UNNAMED`] until main names it.
+fn listing_draft(l: &Value, routes: &[Route], origin: &str) -> Result<xbt402::listing::Draft, String> {
     let mut l = l.clone();
+    let at_origin = |items: Option<&mut Value>| {
+        for it in items.and_then(Value::as_array_mut).into_iter().flatten() {
+            if let Some(Value::String(u)) = it.get_mut("url") {
+                if u.starts_with('/') && !u.starts_with("//") {
+                    *u = format!("{origin}{u}");
+                }
+            }
+        }
+    };
+    at_origin(l.get_mut("items"));
+    for s in l.get_mut("services").and_then(Value::as_array_mut).into_iter().flatten() {
+        at_origin(s.get_mut("items"));
+    }
     if let Some(list) = l.get_mut("services").and_then(Value::as_array_mut) {
         for (i, s) in list.iter_mut().enumerate() {
             let path = s.get("path").and_then(Value::as_str).unwrap_or("").to_string();
@@ -2029,6 +2053,34 @@ mod tests {
         assert_eq!(d.services[1].prices, json!({"request_msat": "2500"}));
         v["listing"]["services"][1]["path"] = json!("/nowhere");
         assert!(Config::from_json(&v).unwrap_err().to_string().contains("not one of the routes"));
+    }
+
+    /// The Sell page writes a service's addresses from the shop's own root (`/files/a.mkv`): a shop
+    /// with a web address lists them there, and a shop reached by key lists them at its shop name,
+    /// which main gives it at start (`name_shop`). A `//host` address is another host's, not relative.
+    #[test]
+    fn a_listing_names_its_relative_addresses_at_the_shops_origin_once_it_is_known() {
+        let mut v = base();
+        v["listing"] = json!({"name": "One box", "updated": "2026-10-30", "services": [
+            {"name": "Files", "kind": "files", "path": "/files/", "items": [{"title": "a.mkv", "url": "/files/a.mkv"}]},
+            {"name": "Model", "kind": "app", "path": "/api", "items": [{"title": "Open", "url": "/api/web/"}]},
+        ]});
+        let d = Config::from_json(&v).unwrap().listing.unwrap();
+        assert_eq!(d.services[0].items[0].url, "http://127.0.0.1:8402/files/a.mkv");
+        assert_eq!(d.services[1].items[0].url, "http://127.0.0.1:8402/api/web/");
+
+        v["public_url"] = json!("link");
+        v["link"] = json!({"relays": []});
+        let mut c = Config::from_json(&v).unwrap();
+        let origin = xbt402::shop::origin_for(&[7; 32]);
+        c.name_shop(origin.clone());
+        assert_eq!(c.public_url, origin);
+        let d = c.listing.unwrap();
+        assert_eq!(d.services[0].items[0].url, format!("{origin}/files/a.mkv"));
+        assert_eq!(d.services[1].items[0].url, format!("{origin}/api/web/"));
+
+        v["listing"]["services"][0]["items"][0]["url"] = json!("//elsewhere.example/a.mkv");
+        assert!(Config::from_json(&v).is_err(), "a scheme-relative address is not the shop's own");
     }
 
     #[test]

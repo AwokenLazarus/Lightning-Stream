@@ -55,6 +55,11 @@ pub fn host_for(pk: &[u8; 32]) -> String {
     format!("{}{SUFFIX}", base32(pk))
 }
 
+/// The origin a shop reached by key has before its gateway names it by its key at start: a
+/// listing's own addresses are held under it until then (`listing::Draft::rebase`). Never a shop's
+/// name ([`key_of`] is `None` for it), and `.invalid` never resolves.
+pub const UNNAMED: &str = "http://unnamed.shop.invalid";
+
 /// The origin the rest of the code knows the shop by.
 pub fn origin_for(pk: &[u8; 32]) -> String {
     format!("http://{}", host_for(pk))

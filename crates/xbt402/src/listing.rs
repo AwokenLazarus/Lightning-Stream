@@ -48,6 +48,19 @@ pub struct Draft {
     pub services: Vec<Section>,
 }
 
+impl Draft {
+    /// Moves every item at origin `from` (its paths kept) to origin `to`.
+    pub fn rebase(&mut self, from: &str, to: &str) {
+        let at = |i: &mut Item| {
+            if let Some(rest) = i.url.strip_prefix(from).filter(|r| r.is_empty() || r.starts_with('/')) {
+                i.url = format!("{to}{rest}");
+            }
+        };
+        self.items.iter_mut().for_each(at);
+        self.services.iter_mut().flat_map(|s| s.items.iter_mut()).for_each(at);
+    }
+}
+
 /// One service of a `listing/1`: what it is, the path it is sold under, and its price.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {

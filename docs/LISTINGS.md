@@ -110,3 +110,9 @@ A reader sees a `listing/0` as one service under `/`.
   "credit": "(c) Blender Foundation, CC BY 3.0"
 }
 ```
+
+In a gateway's config, an entry's `url` may also start at the shop's own root (`/files/film.mkv`,
+`/web/`). The gateway lists it at its `public_url`. A shop reached by key, with no web address,
+lists it at its shop name (`http://<key>.shop.invalid`, see DIRECT-LINKS.md), which the gateway
+takes from its Nostr key at start. A signed listing always carries full addresses. A `//host/...`
+address is another host's and is refused.
