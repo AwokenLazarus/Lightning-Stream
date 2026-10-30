@@ -1834,6 +1834,12 @@ impl Signer {
     /// are always asked for). At most 64 routes a seller and 64 sellers.
     fn route_terms_keep(&self, origin: &str, pr: &Value) {
         let entries: Vec<&Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten().collect();
+        // a seller that offers draws on a route: what was kept of its other routes may leave out the draw entry they
+        // are offered now, and none of it is used again until each is asked
+        if entries.iter().any(|e| e.get("scheme").and_then(Value::as_str) == Some(xbt402::lottery::SCHEME)) {
+            lock(&self.route_terms).remove(origin);
+            return;
+        }
         if entries.iter().any(|e| e.get("scheme").and_then(Value::as_str) != Some(xbt402::ticket::SCHEME)) {
             return;
         }
@@ -1851,6 +1857,22 @@ impl Signer {
             mine.clear();
         }
         mine.insert(route.to_string(), pr.clone());
+    }
+
+    /// Whether terms kept for a route of `origin` are those of the session open with it: the same node,
+    /// receipt key, ticket and endpoints. Terms kept from before the session was opened again on others
+    /// would stop it as a seller whose terms changed; the price is asked instead.
+    fn route_terms_fit(&self, origin: &str, pr: &Value, lightning: &str) -> bool {
+        let Some(slot) = lock(&self.ticket_http).get(origin).cloned() else { return false };
+        let Ok(open) = slot.open.try_lock() else { return false };
+        let Some(h) = open.as_ref() else { return false };
+        offers(pr, lightning).into_iter().any(|o| match o {
+            Offer::Ticket(acc, prepaid) => {
+                let prepaid = prepaid.and_then(|a| PayTerms::parse(&a, lightning).ok()).map(|p| p.terms);
+                PayTerms::parse(&acc, lightning).is_ok_and(|t| h.terms.same_seller(&t)) && prepaid == h.prepaid
+            }
+            _ => false,
+        })
     }
 
     /// The terms kept for the route of `url` at `origin`, the route the seller's gateway would take
@@ -1894,13 +1916,42 @@ impl Signer {
     /// sends the page's own request headers (`headers`, [`caller_headers`]) and, with
     /// `head_headers`, gets the seller's response headers in the head line ([`passed_headers`]).
     pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
-        let v = self.xbt402_pay_as(p, true);
-        // paid on terms the seller stated for another of its routes, and refused unpaid: asked properly, once
-        if v.get("seller_code").and_then(Value::as_str) == Some("terms_changed") {
-            if let Some(o) = p.get("url").and_then(Value::as_str).and_then(|u| origin_of(u).ok()) {
-                lock(&self.route_terms).remove(&normalize_dest(&o));
+        let origin = p.get("url").and_then(Value::as_str).and_then(|u| origin_of(u).ok()).map(|o| normalize_dest(&o));
+        let forget = || {
+            if let Some(o) = &origin {
+                lock(&self.route_terms).remove(o);
             }
-            return self.xbt402_pay_as(p, false);
+        };
+        // a session stopped because the seller's terms changed: what was kept of its routes' terms is not its terms now either
+        let stopped_on_new_terms = |v: &Value| v.get("rule").and_then(Value::as_str) == Some("ticket_terms_changed");
+        let first = self.xbt402_pay_as(p, true);
+        if stopped_on_new_terms(&first) {
+            forget();
+        }
+        // paid on terms the seller stated for another of its routes, and refused unpaid: asked properly, once
+        if first.get("seller_code").and_then(Value::as_str) != Some("terms_changed") {
+            return first;
+        }
+        forget();
+        // what the first try booked (a ticket released to make up the balance, say) is this call's too: the second
+        // may spend only what is left of the call's limit, and the answer counts both
+        let booked = py_int(first.get("charged_sats")).unwrap_or(0).max(0);
+        let released = first.get("tickets_released").and_then(Value::as_u64).unwrap_or(0);
+        let mut again = p.clone();
+        if booked > 0 {
+            if let Some(m) = py_int(p.get("max_sats").filter(|v| !v.is_null())) {
+                again["max_sats"] = (m - booked).max(0).into();
+            }
+        }
+        let mut v = self.xbt402_pay_as(&again, false);
+        if stopped_on_new_terms(&v) {
+            forget();
+        }
+        if booked > 0 {
+            v["charged_sats"] = (py_int(v.get("charged_sats")).unwrap_or(0) + booked).into();
+        }
+        if released > 0 || v.get("tickets_released").is_some() {
+            v["tickets_released"] = (v.get("tickets_released").and_then(Value::as_u64).unwrap_or(0) + released).into();
         }
         v
     }
@@ -2015,7 +2066,8 @@ impl Signer {
         let named0 = self.ticket_seller_sid(&origin, false);
         // a plain read on a route whose terms this seller stated, with a session open: paid without asking
         let known = (known_terms && named0.is_some() && matches!(method.as_str(), "GET" | "HEAD") && raw.is_empty() && !upgrade)
-            .then(|| self.route_terms_for(&origin, &url)).flatten();
+            .then(|| self.route_terms_for(&origin, &url)).flatten()
+            .filter(|pr| self.route_terms_fit(&origin, pr, &lightning));
         let pr = match known {
             Some(pr) => pr,
             None => {
@@ -3492,7 +3544,11 @@ impl Signer {
             // a seller that gives accounts and has not been told who this wallet is (it restarted, say): told, and asked again, once
             if ans.status == 403 && !identified_again && self.identify_wanted(hs) {
                 let headers = ans.headers.clone();
-                let body = ans.read_small(SMALL_BODY).unwrap_or_default();
+                // an answer that cannot be read may be the seller asking who this wallet is: not handed on as an empty one
+                let Ok(body) = ans.read_small(SMALL_BODY) else {
+                    return fail(hs, &spent, with(refusal("ticket_refused", "the seller refused the request (HTTP 403) and its answer could not be read: \
+                                                                           whether it asks to know who this wallet is first is not known"), json!({"status": 403})));
+                };
                 let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 if v.get("error").and_then(Value::as_str) == Some("identify_first") {
                     identified_again = true;

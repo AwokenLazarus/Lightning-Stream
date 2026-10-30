@@ -1624,11 +1624,14 @@ impl Gateway {
         // sent without asking the price first (a buyer that knows the route's terms) may be for a
         // path that is refused, unknown or free, and an answer to a payment nobody signed is the
         // seller's fault to its buyer. Refused here, it is charged nothing.
+        // A payment that does not authenticate (a seq used already, a session the book does not hold) is
+        // answered with that refusal, as on a path that is sold: the buyer learns what is wrong with it.
         let signed = |r: Response| -> Reply {
             if let Ok(Some(pay)) = self.pay_header(&req) {
-                if let Ok(a) = self.authenticate(&req, &pay, None) {
-                    return Reply::Whole(self.answered(&a, r, 0));
-                }
+                return Reply::Whole(match self.authenticate(&req, &pay, None) {
+                    Ok(a) => self.answered(&a, r, 0),
+                    Err(refused) => refused,
+                });
             }
             Reply::Whole(r)
         };
@@ -1643,14 +1646,16 @@ impl Gateway {
             // before payment and before the service: nothing is charged, and the service never sees it
             return signed(error(403, "path_refused", "the seller does not serve this path to buyers"));
         }
-        // a paid request for what is free here (a list of models, a free route): not served as paid,
-        // nothing charged, and the buyer asks again as anyone does
+        // a paid request for what is free here (a list of models, a free route) that names the price it
+        // took this path to have (a buyer that paid without asking): not served as paid, nothing charged,
+        // and the buyer asks again as anyone does. One that names no price is served free, as it always was
         let free_here = Self::model_list(&req, &path, route) || route.free;
-        if free_here {
+        if free_here && req.header(xbt402::ticket::PRICE_HEADER).is_some() {
             if let Ok(Some(pay)) = self.pay_header(&req) {
-                if let Ok(a) = self.authenticate(&req, &pay, None) {
-                    return Reply::Whole(self.refused(&a, &self.req_url(&req), None, Refusal::TermsChanged));
-                }
+                return Reply::Whole(match self.authenticate(&req, &pay, None) {
+                    Ok(a) => self.refused(&a, &self.req_url(&req), None, Refusal::TermsChanged),
+                    Err(refused) => refused,
+                });
             }
         }
         // An AI model's list of models is free to read: a buyer needs it to choose a model before
