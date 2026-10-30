@@ -3825,6 +3825,9 @@ impl Signer {
         });
         // the connection is closed here: a seller that was still sending stops within what the balance covers
         drop(body);
+        // and the reader's socket too: its client has the whole body now, not after the seller's last receipt is
+        // fetched below, a round trip or more on a slow link (the call's reply still says what the answer cost)
+        sink.out = None;
         *spent = std::mem::take(&mut lock(&spent_cell));
         let stopped = lock(&state).1.clone();
         let complete = stopped.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);

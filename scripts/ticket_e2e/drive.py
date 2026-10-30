@@ -1663,6 +1663,31 @@ def jellyfin_api(method: str, path: str, key: str, body: dict[str, Any] | None =
         conn.close()
 
 
+JF_MARGIN_S = float(os.environ.get("JF_MARGIN_S", "3"))
+JF_MARGIN_FRAMES = int(os.environ.get("JF_MARGIN_FRAMES", "5"))
+_JF_BASELINES: dict[str, dict[str, Any]] = {}
+
+
+def jellyfin_baseline(item: str) -> dict[str, Any] | None:
+    """The film played straight from Jellyfin by the same driver on this machine, with no Stream in the
+    path, once per run (JF_BASELINE=1; JF_GUEST_USER and JF_GUEST_PW name a user that may watch it).
+    None without JF_BASELINE: the checks keep their fixed limits."""
+    if os.environ.get("JF_BASELINE") != "1":
+        return None
+    if item not in _JF_BASELINES:
+        out = f"{OUT}/jellyfin_baseline"
+        subprocess.run(["node", os.path.join(os.path.dirname(__file__), "jellyfin_drive.mjs"), os.environ["JELLYFIN_URL"], item, out],
+                       env=dict(os.environ, JF_TAP_USER=""), capture_output=True, text=True, timeout=600)
+        with open(f"{out}/log.json") as f:
+            rep = json.load(f)
+        samples = [x for x in rep.get("samples") or [] if x]
+        _JF_BASELINES[item] = {"startup_s": rep.get("startup_s"), "seek_s": rep.get("seek_s"), "after_seek": rep.get("after_seek"),
+                               "width": max((x.get("w", 0) for x in samples), default=0),
+                               "dropped": max((x.get("dropped", 0) or 0 for x in samples), default=0)}
+        measured("jellyfin_baseline", _JF_BASELINES[item])
+    return _JF_BASELINES[item]
+
+
 def jellyfin(link: str = "") -> None:
     """A seller's whole web app, sold by the byte: the real Jellyfin web client in a browser, through the
     wallet app's app port, the connector and the signer, to a gateway that gives each buyer an account of
@@ -1824,9 +1849,21 @@ def jellyfin(link: str = "") -> None:
           bool(rep.get("home")) and "/web/" in str(rep.get("after_login")) and len(users) == 1 and accounts == 1
           and all(not k["admin"] and not k["all_libraries"] and k["libraries"] == [need["JF_LIBRARY"]] for k in kept.values()),
           {**seen, "accounts": accounts, "users": kept})
-    check(f"{tag}: the 4K film plays within 5 s, drops no frame, and a seek to 300 s plays again within 5 s",
-          bool(rep.get("started")) and float(rep.get("startup_s") or 99) <= 5 and seen["width"] >= 3840 and seen["dropped"] == 0
-          and bool(rep.get("seek_resumed")) and float(rep.get("seek_s") or 99) <= 5, seen)
+    base = jellyfin_baseline(need["JF_ITEM"])
+    if base is None:
+        check(f"{tag}: the 4K film plays within 5 s, drops no frame, and a seek to 300 s plays again within 5 s",
+              bool(rep.get("started")) and float(rep.get("startup_s") or 99) <= 5 and seen["width"] >= 3840 and seen["dropped"] == 0
+              and bool(rep.get("seek_resumed")) and float(rep.get("seek_s") or 99) <= 5, seen)
+    else:
+        # judged against the same film played straight from Jellyfin on this machine: what Stream adds, not what
+        # Jellyfin's transcode or this machine's CPU cost both runs alike
+        stalls = lambda r: int((r.get("after_seek") or {}).get("stalls") or 0)
+        check(f"{tag}: the 4K film plays, and starts, seeks, drops frames and stalls within a margin of the same film without Stream",
+              bool(rep.get("started")) and seen["width"] >= base["width"]
+              and float(rep.get("startup_s") or 99) <= float(base["startup_s"]) + JF_MARGIN_S
+              and bool(rep.get("seek_resumed")) and float(rep.get("seek_s") or 99) <= float(base["seek_s"]) + JF_MARGIN_S
+              and (seen["dropped"] or 0) <= base["dropped"] + JF_MARGIN_FRAMES and stalls(rep) <= stalls(base) + 1,
+              {**seen, "baseline": base, "margin_s": JF_MARGIN_S})
     paid = {k: after[k] - before[k] for k in ("buyer_node_paid_msat", "seller_node_received_msat", "wallet_book_settled_msat", "tickets")}
     # the browser counts what it decoded; the seller charges what it sent, about as much for a film
     priced = rep.get("bytes", 0) * JF_PRICE_MSAT // PER_BYTES

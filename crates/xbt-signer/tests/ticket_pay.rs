@@ -1275,6 +1275,43 @@ fn the_balance_a_session_leaves_with_the_seller_is_always_under_one_ticket() {
     }
 }
 
+/// The reader of a streamed body has all of it, and its end, once the body has arrived: not after
+/// the wallet has fetched the seller's last receipt, which over a slow link (a relay far away) is
+/// another round trip or more. Here the seller's status takes 1.5 s; the reader is not kept waiting.
+#[test]
+fn a_streamed_body_ends_for_its_reader_before_the_sellers_last_receipt_is_fetched() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // a first call opens the session, so the second's status is the only slow step
+    r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{MIB}")), "max_sats": CALL, "task": "film"}));
+    r.tap.set(Box::new(|seen, _| {
+        if seen.path.ends_with("/x402/ticket/status") {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+        None
+    }));
+    let l = UnixListener::bind(dir.path().join("page-slow")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        s.read_to_end(&mut all).unwrap();
+        (all.len(), Instant::now())
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{MIB}")), "max_sats": CALL, "task": "film", "stream_to": "page-slow"}));
+    let returned = Instant::now();
+    r.tap.clear();
+    let (got, ended) = reader.join().unwrap();
+    let statuses = r.tap.seen("").iter().filter(|s| s.path.ends_with("/x402/ticket/status")).count();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), got), (Some(200), Some(true), MIB), "{v}");
+    assert!(statuses > 0, "the seller's status was never asked: {:?}", r.tap.seen(""));
+    assert!(returned.duration_since(ended) >= Duration::from_millis(1000),
+            "the reader's body ended only {:?} before the call returned: it waited for the seller's status", returned.duration_since(ended));
+}
+
 /// A body streamed on as it is paid for (`stream_to`), as a local player needs it: the reader at
 /// the socket gets the whole body, the same bytes the receipt signs; and a reader that goes away
 /// ends the call there, with nothing more released.
