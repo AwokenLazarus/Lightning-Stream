@@ -396,8 +396,21 @@ fn receipt_secret() -> SecretKey {
     SecretKey::from_slice(&[9u8; 32]).unwrap()
 }
 
-/// How long the next shop waits for a refill before it ends an answer (the gateway's own default is 3 s).
-static REFILL_WAIT_MS: AtomicU64 = AtomicU64::new(400);
+/// How long the next shop waits for a refill before it ends an answer (the gateway as shipped: 15 s).
+/// Long enough by default that a wallet slowed by a loaded machine is not cut; a test of the seller
+/// ending an answer it was not paid for builds its rig with [`quick_cut`]: those that wait for it to end one.
+static REFILL_WAIT_MS: AtomicU64 = AtomicU64::new(REFILL_WAIT_DEFAULT_MS);
+const REFILL_WAIT_DEFAULT_MS: u64 = 2_000;
+/// A seller that ends an unpaid answer soon, for the tests that wait for it to.
+const QUICK_CUT_MS: u64 = 400;
+
+/// A rig (`make`) whose seller waits only [`QUICK_CUT_MS`] for a refill before it ends an answer.
+fn quick_cut(make: impl FnOnce() -> Rig) -> Rig {
+    REFILL_WAIT_MS.store(QUICK_CUT_MS, Ordering::SeqCst);
+    let r = make();
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    r
+}
 
 /// The gateway's config for a shop. Unless `conf` says otherwise, the shop issues held tickets to
 /// a session that has paid nothing yet and counts no unpaid invoices per address (the gateway
@@ -2415,7 +2428,7 @@ fn no_ticket_is_released_into_an_answer_the_seller_is_still_waiting_to_go_on_wit
     // a seller that waits 3 s for a refill before it ends an answer, as the gateway does by default
     REFILL_WAIT_MS.store(3_000, Ordering::SeqCst);
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
-    REFILL_WAIT_MS.store(400, Ordering::SeqCst);
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
     assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
     // the wallet's node goes away in the middle of a file: the answer ends when the pool is used up, and the seller,
     // which has sent everything that was paid for, goes on waiting for the next ticket
@@ -3516,7 +3529,7 @@ fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
     let _g = env_lock();
     // an invoice for another payee, and one for another amount: refused by the checks every invoice passes, nothing booked
     for (lie, rule) in [(Lie::OtherPayee, "ticket_payee"), (Lie::OtherAmount, "ticket_amount")] {
-        let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+        let r = quick_cut(|| draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}})));
         *r.shop.node.lie.lock().unwrap() = lie;
         let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
         assert_eq!(v["rail"], "lottery", "{v}");
@@ -3934,7 +3947,7 @@ fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
 #[test]
 fn a_win_found_as_the_void_pieces_of_a_cut_answer_are_named_is_paid_in_that_call() {
     let _g = env_lock();
-    let r = draws_rig(json!({}));
+    let r = quick_cut(|| draws_rig(json!({})));
     // the seller's draw endpoint gives no answer to the first values of each answer, seven times in a row: the
     // wallet gives up the answer with those values open. The round that names the void pieces is let through
     let (lost, late) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -4291,7 +4304,7 @@ fn wins_are_paid_by_the_sellers_offer_and_each_once() {
 #[test]
 fn a_call_never_books_above_its_max_sats_and_the_fee_limit_counts() {
     let _g = env_lock();
-    let r = Rig::new(json!({}));
+    let r = quick_cut(|| Rig::new(json!({})));
     // a 1,000-sat ticket books 1,003 with its fee limit: 1,002 is one short
     let v = r.pay("/page/10", 1_002);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["ticket_booking_sats"].as_i64(), v["charged_sats"].as_i64()),
@@ -4562,7 +4575,7 @@ fn throughput_of_a_paid_stream_and_the_longest_gap_at_a_refill() {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("B2_STREAM_DIR", dir.path());
     let prepaid_only = || json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
-    // the gateway waits for a refill as long as it does as shipped (15 s), not the tests' 400 ms
+    // the gateway waits for a refill as long as it does as shipped (15 s), not the tests' 2 s
     REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
     // (route, bytes, max_sats, the shop, how long one payment takes on the buyer's node)
     for (route, n, max_sats, shop, takes) in [("/uhd/", 1024 * MIB, 5_000i64, shipped_shop(), 0u64), ("/hd20/", 512 * MIB, 20_000, shipped_shop(), 0),
@@ -4601,7 +4614,7 @@ fn throughput_of_a_paid_stream_and_the_longest_gap_at_a_refill() {
                  got / MIB, took.as_secs_f64(), v["tickets_released"], v["charged_sats"], worst, p99);
         assert_eq!((got, v["complete"].as_bool()), (n, Some(true)), "{v}");
     }
-    REFILL_WAIT_MS.store(400, Ordering::SeqCst);
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
     std::env::remove_var("B2_STREAM_DIR");
 }
 
@@ -4798,7 +4811,7 @@ fn a_websocket_open_does_not_hold_up_other_requests_to_the_seller() {
     let _g = env_lock();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("B2_STREAM_DIR", dir.path());
-    let r = Rig::new(json!({}));
+    let r = quick_cut(|| Rig::new(json!({})));
     let first = r.pay("/page/10", CALL);
     let sid = first["session"].as_str().unwrap().to_string();
     let l = UnixListener::bind(dir.path().join("sock")).unwrap();

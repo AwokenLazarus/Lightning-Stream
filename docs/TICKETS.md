@@ -388,12 +388,20 @@ a new session is no new start (section 14).
 **An answer priced as it goes.** A body priced per byte or per second (section 1, `price`) is paid
 for while it is sent: the seller takes the price of each piece of the body from the balance before
 it sends that piece, and of each second as it starts. When the balance runs out it stops sending
-and waits a few seconds for more; then it ends the answer, cut short where the buyer can see it
+and waits for more (15 s by default); then it ends the answer, cut short where the buyer can see it
 (a body shorter than its `Content-Length`, or a chunked body with no last chunk). The buyer keeps
 such an answer going with `POST <session>/release {"secrets": ["<s1>", ...]}`: each secret is
 taken as in section 3, steps 2 and 3, and the answer names the hashes `released` and those
 `refused`, each with its code. A buyer that releases one ticket when the last is used up is never
 more than one ticket ahead of what it has received; what it has not used stays its balance.
+This wallet releases the next ticket a little before the last is used up, so that a payment that
+takes a moment does not hold the body up: when what has arrived comes within a lead of what is
+paid for. The lead is twice what arrived while the last ticket's release took, at most half of
+what one ticket pays for; before the answer's first release is timed, 3 s of the body at the
+rate it came, at most half of what is paid for. So right after a release the seller holds up to
+about 1.5 tickets of unspent credit for the answer, falling to nothing as the body arrives
+(answers side by side each draw on the same balance, and each releases only as it needs). The
+seller's wait for a release before it ends an answer is `times.refill_wait_ms`.
 
 The head of such an answer carries a receipt for what was charged before the body (`bodyHash`
 empty, and `"stream": true` beside the receipt). The receipt for the whole answer, with the bytes
@@ -1581,7 +1589,7 @@ the last ticket.
 | A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use. |
 | The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
 | The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | The part of the last released ticket that paid for nothing. |
-| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its 3 s wait for a refill), then releases. | Up to 3 s of waiting. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
+| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its wait for a refill, 15 s by default), then releases. | Up to that wait. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
 | The seller never shows a ticket `ACCEPTED`, and the wallet's own node calls its payment in flight and carries it on no channel (a node killed as it sent it). | The session is stopped (`ticket_session_ended`); the next call opens a new one, with a pool inside what the owner's cap for that seller has left. | Nothing: no secret was released. The ticket counts as locked until the node gives it up. |
