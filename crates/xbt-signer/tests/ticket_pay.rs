@@ -2381,24 +2381,30 @@ fn a_lock_round_that_never_reached_an_invoice_frees_its_places_in_the_pool_at_on
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
     assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
     // the answer to the next lock is lost: its hashes were offered and no invoice came for them
-    let n = Arc::new(AtomicUsize::new(0));
-    let n1 = n.clone();
+    // (the round whose answer was lost, by its own body: a refill of the first call's may come before or after it)
+    let lost_body = Arc::new(Mutex::new(None::<String>));
+    let l1 = lost_body.clone();
     r.tap.set(Box::new(move |seen, real| {
-        if seen.path == "/x402/ticket/lock" && n1.fetch_add(1, Ordering::SeqCst) == 0 {
+        let mut lost = l1.lock().unwrap();
+        if seen.path == "/x402/ticket/lock" && lost.is_none() {
+            *lost = Some(seen.body.clone());
             let _ = real();
             return Some(Err(xbt402::ChannelError::new("transport_error", "connection reset")));
         }
         None
     }));
     // the file goes on all the same: the next round offers new hashes, where it used to find the pool "full" for 2 minutes
-    let v = r.pay(&format!("/files/{}", 12 * MIB), 5_000);
+    // (long enough to need rounds past the lost one, whatever the pool held)
+    let v = r.pay(&format!("/files/{}", 24 * MIB), 5_000);
     r.tap.clear();
-    assert_eq!((v["complete"].as_bool(), v["bytes"].as_u64()), (Some(true), Some(12 * MIB as u64)), "{v}");
+    assert_eq!((v["complete"].as_bool(), v["bytes"].as_u64()), (Some(true), Some(24 * MIB as u64)), "{v}");
     let locks = r.tap.seen("/x402/ticket/lock");
-    let hashes = |i: usize| serde_json::from_str::<Value>(&locks[i].body).unwrap()["hashes"].clone();
-    assert!(locks.len() >= 3 && hashes(1) != hashes(2), "new hashes, never the same again: {}", locks.len());
+    let hashes = |body: &str| serde_json::from_str::<Value>(body).unwrap()["hashes"].clone();
+    let lost_body = lost_body.lock().unwrap().clone().expect("a lock round was lost");
+    let at = locks.iter().position(|l| l.body == lost_body).unwrap();
+    assert!(locks.len() > at + 1 && locks[at + 1..].iter().all(|l| hashes(&l.body) != hashes(&lost_body)), "new hashes, never the same again: {}", locks.len());
     // the invoices of the lost round were never paid
-    let lost: Vec<String> = hashes(1).as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect();
+    let lost: Vec<String> = hashes(&lost_body).as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect();
     assert!(r.ln.state().payments.iter().all(|p| !lost.contains(&p["payment_hash"].as_str().unwrap().to_string())));
     r.assert_booked();
 }
