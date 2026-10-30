@@ -227,7 +227,9 @@ async fn answer_upgrade(mut s: tokio::net::TcpStream, secret: Option<&str>) -> i
     if let Some(want) = secret {
         let name = format!("{}:", TUNNEL_HEADER.to_ascii_lowercase());
         let given = raw.lines().find(|l| l.to_ascii_lowercase().starts_with(&name)).and_then(|l| l.split_once(':')).map(|(_, v)| v.trim()).unwrap_or("");
-        if ring::constant_time::verify_slices_are_equal(given.as_bytes(), want.as_bytes()).is_err() {
+        // compared by their digests, so the time taken says nothing about the secret
+        let digest = |v: &str| ring::digest::digest(&ring::digest::SHA256, v.as_bytes()).as_ref().to_vec();
+        if digest(given) != digest(want) {
             let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
             return Err(io::Error::other("not from the shop's gateway"));
         }

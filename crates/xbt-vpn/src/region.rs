@@ -102,11 +102,42 @@ pub fn parse_trace(body: &str) -> Option<IpAddr> {
 /// change what they say (a plain page, or STUN, it could). Each: address, TLS name, path, and
 /// whether the body is a trace (`ip=` line) or the bare address.
 pub const EGRESS_SOURCES: &[(&str, &str, &str, bool)] = &[
-    ("1.1.1.1:443", "one.one.one.one", "/cdn-cgi/trace", true),
+    ("one.one.one.one:443", "one.one.one.one", "/cdn-cgi/trace", true),
     ("checkip.amazonaws.com:443", "checkip.amazonaws.com", "/", false),
     ("ifconfig.co:443", "ifconfig.co", "/ip", false),
-    ("api.ipify.org:443", "api.ipify.org", "/", false),
+    ("api64.ipify.org:443", "api64.ipify.org", "/", false),
+    ("ipinfo.io:443", "ipinfo.io", "/ip", false),
+    ("ident.me:443", "ident.me", "/", false),
+    ("ifconfig.me:443", "ifconfig.me", "/ip", false),
+    ("www.cloudflare.com:443", "www.cloudflare.com", "/cdn-cgi/trace", true),
 ];
+
+/// How many of [`EGRESS_SOURCES`] one check asks, drawn at random: an exit can't know in advance
+/// which sites to route apart from its buyers' traffic. Best-effort all the same: an exit that
+/// routes every one of them elsewhere is not caught.
+pub const SOURCES_PER_CHECK: usize = 4;
+
+/// `n` distinct indexes into [`EGRESS_SOURCES`], drawn with `rand(i)` (a source of random numbers).
+pub fn pick_sources(n: usize, mut rand: impl FnMut() -> u64) -> Vec<usize> {
+    let mut all: Vec<usize> = (0..EGRESS_SOURCES.len()).collect();
+    // a partial Fisher-Yates shuffle
+    let n = n.min(all.len());
+    for i in 0..n {
+        let j = i + (rand() as usize) % (all.len() - i);
+        all.swap(i, j);
+    }
+    all.truncate(n);
+    all
+}
+
+/// One check over both address families: the IPv4 result stands, unless the exit's IPv6 traffic
+/// (where it has any that the sources agree on) comes out elsewhere, which it then reports.
+pub fn both_families(v4: RegionCheck, v6: Option<RegionCheck>) -> RegionCheck {
+    match (v4, v6) {
+        (RegionCheck::Verified, Some(v6)) if v6 != RegionCheck::Verified && v6 != RegionCheck::Unknown => v6,
+        (v4, _) => v4,
+    }
+}
 
 /// The address the sources agree on: at least `need` of them answered, and every one that
 /// answered said the same. Sources that disagree mean nothing is believed (one of them was lied
@@ -237,6 +268,34 @@ fn year_month(unix_secs: u64, months_back: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sources_are_drawn_at_random_and_never_twice() {
+        let mut seed = 7u64;
+        let mut rand = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let a = super::pick_sources(super::SOURCES_PER_CHECK, &mut rand);
+        assert_eq!(a.len(), super::SOURCES_PER_CHECK);
+        assert!(a.iter().all(|i| *i < super::EGRESS_SOURCES.len()));
+        let mut d = a.clone();
+        d.sort();
+        d.dedup();
+        assert_eq!(d.len(), a.len(), "no source twice");
+        let draws: std::collections::HashSet<Vec<usize>> = (0..20).map(|_| super::pick_sources(super::SOURCES_PER_CHECK, &mut rand)).collect();
+        assert!(draws.len() > 1, "not the same four every time");
+        assert_eq!(super::pick_sources(99, &mut rand).len(), super::EGRESS_SOURCES.len());
+    }
+
+    #[test]
+    fn an_exits_ipv6_traffic_elsewhere_is_caught() {
+        use super::RegionCheck::*;
+        assert_eq!(super::both_families(Verified, None), Verified, "no IPv6 out of the exit: the IPv4 check stands");
+        assert_eq!(super::both_families(Verified, Some(Unknown)), Verified);
+        assert_eq!(super::both_families(Verified, Some(Elsewhere("US".into()))), Elsewhere("US".into()));
+        assert_eq!(super::both_families(Elsewhere("FR".into()), Some(Verified)), Elsewhere("FR".into()));
+    }
+
     use super::*;
 
     #[test]

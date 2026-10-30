@@ -244,7 +244,7 @@ impl Buyer {
 
     /// Whether `id` is held off (a tunnel that died young, or terms above its announcement).
     pub fn is_held_off(&self, id: &str) -> bool {
-        let mut h = self.held_off.lock().unwrap_or_else(|e| e.into_inner());
+        let h = self.held_off.lock().unwrap_or_else(|e| e.into_inner());
         match h.get(id) {
             Some((until, _)) if Instant::now() < *until => true,
             _ => false,
@@ -358,23 +358,28 @@ impl Buyer {
         let read = async {
             let conn = self.carrier_once(id).await?;
             let egress = match test_echo {
-                Some((echo, host, path)) => Self::egress_from(&conn, echo, &host, &path, true, None).await,
+                Some((echo, host, path)) => Self::egress_from(&conn, echo, &host, &path, true, None).await.map(|a| (a, None)),
                 None => {
                     // the sources' names are looked up here, by the buyer's own resolver; the requests go through the exit
                     let mut roots = rustls::RootCertStore::empty();
                     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                     let tls = Arc::new(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                         .with_safe_default_protocol_versions().ok()?.with_root_certificates(roots).with_no_client_auth());
-                    let ask = |i: usize| {
-                        let (at, host, path, trace) = region::EGRESS_SOURCES[i];
+                    // four of the pool, drawn at random for this check; each asked over IPv4 and IPv6
+                    let picked = region::pick_sources(region::SOURCES_PER_CHECK, || u64::from_le_bytes(rand_secret()[..8].try_into().unwrap_or([0; 8])));
+                    let ask = |n: usize, v6: bool| {
+                        let i = picked.get(n).copied();
                         let (conn, tls) = (&conn, &tls);
                         async move {
-                            let to = tokio::net::lookup_host(at).await.ok()?.find(SocketAddr::is_ipv4)?;
+                            let (at, host, path, trace) = region::EGRESS_SOURCES[i?];
+                            let to = tokio::net::lookup_host(at).await.ok()?.find(|a| a.is_ipv6() == v6)?;
                             tokio::time::timeout(Duration::from_secs(15), Self::egress_from(conn, to, host, path, trace, Some(tls))).await.ok().flatten()
                         }
                     };
-                    let (a, b, c, d) = tokio::join!(ask(0), ask(1), ask(2), ask(3));
-                    region::egress_quorum(&[a, b, c, d], 2)
+                    let (a, b, c, d, e, f, g, h) = tokio::join!(ask(0, false), ask(1, false), ask(2, false), ask(3, false),
+                                                                ask(0, true), ask(1, true), ask(2, true), ask(3, true));
+                    let v6 = region::egress_quorum(&[e, f, g, h], 2).filter(std::net::IpAddr::is_ipv6);
+                    region::egress_quorum(&[a, b, c, d], 2).map(|v4| (v4, v6))
                 }
             };
             if let Carrier::Tunnel(m) = &conn {
@@ -382,13 +387,14 @@ impl Buyer {
             }
             egress
         };
-        let Some(egress) = tokio::time::timeout(Duration::from_secs(30), read).await.ok().flatten() else { return self.noted(id, announced, RegionCheck::Unknown) };
+        let Some((egress, egress_v6)) = tokio::time::timeout(Duration::from_secs(30), read).await.ok().flatten() else { return self.noted(id, announced, RegionCheck::Unknown) };
         let rtt = self.link.path(id).map(|p| match p {
             xbt_iroh_link::Path::Direct { rtt_ms, .. } | xbt_iroh_link::Path::Relay { rtt_ms, .. } => rtt_ms as f64,
         });
         let home = self.home_country.read().unwrap_or_else(|e| e.into_inner()).clone();
         let km = home.and_then(|h| region::km_between(&h, announced));
-        self.noted(id, announced, region::check(&geo, announced, egress, rtt, km))
+        let v6 = egress_v6.map(|a| region::check(&geo, announced, a, None, None));
+        self.noted(id, announced, region::both_families(region::check(&geo, announced, egress, rtt, km), v6))
     }
 
     fn noted(&self, id: &str, announced: &str, r: RegionCheck) -> RegionCheck {
