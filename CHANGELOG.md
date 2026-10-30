@@ -64,6 +64,10 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A hashmaker rents out only miners that have connected and named themselves, so a rental never
   gets a silent connection that does no work.
 
+**Linux**
+- The installer refuses a chain name the node doesn't use (for example mainnet instead of main) and
+  says which to use.
+
 ## 0.1.19 (2026-10-29)
 
 **Paying**
