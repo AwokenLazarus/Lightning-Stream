@@ -1620,8 +1620,20 @@ impl Gateway {
             Ok(p) => p,
             Err(why) => return Reply::Whole(error(400, "bad_target", why)),
         };
+        // A request that carries a payment is answered with a receipt whatever happens to it: one
+        // sent without asking the price first (a buyer that knows the route's terms) may be for a
+        // path that is refused, unknown or free, and an answer to a payment nobody signed is the
+        // seller's fault to its buyer. Refused here, it is charged nothing.
+        let signed = |r: Response| -> Reply {
+            if let Ok(Some(pay)) = self.pay_header(&req) {
+                if let Ok(a) = self.authenticate(&req, &pay, None) {
+                    return Reply::Whole(self.answered(&a, r, 0));
+                }
+            }
+            Reply::Whole(r)
+        };
         let Some(route) = self.cfg.route(&path) else {
-            return Reply::Whole(error(
+            return signed(error(
                 404,
                 "no_route",
                 "nothing is sold or served at this path",
@@ -1629,7 +1641,17 @@ impl Gateway {
         };
         if route.path_refused(&path) {
             // before payment and before the service: nothing is charged, and the service never sees it
-            return Reply::Whole(error(403, "path_refused", "the seller does not serve this path to buyers"));
+            return signed(error(403, "path_refused", "the seller does not serve this path to buyers"));
+        }
+        // a paid request for what is free here (a list of models, a free route): not served as paid,
+        // nothing charged, and the buyer asks again as anyone does
+        let free_here = Self::model_list(&req, &path, route) || route.free;
+        if free_here {
+            if let Ok(Some(pay)) = self.pay_header(&req) {
+                if let Ok(a) = self.authenticate(&req, &pay, None) {
+                    return Reply::Whole(self.refused(&a, &self.req_url(&req), None, Refusal::TermsChanged));
+                }
+            }
         }
         // An AI model's list of models is free to read: a buyer needs it to choose a model before
         // paying, and it costs the service nothing.
@@ -1637,7 +1659,7 @@ impl Gateway {
             return self.free(&req, route);
         }
         if !route.methods.iter().any(|m| m == &req.method) {
-            return Reply::Whole(error(
+            return signed(error(
                 405,
                 "method_not_allowed",
                 "this route does not take that method",

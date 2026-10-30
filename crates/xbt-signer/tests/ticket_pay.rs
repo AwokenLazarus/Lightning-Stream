@@ -1319,7 +1319,36 @@ fn terms_kept_for_another_route_are_refused_unpaid_and_the_price_is_asked() {
     assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some("500")), "{v}");
     let sent: Vec<bool> = r.tap.seen("/tiny/1").iter().map(|s| s.paid).collect();
     assert_eq!(sent, vec![true, false, true], "paid on the kept terms, refused, asked, paid: {sent:?}");
-    assert!(r.status()["sellers"][0]["seller_fault"].is_null(), "{}", r.status());
+    // the kept terms claim the whole shop again: a path the seller has no route for, and a free one, are
+    // answered as anyone's would be, signed and charged nothing, and the session goes on
+    let claim_all = |r: &Rig, page: &str| {
+        r.tap.set(Box::new(|seen, real| {
+            if seen.paid || !seen.path.starts_with("/page/") {
+                return None;
+            }
+            let (status, mut headers, body) = whole(real().ok()?);
+            if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+                let mut pr = unb64json(v).unwrap();
+                for e in pr["accepts"].as_array_mut().unwrap() {
+                    e["extra"]["route"] = "/".into();
+                }
+                *v = b64json(&pr);
+            }
+            Some(Ok(answer(status, headers, body)))
+        }));
+        let v = r.pay(page, CALL);
+        r.tap.clear();
+        v["session"].as_str().unwrap().to_string()
+    };
+    let session = claim_all(&r, "/page/300");
+    let nowhere = r.pay("/nowhere", CALL);
+    assert_eq!((nowhere["status"].as_u64(), nowhere.get("seller_fault")), (Some(404), None), "{nowhere}");
+    assert_eq!(r.tap.seen("/nowhere").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![true], "sent paid, answered with a receipt");
+    assert_eq!(claim_all(&r, "/page/500"), session, "the session goes on");
+    let free = r.pay("/free/10", CALL);
+    assert_eq!((free["status"].as_u64(), free["charged_sats"].as_i64(), free.get("seller_fault")), (Some(200), Some(0), None), "{free}");
+    assert_eq!(r.tap.seen("/free/10").iter().map(|s| s.paid).collect::<Vec<_>>(), vec![true, false], "paid, refused unpaid, asked: free");
+    assert_eq!(r.pay("/page/400", CALL)["session"].as_str(), Some(session.as_str()), "the session goes on");
 }
 
 /// The reader of a streamed body has all of it, and its end, once the body has arrived: not after
@@ -1997,7 +2026,8 @@ fn terms_that_change_under_an_open_session_stop_it_and_pay_nothing_more() {
         }
         Some(Ok(answer(status, headers, body)))
     }));
-    let v = r.pay("/page/10", CALL);
+    // a route the wallet has not asked before: a page of a route it knows is paid on the terms it was told
+    let v = r.pay("/api", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["stopped"]["cancel_sent"].as_bool()), (Some("deny"), Some("ticket_terms_changed"), Some(true)), "{v}");
     assert_eq!(r.tap.secrets().len(), 1, "no secret after the terms changed");
     wait_for("the unused tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty());

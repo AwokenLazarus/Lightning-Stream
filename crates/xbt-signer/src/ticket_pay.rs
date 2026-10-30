@@ -2075,7 +2075,10 @@ impl Signer {
                     return deny("xbt402", "402 without a readable PAYMENT-REQUIRED");
                 };
                 drop(probe);
-                self.route_terms_keep(&origin, &pr);
+                // a GET's terms only: a HEAD's leave out the draw entry a GET would be offered
+                if method == "GET" {
+                    self.route_terms_keep(&origin, &pr);
+                }
                 pr
             }
         };
