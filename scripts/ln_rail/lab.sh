@@ -29,4 +29,12 @@ if [ ! -x "$LAB/bin/lnd" ] || [ ! -x "$LAB/bin/lncli" ] || [ "$(cat "$LAB/bin/.t
 fi
 docker image inspect knots-blake2b:final-zmq >/dev/null 2>&1 || \
   (cd "$LAB/knots" && DOCKER_BUILDKIT=0 docker build --cpuset-cpus=0-3 -t knots-blake2b:final-zmq .)
-(cd "$LAB" && docker compose build -q lf1)
+# LAB_PREBUILT_IMAGES=1: a lab machine whose lightning-fork:dev image was loaded ready-made (docker
+# load, no build cache) keeps it, as long as bin/.image-tags says it holds the binaries bin/.tags names;
+# rebuilding it there would fetch its Debian packages again
+if [ "${LAB_PREBUILT_IMAGES:-0}" = 1 ] && docker image inspect lightning-fork:dev >/dev/null 2>&1 &&
+  [ "$(cat "$LAB/bin/.image-tags" 2>/dev/null)" = "$(cat "$LAB/bin/.tags")" ]; then
+  :
+else
+  (cd "$LAB" && docker compose build -q lf1)
+fi
