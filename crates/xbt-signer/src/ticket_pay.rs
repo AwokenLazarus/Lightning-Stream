@@ -1848,11 +1848,6 @@ impl Signer {
         }
         let mut range_headers: Vec<(String, String)> = range.iter().map(|r| ("Range".to_string(), r.header())).collect();
         range_headers.extend(extra.iter().cloned());
-        // the session open with this seller, named in the ask of the price: a seller whose route is full
-        // goes on serving a buyer it serves there (docs/CAPACITY.md)
-        if let Some(sid) = self.ticket_seller_sid(&origin) {
-            range_headers.push(("PAYMENT-SESSION".into(), sid));
-        }
         // the owner's word before any request leaves: an allowlisted origin, or a task that pays any seller
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
@@ -1892,19 +1887,37 @@ impl Signer {
             (Ok(l), Ok(c)) => (l, c),
             (Err(e), _) | (_, Err(e)) => return deny("xbt402", e.msg),
         };
-        let probe = if upgrade {
-            // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
-            match self.wire_upgrade(&url, &range_headers, Self::ticket_read_timeout(&tp)) {
-                Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
-                Ok(u) => Ok(u.answer),
-                Err(e) => Err(e),
+        // the session open with this seller, named in the ask of the price: a seller whose route is full
+        // goes on serving a buyer it serves there (docs/CAPACITY.md)
+        let mut named = self.ticket_seller_sid(&origin, false);
+        let mut probe = loop {
+            let mut headers = range_headers.clone();
+            if let Some(sid) = &named {
+                headers.push(("PAYMENT-SESSION".into(), sid.clone()));
             }
-        } else {
-            self.wire(&method, &url, &raw, &range_headers, Self::ticket_read_timeout(&tp))
-        };
-        let mut probe = match probe {
-            Ok(a) => a,
-            Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
+            let probe = if upgrade {
+                // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
+                match self.wire_upgrade(&url, &headers, Self::ticket_read_timeout(&tp)) {
+                    Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
+                    Ok(u) => Ok(u.answer),
+                    Err(e) => Err(e),
+                }
+            } else {
+                self.wire(&method, &url, &raw, &headers, Self::ticket_read_timeout(&tp))
+            };
+            let probe = match probe {
+                Ok(a) => a,
+                Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
+            };
+            // busy while another call was opening the session with this seller (a page's first parts at
+            // once): asked again as that session's buyer, once it is open
+            if probe.status == 503 && named.is_none() {
+                named = self.ticket_seller_sid(&origin, true);
+                if named.is_some() {
+                    continue;
+                }
+            }
+            break probe;
         };
         // a seller whose service is full turns a new visit away before it is sold anything
         if probe.status == 503 {
@@ -2367,10 +2380,11 @@ impl Signer {
     /// (its id and key are written to the book before anything is paid), or a later, authenticated
     /// one. `Ok`: the seller's answer. A seller that answers `slots_short` is not failing: the
     /// session locks nothing until its `retryAfter` has passed, and the refusal says so.
-    /// The seller's id of the session open with `origin`, if one is and no call is opening one now.
-    fn ticket_seller_sid(&self, origin: &str) -> Option<String> {
+    /// The seller's id of the session open with `origin`, if one is. While a call is opening one: none,
+    /// or with `wait`, the one it opened.
+    fn ticket_seller_sid(&self, origin: &str, wait: bool) -> Option<String> {
         let slot = lock(&self.ticket_http).get(origin).cloned()?;
-        let open = slot.open.try_lock().ok()?;
+        let open = if wait { lock(&slot.open) } else { slot.open.try_lock().ok()? };
         let sid = lock_link(open.as_ref()?).seller_sid.clone();
         (!sid.is_empty()).then_some(sid)
     }

@@ -2816,6 +2816,35 @@ fn a_full_route_goes_on_serving_this_wallet_at_new_addresses() {
     }
 }
 
+/// A page's first parts go out at once: one call opens the session while the others ask the price.
+/// One that a route just filled by that very session turns away is asked again, once the session is
+/// open, as that session's buyer, and is served.
+#[test]
+fn the_first_parts_of_a_page_are_served_while_their_session_opens_on_a_route_it_fills() {
+    let _g = env_lock();
+    let r = Arc::new(Rig::with(json!({}), true, false, 483, json!({"tickets": {"max_tickets": 8}, "caps": {"sessions_per_address": 0, "inbound_slots": 483},
+                                                                  "capacity": {"/page/": {"max_buyers": 2}}})));
+    assert_eq!(rival_seat(&r.shop.origin, "/page/"), 200, "one place of two taken");
+    // the session's first lock takes the last place, then the session takes a while to open
+    let mut slow = true;
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path == "/x402/ticket/lock" && !seen.paid && std::mem::take(&mut slow) {
+            let got = real();
+            std::thread::sleep(Duration::from_millis(800));
+            return Some(got);
+        }
+        None
+    }));
+    let first = { let r = r.clone(); std::thread::spawn(move || r.pay("/page/100", CALL)) };
+    std::thread::sleep(Duration::from_millis(300));
+    let second = r.pay("/page/101", CALL);
+    let first = first.join().unwrap();
+    for v in [&first, &second] {
+        assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+    }
+    assert_eq!(first["session"], second["session"]);
+}
+
 /// Between this wallet's ask of the price and its first lock, other buyers can fill the route: the
 /// first lock names the address, the seller sells nothing to a buyer it would not serve, and the
 /// wallet says the shop is busy, having paid nothing and kept no session.
