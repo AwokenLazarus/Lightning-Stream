@@ -64,6 +64,9 @@ if (loginForm && TAP) {
   await ev(`(()=>{const f=document.querySelector('form.manualLoginForm'); const b=f&&f.querySelector('button[type=submit]'); if(b){b.click(); return true} return false})()`);
   await sleep(6000);
 }
+// signed in once the web client has a user: over a slow link, seconds after the tap or the submit
+const signedIn = await waitFor("(()=>{try{return !!(window.ApiClient && window.ApiClient.getCurrentUserId())}catch(e){return false}})()", Number(process.env.JF_LOGIN_WAIT_MS || 90000));
+step(`signed in: ${signedIn}`);
 await shot("02-after-login");
 res.after_login = await ev("location.href"); step(`after login: ${res.after_login}`);
 const home = await waitFor("!!document.querySelector('.card, .itemsContainer .card')", 20000);
