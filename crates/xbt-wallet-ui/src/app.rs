@@ -89,11 +89,12 @@ pub(crate) struct Ctx {
     pub(crate) flash: Option<(bool, String)>,
 }
 
-const INT_KEYS: [(&str, &str, &str); 12] = [
+const INT_KEYS: [(&str, &str, &str); 13] = [
     ("max_per_tx_sats", "Largest single payment (sats)", "budgets"),
     ("daily_budget_sats", "Spending limit for any 24 hours (sats)", "budgets"),
     ("weekly_budget_sats", "Spending limit for any 7 days (sats)", "budgets"),
     ("per_counterparty_cap_sats", "Most to any one seller in 7 days (sats)", "budgets"),
+    ("per_counterparty_daily_sats", "Most to any one seller in 24 hours (sats)", "budgets"),
     ("human_threshold_sats", "Ask me first for a payment of at least (sats)", "human"),
     ("approval_ttl_s", "A request for your approval expires after (seconds)", "human"),
     ("split_window_s", "Smaller payments to one seller within this many seconds count as one (so a large payment can't be split to avoid asking you)", "human"),
@@ -130,7 +131,7 @@ pub fn starter_exposure_cap(held: i64) -> i64 {
 
 /// The money limits the plain form never pre-fills above their mainnet starter value from the
 /// signer's built-in defaults (which are for test chains). For these, a larger number trusts more.
-const MAINNET_CAPPED_KEYS: [&str; 7] = ["max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+const MAINNET_CAPPED_KEYS: [&str; 8] = ["max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats", "per_counterparty_daily_sats",
                                          "human_threshold_sats", "hot_balance_cap_sats", "velocity_max"];
 
 /// Whether paying over Lightning is turned on in `p`.
@@ -151,11 +152,11 @@ pub fn starter_policy(chain: &str) -> Value {
 /// in its channels now ([`starter_exposure_cap`]); `None`: the least cap.
 pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
     let mut p = json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
-           "per_counterparty_cap_sats": 100000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
+           "per_counterparty_cap_sats": 100000, "per_counterparty_daily_sats": 20000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
            "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300,
            "ln": {"enabled": true}, "tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 100000}, "hashrate": {"budget_sats": 100000}}}});
     if chain == "main" {
-        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000),
+        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000), ("per_counterparty_daily_sats", 5000),
                        ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
             p[k] = json!(v);
         }
@@ -274,10 +275,25 @@ impl App {
         // the session's stream token: only a page of the wallet's own knows it (another page of the box sends
         // the cookie with what it asks for, but cannot read the token), so only the wallet's own page pays
         let token = path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).map(|(t, _)| t).unwrap_or("");
+        // `<token>.<service id>`: the service is only which price applies, never what the token proves
+        let token = token.split_once('.').map_or(token, |(t, _)| t);
         if !crate::ct_eq(token.as_bytes(), stream_token(&csrf).as_bytes()) {
             return Some(Err(Resp::text(403, "text/plain", "refused: a stream this page did not ask for")));
         }
         Some(Ok(None))
+    }
+
+    /// The listing's prices of the service the buyer chose for the relayed `item`, as the call's
+    /// `price_ceiling`: from a player's link, the service it was made for; from a Download
+    /// (`/s/~<token>.<service id>/`), the service it names. `None`: that service lists no price.
+    pub fn relay_ceiling(&self, req: &Req, item: &str) -> Option<Value> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        let service = match path.strip_prefix("/r/") {
+            Some(token) => self.relays.service_of(token)?,
+            None => path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).and_then(|(t, _)| t.split_once('.')).map(|(_, s)| s.to_string())?,
+        };
+        let all = self.services().ok()?;
+        crate::services::find_item_of(&all, &service, item).and_then(|(s, _)| s.price_ceiling())
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {
@@ -580,6 +596,8 @@ impl App {
             "/deny" => back("./approvals", self.call("deny_approval", json!({"token": g("token"), "reason": g("reason"), "expiry": i("expiry"), "signature": sig()})),
                             &|_| "Denied.".into()),
             "/policy" => self.policy_preview(ctx, f),
+            "/seller-unblock" => back("./policy", self.call("seller_unblock", json!({"block": g("block"), "expiry": i("expiry"), "signature": sig()})),
+                                      &|_| "Unblocked. The app may buy from this shop again.".into()),
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
             "/policy-apply" => back(if self.ack_needed() { "./lightning#ack" } else { "./policy" }, self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
                                                                               "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
@@ -973,6 +991,39 @@ impl App {
         self.page("Spending rules", ctx, b)
     }
 
+    /// Shops the wallet caught charging more than they delivered: blocked until the owner lifts it
+    /// with the approval key. Each shows the three it is blocked by and the evidence.
+    fn blocked_sellers(&self, ctx: &Ctx) -> String {
+        let list = self.call("seller_blocks", json!({})).ok().and_then(|v| v["blocked"].as_array().cloned()).unwrap_or_default();
+        if list.is_empty() {
+            return String::new();
+        }
+        let human = self.human_pub();
+        let mut b = String::from("<section id=\"blocked\"><h2>Shops blocked for overcharging</h2><p>The app caught these shops charging more than \
+            they delivered. It stopped paying them at once and buys nothing more from them, and pays them no lottery win, until you unblock \
+            them with your approval key. A shop is blocked by its Lightning node, its receipt key and its address: changing one of them \
+            does not lift the block.</p>");
+        for e in &list {
+            let id = txt(e.get("id"));
+            let receipt = e["evidence"]["receipt"].clone();
+            let rows = [("Address", esc(&txt(e.get("origin")))), ("Lightning node", format!("<code>{}</code>", esc(&txt(e.get("payee"))))),
+                        ("Receipt key", format!("<code>{}</code>", esc(&txt(e.get("receipt_key"))))), ("What it did", esc(&txt(e.get("reason")))),
+                        ("When", utc(int(e.get("ts"))))];
+            b.push_str("<div class=\"card\">");
+            b.push_str(&kv(&rows));
+            if !receipt.is_null() {
+                b.push_str(&format!("<details><summary>The receipt it signed (evidence)</summary><pre>{}</pre></details>",
+                                    esc(&serde_json::to_string_pretty(&receipt).unwrap_or_default())));
+            }
+            let sexp = now() + SIGN_WINDOW_S;
+            b.push_str(&self.signed_form(ctx, "./seller-unblock", "unblock", &human, &[("block", id.clone()), ("expiry", sexp.to_string())], "",
+                                         "Unblock", Ext::Bytes(msg::unblock(&id, sexp))));
+            b.push_str("</div>");
+        }
+        b.push_str("</section>");
+        b
+    }
+
     fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
@@ -980,6 +1031,7 @@ impl App {
         };
         let mut b = String::from("<p class=\"lead\">The rules the wallet applies to every payment an app or an agent asks for. A change takes \
             effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
+        b.push_str(&self.blocked_sellers(ctx));
         let pr = cur["pending_restart"].as_array().cloned().unwrap_or_default();
         if !pr.is_empty() {
             let hint = self.cfg.restart_hint.clone();

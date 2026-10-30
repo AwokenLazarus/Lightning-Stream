@@ -165,6 +165,7 @@ class Wallet:
             "daily_budget_sats": 4_000_000,
             "weekly_budget_sats": 8_000_000,
             "per_counterparty_cap_sats": 4_000_000,
+            "per_counterparty_daily_sats": 4_000_000,
             "velocity_max": 1_000,
             "velocity_window_s": 3600,
             "human_threshold_sats": 40_000,
@@ -942,6 +943,12 @@ def stream() -> None:
 def lie(name: str, what: str, act: Any, expect: Any, most_tickets: int) -> None:
     """One lie: `act` makes the paid calls with the proxy in mode `name`; `expect` judges the last reply."""
     stop_sessions()
+    # each case starts clean: a seller the last case caught over-charging is blocked, and the owner lifts it (the lab
+    # has no approval key to sign the unblock with, so it clears the signer's block file, as the owner's signed
+    # message would)
+    blocks = f"{WALLET}/.run/blocked_sellers.json"
+    if os.path.exists(blocks):
+        os.remove(blocks)
     before = money()
     paid_before = set(buyer_payments())
     Lies.mode, Lies.kept_receipt = None, None

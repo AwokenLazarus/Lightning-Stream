@@ -108,14 +108,17 @@ impl App {
     pub(crate) fn file_link(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let item_url = f.get("item").map(|s| s.trim().to_string()).unwrap_or_default();
         let all = self.services().unwrap_or_default();
-        let Some((svc, _)) = services::find_item(&all, &item_url).filter(|(s, _)| s.has_files()) else {
+        // the service the buyer chose, where several list the file; else the first that does
+        let chosen = f.get("service").map(|s| s.trim().to_string()).unwrap_or_default();
+        let found = services::find_item_of(&all, &chosen, &item_url).or_else(|| services::find_item(&all, &item_url));
+        let Some((svc, _)) = found.filter(|(s, _)| s.has_files()) else {
             self.flash(ctx, false, "That file is not in your list of services.");
             return Resp::redirect("./browse?cat=files");
         };
         let back = format!("./service?seller={}&name={}", services::urlenc(&svc.seller), services::urlenc(&svc.name));
         match f.get("action").map(String::as_str) {
             Some("create") => {
-                self.relays.create(&item_url);
+                self.relays.create_for(&item_url, &svc.id());
                 self.flash(ctx, true, format!("Link made: copy it into your player. It plays this file only, and stops working in {}.", lasts(self.cfg.relay_ttl)));
             }
             Some("revoke") => {
@@ -400,10 +403,12 @@ fn files_html(ctx: &Ctx, s: &Service, own: bool, base: &str, links: &dyn Fn(&str
             (Some(n), Some(p)) => about_sats(n, p),
             _ => esc(&s.price_text),
         };
+        // a service not chosen from a listing has no price the app can hold the seller to: said, not hidden
+        let price = if s.prices.is_object() { price } else { format!("{price}<br><span class=\"small\">no listed price</span>") };
         let actions = if own {
             String::new()
         } else {
-            let dl = match services::download_src(&token, &item.url) {
+            let dl = match services::download_src(&token, &s.id(), &item.url) {
                 Ok(src) => format!("<a class=\"button-link\" href=\"{}\" download>Download</a>", esc(&src)),
                 Err(_) => String::new(),
             };
@@ -420,7 +425,8 @@ fn files_html(ctx: &Ctx, s: &Service, own: bool, base: &str, links: &dyn Fn(&str
             }
             format!("<div class=\"row\">{dl}<form method=\"post\" action=\"./file-link\" class=\"inline\">{csrf}\
                 <input type=\"hidden\" name=\"action\" value=\"create\"><input type=\"hidden\" name=\"item\" value=\"{}\">\
-                <button class=\"secondary\" type=\"submit\">Open in your player</button></form></div>{l}", esc(&item.url))
+                <input type=\"hidden\" name=\"service\" value=\"{}\">\
+                <button class=\"secondary\" type=\"submit\">Open in your player</button></form></div>{l}", esc(&item.url), esc(&s.id()))
         };
         b.push_str(&format!("<tr><td><strong>{}</strong>{note}</td><td>{size}</td><td>{price}</td><td>{actions}</td></tr>", esc(&item.title)));
     }
@@ -706,5 +712,55 @@ mod tests {
         let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| false);
         assert!(html.contains("cat-hashrate") && html.contains("Rent miners by the piece of work") && html.contains("href=\"./hashrate\""), "{html}");
         assert!(service_html(&all[0], false).contains("href=\"./hashrate\""));
+    }
+
+    /// Two services list the same file at different prices: the Download and the player's link carry
+    /// the service the buyer chose, and the relay takes that one's prices; a service with no listed
+    /// price says so.
+    ///
+    /// FAILS before: the file was found as the first service that lists it, whatever the buyer chose.
+    #[test]
+    fn a_file_is_paid_at_the_price_of_the_service_the_buyer_chose() {
+        let url = "https://box.example/files/a.mkv";
+        let item = services::Item { title: "A".into(), year: String::new(), url: url.into(), credit: "1 GiB".into() };
+        let svc = |name: &str, byte_msat: u64| Service { name: name.into(), kind: Kind::Files, seller: "https://box.example".into(),
+            price_text: "1 sat a MiB".into(), prices: json!({"byte_msat": byte_msat, "per_bytes": 1_048_576}), items: vec![item.clone()],
+            address: String::new(), app: String::new(), app_base: String::new() };
+        let (cheap, dear) = (svc("Cheap", 1_000), svc("Dear", 9_000));
+        let all = vec![cheap.clone(), dear.clone()];
+        assert_ne!(cheap.id(), dear.id());
+        let (chosen, _) = services::find_item_of(&all, &dear.id(), url).unwrap();
+        assert_eq!(chosen.price_ceiling(), dear.price_ceiling(), "the chosen one, not the first that lists the file");
+        assert!(services::download_src("tok", &dear.id(), url).unwrap().starts_with(&format!("./s/~tok.{}/", dear.id())));
+        let links = crate::relay::RelayLinks::new(std::time::Duration::from_secs(60));
+        let t = links.create_for(url, &dear.id());
+        assert_eq!(links.service_of(&t).as_deref(), Some(dear.id().as_str()));
+        // with no listed price, the page says so
+        let ctx = crate::app::Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let mut plain = cheap.clone();
+        plain.prices = serde_json::Value::Null;
+        assert!(files_html(&ctx, &plain, false, "http://x/", &|_| vec![]).contains("no listed price"));
+        assert!(!files_html(&ctx, &cheap, false, "http://x/", &|_| vec![]).contains("no listed price"));
+    }
+
+    /// A service chosen from a listing keeps the listing's prices, through the services file, as
+    /// the ceiling the app pays it at; one not from a listing has none.
+    #[test]
+    fn a_service_keeps_its_listings_prices_as_its_price_ceiling() {
+        let section = xbt402::listing::Section { name: "Films".into(), kind: "files".into(), path: "/files/".into(),
+            prices: json!({"request_msat": "0", "byte_msat": 1000, "per_bytes": 1_048_576}), items: vec![], licence: String::new(), credits: String::new() };
+        let l = xbt402::listing::Listing { name: "Box".into(), kind: "files".into(), seller: "https://box.example".into(), receipt_key: String::new(),
+            prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
+        let all = services::from_listing(&l);
+        let want = xbt402::listing::price_ceiling(&l.prices);
+        assert_eq!(all[0].price_ceiling(), Some(want.clone()));
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("services.json");
+        services::save(&p, &all).unwrap();
+        let back = services::load(&p).unwrap();
+        assert_eq!(back[0].price_ceiling(), Some(want), "kept through the file");
+        let mut plain = back[0].clone();
+        plain.prices = serde_json::Value::Null;
+        assert_eq!(plain.price_ceiling(), None);
     }
 }

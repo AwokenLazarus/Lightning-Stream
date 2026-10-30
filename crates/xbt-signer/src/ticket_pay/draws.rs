@@ -207,6 +207,13 @@ impl Signer {
             Ok(t) => t,
             Err((rule, why)) => return Tried::Next(format!("{rule}: {why}")),
         };
+        // a seller caught over-charging is paid no draw until the owner lifts the block
+        let rk = hex::encode(&terms.receipt_key);
+        if let Some(b) = self.seller_blocks.get(&crate::seller_block::Seller { payee: &terms.payee, receipt_key: &rk, origin: c.origin }) {
+            return Tried::Done(with(deny("seller_blocked", format!("this seller was caught charging more than it delivered ({}) and is blocked: \
+                                                                   the owner can unblock it on the Spending rules page",
+                                                                  b["reason"].as_str().unwrap_or_default())), json!({"seller_blocked": b["id"]})));
+        }
         if !private_channel(c.origin) {
             return Tried::Next("draws are paid over https, or over http to this machine only (127.0.0.1, ::1, localhost): on a plain connection a \
                                 listener learns the session key".into());
@@ -557,6 +564,12 @@ impl Signer {
     /// a refusal by the owner's bounds stops the call asking for more. `first`: the seller stands
     /// still for this win already.
     fn draw_pay(&self, ds: &DrawSession, win: &Win, invoice: &str, first: bool, counted: &Mutex<Counted>) {
+        // a seller blocked since the draw (another session of it over-charged) is paid no win
+        let rk = hex::encode(&ds.terms.receipt_key);
+        if self.seller_blocks.get(&crate::seller_block::Seller { payee: &ds.terms.payee, receipt_key: &rk, origin: &ds.origin }).is_some() {
+            let _ = self.draw_fault(ds, "the seller is blocked for over-charging: no win is paid to it");
+            return;
+        }
         lock(&ds.state).paying.insert(win.draw());
         // the seller's offer first, where its terms name one, with the note that names this session and draw; its
         // invoice where the offer cannot be fetched

@@ -981,7 +981,8 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     // an older film listing (no web app) is files: each to download or open in the buyer's own player, no player here
     let media = br.get(&format!("/service?seller={}&name={}", enc("https://stream.lazarus-xbt.xyz"), enc("Alpha films"))).body;
     let token = xbt_wallet_ui::app::stream_token(&field(&media, "csrf"));
-    assert!(media.contains("Big Buck Bunny") && media.contains(&format!("href=\"./s/~{token}/{FILM}\" download>Download</a>")), "{media}");
+    // the Download names the service it is bought from: `./s/~<token>.<service id>/<file>`
+    assert!(media.contains("Big Buck Bunny") && media.contains(&format!("href=\"./s/~{token}.")) && media.contains(&format!("/{FILM}\" download>Download</a>")), "{media}");
     assert!(media.contains("Open in your player") && media.contains("20 sat a MiB"), "{media}");
     assert!(!media.contains("./play?") && !media.contains("<video"), "the app has no player: {media}");
     assert_eq!(br.get(&format!("/play?item={}", enc(FILM))).status, 404, "no player page");

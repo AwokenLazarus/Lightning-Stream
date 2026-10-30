@@ -122,6 +122,9 @@ impl Decision {
 }
 
 /// B2's `PolicyConfig` (policy.json), defaults included.
+/// What one seller is paid at most in 24 hours where policy.json does not say.
+pub const DEFAULT_PER_COUNTERPARTY_DAILY_SATS: i64 = 20_000;
+
 #[derive(Debug, Clone)]
 pub struct PolicyConfig {
     pub allowlist: Vec<String>,
@@ -129,6 +132,11 @@ pub struct PolicyConfig {
     pub daily_budget_sats: i64,
     pub weekly_budget_sats: i64,
     pub per_counterparty_cap_sats: i64,
+    /// What one seller may be paid in a day (the last 24 hours), beside its weekly cap. Absent from
+    /// policy.json (one written before the key): [`DEFAULT_PER_COUNTERPARTY_DAILY_SATS`] for a wallet
+    /// that buys with stream tickets, so it gets a daily cap without its owner signing the policy
+    /// again; none for another (its decisions stay as they were).
+    pub per_counterparty_daily_sats: i64,
     pub velocity_max: i64,
     pub velocity_window_s: i64,
     pub human_threshold_sats: i64,
@@ -151,7 +159,7 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self { allowlist: vec![], max_per_tx_sats: 10_000_000, daily_budget_sats: 50_000_000, weekly_budget_sats: 200_000_000,
-               per_counterparty_cap_sats: 30_000_000, velocity_max: 8, velocity_window_s: 3600, human_threshold_sats: 10_000_000,
+               per_counterparty_cap_sats: 30_000_000, per_counterparty_daily_sats: i64::MAX, velocity_max: 8, velocity_window_s: 3600, human_threshold_sats: 10_000_000,
                split_window_s: 600, approval_ttl_s: 900, treasury_csv: 4320, counterparties: Map::new(),
                hot_balance_cap_sats: 0, forward: Map::new(), ln: Map::new(), tickets: Map::new(),
                anchor_interval_s: 60, anchor_required: false, regtest_mine: None }
@@ -176,6 +184,7 @@ impl PolicyConfig {
         int("daily_budget_sats", &mut c.daily_budget_sats)?;
         int("weekly_budget_sats", &mut c.weekly_budget_sats)?;
         int("per_counterparty_cap_sats", &mut c.per_counterparty_cap_sats)?;
+        int("per_counterparty_daily_sats", &mut c.per_counterparty_daily_sats)?;
         int("velocity_max", &mut c.velocity_max)?;
         int("velocity_window_s", &mut c.velocity_window_s)?;
         int("human_threshold_sats", &mut c.human_threshold_sats)?;
@@ -198,6 +207,11 @@ impl PolicyConfig {
         }
         if let Some(Value::Object(m)) = raw.get("tickets") {
             c.tickets = m.clone();
+            // a wallet that buys with stream tickets and whose policy predates the daily cap gets one, without its owner
+            // signing the policy again (other wallets keep what they decided)
+            if raw.get("per_counterparty_daily_sats").is_none() && m.get("enabled").and_then(Value::as_bool) == Some(true) {
+                c.per_counterparty_daily_sats = DEFAULT_PER_COUNTERPARTY_DAILY_SATS;
+            }
         }
         if let Some(Value::Array(a)) = raw.get("allowlist") {
             c.allowlist = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
@@ -218,7 +232,8 @@ impl PolicyConfig {
 }
 
 /// Every key policy.json may hold (B2's `PolicyConfig` plus `human_pubkey`, `recovery_address`).
-pub const POLICY_KEYS: [&str; 23] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+pub const POLICY_KEYS: [&str; 24] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+    "per_counterparty_daily_sats",
     "velocity_max", "velocity_window_s", "human_threshold_sats", "split_window_s", "approval_ttl_s", "treasury_csv",
     "counterparties", "hot_balance_cap_sats", "forward", "anchor_interval_s",
     "anchor_required", "regtest_mine", "human_pubkey", "recovery_address",
@@ -255,7 +270,8 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
         }
     }
     let nonneg = [("max_per_tx_sats", c.max_per_tx_sats), ("daily_budget_sats", c.daily_budget_sats), ("weekly_budget_sats", c.weekly_budget_sats),
-                  ("per_counterparty_cap_sats", c.per_counterparty_cap_sats), ("velocity_max", c.velocity_max), ("human_threshold_sats", c.human_threshold_sats),
+                  ("per_counterparty_cap_sats", c.per_counterparty_cap_sats), ("per_counterparty_daily_sats", c.per_counterparty_daily_sats),
+                  ("velocity_max", c.velocity_max), ("human_threshold_sats", c.human_threshold_sats),
                   ("split_window_s", c.split_window_s), ("hot_balance_cap_sats", c.hot_balance_cap_sats),
                   ("anchor_interval_s", c.anchor_interval_s), ("treasury_csv", c.treasury_csv)];
     for (k, v) in nonneg {
@@ -744,6 +760,7 @@ impl PolicyEngine {
         let daily = Self::spent(&ledger, DAY_S, now, None)?;
         let weekly = Self::spent(&ledger, WEEK_S, now, None)?;
         let cpty = Self::spent(&ledger, WEEK_S, now, Some(&p.dest))?;
+        let cpty_day = Self::spent(&ledger, DAY_S, now, Some(&p.dest))?;
         let rd = (cfg.daily_budget_sats - daily).max(0);
         let rw = (cfg.weekly_budget_sats - weekly).max(0);
         let rc = (cfg.per_counterparty_cap_sats - cpty).max(0);
@@ -797,6 +814,11 @@ impl PolicyEngine {
         }
         if cpty_sum > cfg.per_counterparty_cap_sats {
             return Ok(decide(Deny, "per_counterparty", format!("counterparty spend {cpty_sum} exceeds cap {}", cfg.per_counterparty_cap_sats), None, None));
+        }
+        let cpty_day_sum = cpty_day.saturating_add(booked_sats);
+        if cpty_day_sum > cfg.per_counterparty_daily_sats {
+            return Ok(decide(Deny, "per_counterparty_daily", format!("today's spend with this seller {cpty_day_sum} exceeds its daily cap {}",
+                                                                     cfg.per_counterparty_daily_sats), None, None));
         }
         let velocity = crate::ticket::TicketPolicy::from_map(&cfg.tickets).velocity;
         // the payment's own session is not counted against it only for a ticket the rail decides (`admitted`)
@@ -1098,6 +1120,39 @@ mod tests {
             assert!(e2.evaluate_admitted(&pay, 10).unwrap().allowed(), "release {i} of one session");
             e2.commit(&pay, &crate::ticket::ledger_id(&format!("{i:064x}"))).unwrap();
         }
+    }
+
+    /// One seller may be paid at most its daily cap in 24 hours, below its weekly cap; another seller
+    /// the same day is not held back by it. A policy without the key has no daily cap.
+    ///
+    /// FAILS before: there was no daily cap per seller, only the weekly one.
+    #[test]
+    fn one_seller_is_paid_no_more_than_its_daily_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = ("ln:02".to_string() + &"aa".repeat(32), "ln:02".to_string() + &"bb".repeat(32));
+        let cfg = PolicyConfig { allowlist: vec![a.clone(), b.clone()], max_per_tx_sats: 2_000, daily_budget_sats: 50_000, weekly_budget_sats: 100_000,
+                                 per_counterparty_cap_sats: 30_000, per_counterparty_daily_sats: 5_000, human_threshold_sats: 10_000, ..PolicyConfig::default() };
+        let e = PolicyEngine::new(cfg, PolicyStore::open(&d.path().join("ledger.json")).unwrap(), AuditLog::open(&d.path().join("audit.jsonl")).unwrap(),
+                                  Some(Arc::new(|| 10_000.0)));
+        let to_a = Payment::new(&a, 1_000, &crate::ticket::memo("default", "page"));
+        for i in 0..5 {
+            assert!(e.evaluate_admitted(&to_a, 1_000).unwrap().allowed(), "ticket {i}");
+            e.commit(&to_a, &crate::ticket::ledger_id(&format!("{i:064x}"))).unwrap();
+        }
+        let over = e.evaluate_admitted(&to_a, 1_000).unwrap();
+        assert_eq!((over.allowed(), over.rule.as_str()), (false, "per_counterparty_daily"), "{}", over.reason);
+        let to_b = Payment::new(&b, 1_000, &crate::ticket::memo("default", "page"));
+        assert!(e.evaluate_admitted(&to_b, 1_000).unwrap().allowed(), "another seller is not held back");
+        let (errors, _) = validate_policy(&serde_json::json!({"per_counterparty_daily_sats": 5000}));
+        assert!(!errors.iter().any(|e| e.contains("per_counterparty_daily")), "{errors:?}");
+        // a wallet that buys with tickets and whose policy.json predates the key gets the default daily cap at once;
+        // another wallet's policy keeps deciding as it did
+        let old = PolicyConfig::from_value(&serde_json::json!({"tickets": {"enabled": true}})).unwrap();
+        assert_eq!(old.per_counterparty_daily_sats, DEFAULT_PER_COUNTERPARTY_DAILY_SATS);
+        let set = PolicyConfig::from_value(&serde_json::json!({"tickets": {"enabled": true}, "per_counterparty_daily_sats": 7000})).unwrap();
+        assert_eq!(set.per_counterparty_daily_sats, 7000);
+        let plain = PolicyConfig::from_value(&serde_json::json!({})).unwrap();
+        assert_eq!(plain.per_counterparty_daily_sats, i64::MAX);
     }
 
     /// The starter rules (2,000 a payment, ask above 1,000; the day's budget raised here so the seller cap is what binds): a buyer plays a film and then asks the

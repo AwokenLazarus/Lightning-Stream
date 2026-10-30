@@ -78,12 +78,22 @@ impl HashtakerRail for LabHashtaker {
 /// the seller tied to its node, the caps on locked funds), chooses the rail (held tickets, else
 /// prepaid ones), locks tickets ahead and releases them; the gateway charges the slice's price
 /// only when the hashmaker's app answers that it counted the slice. Nothing here holds a key.
+/// The `price_ceiling` of a rental at `price_msat` a slice: the offer's price per slice and nothing by
+/// the byte, second or token (a slice's answer is priced by the request alone).
+pub fn slice_ceiling(price_msat: u64) -> serde_json::Value {
+    // the fields of xbt402::listing::price_ceiling, every one named: none left to mean "any"
+    serde_json::json!({"request_msat": price_msat, "gib_msat": 0, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0})
+}
+
 pub struct SignerPayer {
     pub sock: std::path::PathBuf,
     pub url: String,
     pub task: String,
     pub max_sats: u64,
     pub session: Option<String>,
+    /// The most the hashmaker's signed offer said a slice costs, as the wallet's `price_ceiling`: a
+    /// shop whose terms ask more than the offer it was rented from is paid nothing.
+    pub ceiling: Option<serde_json::Value>,
     /// How long a slice's payment waits for a signer whose socket is not there (a wallet that
     /// starts again): within the hashmaker's grace, so the slice is still paid in time.
     pub wait_for_signer: std::time::Duration,
@@ -114,10 +124,13 @@ pub fn signer_call(sock: &std::path::Path, method: &str, params: &serde_json::Va
 impl SignerPayer {
     /// Pay one slice. `Ok` carries what the signer said (without the seller's body); `Err` why not.
     pub fn pay(&mut self, rental: &str, slice: u64, receipt: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "url": format!("{}/{rental}/{slice}", self.url.trim_end_matches('/')), "method": "POST",
             "body": receipt.to_string(), "max_sats": self.max_sats, "task": self.task,
         });
+        if let Some(c) = &self.ceiling {
+            params["price_ceiling"] = c.clone();
+        }
         // a signer that is starting again is waited for, with growing pauses, as long as the call never
         // reached it: a call that reached it is never made a second time
         let start = std::time::Instant::now();
@@ -208,12 +221,38 @@ mod signer_wait_tests {
             }
         });
         let mut p = SignerPayer { sock, url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, session: None,
-                                  wait_for_signer: Duration::from_secs(10) };
+                                  ceiling: None, wait_for_signer: Duration::from_secs(10) };
         let t0 = Instant::now();
         let r = p.pay("r1", 0, &serde_json::json!({}));
         assert!(r.is_ok(), "{r:?}");
         assert!(t0.elapsed() >= Duration::from_millis(1400));
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The offer's price per slice goes with each payment as the wallet's `price_ceiling`, so a
+    /// shop whose terms ask more than the offer it was rented from is refused before it is paid.
+    #[test]
+    fn each_slice_is_paid_with_the_offers_price_as_its_ceiling() {
+        let dir = scratch("ceiling");
+        let sock = dir.join("signer.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(c) = c else { continue };
+                let mut line = String::new();
+                BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+                *s2.lock().unwrap() = serde_json::from_str(&line).unwrap();
+                let mut w = c;
+                writeln!(w, "{}", serde_json::json!({"id": 1, "result": {"verdict": "deny", "rule": "price_ceiling"}})).unwrap();
+            }
+        });
+        let mut p = SignerPayer { sock, url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, session: None,
+                                  ceiling: Some(serde_json::json!({"request_msat": 40_000})), wait_for_signer: Duration::from_secs(2) };
+        let _ = p.pay("r1", 0, &serde_json::json!({}));
+        let v = seen.lock().unwrap().clone();
+        assert_eq!(v["params"]["price_ceiling"]["request_msat"], 40_000, "{v}");
     }
 
     /// Past the wait, the payment fails plainly: a signer that does not come back is not waited for
@@ -222,7 +261,7 @@ mod signer_wait_tests {
     fn a_signer_that_does_not_come_back_is_not_waited_for_beyond_the_wait() {
         let dir = scratch("gone");
         let mut p = SignerPayer { sock: dir.join("none.sock"), url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10,
-                                  session: None, wait_for_signer: Duration::from_millis(800) };
+                                  session: None, ceiling: None, wait_for_signer: Duration::from_millis(800) };
         let t0 = Instant::now();
         let r = p.pay("r1", 0, &serde_json::json!({}));
         assert!(r.as_ref().is_err_and(|e| signer_unreached(e)), "{r:?}");

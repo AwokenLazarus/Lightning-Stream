@@ -83,6 +83,10 @@ fn fake_wallet(dir: &std::path::Path, slices: String, calls: Arc<Mutex<Vec<Value
             let p = &req["params"];
             calls.lock().unwrap().push(req.clone());
             let result = match req["method"].as_str() {
+                // as the signer does: a slice whose price is above the ceiling the buyer was shown is paid nothing
+                Some("xbt402_pay") if p["price_ceiling"]["request_msat"].as_u64().is_some_and(|c| c < terms().price_msat) => {
+                    json!({"verdict": "deny", "rule": "price_ceiling", "charged_sats": 0})
+                }
                 Some("xbt402_pay") => {
                     let url = p["url"].as_str().unwrap();
                     let path = &url[url.find("/hashrate").unwrap()..];
@@ -193,6 +197,7 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
         task: "hashrate".into(),
         max_sats: 600,
         session: None,
+        ceiling: Some(xbt_hashlink::rail::slice_ceiling(terms().price_msat)),
         wait_for_signer: std::time::Duration::from_secs(5),
     });
     let b = {
@@ -301,6 +306,8 @@ fn paid_then_stopped(wallet: bool) {
         for (i, c) in pays.iter().enumerate() {
             assert!(c["params"]["url"].as_str().unwrap().ends_with(&format!("/rental-1/{}", i + 1)));
             assert_eq!(c["params"]["task"], "hashrate");
+            // the offer's price, with nothing by the byte: an honest hashmaker is paid within it
+            assert_eq!(c["params"]["price_ceiling"], xbt_hashlink::rail::slice_ceiling(terms().price_msat), "{c}");
             let receipt: Value = serde_json::from_str(c["params"]["body"].as_str().unwrap()).unwrap();
             assert_eq!(receipt["slice"], i as u64 + 1);
         }

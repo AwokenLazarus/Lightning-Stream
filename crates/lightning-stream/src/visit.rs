@@ -110,6 +110,9 @@ struct State {
 pub struct Visit {
     base: String,
     limit: i64,
+    /// The seller's listed prices as the most each of the visit's calls pays (`price_ceiling`, from
+    /// the listing the buyer chose the app from): a seller whose terms ask more is paid nothing.
+    ceiling: Option<Value>,
     state: Mutex<State>,
     turn: Condvar,
 }
@@ -271,7 +274,7 @@ impl Visits {
         self.open.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
     }
 
-    fn open(&self, base: String, limit: i64) -> Result<String, String> {
+    fn open(&self, base: String, limit: i64, ceiling: Option<Value>) -> Result<String, String> {
         let mut m = self.open.lock().unwrap_or_else(|p| p.into_inner());
         m.retain(|_, v| {
             let s = v.lock();
@@ -281,7 +284,7 @@ impl Visits {
             return Err("too many visits open".into());
         }
         let id = random_hex();
-        m.insert(id.clone(), Arc::new(Visit { base, limit, state: Mutex::new(State { last: Some(Instant::now()), ..State::default() }), turn: Condvar::new() }));
+        m.insert(id.clone(), Arc::new(Visit { base, limit, ceiling, state: Mutex::new(State { last: Some(Instant::now()), ..State::default() }), turn: Condvar::new() }));
         Ok(id)
     }
 }
@@ -305,7 +308,8 @@ impl Connector {
             if !base_ok(&base) || !(1..=10_000_000).contains(&limit) {
                 return Some(Reply::Whole(json_response(400, &json!({"error": "a visit is a seller URL ending in / and a limit of 1 sat or more"}))));
             }
-            return Some(Reply::Whole(match self.visits.open(base, limit) {
+            let ceiling = v.get("price_ceiling").filter(|c| c.is_object()).cloned();
+            return Some(Reply::Whole(match self.visits.open(base, limit, ceiling) {
                 Ok(id) => json_response(200, &json!({"visit": id})),
                 Err(e) => json_response(503, &json!({"error": e})),
             }));
@@ -365,6 +369,9 @@ impl Connector {
                                     "known_terms": true});
             if let Some(b) = &body {
                 params["body_b64"] = b.clone().into();
+            }
+            if let Some(c) = &visit.ceiling {
+                params["price_ceiling"] = c.clone();
             }
             if let Some(r) = &range {
                 params["range"] = r.clone().into();
@@ -490,6 +497,9 @@ impl Connector {
             .take(24).map(|(k, v)| json!([k, v])).collect();
         let mut params = json!({"url": format!("{}{path}", visit.base), "method": "GET", "max_sats": share, "task": self.cfg.task, "headers": headers,
                             "head_headers": true, "upgrade": true});
+        if let Some(c) = &visit.ceiling {
+            params["price_ceiling"] = c.clone();
+        }
         if let Some(m) = params.as_object_mut() {
             xbt_wallet_mcp::wallet::with_transport(m);
         }
@@ -669,7 +679,7 @@ mod tests {
     use super::*;
 
     fn visit(limit: i64) -> Arc<Visit> {
-        Arc::new(Visit { base: String::new(), limit, state: Mutex::new(State::default()), turn: Condvar::new() })
+        Arc::new(Visit { base: String::new(), limit, ceiling: None, state: Mutex::new(State::default()), turn: Condvar::new() })
     }
 
     /// A page's WebSocket holds its share as long as the page is open: a request waiting to run

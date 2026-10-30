@@ -39,7 +39,7 @@ fn ui_js_signs_exactly_the_signer_s_messages() {
     let dalek = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]).verifying_key().to_bytes();
     assert_eq!(pk, dalek, "the same public key from the same seed");
     let cases = v["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 7);
+    assert_eq!(cases.len(), 8);
     for c in cases {
         let f = &c["fields"];
         let s = |k: &str| f[k].as_str().unwrap().to_string();
@@ -56,6 +56,7 @@ fn ui_js_signs_exactly_the_signer_s_messages() {
             "rotate" => (approval::rotate_message(&s("hot_address"), i("expiry")), xbt_wallet_ui::msg::rotate(&s("hot_address"), i("expiry"))),
             "backup" => (approval::backup_message(&s("hot_address"), i("expiry")), xbt_wallet_ui::msg::backup(&s("hot_address"), i("expiry"))),
             "deny" => (approval::deny_message(&s("token"), i("expiry")), xbt_wallet_ui::msg::deny(&s("token"), i("expiry"))),
+            "unblock" => (approval::unblock_message(&s("block"), i("expiry")), xbt_wallet_ui::msg::unblock(&s("block"), i("expiry"))),
             k => panic!("unknown kind {k}"),
         };
         let js = hex::decode(c["msg"].as_str().unwrap()).unwrap();

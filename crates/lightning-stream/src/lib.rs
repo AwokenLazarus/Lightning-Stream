@@ -89,7 +89,7 @@ impl Connector {
 
     /// One paid answer, handed on as it arrives: the seller's status and range from the head line,
     /// then the body.
-    fn stream(&self, url: &str, max_sats: i64, range: Option<&str>) -> Reply {
+    fn stream(&self, url: &str, max_sats: i64, range: Option<&str>, ceiling: Option<Value>) -> Reply {
         let name = format!("ls-{}", random_hex());
         let path = self.cfg.stream_dir.join(&name);
         let listener = match listen_stream(&path) {
@@ -102,6 +102,10 @@ impl Connector {
         let mut params = json!({"url": url, "max_sats": max_sats, "task": self.cfg.task, "stream_to": name, "stream_head": true});
         if let Some(r) = range {
             params["range"] = r.into();
+        }
+        // the seller's listed prices, where the caller chose it from a listing: its terms past them are paid nothing
+        if let Some(c) = ceiling {
+            params["price_ceiling"] = c;
         }
         if let Some(m) = params.as_object_mut() {
             xbt_wallet_mcp::wallet::with_transport(m);
@@ -222,7 +226,9 @@ impl Handler for Connector {
         }
         let max_sats = req.header("X-Max-Sats").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n >= 0).unwrap_or(self.cfg.max_sats).min(self.cfg.max_sats);
         let range = req.header("Range").map(str::trim).filter(|r| one_range(r));
-        self.stream(url, max_sats, range)
+        // `X-Price-Ceiling`: the listing's prices as the most this call pays. Only ever stricter than none
+        let ceiling = req.header("X-Price-Ceiling").filter(|v| v.len() <= 1024).and_then(|v| serde_json::from_str::<Value>(v).ok()).filter(Value::is_object);
+        self.stream(url, max_sats, range, ceiling)
     }
 }
 

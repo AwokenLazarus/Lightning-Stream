@@ -317,7 +317,9 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         let g = lock(r);
         (g.key, g.user.clone(), g.signer.clone(), g.task.clone())
     };
-    let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats: budget_sats, session: None,
+    // the offer's price per slice is the most the wallet pays the shop for one ([`SignerPayer::ceiling`])
+    let ceiling = Some(xbt_hashlink::rail::slice_ceiling(h.terms.price_msat));
+    let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats: budget_sats, session: None, ceiling,
                                                        wait_for_signer: std::time::Duration::from_millis(h.terms.grace_ms / 2) });
     let cfg = hashtaker::Config {
         hashmaker: addr,
