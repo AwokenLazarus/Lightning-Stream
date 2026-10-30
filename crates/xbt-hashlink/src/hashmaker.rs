@@ -226,6 +226,7 @@ impl Rental {
             "role": "hasher", "rental": self.id, "buyer": hex::encode(self.hashtaker.serialize()),
             "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "miners": self.units.iter().collect::<Vec<_>>(), "want": self.want, "startedMs": self.started_ms,
+            "ready": self.ready, "suspended": self.suspended.is_some(),
             "unitWork": self.unit_work.iter().map(|(u, w)| (u.clone(), Value::from(w.to_string()))).collect::<serde_json::Map<_, _>>(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "paid": self.paid, "earnedMsat": self.paid * self.terms.price_msat,
@@ -488,6 +489,12 @@ impl Hashmaker {
             std::thread::spawn(move || ticker(h, d, report));
         }
         Ok(Hashmaker { hub, report: cfg.report, down })
+    }
+
+    /// A reader of [`Hashmaker::status`] another thread can keep (a watcher of the hashmaker).
+    pub fn status_fn(&self) -> impl Fn() -> Value + Send + 'static {
+        let hub = self.hub.clone();
+        move || status(&lock(&hub))
     }
 
     /// Everything: the miners, the rentals going on and the last ones that ended.
