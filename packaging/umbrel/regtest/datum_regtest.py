@@ -11,7 +11,8 @@ regtest node on this host, reached at that network's gateway address as a node a
 stand-in Nostr relay, a hashmaker with real stratum-grind behind it.
 
 What the test changes in the app, and only that (the overlay this writes, OUT/overlay.yml):
-  * the images: this tree's builds, tagged <image>:0.1.0-umbtest (UMB_HASHLINK_IMAGE, UMB_DATUM_IMAGE);
+  * the images: this tree's amd64 builds from container/Dockerfile, tagged <image>:0.1.0-umbtest (UMB_HASHLINK_IMAGE,
+    UMB_DATUM_IMAGE, UMB_INIT_IMAGE);
   * the renter's --relays: this lab's relay, not the public ones; the rest of its command is the compose's;
   * the renter's run/signer: the lab wallet's socket folder in place of the app's (the signer is the lab's);
   * the network: this run's, as umbrelOS's.

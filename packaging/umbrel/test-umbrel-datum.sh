@@ -8,9 +8,8 @@
 # Images (amd64 only, from this tree, tagged :0.1.0-umbtest and removed at the end, so no local tag a package
 # names is replaced):
 #   xbt-hashlink        container/Dockerfile's stage, on the static musl binary
-#   xbt-datum-gateway   UMB_DATUM_IMAGE if given (oci_build.sh's, once container/Dockerfile has the stage);
-#                       else a stand-in: the shared base layer, scripts/datum_gateway_build.sh's static gateway
-#                       and xbt-supervise, as uid 10021 (xbt-datum)
+#   xbt-datum-gateway   container/Dockerfile's stage, on scripts/datum_gateway_build.sh's static gateway (its
+#                       unit tests run too) staged as oci_build.sh stages it; or UMB_DATUM_IMAGE, already loaded
 #   xbt-init            when this tree's xbt-init knows the `datum` component: then the compose's own init
 #                       makes the gateway's files; until then the driver lays them out per W5's contract
 # Needs P2P_HASH_GATEWAYS (default ~/xbt-rnd/hash-gateways: bitcoind, bitcoin-cli, stratum-grind), the lab
@@ -67,6 +66,7 @@ grep -q '"datum"' crates/xbt-svc/src/lib.rs crates/xbt-svc/src/layout.rs 2>/dev/
 nice -n 19 cargo build -q -j4 --release --locked --target $T -p xbt-hashlink --bin xbt-hashlink -p xbt-svc --bin xbt-supervise
 [ $INIT = 1 ] && nice -n 19 cargo build -q -j4 --release --locked --target $T -p xbt-svc --bin xbt-init
 CTX=$ROOT/run/umbrel-datum-ctx
+if [ -d "$CTX" ]; then chmod -R u+w "$CTX"; fi
 rm -rf "$CTX" && mkdir -p "$CTX/bin/amd64"
 python3 container/mkbase.py "$CTX/base.tar"
 cp container/Dockerfile "$CTX/Dockerfile"
@@ -81,21 +81,14 @@ fi
 if [ -n "${UMB_DATUM_IMAGE:-}" ]; then
   docker image inspect "$UMB_DATUM_IMAGE" >/dev/null || { echo "test-umbrel-datum: $UMB_DATUM_IMAGE is not loaded" >&2; exit 2; }
 else
-  nice -n 19 scripts/datum_gateway_build.sh --targets x86_64-linux-musl --out "$ROOT/dist/datum"
-  D=$CTX/datum && mkdir -p "$D/bin"
-  cp "$CTX/base.tar" "$D/"
-  cp "$ROOT/dist/datum/x86_64-linux-musl/xbt-datum-gateway" "$MUSL/xbt-supervise" "$D/bin/"
-  cat >"$D/Dockerfile" <<'EOF'
-# test stand-in for the xbt-datum-gateway image (container/Dockerfile's stage, once it is there)
-FROM scratch
-ADD base.tar /
-ENV XBT_DATA_DIR=/data XBT_MODE=production
-COPY --chmod=0555 bin/ /usr/bin/
-USER 10021:10021
-ENTRYPOINT ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--", "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:7152/", "--waiting-for", "/data/run/datum/config.json"]
-EOF
-  docker buildx build -q --platform linux/amd64 --load -t "xbt-datum-gateway:$TAG" "$D" >/dev/null
+  # the gateway's static binary and its licences, staged as scripts/oci_build.sh stages them
+  nice -n 19 scripts/datum_gateway_build.sh --targets x86_64-linux-musl --out "$ROOT/dist/datum" --test
+  r=$CTX/bin/amd64/xbt-datum-gateway.root
+  mkdir -p "$r/usr/bin" "$r/usr/share/xbt-datum-gateway"
+  cp "$ROOT/dist/datum/x86_64-linux-musl/xbt-datum-gateway" "$MUSL/xbt-supervise" "$r/usr/bin/" && chmod 0555 "$r/usr/bin/"*
+  cp "$ROOT/dist/datum/licenses/"* "$r/usr/share/xbt-datum-gateway/" && chmod 0444 "$r/usr/share/xbt-datum-gateway/"*
+  chmod 0755 "$r/usr" "$r/usr/bin" "$r/usr/share" && chmod 0555 "$r/usr/share/xbt-datum-gateway"
+  docker buildx build -q --platform linux/amd64 --target xbt-datum-gateway --load -t "xbt-datum-gateway:$TAG" "$CTX" >/dev/null
   export UMB_DATUM_IMAGE=xbt-datum-gateway:$TAG
 fi
 echo "test-umbrel-datum: images $UMB_HASHLINK_IMAGE $UMB_DATUM_IMAGE ${UMB_INIT_IMAGE:-(no init with datum: laid out by the driver)}"
