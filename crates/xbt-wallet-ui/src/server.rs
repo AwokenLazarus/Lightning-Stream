@@ -277,15 +277,24 @@ pub fn range_len(r: &str) -> Option<u64> {
     (b >= a).then(|| b - a + 1)
 }
 
-/// Whether a seller's answer says it sends more than the listed size can stand for: its whole
-/// `Content-Length` (a `200`) or the total in its `Content-Range` (a `206`) above `size`.
+/// Whether a seller's answer says it sends more than the listed size can stand for: the total in
+/// a `206`'s `Content-Range`, or the `Content-Length` of any other `2xx`, above `size` (the rule the
+/// wallet and the seller judge by too).
 pub fn more_than_listed(status: u16, content_length: Option<&str>, content_range: Option<&str>, size: u64) -> bool {
     let num = |s: &str| s.trim().parse::<u64>().ok();
-    let total = content_range.and_then(|r| r.rsplit_once('/')).and_then(|(_, t)| num(t));
     match status {
-        206 => total.is_some_and(|t| t > size),
-        _ => content_length.and_then(num).is_some_and(|n| n > size) || total.is_some_and(|t| t > size),
+        206 => content_range.and_then(|r| r.rsplit_once('/')).and_then(|(_, t)| num(t)).is_some_and(|t| t > size),
+        200..=299 => content_length.and_then(num).is_some_and(|n| n > size),
+        _ => false,
     }
+}
+
+/// The answer to a reader whose file the seller says is larger than its listing shows.
+fn larger_than_listed() -> xbt_svc::http::Reply {
+    let v = serde_json::json!({"error": "the seller sends more than the size its listing shows; nothing more is paid for this file"});
+    let mut whole = Resp::json(502, &v);
+    security_headers(&mut whole);
+    xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body))
 }
 
 /// The headers of a relayed answer that are passed on from the connector.
@@ -301,8 +310,11 @@ fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>, li
     }
     // the connector pays no more than this part of the listed file can cost (it takes the lower of
     // this and its own limit)
-    if let Some((_, sats)) = limit {
+    if let Some((size, sats)) = limit {
         rq = rq.set("X-Max-Sats", &sats.to_string());
+        // and the most bytes the listed file has: a seller that says it sends more is refused before
+        // any of its body is sent, so a file that grew after it was listed costs nothing
+        rq = rq.set("X-Max-Size", &size.to_string());
     }
     if let Some(r) = range.map(str::trim).filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
         rq = rq.set("Range", r);
@@ -315,6 +327,12 @@ fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>, li
         Err(ureq::Error::Status(code, r)) => {
             let headers = passed(&r).into_iter().filter(|(k, _)| k != "Content-Type").collect::<Vec<_>>();
             let body = r.into_string().unwrap_or_default().into_bytes();
+            // the seller (412) or the wallet (502, the seller not reading the size it was told) refused
+            // a file larger than its listing before any of it was read
+            let said = String::from_utf8_lossy(&body);
+            if limit.is_some() && matches!(code, 412 | 502) && (said.contains("larger_than_shown") || said.contains("the buyer was shown")) {
+                return larger_than_listed();
+            }
             let mut whole = Resp::text(code, "application/json", body);
             whole.headers.extend(headers);
             security_headers(&mut whole);
@@ -339,10 +357,7 @@ fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>, li
     // the wallet pays for none of it (at most the part's head), and the buyer is told why
     if let Some((size, _)) = limit {
         if more_than_listed(status, resp.header("Content-Length"), resp.header("Content-Range"), size) {
-            let v = serde_json::json!({"error": "the seller sends more than the size its listing shows; nothing more is paid for this file"});
-            let mut whole = Resp::json(502, &v);
-            security_headers(&mut whole);
-            return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
+            return larger_than_listed();
         }
     }
     // and one that sends more than that without saying so is cut there
@@ -446,7 +461,10 @@ mod tests {
         assert!(more_than_listed(200, Some("1001"), None, size), "a whole file bigger than listed");
         assert!(!more_than_listed(206, Some("100"), Some("bytes 0-99/1000"), size));
         assert!(more_than_listed(206, Some("100"), Some("bytes 0-99/5000"), size), "a part of a file bigger than listed");
-        assert!(more_than_listed(200, None, Some("bytes 0-99/5000"), size));
+        // one rule with the wallet and the seller: a 206 by its total, any other 2xx by its length
+        assert!(!more_than_listed(200, None, Some("bytes 0-99/5000"), size), "a 200 is judged by its length");
+        assert!(more_than_listed(203, Some("1001"), None, size));
+        assert!(!more_than_listed(404, Some("5000"), None, size), "not a 2xx: not the file");
         assert!(!more_than_listed(200, None, None, size), "no length said: cut at the listed size as it streams");
         assert_eq!((range_len("bytes=0-99"), range_len("bytes=10-9"), range_len("bytes=5-")), (Some(100), None, None));
     }

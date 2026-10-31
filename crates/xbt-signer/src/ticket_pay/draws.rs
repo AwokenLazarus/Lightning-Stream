@@ -824,6 +824,9 @@ impl Signer {
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
         let mut sink = Sink::for_call(c);
         let (head_fields, not_read) = c.head(&mut ans, &mut sink);
+        // the wallet's own refusal of an answer larger than the size the call named: read no further, but the
+        // request was served, and its own piece is drawn for as the ticket rail charges it
+        let size_refused = super::larger_than_shown(status, &head_fields, c.max_size).is_some();
         out = with(out, head_fields);
         if status >= 400 {
             // an error of the service, passed on: no piece, and no draw
@@ -838,7 +841,7 @@ impl Signer {
             if let Some(why) = not_read {
                 lock(&counted).stop.get_or_insert(why);
             }
-            let m = self.draw_stream(ds, c, price, &head, seq, req, ans, max_msat, &mut sink, &counted);
+            let m = self.draw_stream(ds, c, price, &head, seq, req, ans, max_msat, &mut sink, &counted, size_refused);
             out = with(out, m);
         }
         let (_, stored, text) = sink.done();
@@ -856,7 +859,7 @@ impl Signer {
     /// never waits for a payment. Returns fields for the reply.
     #[allow(clippy::too_many_arguments)]
     fn draw_stream(&self, ds: &Arc<DrawSession>, c: &Call, price: &Price, head: &DrawReceipt, seq: u64, req: [u8; 32], ans: WireAnswer, max_msat: u64, sink: &mut Sink,
-                   counted: &Mutex<Counted>) -> Value {
+                   counted: &Mutex<Counted>, size_refused: bool) -> Value {
         let tp = self.ticket_policy();
         let piece_bytes = ds.terms.piece_bytes.max(1);
         let by_bytes = price.byte_msat > 0;
@@ -1033,7 +1036,15 @@ impl Signer {
                 let mut off = 0;
                 while off < n {
                     let have = sink.bytes;
-                    let take = if by_bytes { ((n - off) as u64).min(piece_bytes - have % piece_bytes) as usize } else { n - off };
+                    // past the size the buyer was shown (a body that stated no size): read no further
+                    if c.max_size.is_some_and(|most| have >= most) {
+                        stop_now(super::PASSED_SHOWN.into());
+                        break;
+                    }
+                    let mut take = if by_bytes { ((n - off) as u64).min(piece_bytes - have % piece_bytes) as usize } else { n - off };
+                    if let Some(most) = c.max_size {
+                        take = take.min(usize::try_from(most - have).unwrap_or(usize::MAX));
+                    }
                     sink.put(&buf[off..off + take]);
                     if sink.gone {
                         stop_now(super::READER_GONE.into());
@@ -1049,7 +1060,7 @@ impl Signer {
                         }
                     }
                 }
-                if sink.gone || length.is_some_and(|l| sink.bytes >= l) {
+                if sink.gone || stopped() || length.is_some_and(|l| sink.bytes >= l) {
                     break;
                 }
             }
@@ -1061,6 +1072,11 @@ impl Signer {
             }
             // an answer paid whole at its head: its one piece has arrived when the body has, and is the one the receipt signs
             if whole && complete && price.request_msat > 0 && hex::encode(sink.hash.clone().finalize()) == head.body_hash {
+                lock(&shared).pending.push(piece(Kind::Request, 0, price.request_msat));
+            }
+            // one the wallet itself did not read, its size past what the buyer was shown: the request was served all
+            // the same, and its piece is drawn for (the ticket rail charges the request's price for it), not named void
+            if whole && size_refused && price.request_msat > 0 {
                 lock(&shared).pending.push(piece(Kind::Request, 0, price.request_msat));
             }
             lock(&shared).done = true;
@@ -1098,7 +1114,7 @@ impl Signer {
             let ahead = u64::from(ds.terms.window).min(1024) + 1;
             let secs = if price.second_msat > 0 { head_at.elapsed().as_secs() + 1 } else { 0 };
             let mut ids: Vec<PieceId> = vec![];
-            if !complete && price.request_msat > 0 {
+            if !complete && price.request_msat > 0 && !(whole && size_refused) {
                 ids.push(PieceId { seq, kind: Kind::Request, k: 0 });
             }
             if !complete && by_bytes {

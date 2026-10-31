@@ -114,6 +114,10 @@ impl Handler for Service {
             let _ = n;
             Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
         };
+        if let Some(n) = path.strip_prefix("/files/unsized/").or_else(|| path.strip_prefix("/pieces/unsized/")).and_then(|n| n.parse::<usize>().ok()) {
+            // a file whose server states no size (sent as it is read): its length is known only at its end
+            return stream(n, None, body(n, 64 << 10, Duration::ZERO));
+        }
         if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")).or_else(|| sized("/uhd/")).or_else(|| sized("/hd20/")) {
             // one byte range, as a file server answers it: 206 and that part of the same bytes
             let range = req.header("Range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
@@ -981,6 +985,8 @@ struct Tap {
     trust: Mutex<Vec<(String, Option<SellerTls>)>>,
     /// Leave out the call's limit (`X-Xbt402-Max-Msat`): the seller then charges as one that ignores it.
     drop_cap: AtomicBool,
+    /// Leave out the size the buyer was shown (`X-Xbt402-Max-Size`): the seller then sends as one that ignores it.
+    drop_size: AtomicBool,
 }
 
 impl TicketWire for Tap {
@@ -1003,6 +1009,7 @@ impl TicketWire for Tap {
                           cap_msat: cap_of(headers) };
         self.log.lock().unwrap().push(seen.clone());
         let kept: Vec<(String, String)> = headers.iter().filter(|(k, _)| !(self.drop_cap.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)))
+            .filter(|(k, _)| !(self.drop_size.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_SIZE_HEADER)))
             .cloned().collect();
         let real = || self.inner.send(method, url, body, &kept, read_timeout);
         let mut hook = self.hook.lock().unwrap().take();
@@ -1743,7 +1750,7 @@ fn a_sellers_web_page_gets_the_callers_headers_and_its_answer_comes_back_with_it
     r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "stream_to": "plain", "stream_head": true}));
     assert!(plain.join().unwrap().0.get("headers").is_none());
     // the wallet's own headers, and the ones a proxy must not pass on, are refused before anything is sent
-    for h in ["Host", "Payment-Signature", "Content-Length", "Range", "Transfer-Encoding", "X-Forwarded-For", "Accept-Encoding"] {
+    for h in ["Host", "Payment-Signature", "Content-Length", "Range", "Transfer-Encoding", "X-Forwarded-For", "Accept-Encoding", "X-Xbt402-Max-Size", "x-xbt402-max-msat"] {
         let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "headers": [[h, "x"]]}));
         assert_eq!(v["rule"], "headers", "{h}: {v}");
     }
@@ -1751,6 +1758,182 @@ fn a_sellers_web_page_gets_the_callers_headers_and_its_answer_comes_back_with_it
     assert_eq!(v["rule"], "headers", "{v}");
     std::env::remove_var("B2_STREAM_DIR");
     r.assert_booked();
+}
+
+/// A file that grew after the buyer was shown its size (`max_size`, what the app passes for a listed
+/// file), read as the app reads it: the head line, then the body only if the head is within the
+/// listing. The seller refuses it before any of its body is sent, and neither its book nor the
+/// wallet's counts a msat for it. A seller that ignores the size it was told has its body left
+/// unread by the wallet itself.
+#[test]
+fn a_file_larger_than_the_buyer_was_shown_is_refused_before_its_body_and_costs_nothing() {
+    use std::io::{BufRead as _, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // the seller's own count of what the session has been charged, from a page's signed receipt (the page's 2,500 msat in it)
+    let seller_spent = |r: &Rig| -> u64 {
+        let v = r.pay("/page/10", CALL);
+        v["untrusted_provider_response"]["receipt"]["spentMsat"].as_str().unwrap_or_else(|| panic!("{v}")).parse().unwrap()
+    };
+    // the app's reader: the head line, then nothing more where the head says the file is larger than its listing
+    let shown = 3 * MIB as u64;
+    let reader = |name: &'static str| {
+        let l = UnixListener::bind(dir.path().join(name)).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut s = std::io::BufReader::new(s);
+            let mut line = String::new();
+            s.read_line(&mut line).unwrap();
+            let head: Value = serde_json::from_str(&line).unwrap();
+            let larger = head.get("error").is_some() || head["content_length"].as_u64().is_some_and(|n| n > shown) || head["status"].as_u64() != Some(200);
+            let mut rest = vec![];
+            if !larger {
+                s.read_to_end(&mut rest).unwrap();
+            }
+            (head, rest.len())
+        })
+    };
+    let before = seller_spent(&r);
+    // 4 MiB where 3 MiB was listed: at 200 sat a MiB, 800 sat had it been sent
+    let grown = reader("grown-1");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 4 * MIB)), "max_sats": 5_000, "task": "film",
+                                        "stream_to": "grown-1", "stream_head": true, "max_size": shown}));
+    let (head, got) = grown.join().unwrap();
+    let after = seller_spent(&r);
+    // the money first, on both sides: the seller's signed count and the wallet's own
+    assert_eq!(after - before, 2500, "the seller's book charged {} msat for the file, beside the page's 2,500: {v}", after - before - 2500);
+    assert_eq!(v["price_msat"].as_str(), Some("0"), "the wallet counts nothing for it: {v}");
+    assert_eq!((v["status"].as_u64(), head["status"].as_u64(), got), (Some(412), Some(412), 0), "the seller refuses it before its body: {v}");
+    // the size it was shown went with the request; a file within it is served whole and paid as before
+    let ok = reader("ok-1");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 3 * MIB)), "max_sats": 5_000, "task": "film",
+                                        "stream_to": "ok-1", "stream_head": true, "max_size": shown}));
+    let (_, got) = ok.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), got, v["price_msat"].as_str()), (Some(200), Some(true), 3 * MIB, Some("600000")), "{v}");
+    // a seller that ignores the size it was told (one from before the header): the wallet reads none of
+    // the larger body and says why on the head line. What it sent before the wallet closed (in the
+    // socket's buffers) is charged, and both books say the same: a small part of the file, never the file
+    let before_old = seller_spent(&r);
+    r.tap.drop_size.store(true, Ordering::SeqCst);
+    let old = reader("grown-2");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 4 * MIB)), "max_sats": 5_000, "task": "film",
+                                        "stream_to": "grown-2", "stream_head": true, "max_size": shown}));
+    let (head, got) = old.join().unwrap();
+    r.tap.drop_size.store(false, Ordering::SeqCst);
+    let after_old = seller_spent(&r);
+    let old_charged = after_old - before_old - 2500;
+    assert_eq!(v["price_msat"].as_str(), Some(old_charged.to_string().as_str()), "the wallet's count is the seller's: {v}");
+    assert!(old_charged <= 400_000, "only what was in flight when the wallet stopped, at most 2 MiB of it, never the file's 800 sat: {old_charged} msat");
+    assert_eq!((head["status"].as_u64(), got, v["complete"].as_bool()), (Some(200), 0, Some(false)), "{v}");
+    assert!(head["error"].as_str().unwrap_or("").contains("the buyer was shown"), "{head}");
+    assert!(v["ended"].as_str().unwrap_or("").contains("the buyer was shown"), "{v}");
+    // a size of 0, or not a number, is refused before anything is sent
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "max_size": 0}));
+    assert_eq!(v["rule"], "max_size", "{v}");
+    // a size named for a page priced by the request is no way to have its work for nothing: refused,
+    // its body not sent, and its price charged on both sides, as for an answer with no body
+    let before_page = seller_spent(&r);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/100"), "max_sats": CALL, "task": "film", "max_size": 1}));
+    let after_page = seller_spent(&r);
+    assert_eq!(after_page - before_page - 2500, 2500, "the seller's book charged the page's price: {v}");
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str(), v["untrusted_provider_response"]["receipt"]["charged"].as_str()), (Some(412), Some("2500"), Some("2500")), "{v}");
+    assert_eq!(v["untrusted_provider_response"]["body"].as_str().map(|b| b.contains("larger_than_shown")), Some(true), "{v}");
+    // a HEAD is judged as its GET: the size refused, nothing of a file's price charged; within it, answered
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 4 * MIB)), "method": "HEAD", "max_sats": CALL, "task": "film", "max_size": shown}));
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(412), Some("0")), "{v}");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 3 * MIB)), "method": "HEAD", "max_sats": CALL, "task": "film", "max_size": shown}));
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some("0")), "{v}");
+    // a file whose server states no size: the seller sends no more than the size shown, and ends it cut short,
+    // never as a whole one; what was sent is what both books charge (3 MiB at 200 sat a MiB)
+    let before_cut = seller_spent(&r);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/unsized/{}", 4 * MIB)), "max_sats": 5_000, "task": "film", "max_size": shown}));
+    let cut = seller_spent(&r) - before_cut - 2500;
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(false), Some(shown)), "{v}");
+    assert_eq!((cut, v["price_msat"].as_str()), (600_000, Some("600000")), "{v}");
+    // a size that falls inside the service's last read, with nothing after it: still ended cut short, never
+    // signed as a whole answer of fewer bytes; both books charge what was sent
+    let most = 3 * MIB as u64 - 1000;
+    let before_mid = seller_spent(&r);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/unsized/{}", 3 * MIB)), "max_sats": 5_000, "task": "film", "max_size": most}));
+    let mid = seller_spent(&r) - before_mid - 2500;
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(false), Some(most)), "{v}");
+    assert_eq!(v["price_msat"].as_str(), Some(mid.to_string().as_str()), "{v}");
+    // of exactly that size: whole, and paid as before
+    let before_exact = seller_spent(&r);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/unsized/{}", 3 * MIB)), "max_sats": 5_000, "task": "film", "max_size": shown}));
+    let exact = seller_spent(&r) - before_exact - 2500;
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64(), exact, v["price_msat"].as_str()),
+               (Some(200), Some(true), Some(shown), 600_000, Some("600000")), "{v}");
+    // and from a seller that ignores the size it was told: the wallet takes no more than the size shown and
+    // stops; what that seller pushed past it before the stop is charged, the same in both books
+    let before_old_cut = seller_spent(&r);
+    r.tap.drop_size.store(true, Ordering::SeqCst);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/unsized/{}", 4 * MIB)), "max_sats": 5_000, "task": "film", "max_size": shown}));
+    r.tap.drop_size.store(false, Ordering::SeqCst);
+    let old_cut = seller_spent(&r) - before_old_cut - 2500;
+    assert_eq!((v["complete"].as_bool(), v["bytes"].as_u64()), (Some(false), Some(shown)), "{v}");
+    assert!(v["ended"].as_str().unwrap_or("").contains("passed the size the buyer was shown"), "{v}");
+    assert_eq!(v["price_msat"].as_str(), Some(old_cut.to_string().as_str()), "the wallet's count is the seller's: {v}");
+    assert!((600_000..=800_000).contains(&old_cut), "the size shown, and at most what was in flight past it: {old_cut} msat");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// A file that grew after the buyer was shown its size, offered by draws: the seller sends no piece
+/// of it, so the wallet owes no draw and voids nothing, and no win is paid for it. The session goes
+/// on, and a file within the size is bought by draws as before.
+#[test]
+fn a_file_larger_than_the_buyer_was_shown_sends_no_piece_by_draws() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    let shown = 32 * PIECE as u64;
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{}", 64 * PIECE)), "max_sats": 1_000, "task": "film", "max_size": shown}));
+    assert_eq!((v["rail"].as_str(), v["status"].as_u64()), (Some("lottery"), Some(412)), "{v}");
+    assert_eq!(v["untrusted_provider_response"]["body"].as_str().map(|b| b.contains("larger_than_shown")), Some(true), "the seller's refusal, not the file: {v}");
+    // the money on both sides: the seller's signed receipt charges nothing, the wallet counts nothing,
+    // no draw was made, and no win was paid by the node or taken by the seller's
+    assert_eq!((v["untrusted_provider_response"]["receipt"]["charged"].as_str(), v["price_msat"].as_str(), v["draws"].as_u64(), v["wins"].as_u64()),
+               (Some("0"), Some("0"), Some(0), Some(0)), "{v}");
+    assert!(r.tap.seen("/x402/lottery/draw").is_empty(), "no piece, so no value is owed");
+    assert_wins(&r, 0);
+    // within the size: bought by draws, whole, in the same session
+    let ok = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{}", 32 * PIECE)), "max_sats": 1_000, "task": "film", "max_size": shown}));
+    assert_eq!((ok["rail"].as_str(), ok["status"].as_u64(), ok["complete"].as_bool(), ok["draws"].as_u64(), ok["session"].as_str()),
+               (Some("lottery"), Some(200), Some(true), Some(32), v["session"].as_str()), "{ok}");
+    let mut wins = ok["wins"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    // a file whose server states no size: the wallet takes no more than the size shown and stops; the pieces
+    // it has are drawn for, the rest named void
+    let cut = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/unsized/{}", 64 * PIECE)), "max_sats": 1_000, "task": "film", "max_size": shown}));
+    assert_eq!((cut["rail"].as_str(), cut["complete"].as_bool(), cut["bytes"].as_u64(), cut["draws"].as_u64(), cut["price_msat"].as_str()),
+               (Some("lottery"), Some(false), Some(shown), Some(32), Some("64000")), "{cut}");
+    assert!(cut["ended"].as_str().unwrap_or("").contains("passed the size the buyer was shown"), "{cut}");
+    wins += cut["wins"].as_u64().unwrap();
+    assert_wins(&r, wins);
+}
+
+/// A page priced by the request, offered by draws, with a size named that it is larger than: the seller
+/// does not judge it there (the request is a piece of its own), and the wallet reads none of the body.
+/// The request was served all the same, so its piece gets its value, as the ticket rail charges the
+/// request's price for it: one draw, and nothing named void.
+///
+/// FAILS before: the wallet named the request's piece void, and the service's work cost nothing.
+#[test]
+fn a_page_by_draws_refused_for_its_size_still_draws_for_its_request() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/100"), "max_sats": 1_000, "task": "film", "max_size": 1}));
+    assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some("lottery"), Some(200), Some(false), Some(0)), "{v}");
+    // the money on both sides: the seller's receipt signs the request's price, the wallet drew for it once
+    assert_eq!((v["untrusted_provider_response"]["receipt"]["charged"].as_str(), v["price_msat"].as_str(), v["draws"].as_u64()),
+               (Some("2500"), Some("2500"), Some(1)), "{v}");
+    let voided: Vec<Value> = r.tap.seen("/x402/lottery/draw").iter()
+        .flat_map(|s| serde_json::from_str::<Value>(&s.body).ok()?.get("void")?.as_array().cloned()).flatten().collect();
+    assert!(voided.iter().all(|x| x["kind"] != "request"), "the request's piece is drawn for, not named void: {voided:?}");
+    assert_wins(&r, v["wins"].as_u64().unwrap());
 }
 
 /// A part of a body (`range`), as a player that seeks asks for it: the seller's 206 is paid for

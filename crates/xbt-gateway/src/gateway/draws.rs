@@ -744,6 +744,18 @@ impl Gateway {
             };
             return Reply::Whole(self.draw_answered(&a, passed, 0));
         }
+        // the buyer was shown the resource at no more than this size (a listed file): as on the
+        // ticket rail, an answer that says it is larger is refused before any piece of it is sent,
+        // and no draw is owed for it. Only on a route with no price per request: the request's own
+        // piece is a draw the wallet would owe a value for, and the size is no way to have the
+        // service's work for nothing
+        if let Some((_, most)) = larger_than_shown(if route.price.tokens.active() || route.price.request_msat > 0 { None } else { shown_size(&req) }, &answer) {
+            return Reply::Whole(self.draw_answered(
+                &a,
+                error(412, "larger_than_shown", &format!("the answer is larger than the {most} bytes the buyer was shown; no piece of it was sent")),
+                0,
+            ));
+        }
         let m = Pieces {
             session: a.session.clone(),
             seq: a.seq,

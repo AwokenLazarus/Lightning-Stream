@@ -1619,6 +1619,36 @@ left from earlier calls) and the tickets this call released, the last of them re
 call was still under its limit. So past the limit it can take at most one ticket of this call, plus
 the balance it held before (under one ticket), and nothing after.
 
+**A file larger than it was listed.** A call may name the most bytes, in all, the buyer was shown
+the resource has (`max_size`; the app passes a listed file's size). It goes to the seller as
+`X-Xbt402-Max-Size`; a caller's own `x-xbt402-*` headers are refused. The seller, the wallet and the
+app judge an answer by one rule: a `206` by the total in its `Content-Range`, any other `2xx` by its
+`Content-Length`. A 0.1.20 seller judges a GET or HEAD of a route not priced by the token by it,
+taking the smallest size named, and refuses an answer that states more before any of its body is
+sent: `412` `larger_than_shown`. It charges the request's price, as for an answer with no body: on a
+route priced only by the byte or the second (a file) that is nothing; on one priced by the request
+the size is no way to have the service's work for nothing. The wallet takes the request's price for
+such a `412` (a GET or HEAD that named a size, with that code), and nothing for any other error.
+
+On the lottery rail a route with no price per request sends no piece of such an answer (`412`, no
+draw owed, nothing charged). A route priced by the request is not judged by the seller there, since
+its request is a piece of its own: the answer is served, the wallet reads none of a body larger than
+the size, and it draws for the request's piece all the same, as the ticket rail charges its price.
+
+An answer that states no size is cut at the size named as it is sent: the 0.1.20 seller ends it
+there cut short (on the ticket rail; the lottery rail does not yet), and the wallet reads no more
+than that on either rail. A seller that ignores the header (gateways before 0.1.20) sends as before;
+the wallet reads none of a body whose head states more, or no more than the size of one that
+states none, and stops the call. That seller then charges only what it had pushed into the buffers
+between the wallet and itself before the stop (a socket's, a proxy's, a relay's: up to a few MiB),
+never more than the call's limit, and both books agree on it. Why: a file that grew after it was
+listed was refused by the app only once its head arrived, and the 1 MB the signer had already read
+by then was charged for nothing delivered. Tests (crates/xbt-signer/tests/ticket_pay.rs):
+`a_file_larger_than_the_buyer_was_shown_is_refused_before_its_body_and_costs_nothing`,
+`a_file_larger_than_the_buyer_was_shown_sends_no_piece_by_draws`,
+`a_page_by_draws_refused_for_its_size_still_draws_for_its_request`; and
+`an_answer_is_larger_than_shown_by_its_whole_size` (crates/xbt-gateway).
+
 **Stop.** `ticket_stop`, a session idle for `tickets.http_idle_s` (120 s by default), a seller
 fault and changed terms all end a session the same way: the book locks and releases nothing more,
 the wallet sends `cancel` for all the session's tickets, and its own node shows them back. A

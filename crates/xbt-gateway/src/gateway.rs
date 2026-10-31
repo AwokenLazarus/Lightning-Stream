@@ -214,6 +214,42 @@ fn busy(b: &admission::Busy) -> Response {
     r
 }
 
+/// Why a body that went past the size the buyer was shown ended there.
+const PASSED_SHOWN: &str = "the answer passed the size the buyer was shown";
+
+/// The most bytes, in all, the buyer was shown the resource has ([`xbt402::ticket::MAX_SIZE_HEADER`]):
+/// the smallest the request names, and only on a GET or HEAD. A request that sends the service work
+/// to do (a body, priced by the token or not) is not judged by it.
+fn shown_size(req: &Request) -> Option<u64> {
+    if !(req.method.eq_ignore_ascii_case("GET") || req.method.eq_ignore_ascii_case("HEAD")) {
+        return None;
+    }
+    req.headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_SIZE_HEADER))
+        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+        .min()
+}
+
+/// The size an answer states in all, where it is more than `most` ([`shown_size`]): `(stated,
+/// most)`. A `206` by the total in its `Content-Range`, any other `2xx` by its `Content-Length` (the
+/// rule the wallet and the app judge by too); an answer that states no size is cut at `most` bytes
+/// as it is sent instead.
+fn larger_than_shown(most: Option<u64>, answer: &Answer) -> Option<(u64, u64)> {
+    let most = most?;
+    let total = match answer.status {
+        206 => answer
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+            .and_then(|(_, v)| v.rsplit_once('/'))
+            .and_then(|(_, t)| t.trim().parse::<u64>().ok()),
+        200..=299 => answer.length,
+        _ => None,
+    }?;
+    (total > most).then_some((total, most))
+}
+
 fn addr_name(client: Option<IpAddr>) -> String {
     match client.map(AddrKey::of) {
         Some(AddrKey::V4(a)) => format!("v4:{a}"),
@@ -259,6 +295,9 @@ struct Metered {
     tokens: Option<TokenCall>,
     /// The most the buyer lets this answer charge, in msat ([`xbt402::ticket::MAX_MSAT_HEADER`]).
     cap_msat: Option<u64>,
+    /// The most bytes the buyer was shown the resource has ([`shown_size`]): a body that states no
+    /// size ends there.
+    max_bytes: Option<u64>,
 }
 
 /// The most the buyer lets an answer to `req` charge, in msat ([`xbt402::ticket::MAX_MSAT_HEADER`]);
@@ -1878,6 +1917,23 @@ impl Gateway {
             };
             return Reply::Whole(self.answered(&a, passed, 0));
         }
+        // the buyer was shown the resource at no more than this size (a listed file): an answer that
+        // says it is larger is refused before any of its body is sent. The request's price stands, as
+        // for an answer with no body: the service did what was asked, and naming a size is no way to
+        // have that for nothing. The first second is given back
+        let shown = if route.price.tokens.active() { None } else { shown_size(&req) };
+        if let Some((_, most)) = larger_than_shown(shown, &answer) {
+            refund(first_second);
+            return Reply::Whole(self.answered(
+                &a,
+                error(
+                    412,
+                    "larger_than_shown",
+                    &format!("the answer is larger than the {most} bytes the buyer was shown; none of it was sent, and only the request's price was charged"),
+                ),
+                reserve.saturating_sub(first_second),
+            ));
+        }
         if head_only || matches!(answer.status, 100..=199 | 204 | 304) {
             // no body: the request's price, and no second of a body that does not exist. The
             // answer keeps the length the service stated (what a HEAD is asked for).
@@ -1965,6 +2021,7 @@ impl Gateway {
             started: Instant::now(),
             tokens: prepared.as_ref().map(|p| TokenCall { body_len: req.body.len() as u64, max_output: p.max_output }),
             cap_msat: buyers_cap(&req),
+            max_bytes: shown,
         };
         let event_stream = answer.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().starts_with("text/event-stream"));
         // a body priced by the token has no length known before it is counted
@@ -2098,6 +2155,16 @@ impl Gateway {
                 Ok(n) => n,
                 Err(e) => break Err(e),
             };
+            // a body that passes the size the buyer was shown (one that stated no size) ends there: what fits
+            // is sent, and the answer ends cut short, never as a whole one
+            let (n, past) = match m.max_bytes {
+                Some(most) if meter.bytes() >= most => break stopped(PASSED_SHOWN),
+                Some(most) => {
+                    let left = usize::try_from(most - meter.bytes()).unwrap_or(usize::MAX);
+                    (n.min(left), n > left)
+                }
+                None => (n, false),
+            };
             let mut off = 0;
             while off < n {
                 let (take, due) = self.pay_bytes(&m, &meter, (n - off) as u64, &mut || out.gone());
@@ -2115,6 +2182,9 @@ impl Gateway {
                 hash.update(&buf[off..off + take_n]);
                 meter.sent(take, due);
                 off += take_n;
+            }
+            if past {
+                break stopped(PASSED_SHOWN);
             }
         };
         let charged = m.at_head.saturating_add(meter.charged());
@@ -2474,5 +2544,43 @@ mod tests {
             assert!(PROTOCOL_CODES.contains(&c.as_str()), "{c} is answered by the gateway and unknown to the wallet");
             assert_eq!(xbt402::ticket::protocol_code(Some(&json!(c))), c);
         }
+    }
+
+    /// The size the buyer was shown, against what an answer states: a whole one's length, a
+    /// part's total in its `Content-Range` (not the part's own length), and nothing where the
+    /// request names no size, sends work (not a GET or HEAD), or the answer states none. Several
+    /// sizes named: the smallest.
+    #[test]
+    fn an_answer_is_larger_than_shown_by_its_whole_size() {
+        let req = |method: &str, most: &[&str]| Request {
+            method: method.into(),
+            headers: most.iter().map(|m| (xbt402::ticket::MAX_SIZE_HEADER.to_ascii_lowercase(), m.to_string())).collect(),
+            ..Request::default()
+        };
+        let answer = |status: u16, length: Option<u64>, range: Option<&str>| Answer {
+            status,
+            headers: range.map(|r| ("Content-Range".to_string(), r.to_string())).into_iter().collect(),
+            length,
+            body: Box::new(std::io::empty()),
+        };
+        let shown = shown_size(&req("GET", &["3145728"]));
+        assert_eq!(shown, Some(3_145_728));
+        assert_eq!(larger_than_shown(shown, &answer(200, Some(4_194_304), None)), Some((4_194_304, 3_145_728)));
+        assert_eq!(larger_than_shown(shown, &answer(200, Some(3_145_728), None)), None, "the size shown, exactly");
+        // a part of 1 MiB of a 4 MiB file: larger than shown by the file, though the part is small
+        assert_eq!(larger_than_shown(shown, &answer(206, Some(1_048_576), Some("bytes 0-1048575/4194304"))), Some((4_194_304, 3_145_728)));
+        assert_eq!(larger_than_shown(shown, &answer(206, Some(1_048_576), Some("bytes 0-1048575/3145728"))), None);
+        // any other 2xx by its length; not a 2xx, or an answer of unknown length: not refused here (the
+        // latter is cut as it is sent)
+        assert_eq!(larger_than_shown(shown, &answer(203, Some(4_194_304), None)), Some((4_194_304, 3_145_728)));
+        assert_eq!(larger_than_shown(shown, &answer(304, Some(4_194_304), None)), None);
+        assert_eq!(larger_than_shown(shown, &answer(200, None, None)), None);
+        // no size named, a size that is not a number, or a request that sends work: none
+        assert_eq!(shown_size(&req("GET", &[])), None);
+        assert_eq!(shown_size(&req("GET", &["lots"])), None);
+        assert_eq!(shown_size(&req("POST", &["1"])), None);
+        assert_eq!(shown_size(&req("head", &["1"])), Some(1));
+        // several: the smallest holds
+        assert_eq!(shown_size(&req("GET", &["9000000", "3145728", "x"])), Some(3_145_728));
     }
 }

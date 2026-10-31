@@ -49,7 +49,10 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
   begins, and a prepaid ticket or win paid without its proof now counts in what the call charged.
-- A file is never paid past the size its listing shows.
+- A file is never read past the size its listing shows. From a 0.1.20 shop, a file that grew after
+  it was listed is refused before any of it is sent and costs nothing, and one whose server states
+  no size is stopped at the listed size. From an older shop, the wallet stops at the listed size and
+  pays only for what was already on its way.
 - A new zero-conf channel carries payments once its funding confirms.
 - The price a shop shows in its listing is now the most your wallet will pay it: one that asks more
   than it advertised is refused before anything is paid. This covers web apps, Files, AI, hashrate

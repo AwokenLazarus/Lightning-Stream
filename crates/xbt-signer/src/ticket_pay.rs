@@ -853,11 +853,16 @@ struct Sink {
     out: Option<std::os::unix::net::UnixStream>,
     /// The reader at `out` went away: the call reads no further.
     gone: bool,
+    /// The most bytes the buyer was shown the body has (the call's `max_size`): a body that states no
+    /// size is taken to there and no further.
+    most: Option<u64>,
+    /// The body went past `most`: the call reads no further ([`PASSED_SHOWN`]).
+    passed: bool,
 }
 
 impl Sink {
     fn new() -> Self {
-        Self { hash: Sha256::new(), bytes: 0, preview: vec![], cap: body_cap(), file: None, file_error: None, out: None, gone: false }
+        Self { hash: Sha256::new(), bytes: 0, preview: vec![], cap: body_cap(), file: None, file_error: None, out: None, gone: false, most: None, passed: false }
     }
 
     /// A sink for `c`: one that streams to the call's socket where it named one. A socket that
@@ -900,6 +905,14 @@ impl Sink {
 
     fn put(&mut self, chunk: &[u8]) {
         use std::io::Write;
+        // past the size the buyer was shown: what fits is taken, and the call reads no further
+        let chunk = match self.most {
+            Some(most) if self.bytes.saturating_add(chunk.len() as u64) > most => {
+                self.passed = true;
+                &chunk[..usize::try_from(most.saturating_sub(self.bytes)).unwrap_or(0).min(chunk.len())]
+            }
+            _ => chunk,
+        };
         if let Some(out) = self.out.as_mut() {
             if out.write_all(chunk).is_err() {
                 self.out = None;
@@ -1545,6 +1558,9 @@ struct Call<'a> {
     /// (a VPN exit's region, a hashrate trial) may buy the seller's whole ticket within `max_sats`
     /// and still be charged only its own use, the rest staying as credit with that seller.
     charge_sats: i64,
+    /// The most bytes the caller was shown the resource has (`max_size`, a listed file's size): sent
+    /// to the seller ([`xbt402::ticket::MAX_SIZE_HEADER`]), and an answer that states more is not read.
+    max_size: Option<u64>,
 }
 
 impl Call<'_> {
@@ -1552,20 +1568,40 @@ impl Call<'_> {
     fn headers(&self) -> Vec<(String, String)> {
         let mut h: Vec<(String, String)> = self.range.iter().map(|r| ("Range".to_string(), r.header())).collect();
         h.extend(self.extra.iter().cloned());
+        h.extend(self.max_size.map(|n| (xbt402::ticket::MAX_SIZE_HEADER.to_string(), n.to_string())));
         h
     }
 
     /// The answer's head, read ([`answer_head`]); with `stream_head`, the first line on the socket.
     /// `Some`: why its body is not read.
     fn head(&self, ans: &mut WireAnswer, sink: &mut Sink) -> (Value, Option<String>) {
-        head_to(ans, self.range, self.stream_head, self.head_headers, sink)
+        head_to(ans, self.range, self.max_size, self.stream_head, self.head_headers, sink)
     }
 }
 
+/// Why an answer whose head states more bytes in all than `most` is not read: the total in a
+/// `206`'s `Content-Range`, or the `Content-Length` of any other `2xx` (the rule the seller and the
+/// app judge by too). `None`: within it, nothing stated, or not a `2xx`.
+fn larger_than_shown(status: u16, head: &Value, most: Option<u64>) -> Option<String> {
+    let most = most?;
+    let total = match status {
+        206 => head.get("content_range").and_then(Value::as_str).and_then(|cr| cr.rsplit_once('/')).and_then(|(_, t)| t.parse::<u64>().ok()),
+        200..=299 => head.get("content_length").and_then(Value::as_u64),
+        _ => None,
+    }?;
+    (total > most).then(|| format!("the seller's answer is {total} bytes, more than the {most} the buyer was shown; nothing of it is read"))
+}
+
 /// [`answer_head`], and with `line` the head as the first line on the sink's socket (with `error`:
-/// why the body is not read, where it is not).
-fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, line: bool, with_headers: bool, sink: &mut Sink) -> (Value, Option<String>) {
+/// why the body is not read, where it is not). An answer larger than `most` ([`larger_than_shown`])
+/// is not read.
+fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, most: Option<u64>, line: bool, with_headers: bool, sink: &mut Sink) -> (Value, Option<String>) {
     let (head, refused) = answer_head(ans, range);
+    let refused = refused.or_else(|| larger_than_shown(ans.status, &head, most));
+    // the file's body (a 2xx) is read to the size shown and no further; an error's is the seller's own
+    if (200..300).contains(&ans.status) {
+        sink.most = most;
+    }
     if line {
         let mut l = head.clone();
         if let Some(why) = &refused {
@@ -1611,7 +1647,9 @@ pub(crate) fn caller_headers(v: Option<&Value>) -> std::result::Result<Vec<(Stri
         if !token(k) {
             return Err(format!("header name {k:?} is not a plain token"));
         }
-        if CALLER_REFUSED.contains(&lk.as_str()) || lk.starts_with("payment-") || lk.starts_with("x-forwarded-") {
+        // `x-xbt402-*` are the wallet's to the seller (the call's limit, the size shown, the price line):
+        // a caller's own would stand beside them, and a seller may read either
+        if CALLER_REFUSED.contains(&lk.as_str()) || lk.starts_with("payment-") || lk.starts_with("x-forwarded-") || lk.starts_with("x-xbt402-") {
             return Err(format!("header {k} is the wallet's own, or not one a proxy passes on"));
         }
         if val.len() > HEADER_VALUE || !val.bytes().all(|b| b.is_ascii_graphic() || b == b' ' || b == b'\t') {
@@ -1857,6 +1895,8 @@ const FIRST_PAY_S: f64 = 3.0;
 
 /// Why a call stopped reading when the program it streams to stopped reading first.
 const READER_GONE: &str = "stopped by the buyer: the reader the body was streamed to went away";
+/// Why the wallet read no further of a body that went past the size the buyer was shown (`max_size`).
+const PASSED_SHOWN: &str = "stopped by the wallet: the answer passed the size the buyer was shown";
 
 /// The socket a call streams its body to (`stream_to`): a name in `B2_STREAM_DIR`, which the
 /// operator sets for a local program that hands the body on (a player). A name, never a path, so a
@@ -2115,7 +2155,7 @@ impl Signer {
     /// joined until either side ends it. Nothing is paid.
     fn free_websocket(&self, mut ans: WireAnswer, writer: Box<dyn Write + Send>, stream_to: Option<&std::path::Path>, stream_head: bool, head_headers: bool) -> Value {
         let mut sink = Sink::streaming_to(stream_to);
-        let (head, _) = head_to(&mut ans, None, stream_head, head_headers, &mut sink);
+        let (head, _) = head_to(&mut ans, None, None, stream_head, head_headers, &mut sink);
         let up = AtomicU64::new(0);
         let (back, stopper) = (sink.back_channel(), sink.back_channel());
         let ended = std::thread::scope(|scope| {
@@ -2365,11 +2405,20 @@ impl Signer {
                 None => return deny("amount", "max_charge_sats must be an integer"),
             },
         };
+        // the most bytes the caller was shown the resource has: a larger answer is refused before its body
+        let max_size = match p.get("max_size").filter(|v| !v.is_null()) {
+            None => None,
+            Some(v) => match v.as_u64().filter(|n| *n > 0) {
+                Some(n) => Some(n),
+                None => return deny("max_size", "max_size is a number of bytes, above 0"),
+            },
+        };
         if upgrade && (stream_to.is_none() || method != "GET" || range.is_some()) {
             return deny("upgrade", "a WebSocket (upgrade) is a GET with stream_to, and no range");
         }
         let mut range_headers: Vec<(String, String)> = range.iter().map(|r| ("Range".to_string(), r.header())).collect();
         range_headers.extend(extra.iter().cloned());
+        range_headers.extend(max_size.map(|n| (xbt402::ticket::MAX_SIZE_HEADER.to_string(), n.to_string())));
         // the owner's word before any request leaves: an allowlisted origin, or a task that pays any seller
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
@@ -2462,7 +2511,7 @@ impl Signer {
                     let status = probe.status;
                     // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
                     let mut sink = Sink::streaming_to(stream_to.as_deref());
-                    let (head, refused) = head_to(&mut probe, range, stream_head, head_headers, &mut sink);
+                    let (head, refused) = head_to(&mut probe, range, max_size, stream_head, head_headers, &mut sink);
                     let ended = match refused {
                         Some(why) => Some(format!("not read: {why}")),
                         None => read_all(probe, &mut sink),
@@ -2486,7 +2535,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats, max_size };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
@@ -3974,7 +4023,7 @@ impl Signer {
             };
             let seq_deadline = Instant::now() + SEQ_WAIT;
             let mut sent_epoch;
-            let (mut ans, receipt) = loop {
+            let (ans, receipt) = loop {
                 let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
                 let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
                 let mut headers = c.headers();
@@ -4058,9 +4107,21 @@ impl Signer {
                     return fail(hs, &spent, with(d, json!({"status": status})));
                 }
             };
+            // the seller's refusal of an answer larger than the size this GET or HEAD named (`larger_than_shown`):
+            // charged as an answer with no body, at the request's price. Its short body is read for its code here,
+            // and kept for the reply
+            let (mut ans, size_refusal) = if ans.status == 412 && c.max_size.is_some() && (c.method.eq_ignore_ascii_case("GET") || c.method.eq_ignore_ascii_case("HEAD")) {
+                let (status, headers, length) = (ans.status, ans.headers.clone(), ans.length);
+                let body = ans.read_small(SMALL_BODY).unwrap_or_default();
+                let code = serde_json::from_slice::<Value>(&body).ok().is_some_and(|v| protocol_code(v.get("error")) == "larger_than_shown");
+                (WireAnswer { status, headers, length, body: Box::new(std::io::Cursor::new(body)), closer: None }, code)
+            } else {
+                (ans, false)
+            };
             // the receipt's totals, inside what the wallet can account for ([`Money::take`])
             let metered = head.body_hash.is_empty() && ans.status < 400;
             let charged_max = match ans.status {
+                _ if size_refusal => price.request_msat,
                 s if s >= 400 => 0,
                 _ if metered => price.request_msat.saturating_add(price.second_msat),
                 _ => price.request_msat,
@@ -4501,6 +4562,10 @@ impl Signer {
                     account(st.cost(bytes));
                 }
                 wake.notify_all();
+                if sink.passed {
+                    lock(&state).1.get_or_insert(PASSED_SHOWN.into());
+                    break;
+                }
                 if length.is_some_and(|l| bytes >= l) {
                     break;
                 }
@@ -5049,6 +5114,9 @@ fn read_all(ans: WireAnswer, sink: &mut Sink) -> Option<String> {
         }
         if sink.gone {
             return Some(READER_GONE.into());
+        }
+        if sink.passed {
+            return Some(PASSED_SHOWN.into());
         }
     }
     length.filter(|l| *l != sink.bytes).map(|l| format!("cut short: {} of {l} bytes", sink.bytes))
