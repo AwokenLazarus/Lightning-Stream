@@ -484,10 +484,10 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     }
     let datum = lock(r).datum.clone();
     if datum.is_empty() {
-        return (400, json!({"error": "no DATUM Gateway set: rented hashrate goes to your own DATUM Gateway"}));
+        return (400, json!({"error": "no gateway set: rented hashrate goes to your own gateway"}));
     }
     if !reachable(&datum) {
-        return (400, json!({"error": format!("your DATUM Gateway at {datum} does not answer")}));
+        return (400, json!({"error": format!("your gateway at {datum} does not answer")}));
     }
     // looked at again now: this is the money's last chance to stay home
     let allow_unblinded = lock(r).allow_unblinded;
