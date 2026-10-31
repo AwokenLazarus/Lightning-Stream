@@ -5621,6 +5621,84 @@ fn a_wallet_tells_a_seller_with_accounts_who_it_is_and_stays_anonymous_when_told
     let _ = std::fs::remove_file(ACCOUNT_HOOK);
 }
 
+/// A web app's page reaches a route that gives accounts in a session that opened on another route
+/// (a shop's files, say), or after the seller started again and forgot who the wallet is (a shop
+/// turned private restarts its gateway). The seller asks who the wallet is (`identify_first`); the
+/// wallet tells it and asks again, and the page gets the service's answer, not the seller's
+/// refusal. Found on a private shop: its Jellyfin opened to a raw "403 identify_first".
+#[test]
+fn a_page_on_a_route_with_accounts_is_served_after_the_wallet_says_who_it_is() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let guest = |v: &Value| -> String {
+        let body: Value = serde_json::from_str(v["untrusted_provider_response"]["body"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
+        body["guest"].as_str().unwrap_or("").to_string()
+    };
+    // a session opened on a route without accounts: nothing is said of who the wallet is then
+    let mut r = Rig::new(json!({}));
+    let first = r.pay_known("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    assert!(r.tap.seen("/x402/ticket/identify").is_empty(), "{:?}", r.tap.seen(""));
+    // the page asks the route with accounts in the same session: the seller asks who the wallet is, is told, and serves
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v.get("seller_fault"), v["session"] == first["session"]), (Some(200), None, true), "{v}");
+    let me = guest(&v);
+    assert!(me.starts_with("buyer-"), "the buyer's own account served the page: {v}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1);
+    // charged once, for the answer served: the seller's refusal cost nothing
+    assert_eq!(v["price_msat"].as_str(), Some("2500"), "{v}");
+    // the seller starts again and forgets who the wallet is; the page's next request is streamed as a page's is
+    r.shop.restart();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let l = UnixListener::bind(dir.path().join("acct-page")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        s.read_to_end(&mut all).unwrap();
+        all
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/acct/echo"), "max_sats": CALL, "task": "film", "known_terms": true,
+                                       "stream_to": "acct-page", "stream_head": true, "head_headers": true}));
+    let page = String::from_utf8_lossy(&reader.join().unwrap()).to_string();
+    std::env::remove_var("B2_STREAM_DIR");
+    assert_eq!((v["status"].as_u64(), v.get("seller_fault"), v["session"] == first["session"]), (Some(200), None, true), "{v}");
+    assert!(!page.contains("identify_first") && page.contains(&me), "the page got the service's answer as the same buyer, not the seller's refusal: {page}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 2, "told again after the restart");
+    assert_eq!(v["price_msat"].as_str(), Some("2500"), "{v}");
+    // and the same once the wallet itself starts again: the same wallet is the same buyer there
+    r.restart();
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), guest(&v) == me), (Some(200), true), "{v}");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// A wallet that stays anonymous at a seller whose route gives accounts and has no guest: the page
+/// is told why in the wallet's own words, not shown the seller's raw refusal.
+#[test]
+fn an_anonymous_wallet_is_told_why_a_route_with_accounts_refuses_it() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let quiet = Rig::new(json!({}));
+    let set = quiet.call("identity_set", json!({"origin": quiet.shop.origin, "anonymous": true}));
+    assert_eq!(set["ok"], true, "{set}");
+    let v = quiet.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str(), v.get("seller_fault")), (Some(403), Some("ticket_refused"), None), "{v}");
+    assert!(v["reason"].as_str().is_some_and(|r| r.contains("anonymous")), "{v}");
+    assert!(quiet.tap.seen("/x402/ticket/identify").is_empty(), "an anonymous wallet says nothing");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
 // --- a session that lives on its credit (found on mainnet: a busy session was taken for idle) ------
 
 /// A session paid only from the credit of one prepaid ticket, one small request every 30 s for 30
