@@ -379,6 +379,9 @@ struct SellerNode {
     clock: Arc<AtomicU64>,
     /// How far back its invoices are dated: an invoice that comes nearly dead.
     backdate: AtomicU64,
+    /// The invoices made just after a cancel, in order: a win's next invoice, where the buyer asked.
+    reinvoiced: Mutex<Vec<String>>,
+    cancelled: AtomicBool,
     /// What the seller's node was given to settle: the buyer's node learns the preimage from it.
     preimages: Arc<Mutex<HashMap<String, String>>>,
     lie: Mutex<Lie>,
@@ -405,6 +408,9 @@ impl SellerNodeApi for SellerNode {
         self.inner.add_invoice(preimage, msat, cltv_blocks, expiry_s)?;
         let hash: Hash = Sha256::digest(preimage).into();
         self.preimages.lock().unwrap().insert(hex::encode(hash), hex::encode(preimage));
+        if self.cancelled.swap(false, Ordering::SeqCst) {
+            self.reinvoiced.lock().unwrap().push(hex::encode(hash));
+        }
         let lie = *self.lie.lock().unwrap();
         let key = if lie == Lie::OtherPayee { SecretKey::from_slice(&[0x44; 32]).unwrap() } else { self.key };
         let msat = if lie == Lie::OtherAmount { msat + 1 } else { msat };
@@ -426,7 +432,11 @@ impl SellerNodeApi for SellerNode {
     }
 
     fn cancel(&self, hash: &Hash) -> Result<(), NodeError> {
-        self.inner.cancel(hash)
+        let r = self.inner.cancel(hash);
+        if r.is_ok() {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+        r
     }
 
     fn lookup(&self, hash: &Hash) -> Result<Option<Invoice>, NodeError> {
@@ -583,7 +593,7 @@ impl Shop {
         let key = SecretKey::from_slice(&[0x33; 32]).unwrap();
         let standin = Arc::new(StandIn::new(H0 as u32));
         standin.set_identity(&node_id(&key), &["regtest"]);
-        let node = Arc::new(SellerNode { inner: standin.clone(), key, clock: clock.clone(), backdate: AtomicU64::new(0), preimages: Arc::new(Mutex::new(HashMap::new())), lie: Mutex::new(Lie::None) });
+        let node = Arc::new(SellerNode { inner: standin.clone(), key, clock: clock.clone(), backdate: AtomicU64::new(0), reinvoiced: Mutex::new(vec![]), cancelled: AtomicBool::new(false), preimages: Arc::new(Mutex::new(HashMap::new())), lie: Mutex::new(Lie::None) });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = tempfile::tempdir().unwrap();
@@ -736,6 +746,8 @@ struct PayState {
     /// The next payment fails each time it is sent, as to a hop that stays full; `failing` is its hash.
     fail_one: bool,
     failing: Option<String>,
+    /// Invoices whose payments fail as well (a win's next invoice, in the same drop).
+    fail_also: Vec<String>,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
     late_fail: usize,
@@ -928,7 +940,7 @@ impl LnBackend for PayLn {
         }
         // its own channel down: as the real node says it, no balance, and no attempt on its record
         let down = s.channel["active"] != true;
-        let failing = down || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str());
+        let failing = down || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
         s.fail_next = s.fail_next.saturating_sub(1);
         let late = !failing && s.late_fail > 0;
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
@@ -4972,6 +4984,13 @@ const PIECE: usize = 65_536;
 fn draws_shop() -> Value {
     // (a grace of 2 s where the gateway ships 30: an answer whose win stays unpaid stands still for that long)
     json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2}})
+}
+
+/// A seller that serves on while a win waits for its next invoice: what a test is about is the invoice,
+/// not the seller's answer standing still for its grace.
+fn patient_draws_rig(extra: Value) -> Rig {
+    Rig::shipped(extra, 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                                   "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}))
 }
 
 /// The wallet as it ships on a 30-slot channel, paying a seller that offers the lottery.
@@ -9148,7 +9167,7 @@ fn a_channel_out_for_a_moment_ends_no_tunnel_whether_an_htlc_is_pending_or_the_p
 #[test]
 fn a_call_whose_answer_has_ended_waits_for_the_next_invoice_of_a_win_that_ran_out() {
     let _g = env_lock();
-    let r = draws_rig(json!({}));
+    let r = patient_draws_rig(json!({}));
     lapse_at_wins_after(&r, 1, 28, Duration::from_millis(1_500));
     let size = 256 * PIECE;
     let v = r.pay(&format!("/pieces/{size}"), 1_000);
@@ -9451,7 +9470,7 @@ fn a_node_that_fails_every_payment_is_not_asked_for_ever() {
 #[test]
 fn a_seller_without_cancel_is_asked_once() {
     let _g = env_lock();
-    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
     old_seller(&r);
     r.ln.st.lock().unwrap().hop_full = true;
     let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
@@ -9468,15 +9487,20 @@ fn a_seller_without_cancel_is_asked_once() {
 #[test]
 fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
     let _g = env_lock();
-    let r = draws_rig(json!({}));
-    let ln = r.ln.clone();
+    let r = patient_draws_rig(json!({}));
+    let (ln, node) = (r.ln.clone(), r.shop.node.clone());
     let mut st = r.ln.st.lock().unwrap();
-    st.send_takes = Duration::from_millis(200);
-    st.hop_full = true;
-    // the drop is over once two payments have failed in it
+    // payments take a second on the way: the wins are paid after the answer has ended
+    st.send_takes = Duration::from_millis(1_000);
+    st.fail_one = true;
+    // the win's next invoice, which the seller makes at the wallet's asking, fails in the same drop
     st.on_look = Some(Arc::new(move |_| {
-        if ln.by_status("FAILED").len() >= 2 {
-            ln.st.lock().unwrap().hop_full = false;
+        let next = node.reinvoiced.lock().unwrap().first().cloned();
+        if let Some(h) = next {
+            let mut s = ln.st.lock().unwrap();
+            if s.fail_also.is_empty() {
+                s.fail_also.push(h);
+            }
         }
     }));
     drop(st);
@@ -9486,7 +9510,8 @@ fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
     let wins = v["wins"].as_u64().unwrap();
     assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
     let failed = r.ln.by_status("FAILED");
-    assert!(failed.len() >= 2, "{v}");
+    assert_eq!(failed.len(), 2, "the win's invoice and its next one: {v}");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 2, "{v}");
     assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "no failed invoice sent again: {v}");
     assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
 }
