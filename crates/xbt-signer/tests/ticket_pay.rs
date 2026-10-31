@@ -5711,6 +5711,48 @@ fn a_call_may_buy_a_whole_ticket_and_be_charged_only_its_max_charge() {
     assert!(charged <= 30_000 && charged > 20_000, "charged {charged} msat for a cap of 30 sat: {film}");
 }
 
+/// A seller that ignores a small use's `max_charge_sats` (a region check's 20 sat, from no credit,
+/// where the call may buy the whole ticket within `max_sats`) and charges past it: the wallet reads no
+/// further than the cap by its own count, the receipt over the cap is the seller's fault, the session
+/// is stopped and the seller blocked, at once. Both sides hold one ticket and nothing more.
+///
+/// FAILS before the charge cap was the bound: such a seller could charge the use its whole ticket.
+#[test]
+fn a_seller_that_charges_a_small_use_past_its_charge_cap_is_a_fault_and_blocked() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    r.tap.drop_cap.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 30 * MIB)), "max_sats": CALL, "max_charge_sats": 20, "task": "film"}));
+    r.tap.drop_cap.store(false, Ordering::SeqCst);
+    assert!(started.elapsed() < Duration::from_secs(30), "the call ends promptly: {:?}", started.elapsed());
+    // the seller's word: past the cap
+    let price: u64 = v["price_msat"].as_str().unwrap_or("0").parse().unwrap();
+    assert!(price > 20_000, "the seller charged past the charge cap here: {v}");
+    let fault = v["seller_fault"].as_str().unwrap_or_default();
+    assert!(fault.contains(&format!("charged {price} msat")) && fault.contains("more than the 20000 msat"), "{v}");
+    // the wallet's own count: it read about 20 sat of a 200 sat/MiB file (100 KiB), not the 5,000 sat that could leave
+    let bytes = v["bytes"].as_u64().unwrap();
+    assert!(bytes <= 128 * 1024, "{bytes} bytes read for a 20 sat cap: {v}");
+    // what left: one ticket (and its fee), bought from no credit; the seller's node took that one and nothing more
+    assert_eq!((v["tickets_released"].as_u64(), r.shop.settled()), (Some(1), 1), "{v}");
+    assert_eq!(r.ln.paid_msat(), TICKET, "the buyer's node paid one ticket");
+    // the ledger, made exact once the node shows the ticket settled: the ticket and its fee, within what the call said left
+    r.tick();
+    let booked = r.ledger_sum();
+    assert!((TICKET / 1000) as i64 <= booked && booked <= v["charged_sats"].as_i64().unwrap() && booked <= (TICKET / 1000) as i64 + 15, "{booked} booked: {v}");
+    r.assert_booked();
+    let over = r.audit("ticket_over_cap");
+    assert_eq!((over.len(), over[0]["max_msat"].as_str(), over[0]["charged_msat"].as_str()), (1, Some("20000"), Some(price.to_string().as_str())), "{over:?}");
+    assert_ne!(r.session(v["session"].as_str().unwrap())["sessions"][0]["state"], "open", "the session is stopped");
+    // blocked: the next call to it, however small and whatever it may spend, is refused before anything leaves
+    let blocked: Value = serde_json::from_str(&std::fs::read_to_string(r.root.join(".run").join("blocked_sellers.json")).unwrap()).unwrap();
+    assert!(blocked.as_object().unwrap().values().any(|b| b["payee"] == r.shop.id()), "{blocked}");
+    let next = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "max_charge_sats": 20, "task": "film"}));
+    assert_eq!(next["rule"].as_str(), Some("seller_blocked"), "{next}");
+    assert_eq!((r.ln.paid_msat(), r.shop.settled()), (TICKET, 1), "nothing more left");
+}
+
 /// The draw rail keeps a call's `max_charge_sats` as the ticket rail does: the answer is read no
 /// further than it, while `max_sats` stays what may leave (here, a whole win of 64 sat).
 ///
