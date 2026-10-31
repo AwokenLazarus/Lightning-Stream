@@ -157,10 +157,12 @@ def masked_block(header):
 
 
 def node_up(gw, subnet):
+    """The node's RPC on the test network's bridge address (the containers' way in: the host's own connection to that
+    address is refused as from outside the subnet) and on 127.0.0.1 for this script's bitcoin-cli."""
     os.makedirs(NODE_DIR, exist_ok=True)
     with open(os.path.join(NODE_DIR, "bitcoin.conf"), "w") as f:
         f.write("regtest=1\nserver=1\nlistenonion=0\ndiscover=0\ndnsseed=0\nfixedseeds=0\nfallbackfee=0.0002\ntxindex=1\nblake2b_headline=Lazarus\n"
-                f"[regtest]\nlisten=0\nrpcbind={gw}\nrpcallowip={subnet}\nrpcport={RPC}\nrpcconnect={gw}\nrpcuser=lab\nrpcpassword={RPC_PASS}\n"
+                f"[regtest]\nlisten=0\nrpcbind={gw}\nrpcbind=127.0.0.1\nrpcallowip={subnet}\nrpcallowip=127.0.0.1\nrpcport={RPC}\nrpcuser=lab\nrpcpassword={RPC_PASS}\n"
                 "testactivationheight=blake2b@101\nmaxtipage=315360000\n")
     os.chmod(os.path.join(NODE_DIR, "bitcoin.conf"), 0o600)
     sh(f"{HG}/bitcoind", f"-datadir={NODE_DIR}", "-daemon", env={**os.environ, "LD_LIBRARY_PATH": f"{HG}/lib"})
@@ -180,7 +182,7 @@ def cleanup():
     try:
         cli("stop")
     except Exception:  # noqa: BLE001
-        pass
+        subprocess.run(["pkill", "-f", f"-datadir={NODE_DIR}"], capture_output=True)
 
 
 def main():
