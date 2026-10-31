@@ -49,6 +49,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A slow wallet no longer stops its session with a seller and marks the seller at fault when the
+  seller times out waiting for the wallet's request. It sends the request again.
 - A file no longer gets cut because the wallet's disk is slow while it pays many sellers. With 100 ms
   added to each of the wallet's disk writes and 20 other sellers' wins queued, the win a seller was
   waiting for was paid after 22 to 28 others and its file was cut, in 3 of 3 runs. It is now paid after
