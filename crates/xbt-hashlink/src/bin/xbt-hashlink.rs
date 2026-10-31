@@ -276,28 +276,34 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         }
     };
     let budget_sats = f.get("budget-sats").map(|v| v.parse::<u64>()).transpose().map_err(|_| "--budget-sats")?;
-    // --max-sats: what a slice may move, uncapped in charge; else a budget's caps, as the app's rentals
-    let (max_sats, max_charge_sats) = match (f.get("max-sats"), budget_sats) {
-        (None, Some(b)) => xbt_hashlink::rail::pay_caps(b),
-        _ => (num(f, "max-sats", None)?, None),
-    };
     let payer = match f.get("signer") {
-        Some(sock) => Some(SignerPayer {
-            sock: PathBuf::from(sock),
-            url: f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
-            task: need(f, "task")?.into(),
-            max_sats,
-            max_charge_sats,
-            session: None,
-            // the offer's price per slice: the most the shop is paid for one
-            ceiling: Some(xbt_hashlink::rail::slice_ceiling(t.price_msat)),
-            wait_for_signer: std::time::Duration::from_secs(num(f, "wait-for-signer-s", Some(15))?),
-        }),
+        Some(sock) => {
+            // what a slice may move and what it may be charged: a budget alone sets the app's caps (as the
+            // app's rentals); --max-sats sets what may move, and a budget beside it is still the charge cap
+            let (max_sats, max_charge_sats) = match (f.get("max-sats"), budget_sats) {
+                (None, Some(b)) => xbt_hashlink::rail::pay_caps(b),
+                (_, b) => {
+                    let m: u64 = num(f, "max-sats", None)?;
+                    (m, b.map(|b| b.min(m)).filter(|c| *c > 0))
+                }
+            };
+            Some(SignerPayer {
+                sock: PathBuf::from(sock),
+                url: f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
+                task: need(f, "task")?.into(),
+                max_sats,
+                max_charge_sats,
+                session: None,
+                // the offer's price per slice: the most the shop is paid for one
+                ceiling: Some(xbt_hashlink::rail::slice_ceiling(t.price_msat)),
+                wait_for_signer: std::time::Duration::from_secs(num(f, "wait-for-signer-s", Some(15))?),
+            })
+        }
         None => None,
     };
     let cfg = hashtaker::Config {
         miners: num(f, "miners", Some(0))?,
-        budget_msat: budget_sats.map(|s| s * 1000),
+        budget_msat: budget_sats.map(|s| s.checked_mul(1000).ok_or("--budget-sats: too large")).transpose()?,
         cut: None,
         live: None,
         hashmaker,
