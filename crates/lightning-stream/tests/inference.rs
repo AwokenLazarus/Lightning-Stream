@@ -291,6 +291,11 @@ fn rig_with(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool) -> Rig 
 
 /// [`rig_with`], with `pay_wait` for a call's payment.
 fn rig_paying(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool, pay_wait: Duration) -> Rig {
+    rig_timed(cheap, dear, limit_sats, models_down, pay_wait, Duration::from_millis(1000))
+}
+
+/// [`rig_paying`], with `first_byte` for a seller's first byte.
+fn rig_timed(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool, pay_wait: Duration, first_byte: Duration) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let sellers = Arc::new(Mutex::new(Sellers { plans: HashMap::from([("cheap.example".into(), cheap), ("dear.example".into(), dear)]), paid: vec![],
                                                 served: vec![], calls: vec![], models_down }));
@@ -305,7 +310,7 @@ fn rig_paying(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool, pay_w
         {"name": "dear", "route": "https://dear.example/ai/", "prices": {"per_1k_output_msat": 9000}, "max_output": 1024}]}).to_string()).unwrap();
     let cfg = lightning_stream::inference_server::Config {
         signer: sock, stream_dir: dir.path().to_path_buf(), task: "ai".into(), max_sats: 2000, credentials: creds.clone(), sellers: list,
-        state: dir.path().join("ai-state.json"), first_byte: Duration::from_millis(1000), pay_wait,
+        state: dir.path().join("ai-state.json"), first_byte, pay_wait,
         account_wait: Duration::from_millis(500), allowed_hosts: vec![],
     };
     let run = lightning_stream::inference_server::serve(cfg, TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
@@ -431,6 +436,60 @@ fn a_proxys_524_after_the_request_left_is_not_followed_by_another_seller() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(served(&r), ["cheap.example"]);
     assert_eq!(spent(&r), 500, "no receipt: the most the request may cost");
+}
+
+/// More quick calls at once than may wait on a payment (8) are a moment's queue, not a refusal: all
+/// 12 are served, and each is booked.
+///
+/// FAILS before: the 9th call on was answered 503 at once, with nothing slow.
+#[test]
+fn more_quick_calls_at_once_than_may_wait_on_a_payment_are_all_served() {
+    let r = rig_timed(Plan::Answer(10), Plan::Answer(10), 100, false, lightning_stream::inference_server::PAY_WAIT, Duration::from_secs(20));
+    model_ids(&r);
+    let (addr, key) = (r.addr.clone(), r.key.clone());
+    let calls: Vec<_> = (0..12).map(|_| {
+        let (addr, key) = (addr.clone(), key.clone());
+        std::thread::spawn(move || call(&addr, "POST", "/v1/chat/completions", Some(&key), "", &json!({"model": "llama", "stream": true, "max_tokens": 100}).to_string()))
+    }).collect();
+    let got: Vec<_> = calls.into_iter().map(|c| c.join().unwrap()).collect();
+    assert!(got.iter().all(|(status, _, body)| (*status, body.as_str()) == (200, ANSWER)), "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(served(&r).len(), 12);
+    assert_eq!(spent(&r), 120, "each booked once");
+}
+
+/// When a slow route holds every place, a call waits only a moment for one, is told 503, and nothing
+/// is sent or paid for it; the endpoint's health and list of models still answer.
+#[test]
+fn a_slow_route_holding_every_place_refuses_soon_and_the_endpoint_still_answers() {
+    let r = rig(Plan::SlowPay(10, 3000), Plan::Answer(10), 100);
+    model_ids(&r);
+    let calls: Vec<_> = (0..8).map(|_| {
+        let (addr, key) = (r.addr.clone(), r.key.clone());
+        std::thread::spawn(move || call(&addr, "POST", "/v1/chat/completions", Some(&key), "", &json!({"model": "llama", "stream": true, "max_tokens": 100}).to_string()))
+    }).collect();
+    wait_until("all 8 at the wallet", || r.sellers.lock().unwrap().calls.len() == 8);
+    let t = std::time::Instant::now();
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"]["code"], "busy");
+    assert!(t.elapsed() < Duration::from_secs(2), "told soon, not after the payment: {:?}", t.elapsed());
+    assert_eq!(call(&r.addr, "GET", "/health", None, "", "").0, 200);
+    assert!(model_ids(&r).contains(&"llama".to_string()));
+    assert_eq!(r.sellers.lock().unwrap().calls.len(), 8, "nothing sent for the call refused");
+    for c in calls {
+        assert_eq!(c.join().unwrap().0, 200);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(spent(&r), 80, "the 8 served are booked, the one refused is not");
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < end, "waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A seller whose service is full turns the request away before anything is paid or served: the

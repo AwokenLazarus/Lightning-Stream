@@ -67,10 +67,19 @@ pub const ACCOUNT_WAIT: Duration = Duration::from_secs(12);
 /// gives every paid call up before it is paid.
 pub const PAY_WAIT_FLOOR: Duration = Duration::from_secs(30);
 
-/// The most calls that wait on a payment at once ([`serve`] answers on 16 threads): one more is
-/// answered 503 at once, so that a slow route never holds every thread and the endpoint's health
-/// and list of models still answer.
+/// The most calls that wait on a payment at once ([`serve`] answers on 16 threads), so that a slow
+/// route never holds every thread and the endpoint's health and list of models still answer.
 pub const MAX_PAYING: usize = 8;
+
+/// The most calls that wait for one of those places. Past that a call is answered 503 at once: with
+/// [`MAX_PAYING`] it leaves 4 of the 16 threads for the endpoint's health and list of models.
+pub const MAX_WAITING: usize = 4;
+
+/// How long a call waits for a place at most (a quarter of `first_byte` where that is less). A place
+/// is held for the whole of a call's start, not only a slow payment, so that more than
+/// [`MAX_PAYING`] quick calls at once are a moment's queue, not a refusal; and the wait stays well
+/// under the time a seller is given, so that a client is told soon when a slow route has them all.
+pub const SLOT_WAIT: Duration = Duration::from_secs(5);
 
 /// `max_tokens` when a request names none, for the bound of what it may cost.
 const DEFAULT_MAX_TOKENS: u64 = 1024;
@@ -124,6 +133,8 @@ pub struct AiServer {
     inner: Arc<Mutex<Inner>>,
     /// Calls waiting on a payment now ([`MAX_PAYING`]).
     paying: AtomicUsize,
+    /// Calls waiting for a place among them ([`MAX_WAITING`]).
+    waiting: AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -499,7 +510,7 @@ impl AiServer {
             Err(e) => return Err(e),
         }
         let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, keep: CATALOGUE_TTL, fetches: 0, fetching: false, sellers_changed: None })),
-                        paying: AtomicUsize::new(0) };
+                        paying: AtomicUsize::new(0), waiting: AtomicUsize::new(0) };
         // the sellers' model lists are asked for at once, in the background: the first request does not wait for all of them
         me.fetch_in_background();
         Ok(me)
@@ -615,7 +626,7 @@ impl AiServer {
         };
         // a cap on the calls waiting on a payment at once (a fetch of the catalogue included): the endpoint's other
         // requests (its health, its list of models) keep threads to answer on while a slow route holds the rest
-        let Some(_slot) = Slot::take(&self.paying, MAX_PAYING) else {
+        let Some(_slot) = self.paying_place() else {
             return Reply::Whole(json_response(503, &error_body("busy", "api_error", "Too many requests are waiting for their payment to go through; try again shortly.")));
         };
         self.refresh();
@@ -674,6 +685,23 @@ impl AiServer {
         }
         let (status, message) = last.unwrap_or((502, "no seller answered".into()));
         Reply::Whole(json_response(status, &error_body("upstream_failed", "api_error", &format!("No seller could answer: {message}"))))
+    }
+
+    /// A place among the calls waiting on a payment, waited for at most [`SLOT_WAIT`]; none for a
+    /// call past [`MAX_WAITING`], or that waited that long.
+    fn paying_place(&self) -> Option<Slot<'_>> {
+        if let Some(s) = Slot::take(&self.paying, MAX_PAYING) {
+            return Some(s);
+        }
+        let _waiting = Slot::take(&self.waiting, MAX_WAITING)?;
+        let end = Instant::now() + SLOT_WAIT.min(self.cfg.first_byte / 4);
+        while Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+            if let Some(s) = Slot::take(&self.paying, MAX_PAYING) {
+                return Some(s);
+            }
+        }
+        None
     }
 
     /// Books what a call the client got no answer from cost the key, by the wallet's account of it:

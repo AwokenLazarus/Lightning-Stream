@@ -131,8 +131,9 @@ to pay, or it says the request never left, or the seller answered with a failure
 silent, or slow to its first byte after a 2xx head, is not followed by another: it may still be
 serving the request, and one answer is never paid to two sellers. Whatever such a call cost is
 booked to the key when the wallet says it; where it never says, or the request may have left with
-no receipt, the most the request may cost. At most 8 calls wait on a payment at once; more are
-answered 503 at once, so the endpoint's other requests keep threads to answer on.
+no receipt, the most the request may cost. At most 8 calls wait on a payment at once. More wait up
+to 5 s for a place, 4 at most, then are answered 503, so the endpoint's other requests keep threads
+to answer on.
 
 The AI page's settings are `XBT_UI_AI_ENDPOINT` (the address it shows), `XBT_UI_AI_SELLERS`,
 `XBT_UI_CREDENTIALS` and `XBT_UI_AI_STATE` (docs in `crates/xbt-wallet-ui/src/config.rs`).
