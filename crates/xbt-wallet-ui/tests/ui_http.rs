@@ -2825,6 +2825,45 @@ fn a_shop_saved_before_its_first_service_is_published_once_it_has_one() {
     assert_eq!(config()["nostr"]["publish"], true);
 }
 
+/// A shop reached by its key that sells only its VPN exit is still listed and published: buyers'
+/// wallets reach a key-named shop only through the transport document its listing carries.
+#[cfg(unix)]
+#[test]
+fn a_direct_shop_that_sells_only_its_vpn_exit_is_listed_and_published() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let vpn = tempfile::tempdir().unwrap();
+    let vdir = vpn.path().to_path_buf();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.nostr_relays = vec!["wss://relay.one.example".into()];
+        c.vpn = xbt_wallet_ui::config::VpnSetup { status_dir: vdir.clone(), dir: vdir.clone(), endpoint: Some("192.168.1.20:51820".into()),
+                                                   tunnel_upstream: Some("http://127.0.0.1:51880".into()) };
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Pi exit"), ("reach", "direct")]);
+    let config = || -> Value { serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap() };
+    assert!(config().get("listing").is_none(), "nothing to sell yet");
+    let r = br.act("/sell-vpn", "/sell-vpn", &[("offer", "on"), ("understood", "on"), ("sat_per_gb", "1000"), ("country", "US"), ("kind", "private"),
+                                                ("max_connections", "512"), ("blocked_ports", "25")]);
+    // (no gateway runs here to name the shop's key, so the page says the exit waits to be announced)
+    assert!(br.flash_after(&r).starts_with("Saved"));
+    let c = config();
+    let parsed = xbt_gateway::config::Config::from_json(&c).unwrap();
+    let l = parsed.listing.expect("the exit alone is listed");
+    assert!(l.services.iter().any(|s| s.name == "VPN exit" && s.path == "/vpn/"), "{c}");
+    assert_eq!(c["nostr"]["publish"], true, "and the shop goes on Nostr, with its transport: {c}");
+    assert!(c["routes"].as_array().unwrap().iter().any(|r| r["path"] == "/vpn/" && r["service"] == "vpn-exit"));
+}
+
 /// Files: a folder on this box, shared with no media server. The Sell page writes a route to the
 /// folder the app serves, with the files key and GET/HEAD only, priced per GB; the listing names each
 /// file with its size; the folder answers only with the key, and serves a range. A buyer's app reads
