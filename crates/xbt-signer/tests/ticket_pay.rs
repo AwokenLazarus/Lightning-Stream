@@ -960,6 +960,12 @@ struct Seen {
     path: String,
     body: String,
     paid: bool,
+    /// The call's limit the wallet sent the seller (`X-Xbt402-Max-Msat`), if any.
+    cap_msat: Option<String>,
+}
+
+fn cap_of(headers: &[(String, String)]) -> Option<String> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)).map(|(_, v)| v.clone())
 }
 
 type Hook = Box<dyn FnMut(&Seen, &dyn Fn() -> xbt402::Result<WireAnswer>) -> Option<xbt402::Result<WireAnswer>> + Send>;
@@ -980,7 +986,8 @@ struct Tap {
 impl TicketWire for Tap {
     fn upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>) -> xbt402::Result<xbt_signer::ticket_pay::WireUpgrade> {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
-        self.log.lock().unwrap().push(Seen { method: "GET".into(), path, body: String::new(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE") });
+        self.log.lock().unwrap().push(Seen { method: "GET".into(), path, body: String::new(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
+                                             cap_msat: cap_of(headers) });
         self.inner.upgrade(url, headers, read_timeout, tls)
     }
 
@@ -992,7 +999,8 @@ impl TicketWire for Tap {
 
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> xbt402::Result<WireAnswer> {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
-        let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE") };
+        let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
+                          cap_msat: cap_of(headers) };
         self.log.lock().unwrap().push(seen.clone());
         let kept: Vec<(String, String)> = headers.iter().filter(|(k, _)| !(self.drop_cap.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)))
             .cloned().collect();
@@ -5711,7 +5719,7 @@ fn a_call_may_buy_a_whole_ticket_and_be_charged_only_its_max_charge() {
     assert!(charged <= 30_000 && charged > 20_000, "charged {charged} msat for a cap of 30 sat: {film}");
 }
 
-/// A hashrate trial's payments, as `xbt-hashlink`'s `SignerPayer` makes them (`trial_caps`: `max_sats`
+/// A hashrate trial's payments, as `xbt-hashlink`'s `SignerPayer` makes them (`pay_caps`: `max_sats`
 /// 2,000 so the shop's whole ticket may be bought, `max_charge_sats` the trial's 40 sat), from no
 /// credit: the first slice buys one ticket, every slice after is paid from it, each is charged its
 /// own price, and the buyer's node, the seller's node, the receipts and the ledger agree on it.
@@ -5736,6 +5744,15 @@ fn a_trial_from_no_credit_buys_one_ticket_and_pays_every_slice_from_it() {
         sessions.insert(v["session"].as_str().unwrap().to_string());
     }
     assert_eq!(sessions.len(), 1, "{sessions:?}");
+    // the shop is told the trial's cap, not what may leave the wallet: 40 sat on every paid slice
+    let caps: Vec<Option<String>> = r.tap.seen("/api").into_iter().filter(|s| s.paid).map(|s| s.cap_msat).collect();
+    assert!(caps.len() as u64 == SLICES && caps.iter().all(|c| c.as_deref() == Some("40000")), "{caps:?}");
+    // and a use quoted above the cap is refused before anything is asked of the seller, though 2,000 may leave:
+    // the longest answer of the dear model would cost 800 sat
+    let dear = r.call("xbt402_pay", json!({"url": r.shop.url("/dear/v1/chat/completions"), "method": "POST", "body": json!({"model": "m", "messages": []}).to_string(),
+                                          "max_sats": 2_000, "max_charge_sats": 40, "task": "film"}));
+    assert_eq!((dear["verdict"].as_str(), dear["rule"].as_str(), dear["charged_sats"].as_i64()), (Some("deny"), Some("max_sats"), Some(0)), "{dear}");
+    assert!(r.tap.seen("/dear/").iter().all(|s| !s.paid), "nothing paid to the seller for it");
     // the seller's signed count: every slice at its price, and no more
     let sid = sessions.into_iter().next().unwrap();
     let stop = r.call("ticket_stop", json!({"session": sid}));
@@ -5789,6 +5806,50 @@ fn a_seller_that_charges_a_small_use_past_its_charge_cap_is_a_fault_and_blocked(
     let next = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "max_charge_sats": 20, "task": "film"}));
     assert_eq!(next["rule"].as_str(), Some("seller_blocked"), "{next}");
     assert_eq!((r.ln.paid_msat(), r.shop.settled()), (TICKET, 1), "nothing more left");
+}
+
+/// A call that may move more than it may be charged (`max_sats` 2,000, `max_charge_sats` 20: a VPN
+/// region check, a hashrate slice) asks a seller that lets the wallet choose the size for a ticket of
+/// about its charge, the seller's smallest at the least, and not for the seller's own 1,000 sat: a
+/// prepaid ticket of at most 20 sat from a seller whose smallest is 1 sat, a held one of 546 from the
+/// sell page's default smallest. The same call without a charge cap still takes the seller's own size.
+///
+/// FAILS before tickets were sized to the charge cap: 1,002 sat left for a 20-sat use.
+#[test]
+fn a_call_charged_less_than_it_may_move_buys_a_ticket_sized_to_its_charge() {
+    let _g = env_lock();
+    let pay = |r: &Rig, charge: Option<i64>| {
+        let mut p = json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "film"});
+        if let Some(c) = charge {
+            p["max_charge_sats"] = c.into();
+        }
+        r.call("xbt402_pay", p)
+    };
+    let asked = |r: &Rig| -> Vec<u64> {
+        r.tap.seen("/x402/ticket/lock").iter().filter_map(|l| serde_json::from_str::<Value>(&l.body).ok()?["ticketMsat"].as_str()?.parse().ok()).collect()
+    };
+    // prepaid only, tickets down to 1 sat: one ticket of at most the charge, the page paid from it
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), Some(1_000)));
+    let v = pay(&r, Some(20));
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str(), v["tickets_prepaid"].as_u64()), (Some(200), Some("2500"), Some(1)), "{v}");
+    r.tick();
+    let paid = r.ln.paid_msat();
+    assert!((2_500..=20_000).contains(&paid) && asked(&r) == vec![paid], "a ticket of the charge, not the seller's 1,000 sat: paid {paid} msat, asked {:?}: {v}", asked(&r));
+    assert_eq!(v["balance_msat"].as_str(), Some((paid - 2_500).to_string().as_str()), "{v}");
+    assert!(v["charged_sats"].as_i64().unwrap() <= 25 && r.ledger_sum() <= 25, "what left: {v}, ledger {}", r.ledger_sum());
+    r.assert_booked();
+    // held, the sell page's smallest (546 sat): the seller's smallest, not its own 1,000
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-use"]), Some(546_000)));
+    let v = pay(&r, Some(20));
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
+    let booked = v["charged_sats"].as_i64().unwrap();
+    assert!((546..=561).contains(&booked) && asked(&r).iter().all(|m| *m == 546_000), "the seller's smallest ticket: booked {booked}, asked {:?}: {v}", asked(&r));
+    // the same call without a charge cap: the seller's own size, as before
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), Some(1_000)));
+    let v = pay(&r, None);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    r.tick();
+    assert_eq!((r.ln.paid_msat(), asked(&r)), (1_000_000, vec![]), "{v}");
 }
 
 /// The draw rail keeps a call's `max_charge_sats` as the ticket rail does: the answer is read no
