@@ -96,12 +96,10 @@ impl Standing {
         if self.msat_of(after.saturating_sub(self.proven)) > self.step_msat() {
             return false;
         }
-        // with the output and a buy's time measured: pay once what's paid runs short of two buys' time. Before that,
-        // keep the step paid ahead
-        if self.msat_a_second <= 0.0 || self.buy_secs <= 0.0 {
-            return true;
-        }
-        self.secs_left() < 2.0 * self.buy_secs
+        // keep the whole step paid ahead: the next ticket is bought while that lasts, which starts it well before what's
+        // paid runs short of two buys' time, and a link that stalls for a few seconds finds the work still paid for. A
+        // trigger at two buys' time alone was measured to end a rental on a 3 s one-way stall (regtest, 7569c9ba)
+        true
     }
 
     /// How long what's paid and not yet worked lasts at the measured output.
