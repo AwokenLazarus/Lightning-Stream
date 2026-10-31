@@ -134,6 +134,9 @@ pub struct Polls {
     pub failing_since: Option<Instant>,
     /// The wallet already said once that the seller counts too little ([`undercount`]).
     pub undercount_told: bool,
+    /// Newer counts in a row that were far below the wallet's ([`undercount`]): one may be a
+    /// receipt signed a moment before a burst; two in a row are a meter not counting.
+    pub under_in_a_row: u32,
 }
 
 impl Polls {
@@ -148,7 +151,25 @@ impl Polls {
     }
     /// A newer count: the seller is counting.
     pub fn counted(&mut self) {
-        *self = Polls { undercount_told: self.undercount_told, ..Polls::default() };
+        *self = Polls { undercount_told: self.undercount_told, under_in_a_row: self.under_in_a_row, ..Polls::default() };
+    }
+
+    /// A newer count, and whether it was far below the wallet's: the words to say, once, after
+    /// [`UNDER_IN_A_ROW`] of them in a row.
+    pub fn under(&mut self, seen: &Seen) -> Option<String> {
+        match undercount(seen) {
+            Some(words) => {
+                self.under_in_a_row = self.under_in_a_row.saturating_add(1);
+                (self.under_in_a_row >= UNDER_IN_A_ROW && !self.undercount_told).then(|| {
+                    self.undercount_told = true;
+                    words
+                })
+            }
+            None => {
+                self.under_in_a_row = 0;
+                None
+            }
+        }
     }
 }
 
@@ -157,6 +178,8 @@ impl Polls {
 /// only a count under half the wallet's, past this many bytes, points at a meter that is not
 /// counting. Not a fault: a seller counting too little charges the buyer less.
 pub const UNDERCOUNT_FROM: u64 = 32 << 20;
+/// How many newer counts in a row must be far below the wallet's before it says so.
+pub const UNDER_IN_A_ROW: u32 = 2;
 
 /// A seller's count of an open answer far below the wallet's own (see [`UNDERCOUNT_FROM`]): the words
 /// for the wallet's log, never a fault. `own_at` is the wallet's count when it first saw that part.
@@ -298,8 +321,16 @@ mod tests {
         let mut short = None;
         check(&receipt(1, 0, 1 << 20, cost(1 << 20)), 7, "d", 101, 0, 8 << 20, &price(), u64::MAX, &mut short).unwrap();
         assert_eq!(undercount(short.as_ref().unwrap()), None, "under the threshold");
-        // told once: a newer count does not forget it
-        let mut p = Polls { undercount_told: true, ..Polls::default() };
+        // said only after two newer counts in a row far below, and once
+        let low = |part, own: u64| Seen { part, charged: 0, up: 0, down: 1 << 20, at: Instant::now(), own_at: own };
+        let fine = Seen { part: 3, charged: 0, up: 0, down: 99 << 20, at: Instant::now(), own_at: 100 << 20 };
+        let mut p = Polls::default();
+        assert_eq!(p.under(&low(1, 100 << 20)), None, "one may be a receipt signed before a burst");
+        assert_eq!(p.under(&fine), None, "an honest one after it starts again");
+        assert_eq!(p.under(&low(4, 200 << 20)), None);
+        p.counted();
+        assert!(p.under(&low(5, 300 << 20)).is_some(), "two in a row");
+        assert_eq!(p.under(&low(6, 400 << 20)), None, "said once");
         p.counted();
         assert!(p.undercount_told);
     }

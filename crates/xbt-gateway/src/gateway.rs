@@ -157,6 +157,37 @@ pub struct Gateway {
 /// Where the gateway says how its link stands, for the seller's app.
 pub const LINK_STATUS_PATH: &str = "/.well-known/lightning-stream-link.json";
 
+/// Beside the journal in the state directory: what the sessions dropped before its last compaction
+/// had been charged (`{"dropped_msat": "…"}`), which a compacted journal no longer holds. Rewritten
+/// after each compaction; one lost to a crash between the two undercounts the seller's earnings,
+/// never its money.
+pub const CHARGED_FILE: &str = "charged.json";
+
+/// What [`CHARGED_FILE`] says, or 0 where there is none.
+fn dropped_charged_in(dir: &std::path::Path) -> u64 {
+    std::fs::read(dir.join(CHARGED_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.get("dropped_msat")?.as_str()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Write [`CHARGED_FILE`] whole (a new file, then renamed over the old one).
+fn keep_dropped_charged(dir: &std::path::Path, msat: u64) {
+    use std::io::Write as _;
+    let path = dir.join(CHARGED_FILE);
+    let tmp = path.with_extension("json.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json!({"dropped_msat": msat.to_string()}).to_string().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        eprintln!("xbt-gateway: {} could not be written: {e}", path.display());
+    }
+}
+
 /// Wall-clock seconds.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -312,6 +343,8 @@ impl Gateway {
         let (mut store, recs) =
             Store::open(&cfg.state_dir).map_err(|e| Error::Journal(e.to_string()))?;
         let mut book = Book::restore(cfg.caps.clone(), &recs, clock())?;
+        // the sessions dropped before the journal was last compacted, with those dropped since (in it)
+        book.add_dropped_charged(dropped_charged_in(&cfg.state_dir));
         // a runner who gave a channels macaroon wants the cap read from the node: a macaroon that
         // does not work is a config that does not, and nothing starts on it
         if cfg.node.channels_macaroon.is_some() {
@@ -337,6 +370,7 @@ impl Gateway {
         store
             .compact(&book.snapshot())
             .map_err(|e| Error::Journal(e.to_string()))?;
+        keep_dropped_charged(&cfg.state_dir, book.dropped_charged_msat());
         // a ticket settled on arrival is not followed: the node's word is asked for when it is presented
         let unfinished: Vec<Hash> = book
             .unfinished()
@@ -640,8 +674,9 @@ impl Gateway {
             self.journal(&mut st, &marks);
             if st.store.lines() > COMPACT_AT {
                 let snapshot = st.book.snapshot();
-                if let Err(e) = st.store.compact(&snapshot) {
-                    eprintln!("xbt-gateway: the journal could not be rewritten: {e}");
+                match st.store.compact(&snapshot) {
+                    Ok(()) => keep_dropped_charged(&self.cfg.state_dir, st.book.dropped_charged_msat()),
+                    Err(e) => eprintln!("xbt-gateway: the journal could not be rewritten: {e}"),
                 }
             }
             st.store.handle()
@@ -2387,6 +2422,16 @@ impl Handler for Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_dropped_sessions_were_charged_is_kept_beside_the_journal() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(dropped_charged_in(d.path()), 0, "none yet");
+        keep_dropped_charged(d.path(), 294_967);
+        assert_eq!(dropped_charged_in(d.path()), 294_967);
+        keep_dropped_charged(d.path(), 300_000);
+        assert_eq!(dropped_charged_in(d.path()), 300_000, "rewritten whole");
+    }
     use xbt402::lottery::DrawError;
     use xbt402::ticket::PROTOCOL_CODES;
 
