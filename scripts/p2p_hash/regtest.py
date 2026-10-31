@@ -25,6 +25,14 @@ Checks:
             counts equal; every slice paid once; slices x price = the wallet's spent = what the hashmaker earned;
             the seller's node settled what the wallet's node paid, and what left the wallet is that and its
             fees; nothing held
+  reprice   a new price while a rental goes on, with the hashmaker's real app: the wallet app (its Sell page and
+            Sell -> Hashrate, which re-prices every minute), the shop's gateway under xbt-supervise as the images run
+            it, and the hashmaker service on its settings file. The owner's new price waits while the rental goes on:
+            the rental pays the old price, no new rental starts, the gateway's route keeps the old price and the
+            gateway does not restart. Once the rental ends, the app writes the new terms and route, the gateway
+            restarts with the new price, and the next rental pays it. (P2P_HASH_ONLY=reprice runs only this.)
+            The price is the owner's fixed one (regtest's difficulty is not a market), and the settings file is
+            written as the Save button writes it but with the lab's small slice (Save refuses one under 2^32).
   solo, pool  real money as above, on real work: a real DATUM gateway on a real Knots regtest of its own, real
             stratum-grind through the hashmaker. Every share wins on regtest, so each block is a real masked
             one: its key isn't null, its clear_bits equal the share's bits, and its id is the raw hash XOR
@@ -38,10 +46,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import os
+import re
+import secrets
 import subprocess
 import socket
+import urllib.parse
 import sys
 import threading
 import time
@@ -61,6 +73,11 @@ ORIGIN2 = f"http://127.0.0.1:{GW2}"
 # a third, for the rental whose link drops, and the road its link takes
 GW3, ROAD = B + 11, B + 12
 ORIGIN3 = f"http://127.0.0.1:{GW3}"
+# the reprice check: the hashmaker's app, its gateway (under xbt-supervise), the hashmaker service, its miners' fallback
+# pool and the rentals' pool
+RP_GW, RP_SLICES, RP_LINK, RP_MINERS, RP_CONTROL, RP_UI, RP_FALLBACK, RP_POOL = (B + 29 + i for i in range(8))
+RP_ORIGIN = f"http://127.0.0.1:{RP_GW}"
+RP_PRICES = (100, 150)  # sats a slice: the price in force, and the owner's new one
 SMALL_BUDGET_SATS = 500
 RELAY_URL = f"ws://127.0.0.1:{RELAY}"
 DIFF = 2**-20  # about 4096 tries a share, in the chain's real share format
@@ -86,8 +103,8 @@ def check(name: str, ok: bool, saw: Any) -> None:
 def policy() -> dict[str, Any]:
     pk = lab.pubkey(d.SELLER)
     return {
-        "allowlist": [ORIGIN, ORIGIN2, ORIGIN3],
-        "counterparties": {ORIGIN: {"ln_node": pk}, ORIGIN2: {"ln_node": pk}, ORIGIN3: {"ln_node": pk}},
+        "allowlist": [ORIGIN, ORIGIN2, ORIGIN3, RP_ORIGIN],
+        "counterparties": {ORIGIN: {"ln_node": pk}, ORIGIN2: {"ln_node": pk}, ORIGIN3: {"ln_node": pk}, RP_ORIGIN: {"ln_node": pk}},
         "max_per_tx_sats": 10_000,
         "daily_budget_sats": 100_000,
         "weekly_budget_sats": 200_000,
@@ -342,6 +359,272 @@ def drop_check() -> None:
            "stopped": [e for e in bz["events"] if e["ev"] == "wallet session stopped"][:1]})
 
 
+class UI:
+    """The hashmaker's wallet app over HTTP, as its owner's browser uses it: logged in, each form with its csrf."""
+
+    def __init__(self, port: int, password: str) -> None:
+        self.port, self.cookie = port, ""
+        st, h, _ = self.req("POST", "/login", {"password": password})
+        self.cookie = h.get("set-cookie", "").split(";")[0]
+        if st != 303 or not self.cookie:
+            raise lab.LabError(f"the hashmaker's app login: {st}")
+
+    def req(self, method: str, path: str, form: dict[str, str] | None = None) -> tuple[int, dict[str, str], str]:
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        try:
+            headers = {"Cookie": self.cookie} if self.cookie else {}
+            body = None
+            if form is not None:
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                body = urllib.parse.urlencode(form).encode()
+            c.request(method, path, body=body, headers=headers)
+            r = c.getresponse()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read().decode(errors="replace")
+        finally:
+            c.close()
+
+    def act(self, path: str, form: dict[str, str]) -> str:
+        page = self.req("GET", path)[2]
+        csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+        st, h, body = self.req("POST", path, {"csrf": csrf, **form})
+        if st == 303:
+            body = self.req("GET", h.get("location", path))[2]
+        return body
+
+
+def reprice_check() -> None:
+    """A new price while a rental goes on, with the hashmaker's real app, its gateway under xbt-supervise and the
+    hashmaker service: the old price is charged during the rental, no new rental starts, the gateway restarts with
+    the new price once the rental has ended, and the next rental pays that."""
+    rp = f"{RUN}/reprice"
+    os.makedirs(f"{rp}/gw", exist_ok=True)
+    settings_path, token_path, gw_config = f"{rp}/hashrate-settings.json", f"{rp}/hasher-token", f"{rp}/gw/config.json"
+    t0 = time.time()
+    timeline: list[dict[str, Any]] = []
+    REPORT["reprice_timeline"] = timeline
+
+    def note(what: str, **kw: Any) -> None:
+        timeline.append({"s": round(time.time() - t0, 1), "what": what, **kw})
+        print(f"      reprice +{time.time() - t0:.0f}s {what} {json.dumps(kw)[:300]}", flush=True)
+
+    def settings() -> dict[str, Any]:
+        with open(settings_path) as f:
+            return json.load(f)
+
+    def write_settings(v: dict[str, Any]) -> None:
+        with open(settings_path + ".new", "w") as f:
+            json.dump(v, f, indent=1)
+        os.replace(settings_path + ".new", settings_path)
+
+    with open(token_path, "w") as f:
+        f.write(secrets.token_hex(32))
+    with open(token_path) as f:
+        token = f.read().strip()
+
+    def hasher(method: str = "GET", path: str = "/status") -> dict[str, Any]:
+        c = http.client.HTTPConnection("127.0.0.1", RP_CONTROL, timeout=10)
+        try:
+            c.request(method, path, headers={"Authorization": f"Bearer {token}"})
+            return json.loads(c.getresponse().read())
+        finally:
+            c.close()
+
+    def charged() -> int | None:
+        """What the gateway charges a slice now (its /services), None while it is not up."""
+        try:
+            code, _, body = d.send("GET", "/services", RP_GW)
+        except OSError:
+            return None
+        if code != 200:
+            return None
+        routes = [r for r in json.loads(body).get("routes", []) if r.get("path") == "/hashrate/"]
+        return int(routes[0]["price"]["requestMsat"]) if routes else None
+
+    def route_in_config() -> int | None:
+        try:
+            with open(gw_config) as f:
+                routes = [r for r in json.load(f).get("routes", []) if r.get("path") == "/hashrate/"]
+        except (OSError, ValueError):
+            return None
+        return int(routes[0]["price"]["request_msat"]) if routes else None
+
+    def gateway_pid() -> int | None:
+        kids = subprocess.run(["pgrep", "-P", str(supervise.pid)], capture_output=True, text=True).stdout.split()
+        return int(kids[0]) if kids else None
+
+    # the owner's settings, as a Save at a fixed price leaves them, with the lab's slice and no price worked out yet
+    write_settings({"enabled": True, "fallback": f"127.0.0.1:{RP_FALLBACK}", "priceMode": "fixed", "fixedPriceSat": RP_PRICES[0],
+                    "fixedSliceWork": str(SLICE_WORK), "sliceFixed": True, "sliceWork": str(SLICE_WORK), "rentable": None,
+                    "graceMs": GRACE_MS, "name": "reprice hashmaker", "linkPublic": f"127.0.0.1:{RP_LINK}", "payUrl": f"{RP_ORIGIN}/hashrate"})
+    for who in ("rp1", "rp2", "rp3"):
+        subprocess.run([f"{BIN}/xbt-hashlink", "keygen", f"{RUN}/keys/{who}.key"], check=True, stdout=subprocess.DEVNULL)
+    spawn("rp-fallback", ["standin-pool", "--listen", f"127.0.0.1:{RP_FALLBACK}", "--diff", str(DIFF), "--job-ms", "1000", "--report", f"{rp}/fallback.json"])
+    spawn("rp-pool", ["standin-pool", "--listen", f"127.0.0.1:{RP_POOL}", "--diff", str(DIFF), "--job-ms", "1000", "--report", f"{rp}/pool.json"])
+    spawn("rp-hashmaker", ["hashmaker", "--key", f"{RUN}/keys/hasher.key", "--config", settings_path, "--control", f"127.0.0.1:{RP_CONTROL}",
+                           "--control-token-file", token_path, "--gateway", RP_ORIGIN, "--miners", f"127.0.0.1:{RP_MINERS}", "--link", f"127.0.0.1:{RP_LINK}",
+                           "--slices", f"127.0.0.1:{RP_SLICES}", "--report", f"{rp}/hasher.json", "--iroh", "off", "--pay-node", lab.pubkey(d.SELLER)])
+    lab.wait("the hashmaker service", 30, lambda: hasher().get("role") == "hasher", every=0.5)
+    # three miners; a rental takes two, so one stays free: only the new price's wait can turn a renter away
+    for i in (1, 2, 3):
+        spawn(f"rp-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{RP_MINERS}", "--user", f"hasher.m{i}", "--rate", "0.5", "--duration-s", "3000"])
+    # measured before the app prices: the start fee is sized to their speed
+    lab.wait("the three miners measured", 180,
+             lambda: sum(1 for m in hasher().get("miners", []) if m.get("connected") and float(m.get("hashrateHs") or 0) > 0) == 3, every=2)
+
+    # the shop's gateway as the images run it: started once the app writes its config, and again when it changes
+    log = open(f"{RUN}/rp-gateway.log", "ab")
+    supervise = subprocess.Popen([f"{BIN}/xbt-supervise", "--wait", gw_config, "--", f"{BIN}/xbt-gateway", gw_config], stdout=log, stderr=log)
+    PROCS.append(supervise)
+    password = secrets.token_hex(12)
+    env = dict(os.environ, XBT_UI_BIND=f"127.0.0.1:{RP_UI}", XBT_UI_SIGNER_SOCK=d.SOCK, XBT_DATA_DIR=f"{rp}/data", XBT_UI_DATA_DIR=f"{rp}/ui",
+               XBT_UI_PASSWORD=password, XBT_UI_SELL="1", XBT_UI_GW_DIR=f"{rp}/gw", XBT_UI_GW_NODE_REST=f"https://127.0.0.1:{lab.PORT[d.SELLER]}",
+               XBT_UI_GW_NODE_TLS_CERT=f"{RUN}/{d.SELLER}.tls.cert", XBT_UI_GW_STATE_DIR=f"{rp}/state-gateway", XBT_UI_GW_PORT=str(RP_GW),
+               XBT_UI_GW_HEALTH_URL=f"{RP_ORIGIN}/x402/ticket/health", XBT_UI_HASHER=f"http://127.0.0.1:{RP_CONTROL}",
+               XBT_UI_HASHER_SETTINGS=settings_path, XBT_UI_HASHER_SLICES=f"http://127.0.0.1:{RP_SLICES}", XBT_UI_HASHER_TOKEN_FILE=token_path)
+    log = open(f"{RUN}/rp-ui.log", "ab")
+    PROCS.append(subprocess.Popen([f"{BIN}/xbt-wallet-ui"], env=env, cwd=rp, stdout=log, stderr=log))
+    lab.wait("the hashmaker's app", 60, lambda: d.send("GET", "/login", RP_UI)[0] == 200, every=0.5)
+    ui = UI(RP_UI, password)
+    # the owner sets up the shop on the Sell page: the node's keys, the shop's address, the chain
+    with open(f"{RUN}/invoices.macaroon", "rb") as f:
+        inv = f.read().hex()
+    with open(f"{RUN}/info.macaroon", "rb") as f:
+        info = f.read().hex()
+    said = [ui.act("/sell", {"action": "connect", "invoices_macaroon": inv, "info_macaroon": info}),
+            ui.act("/sell", {"action": "shop", "name": "reprice hashmaker", "reach": "web", "public_url": RP_ORIGIN}),
+            ui.act("/sell", {"action": "advanced", "max_sessions": "30", "sessions_per_address": "0", "max_held_tickets": "15", "proxies": "",
+                             "network": "bip122:" + lab.chain("getblockhash", "101")[:32]})]
+    note("shop set up on the Sell page", flash=[re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", b.split('class="flash', 1)[-1][:400]))[:200] for b in said])
+    # the app prices within a minute or two: its terms, the route, the gateway started on it, then rentals taken
+    lab.wait("the first price in force, charged by the gateway, rentals taken", 240,
+             lambda: settings().get("priceSat") == RP_PRICES[0] and settings().get("holdNew") is False and charged() == RP_PRICES[0] * 1000
+             and hasher().get("paused") is None and hasher()["terms"]["priceMsat"] == RP_PRICES[0] * 1000, every=2)
+    st = hasher()
+    terms0 = st["terms"]
+    pid0 = gateway_pid()
+    note("price in force", settings={k: settings().get(k) for k in ("priceSat", "sliceWork", "startSlices", "holdNew")}, charged=charged(), terms=terms0, gateway_pid=pid0)
+    pub = subprocess.run([f"{BIN}/xbt-hashlink", "pubkey", f"{RUN}/keys/hasher.key"], check=True, capture_output=True, text=True).stdout.strip()
+
+    def hashtaker(name: str, terms: dict[str, Any], miners: int, secs: int) -> subprocess.Popen[bytes]:
+        return spawn(f"rp-{name}", ["hashtaker", "--key", f"{RUN}/keys/{name}.key", "--hashmaker", f"127.0.0.1:{RP_LINK}", "--hashmaker-key", pub,
+                                    "--price-msat", str(terms["priceMsat"]), "--slice-work", str(terms["sliceWork"]), "--grace-ms", str(terms["graceMs"]),
+                                    "--start-slices", str(terms["startSlices"]), "--upstream", f"127.0.0.1:{RP_POOL}", "--user", "buyer.rented",
+                                    "--allow-unblinded", "1", "--signer", d.SOCK, "--task", "hashrate", "--pay-url", f"{RP_ORIGIN}/hashrate",
+                                    "--max-sats", "1500", "--miners", str(miners), "--rental", f"rt-{name}", "--idle-s", "15", "--duration-s", str(secs),
+                                    "--report", f"{rp}/{name}-buyer.json"])
+
+    def buyer(name: str) -> dict[str, Any]:
+        for _ in range(100):
+            try:
+                with open(f"{rp}/{name}-buyer.json") as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                time.sleep(0.1)
+        return {}
+
+    def oks(name: str) -> list[dict[str, Any]]:
+        return [p for p in buyer(name).get("pays", []) if p.get("ok")]
+
+    def rental_now(rid: str) -> dict[str, Any] | None:
+        return next((r for r in hasher().get("rentals", []) if r.get("rental") == rid), None)
+
+    # 1. a rental of two miners at the price in force
+    r1 = hashtaker("rp1", terms0, 2, 240)
+    lab.wait("three slices paid in the first rental", 120, lambda: len(oks("rp1")) >= 3, every=1)
+    free_before = [m["name"] for m in hasher()["miners"] if m.get("connected") and m.get("rentedTo") is None]
+    before = settings()
+    # the owner changes the price, as Save writes it (Save then re-prices at once; the app's minute does it here)
+    write_settings({**before, "fixedPriceSat": RP_PRICES[1]})
+    changed_ms = int(time.time() * 1000)
+    note("new price saved", fixedPriceSat=RP_PRICES[1], paid_so_far=len(oks("rp1")), free_miners=free_before)
+    lab.wait("the app holding the new price", 90, lambda: settings().get("holdNew") is True and (settings().get("pending") or {}).get("priceSat") == RP_PRICES[1], every=1)
+    lab.wait("the hashmaker taking no new rental", 10, lambda: hasher().get("paused") is not None, every=0.5)
+    held_ms = int(time.time() * 1000)
+    s_held, st_held = settings(), hasher()
+    note("held", priceSat=s_held.get("priceSat"), pending=s_held.get("pending"), holdNew=s_held.get("holdNew"), paused=st_held.get("paused"),
+         route_in_config=route_in_config(), charged=charged(), gateway_pid=gateway_pid())
+    # 2. a new renter, for the miner still free, at the terms in force: turned away
+    r2 = hashtaker("rp2", st_held["terms"], 1, 60)
+    try:
+        r2.wait(60)
+    except subprocess.TimeoutExpired:
+        r2.terminate()
+        r2.wait(10)
+    b2 = buyer("rp2")
+    free_during = [m["name"] for m in hasher()["miners"] if m.get("connected") and m.get("rentedTo") is None]
+    rentals_during = [r["rental"] for r in hasher().get("rentals", [])]
+    check("reprice: while the rental goes on, a new renter is turned away (a miner is free, the new price waits), nothing paid",
+          len(free_before) == 1 and free_during == free_before and rentals_during == ["rt-rp1"] and not [p for p in b2.get("pays", []) if p.get("ok")]
+          and int((b2.get("meter") or {}).get("work", "0")) == 0,
+          {"free miners before": free_before, "free miners now": free_during, "rentals": rentals_during, "paused": st_held.get("paused"),
+           "the renter": {k: b2.get(k) for k in ("closed", "payFailed")}, "renter's pays": b2.get("pays"), "renter's log": open(f"{RUN}/rp-rp2.log").read()[-400:]})
+    # a few more slices of the first rental, after the hold
+    lab.wait("two more slices paid in the first rental after the hold", 120, lambda: sum(1 for p in oks("rp1") if p["atMs"] > held_ms) >= 2, every=1)
+    during = {"route in the config": route_in_config(), "charged": charged(), "gateway pid": gateway_pid(), "terms": hasher()["terms"]["priceMsat"],
+              "settings priceSat": settings().get("priceSat")}
+    note("rental going on after the hold", **during)
+    r1.wait(300)
+    ended_ms = int(time.time() * 1000)
+    lab.wait("the first rental gone from the hashmaker", 60, lambda: rental_now("rt-rp1") is None, every=1)
+    b1 = buyer("rp1")
+    p1 = oks("rp1")
+    after_change = [p for p in p1 if p["atMs"] > changed_ms]
+    h1 = next((r for r in hasher().get("finished", []) if r.get("rental") == "rt-rp1"), None) or {}
+    REPORT["reprice_rental1_pays"] = b1.get("pays")
+    note("first rental ended", paid=len(p1), after_change=len(after_change), closed=b1.get("closed"))
+    check("reprice: the rental going on is charged the old price to its end, slices paid after the change included",
+          len(after_change) >= 2 and all(int(p["wallet"].get("price_msat", 0)) == RP_PRICES[0] * 1000 for p in p1)
+          and during["route in the config"] == during["charged"] == during["terms"] == RP_PRICES[0] * 1000 and during["gateway pid"] == pid0
+          and during["settings priceSat"] == RP_PRICES[0] and not b1.get("payFailed"),
+          {"slices paid": len(p1), "paid after the change": len(after_change), "price_msat each": sorted({int(p["wallet"].get("price_msat", 0)) for p in p1}),
+           "during the hold": during, "gateway pid at first": pid0, "the hashmaker's record": {k: h1.get(k) for k in ("paid", "earnedMsat", "terms")}})
+    # 3. ended: the app writes the new terms and route, the gateway restarts on them, rentals are taken again
+    lab.wait("the new price in the route", 150, lambda: route_in_config() == RP_PRICES[1] * 1000, every=1)
+    routed_ms = int(time.time() * 1000)
+    lab.wait("the gateway charging the new price", 60, lambda: charged() == RP_PRICES[1] * 1000, every=0.5)
+    charging_ms = int(time.time() * 1000)
+    lab.wait("rentals taken again", 150, lambda: settings().get("holdNew") is False and hasher().get("paused") is None, every=1)
+    open_ms = int(time.time() * 1000)
+    pid1 = gateway_pid()
+    with open(f"{RUN}/rp-gateway.log", errors="replace") as f:
+        restarts = [line.strip() for line in f if "changed: restarting" in line]
+    terms1 = hasher()["terms"]
+    note("new price in force", route=route_in_config(), charged=charged(), terms=terms1, gateway_pid=pid1, restarts=restarts)
+    check("reprice: after the rental ends the app writes the new terms and route, the gateway restarts with the new price, and rentals are taken again",
+          route_in_config() == charged() == terms1["priceMsat"] == RP_PRICES[1] * 1000 and settings().get("priceSat") == RP_PRICES[1]
+          and pid1 not in (None, pid0) and restarts and ended_ms <= routed_ms <= charging_ms <= open_ms,
+          {"gateway pid before/after": [pid0, pid1], "supervisor": restarts[-2:], "seconds from the end to the route": round((routed_ms - ended_ms) / 1000),
+           "to the gateway charging it": round((charging_ms - ended_ms) / 1000), "to rentals taken": round((open_ms - ended_ms) / 1000),
+           "settings": {k: settings().get(k) for k in ("priceSat", "holdNew", "pending")}})
+    # 4. the next rental pays the new price
+    r3 = hashtaker("rp3", terms1, 2, 60)
+    r3.wait(240)
+    b3 = buyer("rp3")
+    p3 = oks("rp3")
+    REPORT["reprice_rental3_pays"] = b3.get("pays")
+    last = p3[-1]["wallet"] if p3 else {}
+    h3 = next((r for r in hasher().get("finished", []) if r.get("rental") == "rt-rp3"), None) or {}
+    check("reprice: the next rental pays the new price, each slice, and the hashmaker earns that",
+          len(p3) >= 2 and all(int(p["wallet"].get("price_msat", 0)) == RP_PRICES[1] * 1000 for p in p3) and not b3.get("payFailed"),
+          {"slices paid": len(p3), "price_msat each": sorted({int(p["wallet"].get("price_msat", 0)) for p in p3}),
+           "the hashmaker's record": {k: h3.get(k) for k in ("paid", "earnedMsat", "terms")},
+           "seller's signed spent msat at the last slice": int(last.get("credited_msat", 0)) - int(last.get("balance_msat", 0))})
+    REPORT["reprice_status"] = hasher()
+    for name in ("hashrate-settings.json", "gw/config.json", "hasher.json"):
+        try:
+            with open(f"{rp}/{name}") as f:
+                REPORT.setdefault("reprice_files", {})[name] = json.load(f)
+        except (OSError, ValueError):
+            pass
+    # the logs, beside the report (the lab copies only run/*.log and run/*.json back)
+    for name in ("rp-ui", "rp-gateway", "rp-hashmaker", "rp-rp1", "rp-rp2", "rp-rp3"):
+        try:
+            with open(f"{RUN}/{name}.log", "rb") as f, open(f"{OUT}/p2p_hash_reprice-{name}.log", "wb") as g:
+                g.write(f.read())
+        except OSError:
+            pass
+
+
 def tagged(tag: str, msg: bytes) -> bytes:
     t = hashlib.sha256(tag.encode()).digest()
     return hashlib.sha256(t + t + msg).digest()
@@ -577,6 +860,9 @@ def main() -> int:
         print(f"lab up in {time.time() - t0:.0f} s", flush=True)
         inv0 = d.seller_invoices()
         pay0 = d.buyer_payments()
+        if os.environ.get("P2P_HASH_ONLY") == "reprice":
+            reprice_check()
+            raise StopIteration
         only_real = os.environ.get("P2P_HASH_ONLY") == "real"
         if only_real:
             for mode in os.environ.get("P2P_HASH_REAL_MODES", "solo,pool").split(","):

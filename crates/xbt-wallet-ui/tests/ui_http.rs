@@ -3863,12 +3863,20 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     assert_eq!((terms(&read()).0, read()["priceSeenMs"].clone()), (Some(366), seen_at));
     let p = br.get("/sell-hashrate");
     assert!(p.body.contains("No live price") && p.body.contains("no new rental starts until it can"), "{}", p.body);
-    // a node that can't say the block reward is no price either
-    {
+    // a pruned node, whose getblockstats fails: the block reward is the chain's schedule at the tip (regtest's
+    // halves every 150 blocks: 3.125 at 700), and the price is the one a full node gives
+    let height = {
         let mut c = bx.rig.chain.st.lock().unwrap();
         c.down = false;
         c.subsidy = Some(None);
-    }
+        std::mem::replace(&mut c.height, 700)
+    };
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+    assert_eq!((terms(&read()).0, route()), (Some(366), Some(json!(366_000))));
+    let p = br.get("/sell-hashrate");
+    assert!(!p.body.contains("No live price") && p.body.contains("366 sats"), "{}", p.body);
+    // a node that can't say the block reward is no price either: no getblockstats, and a height whose schedule gives none
+    bx.rig.chain.st.lock().unwrap().height = height;
     assert!(matches!(bx._app.hash_reprice(false), Repriced::NoPrice(w) if w.contains("block reward")));
     bx.rig.chain.st.lock().unwrap().subsidy = None;
 

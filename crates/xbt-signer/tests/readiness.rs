@@ -113,3 +113,59 @@ fn p6_the_signer_never_asks_for_txindex() {
                                   "getrawtransaction", "gettxspendingprevout", "scantxoutset", "getbalances", "estimatesmartfee"].contains(&c.as_str())),
             "{calls:?}");
 }
+
+/// Many Umbrel and StartOS nodes are pruned. When the node can't give `getblockstats` for the tip (it answers
+/// with an error, as Knots does for a block it no longer has), `mining_tip` still says the subsidy: the chain's
+/// own schedule at the tip's height, which is what `getblockstats` would have said. The difficulty is still the
+/// node's, so the hashmaker's market price comes out the same as on a full node.
+#[test]
+fn a_pruned_node_without_getblockstats_still_gives_the_tips_subsidy() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::build(json!({"regtest_mine": null}), false, "main");
+    // a piece of 2^45 hashes at 100%: subsidy × work / (difficulty × 2^32), as Sell → Hashrate prices it
+    let price = |v: &serde_json::Value| (v["subsidySats"].as_u64().unwrap() as f64 * 2f64.powi(45) / (v["difficulty"].as_f64().unwrap() * 4_294_967_296.0)).round();
+    let full = rig.call("mining_tip", json!({}));
+    assert_eq!((full["height"].as_u64(), full["subsidySats"].as_u64(), full["subsidyFrom"].as_str()), (Some(962_000), Some(312_500_000), Some("getblockstats")), "{full}");
+    assert!(full["subsidyError"].is_null(), "{full}");
+    assert_eq!(price(&full), 404.0);
+
+    // pruned: getblockstats fails, and the subsidy is the schedule's at the tip; the price is the same
+    rig.chain.st.lock().unwrap().subsidy = Some(None);
+    let pruned = rig.call("mining_tip", json!({}));
+    assert_eq!((pruned["reachable"].as_bool(), pruned["height"].as_u64(), pruned["subsidySats"].as_u64(), pruned["subsidyFrom"].as_str()),
+               (Some(true), Some(962_000), Some(312_500_000), Some("schedule")), "{pruned}");
+    assert!(pruned["subsidyError"].as_str().unwrap().contains("not available (pruned data)"), "{pruned}");
+    assert_eq!((pruned["difficulty"].clone(), pruned["syncing"].clone()), (full["difficulty"].clone(), json!(false)));
+    assert_eq!(price(&pruned), 404.0);
+    assert!(rig.chain.st.lock().unwrap().calls.iter().any(|c| c == "getblockstats"), "the node is asked first");
+
+    // the schedule follows the height: at the next halving the reward and the price halve
+    rig.chain.st.lock().unwrap().height = 1_050_000;
+    let after = rig.call("mining_tip", json!({}));
+    assert_eq!((after["subsidySats"].as_u64(), after["subsidyFrom"].as_str()), (Some(156_250_000), Some("schedule")), "{after}");
+    assert_eq!(price(&after), 202.0);
+
+    // a node that answers getblockstats again is taken at its word
+    rig.chain.st.lock().unwrap().subsidy = Some(Some(156_250_000));
+    let back = rig.call("mining_tip", json!({}));
+    assert_eq!((back["subsidySats"].as_u64(), back["subsidyFrom"].as_str()), (Some(156_250_000), Some("getblockstats")), "{back}");
+
+    // a node that does not answer at all gives no subsidy and no price (nothing is made up)
+    rig.chain.st.lock().unwrap().down = true;
+    let away = rig.call("mining_tip", json!({}));
+    assert_eq!((away["reachable"].as_bool(), away.get("subsidySats")), (Some(false), None), "{away}");
+}
+
+/// On regtest the schedule halves every 150 blocks, as Knots' regtest does.
+#[test]
+fn a_pruned_regtest_node_gives_the_regtest_schedule() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({}), false);
+    {
+        let mut c = rig.chain.st.lock().unwrap();
+        c.subsidy = Some(None);
+        c.height = 1_000;
+    }
+    let t = rig.call("mining_tip", json!({}));
+    assert_eq!((t["subsidySats"].as_u64(), t["subsidyFrom"].as_str()), (Some(78_125_000), Some("schedule")), "{t}");
+}
