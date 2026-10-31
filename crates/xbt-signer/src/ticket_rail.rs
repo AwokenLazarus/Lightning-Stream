@@ -49,7 +49,7 @@ use crate::pyjson::{dumps_indent, py_int, str_or_empty, ts_value};
 use crate::sigaudit;
 use crate::signer::{deny, with, Signer};
 use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invoice, ledger_id, sats_ceil, sizing, Admit, Book, Limits, SState, Seed, Session,
-                    Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, MAX_TASK_WINDOW_S, OFFER_TTL_S, ROUTE_FULL, SESSION_IDLE_S,
+                    Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, MAX_TASK_WINDOW_S, OFFER_TTL_S, ROUTE_FULL, TIP_UNKNOWN, SESSION_IDLE_S,
                     TAG_RECORD};
 use crate::{err, Result};
 
@@ -58,6 +58,8 @@ use crate::{err, Result};
 /// default (the gateway's `lottery.invoice_secs`), and a busy issuer can leave a request
 /// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
 const OFFER_FETCH_S: i64 = 5;
+/// How many times more a lock round asks for checks a chain node that fails now and then refused.
+const NODE_CHECK_TRIES: usize = 3;
 
 /// Why the book books nothing more for a session whose stop has begun ([`Signer::ticket_is_stopping`]).
 const STOPPING: &str = "the session is being stopped: nothing more is released, locked or bought for it";
@@ -875,7 +877,7 @@ impl Signer {
         };
         let dest = format!("ln:{}", session.payee);
         // the rail's own checks of the node and of the channels a payment may leave through: no lock held
-        if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
+        if let Err(d) = self.ticket_node_checks(&*ln, &lp, &dest) {
             return with(d, json!({"rail": "ticket"}));
         }
         let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
@@ -1174,7 +1176,7 @@ impl Signer {
         let sid = str_or_empty(p.get("session"));
         let cfg = self.config();
         let now = self.engine.now();
-        let tip = self.height_safe();
+        let tip = self.tip_known();
         let out = (|| -> Result<Value> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -1193,6 +1195,11 @@ impl Signer {
             }
             // `hash`: release this ticket and no other (the wallet's own payer names the one the seller has shown locked)
             let named = str_or_empty(p.get("hash"));
+            // no tip: nothing can be said of how long a ticket has left, so none is released, and none is called stale
+            let Some(tip) = tip else {
+                return Ok(with(refusal(TIP_UNKNOWN, "the wallet's chain node is not answering, so how long a ticket has left is not known: no secret was released; \
+                                                     call again"), json!({"session": sid})));
+            };
             let next = st.book.usable(&sid, tip).filter(|t| named.is_empty() || t.hash == named).cloned();
             let Some(mut t) = next else {
                 return Ok(with(refusal("ticket_none", "no locked ticket of this session can be released now: lock more (ticket_offer), and ask the \
@@ -2036,9 +2043,27 @@ impl Signer {
             self.ln_ready().map_err(|d| with(d, json!({"rail": "ticket", "charged_sats": 0})))?
         };
         let dest = format!("ln:{payee}");
-        self.ln_node_checks(&*ln, &lp, &dest, "").map_err(|d| with(d, json!({"rail": "ticket"})))?;
+        self.ticket_node_checks(&*ln, &lp, &dest).map_err(|d| with(d, json!({"rail": "ticket"})))?;
         self.ln_route_checks(&*ln, &lp, &dest, "", false).map_err(|d| with(d, json!({"rail": "ticket"})))?;
         Ok(())
+    }
+
+    /// [`Signer::ln_node_checks`] for a lock round, asked again at once where a chain node that fails now and then
+    /// failed it: between the two checks of a round the seller issues its invoices, and a round given up there costs
+    /// them and their places with the seller. Not asked again of a node that took its time to fail (a timeout): that
+    /// one is not going to answer in a moment, and the caller is waiting.
+    fn ticket_node_checks(&self, ln: &dyn LnBackend, lp: &LnPolicy, dest: &str) -> std::result::Result<(), Value> {
+        for _ in 0..NODE_CHECK_TRIES {
+            let asked = Instant::now();
+            match self.ln_node_checks(ln, lp, dest, "") {
+                Ok(_) => return Ok(()),
+                Err(d) if ticket::CHAIN_RULES.contains(&d["rule"].as_str().unwrap_or_default()) && asked.elapsed() < Duration::from_secs(1) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(d) => return Err(d),
+            }
+        }
+        self.ln_node_checks(ln, lp, dest, "").map(|_| ())
     }
 
     /// A session of the book, as it is now.

@@ -88,6 +88,11 @@ pub const ROUTE_FULL: &str = "ticket_route_full";
 /// Refusals of a held ticket that are no fault of the seller's terms or the owner's budgets, and
 /// leave prepaid tickets, or another rail, as the way to pay: no slot, dust, a full route.
 pub const HOLD_SHORT: [&str; 4] = ["ticket_slots", "ticket_dust", ROUTE_FULL, "ticket_slots_short"];
+/// The rule of a release refused because the chain node gave no tip to judge a ticket by.
+pub const TIP_UNKNOWN: &str = "ticket_chain";
+/// The rules of the wallet's checks of its Lightning node that the chain node's silence can cause
+/// ([`crate::ln::verify_backend`] asks it too).
+pub const CHAIN_RULES: [&str; 2] = ["ln_chain", "ln_backend"];
 /// The default of `tickets.http_idle_s`: a session the wallet pays over HTTP is stopped, and its
 /// unused tickets cancelled, after this long without a paid request. Below the gateway's own five
 /// minutes, so that the wallet cancels before the seller does.

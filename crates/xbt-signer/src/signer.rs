@@ -169,6 +169,10 @@ pub fn address_to_spk(addr: &str, hrp: &str) -> Result<Vec<u8>> {
     Ok(spk)
 }
 
+/// How long the last tip the chain node gave stands in for one it does not give: minutes, against a
+/// ticket's margin of [`crate::ticket::USABLE_MARGIN_BLOCKS`] blocks, so it decides nothing a fresh one would not.
+const TIP_KEPT_S: f64 = 300.0;
+
 /// How to build a signer (tests inject a node, a clock).
 #[derive(Default)]
 pub struct SignerOptions {
@@ -228,6 +232,8 @@ pub struct Signer {
     pub(crate) ticket_synced: std::sync::atomic::AtomicBool,
     /// How many ticket payments are with the node's router at once ([`crate::ticket_rail::Pace`]).
     pub(crate) ticket_pace: crate::ticket_rail::Pace,
+    /// The last tip the chain node gave, and when ([`Self::tip_known`]).
+    tip_seen: Mutex<Option<(i64, f64)>>,
     /// Held tickets booked `sending` whose send has not come back yet: waiting their turn in
     /// [`Self::ticket_pace`] or with the node. The node may have no record of one yet, and that
     /// is not a sign it never reached the node.
@@ -331,7 +337,7 @@ impl Signer {
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
                                 ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
-                                ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
+                                ticket_pace: crate::ticket_rail::Pace::default(), tip_seen: Mutex::new(None), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
                                 ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),
@@ -419,11 +425,28 @@ impl Signer {
     }
 
     fn height(&self) -> Result<i64> {
-        node::height(&*self.node).map(|h| h as i64)
+        let h = node::height(&*self.node).map(|h| h as i64)?;
+        *self.tip_seen.lock().unwrap_or_else(|p| p.into_inner()) = Some((h, self.now()));
+        Ok(h)
     }
 
+    /// The chain's tip: the node's word, or, where the node gives none (busy, restarting), the last it
+    /// gave within [`TIP_KEPT_S`]. `None`: not known, which says nothing about any height.
+    pub(crate) fn tip_known(&self) -> Option<i64> {
+        self.height().ok().or_else(|| {
+            let seen = *self.tip_seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.filter(|(_, at)| self.now() - at <= TIP_KEPT_S).map(|(h, _)| h)
+        })
+    }
+
+    /// Whether the chain node answers now.
+    pub(crate) fn chain_answers(&self) -> bool {
+        self.height().is_ok()
+    }
+
+    /// [`Self::tip_known`], with 0 for a tip not known: for a report, and for a bound that 0 leaves open.
     pub(crate) fn height_safe(&self) -> i64 {
-        self.height().unwrap_or(0)
+        self.tip_known().unwrap_or(0)
     }
 
     /// The chain's network id (`bip122:...`, P4), as a seller's 402 names it. A wrong mainnet anchor
