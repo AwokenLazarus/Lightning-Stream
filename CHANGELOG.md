@@ -91,6 +91,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   one stream, only that one.
 
 **Linux**
+- An update keeps every setting in .env (including ones added by hand), LS_* settings given to
+  install.sh win over .env, also with --yes, and the Files folder has its own port setting,
+  LS_FILES_PORT. install.sh and the Sell page say plainly when another program holds it.
 - The installer refuses a chain name the node doesn't use (for example mainnet instead of main) and
   says which to use.
 
