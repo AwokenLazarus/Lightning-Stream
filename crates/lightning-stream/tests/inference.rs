@@ -45,6 +45,14 @@ enum Plan {
     /// Paid for, then the seller's balance runs short: the wallet pays again for `.1` ms (saying
     /// `paying`, then `paid`), and the seller answers, paid `.0`.
     PayAgain(u64, u64),
+    /// Paid for and sent; a proxy in front of the seller answers 524 with no receipt, and no head
+    /// reaches the caller: the request may still be served behind it.
+    ProxyTimeout,
+    /// Answers whole, paid `.0`; the wallet's account comes `.1` ms after the socket closes (its
+    /// wait for the seller's last receipt).
+    LateReceipt(u64, u64),
+    /// Answers whole; the wallet's account never comes (the call to the signer fails).
+    Lost,
 }
 
 /// The caller's socket is still there (as the signer checks before it sends).
@@ -209,6 +217,32 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                             json!({"verdict": "allow", "rail": "ticket", "status": 200, "complete": true, "price_msat": msat.to_string(), "charged_sats": 1800,
                                    "request_sent": true})
                         }
+                        Plan::ProxyTimeout => {
+                            let Some(s) = opened() else { return_gone(&conn, &gone); return };
+                            serve();
+                            drop(s);
+                            json!({"verdict": "deny", "rule": "ticket_seller", "reason": "the seller answered HTTP 524 without a receipt", "status": 524,
+                                   "request_sent": true, "charged_sats": 900})
+                        }
+                        Plan::LateReceipt(msat, ms) => {
+                            let Some(mut s) = opened() else { return_gone(&conn, &gone); return };
+                            serve();
+                            writeln!(s, "{}", head(200, "text/event-stream")).unwrap();
+                            s.write_all(ANSWER.as_bytes()).unwrap();
+                            drop(s);
+                            std::thread::sleep(Duration::from_millis(ms));
+                            json!({"verdict": "allow", "rail": "ticket", "status": 200, "complete": true, "price_msat": msat.to_string(), "charged_sats": 900,
+                                   "request_sent": true})
+                        }
+                        Plan::Lost => {
+                            let Some(mut s) = opened() else { return_gone(&conn, &gone); return };
+                            serve();
+                            writeln!(s, "{}", head(200, "text/event-stream")).unwrap();
+                            s.write_all(ANSWER.as_bytes()).unwrap();
+                            drop(s);
+                            // the call to the signer ends with no answer
+                            return;
+                        }
                         Plan::Cut(msat) => {
                             let Some(mut s) = opened() else { return_gone(&conn, &gone); return };
                             serve();
@@ -267,7 +301,8 @@ fn rig_paying(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool, pay_w
         {"name": "dear", "route": "https://dear.example/ai/", "prices": {"per_1k_output_msat": 9000}, "max_output": 1024}]}).to_string()).unwrap();
     let cfg = lightning_stream::inference_server::Config {
         signer: sock, stream_dir: dir.path().to_path_buf(), task: "ai".into(), max_sats: 2000, credentials: creds.clone(), sellers: list,
-        state: dir.path().join("ai-state.json"), first_byte: Duration::from_millis(1000), pay_wait, allowed_hosts: vec![],
+        state: dir.path().join("ai-state.json"), first_byte: Duration::from_millis(1000), pay_wait,
+        account_wait: Duration::from_millis(500), allowed_hosts: vec![],
     };
     let run = lightning_stream::inference_server::serve(cfg, TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
     let addr = run.addr.to_string();
@@ -364,7 +399,7 @@ fn a_seller_that_is_refused_or_broken_hands_the_request_to_the_next() {
 
 /// A seller paid for and sent the request, then silent past its time: it may still be serving the
 /// request, and charge for it, so no other seller is tried. The client is told; one seller had the
-/// request; what it charged (nothing, here) is what is booked.
+/// request; with no receipt to say what it drew, what the wallet paid for the call is booked.
 ///
 /// FAILS before: the next seller was tried, and both could serve and charge one answer.
 #[test]
@@ -375,7 +410,53 @@ fn a_seller_paid_for_and_silent_is_not_followed_by_another() {
     assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
     std::thread::sleep(Duration::from_millis(2700));
     assert_eq!(served(&r), ["cheap.example"], "one seller had the request");
-    assert_eq!(spent(&r), 0, "the silent seller charged nothing, and nothing is booked");
+    assert_eq!(spent(&r), 900_000, "no receipt: what the wallet paid for the call, the most the seller could draw, is booked");
+}
+
+/// A request that left, answered by a proxy in front of the seller with a 524 and no receipt: the
+/// request may still be served behind the proxy, so no other seller is tried.
+///
+/// FAILS before: any 5xx in the wallet's account let the next seller be tried, so both could serve
+/// and be paid for one answer.
+#[test]
+fn a_proxys_524_after_the_request_left_is_not_followed_by_another_seller() {
+    let r = rig(Plan::ProxyTimeout, Plan::Answer(777), 100);
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(served(&r), ["cheap.example"]);
+    assert_eq!(spent(&r), 900_000);
+}
+
+/// The wallet's account of a whole answer comes after the endpoint's wait for it (the signer waits
+/// up to 10 s for the seller's last receipt): what it cost is booked when it comes, the seller is
+/// recorded as having answered, and no cut is said to the client.
+///
+/// FAILS before: the endpoint waited 10 s, booked nothing, recorded the seller as cut mid-answer and
+/// sent the client a "stopped mid-answer" event after the answer's end.
+#[test]
+fn a_late_account_of_a_whole_answer_is_booked_with_no_cut_said() {
+    let r = rig(Plan::LateReceipt(432, 1500), Plan::Answer(1), 100);
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!((status, body.as_str()), (200, ANSWER), "the answer as the seller sent it, no cut event");
+    std::thread::sleep(Duration::from_millis(1800));
+    assert_eq!(spent(&r), 432, "booked when the account came");
+    let state: Value = serde_json::from_slice(&std::fs::read(r._dir.path().join("ai-state.json")).unwrap()).unwrap();
+    assert_eq!((state["health"]["cheap"]["ok"].as_u64(), state["health"]["cheap"]["failed"].as_u64()), (Some(1), Some(0)), "{state}");
+}
+
+/// The wallet never says what a whole answer cost (the call to the signer failed): the most the
+/// request may cost is booked to the key, never nothing.
+///
+/// FAILS before: nothing was booked.
+#[test]
+fn an_answer_whose_cost_the_wallet_never_says_books_the_most_it_may_cost() {
+    let r = rig(Plan::Lost, Plan::Answer(1), 100);
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!((status, body.as_str()), (200, ANSWER));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(spent(&r), 500, "100 tokens out at 5 sat the 1,000: the bound");
 }
 
 /// A seller whose call takes 2.5 s to pay for (a first ticket over a slow route), with 1 s for its
@@ -538,7 +619,7 @@ fn a_seller_whose_list_is_not_free_is_listed_with_the_models_its_entry_names() {
     let cfg = lightning_stream::inference_server::Config {
         signer: r._dir.path().join("signer.sock"), stream_dir: r._dir.path().to_path_buf(), task: "ai".into(), max_sats: 2000,
         credentials: r.creds.clone(), sellers: list, state: r._dir.path().join("ai-state-2.json"), first_byte: Duration::from_millis(1000),
-        pay_wait: lightning_stream::inference_server::PAY_WAIT, allowed_hosts: vec![],
+        pay_wait: lightning_stream::inference_server::PAY_WAIT, account_wait: Duration::from_millis(500), allowed_hosts: vec![],
     };
     let run = lightning_stream::inference_server::serve(cfg, TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
     let addr = run.addr.to_string();

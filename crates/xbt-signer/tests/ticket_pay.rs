@@ -2479,6 +2479,25 @@ fn a_call_whose_caller_is_gone_once_it_is_paid_for_is_not_sent() {
     r.assert_booked();
 }
 
+/// A paid request a proxy in front of the seller answers with a 5xx and no receipt (a CDN's 524)
+/// has left: the answer says `request_sent`, so that a caller (the AI address) does not send it to
+/// a second seller while the first may still serve it.
+///
+/// FAILS before: the answer did not say, and the AI address read the 5xx as the seller's failure.
+#[test]
+fn a_paid_request_answered_5xx_without_a_receipt_says_it_was_sent() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/page/")).then(|| Ok(answer(524, vec![], b"a timeout occurred".to_vec())))));
+    let v = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((v["rule"].as_str(), v["status"].as_u64(), v["request_sent"].as_bool()), (Some("ticket_seller"), Some(524), Some(true)), "{v}");
+    // a request the seller refused unserved over its own signature (a short balance, say) is not one that left: the
+    // next call is served, and says so
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(true)), "{v}");
+}
+
 /// A seller's own web page, used inside the app (docs/SELLER-APPS.md): the caller's headers (its
 /// cookies, its login) reach the service, the seller's guest login wins over a forged one, the
 /// page the service serves only compressed comes back plain, and the seller's response headers come

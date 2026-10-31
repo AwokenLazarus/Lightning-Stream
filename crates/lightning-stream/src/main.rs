@@ -106,7 +106,9 @@ fn start_ai(base: &(PathBuf, PathBuf, String, i64)) -> Option<xbt_svc::http::Run
     let (signer, stream_dir, task, max_sats) = base.clone();
     let cfg = lightning_stream::inference_server::Config {
         signer, stream_dir, task, max_sats, credentials: credentials.into(), sellers: sellers.into(), state: state.into(), first_byte,
-        pay_wait: env("LS_AI_PAY_WAIT_S").and_then(|v| v.parse().ok()).map_or(lightning_stream::inference_server::PAY_WAIT, Duration::from_secs),
+        pay_wait: env("LS_AI_PAY_WAIT_S").and_then(|v| v.parse().ok())
+            .map_or(lightning_stream::inference_server::PAY_WAIT, |s| Duration::from_secs(s).max(lightning_stream::inference_server::PAY_WAIT_FLOOR)),
+        account_wait: lightning_stream::inference_server::ACCOUNT_WAIT,
         allowed_hosts,
     };
     let listener = match TcpListener::bind(&listen) {

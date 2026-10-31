@@ -4210,23 +4210,6 @@ impl Signer {
             if hs.ending.load(Ordering::SeqCst) || !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
                 return fail(hs, &spent, refusal("ticket_session", "the session with this seller was stopped while this call waited: call again"));
             }
-            // paid for: from here the seller's time is the seller's, whatever the payment took. Said again after any
-            // payment since the caller was told
-            if c.stream_paid {
-                match early.as_mut() {
-                    None => {
-                        let mut s = Sink::for_call(c);
-                        s.head(&json!({"paid": true}));
-                        early = Some(s);
-                    }
-                    Some(s) if paying_told => s.head(&json!({"paid": true})),
-                    Some(_) => {}
-                }
-                paying_told = false;
-                if !c.upgrade && early.as_mut().is_some_and(|s| !s.reader_there()) {
-                    return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
-                }
-            }
             let digest = request_digest_v2(c.method, c.url, c.body);
             let order = lock_order(hs);
             let (mut seq, sid, key) = match self.seq_take(hs) {
@@ -4255,11 +4238,25 @@ impl Signer {
                 // the price the wallet counts this request at: a seller that checks it refuses another unpaid
                 headers.push((xbt402::ticket::PRICE_HEADER.into(),
                               xbt402::ticket::price_line(price.request_msat, price.byte_msat, price.per_bytes, price.second_msat, &price.tokens)));
-                // checked again before every send: a request sent again (`bad_seq`) may find its caller gone meanwhile
-                if c.stream_paid && !c.upgrade && early.as_mut().is_some_and(|s| !s.reader_there()) {
-                    self.seq_done(hs, seq);
-                    lock_money(hs).close(rid, 0, 0);
-                    return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
+                // paid for, and its turn to leave: from here the seller's time is the seller's, whatever the payment (or
+                // the turn) took. Said again after any payment since the caller was told; and before every send, a caller
+                // gone (a request sent again for `bad_seq` may find it gone meanwhile) is sent nothing
+                if c.stream_paid {
+                    match early.as_mut() {
+                        None => {
+                            let mut s = Sink::for_call(c);
+                            s.head(&json!({"paid": true}));
+                            early = Some(s);
+                        }
+                        Some(s) if paying_told => s.head(&json!({"paid": true})),
+                        Some(_) => {}
+                    }
+                    paying_told = false;
+                    if !c.upgrade && early.as_mut().is_some_and(|s| !s.reader_there()) {
+                        self.seq_done(hs, seq);
+                        lock_money(hs).close(rid, 0, 0);
+                        return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
+                    }
                 }
                 spent.sent = true;
                 sent_epoch = lock_money(hs).epoch;
