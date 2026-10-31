@@ -1583,7 +1583,7 @@ fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {
     assert!(unescape(&r.body).contains("cannot be the login header"), "{}", r.body);
     let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
                                        ("name", "Other"), ("app", "1"), ("app_base", "/Videos/1/")]);
-    assert!(unescape(&r.body).contains("Another service already uses"), "{}", r.body);
+    assert!(unescape(&r.body).contains("already uses /Videos/1/, so Other cannot have it"), "{}", r.body);
 }
 
 /// Buyers' own accounts set up on the Sell page (docs/BUYER-ACCOUNTS.md): the seller pastes the
@@ -2911,8 +2911,10 @@ fn a_shared_folder_is_sold_per_gb_with_each_file_listed_and_served_only_to_the_g
     let l = cfg.listing.unwrap();
     assert_eq!(l.services[0].kind, "files");
     let items: Vec<(&str, &str, Option<&str>)> = l.services[0].items.iter().map(|i| (i.title.as_str(), i.url.as_str(), i.credit.as_deref())).collect();
-    assert_eq!(items, [("Books/A book.epub", "https://seller.example/Books/A%20book.epub", Some("4 bytes")),
-                       ("Sintel.mp4", "https://seller.example/Sintel.mp4", Some("2.5 MB"))], "each file with its size, no hidden ones");
+    // under a path of its own, even alone, so that a media server added later can have the root
+    assert_eq!(route.path, "/my-files/");
+    assert_eq!(items, [("Books/A book.epub", "https://seller.example/my-files/Books/A%20book.epub", Some("4 bytes")),
+                       ("Sintel.mp4", "https://seller.example/my-files/Sintel.mp4", Some("2.5 MB"))], "each file with its size, no hidden ones");
     let page = br.get("/sell").body;
     assert!(page.contains("2 files in the folder") && page.contains("Update the file list"), "{page}");
     // a new file shows once the list is updated
@@ -2941,6 +2943,59 @@ fn a_shared_folder_is_sold_per_gb_with_each_file_listed_and_served_only_to_the_g
     assert_eq!(get("/", None, None).status(), 204, "the Sell page's reachability check");
     // a buyer reads the price per GB
     assert_eq!(xbt_wallet_ui::services::price_words(&json!({"byte_msat": "1000000", "per_bytes": "1000000000"})), "1000 sat a GB");
+}
+
+/// Services added in any order each get a path of their own: a folder, a model and a web app added
+/// before the media server leave `/` to it (its web app sees the shop's root), and every route reaches
+/// its own service. A service that holds `/` by hand is named when a media server would need it.
+#[test]
+fn services_added_in_any_order_each_get_their_own_path() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let shared = tempfile::tempdir().unwrap();
+    std::fs::write(shared.path().join("film.mkv"), b"frames").unwrap();
+    let sdir = shared.path().to_path_buf();
+    let media = mock_http(|_| (200, "jellyfin"));
+    let web = mock_http(|_| (200, "web"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.files.dir = sdir.clone();
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    let added = |br: &mut B, form: &[(&str, &str)]| {
+        let r = br.act("/sell", "/sell", form);
+        let f = br.flash_after(&r);
+        assert!(f.contains("restarts"), "{form:?}: {f}");
+    };
+    // the folder first, then a web app with its own page, then the media server
+    added(&mut br, &[("action", "service"), ("kind", "files"), ("address", ""), ("price", "1000"), ("unit", "gb"), ("name", "My files")]);
+    let web_addr = format!("http://{web}");
+    added(&mut br, &[("action", "service"), ("kind", "web"), ("address", &web_addr), ("price", "1"), ("unit", "request"), ("name", "Notes"), ("app", "1")]);
+    let media_addr = format!("http://{media}");
+    added(&mut br, &[("action", "service"), ("kind", "media"), ("address", &media_addr), ("price", "1"), ("unit", "mib"), ("app_entry", "/web/")]);
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    let mut routes: Vec<(String, String)> = cfg.routes.iter().map(|r| (r.path.clone(), r.upstream.clone().unwrap_or_default())).collect();
+    routes.sort();
+    let files_up = format!("http://{}", bx._srv.files_addr.expect("the folder is served"));
+    assert_eq!(routes, [("/".to_string(), media_addr.clone()), ("/my-files/".to_string(), files_up), ("/notes/".to_string(), web_addr.clone())],
+               "each service under a path of its own, the media server at the root");
+    let page = br.get("/sell").body;
+    assert!(!page.contains("already uses"), "{page}");
+    // a second media server: the root is taken, and the page names who has it
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &media_addr), ("price", "1"), ("unit", "mib"), ("name", "Plex")]);
+    let f = unescape(&r.body);
+    assert!(f.contains("Media server already uses /, so Plex cannot have it"), "{f}");
 }
 
 /// A direct shop (no web address, reached by its key) selling its media server as a web app, a

@@ -596,10 +596,13 @@ impl Shop {
                mainnet_ok: s("/chain") == "main" && s("/mainnet_ack") == MAINNET_ACK, caps, offers }
     }
 
-    /// A path no other offer uses: `/` for the first, `/<name>/` after.
-    fn free_path(&self, name: &str, except: &str) -> String {
-        let used = |p: &str| self.offers.iter().filter(|o| o.id != except).any(|o| o.paths.iter().any(|x| x == p));
-        if !used("/") && self.offers.iter().filter(|o| o.id != except).count() == 0 {
+    /// A path no other offer uses: `/` for a media server, whose web app sees the shop's root, while no
+    /// other offer has it; `/<name>/` for anything else, so that a media server added later still finds `/`.
+    fn free_path(&self, name: &str, kind: Kind, except: &str) -> String {
+        let used = |p: &str| {
+            self.offers.iter().filter(|o| o.id != except).any(|o| o.paths.iter().any(|x| x == p) || o.app.as_ref().is_some_and(|a| a.base == p))
+        };
+        if kind == Kind::Media && !used("/") {
             return "/".into();
         }
         let base = slug(name);
@@ -1555,7 +1558,7 @@ impl App {
                 if paths.is_empty() {
                     paths = match shop.offers.iter().find(|o| o.id == new_id) {
                         Some(o) if !o.paths.is_empty() => o.paths.clone(),
-                        _ => vec![shop.free_path(&name, &new_id)],
+                        _ => vec![shop.free_path(&name, kind, &new_id)],
                     };
                 }
                 let mut accounts_key: Option<String> = None;
@@ -1573,8 +1576,9 @@ impl App {
                     if !base.starts_with('/') || base.contains(['?', '#', '%', ' ', '\\']) || base.contains("//") {
                         return Err(format!("{base} is not a path: it starts with / and has no spaces."));
                     }
-                    if shop.offers.iter().filter(|o| o.id != new_id).any(|o| o.paths.contains(&base) || o.app.as_ref().is_some_and(|a| a.base == base)) {
-                        return Err(format!("Another service already uses {base}: give this page another path."));
+                    if let Some(o) = shop.offers.iter().filter(|o| o.id != new_id).find(|o| o.paths.contains(&base) || o.app.as_ref().is_some_and(|a| a.base == base)) {
+                        return Err(format!("{} already uses {base}, so {name} cannot have it. Edit one of them: give it another path \
+                                            (Paths it is sold under, and What the page sees as /, under its web page and Advanced).", o.name));
                     }
                     let entry = match g("app_entry").trim() {
                         "" => base.clone(),
@@ -1818,13 +1822,26 @@ mod tests {
     #[test]
     fn new_offers_get_a_path_of_their_own() {
         let mut s = Shop::default();
-        assert_eq!(s.free_path("Films", "a"), "/");
-        s.offers.push(Offer { id: "a".into(), name: "Films".into(), kind: Kind::Media, address: "http://j:1".into(), price_msat: 1, unit: Unit::Mib, input_msat: 0,
-                              paused: false, paths: vec!["/".into()], strip: false, titles: vec![], app: None, capacity: Default::default() });
-        assert_eq!(s.free_path("My AI model!", "b"), "/my-ai-model/");
-        assert_eq!(s.free_path("Films", "a"), "/", "an offer keeps the root when it is the only one");
+        // anything but a media server keeps off the root, even first, so that one added later finds it free
+        assert_eq!(s.free_path("My files", Kind::Files, "f"), "/my-files/");
+        assert_eq!(s.free_path("Model", Kind::Ai, "f"), "/model/");
+        assert_eq!(s.free_path("Films", Kind::Media, "a"), "/");
+        s.offers.push(Offer { id: "f".into(), name: "My files".into(), kind: Kind::Files, address: "http://127.0.0.1:8486".into(), price_msat: 1, unit: Unit::Gb,
+                              input_msat: 0, paused: false, paths: vec!["/my-files/".into()], strip: true, titles: vec![], app: None, capacity: Default::default() });
+        assert_eq!(s.free_path("Films", Kind::Media, "a"), "/", "a media server after a folder still gets the root");
+        s.offers.push(Offer { id: "a".into(), name: "Films".into(), kind: Kind::Media, address: "http://j:1".into(), unit: Unit::Mib, paths: vec!["/".into()],
+                              strip: false, ..s.offers[0].clone() });
+        assert_eq!(s.free_path("My AI model!", Kind::Ai, "b"), "/my-ai-model/");
+        assert_eq!(s.free_path("Films", Kind::Media, "a"), "/", "an offer keeps the root it has");
+        assert_eq!(s.free_path("Plex", Kind::Media, "p"), "/plex/", "a second media server: the root is taken");
         s.offers.push(Offer { id: "b".into(), paths: vec!["/x/".into()], ..s.offers[0].clone() });
-        assert_eq!(s.free_path("x", "c"), "/x-2/");
-        assert_eq!(s.free_path("x402", "c"), "/x402-2/");
+        assert_eq!(s.free_path("x", Kind::Web, "c"), "/x-2/");
+        assert_eq!(s.free_path("x402", Kind::Web, "c"), "/x402-2/");
+        // a web app whose page sees the root holds it as well
+        s.offers.push(Offer { id: "w".into(), paths: vec!["/w/".into()],
+                              app: Some(OfferApp { base: "/".into(), entry: "/".into(), login: String::new(), deny: vec![], allow: vec![], live: false, accounts: None }),
+                              ..s.offers[0].clone() });
+        s.offers.retain(|o| o.id != "a");
+        assert_eq!(s.free_path("Films", Kind::Media, "a"), "/films/");
     }
 }
