@@ -4781,9 +4781,10 @@ impl Signer {
         }
         // the price of the answer: the seller's signed charge where it stands inside the wallet's own count, else that count
         // (one cut short: as far as the wallet believed it, but for a charge past the call's limit, which is said as
-        // the seller made it, with its fault)
+        // the seller made it, with its fault). The wallet's own count is never past the call's charge cap, which it read
+        // no further than: by the second, the seconds since the cut would count on here otherwise
         let price_msat = last.as_ref().map(|r| r.charged).filter(|c| *c <= own_cost || !complete)
-            .map(|c| if complete || c > max_msat { c } else { believed_at.map_or(c, |b| c.min(b)) }).unwrap_or_else(|| st.cost(sink.bytes));
+            .map(|c| if complete || c > max_msat { c } else { believed_at.map_or(c, |b| c.min(b)) }).unwrap_or_else(|| st.cost(sink.bytes).min(max_msat));
         let mut m = json!({"complete": complete, "ended": ended, "price_msat": price_msat.to_string()});
         if let Some(why) = fault {
             m["seller_fault"] = self.ticket_fault(hs, &why)["reason"].clone();
