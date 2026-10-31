@@ -2453,8 +2453,13 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     # passed, at once; below that (the cheap run) no ticket moves, and the exit's count does (every 5 s)
     stop_msat = price_of(VPN_STOP_AT_BYTES, sat_gb * 1000, 1 << 30)
 
+    # what the wait last saw while the tunnel ran: by its end the fetch has closed, and the wallet's view with it
+    seen: dict[str, Any] = {}
+
     def drawn() -> bool:
-        open_ = [p for p in status().get("paying", []) if p.get("origin") == origin and p.get("answer_open")]
+        paying = status().get("paying", [])
+        seen.update(exit_down_since=exit_down() - down0, paying=paying)
+        open_ = [p for p in paying if p.get("origin") == origin and p.get("answer_open")]
         if not open_:
             return False
         if stop_msat >= 2 * TICKET_MSAT:
@@ -2466,7 +2471,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     except LabError as e:
         stopped.set()
         t.join(400)
-        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}")
+        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}; last seen {json.dumps(seen)[:900]}")
         return
     stopped.set()
     sid = next((p["session"] for p in status().get("paying", []) if p.get("origin") == origin), None)
