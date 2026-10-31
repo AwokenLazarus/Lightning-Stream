@@ -30,6 +30,9 @@ enum Plan {
     BadRequest,
     /// Sends part of the answer, then stops; paid for what it sent.
     Cut(u64),
+    /// Streams `ANSWER` and is paid `.0`, its payment taking `.1` ms over a slow route before the
+    /// request leaves: the seller itself answers at once.
+    SlowPay(u64, u64),
 }
 
 const EMBEDDING: &str = "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}";
@@ -84,6 +87,15 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                     json!({"verdict": "allow", "rule": "free", "status": 200, "complete": true, "charged_sats": 0})
                 } else {
                     let plan = { let mut g = sellers.lock().unwrap(); g.calls.push((url.clone(), serde_json::from_str(p["body"].as_str().unwrap()).unwrap())); g.plans[&seller] };
+                    // as the signer does on the ticket rail: once the request is paid for, the socket opens, with a line
+                    // that says so first where the caller asked for one
+                    let connect = || {
+                        let mut s = connect();
+                        if p["stream_paid"] == true {
+                            writeln!(s, "{}", json!({"paid": true})).unwrap();
+                        }
+                        s
+                    };
                     match plan {
                         Plan::Answer(msat) if url.ends_with("/v1/embeddings") => {
                             let mut s = connect();
@@ -117,6 +129,13 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                             writeln!(s, "{}", head(400, "application/json")).unwrap();
                             let _ = s.write_all(b"{\"error\":{\"message\":\"max_tokens too large\"}}");
                             json!({"verdict": "allow", "status": 400, "complete": true, "price_msat": "0"})
+                        }
+                        Plan::SlowPay(msat, ms) => {
+                            std::thread::sleep(Duration::from_millis(ms));
+                            let mut s = connect();
+                            writeln!(s, "{}", head(200, "text/event-stream")).unwrap();
+                            s.write_all(ANSWER.as_bytes()).unwrap();
+                            json!({"verdict": "allow", "rail": "ticket", "status": 200, "complete": true, "price_msat": msat.to_string(), "charged_sats": 900})
                         }
                         Plan::Cut(msat) => {
                             let mut s = connect();
@@ -251,6 +270,23 @@ fn a_seller_that_is_refused_broken_or_silent_hands_the_request_to_the_next() {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(spent(&r), 777, "only the seller that answered is booked");
     }
+}
+
+/// A seller whose call takes 2.5 s to pay for (a first ticket over a slow route), with 1 s for its
+/// first byte, is given that second from when it is paid for: it answers, and is the only seller
+/// paid and booked.
+///
+/// FAILS before: the second ran from the start of the call, payment and all, so the request went
+/// to the next seller as the first's payment went through: two sellers paid for one answer, and on
+/// a slow route every AI call of a buyer failed over or failed.
+#[test]
+fn a_seller_paid_over_a_slow_route_is_given_its_time_from_the_payment() {
+    let r = rig(Plan::SlowPay(777, 2500), Plan::Answer(999), 100);
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!((status, body.as_str()), (200, ANSWER));
+    assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called, or paid");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(spent(&r), 777, "the seller that answered, and only it, is booked");
 }
 
 #[test]
