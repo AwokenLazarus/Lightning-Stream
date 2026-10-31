@@ -2394,8 +2394,10 @@ VPN_CHEAP_SAT_GB = 1_000
 
 def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     """A VPN tunnel's money over a realistic amount, stopped as a VPN that is turned off stops it: a 100 MiB
-    public download through a tunnel paid at `sat_gb` sat a GiB, and the agent stops the session while the
-    tunnel is still open, once about 57 MiB have come down (by the exit's count). What the seller charged (its gateway's book) and what the wallet says the
+    public download, started again as it ends, through a tunnel paid at `sat_gb` sat a GiB, and the agent
+    stops the session while the tunnel is still open, once about 57 MiB have come down (by the wallet's
+    released tickets, or the exit's count where 57 MiB cost under two tickets). What the seller charged
+    (its gateway's book) and what the wallet says the
     session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
     the stop says is left with the seller; both nodes and the book agree. Usage is the bytes the buyer took
     out of the tunnel (B): the seller charges for at least those, and for at most B plus 3% and 4 MiB (the
@@ -2421,30 +2423,44 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     out: dict[str, Any] = {}
     url = VPN_BIG_FILES[0]
 
+    stopped = threading.Event()
+
     def fetch() -> None:
+        # not --once: the download starts again as each ends, so the tunnel stays busy and open until the
+        # stop ends it (a fast link can bring the whole file before the stop is due)
         for u in VPN_BIG_FILES:
-            r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", u, "--once", "--secs", "300"],
+            r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", u, "--secs", "280"],
                                env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="39000"),
                                capture_output=True, text=True, timeout=400)
             line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
             out.clear()
             out.update(json.loads(line) if line else {"stderr": r.stderr[-800:]})
             out["url"] = u
-            if int(out.get("bytes") or 0) >= 50 << 20:
+            if stopped.is_set() or int(out.get("bytes") or 0) >= 50 << 20:
                 return
 
     t = threading.Thread(target=fetch)
     t.start()
+    # when the tunnel's 57 MiB cost two tickets or more, the wallet's own released count says when they have
+    # passed, at once; below that (the cheap run) no ticket moves, and the exit's count does (every 5 s)
+    stop_msat = price_of(VPN_STOP_AT_BYTES, sat_gb * 1000, 1 << 30)
 
     def drawn() -> bool:
-        return exit_down() - down0 >= VPN_STOP_AT_BYTES and any(p.get("origin") == origin and p.get("answer_open") for p in status().get("paying", []))
+        open_ = [p for p in status().get("paying", []) if p.get("origin") == origin and p.get("answer_open")]
+        if not open_:
+            return False
+        if stop_msat >= 2 * TICKET_MSAT:
+            return int(open_[0].get("released_msat") or 0) >= stop_msat // TICKET_MSAT * TICKET_MSAT
+        return exit_down() - down0 >= VPN_STOP_AT_BYTES
 
     try:
-        lab.wait("the tunnel to carry about 57 MiB", 300, drawn, every=0.5)
+        lab.wait("the tunnel to carry about 57 MiB", 300, drawn, every=0.1)
     except LabError as e:
+        stopped.set()
         t.join(400)
         check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}")
         return
+    stopped.set()
     sid = next(p["session"] for p in status().get("paying", []) if p.get("origin") == origin)
     stop = agent().tool("ticket_stop", {"session": sid})
     # the seller's book at once: the stop ended the tunnel and took its last receipt (a session the
