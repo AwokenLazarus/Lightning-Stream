@@ -149,3 +149,5 @@ COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-stream-relay /usr/bin/xb
 USER xbt-stream-relay
 ENV XBT_RELAY_LISTEN=0.0.0.0:8443 XBT_RELAY_QUIC_LISTEN=0.0.0.0:7842 RUST_LOG=warn,[conn]=off NO_COLOR=1
 ENTRYPOINT ["/usr/bin/xbt-stream-relay"]
+# alive when its loop rewrote its status file within 2 minutes (it does every 5 s, on or off)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 CMD ["/usr/bin/xbt-stream-relay", "healthcheck"]

@@ -229,7 +229,9 @@ impl xbt_svc::http::Handler for Ui {
                 let range = bounded_range(req.headers.get("range").map(String::as_str), READ_CHUNK);
                 // the file's service's listed prices: the most each part is paid at
                 let ceiling = self.0.relay_ceiling(&req, &item);
-                relay(&url, range.as_deref(), ceiling.as_ref())
+                // and its listed size: the most bytes, and so sats, one part may cost
+                let limit = self.0.relay_limit(&req, &item, range.as_deref().and_then(range_len));
+                relay(&url, range.as_deref(), ceiling.as_ref(), limit)
             }
         }
     }
@@ -268,16 +270,39 @@ pub fn bounded_range(range: Option<&str>, chunk: u64) -> Option<String> {
     Some(format!("bytes={start}-{end}"))
 }
 
+/// The bytes a plain `bytes=N-M` range asks for; `None` for any other.
+pub fn range_len(r: &str) -> Option<u64> {
+    let (a, b) = r.trim().strip_prefix("bytes=")?.split_once('-')?;
+    let (a, b) = (a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?);
+    (b >= a).then(|| b - a + 1)
+}
+
+/// Whether a seller's answer says it sends more than the listed size can stand for: its whole
+/// `Content-Length` (a `200`) or the total in its `Content-Range` (a `206`) above `size`.
+pub fn more_than_listed(status: u16, content_length: Option<&str>, content_range: Option<&str>, size: u64) -> bool {
+    let num = |s: &str| s.trim().parse::<u64>().ok();
+    let total = content_range.and_then(|r| r.rsplit_once('/')).and_then(|(_, t)| num(t));
+    match status {
+        206 => total.is_some_and(|t| t > size),
+        _ => content_length.and_then(num).is_some_and(|n| n > size) || total.is_some_and(|t| t > size),
+    }
+}
+
 /// The headers of a relayed answer that are passed on from the connector.
 const RELAYED: [&str; 3] = ["Content-Type", "Content-Range", "Accept-Ranges"];
 
 /// Stream the connector's answer for a seller URL to the reader, with the reader's `Range` (the
 /// connector takes one plain byte range and ignores any other).
-fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>) -> xbt_svc::http::Reply {
+fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>, limit: Option<(u64, i64)>) -> xbt_svc::http::Reply {
     let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).redirects(0).build();
     let mut rq = agent.get(url);
     if let Some(c) = ceiling {
         rq = rq.set("X-Price-Ceiling", &c.to_string());
+    }
+    // the connector pays no more than this part of the listed file can cost (it takes the lower of
+    // this and its own limit)
+    if let Some((_, sats)) = limit {
+        rq = rq.set("X-Max-Sats", &sats.to_string());
     }
     if let Some(r) = range.map(str::trim).filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
         rq = rq.set("Range", r);
@@ -310,6 +335,18 @@ fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>) ->
     headers.extend([("Cache-Control".to_string(), "no-store".to_string()), ("X-Content-Type-Options".into(), "nosniff".into()),
                     ("Cross-Origin-Resource-Policy".into(), "same-origin".into())]);
     let length = resp.header("Content-Length").and_then(|n| n.parse::<u64>().ok());
+    // a seller that says it sends more than its listing: refused before any of the body is read, so
+    // the wallet pays for none of it (at most the part's head), and the buyer is told why
+    if let Some((size, _)) = limit {
+        if more_than_listed(status, resp.header("Content-Length"), resp.header("Content-Range"), size) {
+            let v = serde_json::json!({"error": "the seller sends more than the size its listing shows; nothing more is paid for this file"});
+            let mut whole = Resp::json(502, &v);
+            security_headers(&mut whole);
+            return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
+        }
+    }
+    // and one that sends more than that without saying so is cut there
+    let mut left = limit.map_or(u64::MAX, |(size, _)| size);
     let mut src = resp.into_reader();
     xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed {
         status,
@@ -318,10 +355,15 @@ fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>) ->
         body: Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| {
             let mut buf = vec![0u8; 64 << 10];
             loop {
-                let n = std::io::Read::read(&mut src, &mut buf)?;
+                let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+                if want == 0 {
+                    return Ok(());
+                }
+                let n = std::io::Read::read(&mut src, &mut buf[..want])?;
                 if n == 0 {
                     return Ok(());
                 }
+                left -= n as u64;
                 // a reader that has gone: the connection to the connector closes, and the wallet stops paying
                 out.send(&buf[..n])?;
             }
@@ -395,6 +437,18 @@ fn files_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seller_saying_it_sends_more_than_listed_is_refused() {
+        let size = 1_000;
+        assert!(!more_than_listed(200, Some("1000"), None, size));
+        assert!(more_than_listed(200, Some("1001"), None, size), "a whole file bigger than listed");
+        assert!(!more_than_listed(206, Some("100"), Some("bytes 0-99/1000"), size));
+        assert!(more_than_listed(206, Some("100"), Some("bytes 0-99/5000"), size), "a part of a file bigger than listed");
+        assert!(more_than_listed(200, None, Some("bytes 0-99/5000"), size));
+        assert!(!more_than_listed(200, None, None, size), "no length said: cut at the listed size as it streams");
+        assert_eq!((range_len("bytes=0-99"), range_len("bytes=10-9"), range_len("bytes=5-")), (Some(100), None, None));
+    }
 
     #[test]
     fn a_readers_range_is_cut_to_one_part() {

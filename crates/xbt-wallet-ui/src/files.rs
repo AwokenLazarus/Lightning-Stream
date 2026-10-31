@@ -79,6 +79,23 @@ pub fn size_words(n: u64) -> String {
     if v >= 100.0 { format!("{v:.0} {unit}") } else { format!("{v:.1} {unit}") }
 }
 
+/// The most bytes a size worded by [`size_words`] can stand for: `1.4 GB` is at most 1.45 GB, and
+/// `276 MB` at most 276.5 MB. `None`: not a size in those words.
+pub fn size_most(words: &str) -> Option<u64> {
+    let (n, unit) = words.trim().split_once(' ')?;
+    let mult: f64 = match unit {
+        "bytes" => return n.parse().ok(),
+        "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        _ => return None,
+    };
+    let v: f64 = n.parse().ok().filter(|v: &f64| v.is_finite() && *v >= 0.0)?;
+    // half of the last digit shown: one decimal below 100, whole units from 100
+    let half = if n.contains('.') { 0.05 } else { 0.5 };
+    Some(((v + half) * mult).ceil() as u64)
+}
+
 /// The URL path of a listed file: each part percent-encoded.
 pub fn url_path(rel: &str) -> String {
     rel.split('/').map(crate::services::urlenc).collect::<Vec<_>>().join("/")
@@ -426,5 +443,13 @@ mod tests {
         assert_eq!(range_of(Some("bytes=0-1,4-5"), 10), None);
         assert_eq!(range_of(None, 10), None);
         assert_eq!((size_words(850), size_words(1_400_000_000), size_words(2_500_000)), ("850 bytes".into(), "1.4 GB".into(), "2.5 MB".into()));
+        // the most each wording can stand for is never below the size it was made from
+        for n in [0u64, 850, 999, 1_000, 1_449, 99_949_999, 276_499_999, 1_449_999_999, 123_456_789_012] {
+            let most = size_most(&size_words(n)).unwrap();
+            assert!(most >= n && most <= n + n / 20 + 1_000, "{n} -> {most}");
+        }
+        assert_eq!(size_most("1.4 GB"), Some(1_450_000_000));
+        assert_eq!(size_most("276 MB"), Some(276_500_000));
+        assert_eq!(size_most("plenty"), None);
     }
 }

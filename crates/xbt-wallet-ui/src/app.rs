@@ -296,6 +296,26 @@ impl App {
         crate::services::find_item_of(&all, &service, item).and_then(|(s, _)| s.price_ceiling())
     }
 
+    /// What one relayed part of a listed file may cost, from its listing: the most bytes its listed
+    /// size can stand for ([`crate::files::size_most`]) and, for a part of `range_len` bytes, the most
+    /// sats at the listed prices with 2% slack. `None`: no listed size or price to hold the seller to.
+    pub fn relay_limit(&self, req: &Req, item: &str, range_len: Option<u64>) -> Option<(u64, i64)> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        let service = match path.strip_prefix("/r/") {
+            Some(token) => self.relays.service_of(token)?,
+            None => path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).and_then(|(t, _)| t.split_once('.')).map(|(_, s)| s.to_string())?,
+        };
+        let all = self.services().ok()?;
+        let (svc, it) = crate::services::find_item_of(&all, &service, item)?;
+        let size = crate::files::size_most(&it.credit)?;
+        let c = svc.price_ceiling()?;
+        let n = |k: &str| c.get(k).and_then(Value::as_u64).unwrap_or(0) as u128;
+        let bytes = range_len.map_or(size, |r| r.min(size)) as u128;
+        let msat = n("request_msat") + (n("gib_msat") * bytes).div_ceil(1 << 30);
+        let sats = (msat * 102 / 100).div_ceil(1000) + 1;
+        Some((size, i64::try_from(sats).unwrap_or(i64::MAX)))
+    }
+
     pub fn handle(&self, mut req: Req) -> Resp {
         if !self.peer_allowed(&req.peer) {
             return Resp::text(403, "text/plain", "forbidden");
@@ -493,7 +513,7 @@ impl App {
             "<label>Setup code<input name=\"code\" autocomplete=\"off\" required></label>\
              <p class=\"hint\">A one-time code that proves this app is yours. It is in the app's log, on the line that says \
              <em>setup code</em>. On Umbrel: right-click the Lightning Stream icon and choose <em>Troubleshoot</em>. \
-             On StartOS: open Lightning Stream and choose <em>Logs</em>.</p>\
+             On StartOS: open Lightning Stream, choose <em>Actions</em>, then <em>Web UI setup code</em>.</p>\
              <details><summary>Running it another way?</summary><p>The code is also in the file <code>setup-code</code> in the app's data folder.</p></details>"
         } else {
             ""

@@ -273,6 +273,32 @@ pub(crate) fn jellyfin_libraries(address: &str, key: &str) -> Result<Vec<(String
 /// requests' own marks. The gateway passes no other beyond the always-forwarded ones.
 const APP_HEADERS: [&str; 7] = ["cookie", "authorization", "x-emby-authorization", "x-mediabrowser-token", "x-requested-with", "x-csrf-token", "x-api-key"];
 
+/// The gateway's settings as the Sell page shows them: every `upstream_headers` value (an app's
+/// login, the files key) is replaced, so a screenshot of the page gives none of them away.
+fn hide_header_values(mut c: Value) -> Value {
+    fn walk(v: &mut Value) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m.iter_mut() {
+                    if k == "upstream_headers" {
+                        if let Value::Object(h) = x {
+                            for val in h.values_mut() {
+                                *val = Value::String("(hidden)".into());
+                            }
+                        }
+                    } else {
+                        walk(x);
+                    }
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(&mut c);
+    c
+}
+
 /// A login header written `Name: value`, as the gateway's `upstream_headers` takes it.
 fn login_header(s: &str) -> Result<Option<(String, String)>, String> {
     let s = s.trim();
@@ -1426,7 +1452,7 @@ impl App {
             esc(&shop.proxies), esc(&shop.network),
             facts,
             if main { format!("<p class=\"small\">On mainnet keep these low: {} buyers, {} per address, {} held payments.</p>", MAINNET_CAPS.0, MAINNET_CAPS.1, MAINNET_CAPS.2) } else { String::new() },
-            self.gateway_now().map(|c| format!("<details><summary>The settings the shop reads</summary>{}</details>", json_block(&c))).unwrap_or_default()));
+            self.gateway_now().map(|c| format!("<details><summary>The settings the shop reads</summary>{}</details>", json_block(&hide_header_values(c)))).unwrap_or_default()));
         self.page("Sell", ctx, b)
     }
 
@@ -1718,6 +1744,16 @@ fn capacity_words(c: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_shown_hide_every_header_value() {
+        let c = json!({"routes": [{"path": "/files/", "upstream_headers": {"x-stream-files-key": "secret1"}},
+                                  {"path": "/app/", "upstream_headers": {"x-emby-authorization": "secret2"}, "free": false}],
+                       "nostr": {"publish": true}});
+        let shown = hide_header_values(c).to_string();
+        assert!(!shown.contains("secret1") && !shown.contains("secret2"), "{shown}");
+        assert!(shown.contains("x-stream-files-key") && shown.contains("(hidden)") && shown.contains("\"publish\":true"), "{shown}");
+    }
 
     #[test]
     fn sats_are_typed_as_people_write_them() {
