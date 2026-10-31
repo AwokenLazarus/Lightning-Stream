@@ -23,8 +23,8 @@
 #   money    every paid service of this lab's gateway over a realistic amount, as usage times the
 #            listed price on both sides: the 100 MB file (Files), and 240 requests of a web app's shape
 #            (pages and 40 media segments, about 70 MiB) to a route priced per request and per byte;
-#            the seller's signed receipts and the wallet's account each come to it to the msat, and
-#            both nodes and the wallet's book agree
+#            each reply must arrive whole; the seller's signed receipts and the wallet's account each
+#            come to it to the msat, and both nodes, the wallet's book and the receipts agree
 #   slots    half of the buyer's channel taken by payments of others: the wallet holds nothing and
 #            pays with prepaid tickets, one at a time; a seller at its cap of 15 says slots_short and
 #            is paid with a prepaid ticket; a lock that finds no slot on the way: the session holds
@@ -66,7 +66,7 @@
 #            through the exit, and what the wallet says left it equal to what its node paid. Then a
 #            100 MiB download through a tunnel that the agent stops while it is open, after about
 #            57 MiB, at 500,000 sat a GiB and again at 1,000 (under one ticket): the seller's book and
-#            the wallet's account each charge the tunnel's bytes at the listed price. Ports BASE+17 to BASE+19
+#            the wallet's account each charge the tunnel's bytes at the listed price, never below it and at most 3% and 1 MiB above (framing, and bytes on their way at the stop: one flow's 512 KiB window). Ports BASE+17 to BASE+19
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab

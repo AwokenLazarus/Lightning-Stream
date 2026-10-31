@@ -1823,11 +1823,13 @@ def paid_for_usage(name: str, what: str, usage_msat: int, seller_msat: int, stop
     left = int((stop.get("http") or {}).get("left_with_seller_msat") or -1)
     paid = m["buyer_node_paid_msat"]
     one = paid == m["seller_node_received_msat"] == m["wallet_book_settled_msat"]
+    # the seller's signed receipts (what they say was released) are a fourth count of the same number
     ok = (abs(seller_msat - usage_msat) <= slack_msat and abs(spent - usage_msat) <= slack_msat and one and paid == spent + left and 0 <= left < most_left
-          and agrees(m, receipts=False))
+          and agrees(m, receipts=True))
     check(f"{name}: {what}", ok, {"usage_msat": usage_msat, "seller_charged_msat": seller_msat, "wallet_spent_msat": spent, "slack_msat": slack_msat,
                                   "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
-                                  "wallet_book_settled_msat": m["wallet_book_settled_msat"], "left_with_seller_msat": left, "most_left_msat": most_left,
+                                  "wallet_book_settled_msat": m["wallet_book_settled_msat"], "receipts_released_msat": m["receipts_released_msat"],
+                                  "left_with_seller_msat": left, "most_left_msat": most_left,
                                   "tickets": m["tickets"], **saw})
     measured(f"{name}_usage_msat", usage_msat)
 
@@ -1847,12 +1849,15 @@ def money_check() -> None:
     r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
     if r.get("saved_to"):
         os.remove(r["saved_to"])
-    usage = price_of(BIG, BYTE_MSAT)
+    # usage is what arrived: the file whole, or the check fails
+    whole = r.get("complete") is True and int(r.get("bytes") or -1) == BIG
+    usage = price_of(BIG, BYTE_MSAT) if whole else -1
     seller = int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or -1)
     stop, m = stop_and_count(str(r.get("session")), m0)
-    paid_for_usage("money", f"Files: a 100 MB file priced per byte is charged its bytes at the listed price ({usage:,} msat) by the seller's signed receipt and in the wallet's account, "
-                   "to the msat; both nodes and the wallet's book agree, and what was paid is what was spent and what is left with the seller",
-                   usage, seller, stop, m, 0, 2 * TICKET_MSAT, {"bytes": r.get("bytes"), "complete": r.get("complete"), "price_msat": r.get("price_msat")})
+    paid_for_usage("money", f"Files: a 100 MB file priced per byte is charged its bytes at the listed price ({price_of(BIG, BYTE_MSAT):,} msat) by the seller's signed "
+                   "receipt and in the wallet's account, to the msat; both nodes and the wallet's book agree, and what was paid is what was spent and what is left "
+                   "with the seller (under one ticket)",
+                   usage, seller, stop, m, 0, TICKET_MSAT, {"bytes": r.get("bytes"), "complete": r.get("complete"), "price_msat": r.get("price_msat")})
     # a web app: pages and segments
     stop_sessions()
     rng = __import__("random").Random(20261031)
@@ -1870,7 +1875,9 @@ def money_check() -> None:
         want = APP_REQUEST_MSAT + price_of(n, APP_BYTE_MSAT)
         usage += want
         bytes_ += n
-        if not call_paid(r) or r.get("price_msat") != str(want) or (sid and r.get("session") != sid):
+        # each reply whole (usage is what arrived), priced at its own request and bytes, in the one session
+        if (not call_paid(r) or r.get("price_msat") != str(want) or (sid and r.get("session") != sid)
+                or r.get("complete") is not True or int(r.get("bytes") or -1) != n):
             wrong.append({"i": i, "size": n, "want_msat": want, **brief(r)})
         sid = sid or str(r.get("session"))
         seller = max(seller, int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or 0))
@@ -2400,8 +2407,9 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     (its gateway's book) and what the wallet says the
     session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
     the stop says is left with the seller; both nodes and the book agree. Usage is the bytes the buyer took
-    out of the tunnel (B): the seller charges for at least those, and for at most B plus 3% and 4 MiB (the
-    tunnel's own framing and requests, and bytes on their way when the stop came). The wallet's account is
+    out of the tunnel (B): the seller charges for at least those, and for at most B plus 3% and 1 MiB (the
+    tunnel's own framing and requests, 3%; and bytes on their way when the stop came, which the tunnel's
+    flow window holds to 512 KiB with one flow, plus the paid-ahead chunks). The wallet's account is
     held to the seller's book within the price of 64 KiB (two 16 KiB chunks each way, paid and not yet
     counted). The shortfall this pins: the stop counted only the tunnel's opening, so the wallet said every
     msat the tunnel drew was left with the seller (fixed in 9cc54ac9). It showed only while the tunnel's
@@ -2461,10 +2469,12 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
         check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}")
         return
     stopped.set()
-    sid = next(p["session"] for p in status().get("paying", []) if p.get("origin") == origin)
+    sid = next((p["session"] for p in status().get("paying", []) if p.get("origin") == origin), None)
+    if sid is None:
+        raise LabError(f"vpn money at {sat_gb:,} sat a GiB: no wallet session pays {origin}: paying {json.dumps(status().get('paying'))[:400]}")
     stop = agent().tool("ticket_stop", {"session": sid})
-    # the seller's book at once: the stop ended the tunnel and took its last receipt (a session the
-    # seller holds nothing of leaves its book in time, and its charge with it)
+    # the seller's book at once: the stop ended the tunnel and took its last receipt (its charged total
+    # counts every session there has been, dropped ones included, so its change is this tunnel's charge)
     book = int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1))
     note_receipts(stop.get("http") or {})
     t.join(400)
@@ -2475,7 +2485,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
     took = int(out.get("bytes") or 0)
     byte_msat = sat_gb * 1000
-    low, high = price_of(took, byte_msat, 1 << 30), price_of(took * 103 // 100 + (4 << 20), byte_msat, 1 << 30)
+    low, high = price_of(took, byte_msat, 1 << 30), price_of(took * 103 // 100 + (1 << 20), byte_msat, 1 << 30)
     seller = book - book0 if book0 >= 0 and book >= 0 else -1
     acct = (stop.get("http") or {}).get("account") or {}
     spent = int(acct.get("spent_msat") or -1)
@@ -2485,13 +2495,14 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     # (at least 1 msat: the two may round the same bytes' price apart by one)
     near = abs(spent - seller) <= max(1, price_of(64 << 10, byte_msat, 1 << 30))
     exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
-    ok = (took >= 50 << 20 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 3 * TICKET_MSAT and agrees(m, receipts=False))
+    ok = (took >= 50 << 20 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 3 * TICKET_MSAT and agrees(m, receipts=True))
     measured(f"vpn_money_{sat_gb}_mib", round(took / 2**20, 1))
-    check(f"vpn: a tunnel stopped while open, after 50 MiB or more: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 3% and 4 MiB above for "
+    check(f"vpn: a tunnel stopped while open, after 50 MiB or more: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 3% and 1 MiB above for "
           "framing and bytes on their way, never below), the wallet's account says the same within 64 KiB's price, what was paid is what was spent and what is left with the "
           "seller, and both nodes and the book agree",
           ok, {"bytes_through": took, "file": url, "usage_low_msat": low, "usage_high_msat": high, "seller_book_charged_msat": seller, "wallet_spent_msat": spent,
                "left_with_seller_msat": left, "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
+               "receipts_released_msat": m["receipts_released_msat"],
                "wallet_book_settled_msat": m["wallet_book_settled_msat"], "tickets": m["tickets"],
                "exit": {k: exit_status.get(k) for k in ("up_bytes", "down_bytes")}, "fetch": out})
 
