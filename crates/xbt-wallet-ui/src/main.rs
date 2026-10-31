@@ -82,9 +82,33 @@ fn node_keys() -> i32 {
             return 2;
         }
     };
+    // XBT_KEYS_WATCH_S with a hand-over folder (Umbrel): watch it until every key the app's dirs lack
+    // is there, so a wallet the owner makes after installing is taken without a restart
+    let watch = std::env::var("XBT_KEYS_WATCH_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+    if let (Some(every), Some(h)) = (watch, s.take_from.as_ref()) {
+        eprintln!("xbt-wallet-ui node-keys: watching {} for the keys node-keys-bake has this box's Lightning node make", h.display());
+        while xbt_wallet_ui::node_keys::handover_wanted(&s) {
+            let mut o = xbt_wallet_ui::node_keys::Outcome::default();
+            match xbt_wallet_ui::node_keys::take_handover(&s, &mut o) {
+                Ok(()) => {
+                    if !o.made.is_empty() {
+                        eprintln!("xbt-wallet-ui node-keys: took {} from the box's Lightning node", o.made.join(", "));
+                    }
+                    for (file, why) in &o.skipped {
+                        eprintln!("xbt-wallet-ui node-keys: {file} kept as it was ({why})");
+                    }
+                }
+                Err(e) => eprintln!("xbt-wallet-ui node-keys: {e}"),
+            }
+            if xbt_wallet_ui::node_keys::handover_wanted(&s) {
+                std::thread::sleep(std::time::Duration::from_secs(every));
+            }
+        }
+        eprintln!("xbt-wallet-ui node-keys: every key is in place (or turned off by the owner)");
+        return 0;
+    }
     // XBT_KEYS_WATCH_S with a grant folder: keep watching it, so a grant the owner approves later (or
     // revokes) is taken without a restart; nothing is baked in this mode
-    let watch = std::env::var("XBT_KEYS_WATCH_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
     if let (Some(every), true) = (watch, s.grant.is_some() && s.admin.as_os_str().is_empty()) {
         eprintln!("xbt-wallet-ui node-keys: watching {} for the keys Lightning Fork grants", s.grant.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         loop {
@@ -117,6 +141,9 @@ fn node_keys() -> i32 {
     };
     let mut tries = 0;
     let mut wait = std::time::Duration::from_secs(5);
+    // XBT_KEYS_RETRY_MAX_S: the longest wait between two asks (default 300; the baker, waiting for a
+    // wallet the owner is making, asks more often)
+    let most = std::env::var("XBT_KEYS_RETRY_MAX_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0).unwrap_or(300);
     loop {
         tries += 1;
         let result = xbt_wallet_ui::node_keys::run_with(&s, given.as_deref());
@@ -141,7 +168,7 @@ fn node_keys() -> i32 {
             Err(e) => {
                 eprintln!("xbt-wallet-ui node-keys: not yet: {e}; asking again in {} s", wait.as_secs());
                 std::thread::sleep(wait);
-                wait = (wait * 2).min(std::time::Duration::from_secs(300));
+                wait = (wait * 2).min(std::time::Duration::from_secs(most));
             }
         }
     }

@@ -305,6 +305,8 @@ impl App {
                  Grant app access task for Lightning Stream, or paste a key below.".into() }
             else if ln.grant { "Approve Lightning Stream in Lightning Fork: open Lightning Fork's tasks and run Grant app access. \
                  The app connects by itself a few seconds later. Or paste a key below.".into() }
+            else if ln.auto { "Create your Lightning wallet in Lightning Fork first. Lightning Stream picks it up automatically, \
+                 within a minute and with no restart. Or paste a key below.".into() }
             else { "Make the key in your node's app and paste it below.".into() }));
         // the node holds more than the signed cap: one click to the rules with it raised
         if !ready && txt(status.get("reason")).contains("above ln.exposure_cap_sats") {

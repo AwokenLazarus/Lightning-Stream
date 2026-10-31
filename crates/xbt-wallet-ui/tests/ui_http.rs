@@ -2389,7 +2389,7 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let ln = tempfile::tempdir().unwrap();
     let dir = ln.path().to_path_buf();
-    let s = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: dir.join("none"), grant: None,
+    let s = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: dir.join("none"), grant: None, bake_to: None, take_from: None,
                                                  rail_dir: Some(dir.clone()), gw_dir: None };
     let rail = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
     let made = xbt_wallet_ui::node_keys::make_keys(&s, &mut |_, _| Ok(hex::decode(&rail).unwrap())).unwrap();
@@ -2416,6 +2416,25 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
     assert!(xbt_wallet_ui::node_keys::run(&s).unwrap().made.is_empty());
     assert!(!dir.join("rail.macaroon").exists());
     assert!(br.get("/lightning").body.contains("Not connected"));
+}
+
+/// Umbrel, the app installed before the owner made the wallet in Lightning Fork: the Lightning page says
+/// to make the wallet there, and that the app then connects by itself (node-keys-bake).
+#[cfg(unix)]
+#[test]
+fn before_the_nodes_wallet_exists_the_page_says_to_make_it_in_lightning_fork() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let dir = ln.path().to_path_buf();
+    let b = start(json!({}), false, |c| {
+        c.ln.dir = dir.clone();
+        c.ln.rest = Some("https://10.21.21.66:8180".into());
+        c.ln.auto = true;
+    });
+    let mut br = logged_in(&b);
+    let page = br.get("/lightning").body;
+    assert!(page.contains("Not connected") && page.contains("Create your Lightning wallet in Lightning Fork first")
+            && page.contains("picks it up automatically"), "{page}");
 }
 
 /// The box's own login proxy (here: the loopback peer, named `localhost`) is the owner, already logged

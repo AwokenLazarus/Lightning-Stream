@@ -12,10 +12,11 @@ description: >-
   service that can spend.
 
 
-  Setup takes a few minutes and no keys to copy. The app connects to this box's Lightning node by
-  itself: a one-shot service asks the node to make the app's own narrow keys (it can pay only within
-  your spending rules, and the selling side can only ask for payments), each revocable alone in the
-  node's app. You open the app from your Umbrel dashboard and log in with the app password Umbrel
+  Setup takes a few minutes and no keys to copy. Create your Lightning wallet in Lightning Fork first;
+  Lightning Stream picks it up automatically, also when you make the wallet after installing it, with no
+  restart. A one-shot service asks the node to make the app's own narrow keys (it can pay only within
+  your spending rules, and the selling side can only ask for payments or vouch for its own link), each
+  revocable alone in the node's app. You open the app from your Umbrel dashboard and log in with the app password Umbrel
   shows for it (its default credentials). Then make your approval
   key in the browser (download its backup), confirm that the app pays with real money, and sign the
   starter spending rules.

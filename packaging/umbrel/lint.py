@@ -19,7 +19,8 @@ exports; `docker compose config` accepts the file with those values, and with th
 Hardening (docs/CONTAINER.md): the agentpay services run read-only, cap_drop ALL, no-new-privileges, under an init
 (init: true), as their image's non-root user, and mount only their own sub-dir plus the dirs they need (a peer's read-only); of the
 Lightning node's data, only its tls.cert, read-only, as a bind that never creates a missing path; no
-admin macaroon. `init` (xbt-init) is the only root container: no network, at most CHOWN/FOWNER/DAC_OVERRIDE.
+admin macaroon. The one exception is the one-shot `node-keys-bake`, by name: as the Lightning app's user
+it mounts that app's data folder read-only, and writes only the hand-over folder run/node-keys. `init` (xbt-init) is the only root container: no network, at most CHOWN/FOWNER/DAC_OVERRIDE.
     python3 packaging/umbrel/lint.py [STORE_DIR]
 """
 from __future__ import annotations
@@ -97,14 +98,25 @@ AGENTPAY = {
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
               "bind": {"create_host_path": False}}
-# The Lightning node's mainnet admin macaroon, the file alone (the directories above it are 0700):
-# only the one-shot node-keys (the UI image, `command: ["node-keys"]`) may mount it, read-only, never
-# created. It reads it once to have the node bake the app's narrow macaroons, and writes only those
-# (run/ln, run/gateway).
-NODE_DATA_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain/bitcoin/mainnet/admin.macaroon",
-                   "target": "/node/admin.macaroon", "read_only": True,
-                   "bind": {"create_host_path": False}}
-NODE_KEYS_MOUNTS = {"${APP_DATA_DIR}/data/run/ln:/data/run/ln", "${APP_DATA_DIR}/data/run/gateway:/data/run/gateway"}
+# The Lightning node's data folder, read-only, never created: the rule "of another app's data, a file
+# only, never a directory" is relaxed for ONE container, named NODE_KEYS_BAKE. Lightning Fork's
+# directories are its user's alone (0700), and its admin macaroon appears only when the owner makes the
+# wallet, so a mount of that one file stops the install until then (Docker refuses a missing file). The
+# baker runs as that user (1000), reads the folder only to have the node bake the app's narrow
+# macaroons, and writes only the hand-over folder; reading the folder gives it nothing the admin
+# macaroon alone (full control of the node) did not. Every other container: tls.cert only.
+NODE_KEYS_BAKE = "node-keys-bake"
+NODE_DIR_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}", "target": "/node", "read_only": True,
+                  "bind": {"create_host_path": False}}
+NODE_KEYS_BAKE_MOUNTS = {"${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro", "${APP_DATA_DIR}/data/run/gateway:/data/run/gateway:ro",
+                         "${APP_DATA_DIR}/data/run/node-keys:/data/run/node-keys"}
+# its user, and its groups: the hand-over's (the UI's), run/gateway's and run/ln's, read only
+NODE_KEYS_BAKE_USER = "1000:1000"
+NODE_KEYS_BAKE_GROUPS = {"10005", "10007", "10008"}
+# node-keys itself (the UI's user) reads nothing of the Lightning app: it moves the baked keys from the
+# hand-over into run/ln and run/gateway
+NODE_KEYS_MOUNTS = {"${APP_DATA_DIR}/data/run/ln:/data/run/ln", "${APP_DATA_DIR}/data/run/gateway:/data/run/gateway",
+                    "${APP_DATA_DIR}/data/run/node-keys:/data/run/node-keys"}
 
 # apps of another community store a dependency may name, and what their exports give a dependent (Paul's
 # umbrel-store, paulscode-lightning-fork/exports.sh)
@@ -281,9 +293,10 @@ def main() -> int:
             elif pins.get(pin["name"]) != img:
                 bad(f"{folder}/{name}: image {img!r} is not the one packaging/images.lock pins ({pins.get(pin['name'])!r})")
             node_keys = s.get("command") == ["node-keys"]
+            baker = name == NODE_KEYS_BAKE
             for v in s.get("volumes") or []:
                 if isinstance(v, dict):
-                    if node_keys and v == NODE_DATA_MOUNT:
+                    if baker and v == NODE_DIR_MOUNT:
                         continue
                     if v != CERT_MOUNT:
                         bad(f"{folder}/{name}: a long-form mount is only the Lightning node's tls.cert, read-only, never created: {v}")
@@ -302,6 +315,22 @@ def main() -> int:
                     bad(f"{folder}/{name}: xbt-init must run with network_mode none, read_only, cap_drop ALL, cap_add within {sorted(INIT_CAPS)}")
                 if s.get("restart") != "no":
                     bad(f"{folder}/{name}: xbt-init is a one-shot (restart: \"no\")")
+            elif baker:
+                env = s.get("environment") or {}
+                if base != "xbt-wallet-ui" or not node_keys:
+                    bad(f"{folder}/{name}: node-keys-bake is node-keys (command [\"node-keys\"]) from the UI's image")
+                if not s.get("read_only") or s.get("cap_drop") != ["ALL"] or "no-new-privileges:true" not in (s.get("security_opt") or []):
+                    bad(f"{folder}/{name}: needs read_only, cap_drop ALL, no-new-privileges")
+                if str(s.get("user")) != NODE_KEYS_BAKE_USER or s.get("ports") or s.get("restart") != "no" or "network_mode" in s or s.get("privileged"):
+                    bad(f"{folder}/{name}: node-keys-bake is a one-shot (restart: \"no\") as the Lightning app's user {NODE_KEYS_BAKE_USER}, on the app's network, with no port")
+                if set(map(str, s.get("group_add") or [])) != NODE_KEYS_BAKE_GROUPS:
+                    bad(f"{folder}/{name}: node-keys-bake joins exactly the groups {sorted(NODE_KEYS_BAKE_GROUPS)}")
+                if env.get("XBT_KEYS_BAKE_TO") != "/data/run/node-keys" or "XBT_KEYS_TAKE_FROM" in env or "XBT_KEYS_GRANT_DIR" in env:
+                    bad(f"{folder}/{name}: node-keys-bake bakes into the hand-over (XBT_KEYS_BAKE_TO=/data/run/node-keys) only")
+                vols = s.get("volumes") or []
+                if NODE_DIR_MOUNT not in vols or [v for v in vols if isinstance(v, dict) and v != NODE_DIR_MOUNT] \
+                        or {str(v) for v in vols if not isinstance(v, dict)} != NODE_KEYS_BAKE_MOUNTS:
+                    bad(f"{folder}/{name}: node-keys-bake mounts the node's data read-only, run/ln and run/gateway read-only, and writes only run/node-keys")
             elif node_keys:
                 if base != "xbt-wallet-ui":
                     bad(f"{folder}/{name}: node-keys runs from the UI's image")
@@ -309,11 +338,11 @@ def main() -> int:
                     bad(f"{folder}/{name}: needs read_only, cap_drop ALL, no-new-privileges")
                 if "user" in s or s.get("ports") or s.get("restart") != "no":
                     bad(f"{folder}/{name}: node-keys is a one-shot (restart: \"no\") as its image's user, with no port")
-                if set(map(str, s.get("group_add") or [])) - {"1000"}:
-                    bad(f"{folder}/{name}: node-keys may join only the Lightning app's group (1000)")
+                if s.get("group_add"):
+                    bad(f"{folder}/{name}: node-keys joins no other group (the Lightning app's data is node-keys-bake's alone)")
                 vols = s.get("volumes") or []
-                if NODE_DATA_MOUNT not in vols or {str(v) for v in vols if not isinstance(v, dict)} - NODE_KEYS_MOUNTS:
-                    bad(f"{folder}/{name}: node-keys mounts the node's chain data read-only and writes only run/ln and run/gateway")
+                if any(isinstance(v, dict) for v in vols) or {str(v) for v in vols} - NODE_KEYS_MOUNTS:
+                    bad(f"{folder}/{name}: node-keys reads nothing of the Lightning app, and writes only run/ln, run/gateway and run/node-keys")
             elif base in AGENTPAY:
                 comp, own_runs, peers = AGENTPAY[base]
                 if not s.get("read_only") or s.get("cap_drop") != ["ALL"] or "no-new-privileges:true" not in (s.get("security_opt") or []):

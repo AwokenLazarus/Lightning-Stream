@@ -84,6 +84,9 @@ pub const RUN_UI: &str = "ui";
 pub const RUN_LN: &str = "ln";
 /// The gateway's config and macaroons, written by the UI's gateway page, read by the gateway.
 pub const RUN_GATEWAY: &str = "gateway";
+/// Umbrel: the hand-over folder of the keys the one-shot `node-keys-bake` (the Lightning app's user)
+/// has the node bake; `node-keys` (the UI) moves them into `run/ln` and `run/gateway` (`node_keys`).
+pub const RUN_NODE_KEYS: &str = "node-keys";
 /// A copy of the signer's one-time enrolment code for the UI's setup page (`B2_ENROLL_CODE_COPY`):
 /// the signer writes it, the UI reads it by group, the MCP is in neither the group nor the mount.
 pub const RUN_ENROLL: &str = "enroll";

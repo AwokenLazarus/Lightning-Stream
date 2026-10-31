@@ -32,6 +32,16 @@
 //! approves later is taken without a restart. With neither a grant nor an admin macaroon nothing is
 //! made, and the owner pastes the keys on the app's pages.
 //!
+//! Where the node's data can be read only by the node app's own user (Umbrel: Lightning Fork's
+//! directories are its user's alone, 0700, and a missing admin macaroon cannot be mounted as a file
+//! before the owner has made the wallet), the work is split in two, and either can start first:
+//!
+//! * `node-keys-bake` runs as that user (`XBT_KEYS_BAKE_TO`): it waits until the node's admin
+//!   macaroon exists, has the node bake the keys missing from the app's dirs (which it reads, never
+//!   writes), and writes them, with their record, to a hand-over folder only it and the UI share;
+//! * `node-keys` runs as the UI (`XBT_KEYS_TAKE_FROM`, with `XBT_KEYS_WATCH_S`): it moves each key
+//!   from the hand-over folder into its dir, with its root key id, and removes it there.
+//!
 //! A key that is already there (the owner's own, or one made before) is left alone. Beside the keys,
 //! `auto-keys.json` says they came from the box and names their root key ids (no secret), so the
 //! pages can say "connected automatically" and how to revoke them.
@@ -69,18 +79,31 @@ pub struct Settings {
     pub rail_dir: Option<PathBuf>,
     /// The gateway's key dir (`run/gateway`); `None`: no gateway keys are made.
     pub gw_dir: Option<PathBuf>,
+    /// Bake into this hand-over folder rather than into `rail_dir` and `gw_dir`, which are then only
+    /// read (what is there, what the owner turned off). `None`: bake into the dirs themselves.
+    pub bake_to: Option<PathBuf>,
+    /// Take the keys baked into this hand-over folder (moved: removed there once in place); nothing
+    /// is baked. `None`: no hand-over.
+    pub take_from: Option<PathBuf>,
 }
 
 impl Settings {
     /// `XBT_KEYS_NODE_REST`, `XBT_KEYS_TLS_CERT`, `XBT_KEYS_ADMIN` (a file or a dir), `XBT_KEYS_RAIL_DIR`,
-    /// `XBT_KEYS_GW_DIR`, `XBT_KEYS_GRANT_DIR` (with it, `XBT_KEYS_ADMIN` may be left out).
+    /// `XBT_KEYS_GW_DIR`, `XBT_KEYS_GRANT_DIR` or `XBT_KEYS_TAKE_FROM` (with either, `XBT_KEYS_ADMIN`
+    /// may be left out), `XBT_KEYS_BAKE_TO` (with `XBT_KEYS_ADMIN`).
     pub fn from_env() -> Result<Self, String> {
         let get = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let rest = get("XBT_KEYS_NODE_REST").ok_or("XBT_KEYS_NODE_REST is not set: this box did not say where its Lightning node is")?;
         let grant = get("XBT_KEYS_GRANT_DIR").map(PathBuf::from);
+        let bake_to = get("XBT_KEYS_BAKE_TO").map(PathBuf::from);
+        let take_from = get("XBT_KEYS_TAKE_FROM").map(PathBuf::from);
+        if bake_to.is_some() && (take_from.is_some() || grant.is_some()) {
+            return Err("XBT_KEYS_BAKE_TO goes with neither XBT_KEYS_TAKE_FROM nor XBT_KEYS_GRANT_DIR: the baker and the taker are two services".into());
+        }
         let admin = match get("XBT_KEYS_ADMIN") {
+            Some(_) if take_from.is_some() => return Err("XBT_KEYS_TAKE_FROM reads no admin macaroon: leave XBT_KEYS_ADMIN out".into()),
             Some(a) => a,
-            None if grant.is_some() => String::new(),
+            None if grant.is_some() || take_from.is_some() => String::new(),
             None => return Err("XBT_KEYS_ADMIN is not set: this box gave no node data to read".into()),
         };
         let s = Self {
@@ -90,6 +113,8 @@ impl Settings {
             grant,
             rail_dir: get("XBT_KEYS_RAIL_DIR").map(PathBuf::from),
             gw_dir: get("XBT_KEYS_GW_DIR").map(PathBuf::from),
+            bake_to,
+            take_from,
         };
         if s.rail_dir.is_none() && s.gw_dir.is_none() {
             return Err("neither XBT_KEYS_RAIL_DIR nor XBT_KEYS_GW_DIR is set: nothing to make".into());
@@ -146,7 +171,7 @@ pub fn find_admin(path: &Path) -> Result<PathBuf, String> {
     }
     found.sort();
     match found.len() {
-        0 => Err(format!("no admin.macaroon under {} yet (is the Lightning node's wallet made and unlocked?)", path.display())),
+        0 => Err(format!("no admin.macaroon under {} yet: create your Lightning wallet in Lightning Fork first (Lightning Stream picks it up automatically)", path.display())),
         1 => Ok(found.remove(0)),
         _ => found
             .iter()
@@ -204,7 +229,8 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
             continue;
         }
         for (file, ops) in files {
-            if dir.join(file).is_file() {
+            // baked before and not taken yet: the hand-over holds it
+            if dir.join(file).is_file() || s.bake_to.as_ref().is_some_and(|h| h.join(file).is_file()) {
                 out.kept.push(file.to_string());
                 continue;
             }
@@ -218,12 +244,73 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
                 }
                 r => r?,
             };
-            write_shared(dir, file, &mac)?;
-            record(dir, file, id, ops)?;
+            match &s.bake_to {
+                // the record first: the taker never finds a key without its root key id
+                Some(h) => {
+                    record(h, file, id, ops)?;
+                    write_shared(h, file, &mac)?;
+                }
+                None => {
+                    write_shared(dir, file, &mac)?;
+                    record(dir, file, id, ops)?;
+                }
+            }
             out.made.push(file.to_string());
         }
     }
     Ok(out)
+}
+
+/// The keys each dir takes from the hand-over folder, by name.
+const HANDED: [(bool, &str); 4] = [(true, RAIL_MACAROON), (false, GW_INVOICES), (false, GW_INFO), (false, GW_SIGN)];
+
+/// Move the keys baked into the hand-over folder ([`Settings::take_from`]) into their dirs, each with
+/// its record (root key id, permissions), and remove them there. A dir that already has the key (the
+/// owner's own) or that the owner turned off keeps what it has: the baked one is removed, and its
+/// root key id is said, so it can be revoked on the node.
+pub fn take_handover(s: &Settings, out: &mut Outcome) -> Result<(), String> {
+    let Some(h) = &s.take_from else { return Ok(()) };
+    let from = read_record(h);
+    for (rail, file) in HANDED {
+        let src = h.join(file);
+        if !src.is_file() {
+            continue;
+        }
+        let dir = if rail { &s.rail_dir } else { &s.gw_dir };
+        let Some(dir) = dir.as_ref().filter(|d| !is_off(d) && !d.join(file).is_file()) else {
+            std::fs::remove_file(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+            out.skipped.push((file.to_string(), format!("not needed here; revoke {} on the node", rec_line(&from, file))));
+            continue;
+        };
+        let mac = std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+        if mac.is_empty() {
+            // being written: the next look takes it
+            continue;
+        }
+        write_shared(dir, file, &mac)?;
+        let mut rec = read_record(dir);
+        rec[file] = from.get(file).cloned().unwrap_or_else(|| json!({}));
+        rec["made_by"] = json!("the app, from this box's own Lightning node");
+        write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())?;
+        std::fs::remove_file(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+        out.made.push(file.to_string());
+    }
+    Ok(())
+}
+
+/// Whether a dir still lacks a key the hand-over could bring (the taker stops watching once none does).
+pub fn handover_wanted(s: &Settings) -> bool {
+    HANDED.iter().any(|(rail, file)| {
+        let dir = if *rail { &s.rail_dir } else { &s.gw_dir };
+        dir.as_ref().is_some_and(|d| !is_off(d) && !d.join(file).is_file())
+    })
+}
+
+fn rec_line(rec: &serde_json::Value, file: &str) -> String {
+    match rec[file]["root_key_id"].as_str() {
+        Some(id) => format!("root key id {id}"),
+        None => "its key (root key id not recorded)".into(),
+    }
 }
 
 /// Copy the keys the node granted into place: a missing key, or one copied from a grant before
@@ -284,13 +371,17 @@ pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
     // the node's own grant first: then no admin macaroon is read for what it gave
     let mut granted = Outcome::default();
     take_grants(s, &mut granted)?;
-    // nothing to make: the node is not asked and its admin macaroon is not read
-    let missing = s.rail_dir.as_ref().is_some_and(|d| !is_off(d) && !d.join(RAIL_MACAROON).is_file())
-        || s.gw_dir.as_ref().is_some_and(|d| !is_off(d) && (!d.join(GW_INVOICES).is_file() || !d.join(GW_INFO).is_file()));
+    take_handover(s, &mut granted)?;
+    // nothing to make: the node is not asked and its admin macaroon is not read (a key baked into the
+    // hand-over and not taken yet counts as there)
+    let there = |d: &Path, f: &str| d.join(f).is_file() || s.bake_to.as_ref().is_some_and(|h| h.join(f).is_file());
+    let missing = s.rail_dir.as_ref().is_some_and(|d| !is_off(d) && !there(d, RAIL_MACAROON))
+        || s.gw_dir.as_ref().is_some_and(|d| !is_off(d) && (!there(d, GW_INVOICES) || !there(d, GW_INFO)));
     if !missing {
-        return Ok(if granted.made.is_empty() && granted.revoked.is_empty() { Outcome { kept: vec!["all".into()], ..Outcome::default() } } else { granted });
+        return Ok(if granted.made.is_empty() && granted.revoked.is_empty() && granted.skipped.is_empty() { Outcome { kept: vec!["all".into()], ..Outcome::default() } } else { granted });
     }
-    // no admin macaroon given (a grant only): what is still missing is the owner's to paste
+    // no admin macaroon given (a grant or a hand-over only): what is still missing is the owner's to
+    // paste, or the baker's to bring
     if given.is_none() && s.admin.as_os_str().is_empty() {
         return Ok(granted);
     }
@@ -397,7 +488,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let rail = shared_dir(t.path(), "ln");
         let gw = shared_dir(t.path(), "gateway");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()) };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None, rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()) };
         let mut asked: Vec<(Vec<String>, u64)> = vec![];
         let out = make_keys(&s, &mut |ops, id| {
             asked.push((ops.iter().map(|o| o.to_string()).collect(), id));
@@ -425,7 +516,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let rail = shared_dir(t.path(), "ln");
         std::fs::write(rail.join(RAIL_MACAROON), b"owner's").unwrap();
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: Some(rail.clone()), gw_dir: None };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None, rail_dir: Some(rail.clone()), gw_dir: None };
         // nothing missing: the admin macaroon is not even looked for
         assert_eq!(run(&s).unwrap().made, Vec::<String>::new());
         assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"owner's");
@@ -436,7 +527,7 @@ mod tests {
     fn a_key_the_owner_disconnected_is_not_made_again() {
         let t = tempfile::tempdir().unwrap();
         let rail = shared_dir(t.path(), "ln");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: Some(rail.clone()), gw_dir: None };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None, rail_dir: Some(rail.clone()), gw_dir: None };
         make_keys(&s, &mut |_, _| Ok(b"k".to_vec())).unwrap();
         assert!(made_by_box(&rail));
         assert!(root_key_line(&rail, RAIL_MACAROON).starts_with("root key id "));
@@ -454,7 +545,7 @@ mod tests {
         let rail = shared_dir(t.path(), "ln");
         let gw = shared_dir(t.path(), "gateway");
         let grant = shared_dir(t.path(), "grant");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: Some(grant.clone()),
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: Some(grant.clone()), bake_to: None, take_from: None,
                            rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()) };
         // no grant yet and no admin macaroon: nothing made, nothing refused (the owner approves, or pastes)
         assert_eq!(run(&s).unwrap(), Outcome::default());
@@ -489,7 +580,7 @@ mod tests {
         let grant = shared_dir(t.path(), "grant");
         std::fs::write(rail.join(RAIL_MACAROON), b"owner's").unwrap();
         std::fs::write(grant.join(GRANT_ACCESS), b"granted").unwrap();
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: Some(grant.clone()),
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: Some(grant.clone()), bake_to: None, take_from: None,
                            rail_dir: Some(rail.clone()), gw_dir: None };
         assert!(run(&s).unwrap().made.is_empty());
         assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"owner's");
@@ -503,7 +594,7 @@ mod tests {
     fn a_refused_bake_writes_nothing() {
         let t = tempfile::tempdir().unwrap();
         let gw = shared_dir(t.path(), "gateway");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: None, gw_dir: Some(gw.clone()) };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None, rail_dir: None, gw_dir: Some(gw.clone()) };
         let mut n = 0;
         let e = make_keys(&s, &mut |ops, _| {
             if ops == SIGN_OPS {
@@ -529,7 +620,7 @@ mod tests {
     fn a_node_that_will_not_bake_the_sign_key_still_gets_the_keys_the_app_needs() {
         let t = tempfile::tempdir().unwrap();
         let gw = shared_dir(t.path(), "gateway");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: None, gw_dir: Some(gw.clone()) };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None, rail_dir: None, gw_dir: Some(gw.clone()) };
         let out = make_keys(&s, &mut |ops, _| if ops == SIGN_OPS { Err("unknown permission".into()) } else { Ok(b"k".to_vec()) }).unwrap();
         assert_eq!(out.made, vec![GW_INVOICES, GW_INFO]);
         assert_eq!(out.skipped, vec![(GW_SIGN.to_string(), "unknown permission".to_string())]);
@@ -537,5 +628,77 @@ mod tests {
         // the next run asks again
         let out = make_keys(&s, &mut |_, _| Ok(b"k".to_vec())).unwrap();
         assert_eq!(out.made, vec![GW_SIGN]);
+    }
+
+    /// Umbrel: the baker (Lightning Fork's user) writes only the hand-over; the taker (the UI) moves each
+    /// key into its dir with its root key id, and the hand-over is left empty.
+    #[test]
+    fn keys_baked_into_the_hand_over_are_moved_into_place_with_their_record() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let gw = shared_dir(t.path(), "gateway");
+        let h = shared_dir(t.path(), "node-keys");
+        let baker = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("node/data/chain"), grant: None,
+                               rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: Some(h.clone()), take_from: None };
+        let taker = Settings { admin: PathBuf::new(), bake_to: None, take_from: Some(h.clone()), ..baker.clone() };
+        // no wallet yet: the baker says what to do, the taker still wants every key
+        let e = run(&baker).unwrap_err();
+        assert!(e.contains("create your Lightning wallet in Lightning Fork first"), "{e}");
+        assert!(handover_wanted(&taker));
+        let mut ids = vec![];
+        let out = make_keys(&baker, &mut |ops, id| {
+            ids.push(id);
+            Ok(format!("mac:{}", ops.join(",")).into_bytes())
+        }).unwrap();
+        assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
+        for f in [RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN] {
+            assert!(h.join(f).is_file() && !rail.join(f).exists() && !gw.join(f).exists(), "{f}: the hand-over only");
+        }
+        // baked and not taken yet: not baked again, and the admin macaroon is not even looked for
+        assert!(make_keys(&baker, &mut |_, _| panic!("baked again")).unwrap().made.is_empty());
+        assert_eq!(run(&baker).unwrap().kept, vec!["all"]);
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert_eq!(o.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), format!("mac:{}", RAIL_OPS.join(",")).into_bytes());
+        assert_eq!(std::fs::read(gw.join(GW_SIGN)).unwrap(), format!("mac:{}", SIGN_OPS.join(",")).into_bytes());
+        assert!([RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN].iter().all(|f| !h.join(f).exists()), "moved, not copied");
+        assert!(made_by_box(&rail) && made_by_box(&gw));
+        assert_eq!(root_key_line(&rail, RAIL_MACAROON), format!("root key id {}", ids[0]));
+        assert_eq!(root_key_ids(&gw), { let mut v: Vec<String> = ids[1..].iter().map(u64::to_string).collect(); v.sort(); v });
+        assert!(!handover_wanted(&taker));
+        // every key there: the baker has nothing to do
+        assert_eq!(run(&baker).unwrap().kept, vec!["all"]);
+    }
+
+    /// The owner's own key, or a dir the owner turned off, is never replaced by a baked one: the baker
+    /// does not bake it, and one found in the hand-over anyway is removed, with its root key id said.
+    #[test]
+    fn the_hand_over_never_replaces_an_owners_key_or_a_key_turned_off() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let gw = shared_dir(t.path(), "gateway");
+        let h = shared_dir(t.path(), "node-keys");
+        std::fs::write(rail.join(RAIL_MACAROON), b"owner's").unwrap();
+        let baker = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None,
+                               rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: Some(h.clone()), take_from: None };
+        let taker = Settings { admin: PathBuf::new(), bake_to: None, take_from: Some(h.clone()), ..baker.clone() };
+        let out = make_keys(&baker, &mut |_, _| Ok(b"k".to_vec())).unwrap();
+        assert_eq!(out.made, vec![GW_INVOICES, GW_INFO, GW_SIGN]);
+        assert!(!h.join(RAIL_MACAROON).exists());
+        // one there anyway (made before the owner pasted theirs): removed, the owner's kept
+        record(&h, RAIL_MACAROON, 77, &RAIL_OPS).unwrap();
+        std::fs::write(h.join(RAIL_MACAROON), b"baked").unwrap();
+        // the owner turns the gateway's keys off before they are taken
+        write_shared(&gw, AUTO_KEYS, b"{\"off\": true}\n").unwrap();
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert!(o.made.is_empty(), "{o:?}");
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"owner's");
+        assert!(!gw.join(GW_INVOICES).exists());
+        assert_eq!(o.skipped.len(), 4);
+        assert!(o.skipped[0].1.contains("root key id 77"), "{:?}", o.skipped);
+        assert!(std::fs::read_dir(&h).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".macaroon")), "no key left behind");
+        assert!(!handover_wanted(&taker));
     }
 }
