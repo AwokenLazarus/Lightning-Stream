@@ -2198,7 +2198,9 @@ impl Signer {
             // released to a seller in such a session, and its balance is not spent either
             .filter(|s| s.http.is_some() && !s.why.contains(CREDIT_GIVEN_UP) && !s.why.starts_with("seller fault") && !s.why.contains("terms changed"))
             .max_by(|a, b| a.stopped_ts.max(a.active_ts).total_cmp(&b.stopped_ts.max(b.active_ts)))?;
-        let http = old.http.clone()?;
+        let mut http = old.http.clone()?;
+        // what the seller knows goes with its session, not with the wallet session that said it: any that used it
+        http.identified = st.book.sessions.values().any(|s| s.http.as_ref().is_some_and(|h| h.id == http.id && h.identified));
         let using: Vec<&str> = st.book.sessions.values().filter(|s| s.http.as_ref().is_some_and(|h| h.id == http.id)).map(|s| s.id.as_str()).collect();
         let sent = using.iter().flat_map(|id| st.book.of_session(id)).filter(|t| matches!(t.state, TState::Released | TState::Settled))
             .fold(0u64, |a, t| a.saturating_add(t.msat));
@@ -2222,6 +2224,46 @@ impl Signer {
             s.why = if s.why.is_empty() { CREDIT_GIVEN_UP.to_string() } else { format!("{}; {CREDIT_GIVEN_UP}", s.why) };
         }
         st.commit(&[s.row()])
+    }
+
+    /// The address and the node of every session on the book: which node a seller's address has been.
+    pub(crate) fn ticket_sellers_seen(&self) -> Vec<(String, String)> {
+        let Ok(g) = self.ticket_store() else { return vec![] };
+        g.as_ref().map_or_else(Vec::new, |st| st.book.sessions.values().map(|s| (s.origin.clone(), s.payee.clone())).collect())
+    }
+
+    /// Note on disk that the wallet says who it is in `sid`'s seller session, before it does
+    /// ([`ticket::SellerSession::identified`]). `Err`: not noted, and so not to be said.
+    pub(crate) fn ticket_mark_identified(&self, sid: &str) -> Result<()> {
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let mut s = st.book.sessions.get(sid).cloned().ok_or_else(|| err("ticket_session", "no such session"))?;
+        let h = s.http.as_mut().ok_or_else(|| err("ticket_session", "the session has no seller side"))?;
+        if h.identified {
+            return Ok(());
+        }
+        h.identified = true;
+        st.commit(&[s.row()])
+    }
+
+    /// Give up the credit of every stopped session of the wallet that used seller session
+    /// `seller_sid`: no later session takes that seller session over ([`Signer::ticket_resumable`]).
+    /// How many were marked.
+    pub(crate) fn ticket_give_up_seller_session(&self, seller_sid: &str) -> Result<usize> {
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let rows: Vec<Value> = st.book.sessions.values()
+            .filter(|s| s.state != SState::Open && s.http.as_ref().is_some_and(|h| h.id == seller_sid) && !s.why.contains(CREDIT_GIVEN_UP))
+            .map(|s| {
+                let mut s = s.clone();
+                s.why = if s.why.is_empty() { CREDIT_GIVEN_UP.to_string() } else { format!("{}; {CREDIT_GIVEN_UP}", s.why) };
+                s.row()
+            }).collect();
+        let n = rows.len();
+        if n > 0 {
+            st.commit(&rows)?;
+        }
+        Ok(n)
     }
 
     pub(crate) fn ticket_set_http(&self, sid: &str, http: ticket::SellerSession) -> Result<()> {

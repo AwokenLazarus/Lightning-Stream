@@ -623,6 +623,33 @@ fn sessions_are_capped_a_wrong_size_is_refused_and_a_session_outlives_the_gatewa
     assert_eq!(rig.gw.stats().held_tickets, 0);
 }
 
+/// A route that gives each buyer an account (docs/BUYER-ACCOUNTS.md) is paid with tickets only:
+/// the draws path serves no buyer as its account, so a draw there would be served as nobody. Not in
+/// its 402, not in the list of what is sold, and a buyer that names the lottery for it all the same
+/// is refused before the service is asked.
+#[test]
+fn a_route_with_accounts_is_not_drawn_for() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["routes"].as_array_mut().unwrap().push(json!({"path": "/acct/", "price": {"request_msat": 2500},
+                                                        "accounts": {"kind": "hook", "command": "/bin/true"}}));
+    });
+    // the same price as /api, which is drawn for: tickets only on the route with accounts
+    let api = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert_eq!(api["accepts"].as_array().unwrap().last().unwrap()["scheme"], "lottery", "{api}");
+    let j = http(&rig.addr, "GET", "/acct/x", &[], b"", None).json();
+    assert!(j["accepts"].as_array().unwrap().iter().all(|a| a["scheme"] == "ticket"), "{j}");
+    let s = http(&rig.addr, "GET", "/services", &[], b"", None).json();
+    let by = |p: &str| s["routes"].as_array().unwrap().iter().find(|r| r["path"] == p).unwrap()["lottery"].clone();
+    assert_eq!((by("/api"), by("/acct/")), (json!(true), json!(false)));
+    // a buyer that reads no 402 and names the lottery for it: refused, signed, nothing charged, the service not asked
+    let mut b = Drawer::open(&rig, 40);
+    let (_, got) = b.get("/acct/x");
+    assert_eq!(got.status, 402, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(receipt_of(&got, &b.receipt_key)["charged"], "0");
+    assert_eq!(rig.hits(), 0);
+}
+
 #[test]
 fn a_route_whose_dearest_piece_is_more_than_a_quarter_of_a_win_is_not_drawn_for_whatever_the_request_says() {
     // the shipped rule: no max_odds_den in the file

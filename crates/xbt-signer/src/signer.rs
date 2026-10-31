@@ -243,6 +243,8 @@ pub struct Signer {
     /// gateway refuses a paid request that repeats another route's terms (`termsChecked`): a request
     /// on a known route is then paid without asking its price first, a round trip saved.
     pub(crate) route_terms: Mutex<HashMap<String, HashMap<String, Value>>>,
+    /// One change at a time of the owner's choices file (`identity_set`).
+    pub(crate) identity_write: Mutex<()>,
     pub(crate) ticket_cancel_tried: Mutex<HashSet<String>>,
     /// Sessions whose stop has begun and that the book still shows open, while their streams end
     /// ([`crate::ticket_pay`]'s `ticket_http_stop`): the book books nothing more for them, a release,
@@ -331,7 +333,7 @@ impl Signer {
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
                                 ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
-                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
+                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),
                                 seller_blocks });
         let _ = s.me.set(Arc::downgrade(&s));
@@ -505,7 +507,12 @@ impl Signer {
             // takes the spend lock itself, and only for each lock and release, where an answer may be long (crate::ticket_pay)
             "xbt402_pay" => sanitize(self.xbt402_pay(p)),
             // the sellers this wallet stays anonymous at (docs/BUYER-ACCOUNTS.md)
-            "identity_get" => sanitize(json!({"ok": true, "anonymous": self.anonymous_origins()})),
+            // `damaged`: the choices file is there and cannot be read, and the wallet stays anonymous everywhere until it is mended
+            // `here`: with `origin`, whether the owner's choice covers that shop, under this address or another of the same seller
+            "identity_get" => {
+                let here = p.get("origin").and_then(Value::as_str).map(|o| self.anonymous_listed(o, None));
+                sanitize(json!({"ok": true, "anonymous": self.anonymous_origins(), "damaged": self.identity_damaged(), "here": here}))
+            }
             "identity_set" => sanitize(self.identity_set(p)),
             // AGP-048 rail=ln
             "ln_pay" => {

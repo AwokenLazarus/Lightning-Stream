@@ -269,6 +269,12 @@ fn stopping_refusal() -> Value {
     refusal("ticket_session", "the session is being stopped: no ticket is released")
 }
 
+/// Whether a route's terms ask to know who the buyer is: the route gives each buyer an account
+/// (docs/BUYER-ACCOUNTS.md).
+fn identify_asked(accepted: &Value) -> bool {
+    accepted["extra"]["identify"] == true
+}
+
 // --- HTTP as this module needs it ---------------------------------------------------------------------
 
 /// The head of an answer, and its body still to be read.
@@ -2538,6 +2544,11 @@ impl Signer {
         let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats, max_size };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
+        // a route that gives each buyer an account is paid with tickets only: draws serve no buyer as its account
+        // (docs/BUYER-ACCOUNTS.md), so a seller from before that rule that offers them there is not paid by them
+        if ways.iter().any(|o| matches!(o, Offer::Ticket(acc, _) if identify_asked(acc))) {
+            ways.retain(|o| !matches!(o, Offer::Lottery(_)));
+        }
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
         if self.draws_first(&call, &ways, &lightning, &tp) {
             if let Some(i) = ways.iter().position(|o| matches!(o, Offer::Lottery(_))) {
@@ -2847,7 +2858,7 @@ impl Signer {
         let out = {
             // shared: other requests to this seller run beside this one
             let _call = hs.calls.read().unwrap_or_else(|p| p.into_inner());
-            self.ticket_request(&hs, c, &terms.price)
+            self.ticket_request(&hs, c, &terms)
         };
         // the pool is filled again behind the call
         self.ticket_refill_later(&hs);
@@ -3070,7 +3081,7 @@ impl Signer {
             return Err(refusal("ticket_seller", "the seller's first lock answer names no session id and key"));
         };
         // on disk before anything is paid: a wallet that starts again can still ask for the cancel
-        if let Err(e) = self.ticket_set_http(&hs.sid, SellerSession { id: seller_sid.clone(), key, base: hs.base.clone() }) {
+        if let Err(e) = self.ticket_set_http(&hs.sid, SellerSession { id: seller_sid.clone(), key, base: hs.base.clone(), identified: false }) {
             return Err(refusal("ticket", e.msg));
         }
         {
@@ -3090,7 +3101,7 @@ impl Signer {
     /// Whether to tell this seller who this wallet is: its terms ask (`identify`), and the owner has
     /// not chosen to stay anonymous there (docs/BUYER-ACCOUNTS.md).
     fn identify_wanted(&self, hs: &HttpSession) -> bool {
-        hs.terms.accepted["extra"]["identify"] == true && !self.anonymous_at(&hs.origin)
+        identify_asked(&hs.terms.accepted) && !self.anonymous_at(&hs.origin, &hs.terms.terms.payee)
     }
 
     /// The sellers the owner stays anonymous at, by origin (`identity.json`).
@@ -3100,9 +3111,37 @@ impl Signer {
             .iter().filter_map(|o| o.as_str().map(normalize_dest)).collect()
     }
 
-    fn anonymous_at(&self, origin: &str) -> bool {
-        self.anonymous_origins().contains(&normalize_dest(origin))
+    fn anonymous_at(&self, origin: &str, payee: &str) -> bool {
+        // a choices file that is there and cannot be read keeps the wallet anonymous everywhere: failing closed
+        self.identity_damaged() || self.anonymous_listed(origin, Some(payee))
     }
+
+    /// Whether the owner chose to stay anonymous at this shop. "This shop" is the seller: its address
+    /// as chosen, or any other address of the same node, as the sessions on the book show them. An
+    /// address no session has reached yet is known only by itself.
+    pub(crate) fn anonymous_listed(&self, origin: &str, payee: Option<&str>) -> bool {
+        let list = self.anonymous_origins();
+        let origin = normalize_dest(origin);
+        if list.contains(&origin) {
+            return true;
+        }
+        if list.is_empty() {
+            return false;
+        }
+        let seen = self.ticket_sellers_seen();
+        let nodes: HashSet<&str> = seen.iter().filter(|(o, _)| normalize_dest(o) == origin).map(|(_, p)| p.as_str()).chain(payee).collect();
+        seen.iter().any(|(o, p)| nodes.contains(p.as_str()) && list.contains(&normalize_dest(o)))
+    }
+
+    /// The owner's choices file is there and cannot be read as one (`identity.json`).
+    pub(crate) fn identity_damaged(&self) -> bool {
+        let path = self.run.join(IDENTITY_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(t) => serde_json::from_str::<Value>(&t).ok().and_then(|v| v.get("anonymous").and_then(Value::as_array).map(|a| a.iter().all(Value::is_string))) != Some(true),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
+    }
+
 
     /// `identity_set`: stay anonymous at a seller (`anonymous: true`), or let it recognise this
     /// wallet. Read again by every session that opens after it.
@@ -3111,16 +3150,53 @@ impl Signer {
             Ok(o) => normalize_dest(&o),
             Err(e) => return deny("dest", e.msg),
         };
-        let mut all = self.anonymous_origins();
-        all.retain(|o| o != &origin);
-        if p.get("anonymous").and_then(Value::as_bool) == Some(true) {
-            all.push(origin);
+        let Some(anonymous) = p.get("anonymous").and_then(Value::as_bool) else {
+            return deny("identity", "anonymous is true or false");
+        };
+        const WHY: &str = "the owner chose to stay anonymous at this seller";
+        let written = {
+            let _one = lock(&self.identity_write);
+            // not written over: the choices it holds would be lost, and every seller would know the wallet again
+            if self.identity_damaged() {
+                Err(format!("{IDENTITY_FILE} is there and cannot be read, so this choice was not saved: the wallet stays anonymous at every seller until it is mended or removed"))
+            } else {
+                let mut all = self.anonymous_origins();
+                if anonymous {
+                    all.retain(|o| o != &origin);
+                    all.push(origin.clone());
+                } else {
+                    // the shop is the seller: every address of it the choice was made under
+                    let seen = self.ticket_sellers_seen();
+                    let nodes: HashSet<&str> = seen.iter().filter(|(o, _)| normalize_dest(o) == origin).map(|(_, n)| n.as_str()).collect();
+                    let same: HashSet<String> = seen.iter().filter(|(_, n)| nodes.contains(n.as_str())).map(|(o, _)| normalize_dest(o)).collect();
+                    all.retain(|o| o != &origin && !same.contains(o));
+                }
+                all.sort();
+                write_private(&self.run.join(IDENTITY_FILE), &json!({"anonymous": all}).to_string()).map(|()| all).map_err(|e| e.msg)
+            }
+        };
+        // a session open with that seller now (at this address or another of the same seller) may have told it who the
+        // wallet is: stopped, so that nothing more is served through it as the owner's account. Whether the choice could
+        // be saved or not: the owner asked for it, and the wallet stays anonymous either way
+        let stopped = if anonymous { self.ticket_stop_sessions_at(&origin, WHY) } else { vec![] };
+        let about = json!({"sessions_stopped": stopped.len(), "stopped": stopped});
+        match written {
+            Ok(all) => with(json!({"ok": true, "anonymous": all}), about),
+            Err(why) => with(deny("identity", why), about),
         }
-        all.sort();
-        match write_private(&self.run.join(IDENTITY_FILE), &json!({"anonymous": all}).to_string()) {
-            Ok(()) => json!({"ok": true, "anonymous": all}),
-            Err(e) => deny("identity", e.msg),
-        }
+    }
+
+    /// Stop the sessions open with the seller at `origin`, and with the same seller under any other
+    /// address: its node, as a session open there now or one on the book says. What each stop left.
+    fn ticket_stop_sessions_at(&self, origin: &str, why: &str) -> Vec<Value> {
+        let slots: Vec<Arc<Slot>> = lock(&self.ticket_http).values().cloned().collect();
+        let open: Vec<Arc<HttpSession>> = slots.iter().filter_map(|slot| slot.open.lock().unwrap_or_else(|p| p.into_inner()).clone()).collect();
+        let mut payees: HashSet<String> = open.iter().filter(|h| normalize_dest(&h.origin) == origin).map(|h| h.terms.terms.payee.clone()).collect();
+        payees.extend(self.ticket_sellers_seen().into_iter().filter(|(o, _)| normalize_dest(o) == origin).map(|(_, payee)| payee));
+        open.iter().filter(|h| payees.contains(&h.terms.terms.payee)).map(|h| {
+            let r = self.ticket_http_stop(h, why, Duration::ZERO);
+            json!({"session": r["session"], "origin": h.origin, "left_with_seller_msat": r["left_with_seller_msat"], "cancel_asked": r["cancel_asked"], "still_locked": r["still_locked"]})
+        }).collect()
     }
 
     /// Tell the seller who this wallet is to it, for this session: its key for this seller alone,
@@ -3133,6 +3209,8 @@ impl Signer {
         let secp = xbt402::xbt_primitives::secp256k1::Secp256k1::signing_only();
         let pubkey = xbt402::xbt_primitives::secp256k1::PublicKey::from_secret_key(&secp, &sk);
         let body = json!({"buyer": hex::encode(pubkey.serialize()), "sig": hex::encode(xbt402::xbt_primitives::ecdsa::sign(&sk, &msg))});
+        // on disk before it goes: an answer that is lost, refused or cut by a crash may still have told the seller
+        self.ticket_mark_identified(&hs.sid).map_err(|e| format!("the wallet could not note that it tells this seller who it is, so it did not: {}", e.msg))?;
         match self.ticket_call(hs, "identify", &body, false) {
             Ok((200, _, _)) => Ok(()),
             Ok((status, v, _)) => Err(format!("the seller refused identify: HTTP {status} {}", protocol_code(v.get("error")))),
@@ -3449,6 +3527,20 @@ impl Signer {
         let old = SellerSession { base: hs.base.clone(), ..old };
         if sent == 0 {
             return false;
+        }
+        // a seller session the wallet said who it is in, where the owner now stays anonymous: the seller still knows
+        // the wallet by it, so it is not taken over. Its credit is given up where the owner's choice is known; a choices
+        // file that cannot be read only holds it back, since mending the file brings it back
+        if old.identified {
+            let damaged = self.identity_damaged();
+            let listed = !damaged && self.anonymous_listed(&hs.origin, Some(&hs.terms.terms.payee));
+            if damaged || listed {
+                let given_up = listed && self.ticket_give_up_seller_session(&old.id).is_ok();
+                self.ticket_audit("ticket_resume_skipped", json!({"session": hs.sid, "seller_session": old.id, "origin": hs.origin,
+                                                                  "dest": format!("ln:{}", hs.terms.terms.payee), "released_msat": sent.to_string(), "credit_given_up": given_up,
+                                                                  "why": if damaged { "the owner's choices file cannot be read" } else { "the owner stays anonymous here now, and the wallet told the seller who it is in that seller session" }}));
+                return false;
+            }
         }
         {
             let mut link = lock_link(hs);
@@ -3950,7 +4042,8 @@ impl Signer {
 
     /// One paid request of a session: the balance topped up by whole tickets, the request, its
     /// receipt, its body as it arrives.
-    fn ticket_request(&self, hs: &Arc<HttpSession>, c: &Call, price: &Price) -> Value {
+    fn ticket_request(&self, hs: &Arc<HttpSession>, c: &Call, terms: &PayTerms) -> Value {
+        let price = &terms.price;
         let tp = self.ticket_policy();
         // what the answer may charge; what may leave for it (a whole ticket included) is `max_sats`, in `spent`
         let max_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
@@ -4006,6 +4099,11 @@ impl Signer {
                 if let Err(d) = self.ticket_release_one(hs, &mut spent, started, &short_now) {
                     return fail(hs, &spent, d);
                 }
+            }
+            // stopped while this call waited for a ticket (the owner turned anonymous here, say): nothing more goes out on it
+            // (`ending` first: a stop sets it before it closes the session on the book)
+            if hs.ending.load(Ordering::SeqCst) || !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
+                return fail(hs, &spent, refusal("ticket_session", "the session with this seller was stopped while this call waited: call again"));
             }
             let digest = request_digest_v2(c.method, c.url, c.body);
             let order = lock_order(hs);
@@ -4147,8 +4245,10 @@ impl Signer {
             if let Some(why) = hs.fault() {
                 return fail(hs, &spent, with(self.ticket_fault(hs, &why), json!({"status": ans.status})));
             }
-            // a seller that gives accounts and has not been told who this wallet is (it restarted, say): told, and asked again, once
-            if ans.status == 403 && !identified_again && self.identify_wanted(hs) {
+            // a seller that gives accounts and has not been told who this wallet is (it restarted, say, or the session
+            // opened on a route without accounts): told, and asked again, once. Asked by this request's route or the
+            // session's, so a page on a route with accounts never gets the seller's refusal in place of its answer
+            if ans.status == 403 && !identified_again && (identify_asked(&terms.accepted) || identify_asked(&hs.terms.accepted)) {
                 let headers = ans.headers.clone();
                 // an answer that cannot be read may be the seller asking who this wallet is: not handed on as an empty one
                 let Ok(body) = ans.read_small(SMALL_BODY) else {
@@ -4157,6 +4257,13 @@ impl Signer {
                 };
                 let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 if v.get("error").and_then(Value::as_str) == Some("identify_first") {
+                    // the owner chose to stay anonymous here, and this service has no guest for such buyers: said in the
+                    // wallet's own words, not handed on as the seller's refusal
+                    if self.anonymous_at(&hs.origin, &hs.terms.terms.payee) {
+                        return fail(hs, &spent, with(refusal("ticket_refused", "this service gives each buyer an account, and this wallet stays anonymous at \
+                                                                               this seller (identity): it serves no anonymous buyer. Nothing was charged for this request"),
+                                                     json!({"status": 403})));
+                    }
                     identified_again = true;
                     if self.ticket_identify(hs).is_ok() {
                         continue;

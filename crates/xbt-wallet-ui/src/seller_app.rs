@@ -159,13 +159,17 @@ impl App {
     /// The note, and the choice, for a shop that keeps an account for each buyer of the app at
     /// `base` (docs/BUYER-ACCOUNTS.md); nothing for a shop that does not.
     fn identity_card(&self, ctx: &Ctx, seller: &str, base: &str, entry: &str) -> String {
-        if !shop_keeps_accounts(seller, base) {
+        if !shop_keeps_accounts(seller) {
             return String::new();
         }
         let origin = crate::services::http_origin(seller).unwrap_or_default();
-        let anonymous = self.call("identity_get", json!({})).ok()
-            .and_then(|v| v.get("anonymous").and_then(Value::as_array).cloned()).unwrap_or_default()
-            .iter().any(|o| o.as_str().is_some_and(|o| o.trim_end_matches('/') == origin.trim_end_matches('/')));
+        let known = self.call("identity_get", json!({"origin": origin})).unwrap_or(Value::Null);
+        // the wallet cannot read its choices: it stays anonymous everywhere, and there is nothing to choose until that is mended
+        if known.get("damaged") == Some(&json!(true)) {
+            return "<section class=\"card\"><h3>Your history at this shop</h3><p>The wallet cannot read its record of which shops may recognise you, so it stays anonymous \
+                    at every shop for now. A shop with no shared guest refuses you until that file (identity.json) is mended or removed.</p></section>".to_string();
+        }
+        let anonymous = known.get("here") == Some(&json!(true));
         let (state, button, to) = if anonymous {
             ("You stay anonymous at this shop: it does not keep your history, and you use its shared guest where it has one.", "Let this shop recognise me", "0")
         } else {
@@ -183,7 +187,10 @@ impl App {
     pub(crate) fn identity(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let g = |k: &str| f.get(k).cloned().unwrap_or_default();
         match self.call("identity_set", json!({"origin": g("origin"), "anonymous": g("anonymous") == "1"})) {
-            Ok(v) if v.get("ok") == Some(&json!(true)) => self.flash(ctx, true, if g("anonymous") == "1" { "You stay anonymous at that shop." } else { "That shop recognises you now." }),
+            Ok(v) if v.get("ok") == Some(&json!(true)) => {
+                let said = if g("anonymous") == "1" { format!("You stay anonymous at that shop.{}", stopped_note(&v)) } else { "That shop recognises you now.".to_string() };
+                self.flash(ctx, true, said)
+            }
             Ok(v) => self.flash(ctx, false, format!("Not changed: {}", v.get("reason").and_then(Value::as_str).unwrap_or("the wallet refused"))),
             Err(e) => self.flash(ctx, false, format!("Not changed: {e}")),
         }
@@ -583,17 +590,32 @@ impl AppOrigin {
 
 /// Whether the shop's route for the app at `base` gives each buyer an account: its `/services`
 /// says so. Asked when the page is shown; a shop that does not answer is taken to keep none.
-fn shop_keeps_accounts(seller: &str, base: &str) -> bool {
+fn shop_keeps_accounts(seller: &str) -> bool {
     let Some(origin) = crate::services::http_origin(seller) else { return false };
-    let path = base.strip_prefix(origin.trim_end_matches('/')).unwrap_or("/");
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(4)).redirects(0).build();
     let Ok(r) = agent.get(&format!("{}/services", origin.trim_end_matches('/'))).call() else { return false };
     let v: Value = serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or(Value::Null);
-    // the route the app's base falls under: the longest that covers it
-    v.get("routes").and_then(Value::as_array).into_iter().flatten()
-        .filter(|r| r.get("path").and_then(Value::as_str).is_some_and(|p| path.starts_with(p)))
-        .max_by_key(|r| r.get("path").and_then(Value::as_str).map_or(0, str::len))
-        .is_some_and(|r| r.get("accounts") == Some(&json!(true)))
+    routes_keep_accounts(&v)
+}
+
+/// Whether any route of a shop's list of what it sells keeps buyers' accounts. Any, not the one the app's
+/// base falls under: an app's pages reach the shop's other routes too (a Jellyfin listed at `/films/` asks
+/// `/` for its accounts), so the owner is offered the choice wherever an account can be made.
+fn routes_keep_accounts(services: &Value) -> bool {
+    services.get("routes").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("accounts") == Some(&json!(true)))
+}
+
+/// What turning anonymous stopped, for the owner: the sessions, and the credit they left with the shop.
+fn stopped_note(v: &Value) -> String {
+    let stopped = v.get("stopped").and_then(Value::as_array).cloned().unwrap_or_default();
+    if stopped.is_empty() {
+        return String::new();
+    }
+    let left: u64 = stopped.iter().filter_map(|s| s.get("left_with_seller_msat").and_then(Value::as_str)?.parse::<u64>().ok()).sum();
+    match left / 1000 {
+        0 => " Your open session there was stopped.".to_string(),
+        sats => format!(" Your open session there was stopped; {sats} sat of credit stays with that shop."),
+    }
 }
 
 /// A text answer a page's own links are in: HTML, scripts, styles, JSON, SVG and manifests. Video,
@@ -680,6 +702,24 @@ pub fn spawn(app: &Arc<App>, strict: bool) -> Result<Vec<(u16, xbt_svc::http::Ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owner is offered "Stay anonymous here" for a shop where any route keeps accounts, not only
+    /// the one its app is listed under: a Jellyfin listed at `/films/` asks `/` for its accounts.
+    #[test]
+    fn a_shop_keeps_accounts_where_any_of_its_routes_does() {
+        let jellyfin = json!({"routes": [{"path": "/files/"}, {"path": "/films/"}, {"path": "/", "accounts": true}]});
+        assert!(routes_keep_accounts(&jellyfin));
+        assert!(!routes_keep_accounts(&json!({"routes": [{"path": "/files/"}, {"path": "/", "accounts": false}]})));
+        assert!(!routes_keep_accounts(&json!({})));
+    }
+
+    /// Turning anonymous says what it stopped and what credit stays with the shop.
+    #[test]
+    fn turning_anonymous_says_what_it_stopped_and_left() {
+        assert_eq!(stopped_note(&json!({"stopped": []})), "");
+        assert_eq!(stopped_note(&json!({"stopped": [{"left_with_seller_msat": "0"}]})), " Your open session there was stopped.");
+        assert_eq!(stopped_note(&json!({"stopped": [{"left_with_seller_msat": "997500"}]})), " Your open session there was stopped; 997 sat of credit stays with that shop.");
+    }
 
     #[test]
     fn the_seller_gets_only_its_own_cookies_and_the_wallets_stay_here() {

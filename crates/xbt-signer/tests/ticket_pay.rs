@@ -5812,6 +5812,414 @@ fn a_wallet_tells_a_seller_with_accounts_who_it_is_and_stays_anonymous_when_told
     let _ = std::fs::remove_file(ACCOUNT_HOOK);
 }
 
+/// A web app's page reaches a route that gives accounts in a session that opened on another route
+/// (a shop's files, say), or after the seller started again and forgot who the wallet is (a shop
+/// turned private restarts its gateway). The seller asks who the wallet is (`identify_first`); the
+/// wallet tells it and asks again, and the page gets the service's answer, not the seller's
+/// refusal. Found on a private shop: its Jellyfin opened to a raw "403 identify_first".
+#[test]
+fn a_page_on_a_route_with_accounts_is_served_after_the_wallet_says_who_it_is() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let guest = |v: &Value| -> String {
+        let body: Value = serde_json::from_str(v["untrusted_provider_response"]["body"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
+        body["guest"].as_str().unwrap_or("").to_string()
+    };
+    // a session opened on a route without accounts: nothing is said of who the wallet is then
+    let mut r = Rig::new(json!({}));
+    let first = r.pay_known("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    assert!(r.tap.seen("/x402/ticket/identify").is_empty(), "{:?}", r.tap.seen(""));
+    // the page asks the route with accounts in the same session: the seller asks who the wallet is, is told, and serves
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v.get("seller_fault"), v["session"] == first["session"]), (Some(200), None, true), "{v}");
+    let me = guest(&v);
+    assert!(me.starts_with("buyer-"), "the buyer's own account served the page: {v}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1);
+    // charged once, for the answer served: the seller's refusal cost nothing. No ticket was released for it, and the
+    // balance with the seller fell by the page's price alone
+    let bal = |v: &Value| v["balance_msat"].as_str().and_then(|b| b.parse::<u64>().ok()).unwrap_or(0);
+    assert_eq!((v["price_msat"].as_str(), v["tickets_released"].as_u64(), v["charged_sats"].as_i64()), (Some("2500"), Some(0), Some(0)), "{v}");
+    assert_eq!((bal(&first), bal(&v)), (997_500, 995_000), "{first} {v}");
+    // the seller starts again and forgets who the wallet is; the page's next request is streamed as a page's is
+    r.shop.restart();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let l = UnixListener::bind(dir.path().join("acct-page")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        s.read_to_end(&mut all).unwrap();
+        all
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/acct/echo"), "max_sats": CALL, "task": "film", "known_terms": true,
+                                       "stream_to": "acct-page", "stream_head": true, "head_headers": true}));
+    let page = String::from_utf8_lossy(&reader.join().unwrap()).to_string();
+    std::env::remove_var("B2_STREAM_DIR");
+    assert_eq!((v["status"].as_u64(), v.get("seller_fault"), v["session"] == first["session"]), (Some(200), None, true), "{v}");
+    assert!(!page.contains("identify_first") && page.contains(&me), "the page got the service's answer as the same buyer, not the seller's refusal: {page}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 2, "told again after the restart");
+    assert_eq!((v["price_msat"].as_str(), v["tickets_released"].as_u64(), v["charged_sats"].as_i64(), bal(&v)), (Some("2500"), Some(0), Some(0), 992_500), "{v}");
+    // and the same once the wallet itself starts again: the same wallet is the same buyer there
+    r.restart();
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), guest(&v) == me), (Some(200), true), "{v}");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// A wallet that stays anonymous at a seller whose route gives accounts and has no guest: the page
+/// is told why in the wallet's own words, not shown the seller's raw refusal.
+#[test]
+fn an_anonymous_wallet_is_told_why_a_route_with_accounts_refuses_it() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let quiet = Rig::new(json!({}));
+    let set = quiet.call("identity_set", json!({"origin": quiet.shop.origin, "anonymous": true}));
+    assert_eq!(set["ok"], true, "{set}");
+    // the session opens on a route without accounts, then a page asks the route with accounts: the route's own
+    // terms ask who the wallet is, and the owner's choice holds there too
+    let first = quiet.pay_known("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let v = quiet.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str(), v.get("seller_fault"), v["session"] == first["session"]),
+               (Some(403), Some("ticket_refused"), None, true), "{v}");
+    assert!(v["reason"].as_str().is_some_and(|r| r.contains("anonymous") && r.contains("Nothing was charged for this request")), "{v}");
+    assert!(quiet.tap.seen("/x402/ticket/identify").is_empty(), "an anonymous wallet says nothing");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// An owner who chose to stay anonymous at a seller after the wallet had told it who it is: a later
+/// session does not take over the seller session the wallet was known by (its credit stays there),
+/// so the owner is not served as their account through it.
+#[test]
+fn a_session_the_wallet_was_known_by_is_not_resumed_once_the_owner_stays_anonymous() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let first = r.pay_known("/acct/echo", CALL);
+    assert_eq!((first["status"].as_u64(), first["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{first}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1, "known to the seller by this session");
+    // nothing for 11 minutes: the session stops, with credit left at the seller
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    assert_ne!(r.session(first["session"].as_str().unwrap())["sessions"][0]["state"], "open");
+    // the wallet starts again on its files: what it said in that seller session is on its book, not in its memory
+    r.restart();
+    // the owner now stays anonymous there; the next call does not take that seller session over
+    let set = r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}));
+    assert_eq!(set["ok"], true, "{set}");
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
+    assert_ne!(v["session"], first["session"]);
+    assert!(r.audit("ticket_resumed").is_empty(), "the seller session the wallet was known by was not taken over");
+    let skipped = r.audit("ticket_resume_skipped");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!((skipped[0]["credit_given_up"].as_bool(), skipped[0]["dest"].as_str()), (Some(true), Some(format!("ln:{}", r.shop.id()).as_str())), "{skipped:?}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1, "and nothing more said");
+    // its credit is given up: the next call does not try that seller session again
+    let again = r.pay_known("/acct/echo", CALL);
+    assert_eq!(again["rule"].as_str(), Some("ticket_refused"), "{again}");
+    assert_eq!(r.audit("ticket_resume_skipped").len(), 1, "asked about once");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// Turning anonymous at a seller stops the session open with it: a session the wallet said who it
+/// is in is not used again to serve the owner as their account.
+#[test]
+fn turning_anonymous_at_a_seller_stops_the_session_open_with_it() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::new(json!({}));
+    let first = r.pay_known("/acct/echo", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let set = r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}));
+    assert_eq!((set["ok"].as_bool(), set["sessions_stopped"].as_u64()), (Some(true), Some(1)), "{set}");
+    assert_ne!(r.session(first["session"].as_str().unwrap())["sessions"][0]["state"], "open");
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "{v}");
+    assert_ne!(v["session"], first["session"]);
+    // a choices file that cannot be read keeps the wallet anonymous everywhere, and is not written over
+    std::fs::write(r.root.join(".run").join("identity.json"), "{not json").unwrap();
+    assert_eq!(r.call("identity_get", json!({}))["damaged"], true);
+    assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": false}))["verdict"], "deny");
+    // asked to stay anonymous all the same: the choice cannot be saved, says so, and the session open now is stopped
+    let open = v["session"].as_str().unwrap().to_string();
+    let set = r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}));
+    assert_eq!((set["verdict"].as_str(), set["sessions_stopped"].as_u64()), (Some("deny"), Some(1)), "{set}");
+    assert!(set["reason"].as_str().is_some_and(|w| w.contains("was not saved")), "{set}");
+    assert_eq!(set["stopped"][0]["session"].as_str(), Some(open.as_str()), "{set}");
+    assert_ne!(r.session(&open)["sessions"][0]["state"], "open");
+    assert_eq!(std::fs::read_to_string(r.root.join(".run").join("identity.json")).unwrap(), "{not json", "not written over");
+    // and a choice that is neither is no choice
+    std::fs::remove_file(r.root.join(".run").join("identity.json")).unwrap();
+    assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": "yes"}))["verdict"], "deny");
+    assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin}))["verdict"], "deny");
+    let other = Rig::new(json!({}));
+    std::fs::write(other.root.join(".run").join("identity.json"), "[]").unwrap();
+    let v = other.pay_known("/acct/echo", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_refused"), "{v}");
+    assert!(other.tap.seen("/x402/ticket/identify").is_empty(), "nothing said where the choices cannot be read");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// The answer to `identify` is lost after the seller has taken it: the seller knows the wallet by
+/// that session whatever the wallet heard, so the session counts as identified. It is noted before
+/// the call goes out, and not taken over once the owner stays anonymous there.
+#[test]
+fn a_session_whose_identify_answer_was_lost_counts_as_identified() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    r.tap.set(Box::new(|seen, real| {
+        if !seen.path.ends_with("/x402/ticket/identify") {
+            return None;
+        }
+        // the seller has it; the wallet never hears
+        let _ = real();
+        Some(Err(xbt402::ChannelError::new("transport_error", "connection reset")))
+    }));
+    let first = r.pay_known("/acct/echo", CALL);
+    r.tap.clear();
+    assert_eq!(first["status"].as_u64(), Some(200), "the seller took it, and serves the account: {first}");
+    assert_eq!(r.audit("identify_failed").len(), 1, "the wallet did not hear");
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    assert_ne!(r.session(first["session"].as_str().unwrap())["sessions"][0]["state"], "open");
+    assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}))["ok"], true);
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
+    assert!(r.audit("ticket_resumed").is_empty());
+    assert_eq!(r.audit("ticket_resume_skipped").len(), 1);
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// Turning anonymous at a seller's address stops the session open with the same seller under its
+/// other address.
+#[test]
+fn turning_anonymous_at_a_seller_stops_its_session_under_another_address() {
+    let _g = env_lock();
+    let mut conf = sized_shop(json!(["on-arrival"]), None);
+    conf["alias"] = true.into();
+    let r = Rig::shipped(json!({}), 30, conf);
+    let first = r.pay("/page/10", 2_000);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    // the same shop under its other name: the session moves there
+    let alias = r.shop.url("/page/10").replace("127.0.0.1", "localhost");
+    let w = r.call("xbt402_pay", json!({"url": alias, "max_sats": 2_000, "task": "film"}));
+    assert_eq!(w["status"].as_u64(), Some(200), "{w}");
+    assert_ne!(w["session"], first["session"]);
+    assert_eq!(r.session(w["session"].as_str().unwrap())["sessions"][0]["state"], "open");
+    let set = r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}));
+    assert_eq!((set["ok"].as_bool(), set["sessions_stopped"].as_u64()), (Some(true), Some(1)), "{set}");
+    assert_ne!(r.session(w["session"].as_str().unwrap())["sessions"][0]["state"], "open");
+}
+
+/// What the seller knows goes with its session, not with the wallet session that told it. A opens
+/// a seller session and says nothing; B takes it over, identifies, and ends with its credit given up;
+/// the owner then stays anonymous. The next session finds A, but that seller session is still the
+/// one the seller knows the wallet by, so it is not taken over.
+#[test]
+fn a_seller_session_identified_by_a_later_wallet_session_counts_as_identified() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let a = r.pay_known("/page/10", CALL);
+    assert_eq!((a["status"].as_u64(), a["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{a}");
+    assert!(r.tap.seen("/x402/ticket/identify").is_empty());
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    assert_ne!(r.session(a["session"].as_str().unwrap())["sessions"][0]["state"], "open");
+    let b = r.pay_known("/acct/echo", CALL);
+    assert_eq!((b["status"].as_u64(), b["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from what A left: {b}");
+    assert_ne!(b["session"], a["session"]);
+    assert_eq!((r.audit("ticket_resumed").len(), r.tap.seen("/x402/ticket/identify").len()), (1, 1), "B took A's seller session over, and said who it is in it");
+    r.call("ticket_stop", json!({"session": b["session"]}));
+    let forgot = r.call("ticket_stop", json!({"session": b["session"], "forget_credit": true}));
+    assert_eq!(forgot["credit_given_up"], true, "{forgot}");
+    assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}))["ok"], true);
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
+    assert_eq!((r.audit("ticket_resumed").len(), r.audit("ticket_resume_skipped").len()), (1, 1), "A's row was not taken over");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// A choices file that cannot be read holds an identified seller session back, and burns nothing:
+/// the credit is given up only where the owner's choice is known.
+#[test]
+fn a_choices_file_that_cannot_be_read_gives_no_credit_up() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let first = r.pay_known("/acct/echo", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let sid = first["session"].as_str().unwrap();
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    std::fs::write(r.root.join(".run").join("identity.json"), "{not json").unwrap();
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "{v}");
+    assert!(r.audit("ticket_resumed").is_empty());
+    let skipped = r.audit("ticket_resume_skipped");
+    assert_eq!((skipped.len(), skipped[0]["credit_given_up"].as_bool()), (1, Some(false)), "{skipped:?}");
+    let why = r.session(sid)["sessions"][0]["why"].as_str().unwrap_or("").to_string();
+    assert!(!why.contains("given up"), "the credit is still the owner's: {why}");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// The owner turns anonymous while a call is waiting for its ticket: the call is not sent on the
+/// session that was stopped, so it is not served as the account.
+#[test]
+fn a_call_racing_the_switch_to_anonymous_is_not_sent_as_the_account() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let (s, origin) = (r.s.clone(), r.shop.origin.clone());
+    let once = Arc::new(AtomicBool::new(false));
+    let switch: Arc<Mutex<Option<std::thread::JoinHandle<Value>>>> = Arc::new(Mutex::new(None));
+    let keep = switch.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.ends_with("/x402/ticket/release") || once.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let got = real();
+        // the seller has the ticket; the owner turns anonymous now, while this call is still waiting
+        let (s2, o2) = (s.clone(), origin.clone());
+        *keep.lock().unwrap() = Some(std::thread::spawn(move || call(&s2, "identity_set", json!({"origin": o2, "anonymous": true}))));
+        let until = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < until && !call(&s, "ticket_status", json!({}))["sessions"].as_array().is_some_and(|a| a.iter().all(|x| x["state"] != "open")) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(got)
+    }));
+    let v = r.pay_known("/acct/echo", CALL);
+    r.tap.clear();
+    let set = switch.lock().unwrap().take().expect("the owner turned anonymous during the call").join().unwrap();
+    assert_eq!(set["ok"], true, "{set}");
+    assert_eq!(v["rule"].as_str(), Some("ticket_session"), "{v}");
+    assert!(r.tap.seen("/acct/echo").iter().all(|x| !x.paid), "the request was not sent on the stopped session: {:?}", r.tap.seen("/acct/echo"));
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// "This shop" is the seller: anonymous at a shop's name also holds at its other address, for what
+/// the wallet says there and for the seller session it knows the wallet by; and letting the shop
+/// recognise the wallet again under either address lifts it for both.
+#[test]
+fn staying_anonymous_at_a_shop_holds_at_its_other_address() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut conf = sized_shop(json!(["on-arrival"]), None);
+    conf["alias"] = true.into();
+    let r = Rig::shipped(json!({}), 30, conf);
+    let first = r.pay_known("/acct/echo", 2_000);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1);
+    let name = r.shop.origin.clone();
+    let key_address = name.replace("127.0.0.1", "localhost");
+    let set = r.call("identity_set", json!({"origin": name, "anonymous": true}));
+    assert_eq!((set["ok"].as_bool(), set["sessions_stopped"].as_u64()), (Some(true), Some(1)), "{set}");
+    let v = r.call("xbt402_pay", json!({"url": format!("{key_address}/acct/echo"), "max_sats": 2_000, "task": "film", "known_terms": true}));
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not told at the other address: {v}");
+    assert_eq!(r.call("identity_get", json!({"origin": key_address}))["here"], true, "the wallet shows the choice at the other address too");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1, "nothing more said");
+    assert!(r.audit("ticket_resumed").is_empty(), "the seller session it was known by is not taken over there either");
+    assert_eq!(r.audit("ticket_resume_skipped").len(), 1);
+    let back = r.call("identity_set", json!({"origin": key_address, "anonymous": false}));
+    assert_eq!((back["ok"].as_bool(), back["anonymous"].clone()), (Some(true), json!([])), "the shop's choice, under either address: {back}");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// A seller from before the rule that offers draws on a route with accounts: the wallet pays that
+/// route with tickets, never by draws, which would serve the owner as nobody.
+#[test]
+fn draws_offered_on_a_route_with_accounts_are_not_paid() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // a task that says draws whatever the call may use: only the rule for this route keeps it on tickets
+    let r = draws_rig(json!({"tickets": {"tasks": {"film": {"budget_sats": 40_000, "meter": "draws"}}}}));
+    // the lottery entry the seller offers on a route of small pieces, taken from its 402
+    let entry: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let keep = entry.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || !seen.path.starts_with("/tiny/") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let pr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")).and_then(|(_, v)| unb64json(v).ok());
+        *keep.lock().unwrap() = pr.and_then(|p| p["accepts"].as_array()?.iter().find(|a| a["scheme"] == "lottery").cloned());
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let _ = r.call("xbt402_pay", json!({"url": r.shop.url("/tiny/1"), "max_sats": 0, "task": "film"}));
+    let lottery = entry.lock().unwrap().clone().expect("the seller draws for small pieces");
+    // the route with accounts, as a seller from before the rule offers it: the same lottery entry beside its tickets
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || !seen.path.starts_with("/acct/") {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        let Some(i) = headers.iter().position(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")).filter(|_| status == 402) else {
+            return Some(Ok(answer(status, headers, body)));
+        };
+        let mut pr = unb64json(&headers[i].1).ok()?;
+        pr["accepts"].as_array_mut()?.push(lottery.clone());
+        headers[i].1 = b64json(&pr);
+        let body = pr.to_string().into_bytes();
+        Some(Ok(answer(402, headers, body)))
+    }));
+    let v = r.pay("/acct/echo", CALL);
+    r.tap.clear();
+    assert_eq!((v["status"].as_u64(), v["rail"].as_str()), (Some(200), Some("ticket")), "paid with tickets: {v}");
+    let body: Value = serde_json::from_str(v["untrusted_provider_response"]["body"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
+    assert!(body["guest"].as_str().is_some_and(|g| g.starts_with("buyer-")), "served as the owner's account: {v}");
+    assert!(r.tap.seen("/x402/lottery").is_empty(), "no draw session opened: {:?}", r.tap.seen("/x402/lottery"));
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
 // --- a session that lives on its credit (found on mainnet: a busy session was taken for idle) ------
 
 /// A session paid only from the credit of one prepaid ticket, one small request every 30 s for 30
