@@ -388,11 +388,24 @@ class UI:
         csrf = page.split('name="csrf" value="', 1)[1].split('"', 1)[0]
         st, h, body = self.req("POST", path, {"csrf": csrf, **form})
         if st == 303:
-            body = self.req("GET", h.get("location", path))[2]
+            body = self.req("GET", urllib.parse.urljoin(path, h.get("location", path)))[2]
         return body
 
 
 def reprice_check() -> None:
+    try:
+        reprice_run()
+    finally:
+        # the logs, beside the report (the lab copies only run/*.log and run/*.json back)
+        for name in ("rp-ui", "rp-gateway", "rp-hashmaker", "rp-rp1", "rp-rp2", "rp-rp3"):
+            try:
+                with open(f"{RUN}/{name}.log", "rb") as f, open(f"{OUT}/p2p_hash_reprice-{name}.log", "wb") as g:
+                    g.write(f.read())
+            except OSError:
+                pass
+
+
+def reprice_run() -> None:
     """A new price while a rental goes on, with the hashmaker's real app, its gateway under xbt-supervise and the
     hashmaker service: the old price is charged during the rental, no new rental starts, the gateway restarts with
     the new price once the rental has ended, and the next rental pays that."""
@@ -466,7 +479,9 @@ def reprice_check() -> None:
     lab.wait("the hashmaker service", 30, lambda: hasher().get("role") == "hasher", every=0.5)
     # three miners; a rental takes two, so one stays free: only the new price's wait can turn a renter away
     for i in (1, 2, 3):
-        spawn(f"rp-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{RP_MINERS}", "--user", f"hasher.m{i}", "--rate", "0.5", "--duration-s", "3000"])
+        spawn(f"rp-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{RP_MINERS}", "--user", f"hasher.m{i}", "--rate", "0.5", "--duration-s", "3000",
+                                         # as a real miner does: it follows client.reconnect, which moves it to a rental and back
+                                         "--reconnect", "1"])
     # measured before the app prices: the start fee is sized to their speed
     lab.wait("the three miners measured", 180,
              lambda: sum(1 for m in hasher().get("miners", []) if m.get("connected") and float(m.get("hashrateHs") or 0) > 0) == 3, every=2)
@@ -551,13 +566,15 @@ def reprice_check() -> None:
         r2.terminate()
         r2.wait(10)
     b2 = buyer("rp2")
+    with open(f"{RUN}/rp-rp2.log", errors="replace") as f:
+        log2 = f.read()
     free_during = [m["name"] for m in hasher()["miners"] if m.get("connected") and m.get("rentedTo") is None]
     rentals_during = [r["rental"] for r in hasher().get("rentals", [])]
     check("reprice: while the rental goes on, a new renter is turned away (a miner is free, the new price waits), nothing paid",
-          len(free_before) == 1 and free_during == free_before and rentals_during == ["rt-rp1"] and not [p for p in b2.get("pays", []) if p.get("ok")]
-          and int((b2.get("meter") or {}).get("work", "0")) == 0,
+          len(free_before) == 1 and free_during == free_before and rentals_during == ["rt-rp1"] and not [p for p in b2.get("pays") or [] if p.get("ok")]
+          and int((b2.get("meter") or {}).get("work", "0")) == 0 and "no miners free now" in log2,
           {"free miners before": free_before, "free miners now": free_during, "rentals": rentals_during, "paused": st_held.get("paused"),
-           "the renter": {k: b2.get(k) for k in ("closed", "payFailed")}, "renter's pays": b2.get("pays"), "renter's log": open(f"{RUN}/rp-rp2.log").read()[-400:]})
+           "the renter": {k: b2.get(k) for k in ("closed", "payFailed")}, "renter's pays": b2.get("pays"), "renter's log": log2[-400:]})
     # a few more slices of the first rental, after the hold
     lab.wait("two more slices paid in the first rental after the hold", 120, lambda: sum(1 for p in oks("rp1") if p["atMs"] > held_ms) >= 2, every=1)
     during = {"route in the config": route_in_config(), "charged": charged(), "gateway pid": gateway_pid(), "terms": hasher()["terms"]["priceMsat"],
@@ -615,13 +632,6 @@ def reprice_check() -> None:
             with open(f"{rp}/{name}") as f:
                 REPORT.setdefault("reprice_files", {})[name] = json.load(f)
         except (OSError, ValueError):
-            pass
-    # the logs, beside the report (the lab copies only run/*.log and run/*.json back)
-    for name in ("rp-ui", "rp-gateway", "rp-hashmaker", "rp-rp1", "rp-rp2", "rp-rp3"):
-        try:
-            with open(f"{RUN}/{name}.log", "rb") as f, open(f"{OUT}/p2p_hash_reprice-{name}.log", "wb") as g:
-                g.write(f.read())
-        except OSError:
             pass
 
 
