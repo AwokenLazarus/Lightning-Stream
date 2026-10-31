@@ -745,6 +745,11 @@ struct PayState {
     /// How long the node takes to list its channels: the checks the wallet makes of them before a
     /// payment (a busy node, a slow disk).
     checks_take: Duration,
+    /// The next sends reach the seller's node `arrives_after_s` seconds after they are sent (a slow
+    /// route): the clock moves on by as much first, and an invoice that has lapsed by then is refused
+    /// there, as lnd refuses one (it cancels the invoice, and the payer is told incorrect payment details).
+    slow_next: usize,
+    arrives_after_s: u64,
     /// The next sends are in flight on this node and never reach the seller's (the node dies as it
     /// sends them); once `stranded_off_channel` is set, no channel of the node carries them and
     /// the node goes on calling them in flight.
@@ -913,7 +918,18 @@ impl LnBackend for PayLn {
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
         let stranded = !failing && !late && s.strand_next > 0;
         s.strand_next = s.strand_next.saturating_sub(usize::from(stranded));
-        let arrives = !failing && r.cltv_limit >= 123 && (late || stranded || self.seller.pay_msat(&raw, d.amount_msat));
+        // on its way for a while: the seller's node finds the invoice lapsed, cancels it, and refuses the payment
+        let mut lapsed = false;
+        let slow = !failing && !late && !stranded && s.slow_next > 0;
+        s.slow_next = s.slow_next.saturating_sub(usize::from(slow));
+        if slow {
+            let now = self.clock.fetch_add(s.arrives_after_s, Ordering::SeqCst) + s.arrives_after_s;
+            if d.timestamp + d.expiry_s <= now {
+                self.seller.expire_unpaid(&raw);
+                lapsed = true;
+            }
+        }
+        let arrives = !failing && !lapsed && r.cltv_limit >= 123 && (late || stranded || self.seller.pay_msat(&raw, d.amount_msat));
         let status = if arrives { "IN_FLIGHT" } else { "FAILED" };
         let in_flight = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT").count() + usize::from(arrives);
         s.peak = s.peak.max(in_flight);
@@ -923,7 +939,7 @@ impl LnBackend for PayLn {
             {"pub_key": d.payee_hex(), "expiry": h + 43, "custom_records": {TAG_RECORD.to_string(): B64.encode(&r.tag)}}]});
         let p = json!({"payment_hash": hash, "payment_index": s.next_index.to_string(), "status": status, "value_msat": d.amount_msat.unwrap_or(0).to_string(),
                        "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
-                       "failure_reason": if arrives { "FAILURE_REASON_NONE" } else { "FAILURE_REASON_NO_ROUTE" },
+                       "failure_reason": if arrives { "FAILURE_REASON_NONE" } else if lapsed { "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS" } else { "FAILURE_REASON_NO_ROUTE" },
                        "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late, "stranded": stranded});
         s.payments.push(p.clone());
         Ok(p)
@@ -4993,6 +5009,39 @@ fn a_seller_blocked_for_over_charging_is_paid_no_draw() {
     assert_eq!(unblock(&r, &id)["ok"], true);
     let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
     assert_eq!((v["rail"].as_str(), v["status"].as_u64()), (Some("lottery"), Some(200)), "unblocked, it is paid again: {v}");
+}
+
+/// A win paid over a slow route (its payment takes 40 s to reach the seller) to a seller whose
+/// lottery is as it ships: paid before its invoice lapses, and the node, the seller, the book and
+/// the ledger hold it.
+///
+/// FAILS before: a win's invoice lived as long as the grace, 30 s as shipped, so the seller's node
+/// refused the payment (incorrect payment details), and each next invoice lapsed on its way the
+/// same: a buyer on a slow route had every win refused and was served nothing more.
+#[test]
+fn a_win_paid_over_a_slow_route_reaches_a_seller_as_it_ships_before_its_invoice_lapses() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0}}));
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.slow_next, s.arrives_after_s) = (1, 40);
+    }
+    // 64 pieces of 2 sat on wins of 64 sat: 2 wins expected a call; calls until one is won
+    let mut wins = 0;
+    for _ in 0..10 {
+        let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+        assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool()), (Some("lottery"), Some(200), Some(true)), "{v}");
+        let w = v["wins"].as_u64().unwrap();
+        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(w), Some(0)), "every win is paid: {v}");
+        wins += w;
+        if wins > 0 {
+            break;
+        }
+    }
+    assert!(wins > 0, "ten calls of 64 pieces and no win");
+    assert_eq!(r.ln.state().slow_next, 0, "the first win went the slow way");
+    assert!(r.ln.by_status("FAILED").is_empty(), "no win was refused at the seller: {:?}", r.ln.by_status("FAILED"));
+    assert_wins(&r, wins);
 }
 
 #[test]

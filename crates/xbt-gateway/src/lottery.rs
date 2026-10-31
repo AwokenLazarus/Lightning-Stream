@@ -143,7 +143,10 @@ impl LotteryConfig {
 
     fn read(m: &Map<String, Value>, ticket_blocks: u32) -> Result<Self, String> {
         let win_msat = num(m, "win_msat", 64_000)?;
-        let grace_seconds = num32(m, "grace_seconds", 30)?;
+        // as long as a ticket's invoice lives (60 s): a win's invoice lives as long as the grace, and a buyer pays a win
+        // over a slow route in tens of seconds; one that lapsed on its way is refused at the seller with nothing paid,
+        // and the next lapses the same way. What a seller serves meanwhile is bounded by `grace_pieces` too
+        let grace_seconds = num32(m, "grace_seconds", xbt402::ticket::INVOICE_EXPIRY_S)?;
         Ok(Self {
             win_msat,
             min_win_msat: num(m, "min_win_msat", win_msat.min(16_000))?,
@@ -1085,9 +1088,9 @@ mod tests {
     fn the_defaults_are_the_drafts_numbers_and_a_wrong_file_is_refused() {
         let c = LotteryConfig::parse(&json!({}), 40).unwrap();
         assert_eq!((c.win_msat, c.min_win_msat, c.win_blocks, c.window), (64_000, 16_000, 40, 8));
-        assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (30, 64, 2, 65_536));
+        assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (60, 64, 2, 65_536));
         assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids, c.max_odds_den), (262_144, 64, 4, 4, 4));
-        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 30, 10));
+        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 60, 10));
         // a win's invoice lives no longer than the grace, unless the grace is shorter than 5 s
         for (grace, invoice) in [(20, 20), (10, 15), (0, 15), (100, 100), (7200, 3600)] {
             assert_eq!(LotteryConfig::parse(&json!({"grace_seconds": grace}), 40).unwrap().invoice_secs, invoice, "{grace}");

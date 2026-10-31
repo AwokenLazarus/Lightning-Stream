@@ -312,7 +312,7 @@ involved no node.
   together, in the order they were found, except that a win its seller's answer stands still
   for goes first. On one 30-slot channel that paid the wins of 100
   sellers of one buyer at 14 wins a second, with no payment failed; a buyer whose wins come
-  faster than that keeps its sellers waiting: a seller serves on for its grace of 30 s, and an
+  faster than that keeps its sellers waiting: a seller serves on for its grace of 60 s, and an
   answer it is sending stands still for a payment for 10 s at the most before it is cut. Before the wallet kept a win inside that limit until it had settled, 24 payments were
   pending on the channel at once and 47 of 313 failed: found on the lab, and what the limit is
   for.
@@ -343,10 +343,14 @@ involved no node.
   refused the session.
 - A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
   invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
-  the first has lapsed: a win's invoice lives as long as the grace (30 s), so the next one comes
+  the first has lapsed: a win's invoice lives as long as the grace (60 s), so the next one comes
   with the first request the gateway refuses `win_unpaid`, and the session goes on once it is
-  paid. A slow payment pays less time: an invoice of 30 s that is not paid within it (a win that
-  waited its turn behind many others, section above) fails, and waits for the next one.
+  paid. A slow payment pays less time: an invoice that is not paid within it (a win that waited
+  its turn behind many others, section above, or a payment over a slow route) fails, and waits
+  for the next one. Until 0.1.20 the grace, and so a win's invoice, was 30 s: a buyer whose
+  payment took longer than that to reach the seller (a hop held one 8 to 22 s on a loaded lab
+  node) had every win refused, and was served nothing more. A seller that shortens the grace
+  shortens its invoices with it.
 - A wallet that starts again pays no win it found before the start: it cannot tell a start from
   a restore of older records, in which that win may be paid already; the seller has lost the
   wins that were unpaid at that moment (at most the 2 it bears). A gateway that starts again

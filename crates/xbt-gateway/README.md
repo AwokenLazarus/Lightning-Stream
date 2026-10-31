@@ -223,7 +223,7 @@ draws (`docs/TICKETS.md`, section 9). It is off unless you write the section: wi
 first.
 
 ```json
-"lottery": {"win_msat": 64000, "min_win_msat": 16000, "window": 8, "grace_seconds": 30,
+"lottery": {"win_msat": 64000, "min_win_msat": 16000, "window": 8, "grace_seconds": 60,
             "grace_pieces": 64, "max_unpaid_wins": 2, "piece_bytes": 262144}
 ```
 
