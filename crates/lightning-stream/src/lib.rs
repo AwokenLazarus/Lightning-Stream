@@ -361,8 +361,25 @@ pub fn serve(cfg: Config, listener: std::net::TcpListener) -> io::Result<xbt_svc
 
 #[cfg(test)]
 mod tests {
-    use super::listen_stream;
+    use super::{listen_stream, whole};
+    use serde_json::{json, Value};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_answer_is_whole_by_its_length_or_the_signers_account_and_otherwise_cut() {
+        let never = || -> Option<Result<Value, String>> { panic!("all of a stated length needs no account") };
+        assert!(whole(Some(10), 10, never).is_ok());
+        let said = |v: Value| move || Some(Ok(v));
+        // no length stated: the account says
+        assert!(whole(None, 10, said(json!({"complete": true}))).is_ok());
+        let cut = whole(None, 10, said(json!({"complete": false, "ended": "max_sats"}))).unwrap_err().to_string();
+        assert!(cut.contains("max_sats") && cut.contains("10 bytes"), "{cut}");
+        // short of a stated length is cut, whatever the account says
+        assert!(whole(Some(20), 10, said(json!({"complete": true}))).is_err());
+        // an error from the signer, or no account in time, is not whole
+        assert!(whole(None, 10, || Some(Err("gone".to_string()))).is_err());
+        assert!(whole(None, 10, || None).unwrap_err().to_string().contains("did not say"));
+    }
 
     #[test]
     fn a_stream_socket_is_group_writable() {
