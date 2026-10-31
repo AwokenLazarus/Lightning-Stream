@@ -1679,6 +1679,7 @@ fn a_ticket_given_up_that_reaches_the_node_late_is_booked_again() {
 /// and after that the release says what is wrong, and calls no ticket stale.
 #[test]
 fn a_release_on_a_tip_nobody_knows_says_so_and_calls_no_ticket_stale() {
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     let sid = r.open();
     r.fill(&sid);
