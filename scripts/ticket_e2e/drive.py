@@ -1749,6 +1749,129 @@ def huge_file() -> str:
     return h.hexdigest()
 
 
+class RangeFiles(BaseHTTPRequestHandler):
+    """The service's files with byte ranges, as a media server gives them (the stock server has none)."""
+
+    def log_message(self, *_: Any) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        path = f"{RUN}/www{self.path.split('?')[0]}"
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        size = os.path.getsize(path)
+        start, want = 0, self.headers.get("Range", "")
+        if want.startswith("bytes=") and want.endswith("-"):
+            start = int(want[6:-1])
+        self.send_response(206 if want else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(size - start))
+        if want:
+            self.send_header("Content-Range", f"bytes {start}-{size - 1}/{size}")
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(start)
+            try:
+                for chunk in iter(lambda: f.read(1 << 16), b""):
+                    self.wfile.write(chunk)
+            except OSError:
+                pass
+
+
+def paused_player() -> None:
+    """A player paused with its buffer full, past the 30 s the app gives a client that takes nothing:
+    its connection ends and the wallet stops paying for that answer. Going on, it asks again from
+    where it was, by `Range`: the file comes whole between the two answers, its sha256 the file's, and
+    the money agrees, the seller paid for the bytes and what was on its way, less than two tickets more."""
+    want = huge_file()
+    range_port, gw_port, conn_port = BASE + 22, BASE + 23, BASE + 24
+    stop_sessions()
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    server = ThreadingHTTPServer(("127.0.0.1", range_port), RangeFiles)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    origin = f"http://127.0.0.1:{gw_port}"
+    path = gateway_config("gateway-range", gw_port, origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["upstream"] = f"http://127.0.0.1:{range_port}"
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("gateway-range", gw_port)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    os.makedirs(f"{RUN}/stream", exist_ok=True)
+    digest, got, first_status, second_status, first_end, second_end = hashlib.sha256(), 0, 0, 0, "", ""
+    try:
+        restart_signer()
+        with open(f"{RUN}/connector-pause.log", "ab") as log:
+            PROCS["connector-pause"] = subprocess.Popen([f"{BIN}/lightning-stream"], env=dict(os.environ, LS_LISTEN=f"127.0.0.1:{conn_port}", B2_SIGNER_SOCK=SOCK,
+                                                        B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="film", LS_MAX_SATS="20000", XBT_SHOPS_FILE=SHOPS_FILE),
+                                                        stdout=log, stderr=log)
+        lab.wait("the connector", 60, lambda: PROCS["connector-pause"].poll() is None and send("GET", "/health", conn_port)[0] == 200, every=0.2)
+        c = http.client.HTTPConnection("127.0.0.1", conn_port, timeout=120)
+        c.request("GET", f"/s/{origin}/huge.bin", headers={"X-Max-Sats": "20000"})
+        resp = c.getresponse()
+        first_status = resp.status
+        paused = False
+        try:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                got += len(chunk)
+                digest.update(chunk)
+                if not paused and got >= 32 << 20:
+                    # the player's buffer is full: it takes nothing past the app's 30 s
+                    paused = True
+                    time.sleep(40)
+        except (http.client.IncompleteRead, OSError) as e:
+            # what was read of the cut answer is the player's too
+            part = getattr(e, "partial", b"") or b""
+            got += len(part)
+            digest.update(part)
+            first_end = f"{type(e).__name__}"
+        c.close()
+        whole_at_first = got == HUGE
+        if not whole_at_first:
+            c = http.client.HTTPConnection("127.0.0.1", conn_port, timeout=120)
+            c.request("GET", f"/s/{origin}/huge.bin", headers={"X-Max-Sats": "20000", "Range": f"bytes={got}-"})
+            resp = c.getresponse()
+            second_status = resp.status
+            try:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    digest.update(chunk)
+            except (http.client.IncompleteRead, OSError) as e:
+                second_end = f"{type(e).__name__}: {e}"[:200]
+            c.close()
+    finally:
+        if "connector-pause" in PROCS:
+            PROCS["connector-pause"].terminate()
+            PROCS["connector-pause"].wait(10)
+    stop_sessions()
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
+    price_msat = -(-HUGE * HUGE_BYTE_MSAT // PER_BYTES)
+    paid_for = price_msat <= m["seller_node_received_msat"] < price_msat + 2 * TICKET_MSAT
+    check("paused_player: a player paused past the 30 s the app gives a client that takes nothing loses its connection, and asking again by Range from where it was gets the rest: the file whole, its sha256 the file's, the money agreeing, the seller paid for its bytes and less than two tickets more",
+          first_status == 200 and bool(first_end) and second_status == 206 and not second_end and got == HUGE and digest.hexdigest() == want and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {"first": first_status, "first_end": first_end, "second": second_status, "second_end": second_end, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "price_msat": price_msat, **inv, "money": m})
+    PROCS["gateway-range"].terminate()
+    PROCS["gateway-range"].wait(10)
+    server.shutdown()
+
+
 def long_download(relay: bool) -> None:
     """A download that takes longer than the wallet's limit for an answer read whole (here 2 s, the
     default 50 s): the 320 MB file through the connector, which streams it on as it is paid for. It
@@ -2215,7 +2338,7 @@ def jellyfin(link: str = "") -> None:
         pass
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "pruned": pruned, "jellyfin": jellyfin,
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
           "vpn": vpn,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 

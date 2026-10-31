@@ -40,6 +40,8 @@
 #            for, with the wallet's limit for an answer read whole set to 3 s: it comes whole, its
 #            sha256 the file's, the money agreeing. long_download_relay (by name only): the same
 #            from a relay-only shop, through our relay
+#   paused_player  a player paused past the 30 s the app gives a client that takes nothing: it loses
+#            its connection, and asks again by Range from where it was. The file whole, the money agreeing
 #   jellyfin (by name only) a seller's whole web app: the real Jellyfin web client in Chrome,
 #            through the wallet app's app port, the connector and the signer, to a gateway that
 #            gives each buyer a Jellyfin account of their own, sold by the byte on these nodes: one
@@ -124,11 +126,11 @@ R=$(mktemp -d "${TICKET_E2E_SCRATCH:-$ROOT/run}/ticket-e2e-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
 # a seller's whole web app (the jellyfin check, run by name only) also needs the wallet app and the connector, and
-# the long_download checks (one of them in the default run) the connector
+# the long_download and paused_player checks (in the default run) the connector
 case " $* " in *" jellyfin"*)
   nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p lightning-stream --bin lightning-stream ;;
 esac
-case " $* " in *" long_download"*|"  ") nice -n 19 cargo build -q -j4 --release --locked -p lightning-stream --bin lightning-stream ;; esac
+case " $* " in *" long_download"*|*" paused_player"*|"  ") nice -n 19 cargo build -q -j4 --release --locked -p lightning-stream --bin lightning-stream ;; esac
 # a VPN exit sold as a service (the vpn check, run by name only) needs the VPN service
 case " $* " in *" vpn "*|*" vpn") nice -n 19 cargo build -q -j4 --release --locked -p xbt-vpn --bin xbt-vpn ;; esac
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release

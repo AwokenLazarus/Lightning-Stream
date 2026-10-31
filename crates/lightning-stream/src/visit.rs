@@ -772,6 +772,48 @@ mod tests {
         Arc::new(Visit { base: String::new(), limit, ceiling: None, state: Mutex::new(State::default()), turn: Condvar::new() })
     }
 
+    /// A film may run for hours: a request waiting to run alone does not wait for an answer that has
+    /// been open a while, as it does not for a WebSocket.
+    #[test]
+    fn a_request_that_runs_alone_does_not_wait_for_a_long_open_answer() {
+        let v = visit(100_000);
+        let film = v.reserve(ANSWER_SHARE).unwrap();
+        let (a, _b) = UnixStream::pair().unwrap();
+        let _open = v.track(&a, film);
+        v.lock().streams.values_mut().for_each(|o| o.opened = Instant::now() - LONG_OPEN);
+        let t = Instant::now();
+        assert_eq!(v.reserve_alone(i64::MAX).unwrap(), 100_000 - film);
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// A visit with an answer still open stays, however long ago it was last asked for, so that a stop
+    /// finds it; the stop shuts the answer's socket, which is what stops the signer paying. With nothing
+    /// open, it goes as before.
+    #[test]
+    fn an_open_answer_keeps_its_visit_for_a_stop_to_find() {
+        use std::io::Read as _;
+        let long_ago = || Some(Instant::now() - 2 * IDLE);
+        let visits = Visits::default();
+        let id = visits.open("https://a.example/".into(), 1_000, None).unwrap();
+        let v = visits.get(&id).unwrap();
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let open = v.track(&a, 100);
+        v.lock().last = long_ago();
+        visits.open("https://b.example/".into(), 1_000, None).unwrap();
+        assert!(visits.get(&id).is_some(), "the visit went with its answer still open");
+        v.stop();
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(b.read(&mut [0u8; 8]).unwrap(), 0, "the stop did not shut the answer's socket");
+        // an answer that arrives after the stop is shut at once
+        let (c, mut d) = UnixStream::pair().unwrap();
+        let late = v.track(&c, 100);
+        d.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(d.read(&mut [0u8; 8]).unwrap(), 0);
+        drop((open, late));
+        visits.open("https://c.example/".into(), 1_000, None).unwrap();
+        assert!(visits.get(&id).is_none(), "a stopped visit with nothing open stays");
+    }
+
     /// A page's WebSocket holds its share as long as the page is open: a request waiting to run
     /// alone does not wait for it, and the requests behind it are not held up for it.
     #[test]
