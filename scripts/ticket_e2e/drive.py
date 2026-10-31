@@ -1829,6 +1829,8 @@ def paused_player() -> None:
                     # the player's buffer is full: it takes nothing past the app's 30 s
                     paused = True
                     time.sleep(40)
+            if resp.length:
+                first_end = f"short of its length by {resp.length} bytes"
         except (http.client.IncompleteRead, OSError) as e:
             # what was read of the cut answer is the player's too
             part = getattr(e, "partial", b"") or b""
@@ -1849,6 +1851,8 @@ def paused_player() -> None:
                         break
                     got += len(chunk)
                     digest.update(chunk)
+                if resp.length:
+                    second_end = f"short of its length by {resp.length} bytes"
             except (http.client.IncompleteRead, OSError) as e:
                 second_end = f"{type(e).__name__}: {e}"[:200]
             c.close()
@@ -1919,6 +1923,9 @@ def long_download(relay: bool) -> None:
                 ahead = got / LONG_READ_BPS - (time.monotonic() - t0)
                 if ahead > 0:
                     time.sleep(ahead)
+            # read(n) of a body short of its Content-Length just ends: what is left of the length says so
+            if resp.length:
+                cut = f"short of its length by {resp.length} bytes"
         except (http.client.IncompleteRead, OSError) as e:
             cut = f"{type(e).__name__}: {e}"[:200]
         took = time.monotonic() - t0
