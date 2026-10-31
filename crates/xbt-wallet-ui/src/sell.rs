@@ -1209,8 +1209,9 @@ impl App {
         let keys = self.keys_stored();
         if !keys {
             b.push_str(&format!("<section class=\"card step-card\"><h2>1. Connect your Lightning node</h2>\
-                <p>Buyers pay you through your Lightning node. Make two keys in your node's app and paste them here. They let this app ask \
-                for payments and read the time on the network; they cannot spend your money.</p>\
+                <p>Buyers pay you through your Lightning node. Make these keys in your node's app and paste them here. The first two let this \
+                app ask for payments and read the time on the network. The third, optional, lets your node vouch for your shop's link, so \
+                buyers can reach you directly through their app. None of them can spend your money.</p>\
                 <form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"connect\">\
                 <label>First key: payment requests<textarea name=\"invoices_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\" required></textarea></label>\
                 <label>Second key: network time<textarea name=\"info_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\" required></textarea></label>\
@@ -1497,9 +1498,7 @@ impl App {
                 if !sign.is_empty() {
                     let what = "The link signing key";
                     let mac = decode_macaroon(&sign).map_err(|_| format!("{what} is not a key: copy it again, whole."))?;
-                    checked_macaroon(&mac, what, &SIGN_OPS, true)
-                        .or_else(|_| checked_macaroon(&mac, what, &SIGN_ENTITY_OPS, true))
-                        .map_err(|e| format!("{what} does not fit: {e}"))?;
+                    sign_key_fits(&mac).map_err(|e| format!("{what} does not fit: {e}"))?;
                     macs.push((GW_SIGN, mac));
                 }
                 for (field, file, ops, what) in [("invoices_macaroon", GW_INVOICES, &INVOICE_OPS[..], "The payment requests key"),
@@ -1735,6 +1734,23 @@ const KNOWN_SERVICES: &[(&str, &str)] = &[
     ("Open WebUI", "http://open-webui_web_1:8080"),
     ("LlamaGPT", "http://llama-gpt_llama-gpt-api_1:8000"),
 ];
+
+/// The link signing key signs messages and does nothing else: lnd's `message:write` (what Lightning
+/// Fork's dashboard bakes), SignMessage's URI permission (what node-keys bakes), or both. Anything
+/// more is refused by name, and so is a key whose permissions cannot be read.
+fn sign_key_fits(mac: &[u8]) -> Result<(), String> {
+    let m = xbt402::macaroon::parse(mac)?;
+    let need = SIGN_ENTITY_OPS.join(" ");
+    if !m.readable() {
+        return Err(format!("its permissions cannot be read (not this node's identifier): bake one with only {need}"));
+    }
+    // readable: at least one permission, so with nothing outside the two, one of them is there
+    let allowed: Vec<&str> = SIGN_ENTITY_OPS.iter().chain(SIGN_OPS.iter()).copied().collect();
+    match m.outside(&allowed).as_slice() {
+        [] => Ok(()),
+        more => Err(format!("it also grants {}: bake one with only {need}", more.join(", "))),
+    }
+}
 
 /// Whether something listens at `url`'s host and port (a TCP connect, at most 600 ms).
 fn answers(url: &str) -> bool {

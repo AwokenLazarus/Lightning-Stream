@@ -1731,14 +1731,25 @@ fn a_pasted_link_signing_key_lets_the_node_vouch_for_the_direct_link() {
     let sign_entity = mac(&[("message", &["write"])]);
     let sign = dir.join("sign.macaroon");
 
-    // a key that can do more than sign is refused, and nothing is written
+    // a key that can do more than sign is refused, by the permission it should not have, and nothing is written
     let wide = mac(&[("message", &["write"]), ("invoices", &["write"])]);
     let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &wide)]);
-    assert!(br.flash_after(&r).contains("does not fit"));
+    let said = br.flash_after(&r);
+    assert!(said.contains("does not fit") && said.contains("invoices:write"), "{said}");
     assert!(!sign.exists() && !dir.join("invoices.macaroon").exists(), "nothing written when one key is refused");
     // an invoices key in the signing field is refused
     let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &inv)]);
-    assert!(br.flash_after(&r).contains("does not fit"));
+    let said = br.flash_after(&r);
+    assert!(said.contains("does not fit") && said.contains("invoices:read"), "{said}");
+    assert!(!sign.exists());
+    // so is SignMessage's URI with another URI beside it, named; and a key whose permissions can't be read
+    let uris = mac(&[("uri", &["/lnrpc.Lightning/SignMessage", "/lnrpc.Lightning/SendCoins"])]);
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &uris)]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("does not fit") && said.contains("uri:/lnrpc.Lightning/SendCoins") && !said.contains("SignMessage,"), "{said}");
+    let unreadable = hex::encode(xbt402::macaroon::lnd_macaroon_for_tests(&[], &[]));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &unreadable)]);
+    assert!(br.flash_after(&r).contains("cannot be read"));
     assert!(!sign.exists());
 
     // without it the shop connects (it can sell at a web address), and the page says what is missing
@@ -1757,6 +1768,22 @@ fn a_pasted_link_signing_key_lets_the_node_vouch_for_the_direct_link() {
     let r = br.act("/sell", "/sell", &[("action", "connect"), ("sign_macaroon", &sign_uri)]);
     assert!(br.flash_after(&r).contains("connected"));
     assert_eq!(hex::encode(std::fs::read(&sign).unwrap()), sign_uri);
+    // a key with both (each signs messages only) is taken; so is one narrowed further by caveats
+    let both = mac(&[("message", &["write"]), ("uri", &["/lnrpc.Lightning/SignMessage"])]);
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("sign_macaroon", &both)]);
+    assert!(br.flash_after(&r).contains("connected"));
+    assert_eq!(hex::encode(std::fs::read(&sign).unwrap()), both);
+    let caveated = xbt402::macaroon::lnd_macaroon_for_tests(&[("message", &["write"])], &["time-before 2099-01-01T00:00:00Z", "ipaddr 10.21.21.66"]);
+    // pasted as base64, wrapped over lines as a dashboard shows it
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&caveated);
+    let wrapped: String = b64.as_bytes().chunks(40).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\n");
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("sign_macaroon", &format!("  {wrapped}\n"))]);
+    assert!(br.flash_after(&r).contains("connected"));
+    assert_eq!(std::fs::read(&sign).unwrap(), caveated);
+    // written as the gateway's other keys are: readable by its group, by no one else
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&sign).unwrap().permissions().mode() & 0o777, 0o640);
 }
 
 /// The one Lightning Stream app (`XBT_UI_SELL=1`): Sell sets up the gateway beside the wallet in

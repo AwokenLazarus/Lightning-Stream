@@ -244,10 +244,12 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
     );
     std::thread::Builder::new().name("link-vouch".into()).spawn(move || {
         let mut tried = unix_now();
+        let mut key = SignKey::read(&v.sign_mac);
         loop {
             // the keys buyers can reach are looked at every REACH_CHECK, and the document made again
-            // when they change; the node is asked again ten days before its word runs out, or each hour
-            // while it has not vouched
+            // when they change; the node is asked again ten days before its word runs out, each hour
+            // while it has not vouched, and at once when its sign key is given or replaced (pasted on
+            // a running shop: the gateway is not restarted for it, so no session is dropped)
             std::thread::sleep(REACH_CHECK);
             if v.gw.stopped() {
                 return;
@@ -256,7 +258,8 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
                 Some(u) => unix_now() + VOUCH_AHEAD >= u,
                 None => unix_now() >= tried + 3600,
             };
-            if due || v.reach_changed() {
+            let new_key = key.changed();
+            if due || new_key || v.reach_changed() {
                 tried = unix_now();
                 match v.once() {
                     Ok(u) => until = u.or(until.filter(|u| *u > unix_now())),
@@ -266,6 +269,29 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
         }
     }).map_err(|e| format!("link: {e}"))?;
     Ok(links)
+}
+
+/// The node key the gateway asks the node to sign with (`sign.macaroon`), as last seen: the owner
+/// may give or replace it while the shop runs (StartOS: pasted on the Sell page), and the node is
+/// asked to vouch at once when it changes, not at the next hourly try.
+struct SignKey {
+    path: std::path::PathBuf,
+    seen: Option<Vec<u8>>,
+}
+
+impl SignKey {
+    fn read(path: &std::path::Path) -> Self {
+        SignKey { path: path.to_path_buf(), seen: std::fs::read(path).ok() }
+    }
+
+    /// Whether the key is there now and differs from the one last seen (a key removed is no reason
+    /// to ask the node).
+    fn changed(&mut self) -> bool {
+        let now = std::fs::read(&self.path).ok();
+        let new = now.is_some() && now != self.seen;
+        self.seen = now;
+        new
+    }
 }
 
 /// How long the node's word for the link holds, and how long before its end it is asked again.
@@ -403,5 +429,33 @@ impl Vouch {
         }
         self.gw.set_link(&vouched, &unix_now().to_string());
         Ok(vouched.iter().map(|l| l.expires).min())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SignKey;
+
+    /// A sign key pasted on a running shop is noticed at the next look (the node then vouches within
+    /// REACH_CHECK, with no restart); the same key written again, or the key removed, is not news.
+    #[test]
+    fn a_sign_key_given_or_replaced_while_running_is_noticed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sign.macaroon");
+        let mut k = SignKey::read(&p);
+        assert!(!k.changed(), "no key yet: nothing to ask the node");
+        std::fs::write(&p, b"key one").unwrap();
+        assert!(k.changed(), "a key pasted while running");
+        assert!(!k.changed(), "noticed once");
+        std::fs::write(&p, b"key one").unwrap();
+        assert!(!k.changed(), "the same key written again (a form saved twice)");
+        std::fs::write(&p, b"key two").unwrap();
+        assert!(k.changed(), "a key replaced");
+        std::fs::remove_file(&p).unwrap();
+        assert!(!k.changed(), "a key removed");
+        std::fs::write(&p, b"key two").unwrap();
+        assert!(k.changed(), "given back after removal");
+        let mut at_start = SignKey::read(&p);
+        assert!(!at_start.changed(), "a key there at start was already used for the first vouch");
     }
 }

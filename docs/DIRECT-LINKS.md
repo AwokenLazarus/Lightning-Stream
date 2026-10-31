@@ -84,7 +84,11 @@ On StartOS, Lightning Fork's app grant gives the wallet its key and no gateway k
 package, and the wallet's must stay a key that only pays). The gateway's keys, the sign key among
 them, are pasted on the Sell page until the node package grants them. Lightning Fork bakes entity
 permissions only, so the Sell page takes the sign key as lnd's `message:write` (which allows
-SignMessage and no other call) as well as the URI permission.
+SignMessage and no other call) as well as the URI permission, and nothing beyond those two.
+
+A sign key given or replaced while the shop runs is used at the gateway's next look at its link
+(every 15 s): the node is asked to vouch then, with no restart and no session dropped. Without a
+key the gateway asks again each hour.
 
 ### One shop, several link keys
 
