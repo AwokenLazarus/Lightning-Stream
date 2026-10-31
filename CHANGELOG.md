@@ -101,7 +101,10 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   a session that took over a shop's credit keeps its tickets and nothing stays held.
 - A shop that will not say what an earlier session left with it no longer has a new ticket bought
   beside that credit: the call is refused with a time to retry. After two minutes a new session starts,
-  your wallet's history names what may be left, and a later session still finds that credit.
+  your wallet's history names what may be left, and the next session uses that credit first, oldest first.
+- A kill or a lost answer no longer buys a second ticket when the first was paid: the next call waits
+  for the shop to take it, for two minutes at most. Long answers open for over ten minutes are no longer
+  cut by a second call to the same shop.
 
 **VPN exits**
 - A priced exit's region check now runs for a buyer with no credit at that exit. Each check is

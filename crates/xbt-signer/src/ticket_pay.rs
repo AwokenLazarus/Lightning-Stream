@@ -2822,6 +2822,14 @@ impl Signer {
         // the session with this seller, or why there is none
         let found: std::result::Result<Arc<HttpSession>, Tried> = 'open: {
             let mut open = lock(&slot.open);
+            // a seller that gave no word about its earlier session a moment ago: a call that queued behind that wait, or came
+            // straight after it, is told the same at once, and is not made to wait as long again, each behind the last
+            if open.is_none() {
+                let said = lock(&self.ticket_unanswered).get(c.origin).filter(|(at, _)| self.engine.now() - at < RESUME_RETRY_AFTER_S as f64).map(|(_, d)| d.clone());
+                if let Some(d) = said {
+                    break 'open Err(Tried::Done(d));
+                }
+            }
             // this place may have been forgotten while this call waited for it (its last session ended): it is put back,
             // unless another call has made a new one meanwhile
             {
@@ -2904,13 +2912,14 @@ impl Signer {
                         Resumed::Taken => true,
                         Resumed::Fresh => false,
                         Resumed::Wait(d) => {
-                            let stopped = self.ticket_http_stop(&h, "the seller has not said what an earlier session left with it", Duration::ZERO);
+                            lock(&self.ticket_unanswered).insert(c.origin.to_string(), (self.engine.now(), d.clone()));
+                            let stopped = self.ticket_http_stop(&h, crate::ticket::RESUME_WAIT_WHY, Duration::ZERO);
                             break 'open Err(Tried::Done(with(d, json!({"stopped": stopped}))));
                         }
                     };
                     if !resumed {
                         if let Some(d) = self.ticket_prepaid_unfollowed(&h.terms.terms.payee, &h.sid) {
-                            let stopped = self.ticket_http_stop(&h, "an earlier prepaid ticket with this seller is not followed yet", Duration::ZERO);
+                            let stopped = self.ticket_http_stop(&h, crate::ticket::PREPAY_FOLLOW_WHY, Duration::ZERO);
                             break 'open Err(Tried::Done(with(d, json!({"stopped": stopped}))));
                         }
                     }
@@ -3641,11 +3650,14 @@ impl Signer {
     /// `true`: taken over.
     fn ticket_resume(&self, hs: &HttpSession) -> Resumed {
         let receipt_key = hex::encode(&hs.terms.receipt_key);
-        let candidates = self.ticket_resumable_all(&hs.terms.terms.payee, &receipt_key, &hs.sid);
+        let candidates = self.ticket_resumable_all(&hs.terms.terms.payee, &receipt_key, &hs.origin, &hs.sid);
         let waiting = format!("resume:{}:{receipt_key}", hs.terms.terms.payee);
         let empty = |found: &crate::ticket_rail::Resumable| format!("empty:{}:{}", found.http.id, found.sent);
-        let mut unanswered = false;
-        let asked = candidates.iter().filter(|found| found.sent > 0 && !lock(&self.ticket_cancel_tried).contains(&empty(found))).take(RESUME_MOST_ASKED);
+        // a seller session this process still holds for a session of its own, whatever the book says of that session (an
+        // idle stop, with its answer still open): that session's to spend, and its tickets are not this one's to cancel
+        let held_here = self.ticket_seller_sessions_held(&hs.sid);
+        let mut silent = None;
+        let asked = candidates.iter().filter(|found| found.sent > 0 && !held_here.contains(&found.http.id) && !lock(&self.ticket_cancel_tried).contains(&empty(found))).take(RESUME_MOST_ASKED);
         for found in asked {
             match self.ticket_resume_one(hs, found, &receipt_key, &empty(found)) {
                 Asked::Taken => {
@@ -3653,17 +3665,19 @@ impl Signer {
                     return Resumed::Taken;
                 }
                 Asked::No => {}
+                // already waited out, and named: no one is held to it twice. It is asked again each time all the same
+                Asked::Unanswered if lock(&self.ticket_cancel_tried).contains(&format!("unanswered:{}", found.http.id)) => {}
                 // the same seller: another of its sessions would wait as long
                 Asked::Unanswered => {
-                    unanswered = true;
+                    silent = Some(found);
                     break;
                 }
             }
         }
-        if !unanswered {
+        let Some(found) = silent else {
             lock(&self.ticket_late_tries).remove(&waiting);
             return Resumed::Fresh;
-        }
+        };
         // nothing is bought beside a credit the seller will not speak of, for as long as it may yet speak; then the buyer
         // is not held to it any longer, and the owner's record names what may be left. A later session asks again
         let now = self.engine.now();
@@ -3674,13 +3688,10 @@ impl Signer {
                                       json!({"session": hs.sid, "retry_after_s": RESUME_RETRY_AFTER_S})));
         }
         lock(&self.ticket_late_tries).remove(&waiting);
-        for found in candidates.iter().filter(|found| found.sent > 0) {
-            if lock(&self.ticket_cancel_tried).insert(format!("unanswered:{}", found.http.id)) {
-                self.ticket_audit("ticket_left_with_seller", json!({"session": found.newest, "seller_session": found.http.id, "dest": format!("ln:{}", hs.terms.terms.payee),
-                                                                    "origin": hs.origin, "left_msat": Value::Null, "sent_msat": found.sent.to_string(),
-                                                                    "why": "the seller gave no signed answer about it: a new session starts beside it, and a later one asks again"}));
-            }
-        }
+        lock(&self.ticket_cancel_tried).insert(format!("unanswered:{}", found.http.id));
+        self.ticket_audit("ticket_left_with_seller", json!({"session": found.newest, "seller_session": found.http.id, "dest": format!("ln:{}", hs.terms.terms.payee),
+                                                            "origin": hs.origin, "left_msat": Value::Null, "sent_msat": found.sent.to_string(),
+                                                            "why": "the seller gave no signed answer about it: a new session starts beside it, and the next one asks this one first"}));
         Resumed::Fresh
     }
 
@@ -3704,6 +3715,7 @@ impl Signer {
         let sent = found.sent;
         // the seller as it is reached now: its id and key, at this call's address. Its receipt key is on record once it has signed
         let old = SellerSession { base: hs.base.clone(), receipt_key: receipt_key.to_string(), ..found.http.clone() };
+        let old_id = old.id.clone();
         // a seller session the wallet said who it is in, where the owner now stays anonymous: the seller still knows
         // the wallet by it, so it is not taken over. Its credit is given up where the owner's choice is known; a choices
         // file that cannot be read only holds it back, since mending the file brings it back
@@ -3736,11 +3748,22 @@ impl Signer {
         // a signed answer first: only that shows this is the seller that session paid, whatever key its terms name. Then the
         // prepaid tickets of earlier sessions there that the node settled after their call are shown to it, so that its
         // count is the book's (it credits them when shown, or later by its own sweep)
+        // `session_unknown` cannot be signed: from the address the session was opened at, the seller has forgotten it, so
+        // it holds nothing to come back for and uses up no more asks. From another, it says nothing of that session
+        let forgotten = || {
+            if found.http.base != hs.base {
+                return Asked::Unanswered;
+            }
+            if self.ticket_give_up_seller_session(&old_id).is_ok() {
+                self.ticket_audit("ticket_seller_forgot", json!({"session": hs.sid, "seller_session": old_id, "origin": hs.origin, "sent_msat": sent.to_string()}));
+            }
+            Asked::No
+        };
         let first = match self.ticket_resume_status(hs) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 forget();
-                return Asked::No;
+                return forgotten();
             }
             Err(()) => {
                 forget();
@@ -3756,7 +3779,7 @@ impl Signer {
                 Ok(Some(r)) => r,
                 Ok(None) => {
                     forget();
-                    return Asked::No;
+                    return forgotten();
                 }
                 Err(()) => {
                     forget();
@@ -3769,8 +3792,11 @@ impl Signer {
             if r.released_msat == sent {
                 lock(&self.ticket_cancel_tried).insert(empty.to_string());
             }
+            // short of what the book sent, with a ticket the node settled still not shown to it: that is a credit in the
+            // post (the preimage did not reach it, or was not taken for now), and not a reason to buy a second ticket beside it
+            let in_the_post = r.released_msat < sent && !self.ticket_late_prepaid(Some(&earlier)).is_empty();
             forget();
-            return Asked::No;
+            return if in_the_post { Asked::Unanswered } else { Asked::No };
         }
         let balance = r.released_msat - r.spent_msat;
         {
@@ -5369,6 +5395,26 @@ impl Signer {
         slots.iter().find_map(|s| lock(&s.open).as_ref().filter(|h| h.sid == sid).cloned())
     }
 
+    /// Whether this process may have `sid` open, for the watcher, which waits for no call: a place a
+    /// call holds right now (one waiting on a seller's word, say) may be that session's.
+    fn ticket_http_maybe_of(&self, sid: &str) -> bool {
+        let slots: Vec<Arc<Slot>> = lock(&self.ticket_http).values().cloned().collect();
+        slots.iter().any(|s| s.open.try_lock().map_or(true, |open| open.as_ref().is_some_and(|h| h.sid == sid)))
+    }
+
+    /// The sessions of this process with a call or an answer open: never idle, whatever the book last
+    /// saw of them. Waits for no call.
+    pub(crate) fn ticket_sessions_in_use(&self) -> HashSet<String> {
+        let slots: Vec<Arc<Slot>> = lock(&self.ticket_http).values().cloned().collect();
+        slots.iter().filter_map(|s| s.open.try_lock().ok().and_then(|open| open.as_ref().filter(|h| h.streaming.load(Ordering::SeqCst) > 0 || h.calls.try_write().is_err()).map(|h| h.sid.clone()))).collect()
+    }
+
+    /// The seller sessions this process holds for sessions of its own other than `sid`.
+    fn ticket_seller_sessions_held(&self, sid: &str) -> HashSet<String> {
+        let slots: Vec<Arc<Slot>> = lock(&self.ticket_http).values().cloned().collect();
+        slots.iter().filter_map(|s| s.open.try_lock().ok().and_then(|open| open.as_ref().filter(|h| h.sid != sid).map(|h| lock_link(h).seller_sid.clone()))).filter(|id| !id.is_empty()).collect()
+    }
+
     /// `ticket_stop`: stop a session. Where the wallet itself speaks to the seller, it also asks
     /// for the cancel and reports what its own node then shows; otherwise it names the tickets for
     /// the caller to have cancelled, as before.
@@ -5454,17 +5500,38 @@ impl Signer {
     /// Once a ticket, at most.
     fn ticket_prepaid_overdue_tick(&self) {
         for (t, s) in self.ticket_prepaid_overdue() {
-            if !lock(&self.ticket_cancel_tried).insert(format!("overdue:{}", t.hash)) {
+            let key = format!("overdue:{}", t.hash);
+            let now = self.engine.now();
+            if lock(&self.ticket_cancel_tried).contains(&key) || lock(&self.ticket_late_tries).get(&key).is_some_and(|(_, at)| now < *at) {
                 continue;
             }
             let released = self.ticket_seller_released(&s);
+            // no answer says nothing of its credit: the owner is told so, once, and it is asked again later, doubling, for
+            // as long as the credit could be taken over
+            if released.is_none() && now - t.done_ts.max(t.sent_ts) <= crate::ticket_rail::LATE_PREPAID_WITHIN_S {
+                let mut tries = lock(&self.ticket_late_tries);
+                let e = tries.entry(key).or_insert((0, now));
+                e.0 = e.0.saturating_add(1);
+                e.1 = now + (LATE_SHOW_FIRST_WAIT_S * f64::from(1u32 << e.0.min(16).saturating_sub(1))).min(LATE_SHOW_MOST_WAIT_S);
+                let first = e.0 == 1;
+                drop(tries);
+                if first {
+                    self.ticket_audit("ticket_prepay_unanswered", json!({"session": s.id, "origin": s.origin, "dest": format!("ln:{}", t.payee), "hash": t.hash,
+                                                                         "reason": "past the wait for a prepaid ticket this seller did not answer: nothing is known of its credit yet, and it is asked again"}));
+                }
+                continue;
+            }
+            lock(&self.ticket_cancel_tried).insert(key.clone());
+            lock(&self.ticket_late_tries).remove(&key);
             let sent = s.http.as_ref().map_or(0, |h| self.ticket_sent_in(&h.id));
             if released.is_some_and(|r| r >= sent) {
                 continue;
             }
             self.ticket_audit("ticket_prepay_overdue", json!({"session": s.id, "origin": s.origin, "dest": format!("ln:{}", t.payee), "hash": t.hash, "invoice_expired": crate::pyjson::ts_value(t.invoice_expires),
                                                               "seller_released_msat": released.map(|r| r.to_string()), "sent_msat": sent.to_string(),
-                                                              "reason": if t.state == crate::ticket::TState::Settled {
+                                                              "reason": if released.is_none() {
+                                                                  "a prepaid ticket's seller did not answer for as long as its credit could be taken over: nothing is known of that credit"
+                                                              } else if t.state == crate::ticket::TState::Settled {
                                                                   "the wallet's node shows a prepaid ticket paid, and past the wait for it this seller has not credited it: it has the money, and the ticket's credit is not to be had"
                                                               } else {
                                                                   "a prepaid ticket's payment is still in flight past its invoice's life, and this seller has not credited it: a hop on the route, or the seller, holds it"
@@ -5575,7 +5642,7 @@ impl Signer {
                     self.ticket_audit("ticket_prepaid_given_up", json!({"session": sid, "payment_hash": hash, "given_up": 1, "msat": msat.to_string(), "why": "its credit can no longer be taken over"}));
                     continue;
                 }
-                if self.ticket_http_of(&sid).is_some() || lock(&self.ticket_late_tries).get(&hash).is_some_and(|(_, at)| now < *at) {
+                if self.ticket_http_maybe_of(&sid) || lock(&self.ticket_late_tries).get(&hash).is_some_and(|(_, at)| now < *at) {
                     continue;
                 }
             }
@@ -5667,7 +5734,7 @@ impl Signer {
             }
         }
         for s in self.ticket_stopping_with_seller() {
-            if self.ticket_http_of(&s.id).is_some() || !lock(&self.ticket_cancel_tried).insert(s.id.clone()) {
+            if self.ticket_http_maybe_of(&s.id) || !lock(&self.ticket_cancel_tried).insert(s.id.clone()) {
                 continue;
             }
             out.push(json!({"ticket_cancel_asked": self.ticket_cancel_recorded(&s, Duration::ZERO)}));

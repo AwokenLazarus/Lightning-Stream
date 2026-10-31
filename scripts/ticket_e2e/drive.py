@@ -42,6 +42,7 @@ Environment: LAB, RUN, OUT, BIN, TICKET_E2E_PORT_BASE (see the shell script).
 from __future__ import annotations
 
 import base64
+import glob
 import hashlib
 import http.client
 import json
@@ -80,6 +81,7 @@ ORIGIN = f"http://127.0.0.1:{GW_PORT}"
 LIAR = f"http://127.0.0.1:{PROXY_PORT}"
 SPLIT = 125  # the regtest stand-in for the height the chains split at
 TICKET_MSAT = 1_000_000
+ON_THE_WAY_MSAT = 10_000_000  # measured below; see `kill`
 BIG = 100_000_000
 BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
 #: The long_download checks' file: a download that runs well past the wallet's limit for an answer read whole,
@@ -426,6 +428,7 @@ def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
                 gave_up = signer("ticket_stop", {"session": sid, "forget_credit": True})
                 FORGOTTEN.add(sid)
                 GAVE_UP[sid] = str(gave_up.get("left_with_seller_msat"))
+                SELLER_SPENT[sid] = int(gave_up.get("seller_released_msat") or 0) - int(gave_up.get("left_with_seller_msat") or 0)
                 # the seller's own count for that seller session: what a call that died before its receipt could not note
                 if gave_up.get("seller_released_msat") is not None:
                     RECEIPTS[sid] = max(RECEIPTS.get(sid, 0), int(gave_up["seller_released_msat"]))
@@ -438,6 +441,7 @@ def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
 
 CREDIT_TOLD: list[dict[str, Any]] = []  # credit given up, as both sides count it
 GAVE_UP: dict[str, str] = {}  # what the seller said it held of a session, when the session's credit was given up
+SELLER_SPENT: dict[str, int] = {}  # and what it counted as spent there
 
 
 def credit_told_alike() -> list[dict[str, Any]]:
@@ -1327,6 +1331,9 @@ def kill() -> None:
         else:
             killed(victim, "an answer open")
         t.join(200)
+        # what the wallet had of the answer as it died: its body file stays, written as the bytes arrived
+        bodies = glob.glob(f"{RUN}/bodies/ticket-*.bin")
+        received = os.path.getsize(max(bodies, key=os.path.getmtime)) if bodies and victim == "signer" else 0
         if victim != "mcp":
             other.close()
         if result.get("saved_to"):
@@ -1345,6 +1352,12 @@ def kill() -> None:
         if credit is not None:
             credit["seller_left_msat"] = GAVE_UP.get(str(under_way.get("session")))
             credit["ok"] = credit["ok"] or credit["seller_left_msat"] == "0"
+            # and whatever it left, what it charged is what the wallet received, within what was still on its way when the
+            # wallet died (the socket's buffers, at the seller's side and the wallet's): a seller that kept the balance does not pass
+            credit["seller_spent_msat"] = SELLER_SPENT.get(str(under_way.get("session")), 0)
+            credit["received_bytes"] = received
+            credit["unexplained_msat"] = credit["seller_spent_msat"] - received * BYTE_MSAT // PER_BYTES
+            credit["ok"] = credit["ok"] and credit["unexplained_msat"] <= ON_THE_WAY_MSAT
         inv, m, waited = never_sent_settled(booked_and_once(), money())
         how = result.get("error") or result.get("ended") or ("complete" if result.get("complete") else brief(result))
         ok = not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m)

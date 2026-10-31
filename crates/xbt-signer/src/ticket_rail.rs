@@ -59,6 +59,10 @@ use crate::{err, Result};
 /// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
 const OFFER_FETCH_S: i64 = 5;
 
+/// How long a call refused beside a session that stays open is told to wait: that session may be a
+/// long answer, so this is only how soon asking again is worth it.
+const SESSION_EXISTS_RETRY_S: u64 = 30;
+
 /// Why the book books nothing more for a session whose stop has begun ([`Signer::ticket_is_stopping`]).
 const STOPPING: &str = "the session is being stopped: nothing more is released, locked or bought for it";
 
@@ -657,11 +661,10 @@ impl Signer {
         // taken to carry 30 pending payments, and every lock reads them again and refuses without a listing
         let cap = tp.feerate_cap(&self.chain);
         let limits = if held.is_some() { self.ticket_limits_read(&terms.payee, cap).unwrap_or_else(|| Limits::unseen(cap)) } else { Limits::unseen(cap) };
-        // the book as the node has it now: the pool is sized inside what is still locked with this seller, and a
-        // ticket of an earlier session that the seller has cancelled meanwhile is not
-        if held.is_some() {
-            self.ticket_reconcile_locked();
-        }
+        // the book as the node has it now: the pool is sized inside what is still locked with this seller, a ticket of an
+        // earlier session that the seller has cancelled meanwhile is not, and one the node has settled since (a kill, and no
+        // watcher's tick yet) is known as settled to the takeover and to the guard against buying a second
+        self.ticket_reconcile_locked();
         let lp_open = LnPolicy::from_map(&cfg.ln);
         // the most one ticket may book, its fee limit included: below the owner's approval threshold (no
         // one can approve a release as it happens) and within the most one payment may be
@@ -673,7 +676,7 @@ impl Signer {
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             self.ticket_seed(&st.book)?;
             if let Some(s) = st.book.open_with(&terms.payee) {
-                return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first"), json!({"session": s.id})));
+                return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first, or call again when it ends"), json!({"session": s.id, "retry_after_s": SESSION_EXISTS_RETRY_S})));
             }
             if st.book.open_sessions(None) as i64 >= tp.max_sellers {
                 return Ok(refusal("ticket_sellers", format!("{} sessions are open (tickets.max_sellers)", tp.max_sellers)));
@@ -1375,6 +1378,8 @@ impl Signer {
         let lp = LnPolicy::from_map(&self.config().ln);
         let now = self.engine.now();
         let mut out = vec![];
+        // a session with a call or an answer open is not idle, however long since its last ticket
+        let in_use = self.ticket_sessions_in_use();
         let res = (|| -> Result<()> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -1412,7 +1417,7 @@ impl Signer {
             // sessions: stopped when idle, closed when every ticket is final
             let sessions: Vec<Session> = st.book.sessions.values().filter(|s| s.state != SState::Closed).cloned().collect();
             for mut s in sessions {
-                if s.state == SState::Open && now - s.active_ts > SESSION_IDLE_S {
+                if s.state == SState::Open && now - s.active_ts > SESSION_IDLE_S && !in_use.contains(&s.id) {
                     s.state = SState::Stopping;
                     s.stopped_ts = now;
                     s.why = format!("idle for {SESSION_IDLE_S:.0} s");
@@ -2248,9 +2253,9 @@ impl Signer {
         st.commit(&rows)
     }
 
-    /// The stopped seller sessions of the seller `payee` that may still hold a balance, newest first:
-    /// those stopped in the last [`RESUME_WITHIN_S`], other than `sid`, with their seller side on
-    /// record. Keyed on the seller's node, not its address: a shop reached under
+    /// The stopped seller sessions of the seller `payee` that may still hold a balance, oldest first,
+    /// since the oldest is the first to lapse: those stopped in the last [`RESUME_WITHIN_S`], other
+    /// than `sid`, with their seller side on record. Keyed on the seller's node, not its address: a shop reached under
     /// another name (an alias, or an address it moved from) is the same seller. The caller checks
     /// the rest against the seller's signed `status`, under the receipt key of its terms now. With it, what the wallet's own book says left the wallet in
     /// that seller session across every session of the wallet that used it (the seller's totals are
@@ -2260,7 +2265,9 @@ impl Signer {
     /// still hold there (sending, locked, or retired at a start), by session, for the cancel before
     /// the takeover.
     /// One whose receipt key on record is another's is another shop on the same node, and is passed over.
-    pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, sid: &str) -> Vec<Resumable> {
+    /// One with no key on record (killed before its first signed receipt, or from before 0.1.20) has
+    /// nothing to know its seller by but where it was opened: only a call to that `origin` may take it.
+    pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, origin: &str, sid: &str) -> Vec<Resumable> {
         let now = self.engine.now();
         let Ok(g) = self.ticket_store() else { return vec![] };
         let Some(st) = g.as_ref() else { return vec![] };
@@ -2281,6 +2288,7 @@ impl Signer {
             // did (a fault, terms that changed under it): nothing more is released to a seller in such a session, and its
             // balance is not spent either
             if (!on_record.is_empty() && on_record != receipt_key)
+                || (on_record.is_empty() && !group.iter().any(|o| o.origin == origin))
                 || group.iter().any(|o| o.state == SState::Open || o.why.contains(CREDIT_GIVEN_UP) || o.why.starts_with("seller fault") || o.why.contains("terms changed")) {
                 continue;
             }
@@ -2293,6 +2301,7 @@ impl Signer {
             let held = group.iter().map(|o| (o.id.clone(), st.book.of_session(&o.id).into_iter().filter(|t| t.may_take_a_place(now)).map(|t| t.hash.clone()).collect())).collect();
             out.push(Resumable { http, sent, proven, held, newest: s.id.clone() });
         }
+        out.reverse();
         out
     }
 
@@ -2644,7 +2653,7 @@ impl Signer {
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             self.ticket_seed(&st.book)?;
             if let Some(s) = st.book.draws_open_with(&terms.payee, &origin) {
-                return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first"), json!({"session": s.id})));
+                return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first, or call again when it ends"), json!({"session": s.id, "retry_after_s": SESSION_EXISTS_RETRY_S})));
             }
             if st.book.open_sessions(None) as i64 >= tp.max_sellers {
                 return Ok(refusal("ticket_sellers", format!("{} sessions are open (tickets.max_sellers)", tp.max_sellers)));

@@ -1006,6 +1006,11 @@ pub fn prepaid_size(terms: &Terms, pol: &TicketPolicy) -> Result<u64, Refusal> {
 }
 
 /// Why a session whose prepaid ticket had no final answer in time was stopped: not the seller's fault.
+/// Why a session opened for one call was stopped at once, that call told to come back: such a
+/// session bought nothing and holds nothing, and is not a seller newly opened
+/// ([`Book::opened_since`]). (A session's reason is kept cut short.)
+pub const RESUME_WAIT_WHY: &str = "the seller has not said what an earlier session left with it";
+pub const PREPAY_FOLLOW_WHY: &str = "an earlier prepaid ticket with this seller is not followed yet";
 pub const PREPAY_PENDING_WHY: &str = "the payment of a prepaid ticket has no final answer from the wallet's node yet: it is booked as spent until the node shows it \
                                       failed, and a later call takes up its credit with this seller once the node shows it paid";
 /// How long past a prepaid invoice's life the wallet waits for the seller to follow its payment: the
@@ -1586,7 +1591,7 @@ impl Book {
 
     /// Sessions opened since `t`.
     pub fn opened_since(&self, t: f64) -> usize {
-        self.sessions.values().filter(|s| s.opened_ts >= t).count()
+        self.sessions.values().filter(|s| s.opened_ts >= t && !s.why.starts_with(&RESUME_WAIT_WHY[..40]) && !s.why.starts_with(&PREPAY_FOLLOW_WHY[..40])).count()
     }
 
     /// Ticket payments handed to the router since `t`.

@@ -545,9 +545,8 @@ wallet) and against a stand-in node in its tests.
   such locks are for prepaid tickets: an unauthenticated lock for held ones is refused
   `prepaid_first`, so the 15 held places go only to sessions that have paid one ticket each; the
   invoices of a first lock lapse after 60 s (`caps.first_lock_secs`), and the gateway gives one up
-  unpaid 15 s after that, at 75 s, with its session's place, whatever `caps.first_use_secs` says
-  (before the fix, the first-use sweep cancelled it at 61 s as shipped, and at 16 s with a
-  `first_use_secs` of 15); and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`). Until
+  unpaid 15 s after that, at 75 s, with its session's place, whatever `caps.first_use_secs` says;
+  and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`). Until
   0.1.20 a first lock's invoices lapsed after 20 s: a buyer whose payment took longer than that to
   reach the seller over a slow route was refused at the seller's node every time, with nothing
   paid, and could never open a session (measured on the lab route at 8 to 22 s a hop under load).
@@ -920,10 +919,12 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   payment failed, or, for a payment the node never had, 60 seconds after the timeout. Until
   0.1.20 the wait was the whole `timeout_s` (up to 600 s), and such a session was stopped as the
   seller's fault, which left its credit with the seller.
-- The wallet keeps a prepaid ticket's preimage in memory until the seller has credited it. A
-  signer killed in between has paid for a ticket whose balance it then gives up with the
-  session, as it gives up any balance at a restart. The gateway credits the session all the
-  same, 75 seconds after it issued the invoice.
+- A signer killed between a prepaid ticket's payment and the seller's credit has lost nothing: the
+  book marks the ticket as it settles, the watcher shows the seller its preimage from the node's
+  record, and the next call to that seller takes the credit over. Until a shown ticket is
+  credited, for two minutes at the most, that call is refused with `retry_after_s`
+  (`ticket_seller_unanswered`), so that no second ticket is bought beside it. The gateway also
+  credits the session by itself, 75 seconds after it issued the invoice.
 - The slot and dust checks, the wait after a failed lock and the fallback run on the wallet's
   own node and on what the seller says. A seller that always answers `slots_short` is paid with
   prepaid tickets or not at all; it cannot make the wallet hold more, pay more, or pay sooner.

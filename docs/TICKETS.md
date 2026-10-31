@@ -2030,7 +2030,9 @@ fit, and says which limit and by how much.
 signer starting again) may leave prepaid credit at the seller, which keeps a session with a balance
 for a day (section 4). Credit is the seller's, not its address's: when the next call opens a session
 with the same seller (its node), under any address, the wallet first looks through the seller
-sessions it stopped in the last 20 hours, newest first, asking four at most. One it still holds open under
+sessions it stopped in the last 20 hours, oldest first since the oldest lapses first, asking four at
+most. A session the seller has forgotten (`session_unknown`, from the address it was opened at) is
+given up and not asked about again. One it still holds open under
 another address (an alias of the shop, or the address it moved from) is stopped first, unless a call
 is using it right now. If the seller's `status` for one, signed with the receipt key of the seller's terms now,
 credits exactly what the wallet's own book says left the wallet in that seller session, and shows
@@ -2039,12 +2041,17 @@ session starts fresh. The seller's word moves no money: it only lets the wallet 
 counts as paid. Only a seller with the same receipt key is taken over: another shop on the same node
 is another seller, even though its payments reach the same node. A key is public, so naming it proves nothing:
 a session's key goes on record at its first signed receipt, and one with another key on record is not asked about at all.
+One with no key on record (killed before its first signed receipt, or from before 0.1.20) is taken over only at the address it was opened at.
+A `session_unknown` from any other address cannot be signed and says nothing of that session: it counts as no answer.
 
-A `status` that does not answer is asked again, three times in all, a few seconds each. Still none, and the call is refused
-(`ticket_seller_unanswered`, with `retry_after_s`), with no new seller session and nothing bought beside
-a credit that may be there. Past 2 minutes of that the buyer is not held to it: the call starts fresh, and the audit
-names the session left behind (`ticket_left_with_seller`, `left_msat` null, with what the book sent). A later
-call still looks at that session, so its credit can be taken over once the seller answers.
+A `status` that does not answer is asked again, three times in all, a few seconds each. Still none, or
+a signed count short of what the book sent while a ticket the node settled has not been taken from its
+preimage, and the call is refused (`ticket_seller_unanswered`, with `retry_after_s`), with no new seller
+session and nothing bought beside a credit that may be there. Calls queued behind that wait, and any in the
+next few seconds, have the same refusal at once, none counts against `max_new_sellers_per_min`, and the watcher does not wait for them. Past 2
+minutes of that the buyer is not held to it: the call starts fresh, and the audit names the session asked
+and left behind (`ticket_left_with_seller`, `left_msat` null, with what the book sent). The next call that
+opens a session asks that one first, so its credit is used as soon as the seller answers, and it holds no one up again.
 
 Only after that signed `status` does a takeover show the seller the preimages of prepaid tickets its
 earlier sessions never delivered (below), and only signed answers count; it asks `status` again where those
@@ -2073,8 +2080,10 @@ with `left_msat` null where the seller did not say. Giving up a stopped session'
 (`forget_credit`) answers the amount, as the seller counts it, and what it credited in that seller session.
 
 A stop or a takeover cancels by hash: every ticket that may hold a place at the seller, including a hash offered and not
-yet paid, whose invoice still counts against the session's cap. A session of the same seller session another
-wallet session has open is not taken over, and so never has its tickets named.
+yet paid, whose invoice still counts against the session's cap. A seller session that a session of this process
+still holds, whatever the book says of it, or that one on the book has open, is not taken over, and so never has its tickets named.
+The book does not call a session idle while it has a call or an answer open. A call under another address on other terms, beside
+a session that stays open, is refused `ticket_session_exists` with `retry_after_s`: asking again is worth it then, though that session may be a long answer.
 
 ## 17. Requests side by side in one session (2026-10-29)
 
