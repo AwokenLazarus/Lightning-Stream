@@ -264,6 +264,11 @@ fn refusal(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "ticket", "charged_sats": 0}))
 }
 
+/// Why nothing more is released into a session being stopped ([`HttpSession::ending`]).
+fn stopping_refusal() -> Value {
+    refusal("ticket_session", "the session is being stopped: no ticket is released")
+}
+
 // --- HTTP as this module needs it ---------------------------------------------------------------------
 
 /// The head of an answer, and its body still to be read.
@@ -2629,6 +2634,12 @@ impl Signer {
                     }
                 }
             }
+            // a session being stopped: its open answers are taking their last receipts, and what it leaves with the seller
+            // is not yet known. A new session now would open beside it, without that credit: the caller asks again
+            if open.as_ref().is_some_and(|h| h.ending.load(Ordering::SeqCst)) {
+                break 'open Err(Tried::Done(with(refusal("ticket_busy", "the session with this seller is being stopped: call again in a moment"),
+                                                 json!({"retry_after_s": 1}))));
+            }
             // a session the book no longer holds open (stopped by the agent, idle, a fault) is gone
             if let Some(h) = open.as_ref().filter(|h| h.fault().is_some() || !self.ticket_session(&h.sid).is_some_and(|s| s.state == SState::Open)).cloned() {
                 *open = None;
@@ -3039,7 +3050,8 @@ impl Signer {
     fn ticket_buy_prepaid(&self, hs: &HttpSession, spent: &mut Spent) -> std::result::Result<(), Value> {
         // nothing is paid to a seller found at fault, by this answer or one beside it: asked here, after the node's own
         // check, and again just before the payment
-        let at_fault = || hs.fault().map(|why| self.ticket_fault(hs, &why));
+        // or the session is being stopped: nothing more is bought for it
+        let at_fault = || hs.fault().map(|why| self.ticket_fault(hs, &why)).or_else(|| hs.ending.load(Ordering::SeqCst).then(stopping_refusal));
         if let Some(d) = at_fault() {
             return Err(d);
         }
@@ -3546,10 +3558,6 @@ impl Signer {
     /// finding the balance covers them now, release nothing (`Ok`). A secret that has left and is
     /// not confirmed is delivered whatever it says.
     fn ticket_release_one(&self, hs: &HttpSession, spent: &mut Spent, opened: Instant, still_due: &dyn Fn() -> bool) -> std::result::Result<(), Value> {
-        // a session being stopped is released nothing more: its open answers end on the credit they have
-        if hs.ending.load(Ordering::SeqCst) {
-            return Err(refusal("ticket_session", "the session is being stopped: no ticket is released"));
-        }
         // a seller blocked meanwhile (another session of it over-charged) is released nothing more
         if let Some(b) = self.seller_blocked(hs) {
             return Err(with(deny("seller_blocked", format!("this seller was caught charging more than it delivered ({}) and is blocked: nothing more \
@@ -3601,9 +3609,15 @@ impl Signer {
         if !self.ticket_may_reach(&hs.origin, &hs.task) {
             return Err(refusal("allowlist", format!("destination not on allowlist: {}", hs.origin)));
         }
-        // a secret that has left and was not confirmed goes first, the same one: that is this release
+        // a secret that has left and was not confirmed goes first, the same one: that is this release. It is delivered
+        // even to a session being stopped: it has left already, and the seller holds it either way
         if lock_money(hs).pending.is_some() {
             return self.ticket_deliver(hs);
+        }
+        // a session being stopped is released nothing more: its open answers end on the credit they have. Asked under
+        // `paying`, and again before each step that could release one (the book stays open while a stop waits)
+        if hs.ending.load(Ordering::SeqCst) {
+            return Err(stopping_refusal());
         }
         // another request released one while this one waited: nothing more is due
         if !still_due() {
@@ -3699,6 +3713,9 @@ impl Signer {
                 }
             }
             // stopped meanwhile (its tickets are being cancelled, so the seller will never show this one locked)
+            if hs.ending.load(Ordering::SeqCst) {
+                return Err(stopping_refusal());
+            }
             if !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
                 return Err(refusal("ticket_session", "the session was stopped: nothing more is released for it"));
             }
@@ -3733,9 +3750,12 @@ impl Signer {
             return Err(d);
         }
         // asked again just before the book: another answer may have found the seller at fault while this one waited for it
-        // to show the ticket ready, and nothing more is released to a seller at fault
+        // to show the ticket ready, and nothing more is released to a seller at fault, or into a session being stopped
         if let Some(why) = hs.fault() {
             return Err(self.ticket_fault(hs, &why));
+        }
+        if hs.ending.load(Ordering::SeqCst) {
+            return Err(stopping_refusal());
         }
         // 2. the book: booked, then the secret exists here
         let r = {
@@ -3844,7 +3864,8 @@ impl Signer {
         }
         // a call that found the session as it was being stopped goes no further in it
         if hs.ending.load(Ordering::SeqCst) {
-            return fail(hs, &spent, refusal("ticket_session", "the session was stopped: nothing was asked of the seller in it"));
+            return fail(hs, &spent, with(refusal("ticket_busy", "the session with this seller is being stopped: nothing was asked of the seller in it; call \
+                                                                 again in a moment"), json!({"retry_after_s": 1})));
         }
         if let Some(why) = hs.fault() {
             return fail(hs, &spent, self.ticket_fault(hs, &why));
@@ -4698,6 +4719,17 @@ impl Signer {
         // from here no ticket is released in the session, no new call takes it, and its open answers end: a stream
         // (a WebSocket, a VPN tunnel, a body read as it comes) stops reading and takes its last receipt as it closes
         hs.ending.store(true, Ordering::SeqCst);
+        // a stop that may wait (the caller's own) waits for those last receipts, so that what the session leaves with
+        // the seller below counts what the streams drew. Waited for here, holding nothing of the session or its slot
+        // (the slot still names the session meanwhile, so that a new call to the seller is told to call again rather
+        // than opening another session beside it); a stop with no wait (one made inside an answer, at a fault, or by
+        // the wallet itself) does not wait, and one made inside an answer must not: that answer is among the open streams
+        if !wait.is_zero() {
+            let streams_by = Instant::now() + wait.max(STOP_STREAMS_WAIT);
+            while hs.streaming.load(Ordering::SeqCst) > 0 && Instant::now() < streams_by {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         {
             let slot = lock(&self.ticket_http).get(&hs.origin).cloned();
             if let Some(slot) = slot {
@@ -4708,16 +4740,6 @@ impl Signer {
                 }
             }
             self.ticket_slot_drop(&hs.origin);
-        }
-        // a stop that may wait (the caller's own) waits for those last receipts, so that what the session leaves with
-        // the seller below counts what the streams drew. Waited for here, holding nothing of the session or its slot;
-        // a stop with no wait (one made inside an answer, at a fault, or by the wallet itself) does not wait, and one
-        // made inside an answer must not: that answer is itself among the open streams
-        if !wait.is_zero() {
-            let streams_by = Instant::now() + wait.max(STOP_STREAMS_WAIT);
-            while hs.streaming.load(Ordering::SeqCst) > 0 && Instant::now() < streams_by {
-                std::thread::sleep(Duration::from_millis(20));
-            }
         }
         let still_streaming = hs.streaming.load(Ordering::SeqCst) > 0;
         let stopped = {
