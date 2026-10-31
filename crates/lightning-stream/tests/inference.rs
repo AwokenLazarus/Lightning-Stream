@@ -341,9 +341,8 @@ fn call(addr: &str, method: &str, path: &str, auth: Option<&str>, extra: &str, b
     if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
         let mut out = vec![];
         let mut rest = &body[..];
-        loop {
-            // a body cut short has no last chunk ([`chat_raw`] tells them apart)
-            let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") else { break };
+        // a body cut short has no last chunk ([`chat_raw`] tells them apart)
+        while let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") {
             let n = usize::from_str_radix(std::str::from_utf8(&rest[..nl]).unwrap().trim(), 16).unwrap();
             if n == 0 {
                 break;
