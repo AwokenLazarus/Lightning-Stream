@@ -724,8 +724,7 @@ mod come_back_tests {
             jobs_shown_blinded: 0,
             blinding: None,
             keys_seen: Vec::new(),
-        keys_seen: Vec::new(),
-        first_proven: None,
+            first_proven: None,
             dues: 0,
             last_due: None,
         }))
