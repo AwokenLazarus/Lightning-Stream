@@ -318,6 +318,8 @@ fn ended_words(why: &str) -> String {
         "shares harder than the difficulty said" => "The hashmaker stopped it: its miners' work looked harder than your pool said.".into(),
         "the gateway's jobs aren't blinded" => "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.".into(),
         "shares on an old job" => "The miners kept working on an out-of-date job, so the rental stopped.".into(),
+        "too many waits for payment" => "The hashmaker stopped it: your payments kept arriving late.".into(),
+        "the route to this hashmaker is too slow for its miners' rate" => "Your wallet's payments take longer to reach this hashmaker than its miners take to use them. Rent fewer or slower miners, or from a hashmaker your node reaches faster.".into(),
         "too many resumes" => "The connection to the hashmaker came and went too often, so it stopped.".into(),
         "shares arrive too old" => "The miners' work kept arriving late, so the rental stopped.".into(),
         "shares that don't prove" => "The hashmaker sent work that doesn't check out, so the rental stopped.".into(),
@@ -607,7 +609,7 @@ impl App {
             <label>Name, as hashtakers see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
             {}\
             <label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{}> Rent out my miners</label>\
-            <p class=\"hint\">A renter gets no work it hasn't paid for. If it stops paying, your miners go back to your own pool within seconds. Your node checks every share's hash itself, so a renter's word doesn't set what the work is worth.</p>\
+            <p class=\"hint\">A renter gets no work it hasn't paid for. If it stops paying, your miners go back to your own pool within seconds. A renter whose payment is slow to arrive can send them back to it for up to 10 seconds while it does. Your node checks every share's hash itself, so a renter's word doesn't set what the work is worth.</p>\
             <details><summary>Advanced</summary>\
             <label>Work in each piece (hashes) <small>(empty: about one share of your fastest miner)</small><input name=\"slice_work\" value=\"{}\" placeholder=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]*\" class=\"mono\"></label>\
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\

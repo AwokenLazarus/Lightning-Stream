@@ -271,7 +271,7 @@ fn w(v: &Value) -> u128 {
 
 /// Is another slice due by the renter's rule, at this count, with shares of this size?
 fn due(terms: &Terms, proven: u128, largest_share: u128, paid: u64) -> bool {
-    order::Standing { proven, largest_share, paid, start_slices: terms.start_slices, slice_work: terms.slice_work, price_msat: terms.price_msat, msat_a_second: 0.0 }.pay_next()
+    order::Standing { proven, largest_share, paid, start_slices: terms.start_slices, slice_work: terms.slice_work, price_msat: terms.price_msat, msat_a_second: 0.0, buy_secs: 0.0 }.pay_next()
 }
 
 /// Every payment was due by the hashtaker's rule when it was made: each receipt says its proven count

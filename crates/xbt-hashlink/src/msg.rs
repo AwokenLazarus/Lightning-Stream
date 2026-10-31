@@ -7,6 +7,7 @@
 //! | `welcome` | hashmaker | the terms are accepted; their hash; the proof, repeated |
 //! | `resend` | hashmaker | after a `resume`: a recent share the hashtaker may never have read, for its count alone |
 //! | `due` | hashmaker | a share is waiting for payment: what this side has proven, and has been paid |
+//! | `paying` | hashtaker | a payment is on its way: wait for it up to 10 s, with the miners on the hashmaker's own pool |
 //! | `open` | hashmaker | a miner connected: channel id and its worker name |
 //! | `up` | hashmaker | a Stratum V1 line from that miner (subscribe, authorize, submit: only shares its hash proves) |
 //! | `down` | hashtaker | a Stratum V1 line from the hashtaker's gateway (notify, set_difficulty: the jobs; the results of submits: the gateway's verdicts) |
@@ -67,6 +68,8 @@ pub enum Msg {
     Resend { chan: u32, line: String },
     /// A proven share doesn't fit in what's paid, and waits on a short clock.
     Due { work: u128, paid: u64 },
+    /// A payment is on its way, after a `due`.
+    Paying,
     Open { chan: u32, worker: String },
     Up { chan: u32, line: String },
     Down { chan: u32, line: String },
@@ -93,6 +96,7 @@ impl Msg {
             Msg::Welcome { rental, terms_hash, proof } => json!({"t": "welcome", "rental": rental, "termsHash": terms_hash, "proof": proof}),
             Msg::Resend { chan, line } => json!({"t": "resend", "chan": chan, "line": line}),
             Msg::Due { work, paid } => json!({"t": "due", "work": work.to_string(), "paid": paid}),
+            Msg::Paying => json!({"t": "paying"}),
             Msg::Open { chan, worker } => json!({"t": "open", "chan": chan, "worker": worker}),
             Msg::Up { chan, line } => json!({"t": "up", "chan": chan, "line": line}),
             Msg::Down { chan, line } => json!({"t": "down", "chan": chan, "line": line}),
@@ -127,6 +131,7 @@ impl Msg {
             "welcome" => Msg::Welcome { rental: s("rental")?, terms_hash: s("termsHash")?, proof: s("proof") },
             "resend" => Msg::Resend { chan: chan()?, line: s("line")? },
             "due" => Msg::Due { work: s("work")?.parse().ok()?, paid: u("paid")? },
+            "paying" => Msg::Paying,
             "open" => Msg::Open { chan: chan()?, worker: s("worker")? },
             "up" => Msg::Up { chan: chan()?, line: s("line")? },
             "down" => Msg::Down { chan: chan()?, line: s("line")? },
@@ -155,6 +160,7 @@ mod tests {
             Msg::Welcome { rental: "r".into(), terms_hash: "00".into(), proof: Some(PROOF.into()) },
             Msg::Resend { chan: 3, line: "{\"id\":1}".into() },
             Msg::Due { work: 1 << 70, paid: 4 },
+            Msg::Paying,
             Msg::Up { chan: 3, line: "{\"id\":1}".into() },
             Msg::Pay { slice: 2, preimage: "00".into(), receipt: json!({"a": 1}) },
             Msg::Rate { hs: 1.5e12, miners: 2 },

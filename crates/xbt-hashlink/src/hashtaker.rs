@@ -20,7 +20,7 @@ use crate::rail::{sha256, HashtakerRail, SignerPayer};
 use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -66,6 +66,8 @@ pub struct Config {
 
 /// Tickets kept locked ahead of the work.
 const AHEAD: u64 = 2;
+/// Ticket buys whose time is kept, for the trigger.
+const BUYS_KEPT: usize = 16;
 /// Job keys kept for the report.
 const KEYS_REPORTED: usize = 1024;
 /// Refused shares a rental stands before it asks how they compare with the proven ones.
@@ -112,6 +114,9 @@ struct St {
     /// The hashmaker said a share waits for payment, how many times, and its last count when it did.
     dues: u64,
     last_due: Option<(u128, u64)>,
+    /// Payments queued for the wallet and not yet answered, and how long the last ones that bought a ticket took.
+    in_flight: u64,
+    buys: VecDeque<f64>,
 }
 
 impl St {
@@ -167,6 +172,11 @@ impl St {
             slice_work: self.terms.slice_work,
             price_msat: self.terms.price_msat,
             msat_a_second,
+            buy_secs: {
+                let mut b: Vec<f64> = self.buys.iter().copied().collect();
+                b.sort_by(f64::total_cmp);
+                b.get(((b.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)).copied().unwrap_or(0.0)
+            },
         }
     }
 
@@ -202,6 +212,7 @@ impl St {
                 if self.pay_failed || q.send((slice, receipt.clone())).is_err() {
                     return;
                 }
+                self.in_flight += 1;
                 self.receipts.push(receipt);
                 self.released = slice;
                 continue;
@@ -315,6 +326,8 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
         first_proven: None,
         dues: 0,
         last_due: None,
+        in_flight: 0,
+        buys: VecDeque::new(),
     }));
     lock(&st).lock_ahead(&tx);
     let blind_check = if cfg.allow_unblinded { None } else { cfg.gateway_api.clone().map(|a| Arc::new(blind::Check::new(a))) };
@@ -337,6 +350,13 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 let r = p.pay(&rental, slice, &receipt);
                 let mut g = lock(&st);
                 let ms = t0.elapsed().as_millis() as u64;
+                g.in_flight = g.in_flight.saturating_sub(1);
+                if r.as_ref().is_ok_and(|v| v["charged_sats"].as_u64().is_some_and(|c| c > 0)) {
+                    if g.buys.len() == BUYS_KEPT {
+                        g.buys.pop_front();
+                    }
+                    g.buys.push_back(ms as f64 / 1000.0);
+                }
                 match r {
                     Ok(v) => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": true, "wallet": v})),
                     Err(why) => {
@@ -373,6 +393,8 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 Some("cut by the hashtaker")
             } else if no_more && !order::fits(g.meter.work, largest.max(1), g.released, g.terms.start_slices, s) {
                 Some("budget used up")
+            } else if g.standing().too_slow() {
+                Some("the route to this hashmaker is too slow for its miners' rate")
             } else if g.pay_failed && g.paid_slices() == 0 {
                 Some("the first slice could not be paid")
             } else if g.last_work.elapsed() > idle {
@@ -485,6 +507,10 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 g.dues += 1;
                 g.last_due = Some((work, paid));
                 g.settle_up(&tx);
+                // a payment on its way: the hashmaker waits for it, its miners on its own pool meanwhile
+                if g.in_flight > 0 {
+                    let _ = tx.send(&Msg::Paying);
+                }
             }
             Msg::Resend { chan, line } => {
                 // counted once if it proves; its gateway session ended with the old link
@@ -727,6 +753,8 @@ mod come_back_tests {
             first_proven: None,
             dues: 0,
             last_due: None,
+            in_flight: 0,
+            buys: VecDeque::new(),
         }))
     }
 

@@ -10893,7 +10893,7 @@ impl Renter {
         let _ = std::fs::remove_file(&sock);
         let running = xbt_signer::server::spawn(r.s.clone(), &sock, false).unwrap();
         let payer = xbt_hashlink::rail::SignerPayer::new(sock, r.shop.url("/hashrate"), task.into(), price_msat, budget_sats, None, Duration::from_secs(5));
-        let standing = xbt_hashlink::order::Standing { proven: 0, largest_share: SLICE_WORK, paid: 0, start_slices, slice_work: SLICE_WORK, price_msat, msat_a_second: 0.0 };
+        let standing = xbt_hashlink::order::Standing { proven: 0, largest_share: SLICE_WORK, paid: 0, start_slices, slice_work: SLICE_WORK, price_msat, msat_a_second: 0.0, buy_secs: 0.0 };
         Self { payer, standing, _running: running }
     }
 

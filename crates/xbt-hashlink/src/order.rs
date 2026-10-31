@@ -16,6 +16,11 @@ pub const FIRST_STEP_MSAT: u64 = 546_000;
 pub const STEP_SECONDS: f64 = 30.0;
 /// How long a share that doesn't fit waits for payment before the rental stops.
 pub const WAIT_FOR_PAYMENT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long it waits instead when the renter has said a payment is on its way (`paying`). Its miners hash for the
+/// hashmaker's own pool meanwhile, so the wait costs it nothing but the move.
+pub const WAIT_FOR_PAYING: std::time::Duration = std::time::Duration::from_secs(10);
+/// Such waits a rental may have in an hour.
+pub const PAYING_WAITS_AN_HOUR: usize = 6;
 /// A share may be worth this many slices at most. Past it a renter would pay many slices ahead of one share.
 pub const LARGEST_SHARE_SLICES: u128 = 4;
 
@@ -59,6 +64,8 @@ pub struct Standing {
     pub slice_work: u128,
     pub price_msat: u64,
     pub msat_a_second: f64,
+    /// How long buying a ticket takes, as measured (p95 of the last few); 0 till one is measured.
+    pub buy_secs: f64,
 }
 
 impl Standing {
@@ -86,7 +93,32 @@ impl Standing {
             return true;
         }
         let after = covered + self.slice_work;
-        self.msat_of(after.saturating_sub(self.proven)) <= self.step_msat()
+        if self.msat_of(after.saturating_sub(self.proven)) > self.step_msat() {
+            return false;
+        }
+        // with the output and a buy's time measured: pay once what's paid runs short of two buys' time. Before that,
+        // keep the step paid ahead
+        if self.msat_a_second <= 0.0 || self.buy_secs <= 0.0 {
+            return true;
+        }
+        self.secs_left() < 2.0 * self.buy_secs
+    }
+
+    /// How long what's paid and not yet worked lasts at the measured output.
+    pub fn secs_left(&self) -> f64 {
+        let covered = paid_work(self.paid, self.start_slices, self.slice_work);
+        if self.msat_a_second <= 0.0 {
+            return f64::INFINITY;
+        }
+        self.msat_of(covered.saturating_sub(self.proven)) as f64 / self.msat_a_second
+    }
+
+    /// The route is too slow for this miner's rate: the most the renter may have paid ahead, and the hashmaker's wait for
+    /// a payment on its way, last less than a ticket takes to buy. Said in words, before a share waits past them.
+    pub fn too_slow(&self) -> bool {
+        self.msat_a_second > 0.0
+            && self.buy_secs > 0.0
+            && (self.step_msat() as f64 / self.msat_a_second) + WAIT_FOR_PAYING.as_secs_f64() < self.buy_secs
     }
 
     /// The largest ticket worth buying for the payment that's due. With the start fee on the first, whose share
@@ -132,7 +164,7 @@ mod tests {
     }
 
     fn at(proven: u128, largest_share: u128, paid: u64) -> Standing {
-        Standing { proven, largest_share, paid, start_slices: 2, slice_work: 1000, price_msat: 400_000, msat_a_second: 0.0 }
+        Standing { proven, largest_share, paid, start_slices: 2, slice_work: 1000, price_msat: 400_000, msat_a_second: 0.0, buy_secs: 0.0 }
     }
 
     #[test]
@@ -182,7 +214,7 @@ mod tests {
     /// and no further.
     #[test]
     fn the_renter_keeps_the_step_paid_ahead_and_no_more() {
-        let s = |paid| Standing { proven: 0, largest_share: 100, paid, start_slices: 0, slice_work: 1000, price_msat: 100_000, msat_a_second: 0.0 };
+        let s = |paid| Standing { proven: 0, largest_share: 100, paid, start_slices: 0, slice_work: 1000, price_msat: 100_000, msat_a_second: 0.0, buy_secs: 0.0 };
         assert!(s(1).pay_next() && s(4).pay_next(), "up to 500 sat unused, under the 546 sat step");
         assert!(!s(5).pay_next(), "600 sat unused would pass the step");
     }
@@ -203,5 +235,66 @@ mod tests {
         let s = Standing { price_msat: 1_000_000, start_slices: 1, ..at(0, 0, 0) };
         assert_eq!(s.ticket_msat(), 2_000_000);
         assert_eq!(at(0, 0, 3).ticket_msat(), 546_000);
+    }
+
+    /// A rental on a timeline: a share every second, each payment that buys a ticket taking `buy` seconds to arrive
+    /// (one in every `per_ticket` payments). A share that doesn't fit waits 2 s, or 10 s while a payment is on its way
+    /// (`paying`). What the most paid ahead came to, whether a share waited past that, whether the route was said to be
+    /// too slow, and how many 10 s waits there were.
+    fn timeline(price_msat: u64, buy: f64, per_ticket: u64, seconds: u64) -> (u64, bool, bool, usize) {
+        let slice = 1000u128;
+        let share = 100u128;
+        let mut s = Standing { proven: 0, largest_share: share, paid: 0, start_slices: 0, slice_work: slice, price_msat, msat_a_second: 0.0, buy_secs: 0.0 };
+        let mut arrives: Vec<f64> = Vec::new();
+        let (mut most_ahead, mut stalled, mut said_slow, mut waits) = (0u64, false, false, 0usize);
+        for t in 0..seconds {
+            let now = t as f64;
+            while s.pay_next() {
+                s.paid += 1;
+                let slow = s.paid % per_ticket == 1;
+                arrives.push(now + if slow { buy } else { 0.01 });
+                if slow {
+                    s.buy_secs = buy;
+                }
+            }
+            said_slow |= s.too_slow();
+            let issued = paid_work(s.paid, 0, slice);
+            most_ahead = most_ahead.max(s.msat_of(issued - s.proven));
+            assert!(s.msat_of(issued - s.proven) <= s.step_msat().max(s.msat_of(slice)), "never past the step: t {now}");
+            let arrived = |at: f64| arrives.iter().filter(|a| **a <= at).count() as u64;
+            if s.proven + share > paid_work(arrived(now), 0, slice) {
+                let on_its_way = arrived(f64::INFINITY) > arrived(now);
+                let wait = if on_its_way { WAIT_FOR_PAYING } else { WAIT_FOR_PAYMENT }.as_secs_f64();
+                if s.proven + share > paid_work(arrived(now + wait), 0, slice) {
+                    stalled = true;
+                    break;
+                }
+                waits += usize::from(on_its_way && s.proven + share > paid_work(arrived(now + WAIT_FOR_PAYMENT.as_secs_f64()), 0, slice));
+            }
+            s.proven += share;
+            s.msat_a_second = if t >= 2 { s.msat_of(s.proven) as f64 / (now + 1.0) } else { 0.0 };
+        }
+        (most_ahead, stalled, said_slow, waits)
+    }
+
+    /// Payments that take 8 s to buy a ticket. A small miner's step outlasts two buys, so nothing waits; a large one's
+    /// first steps don't, and it waits on `paying` a few times, within the hour's limit, then its step outlasts them.
+    #[test]
+    fn slow_ticket_buys_keep_a_rental_running_small_or_large() {
+        // 10 sat a slice of 10 shares, a share a second: the 546 sat step lasts 546 s
+        let (most, stalled, slow, waits) = timeline(10_000, 8.0, 54, 3600);
+        assert!(!stalled && !slow && waits == 0, "small: most ahead {most}, waits {waits}");
+        assert!(most <= 546_000);
+        // 1,000 sat a slice: 100 sat a second; the 546 sat step lasts 5.46 s at first, against a buy of 8 s
+        let (most, stalled, slow, waits) = timeline(1_000_000, 8.0, 1, 3600);
+        assert!(!stalled && !slow, "large: most ahead {most}, waits {waits}");
+        assert!(waits <= PAYING_WAITS_AN_HOUR, "large: {waits} waits in the hour");
+    }
+
+    /// A buy slower than the step and the 10 s wait together: said in words.
+    #[test]
+    fn a_route_too_slow_for_the_miner_is_said_in_words() {
+        let (_, _, slow, _) = timeline(1_000_000, 20.0, 1, 120);
+        assert!(slow, "a 20 s buy against a 5.46 s step and a 10 s wait");
     }
 }

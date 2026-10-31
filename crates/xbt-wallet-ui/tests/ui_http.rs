@@ -2523,7 +2523,7 @@ fn renting_out_starts_unticked_says_what_a_renter_can_do_and_keeps_a_saved_choic
     let mut br = logged_in(&bx);
     const OFF: &str = "name=\"enabled\" value=\"1\"> Rent out my miners";
     const ON: &str = "name=\"enabled\" value=\"1\" checked> Rent out my miners";
-    const WARNING: &str = "A renter gets no work it hasn&#39;t paid for. If it stops paying, your miners go back to your own pool within seconds. Your node checks every share&#39;s hash itself, so a renter&#39;s word doesn&#39;t set what the work is worth.";
+    const WARNING: &str = "A renter gets no work it hasn&#39;t paid for. If it stops paying, your miners go back to your own pool within seconds. A renter whose payment is slow to arrive can send them back to it for up to 10 seconds while it does. Your node checks every share&#39;s hash itself, so a renter&#39;s word doesn&#39;t set what the work is worth.";
     assert!(!settings.exists(), "nothing saved yet");
     let p = br.get("/sell-hashrate");
     assert!(p.body.contains(OFF) && !p.body.contains(ON), "first view: not ticked: {}", p.body);

@@ -261,6 +261,10 @@ struct Rental {
     /// Proven shares that don't fit in what's paid, in the order they came, and since when.
     held: VecDeque<Held>,
     held_since: Option<Instant>,
+    /// Waiting for a payment the renter said is on its way, its miners on the hashmaker's own pool meanwhile; and when
+    /// each such wait began, for the limit an hour.
+    waiting_since: Option<Instant>,
+    waits: VecDeque<Instant>,
     /// The link dropped: until this deadline the rental waits for the hashtaker to come back
     /// ([`Msg::Resume`]), its miners on the fallback meanwhile; past it, the rental ends.
     suspended: Option<(Instant, String)>,
@@ -339,6 +343,7 @@ impl Rental {
             "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "miners": self.units.iter().collect::<Vec<_>>(), "want": self.want, "startedMs": self.started_ms,
             "ready": self.ready, "suspended": self.suspended.is_some(), "servedMs": self.served.as_millis() as u64,
+            "waitingForPayment": self.waiting_since.is_some(), "paymentWaits": self.waits.len(),
             "unitWork": self.unit_work.iter().map(|(u, w)| (u.clone(), Value::from(w.to_string()))).collect::<serde_json::Map<_, _>>(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "paid": self.paid, "earnedMsat": self.paid * self.terms.price_msat,
@@ -412,7 +417,7 @@ impl Hub {
     /// Where a unit's miner should hash now: a ready rental, or the fallback (`None`).
     fn target(&self, unit: &str) -> Option<String> {
         let r = self.units.get(unit)?.rental.as_ref()?;
-        self.rentals.get(r).filter(|r| r.ready && r.suspended.is_none() && r.stopped.is_none()).map(|r| r.id.clone())
+        self.rentals.get(r).filter(|r| r.ready && r.suspended.is_none() && r.stopped.is_none() && r.waiting_since.is_none()).map(|r| r.id.clone())
     }
 
     fn slot_rental(&self, conn: u64, slot: u64) -> Option<String> {
@@ -878,6 +883,8 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             proven_shares: VecDeque::new(),
             held: VecDeque::new(),
             held_since: None,
+            waiting_since: None,
+            waits: VecDeque::new(),
             suspended: None,
             stopped: None,
             last_heard: Instant::now(),
@@ -945,6 +952,24 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 let ok = pay(r, slice, &preimage, &receipt);
                 r.note(json!({"ev": "pay", "slice": slice, "ok": ok.is_ok(), "why": ok.as_ref().err(), "atMs": now_ms()}));
                 flush_held(&mut g, &id);
+            }
+            Msg::Paying => {
+                // a payment on its way: wait for it, the miners on this side's own pool meanwhile. Only when something waits,
+                // once at a time, and a few times an hour
+                if r.held.is_empty() || r.waiting_since.is_some() {
+                    continue;
+                }
+                let now = Instant::now();
+                while r.waits.front().is_some_and(|t| now - *t > Duration::from_secs(3600)) {
+                    r.waits.pop_front();
+                }
+                if r.waits.len() >= order::PAYING_WAITS_AN_HOUR {
+                    g.stop_unpaid(&id, "too many waits for payment");
+                    return;
+                }
+                r.waits.push_back(now);
+                r.waiting_since = Some(now);
+                r.note(json!({"ev": "waiting for a payment on its way", "atMs": now_ms()}));
             }
             Msg::Shut { chan } => {
                 // the hashtaker's last verdict for this channel has been read: both meters let it go here
@@ -1038,7 +1063,9 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                 let slice_time = by_speed.max(g.min_slice_time);
                 let why = if !r.ready && r.asked_at.elapsed() > grace {
                     Some("no first payment")
-                } else if r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT) {
+                } else if r.waiting_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYING) {
+                    Some("unpaid")
+                } else if r.waiting_since.is_none() && r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT) {
                     Some("unpaid")
                 } else if r.served > slice_time.saturating_mul((r.paid.min(1 << 20) as u32) * PAID_TIME_FACTOR) {
                     Some("paid time used up")
@@ -1359,6 +1386,8 @@ fn flush_held(g: &mut Hub, rental: &str) {
     loop {
         let Some(r) = g.rentals.get_mut(rental) else { return };
         let t = &r.terms;
+        // a payment came: whatever wait there was ends, and the miners come back
+        r.waiting_since = None;
         let fits = match r.held.front() {
             None => {
                 r.held_since = None;
