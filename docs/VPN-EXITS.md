@@ -134,8 +134,10 @@ A **priced** exit's region is read through a paid tunnel, so it is checked only 
 rules ask for that region and would otherwise take it. A check is charged at most 20 sats
 (`max_charge_sats`), but a buyer with no credit at the exit's shop must first buy one of its
 tickets, so the wallet may move up to 2,000 sats out for one check (the check tunnel's `max_sats`,
-within the owner's rules); a shop whose ticket is bigger can't be checked. What the check leaves of
-the ticket stays as credit with that shop, for the tunnel after it. Every check through a paid
+within the owner's rules); a shop whose ticket is bigger can't be checked. A shop whose terms let
+the wallet choose a smaller ticket (`minTicketMsat`) is asked for one of about the check's charge,
+its fee limit included, and no smaller than the shop's smallest. What the check leaves of the ticket
+stays as credit with that shop, for the tunnel after it. Every check through a paid
 tunnel (an exit that named one, whatever price it announced) shares one budget
 (`xbt_vpn::holds::CheckGate`): at most 4,000 sats may leave the wallet for them in a budget day, the
 24 hours from the first check after the last budget day ran out (a fixed window, so 24 hours that
