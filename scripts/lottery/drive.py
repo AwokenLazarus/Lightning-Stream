@@ -444,6 +444,26 @@ def file() -> None:
     stop_sessions()
 
 
+def flap() -> None:
+    url = f"{ORIGIN}/big.bin"
+    with open(f"{RUN}/www/big.bin", "rb") as f:
+        want = hashlib.sha256(f.read()).hexdigest()
+    before = money()
+    with e2e.ChannelDrops() as drops:
+        r = pay(url, 800)
+    if r.get("saved_to"):
+        os.remove(r["saved_to"])
+    wins = int(r.get("wins") or 0)
+    check("flap: a 100 MB file paid by draws comes whole, every win paid, while the channel's peer connection is dropped under it, on the real nodes",
+          ok_draws(r) and r.get("complete") is True and r.get("body_digest") == want and r.get("wins_paid") == wins and not r.get("wins_unpaid") and drops.drops >= 1 and not drops.errors,
+          {"ended": r.get("ended"), "wins": wins, "wins_paid": r.get("wins_paid"), "unpaid": r.get("wins_unpaid"), "drops": drops.drops, "errors": drops.errors})
+    quiet()
+    m = money()
+    check("flap: what the buyer's node paid is the wins the wallet found and booked, to the millisat, and no payment failed",
+          agrees(m) and m["buyer_node_paid_msat"] - before["buyer_node_paid_msat"] == wins * WIN_MSAT and m["failed_payments"] == before["failed_payments"], {"wins": wins, **m})
+    stop_sessions()
+
+
 def page() -> None:
     url = f"{ORIGIN}/small.txt"
     free, paid, wins = [], [], 0
@@ -902,7 +922,7 @@ def kill() -> None:
     stop_sessions()
 
 
-CHECKS = {"terms": terms, "file": file, "page": page, "swarm": swarm, "cheat": cheat, "liar": liar, "kill": kill}
+CHECKS = {"terms": terms, "file": file, "flap": flap, "page": page, "swarm": swarm, "cheat": cheat, "liar": liar, "kill": kill}
 
 
 def main() -> int:

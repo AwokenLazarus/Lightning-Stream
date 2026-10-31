@@ -959,6 +959,52 @@ def stream() -> None:
           agrees(m) and m["tickets"] > 20, m)
 
 
+class ChannelDrops:
+    """The buyer's connection to its one peer dropped and made again every second, on the real nodes: its channel
+    goes inactive, as it does when a peer's connection drops, under whatever the wallet is paying then."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.drops = 0
+        self.errors: list[str] = []
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self) -> None:
+        pk = lab.pubkey(HOP)
+        while not self.done.wait(1.0):
+            try:
+                lab.lncli(BUYER, "disconnect", pk)
+                self.drops += 1
+                lab.lncli(BUYER, "connect", f"{pk}@{HOP}:9735")
+            except LabError as e:
+                self.errors.append(str(e)[:200])
+
+    def __enter__(self) -> "ChannelDrops":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.done.set()
+        self.thread.join()
+        pk = lab.pubkey(HOP)
+        lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
+
+
+def flap() -> None:
+    stop_sessions()
+    with ChannelDrops() as drops:
+        r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
+    ok = call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG)
+    check("flap: a 100 MB file paid by tickets comes whole while the channel's peer connection is dropped under it, on the real nodes",
+          ok and drops.drops >= 1 and not drops.errors, {**brief(r), "drops": drops.drops, "errors": drops.errors})
+    if r.get("saved_to"):
+        os.remove(r["saved_to"])
+    quiet()
+    m = money()
+    check("flap: what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number, to the millisat",
+          agrees(m), m)
+
+
 def lie(name: str, what: str, act: Any, expect: Any, most_tickets: int) -> None:
     """One lie: `act` makes the paid calls with the proxy in mode `name`; `expect` judges the last reply."""
     stop_sessions()
@@ -2365,7 +2411,7 @@ def jellyfin(link: str = "") -> None:
         pass
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
+CHECKS = {"page": page, "latency": latency, "stream": stream, "flap": flap, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
           "vpn": vpn,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
