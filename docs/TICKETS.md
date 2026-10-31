@@ -1288,7 +1288,7 @@ this tree (the wallet's signer, its MCP server, the gateway), a stock file serve
 Lightning Fork nodes (buyer, one routing hop, seller) on one host over loopback, the buyer's
 channel and the seller's inbound channel opened with 30 slots. The lottery's own rules are the
 shipped ones on both sides (wins of 64 sat through a hop, odds of 1 in 4 at the most, 8 values
-ahead; a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid wins), with pieces of
+ahead; a window of 8 pieces, a grace of 60 s and 64 pieces, 2 unpaid wins), with pieces of
 64 KiB. Other settings of the lab are not the shipped ones. Its wallet policy has
 `velocity_max` 1,000 (shipped: 8), `max_sellers` 108 and `max_new_sellers_per_min` 400 for the
 100 sellers (15 and 30), `max_sends_per_hour` 100,000 (1,200), `max_answer_s` 120 (50) and a lab

@@ -7,9 +7,11 @@
 //! Every request carries `Authorization: Bearer sk-stream-…`, an AI key from the owner's credential
 //! store ([`crate::credentials`]), each with its own limit. The router orders the sellers that offer
 //! the model ([`crate::inference::Router::order`]); the request goes to the first, through the
-//! signer's `xbt402_pay` with the body streamed to a socket of ours, and moves to the next only when
-//! the first failed before any byte of its answer. What a call cost is the seller's receipt
-//! (`price_msat` in the signer's answer), booked against the key when the answer has ended.
+//! signer's `xbt402_pay` with the body streamed to a socket of ours, and moves to the next only
+//! while the request cannot have reached the first: the wallet refused it, or says it never left, or
+//! the seller answered with a failure of its own. One answer is never paid to two sellers. What a
+//! call cost is the seller's receipt (`price_msat` in the signer's answer), booked against the key
+//! when the answer has ended, or when the wallet says, for a call the client got no answer from.
 //!
 //! The sellers come from a file the app writes (`sellers`): for each, its name, its AI route (the
 //! seller's address of the route, ending in `/`), its prices and its cap on output. Their model
@@ -22,6 +24,7 @@
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,6 +58,11 @@ const HEAD_LINE: u64 = 4096;
 /// being slow.
 pub const PAY_WAIT: Duration = Duration::from_secs(90);
 
+/// The most calls that wait on a payment at once ([`serve`] answers on 16 threads): one more is
+/// answered 503 at once, so that a slow route never holds every thread and the endpoint's health
+/// and list of models still answer.
+pub const MAX_PAYING: usize = 8;
+
 /// `max_tokens` when a request names none, for the bound of what it may cost.
 const DEFAULT_MAX_TOKENS: u64 = 1024;
 
@@ -78,8 +86,8 @@ pub struct Config {
     /// How long a seller has for the first byte of its answer before the next is tried, from when
     /// its call is paid for.
     pub first_byte: Duration,
-    /// How long a paid call waits for the wallet to pay for it ([`PAY_WAIT`]). Past it, the next
-    /// seller is tried only once the wallet has said that nothing was paid.
+    /// How long a paid call waits for the wallet to pay for it ([`PAY_WAIT`]; `LS_AI_PAY_WAIT_S`).
+    /// Past it, the next seller is tried only once the wallet has said the request never left.
     pub pay_wait: Duration,
     /// Host names a request may name (DNS rebinding): empty admits any.
     pub allowed_hosts: Vec<String>,
@@ -102,6 +110,8 @@ struct Inner {
 pub struct AiServer {
     cfg: Arc<Config>,
     inner: Arc<Mutex<Inner>>,
+    /// Calls waiting on a payment now ([`MAX_PAYING`]).
+    paying: AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -160,6 +170,23 @@ struct Begun {
     ttft: Duration,
 }
 
+/// The wallet's account of a call given up on, or the way to it while the call goes on: what the
+/// seller charged is booked to the key from it.
+enum Account {
+    Said(Value),
+    Pending(mpsc::Receiver<Result<Value, String>>),
+    Unknown,
+}
+
+impl Account {
+    fn said(&self) -> Option<&Value> {
+        match self {
+            Account::Said(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
 /// How a call failed before any byte of its answer.
 struct Failed {
     /// Said to the client when no seller is left.
@@ -168,18 +195,86 @@ struct Failed {
     /// The seller refused the request itself (a 4xx other than payment): no other seller is tried,
     /// since the request would fare no better there.
     final_answer: Option<(u16, Vec<u8>, Option<String>)>,
-    /// The wallet paid this seller for the call, or may still: no other seller is tried, so that
-    /// one answer is never paid to two.
+    /// The request may have reached this seller, and be served or charged by it: no other seller
+    /// is tried, so that one answer is never paid to two.
     paid: bool,
+    /// The wallet was still paying for the call when it was given up: the buyer's route was slow,
+    /// not the seller.
+    paying: bool,
+    account: Account,
+}
+
+/// Where a paid call was when its socket said nothing more in time.
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    /// The socket opened, no line yet.
+    Opened,
+    /// The wallet said the request is paid for and leaving.
+    Paid,
+    /// The wallet pays again after it said so (the seller's balance ran short).
+    Paying,
+}
+
+/// What the seller's receipt charged the call, in msat, by the wallet's account of it.
+fn price_msat(v: &Value) -> u64 {
+    v.get("price_msat").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0)
+}
+
+/// A seller's answer that is a failure of its own: another seller may serve the request.
+fn sellers_failure(status: u16) -> bool {
+    status >= 500 || matches!(status, 402 | 408 | 429)
+}
+
+/// Whether another seller may be tried after a call, by the wallet's account of it: the seller
+/// answered with a failure of its own, or the request never left (the wallet says so, or refused it
+/// before any answer and charged nothing for one). No account, or anything else, may be an answer
+/// being served and paid for: never a second seller.
+fn another_may_serve(account: Option<&Value>) -> bool {
+    let Some(v) = account else { return false };
+    let status = v.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok());
+    if status.is_some_and(sellers_failure) {
+        return true;
+    }
+    match v.get("request_sent").and_then(Value::as_bool) {
+        Some(sent) => !sent,
+        None => status.is_none() && price_msat(v) == 0,
+    }
+}
+
+/// The wallet's account of a call, waited for at most `wait`; past it, the way to it is kept.
+fn hear(rx: mpsc::Receiver<Result<Value, String>>, wait: Duration) -> Account {
+    match rx.recv_timeout(wait) {
+        Ok(Ok(v)) => Account::Said(v),
+        Err(mpsc::RecvTimeoutError::Timeout) => Account::Pending(rx),
+        _ => Account::Unknown,
+    }
+}
+
+/// A paid call whose socket said nothing more in time, by where the wallet was.
+fn given_up(cfg: &Config, stage: Stage, rx: mpsc::Receiver<Result<Value, String>>, first_byte: Duration) -> Failed {
+    if stage == Stage::Paid {
+        // told the request is paid for and leaving: it may be served, and charged, whatever comes next
+        return Failed { status: 504, message: format!("the seller sent nothing within {} s of being paid", first_byte.as_secs()), final_answer: None,
+                        paid: true, paying: false, account: Account::Pending(rx) };
+    }
+    // paying (again), or no line at all: the wallet says whether the request left. Its socket is closed, so it sends
+    // nothing more on this call
+    let account = hear(rx, cfg.pay_wait);
+    let paying = stage == Stage::Paying;
+    let message = if paying { format!("the wallet's payment of the seller took more than {} s", cfg.pay_wait.as_secs()) }
+                  else { format!("the seller sent nothing within {} s", first_byte.as_secs()) };
+    Failed { status: 504, message, final_answer: None, paid: !another_may_serve(account.said()), paying, account }
 }
 
 /// Has the signer pay for one call and stream its body to a socket of ours; waits for the head
 /// and the first byte of the body, at most `first_byte` from when the call is paid for (the
-/// signer's `paid` line; a call that pays nothing, or a rail that sends no such line, from the start),
-/// and for the payment itself at most [`PAY_WAIT`].
+/// signer's `paid` line; a rail that sends no such line, from when the socket opens; a call that
+/// pays nothing, from the start), and for a payment at most `pay_wait` (the clock stops on the
+/// signer's `paying` line). A call is given up for another seller only while the request cannot
+/// have reached this one ([`Failed::paid`]).
 /// `ceiling`: the seller's listed prices, the most the wallet pays it (none for a free read).
 fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration, ceiling: Option<&Value>) -> Result<Begun, Failed> {
-    let fail = |status: u16, message: String| Failed { status, message, final_answer: None, paid: false };
+    let fail = |status: u16, message: String| Failed { status, message, final_answer: None, paid: false, paying: false, account: Account::Unknown };
     let name = format!("ai-{}", random_hex());
     let path = cfg.stream_dir.join(&name);
     let listener = listen_stream(&path).map_err(|e| fail(500, format!("stream socket: {e}")))?;
@@ -213,86 +308,112 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
         }
         if let Ok(done) = rx.try_recv() {
             let _ = std::fs::remove_file(&path);
-            let why = match done {
-                Ok(v) => v.get("reason").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| "the wallet would not pay this seller".into()),
-                Err(e) => e,
-            };
-            return Err(fail(502, why));
+            // over before its socket opened: refused, or ended at the seller; the wallet says which
+            return Err(match done {
+                Ok(v) => Failed {
+                    status: 502,
+                    message: v.get("reason").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| "the wallet would not pay this seller".into()),
+                    final_answer: None,
+                    paid: paid_call && !another_may_serve(Some(&v)),
+                    paying: false,
+                    account: Account::Said(v),
+                },
+                Err(e) => Failed { paid: paid_call, ..fail(502, e) },
+            });
         }
         // a paid call: the socket opens once it is paid for, which a slow route makes long
         if started.elapsed() > if paid_call { cfg.pay_wait } else { first_byte } {
             let _ = std::fs::remove_file(&path);
+            // a connection not taken is refused from here: the wallet sends nothing on it
+            drop(listener);
             if !paid_call {
                 return Err(fail(504, format!("the seller sent nothing within {} s", first_byte.as_secs())));
             }
-            // the wallet is still at the payment: another seller is tried only once it has said that nothing was paid,
-            // never while this one may yet be
-            let ended = rx.recv_timeout(cfg.pay_wait);
-            let charged = match &ended {
-                Ok(Ok(v)) => v.get("charged_sats").and_then(Value::as_i64).unwrap_or(1) > 0,
-                _ => true,
-            };
-            let why = format!("the wallet's payment of the seller took more than {} s", cfg.pay_wait.as_secs());
-            return Err(Failed { status: 504, message: why, final_answer: None, paid: charged });
+            // the wallet is still at the payment: another seller is tried only once it has said the request never left
+            let account = hear(rx, cfg.pay_wait);
+            return Err(Failed { status: 504, message: format!("the wallet's payment of the seller took more than {} s", cfg.pay_wait.as_secs()),
+                                final_answer: None, paid: !another_may_serve(account.said()), paying: true, account });
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     let _ = std::fs::remove_file(&path);
+    drop(listener);
     let _ = src.set_nonblocking(false);
     let mut src = BufReader::new(src);
-    // the seller's time: from the wallet's `paid` line where it sends one, from the start where not
-    let mut since = started;
-    let mut paid_line = false;
+    // the seller's time: from the wallet's `paid` line; for a rail that sends none, from when the socket opened (it
+    // opens once the seller has answered); for a call that pays nothing, from its start. A `paying` line stops the
+    // clock while the wallet pays again, up to the wait for a payment
+    let mut since = if paid_call { Instant::now() } else { started };
+    let mut until = since + first_byte;
+    let mut stage = Stage::Opened;
     let head: Value = loop {
-        let _ = src.get_ref().set_read_timeout(Some(first_byte.saturating_sub(since.elapsed()).max(Duration::from_millis(100))));
+        let _ = src.get_ref().set_read_timeout(Some(until.saturating_duration_since(Instant::now()).max(Duration::from_millis(100))));
         let mut line = String::new();
         match (&mut src).take(HEAD_LINE).read_line(&mut line) {
             Ok(_) if line.ends_with('\n') => {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-                if !paid_line && v.get("paid").and_then(Value::as_bool) == Some(true) {
-                    (since, paid_line) = (Instant::now(), true);
+                if v.get("paid").and_then(Value::as_bool) == Some(true) {
+                    since = Instant::now();
+                    (until, stage) = (since + first_byte, Stage::Paid);
+                    continue;
+                }
+                if v.get("paying").and_then(Value::as_bool) == Some(true) {
+                    (until, stage) = (Instant::now() + cfg.pay_wait, Stage::Paying);
                     continue;
                 }
                 break v;
             }
             Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                return Err(fail(504, format!("the seller sent nothing within {} s of being paid", first_byte.as_secs())));
+                // given up: the socket closes, so the wallet sends nothing more on this call
+                drop(src);
+                if !paid_call {
+                    return Err(fail(504, format!("the seller sent nothing within {} s", first_byte.as_secs())));
+                }
+                return Err(given_up(cfg, stage, rx, first_byte));
             }
-            // the socket closed with no head: the wallet ended the call after paying (a seller fault, say), and says why
+            // the socket closed with no head: the wallet ended the call (a refusal, a seller fault), and says why
             _ => break Value::Null,
         }
     };
     let Some(status) = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s)) else {
-        let why = match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(v)) => v.get("reason").and_then(Value::as_str).map(str::to_string),
-            Ok(Err(e)) => Some(e),
-            Err(_) => None,
-        };
-        return Err(fail(502, why.unwrap_or_else(|| "the wallet sent no head for the seller's answer".into())));
+        drop(src);
+        let account = hear(rx, if paid_call { cfg.pay_wait } else { Duration::from_secs(5) });
+        let why = account.said().and_then(|v| v.get("reason")).and_then(Value::as_str).map(str::to_string);
+        return Err(Failed { status: 502, message: why.unwrap_or_else(|| "the wallet sent no head for the seller's answer".into()), final_answer: None,
+                            paid: paid_call && !another_may_serve(account.said()), paying: false, account });
     };
+    // a signed head that is an answer (not a failure of the seller's): the request is the seller's, and no other is tried
+    let answering = paid_call && !sellers_failure(status) && status < 400;
     let content_type = head.get("content_type").and_then(Value::as_str).filter(|t| t.len() <= 128 && t.bytes().all(|b| b.is_ascii_graphic() || b == b' ')).map(str::to_string);
-    let _ = src.get_ref().set_read_timeout(Some(first_byte.saturating_sub(since.elapsed()).max(Duration::from_millis(100))));
+    let _ = src.get_ref().set_read_timeout(Some(until.saturating_duration_since(Instant::now()).max(Duration::from_millis(100))));
     let mut first = vec![0u8; 16 << 10];
     let n = loop {
         match src.read(&mut first) {
             Ok(n) => break n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return Err(fail(504, format!("the seller sent no answer within {} s", first_byte.as_secs()))),
+            Err(_) => {
+                drop(src);
+                return Err(Failed { paid: answering, account: Account::Pending(rx), ..fail(504, format!("the seller sent no answer within {} s", first_byte.as_secs())) });
+            }
         }
     };
     first.truncate(n);
     let _ = src.get_ref().set_read_timeout(Some(Duration::from_secs(600)));
-    // a seller's own failure: another may serve the request; a refusal of the request itself may not
-    if status >= 500 || status == 402 || status == 429 || status == 408 {
-        return Err(fail(502, format!("the seller answered {status}")));
+    // a seller's own failure: another may serve the request; a refusal of the request itself may not. What either
+    // cost is booked once the wallet says
+    if sellers_failure(status) {
+        drop(src);
+        return Err(Failed { account: Account::Pending(rx), ..fail(502, format!("the seller answered {status}")) });
     }
     if status >= 400 {
         let mut whole = first;
-        let _ = src.take(1 << 20).read_to_end(&mut whole);
-        return Err(Failed { status, message: String::new(), final_answer: Some((status, whole, content_type)), paid: false });
+        let _ = (&mut src).take(1 << 20).read_to_end(&mut whole);
+        drop(src);
+        return Err(Failed { final_answer: Some((status, whole, content_type)), account: Account::Pending(rx), ..fail(status, String::new()) });
     }
     if n == 0 {
-        return Err(fail(502, "the seller's answer was empty".into()));
+        drop(src);
+        return Err(Failed { paid: answering, account: Account::Pending(rx), ..fail(502, "the seller's answer was empty".into()) });
     }
     // the seller's own speed, its payment apart
     Ok(Begun { status, content_type, first, rest: src, done: rx, ttft: since.elapsed() })
@@ -340,7 +461,8 @@ impl AiServer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, keep: CATALOGUE_TTL, fetches: 0, fetching: false, sellers_changed: None })) };
+        let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, keep: CATALOGUE_TTL, fetches: 0, fetching: false, sellers_changed: None })),
+                        paying: AtomicUsize::new(0) };
         // the sellers' model lists are asked for at once, in the background: the first request does not wait for all of them
         me.fetch_in_background();
         Ok(me)
@@ -462,7 +584,12 @@ impl AiServer {
             return Reply::Whole(json_response(404, &error_body("model_not_found", "invalid_request_error",
                 &format!("No seller you allowed offers the model {model}, or every one is resting after failures."))));
         }
-        let mut last: Option<Failed> = None;
+        // a cap on the calls waiting on a payment at once: the endpoint's other requests (its health, its list of
+        // models) keep threads to answer on while a slow route holds the rest
+        let Some(_slot) = Slot::take(&self.paying, MAX_PAYING) else {
+            return Reply::Whole(json_response(503, &error_body("busy", "api_error", "Too many requests are waiting for their payment to go through; try again shortly.")));
+        };
+        let mut last: Option<(u16, String)> = None;
         for offer in offers {
             let bound = offer.bound_msat(input, max_tokens);
             // one lock for both reads (a guard held in an `if let` scrutinee lives through its block)
@@ -486,25 +613,47 @@ impl AiServer {
             // the seller's own listed prices are the most it is paid: a 402 asking more is refused
             match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, self.cfg.first_byte, Some(&offer.ceiling)) {
                 Ok(b) => return self.relay(b, offer.seller.clone(), key_id.to_string(), today),
-                Err(f) => {
-                    let mut inner = lock(&self.inner);
-                    if let Some((status, whole, ct)) = f.final_answer {
+                Err(Failed { status, message, final_answer, paid, paying, account }) => {
+                    // whatever the call cost this seller is booked to the key, now or when the wallet says
+                    self.book_later(key_id, today, account);
+                    if let Some((status, whole, ct)) = final_answer {
                         // the seller refused the request itself: said to the client as the seller said it
                         let headers = vec![("Content-Type".into(), ct.unwrap_or_else(|| "application/json".into())), ("Cache-Control".into(), "no-store".into())];
                         return Reply::Whole(Response::new(status, headers, whole));
                     }
-                    inner.router.record(&offer.seller, Outcome::FailedBeforeAnswer, now);
-                    self.save_state(&inner);
-                    let paid = f.paid;
-                    last = Some(f);
+                    // a payment that outlasted its wait is the buyer's route, not the seller's failure
+                    if !paying {
+                        let mut inner = lock(&self.inner);
+                        inner.router.record(&offer.seller, Outcome::FailedBeforeAnswer, now);
+                        self.save_state(&inner);
+                    }
+                    last = Some((status, message));
                     if paid || !Router::may_fall_back(Outcome::FailedBeforeAnswer) {
                         break;
                     }
                 }
             }
         }
-        let f = last.unwrap_or(Failed { status: 502, message: "no seller answered".into(), final_answer: None, paid: false });
-        Reply::Whole(json_response(f.status, &error_body("upstream_failed", "api_error", &format!("No seller could answer: {}", f.message))))
+        let (status, message) = last.unwrap_or((502, "no seller answered".into()));
+        Reply::Whole(json_response(status, &error_body("upstream_failed", "api_error", &format!("No seller could answer: {message}"))))
+    }
+
+    /// Books what a call the client got no answer from cost the key, by the wallet's account of it:
+    /// at once where it was said, and where the call goes on, once the wallet says (for as long as
+    /// one answer is followed).
+    fn book_later(&self, key_id: &str, today: u64, account: Account) {
+        let (credentials, inner, key_id) = (self.cfg.credentials.clone(), Arc::clone(&self.inner), key_id.to_string());
+        match account {
+            Account::Said(v) => book(&credentials, &inner, &key_id, today, price_msat(&v)),
+            Account::Pending(rx) => {
+                std::thread::spawn(move || {
+                    if let Ok(Ok(v)) = rx.recv_timeout(LONGEST) {
+                        book(&credentials, &inner, &key_id, today, price_msat(&v));
+                    }
+                });
+            }
+            Account::Unknown => {}
+        }
     }
 
     /// Hands an answer on as it arrives, then books what it cost against the key and the seller's
@@ -538,21 +687,11 @@ impl AiServer {
                 // a client gone: dropping the socket tells the signer to stop paying
                 drop(rest);
                 let account = done.recv_timeout(Duration::from_secs(10)).ok().and_then(Result::ok).unwrap_or(Value::Null);
-                let price_msat = account.get("price_msat").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0);
                 let complete = account.get("complete").and_then(Value::as_bool).unwrap_or(false);
                 let now = credentials::now();
                 {
-                    // booked under the store's lock, so a change the app makes at the same time is kept
-                    let booked = Store::update(&credentials, |s| {
-                        s.add_spend(&key_id, price_msat, today);
-                        s.pause_if_over(&key_id, today);
-                    });
+                    book(&credentials, &inner, &key_id, today, price_msat(&account));
                     let mut g = lock(&inner);
-                    if booked.is_ok() {
-                        if let Ok(s) = Store::open(&credentials) {
-                            g.store = s;
-                        }
-                    }
                     let outcome = if complete { Outcome::Answered { ttft_ms: u64::try_from(ttft.as_millis()).unwrap_or(u64::MAX) } } else { Outcome::CutMidAnswer };
                     g.router.record(&seller, outcome, now);
                     let _ = write_atomic(&state, &state_json(&g.router));
@@ -564,6 +703,38 @@ impl AiServer {
                 wrote.map(|_| ())
             }),
         })
+    }
+}
+
+/// Books `price_msat` against the key, under the store's lock (so a change the app makes at the
+/// same time is kept), and takes the store as booked.
+fn book(credentials: &Path, inner: &Mutex<Inner>, key_id: &str, today: u64, price_msat: u64) {
+    if price_msat == 0 {
+        return;
+    }
+    let booked = Store::update(credentials, |s| {
+        s.add_spend(key_id, price_msat, today);
+        s.pause_if_over(key_id, today);
+    });
+    if booked.is_ok() {
+        if let Ok(s) = Store::open(credentials) {
+            lock(inner).store = s;
+        }
+    }
+}
+
+/// One of the places for a call waiting on a payment ([`MAX_PAYING`]), given back when dropped.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl<'a> Slot<'a> {
+    fn take(n: &'a AtomicUsize, most: usize) -> Option<Self> {
+        n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| (v < most).then_some(v + 1)).ok().map(|_| Slot(n))
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

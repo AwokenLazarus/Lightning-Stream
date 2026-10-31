@@ -93,7 +93,8 @@ fn main() {
 /// The AI endpoint, when `LS_AI_LISTEN` is set: an OpenAI-compatible address for programs on the
 /// owner's network, each with a key from `LS_CREDENTIALS` (see `inference_server`). It needs
 /// `LS_CREDENTIALS`, `LS_AI_SELLERS` and `LS_AI_STATE`; `LS_AI_HOSTS` (comma-separated) lists the
-/// host names it answers to, `LS_AI_FIRST_BYTE_S` how long a seller has for its first byte.
+/// host names it answers to, `LS_AI_FIRST_BYTE_S` how long a seller has for its first byte, from
+/// when its call is paid for, and `LS_AI_PAY_WAIT_S` how long a call waits for the wallet to pay.
 fn start_ai(base: &(PathBuf, PathBuf, String, i64)) -> Option<xbt_svc::http::Running> {
     let listen = env("LS_AI_LISTEN")?;
     let (Some(credentials), Some(sellers), Some(state)) = (env("LS_CREDENTIALS"), env("LS_AI_SELLERS"), env("LS_AI_STATE")) else {
@@ -105,7 +106,8 @@ fn start_ai(base: &(PathBuf, PathBuf, String, i64)) -> Option<xbt_svc::http::Run
     let (signer, stream_dir, task, max_sats) = base.clone();
     let cfg = lightning_stream::inference_server::Config {
         signer, stream_dir, task, max_sats, credentials: credentials.into(), sellers: sellers.into(), state: state.into(), first_byte,
-        pay_wait: lightning_stream::inference_server::PAY_WAIT, allowed_hosts,
+        pay_wait: env("LS_AI_PAY_WAIT_S").and_then(|v| v.parse().ok()).map_or(lightning_stream::inference_server::PAY_WAIT, Duration::from_secs),
+        allowed_hosts,
     };
     let listener = match TcpListener::bind(&listen) {
         Ok(l) => l,

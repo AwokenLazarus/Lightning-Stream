@@ -54,8 +54,8 @@ use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invo
 use crate::{err, Result};
 
 /// The longest the wallet waits for the seller's invoice for its offer, in seconds, before it
-/// pays the ticket or win by the seller's BOLT 11 invoice instead: a win's invoice lives 30 s by
-/// default (the gateway's `lottery.invoice_secs`), and a busy issuer can leave a request
+/// pays the ticket or win by the seller's BOLT 11 invoice instead: a win's invoice lives 60 s by
+/// default (the gateway's `lottery.invoice_secs`, its grace), and a busy issuer can leave a request
 /// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
 const OFFER_FETCH_S: i64 = 5;
 
@@ -94,7 +94,7 @@ pub const SEND_PARALLEL: usize = 8;
 /// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
 /// that no seller's win waits behind a later one's until that seller's grace has run out. Before
 /// them all, in their own order of arrival, go the wins a seller's answer stands still for
-/// ([`Pace::hurry`]): a seller waits 30 s for a win it serves on beside, and 10 s for one it has
+/// ([`Pace::hurry`]): a seller waits its grace (60 s as shipped) for a win it serves on beside, and 10 s for one it has
 /// stopped for, so the second cannot wait behind a hundred of the first.
 #[derive(Default)]
 pub struct Pace {

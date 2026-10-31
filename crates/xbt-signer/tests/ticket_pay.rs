@@ -2437,6 +2437,48 @@ fn a_call_that_asks_is_told_on_its_socket_when_it_is_paid_for_before_the_head() 
     r.assert_booked();
 }
 
+/// A caller that asked to be told (`stream_paid`, the AI address) and is gone by the time its
+/// request is paid for (its socket not there) is sent nothing: the request does not leave, the
+/// answer says so (`request_sent` false, no status), and the ticket bought for it stays with the
+/// seller as credit, which the next call spends without buying another.
+///
+/// FAILS before: the request left for the seller whatever became of the caller, so the AI address,
+/// which had gone on to another seller, had one answer paid to two.
+#[test]
+fn a_call_whose_caller_is_gone_once_it_is_paid_for_is_not_sent() {
+    use std::io::{BufReader, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    // no socket by that name: the caller is gone
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/11"), "max_sats": CALL, "task": "film", "stream_to": "gone", "stream_head": true,
+                                        "stream_paid": true}));
+    assert_eq!((v["rule"].as_str(), v["request_sent"].as_bool()), (Some("ticket_caller_gone"), Some(false)), "{v}");
+    assert!(v["status"].is_null(), "{v}");
+    assert_eq!(v["tickets_prepaid"].as_u64(), Some(1), "the ticket was bought before the request would have left: {v}");
+    assert!(r.tap.seen("/page/11").iter().all(|s| !s.paid), "the seller got no paid request");
+    // the next call, to a caller that is there, spends that credit: no second ticket
+    let l = UnixListener::bind(dir.path().join("here")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut all = String::new();
+        BufReader::new(s).read_to_string(&mut all).unwrap();
+        all
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/11"), "max_sats": CALL, "task": "film", "stream_to": "here", "stream_head": true,
+                                        "stream_paid": true}));
+    let got = reader.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(0), Some(true)), "{v}");
+    assert!(got.starts_with("{\"paid\":true}\n"), "{got}");
+    assert_eq!(r.tap.seen("/page/11").iter().filter(|s| s.paid).count(), 1, "one paid request reached the seller");
+    std::env::remove_var("B2_STREAM_DIR");
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
 /// A seller's own web page, used inside the app (docs/SELLER-APPS.md): the caller's headers (its
 /// cookies, its login) reach the service, the seller's guest login wins over a forged one, the
 /// page the service serves only compressed comes back plain, and the seller's response headers come
