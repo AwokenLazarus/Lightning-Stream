@@ -624,7 +624,7 @@ impl Gateway {
     /// on its way after all, either the node settled it first and the win is paid by the look that
     /// follows, or it cancelled first and refuses the payment, which comes back to the buyer. It gives the
     /// buyer no draw and no money, and costs the node a cancel and an invoice, [`LotteryConfig::max_win_cancels`] times.
-    fn lottery_cancel(&self, l: &Lottery, session: &str, body: &Map<String, Value>) -> Result<bool, Refusal> {
+    fn lottery_cancel(&self, l: &Lottery, session: &str, body: &Map<String, Value>) -> Result<bool, Refused> {
         let draw = body.get("draw").and_then(Value::as_u64);
         let hash = body.get("hash").and_then(Value::as_str).and_then(xbt402::ticket::hex32);
         let (Some(draw), Some(hash)) = (draw, hash) else { return Ok(false) };
