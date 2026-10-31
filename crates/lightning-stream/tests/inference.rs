@@ -528,32 +528,49 @@ fn a_busy_seller_hands_the_request_to_the_next() {
     assert_eq!(spent(&r), 777);
 }
 
-/// The wallet's account of a whole answer comes after the endpoint's wait for it (the signer waits
-/// up to 10 s for the seller's last receipt): what it cost is booked when it comes, the seller is
-/// recorded as having answered, and no cut is said to the client.
+/// The account of a whole answer arrives after its last byte (the wallet takes the seller's last
+/// receipt first), within the wait for it: what it cost is booked, the seller is recorded as having
+/// answered, and the answer ends whole, with no cut said.
 ///
 /// FAILS before: the endpoint waited 10 s, booked nothing, recorded the seller as cut mid-answer and
 /// sent the client a "stopped mid-answer" event after the answer's end.
 #[test]
 fn a_late_account_of_a_whole_answer_is_booked_with_no_cut_said() {
-    let r = rig(Plan::LateReceipt(432, 1500), Plan::Answer(1), 100);
-    let (status, _, body) = chat(&r, "llama");
+    let r = rig(Plan::LateReceipt(432, 200), Plan::Answer(1), 100);
+    let raw = chat_raw(&r, "llama");
+    assert!(raw.ends_with(b"0\r\n\r\n"), "a whole answer has its last chunk");
+    let (status, _, body) = chat(&rig(Plan::LateReceipt(432, 200), Plan::Answer(1), 100), "llama");
     assert_eq!((status, body.as_str()), (200, ANSWER), "the answer as the seller sent it, no cut event");
-    std::thread::sleep(Duration::from_millis(1800));
     assert_eq!(spent(&r), 432, "booked when the account came");
     let state: Value = serde_json::from_slice(&std::fs::read(r._dir.path().join("ai-state.json")).unwrap()).unwrap();
     assert_eq!((state["health"]["cheap"]["ok"].as_u64(), state["health"]["cheap"]["failed"].as_u64()), (Some(1), Some(0)), "{state}");
 }
 
-/// The wallet never says what a whole answer cost (the call to the signer failed): the most the
-/// request may cost is booked to the key, never nothing.
+/// No account in the wait for it: the client is not told the answer ended cleanly, since nothing
+/// says it did. What it cost is still booked when the wallet says, and the seller recorded by that.
+#[test]
+fn an_answer_with_no_account_in_time_is_not_whole_and_is_booked_when_it_comes() {
+    let r = rig(Plan::LateReceipt(432, 1500), Plan::Answer(1), 100);
+    let raw = chat_raw(&r, "llama");
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert!(text.contains("answer_cut") && text.contains("has not said"), "{text}");
+    assert!(!raw.ends_with(b"0\r\n\r\n"), "ended clean with no account: {text}");
+    std::thread::sleep(Duration::from_millis(1800));
+    assert_eq!(spent(&r), 432, "booked when the account came");
+    let state: Value = serde_json::from_slice(&std::fs::read(r._dir.path().join("ai-state.json")).unwrap()).unwrap();
+    assert_eq!((state["health"]["cheap"]["ok"].as_u64(), state["health"]["cheap"]["failed"].as_u64()), (Some(1), Some(0)), "by the wallet's late word it answered: {state}");
+}
+
+/// The wallet never says what an answer cost (the call to the signer failed): it is not called whole,
+/// and the most the request may cost is booked to the key, never nothing.
 ///
 /// FAILS before: nothing was booked.
 #[test]
 fn an_answer_whose_cost_the_wallet_never_says_books_the_most_it_may_cost() {
     let r = rig(Plan::Lost, Plan::Answer(1), 100);
-    let (status, _, body) = chat(&r, "llama");
-    assert_eq!((status, body.as_str()), (200, ANSWER));
+    let raw = chat_raw(&r, "llama");
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert!(text.contains("answer_cut") && !raw.ends_with(b"0\r\n\r\n"), "ended clean with no account: {text}");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(spent(&r), 500, "100 tokens out at 5 sat the 1,000: the bound");
 }

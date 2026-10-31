@@ -45,8 +45,9 @@ pub const CATALOGUE_RETRY: Duration = Duration::from_secs(2);
 /// The largest request body accepted.
 pub const MAX_BODY: usize = 4 << 20;
 
-/// The longest one answer is followed: as long as the wallet keeps one open (`tickets.max_stream_s`).
-const LONGEST: Duration = Duration::from_secs(6 * 3600);
+/// The longest one answer is followed: past the most an owner can set `tickets.max_stream_s` to, so
+/// that the wallet ends an answer and says so before this gives up on it.
+const LONGEST: Duration = Duration::from_secs(25 * 3600);
 
 /// The longest head line the signer writes before the body.
 const HEAD_LINE: u64 = 4096;
@@ -59,9 +60,10 @@ const HEAD_LINE: u64 = 4096;
 pub const PAY_WAIT: Duration = Duration::from_secs(90);
 
 /// How long an answer handed on waits, once it has ended, for the wallet's account of it
-/// ([`Config::account_wait`], this by default): longer than the signer's own wait for the seller's
-/// last receipt after the socket closes (10 s, and a second more).
-pub const ACCOUNT_WAIT: Duration = Duration::from_secs(12);
+/// ([`Config::account_wait`], this by default): as the connector does, long enough for the signer's
+/// tail after the socket closes (the session's order, then the seller's last receipt, 10 s of it).
+/// Past it the answer is not called whole.
+pub const ACCOUNT_WAIT: Duration = Duration::from_secs(120);
 
 /// The shortest `LS_AI_PAY_WAIT_S` taken: a wait shorter than a payment over an ordinary route
 /// gives every paid call up before it is paid.
@@ -729,8 +731,8 @@ impl AiServer {
     /// Hands an answer on as it arrives, then books what it cost against the key and the seller's
     /// health. A seller that stops mid-answer is not left for another: the client gets what arrived
     /// (paid exactly) and, for a stream of events, an event saying the answer was cut. The wallet's
-    /// account is waited for [`Config::account_wait`] (it may wait that long for the seller's last
-    /// receipt); past it, it is booked when it comes, and no cut is said that is not known.
+    /// account is waited for [`Config::account_wait`] (it may wait a while for the seller's last
+    /// receipt); past it the answer is not called whole, and what it cost is booked when it comes.
     /// `bound`: the most the request may cost, booked where the wallet never says what it did.
     fn relay(&self, b: Begun, seller: String, key_id: String, today: u64, bound: u64) -> Reply {
         let account_wait = self.cfg.account_wait;
@@ -764,9 +766,10 @@ impl AiServer {
                 }
                 // a client gone: dropping the socket tells the signer to stop paying
                 drop(rest);
-                let complete = match done.recv_timeout(account_wait) {
-                    Ok(Ok(account)) => settle.account(&account, ttft_ms),
-                    // the wallet still at the seller's last receipt: booked when it says, and no cut said meanwhile
+                // no account in time, or none at all, is not whole: a client is never told an answer ended cleanly without the
+                // wallet's word. What it cost is still booked when the wallet says, or the most it may cost
+                let (complete, said) = match done.recv_timeout(account_wait) {
+                    Ok(Ok(account)) => (settle.account(&account, ttft_ms), true),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         std::thread::spawn(move || match done.recv_timeout(LONGEST) {
                             Ok(Ok(account)) => {
@@ -774,16 +777,18 @@ impl AiServer {
                             }
                             _ => settle.unknown(),
                         });
-                        true
+                        (false, false)
                     }
                     _ => {
                         settle.unknown();
-                        true
+                        (false, false)
                     }
                 };
                 let cut = !complete || read_failed;
                 if cut && sse && wrote.is_ok() {
-                    let ev = json!({"error": {"message": format!("The seller {seller} stopped mid-answer. What arrived was paid for; nothing more."), "type": "api_error", "code": "answer_cut"}});
+                    let message = if said { format!("The seller {seller} stopped mid-answer. What arrived was paid for; nothing more.") }
+                                  else { format!("The wallet has not said whether the answer from {seller} came whole: treat it as cut.") };
+                    let ev = json!({"error": {"message": message, "type": "api_error", "code": "answer_cut"}});
                     let _ = out.send(format!("data: {ev}\n\n").as_bytes());
                 }
                 wrote?;
