@@ -91,6 +91,7 @@ fn open_blocking(w: &Wallet, url: &str, ceiling: Option<Value>) -> io::Result<Op
     let name = format!("vpn-{}", random_hex());
     let path = w.stream_dir.join(&name);
     let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    let_the_signer_in(&path, &w.stream_dir)?;
     listener.set_nonblocking(true)?;
     let mut params = json!({"url": url, "method": "GET", "max_sats": w.max_sats, "task": w.task, "upgrade": true,
                             "stream_to": name, "stream_head": true, "head_headers": true,
@@ -144,6 +145,21 @@ fn open_blocking(w: &Wallet, url: &str, ceiling: Option<Value>) -> io::Result<Op
     let src = r.into_inner();
     src.set_read_timeout(None)?;
     Ok((src, early, done))
+}
+
+/// The signer (another user, in a package) connects to the tunnel's socket to hand over the paid stream,
+/// and connecting to a Unix socket needs write on it: a socket bound under the default umask (0755)
+/// keeps the signer out, the signer finds "a reader already gone", and the tunnel ends as it opens
+/// (a 101 with no bytes). The socket takes the stream dir's group (xbt-streams, which has the signer
+/// and this service in it) and 0660: whoever may enter that dir may connect, and no one else.
+fn let_the_signer_in(sock: &std::path::Path, dir: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let gid = std::fs::metadata(dir)?.gid();
+    if std::fs::metadata(sock)?.gid() != gid {
+        // only a group this process is in; otherwise the mode alone has to do
+        let _ = std::os::unix::fs::chown(sock, None, Some(gid));
+    }
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o660))
 }
 
 /// The signer's answer to a call that ended before its stream opened, in words.
@@ -357,4 +373,18 @@ mod tests {
         // RFC 6455, section 1.3
         assert_eq!(websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
     }
+    #[test]
+    fn the_tunnels_socket_lets_the_signer_in_by_the_stream_dirs_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = std::env::temp_dir().join(format!("vpn-sock-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("vpn-x");
+        let _l = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let_the_signer_in(&p, &d).unwrap();
+        let m = std::fs::metadata(&p).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o660, "the group (the signer) may connect, others may not");
+        assert_eq!(m.gid(), std::fs::metadata(&d).unwrap().gid());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
 }
