@@ -694,6 +694,8 @@ struct PayState {
     offer_note_lie: bool,
     /// The payer notes of the invoices fetched from offers, in order.
     fetched_notes: Vec<String>,
+    /// A payment the seller's node settles shows succeeded without its preimage (a node that lost it).
+    preimage_lost: bool,
     /// How many times `down` turned away a question about the node itself (`GetInfo`, which the
     /// wallet asks before it begins a payment).
     turned_away: usize,
@@ -725,6 +727,7 @@ fn node_err(m: &str) -> xbt402::ChannelError {
 impl PayLn {
     /// Bring every payment in flight to what the seller's node has made of its invoice.
     fn refresh(&self, s: &mut PayState) {
+        let lost = s.preimage_lost;
         for p in s.payments.iter_mut().filter(|p| p["status"] == "IN_FLIGHT" && p["stranded"] != true) {
             if p["late_fail"] == true {
                 p["status"] = "FAILED".into();
@@ -738,7 +741,9 @@ impl PayLn {
                 Some(InvoiceState::Settled) => {
                     let Some(pre) = self.preimages.lock().unwrap().get(&hash).cloned() else { continue };
                     p["status"] = "SUCCEEDED".into();
-                    p["payment_preimage"] = pre.into();
+                    if !lost {
+                        p["payment_preimage"] = pre.into();
+                    }
                     p["fee_msat"] = FEE_MSAT.to_string().into();
                     p["htlcs"][0]["status"] = "SUCCEEDED".into();
                 }
@@ -3812,6 +3817,7 @@ fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_
     let v = r.pay("/page/1000", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_seller_fault")), "{v}");
     assert_eq!(r.ledger_sum(), BOOKING, "the ticket is in the ledger before the node was asked to pay it: {v}");
+    assert_eq!(v["charged_sats"].as_i64(), Some(BOOKING), "the call says the ticket booked as spent among what it charged: {v}");
     assert!(r.tap.secrets().is_empty());
     // the node is back and never had it: after the time a send can take, the booking goes
     r.ln.st.lock().unwrap().router_down = false;
@@ -5790,6 +5796,21 @@ fn a_session_stopped_during_a_film_ends_it_at_once_and_releases_nothing_after() 
         assert!(spent >= 2_500 + cost && spent <= 2_500 + cost + 200_000, "spent {spent} msat for {got} bytes (cost {cost}): {stop}");
     });
     r.tap.clear();
+}
+
+/// A prepaid ticket the node shows paid without the preimage that proves it stays booked as spent,
+/// and the call says so among what it charged: nothing can be shown to the seller for it, but it left.
+#[test]
+fn a_prepaid_ticket_paid_without_its_preimage_is_said_among_what_the_call_charged() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    r.ln.st.lock().unwrap().preimage_lost = true;
+    let v = r.pay("/page/1000", CALL);
+    assert_eq!(v["verdict"].as_str(), Some("deny"), "{v}");
+    assert!(v.to_string().contains("without the preimage"), "{v}");
+    assert!(r.tap.secrets().is_empty(), "nothing was shown to the seller: {v}");
+    assert_eq!(r.ledger_sum(), SETTLED, "the ticket stays booked as spent: {v}");
+    assert_eq!(v["charged_sats"].as_i64(), Some(SETTLED), "the call says what its ticket booked: {v}");
 }
 
 /// A stop that comes while a prepaid ticket is on its way to its payment (asked of the seller, past

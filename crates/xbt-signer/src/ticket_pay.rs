@@ -3116,6 +3116,10 @@ impl Signer {
                 self.ticket_prepay(&p)
             }
         };
+        // what the book booked for the ticket left with the call, however its payment ended: paid, not final yet, or
+        // settled without the preimage that proves it (both stay booked as spent). Counted before either is refused, so
+        // that the call says it among what it charged. A payment that failed books nothing
+        spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
         if r["verdict"] == "pending" {
             // booked, and neither paid nor failed by the node's word: nothing more is paid in this session
             return Err(self.ticket_fault(hs, "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"));
@@ -3135,7 +3139,6 @@ impl Signer {
         }
         spent.hashes.push(hash);
         spent.prepaid += 1;
-        spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
         self.ticket_deliver(hs)
     }
 
