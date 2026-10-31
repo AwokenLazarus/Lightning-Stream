@@ -181,13 +181,14 @@ who saw that key on the link, can tell it is the hashtaker it served:
 
 It names no pool, payout address, user name, rental name or IP address.
 
-**A hashmaker's summary.** A hashmaker with relays and a Nostr key set publishes, at most every ten
-minutes after a rental ends, its own signed list of the rentals it served: kind 30078, `d` =
+**A hashmaker's summary.** A hashmaker with relays and a Nostr key set publishes, at most every six
+hours after a rental ends, its own signed totals of the rentals it served: kind 30078, `d` =
 `lightning-stream-hash-summary:<link key>`, `t` = `lightning-stream-hash-summary`, `p` = its link
-key (x-only), content at most 16 KiB with its newest 40 rentals (the commitment, the hashtaker's
-key, slices and millisatoshis paid, work, the receipts hash, the hour it ended). It is signed by the
-Nostr key the hashmaker's listing is bound to; a summary by any other key is ignored. The hashmaker
-keeps it in `hash-summary.json` beside its settings, so it survives a restart.
+key (x-only), content `{"v": 2, "hashmaker", "rentals", "paidSlices", "paidMsat", "work"}`, dated to the
+hour. It names no renter's key, no rental and no time a rental ran, so nobody can follow a renter from
+it. It is signed by the Nostr key the hashmaker's listing is bound to; a summary by any other key is
+ignored. The list behind it, rental by rental, stays on the hashmaker's box in `hash-summary.json` beside
+its settings, so it survives a restart.
 
 **What the offer shows.** Each offer on Services → Hashrate carries the delivery records about its
 hashmaker on the app's relays: how many, and from how many keys, under the words "Anyone can publish
