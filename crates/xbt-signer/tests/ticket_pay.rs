@@ -8014,6 +8014,48 @@ fn a_session_with_no_key_on_record_is_taken_over_only_where_it_was_opened() {
     assert_eq!(r.ln.paid_msat(), 2 * TICKET);
 }
 
+/// A session the book has called idle while this process still holds it (the owner's idle time is
+/// longer than the book's): its seller session is not taken over from beside it, under another
+/// address on other terms, and its tickets are not cancelled under it.
+#[test]
+fn a_seller_session_this_process_still_holds_is_not_taken_over_beside_it() {
+    let _g = env_lock();
+    let mut shop = strict_shop();
+    shop["alias"] = true.into();
+    let r = Rig::shipped(json!({"tickets": {"http_idle_s": 3600}}), 30, shop);
+    let a = r.pay("/page/1", CALL);
+    assert_eq!(a["status"].as_u64(), Some(200), "{a}");
+    wait_refill(&r, "two tickets held", 2);
+    let sid = new_sid_of(&a);
+    let mine: Vec<String> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "locked").map(|t| t["hash"].as_str().unwrap().to_string()).collect();
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    assert_ne!(r.session(&sid)["sessions"][0]["state"], "open", "the book calls it idle");
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid || seen.path.starts_with("/x402/") {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        for (_, v) in headers.iter_mut().filter(|(k, _)| k == "PAYMENT-REQUIRED") {
+            let mut pr = unb64json(v).unwrap();
+            for entry in pr["accepts"].as_array_mut().unwrap() {
+                if let Some(n) = entry["extra"]["maxTickets"].as_u64().or(entry["maxTickets"].as_u64()) {
+                    let at = if entry["extra"]["maxTickets"].is_null() { &mut entry["maxTickets"] } else { &mut entry["extra"]["maxTickets"] };
+                    *at = (n - 1).into();
+                }
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let c = r.call("xbt402_pay", json!({"url": r.shop.url("/page/1").replace("127.0.0.1", "localhost"), "max_sats": CALL, "task": "film"}));
+    r.tap.clear();
+    assert_eq!((c["status"].as_u64(), c["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a ticket of its own: {c}");
+    assert!(r.audit("ticket_resumed").is_empty(), "held here");
+    let named: Vec<String> = r.tap.seen("/x402/ticket/cancel").iter().flat_map(|s| serde_json::from_str::<Value>(&s.body).unwrap()["hashes"].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect::<Vec<_>>()).collect();
+    assert!(named.iter().all(|h| !mine.contains(h)), "its tickets named: {named:?} {mine:?}");
+}
+
 /// A seller session the seller has forgotten stops using up the asks: the next takeover goes to the
 /// next session's credit.
 #[test]
@@ -10586,6 +10628,8 @@ fn calls_queued_behind_a_silent_status_are_told_at_once_and_the_watcher_waits_fo
         (tick, out)
     });
     assert!(times.1.iter().all(|(_, s)| *s < 90), "a call waited past the app's 90 s: {times:?}");
+    // (one question to that seller of its own, for what the start stopped; nothing waited for the calls)
+    assert!(times.0 < 12, "the watcher waited for the calls: {times:?}");
 }
 
 /// A long answer with no ticket event for 10 minutes: the book calls the session idle while it runs.
