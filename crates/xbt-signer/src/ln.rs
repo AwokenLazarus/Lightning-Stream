@@ -13,7 +13,7 @@
 //!    own Knots node;
 //! 3. the node's decode of the same invoice, field by field;
 //! 4. the channels it may leave through ([`usable_channels`]): active, unified (0x21) signatures,
-//!    **not taproot**, not zero-conf, funded at or above the split height, and (AGP-049) a funding
+//!    **not taproot**, not zero-conf until its funding confirms, funded at or above the split height, and (AGP-049) a funding
 //!    transaction proven on our own node to carry, on every input, only 0x21 signatures that the
 //!    input's script checks ([`crate::ln_funding`], AGP-066), whatever the node's `unified_sigs` flag
 //!    says; the proof is cached per funding block hash, so a reorg proves it again, and kept on disk,
@@ -784,13 +784,18 @@ pub fn channel_refusal(c: &Value, split_height: i64) -> Option<String> {
     if c.get("unified_sigs") != Some(&Value::Bool(true)) {
         return Some("not unified (option_unified_sigs): its signatures are 0x01 and replayable".into());
     }
-    if c.get("zero_conf") == Some(&Value::Bool(true)) {
+    // lnd's zero_conf says how the channel was opened and stays true once its funding confirms; the
+    // funding is judged by zero_conf_confirmed_scid, which lnd sets at that confirmation (chan_id stays
+    // the channel's alias, which names no block)
+    let confirmed_scid = u64_of(c.get("zero_conf_confirmed_scid"));
+    let zero_conf = c.get("zero_conf") == Some(&Value::Bool(true));
+    if zero_conf && confirmed_scid == 0 {
         return Some("zero-conf: its funding is not confirmed on our chain".into());
     }
     if c.get("active") != Some(&Value::Bool(true)) {
         return Some("inactive".into());
     }
-    let h = (u64_of(c.get("chan_id")) >> 40) as i64;
+    let h = ((if zero_conf { confirmed_scid } else { u64_of(c.get("chan_id")) }) >> 40) as i64;
     if h < split_height {
         return Some(format!("funded at height {h}, below the split {split_height}: the funding exists on both chains"));
     }
