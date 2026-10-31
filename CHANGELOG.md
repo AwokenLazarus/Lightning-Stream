@@ -139,7 +139,6 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   most shares down.
 - Checking a share costs about 1.7 µs on a lab core, about 7 µs estimated on a Raspberry Pi 4.
 - Old and new versions refuse each other, with nothing paid: update both sides.
-
 - A trial slice and a rental smaller than the shop's ticket are paid from no credit, instead of
   being refused; credit left with a seller lasts about 20 hours, and the rental card says what left
   the wallet.
