@@ -8900,7 +8900,10 @@ fn flap(r: &Rig, after: usize, out: Duration) -> Arc<AtomicBool> {
 #[test]
 fn a_channel_out_for_a_moment_does_not_end_a_file_paid_by_tickets() {
     let _g = env_lock();
+    // the seller waits for a ticket as long as it does as shipped (15 s), not the tests' 2 s, which the 1.5 s out can use up
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
     let r = Rig::shipped(json!({}), 30, shipped_shop());
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
     let came = flap(&r, 4, Duration::from_millis(1_500));
     let size = 30 * MIB;
     let v = r.pay(&format!("/files/{size}"), 20_000);
@@ -9128,7 +9131,10 @@ fn a_channel_out_for_a_moment_ends_no_tunnel_whether_an_htlc_is_pending_or_the_p
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("B2_STREAM_DIR", dir.path());
     for pending in [false, true] {
+        // the seller waits for a ticket as long as it does as shipped (15 s), not the tests' 2 s
+        REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
         let r = Rig::new(json!({}));
+        REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
         // with the pool empty: its first locks find no slot, and for the wait that follows the tunnel pays by prepaid
         // tickets, each a refill its release waits for, with nothing held on the channel
         r.ln.st.lock().unwrap().fail_next = if pending { 0 } else { 2 };
