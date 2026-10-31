@@ -969,7 +969,14 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 }
                 r.waits.push_back(now);
                 r.waiting_since = Some(now);
-                r.note(json!({"ev": "waiting for a payment on its way", "atMs": now_ms()}));
+                r.note(json!({"ev": "waiting for a payment on its way", "atMs": now_ms(), "held": r.held.len()}));
+                // the miners go to this side's own pool and their channels close, so a share held for payment can't go on
+                // later: its miner is told, and it is neither counted nor paid
+                r.held_since = None;
+                let held = std::mem::take(&mut r.held);
+                for h in held {
+                    answer_share(&mut g, h.conn, &Refused::TooOld, &h.v);
+                }
             }
             Msg::Shut { chan } => {
                 // the hashtaker's last verdict for this channel has been read: both meters let it go here
