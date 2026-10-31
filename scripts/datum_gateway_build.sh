@@ -145,7 +145,9 @@ EOF
     done && "$AR" rcs "$P/lib/libargp.a" argp-*.o && cp argp.h "$P/include/") >>"$log" 2>&1 \
     || { tail -30 "$log" >&2; echo "datum_gateway_build: argp failed for $T ($log)" >&2; exit 1; }
 
-  # the gateway, against those alone (CMAKE_FIND_ROOT_PATH: no host library is found)
+  # the gateway, against those alone (CMAKE_FIND_ROOT_PATH: no host library is found). Linked without debug
+  # info: zig builds its musl libc once into its own cache, with that build's working directory and zig's own
+  # install path in the DWARF (no -ffile-prefix-map reaches it), and those are host paths
   B=$W/gw
   (cmake -S "$ROOT/third_party/datum_gateway" -B "$B" -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR="$PROC" \
@@ -153,7 +155,7 @@ EOF
       -DCMAKE_FIND_ROOT_PATH="$P" -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
       -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
       -DARGP_INCLUDE_DIR="$P/include" -DARGP_LIBRARY="$P/lib/libargp.a" \
-      -DCMAKE_C_FLAGS="$CFLAGS -ffile-prefix-map=$B=/build" -DCMAKE_EXE_LINKER_FLAGS="-static" >>"$log" 2>&1 \
+      -DCMAKE_C_FLAGS="$CFLAGS -ffile-prefix-map=$B=/build" -DCMAKE_EXE_LINKER_FLAGS="-static -Wl,--strip-debug" >>"$log" 2>&1 \
     && cmake --build "$B" -j"$J" >>"$log" 2>&1) \
     || { tail -40 "$log" >&2; echo "datum_gateway_build: the gateway failed for $T ($log)" >&2; exit 1; }
 
