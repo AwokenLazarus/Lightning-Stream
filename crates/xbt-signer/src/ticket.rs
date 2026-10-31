@@ -498,7 +498,7 @@ pub fn mainnet_ack_file() -> bool {
 pub const MAINNET_DEFAULTS: [(&str, i64); 5] = [("max_locked_tickets", 4), ("max_locked_sats", 4_000), ("max_sellers", 4), ("max_new_sellers_per_min", 4),
                                                ("max_sends_per_hour", 120)];
 
-pub const TICKET_INT_KEYS: [&str; 21] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
+pub const TICKET_INT_KEYS: [&str; 22] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
                                          "max_new_sellers_per_min", "max_sends_per_hour", "pool", "pool_many", "many_sellers", "floor_ticket_sats",
                                          "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "max_socket_s", "max_stream_s", "feerate_cap_sat_per_kw"];

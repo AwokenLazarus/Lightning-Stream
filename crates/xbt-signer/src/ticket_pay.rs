@@ -87,7 +87,7 @@ use crate::keystore::write_private;
 use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::signer::{deny, with, Signer};
-use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, ROUTE_FULL};
+use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, PROGRESS_FLOOR_BYTES, ROUTE_FULL};
 use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, PriceCeiling, Receipt};
 use crate::{err, Result};
 
