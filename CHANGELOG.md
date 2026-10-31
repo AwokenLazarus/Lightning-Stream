@@ -54,6 +54,13 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   reason; a file paid by draws may still finish, with the wins it could not pay listed unpaid.
 - A win whose invoice ran out while it waited its turn is paid on the seller's next invoice, rather
   than ending the file; a win that would arrive after its invoice ends is not sent.
+- Going on with a file from where it stopped (`range`) no longer buys the start of it again from a seller
+  whose server ignores ranges. Until now the wallet read and paid for a whole body sent in answer to a range,
+  "like any other"; now it reads none of it and says `ticket_range_ignored`, with what the call cost (on a route
+  priced by the byte, what the seller's socket took before the wallet closed it). A call that goes on from an
+  earlier answer can name that answer's `etag` (`if_range`): a seller whose file has changed since sends the whole
+  new file, which is not read either, rather than the rest of another file spliced onto the old start. The app's
+  player link passes the player's own `If-Range` on.
 - A win whose payment failed no longer costs a file: the wallet asks the seller to cancel that invoice,
   and pays the seller's next one at once rather than waiting for the first to lapse. A seller on an
   earlier version behaves as before.

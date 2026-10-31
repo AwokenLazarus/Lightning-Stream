@@ -47,6 +47,7 @@ import http.client
 import json
 import os
 import secrets
+import shutil
 import signal
 import socket
 import statistics
@@ -998,6 +999,11 @@ class ChannelDrops:
         lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
 
 
+# What an answer the wallet does not read may still cost on a route priced by the byte: what the seller's socket took
+# before the wallet closed it (its buffers, a few hundred KiB at most); the check reports the amount.
+UNREAD_MOST_MSAT = -(-(256 << 10) * BYTE_MSAT // PER_BYTES)
+
+
 def digest_of_range(start: int) -> str:
     h = hashlib.sha256()
     with open(f"{RUN}/www/big.bin", "rb") as f:
@@ -1033,33 +1039,78 @@ def flap() -> None:
     m = money()
     check("flap: what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number, to the millisat",
           agrees(m), m)
-    # an outage: a drop every second
+    # an outage: a drop every second, on a file served with ranges (the stock server has none), so that it can go on
     stop_sessions()
-    with ChannelDrops(1.0) as drops:
-        r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
-    got = int(r.get("bytes") or 0)
-    if r.get("saved_to"):
-        os.remove(r["saved_to"])
-    first = {**brief(r), "drops": drops.drops, "errors": drops.errors}
-    if r.get("complete") is True and got == BIG:
-        check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
-              r.get("body_digest") == digest_of_prefix(BIG) and not drops.errors, {"whole": True, **first})
-    else:
-        ended = str(r.get("ended") or "")
-        clear = ended.startswith("stopped by the wallet: ") or ended.startswith("cut short by the seller")
-        rest = BIG - got
-        again = (agent()).tool("xbt402_pay", {"url": f"{ORIGIN}/big.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-"})
-        note_receipts(again)
-        if again.get("saved_to"):
-            os.remove(again["saved_to"])
-        price = int(again.get("price_msat") or 0)
-        rest_msat = -(-rest * BYTE_MSAT // PER_BYTES)
-        resumed = {"bytes": again.get("bytes"), "complete": again.get("complete"), "status": again.get("status"), "price_msat": price,
-                   "price_of_the_rest_msat": rest_msat, "ended": again.get("ended")}
-        check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
-              bool(got) and clear and again.get("status") == 206 and again.get("complete") is True and again.get("bytes") == rest
-              and again.get("body_digest") == digest_of_range(got) and price <= rest_msat and not drops.errors,
-              {"first": first, "stopped_at": got, "reason_clear": clear, "resumed": resumed})
+    range_port, gw_port = BASE + 25, BASE + 26
+    server = ThreadingHTTPServer(("127.0.0.1", range_port), RangeFiles)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    origin = f"http://127.0.0.1:{gw_port}"
+    path = gateway_config("gateway-flap", gw_port, origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["upstream"] = f"http://127.0.0.1:{range_port}"
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("gateway-flap", gw_port)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    shutil.copyfile(f"{RUN}/www/big.bin", f"{RUN}/www/flap.bin")
+    try:
+        with ChannelDrops(1.0) as drops:
+            r = pay(f"{origin}/flap.bin", max_sats=25_000)
+        got = int(r.get("bytes") or 0)
+        if r.get("saved_to"):
+            os.remove(r["saved_to"])
+        first = {**brief(r), "drops": drops.drops, "errors": drops.errors}
+        if r.get("complete") is True and got == BIG:
+            check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
+                  r.get("body_digest") == digest_of_prefix(BIG) and not drops.errors, {"whole": True, **first})
+        else:
+            ended = str(r.get("ended") or "")
+            clear = ended.startswith("stopped by the wallet: ") or ended.startswith("cut short by the seller")
+            rest = BIG - got
+            again = agent().tool("xbt402_pay", {"url": f"{origin}/flap.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-",
+                                                "if_range": r.get("etag") or ""})
+            note_receipts(again)
+            if again.get("saved_to"):
+                os.remove(again["saved_to"])
+            price = int(again.get("price_msat") or 0)
+            rest_msat = -(-rest * BYTE_MSAT // PER_BYTES)
+            resumed = {"bytes": again.get("bytes"), "complete": again.get("complete"), "status": again.get("status"), "price_msat": price,
+                       "price_of_the_rest_msat": rest_msat, "ended": again.get("ended"), "etag": r.get("etag")}
+            check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
+                  bool(got) and clear and bool(r.get("etag")) and again.get("status") == 206 and again.get("complete") is True and again.get("bytes") == rest
+                  and again.get("body_digest") == digest_of_range(got) and price <= rest_msat and not drops.errors,
+                  {"first": first, "stopped_at": got, "reason_clear": clear, "resumed": resumed})
+        # the file changed between the two calls: the seller's copy is another, and its rest is not spliced on
+        stop_sessions()
+        r = pay(f"{origin}/flap.bin", max_sats=25_000)
+        etag = r.get("etag") or ""
+        if r.get("saved_to"):
+            os.remove(r["saved_to"])
+        with open(f"{RUN}/www/flap.bin", "r+b") as f:
+            f.seek(BIG // 2)
+            f.write(b"another copy")
+        changed = agent().tool("xbt402_pay", {"url": f"{origin}/flap.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={BIG // 4}-", "if_range": etag})
+        note_receipts(changed)
+        if changed.get("saved_to"):
+            os.remove(changed["saved_to"])
+        check("flap: a range that goes on from a copy the seller no longer has comes back whole, and none of it is read; it costs at most what the seller's socket took",
+              bool(etag) and changed.get("rule") == "ticket_range_ignored" and changed.get("status") == 200 and int(changed.get("bytes") or 0) == 0
+              and int(changed.get("price_msat") or 0) <= UNREAD_MOST_MSAT,
+              {k: changed.get(k) for k in ("status", "rule", "reason", "bytes", "price_msat", "charged_sats", "complete", "ended")} | {"etag": etag})
+    finally:
+        server.shutdown()
+    # the stock server, which has no ranges: a range is answered with the whole body, and none of it is read
+    stop_sessions()
+    plain = agent().tool("xbt402_pay", {"url": f"{ORIGIN}/big.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={BIG // 2}-"})
+    note_receipts(plain)
+    if plain.get("saved_to"):
+        os.remove(plain["saved_to"])
+    check("flap: a seller whose server has no ranges answers a range with the whole body, and the wallet reads none of it; it costs at most what the seller's socket took",
+          plain.get("rule") == "ticket_range_ignored" and plain.get("status") == 200 and int(plain.get("bytes") or 0) == 0 and int(plain.get("price_msat") or 0) <= UNREAD_MOST_MSAT,
+          {k: plain.get(k) for k in ("status", "rule", "reason", "bytes", "price_msat", "charged_sats", "complete", "ended")})
     quiet()
     m = money()
     check("flap: after the outage and the resumed file, what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number",
@@ -1883,12 +1934,18 @@ class RangeFiles(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         size = os.path.getsize(path)
+        st = os.stat(path)
+        etag = f'"{size:x}-{st.st_mtime_ns:x}"'
         start, want = 0, self.headers.get("Range", "")
+        # If-Range: a range only of the copy the client names; another copy goes whole (RFC 9110 13.1.5)
+        if want and self.headers.get("If-Range") not in (None, etag):
+            want = ""
         if want.startswith("bytes=") and want.endswith("-"):
             start = int(want[6:-1])
         self.send_response(206 if want else 200)
         self.send_header("Content-Type", "video/mp4")
         self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
         self.send_header("Content-Length", str(size - start))
         if want:
             self.send_header("Content-Range", f"bytes {start}-{size - 1}/{size}")

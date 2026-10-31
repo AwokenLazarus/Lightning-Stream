@@ -1031,6 +1031,7 @@ impl Signer {
         }
         let (_, stored, text) = sink.done();
         out = with(with(out, stored), about(ds, &counted));
+        super::range_ignored(&mut out, c);
         out["ms"] = json!((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0);
         out[UNTRUSTED_KEY] = untrusted(&text, head.raw);
         *lock(&ds.used) = self.engine.now();

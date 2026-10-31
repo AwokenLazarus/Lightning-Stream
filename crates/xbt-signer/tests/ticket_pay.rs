@@ -112,15 +112,17 @@ impl Handler for Service {
         };
         let stream = |n: usize, length: Option<u64>, b: xbt_svc::http::Body| {
             let _ = n;
-            Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
+            Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into()), ("ETag".into(), FILE_TAG.into())], length, body: b })
         };
         if let Some(n) = path.strip_prefix("/files/unsized/").or_else(|| path.strip_prefix("/pieces/unsized/")).and_then(|n| n.parse::<usize>().ok()) {
             // a file whose server states no size (sent as it is read): its length is known only at its end
             return stream(n, None, body(n, 64 << 10, Duration::ZERO));
         }
         if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")).or_else(|| sized("/uhd/")).or_else(|| sized("/hd20/")) {
-            // one byte range, as a file server answers it: 206 and that part of the same bytes
-            let range = req.header("Range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
+            // one byte range, as a file server answers it: 206 and that part of the same bytes; with an If-Range of
+            // another copy than this one, the whole body (RFC 9110 13.1.5), as a server whose file has changed
+            let other_copy = req.header("If-Range").is_some_and(|v| v != FILE_TAG);
+            let range = req.header("Range").filter(|_| !other_copy).and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
                 .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, if b.is_empty() { n.checked_sub(1)? } else { b.parse::<usize>().ok()?.min(n.checked_sub(1)?) })));
             if let Some((a, b)) = range.filter(|(a, b)| a <= b) {
                 let span = b - a + 1;
@@ -5013,6 +5015,9 @@ fn win_tickets(r: &Rig, sid: &str) -> Vec<Value> {
     r.session(sid)["session_tickets"].as_array().cloned().unwrap_or_default().into_iter().filter(|t| t["win"].as_u64().unwrap_or(0) > 0).collect()
 }
 
+/// The validator of the test service's files (`ETag`): one copy, which never changes.
+const FILE_TAG: &str = "\"v1\"";
+
 /// A seller of an earlier version: it knows no `cancel`, and its route table answers 404.
 fn old_seller(r: &Rig) {
     r.tap.set(Box::new(|seen, _| seen.path.ends_with("/lottery/cancel").then(|| Ok(answer(404, vec![], br#"{"error":"no_route"}"#.to_vec())))));
@@ -9570,5 +9575,36 @@ fn a_moment_with_no_route_to_the_seller_is_waited_for_and_costs_no_failed_paymen
             assert!(no_route.is_empty(), "a window of 3 s is waited out: {no_route:?}");
         }
     }
+}
+
+/// A range that goes on from a copy the seller no longer has (`if_range` names another) is answered with the
+/// whole body: none of it is read, the call says so by its own rule and what it cost, and the money is the same
+/// on both sides. The copy it names goes on from the byte asked for, and the head says its validator.
+///
+/// FAILS before: the whole body was read and metered, the bytes the caller had bought again.
+#[test]
+fn a_range_answered_with_the_whole_body_is_not_read_and_one_of_the_same_copy_goes_on() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let n = 8 * MIB;
+    let first = r.pay(&format!("/files/{n}"), 5_000);
+    assert_eq!((first["status"].as_u64(), first["etag"].as_str()), (Some(200), Some(FILE_TAG)), "{first}");
+    let before = r.money();
+    let other = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                          "range": "bytes=1048576-", "if_range": "\"v0\""}));
+    assert_eq!((other["status"].as_u64(), other["rule"].as_str(), other["complete"].as_bool(), other["bytes"].as_u64()),
+               (Some(200), Some("ticket_range_ignored"), Some(false), Some(0)), "{other}");
+    let cost = other["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+    assert!(other["reason"].as_str().unwrap().contains(&format!("{cost} msat")), "{other}");
+    assert!(cost <= 50_000, "at most what the seller's socket took (256 KiB at 200 sat a MiB): {cost} msat");
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "{other}");
+    assert!(paid - before.0 <= TICKET && ledger >= before.3, "no file bought again: {other}");
+    let same = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                         "range": "bytes=1048576-", "if_range": FILE_TAG}));
+    assert_eq!((same["status"].as_u64(), same["complete"].as_bool(), same["bytes"].as_u64()), (Some(206), Some(true), Some((n - MIB) as u64)), "{same}");
+    let bad = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": 5_000, "task": "film", "if_range": FILE_TAG}));
+    assert_eq!(bad["rule"], "if_range", "{bad}");
+    r.assert_booked();
 }
 
