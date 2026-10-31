@@ -5904,6 +5904,28 @@ fn a_call_charged_less_than_it_may_move_buys_a_ticket_sized_to_its_charge() {
     assert_eq!((r.ln.paid_msat(), asked(&r)), (1_000_000, vec![]), "{v}");
 }
 
+/// A metered answer under a charge cap, at a seller that lets the wallet choose a small ticket
+/// (prepaid, its smallest 1 sat): the call may move 2,000 sat but be charged 30, so one ticket of
+/// about 30 sat is bought, and none more as the film nears the end of what that ticket pays for:
+/// the call could never be charged for a second. The film is read to the cap and no further.
+///
+/// FAILS before a release was held to the charge cap: a second ticket, about 60 sat left for 30 used.
+#[test]
+fn a_capped_metered_answer_buys_no_ticket_past_its_charge_cap() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), Some(1_000)));
+    let film = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/hd20/{}", 30 * MIB)), "max_sats": 2_000, "max_charge_sats": 30, "task": "film"}));
+    r.tick();
+    assert_eq!(film["complete"].as_bool(), Some(false), "read to the cap, not to the film's end: {film}");
+    let charged: u64 = film["price_msat"].as_str().unwrap().parse().unwrap();
+    assert!(charged <= 30_000 && charged > 20_000, "charged {charged} msat for a cap of 30 sat: {film}");
+    let paid = r.ln.paid_msat();
+    assert_eq!(film["tickets_prepaid"].as_u64(), Some(1), "one ticket, paid {paid} msat: {film}");
+    assert!((30_000..=40_000).contains(&paid), "one ticket of about the cap: paid {paid} msat: {film}");
+    assert!(film["charged_sats"].as_i64().unwrap() <= 40 && r.ledger_sum() <= 40, "what left: {film}, ledger {}", r.ledger_sum());
+    r.assert_booked();
+}
+
 /// The draw rail keeps a call's `max_charge_sats` as the ticket rail does: the answer is read no
 /// further than it, while `max_sats` stays what may leave (here, a whole win of 64 sat).
 ///

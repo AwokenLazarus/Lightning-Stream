@@ -1550,14 +1550,20 @@ prepaid ticket instead: a lock with `settle: "on-arrival"` and a count of 1, the
 the invoice and every rule of a release, the ledger row, the payment, and then the preimage in
 `release`. One at a time, and none ahead of need.
 
-`max_sats` bounds what the call books, and so what it uses. Money moves a ticket at a time, and a
+`max_sats` bounds what the call books, whole tickets and their fee limits included; its charge cap
+(`max_charge_sats`, else `max_sats`) bounds what it uses. Money moves a ticket at a time, and a
 ticket is released or bought for a call only when it fits what is left of the call's `max_sats`,
-its fee limit included. Where the seller's own size does not fit and its terms let the wallet ask
-for a smaller one (`minTicketMsat`), the wallet asks for the largest that fits, in whole sats, and
-no larger than the call's charge cap needs (a ticket of that cap with its fee limit, or the
-seller's smallest where that is larger): a prepaid ticket is sized for each purchase, a session's
-held tickets once, to the call that opens it, and a held ticket that does not fit a later call
-gives way to a smaller prepaid one where the seller sells those. Where nothing fits, nothing is paid and the call is refused (`max_sats`, with
+its fee limit included, and only while what the call's tickets have credited does not already
+cover its charge cap: the call could never be charged for one more. Where the seller's own size
+does not fit and its terms let the wallet ask for a smaller one (`minTicketMsat`), the wallet asks
+for the largest that fits, in whole sats, and no larger than the call's charge cap needs: a ticket
+of that cap with its fee limit, or, where that is larger, the seller's smallest for a prepaid
+ticket, and for a held one the larger of the seller's smallest and the smallest the wallet holds
+(the largest of 546 sat, the owner's `tickets.floor_ticket_sats` and the channels' dust limit:
+section 11). A
+prepaid ticket is sized for each purchase, a session's held tickets once, to the call that opens
+it, and a held ticket that does not fit a later call gives way to a smaller prepaid one where the
+seller sells those. Where nothing fits, nothing is paid and the call is refused (`max_sats`, with
 `ticket_sats` and `ticket_booking_sats`, the size the call would need). A call that fits a ticket
 can still use less of it than it books: a 3-sat page under a limit of 1,003 sat releases a
 1,000-sat ticket, and the rest is the session's balance for later calls, whatever their limits. What a seller's receipts say moves only the

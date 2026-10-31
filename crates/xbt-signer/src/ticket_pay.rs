@@ -1733,12 +1733,13 @@ struct Stream {
 }
 
 impl Stream {
-    /// Why the wallet reads no further, if it does not: the call's `max_sats` is used up by its
-    /// own count, or the answer has been open for as long as the owner allows.
+    /// Why the wallet reads no further, if it does not: the call's charge cap (`max_charge_sats`,
+    /// else its `max_sats`) is used up by its own count, or the answer has been open for as long as
+    /// the owner allows.
     fn over(&self, bytes: u64) -> Option<String> {
         // a body with a price of its own only: one paid for at its head costs nothing more however long it is
         if self.price.metered() && self.cost(bytes) >= self.max_msat {
-            return Some("max_sats: the call's limit is used up".into());
+            return Some("max_sats: the call's charge cap is used up".into());
         }
         (self.started.elapsed() >= self.max_open).then(|| format!("{}: the answer has been open for {} s", self.limit, self.max_open.as_secs()))
     }
@@ -1760,6 +1761,14 @@ impl Stream {
         credited.saturating_sub(self.base_spent)
     }
 
+    /// The credit released so far already covers all the request may be charged (its charge cap):
+    /// no ticket more is due for it, whatever its body does. Without this a capped call at a seller
+    /// of small tickets bought a second one as the body neared the end of the first, which it could
+    /// never be charged for.
+    fn capped(&self, credited: u64) -> bool {
+        self.avail(credited) >= self.max_msat
+    }
+
     /// What does not depend on the body's size: the request and the seconds started.
     fn fixed(&self) -> u64 {
         self.price.request_msat.saturating_add(self.price.for_seconds(self.seconds()).unwrap_or(u64::MAX))
@@ -1776,7 +1785,7 @@ impl Stream {
     /// an answer that pauses, and the seller pauses where the balance runs out, so a wallet that
     /// waited for every paid byte would wait for bytes the seller is waiting to be paid to push.
     fn due_bytes(&self, credited: u64, bytes: u64, length: Option<u64>) -> bool {
-        if self.price.byte_msat == 0 {
+        if self.price.byte_msat == 0 || self.capped(credited) {
             return false;
         }
         let covered = self.covered(credited);
@@ -1790,7 +1799,7 @@ impl Stream {
     /// before the body reaches the end of what is paid for, so a payment that takes a second or two
     /// does not hold the body up. `lead` is the caller's, and at most half of what one ticket covers.
     fn due_bytes_ahead(&self, credited: u64, bytes: u64, length: Option<u64>, lead: u64) -> bool {
-        if self.price.byte_msat == 0 {
+        if self.price.byte_msat == 0 || self.capped(credited) {
             return false;
         }
         let covered = self.covered(credited);
@@ -1802,7 +1811,7 @@ impl Stream {
 
     /// A body priced by the second: the balance does not cover the second that starts next.
     fn due_time(&self, credited: u64) -> bool {
-        self.price.second_msat > 0 && self.avail(credited) < self.fixed().saturating_add(self.price.second_msat)
+        self.price.second_msat > 0 && !self.capped(credited) && self.avail(credited) < self.fixed().saturating_add(self.price.second_msat)
     }
 
     /// The most the seller may charge an answer cut short after `read` bytes both ways and `secs`
@@ -5174,6 +5183,27 @@ mod tests {
     }
     use super::*;
 
+    /// Once the credit released for a request covers its charge cap, no ticket more is due for it,
+    /// however far its body goes or however long it runs: it could never be charged for one.
+    #[test]
+    fn no_ticket_is_due_once_the_credit_covers_the_charge_cap() {
+        let per_mib = Price { request_msat: 0, byte_msat: 20_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
+        let st = Stream { price: per_mib, base_spent: 5_000, started: Instant::now(), max_msat: 30_000, max_open: Duration::from_secs(50), limit: "max_answer_s" };
+        let cap_bytes = per_mib.bytes_for(30_000);
+        // 20 sat credited for it, below its 30-sat cap: due near the end of what that pays for, as always
+        assert!(st.due_bytes(25_000, cap_bytes, None) && st.due_bytes_ahead(25_000, 0, None, cap_bytes));
+        // 30 sat credited, the cap: never, though the body goes on past what the credit pays for
+        assert!(!st.due_bytes(35_000, cap_bytes, None) && !st.due_bytes(35_000, 4 * cap_bytes, None));
+        assert!(!st.due_bytes_ahead(35_000, cap_bytes, None, cap_bytes));
+        // and the body is read no further than the cap
+        assert!(st.over(cap_bytes).is_some_and(|w| w.contains("charge cap")) && st.over(cap_bytes / 2).is_none());
+        // by the second: the next second is not paid for, but the credit already covers the cap
+        let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: 10_000, tokens: xbt402::tokens::TokenRule::NONE };
+        let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: 15_000, max_open: Duration::from_secs(50), limit: "max_answer_s" };
+        assert!(st.due_time(10_000), "one second paid, below the cap");
+        assert!(!st.due_time(15_000), "the cap is paid for");
+    }
+
     #[test]
     fn a_ticket_is_due_only_when_the_balance_does_not_cover_the_next_piece() {
         let per_mib = Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
@@ -5201,8 +5231,8 @@ mod tests {
         assert_eq!(st.seconds(), 1, "the first second has started");
         assert!(st.due_time(100_000), "one second paid, the second is not");
         assert!(!st.due_time(200_000) && !st.due_bytes(100_000, 1 << 30, None));
-        // a price that does not fit is due at once and costs the most there is
-        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50), limit: "max_answer_s" };
+        // a price that does not fit is due at once and costs the most there is, over even the largest limit
+        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert_eq!(huge.cost(1), u64::MAX);
         assert!(huge.due_bytes(1_000_000, 0, None));
         assert!(huge.over(0).is_some_and(|w| w.starts_with("max_sats")), "and is over any limit");
