@@ -10861,7 +10861,7 @@ fn mainnet_starter(hashrate: Value) -> Value {
 }
 
 fn starter_rental() -> Value {
-    json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 50_000, "max_sends_per_hour": 600}})
+    json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}})
 }
 
 /// The task as the starter rules had it before: an older wallet's, whose owner has signed nothing since.
@@ -11052,6 +11052,34 @@ fn a_rental_tasks_ticket_is_clamped_where_anothers_is_refused() {
     assert!(v["reason"].as_str().unwrap().contains("max_ticket_sats") && r.ln.paid_msat() == 0, "{v}");
 }
 
+/// A miner whose earned step is above the starter rules' 10,000 sat a ticket: a 100 TH/s miner at market price earns
+/// a step of 30 s of its output, about 34,500 sat. Its tickets are clamped to the cap and paid, never refused or left
+/// waiting, and at that size it needs about 414 of them an hour, under the 600 its task allows.
+#[test]
+fn a_big_miners_step_above_the_starter_cap_is_paid_in_tickets_of_the_cap() {
+    let _g = env_lock();
+    let shop = hash_shop(MARKET_MSAT, json!({"ticket_msat": 546_000, "min_ticket_msat": 546_000}), Some(100_000_000));
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, shop);
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(200_000));
+    // 100 TH/s at market: 2^45 hashes a slice, about 2.84 slices a second, 1,149 sat a second
+    let slices_a_second = 100e12 / SLICE_WORK as f64;
+    t.standing.msat_a_second = slices_a_second * MARKET_MSAT as f64;
+    t.standing.proven = 200 * SLICE_WORK;
+    t.standing.paid = 200;
+    let step = t.standing.ticket_msat();
+    assert!(step > 30_000_000, "the step a 100 TH/s miner has earned: {step} msat");
+    for n in 201..=203 {
+        t.standing.paid = n;
+        let v = t.pay().unwrap_or_else(|e| panic!("slice {n}: {e}"));
+        assert_eq!(v["verdict"], "allow", "{v}");
+    }
+    let tickets = paid_tickets(&r);
+    assert!(!tickets.is_empty() && tickets.iter().all(|s| *s <= 10_000), "every ticket within the cap: {tickets:?}");
+    assert!(tickets.contains(&10_000), "clamped to the cap, not smaller: {tickets:?}");
+    let an_hour = 3600.0 * slices_a_second * MARKET_MSAT as f64 / 10_000_000.0;
+    assert!(an_hour < 600.0, "{an_hour:.0} tickets an hour at the cap");
+}
+
 /// The analysis' claim that, with the charge cap set per call, the ticket's size needs no wallet change.
 /// It holds for a task with no new settings only inside the seller's own size and the owner's "ask me
 /// first" line: the ticket is the charge cap from the seller's smallest up to those, and no further.
@@ -11153,7 +11181,7 @@ fn a_shop_wide_smallest_of_546_changes_nothing_for_a_call_that_could_pay_before(
 #[test]
 fn a_rentals_sends_and_another_tasks_count_apart() {
     let _g = env_lock();
-    let mut extra = mainnet_starter(json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 50_000, "max_sends_per_hour": 2}}));
+    let mut extra = mainnet_starter(json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 2}}));
     extra["tickets"]["max_sends_per_hour"] = 1.into();
     let r = Rig::shipped(extra, 30, hash_shop(MARKET_MSAT, json!({"ticket_msat": 546_000, "min_ticket_msat": 546_000, "settle": ["on-arrival"]}), None));
     let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(100_000));

@@ -169,7 +169,7 @@ fn sig(m: &[u8]) -> String {
 #[test]
 fn the_starter_rules_on_mainnet_are_those_the_signer_is_tested_at_market_with() {
     let p = xbt_wallet_ui::app::starter_policy("main");
-    assert_eq!(p["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 50_000, "max_sends_per_hour": 600}}));
+    assert_eq!(p["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}));
     for (k, v) in [("max_per_tx_sats", 2_000), ("daily_budget_sats", 10_000), ("weekly_budget_sats", 30_000), ("per_counterparty_cap_sats", 10_000),
                    ("per_counterparty_daily_sats", 5_000), ("velocity_max", 60), ("velocity_window_s", 3600), ("human_threshold_sats", 1_000), ("split_window_s", 600)] {
         assert_eq!(p[k], json!(v), "{k}");

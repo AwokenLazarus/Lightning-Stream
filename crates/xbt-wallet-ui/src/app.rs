@@ -171,7 +171,7 @@ pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
         p["tickets"]["tasks"]["default"]["budget_sats"] = json!(10000);
         // market price for a 4 TH/s miner is about 165,000 sat an hour, which no limit above would let through: the
         // task pays by its own (`tickets.tasks.*.rental`), and the rest of the wallet stands
-        p["tickets"]["tasks"]["hashrate"] = json!({"budget_sats": STARTER_RENTAL_BUDGET_SATS, "rental": {"max_ticket_sats": 50_000, "max_sends_per_hour": 600}});
+        p["tickets"]["tasks"]["hashrate"] = json!({"budget_sats": STARTER_RENTAL_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}});
     }
     p
 }

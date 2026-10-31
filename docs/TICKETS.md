@@ -1621,7 +1621,10 @@ smallest is not; its sends count against its own `max_sends_per_hour`; and the t
 what bounds it. The wallet's limits for one payment, a day, a week and one seller, its velocity and
 its approval threshold don't apply to it, and its payments don't count against them, so every other
 use of the wallet stands as it did. This is the one exception to "a budget is one budget". A wallet
-whose rules don't say so pays a rental like any other task.
+whose rules don't say so pays a rental like any other task. On mainnet the starter rules sign this for the
+hashrate task: a budget of 200,000 sat, tickets of at most 10,000 sat, and 600 sends an hour. A 4 TH/s
+miner at market price runs well inside them (its step is about 1,400 sat); a miner fast enough that its
+step would pass 10,000 sat pays in tickets of 10,000, about 414 an hour at 100 TH/s.
 
 The owner's limits are never raised by either one. The task's budget, the cap per seller and the
 caps on locked funds count what leaves the wallet, so a ticket bought for a small call counts in
