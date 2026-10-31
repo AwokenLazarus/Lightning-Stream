@@ -45,6 +45,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
+  begins, and a prepaid ticket or win paid without its proof now counts in what the call charged.
 - A file is never paid past the size its listing shows.
 - A new zero-conf channel carries payments once its funding confirms.
 - The price a shop shows in its listing is now the most your wallet will pay it: one that asks more
