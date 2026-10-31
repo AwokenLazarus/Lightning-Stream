@@ -2819,6 +2819,39 @@ fn a_file_waits_for_a_ticket_the_node_has_not_yet_shown_locked_rather_than_endin
     r.assert_booked();
 }
 
+/// A ticket takes its time to reach the seller over a slow route, or a seller that is loaded takes its time to say
+/// so. The answer is paused meanwhile, and the seller keeps it open: the wallet waits as long.
+///
+/// FAILS with 3 s: `stopped by the wallet: ticket_not_ready`, on a lab at load 60 in the middle of a 100 MB file.
+#[test]
+fn a_file_waits_for_a_ticket_the_seller_is_slow_to_show_locked() {
+    let _g = env_lock();
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::new(json!({}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true), "{first}");
+    // the seller does not hear of a new ticket for 12 s, inside the 15 s it keeps the answer open for; the seven it
+    // holds from before, it has shown
+    r.shop.standin.hold_streams(true);
+    let n = 40 * MIB;
+    let v = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(12));
+            r.shop.standin.hold_streams(false);
+        });
+        r.pay(&format!("/files/{n}"), 12_000)
+    });
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert!(v["ended"].is_null(), "{v}");
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["body"].as_str()), (Some("8000000"), Some("as signed")), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n));
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "the buyer's node, the seller's node and the book: {paid} {taken} {book}");
+    assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
+    r.assert_booked();
+}
+
 /// The wait for a ticket on its way is no wait for a stop: the answer ends at once, and nothing more is released.
 #[test]
 fn a_stop_ends_the_wait_for_a_ticket_the_node_has_not_yet_shown_locked() {
