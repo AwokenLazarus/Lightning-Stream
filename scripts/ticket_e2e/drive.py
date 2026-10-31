@@ -977,7 +977,9 @@ class ChannelDrops:
                 self.drops += 1
                 lab.lncli(BUYER, "connect", f"{pk}@{HOP}:9735")
             except LabError as e:
-                self.errors.append(str(e)[:200])
+                # the nodes may have reconnected by themselves, and that is what they do
+                if "already connected" not in str(e):
+                    self.errors.append(str(e)[:200])
 
     def __enter__(self) -> "ChannelDrops":
         self.thread.start()
