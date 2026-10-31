@@ -265,24 +265,20 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
         link.learn(&exit_id, Hints { relays: strings("relays"), direct })?;
     }
     let hop_id = arg(args, "--hop");
-    let (way, via) = match (&tunnel, &hop_id) {
+    let (way, via, said) = match (&tunnel, &hop_id) {
         (Some(url), _) => {
             let mut w = xbt_vpn::paid::Wallet::from_env().ok_or_else(|| std::io::Error::other("--tunnel needs B2_SIGNER_SOCK and B2_STREAM_DIR"))?;
             // `--max-charge-sats N`: the tunnel is charged no more than N, as a region check's is,
             // while the wallet may still buy the exit's whole ticket within `max_sats`
-            if let Some(c) = arg(args, "--max-charge-sats").and_then(|c| c.parse::<u64>().ok()) {
+            if let Some(c) = arg(args, "--max-charge-sats") {
+                let c: u64 = c.parse().map_err(|_| std::io::Error::other(format!("--max-charge-sats: not a number: {c}")))?;
                 w.max_charge_sats = Some(c.min(w.max_sats));
             }
             // the exit's announced price a GB, if given, is the most the wallet pays it
             let ceiling = arg(args, "--price-msat-gb").and_then(|p| p.parse().ok()).map(xbt_vpn::paid::ceiling);
             let t = link.runtime().block_on(xbt_vpn::paid::open(&w, url, ceiling))?;
-            // what the wallet says when the tunnel ends, printed once it does
-            std::thread::spawn(move || {
-                if let Ok(r) = t.done.recv() {
-                    eprintln!("the wallet: {}", r.map(|v| v.to_string()).unwrap_or_else(|e| e));
-                }
-            });
-            (Way::Tunnel(xbt_vpn::flow::Carrier::Tunnel(t.mux)), String::new())
+            // what the wallet says when the tunnel ends is printed once it does, before the fetch exits
+            (Way::Tunnel(xbt_vpn::flow::Carrier::Tunnel(t.mux)), String::new(), Some(t.done))
         }
         (None, Some(hop_id)) => {
             let hh: serde_json::Value = serde_json::from_str(&arg(args, "--hop-hints").expect("--hop-hints JSON")).map_err(std::io::Error::other)?;
@@ -292,9 +288,9 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
             let hop = link.runtime().block_on(link.connect_conn_alpn(hop_id, ALPN_VPN_HOP))?;
             let exit: [u8; 32] = hex::decode(&exit_id).map_err(std::io::Error::other)?.try_into().map_err(|_| std::io::Error::other("an exit key is 32 bytes"))?;
             let tls = sealed::buyer_config(&secret(), &exit);
-            (Way::Sealed { hop, exit, relays: strings("relays"), tls }, hop_id.clone())
+            (Way::Sealed { hop, exit, relays: strings("relays"), tls }, hop_id.clone(), None)
         }
-        (None, None) => (Way::Straight(link.connect_conn(&exit_id)?), exit_id.clone()),
+        (None, None) => (Way::Straight(link.connect_conn(&exit_id)?), exit_id.clone(), None),
     };
     let report = link.runtime().block_on(async {
         let to = tokio::net::lookup_host(format!("{host}:80")).await?.find(|a| a.is_ipv4()).ok_or_else(|| std::io::Error::other("no IPv4 address"))?;
@@ -343,6 +339,14 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
         }))
     })?;
     println!("{report}");
+    // the tunnel ends here; the wallet answers once its last receipt is in (its stop waits up to 15 s for it)
+    drop(way);
+    if let Some(done) = said {
+        match done.recv_timeout(Duration::from_secs(30)) {
+            Ok(r) => eprintln!("the wallet: {}", r.map(|v| v.to_string()).unwrap_or_else(|e| e)),
+            Err(_) => eprintln!("the wallet: no answer within 30 s of the tunnel's end"),
+        }
+    }
     Ok(())
 }
 
