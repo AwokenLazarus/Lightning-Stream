@@ -41,6 +41,8 @@ const ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\
 
 struct Sellers {
     plans: HashMap<String, Plan>,
+    /// The sellers the stand-in wallet paid, one entry a paid call.
+    paid: Vec<String>,
     /// Each paid call: (url, body sent).
     calls: Vec<(String, Value)>,
     /// No seller's model list can be had (the wallet not ready, the links not open yet).
@@ -132,9 +134,14 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                         }
                         Plan::SlowPay(msat, ms) => {
                             std::thread::sleep(Duration::from_millis(ms));
-                            let mut s = connect();
-                            writeln!(s, "{}", head(200, "text/event-stream")).unwrap();
-                            s.write_all(ANSWER.as_bytes()).unwrap();
+                            // paid: the caller may have stopped waiting meanwhile, and its socket be gone
+                            if let Ok(mut s) = UnixStream::connect(stream_dir.join(p["stream_to"].as_str().unwrap())) {
+                                if p["stream_paid"] == true {
+                                    let _ = writeln!(s, "{}", json!({"paid": true}));
+                                }
+                                let _ = writeln!(s, "{}", head(200, "text/event-stream"));
+                                let _ = s.write_all(ANSWER.as_bytes());
+                            }
                             json!({"verdict": "allow", "rail": "ticket", "status": 200, "complete": true, "price_msat": msat.to_string(), "charged_sats": 900})
                         }
                         Plan::Cut(msat) => {
@@ -145,6 +152,9 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                         }
                     }
                 };
+                if result["charged_sats"].as_i64().unwrap_or(0) > 0 {
+                    sellers.lock().unwrap().paid.push(seller.clone());
+                }
                 let _ = writeln!(conn, "{}", json!({"id": 1, "result": result}));
             });
         }
@@ -167,9 +177,14 @@ fn rig(cheap: Plan, dear: Plan, limit_sats: u64) -> Rig {
 
 /// The rig, its sellers' model lists unavailable when its endpoint starts if `models_down`.
 fn rig_with(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool) -> Rig {
+    rig_paying(cheap, dear, limit_sats, models_down, lightning_stream::inference_server::PAY_WAIT)
+}
+
+/// [`rig_with`], with `pay_wait` for a call's payment.
+fn rig_paying(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool, pay_wait: Duration) -> Rig {
     let dir = tempfile::tempdir().unwrap();
-    let sellers = Arc::new(Mutex::new(Sellers { plans: HashMap::from([("cheap.example".into(), cheap), ("dear.example".into(), dear)]), calls: vec![],
-                                                models_down }));
+    let sellers = Arc::new(Mutex::new(Sellers { plans: HashMap::from([("cheap.example".into(), cheap), ("dear.example".into(), dear)]), paid: vec![],
+                                                calls: vec![], models_down }));
     let sock = signer(dir.path(), Arc::clone(&sellers));
     let creds = dir.path().join("credentials.json");
     let mut store = Store::open(&creds).unwrap();
@@ -181,7 +196,7 @@ fn rig_with(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool) -> Rig 
         {"name": "dear", "route": "https://dear.example/ai/", "prices": {"per_1k_output_msat": 9000}, "max_output": 1024}]}).to_string()).unwrap();
     let cfg = lightning_stream::inference_server::Config {
         signer: sock, stream_dir: dir.path().to_path_buf(), task: "ai".into(), max_sats: 2000, credentials: creds.clone(), sellers: list,
-        state: dir.path().join("ai-state.json"), first_byte: Duration::from_millis(1000), allowed_hosts: vec![],
+        state: dir.path().join("ai-state.json"), first_byte: Duration::from_millis(1000), pay_wait, allowed_hosts: vec![],
     };
     let run = lightning_stream::inference_server::serve(cfg, TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
     let addr = run.addr.to_string();
@@ -284,9 +299,28 @@ fn a_seller_paid_over_a_slow_route_is_given_its_time_from_the_payment() {
     let r = rig(Plan::SlowPay(777, 2500), Plan::Answer(999), 100);
     let (status, _, body) = chat(&r, "llama");
     assert_eq!((status, body.as_str()), (200, ANSWER));
-    assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called, or paid");
+    assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
     std::thread::sleep(Duration::from_millis(200));
+    // both sides: the wallet paid one seller, and the key is booked that seller's price only
+    assert_eq!(r.sellers.lock().unwrap().paid, ["cheap.example"], "the wallet paid one seller");
     assert_eq!(spent(&r), 777, "the seller that answered, and only it, is booked");
+}
+
+/// A seller whose payment outlasts even the wait for it (here 1.5 s, against a payment of 2.5 s):
+/// no other seller is tried while the wallet may still pay the first, and once the wallet says it
+/// did, none is. The client is told; one seller was paid, nothing is booked to the key for an
+/// answer it did not get.
+///
+/// FAILS before: the next seller was tried at once, and paid, as the first's payment went through.
+#[test]
+fn a_seller_whose_payment_outlasts_the_wait_is_not_followed_by_another_while_it_may_be_paid() {
+    let r = rig_paying(Plan::SlowPay(777, 2500), Plan::Answer(999), 100, false, Duration::from_millis(1500));
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!(status, 504, "{body}");
+    assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(r.sellers.lock().unwrap().paid, ["cheap.example"], "the wallet paid one seller, not two");
+    assert_eq!(spent(&r), 0, "nothing is booked to the key: it got no answer");
 }
 
 #[test]

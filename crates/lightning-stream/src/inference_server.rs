@@ -49,10 +49,11 @@ const LONGEST: Duration = Duration::from_secs(3600);
 const HEAD_LINE: u64 = 4096;
 
 /// How long a paid call waits for the wallet to have paid for it, before the seller's own time
-/// (`first_byte`) begins: longer than the wallet's own wait for a ticket's payment (the node's
-/// `lightning.timeout_s`, 60 s by default, and 5 s more) after the lock. A buyer on a slow route
-/// pays a first ticket in tens of seconds; that is not the seller being slow.
-const PAY_WAIT: Duration = Duration::from_secs(90);
+/// (`first_byte`) begins ([`Config::pay_wait`], this by default): longer than the wallet's own wait
+/// for a ticket's payment (the node's `lightning.timeout_s`, 60 s by default, and 5 s more) after
+/// the lock. A buyer on a slow route pays a first ticket in tens of seconds; that is not the seller
+/// being slow.
+pub const PAY_WAIT: Duration = Duration::from_secs(90);
 
 /// `max_tokens` when a request names none, for the bound of what it may cost.
 const DEFAULT_MAX_TOKENS: u64 = 1024;
@@ -74,8 +75,12 @@ pub struct Config {
     pub sellers: PathBuf,
     /// The sellers' health record (JSON, written by this server; the app only reads it).
     pub state: PathBuf,
-    /// How long a seller has for the first byte of its answer before the next is tried.
+    /// How long a seller has for the first byte of its answer before the next is tried, from when
+    /// its call is paid for.
     pub first_byte: Duration,
+    /// How long a paid call waits for the wallet to pay for it ([`PAY_WAIT`]). Past it, the next
+    /// seller is tried only once the wallet has said that nothing was paid.
+    pub pay_wait: Duration,
     /// Host names a request may name (DNS rebinding): empty admits any.
     pub allowed_hosts: Vec<String>,
 }
@@ -163,6 +168,9 @@ struct Failed {
     /// The seller refused the request itself (a 4xx other than payment): no other seller is tried,
     /// since the request would fare no better there.
     final_answer: Option<(u16, Vec<u8>, Option<String>)>,
+    /// The wallet paid this seller for the call, or may still: no other seller is tried, so that
+    /// one answer is never paid to two.
+    paid: bool,
 }
 
 /// Has the signer pay for one call and stream its body to a socket of ours; waits for the head
@@ -171,7 +179,7 @@ struct Failed {
 /// and for the payment itself at most [`PAY_WAIT`].
 /// `ceiling`: the seller's listed prices, the most the wallet pays it (none for a free read).
 fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration, ceiling: Option<&Value>) -> Result<Begun, Failed> {
-    let fail = |status: u16, message: String| Failed { status, message, final_answer: None };
+    let fail = |status: u16, message: String| Failed { status, message, final_answer: None, paid: false };
     let name = format!("ai-{}", random_hex());
     let path = cfg.stream_dir.join(&name);
     let listener = listen_stream(&path).map_err(|e| fail(500, format!("stream socket: {e}")))?;
@@ -212,9 +220,20 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
             return Err(fail(502, why));
         }
         // a paid call: the socket opens once it is paid for, which a slow route makes long
-        if started.elapsed() > if paid_call { PAY_WAIT } else { first_byte } {
+        if started.elapsed() > if paid_call { cfg.pay_wait } else { first_byte } {
             let _ = std::fs::remove_file(&path);
-            return Err(fail(504, format!("the seller sent nothing within {} s", started.elapsed().as_secs())));
+            if !paid_call {
+                return Err(fail(504, format!("the seller sent nothing within {} s", first_byte.as_secs())));
+            }
+            // the wallet is still at the payment: another seller is tried only once it has said that nothing was paid,
+            // never while this one may yet be
+            let ended = rx.recv_timeout(cfg.pay_wait);
+            let charged = match &ended {
+                Ok(Ok(v)) => v.get("charged_sats").and_then(Value::as_i64).unwrap_or(1) > 0,
+                _ => true,
+            };
+            let why = format!("the wallet's payment of the seller took more than {} s", cfg.pay_wait.as_secs());
+            return Err(Failed { status: 504, message: why, final_answer: None, paid: charged });
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -270,7 +289,7 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
     if status >= 400 {
         let mut whole = first;
         let _ = src.take(1 << 20).read_to_end(&mut whole);
-        return Err(Failed { status, message: String::new(), final_answer: Some((status, whole, content_type)) });
+        return Err(Failed { status, message: String::new(), final_answer: Some((status, whole, content_type)), paid: false });
     }
     if n == 0 {
         return Err(fail(502, "the seller's answer was empty".into()));
@@ -476,14 +495,15 @@ impl AiServer {
                     }
                     inner.router.record(&offer.seller, Outcome::FailedBeforeAnswer, now);
                     self.save_state(&inner);
+                    let paid = f.paid;
                     last = Some(f);
-                    if !Router::may_fall_back(Outcome::FailedBeforeAnswer) {
+                    if paid || !Router::may_fall_back(Outcome::FailedBeforeAnswer) {
                         break;
                     }
                 }
             }
         }
-        let f = last.unwrap_or(Failed { status: 502, message: "no seller answered".into(), final_answer: None });
+        let f = last.unwrap_or(Failed { status: 502, message: "no seller answered".into(), final_answer: None, paid: false });
         Reply::Whole(json_response(f.status, &error_body("upstream_failed", "api_error", &format!("No seller could answer: {}", f.message))))
     }
 
