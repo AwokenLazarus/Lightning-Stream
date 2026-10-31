@@ -3906,8 +3906,11 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     fn offers() -> Value {
         json!({"offers": [{"name": "Big miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
-                           "miners": 1, "freeMiners": 1, "freeHs": "4000000000000"}]})
+                           "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": format!("{PROVIDER}/hashrate"),
+                           "payNode": format!("03{}", "c".repeat(64))}]})
     }
+    // the hashmaker is on the spending rules, with its node, so the gateway is the only thing Rent waits for
+    let rules = json!({"counterparties": {PROVIDER: {"ln_node": format!("03{}", "c".repeat(64))}}});
     for masked in [false, true] {
         let (renter, rseen) = if masked {
             control_standin(|m, p| match (m, p) {
@@ -3929,7 +3932,7 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let rtok = dir.path().join("renter-token");
         std::fs::write(&rtok, "r".repeat(64)).unwrap();
-        let bx = start(json!({}), false, |c| {
+        let bx = start(rules.clone(), false, |c| {
             c.hash.renter = Some(renter.clone());
             c.hash.renter_token = Some(rtok.clone());
         });

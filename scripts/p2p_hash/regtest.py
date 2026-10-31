@@ -45,6 +45,7 @@ Checks:
 from __future__ import annotations
 
 import base64
+import glob
 import hashlib
 import http.client
 import json
@@ -273,6 +274,21 @@ def rental(name: str, stop_after: int | None, miner_secs: int, rate: float, orig
 
 
 def drop_check() -> None:
+    try:
+        drop_run()
+    finally:
+        # its reports and logs, beside the report (the lab copies only run/*.log and run/*.json back)
+        for src in sorted(glob.glob(f"{RUN}/drop*")):
+            base = os.path.basename(src)
+            if base.endswith((".log", ".json")):
+                try:
+                    with open(src, "rb") as f, open(f"{OUT}/p2p_hash_{base}", "wb") as g:
+                        g.write(f.read())
+                except OSError:
+                    pass
+
+
+def drop_run() -> None:
     """The rental whose link drops: real tickets, the real gateway's wait, money on every side."""
     road = Road(ROAD, LINK)
     outage: dict[str, Any] = {"at": 0.0, "lost_from_ms": 0}
