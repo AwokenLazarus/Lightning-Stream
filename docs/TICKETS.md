@@ -1111,7 +1111,14 @@ when the node shows the first cancelled (it lapsed unpaid).
 
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed. Before any payment of the rail the wallet waits for an
+gateway does when the first has lapsed, or at once where the wallet asks it to cancel the first:
+`POST .../cancel` with `{"draw", "hash"}`, signed as every call of the session. The wallet asks only
+when its node shows the payment failed with nothing in flight, at most 4 times for a win and 32 for a
+session. The gateway cancels only the current invoice of that session's unpaid win, only where its own
+node shows it open (`cancelled` says whether it did), and at most `max_win_cancels` times a session, 32
+by default, past which it says `too_many_cancels`; the win's grace still runs from its draw, so a
+cancel buys the buyer no time, no draw and no money. A seller without the call answers 404, and the
+win waits for the lapse. Before any payment of the rail the wallet waits for an
 inactive channel, at most 8 s from when it first saw it out. A win whose invoice would end before
 the payment could arrive (by twice the longest of the latest payments' time on the way, at least 5 s
 and at most half its life) is not sent, and one that ran out while the win waited at the gate does

@@ -964,6 +964,7 @@ class ChannelDrops:
     goes inactive, as it does when a peer's connection drops, under whatever the wallet is paying then."""
 
     def __init__(self) -> None:
+        self.every = float(os.environ.get("FLAP_EVERY", "1"))
         self.done = threading.Event()
         self.drops = 0
         self.errors: list[str] = []
@@ -971,15 +972,13 @@ class ChannelDrops:
 
     def run(self) -> None:
         pk = lab.pubkey(HOP)
-        while not self.done.wait(1.0):
+        while not self.done.wait(self.every):
             try:
                 lab.lncli(BUYER, "disconnect", pk)
                 self.drops += 1
                 lab.lncli(BUYER, "connect", f"{pk}@{HOP}:9735")
             except LabError as e:
-                # the nodes may have reconnected by themselves, and that is what they do
-                if "already connected" not in str(e):
-                    self.errors.append(str(e)[:200])
+                self.errors.append(str(e).split("rpc error:")[-1][:160])
 
     def __enter__(self) -> "ChannelDrops":
         self.thread.start()

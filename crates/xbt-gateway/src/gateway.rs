@@ -2431,7 +2431,7 @@ impl Handler for Service {
         }
         if let Some(call) = self.lottery_path(&path) {
             return Reply::Whole(match (req.method.as_str(), call) {
-                ("POST", "open" | "draw" | "status" | "close") => gw.lottery_call(&req, call),
+                ("POST", "open" | "draw" | "status" | "close" | "cancel") => gw.lottery_call(&req, call),
                 _ => error(404, "no_route", "no such session endpoint"),
             });
         }

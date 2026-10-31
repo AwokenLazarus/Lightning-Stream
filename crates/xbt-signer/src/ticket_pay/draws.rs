@@ -54,6 +54,10 @@ const STOP_WAIT: Duration = Duration::from_secs(15);
 /// invoice within 5 s of its end. An invoice with longer to live than this is not waited for.
 const OWED_WAIT: Duration = Duration::from_secs(10);
 const OWED_POLL: Duration = Duration::from_millis(250);
+/// How many of a win's invoices, and of a session's, the wallet asks to have cancelled after failed payments.
+/// Past these it waits for them to lapse: a seller's node that fails every payment is not asked for ever.
+const CANCELS_PER_WIN: u32 = 4;
+const CANCELS_PER_SESSION: u32 = 32;
 /// How many of a win's invoices, and of a session's, may run out in the wallet's queue before it stops asking.
 const LAPSES_PER_WIN: u32 = 4;
 const LAPSES_PER_SESSION: u32 = 32;
@@ -136,9 +140,16 @@ struct State {
     /// How many of a win's invoices, and of the session's, ran out in the wallet's queue.
     lapses: HashMap<u64, u32>,
     lapsed: u32,
+    /// How many invoices the seller has been asked to cancel, by win and in all, and that it will not
+    /// (one of an earlier version, or at its own limit).
+    cancels: HashMap<u64, u32>,
+    cancels_asked: u32,
+    no_cancel: bool,
     /// Wins whose invoice ran out or whose payment failed: their next invoice goes before the wins no seller
     /// waits for. Behind them it can run out too: on an 8 GB lab, a win lapsed twice waiting behind wins of 100 sellers.
     again: HashSet<u64>,
+    /// Invoices to ask the seller to cancel, before its list is next asked for.
+    to_cancel: Vec<(u64, String)>,
     /// When the latest invoice of a win that is owed again ends: the seller's next one comes after that.
     next_invoice_after: f64,
     /// Why this session draws no more.
@@ -470,6 +481,7 @@ impl Signer {
     /// reveal and work out every draw it covers. `Err`: the session is faulty (the refusal), and
     /// was stopped. This is the only place a [`Win`] comes from.
     fn draw_round(&self, ds: &DrawSession, pieces: &[Piece], voids: &[PieceId], ask: bool, counted: &Mutex<Counted>) -> std::result::Result<Round, Value> {
+        self.draw_cancel_failed(ds);
         let ahead = self.ticket_policy().lottery.ahead.max(1) as u64;
         let mut left: Vec<Piece> = vec![];
         let values: Vec<Value> = {
@@ -649,6 +661,12 @@ impl Signer {
         let out = self.lottery_pay_win(&ds.sid, win, invoice, first, by.as_ref());
         let charged = py_int(out.get("charged_sats")).unwrap_or(0).max(0);
         let rule = str_or_empty(out.get("rule"));
+        // the book holds this invoice's payment failed, with nothing of it in flight on the wallet's node
+        let failed_hash = (rule == "lottery_win_failed").then(|| crate::bolt11::decode(invoice).ok().map(|i| i.payment_hash_hex())).flatten()
+            .filter(|h| out.get("hash").and_then(Value::as_str) == Some(h.as_str()));
+        if let Some(hash) = failed_hash {
+            self.draw_cancel_later(ds, win, hash);
+        }
         let mut s = lock(&ds.state);
         s.paying.remove(&win.draw());
         let mut c = lock(counted);
@@ -743,6 +761,37 @@ impl Signer {
                     c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
                     c.halt = true;
                 }
+            }
+        }
+    }
+
+    /// Remembers that the invoice `hash` of a win that is about to be owed again should be cancelled
+    /// by the seller, which [`Self::draw_round`] asks for before it asks for the seller's list.
+    fn draw_cancel_later(&self, ds: &DrawSession, win: &Win, hash: String) {
+        let mut s = lock(&ds.state);
+        let asked = s.cancels.get(&win.draw()).copied().unwrap_or(0);
+        if s.no_cancel || asked >= CANCELS_PER_WIN || s.cancels_asked >= CANCELS_PER_SESSION {
+            return;
+        }
+        s.cancels.insert(win.draw(), asked + 1);
+        s.cancels_asked += 1;
+        s.to_cancel.push((win.draw(), hash));
+    }
+
+    /// Asks the seller to cancel the invoices of wins whose payment failed, signed as every call of the
+    /// session is: its next invoice for each then comes at once, not when the first has lapsed, which on a
+    /// seller of 60 s is long after its answer has stopped waiting. No invoice is paid again. A seller
+    /// that cannot, or will not any more, is not asked again, and the win waits for the lapse as before.
+    fn draw_cancel_failed(&self, ds: &DrawSession) {
+        let asks = std::mem::take(&mut lock(&ds.state).to_cancel);
+        for (draw, hash) in asks {
+            let said = self.draw_call(ds, "cancel", &json!({"draw": draw, "hash": hash}));
+            let cancelled = said.as_ref().is_ok_and(|(status, v, _)| *status == 200 && v.get("cancelled") == Some(&Value::Bool(true)));
+            let mut s = lock(&ds.state);
+            if cancelled {
+                s.next_invoice_after = self.engine.now();
+            } else if said.as_ref().map_or(true, |(status, v, _)| *status != 200 || v.get("refused").is_some()) {
+                s.no_cancel = true;
             }
         }
     }

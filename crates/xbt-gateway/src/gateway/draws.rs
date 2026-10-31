@@ -592,6 +592,15 @@ impl Gateway {
                 Err(why) => return json_response(402, &json!({"error": why.code()})),
             }
         }
+        if call == "cancel" {
+            out["cancelled"] = match self.lottery_cancel(l, &a.session, &body) {
+                Ok(done) => done.into(),
+                Err(why) => {
+                    out["refused"] = why.code().into();
+                    false.into()
+                }
+            };
+        }
         // the wins of this request get their invoices here, and a win paid meanwhile leaves the list
         self.lottery_refresh(l, &a.session);
         let view = self.draw_view(l, &a.session);
@@ -607,6 +616,25 @@ impl Gateway {
             l.lock().close(&a.session, now);
         }
         answer
+    }
+
+    /// The buyer's payment of a win failed, and it asks for that win's invoice to be cancelled, so that the
+    /// next one need not wait for the first to lapse. Only an invoice of this session's unpaid win, and only
+    /// one the seller's own node shows open: the buyer's word moves nothing. Should its payment be
+    /// on its way after all, either the node settled it first and the win is paid by the look that
+    /// follows, or it cancelled first and refuses the payment, which comes back to the buyer. It gives the
+    /// buyer no draw and no money, and costs the node a cancel and an invoice, [`LotteryConfig::max_win_cancels`] times.
+    fn lottery_cancel(&self, l: &Lottery, session: &str, body: &Map<String, Value>) -> Result<bool, Refusal> {
+        let draw = body.get("draw").and_then(Value::as_u64);
+        let hash = body.get("hash").and_then(Value::as_str).and_then(xbt402::ticket::hex32);
+        let (Some(draw), Some(hash)) = (draw, hash) else { return Ok(false) };
+        if !l.lock().may_cancel(session, draw, &hash)? {
+            return Ok(false);
+        }
+        match self.node.lookup(&hash) {
+            Ok(Some(inv)) if inv.state == InvoiceState::Open => Ok(self.node.cancel(&hash).is_ok()),
+            _ => Ok(false),
+        }
     }
 
     fn lottery_open(&self, l: &Lottery, req: &Request) -> Response {

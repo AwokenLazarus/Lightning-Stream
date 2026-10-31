@@ -1146,3 +1146,126 @@ fn the_operators_view_answers_the_app_in_another_container_by_its_token_only() {
     assert_eq!(health(&[elsewhere, ("X-Xbt402-Health-Token", TOKEN)]), 200, "the app's token");
     assert_eq!(health(&[("X-Real-IP", "127.0.0.1")]), 200, "this machine, as before");
 }
+
+/// A session with an unpaid win: the session, the answer that lists it, and its draw and invoice.
+fn with_a_win(rig: &Rig, tag: u8) -> (Drawer, u64, Hash) {
+    let mut b = Drawer::open(rig, tag);
+    loop {
+        let (seq, got) = b.get("/api");
+        assert_eq!(got.status, 200);
+        let p = b.piece(seq, "/api", Kind::Request, 0, 2500);
+        let j = b.draw(&[p]);
+        if !b.owed.is_empty() {
+            let draw = b.owed[0];
+            let hash = b.invoice_hash(&j, draw);
+            return (b, draw, hash);
+        }
+    }
+}
+
+fn ask_cancel(b: &mut Drawer, draw: u64, hash: &Hash) -> Value {
+    let got = b.call("cancel", &json!({"draw": draw, "hash": hex::encode(hash)}));
+    assert_eq!(got.status, 200, "{}", got.json());
+    got.json()
+}
+
+/// The buyer's payment failed, and it asks for the invoice to be cancelled: the node's next invoice comes in
+/// the answer. The win's grace still runs from its draw: a cancel buys no time.
+#[test]
+fn a_cancelled_invoice_is_replaced_at_once_and_buys_no_time() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["grace_seconds"] = json!(20);
+    });
+    let (mut b, draw, first) = with_a_win(&rig, 70);
+    let j = ask_cancel(&mut b, draw, &first);
+    assert_eq!(j["cancelled"], true, "{j}");
+    assert_eq!(rig.node.state_of(&first), Some(InvoiceState::Canceled));
+    let next = Drawer::hash_in(&j, draw);
+    assert!(next != first && rig.node.state_of(&next) == Some(InvoiceState::Open));
+    // the grace is what it was
+    rig.advance(21);
+    let (_, got) = b.get("/api");
+    assert_eq!((got.status, got.error().as_str()), (402, "win_unpaid"), "a cancel moved the grace");
+    assert!(rig.node.pay(&next));
+    assert_eq!(b.get("/api").1.status, 200);
+}
+
+/// Only the session's own unpaid win's current invoice is cancelled, and only by the session's key.
+///
+/// FAILS with the buyer's word taken for which invoice: another's is cancelled.
+#[test]
+fn a_cancel_reaches_only_the_sessions_own_current_invoice() {
+    let (rig, _d) = start(&lottery);
+    let (mut a, _, a_hash) = with_a_win(&rig, 71);
+    let (mut b, b_draw, b_hash) = with_a_win(&rig, 72);
+    // no signature
+    let body = json!({"draw": b_draw, "hash": hex::encode(b_hash)}).to_string();
+    assert_eq!(http(&rig.addr, "POST", "/x402/lottery/cancel", &[], body.as_bytes(), None).status, 401);
+    // another session's invoice, by its draw and its hash
+    assert_eq!(ask_cancel(&mut a, b_draw, &b_hash)["cancelled"], false);
+    assert_eq!(rig.node.state_of(&b_hash), Some(InvoiceState::Open));
+    // an invoice that is not a win's, a draw that did not win, a body that names nothing
+    assert_eq!(ask_cancel(&mut a, 999_999, &a_hash)["cancelled"], false);
+    assert_eq!(rig.node.state_of(&a_hash), Some(InvoiceState::Open));
+    assert_eq!(a.call("cancel", &json!({})).json()["cancelled"], false);
+    // its own, replaced: the old one asks for nothing
+    let replaced = ask_cancel(&mut b, b_draw, &b_hash);
+    assert_eq!(replaced["cancelled"], true);
+    let next = Drawer::hash_in(&replaced, b_draw);
+    assert_eq!(ask_cancel(&mut b, b_draw, &b_hash)["cancelled"], false);
+    assert_eq!(rig.node.state_of(&next), Some(InvoiceState::Open));
+}
+
+/// A cancel that races a payment really on its way. Settled first: the win is paid, once, and no invoice is
+/// made. Cancelled first: the node refuses the late payment, nothing is paid for it, and the next invoice
+/// pays the win, once.
+///
+/// FAILS with the buyer's word taken over the node's: a settled win gets a second invoice.
+#[test]
+fn a_cancel_that_races_a_payment_leaves_each_win_paid_once() {
+    let (rig, _d) = start(&lottery);
+    let wins_paid = |rig: &Rig| http(&rig.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "127.0.0.1")], b"", None).json()["lottery"]["paidWins"].as_u64();
+    // the payment arrives first, with a node that says yes to a cancel of what it has settled
+    let (mut b, draw, first) = with_a_win(&rig, 73);
+    rig.node.cancel_answers_yes_for_settled();
+    assert!(rig.node.pay(&first));
+    let j = ask_cancel(&mut b, draw, &first);
+    assert_eq!(j["cancelled"], false, "{j}");
+    assert_eq!(rig.node.state_of(&first), Some(InvoiceState::Settled));
+    assert!(!j["wins"].as_array().unwrap().iter().any(|w| w["draw"].as_u64() == Some(draw)), "paid, and no next invoice: {j}");
+    assert_eq!(wins_paid(&rig), Some(1));
+    // the cancel arrives first
+    let (mut c, draw, first) = with_a_win(&rig, 74);
+    let j = ask_cancel(&mut c, draw, &first);
+    assert_eq!(j["cancelled"], true, "{j}");
+    assert!(!rig.node.pay(&first), "the node refuses the late payment");
+    let next = Drawer::hash_in(&j, draw);
+    assert_eq!(wins_paid(&rig), Some(1));
+    assert!(rig.node.pay(&next));
+    rig.gw.tick();
+    assert_eq!(wins_paid(&rig), Some(2));
+}
+
+/// A buyer cannot have a seller make invoices without limit: past `max_win_cancels` the session is told so, its
+/// invoice stands, and it lapses as any invoice does.
+///
+/// FAILS with no cap: an invoice from the node at every ask.
+#[test]
+fn a_session_may_have_only_so_many_invoices_cancelled() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["max_win_cancels"] = json!(2);
+    });
+    let (mut b, draw, mut hash) = with_a_win(&rig, 75);
+    for _ in 0..2 {
+        let j = ask_cancel(&mut b, draw, &hash);
+        assert_eq!(j["cancelled"], true, "{j}");
+        hash = Drawer::hash_in(&j, draw);
+    }
+    let j = ask_cancel(&mut b, draw, &hash);
+    assert_eq!((j["cancelled"].as_bool(), j["refused"].as_str()), (Some(false), Some("too_many_cancels")), "{j}");
+    assert_eq!(rig.node.state_of(&hash), Some(InvoiceState::Open));
+    assert_eq!(Drawer::hash_in(&j, draw), hash, "no invoice was made for it");
+}
+

@@ -54,6 +54,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   reason; a file paid by draws may still finish, with the wins it could not pay listed unpaid.
 - A win whose invoice ran out while it waited its turn is paid on the seller's next invoice, rather
   than ending the file; a win that would arrive after its invoice ends is not sent.
+- A win whose payment failed no longer costs a file: the wallet asks the seller to cancel that invoice,
+  and pays the seller's next one at once rather than waiting for the first to lapse. A seller on an
+  earlier version behaves as before.
 - A small payment works from no credit at a shop: the wallet buys a ticket sized to what the call may
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
