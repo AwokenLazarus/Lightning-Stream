@@ -9460,3 +9460,34 @@ fn a_seller_without_cancel_is_asked_once() {
     assert_wins(&r, 0);
 }
 
+/// A drop that fails a win's payment and then its next invoice's too, as one peer drop does to every
+/// payment on the wire: the call waits for the third invoice and returns with every win paid, the file whole,
+/// and no invoice sent twice.
+///
+/// FAILS with the call returning while the win is owed (on a loaded lab, 3 of 100 sessions so).
+#[test]
+fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    let ln = r.ln.clone();
+    let mut st = r.ln.st.lock().unwrap();
+    st.send_takes = Duration::from_millis(200);
+    st.hop_full = true;
+    // the drop is over once two payments have failed in it
+    st.on_look = Some(Arc::new(move |_| {
+        if ln.by_status("FAILED").len() >= 2 {
+            ln.st.lock().unwrap().hop_full = false;
+        }
+    }));
+    drop(st);
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    let failed = r.ln.by_status("FAILED");
+    assert!(failed.len() >= 2, "{v}");
+    assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "no failed invoice sent again: {v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+}
+
