@@ -1759,9 +1759,11 @@ fn a_pasted_link_signing_key_lets_the_node_vouch_for_the_direct_link() {
     let page = br.get("/sell").body;
     assert!(page.contains("name=\"sign_macaroon\""), "the replace form takes it later: {page}");
 
-    // Lightning Fork's kind (message:write) is taken on its own, the other keys kept
+    // Lightning Fork's kind (message:write) is taken on its own, the other keys kept; the shop is not
+    // restarted for it (the gateway reads it at its next look at the link) and the page does not say it is
     let r = br.act("/sell", "/sell", &[("action", "connect"), ("sign_macaroon", &sign_entity)]);
-    assert!(br.flash_after(&r).contains("connected"));
+    let said = br.flash_after(&r);
+    assert!(said.contains("connected") && !said.contains("restarts with it"), "{said}");
     assert_eq!(hex::encode(std::fs::read(&sign).unwrap()), sign_entity);
     assert_eq!(hex::encode(std::fs::read(dir.join("invoices.macaroon")).unwrap()), inv);
     // and the URI kind, as Umbrel and Linux bake it, replaces it

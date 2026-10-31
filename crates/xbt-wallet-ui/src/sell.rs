@@ -1517,10 +1517,17 @@ impl App {
                 if macs.is_empty() {
                     return Err("Paste at least one key to replace.".into());
                 }
+                let only_sign = macs.iter().all(|(file, _)| *file == GW_SIGN);
                 for (file, mac) in macs {
                     write_shared(&self.cfg.gw.dir, file, &mac)?;
                 }
-                self.commit(&shop, "Your Lightning node is connected.")
+                let words = self.commit(&shop, "Your Lightning node is connected.")?;
+                // the gateway reads the sign key itself at its next look at the link: nothing restarts for it
+                Ok(if only_sign {
+                    words.replace(" Your shop restarts with it in a few seconds.", " Your node vouches for your shop's link within a minute, with no restart.")
+                } else {
+                    words
+                })
             })(),
             "shop" => {
                 shop.name = g("name").chars().take(200).collect();
