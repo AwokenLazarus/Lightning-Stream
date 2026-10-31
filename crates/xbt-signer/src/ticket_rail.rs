@@ -59,6 +59,9 @@ use crate::{err, Result};
 /// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
 const OFFER_FETCH_S: i64 = 5;
 
+/// Why the book books nothing more for a session whose stop has begun ([`Signer::ticket_is_stopping`]).
+const STOPPING: &str = "the session is being stopped: nothing more is released, locked or bought for it";
+
 /// A seller's BOLT 12 offer and the seller's session a payment by it is for: what the payer note
 /// is made of ([`xbt402::offer::note`]). The key is the session key the seller sent.
 pub struct OfferWay<'a> {
@@ -789,6 +792,9 @@ impl Signer {
             if s.state != SState::Open {
                 return Ok(refusal("ticket_session", format!("the session is {}", s.state.as_str())));
             }
+            if self.ticket_is_stopping(&sid) {
+                return Ok(refusal("ticket_session", STOPPING));
+            }
             let seed = self.ticket_seed(&st.book)?;
             // hashes the seller sent no invoice for: their slots are offered again
             let mut rows: Vec<Value> = st.book.of_session(&sid).into_iter().filter(|t| t.state == TState::Offered && now - t.ts > OFFER_TTL_S).map(|t| {
@@ -1026,6 +1032,9 @@ impl Signer {
         let mut g = self.ticket_store().map_err(|e| refusal("ticket", e.msg))?;
         let st = g.as_mut().ok_or_else(|| refusal("ticket", "no ticket book"))?;
         let Some(mut s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open).cloned() else { return Err(refusal("ticket_session", "no such open session")) };
+        if self.ticket_is_stopping(sid) {
+            return Err(refusal("ticket_session", STOPPING));
+        }
         let Some(task) = tp.tasks.get(&s.task) else { return Err(refusal("ticket_task", format!("the owner's policy no longer names the task {:?}", s.task))) };
         // the seller may have left the owner's list since the session opened
         let listed = self.ticket_listed(&cfg, &s.payee, &s.origin);
@@ -1163,6 +1172,9 @@ impl Signer {
             let Some(mut s) = st.book.sessions.get(&sid).filter(|s| s.state == SState::Open).cloned() else {
                 return Ok(refusal("ticket_session", "no such open session"));
             };
+            if self.ticket_is_stopping(&sid) {
+                return Ok(refusal("ticket_session", STOPPING));
+            }
             let Some(task) = tp.tasks.get(&s.task) else {
                 return Ok(refusal("ticket_task", format!("the owner's policy no longer names the task {:?}", s.task)));
             };
@@ -1843,6 +1855,9 @@ impl Signer {
         let mut g = self.ticket_store()?;
         let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
         let Some(mut s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open).cloned() else { return Ok(Err(refusal("ticket_session", "no such open session"))) };
+        if self.ticket_is_stopping(sid) {
+            return Ok(Err(refusal("ticket_session", STOPPING)));
+        }
         if s.prepaid_msat == 0 {
             return Ok(Err(refusal("ticket_terms", "this seller's terms offer no prepaid tickets")));
         }
@@ -2159,6 +2174,13 @@ impl Signer {
         let sent = using.iter().flat_map(|id| st.book.of_session(id)).filter(|t| matches!(t.state, TState::Released | TState::Settled))
             .fold(0u64, |a, t| a.saturating_add(t.msat));
         Some((http, sent))
+    }
+
+    /// The stop of `sid` has begun ([`Signer::ticket_stopping`]): the book books nothing more for it.
+    /// Asked under the spend lock, beside the book's own state, which stays open while the stop waits
+    /// for the session's streams to end.
+    pub(crate) fn ticket_is_stopping(&self, sid: &str) -> bool {
+        self.ticket_stopping.lock().unwrap_or_else(|p| p.into_inner()).contains(sid)
     }
 
     /// The caller gave up the credit `sid` left with its seller (`ticket_stop` with `forget_credit`):

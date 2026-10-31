@@ -2660,12 +2660,9 @@ impl Signer {
                     }
                 }
             }
-            // a session being stopped: its open answers are taking their last receipts, and what it leaves with the seller
-            // is not yet known. A new session now would open beside it, without that credit: the caller asks again
-            if open.as_ref().is_some_and(|h| h.ending.load(Ordering::SeqCst)) {
-                break 'open Err(Tried::Done(with(refusal("ticket_busy", "the session with this seller is being stopped: call again in a moment"),
-                                                 json!({"retry_after_s": 1}))));
-            }
+            // a session being stopped is kept here while the book holds it open (its open answers are taking their last
+            // receipts, and what it leaves with the seller is not yet known): the request finds it ending and the caller
+            // is told to call again, rather than a new session opening beside it without that credit
             // a session the book no longer holds open (stopped by the agent, idle, a fault) is gone
             if let Some(h) = open.as_ref().filter(|h| h.fault().is_some() || !self.ticket_session(&h.sid).is_some_and(|s| s.state == SState::Open)).cloned() {
                 *open = None;
@@ -3162,8 +3159,8 @@ impl Signer {
             self.ticket_offer_passed(hs, "ticket_seller", "the seller's lock by offer named no session".into());
             return None;
         }
-        // a seller found at fault meanwhile is paid nothing: the caller asks again and refuses
-        if hs.fault().is_some() {
+        // a seller found at fault meanwhile, or a session being stopped, is paid nothing: the caller asks again and refuses
+        if hs.fault().is_some() || hs.ending.load(Ordering::SeqCst) {
             return None;
         }
         let by = crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session };
@@ -3185,7 +3182,7 @@ impl Signer {
 
     /// Fill the pool behind a call, one refill of a session at a time.
     fn ticket_refill_later(&self, hs: &Arc<HttpSession>) {
-        if self.ticket_want(&hs.sid) == 0 || hs.fault().is_some() {
+        if hs.ending.load(Ordering::SeqCst) || self.ticket_want(&hs.sid) == 0 || hs.fault().is_some() {
             return;
         }
         let Some(guard) = Refilling::take(hs.clone()) else { return };
@@ -4768,7 +4765,10 @@ impl Signer {
     /// to `wait` until those tickets show failed. The wallet believes its node, not the answer.
     pub(crate) fn ticket_http_stop(&self, hs: &HttpSession, why: &str, wait: Duration) -> Value {
         // from here no ticket is released in the session, no new call takes it, and its open answers end: a stream
-        // (a WebSocket, a VPN tunnel, a body read as it comes) stops reading and takes its last receipt as it closes
+        // (a WebSocket, a VPN tunnel, a body read as it comes) stops reading and takes its last receipt as it closes.
+        // The book is told first: it still shows the session open while the streams end, and books nothing more for it
+        // (a release, a lock, a prepaid ticket), however far a call had got (past every check of `ending`) when the stop came
+        lock(&self.ticket_stopping).insert(hs.sid.clone());
         hs.ending.store(true, Ordering::SeqCst);
         // a stop that may wait (the caller's own) waits for those last receipts, so that what the session leaves with
         // the seller below counts what the streams drew. Waited for here, holding nothing of the session or its slot
@@ -4795,7 +4795,12 @@ impl Signer {
         let still_streaming = hs.streaming.load(Ordering::SeqCst) > 0;
         let stopped = {
             let _g = self.lock();
-            self.ticket_stop_locked(&json!({"session": hs.sid, "why": why}))
+            let stopped = self.ticket_stop_locked(&json!({"session": hs.sid, "why": why}));
+            // the book's own state says it from here (kept where the book could not be written: it stays refused)
+            if self.ticket_session(&hs.sid).is_none_or(|s| s.state != SState::Open) {
+                lock(&self.ticket_stopping).remove(&hs.sid);
+            }
+            stopped
         };
         let asked: Vec<String> = stopped.get("cancel").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.as_str().map(str::to_string)).collect();
         let mut sent = false;

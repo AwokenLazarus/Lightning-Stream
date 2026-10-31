@@ -680,6 +680,9 @@ struct PayState {
     router_down: bool,
     /// How long a send takes to return: a payment's way through a hop.
     send_takes: Duration,
+    /// How long the node takes to list its channels: the checks the wallet makes of them before a
+    /// payment (a busy node, a slow disk).
+    checks_take: Duration,
     /// The next sends are in flight on this node and never reach the seller's (the node dies as it
     /// sends them); once `stranded_off_channel` is set, no channel of the node carries them and
     /// the node goes on calling them in flight.
@@ -792,6 +795,8 @@ impl LnBackend for PayLn {
     }
 
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
+        let takes = self.st.lock().unwrap().checks_take;
+        std::thread::sleep(takes);
         let s = self.state();
         let mut c = s.channel.clone();
         let mut htlcs: Vec<Value> = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT" && !(s.stranded_off_channel && p["stranded"] == true)).map(|p| {
@@ -5783,6 +5788,43 @@ fn a_session_stopped_during_a_film_ends_it_at_once_and_releases_nothing_after() 
         let got = out["bytes"].as_u64().unwrap();
         let cost = (got * 200_000).div_ceil(1 << 20);
         assert!(spent >= 2_500 + cost && spent <= 2_500 + cost + 200_000, "spent {spent} msat for {got} bytes (cost {cost}): {stop}");
+    });
+    r.tap.clear();
+}
+
+/// A stop that comes while a prepaid ticket is on its way to its payment (asked of the seller, past
+/// every check of the session's `ending`, the node's own checks of its channels still going) stops
+/// it there: the book books nothing for a session whose stop has begun, and the node pays nothing
+/// more. Before, the book still showed the session open while the stop waited for its streams, and
+/// the ticket was booked and paid after the stop.
+#[test]
+fn a_prepaid_ticket_on_its_way_when_the_stop_comes_is_not_paid() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"], 200, "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
+    let paid = || r.ln.by_status("SUCCEEDED").len();
+    // 200 MiB at 200 sat a MiB: a prepaid ticket every second or so, for longer than the test
+    let film = 200 * MIB;
+    std::thread::scope(|sc| {
+        let before_film = paid();
+        let t = sc.spawn(|| r.pay(&format!("/slow/{film}"), 100_000));
+        wait_for("a prepaid ticket paid for the film", || paid() > before_film);
+        // the node's checks before a payment now take 2 s: the next ticket, its invoice asked for, waits there
+        let locks = r.tap.seen("/x402/ticket/lock").len();
+        r.ln.st.lock().unwrap().checks_take = Duration::from_secs(2);
+        wait_for("the next prepaid ticket asked of the seller", || r.tap.seen("/x402/ticket/lock").len() > locks);
+        std::thread::sleep(Duration::from_millis(400));
+        let before_stop = paid();
+        let stop = sc.spawn(|| r.call("ticket_stop", json!({"session": sid})));
+        let out = t.join().unwrap();
+        let stop = stop.join().unwrap();
+        r.ln.st.lock().unwrap().checks_take = Duration::ZERO;
+        assert_eq!(out["complete"], false, "{out}");
+        // the ticket on its way when the stop came, or any after it, is not paid
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(paid(), before_stop, "a prepaid ticket was paid after the stop began: {stop} {out}");
     });
     r.tap.clear();
 }
