@@ -497,7 +497,7 @@ impl Signer {
         };
         if let Err(why) = &receipt {
             let code = protocol_code(v.get("error"));
-            if status >= 500 {
+            if unsigned_and_no_fault(status) {
                 return Ok(Round { wins: vec![], again: true, left });
             }
             if code == "session_unknown" {
@@ -797,7 +797,7 @@ impl Signer {
                             continue;
                         }
                     }
-                    if status >= 500 {
+                    if unsigned_and_no_fault(status) {
                         return fail(ds, with(refused("ticket_seller", format!("the seller answered HTTP {status} without a receipt")), json!({"status": status})));
                     }
                     if status == 402 && code == "session_unknown" {

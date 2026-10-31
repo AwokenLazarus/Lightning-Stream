@@ -1956,6 +1956,14 @@ const READER_GONE: &str = "stopped by the buyer: the reader the body was streame
 /// Why the wallet read no further of a body that went past the size the buyer was shown (`max_size`).
 const PASSED_SHOWN: &str = "stopped by the wallet: the answer passed the size the buyer was shown";
 
+/// An answer without a receipt that blames nobody, and stops no session. A server error may be a
+/// proxy's. A 408 is the seller's HTTP layer giving up on a request that did not reach it in time,
+/// before anything serves or charges it: a wallet on a slow disk or short of memory sends one late.
+/// Neither moves money, and a seller gains nothing by either: the wallet goes on holding what it holds.
+fn unsigned_and_no_fault(status: u16) -> bool {
+    status >= 500 || status == 408
+}
+
 /// The socket a call streams its body to (`stream_to`): a name in `B2_STREAM_DIR`, which the
 /// operator sets for a local program that hands the body on (a player). A name, never a path, so a
 /// call reaches no socket outside that directory.
@@ -4247,10 +4255,10 @@ impl Signer {
                     if code == "bad_seq" {
                         return fail(hs, &spent, refusal("ticket_seller", "the seller keeps answering bad_seq"));
                     }
-                    // an answer nobody signed. A server error may be a proxy's; anything else is the seller serving or
-                    // refusing without a receipt, or someone answering in its place: the session ends, and nothing was
-                    // released on that answer's word
-                    if status >= 500 {
+                    // an answer nobody signed. A server error may be a proxy's, and a 408 is no one's fault
+                    // ([`unsigned_and_no_fault`]); anything else is the seller serving or refusing without a receipt,
+                    // or someone answering in its place: the session ends, and nothing was released on that answer's word
+                    if unsigned_and_no_fault(status) {
                         return fail(hs, &spent, with(refusal("ticket_seller", format!("the seller answered HTTP {status} without a receipt")), json!({"status": status})));
                     }
                     let d = self.ticket_fault(hs, &format!("an answer to a paid request (HTTP {status} {code}) without a valid receipt: {why}"));
