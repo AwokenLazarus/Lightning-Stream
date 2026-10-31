@@ -5836,7 +5836,8 @@ fn a_call_charged_less_than_it_may_move_buys_a_ticket_sized_to_its_charge() {
     let paid = r.ln.paid_msat();
     assert!((2_500..=20_000).contains(&paid) && asked(&r) == vec![paid], "a ticket of the charge, not the seller's 1,000 sat: paid {paid} msat, asked {:?}: {v}", asked(&r));
     assert_eq!(v["balance_msat"].as_str(), Some((paid - 2_500).to_string().as_str()), "{v}");
-    assert!(v["charged_sats"].as_i64().unwrap() <= 25 && r.ledger_sum() <= 25, "what left: {v}, ledger {}", r.ledger_sum());
+    // what the call booked: that ticket and its fee limit (10 sat and 0.5%), not 1,002
+    assert!(v["charged_sats"].as_i64().unwrap() <= 31 && r.ledger_sum() <= 31, "what left: {v}, ledger {}", r.ledger_sum());
     r.assert_booked();
     // held, the sell page's smallest (546 sat): the seller's smallest, not its own 1,000
     let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-use"]), Some(546_000)));
