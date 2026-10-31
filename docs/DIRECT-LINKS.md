@@ -86,9 +86,12 @@ them, are pasted on the Sell page until the node package grants them. Lightning 
 permissions only, so the Sell page takes the sign key as lnd's `message:write` (which allows
 SignMessage and no other call) as well as the URI permission, and nothing beyond those two.
 
-A sign key given or replaced while the shop runs is used at the gateway's next look at its link
-(every 15 s): the node is asked to vouch then, with no restart and no session dropped. Without a
-key the gateway asks again each hour.
+A sign key given while the shop runs, to a shop reached directly whose node has not vouched yet,
+is used within a minute: the gateway reads it at its next look at its link and asks the node then,
+with no restart and no session dropped (the Sell page leaves the gateway's config as it is). A key
+that replaces one whose word still holds is used at the next renewal, ten days before the word runs
+out. Without a key, or after the node refused, the gateway asks again an hour later. A shop sold
+only at a web address has no link, so a sign key gives it nothing to vouch for.
 
 ### One shop, several link keys
 

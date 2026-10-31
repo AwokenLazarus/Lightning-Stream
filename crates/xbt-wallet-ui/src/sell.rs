@@ -1006,11 +1006,14 @@ impl App {
         Ok(())
     }
 
-    /// Save the shop, and the gateway's config when the shop is complete. `Ok`: the words for
-    /// the owner.
+    /// Save the shop, and the gateway's config when the shop is complete and the config changes.
+    /// A config that differs from the one there is only by the listing's date is not written: the
+    /// gateway restarts on any change to it, and that would cut buyers' sessions for nothing.
+    /// `Ok`: the words for the owner.
     pub(crate) fn commit(&self, shop: &Shop, done: &str) -> Result<String, String> {
         self.save_shop(shop)?;
         match self.shop_config(shop, &self.chain()) {
+            Ok(cfg) if self.config_is(&cfg) => Ok(format!("{done} {KEEPS_RUNNING}")),
             Ok(cfg) => {
                 let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())? + "\n";
                 write_shared(&self.cfg.gw.dir, GW_CONFIG, text.as_bytes())?;
@@ -1018,6 +1021,13 @@ impl App {
             }
             Err(missing) => Ok(format!("{done} Not selling yet: {missing}")),
         }
+    }
+
+    /// Whether the gateway's config is `cfg` already, the listing's date aside.
+    fn config_is(&self, cfg: &Value) -> bool {
+        let path = self.cfg.gw.dir.join(GW_CONFIG);
+        let old = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        old.as_ref().map(undated) == Some(undated(cfg))
     }
 
     /// At start: write the gateway's config again when the shop, as this version describes it,
@@ -1030,16 +1040,7 @@ impl App {
             return None;
         }
         let Ok(new) = self.shop_config(&self.shop(), &chain) else { return Some("not complete") };
-        let undated = |v: &Value| {
-            let mut v = v.clone();
-            if let Some(l) = v.get_mut("listing").and_then(Value::as_object_mut) {
-                l.remove("updated");
-            }
-            v
-        };
-        let path = self.cfg.gw.dir.join(GW_CONFIG);
-        let old = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        if old.as_ref().map(undated) == Some(undated(&new)) {
+        if self.config_is(&new) {
             return Some("unchanged");
         }
         let Ok(text) = serde_json::to_string_pretty(&new) else { return Some("not written") };
@@ -1522,11 +1523,14 @@ impl App {
                     write_shared(&self.cfg.gw.dir, file, &mac)?;
                 }
                 let words = self.commit(&shop, "Your Lightning node is connected.")?;
-                // the gateway reads the sign key itself at its next look at the link: nothing restarts for it
-                Ok(if only_sign {
-                    words.replace(" Your shop restarts with it in a few seconds.", " Your node vouches for your shop's link within a minute, with no restart.")
-                } else {
-                    words
+                // the gateway reads the sign key itself at its next look at the link: nothing restarts
+                // for it. Only a shop reached directly has a link for the node to vouch for
+                Ok(match (only_sign, words.ends_with(KEEPS_RUNNING), shop.direct) {
+                    (true, true, true) => "Your link signing key is in. Your node vouches for your shop's link within a minute; \
+                                           the shop keeps running.".to_string(),
+                    (true, true, false) => "Your link signing key is in. Your shop sells at its web address, so it keeps running \
+                                            and there is no link to vouch for.".to_string(),
+                    _ => words,
                 })
             })(),
             "shop" => {
@@ -1742,12 +1746,27 @@ const KNOWN_SERVICES: &[(&str, &str)] = &[
     ("LlamaGPT", "http://llama-gpt_llama-gpt-api_1:8000"),
 ];
 
+/// What `commit` says when the gateway's config is unchanged, so the shop is not restarted.
+const KEEPS_RUNNING: &str = "Your shop keeps running: nothing it reads changed.";
+
+/// A gateway config without the listing's date, which changes each day and is no change to the shop.
+fn undated(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(l) = v.get_mut("listing").and_then(Value::as_object_mut) {
+        l.remove("updated");
+    }
+    v
+}
+
 /// The link signing key signs messages and does nothing else: lnd's `message:write` (what Lightning
 /// Fork's dashboard bakes), SignMessage's URI permission (what node-keys bakes), or both. Anything
 /// more is refused by name, and so is a key whose permissions cannot be read.
 fn sign_key_fits(mac: &[u8]) -> Result<(), String> {
     let m = xbt402::macaroon::parse(mac)?;
     let need = SIGN_ENTITY_OPS.join(" ");
+    if m.exact && m.ops.is_empty() {
+        return Err(format!("it grants no permission at all: bake one with only {need}"));
+    }
     if !m.readable() {
         return Err(format!("its permissions cannot be read (not this node's identifier): bake one with only {need}"));
     }

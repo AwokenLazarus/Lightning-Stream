@@ -1747,9 +1747,17 @@ fn a_pasted_link_signing_key_lets_the_node_vouch_for_the_direct_link() {
     let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &uris)]);
     let said = br.flash_after(&r);
     assert!(said.contains("does not fit") && said.contains("uri:/lnrpc.Lightning/SendCoins") && !said.contains("SignMessage,"), "{said}");
-    let unreadable = hex::encode(xbt402::macaroon::lnd_macaroon_for_tests(&[], &[]));
-    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &unreadable)]);
-    assert!(br.flash_after(&r).contains("cannot be read"));
+    let nothing = hex::encode(xbt402::macaroon::lnd_macaroon_for_tests(&[], &[]));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &nothing)]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("grants no permission"), "{said}");
+    // not lnd's identifier (its version byte): what it allows can't be read from it
+    let mut other = xbt402::macaroon::lnd_macaroon_for_tests(&[("message", &["write"])], &[]);
+    assert_eq!(other[8], 3, "the identifier's version byte");
+    other[8] = 4;
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &hex::encode(&other))]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("cannot be read"), "{said}");
     assert!(!sign.exists());
 
     // without it the shop connects (it can sell at a web address), and the page says what is missing
@@ -1786,6 +1794,59 @@ fn a_pasted_link_signing_key_lets_the_node_vouch_for_the_direct_link() {
     // written as the gateway's other keys are: readable by its group, by no one else
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::metadata(&sign).unwrap().permissions().mode() & 0o777, 0o640);
+}
+
+/// A link signing key pasted alone on a running, complete shop does not touch the gateway's config:
+/// the gateway restarts on any change to it (cutting buyers' sessions), and it reads the sign key
+/// itself. A config written on an earlier day differs from today's only by the listing's date,
+/// which is no change, so it is left byte for byte. The same holds for any save that changes nothing.
+#[cfg(unix)]
+#[test]
+fn a_sign_key_pasted_on_a_running_shop_leaves_its_config_as_it_is_from_any_day() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.nostr_relays = vec!["wss://relay.one.example".into()];
+    });
+    let mut br = logged_in(&bx);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &mac(&[("invoices", &["read", "write"])])),
+                               ("info_macaroon", &mac(&[("info", &["read"])]))]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct")]);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", &format!("http://{media}")), ("price", "1"), ("unit", "request")]);
+    assert!(br.flash_after(&r).contains("restarts with it"), "a complete shop: its config is written");
+    let path = dir.join("config.json");
+    // the config as the gateway runs it, written yesterday (or any earlier day)
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(c["listing"]["updated"].is_string() && c["link"].is_object(), "{c}");
+    c["listing"]["updated"] = json!("2026-10-30");
+    let yesterday = serde_json::to_string_pretty(&c).unwrap() + "\n";
+    std::fs::write(&path, &yesterday).unwrap();
+
+    let sign = mac(&[("message", &["write"])]);
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("sign_macaroon", &sign)]);
+    let said = br.flash_after(&r);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), yesterday, "config.json untouched, so the gateway is not restarted");
+    assert_eq!(hex::encode(std::fs::read(dir.join("sign.macaroon")).unwrap()), sign);
+    assert!(said.contains("signing key is in") && said.contains("within a minute") && said.contains("keeps running")
+            && !said.contains("restarts"), "{said}");
+    // a save that changes nothing leaves it too, and says the shop keeps running
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct")]);
+    let said = br.flash_after(&r);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), yesterday);
+    assert!(said.contains("keeps running") && !said.contains("restarts"), "{said}");
+    // a real change is written, with today's date
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films and more"), ("reach", "direct")]);
+    assert!(br.flash_after(&r).contains("restarts with it"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(c["listing"]["name"], "Home films and more");
+    assert_ne!(c["listing"]["updated"], "2026-10-30");
 }
 
 /// The one Lightning Stream app (`XBT_UI_SELL=1`): Sell sets up the gateway beside the wallet in

@@ -232,6 +232,8 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
     }
     let v = Vouch { links: links.clone(), private: l.private, state_dir: state_dir.to_path_buf(), node: node.clone(), seller: seller.to_string(),
                     sign_mac: sign_mac.to_path_buf(), gw: gw.clone(), nostr_pk, words: Default::default(), named: Default::default() };
+    // the sign key as it is before the first try: one pasted after it is news to the loop below
+    let mut key = SignKey::read(&v.sign_mac);
     let mut until = v.once()?;
     eprintln!(
         "xbt-gateway: reached by {} over {}{}",
@@ -243,28 +245,24 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
         if until.is_some() { "; the node vouches for it" } else { "; the node has not vouched for it (see sign_error at /.well-known/lightning-stream-link.json), so buyers cannot check it and nothing names it" }
     );
     std::thread::Builder::new().name("link-vouch".into()).spawn(move || {
-        let mut tried = unix_now();
-        let mut key = SignKey::read(&v.sign_mac);
+        let mut ask_at = next_ask(until, unix_now());
         loop {
             // the keys buyers can reach are looked at every REACH_CHECK, and the document made again
-            // when they change; the node is asked again ten days before its word runs out, each hour
-            // while it has not vouched, and at once when its sign key is given or replaced (pasted on
-            // a running shop: the gateway is not restarted for it, so no session is dropped)
+            // when they change; the node is asked again ten days before its word runs out, an hour
+            // after a try that got no word (none yet, or a renewal refused), and at once when its sign
+            // key is given or replaced (pasted on a running shop: the gateway is not restarted for it,
+            // so no session is dropped)
             std::thread::sleep(REACH_CHECK);
             if v.gw.stopped() {
                 return;
             }
-            let due = match until {
-                Some(u) => unix_now() + VOUCH_AHEAD >= u,
-                None => unix_now() >= tried + 3600,
-            };
             let new_key = key.changed();
-            if due || new_key || v.reach_changed() {
-                tried = unix_now();
+            if unix_now() >= ask_at || new_key || v.reach_changed() {
                 match v.once() {
                     Ok(u) => until = u.or(until.filter(|u| *u > unix_now())),
                     Err(e) => eprintln!("xbt-gateway: link: {e}"),
                 }
+                ask_at = next_ask(until, unix_now());
             }
         }
     }).map_err(|e| format!("link: {e}"))?;
@@ -272,8 +270,10 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
 }
 
 /// The node key the gateway asks the node to sign with (`sign.macaroon`), as last seen: the owner
-/// may give or replace it while the shop runs (StartOS: pasted on the Sell page), and the node is
-/// asked to vouch at once when it changes, not at the next hourly try.
+/// may give or replace it while the shop runs (StartOS: pasted on the Sell page), and the link is
+/// looked at again at once when it changes, not at the next hourly try. A key given where the node
+/// had not vouched is asked with then; one that replaces a key whose word still holds signs at the
+/// next renewal.
 struct SignKey {
     path: std::path::PathBuf,
     seen: Option<Vec<u8>>,
@@ -294,6 +294,18 @@ impl SignKey {
     }
 }
 
+/// When the node is next asked for its word, after a try at `now` that left it held until `until`:
+/// ten days before it runs out; or, when there is none or it is due already (the node did not vouch,
+/// or refused to renew), an hour on, so a key the node refuses is not tried every REACH_CHECK.
+fn next_ask(until: Option<u64>, now: u64) -> u64 {
+    match until {
+        Some(u) if u > now + VOUCH_AHEAD => u - VOUCH_AHEAD,
+        _ => now + ASK_AGAIN,
+    }
+}
+
+/// How long after a try that got no word the node is asked again.
+const ASK_AGAIN: u64 = 3600;
 /// How long the node's word for the link holds, and how long before its end it is asked again.
 const VOUCH_FOR: u64 = 30 * 86_400;
 const VOUCH_AHEAD: u64 = 10 * 86_400;
@@ -373,8 +385,12 @@ impl Vouch {
                         }
                     }
                 }
-                (None, Err(_)) => {
+                (None, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     sign_error = Some("no key to ask the node to sign with (sign.macaroon): buyers cannot check this link yet".into());
+                    None
+                }
+                (None, Err(e)) => {
+                    sign_error = Some(format!("cannot read sign.macaroon: {e}: buyers cannot check this link yet"));
                     None
                 }
             };
@@ -434,7 +450,18 @@ impl Vouch {
 
 #[cfg(test)]
 mod tests {
-    use super::SignKey;
+    use super::{next_ask, SignKey, ASK_AGAIN, VOUCH_AHEAD, VOUCH_FOR};
+
+    /// The node is asked ten days before its word runs out; after a try that got no word, or a
+    /// renewal it refused (the word is due already), an hour on, not at every look at the link.
+    #[test]
+    fn a_refused_renewal_is_tried_again_an_hour_on_not_every_look() {
+        let now = 1_800_000_000;
+        assert_eq!(next_ask(Some(now + VOUCH_FOR), now), now + VOUCH_FOR - VOUCH_AHEAD, "a fresh word: renewed ten days before its end");
+        assert_eq!(next_ask(None, now), now + ASK_AGAIN, "no word: an hour on");
+        assert_eq!(next_ask(Some(now + VOUCH_AHEAD - 60), now), now + ASK_AGAIN, "a renewal refused: an hour on, while the word holds");
+        assert_eq!(next_ask(Some(now + VOUCH_AHEAD), now), now + ASK_AGAIN, "due exactly now and refused: an hour on");
+    }
 
     /// A sign key pasted on a running shop is noticed at the next look (the node then vouches within
     /// REACH_CHECK, with no restart); the same key written again, or the key removed, is not news.
