@@ -109,7 +109,9 @@ or `--config`, the service the app runs):
   - any other miner is sent `client.reconnect` to the app's own address and is placed by its
     worker name when it comes back.
 - **The listing says what is free** (`capacity`: miners, free miners, free hashrate) and is
-  published again when that changes.
+  published again when that changes, and every six hours at the least. A listing more than two days
+  old is not offered: its hashmaker has gone. The event says so to other clients too (NIP-40
+  `expiration`).
 - **The end of a rental.** Both sides let a channel's meter go at the same point: after the hashtaker's
   upstream session for it has ended and its last verdict was sent, the hashtaker says `shut`, and the
   hashmaker lets the channel go there too. This removed the case where the hashmaker counted one more

@@ -532,6 +532,14 @@ mod tests {
     const S: fn(u64) -> Duration = Duration::from_secs;
 
     #[test]
+    fn a_listing_is_published_again_well_before_it_expires() {
+        // readers drop a listing two days old: one published every six hours at the least has eight chances
+        assert!(REPUBLISH_MAX * 8 <= Duration::from_secs(listing::MAX_AGE_S));
+        let same = said(1, 1, 4_000_000_000_000);
+        assert!(due(Some((&same, true)), &same, REPUBLISH_MAX), "nothing changed, and still published again");
+    }
+
+    #[test]
     fn a_wobbling_hashrate_is_not_republished() {
         let last = said(1, 1, 4_000_000_000_000);
         // 2.9 TH/s against 4.0 published: a 27% move, but only ten minutes after the last publish
