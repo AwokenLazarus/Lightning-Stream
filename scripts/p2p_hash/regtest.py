@@ -5,8 +5,8 @@ wallet's signer on lf1 with a "hashrate" task, the hashmaker's gateway beside lf
 /hashrate/, passed to the hashmaker's paid-slice endpoint, a stand-in Nostr relay, a stand-in pool as
 the hashtaker's gateway and stand-in miners. The hashmaker publishes its listing to the relay; the hashtaker
 finds it there, opens the link to the endpoint it names, and pays slice by slice through the
-wallet, ahead of the work: one paid request per slice, on the gateway's tickets (prepaid first, then
-held). The stand-ins hash the chain's real share format at a tiny difficulty, and both sides prove each share.
+wallet, ahead of the work: one paid request per slice, on prepaid tickets sized to the step the rental has
+earned (the hashrate task is a rental task, as the starter rules make it on mainnet). The stand-ins hash the chain's real share format at a tiny difficulty, and both sides prove each share.
 
 Checks:
   listing   found on the relay, its link key the hashmaker's, the link opened to the address it names
@@ -16,13 +16,9 @@ Checks:
   no-hash   the miners stop: no payment after that, the wallet's session stopped, nothing left held
   unpaid    the hashtaker stops paying after slice 3: the next share waits on the clock and goes no further, the
             hashmaker stops, and the gateway charges nothing more
-  small     a rental whose budget (500 sat) is under the shop's ticket (1,000 sat), from no credit at a
-            second gateway on the same node, with the app's caps (rail::pay_caps: 2,000 sat may leave a
-            slice, the budget is the most it is charged): the old caps (max_sats = the budget) are
-            refused with nothing paid; the app's buy one whole ticket and pay every slice of the budget
-            from it; slices x price = the wallet's spent = the seller's signed spent, the credit left
-            = the ticket - spent, and the seller's node settled exactly the one ticket the wallet's
-            node paid; the rental's report says what left and what stays with the seller
+  small     a direct call with max_sats 500 from no credit is refused, nothing paid; and a rental whose budget
+            (500 sat) is under the smallest ticket (546 sat) is refused before any work, nothing paid, the
+            renter told why
   drop      a rental at a third gateway, from no credit, whose link loses what the hashmaker sends for a
             stretch, then is down for 4 s, with a slice paid while it's down. At the resume the hashmaker sends
             its recent shares again, and the hashtaker counts those it never read, once each: both proven
@@ -103,7 +99,8 @@ def policy() -> dict[str, Any]:
         "regtest_mine": False,
         "anchor_interval_s": 3600,
         "ln": {"enabled": True, "split_height": d.SPLIT},
-        "tickets": {"enabled": True, "tasks": {"hashrate": {"budget_sats": 50_000}}},
+        # the hashrate task as the starter rules sign it on mainnet: a rental task, prepaid tickets of at most 10,000 sat
+        "tickets": {"enabled": True, "tasks": {"hashrate": {"budget_sats": 50_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}}},
     }
 
 
@@ -144,9 +141,10 @@ def setup() -> None:
                  "macaroon": f"{RUN}/invoices.macaroon", "info_macaroon": f"{RUN}/info.macaroon"},
         "caps": {"sessions_per_address": 0, "unpaid_per_address": 0, "first_use_secs": 20, "idle_secs": 120},
         "times": {"height_max_age_secs": 5},
-        "tickets": {"ticket_msat": TICKET_MSAT, "max_tickets": 2, "ticket_blocks": 40, "settle": ["on-use", "on-arrival"]},
+        # as the app writes a hashmaker's shop: tickets down to the dust floor, and a larger top ticket on the hashrate route
+        "tickets": {"ticket_msat": TICKET_MSAT, "min_ticket_msat": 546_000, "max_tickets": 2, "ticket_blocks": 40, "settle": ["on-use", "on-arrival"]},
         "routes": [{"path": "/hashrate/", "upstream": f"http://127.0.0.1:{SLICES}", "methods": ["POST"], "max_body": 8192,
-                    "price": {"request_msat": PRICE_MSAT}}],
+                    "price": {"request_msat": PRICE_MSAT}, "top_ticket_msat": 100_000_000}],
     }
     cfg2 = {**cfg, "listen": f"127.0.0.1:{GW2}", "public_url": ORIGIN2, "state_dir": f"{RUN}/state-gateway2"}
     cfg3 = {**cfg, "listen": f"127.0.0.1:{GW3}", "public_url": ORIGIN3, "state_dir": f"{RUN}/state-gateway3"}
@@ -598,8 +596,8 @@ def main() -> int:
         rails = sorted({p["wallet"].get("rail") for p in oks})
         held_used = [p["slice"] for p in oks if int(p["wallet"].get("tickets_released", 0)) > 0 and int(p["wallet"].get("tickets_prepaid", 0)) == 0]
         prepaid_used = [p["slice"] for p in oks if int(p["wallet"].get("tickets_prepaid", 0)) > 0]
-        check("paid: the gateway spent exactly slices x price, on a prepaid ticket and then held ones",
-              priced == spent == paid * PRICE_MSAT and rails == ["ticket"] and prepaid_used == [1] and held_used,
+        check("paid: the gateway spent exactly slices x price, on prepaid tickets only (a rental task holds nothing)",
+              priced == spent == paid * PRICE_MSAT and rails == ["ticket"] and prepaid_used and not held_used,
               {"priced_msat": priced, "spent_msat": spent, "expected_msat": paid * PRICE_MSAT, "rails": rails,
                "prepaid ticket at slice": prepaid_used, "held ticket released at slices": held_used,
                "moved_sats": sum(int(p["wallet"].get("charged_sats", 0)) for p in oks)})
@@ -653,46 +651,16 @@ def main() -> int:
               old.get("verdict") != "allow" and int(old.get("charged_sats", 0)) == 0 and not moved and d.held() == 0,
               {"verdict": old.get("verdict"), "rule": old.get("rule"), "reason": str(old.get("reason"))[:200],
                "charged_sats": old.get("charged_sats"), "payments": moved})
-        expect = SMALL_BUDGET_SATS * 1000 // PRICE_MSAT
-        r = rental("small", None, 70, 1.5, origin=ORIGIN2, caps=("--budget-sats", str(SMALL_BUDGET_SATS)))
+        # a rental whose budget is under the smallest ticket any seller sells (546 sat): refused before any work, nothing paid,
+        # and the renter told why
+        r = rental("small", None, 20, 1.5, origin=ORIGIN2, caps=("--budget-sats", str(SMALL_BUDGET_SATS)))
         hz, bz = r["hasher"], r["buyer"]
-        oks = [p for p in bz["pays"] if p.get("ok")]
         REPORT["small_pays"] = bz["pays"]
-        paid = hz["paid"]
-        check("small: every slice of the budget paid once through the wallet, then the rental stopped at its budget",
-              paid == len(oks) == expect and not bz["payFailed"] and bz["closed"] == "budget used up"
-              and int(hz["meter"]["work"]) <= paid * SLICE_WORK,
-              {"hashmaker paid": paid, "wallet ok": len(oks), "expected": expect, "closed": bz["closed"], "meter": hz["meter"]})
-        priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
-        last_w = oks[-1]["wallet"] if oks else {}
-        credited, balance = int(last_w.get("credited_msat", 0)), int(last_w.get("balance_msat", 0))
-        spent = credited - balance
-        moved_sats = sum(int(p["wallet"].get("charged_sats", 0)) for p in oks)
-        inv1, pay1 = d.seller_invoices(), d.buyer_payments()
-        new_inv = {h: i for h, i in inv1.items() if h not in inv0}
-        new_pay = {h: p for h, p in pay1.items() if h not in pay0}
-        settled = {h: i for h, i in new_inv.items() if i["state"] == "SETTLED"}
-        succeeded = {h: p for h, p in new_pay.items() if p["status"] == "SUCCEEDED"}
-        node_out_msat = sum(int(p["value_msat"]) + int(p["fee_msat"]) for p in succeeded.values())
-        REPORT["small_tickets"] = [{"hash": h, "state": i["state"], "value_msat": i.get("value_msat"), "paid_msat": i.get("amt_paid_msat")} for h, i in new_inv.items()]
-        REPORT["small_payments"] = [{"hash": h, "status": p["status"], "value_msat": p["value_msat"], "fee_msat": p["fee_msat"]} for h, p in new_pay.items()]
-        check("small: slices x price = the wallet's spent = the seller's signed spent; one whole ticket bought at slice 1, "
-              "the credit left = the ticket - spent",
-              priced == spent == paid * PRICE_MSAT and credited == TICKET_MSAT and balance == TICKET_MSAT - spent
-              and [p["slice"] for p in oks if int(p["wallet"].get("tickets_prepaid", 0)) > 0] == [1]
-              and all(int(p["wallet"].get("price_msat", 0)) <= SMALL_BUDGET_SATS * 1000 for p in oks),
-              {"slices x price msat": paid * PRICE_MSAT, "wallet priced msat": priced, "seller's signed spent msat": spent,
-               "credited msat": credited, "credit left msat": balance, "ticket msat": TICKET_MSAT})
-        check("small: the seller's node settled exactly the one ticket the wallet's node paid; what left the wallet is that "
-              "ticket and its fee, within the 2,000 sat a slice may move; nothing held",
-              len(settled) == 1 and list(settled) == list(succeeded) and int(next(iter(settled.values()))["amt_paid_msat"]) == TICKET_MSAT
-              and node_out_msat <= moved_sats * 1000 < node_out_msat + 1000 and moved_sats <= 2_000 and d.held() == 0,
-              {"settled": len(settled), "succeeded": len(succeeded), "node out msat": node_out_msat, "wallet booked sats": moved_sats,
-               "other tickets": sorted({i["state"] for h, i in new_inv.items() if h not in settled}), "held": d.held()})
-        check("small: the rental's report (the wallet app's card) says what left the wallet and what stays with the seller as credit",
-              bz.get("walletMovedSats") == moved_sats and bz.get("leftWithSellerMsat") == balance,
-              {"walletMovedSats": bz.get("walletMovedSats"), "leftWithSellerMsat": bz.get("leftWithSellerMsat"),
-               "wallet booked sats": moved_sats, "credit left msat": balance})
+        moved = {h: p["status"] for h, p in d.buyer_payments().items() if h not in pay0}
+        why = " ".join(str(p.get("why", "")) for p in bz["pays"])
+        check("small: a budget under the smallest ticket is refused before any work, with nothing paid and the reason said",
+              hz["paid"] == 0 and int(hz["meter"]["work"]) == 0 and bz["payFailed"] and not moved and d.held() == 0 and "smallest ticket" in why,
+              {"hashmaker paid": hz["paid"], "work": hz["meter"]["work"], "closed": bz["closed"], "why": why[:300], "payments": moved, "held": d.held()})
 
         drop_check()
         real_gateway("solo")
