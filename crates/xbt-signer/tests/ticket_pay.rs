@@ -2876,8 +2876,20 @@ fn a_seller_that_charges_past_the_calls_limit_is_stopped_and_said_so() {
 fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
+    // the seller's own record of each answer that ended (its status lists them: the bytes its socket took, and the
+    // signed charge), as the wallet fetches it to close the cut answer
+    let finals = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let kept = finals.clone();
     // the connection dies after 7 MiB of a 30 MiB file
-    r.tap.set(Box::new(|seen, real| {
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path.ends_with("/x402/ticket/status") {
+            let (status, headers, body) = whole(real().ok()?);
+            if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+                kept.lock().unwrap().extend(v["responses"].as_array().into_iter().flatten().cloned());
+            }
+            let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+            return Some(Ok(answer(status, headers, body)));
+        }
         if !(seen.paid && seen.path.starts_with("/files/")) {
             return None;
         }
@@ -2903,18 +2915,25 @@ fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
     // 7 MiB is 1,400 sat: two tickets were released for it, and no third
     assert_eq!((v["tickets_released"].as_u64(), r.tap.secrets().len()), (Some(2), 2), "{v}");
     assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
-    // the session goes on: the seller's signed balance is what is left. The seller charges what it has sent, and its
-    // socket took the 7 MiB read and what the kernel buffered ahead of a reader that then stopped, up to the credit
-    // released: a little on a quiet machine, the whole 2,000 sat on a loaded one (CI on a lab VM). So the next call is
-    // paid from what is left where that covers it and buys one ticket where it does not, and either way to the msat
+    // the seller charged the cut answer for the bytes its socket took and not one more: the 7 MiB read and what the
+    // kernel buffered ahead of a reader that then stopped, up to the credit released (a little on a quiet machine, all
+    // 10 MiB on a loaded one). A seller that kept the credit it had reserved, or billed the rest of it on the cut,
+    // charges past its own count of bytes
+    let cut = finals.lock().unwrap().iter().find(|f| f["complete"] == false).cloned().unwrap_or_else(|| panic!("no record of the cut answer: {v}"));
+    let wrote = cut["bytes"].as_u64().unwrap();
+    let charged: u64 = cut["charged"].as_str().and_then(|s| s.parse().ok()).unwrap_or_else(|| panic!("{cut}"));
+    assert!(wrote >= 7 * MIB as u64, "the seller wrote less than was read: {cut}");
+    assert_eq!(charged, (wrote * 200_000).div_ceil(MIB as u64), "charged for exactly the {wrote} bytes it wrote: {cut}");
+    // the session goes on: the seller's signed balance is what is left. So the next call is paid from what is left
+    // where that covers it and buys one ticket where it does not, and either way to the msat
     let next = r.pay("/page/10", CALL);
     let num = |k: &str| next[k].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| panic!("{k}: {next}"));
     let (credited, balance, page) = (num("credited_msat"), num("balance_msat"), num("price_msat"));
     let released_next = next["tickets_released"].as_u64().unwrap();
     assert_eq!(credited, (2 + released_next) * TICKET, "{next}");
     let cut_cost = credited - balance - page;
-    let read = 7 * 200_000;
-    assert!((read..=2 * TICKET).contains(&cut_cost), "the cut answer cost {cut_cost} msat: at least the {read} read, at most the 2 tickets released for it: {next}");
+    assert_eq!(cut_cost, charged, "the signed balance is the seller's own count: {next}");
+    assert!(cut_cost <= 2 * TICKET, "the cut answer cost {cut_cost} msat, past the 2 tickets released for it: {next}");
     let needed = u64::from(2 * TICKET - cut_cost < page);
     assert_eq!((next["status"].as_u64(), released_next), (Some(200), needed), "the credit left pays first: {next}");
     assert_eq!(r.money(), ((2 + needed) * TICKET, (2 + needed) * TICKET, (2 + needed) * TICKET, (2 + needed) as i64 * SETTLED));
