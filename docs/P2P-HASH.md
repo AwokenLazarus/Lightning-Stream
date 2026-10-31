@@ -1,6 +1,6 @@
 # p2p-hash: rented hashrate over Lightning Stream (phase 1)
 
-**In 0.2.0:** Renting hashrate needs a DATUM Gateway that masks its jobs (hides which shares win), so a hashmaker can't keep back the shares that would be blocks. No released gateway does that yet: a gateway app that does is coming in a follow-up release, and Lazarus Pool support with it. Until then the app checks your gateway, says so, and rents nothing. Selling hashrate (renting out your own miners) works now.
+**In 0.2.0:** Renting hashrate needs masked jobs (jobs that hide which shares win), solo or through a pool, so a hashmaker can't keep back the shares that would be blocks. No released gateway shows that yet: a gateway app that masks, and support for pools that mask (Lazarus Pool first), are coming in a follow-up release. Until then the app checks your gateway, says so, and rents nothing. Selling hashrate (renting out your own miners) works now.
 
 Anyone rents hashrate from anyone, paid as it is used, seconds at a time, pointed at the hashtaker's own DATUM
 Gateway. The hashtaker makes the jobs; the hashmaker runs no gateway. Nobody holds anyone's money.

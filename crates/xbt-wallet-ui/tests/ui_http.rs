@@ -3933,7 +3933,7 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
             assert!(p.body.contains("Ready to rent") && !p.body.contains("masks its jobs"), "{}", p.body);
             assert!(card.contains("<button>Rent</button>"), "{card}");
         } else {
-            assert!(p.body.contains("Renting needs a gateway that masks its jobs") && p.body.contains("A gateway app that does is coming soon")
+            assert!(p.body.contains("Renting needs a gateway that masks its jobs") && p.body.contains("A gateway app that masks its jobs, and support for pools that mask, are")
                     && p.body.contains("nothing is paid"), "{}", p.body);
             assert!(card.contains("<button disabled>Rent</button>"), "{card}");
             assert!(!p.body.contains("can't be checked") && !p.body.contains("refused"), "no scary words: {}", p.body);
