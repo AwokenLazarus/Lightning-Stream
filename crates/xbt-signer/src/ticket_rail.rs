@@ -2136,6 +2136,15 @@ impl Signer {
         }
     }
 
+    /// Whether a ticket of the session is on its way and not yet one a release can take: sent and not
+    /// shown locked by the wallet's node, or locked with no expiry the node has reported. A release
+    /// that finds the pool empty waits for such a ticket rather than ending its answer.
+    pub(crate) fn ticket_coming(&self, sid: &str) -> bool {
+        let Ok(g) = self.ticket_store() else { return false };
+        let Some(st) = g.as_ref() else { return false };
+        st.book.of_session(sid).iter().any(|t| t.state == TState::Sending || (t.state == TState::Locked && t.final_expiry == 0))
+    }
+
     /// Whether the wallet's own node calls a ticket's payment in flight and carries it on none of
     /// its channels: seen of a Lightning Fork node that was killed as it sent the payment
     /// (`docs/LIMITS.md`). The seller will never show such a ticket locked. `false` whenever the

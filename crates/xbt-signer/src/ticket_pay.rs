@@ -3917,6 +3917,25 @@ impl Signer {
                 }
             }
             filled?;
+            // a ticket sent and not yet shown locked by the wallet's own node (a loaded node answers the send, or its
+            // payment stream breaks, before it lists the HTLC): the pool counts it, so no fill sends another, and the
+            // answer would end for want of one that is on its way. It is waited for, the node asked again, for as long
+            // as a refill is; a stop ends the wait, and one the node fails is let go by the book
+            let until = Instant::now() + REFILL_WAIT;
+            while next.is_none() && self.ticket_coming(&hs.sid) && Instant::now() < until {
+                if hs.ending.load(Ordering::SeqCst) {
+                    return Err(stopping_refusal());
+                }
+                if !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
+                    return Err(refusal("ticket_session", "the session was stopped: nothing more is released for it"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                {
+                    let _g = self.lock();
+                    self.ticket_reconcile_locked();
+                }
+                next = self.ticket_next(&hs.sid).0;
+            }
         }
         let Some(mut hash) = next else {
             // the book says why nothing can be released (a stopped session, a task the owner removed, no ticket). It is
