@@ -8044,10 +8044,11 @@ fn an_unsigned_answer_at_a_takeover_ends_nothing() {
     assert_eq!(r.audit("ticket_prepaid_shown")[0]["credited_now"].as_u64(), Some(1));
 }
 
-/// A session open under another address on other terms is not moved aside, and its seller session is
-/// not another's to take: a call there is not paid from it, and none of its tickets are cancelled.
+/// A session open under another address on other terms is not moved aside, and the book opens no
+/// second session with that seller beside it: so no takeover meets a seller session in use. The call
+/// is refused, nothing of the session is asked about, and none of its tickets are cancelled.
 #[test]
-fn a_takeover_leaves_a_seller_session_another_session_has_open_alone() {
+fn a_call_on_other_terms_beside_an_open_session_takes_nothing_from_it() {
     let _g = env_lock();
     let mut shop = strict_shop();
     shop["alias"] = true.into();
@@ -8085,17 +8086,15 @@ fn a_takeover_leaves_a_seller_session_another_session_has_open_alone() {
     }));
     let c = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10").replace("127.0.0.1", "localhost"), "max_sats": CALL, "task": "film"}));
     r.tap.clear();
-    assert_ne!(c["session"], b["session"], "{c}");
-    assert_eq!((c["status"].as_u64(), c["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a ticket of its own: {c}");
+    assert_eq!((c["rule"].as_str(), c["session"].as_str()), (Some("ticket_session_exists"), Some(sid.as_str())), "{c}");
     assert_eq!(r.audit("ticket_resumed").len(), 1, "that seller session is in use");
     let named: Vec<String> = r.tap.seen("/x402/ticket/cancel").iter().flat_map(|s| {
         serde_json::from_str::<Value>(&s.body).unwrap()["hashes"].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect::<Vec<_>>()
     }).collect();
     assert!(named.iter().all(|h| !mine.contains(h)), "a live session's tickets named: {named:?} {mine:?}");
     assert_eq!(locked_of(&sid), mine, "its tickets are untouched");
-    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
-    let (node, seller, book, _) = r.money();
-    assert_eq!((node, seller, book), (2 * TICKET, 2 * TICKET, 2 * TICKET));
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "nothing bought beside it");
+    assert_eq!(both_sides_of(&r, &sid), TICKET - 2 * 2_500);
 }
 
 /// A stop names a held ticket booked as released whose secret the seller did not take: it can still
@@ -8385,6 +8384,17 @@ fn a_start_logs_credit_it_could_not_learn_as_unknown_and_none_as_nothing() {
     r.restart();
     r.tick();
     assert_eq!(r.audit("ticket_left_with_seller").len(), stopped_by_the_caller, "a session already stopped is not this start's to report");
+
+    // and a seller that says the session holds nothing: there is nothing to report
+    let mut r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/1", CALL)["status"].as_u64(), Some(200));
+    r.restart();
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/status").then(|| {
+        Ok(answer(200, vec![], json!({"session": {"balanceMsat": "0", "releasedMsat": TICKET.to_string()}}).to_string().into_bytes()))
+    })));
+    r.tick();
+    r.tap.clear();
+    assert!(r.audit("ticket_left_with_seller").is_empty(), "{:?}", r.audit("ticket_left_with_seller"));
 }
 
 /// Forgetting a session stopped earlier says how much is given up, as the seller counts it.
