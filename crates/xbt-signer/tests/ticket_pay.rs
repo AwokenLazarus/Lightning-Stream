@@ -9238,19 +9238,19 @@ fn a_request_refused_for_a_win_waits_for_the_sellers_next_invoice_and_is_served(
 fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pays_it() {
     let _g = env_lock();
     // a seller that serves on while wins take their 3 s: this is about the invoice, not its answer standing still
-    let r = Rig::shipped(json!({"tickets": {"lottery": {"max_odds_den": 2}}}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
                                                "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
     r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
-    let (ln, clock, node, standin, once) = (r.ln.clone(), r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
+    let size = 256 * PIECE;
+    // a file's wins teach the wallet how long they take on the way
+    let first = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((first["rail"].as_str(), first["complete"].as_bool()), (Some("lottery"), Some(true)), "{first}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{first}");
+    let (clock, node, standin, once) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
     r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
-        if ln.by_status("SUCCEEDED").is_empty() {
-            return;
-        }
         let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
         let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
         if !open.is_empty() && !once.swap(true, Ordering::SeqCst) {
-            // (the wallet has seen that payment end by now, and knows how long it took)
-            std::thread::sleep(Duration::from_millis(300));
             // an invoice is dated a second back: 5 s left, which every prepaid invoice may have and these wins may not
             clock.fetch_add(24, Ordering::SeqCst);
             let standin = standin.clone();
@@ -9263,12 +9263,13 @@ fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pay
             });
         }
     }));
-    // a win in every fourth piece: far more than the 8 the gate lets on the way before the first has arrived
-    let size = 128 * PIECE;
-    let v = r.pay(&format!("/hot/{size}"), 4_000);
-    assert_eq!(v["rail"].as_str(), Some("lottery"), "{v}");
+    // the next file's first win finds its invoice so
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
     assert_eq!(r.ln.by_status("FAILED").len(), 0, "nothing was sent that could not arrive: {v}");
-    assert_paid_after_lapses(&r, &v, size, 1);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["session"].as_str()), (Some(200), Some(true), first["session"].as_str()), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), first["wins"].as_u64().unwrap() + wins);
     assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
 }
 
