@@ -1750,7 +1750,18 @@ def huge_file() -> str:
 
 
 #: A TCP socket's states once the other side has closed or reset it (Linux's TCP_INFO, its first byte).
-TCP_PEER_GONE = (7, 8)
+TCP_ESTABLISHED = 1
+
+
+def connection_open_at(listen_port: int, client_port: int) -> bool:
+    """Whether the side of a local connection that listens on `listen_port` still holds it open. A close there with bytes
+    still queued sends its FIN after them, so a client that takes nothing may not be told: only this side's state shows it."""
+    with open("/proc/net/tcp") as f:
+        for line in f.readlines()[1:]:
+            local, remote, state = line.split()[1:4]
+            if int(local.split(":")[1], 16) == listen_port and int(remote.split(":")[1], 16) == client_port:
+                return int(state, 16) == TCP_ESTABLISHED
+    return False
 
 
 class RangeFiles(BaseHTTPRequestHandler):
@@ -1830,13 +1841,12 @@ def paused_player() -> None:
                 got += len(chunk)
                 digest.update(chunk)
                 if not paused and got >= 32 << 20:
-                    # the player's buffer is full: it takes nothing until the app has given up on it, which the
-                    # socket's state shows (CLOSE_WAIT: the other side has closed) with bytes still unread
+                    # the player's buffer is full: it takes nothing until the app has given up on it, with bytes still unread
                     paused = True
                     pause_at = time.monotonic()
                     # (the response holds the socket: an answer with Connection: close leaves the connection object without it)
-                    held = resp.fp.raw._sock
-                    while time.monotonic() - pause_at < 150 and held.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 1)[0] not in TCP_PEER_GONE:
+                    client_port = resp.fp.raw._sock.getsockname()[1]
+                    while time.monotonic() - pause_at < 150 and connection_open_at(conn_port, client_port):
                         time.sleep(0.5)
                     cut_after = round(time.monotonic() - pause_at, 1)
             if resp.length:
