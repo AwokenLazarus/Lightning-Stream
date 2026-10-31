@@ -18,6 +18,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop reached only by its key can list web apps and Files from the Sell page.
 - The AI address and agents can pay shops reached by key.
 - The AI page shows prices for shops reached by key.
+- A seller added, updated or removed on the Services page reaches the AI address at once.
+- Two AI sellers with the same name are told apart by their shop key or address, so preferring or
+  blocking one no longer hits the other.
 - After a restart, the AI address finds sellers' models within seconds, instead of answering
   "model not found" for about five minutes.
 - A shop saved before its first service is now published on Nostr, so buyers can find it.
