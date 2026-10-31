@@ -2296,7 +2296,8 @@ class FarSide:
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                want = int(self.path.rsplit("bytes=", 1)[-1])
+                q = dict(kv.split("=", 1) for kv in self.path.split("?", 1)[-1].split("&") if "=" in kv)
+                want, pace = int(q["bytes"]), int(q.get("rate") or VPN_FAR_BYTES_PER_S)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(want))
@@ -2309,7 +2310,7 @@ class FarSide:
                         self.wfile.write(far.block[at:at + n])
                         sent += n
                         far.served += n
-                        time.sleep(max(0.0, t0 + sent / VPN_FAR_BYTES_PER_S - time.monotonic()))
+                        time.sleep(max(0.0, t0 + sent / pace - time.monotonic()))
                 except OSError:
                     pass
 
@@ -2466,18 +2467,26 @@ def vpn() -> None:
           {"fetch": out, "file": url, "seconds": round(took, 1), "mbit_s": mbit, "interim_faults": faults, "exit": {k: exit_status.get(k) for k in ("offered", "paid", "down_bytes", "up_bytes")},
            "tickets": len(paid), **inv, "money": m})
     vpn_money(origin, vdir, VPN_SAT_GB)
+
+    def price_route(sat_gb: int) -> None:
+        with open(f"{RUN}/gateway-vpn.json") as f:
+            cfg = json.load(f)
+        for route in cfg["routes"]:
+            if route["path"] == "/vpn/":
+                route["price"]["byte_msat"] = sat_gb * 1000
+        with open(f"{RUN}/gateway-vpn.json", "w") as f:
+            json.dump(cfg, f, indent=1)
+        PROCS["gateway-vpn"].terminate()
+        PROCS["gateway-vpn"].wait(10)
+        start_gateway("gateway-vpn", gw_port)
+
+    # a middle price at 200 Mbit over about 500 MiB: about 25 MiB a second and 50 MiB a ticket, so what the wallet
+    # pays ahead (rate times a payment's time) is a real share of a ticket, and the run is long enough to show it
+    price_route(VPN_MID_SAT_GB)
+    vpn_money(origin, vdir, VPN_MID_SAT_GB, stop_bytes=VPN_MID_STOP_AT_BYTES, pace=VPN_MID_BYTES_PER_S, file_bytes=1 << 30)
     # the same at 1,000 sat a GiB, where ~60 MiB cost under one ticket: no ticket is released while the
     # tunnel runs, so nothing but the stop's own count tells what the tunnel drew (the shortfall's regime)
-    with open(f"{RUN}/gateway-vpn.json") as f:
-        cfg = json.load(f)
-    for route in cfg["routes"]:
-        if route["path"] == "/vpn/":
-            route["price"]["byte_msat"] = VPN_CHEAP_SAT_GB * 1000
-    with open(f"{RUN}/gateway-vpn.json", "w") as f:
-        json.dump(cfg, f, indent=1)
-    PROCS["gateway-vpn"].terminate()
-    PROCS["gateway-vpn"].wait(10)
-    start_gateway("gateway-vpn", gw_port)
+    price_route(VPN_CHEAP_SAT_GB)
     vpn_money(origin, vdir, VPN_CHEAP_SAT_GB)
     for name in ("gateway-vpn", "vpn"):
         PROCS[name].terminate()
@@ -2485,22 +2494,28 @@ def vpn() -> None:
     FAR_SIDE.close()
 
 
-#: The tunnel is stopped once this much has come down through it (the exit's own count).
+#: The tunnel is stopped once the far side has sent this much into it.
 VPN_STOP_AT_BYTES = 60 << 20
 VPN_CHEAP_SAT_GB = 1_000
+VPN_MID_SAT_GB = 20_000
+VPN_MID_STOP_AT_BYTES = 500 << 20
+VPN_MID_BYTES_PER_S = 25_000_000
 
 
-def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
-    """A VPN tunnel's money over a realistic amount, stopped as a VPN that is turned off stops it: a 100 MiB
-    download from the far side of the exit ([`FarSide`]), through a tunnel paid at `sat_gb` sat a GiB, and the
-    agent stops the session while the tunnel is still open, once about 60 MiB have come down (by what the
-    seller's receipts say was spent, or the exit's count where 60 MiB cost under two tickets). What the seller charged
+def vpn_money(origin: str, vdir: str, sat_gb: int, stop_bytes: int = VPN_STOP_AT_BYTES, pace: int = VPN_FAR_BYTES_PER_S,
+              file_bytes: int = 100 << 20) -> None:
+    """A VPN tunnel's money over a realistic amount, stopped as a VPN that is turned off stops it: a download
+    from the far side of the exit ([`FarSide`]) at `pace` bytes a second, through a tunnel paid at `sat_gb` sat a
+    GiB, and the agent stops the session while the tunnel is still open, once the far side has sent `stop_bytes`
+    (by its own count, which the wallet has no part in: a stop keyed on what the wallet says was spent comes only
+    when the seller has charged every ticket released, the one moment nothing is paid ahead). What the seller charged
     (its gateway's book) and what the wallet says the
     session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
     the stop says is left with the seller, and that is under two tickets (the wallet pays at most about 1.5
     ahead of use); both nodes and the book agree. Usage is the bytes the buyer took
-    out of the tunnel (B): the seller charges for at least those, and for at most B plus 3% and 1 MiB (the
-    tunnel's own framing and requests, 3%; and bytes on their way when the stop came, which the tunnel's
+    out of the tunnel (B): the seller charges for at least those, and for at most B plus 1% and 1 MiB (the
+    tunnel's own framing and requests, 1%, where 0.08 to 0.16% was measured at 40 and 200 Mbit; and bytes on
+    their way when the stop came, which the tunnel's
     flow window holds to 512 KiB with one flow, plus the paid-ahead chunks). The wallet's account is
     held to the seller's book within the price of 64 KiB (two 16 KiB chunks each way, paid and not yet
     counted). The shortfall this pins: the stop counted only the tunnel's opening, so the wallet said every
@@ -2521,7 +2536,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     down0 = exit_down()
     m0 = money()
     out: dict[str, Any] = {}
-    url = f"http://{VPN_FAR}/file?bytes={100 << 20}"
+    url = f"http://{VPN_FAR}/file?bytes={file_bytes}&rate={pace}"
     served0 = FAR_SIDE.served
 
     def fetch() -> None:
@@ -2542,21 +2557,11 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
 
     t = threading.Thread(target=fetch)
     t.start()
-    # when the tunnel's 60 MiB cost two tickets or more, what the seller's receipts say was spent tells when they
-    # have passed (released tickets run ahead of it by rate times a payment's time); below that (the cheap run) no
-    # ticket moves, and the exit's count does (every 5 s)
-    stop_msat = price_of(VPN_STOP_AT_BYTES, sat_gb * 1000, 1 << 30)
-
     def drawn() -> bool:
-        open_ = [p for p in status().get("paying", []) if p.get("origin") == origin and p.get("answer_open")]
-        if not open_:
-            return False
-        if stop_msat >= 2 * TICKET_MSAT:
-            return int(open_[0].get("spent_msat") or 0) >= stop_msat // TICKET_MSAT * TICKET_MSAT
-        return exit_down() - down0 >= VPN_STOP_AT_BYTES
+        return FAR_SIDE.served - served0 >= stop_bytes and any(p.get("origin") == origin and p.get("answer_open") for p in status().get("paying", []))
 
     try:
-        lab.wait("the tunnel to carry about 60 MiB", 300, drawn, every=0.1)
+        lab.wait(f"the tunnel to carry {stop_bytes >> 20} MiB", 300, drawn, every=0.02)
     except LabError as e:
         # every count at this one moment; then the tunnel ended, and where the money went
         paying = status().get("paying", [])
@@ -2585,7 +2590,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
     took = int(out.get("bytes") or 0)
     byte_msat = sat_gb * 1000
-    low, high = price_of(took, byte_msat, 1 << 30), price_of(took * 103 // 100 + (1 << 20), byte_msat, 1 << 30)
+    low, high = price_of(took, byte_msat, 1 << 30), price_of(took * 101 // 100 + (1 << 20), byte_msat, 1 << 30)
     seller = book - book0 if book0 >= 0 and book >= 0 else -1
     acct = (stop.get("http") or {}).get("account") or {}
     spent = int(acct.get("spent_msat") or -1)
@@ -2595,9 +2600,9 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     # (at least 1 msat: the two may round the same bytes' price apart by one)
     near = abs(spent - seller) <= max(1, price_of(64 << 10, byte_msat, 1 << 30))
     exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
-    ok = (took >= 50 << 20 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 2 * TICKET_MSAT and agrees(m, receipts=True))
+    ok = (took >= stop_bytes * 5 // 6 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 2 * TICKET_MSAT and agrees(m, receipts=True))
     measured(f"vpn_money_{sat_gb}_mib", round(took / 2**20, 1))
-    check(f"vpn: a tunnel stopped while open, after 50 MiB or more: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 3% and 1 MiB above for "
+    check(f"vpn: a tunnel stopped while open, after {stop_bytes * 5 // 6 >> 20} MiB or more at {pace * 8 // 1_000_000} Mbit: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 1% and 1 MiB above for "
           "framing and bytes on their way, never below), the wallet's account says the same within 64 KiB's price, what was paid is what was spent and what is left with the "
           "seller (under two tickets: what the wallet pays ahead), and both nodes and the book agree",
           ok, {"bytes_through": took, "served_by_far_side": FAR_SIDE.served - served0, "file": url, "usage_low_msat": low, "usage_high_msat": high, "seller_book_charged_msat": seller, "wallet_spent_msat": spent,

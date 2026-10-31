@@ -64,12 +64,13 @@
 #            check, reached by a NAT rule, so sudo iptables is needed): whole, interim receipts checked
 #            with no fault, the money agreeing. First, from no credit at that shop, a region check of the
 #            exit (vpn_region_check): one ticket bought, charged at most 20 sats, the trace page read
-#            through the exit, and what the wallet says left it equal to what its node paid. Then a
-#            100 MiB download through a tunnel that the agent stops while it is open, after about
-#            60 MiB, at 500,000 sat a GiB and again at 1,000 (under one ticket): the seller's book and
+#            through the exit, and what the wallet says left it equal to what its node paid. Then
+#            tunnels the agent stops while they are open, once the far side has sent 60 MiB at
+#            40 Mbit (500,000 sat a GiB, and 1,000: under one ticket) and 500 MiB at 200 Mbit (20,000
+#            sat a GiB, where what is paid ahead is a real share of a ticket): the seller's book and
 #            the wallet's account each charge the tunnel's bytes at the listed price, never below it
-#            and at most 3% and 1 MiB above (framing, and bytes on their way at the stop: one flow's
-#            512 KiB window). Ports BASE+17 to BASE+20
+#            and at most 1% and 1 MiB above (framing, and bytes on their way at the stop: one flow's
+#            512 KiB window), and under two tickets are left with the seller. Ports BASE+17 to BASE+20
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab
