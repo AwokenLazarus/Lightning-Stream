@@ -81,6 +81,10 @@ MID = 10_000_000
 BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
 REQUEST_MSAT = 2_500
 FIRST_USE_S = 15
+# how long an answer whose balance ran out waits for the next release before it ends: the gateway's
+# shipped default (times.refill_wait_ms; 3 s until 2026-10-25, then 15 s for a proxy that holds back
+# a paused answer's tail), written into the config so that the fetch check's bound is the config's
+REFILL_WAIT_S = 15
 POOL = 2  # tickets a session holds, as the gateway ships
 SLOTS = 30  # pending payments the seller's inbound channel carries
 HELD_CAP = SLOTS // 2  # held tickets for all sessions together: half of them
@@ -424,7 +428,7 @@ def write_config(path: str, chain: str, macaroon: str, info_macaroon: str, chann
         # buyer here comes from one address. The checks of the ticket mechanics lock held tickets at once: the
         # shipped rule that a session's first ticket is a prepaid one has a check of its own (paidfirst)
         "caps": {"sessions_per_address": 0, "first_use_secs": FIRST_USE_S, "held_after_paid": False, "unpaid_per_address": 0},
-        "times": {"height_max_age_secs": 5},
+        "times": {"height_max_age_secs": 5, "refill_wait_ms": REFILL_WAIT_S * 1000},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
             {"path": "/mid.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
@@ -632,17 +636,22 @@ def fetch() -> None:
     locks = 1
     # release one ticket when the last is used up (the body waits for it); with one left, lock the next behind
     # it, so that two are never both gone; stop at ten
+    last_release = time.monotonic()
     while not done.is_set() and b.released < stop_at:
         if b.balance() == 0:
             b.release(pool.pop(0))
+            last_release = time.monotonic()
             if len(pool) < POOL:
                 pool += b.lock(1)
                 locks += 1
         else:
             time.sleep(0.002)
     stopped = time.monotonic()
-    done.wait(30)
-    ended_after = time.monotonic() - stopped
+    done.wait(REFILL_WAIT_S + 15)
+    # from the buyer's last release: the seller sends what it paid for, then waits the refill wait for
+    # another release, and only then ends the answer (not timed from `stopped`, which also counts the
+    # lock taken after that release)
+    ended_after = time.monotonic() - last_release
     conn.close()
     lab.wait("the last receipt", 10, lambda: b.status()["responses"], every=0.05)
     st = b.status()
@@ -655,7 +664,10 @@ def fetch() -> None:
     ok = receipt_ok(last, b.terms["extra"]["receiptKey"]) and int(last["charged"]) == paid and last["bytes"] == want_bytes and last["complete"] is False and last["bodyHash"] == hashlib.sha256(bytes(got)).hexdigest()
     check("fetch: the last receipt is signed, and has the bytes sent, their hash and their price", ok, last)
     check("fetch: nothing was served beyond what was released (spent equals released, balance 0)", (int(st["session"]["releasedMsat"]), int(st["session"]["spentMsat"]), int(st["session"]["balanceMsat"])) == (paid, paid, 0), st["session"])
-    check("fetch: the body stopped within the refill wait of the buyer's last release", ended_after < 5, round(ended_after, 2))
+    # not before the refill wait (the seller waits for a release rather than cutting the answer at a
+    # ticket's end), and not long after it (the answer does not stay open once the buyer stops paying)
+    check(f"fetch: with no further release the body ended after the seller's refill wait ({REFILL_WAIT_S} s), not before it and not long after",
+          REFILL_WAIT_S - 0.5 <= ended_after < REFILL_WAIT_S + 5, round(ended_after, 2))
     left = len(b.secrets)
     cancelled = b.call("cancel", {"hashes": "all"}).json()["cancelled"]
     finals = lab.tally(lab.POOL.map(lambda t: lab.payment(BUYER, t, final=True), list(b.tickets.values())))
