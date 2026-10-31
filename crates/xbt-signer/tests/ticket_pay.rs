@@ -5247,6 +5247,9 @@ fn a_seller_that_never_reveals_does_not_keep_the_call_open() {
     });
     let v = rx.recv_timeout(Duration::from_secs(90)).expect("the call returns");
     assert_eq!((v["rail"].as_str(), v["wins_paid"].as_u64()), (Some("lottery"), Some(0)), "{v}");
+    // with no win drawn the seller is stopped for revealing nothing; when the draws do give it a win
+    // (they are random), it lists one no reveal shows, and is stopped for that: either way, for its
+    // missing reveal, and nothing is paid
     assert!(v["ended"].as_str().is_some_and(|e| e.contains("reveal")), "{v}");
 }
 
