@@ -129,6 +129,9 @@ fn offer_json(h: &Hashrate, event: &str) -> Value {
         "priceMsat": h.terms.price_msat, "sliceWork": h.terms.slice_work.to_string(), "graceMs": h.terms.grace_ms,
         "hashrateHs": h.hashrate_hs.to_string(), "payUrl": h.pay_url, "payNode": h.pay_node,
         "miners": h.capacity.miners, "freeMiners": h.capacity.free_miners, "freeHs": h.capacity.free_hs.to_string(), "event": event,
+        // what a trial (one slice's budget) may leave the wallet for: the shop's whole ticket
+        "trialMayBuyTicketUpToSats": xbt_hashlink::rail::pay_caps(h.terms.price_msat.div_ceil(1000)).0,
+        "mayBuyTicketUpToSats": xbt_hashlink::rail::TICKET_ROOM_SATS,
     })
 }
 
@@ -319,7 +322,9 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     };
     // the offer's price per slice is the most the wallet pays the shop for one ([`SignerPayer::ceiling`])
     let ceiling = Some(xbt_hashlink::rail::slice_ceiling(h.terms.price_msat));
-    let (max_sats, max_charge_sats) = if trial { xbt_hashlink::rail::trial_pay_caps(budget_sats) } else { (budget_sats, None) };
+    // a budget under the shop's ticket may still buy one: the slices are charged within the budget,
+    // and the ticket's rest stays with that shop as credit
+    let (max_sats, max_charge_sats) = xbt_hashlink::rail::pay_caps(budget_sats);
     let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats, max_charge_sats, session: None, ceiling,
                                                        wait_for_signer: std::time::Duration::from_millis(h.terms.grace_ms / 2) });
     let cfg = hashtaker::Config {
@@ -372,8 +377,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         done.store(true, Ordering::Relaxed);
         eprintln!("hashtaker: rental with {} ended", hex::encode(hashmaker_key.serialize()));
     });
-    // a trial may buy the shop's ticket: what of it the slice does not use stays with that shop as credit
-    (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes, "mayBuyTicketUpToSats": max_charge_sats.map(|_| max_sats)}))
+    // the rental may buy the shop's ticket: what of it the slices do not use stays with that shop as credit
+    (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes, "mayBuyTicketUpToSats": max_sats}))
 }
 
 /// Publish the signed delivery record of a rental that ended (the hashtaker's choice, per rental).

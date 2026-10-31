@@ -2199,11 +2199,12 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
             "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
                          "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12}}}]}),
         ("GET", "/offers") => json!({"offers": [{"name": "Basement miners", "linkKey": "02bb", "priceMsat": 40000, "sliceWork": "140737488355328",
-                                                  "miners": 2, "freeMiners": 1, "freeHs": "4000000000000"},
+                                                  "miners": 2, "freeMiners": 1, "freeHs": "4000000000000",
+                                                  "trialMayBuyTicketUpToSats": 2000, "mayBuyTicketUpToSats": 2000},
                                                  {"name": "Garage miners", "linkKey": "02dd", "priceMsat": 40000, "sliceWork": "140737488355328",
                                                   "miners": 1, "freeMiners": 1, "freeHs": "4000000000000",
                                                   "payUrl": "https://miners.example/hashrate", "payNode": format!("03{}", "c".repeat(64))}]}),
-        ("POST", "/rent") => json!({"ok": true, "rental": "r10"}),
+        ("POST", "/rent") => json!({"ok": true, "rental": "r10", "budgetSats": 40, "mayBuyTicketUpToSats": 2000}),
         ("POST", "/cut") => json!({"ok": true}),
         ("POST", "/datum") => json!({"ok": true, "datum": "datum-gateway:23334", "reachable": true}),
         _ => json!({"error": "no"}),
@@ -2271,12 +2272,22 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert!(garage.contains("Allow this hashmaker to be paid") && garage.contains("./policy?allow=") && garage.contains(&format!("node=03{}", "c".repeat(64))),
             "{garage}");
     assert!(garage.contains("<button disabled>Rent</button>"), "{garage}");
+    // a trial (40 sats) and a small rental may buy the shop's whole ticket: what may leave the wallet is said
+    let basement = &p.body[p.body.find("Hashrate</span><h3>Basement miners</h3>").unwrap()..];
+    let basement = &basement[..basement.find("</section>").unwrap()];
+    assert_eq!(basement.matches("your wallet may buy a ticket of up to 2,000 sats from this shop; unused credit stays with this seller").count(), 2,
+               "the trial's text and the rental's: {basement}");
+    assert!(basement.contains("about 40 sats") && basement.contains("charged at most that"), "{basement}");
     let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);
     assert!(br.flash_after(&r).starts_with("Renting."));
     let rent = rseen.lock().unwrap().iter().find(|(m, p, _, _)| m == "POST" && p == "/rent").cloned().unwrap();
     let body: Value = serde_json::from_str(&rent.3).unwrap();
     assert_eq!((body["linkKey"].clone(), body["miners"].clone(), body["budgetSats"].clone()), (json!("02bb"), json!(1), json!(4000)));
     assert_eq!(rent.2, format!("Bearer {}", "r".repeat(64)));
+    let r = br.act("/hashrate", "/hashrate", &[("action", "trial"), ("key", "02bb")]);
+    let said = br.flash_after(&r);
+    assert!(said.starts_with("Trying one slice, at most 40 sats. Your wallet may buy a ticket of up to 2,000 sats from this shop for it; unused credit stays with this seller."),
+            "{said}");
     // Live connections shows the rental, with its Cut button
     let p = br.get("/connections");
     assert!(p.body.contains("Rented hashrate") && p.body.contains("data-spent=\"200\""), "{}", p.body);

@@ -90,9 +90,9 @@ pub struct SignerPayer {
     pub url: String,
     pub task: String,
     pub max_sats: u64,
-    /// The most one slice's payment may be charged, where that is less than `max_sats` (a trial: one
-    /// slice's price, while `max_sats` lets the wallet buy the shop's whole ticket, the rest staying
-    /// as credit with that shop).
+    /// The most one slice's payment may be charged, where that is less than `max_sats` (a rental's
+    /// budget, while `max_sats` lets the wallet buy the shop's whole ticket, the rest staying as
+    /// credit with that shop: [`pay_caps`]).
     pub max_charge_sats: Option<u64>,
     pub session: Option<String>,
     /// The most the hashmaker's signed offer said a slice costs, as the wallet's `price_ceiling`: a
@@ -103,15 +103,17 @@ pub struct SignerPayer {
     pub wait_for_signer: std::time::Duration,
 }
 
-/// What may leave the wallet for a trial slice: enough for a shop's whole ticket and its routing
-/// fees, since a ticket is far more than one slice.
-pub const TRIAL_TICKET_SATS: u64 = 2_000;
+/// What may leave the wallet for a rental whose budget is smaller: enough for a shop's whole ticket
+/// and its routing fees, since a ticket (some 500 to 1,000 sat) is far more than a slice.
+pub const TICKET_ROOM_SATS: u64 = 2_000;
 
-/// A trial's `max_sats` and `max_charge_sats` ([`SignerPayer`]): its budget, one slice's price, is
-/// less than any shop's ticket, so it may buy one ([`TRIAL_TICKET_SATS`]) and is charged only the
-/// slice; the rest of the ticket stays as credit with that shop for a rental after it.
-pub fn trial_pay_caps(budget_sats: u64) -> (u64, Option<u64>) {
-    (TRIAL_TICKET_SATS.max(budget_sats), Some(budget_sats))
+/// A rental's `max_sats` and `max_charge_sats` ([`SignerPayer`]), a trial's (one slice) and every
+/// other: `max_sats`, what may leave the wallet for a slice, is at least [`TICKET_ROOM_SATS`], so a
+/// budget smaller than the shop's ticket can still buy one from no credit; `max_charge_sats`, what
+/// a slice may be charged and what the shop is told, is the budget. What the rental does not use
+/// of the ticket stays as credit with that shop. The rental's own count stops it at its budget.
+pub fn pay_caps(budget_sats: u64) -> (u64, Option<u64>) {
+    (TICKET_ROOM_SATS.max(budget_sats), Some(budget_sats))
 }
 
 /// Whether a failed [`signer_call`] never reached the signer: its socket was missing or refused

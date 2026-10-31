@@ -1451,7 +1451,8 @@ reads the smaller of the two numbers, sees 30 in both cases.
 
 ## 12. The wallet's side: `xbt402_pay`
 
-An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)`. Everything else
+An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)`, with an optional
+`max_charge_sats` beside `max_sats` (below: two limits, not one). Everything else
 is the wallet's signer's (`crates/xbt-signer/src/ticket_pay.rs`): it sends the request once without
 paying, reads the 402 itself, and chooses the rail. Who the seller is therefore comes from what
 the signer fetched from the URL's own origin, never from its caller.
@@ -1560,6 +1561,38 @@ wallet's count of that balance, and only where it stands inside the wallet's own
 released total never above what the wallet released, a charge never above the price by the terms
 of what was asked for and received). The ledger holds the wallet's own tickets and the fees its
 node reports, and nothing else.
+
+**Two limits: what may leave the wallet, and what the call may be charged.** A call names
+`max_sats`, and may name `max_charge_sats` beside it. They bound different things:
+
+| | `max_sats` | `max_charge_sats` (default: `max_sats`; never above it) |
+|---|---|---|
+| Bounds | What may leave the wallet for the call: the tickets it releases or buys, whole, with their routing fees | What the call's answer may be charged by the seller |
+| Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the seller stops the answer there |
+| Checked by the wallet | Before a ticket is released or bought: it must fit what is left of `max_sats` | A quoted price above it is refused before anything is paid (`max_sats`); a metered answer is cut there; a receipt that charges more is a seller fault (`ticket_over_cap`) |
+| Where the difference goes | — | It stays as the session's credit with that seller, for later calls; it is not spent |
+
+They differ where a use is smaller than the seller's ticket. Tickets run to some 500 to 1,000 sat
+or more, so a call whose `max_sats` is its own small price fits no ticket and, with no credit at
+that seller, is refused before anything is paid. Such a call names a `max_sats` that a whole
+ticket fits, and its own price as `max_charge_sats`. With no credit, a ticket of up to `max_sats`
+leaves the wallet; the call is charged at most `max_charge_sats` of it; the rest is credit with
+that seller. Nothing is lost, but more leaves the wallet than the call costs, and a page that
+starts such a call says so: "may buy a ticket of up to N sats; unused credit stays with this
+seller". The callers in this repository:
+
+- **A VPN exit's region check** (`docs/VPN-EXITS.md`): charged at most 20 sat, and may buy the
+  exit's ticket.
+- **A hashrate rental** (`crates/xbt-hashlink/src/rail.rs`, `pay_caps`). This covers a trial (one
+  slice) and every other rental. `max_charge_sats` is the rental's budget. `max_sats` is the
+  larger of the budget and 2,000 sat (a ticket and its fees), so a 60-sat rental of twelve slices
+  can start from no credit. The rental's own count of what its slices were charged stops it at its
+  budget, whatever is left of the ticket. The hashtaker's offers and its answer to `/rent` give
+  the figure (`mayBuyTicketUpToSats`), and the wallet's Hashrate page shows it.
+
+The owner's limits are never raised by either one. The task's budget, the cap per seller and the
+caps on locked funds count what leaves the wallet, so a ticket bought for a small call counts in
+full.
 
 **A seller that ignores the call's limit.** Each paid request names the call's limit to the seller
 (`X-Xbt402-Max-Msat`), and a seller that reads it never charges the answer more. One that does not
