@@ -71,6 +71,8 @@ if [ -n "$PUSH" ] && [ -n "$DIRTY" ]; then echo "oci_build: --push needs a clean
 OUT=$ROOT/dist/oci
 CTX=$OUT/ctx
 mkdir -p "$OUT"
+# a staged image root keeps read-only folders (xbt-vpn's table, 0555): writable again before removal
+if [ -d "$CTX" ]; then chmod -R u+w "$CTX"; fi
 rm -rf "$CTX"
 mkdir -p "$CTX"
 
