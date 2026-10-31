@@ -2483,6 +2483,23 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     let body: Value = serde_json::from_str(&rent.3).unwrap();
     assert_eq!((body["linkKey"].clone(), body["miners"].clone(), body["budgetSats"].clone()), (json!("02bb"), json!(1), json!(4000)));
     assert_eq!(rent.2, format!("Bearer {}", "r".repeat(64)));
+    // the form sent twice (a double click, the browser sending it again) carries one request mark, which the
+    // renter's service starts one rental for: each Rent form has its own
+    let page = br.get("/hashrate").body;
+    let form = &page[page.find("Hashrate</span><h3>Basement miners</h3>").unwrap()..];
+    let once = field(&form[form.find("value=\"rent\"").unwrap()..], "once");
+    assert!(once.len() >= 32, "{once}");
+    assert_ne!(once, field(&form[form.find("value=\"trial\"").unwrap()..], "once"), "the trial's form has a mark of its own");
+    let csrf = field(&page, "csrf");
+    for _ in 0..2 {
+        let r = br.post("/hashrate", &[("csrf", csrf.as_str()), ("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60"),
+                                       ("once", once.as_str())]);
+        assert!(br.flash_after(&r).starts_with("Renting."));
+    }
+    let marks: Vec<Value> = rseen.lock().unwrap().iter().filter(|(m, p, _, _)| m == "POST" && p == "/rent")
+        .map(|x| serde_json::from_str::<Value>(&x.3).unwrap()["once"].clone()).collect();
+    assert_eq!(marks[marks.len() - 2..], [json!(once), json!(once)], "both sends carried the form's mark: {marks:?}");
+    assert_ne!(field(&br.get("/hashrate").body, "once"), once, "a page shown again has new marks");
     let r = br.act("/hashrate", "/hashrate", &[("action", "trial"), ("key", "02bb")]);
     let said = br.flash_after(&r);
     assert!(said.starts_with("Trying one slice, at most 40 sats. Your wallet may buy a ticket of up to 2,000 sats from this shop for it; unused credit stays \

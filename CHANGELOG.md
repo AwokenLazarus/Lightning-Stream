@@ -210,6 +210,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Sell, Hashrate says this beside "Rent out my miners", and the box starts unticked for an owner who has never
   saved the form; one who has keeps their choice. A rental card says in plain words why the hashmaker ended it for
   these two reasons.
+- Rent sent twice (a double click, or the browser sending the form again) starts one rental and pays one start
+  fee. Before, each send started a rental of its own, with its own start fee.
 
 **The app**
 - A visit to a shop reached by its key is headed by the shop's name, and pages show such a shop by
