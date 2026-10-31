@@ -66,8 +66,10 @@ shops. A buyer may give a display name, which the gateway sets as the account's 
 Before an app of such a shop opens, Lightning Stream says, in plain words: "This shop keeps your
 watch history. It sees a private handle, not who you are, and it is the same each time you come
 back", with **Stay anonymous here**. A buyer who chooses it is never identified to that shop (the
-wallet keeps the choice per shop, `identity_set`), and uses the shop's shared guest where it has
-one; a shop with no guest then refuses them, and the wallet says so in its own words. The choice
+wallet keeps the choice per shop, `identity_set`; the shop is the seller, so the choice also holds at
+any other address the wallet has reached the same node under), and uses the shop's shared guest where
+it has one; a shop with no guest then refuses them, and the wallet says so in its own words. An
+address the wallet has not reached yet is known only by itself until it has. The choice
 also holds for a session the wallet was already known by: a later session does not take over that
 seller session (its credit stays with the seller), so the shop cannot go on serving the owner as their
 account through it. The app learns that a shop keeps accounts from the shop's `/services`
@@ -104,9 +106,10 @@ the guest. Accounts already made go on with their own logins.
 - the key and its proof: `Seed::buyer_key` (signer), `xbt402::ticket::buyer_message`, the wallet's
   `identify` after a session's first lock, and once more on `403 identify_first` on a route whose
   terms ask it, noted on the ticket book's seller session (`identified`) before it is said; a
-  session at a shop the owner now stays anonymous at does not resume an identified one (its credit is
-  given up), turning anonymous stops the sessions open with that seller, and a choices file that
-  cannot be read keeps the wallet anonymous everywhere;
+  session at a shop the owner now stays anonymous at does not resume a seller session any wallet
+  session identified in (its credit is given up), turning anonymous stops the sessions open with that
+  seller and says what credit they left, and a choices file that cannot be read keeps the wallet
+  anonymous everywhere without giving any credit up;
 - the gateway: route `accounts`, the session call `identify`, `gateway/accounts.rs`;
 - tests: `a_buyer_key_is_the_same_at_one_seller_and_unrelated_at_another` (signer),
   `a_wallet_tells_a_seller_with_accounts_who_it_is_and_stays_anonymous_when_told` (signer, through
@@ -116,6 +119,10 @@ the guest. Accounts already made go on with their own logins.
   `a_session_whose_identify_answer_was_lost_counts_as_identified`,
   `turning_anonymous_at_a_seller_stops_the_session_open_with_it`,
   `turning_anonymous_at_a_seller_stops_its_session_under_another_address`,
+  `a_seller_session_identified_by_a_later_wallet_session_counts_as_identified`,
+  `a_choices_file_that_cannot_be_read_gives_no_credit_up`,
+  `a_call_racing_the_switch_to_anonymous_is_not_sent_as_the_account`,
+  `staying_anonymous_at_a_shop_holds_at_its_other_address`,
   `draws_offered_on_a_route_with_accounts_are_not_paid` (signer),
   `a_route_with_accounts_is_not_drawn_for` (gateway), `tests/accounts_jellyfin.rs` (gateway, a real
   Jellyfin, not run by default), `a_shop_keeps_accounts_where_any_of_its_routes_does` (wallet UI), and

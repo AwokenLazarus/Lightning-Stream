@@ -163,9 +163,13 @@ impl App {
             return String::new();
         }
         let origin = crate::services::http_origin(seller).unwrap_or_default();
-        let anonymous = self.call("identity_get", json!({})).ok()
-            .and_then(|v| v.get("anonymous").and_then(Value::as_array).cloned()).unwrap_or_default()
-            .iter().any(|o| o.as_str().is_some_and(|o| o.trim_end_matches('/') == origin.trim_end_matches('/')));
+        let known = self.call("identity_get", json!({"origin": origin})).unwrap_or(Value::Null);
+        // the wallet cannot read its choices: it stays anonymous everywhere, and there is nothing to choose until that is mended
+        if known.get("damaged") == Some(&json!(true)) {
+            return "<section class=\"card\"><h3>Your history at this shop</h3><p>The wallet cannot read its record of which shops may recognise you, so it stays anonymous \
+                    at every shop for now. A shop with no shared guest refuses you until that file (identity.json) is mended or removed.</p></section>".to_string();
+        }
+        let anonymous = known.get("here") == Some(&json!(true));
         let (state, button, to) = if anonymous {
             ("You stay anonymous at this shop: it does not keep your history, and you use its shared guest where it has one.", "Let this shop recognise me", "0")
         } else {
@@ -183,7 +187,10 @@ impl App {
     pub(crate) fn identity(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let g = |k: &str| f.get(k).cloned().unwrap_or_default();
         match self.call("identity_set", json!({"origin": g("origin"), "anonymous": g("anonymous") == "1"})) {
-            Ok(v) if v.get("ok") == Some(&json!(true)) => self.flash(ctx, true, if g("anonymous") == "1" { "You stay anonymous at that shop." } else { "That shop recognises you now." }),
+            Ok(v) if v.get("ok") == Some(&json!(true)) => {
+                let said = if g("anonymous") == "1" { format!("You stay anonymous at that shop.{}", stopped_note(&v)) } else { "That shop recognises you now.".to_string() };
+                self.flash(ctx, true, said)
+            }
             Ok(v) => self.flash(ctx, false, format!("Not changed: {}", v.get("reason").and_then(Value::as_str).unwrap_or("the wallet refused"))),
             Err(e) => self.flash(ctx, false, format!("Not changed: {e}")),
         }
@@ -598,6 +605,19 @@ fn routes_keep_accounts(services: &Value) -> bool {
     services.get("routes").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("accounts") == Some(&json!(true)))
 }
 
+/// What turning anonymous stopped, for the owner: the sessions, and the credit they left with the shop.
+fn stopped_note(v: &Value) -> String {
+    let stopped = v.get("stopped").and_then(Value::as_array).cloned().unwrap_or_default();
+    if stopped.is_empty() {
+        return String::new();
+    }
+    let left: u64 = stopped.iter().filter_map(|s| s.get("left_with_seller_msat").and_then(Value::as_str)?.parse::<u64>().ok()).sum();
+    match left / 1000 {
+        0 => " Your open session there was stopped.".to_string(),
+        sats => format!(" Your open session there was stopped; {sats} sat of credit stays with that shop."),
+    }
+}
+
 /// A text answer a page's own links are in: HTML, scripts, styles, JSON, SVG and manifests. Video,
 /// images and other bytes pass untouched.
 fn rewritable(content_type: &str) -> bool {
@@ -691,6 +711,14 @@ mod tests {
         assert!(routes_keep_accounts(&jellyfin));
         assert!(!routes_keep_accounts(&json!({"routes": [{"path": "/files/"}, {"path": "/", "accounts": false}]})));
         assert!(!routes_keep_accounts(&json!({})));
+    }
+
+    /// Turning anonymous says what it stopped and what credit stays with the shop.
+    #[test]
+    fn turning_anonymous_says_what_it_stopped_and_left() {
+        assert_eq!(stopped_note(&json!({"stopped": []})), "");
+        assert_eq!(stopped_note(&json!({"stopped": [{"left_with_seller_msat": "0"}]})), " Your open session there was stopped.");
+        assert_eq!(stopped_note(&json!({"stopped": [{"left_with_seller_msat": "997500"}]})), " Your open session there was stopped; 997 sat of credit stays with that shop.");
     }
 
     #[test]

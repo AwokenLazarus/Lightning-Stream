@@ -2198,7 +2198,9 @@ impl Signer {
             // released to a seller in such a session, and its balance is not spent either
             .filter(|s| s.http.is_some() && !s.why.contains(CREDIT_GIVEN_UP) && !s.why.starts_with("seller fault") && !s.why.contains("terms changed"))
             .max_by(|a, b| a.stopped_ts.max(a.active_ts).total_cmp(&b.stopped_ts.max(b.active_ts)))?;
-        let http = old.http.clone()?;
+        let mut http = old.http.clone()?;
+        // what the seller knows goes with its session, not with the wallet session that said it: any that used it
+        http.identified = st.book.sessions.values().any(|s| s.http.as_ref().is_some_and(|h| h.id == http.id && h.identified));
         let using: Vec<&str> = st.book.sessions.values().filter(|s| s.http.as_ref().is_some_and(|h| h.id == http.id)).map(|s| s.id.as_str()).collect();
         let sent = using.iter().flat_map(|id| st.book.of_session(id)).filter(|t| matches!(t.state, TState::Released | TState::Settled))
             .fold(0u64, |a, t| a.saturating_add(t.msat));
