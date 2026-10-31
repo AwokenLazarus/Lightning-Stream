@@ -4052,7 +4052,8 @@ impl Signer {
                 }
             }
             // stopped while this call waited for a ticket (the owner turned anonymous here, say): nothing more goes out on it
-            if !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
+            // (`ending` first: a stop sets it before it closes the session on the book)
+            if hs.ending.load(Ordering::SeqCst) || !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
                 return fail(hs, &spent, refusal("ticket_session", "the session with this seller was stopped while this call waited: call again"));
             }
             let digest = request_digest_v2(c.method, c.url, c.body);
