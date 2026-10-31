@@ -7703,6 +7703,39 @@ fn a_408_to_a_paid_request_stops_no_ticket_session() {
     r.assert_booked();
 }
 
+/// A 408 comes from the seller's HTTP layer before any handler runs: the reply says the request was not
+/// sent, the call is charged nothing, and the node, the seller, the book and the ledger do not move. On both rails.
+///
+/// FAILS with a 408 taken as a receipt-less 5xx: `request_sent` true, and whoever accounts for the call books its bound.
+#[test]
+fn a_408_says_the_request_was_not_sent_and_moves_no_money_on_either_side() {
+    let _g = env_lock();
+    // draws
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let v = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    let wins = v["wins_paid"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/pieces/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let late = r.pay(&format!("/pieces/{}", 16 * PIECE), 1_000);
+    r.tap.clear();
+    assert_eq!((late["status"].as_u64(), late["request_sent"].as_bool(), late["charged_sats"].as_i64()), (Some(408), Some(false), Some(0)), "{late}");
+    assert_wins(&r, wins);
+    // tickets
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    let before = r.money();
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/page/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let late = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((late["status"].as_u64(), late["request_sent"].as_bool(), late["charged_sats"].as_i64()), (Some(408), Some(false), Some(0)), "{late}");
+    assert_eq!(r.money(), before, "{late}");
+    // a receipt-less 5xx may have been served behind a proxy: that one says it was sent
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/page/")).then(|| Ok(answer(502, vec![], b"{}".to_vec())))));
+    let proxy = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((proxy["status"].as_u64(), proxy["request_sent"].as_bool()), (Some(502), Some(true)), "{proxy}");
+}
+
 #[test]
 fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_twice() {
     let _g = env_lock();

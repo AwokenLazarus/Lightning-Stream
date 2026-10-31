@@ -57,6 +57,8 @@ enum Plan {
     Lost,
     /// Its service is full: it turns the request away before anything is paid or served.
     Busy,
+    /// Its HTTP layer gave up on a request the wallet sent late (408): no handler ran, and nothing was served or charged.
+    TooLate,
 }
 
 /// The caller's socket is still there (as the signer checks before it sends).
@@ -160,6 +162,8 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                         Plan::Refused => json!({"verdict": "deny", "rule": "allowlist", "reason": "destination not on allowlist", "charged_sats": 0}),
                         Plan::Busy => json!({"verdict": "deny", "rule": "seller_busy", "reason": "the seller's service is full (30 of 30 buyers): nothing was paid",
                                              "status": 503, "charged_sats": 0, "request_sent": false}),
+                        Plan::TooLate => json!({"verdict": "deny", "rule": "ticket_seller", "reason": "the seller answered HTTP 408 without a receipt",
+                                                "status": 408, "charged_sats": 0, "request_sent": false}),
                         Plan::Silent => {
                             // paid for and sent: the seller has it, and says nothing for longer than the endpoint waits
                             let _s = opened();
@@ -526,6 +530,18 @@ fn a_busy_seller_hands_the_request_to_the_next() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!((served(&r), r.sellers.lock().unwrap().paid.clone()), (vec!["dear.example".to_string()], vec!["dear.example".to_string()]));
     assert_eq!(spent(&r), 777);
+}
+
+/// A 408 comes before any handler of the seller's runs: no bound is booked, and the next seller is asked.
+#[test]
+fn a_408_books_nothing_and_hands_the_request_to_the_next() {
+    let r = rig(Plan::TooLate, Plan::Answer(777), 100);
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!((status, body.as_str()), (200, ANSWER));
+    assert_eq!(sellers_called(&r), ["cheap.example", "dear.example"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(served(&r), vec!["dear.example".to_string()]);
+    assert_eq!(spent(&r), 777, "what the next seller's answer cost, and nothing for the 408");
 }
 
 /// The account of a whole answer arrives after its last byte (the wallet takes the seller's last

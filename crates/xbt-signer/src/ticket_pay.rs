@@ -4838,6 +4838,8 @@ impl Signer {
                     // ([`unsigned_and_no_fault`]); anything else is the seller serving or refusing without a receipt,
                     // or someone answering in its place: the session ends, and nothing was released on that answer's word
                     if unsigned_and_no_fault(status) {
+                        // a 408 comes before anything serves the request; behind a proxy's 5xx it may have been served
+                        spent.sent = status != 408;
                         return fail(hs, &spent, with(refusal("ticket_seller", format!("the seller answered HTTP {status} without a receipt")), json!({"status": status})));
                     }
                     let d = self.ticket_fault(hs, &format!("an answer to a paid request (HTTP {status} {code}) without a valid receipt: {why}"));
