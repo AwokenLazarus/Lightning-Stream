@@ -4184,6 +4184,7 @@ fn a_prepaid_ticket_with_no_final_answer_in_time_leaves_its_credit_to_the_next_c
     wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
     r.assert_booked();
+    assert_eq!(both_sides_of(&r, &new_sid_of(&next)).to_string(), next["balance_msat"].as_str().unwrap(), "what is left, as the call was told");
 }
 
 /// A seller that settles a prepaid ticket held past the wallet's wait and never credits it (here its
@@ -4316,6 +4317,7 @@ fn a_pending_prepaid_ticket_that_fails_leaves_the_sessions_earlier_credit_to_the
     assert_eq!(next["balance_msat"].as_str(), Some("63000"), "1,500 left, 64,000 bought, 2,500 spent: {next}");
     assert_eq!((r.ln.paid_msat(), r.shop.settled() as u64), (2 * SMALL, 2));
     r.assert_booked();
+    assert_eq!(both_sides_of(&r, &new_sid_of(&next)).to_string(), next["balance_msat"].as_str().unwrap(), "what is left, as the call was told");
 }
 
 /// A prepaid payment stuck past its invoice's life and the wait for it, with no credit at the seller:
@@ -6502,6 +6504,7 @@ fn a_balance_left_with_the_seller_is_used_after_the_signer_starts_again() {
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
     assert_eq!(r.ln.state().payments.len(), paid, "no new ticket while the old balance lasts: {v}");
     assert_eq!(v["tickets_prepaid"].as_u64().unwrap_or(0), 0, "{v}");
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)).to_string(), v["balance_msat"].as_str().unwrap(), "what is left, as the call was told");
 }
 
 /// Credit is the seller's, not its address's: a balance left with a shop is spent first when the
@@ -7149,9 +7152,11 @@ fn a_seller_session_identified_by_a_later_wallet_session_counts_as_identified() 
     assert_eq!((b["status"].as_u64(), b["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from what A left: {b}");
     assert_ne!(b["session"], a["session"]);
     assert_eq!((r.audit("ticket_resumed").len(), r.tap.seen("/x402/ticket/identify").len()), (1, 1), "B took A's seller session over, and said who it is in it");
-    r.call("ticket_stop", json!({"session": b["session"]}));
+    let stop = r.call("ticket_stop", json!({"session": b["session"]}));
     let forgot = r.call("ticket_stop", json!({"session": b["session"], "forget_credit": true}));
     assert_eq!(forgot["credit_given_up"], true, "{forgot}");
+    assert_eq!(forgot["left_with_seller_msat"], stop["http"]["left_with_seller_msat"], "what is given up, buyer and seller: {stop} {forgot}");
+    assert_eq!(forgot["seller_released_msat"], stop["http"]["account"]["credited_msat"], "what was credited, buyer and seller: {stop} {forgot}");
     assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}))["ok"], true);
     let v = r.pay_known("/acct/echo", CALL);
     assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
@@ -7179,12 +7184,15 @@ fn a_seller_session_a_later_session_identified_is_not_taken_over_once_the_owner_
     let b = r.pay_known("/acct/echo", CALL);
     assert_eq!((b["status"].as_u64(), b["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from what A left: {b}");
     assert_eq!((r.audit("ticket_resumed").len(), r.tap.seen("/x402/ticket/identify").len()), (1, 1), "B took A's seller session over, and said who it is in it");
-    r.call("ticket_stop", json!({"session": b["session"]}));
+    let stop = r.call("ticket_stop", json!({"session": b["session"]}));
     assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}))["ok"], true);
     let v = r.pay_known("/acct/echo", CALL);
     assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
     assert_eq!((r.audit("ticket_resumed").len(), r.audit("ticket_resume_skipped").len()), (1, 1), "passed over, and named");
     assert_eq!(r.audit("ticket_resume_skipped")[0]["seller_session"].as_str(), r.audit("ticket_resumed")[0]["seller_session"].as_str());
+    let forgot = r.call("ticket_stop", json!({"session": b["session"], "forget_credit": true}));
+    assert_eq!(forgot["left_with_seller_msat"], stop["http"]["left_with_seller_msat"], "what is left, buyer and seller: {stop} {forgot}");
+    assert_eq!(forgot["seller_released_msat"], stop["http"]["account"]["credited_msat"], "what was credited, buyer and seller: {stop} {forgot}");
     let _ = std::fs::remove_file(ACCOUNT_HOOK);
 }
 
@@ -7400,6 +7408,7 @@ fn the_credit_an_idle_session_left_with_its_seller_pays_the_next_call() {
     let v = r.pay("/page/1", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the credit left behind: {v}");
     assert!(!r.audit("ticket_resumed").is_empty(), "the old balance was taken over");
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)).to_string(), v["balance_msat"].as_str().unwrap(), "what is left, as the call was told");
 }
 
 /// A session that takes over the credit an earlier one left with a seller that holds only after a
@@ -7685,6 +7694,7 @@ fn a_takeover_on_the_sellers_count_alone_does_not_lift_the_first_prepaid_ticket_
     assert_eq!(st["sessions"][0]["paid_first"].as_bool(), Some(true), "{st}");
     assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "nothing held on the seller's word");
     assert!(r.audit("ticket_paid_first_met").is_empty());
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)).to_string(), v["balance_msat"].as_str().unwrap(), "what is left, as the call was told");
 }
 
 /// The first lock after a takeover fails (the seller still counts the earlier session's tickets, or
@@ -8360,6 +8370,7 @@ fn a_start_logs_the_credit_each_session_left_with_its_seller() {
     assert_eq!((next["status"].as_u64(), next["tickets_released"].as_u64()), (Some(200), Some(0)), "the credit logged is the credit that pays: {next}");
     assert!(!r.audit("ticket_resumed").is_empty());
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    assert_eq!(both_sides_of(&r, &new_sid_of(&next)).to_string(), next["balance_msat"].as_str().unwrap(), "what is left, as the call was told");
 }
 
 /// A seller that does not say what a session left is logged as not saying: the credit is unknown,
