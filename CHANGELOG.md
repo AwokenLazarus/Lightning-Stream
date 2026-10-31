@@ -92,6 +92,16 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   that seller for up to about 85 s, and your next call takes up the ticket's credit once your node
   shows it paid and the seller has credited it. A seller that keeps the money without crediting it
   is named in your wallet's history.
+- After a restart, a session that picks up the credit left with a shop holds tickets with it again
+  at once, instead of holding none until that credit ran out and buying another prepaid ticket.
+- A prepaid ticket that settles after its call ended, or just as the wallet stopped, is shown to its
+  shop, so its credit is there for the next call. A shop is told only after it has signed an answer
+  for that session, so another on the same node, or one merely naming that shop's key, is not.
+- A cancel names the session's own tickets, and also a ticket whose secret never reached the shop, so
+  a session that took over a shop's credit keeps its tickets and nothing stays held.
+- A shop that will not say what an earlier session left with it no longer has a new ticket bought
+  beside that credit: the call is refused with a time to retry. After two minutes a new session starts,
+  your wallet's history names what may be left, and a later session still finds that credit.
 
 **VPN exits**
 - A priced exit's region check now runs for a buyer with no credit at that exit. Each check is

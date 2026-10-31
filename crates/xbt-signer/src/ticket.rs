@@ -1116,6 +1116,24 @@ impl TState {
     }
 }
 
+impl Ticket {
+    /// The seller may still hold this ticket's HTLC, so a cancel of a session's tickets names it:
+    /// on its way or locked (retired, if that was at a start of the signer), or a held ticket booked
+    /// as released, whose secret may never have reached the seller. A seller that took the secret
+    /// keeps it whatever the cancel says; a prepaid ticket is not held at all.
+    pub fn may_be_held(&self) -> bool {
+        matches!(self.state, TState::Sending | TState::Locked | TState::Retired) || (self.state == TState::Released && !self.prepaid)
+    }
+
+    /// What a cancel of a session's tickets names: what the seller may hold, and a hash offered
+    /// lately and never paid, whose invoice the seller may have issued: unpaid, it still takes a
+    /// place in that seller session until it lapses, and a later session wants the place. A seller
+    /// that never issued it passes over its name.
+    pub fn may_take_a_place(&self, now: f64) -> bool {
+        self.may_be_held() || (!self.prepaid && self.sent_ts == 0.0 && now - self.ts < OFFER_TTL_S && matches!(self.state, TState::Offered | TState::Failed))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ticket {
     pub hash: String,
@@ -1288,6 +1306,9 @@ pub struct SellerSession {
     /// or was about to: set and on disk before the call goes out. A session the owner has since
     /// chosen to stay anonymous at is not taken over by a later one.
     pub identified: bool,
+    /// The receipt key of the seller's terms, hex: who this seller is, whatever its address. Empty
+    /// in a row from before 0.1.20.
+    pub receipt_key: String,
 }
 
 impl std::fmt::Debug for SellerSession {
@@ -1307,6 +1328,9 @@ impl Session {
             // written only when set: a row from before reads as a session nothing was said in
             if h.identified {
                 r["http"]["identified"] = true.into();
+            }
+            if !h.receipt_key.is_empty() {
+                r["http"]["receipt_key"] = h.receipt_key.clone().into();
             }
         }
         // written only when set: a row from before reads as a session that holds and waits for nothing
@@ -1388,7 +1412,7 @@ impl Session {
                         None => None,
                         // a row that names a seller session names all of it, or the row is damage
                         Some(h) => Some(SellerSession { id: str_or_empty(h.get("id")), key: hex::decode(str_or_empty(h.get("key"))).ok()?.try_into().ok()?,
-                                                        base: str_or_empty(h.get("base")),
+                                                        base: str_or_empty(h.get("base")), receipt_key: str_or_empty(h.get("receipt_key")),
                                                         identified: match h.get("identified") {
                                                             None => false,
                                                             Some(v) => v.as_bool()?,
@@ -2228,7 +2252,7 @@ mod tests {
     fn the_sellers_side_of_a_session_is_kept_in_its_row_and_a_damaged_one_refuses_the_row() {
         let mut s = session("s1", 8);
         assert_eq!(Session::from_row(&s.row()), Some(s.clone()), "a row from before the HTTP binding has no seller side");
-        s.http = Some(SellerSession { id: "ab".repeat(16), key: [7u8; 32], base: "https://seller.example/x402/ticket".into(), identified: false });
+        s.http = Some(SellerSession { id: "ab".repeat(16), key: [7u8; 32], base: "https://seller.example/x402/ticket".into(), receipt_key: String::new(), identified: false });
         let row = s.row();
         assert_eq!(Session::from_row(&row), Some(s.clone()));
         assert!(row["http"].get("identified").is_none(), "unset, not written: a row as before");
@@ -2242,6 +2266,8 @@ mod tests {
         assert_eq!(s.public()["http"], true);
         assert!(!s.public().to_string().contains(&hex::encode([7u8; 32])), "the key is not in what a caller is shown");
         assert!(!format!("{s:?}").contains("0707"), "nor in a debug print");
+        s.http.as_mut().unwrap().receipt_key = "02".repeat(33);
+        assert_eq!(Session::from_row(&s.row()), Some(s.clone()), "the receipt key is kept");
         let mut bent = row.clone();
         bent["http"]["key"] = "07".into();
         assert_eq!(Session::from_row(&bent), None);

@@ -567,8 +567,12 @@ fn shop_config_aliased(origin: &str, upstream: &str, state: &std::path::Path, ne
 }
 
 fn start_gateway(cfg: &Value, node: &Arc<SellerNode>, clock: &Arc<AtomicU64>, listener: TcpListener) -> (Arc<Gateway>, Running) {
+    start_gateway_signing(cfg, node, clock, listener, receipt_secret())
+}
+
+fn start_gateway_signing(cfg: &Value, node: &Arc<SellerNode>, clock: &Arc<AtomicU64>, listener: TcpListener, receipts: SecretKey) -> (Arc<Gateway>, Running) {
     let c = clock.clone();
-    let gw = Gateway::start(Config::from_json(cfg).unwrap(), node.clone(), receipt_secret(), Box::new(move || c.load(Ordering::SeqCst))).unwrap();
+    let gw = Gateway::start(Config::from_json(cfg).unwrap(), node.clone(), receipts, Box::new(move || c.load(Ordering::SeqCst))).unwrap();
     let running = gw.serve(listener).unwrap();
     (gw, running)
 }
@@ -600,7 +604,9 @@ impl Shop {
         let port = listener.local_addr().unwrap().port();
         let state = tempfile::tempdir().unwrap();
         let (origin, upstream) = (format!("http://127.0.0.1:{port}"), format!("http://{}", service_running.addr));
-        let (gw, running) = start_gateway(&shop_config(&origin, &upstream, state.path(), &first.network, &conf), &first.node, &first.clock, listener);
+        // (`own_receipt_key`: another seller on the same node, as a second shop is; otherwise the rig's shops sign alike)
+        let receipts = if conf["own_receipt_key"] == true { SecretKey::from_slice(&[10u8; 32]).unwrap() } else { receipt_secret() };
+        let (gw, running) = start_gateway_signing(&shop_config(&origin, &upstream, state.path(), &first.network, &conf), &first.node, &first.clock, listener, receipts);
         Self { gw, running: Some(running), node: first.node.clone(), standin: first.standin.clone(), service, _service_running: service_running, upstream, state, origin, port,
                network: first.network.clone(), clock: first.clock.clone(), conf }
     }
@@ -4168,20 +4174,10 @@ fn a_prepaid_ticket_with_no_final_answer_in_time_leaves_its_credit_to_the_next_c
     let early = r.pay("/page/10", CALL);
     assert_eq!((early["rule"].as_str(), early["charged_sats"].as_i64()), (Some("ticket_prepaid_pending"), Some(0)), "{early}");
     assert_eq!(r.ln.state().payments.len(), 1, "no second ticket: {early}");
-    // the node's word comes: paid. The seller follows a prepaid ticket only when its preimage is shown, or on its own
-    // sweep once the ticket's life is over: until then a call is told when to come back, and buys nothing
+    // the node's word comes: paid. The watcher shows the seller its preimage, and the next call takes it up and buys nothing
     r.ln.st.lock().unwrap().held_back = false;
     wait_for("the payment to show paid", || r.ln.paid_msat() == TICKET);
     r.tick();
-    let early = r.pay("/page/10", CALL);
-    assert_eq!(early["rule"].as_str(), Some("ticket_prepaid_pending"), "{early}");
-    let wait = early["retry_after_s"].as_u64().unwrap();
-    assert!(wait > 0 && wait <= 85, "{early}");
-    assert_eq!(r.ln.state().payments.len(), 1, "still one ticket: {early}");
-    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
-    // when it said: the seller's sweep has credited it, and the next call takes it up and buys nothing
-    r.clock.fetch_add(wait + 1, Ordering::SeqCst);
-    r.shop.gw.tick();
     let next = r.pay("/page/10", CALL);
     assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64()), (Some(200), Some(0)), "the credit is taken up: {next}");
     assert_eq!(r.audit("ticket_resumed").len(), 1);
@@ -4204,6 +4200,11 @@ fn a_seller_that_settles_a_pending_prepaid_ticket_and_does_not_credit_it_is_name
     r.ln.st.lock().unwrap().held_back = true;
     let v = r.pay("/page/10", CALL);
     assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    // a seller that will not credit it, even shown its preimage (an honest one is, in the test below)
+    let hash = v["hash"].as_str().unwrap().to_string();
+    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/release") && serde_json::from_str::<Value>(&seen.body).unwrap()["secrets"].as_array().unwrap().iter().any(|x| sha(x.as_str().unwrap()) == hash)).then(|| {
+        Ok(answer(200, vec![], json!({"released": [], "refused": [{"hash": hash, "error": "node_unavailable"}]}).to_string().into_bytes()))
+    })));
     r.ln.st.lock().unwrap().held_back = false;
     wait_for("the payment to show paid", || r.ln.paid_msat() == TICKET);
     r.tick();
@@ -4223,6 +4224,30 @@ fn a_seller_that_settles_a_pending_prepaid_ticket_and_does_not_credit_it_is_name
     assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
     r.tick();
     assert_eq!(r.audit("ticket_prepay_overdue").len(), 1, "once");
+}
+
+/// The same pending ticket at an honest seller: it is shown the preimage before it is judged, credits
+/// it, and is named nowhere however late the watcher comes; the next call is paid from it, one ticket in all.
+#[test]
+fn an_honest_seller_is_shown_a_late_prepaid_ticket_before_it_is_judged() {
+    let _g = env_lock();
+    let shop = json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true, "unpaid_secs": 100000, "first_use_secs": 100000}});
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, shop);
+    r.ln.st.lock().unwrap().held_back = true;
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    r.ln.st.lock().unwrap().held_back = false;
+    wait_for("the payment to show paid", || r.ln.paid_msat() == TICKET);
+    r.tick();
+    r.clock.fetch_add(120, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    assert!(r.audit("ticket_prepay_overdue").is_empty(), "an honest seller named: {:?}", r.audit("ticket_prepay_overdue"));
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "{next}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "one ticket in all");
+    assert_eq!(both_sides_of(&r, &new_sid_of(&next)), TICKET - 2_500);
 }
 
 /// The guard holds for the seller, whatever its address: a call to a second address of the same
@@ -4549,6 +4574,55 @@ fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_
     let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     r.assert_booked();
+}
+
+/// After a restart, the cancel asked for a session of the earlier process names that session's
+/// own tickets. A new session that took its seller session over (the credit left there) before the
+/// watcher asked keeps the tickets it locked there: the cancel is not "all" of the seller session.
+///
+/// FAILS before: the earlier session's cancel asked for all the seller session's tickets, the new
+/// session's among them, which failed (INCORRECT_PAYMENT_DETAILS) and left its pool empty (found
+/// 2026-10-31 by the lab's kill check).
+#[test]
+fn the_cancel_for_a_session_of_an_earlier_process_spares_the_session_that_took_its_seller_session_over() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let held = r.status()["locked"]["tickets"].as_i64().unwrap();
+    assert!(held > 0, "a pool is held");
+    // the signer is killed with the pool locked: its tickets are retired, its session stopping
+    r.restart();
+    assert_eq!(r.status()["tickets"]["retired"].as_i64(), Some(held));
+    // before the watcher asks that session's seller to cancel, the next call takes the seller session over and locks
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(0)), "{v}");
+    assert_ne!(v["session"], first["session"]);
+    assert!(!r.audit("ticket_resumed").is_empty(), "the seller session was taken over");
+    // (what the seller cap leaves beside the retired ones, which still count with this seller: 1 of 8 here)
+    let locked_of = |sid: &str| -> Vec<String> {
+        r.session(sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "locked").map(|t| t["hash"].as_str().unwrap().to_string()).collect()
+    };
+    let new_sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the new session to hold a ticket", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0 && !locked_of(&new_sid).is_empty());
+    let mine = locked_of(&new_sid);
+    // the earlier session's tickets are cancelled by their hashes (at the takeover, or by the watcher), never "all" of the
+    // seller session, and none of the new session's
+    r.tick();
+    let asked: Vec<Value> = r.tap.seen("/x402/ticket/cancel").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
+    assert!(!asked.is_empty(), "the earlier session's tickets were asked to be cancelled");
+    let named: Vec<String> = asked.iter().flat_map(|a| a["hashes"].as_array().expect("hashes named, not \"all\"").iter().map(|h| h.as_str().unwrap().to_string())).collect();
+    assert_eq!(named.len() as i64, held, "{asked:?}");
+    assert!(named.iter().all(|h| !mine.contains(h)), "none of the new session's: {asked:?}");
+    // the earlier session's come back; the new session's stay locked, and the next call is paid from them
+    wait_for("the earlier session's tickets to come back", || {
+        r.tick();
+        r.ln.by_status("IN_FLIGHT").len() == mine.len()
+    });
+    assert_eq!(locked_of(&new_sid), mine, "the new session's tickets are untouched");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "only the first ticket was ever paid");
+    r.assert_booked();
+    assert_eq!(both_sides_of(&r, &new_sid), TICKET - 2 * 2_500, "the credit, less the two pages");
 }
 
 #[test]
@@ -7081,8 +7155,61 @@ fn a_seller_session_identified_by_a_later_wallet_session_counts_as_identified() 
     assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}))["ok"], true);
     let v = r.pay_known("/acct/echo", CALL);
     assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
-    assert_eq!((r.audit("ticket_resumed").len(), r.audit("ticket_resume_skipped").len()), (1, 1), "A's row was not taken over");
+    // the seller session was given up as a whole, so nothing is left to skip: A's row is not asked about at all
+    assert_eq!((r.audit("ticket_resumed").len(), r.audit("ticket_resume_skipped").len()), (1, 0), "A's row was not taken over");
     let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// A seller session a later wallet session said who it is in, with nothing given up: where the owner
+/// now stays anonymous it is passed over for that reason, for both wallet sessions that used it.
+#[test]
+fn a_seller_session_a_later_session_identified_is_not_taken_over_once_the_owner_is_anonymous() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let a = r.pay_known("/page/10", CALL);
+    assert_eq!((a["status"].as_u64(), a["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{a}");
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let b = r.pay_known("/acct/echo", CALL);
+    assert_eq!((b["status"].as_u64(), b["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from what A left: {b}");
+    assert_eq!((r.audit("ticket_resumed").len(), r.tap.seen("/x402/ticket/identify").len()), (1, 1), "B took A's seller session over, and said who it is in it");
+    r.call("ticket_stop", json!({"session": b["session"]}));
+    assert_eq!(r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}))["ok"], true);
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
+    assert_eq!((r.audit("ticket_resumed").len(), r.audit("ticket_resume_skipped").len()), (1, 1), "passed over, and named");
+    assert_eq!(r.audit("ticket_resume_skipped")[0]["seller_session"].as_str(), r.audit("ticket_resumed")[0]["seller_session"].as_str());
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// Credit given up after a takeover is given up: the earlier wallet session that used the same seller
+/// session is not a way back to it. The next call buys its own ticket, and only that seller session's
+/// count stays as it was.
+#[test]
+fn credit_given_up_after_a_takeover_is_not_taken_over_through_the_earlier_session() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let a = r.pay("/page/10", 2_000);
+    assert_eq!(a["tickets_prepaid"].as_u64(), Some(1), "{a}");
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let b = r.pay("/page/10", 2_000);
+    assert_eq!((b["status"].as_u64(), b["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "{b}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1, "B took A's seller session over");
+    assert_eq!(both_sides_of(&r, &new_sid_of(&b)), TICKET - 2 * 2_500, "what is given up, buyer and seller");
+    let v = r.pay("/page/10", 2_000);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a ticket of its own: {v}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1, "no second takeover");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    let (node, seller, book, _) = r.money();
+    assert_eq!((node, seller, book), (2 * TICKET, 2 * TICKET, 2 * TICKET));
 }
 
 /// A choices file that cannot be read holds an identified seller session back, and burns nothing:
@@ -7273,6 +7400,878 @@ fn the_credit_an_idle_session_left_with_its_seller_pays_the_next_call() {
     let v = r.pay("/page/1", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the credit left behind: {v}");
     assert!(!r.audit("ticket_resumed").is_empty(), "the old balance was taken over");
+}
+
+/// A session that takes over the credit an earlier one left with a seller that holds only after a
+/// paid ticket (the gateway as it ships) holds tickets at once: the seller session it took over is
+/// one the wallet paid, which is what the seller's rule asks. No second prepaid ticket is bought.
+///
+/// FAILS before: the new session kept `paid_first`, which only a prepaid ticket of its own cleared,
+/// so it locked nothing until its credit ran out and it bought another prepaid ticket (found
+/// 2026-10-31 by the lab's kill check, which waited for a pool that never came).
+#[test]
+fn a_session_that_takes_over_paid_credit_holds_at_once_with_a_seller_that_holds_after_a_paid_ticket() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    let first = r.pay("/page/1", CALL);
+    assert_eq!((first["status"].as_u64(), first["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{first}");
+    wait_refill(&r, "two tickets held after the prepaid one", 2);
+    // nothing for 11 minutes: the session is stopped, its held tickets cancelled, and its credit left with the seller
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let st = r.session(first["session"].as_str().unwrap());
+    assert_ne!(st["sessions"][0]["state"], "open", "{st}");
+    wait_refill(&r, "nothing held once the session stopped", 0);
+    let paid_before = r.ln.paid_msat();
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0), v["tickets_released"].as_u64().unwrap_or(0)), (Some(200), 0, 0),
+               "paid from the credit left behind: {v}");
+    assert_ne!(v["session"], first["session"], "a new session took the credit over: {v}");
+    assert!(!r.audit("ticket_resumed").is_empty(), "the old balance was taken over");
+    // the session that took the credit over holds its pool again behind the call, with no prepaid ticket bought
+    wait_refill(&r, "two tickets held by the session that took the credit over", 2);
+    let st = r.session(v["session"].as_str().unwrap());
+    assert_eq!(st["sessions"][0]["paid_first"].as_bool(), Some(false), "{st}");
+    assert_eq!(r.ln.paid_msat(), paid_before, "nothing was paid for: held tickets are locked, not spent");
+    // the money: one prepaid ticket, paid by the buyer's node, taken by the seller's, settled in the book, and in the ledger
+    let (node, seller, book, ledger) = r.money();
+    assert_eq!((node, seller, book, ledger), (TICKET, TICKET, TICKET, SETTLED), "one ticket paid in all");
+    r.assert_booked();
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)), TICKET - 2 * 2_500, "the credit, less the two pages");
+}
+
+/// The signer is killed with a pool held at a seller that holds only after a paid ticket (the
+/// gateway as it ships), and the next call comes before any watcher tick: it is paid at once from
+/// the credit left there, nothing refused first and no prepaid ticket bought; the earlier session's
+/// tickets are cancelled by their hashes before the new session locks; the new session then holds
+/// again, and what it later releases is credited and paid exactly once.
+///
+/// FAILS before: with `paid_first` cleared on the takeover alone, the first lock met the seller still
+/// counting the earlier session's tickets (`too_many_tickets`) and the call was refused; and the
+/// watcher's later cancel of "all" took the new session's tickets too.
+#[test]
+fn after_a_restart_the_next_call_is_paid_from_the_credit_left_and_the_session_holds_again() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let first = r.pay("/page/1", CALL);
+    assert_eq!((first["status"].as_u64(), first["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{first}");
+    wait_refill(&r, "two tickets held after the prepaid one", 2);
+    r.restart();
+    // no tick: the next call is the first thing the new process does with this seller
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["verdict"].as_str(), v["tickets_prepaid"].as_u64().unwrap_or(0), v["tickets_released"].as_u64().unwrap_or(0)),
+               (Some(200), Some("allow"), 0, 0), "paid from the credit left, nothing refused first: {v}");
+    assert!(!r.audit("ticket_resumed").is_empty(), "the credit was taken over");
+    let asked: Vec<Value> = r.tap.seen("/x402/ticket/cancel").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
+    assert!(!asked.is_empty() && asked.iter().all(|a| a["hashes"].is_array()), "the earlier session's tickets are cancelled by their hashes: {asked:?}");
+    let new_sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the new session to hold again", || {
+        r.tick();
+        r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0
+            && r.session(&new_sid)["session_tickets"].as_array().unwrap().iter().any(|t| t["state"] == "locked")
+    });
+    assert_eq!(r.session(&new_sid)["sessions"][0]["paid_first"].as_bool(), Some(false));
+    // the watcher's cancel for the earlier session is not asked again under the new session
+    let before = r.tap.seen("/x402/ticket/cancel").len();
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/cancel").len(), before, "no second cancel");
+    // more than the credit: released from the new session's held tickets, each credited and paid once
+    let big = r.pay(&format!("/files/{}", 6 * MIB), 2_000);
+    assert_eq!((big["status"].as_u64(), big["session"].as_str(), big["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), Some(new_sid.as_str()), 0), "{big}");
+    let released = big["tickets_released"].as_u64().unwrap();
+    assert!(released >= 1, "{big}");
+    wait_for("the earlier tickets to come back", || {
+        r.tick();
+        r.status()["tickets"]["retired"].as_i64().unwrap_or(0) == 0
+    });
+    let (node, seller, book, ledger) = r.money();
+    let paid = 1 + released;
+    assert_eq!((node, seller, book), (paid * TICKET, paid * TICKET, paid * TICKET), "each ticket paid once");
+    assert_eq!(ledger, paid as i64 * SETTLED, "the ledger is exactly the tickets paid, the earlier session's retired ones given back");
+    r.assert_booked();
+    both_sides_of(&r, &new_sid);
+}
+
+/// A prepaid ticket whose payment the wallet's node settles only after its call is over is shown
+/// to its seller: the watcher presents its preimage, the seller credits it, and the four counts
+/// agree. Not left to the seller's own sweep, a minute or more later, before which a session that
+/// took the credit over would find the seller's count short of the wallet's.
+///
+/// FAILS before: nothing presented a late-settled prepaid preimage; the seller credited the ticket
+/// only by its own sweep.
+#[test]
+fn a_prepaid_ticket_the_node_settles_after_its_call_is_shown_to_the_seller_and_credited() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, prepaid_only_shop());
+    a_prepaid_ticket_late_after_its_call(&r);
+    // the watcher: the book settles it from the node, and the seller is shown its preimage
+    wait_for("the late ticket shown to the seller", || {
+        r.tick();
+        !r.audit("ticket_prepaid_shown").is_empty()
+    });
+    let shown = r.audit("ticket_prepaid_shown");
+    assert_eq!((shown[0]["shown"].as_u64(), shown[0]["credited_now"].as_u64()), (Some(1), Some(1)), "the seller credited it: {shown:?}");
+    assert!(r.tap.seen("/x402/ticket/release").iter().any(|s| s.body.contains("secrets")), "presented by its preimage");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "one ticket, paid once, settled at the seller and in the book");
+    // shown once: the next ticks present nothing more
+    let n = r.tap.seen("/x402/ticket/release").len();
+    r.tick();
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/release").len(), n, "not presented again");
+}
+
+/// The wallet's account of a session against the seller's own: what the seller credited in it and
+/// what is left there, as the wallet's stop tells them and as the seller's `status` does. What is left.
+fn new_sid_of(v: &Value) -> String {
+    v["session"].as_str().unwrap().to_string()
+}
+
+fn both_sides_of(r: &Rig, sid: &str) -> u64 {
+    let stop = r.call("ticket_stop", json!({"session": sid}));
+    let wallet_left = stop["http"]["left_with_seller_msat"].as_str().unwrap_or_else(|| panic!("the wallet's count: {stop}")).to_string();
+    let forgot = r.call("ticket_stop", json!({"session": sid, "forget_credit": true}));
+    assert_eq!(forgot["left_with_seller_msat"].as_str(), Some(wallet_left.as_str()), "what is left, buyer and seller: {stop} {forgot}");
+    assert_eq!(forgot["seller_released_msat"].as_str(), stop["http"]["account"]["credited_msat"].as_str(), "what was credited, buyer and seller: {stop} {forgot}");
+    wallet_left.parse().unwrap()
+}
+
+/// A signer stopped where a kill would leave it: a prepaid ticket booked, its send not returned. A
+/// new signer starts on the book. The ticket's invoice, which has not reached any node yet.
+fn killed_with_a_prepaid_ticket_on_its_way(r: &mut Rig, url: String) -> String {
+    let inv = Arc::new(Mutex::new(None::<String>));
+    let got = inv.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.ends_with("/lock") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if let Some(i) = v["tickets"][0]["invoice"].as_str() {
+            *got.lock().unwrap() = Some(i.to_string());
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_secs(600);
+    let old = r.s.clone();
+    std::thread::spawn(move || call(&old, "xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"})));
+    wait_for("the prepaid ticket booked", || r.audit("ticket_prepay").len() == 1 && inv.lock().unwrap().is_some());
+    std::thread::sleep(Duration::from_millis(400));
+    r.restart();
+    r.tap.clear();
+    r.ln.st.lock().unwrap().send_takes = Duration::ZERO;
+    let invoice = inv.lock().unwrap().clone().unwrap();
+    invoice
+}
+
+/// [`killed_with_a_prepaid_ticket_on_its_way`], and the payment then goes through: its hash.
+fn killed_with_a_prepaid_ticket_that_then_settles(r: &mut Rig, url: String) -> String {
+    let invoice = killed_with_a_prepaid_ticket_on_its_way(r, url);
+    r.ln.send_held(&HeldSend { invoice: invoice.clone(), fee_limit_msat: 2_000, timeout_s: 1, http_margin_s: 30, cltv_limit: 200, outgoing_chan_ids: vec![], tag: vec![1u8; 32] }).unwrap();
+    xbt_signer::bolt11::decode(&invoice).unwrap().payment_hash_hex()
+}
+
+/// A prepaid ticket whose call ended before its payment did; the payment then reaches the seller
+/// and settles. Its hash.
+fn a_prepaid_ticket_late_after_its_call(r: &Rig) -> String {
+    r.ln.st.lock().unwrap().strand_next = 1;
+    let v = r.pay("/page/1", CALL);
+    assert_ne!(v["status"].as_u64(), Some(200), "{v}");
+    let (hash, invoice) = {
+        let s = r.ln.st.lock().unwrap();
+        let p = s.payments.iter().find(|p| p["stranded"] == true).expect("a payment on its way");
+        (p["payment_hash"].as_str().unwrap().to_string(), p["payment_request"].as_str().unwrap().to_string())
+    };
+    let d = xbt_signer::bolt11::decode(&invoice).unwrap();
+    let raw: Hash = d.payment_hash.as_slice().try_into().unwrap();
+    assert!(r.ln.seller.pay_msat(&raw, d.amount_msat));
+    let mut s = r.ln.st.lock().unwrap();
+    s.payments.iter_mut().find(|p| p["payment_hash"] == hash).unwrap()["stranded"] = false.into();
+    hash
+}
+
+fn prepaid_only_shop() -> Value {
+    json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}})
+}
+
+/// The signer is killed with a prepaid ticket on its way, which then settles. With no tick in
+/// between, the next call shows the seller its preimage before the takeover reads the seller's
+/// count, and is paid from that credit: no second ticket is bought, and the credit goes on paying.
+#[test]
+fn a_kill_with_a_prepaid_ticket_on_its_way_leaves_its_credit_to_the_next_call() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let url = r.shop.url("/page/1");
+    let hash = killed_with_a_prepaid_ticket_that_then_settles(&mut r, url);
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the late ticket's credit: {v}");
+    assert!(!r.audit("ticket_resumed").is_empty(), "taken over");
+    assert_eq!(r.tap.secrets().iter().filter(|s| sha(s) == hash).count(), 1, "shown once");
+    // the credit goes on paying: 3 MiB at 200 sat a MiB, inside what the ticket left
+    let more = r.pay(&format!("/files/{}", 3 * MIB), 2_000);
+    assert_eq!((more["status"].as_u64(), more["tickets_prepaid"].as_u64().unwrap_or(0), more["tickets_released"].as_u64().unwrap_or(0)), (Some(200), 0, 0), "{more}");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "one ticket, paid once");
+    assert_eq!(r.tap.secrets().iter().filter(|s| sha(s) == hash).count(), 1, "and shown once in all");
+    let left = both_sides_of(&r, &new_sid_of(&v));
+    assert_eq!(left, TICKET - 2_500 - 3 * 200_000, "the ticket, less the page and 3 MiB");
+}
+
+/// A kill after the prepaid ticket settled and before the seller answered for its preimage: the mark
+/// goes in the settle's own write, so the watcher shows it, and the next call is paid from it.
+#[test]
+fn a_kill_between_a_prepaid_tickets_settle_and_its_delivery_leaves_its_credit_to_the_next_call() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    r.tap.set(Box::new(|seen, _real| {
+        if seen.path.ends_with("/release") {
+            std::thread::sleep(Duration::from_secs(600));
+        }
+        None
+    }));
+    let (old, url) = (r.s.clone(), r.shop.url("/page/1"));
+    std::thread::spawn(move || call(&old, "xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"})));
+    wait_for("the preimage on its way", || !r.tap.seen("/x402/ticket/release").is_empty());
+    r.restart();
+    r.tap.clear();
+    r.tick();
+    r.tick();
+    assert_eq!(r.audit("ticket_prepaid_shown").len(), 1, "the watcher showed it");
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "no second ticket: {v}");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)), TICKET - 2_500, "the first call's request never left: one page");
+}
+
+/// A preimage goes only to the seller it paid: a call to another shop on the same node is not
+/// told it, nor does it take that shop's session over; the watcher shows it where it belongs.
+#[test]
+fn a_late_preimage_does_not_go_to_another_shop_on_the_same_node() {
+    let _g = env_lock();
+    let mut beside = strict_shop();
+    beside["own_receipt_key"] = true.into();
+    let mut r = Rig::with_more(json!({}), true, true, 30, strict_shop(), &[beside]);
+    let url = r.shop.url("/page/1");
+    let hash = killed_with_a_prepaid_ticket_that_then_settles(&mut r, url);
+    let other = r.more[0].url("/page/1");
+    let v = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    assert!(!r.tap.secrets().iter().any(|s| sha(s) == hash), "the first shop's preimage went to the shop beside it");
+    assert!(r.audit("ticket_resumed").is_empty(), "the other shop's session is not this one's to take over");
+    r.tick();
+    assert_eq!(r.tap.secrets().iter().filter(|s| sha(s) == hash).count(), 1, "the watcher showed it at the address on record");
+    assert_eq!(r.audit("ticket_prepaid_shown")[0]["credited_now"].as_u64(), Some(1), "and that seller credited it");
+}
+
+/// The wallet's own node has not shown the first ticket paid; the seller, whose node took it, counts
+/// it. The credit is used, on the seller's word that moves no money, but a stranger's first-ticket
+/// rule is not lifted on that word: the session holds nothing.
+#[test]
+fn a_takeover_on_the_sellers_count_alone_does_not_lift_the_first_prepaid_ticket_rule() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let url = r.shop.url("/page/1");
+    let invoice = killed_with_a_prepaid_ticket_on_its_way(&mut r, url);
+    let d = xbt_signer::bolt11::decode(&invoice).unwrap();
+    let raw: Hash = d.payment_hash.as_slice().try_into().unwrap();
+    assert!(r.ln.seller.pay_msat(&raw, d.amount_msat), "the seller's node has it");
+    // the seller's sweep credits it; not so long that the book gives the booking up
+    r.clock.fetch_add(80, Ordering::SeqCst);
+    r.shop.gw.tick();
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "{v}");
+    assert!(!r.audit("ticket_resumed").is_empty(), "taken over: {v}");
+    std::thread::sleep(Duration::from_millis(300));
+    let st = r.session(v["session"].as_str().unwrap());
+    assert_eq!(st["sessions"][0]["paid_first"].as_bool(), Some(true), "{st}");
+    assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "nothing held on the seller's word");
+    assert!(r.audit("ticket_paid_first_met").is_empty());
+}
+
+/// The first lock after a takeover fails (the seller still counts the earlier session's tickets, or
+/// any other reason): the call goes on, on the credit taken over, and the next call locks.
+#[test]
+fn a_first_lock_that_fails_after_a_takeover_does_not_refuse_the_call() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let first = r.pay("/page/1", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_refill(&r, "two tickets held", 2);
+    r.restart();
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/lock").then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["verdict"].as_str(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), Some("allow"), 0), "{v}");
+    r.tap.clear();
+    let next = r.pay("/page/1", CALL);
+    assert_eq!((next["status"].as_u64(), next["session"].as_str()), (Some(200), v["session"].as_str()), "{next}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the session to hold after all", || {
+        r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0
+            && r.session(&sid)["session_tickets"].as_array().unwrap().iter().any(|t| t["state"] == "locked")
+    });
+}
+
+/// A takeover's cancel that the seller answered is not asked again by the watcher, though the
+/// tickets are still on their way back; one it did not answer is.
+#[test]
+fn a_takeovers_cancel_is_asked_again_by_the_watcher_only_where_it_was_not_answered() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/1", CALL)["status"].as_u64(), Some(200));
+    r.restart();
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/cancel").then(|| Ok(answer(200, vec![], json!({"cancelled": []}).to_string().into_bytes())))));
+    assert_eq!(r.pay("/page/1", CALL)["status"].as_u64(), Some(200));
+    let asked = r.tap.seen("/x402/ticket/cancel").len();
+    assert!(asked >= 1);
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/cancel").len(), asked, "answered: not asked again");
+
+    let mut r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/1", CALL)["status"].as_u64(), Some(200));
+    r.restart();
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/cancel").then(|| Ok(answer(500, vec![], b"{}".to_vec())))));
+    assert_eq!(r.pay("/page/1", CALL)["status"].as_u64(), Some(200));
+    let refused = r.tap.seen("/x402/ticket/cancel").len();
+    r.tap.clear();
+    r.tick();
+    let again: Vec<Value> = r.tap.seen("/x402/ticket/cancel").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
+    assert!(again.len() > refused && again.iter().all(|a| a["hashes"].is_array()), "not answered: the watcher asks, by hash: {again:?}");
+    wait_for("the earlier tickets to come back", || {
+        r.tick();
+        r.status()["tickets"]["retired"].as_i64().unwrap_or(0) == 0
+    });
+}
+
+/// A ticket booked as released whose secret never reached the seller is held there still: a cancel
+/// after a restart names it, and it comes back.
+#[test]
+fn a_held_ticket_whose_secret_never_reached_the_seller_comes_back_after_a_restart() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_for("a pool held", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0 && r.status()["locked"]["tickets"].as_i64().unwrap_or(0) > 0);
+    let at = r.tap.seen("/x402/ticket/release").len();
+    r.tap.set(Box::new(|seen, _real| {
+        if seen.path.ends_with("/release") {
+            std::thread::sleep(Duration::from_secs(600));
+        }
+        None
+    }));
+    let (old, url) = (r.s.clone(), r.shop.url(&format!("/files/{}", 20 * MIB)));
+    std::thread::spawn(move || call(&old, "xbt402_pay", json!({"url": url, "max_sats": 5_000, "task": "film"})));
+    wait_for("the next secret on its way", || r.tap.seen("/x402/ticket/release").len() > at);
+    r.restart();
+    r.tap.clear();
+    wait_for("nothing held at the seller", || {
+        r.tick();
+        r.shop.held() == 0
+    });
+    wait_for("the bookings to go", || {
+        r.tick();
+        r.status()["booked_sats"].as_i64().unwrap_or(-1) == 0
+    });
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "only the first ticket was ever paid");
+}
+
+/// A stop's cancel names that session's tickets: one slow to leave cannot take those of the session
+/// that took its seller session over meanwhile.
+#[test]
+fn a_stops_cancel_slow_to_leave_spares_the_session_that_took_over() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/1", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_for("a pool held", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0 && r.status()["locked"]["tickets"].as_i64().unwrap_or(0) > 0);
+    let go = Arc::new(AtomicBool::new(false));
+    let (saw, go2) = (Arc::new(AtomicBool::new(false)), go.clone());
+    let saw2 = saw.clone();
+    r.tap.set(Box::new(move |seen, _real| {
+        if seen.path.ends_with("/cancel") && !saw2.swap(true, Ordering::SeqCst) {
+            while !go2.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        None
+    }));
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    let old = r.s.clone();
+    let stopper = std::thread::spawn(move || old.watch_tick());
+    wait_for("the stop's cancel on its way", || saw.load(Ordering::SeqCst));
+    let v = r.pay("/page/1", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    assert!(!r.audit("ticket_resumed").is_empty(), "taken over: {v}");
+    let new_sid = v["session"].as_str().unwrap().to_string();
+    let locked_of = |sid: &str| -> Vec<String> {
+        r.session(sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "locked").map(|t| t["hash"].as_str().unwrap().to_string()).collect()
+    };
+    wait_for("the new session to hold", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0 && !locked_of(&new_sid).is_empty());
+    let mine = locked_of(&new_sid);
+    go.store(true, Ordering::SeqCst);
+    stopper.join().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    r.tick();
+    let after = locked_of(&new_sid);
+    assert!(mine.iter().all(|h| after.contains(h)), "the earlier session's cancel took the new session's tickets: {mine:?} {after:?}");
+    assert!(r.tap.seen("/x402/ticket/cancel").iter().all(|s| !s.body.contains("\"all\"")), "nothing the wallet sends cancels all");
+    both_sides_of(&r, &new_sid);
+}
+
+/// A seller that gives no answer is shown a late preimage later and later, not at every tick; a
+/// refusal for the moment is tried again; one for good, and a forgotten session, end it.
+#[test]
+fn a_late_preimage_is_presented_later_and_later_and_given_up_on_a_final_answer() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, prepaid_only_shop());
+    let hash = a_prepaid_ticket_late_after_its_call(&r);
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/release").then(|| Ok(answer(500, vec![], b"{}".to_vec())))));
+    for _ in 0..8 {
+        r.tick();
+    }
+    let n = r.tap.seen("/x402/ticket/release").len();
+    assert!(n == 1 || n == 2, "presented {n} times in 8 ticks with the clock still");
+    // the first wait over; then not again until the next, twice as long
+    r.clock.fetch_add(61, Ordering::SeqCst);
+    r.tick();
+    let n2 = r.tap.seen("/x402/ticket/release").len();
+    assert!(n2 > n, "tried again after its wait");
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/release").len(), n2, "and not at the next tick");
+    r.clock.fetch_add(61, Ordering::SeqCst);
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/release").len(), n2, "the second wait is twice the first");
+    r.clock.fetch_add(60, Ordering::SeqCst);
+    r.tick();
+    assert!(r.tap.seen("/x402/ticket/release").len() > n2, "and over after that");
+    // what the gateway answers while its node is unreachable: for the moment, not shown
+    let h = hash.clone();
+    r.tap.set(Box::new(move |seen, _real| seen.path.ends_with("/release").then(|| {
+        Ok(answer(200, vec![], json!({"released": [], "refused": [{"hash": h, "error": "node_unavailable"}]}).to_string().into_bytes()))
+    })));
+    r.clock.fetch_add(300, Ordering::SeqCst);
+    let before = r.tap.seen("/x402/ticket/release").len();
+    r.tick();
+    assert!(r.tap.seen("/x402/ticket/release").len() > before, "tried");
+    assert!(r.audit("ticket_prepaid_shown").is_empty(), "node_unavailable is not shown");
+    // the seller has forgotten the session: that is the end of it
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/release").then(|| Ok(answer(402, vec![], json!({"error": "session_unknown"}).to_string().into_bytes())))));
+    r.clock.fetch_add(3_700, Ordering::SeqCst);
+    r.tick();
+    let given_up = r.audit("ticket_prepaid_given_up");
+    assert_eq!((given_up.len(), given_up[0]["given_up"].as_u64(), given_up[0]["msat"].as_str()), (1, Some(1), Some(TICKET.to_string().as_str())), "by count and amount: {given_up:?}");
+    let n3 = r.tap.seen("/x402/ticket/release").len();
+    r.clock.fetch_add(3_700, Ordering::SeqCst);
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/release").len(), n3, "not presented again");
+    assert!(r.audit("ticket_prepaid_shown").is_empty());
+}
+
+/// A seller's final refusal of a late preimage ends it: it is not presented again.
+#[test]
+fn a_final_refusal_of_a_late_preimage_is_final() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, prepaid_only_shop());
+    let hash = a_prepaid_ticket_late_after_its_call(&r);
+    let h = hash.clone();
+    r.tap.set(Box::new(move |seen, _real| seen.path.ends_with("/release").then(|| {
+        Ok(answer(200, vec![], json!({"released": [], "refused": [{"hash": h, "error": "ticket_unknown"}]}).to_string().into_bytes()))
+    })));
+    wait_for("the seller's answer", || {
+        r.tick();
+        !r.audit("ticket_prepaid_given_up").is_empty()
+    });
+    let n = r.tap.seen("/x402/ticket/release").len();
+    for _ in 0..3 {
+        r.clock.fetch_add(4_000, Ordering::SeqCst);
+        r.tick();
+    }
+    assert_eq!(r.tap.seen("/x402/ticket/release").len(), n, "not presented again");
+    assert!(r.audit("ticket_prepaid_shown").is_empty());
+}
+
+/// A session this process has open delivers its own preimage: the watcher does not present it
+/// beside the call, however long that delivery takes.
+#[test]
+fn the_watcher_leaves_a_preimage_to_the_call_that_is_delivering_it() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    let go = Arc::new(AtomicBool::new(false));
+    let g2 = go.clone();
+    r.tap.set(Box::new(move |seen, _real| {
+        if seen.path.ends_with("/release") {
+            while !g2.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        None
+    }));
+    let (old, url) = (r.s.clone(), r.shop.url("/page/1"));
+    let call_ = std::thread::spawn(move || call(&old, "xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"})));
+    wait_for("the preimage on its way", || !r.tap.seen("/x402/ticket/release").is_empty());
+    r.tick();
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/release").len(), 1, "only the call's");
+    go.store(true, Ordering::SeqCst);
+    let v = call_.join().unwrap();
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    r.tap.clear();
+    r.tick();
+    assert_eq!(r.tap.secrets().len(), 1, "delivered once");
+}
+
+/// A session whose only ticket is a held one booked as released, its secret not arrived: the watcher
+/// asks for its cancel after a start, and it comes back.
+#[test]
+fn a_session_holding_only_a_released_ticket_is_asked_to_cancel_after_a_start() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({"tickets": {"pool": 1, "pool_many": 1, "velocity": "release"}}));
+    r.tap.set(Box::new(|seen, _real| {
+        if seen.path.ends_with("/release") {
+            std::thread::sleep(Duration::from_secs(600));
+        }
+        None
+    }));
+    let (old, url) = (r.s.clone(), r.shop.url("/page/1"));
+    std::thread::spawn(move || call(&old, "xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"})));
+    wait_for("the secret on its way", || !r.tap.seen("/x402/ticket/release").is_empty());
+    r.restart();
+    r.tap.clear();
+    wait_for("nothing held at the seller", || {
+        r.tick();
+        r.shop.held() == 0
+    });
+    assert_eq!(r.ln.paid_msat(), 0, "nothing was paid");
+}
+
+/// A row from 0.1.19 names no receipt key: its session is still taken over, on the seller's signed
+/// answer, and the key goes on record then.
+#[test]
+fn a_session_from_before_receipt_keys_were_kept_is_taken_over() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let first = r.pay("/page/1", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_refill(&r, "two tickets held", 2);
+    let book = r.root.join(".run").join(xbt_signer::ticket_rail::BOOK_FILE);
+    let text = std::fs::read_to_string(&book).unwrap();
+    assert!(text.contains("receipt_key"), "the key was on record");
+    let old: String = text.lines().map(|l| {
+        let mut row: Value = serde_json::from_str(l).unwrap();
+        if let Some(h) = row.get_mut("http").and_then(Value::as_object_mut) {
+            h.remove("receipt_key");
+        }
+        format!("{row}\n")
+    }).collect();
+    std::fs::write(&book, old).unwrap();
+    r.restart();
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from its credit: {v}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1, "taken over");
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)), TICKET - 2 * 2_500);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+}
+
+/// A call to another shop on the same node does not ask it about a session of the first, whose
+/// receipt key is on record: that seller session's id and auth are not sent to it. The first's credit
+/// is still found when the wallet comes back.
+#[test]
+fn another_shop_on_the_same_node_is_not_asked_about_a_session_of_the_first() {
+    let _g = env_lock();
+    let mut beside = strict_shop();
+    beside["own_receipt_key"] = true.into();
+    let r = Rig::with_more(json!({}), true, true, 30, strict_shop(), &[beside]);
+    let a = r.pay("/page/1", CALL);
+    assert_eq!(a["status"].as_u64(), Some(200), "{a}");
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let asked = r.tap.seen("/x402/ticket/status").len();
+    let other = r.more[0].url("/page/1");
+    let b = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
+    assert_eq!((b["status"].as_u64(), b["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{b}");
+    assert_eq!(r.tap.seen("/x402/ticket/status").len(), asked, "nothing asked of the other shop");
+    assert!(r.audit("ticket_resumed").is_empty());
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let c = r.pay("/page/1", CALL);
+    assert_eq!((c["status"].as_u64(), c["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "back at the first: {c}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1);
+    assert_eq!(both_sides_of(&r, &new_sid_of(&c)), TICKET - 2 * 2_500);
+}
+
+/// A second gateway naming the same receipt key, that knows nothing of the session (a key is public):
+/// not shown the first shop's preimage, nothing given up, and the true shop is shown it.
+#[test]
+fn a_shop_merely_naming_the_same_receipt_key_is_not_shown_a_preimage() {
+    let _g = env_lock();
+    let mut r = Rig::with_more(json!({}), true, true, 30, strict_shop(), &[strict_shop()]);
+    let url = r.shop.url("/page/1");
+    let hash = killed_with_a_prepaid_ticket_that_then_settles(&mut r, url);
+    let other = r.more[0].url("/page/1");
+    let v = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    assert!(!r.tap.secrets().iter().any(|s| sha(s) == hash), "the first shop's preimage went to the shop beside it");
+    assert!(r.audit("ticket_prepaid_given_up").is_empty(), "nothing given up on that shop's word");
+    assert!(r.audit("ticket_resumed").is_empty());
+    let w = r.pay("/page/1", CALL);
+    assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "back at the first shop, paid from its credit: {w}");
+    assert_eq!(r.tap.secrets().iter().filter(|s| sha(s) == hash).count(), 1);
+    assert_eq!(r.audit("ticket_resumed").len(), 1);
+    assert_eq!(both_sides_of(&r, &new_sid_of(&w)), TICKET - 2_500);
+}
+
+/// An unsigned answer to a late preimage at a takeover is the end of nothing: not "shown", not given
+/// up, and the true seller is shown it later.
+#[test]
+fn an_unsigned_answer_at_a_takeover_ends_nothing() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let url = r.shop.url("/page/1");
+    let hash = killed_with_a_prepaid_ticket_that_then_settles(&mut r, url);
+    let h = hash.clone();
+    r.tap.set(Box::new(move |seen, _real| seen.path.ends_with("/release").then(|| {
+        Ok(answer(200, vec![], json!({"released": [h], "refused": []}).to_string().into_bytes()))
+    })));
+    let v = r.pay("/page/1", CALL);
+    assert!(r.audit("ticket_prepaid_shown").is_empty(), "no false credit on that answer: {v}");
+    assert!(r.audit("ticket_prepaid_given_up").is_empty());
+    r.tap.clear();
+    r.clock.fetch_add(61, Ordering::SeqCst);
+    wait_for("the watcher to show it", || {
+        r.tick();
+        !r.audit("ticket_prepaid_shown").is_empty()
+    });
+    assert_eq!(r.audit("ticket_prepaid_shown")[0]["credited_now"].as_u64(), Some(1));
+}
+
+/// One failed `status` at a takeover: asked again within the call, and the whole credit is taken over.
+#[test]
+fn one_failed_status_at_a_takeover_does_not_strand_the_credit() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({}));
+    let first = r.pay("/page/1", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_for("a pool held", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0 && r.status()["locked"]["tickets"].as_i64().unwrap_or(0) > 0);
+    r.restart();
+    let once = Arc::new(AtomicBool::new(false));
+    let o = once.clone();
+    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/status") && !o.swap(true, Ordering::SeqCst)).then(|| Ok(answer(503, vec![], b"{}".to_vec())))));
+    let v = r.pay("/page/1", CALL);
+    r.tap.clear();
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the credit: {v}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1, "taken over");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)), TICKET - 2 * 2_500);
+}
+
+/// A seller that will not answer `status`: nothing is bought beside the credit, and the call says when
+/// to come back. Past the bound a new session starts and the record names what may be left; and a
+/// later session still recovers that credit, buyer and seller agreeing.
+#[test]
+fn a_seller_that_will_not_say_is_waited_for_then_named_and_its_credit_still_found() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let first = r.pay("/page/1", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_refill(&r, "two tickets held", 2);
+    let first_sid = new_sid_of(&first);
+    r.restart();
+    let fresh_at = r.ln.state().payments.len();
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/status").then(|| Ok(answer(503, vec![], b"{}".to_vec())))));
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_seller_unanswered")), "{v}");
+    assert!(v["retry_after_s"].as_u64().unwrap() > 0, "{v}");
+    assert_eq!(r.ln.state().payments.len(), fresh_at, "nothing bought beside it: {v}");
+    assert!(r.audit("ticket_left_with_seller").iter().all(|e| e["session"] != first_sid.as_str() || !e["why"].as_str().unwrap_or("").contains("no signed answer")));
+    // past the bound the buyer is not held to it any longer
+    r.clock.fetch_add(121, Ordering::SeqCst);
+    let fresh = r.pay("/page/1", CALL);
+    assert_eq!((fresh["status"].as_u64(), fresh["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a new session: {fresh}");
+    let named: Vec<Value> = r.audit("ticket_left_with_seller").into_iter().filter(|e| e["why"].as_str().unwrap_or("").contains("no signed answer")).collect();
+    assert_eq!(named.len(), 1, "named once: {named:?}");
+    assert_eq!((named[0]["session"].as_str(), named[0]["sent_msat"].as_str()), (Some(first_sid.as_str()), Some(TICKET.to_string().as_str())), "{named:?}");
+    assert!(named[0]["left_msat"].is_null());
+    r.tap.clear();
+    // the seller answers again: that newest credit used up and given up, the earlier one is found
+    both_sides_of(&r, &new_sid_of(&fresh));
+    let back = r.pay("/page/1", CALL);
+    assert_eq!((back["status"].as_u64(), back["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the first credit: {back}");
+    let resumed = r.audit("ticket_resumed");
+    assert_eq!((resumed.len(), resumed[0]["balance_msat"].as_u64()), (1, Some(TICKET - 2_500)), "{resumed:?}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(both_sides_of(&r, &new_sid_of(&back)), TICKET - 2 * 2_500, "buyer and seller");
+    assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED), "two tickets in all, each paid once");
+}
+
+/// Probe of the first-lock review: the signer killed at every step of a first call once the node has
+/// the payment, the next call at once: no second ticket is bought beside the first.
+#[test]
+fn a_kill_at_any_step_after_the_node_paid_buys_no_second_ticket() {
+    let _g = env_lock();
+    let (mut seen, mut double) = (0, vec![]);
+    for step in 0..400 {
+        let mut r = Rig::shipped(json!({}), 30, strict_shop());
+        let done = crashing(step, || r.pay("/page/10", CALL));
+        if done.is_some() {
+            break;
+        }
+        r.restart();
+        r.tick();
+        if r.ln.paid_msat() != TICKET {
+            continue;
+        }
+        seen += 1;
+        let _next = r.pay("/page/10", CALL);
+        if r.ln.paid_msat() != TICKET {
+            double.push(step);
+        }
+    }
+    assert!(seen > 0, "no step left the node paid");
+    assert!(double.is_empty(), "second ticket bought at steps {double:?}");
+}
+
+/// Probe of the first-lock review: a stop as `ticket_prepay_pending`, the node then shows it paid, and
+/// the seller's sweep does not credit it in the wait: the seller is in the owner's record past it.
+#[test]
+fn a_settled_ticket_the_seller_will_not_credit_past_the_wait_is_named() {
+    let _g = env_lock();
+    let shop = json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true, "unpaid_secs": 100000, "first_use_secs": 100000}});
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, shop);
+    r.ln.st.lock().unwrap().held_back = true;
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    let hash = v["hash"].as_str().unwrap().to_string();
+    r.tap.set(Box::new(move |seen, _real| seen.path.ends_with("/release").then(|| {
+        Ok(answer(200, vec![], json!({"released": [], "refused": [{"hash": hash, "error": "node_unavailable"}]}).to_string().into_bytes()))
+    })));
+    r.ln.st.lock().unwrap().held_back = false;
+    wait_for("the payment to show paid", || r.ln.paid_msat() == TICKET);
+    r.tick();
+    r.clock.fetch_add(120, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    assert_eq!(r.audit("ticket_prepay_overdue").len(), 1, "a seller holding a settled ticket with no credit is named");
+}
+
+/// A prepaid ticket whose call ended before its payment did leaves its credit to the next call: the
+/// watcher shows the seller its preimage, and the next call takes the seller session over and is paid
+/// from it, with no second ticket and no wait for the seller's own sweep.
+#[test]
+fn a_prepaid_ticket_late_after_its_call_leaves_its_credit_to_the_next_call() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, prepaid_only_shop());
+    a_prepaid_ticket_late_after_its_call(&r);
+    wait_for("the late ticket shown", || {
+        r.tick();
+        !r.audit("ticket_prepaid_shown").is_empty()
+    });
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "a second ticket was bought, the late one's credit left with the seller: {v}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1, "taken over");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)), TICKET - 2_500);
+}
+
+/// Once its credit could no longer be taken over, a late preimage is not presented any more.
+#[test]
+fn a_late_preimage_is_not_presented_past_the_time_its_credit_could_be_used() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, prepaid_only_shop());
+    a_prepaid_ticket_late_after_its_call(&r);
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/release").then(|| Ok(answer(500, vec![], b"{}".to_vec())))));
+    wait_for("the first try", || {
+        r.tick();
+        !r.tap.seen("/x402/ticket/release").is_empty()
+    });
+    let n = r.tap.seen("/x402/ticket/release").len();
+    r.clock.fetch_add(21 * 3_600, Ordering::SeqCst);
+    r.tick();
+    assert_eq!(r.tap.seen("/x402/ticket/release").len(), n, "past the window: not sent");
+    assert_eq!(r.audit("ticket_prepaid_given_up").len(), 1);
+}
+
+/// A prepaid ticket its call delivered is not shown to the seller again, however the session ends:
+/// the mark goes when the seller is seen to have its preimage.
+#[test]
+fn a_prepaid_ticket_its_call_delivered_is_not_shown_again() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let shown = r.tap.secrets();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    let stop = r.call("ticket_stop", json!({"session": v["session"]}));
+    assert_eq!(stop["verdict"], "allow", "{stop}");
+    for _ in 0..3 {
+        r.tick();
+    }
+    assert_eq!(r.tap.secrets(), shown, "delivered once, by its call");
+    assert!(r.audit("ticket_prepaid_shown").is_empty());
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+}
+
+/// A session stopped by a start cannot say what it left with its seller, as a stop in a running
+/// process does: the watcher asks the seller once and logs it, to the msat the call's own receipt
+/// showed, and that credit then pays the next call.
+#[test]
+fn a_start_logs_the_credit_each_session_left_with_its_seller() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({}));
+    let v = r.pay("/page/1", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    let left = v["balance_msat"].as_str().unwrap().to_string();
+    assert_ne!(left, "0", "{v}");
+    assert!(r.audit("ticket_left_with_seller").is_empty());
+    r.restart();
+    r.tick();
+    let lines = r.audit("ticket_left_with_seller");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!((lines[0]["session"].as_str(), lines[0]["left_msat"].as_str(), lines[0]["why"].as_str()), (v["session"].as_str(), Some(left.as_str()), Some("the signer restarted")));
+    r.tick();
+    assert_eq!(r.audit("ticket_left_with_seller").len(), 1, "once per start");
+    let next = r.pay("/page/1", CALL);
+    assert_eq!((next["status"].as_u64(), next["tickets_released"].as_u64()), (Some(200), Some(0)), "the credit logged is the credit that pays: {next}");
+    assert!(!r.audit("ticket_resumed").is_empty());
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+}
+
+/// A seller that does not say what a session left is logged as not saying: the credit is unknown,
+/// not none. A seller with nothing left is not logged at all.
+#[test]
+fn a_start_logs_credit_it_could_not_learn_as_unknown_and_none_as_nothing() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/1", CALL)["status"].as_u64(), Some(200));
+    r.restart();
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/status").then(|| Ok(answer(500, vec![], b"{}".to_vec())))));
+    r.tick();
+    let lines = r.audit("ticket_left_with_seller");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0]["left_msat"].is_null(), "{lines:?}");
+    r.tap.clear();
+
+    let mut r = Rig::new(json!({}));
+    let v = r.pay("/page/1", CALL);
+    r.call("ticket_stop", json!({"session": v["session"], "forget_credit": true}));
+    let stopped_by_the_caller = r.audit("ticket_left_with_seller").len();
+    r.restart();
+    r.tick();
+    assert_eq!(r.audit("ticket_left_with_seller").len(), stopped_by_the_caller, "a session already stopped is not this start's to report");
+}
+
+/// Forgetting a session stopped earlier says how much is given up, as the seller counts it.
+#[test]
+fn forgetting_the_credit_of_a_stopped_session_says_what_is_given_up() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let v = r.pay("/page/1", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let forgot = r.call("ticket_stop", json!({"session": v["session"], "forget_credit": true}));
+    let left: u64 = forgot["left_with_seller_msat"].as_str().expect("the seller's count").parse().unwrap();
+    assert_eq!(left, TICKET - 2_500, "{forgot}");
 }
 
 /// A web app's other requests while one buys (`credit_only`): such a call buys no ticket, and

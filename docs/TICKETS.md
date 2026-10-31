@@ -721,7 +721,8 @@ cancelled, and with a hold fee more the longer it is held. Then:
 
 **Strangers (built 2026-10-17).** A session with a seller the owner has not named starts with one
 prepaid ticket, paid and settled on arrival, and holds tickets only after the wallet's node shows
-it paid (the session's `paid_first`, cleared in the same write that books the payment). The
+it paid (the session's `paid_first`, cleared in the same write that books the payment, or when the
+session takes over a seller session this wallet paid: see "A balance left with the seller"). The
 wallet holds 1 ticket at a time with such a seller and 2 with a named one: a task's
 `unlisted_max_tickets` is 1 by default, whatever `pool_many` says, and the pool follows it. A
 seller the owner has not named whose terms offer no prepaid tickets is not held with at all
@@ -1586,7 +1587,7 @@ node reports, and nothing else.
 | Bounds | What may leave the wallet for the call on the ticket rail: the tickets it releases or buys, whole, with their routing fees. Not a call paid by draws: its wins are bounded by the charge cap's luck cap and the task's budget (section 9.8) | What the call's answer may be charged by the seller |
 | Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the gateway ends the answer there, a body or a paid WebSocket (gateways before 0.1.20 did not stop a WebSocket at it: bytes in flight past it were charged, and the wallet takes such a receipt as the seller's fault) |
 | Checked by the wallet | Before a ticket is released or bought: it must fit what is left of `max_sats` | A quoted price above it is refused before anything is paid (`max_sats`); a metered answer is cut there; a receipt that charges more is a seller fault (`ticket_over_cap`) |
-| Where the difference goes | — | It stays as credit with that seller. A later session with it takes it over within 20 hours of the stop (the newest stopped session only, and only where the seller's signed count agrees); after that it is lost |
+| Where the difference goes | — | It stays as credit with that seller. A later session with it takes it over within 20 hours of the stop (the newest stopped sessions first, and only where the seller's signed count agrees); after that it is lost |
 
 They differ where a use is smaller than the seller's ticket. Tickets run to some 500 to 1,000 sat
 or more, so a call whose `max_sats` is its own small price fits no ticket and, with no credit at
@@ -1658,9 +1659,11 @@ by then was charged for nothing delivered. Tests (crates/xbt-signer/tests/ticket
 
 **Stop.** `ticket_stop`, a session idle for `tickets.http_idle_s` (120 s by default), a seller
 fault and changed terms all end a session the same way: the book locks and releases nothing more,
-the wallet sends `cancel` for all the session's tickets, and its own node shows them back. A
-wallet that starts again has stopped every session (section 3); it asks each seller on record,
-once, to cancel what it left locked. Stopping gives up the session's balance: the unused part of
+the wallet sends `cancel` naming the session's tickets (never `"all"`: another session of the wallet
+may have taken that seller session over), and its own node shows them back. A wallet that starts
+again has stopped every session (section 3); it asks each seller on record, once, to cancel what it
+may still hold of that session: tickets locked or on their way, and any held ticket booked as
+released whose secret may not have arrived. Stopping gives up the session's balance: the unused part of
 the last ticket.
 
 From the moment a session starts to stop, no ticket is released in it, no new call is made in it,
@@ -2026,13 +2029,52 @@ fit, and says which limit and by how much.
 **A balance left with the seller is used again.** A session the wallet stops (an idle stop, or the
 signer starting again) may leave prepaid credit at the seller, which keeps a session with a balance
 for a day (section 4). Credit is the seller's, not its address's: when the next call opens a session
-with the same seller (its node), under any address, the wallet first looks for the newest such
-session it stopped in the last 20 hours. One it still holds open under another address (an alias of
-the shop, or the address it moved from) is stopped first, unless a call is using it right now. If the seller's
-`status` for it, signed with the receipt key of the seller's terms now, credits exactly what the wallet's own book says left the wallet in that
-seller session, and shows a balance, the new session takes over its seller side; otherwise it starts
-fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
-counts as paid.
+with the same seller (its node), under any address, the wallet first looks through the seller
+sessions it stopped in the last 20 hours, newest first, asking four at most. One it still holds open under
+another address (an alias of the shop, or the address it moved from) is stopped first, unless a call
+is using it right now. If the seller's `status` for one, signed with the receipt key of the seller's terms now,
+credits exactly what the wallet's own book says left the wallet in that seller session, and shows
+a balance, the new session takes over its seller side; one that does not is passed over for the next, and with none the
+session starts fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
+counts as paid. Only a seller with the same receipt key is taken over: another shop on the same node
+is another seller, even though its payments reach the same node. A key is public, so naming it proves nothing:
+a session's key goes on record at its first signed receipt, and one with another key on record is not asked about at all.
+
+A `status` that does not answer is asked again, three times in all, a few seconds each. Still none, and the call is refused
+(`ticket_seller_unanswered`, with `retry_after_s`), with no new seller session and nothing bought beside
+a credit that may be there. Past 2 minutes of that the buyer is not held to it: the call starts fresh, and the audit
+names the session left behind (`ticket_left_with_seller`, `left_msat` null, with what the book sent). A later
+call still looks at that session, so its credit can be taken over once the seller answers.
+
+Only after that signed `status` does a takeover show the seller the preimages of prepaid tickets its
+earlier sessions never delivered (below), and only signed answers count; it asks `status` again where those
+changed the count. It then cancels by hash what they may still hold
+there, so that the seller's places are free. It then holds tickets at once where it would otherwise
+have bought a prepaid ticket first (a seller the owner has not named, or one that holds only after a
+paid ticket), if the wallet's own node settled a ticket of that seller session with its preimage: a
+payment proved, not said. On the seller's count alone the credit is used but the first-ticket rule
+stays. A first lock that fails after a takeover does not refuse the call: it goes on, on the credit,
+and the pool is filled again behind it.
+
+**A prepaid ticket no call delivered.** A prepaid ticket can settle on the wallet's node with no call
+left to show the seller its preimage: the call ended first, or the signer stopped before the seller
+answered. Until the seller is seen to have it the book marks the ticket, in the same write as its
+settle. The watcher presents the preimage at the address on record (and never to a session this
+process still has open, which delivers its own). The seller's answer decides: taken, now or before,
+and it is done; refused for good, or the session forgotten, and it is given up; refused for the
+moment, or no answer, and it is tried again after 60 s, doubling to an hour, for as long as the credit
+could be taken over (20 hours). Without this the seller credits such a ticket by its own sweep, a
+minute or more later. A preimage moves no money; it only proves a payment already made.
+
+**What a stopped session left.** A stop says what it leaves with the seller (`left_with_seller_msat`,
+and `ticket_left_with_seller` in the audit log). A session a start stopped could not: its process had
+died. So the watcher asks each of those sellers once, after any late preimage, and logs the same line,
+with `left_msat` null where the seller did not say. Giving up a stopped session's credit
+(`forget_credit`) answers the amount, as the seller counts it, and what it credited in that seller session.
+
+A stop or a takeover cancels by hash: every ticket that may hold a place at the seller, including a hash offered and not
+yet paid, whose invoice still counts against the session's cap. A session of the same seller session another
+wallet session has open is not taken over, and so never has its tickets named.
 
 ## 17. Requests side by side in one session (2026-10-29)
 

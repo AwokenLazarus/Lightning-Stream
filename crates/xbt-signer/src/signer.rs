@@ -246,6 +246,11 @@ pub struct Signer {
     /// One change at a time of the owner's choices file (`identity_set`).
     pub(crate) identity_write: Mutex<()>,
     pub(crate) ticket_cancel_tried: Mutex<HashSet<String>>,
+    /// Late prepaid tickets whose seller gave no answer that settles them: the tries so far and when
+    /// to try again, by hash. In memory: a start tries each once more.
+    pub(crate) ticket_late_tries: Mutex<HashMap<String, (u32, f64)>>,
+    /// Sessions this start stopped: the watcher asks their sellers, once, what credit they left.
+    pub(crate) ticket_start_stopped: Mutex<Vec<String>>,
     /// Sessions whose stop has begun and that the book still shows open, while their streams end
     /// ([`crate::ticket_pay`]'s `ticket_http_stop`): the book books nothing more for them, a release,
     /// a lock or a prepaid ticket, however far a call had got when the stop came.
@@ -333,7 +338,7 @@ impl Signer {
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
                                 ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
-                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
+                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_late_tries: Mutex::new(HashMap::new()), ticket_start_stopped: Mutex::new(vec![]), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),
                                 seller_blocks });
         let _ = s.me.set(Arc::downgrade(&s));

@@ -557,6 +557,7 @@ impl Signer {
             }
             let open: Vec<Session> = st.book.sessions.values().filter(|s| s.state == SState::Open).cloned().collect();
             let stopped = open.len();
+            *self.ticket_start_stopped.lock().unwrap_or_else(|p| p.into_inner()) = open.iter().map(|s| s.id.clone()).collect();
             for mut s in open {
                 s.state = SState::Stopping;
                 s.stopped_ts = now;
@@ -1329,9 +1330,13 @@ impl Signer {
         t.fee_msat = fee;
         t.done_ts = now;
         if !proven {
-            t.note = "settled without the preimage of its hash".into();
+            t.note = SETTLED_UNPROVEN.into();
         } else if !was.booked() {
             t.note = "settled without a release by this book".into();
+        } else if t.prepaid && t.win == 0 && !t.session.is_empty() {
+            // in the settle's own write, for a kill at any point after it: until the seller is seen to have its preimage
+            // (`ticket_deliver`, or the watcher and a takeover for a call that ended first), it is still to be shown
+            t.note = LATE_PREPAID.into();
         }
         // the prepaid ticket a session had to pay before it holds any: paid, with its preimage. In the same write,
         // after the ticket's row: a crash that keeps only the first leaves a session that buys one more prepaid
@@ -2056,6 +2061,24 @@ impl Signer {
         Ok(true)
     }
 
+    /// The session took over a seller session this wallet paid (`ticket_resume`): the seller has been
+    /// paid in that seller session, which is what its first prepaid ticket was to show, so the session
+    /// holds from now on. `Ok(false)`: it was not waiting for a prepaid ticket.
+    pub(crate) fn ticket_paid_first_met(&self, sid: &str) -> Result<bool> {
+        let _g = self.lock();
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let Some(mut s) = st.book.sessions.get(sid).cloned() else { return Ok(false) };
+        if !s.paid_first {
+            return Ok(false);
+        }
+        s.paid_first = false;
+        st.commit(&[s.row()])?;
+        self.ticket_audit("ticket_paid_first_met", json!({"session": sid, "dest": format!("ln:{}", s.payee),
+                                                          "why": "it took over a seller session this wallet paid"}));
+        Ok(true)
+    }
+
     pub(crate) fn ticket_hold(&self, sid: &str, secs: u64, why: &str) -> Result<f64> {
         let _g = self.lock();
         let now = self.engine.now();
@@ -2225,33 +2248,52 @@ impl Signer {
         st.commit(&rows)
     }
 
-    /// Write the seller's side of a session into the book: its id, its key and its endpoints. On
-    /// disk when this returns, and before any ticket of the session is paid, so that a wallet that
-    /// starts again can still ask the seller to cancel what it locked.
-    /// A stopped session with the seller `payee` whose seller side the seller may still hold a
-    /// balance in: the newest one stopped in the last [`RESUME_WITHIN_S`], other than `sid`, with its
-    /// seller side on record. Keyed on the seller's node, not its address: a shop reached under
+    /// The stopped seller sessions of the seller `payee` that may still hold a balance, newest first:
+    /// those stopped in the last [`RESUME_WITHIN_S`], other than `sid`, with their seller side on
+    /// record. Keyed on the seller's node, not its address: a shop reached under
     /// another name (an alias, or an address it moved from) is the same seller. The caller checks
     /// the rest against the seller's signed `status`, under the receipt key of its terms now. With it, what the wallet's own book says left the wallet in
     /// that seller session across every session of the wallet that used it (the seller's totals are
-    /// for its own session): the secrets released, and the tickets settled.
-    pub(crate) fn ticket_resumable(&self, payee: &str, sid: &str) -> Option<(ticket::SellerSession, u64)> {
+    /// for its own session): the secrets released, and the tickets settled. And what a takeover also
+    /// needs: whether the wallet's own node proved a payment in that seller session (a ticket settled
+    /// with its preimage: not the seller's word), and the tickets earlier sessions of this wallet may
+    /// still hold there (sending, locked, or retired at a start), by session, for the cancel before
+    /// the takeover.
+    /// One whose receipt key on record is another's is another shop on the same node, and is passed over.
+    pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, sid: &str) -> Vec<Resumable> {
         let now = self.engine.now();
-        let g = self.ticket_store().ok()?;
-        let st = g.as_ref()?;
-        let old = st.book.sessions.values()
-            .filter(|s| s.id != sid && s.payee == payee && s.state != SState::Open && now - s.stopped_ts.max(s.active_ts) < RESUME_WITHIN_S)
-            // never one stopped for what the seller did (a fault, terms that changed under it): nothing more is
-            // released to a seller in such a session, and its balance is not spent either
-            .filter(|s| s.http.is_some() && !s.why.contains(CREDIT_GIVEN_UP) && !s.why.starts_with("seller fault") && !s.why.contains("terms changed"))
-            .max_by(|a, b| a.stopped_ts.max(a.active_ts).total_cmp(&b.stopped_ts.max(b.active_ts)))?;
-        let mut http = old.http.clone()?;
-        // what the seller knows goes with its session, not with the wallet session that said it: any that used it
-        http.identified = st.book.sessions.values().any(|s| s.http.as_ref().is_some_and(|h| h.id == http.id && h.identified));
-        let using: Vec<&str> = st.book.sessions.values().filter(|s| s.http.as_ref().is_some_and(|h| h.id == http.id)).map(|s| s.id.as_str()).collect();
-        let sent = using.iter().flat_map(|id| st.book.of_session(id)).filter(|t| matches!(t.state, TState::Released | TState::Settled))
-            .fold(0u64, |a, t| a.saturating_add(t.msat));
-        Some((http, sent))
+        let Ok(g) = self.ticket_store() else { return vec![] };
+        let Some(st) = g.as_ref() else { return vec![] };
+        let recent = |s: &Session| s.stopped_ts.max(s.active_ts);
+        let mut stopped: Vec<&Session> = st.book.sessions.values()
+            .filter(|s| s.id != sid && s.payee == payee && s.http.is_some() && s.state != SState::Open && now - recent(s) < RESUME_WITHIN_S).collect();
+        stopped.sort_by(|a, b| recent(b).total_cmp(&recent(a)));
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out = vec![];
+        for s in stopped {
+            let Some(mut http) = s.http.clone() else { continue };
+            if !seen.insert(s.http.as_ref().map_or("", |h| h.id.as_str())) {
+                continue;
+            }
+            let group: Vec<&Session> = st.book.sessions.values().filter(|o| o.http.as_ref().is_some_and(|h| h.id == http.id)).collect();
+            let on_record = group.iter().filter_map(|o| o.http.as_ref()).map(|h| h.receipt_key.as_str()).find(|k| !k.is_empty()).unwrap_or("").to_string();
+            // another shop on the same node; one a session still has open; and one given up, or stopped for what the seller
+            // did (a fault, terms that changed under it): nothing more is released to a seller in such a session, and its
+            // balance is not spent either
+            if (!on_record.is_empty() && on_record != receipt_key)
+                || group.iter().any(|o| o.state == SState::Open || o.why.contains(CREDIT_GIVEN_UP) || o.why.starts_with("seller fault") || o.why.contains("terms changed")) {
+                continue;
+            }
+            http.receipt_key = on_record;
+            // what the seller knows goes with its session, not with the wallet session that said it: any that used it
+            http.identified = group.iter().any(|o| o.http.as_ref().is_some_and(|h| h.identified));
+            let tickets = || group.iter().flat_map(|o| st.book.of_session(&o.id));
+            let sent = tickets().filter(|t| matches!(t.state, TState::Released | TState::Settled)).fold(0u64, |a, t| a.saturating_add(t.msat));
+            let proven = tickets().any(|t| t.state == TState::Settled && t.note != SETTLED_UNPROVEN);
+            let held = group.iter().map(|o| (o.id.clone(), st.book.of_session(&o.id).into_iter().filter(|t| t.may_take_a_place(now)).map(|t| t.hash.clone()).collect())).collect();
+            out.push(Resumable { http, sent, proven, held, newest: s.id.clone() });
+        }
+        out
     }
 
     /// The stop of `sid` has begun ([`Signer::ticket_stopping`]): the book books nothing more for it.
@@ -2261,8 +2303,23 @@ impl Signer {
         self.ticket_stopping.lock().unwrap_or_else(|p| p.into_inner()).contains(sid)
     }
 
+    /// The first signed receipt of a session's seller side has proved the seller holds the key of
+    /// its terms: the key goes on record. `false`: the session has no seller side yet.
+    pub(crate) fn ticket_note_receipt_key(&self, sid: &str, receipt_key: &str) -> bool {
+        let Ok(mut g) = self.ticket_store() else { return false };
+        let Some(st) = g.as_mut() else { return false };
+        let Some(mut s) = st.book.sessions.get(sid).cloned() else { return false };
+        let Some(h) = s.http.as_mut() else { return false };
+        if h.receipt_key.is_empty() {
+            h.receipt_key = receipt_key.to_string();
+            // unchecked: a session whose key did not reach the disk is judged by a signed answer at its takeover all the same
+            let _ = st.commit(&[s.row()]);
+        }
+        true
+    }
+
     /// The caller gave up the credit `sid` left with its seller (`ticket_stop` with `forget_credit`):
-    /// no later session takes it over ([`Signer::ticket_resumable`]).
+    /// no later session takes it over ([`Signer::ticket_resumable_all`]).
     pub(crate) fn ticket_forget_credit(&self, sid: &str) -> Result<()> {
         let mut g = self.ticket_store()?;
         let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -2313,6 +2370,9 @@ impl Signer {
         Ok(n)
     }
 
+    /// Write the seller's side of a session into the book: its id, its key and its endpoints. On
+    /// disk when this returns, and before any ticket of the session is paid, so that a wallet that
+    /// starts again can still ask the seller to cancel what it locked.
     pub(crate) fn ticket_set_http(&self, sid: &str, http: ticket::SellerSession) -> Result<()> {
         let mut g = self.ticket_store()?;
         let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -2321,13 +2381,36 @@ impl Signer {
         st.commit(&[s.row()])
     }
 
+    /// Prepaid tickets settled whose preimage the seller is not yet known to have, as `(session,
+    /// hash, when it settled, its msat)`: of the sessions named, or of every session.
+    pub(crate) fn ticket_late_prepaid(&self, sessions: Option<&[String]>) -> Vec<(String, String, f64, u64)> {
+        let Ok(g) = self.ticket_store() else { return vec![] };
+        let Some(st) = g.as_ref() else { return vec![] };
+        st.book.tickets.values().filter(|t| t.note == LATE_PREPAID && sessions.is_none_or(|l| l.contains(&t.session)))
+            .map(|t| (t.session.clone(), t.hash.clone(), t.done_ts, t.msat)).collect()
+    }
+
+    /// What became of late prepaid tickets: the seller has their preimages (credited now or before),
+    /// or (`shown` false) it will not take them, and they are not presented again.
+    pub(crate) fn ticket_late_prepaid_done(&self, hashes: &[String], shown: bool) {
+        let Ok(mut g) = self.ticket_store() else { return };
+        let Some(st) = g.as_mut() else { return };
+        let rows: Vec<Value> = hashes.iter().filter_map(|h| st.book.tickets.get(h)).filter(|t| t.note == LATE_PREPAID).map(|t| {
+            let mut t = t.clone();
+            t.note = if shown { LATE_PREPAID_SHOWN } else { LATE_PREPAID_GIVEN_UP }.into();
+            t.row()
+        }).collect();
+        // unchecked: a note that was not written is presented again, and the seller answers that it has it
+        let _ = st.commit(&rows);
+    }
+
     /// Sessions that are stopping, have a seller side on record and still hold tickets that are
     /// not final: what a wallet that started again asks its sellers to cancel.
     pub(crate) fn ticket_stopping_with_seller(&self) -> Vec<Session> {
         let Ok(g) = self.ticket_store() else { return vec![] };
         let Some(st) = g.as_ref() else { return vec![] };
         st.book.sessions.values().filter(|s| s.state == SState::Stopping && s.http.is_some())
-            .filter(|s| st.book.of_session(&s.id).iter().any(|t| t.state.in_flight() && t.state != TState::Released)).cloned().collect()
+            .filter(|s| st.book.of_session(&s.id).iter().any(|t| t.may_be_held())).cloned().collect()
     }
 
     /// The tickets of a session by state, and what they have in the ledger: what a paid call and
@@ -2397,7 +2480,7 @@ impl Signer {
                 st.commit(&rows)?;
                 self.ticket_audit("ticket_stop", json!({"session": sid, "dest": format!("ln:{}", s.payee)}));
             }
-            let cancel: Vec<String> = st.book.of_session(&sid).into_iter().filter(|t| t.state.unreleased()).map(|t| t.hash.clone()).collect();
+            let cancel: Vec<String> = st.book.of_session(&sid).into_iter().filter(|t| t.may_take_a_place(now)).map(|t| t.hash.clone()).collect();
             Ok(with(json!({"verdict": "allow", "rail": "ticket", "cancel": cancel}), s.public()))
         })();
         out.unwrap_or_else(|e| refusal("ticket", e.msg))
@@ -2702,6 +2785,29 @@ const RESUME_WITHIN_S: f64 = 20.0 * 3600.0;
 
 /// What a session's `why` says once its caller gave up the credit it left with the seller.
 const CREDIT_GIVEN_UP: &str = "its credit with the seller given up by the caller";
+
+/// The note of a ticket the node shows settled with no preimage of its hash: nothing it proves.
+const SETTLED_UNPROVEN: &str = "settled without the preimage of its hash";
+/// The note of a settled prepaid ticket whose preimage the seller is not yet known to have; of one
+/// it has; and of one it will not take, or that was not taken while its credit could still be used.
+const LATE_PREPAID: &str = "settled: its preimage is still to be shown to the seller";
+const LATE_PREPAID_SHOWN: &str = "settled: its preimage shown to the seller";
+const LATE_PREPAID_GIVEN_UP: &str = "settled: the seller did not take its preimage";
+/// How long a late prepaid ticket goes on being presented: while its credit could be taken over.
+pub(crate) const LATE_PREPAID_WITHIN_S: f64 = RESUME_WITHIN_S;
+
+/// A seller session a new session may take over ([`Signer::ticket_resumable_all`]).
+pub(crate) struct Resumable {
+    pub(crate) http: ticket::SellerSession,
+    /// What the wallet's own book says left the wallet in it: secrets released, tickets settled.
+    pub(crate) sent: u64,
+    /// The wallet's own node settled a ticket of it with its preimage: a payment proved, not said.
+    pub(crate) proven: bool,
+    /// The tickets each earlier session of this wallet may still hold there, by session id.
+    pub(crate) held: Vec<(String, Vec<String>)>,
+    /// The last session of this wallet that used it, to name it by.
+    pub(crate) newest: String,
+}
 
 /// The most one ticket may book, its fee limit included, in sats: below `human_threshold_sats`,
 /// since no one can approve a release as it happens, and at most `max_per_tx_sats`.

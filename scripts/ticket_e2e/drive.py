@@ -46,6 +46,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import secrets
 import signal
 import socket
@@ -384,7 +385,8 @@ def quiet(secs: float = 120) -> float:
         # a buyer's node that was killed in the instant it sent a payment can go on calling that payment in flight with
         # nothing on its channel (docs/LIMITS.md): such a payment holds no money and no slot, and is not waited for
         on_channel = {base64.b64decode(h["hash_lock"]).hex() for c in lab.channels(BUYER) for h in c["pending_htlcs"]}
-        flying = {h for h, p in buyer_payments().items() if p["status"] == "IN_FLIGHT"}
+        # not final, whatever the node calls it (IN_FLIGHT, or INITIATED for one whose sender was killed as it sent)
+        flying = {h for h, p in buyer_payments().items() if p["status"] not in ("SUCCEEDED", "FAILED")}
         if on_channel or held():
             return False
         ORPHANS.update(flying)
@@ -411,15 +413,43 @@ def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
     book no longer lists one whose tickets are all final (closed), and its credit is taken over as
     an open one's is."""
     listed = status().get("sessions", [])
+    wallet_says: dict[str, str] = {}
     for s in listed:
         if s["state"] == "open":
-            note_receipts((who or agent()).tool("ticket_stop", {"session": s["session"]}).get("http") or {})
+            http = (who or agent()).tool("ticket_stop", {"session": s["session"]}).get("http") or {}
+            note_receipts(http)
+            if http.get("left_with_seller_msat") is not None:
+                wallet_says[s["session"]] = str(http["left_with_seller_msat"])
     if forget:
         for sid in [s["session"] for s in listed] + list(RECEIPTS):
             if sid not in FORGOTTEN:
-                signer("ticket_stop", {"session": sid, "forget_credit": True})
+                gave_up = signer("ticket_stop", {"session": sid, "forget_credit": True})
                 FORGOTTEN.add(sid)
+                # the seller's own count for that seller session: what a call that died before its receipt could not note
+                if gave_up.get("seller_released_msat") is not None:
+                    RECEIPTS[sid] = max(RECEIPTS.get(sid, 0), int(gave_up["seller_released_msat"]))
+                    SELLER_OF.setdefault(sid, str(gave_up.get("seller_session")))
+                # what the wallet's stop said it leaves (its signed receipts) and what the seller says it holds
+                if sid in wallet_says:
+                    CREDIT_TOLD.append({"session": sid, "wallet_msat": wallet_says[sid], "seller_msat": gave_up.get("left_with_seller_msat")})
     quiet()
+
+
+CREDIT_TOLD: list[dict[str, Any]] = []  # credit given up, as both sides count it
+
+
+def credit_told_alike() -> list[dict[str, Any]]:
+    """The credit given up since last asked where the wallet and the seller did not name one amount."""
+    told, CREDIT_TOLD[:] = list(CREDIT_TOLD), []
+    return [t for t in told if t["wallet_msat"] != t["seller_msat"]]
+
+
+def credit_left_or_taken_over(session: str, left_msat: str) -> dict[str, Any]:
+    """After a kill of the signer: what `session` left with its seller was logged, to the msat of the
+    last signed receipt, or a later session took that seller session over and uses it."""
+    logged = [e.get("left_msat") for e in events("ticket_left_with_seller", session)]
+    taken = [e for e in events("ticket_resumed") if e.get("seller_session") == SELLER_OF.get(session)]
+    return {"left_msat": left_msat, "logged": logged, "taken_over": len(taken), "ok": left_msat in logged or bool(taken)}
 
 
 def receipts_released() -> int:
@@ -429,6 +459,14 @@ def receipts_released() -> int:
         seller = SELLER_OF.get(wallet, wallet)
         by_seller[seller] = max(by_seller.get(seller, 0), msat)
     return sum(by_seller.values())
+
+
+def booked_for(hashes: set[str]) -> int:
+    """What the book holds booked, unsettled, for these payment hashes."""
+    if not hashes:
+        return 0
+    return sum(int(t.get("booked_sats") or 0) for s in status().get("sessions", []) for t in status(s["session"]).get("session_tickets", [])
+               if t.get("hash") in hashes and t.get("state") != "settled")
 
 
 def money() -> dict[str, Any]:
@@ -447,6 +485,8 @@ def money() -> dict[str, Any]:
         # booked as spent and not settled: after `quiet`, only tickets whose payment the buyer's node still calls in
         # flight with nothing on its channel (a node killed as it sent one). The wallet counts them until the node drops them
         "booked_for_payments_the_node_left_in_flight_sats": int(st.get("booked_sats") or 0),
+        # what the book holds booked for exactly those payments: `left` must be this, not merely "some orphan exists"
+        "booked_for_the_orphans_sats": booked_for(ORPHANS),
         "buyer_node_cost_sats": sum(cost_sats(p) for p in pays),
         "fees_msat": sum(int(p["fee_msat"]) for p in pays),
         "tickets": len(pays),
@@ -458,7 +498,46 @@ def agrees(m: dict[str, Any], receipts: bool = True) -> bool:
     if receipts:
         one.add(m["receipts_released_msat"])
     left = m["booked_for_payments_the_node_left_in_flight_sats"]
-    return len(one) == 1 and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"] + left and (left == 0 or bool(ORPHANS))
+    return len(one) == 1 and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"] + left and left == m["booked_for_the_orphans_sats"]
+
+
+def unsettled_bookings() -> list[dict[str, Any]]:
+    """Each ticket the book counts as spent and not settled, with what the buyer's node and the
+    seller's node say of it: for a check whose counts disagree, the line that says where."""
+    try:
+        return _unsettled_bookings()
+    except Exception as d:  # noqa: BLE001 (a check's own line must not be lost to its dump)
+        return [{"no_list": f"{type(d).__name__}: {d}"}]
+
+
+def _unsettled_bookings() -> list[dict[str, Any]]:
+    pays, invs = buyer_payments(), seller_invoices()
+    out = []
+    for s in status().get("sessions", []):
+        for t in status(s["session"]).get("session_tickets", []):
+            if int(t.get("booked_sats") or 0) > 0 and t.get("state") != "settled":
+                p, i = pays.get(t["hash"], {}), invs.get(t["hash"], {})
+                out.append({"hash": t["hash"][:16], "session": s["session"][:8], "session_state": s.get("state"), "state": t.get("state"),
+                            "booked_sats": t.get("booked_sats"), "released": t.get("released_ts"), "sent": t.get("sent_ts"), "cltv_until": t.get("cltv_until"),
+                            "final_expiry": t.get("final_expiry"), "prepaid": t.get("prepaid"), "note": t.get("note"),
+                            "buyer_node": p.get("status"), "htlcs": [h.get("status") for h in p.get("htlcs", [])], "seller_node": i.get("state")})
+    return out
+
+
+def never_sent_settled(inv: dict[str, Any], m: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], float]:
+    """After a kill of the signer: a ticket it was sending as it died (its write-ahead row written, its payment never
+    on the node) is booked until the book can show the node never had it, ln.timeout_s + 60 s after it was sent
+    (`ticket_reconcile_locked`). Where that booking is the only difference, it is waited for, and then the counts must be
+    exact. Returns the counts then, and the seconds waited (0: nothing to wait for)."""
+    if not m["booked_for_payments_the_node_left_in_flight_sats"] or ORPHANS or inv["not_in_ledger"] or not inv["same_tickets"]:
+        return inv, m, 0.0
+    t0 = time.monotonic()
+    try:
+        lab.wait("the bookings of tickets that never reached the node to go", 200,
+                 lambda: signer("watch_tick") is not None and money()["booked_for_payments_the_node_left_in_flight_sats"] == 0, every=5)
+    except LabError:
+        pass
+    return booked_and_once(), money(), round(time.monotonic() - t0, 1)
 
 
 def booked_and_once() -> dict[str, Any]:
@@ -1116,8 +1195,33 @@ def killed(victim: str, at: str) -> None:
     else:
         lab.dc("kill", victim)
         lab.forget_connections()
-        lab.dc("start", victim)
-        lab.wait(f"{victim} back and synced", 180, lambda: lab.synced(victim), every=0.2)
+        # `kill` returns before the container has stopped, and a `start` meanwhile does nothing: the node then stayed
+        # down, refusing connections until the wait below ran out (seen on this lab: "Exited (137)" three minutes after
+        # the start). So: stopped first, started, and running before anything is asked of it
+        state = lambda: lab.dc("ps", "-a", "--format", "{{.State}}", victim, check=False).strip()  # noqa: E731
+        lab.wait(f"{victim} stopped", 60, lambda: state() == "exited", every=0.2)
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for _ in range(3):
+            lab.dc("start", victim)
+            try:
+                lab.wait(f"{victim} running", 20, lambda: state() == "running", every=0.2)
+                break
+            except LabError:
+                continue
+        try:
+            lab.wait(f"{victim} back and synced", 180, lambda: lab.synced(victim), every=0.2)
+        except LabError as e:
+            # what the node said since it was started again, its container's state, and how loaded the machine was: a
+            # node starved of CPU on a busy lab host was slow to listen (seen on this lab at load 16 to 124 on 12 cores)
+            try:
+                # its warnings and errors only, every 64-hex value (a preimage, a hash) cut out
+                said = [re.sub(r"[0-9a-f]{64}", "<64hex>", ln) for ln in lab.dc("logs", "--no-color", "--since", started, victim, check=False).splitlines()
+                        if " [WRN] " in ln or " [ERR] " in ln or " [CRT] " in ln]
+                state = lab.dc("ps", "-a", "--format", "{{.Name}} {{.State}} {{.Status}}", victim, check=False)
+                note = f"; load {os.getloadavg()[0]:.1f}; container: {state}; {victim}'s warnings since its start ({len(said)}): {' | '.join(said[-12:])[:2500]}"
+            except Exception as d:  # noqa: BLE001 (the timeout is the error; what is added to it must not replace it)
+                note = f"; (no more said: {type(d).__name__}: {d})"
+            raise LabError(f"{e}{note}") from None
         peers = {BUYER: 1, SELLER: 1}[victim]
         lab.wait(f"{victim}'s channel active again", 180, partial(active, victim, peers), every=0.5)
         if victim == BUYER:
@@ -1165,13 +1269,38 @@ def kill() -> None:
         try:
             lab.wait("the pool locked and listed", 30, settled_down, every=0.1)
         except LabError as e:
+            try:
+                # where the pool did not come: the call, the session as the book has it, its tickets and its audit trail
+                sid = str(r.get("session"))
+                mine = status(sid).get("session_tickets", [])
+                hashes = {t["hash"] for t in mine}
+                trail = [{k: v for k, v in ev.items() if k not in ("dest",)} for ev in signer("history", {"limit": 5000})["events"]
+                         if ev.get("session") == sid or ev.get("payment_hash") in hashes]
+                diag = {"call": {k: r.get(k) for k in ("tickets_prepaid", "tickets_released", "rule", "ended", "session")},
+                        "session": session_of(r), "tickets": [{k: t.get(k) for k in ("hash", "state", "prepaid", "note")} for t in mine], "trail": trail[-25:]}
+                print(f"     the pool did not lock before the kill of {victim}: {json.dumps(diag)[:6000]}", flush=True)
+            except Exception as d:  # noqa: BLE001 (the wait's error is what counts; the dump must not replace it)
+                print(f"     (no dump of the session: {type(d).__name__}: {d})", flush=True)
             raise LabError(f"{e}; last seen: {json.dumps(saw)[:900]}") from e
         killed(victim, "a pool locked")
+        # the watcher's report comes before the next call here, so that it can be held to the last receipt to the msat
+        credit = None
+        if victim == "signer":
+            signer("watch_tick")
+            credit = credit_left_or_taken_over(str(r.get("session")), str(r.get("balance_msat")))
+            credit["ok"] = credit["left_msat"] in credit["logged"]
         resumed = next_call_pays(f"kill {victim} with a pool locked")
         stop_sessions()
-        inv, m = booked_and_once(), money()
+        inv, m, waited = never_sent_settled(booked_and_once(), money())
+        ok = not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m)
+        # the first call after the signer starts again is paid at once (it takes the credit over), not refused first
+        if victim == "signer":
+            ok = ok and resumed["said_first"] == []
+        differ = credit_told_alike()
+        ok = ok and (credit is None or credit["ok"]) and not differ
         check(f"kill: {victim}, with a pool locked: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
-              not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False), {"next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS)})
+              ok, {"next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS), "credit_left": credit, "credit_told_differently": differ,
+                   "never_sent_booking_waited_s": waited, **({} if ok else {"unsettled": unsettled_bookings()})})
         # in the middle of an answer that is being paid for
         other = Mcp()
         result: dict[str, Any] = {}
@@ -1190,6 +1319,7 @@ def kill() -> None:
         except LabError as e:
             t.join(30)
             raise LabError(f"{e} ({victim}): the call {json.dumps(brief(result))[:600]}; paying {json.dumps(status().get('paying'))[:600]}") from None
+        under_way = next((p for p in status().get("paying", []) if p.get("answer_open")), {})
         if victim == "mcp":
             other.kill()
         else:
@@ -1200,13 +1330,25 @@ def kill() -> None:
         if result.get("saved_to"):
             os.remove(result["saved_to"])
         resumed = next_call_pays(f"kill {victim} with an answer open")
+        # its credit was taken over by that call, or the watcher logged it (once the start's report has run): never forgotten unsaid
+        credit = None
+        if victim == "signer":
+            signer("watch_tick")
+            SELLER_OF.setdefault(str(under_way.get("session")), str(under_way.get("seller_session")))
+            RECEIPTS.setdefault(str(under_way.get("session")), 0)
+            credit = credit_left_or_taken_over(str(under_way.get("session")), "")
+            credit["ok"] = bool(credit["logged"]) or credit["taken_over"] > 0
         stop_sessions()
-        inv, m = booked_and_once(), money()
+        inv, m, waited = never_sent_settled(booked_and_once(), money())
         how = result.get("error") or result.get("ended") or ("complete" if result.get("complete") else brief(result))
+        ok = not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m)
+        differ = credit_told_alike()
+        ok = ok and (credit is None or credit["ok"]) and not differ
         check(f"kill: {victim}, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
-              not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+              ok,
               {"the_call_ended": str(how)[:160], "bytes": result.get("bytes"), "next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS),
-               "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": len(ORPHANS)})
+               "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": len(ORPHANS), "never_sent_booking_waited_s": waited, "credit_left": credit, "credit_told_differently": differ,
+               **({} if ok else {"unsettled": unsettled_bookings()})})
 
 
 def session_of(r: dict[str, Any]) -> dict[str, Any]:
