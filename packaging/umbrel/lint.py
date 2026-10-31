@@ -39,6 +39,7 @@ every string of the loaded file as well (a YAML escape or a block scalar's line 
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -205,6 +206,15 @@ class StrictLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
+def _refused_tag(loader, node):
+    # bytes, a set or pairs: lint's walk would not see a substitution compose still makes inside them
+    raise yaml.constructor.ConstructorError(None, None, f"{node.tag.replace('tag:yaml.org,2002:', '!!')} is not allowed", node.start_mark)
+
+
+for _tag in ("binary", "set", "omap", "pairs"):
+    StrictLoader.add_constructor(f"tag:yaml.org,2002:{_tag}", _refused_tag)
+
+
 def package_files(folder: str, here: Path, m: dict) -> None:
     """Only the app's own files, and no link: umbrelOS acts on more of the folder than the compose file."""
     allowed = APP_FILES | {Path(str(u)).name for u in [m.get("icon"), *(m.get("gallery") or [])] if u} | EXTRA_FILES.get(folder, set())
@@ -242,6 +252,12 @@ def substitutions(folder: str, text_nc: str) -> None:
         bad(f"{folder}: {mm.group(0)!r}: only ${{NAME}}, ${{NAME:-}} and a slot's ${{SLOT:-${{FALLBACK}}}} (no default, no other form)")
 
 
+def bind_of(v):
+    """A resolved mount's bind options: a mapping ({} when there are none), or what else is written there."""
+    b = v.get("bind")
+    return {} if b is None or b == [] else b
+
+
 def env_of(sv) -> dict:
     """A service's environment as a mapping, whichever form it is written in (an item with no = passes the
     host's value through: it maps to None)."""
@@ -261,8 +277,11 @@ def loaded_substitutions(folder: str, node, where: str = "") -> None:
     elif isinstance(node, list):
         for v in node:
             loaded_substitutions(folder, v, where)
-    elif isinstance(node, str) and "$" in SUBST.sub("", node):
-        bad(f"{folder}: {where or 'a key'}: {node[:80]!r}: only ${{NAME}}, ${{NAME:-}} and a slot's ${{SLOT:-${{FALLBACK}}}} (no default, no other form)")
+    elif isinstance(node, str):
+        if "$" in SUBST.sub("", node):
+            bad(f"{folder}: {where or 'a key'}: {node[:80]!r}: only ${{NAME}}, ${{NAME:-}} and a slot's ${{SLOT:-${{FALLBACK}}}} (no default, no other form)")
+    elif not isinstance(node, (int, float, bool, type(None), datetime.date)):
+        bad(f"{folder}: {where or 'a key'}: a {type(node).__name__} value (only text, numbers, booleans, null and dates)")
 
 
 def raw_shape(folder: str, c: dict, svcs: dict) -> None:
@@ -280,13 +299,12 @@ def raw_shape(folder: str, c: dict, svcs: dict) -> None:
         if svcs[n].get("command") not in (None, ["init"]) or svcs[n].get("volumes") != INIT_VOLUMES:
             bad(f"{folder}/{n}: xbt-init runs its own command (init) and mounts {INIT_VOLUMES} alone")
     if NODE_KEYS_BAKE in svcs:
-        env = env_of(svcs[NODE_KEYS_BAKE])
-        if any(v is None for v in env.values()):
-            bad(f"{folder}/{NODE_KEYS_BAKE}: its environment passes a variable through from the host's (an item with no value)")
-        env = {k: str(v) for k, v in env.items()}
+        env = {k: str(v) for k, v in env_of(svcs[NODE_KEYS_BAKE]).items()}
         if env != NODE_KEYS_BAKE_ENV:
             bad(f"{folder}/{NODE_KEYS_BAKE}: its environment is not exactly {NODE_KEYS_BAKE_ENV}")
     for name, sv in svcs.items():
+        if any(v is None for v in env_of(sv).values()):
+            bad(f"{folder}/{name}: its environment passes a variable through from the host's (an item with no value)")
         nm = sv.get("network_mode")
         if nm not in (None, "none") and nm != NETNS.get((folder, name)):
             bad(f"{folder}/{name}: network_mode {nm!r}: none, or the namespace pinned for it ({NETNS.get((folder, name))})")
@@ -335,15 +353,16 @@ def resolved_shape(folder: str, cfg: dict, svcs: dict, env: dict) -> None:
         img = str(sv.get("image", ""))
         if base_of(img) == "xbt-init":
             plain = ({}, {"create_host_path": True})
-            vols = [(v.get("type"), v.get("source"), v.get("target"), v.get("read_only") is True, (v.get("bind") or {}) in plain) for v in sv.get("volumes") or []]
+            vols = [(v.get("type"), v.get("source"), v.get("target"), v.get("read_only") is True, bind_of(v) in plain) for v in sv.get("volumes") or []]
             if name != "init" or sv.get("command") not in (None, ["init"]) or vols != [("bind", app + "/data", "/data", False, True)]:
                 bad(f"{folder}/{name}: resolved, xbt-init is the service init, its own command, the data dir alone")
         for v in sv.get("volumes") or []:
             src, tgt, ro = str(v.get("source") or ""), v.get("target"), v.get("read_only") is True
-            never = (v.get("bind") or {}).get("create_host_path") is False
+            b = bind_of(v)
+            never = isinstance(b, dict) and b.get("create_host_path") is False
             if v.get("type") != "bind":
                 bad(f"{folder}/{name}: resolved, a {v.get('type')} mount (bind mounts only): {v}")
-            elif set(v.get("bind") or {}) - {"create_host_path"}:
+            elif not isinstance(b, dict) or set(b) - {"create_host_path"}:
                 bad(f"{folder}/{name}: resolved, bind options {v.get('bind')} (none but create_host_path)")
             elif os.path.normpath(src) != src:
                 bad(f"{folder}/{name}: resolved, mount source {src!r} is not a plain path")

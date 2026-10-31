@@ -55,6 +55,7 @@ class NodeDataRule(unittest.TestCase):
 
     def says(self, out: str, why: str, says) -> None:
         """lint refused the store, and for the reason the case is about."""
+        self.assertNotIn("Traceback", out, f"{why}: lint crashed:\n{out[-1500:]}")
         fails = "\n".join(l for l in out.splitlines() if "FAIL" in l)
         self.assertTrue(fails, f"lint passed a store where {why}:\n{out[-1500:]}")
         for t in (says,) if isinstance(says, str) else says:
@@ -217,6 +218,11 @@ class NodeDataRule(unittest.TestCase):
             "a YAML escape for $ without braces": (lambda t: t.replace(ui_env, ui_env + '      PROBE: "\\u0024NOPE"\n', 1), {}, ("/services/ui/environment/PROBE", subst)),
             "a block scalar line that looks like a comment": (lambda t: t.replace(ui_env, ui_env + "      PROBE: |\n        # ${NOPE:-default}\n", 1), {},
                 ("/services/ui/environment/PROBE", subst)),
+            # bytes or a set: compose substitutes inside them, a walk of text values does not see them
+            "a !!binary value": (lambda t: t.replace(ui_env, ui_env + "      PROBE: !!binary JHtOT1BFOi1kZWZ9\n", 1), {}, "!!binary is not allowed"),
+            "a !!set value": (lambda t: t.replace(ui_env, ui_env + '      PROBE: !!set {"${NOPE:-x}": null}\n', 1), {}, "!!set is not allowed"),
+            "a variable passed through to another service": (lambda t: t.replace(ui_env, ui_env + "      LD_PRELOAD:\n", 1), {},
+                "ui: its environment passes a variable through from the host's"),
             # F1: exports.sh as bash reads it
             "a vertical tab in exports.sh": (lambda t: t, {"exports.sh": ("append_bytes", b'export APP_LIGHTNING_STREAM_APP_PROBE="x"\x0b# ; echo PWNED\n')},
                 "exports.sh holds bytes other than printable ASCII and newline (0x0b)"),
