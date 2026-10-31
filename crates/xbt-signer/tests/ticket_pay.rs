@@ -9029,18 +9029,19 @@ fn a_prepaid_ticket_the_node_found_no_route_for_is_sent_once_more_and_paid_once(
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "{v}");
 }
 
-/// The clock moves `secs` at each of the node's next looks named, with every invoice of the seller's
-/// open then lapsing: a win's invoice runs out while the win waits its turn at the wallet's gate.
-fn lapse_at(r: &Rig, looks: &[usize], secs: u64) {
-    let base = r.ln.st.lock().unwrap().looks;
-    let looks: Vec<usize> = looks.iter().map(|n| base + n).collect();
+/// At the node's next `times` looks at its channels with an invoice of the seller's open (the
+/// wallet is about to pay a win) the clock moves `secs`, and those invoices lapse with the seller:
+/// a win's invoice runs out while the win waits its turn at the wallet's gate.
+fn lapse_at_wins(r: &Rig, times: usize, secs: u64) {
+    let left = AtomicUsize::new(times);
     let (clock, node, standin) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone());
-    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |look| {
-        if looks.contains(&look) {
+    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
+        if !open.is_empty() && left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
             clock.fetch_add(secs, Ordering::SeqCst);
-            let open: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
             for h in &open {
-                standin.expire_unpaid(&hex::decode(h).unwrap().try_into().unwrap());
+                standin.expire_unpaid(h);
             }
         }
     }));
@@ -9082,7 +9083,7 @@ fn assert_each_win_paid_once(r: &Rig, sid: &str, wins: u64) {
 fn a_win_whose_invoice_lapsed_in_the_wallets_queue_is_paid_by_the_sellers_next_invoice() {
     let _g = env_lock();
     let r = draws_rig(json!({}));
-    lapse_at(&r, &[1], 31);
+    lapse_at_wins(&r, 1, 31);
     let size = 256 * PIECE;
     let v = r.pay(&format!("/pieces/{size}"), 1_000);
     assert_paid_after_lapses(&r, &v, size, 1);
@@ -9096,7 +9097,7 @@ fn invoices_that_lapsed_in_the_wallets_queue_are_no_fault_of_the_sellers() {
     let _g = env_lock();
     let r = draws_rig(json!({}));
     // 2 s short of the end of an invoice of 30 s: inside the 5 s a prepaid invoice must have left, `ticket_expiry`
-    lapse_at(&r, &[1, 2, 3, 4], 28);
+    lapse_at_wins(&r, 3, 28);
     let size = 256 * PIECE;
     let v = r.pay(&format!("/pieces/{size}"), 1_000);
     assert_paid_after_lapses(&r, &v, size, 3);
