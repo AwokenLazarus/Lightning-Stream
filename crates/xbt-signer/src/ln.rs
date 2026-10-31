@@ -802,12 +802,14 @@ pub fn channel_refusal(c: &Value, split_height: i64) -> Option<String> {
     None
 }
 
-/// Every channel with its verdict: `(usable ids, report)`.
-/// How long a payment of the ticket rail waits for an inactive channel ([`Signer::ln_channels_back`]):
-/// less than the 10 s a seller's answer stands still for a win, with room left to pay it.
-pub(crate) const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
-pub(crate) const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
+/// How long the ticket rail's checks wait for an inactive channel ([`Signer::ln_channels_back`]): less
+/// than the 10 s a seller's answer stands still for a win, with room left to pay it.
+const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
+const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
+/// Longer than the wait's polls, and than the moment between one refused payment and the next behind it.
+const CHANNEL_OUT_FORGOTTEN: Duration = Duration::from_secs(1);
 
+/// Every channel with its verdict: `(usable ids, report)`.
 pub fn usable_channels(chans: &[Value], split_height: i64) -> (Vec<String>, Vec<Value>) {
     let mut ok = vec![];
     let report = chans.iter().map(|c| {
@@ -1548,23 +1550,25 @@ impl Signer {
         self.ln_routes_of(ln, pol, dest, hash, every, chans)
     }
 
-    /// [`Self::ln_route_checks`] for a payment of the ticket rail, whose seller is waiting and whose
-    /// answer ends if it is refused: a channel out for a moment is waited for
-    /// ([`Self::ln_channels_back`]). The caller holds no lock.
-    pub(crate) fn ln_route_checks_waiting(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool) -> std::result::Result<LnRoutes, Value> {
-        let chans = ln.channels().and_then(|c| self.ln_channels_back(ln, pol.split(&self.chain), c))
+    /// [`Self::ln_route_checks`] for a payment of the ticket rail's session `sid`, whose seller is
+    /// waiting and whose answer ends if it is refused: a channel out for a moment is waited for
+    /// ([`Self::ln_channels_back`]), unless the session is being stopped. The caller holds no lock.
+    pub(crate) fn ln_route_checks_waiting(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool, sid: &str) -> std::result::Result<LnRoutes, Value> {
+        let stopped = || self.ticket_is_stopping(sid) || self.ticket_session(sid).is_some_and(|s| s.state != crate::ticket::SState::Open);
+        let chans = ln.channels().and_then(|c| self.ln_channels_back(ln, pol.split(&self.chain), c, &stopped))
             .map_err(|e| node_said(self.ln_refuse("ln_backend", &e.msg, dest, hash), &e))?;
         self.ln_routes_of(ln, pol, dest, hash, every, chans)
     }
 
     /// The node's channels, once one that could pay is active again. A channel goes inactive for a
-    /// moment whenever its peer's connection drops, and comes back by itself; a payment refused in
-    /// that moment ended a paid answer that a few seconds would have saved. So where every channel
-    /// that could pay is only inactive, they are read again for at most [`CHANNEL_BACK_WAIT`], which
-    /// is less than a seller stands still for a win. That time is counted from when the wallet first
-    /// saw them out, for all its payments together: 100 wins queued behind a channel that stays down
-    /// do not wait in turn. The channels as they stand are returned, and the checks judge them.
-    pub(crate) fn ln_channels_back(&self, ln: &dyn LnBackend, split: i64, mut chans: Vec<Value>) -> Result<Vec<Value>> {
+    /// moment whenever its peer's connection is replaced or drops, and comes back by itself; a payment
+    /// refused in that moment ended a paid answer that a moment would have saved. So where every channel
+    /// that could pay is only inactive, they are read again until [`CHANNEL_BACK_WAIT`] has gone by since
+    /// the wallet first saw them out, for all its payments together: 100 wins queued behind a channel that
+    /// stays down do not wait in turn. An outage nobody has looked at for [`CHANNEL_OUT_FORGOTTEN`] is
+    /// over as far as this goes, and the next one has its own wait. `stopped` ends the wait at once. The
+    /// channels as they stand are returned, and the checks judge them.
+    fn ln_channels_back(&self, ln: &dyn LnBackend, split: i64, mut chans: Vec<Value>, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>> {
         loop {
             let now = Instant::now();
             let up = !usable_channels(&chans, split).0.is_empty();
@@ -1574,12 +1578,11 @@ impl Signer {
                 *out = None;
                 return Ok(chans);
             }
-            // out since an earlier look, unless nothing has looked for so long that they may have been back since
-            let since = out.filter(|(_, seen)| now.duration_since(*seen) <= CHANNEL_BACK_WAIT).map_or(now, |(since, _)| since);
+            let since = out.filter(|(_, seen)| now.duration_since(*seen) <= CHANNEL_OUT_FORGOTTEN).map_or(now, |(since, _)| since);
             *out = Some((since, now));
             drop(out);
             let left = CHANNEL_BACK_WAIT.saturating_sub(now.duration_since(since));
-            if left.is_zero() {
+            if left.is_zero() || stopped() {
                 return Ok(chans);
             }
             std::thread::sleep(CHANNEL_BACK_POLL.min(left));

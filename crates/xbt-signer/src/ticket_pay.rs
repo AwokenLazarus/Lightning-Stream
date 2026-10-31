@@ -2929,7 +2929,7 @@ impl Signer {
 
     fn ticket_fill_once(&self, hs: &HttpSession) -> std::result::Result<usize, Value> {
         // the wallet's own node first: no hash goes to a seller that the node could not then pay for
-        self.ticket_can_lock(&hs.terms.terms.payee)?;
+        self.ticket_can_lock(&hs.terms.terms.payee, &hs.sid)?;
         self.ticket_cancel_dead(hs);
         let offer = {
             let _g = self.lock();
@@ -3289,7 +3289,7 @@ impl Signer {
         spent.room(size.map(|(_, face, booked)| (face, booked)), true)?;
         let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
-        self.ticket_can_lock(&hs.terms.terms.payee)?;
+        self.ticket_can_lock(&hs.terms.terms.payee, &hs.sid)?;
         if let Some(d) = at_fault() {
             return Err(d);
         }

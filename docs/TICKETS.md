@@ -1109,13 +1109,16 @@ before the node is asked (so that a win paid across a restart is seen paid), mak
 for a win at a time, and makes another only
 when the node shows the first cancelled (it lapsed unpaid).
 
-A payment that fails (no route, a fee limit) is not a spent one. The wallet sends that invoice
-again only where its node found no route and nothing of the payment ever left the node, which is
-what a channel out for a moment does, and only once, when a channel is back (an inactive channel
-is waited for, at most 8 s from when the wallet first saw it out, before any payment of the rail).
-Otherwise the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed. An invoice that lapsed while its win waited its turn at
-the wallet's gate is treated the same way, and does not count against the seller. A win's invoice lives as long as the seller's grace
+A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
+invoice again: the win stays owed until the seller sends another invoice for it, which the
+gateway does when the first has lapsed. Before any payment of the rail the wallet waits for an
+inactive channel, at most 8 s from when it first saw it out. A win whose invoice would end before
+the payment could arrive (by twice the longest of the latest payments' time on the way, at least 5 s
+and at most half its life) is not sent, and one that ran out while the win waited at the gate does
+not count against the seller, up to 4 for a win and 32 for a session; past that the session ends
+(`lottery_invoices_lapse`). One that came with less than 5 s left counts as a bad invoice. The
+win's next invoice goes before the wins no seller waits for, and a call waits for it where it is due
+within 10 s, or within what the wallet's margin holds back and 5 s more. A win's invoice lives as long as the seller's grace
 (`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`

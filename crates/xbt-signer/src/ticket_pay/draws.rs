@@ -54,6 +54,9 @@ const STOP_WAIT: Duration = Duration::from_secs(15);
 /// invoice within 5 s of its end. An invoice with longer to live than this is not waited for.
 const OWED_WAIT: Duration = Duration::from_secs(10);
 const OWED_POLL: Duration = Duration::from_millis(250);
+/// How many of a win's invoices, and of a session's, may run out in the wallet's queue before it stops asking.
+const LAPSES_PER_WIN: u32 = 4;
+const LAPSES_PER_SESSION: u32 = 32;
 
 fn refused(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "lottery", "charged_sats": 0}))
@@ -127,6 +130,12 @@ struct State {
     paid_sats: i64,
     /// Invoices of this seller's that the wallet's checks refused (another payee, another amount, no bit 512).
     bad_invoices: u32,
+    /// Invoices that came with less time left than any prepaid invoice must have: no queue of the wallet's
+    /// had a part in that, and each counts against the seller.
+    dead_on_arrival: HashSet<[u8; 16]>,
+    /// How many of a win's invoices, and of the session's, ran out in the wallet's queue.
+    lapses: HashMap<u64, u32>,
+    lapsed: u32,
     /// Wins whose invoice ran out or whose payment failed: their next invoice goes before the wins no seller
     /// waits for. Behind them it can run out too: on an 8 GB lab, a win lapsed twice waiting behind wins of 100 sellers.
     again: HashSet<u64>,
@@ -589,6 +598,9 @@ impl Signer {
                 Some((d, inv)) => {
                     s.handed.insert(*d, (w.clone(), false));
                     s.tried.insert(invoice_mark(inv));
+                    if crate::bolt11::decode(inv).is_ok_and(|i| (i.expires_at() as f64) - self.engine.now() < crate::ticket::PREPAID_EXPIRY_MARGIN_S) {
+                        s.dead_on_arrival.insert(invoice_mark(inv));
+                    }
                     wins.push((w, Some(inv.clone())));
                 }
                 // no invoice yet: the win stays owed, and the seller's next answer may bring one
@@ -677,12 +689,24 @@ impl Signer {
                 // not paid. An invoice the checks refused, or a payment that failed, leaves the win open for the seller's
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
                 // an invoice that lapsed while its win waited its turn at the wallet's gate is no fault of the seller's, and
-                // no bound of the owner's: the seller's next invoice pays the same win. (A seller's invoice that
-                // never had the time to be paid is still its own doing.)
-                let lapsed = matches!(rule.as_str(), "ln_expired" | "ticket_expiry") && crate::bolt11::decode(invoice).is_ok_and(|i| {
-                    let (life, left) = (i.expires_at() as f64 - i.timestamp as f64, i.expires_at() as f64 - self.engine.now());
-                    life > crate::ticket::PREPAID_EXPIRY_MARGIN_S && left < self.ticket_pace.send_margin(life)
-                });
+                // no bound of the owner's: the seller's next invoice pays the same win. (One that came nearly dead
+                // is still the seller's doing, and an "invoice too long" is not one that ran out.)
+                let lapsed = !s.dead_on_arrival.contains(&invoice_mark(invoice)) && matches!(rule.as_str(), "ln_expired" | "ticket_expiry")
+                    && crate::bolt11::decode(invoice).is_ok_and(|i| {
+                        let (life, left) = (i.expires_at() as f64 - i.timestamp as f64, i.expires_at() as f64 - self.engine.now());
+                        left < self.ticket_pace.send_margin(life)
+                    });
+                if lapsed {
+                    s.lapsed += 1;
+                    let this_win = s.lapses.entry(win.draw()).or_default();
+                    *this_win += 1;
+                    if *this_win > LAPSES_PER_WIN || s.lapsed > LAPSES_PER_SESSION {
+                        let why = format!("{} of this seller's invoices ran out before their wins could be paid", s.lapsed);
+                        s.fault.get_or_insert(why);
+                        c.stop.get_or_insert("lottery_invoices_lapse: the seller's invoices for wins keep running out before they can be paid".into());
+                        c.halt = true;
+                    }
+                }
                 let retry = rule == "ln_expired" || rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
                     | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
                 // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
