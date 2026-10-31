@@ -18,6 +18,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop reached only by its key can list web apps and Files from the Sell page.
 - The AI address and agents can pay shops reached by key.
 - The AI page shows prices for shops reached by key.
+- After a restart, the AI address finds sellers' models within seconds, instead of answering
+  "model not found" for about five minutes.
 - A shop saved before its first service is now published on Nostr, so buyers can find it.
 - A web app such as Jellyfin works through a relay over a slow path (a VPN, a far-away buyer); the
   wallet keeps a buyer signed in and re-asks a price only when needed.
