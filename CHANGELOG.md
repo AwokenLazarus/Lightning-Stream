@@ -49,12 +49,16 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
-- A slow wallet no longer stops its session with a seller and marks the seller at fault when the
-  seller times out waiting for the wallet's request. It sends the request again.
-- A file no longer gets cut because the wallet's disk is slow while it pays many sellers. With 100 ms
-  added to each of the wallet's disk writes and 20 other sellers' wins queued, the win a seller was
-  waiting for was paid after 22 to 28 others and its file was cut, in 3 of 3 runs. It is now paid after
-  1 to 3 others, and the file arrives whole in 3 of 3.
+- A slow wallet no longer blames a seller whose web server timed out waiting for the wallet's request
+  (HTTP 408). Nothing was served or charged: the wallet sends the same request once more, and if it
+  times out again, that call alone is refused and the session goes on.
+- A file no longer gets cut because the wallet's disk is slow while it pays many sellers. With 50 or
+  100 ms added to each of the wallet's disk writes and 20 other sellers' wins queued, the win a seller
+  was waiting for was paid after 19 to 30 others, and its file was cut in 9 of 12 runs. It is now paid
+  after 1 to 8 others, and the file arrives whole in 12 of 12.
+- After the wallet's Lightning node restarts in the middle of a download, a win it could not pay at
+  that moment is paid on the next call. The seller used to refuse that call and every later one for
+  as long as the session lasted.
 - A small payment works from no credit at a shop: the wallet buys a ticket sized to what the call may
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
