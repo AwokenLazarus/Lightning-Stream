@@ -27,6 +27,8 @@ funding proof), lf2->lf3 of 5,000,000 sat. A ticket is 1,000 sat for 40 blocks; 
   latency   a paid request against an unpaid one, both through the wallet
   stream    a 100 MB file whole, stopped half way by max_sats, stopped by the agent; the cancel; the
             four counts of money
+  money     Files and a web app's shape over a realistic amount: usage times the listed price, on both
+            sides (seller's receipts, wallet's account, both nodes, the book)
   liar      seven lies, each at most one ticket and booked exactly
   kill      five things killed at two points of a session each
   slots     the 30-slot channel: with half of the buyer's channel taken by others the wallet holds
@@ -93,6 +95,7 @@ LONG_LIMIT_S, LONG_READ_BPS = 2, 40_000_000
 #: What a check sets in the wallet's `tickets` policy over the lab's own, for as long as it runs
 TICKET_OVERRIDES: dict[str, Any] = {}
 REQUEST_MSAT = 2_500
+APP_REQUEST_MSAT, APP_BYTE_MSAT = 2_500, 20_000  # the money check's web app: 2.5 sat a request, 20 sat a MiB
 SOCK = f"{RUN}/signer.sock"
 WALLET = f"{RUN}/wallet"
 PAGE = "a small page\n" * 20
@@ -586,6 +589,8 @@ def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | Non
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
             {"path": "/huge.bin", "price": {"byte_msat": HUGE_BYTE_MSAT, "per_bytes": PER_BYTES}},
+            # a web app's shape (the money check): a price per request and per byte
+            {"path": "/app/", "price": {"request_msat": APP_REQUEST_MSAT, "byte_msat": APP_BYTE_MSAT, "per_bytes": PER_BYTES}},
             {"path": "/small.txt", "price": {"request_msat": page_msat or REQUEST_MSAT}},
             {"path": "/free/", "free": True},
         ],
@@ -1788,6 +1793,94 @@ def offers() -> None:
 # --- a shop reached by key, over its iroh link (docs/DIRECT-LINKS.md) --------------------------------
 
 
+# --- money: what the seller charged and what the buyer paid, against usage times the listed price ----------
+
+
+def price_of(n: int, byte_msat: int, per_bytes: int = PER_BYTES) -> int:
+    """The listed price of n bytes, rounded up over the whole count, as the docs (TICKETS.md) state it."""
+    return -(-n * byte_msat // per_bytes)
+
+
+def stop_and_count(sid: str, m0: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The agent stops session `sid`; then, once nothing is locked, what the stop said and the four counts
+    of money since `m0` (this check's own payments only)."""
+    stop = agent().tool("ticket_stop", {"session": sid})
+    note_receipts(stop.get("http") or {})
+    signer("ticket_stop", {"session": sid, "forget_credit": True})
+    quiet()
+    m1 = money()
+    return stop, {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+
+
+def paid_for_usage(name: str, what: str, usage_msat: int, seller_msat: int, stop: dict[str, Any], m: dict[str, Any], slack_msat: int, most_left: int,
+                   saw: dict[str, Any]) -> None:
+    """The money of one service over a realistic amount, on both sides: the seller's own count (signed or
+    on its book) and the wallet's account each within `slack_msat` of usage times the listed price; the
+    buyer's node, the seller's node and the wallet's book one number; every msat the buyer paid either
+    spent or told as left with the seller, and that under `most_left`."""
+    acct = (stop.get("http") or {}).get("account") or {}
+    spent = int(acct.get("spent_msat") or -1)
+    left = int((stop.get("http") or {}).get("left_with_seller_msat") or -1)
+    paid = m["buyer_node_paid_msat"]
+    one = paid == m["seller_node_received_msat"] == m["wallet_book_settled_msat"]
+    ok = (abs(seller_msat - usage_msat) <= slack_msat and abs(spent - usage_msat) <= slack_msat and one and paid == spent + left and 0 <= left < most_left
+          and agrees(m, receipts=False))
+    check(f"{name}: {what}", ok, {"usage_msat": usage_msat, "seller_charged_msat": seller_msat, "wallet_spent_msat": spent, "slack_msat": slack_msat,
+                                  "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
+                                  "wallet_book_settled_msat": m["wallet_book_settled_msat"], "left_with_seller_msat": left, "most_left_msat": most_left,
+                                  "tickets": m["tickets"], **saw})
+    measured(f"{name}_usage_msat", usage_msat)
+
+
+def money_check() -> None:
+    """Every paid service the lab's own gateway sells, over a realistic amount, checked as usage times the
+    listed price on both sides. Files: the 100 MB file whole, priced per byte. A web app's shape: 240
+    requests in one session to a route priced per request and per byte, 200 pages and 40 media segments
+    of 1 to 2.5 MiB (about 70 MiB). Each reply's price is its own bytes' and request's; the seller's
+    signed receipts, the wallet's account and both nodes agree with the sum to the msat: the price of a
+    known body is fixed, so there is no slack. (AI by the token and hashrate slices have no service in
+    this lab: their money over many requests and slices is checked in process, in xbt-signer's
+    tests/ticket_pay.rs and xbt-hashlink's tests/rental.rs. The VPN tunnel's is the vpn check's.)"""
+    # Files: the file whole
+    stop_sessions()
+    m0 = money()
+    r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
+    if r.get("saved_to"):
+        os.remove(r["saved_to"])
+    usage = price_of(BIG, BYTE_MSAT)
+    seller = int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or -1)
+    stop, m = stop_and_count(str(r.get("session")), m0)
+    paid_for_usage("money", f"Files: a 100 MB file priced per byte is charged its bytes at the listed price ({usage:,} msat) by the seller's signed receipt and in the wallet's account, "
+                   "to the msat; both nodes and the wallet's book agree, and what was paid is what was spent and what is left with the seller",
+                   usage, seller, stop, m, 0, 2 * TICKET_MSAT, {"bytes": r.get("bytes"), "complete": r.get("complete"), "price_msat": r.get("price_msat")})
+    # a web app: pages and segments
+    stop_sessions()
+    rng = __import__("random").Random(20261031)
+    os.makedirs(f"{RUN}/www/app", exist_ok=True)
+    sizes = [rng.randint(1 << 20, 5 << 19) if i % 6 == 5 else rng.randint(200, 40_000) for i in range(240)]
+    for i, n in enumerate(sizes):
+        with open(f"{RUN}/www/app/{i}.bin", "wb") as f:
+            f.write(os.urandom(n))
+    m0 = money()
+    usage, seller, sid, wrong, bytes_ = 0, 0, "", [], 0
+    for i, n in enumerate(sizes):
+        r = pay(f"{ORIGIN}/app/{i}.bin")
+        if r.get("saved_to"):
+            os.remove(r["saved_to"])
+        want = APP_REQUEST_MSAT + price_of(n, APP_BYTE_MSAT)
+        usage += want
+        bytes_ += n
+        if not call_paid(r) or r.get("price_msat") != str(want) or (sid and r.get("session") != sid):
+            wrong.append({"i": i, "size": n, "want_msat": want, **brief(r)})
+        sid = sid or str(r.get("session"))
+        seller = max(seller, int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or 0))
+    stop, m = stop_and_count(sid, m0)
+    ok_each = not wrong
+    paid_for_usage("money", f"web app: 240 requests in one session (200 pages, 40 segments, {bytes_ / 2**20:.1f} MiB) to a route priced per request and per byte: each reply "
+                   "is charged its own request and bytes, and the seller's signed receipts and the wallet's account come to the sum to the msat; both nodes and the book agree",
+                   usage if ok_each else -1, seller, stop, m, 0, TICKET_MSAT, {"bytes": bytes_, "replies_priced_otherwise": wrong[:3]})
+
+
 # the link keys a gateway serves on by default (xbt-gateway's link.endpoints), each named in its document;
 # TICKET_E2E_LINK_KEYS sets another number for the link and jellyfin_link/_relay checks, to compare
 LINK_KEYS = int(os.environ.get("TICKET_E2E_LINK_KEYS", "4"))
@@ -2274,9 +2367,117 @@ def vpn() -> None:
           whole and faults == 0 and len(paid) > 0 and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
           {"fetch": out, "file": url, "seconds": round(took, 1), "mbit_s": mbit, "interim_faults": faults, "exit": {k: exit_status.get(k) for k in ("offered", "paid", "down_bytes", "up_bytes")},
            "tickets": len(paid), **inv, "money": m})
+    vpn_money(origin, vdir, VPN_SAT_GB)
+    # the same at 1,000 sat a GiB, where ~57 MiB cost under one ticket: no ticket is released while the
+    # tunnel runs, so nothing but the stop's own count tells what the tunnel drew (the shortfall's regime)
+    with open(f"{RUN}/gateway-vpn.json") as f:
+        cfg = json.load(f)
+    for route in cfg["routes"]:
+        if route["path"] == "/vpn/":
+            route["price"]["byte_msat"] = VPN_CHEAP_SAT_GB * 1000
+    with open(f"{RUN}/gateway-vpn.json", "w") as f:
+        json.dump(cfg, f, indent=1)
+    PROCS["gateway-vpn"].terminate()
+    PROCS["gateway-vpn"].wait(10)
+    start_gateway("gateway-vpn", gw_port)
+    vpn_money(origin, vdir, VPN_CHEAP_SAT_GB)
     for name in ("gateway-vpn", "vpn"):
         PROCS[name].terminate()
         PROCS[name].wait(10)
+
+
+VPN_BIG_FILES = ["http://speed.cloudflare.com/__down?bytes=104857600", "http://ipv4.download.thinkbroadband.com/100MB.zip"]
+#: The tunnel is stopped once this much has come down through it (the exit's own count).
+VPN_STOP_AT_BYTES = 57 << 20
+VPN_CHEAP_SAT_GB = 1_000
+
+
+def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
+    """A VPN tunnel's money over a realistic amount, stopped as a VPN that is turned off stops it: a 100 MiB
+    public download through a tunnel paid at `sat_gb` sat a GiB, and the agent stops the session while the
+    tunnel is still open, once about 57 MiB have come down (by the exit's count). What the seller charged (its gateway's book) and what the wallet says the
+    session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
+    the stop says is left with the seller; both nodes and the book agree. Usage is the bytes the buyer took
+    out of the tunnel (B): the seller charges for at least those, and for at most B plus 3% and 4 MiB (the
+    tunnel's own framing and requests, and bytes on their way when the stop came). The wallet's account is
+    held to the seller's book within the price of 64 KiB (two 16 KiB chunks each way, paid and not yet
+    counted). The shortfall this pins: the stop counted only the tunnel's opening, so the wallet said every
+    msat the tunnel drew was left with the seller (fixed in 9cc54ac9). It showed only while the tunnel's
+    charge stayed under a ticket, so no ticket released mid-stream refreshed the wallet's count: the
+    cheap run (1,000 sat a GiB) is that regime."""
+    stop_sessions()
+    gw_port = int(origin.rsplit(":", 1)[1])
+    book0 = int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1))
+
+    def exit_down() -> int:
+        try:
+            with open(f"{vdir}/exit-status.json") as f:
+                return int(json.load(f).get("down_bytes") or 0)
+        except (OSError, ValueError):
+            return 0
+
+    down0 = exit_down()
+    m0 = money()
+    out: dict[str, Any] = {}
+    url = VPN_BIG_FILES[0]
+
+    def fetch() -> None:
+        for u in VPN_BIG_FILES:
+            r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", u, "--once", "--secs", "300"],
+                               env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="39000"),
+                               capture_output=True, text=True, timeout=400)
+            line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+            out.clear()
+            out.update(json.loads(line) if line else {"stderr": r.stderr[-800:]})
+            out["url"] = u
+            if int(out.get("bytes") or 0) >= 50 << 20:
+                return
+
+    t = threading.Thread(target=fetch)
+    t.start()
+
+    def drawn() -> bool:
+        return exit_down() - down0 >= VPN_STOP_AT_BYTES and any(p.get("origin") == origin and p.get("answer_open") for p in status().get("paying", []))
+
+    try:
+        lab.wait("the tunnel to carry about 57 MiB", 300, drawn, every=0.5)
+    except LabError as e:
+        t.join(400)
+        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}")
+        return
+    sid = next(p["session"] for p in status().get("paying", []) if p.get("origin") == origin)
+    stop = agent().tool("ticket_stop", {"session": sid})
+    # the seller's book at once: the stop ended the tunnel and took its last receipt (a session the
+    # seller holds nothing of leaves its book in time, and its charge with it)
+    book = int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1))
+    note_receipts(stop.get("http") or {})
+    t.join(400)
+    url = out.get("url", url)
+    signer("ticket_stop", {"session": sid, "forget_credit": True})
+    quiet()
+    m1 = money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    took = int(out.get("bytes") or 0)
+    byte_msat = sat_gb * 1000
+    low, high = price_of(took, byte_msat, 1 << 30), price_of(took * 103 // 100 + (4 << 20), byte_msat, 1 << 30)
+    seller = book - book0 if book0 >= 0 and book >= 0 else -1
+    acct = (stop.get("http") or {}).get("account") or {}
+    spent = int(acct.get("spent_msat") or -1)
+    left = int((stop.get("http") or {}).get("left_with_seller_msat") or -1)
+    paid = m["buyer_node_paid_msat"]
+    one = paid == m["seller_node_received_msat"] == m["wallet_book_settled_msat"]
+    # (at least 1 msat: the two may round the same bytes' price apart by one)
+    near = abs(spent - seller) <= max(1, price_of(64 << 10, byte_msat, 1 << 30))
+    exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
+    ok = (took >= 50 << 20 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 3 * TICKET_MSAT and agrees(m, receipts=False))
+    measured(f"vpn_money_{sat_gb}_mib", round(took / 2**20, 1))
+    check(f"vpn: a tunnel stopped while open, after 50 MiB or more: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 3% and 4 MiB above for "
+          "framing and bytes on their way, never below), the wallet's account says the same within 64 KiB's price, what was paid is what was spent and what is left with the "
+          "seller, and both nodes and the book agree",
+          ok, {"bytes_through": took, "file": url, "usage_low_msat": low, "usage_high_msat": high, "seller_book_charged_msat": seller, "wallet_spent_msat": spent,
+               "left_with_seller_msat": left, "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
+               "wallet_book_settled_msat": m["wallet_book_settled_msat"], "tickets": m["tickets"],
+               "exit": {k: exit_status.get(k) for k in ("up_bytes", "down_bytes")}, "fetch": out})
 
 
 # --- a seller's whole web app: Jellyfin, through the app port, paid for on these nodes -----------------------
@@ -2526,7 +2727,7 @@ def jellyfin(link: str = "") -> None:
         pass
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
+CHECKS = {"page": page, "latency": latency, "stream": stream, "money": money_check, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
           "vpn": vpn,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 

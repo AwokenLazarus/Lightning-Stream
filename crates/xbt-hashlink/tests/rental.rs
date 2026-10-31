@@ -354,6 +354,43 @@ fn unpaid_by_the_wallet_stops_the_hash() {
     unpaid_stops(true);
 }
 
+/// Many slices (a rental of about 30 s at two slices a second): what the hashtaker paid and what the
+/// hashmaker earned are each its paid slices at the listed price, every slice's receipt agrees, and
+/// the paid slices are the work delivered at the slice size, within one slice either way (a slice
+/// is paid as it fills: the last one may be paid and not yet full when the miners stop, or full and
+/// not yet paid). With the wallet: one paid call per slice, each at the slice's price.
+fn many_slices(wallet: bool) {
+    let r = rental(None, 30, wallet);
+    let (s, price) = (terms().slice_work, terms().price_msat);
+    let paid = r.hashmaker["paid"].as_u64().unwrap();
+    assert!(paid >= 30, "only {paid} slices: {}", r.hashmaker);
+    assert_eq!(r.hashtaker["paidSlices"].as_u64().unwrap(), paid, "{}", r.hashtaker);
+    assert_eq!(r.hashtaker["released"].as_u64().unwrap(), paid, "{}", r.hashtaker);
+    assert_eq!(r.hashtaker["spentMsat"].as_u64().unwrap(), paid * price, "the hashtaker paid its slices at the listed price");
+    assert_eq!(r.hashmaker["earnedMsat"].as_u64().unwrap(), paid * price, "the hashmaker earned its slices at the listed price");
+    assert_eq!((r.hashmaker["receiptsAgree"].as_u64().unwrap(), r.hashmaker["receiptsDisagree"].as_u64().unwrap()), (paid, 0));
+    assert_eq!(r.hashmaker["meter"], r.hashtaker["meter"], "both sides counted the same work");
+    let work = w(&r.hashmaker["meter"]["work"]);
+    let p = paid as u128;
+    assert!(work + s >= p * s && work < (p + 1) * s, "{paid} slices paid for {work} work at {s} a slice");
+    assert!(w(&r.pool["work"]) >= work, "the pool saw at least the work both meters counted");
+    if wallet {
+        let pays: Vec<_> = r.wallet_calls.iter().filter(|c| c["method"] == "xbt402_pay").collect();
+        assert_eq!(pays.len() as u64, paid, "one paid call per slice");
+        assert!(pays.iter().all(|c| c["params"]["price_ceiling"]["request_msat"].as_u64() == Some(price)), "each at the slice's price");
+    }
+}
+
+#[test]
+fn many_slices_are_paid_their_work_at_the_listed_price() {
+    many_slices(false);
+}
+
+#[test]
+fn many_slices_paid_by_the_wallet_are_paid_their_work_at_the_listed_price() {
+    many_slices(true);
+}
+
 #[test]
 fn a_slice_the_hashmaker_did_not_count_is_refused() {
     // the hashmaker's endpoint, before any work: a receipt for slice 1 is refused (409), so a gateway
