@@ -9106,11 +9106,12 @@ fn a_win_whose_invoice_lapsed_in_the_wallets_queue_is_paid_by_the_sellers_next_i
 fn invoices_that_lapsed_in_the_wallets_queue_are_no_fault_of_the_sellers() {
     let _g = env_lock();
     let r = draws_rig(json!({}));
-    // 2 s short of the end of an invoice of 30 s: inside the 5 s a prepaid invoice must have left, `ticket_expiry`
-    lapse_at_wins(&r, 3, 28);
+    // 2 s short of the end of this seller's invoice of 15 s: inside the 5 s a prepaid invoice must have left, `ticket_expiry`
+    lapse_at_wins(&r, 3, 13);
     let size = 256 * PIECE;
     let v = r.pay(&format!("/pieces/{size}"), 1_000);
     assert_paid_after_lapses(&r, &v, size, 3);
+    assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry"), "{v}");
 }
 /// A tunnel whose refill finds the channel out for a moment: `active` false for 1.5 s while the
 /// wallet's pool is empty (the refill a release has to wait for), and again with a held ticket's
@@ -9232,7 +9233,7 @@ fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pay
     let _g = env_lock();
     // a seller that serves on while wins take their 3 s: this is about the invoice, not its answer standing still
     let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
-                                               "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
+                                               "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
     r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
     let (ln, clock, node, standin, once) = (r.ln.clone(), r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
     r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
