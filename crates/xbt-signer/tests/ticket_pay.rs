@@ -349,6 +349,8 @@ fn routes() -> Value {
         {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
         {"path": "/wsfree/", "free": true, "websocket": true},
         // a VPN exit's tunnel: 1,000 sat a GiB either way, nothing to open
+        // a WebSocket priced as a VPN exit's tunnel is: 500,000 sat a GiB either way
+        {"path": "/wsgb/", "price": {"byte_msat": 500_000_000, "per_bytes": 1u64 << 30}, "websocket": true},
         {"path": "/wsvpn/", "price": {"byte_msat": 1_000_000, "per_bytes": 1_073_741_824}, "websocket": true},
         // a buyer's own account (docs/BUYER-ACCOUNTS.md), made by the seller's hook: its headers say who the buyer is
         {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK},
@@ -10840,4 +10842,63 @@ fn the_credit_left_behind_is_reached_in_ordinary_use() {
     assert!(!old_id.is_empty());
     assert_eq!(used.first(), Some(&old_id), "the credit of the first seller session is the first to be used: {used:?}");
     assert_eq!(r.ln.paid_msat(), 2 * TICKET, "no ticket beyond the two");
+}
+
+/// A paid tunnel pays ahead what a payment's time takes to pass, at most half a ticket's worth beyond the
+/// ticket in use, however long it runs (docs/TICKETS.md: "about one to two tickets" a seller could keep,
+/// and credit paid ahead stays with it). 30 MiB at a steady 5 MiB a second, at 500,000 sat a GiB: 2 MiB a
+/// ticket, so three seconds' worth would be seven. Stopped open, the seller's book and the wallet's account
+/// are the bytes' price to the msat, both nodes and the book agree, and under two tickets are left.
+#[test]
+fn a_paid_tunnel_stopped_while_open_leaves_under_two_tickets_with_the_seller() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let each = 15 * MIB;
+    let l = UnixListener::bind(dir.path().join("tunnel")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        let chunk: Vec<u8> = (0..64 << 10).map(pattern).collect();
+        let mut back = vec![0u8; chunk.len()];
+        let start = std::time::Instant::now();
+        for i in 1..=each / chunk.len() {
+            w.write_all(&chunk).unwrap();
+            rd.read_exact(&mut back).unwrap();
+            // 2.5 MiB a second each way
+            let due = Duration::from_secs_f64((i * chunk.len()) as f64 / (5 * MIB / 2) as f64);
+            std::thread::sleep(due.saturating_sub(start.elapsed()));
+        }
+        tx.send(()).unwrap();
+        // the tunnel stays open until the wallet ends it
+        let mut rest = vec![];
+        let _ = rd.read_to_end(&mut rest);
+    });
+    std::thread::scope(|sc| {
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/wsgb/vpn"), "max_sats": 40_000, "task": "film", "stream_to": "tunnel", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        rx.recv_timeout(Duration::from_secs(120)).expect("30 MiB went through");
+        let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
+        let usage = ((2 * each) as u64 * 500_000_000).div_ceil(1 << 30);
+        let of = |v: &Value| v.as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| panic!("not msat: {v}"));
+        let stop = r.call("ticket_stop", json!({"session": sid}));
+        let (seller, spent, left) = (r.shop.gw.stats().charged_msat, of(&stop["http"]["account"]["spent_msat"]), of(&stop["http"]["left_with_seller_msat"]));
+        let (paid, taken, book, _) = r.money();
+        assert_eq!((seller, spent), (usage, usage), "the seller's book and the wallet's account are the bytes' price: {stop}");
+        assert_eq!((taken, book), (paid, paid), "the seller's node took {taken}, the wallet booked {book}, the buyer's node paid {paid}");
+        assert_eq!(paid, spent + left, "paid {paid} is what was spent ({spent}) and what is left with the seller ({left}): {stop}");
+        assert!(left < 2 * TICKET, "{left} msat left with the seller, of {paid} paid: the wallet paid too far ahead: {stop}");
+        assert_eq!(ws.join().unwrap()["receipt"]["last"]["charged"].as_str(), Some(usage.to_string().as_str()));
+    });
+    caller.join().unwrap();
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
 }
