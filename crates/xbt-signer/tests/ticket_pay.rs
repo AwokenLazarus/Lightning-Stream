@@ -4446,26 +4446,28 @@ fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
 #[test]
 fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for() {
     let _g = env_lock();
-    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 2 s here,
-    // where the gateway ships 10), and 20 sellers beside it that serve on whatever is unpaid: their wins fill the
-    // wallet's gate, 8 at a time, and no answer waits for one of them
-    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2}});
+    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 8 s here,
+    // where the gateway ships 10: the test's clock does not move, so it stands still for its whole grace), and 20
+    // sellers beside it that serve on whatever is unpaid: their wins fill the wallet's gate, 8 at a time, and no
+    // answer waits for one of them
+    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 8}});
     let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0},
                          "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
     let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
                        "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
     let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
-    // a payment takes 200 ms through the hop: the gate lets 40 through in a second. (100 ms and a grace of 1 s
-    // failed now and then on a shared machine with two cores, where the hurried win's own path took more than a
-    // second; the wins that wait still take longer than the grace to pass, so a gate in order of arrival fails)
-    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(200);
+    // a payment takes 1 s through the hop: the gate lets 8 through in a second, and the 120 wins that wait below take
+    // 15 s to pass, twice the strict seller's 8 s, so a gate in order of arrival fails. The hurried win's own path
+    // (the wallet sees the seller stand still, the win passes the gate, the payment goes) took 4.5 s on a lab VM
+    // starved of CPU, with 200 ms payments: a grace of 2 s failed there every time, and 8 s leaves room for it.
+    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(1_000);
     let size = 64 * PIECE;
     let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
     let (strict_one, others) = std::thread::scope(|sc| {
-        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, eight seconds of the gate
+        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, forty seconds of the gate
         let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
-        // once three seconds' worth of them wait (the node has an invoice for each, and no payment yet), the file from
-        // the strict seller: its third unpaid win stops its answer, which is cut after two seconds
+        // once fifteen seconds' worth of them wait (the node has an invoice for each, and no payment yet), the file from
+        // the strict seller: its third unpaid win stops its answer, which is cut after eight seconds
         // the two counts one after the other, never one lock inside the other ([`PayLn`] takes `preimages` under `st`)
         wait_for("120 wins waiting at the gate", || {
             let invoiced = r.shop.node.preimages.lock().unwrap().len();
