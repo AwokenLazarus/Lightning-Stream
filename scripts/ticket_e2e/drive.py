@@ -1083,6 +1083,25 @@ def flap() -> None:
                   bool(got) and clear and bool(r.get("etag")) and again.get("status") == 206 and again.get("complete") is True and again.get("bytes") == rest
                   and again.get("body_digest") == digest_of_range(got) and price <= rest_msat and not drops.errors,
                   {"first": first, "stopped_at": got, "reason_clear": clear, "resumed": resumed})
+        # every time, whatever the outage did: a file stopped part-way on purpose (the call allows half its price) goes
+        # on from that byte, from the same copy
+        stop_sessions()
+        half = -(-BIG * BYTE_MSAT // PER_BYTES) // 2 // 1000
+        part = pay(f"{origin}/flap.bin", max_sats=half)
+        got = int(part.get("bytes") or 0)
+        if part.get("saved_to"):
+            os.remove(part["saved_to"])
+        on = agent().tool("xbt402_pay", {"url": f"{origin}/flap.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-",
+                                         "if_range": part.get("etag") or ""})
+        note_receipts(on)
+        if on.get("saved_to"):
+            os.remove(on["saved_to"])
+        rest_msat = -(-(BIG - got) * BYTE_MSAT // PER_BYTES)
+        check("flap: a file stopped part-way on purpose goes on from that byte, from the same copy: a 206 of exactly the rest, its bytes the file's, priced as the rest",
+              0 < got < BIG and str(part.get("ended", "")).startswith("stopped by the wallet: max_sats") and on.get("status") == 206 and on.get("complete") is True
+              and on.get("bytes") == BIG - got and on.get("body_digest") == digest_of_range(got) and int(on.get("price_msat") or 0) <= rest_msat,
+              {"stopped_at": got, "first_ended": part.get("ended"), "etag": part.get("etag"),
+               "resumed": {k: on.get(k) for k in ("status", "bytes", "complete", "price_msat", "ended")}, "price_of_the_rest_msat": rest_msat})
         # the file changed between the two calls: the seller's copy is another, and its rest is not spliced on
         stop_sessions()
         r = pay(f"{origin}/flap.bin", max_sats=25_000)
@@ -1102,14 +1121,19 @@ def flap() -> None:
               {k: changed.get(k) for k in ("status", "rule", "reason", "bytes", "price_msat", "charged_sats", "complete", "ended")} | {"etag": etag})
     finally:
         server.shutdown()
-    # the stock server, which has no ranges: a range is answered with the whole body, and none of it is read
+    # the stock server, which has no ranges: the same file stopped part-way on purpose, and its rest asked for, is
+    # answered with the whole body, and none of it is read
     stop_sessions()
-    plain = agent().tool("xbt402_pay", {"url": f"{ORIGIN}/big.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={BIG // 2}-"})
+    part = pay(f"{ORIGIN}/big.bin", max_sats=-(-BIG * BYTE_MSAT // PER_BYTES) // 2 // 1000)
+    got = int(part.get("bytes") or 0)
+    if part.get("saved_to"):
+        os.remove(part["saved_to"])
+    plain = agent().tool("xbt402_pay", {"url": f"{ORIGIN}/big.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-"})
     note_receipts(plain)
     if plain.get("saved_to"):
         os.remove(plain["saved_to"])
     check("flap: a seller whose server has no ranges answers a range with the whole body, and the wallet reads none of it; it costs at most what the seller's socket took",
-          plain.get("rule") == "ticket_range_ignored" and plain.get("status") == 200 and int(plain.get("bytes") or 0) == 0 and int(plain.get("price_msat") or 0) <= UNREAD_MOST_MSAT,
+          0 < got < BIG and plain.get("rule") == "ticket_range_ignored" and plain.get("status") == 200 and int(plain.get("bytes") or 0) == 0 and int(plain.get("price_msat") or 0) <= UNREAD_MOST_MSAT,
           {k: plain.get(k) for k in ("status", "rule", "reason", "bytes", "price_msat", "charged_sats", "complete", "ended")})
     quiet()
     m = money()
