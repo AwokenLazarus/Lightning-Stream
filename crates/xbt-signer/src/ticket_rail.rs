@@ -59,6 +59,9 @@ use crate::{err, Result};
 /// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
 const OFFER_FETCH_S: i64 = 5;
 
+/// Why the book books nothing more for a session whose stop has begun ([`Signer::ticket_is_stopping`]).
+const STOPPING: &str = "the session is being stopped: nothing more is released, locked or bought for it";
+
 /// A seller's BOLT 12 offer and the seller's session a payment by it is for: what the payer note
 /// is made of ([`xbt402::offer::note`]). The key is the session key the seller sent.
 pub struct OfferWay<'a> {
@@ -789,6 +792,9 @@ impl Signer {
             if s.state != SState::Open {
                 return Ok(refusal("ticket_session", format!("the session is {}", s.state.as_str())));
             }
+            if self.ticket_is_stopping(&sid) {
+                return Ok(refusal("ticket_session", STOPPING));
+            }
             let seed = self.ticket_seed(&st.book)?;
             // hashes the seller sent no invoice for: their slots are offered again
             let mut rows: Vec<Value> = st.book.of_session(&sid).into_iter().filter(|t| t.state == TState::Offered && now - t.ts > OFFER_TTL_S).map(|t| {
@@ -1026,6 +1032,9 @@ impl Signer {
         let mut g = self.ticket_store().map_err(|e| refusal("ticket", e.msg))?;
         let st = g.as_mut().ok_or_else(|| refusal("ticket", "no ticket book"))?;
         let Some(mut s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open).cloned() else { return Err(refusal("ticket_session", "no such open session")) };
+        if self.ticket_is_stopping(sid) {
+            return Err(refusal("ticket_session", STOPPING));
+        }
         let Some(task) = tp.tasks.get(&s.task) else { return Err(refusal("ticket_task", format!("the owner's policy no longer names the task {:?}", s.task))) };
         // the seller may have left the owner's list since the session opened
         let listed = self.ticket_listed(&cfg, &s.payee, &s.origin);
@@ -1163,6 +1172,9 @@ impl Signer {
             let Some(mut s) = st.book.sessions.get(&sid).filter(|s| s.state == SState::Open).cloned() else {
                 return Ok(refusal("ticket_session", "no such open session"));
             };
+            if self.ticket_is_stopping(&sid) {
+                return Ok(refusal("ticket_session", STOPPING));
+            }
             let Some(task) = tp.tasks.get(&s.task) else {
                 return Ok(refusal("ticket_task", format!("the owner's policy no longer names the task {:?}", s.task)));
             };
@@ -1628,15 +1640,16 @@ impl Signer {
         let booked = {
             let _g = self.lock();
             self.ticket_book_prepay(sid, &hash, &lni, inv.payment_hash, inv.expires_at() as f64, &lp, &routes.ids, win, amount)
+                .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
         };
-        let send = match booked {
+        let (send, booked_sats) = match booked {
             Ok(Ok(s)) => s,
             Ok(Err(d)) => return Some(with(d, json!({"by_offer": true}))),
             Err(e) => return Some(refusal("ticket", e.msg)),
         };
         // the invoice is paid, never the offer: paying the offer would fetch another invoice
         let req = OfferPayRequest { invoice: lni, fee_limit_msat: send.fee_limit_msat, timeout_s: send.timeout_s };
-        let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, inside, &|| ln.pay_offer(&req));
+        let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, booked_sats, inside, &|| ln.pay_offer(&req));
         // the offer's invoice could not be reached (its blinded path enters through a node this wallet has no route to,
         // while a channel straight to the seller could pay the seller's own invoice): the seller's invoice is tried
         // instead. Only when the node says the payment failed for good, with nothing of it in flight, and the book holds
@@ -1737,21 +1750,30 @@ impl Signer {
         let booked = {
             let _g = self.lock();
             self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win, msat)
+                .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
         };
-        let send = match booked {
+        let (send, booked_sats) = match booked {
             Ok(Ok(s)) => s,
             Ok(Err(d)) => return d,
             Err(e) => return refusal("ticket", e.msg),
         };
-        self.ticket_ordinary_sent(&*ln, &lp, &sid, &dest, &hash, win, inside, &|| ln.send_held(&send))
+        self.ticket_ordinary_sent(&*ln, &lp, &sid, &dest, &hash, win, booked_sats, inside, &|| ln.send_held(&send))
     }
 
-    /// The end of an ordinary payment, booked: `send` hands it to the node, and the node's word
-    /// on it is waited for inside the gate (`inside`, which leaves when this returns), once more
-    /// outside it, and brought into the book. No lock is held while the node routes it.
+    /// What the book holds booked for the ticket `hash` (0 where it holds none, or cannot be read).
+    fn ticket_booked_sats(&self, hash: &str) -> i64 {
+        self.ticket_store().ok().and_then(|g| g.as_ref().and_then(|st| st.book.tickets.get(hash).map(|t| t.booked_sats))).unwrap_or(0)
+    }
+
+    /// The end of an ordinary payment, booked (`booked_sats`): `send` hands it to the node, and
+    /// the node's word on it is waited for inside the gate (`inside`, which leaves when this
+    /// returns), once more outside it, and brought into the book. No lock is held while the node
+    /// routes it. Every answer that leaves the booking in place says it in `charged_sats`: paid,
+    /// `pending` (not final yet, paid without the preimage that proves it, or a word of the node's
+    /// the book could not record), never a refusal that counts it as nothing.
     #[allow(clippy::too_many_arguments)]
-    fn ticket_ordinary_sent(&self, ln: &dyn LnBackend, lp: &LnPolicy, sid: &str, dest: &str, hash: &str, win: Option<&xbt402::lottery::Win>, inside: PaceGuard<'_>,
-                            send: &dyn Fn() -> Result<Value>) -> Value {
+    fn ticket_ordinary_sent(&self, ln: &dyn LnBackend, lp: &LnPolicy, sid: &str, dest: &str, hash: &str, win: Option<&xbt402::lottery::Win>, booked_sats: i64,
+                            inside: PaceGuard<'_>, send: &dyn Fn() -> Result<Value>) -> Value {
         // the names of the two things this pays, for its refusals and its log lines
         let (failed, pending, unproven, paid_kind, what) = match win {
             None => ("ticket_prepay_failed", "ticket_prepay_pending", "ticket_prepay_unproven", "ticket_prepaid", "the prepaid ticket"),
@@ -1794,10 +1816,17 @@ impl Signer {
             }
             Ok(st.book.tickets.get(&hash).cloned())
         })();
+        // the payment was sent, and the book could not take the node's word on it: what was booked stays booked, and
+        // the node's word decides later, as for one not final yet
+        let unrecorded = |why: &str| {
+            with(refusal(pending, format!("the payment of {what} was sent and the book could not record the node's word on it ({why}): it is booked as spent \
+                                           until the wallet's node shows it failed")),
+                 json!({"verdict": "pending", "session": sid, "hash": hash, "prepaid": true, "win": win.map(xbt402::lottery::Win::draw), "charged_sats": booked_sats}))
+        };
         let t = match res {
             Ok(Some(t)) => t,
-            Ok(None) => return refusal("ticket", "the book lost a ticket"),
-            Err(e) => return refusal("ticket", e.msg),
+            Ok(None) => return unrecorded("the book lost a ticket"),
+            Err(e) => return unrecorded(&e.msg),
         };
         let about = json!({"rail": "ticket", "session": sid, "hash": hash, "prepaid": true, "ticket_msat": t.msat.to_string(), "win": win.map(xbt402::lottery::Win::draw),
                            "fee_msat": t.fee_msat.to_string()});
@@ -1805,8 +1834,9 @@ impl Signer {
             TState::Settled => {
                 let preimage = pmt.as_ref().map(preimage_bytes).unwrap_or_default();
                 if !preimage_proves(&preimage, &hash) {
+                    // pending, as the plain Lightning rail says such a payment ([`Signer::ln_settle`]): booked, and spent
                     return with(refusal(unproven, format!("the node shows {what} paid without the preimage of its hash: it is booked, and nothing can be shown to the seller")),
-                                with(about, json!({"charged_sats": t.booked_sats})));
+                                with(about, json!({"verdict": "pending", "charged_sats": t.booked_sats})));
                 }
                 self.ticket_audit(paid_kind, json!({"session": sid, "dest": dest, "payment_hash": hash, "spent_sats": t.booked_sats,
                                                     "win": win.map(xbt402::lottery::Win::draw)}));
@@ -1843,6 +1873,9 @@ impl Signer {
         let mut g = self.ticket_store()?;
         let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
         let Some(mut s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open).cloned() else { return Ok(Err(refusal("ticket_session", "no such open session"))) };
+        if self.ticket_is_stopping(sid) {
+            return Ok(Err(refusal("ticket_session", STOPPING)));
+        }
         if s.prepaid_msat == 0 {
             return Ok(Err(refusal("ticket_terms", "this seller's terms offer no prepaid tickets")));
         }
@@ -2159,6 +2192,13 @@ impl Signer {
         let sent = using.iter().flat_map(|id| st.book.of_session(id)).filter(|t| matches!(t.state, TState::Released | TState::Settled))
             .fold(0u64, |a, t| a.saturating_add(t.msat));
         Some((http, sent))
+    }
+
+    /// The stop of `sid` has begun ([`Signer::ticket_stopping`]): the book books nothing more for it.
+    /// Asked under the spend lock, beside the book's own state, which stays open while the stop waits
+    /// for the session's streams to end.
+    pub(crate) fn ticket_is_stopping(&self, sid: &str) -> bool {
+        self.ticket_stopping.lock().unwrap_or_else(|p| p.into_inner()).contains(sid)
     }
 
     /// The caller gave up the credit `sid` left with its seller (`ticket_stop` with `forget_credit`):

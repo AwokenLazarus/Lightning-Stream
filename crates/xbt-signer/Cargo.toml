@@ -34,6 +34,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 url = "2.5"
 # the public certificate authorities for a WebSocket to an https seller, as ureq trusts them (already in the tree through ureq)
 webpki-roots = "0.26"
+# an answer's connection, found by its addresses and shut when the answer is stopped (already in the tree)
+socket2 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

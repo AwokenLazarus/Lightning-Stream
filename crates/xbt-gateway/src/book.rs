@@ -373,6 +373,11 @@ pub struct Book {
     /// The latest time the book was told (a lock, a charge, a sweep): when a credit with no clock
     /// of its own happened, within one sweep.
     seen_now: u64,
+    /// What the sessions dropped from the book had been charged: with the sessions on it, what the
+    /// seller earned in all ([`Book::charged_msat`]). A compacted journal no longer holds the drops,
+    /// so its snapshot carries their sum as a session of its own, charged it and dropped
+    /// ([`DROPPED_CARRY`]): the sum and the book are written in one file, at once.
+    dropped_charged_msat: u64,
 }
 
 impl Book {
@@ -383,6 +388,7 @@ impl Book {
             tickets: HashMap::new(),
             dirty: HashSet::new(),
             seen_now: 0,
+            dropped_charged_msat: 0,
         }
     }
 
@@ -405,6 +411,25 @@ impl Book {
 
     pub fn sessions(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// What every session was charged in all, the ones dropped from the book included: the seller's
+    /// earnings. It only rises, but for a refund of a charge that bought nothing.
+    pub fn charged_msat(&self) -> u64 {
+        self.sessions.values().fold(self.dropped_charged_msat, |a, s| a.saturating_add(s.spent_msat))
+    }
+
+    /// What the dropped sessions had been charged ([`Book::charged_msat`]).
+    pub fn dropped_charged_msat(&self) -> u64 {
+        self.dropped_charged_msat
+    }
+
+    /// A session leaves the book: what it was charged stays counted.
+    fn drop_session(&mut self, id: &str) {
+        if let Some(s) = self.sessions.remove(id) {
+            self.dropped_charged_msat = self.dropped_charged_msat.saturating_add(s.spent_msat);
+        }
+        self.dirty.remove(id);
     }
 
     /// Sessions that hold a ticket or have a response open: the ones the cap counts.
@@ -747,8 +772,7 @@ impl Book {
         if s.live > 0 || s.released_msat > 0 || s.next_seq > 0 || s.seqs_ahead != 0 {
             return None;
         }
-        self.sessions.remove(session);
-        self.dirty.remove(session);
+        self.drop_session(session);
         Some(Rec::Drop {
             session: session.to_string(),
         })
@@ -1091,8 +1115,7 @@ impl Book {
             .map(|(id, _)| id.clone())
             .collect();
         for id in gone {
-            self.sessions.remove(&id);
-            self.dirty.remove(&id);
+            self.drop_session(&id);
             out.recs.push(Rec::Drop { session: id });
         }
         out
@@ -1121,6 +1144,25 @@ impl Book {
     /// The whole book as records: what a compacted journal holds.
     pub fn snapshot(&self) -> Vec<Rec> {
         let mut out = vec![];
+        // what the dropped sessions were charged, as one session charged that sum and dropped: a
+        // replay adds it back, as it does any dropped session's (a gateway from before, too)
+        if self.dropped_charged_msat > 0 {
+            out.push(Rec::Session {
+                id: DROPPED_CARRY.into(),
+                key: [0; 32],
+                addr: String::new(),
+            });
+            out.push(Rec::Mark {
+                session: DROPPED_CARRY.into(),
+                next_seq: 0,
+                seqs_ahead: 0,
+                spent_msat: self.dropped_charged_msat,
+                pledge: None,
+            });
+            out.push(Rec::Drop {
+                session: DROPPED_CARRY.into(),
+            });
+        }
         for (id, s) in &self.sessions {
             out.push(Rec::Session {
                 id: id.clone(),
@@ -1250,7 +1292,7 @@ impl Book {
                     }
                 }
                 Rec::Drop { session } => {
-                    b.sessions.remove(session);
+                    b.drop_session(session);
                     b.tickets.retain(|_, t| &t.session != session);
                 }
             }
@@ -1263,6 +1305,10 @@ impl Book {
     }
 }
 
+/// The session under which a snapshot carries what the dropped sessions were charged: not hex, so
+/// never the id of a session the gateway made (those are 32 hex digits).
+pub const DROPPED_CARRY: &str = "dropped";
+
 /// The name under which a snapshot carries a session's released sum: not a payment hash anyone can
 /// lock (it would need a preimage of a value fixed by the session id), and never sent to the node.
 fn carry_hash(session: &str) -> Hash {
@@ -1270,7 +1316,7 @@ fn carry_hash(session: &str) -> Hash {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::Record;
 
@@ -1937,6 +1983,37 @@ mod tests {
             vec![],
             "a forgotten session leaves no counters to write"
         );
+    }
+
+    /// What the seller earned counts the sessions dropped from the book: through a sweep, a restart
+    /// from the journal, and a compaction (whose snapshot no longer holds them; the gateway keeps
+    /// their sum beside it and adds it back).
+    #[test]
+    fn what_was_charged_outlives_the_sessions_dropped_from_the_book() {
+        let mark = |id: &str, spent| Rec::Mark { session: id.into(), next_seq: 3, seqs_ahead: 0, spent_msat: spent, pledge: None };
+        let journal = vec![
+            Rec::Session { id: "a".into(), key: [1u8; 32], addr: "x".into() },
+            Rec::Session { id: "b".into(), key: [2u8; 32], addr: "y".into() },
+            mark("a", 294_967),
+            mark("b", 1_000),
+            Rec::Drop { session: "a".into() },
+        ];
+        let b = Book::restore(caps(), &journal, 0).unwrap();
+        assert_eq!((b.sessions(), b.dropped_charged_msat(), b.charged_msat()), (1, 294_967, 295_967));
+        // compacted: the snapshot holds b, and a's charge as the carry, in the same file
+        let mut again = Book::restore(caps(), &b.snapshot(), 0).unwrap();
+        assert_eq!((again.sessions(), again.dropped_charged_msat(), again.charged_msat()), (1, 294_967, 295_967));
+        assert!(again.session(DROPPED_CARRY).is_none(), "the carry is no session on the book");
+        // compacted again, and drops after it: counted once each
+        let mut journal = again.snapshot();
+        journal.push(Rec::Drop { session: "b".into() });
+        let twice = Book::restore(caps(), &journal, 0).unwrap();
+        assert_eq!((twice.sessions(), twice.charged_msat()), (0, 295_967));
+        assert_eq!(Book::restore(caps(), &twice.snapshot(), 0).unwrap().charged_msat(), 295_967);
+        // and a sweep that drops b keeps its charge counted
+        let sw = again.sweep(10_000_000, Some(100));
+        assert_eq!(sw.recs, vec![Rec::Drop { session: "b".into() }]);
+        assert_eq!((again.sessions(), again.charged_msat()), (0, 295_967));
     }
 
     #[test]

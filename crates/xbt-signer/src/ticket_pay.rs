@@ -108,6 +108,9 @@ const TAIL_WAIT: Duration = Duration::from_secs(5);
 const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
+/// How long a stop waits for the session's open streams to end and take their last receipts: past
+/// a closed answer's wait for its last receipt (FINAL_WAIT for one cut short), with room to spare.
+pub const STOP_STREAMS_WAIT: Duration = Duration::from_secs(15);
 /// Refusals of `ticket_open` that mean "not this rail": the next entry of the 402 is tried.
 const NEXT_RAIL: [&str; 14] = ["ticket_disabled", "ticket_mainnet", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
                                "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL, "ticket_prepaid_first"];
@@ -261,6 +264,11 @@ fn refusal(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "ticket", "charged_sats": 0}))
 }
 
+/// Why nothing more is released into a session being stopped ([`HttpSession::ending`]).
+fn stopping_refusal() -> Value {
+    refusal("ticket_session", "the session is being stopped: no ticket is released")
+}
+
 // --- HTTP as this module needs it ---------------------------------------------------------------------
 
 /// The head of an answer, and its body still to be read.
@@ -272,6 +280,30 @@ pub struct WireAnswer {
     pub length: Option<u64>,
     /// The body as it arrives. A body cut short ends in an error or before `length`.
     pub body: Box<dyn Read + Send>,
+    /// Ends the connection the body arrives on, from any thread: a read waiting on a quiet seller
+    /// returns at once. `None`: a wire with no such handle, whose body ends only as its seller ends it.
+    pub closer: Option<Closer>,
+}
+
+/// [`WireAnswer::closer`].
+pub type Closer = Arc<dyn Fn() + Send + Sync>;
+
+/// Shut this process's TCP connection from `local` to `peer`, wherever its socket is held (ureq
+/// keeps an answer's to itself): found among the open files by its two addresses, which no other
+/// connection shares while it is open.
+fn shut_connection(local: std::net::SocketAddr, peer: std::net::SocketAddr) {
+    use std::os::fd::{BorrowedFd, RawFd};
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd").or_else(|_| std::fs::read_dir("/dev/fd")) else { return };
+    for fd in dir.flatten().filter_map(|e| e.file_name().to_str()?.parse::<RawFd>().ok()) {
+        // SAFETY: borrowed for these calls only. A descriptor closed meanwhile fails them; one reused
+        // meanwhile by another file is not a socket between these two addresses, and is left alone
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let s = socket2::SockRef::from(&fd);
+        if s.local_addr().ok().and_then(|a| a.as_socket()) == Some(local) && s.peer_addr().ok().and_then(|a| a.as_socket()) == Some(peer) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    }
 }
 
 impl WireAnswer {
@@ -295,8 +327,8 @@ impl WireAnswer {
     /// [`WireAnswer::read_small`], the whole of it read by `deadline`: past it, the answer is cut
     /// off however slowly its bytes still come.
     fn read_small_by(self, cap: u64, deadline: Instant) -> Result<Vec<u8>> {
-        let WireAnswer { status, headers, length, body } = self;
-        WireAnswer { status, headers, length, body: Box::new(ByDeadline { inner: body, deadline }) }.read_small(cap)
+        let WireAnswer { status, headers, length, body, closer } = self;
+        WireAnswer { status, headers, length, body: Box::new(ByDeadline { inner: body, deadline }), closer }.read_small(cap)
     }
 }
 
@@ -460,8 +492,10 @@ impl UreqWire {
         let headers: Vec<(String, String)> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_uppercase(), v.to_string()))).collect();
         let bodiless = method.eq_ignore_ascii_case("HEAD") || matches!(status, 100..=199 | 204 | 304);
         let length = if bodiless { Some(0) } else { resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()) };
+        let (local, peer) = (resp.local_addr(), resp.remote_addr());
+        let closer: Option<Closer> = (!bodiless).then(|| Arc::new(move || shut_connection(local, peer)) as Closer);
         let body: Box<dyn Read + Send> = if bodiless { Box::new(std::io::empty()) } else { Box::new(resp.into_reader()) };
-        Ok(WireAnswer { status, headers, length, body })
+        Ok(WireAnswer { status, headers, length, body, closer })
     }
 
     /// A TCP connection to a seller's `host`:`port`, as ureq's own calls reach it: a seller's link
@@ -743,7 +777,7 @@ impl TicketWire for UreqWire {
                     None => body,
                 }, None)
             };
-            WireUpgrade { answer: WireAnswer { status, headers, length: if status == 101 { None } else { length }, body }, writer }
+            WireUpgrade { answer: WireAnswer { status, headers, length: if status == 101 { None } else { length }, body, closer: None }, writer }
         };
         if !https {
             let mut s = sock;
@@ -1423,6 +1457,9 @@ pub(crate) struct HttpSession {
     money: Mutex<Money>,
     /// How many answers priced as they go are open: the seller's `spentMsat` moves between receipts.
     streaming: AtomicUsize,
+    /// The session is being stopped: an open stream (a WebSocket, a VPN tunnel) ends now, so its last
+    /// receipt is taken before what the session leaves with the seller is told ([`Signer::ticket_http_stop`]).
+    ending: AtomicBool,
     refilling: AtomicBool,
     /// The wallet's clock at the last paid request.
     used: Mutex<f64>,
@@ -2623,6 +2660,9 @@ impl Signer {
                     }
                 }
             }
+            // a session being stopped is kept here while the book holds it open (its open answers are taking their last
+            // receipts, and what it leaves with the seller is not yet known): the request finds it ending and the caller
+            // is told to call again, rather than a new session opening beside it without that credit
             // a session the book no longer holds open (stopped by the agent, idle, a fault) is gone
             if let Some(h) = open.as_ref().filter(|h| h.fault().is_some() || !self.ticket_session(&h.sid).is_some_and(|s| s.state == SState::Open)).cloned() {
                 *open = None;
@@ -2678,7 +2718,7 @@ impl Signer {
                                                    over_cap: AtomicBool::new(false), evidence: Mutex::new(None),
                                                    prepaid: prepaid_terms.clone(), offer, base, visit: c.url.strip_prefix(c.origin).unwrap_or("/").to_string(), calls: RwLock::new(()),
                                                    paying: Mutex::new(()), order: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
-                                                   money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), refilling: AtomicBool::new(false),
+                                                   money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), ending: AtomicBool::new(false), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
                                                    cancel_asked: Mutex::new(HashSet::new()) });
                     // a balance the wallet left with this seller in a session it stopped (a restart, or an idle stop) is
@@ -3033,7 +3073,8 @@ impl Signer {
     fn ticket_buy_prepaid(&self, hs: &HttpSession, spent: &mut Spent) -> std::result::Result<(), Value> {
         // nothing is paid to a seller found at fault, by this answer or one beside it: asked here, after the node's own
         // check, and again just before the payment
-        let at_fault = || hs.fault().map(|why| self.ticket_fault(hs, &why));
+        // or the session is being stopped: nothing more is bought for it
+        let at_fault = || hs.fault().map(|why| self.ticket_fault(hs, &why)).or_else(|| hs.ending.load(Ordering::SeqCst).then(stopping_refusal));
         if let Some(d) = at_fault() {
             return Err(d);
         }
@@ -3075,9 +3116,19 @@ impl Signer {
                 self.ticket_prepay(&p)
             }
         };
+        // what the book booked for the ticket left with the call, however its payment ended: paid, not final yet, or
+        // settled without the preimage that proves it (both stay booked as spent). Counted before either is refused, so
+        // that the call says it among what it charged. A payment that failed books nothing
+        spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
         if r["verdict"] == "pending" {
-            // booked, and neither paid nor failed by the node's word: nothing more is paid in this session
-            return Err(self.ticket_fault(hs, "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"));
+            // booked, and neither paid nor failed by the node's word (or paid without the preimage that proves it): nothing
+            // more is paid in this session
+            let why = if str_or_empty(r.get("rule")).ends_with("_unproven") {
+                "the wallet's node shows a prepaid ticket paid without the preimage of its hash: it is booked as spent, and nothing can be shown to the seller"
+            } else {
+                "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"
+            };
+            return Err(self.ticket_fault(hs, why));
         }
         if r["verdict"] != "allow" {
             return Err(r);
@@ -3094,7 +3145,6 @@ impl Signer {
         }
         spent.hashes.push(hash);
         spent.prepaid += 1;
-        spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
         self.ticket_deliver(hs)
     }
 
@@ -3118,8 +3168,8 @@ impl Signer {
             self.ticket_offer_passed(hs, "ticket_seller", "the seller's lock by offer named no session".into());
             return None;
         }
-        // a seller found at fault meanwhile is paid nothing: the caller asks again and refuses
-        if hs.fault().is_some() {
+        // a seller found at fault meanwhile, or a session being stopped, is paid nothing: the caller asks again and refuses
+        if hs.fault().is_some() || hs.ending.load(Ordering::SeqCst) {
             return None;
         }
         let by = crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session };
@@ -3141,7 +3191,7 @@ impl Signer {
 
     /// Fill the pool behind a call, one refill of a session at a time.
     fn ticket_refill_later(&self, hs: &Arc<HttpSession>) {
-        if self.ticket_want(&hs.sid) == 0 || hs.fault().is_some() {
+        if hs.ending.load(Ordering::SeqCst) || self.ticket_want(&hs.sid) == 0 || hs.fault().is_some() {
             return;
         }
         let Some(guard) = Refilling::take(hs.clone()) else { return };
@@ -3464,6 +3514,15 @@ impl Signer {
         } else {
             polls.failed(now);
         }
+        // a seller counting far too little, newer count after newer count: told once in the wallet's log, never a fault
+        // (it charges less, not more)
+        if last.as_ref().map(|l| l.part) != before {
+            if let Some(words) = last.as_ref().and_then(|l| polls.under(l)) {
+                eprintln!("b2-signer: {}: {words}", hs.origin);
+                self.ticket_audit("ticket_interim_undercount", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
+                                                                      "reason": words, "own_up": own_up, "own_down": own_down}));
+            }
+        }
         let found = found.or_else(|| crate::ticket_interim::stale(last, polls, own_up.saturating_add(own_down), now, crate::ticket_interim::stale_after()).map(|w| (w, Value::Null)));
         let (why, receipt) = found?;
         self.ticket_audit("ticket_interim_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
@@ -3582,9 +3641,15 @@ impl Signer {
         if !self.ticket_may_reach(&hs.origin, &hs.task) {
             return Err(refusal("allowlist", format!("destination not on allowlist: {}", hs.origin)));
         }
-        // a secret that has left and was not confirmed goes first, the same one: that is this release
+        // a secret that has left and was not confirmed goes first, the same one: that is this release. It is delivered
+        // even to a session being stopped: it has left already, and the seller holds it either way
         if lock_money(hs).pending.is_some() {
             return self.ticket_deliver(hs);
+        }
+        // a session being stopped is released nothing more: its open answers end on the credit they have. Asked under
+        // `paying`, and again before each step that could release one (the book stays open while a stop waits)
+        if hs.ending.load(Ordering::SeqCst) {
+            return Err(stopping_refusal());
         }
         // another request released one while this one waited: nothing more is due
         if !still_due() {
@@ -3680,6 +3745,9 @@ impl Signer {
                 }
             }
             // stopped meanwhile (its tickets are being cancelled, so the seller will never show this one locked)
+            if hs.ending.load(Ordering::SeqCst) {
+                return Err(stopping_refusal());
+            }
             if !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
                 return Err(refusal("ticket_session", "the session was stopped: nothing more is released for it"));
             }
@@ -3714,9 +3782,12 @@ impl Signer {
             return Err(d);
         }
         // asked again just before the book: another answer may have found the seller at fault while this one waited for it
-        // to show the ticket ready, and nothing more is released to a seller at fault
+        // to show the ticket ready, and nothing more is released to a seller at fault, or into a session being stopped
         if let Some(why) = hs.fault() {
             return Err(self.ticket_fault(hs, &why));
+        }
+        if hs.ending.load(Ordering::SeqCst) {
+            return Err(stopping_refusal());
         }
         // 2. the book: booked, then the secret exists here
         let r = {
@@ -3823,6 +3894,11 @@ impl Signer {
         if reserve > max_msat {
             return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > max_sats {}", sats_ceil(reserve), c.max_sats)));
         }
+        // a call that found the session as it was being stopped goes no further in it
+        if hs.ending.load(Ordering::SeqCst) {
+            return fail(hs, &spent, with(refusal("ticket_busy", "the session with this seller is being stopped: nothing was asked of the seller in it; call \
+                                                                 again in a moment"), json!({"retry_after_s": 1})));
+        }
         if let Some(why) = hs.fault() {
             return fail(hs, &spent, self.ticket_fault(hs, &why));
         }
@@ -3928,7 +4004,7 @@ impl Signer {
                             continue;
                         }
                     }
-                    break (WireAnswer { status: 402, length: None, headers: vec![], body: Box::new(std::io::Cursor::new(serde_json::to_vec(&v).unwrap_or_default())) },
+                    break (WireAnswer { status: 402, length: None, headers: vec![], body: Box::new(std::io::Cursor::new(serde_json::to_vec(&v).unwrap_or_default())), closer: None },
                            receipt);
                 }
                 break (ans, receipt);
@@ -4009,7 +4085,7 @@ impl Signer {
                     return fail(hs, &spent, with(refusal("ticket_refused", "the seller asks to know who this wallet is first, and could not be told"), json!({"status": 403})));
                 }
                 // any other refusal the seller signed (a path it does not serve, say) is its answer, handed on as it is
-                ans = WireAnswer { status: 403, length: Some(body.len() as u64), headers, body: Box::new(std::io::Cursor::new(body)) };
+                ans = WireAnswer { status: 403, length: Some(body.len() as u64), headers, body: Box::new(std::io::Cursor::new(body)), closer: None };
             }
             if matches!(ans.status, 402 | 503) {
                 let status = ans.status;
@@ -4144,6 +4220,7 @@ impl Signer {
             .saturating_add(m.reserved.saturating_sub(held));
         let length = ans.length;
         let mut body = ans.body;
+        let closer = ans.closer;
         // shared with the timer of an answer priced by the second: how far the body is, and why it stopped
         let state: Mutex<(u64, Option<String>, bool)> = Mutex::new((0, stop, false));
         let wake = Condvar::new();
@@ -4251,6 +4328,12 @@ impl Signer {
                         stop();
                         return;
                     }
+                    // the session is being stopped: the stream ends here, and its last receipt is taken as it closes
+                    if hs.ending.load(Ordering::SeqCst) {
+                        s.1.get_or_insert_with(|| "ticket_session: the session was stopped".to_string());
+                        stop();
+                        return;
+                    }
                     let total = s.0.saturating_add(up.load(Ordering::SeqCst));
                     account(st.cost(total));
                     let rate = total as f64 / st.started.elapsed().as_secs_f64().max(0.001);
@@ -4273,11 +4356,41 @@ impl Signer {
                     let _ = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner());
                 });
             }
+            if let Some(close) = closer.as_ref().filter(|_| !ws) {
+                // an answer read as it arrives waits in its read on a quiet seller (one at the edge of its credit, waiting
+                // for a ticket that is not coming): stopped (the session, or a ticket that could not go), its connection
+                // ends here, so the read returns now and not after the seller's own wait. A WebSocket's watcher does this
+                // for a socket
+                let (state, wake) = (&state, &wake);
+                scope.spawn(move || {
+                    let mut s = lock(state);
+                    loop {
+                        if s.2 {
+                            return;
+                        }
+                        if hs.ending.load(Ordering::SeqCst) {
+                            s.1.get_or_insert_with(|| "ticket_session: the session was stopped".to_string());
+                        }
+                        if s.1.is_some() {
+                            break;
+                        }
+                        s = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner()).0;
+                    }
+                    drop(s);
+                    close();
+                });
+            }
             if price.second_msat > 0 {
                 // an answer priced by the second is paid by the clock: the next second's ticket goes shortly before it starts
                 scope.spawn(|| loop {
                     let mut s = lock(&state);
                     if s.2 || s.1.is_some() {
+                        return;
+                    }
+                    // the session is being stopped: the answer ends here, with the seconds already paid for
+                    if hs.ending.load(Ordering::SeqCst) {
+                        s.1.get_or_insert_with(|| "ticket_session: the session was stopped".to_string());
+                        wake.notify_all();
                         return;
                     }
                     // the seconds started are drawn on the balance as they start, bytes or none
@@ -4305,6 +4418,11 @@ impl Signer {
             let mut touched = Instant::now();
             loop {
                 if lock(&state).1.is_some() {
+                    break;
+                }
+                // the session is being stopped: the answer is read no further, and ends as one cut short
+                if hs.ending.load(Ordering::SeqCst) {
+                    lock(&state).1.get_or_insert_with(|| "ticket_session: the session was stopped".to_string());
                     break;
                 }
                 if touched.elapsed() >= Duration::from_secs(crate::ticket_rail::TOUCH_EVERY_S) {
@@ -4655,6 +4773,23 @@ impl Signer {
     /// the seller is asked to cancel what is locked, and the wallet's own node is watched for up
     /// to `wait` until those tickets show failed. The wallet believes its node, not the answer.
     pub(crate) fn ticket_http_stop(&self, hs: &HttpSession, why: &str, wait: Duration) -> Value {
+        // from here no ticket is released in the session, no new call takes it, and its open answers end: a stream
+        // (a WebSocket, a VPN tunnel, a body read as it comes) stops reading and takes its last receipt as it closes.
+        // The book is told first: it still shows the session open while the streams end, and books nothing more for it
+        // (a release, a lock, a prepaid ticket), however far a call had got (past every check of `ending`) when the stop came
+        lock(&self.ticket_stopping).insert(hs.sid.clone());
+        hs.ending.store(true, Ordering::SeqCst);
+        // a stop that may wait (the caller's own) waits for those last receipts, so that what the session leaves with
+        // the seller below counts what the streams drew. Waited for here, holding nothing of the session or its slot
+        // (the slot still names the session meanwhile, so that a new call to the seller is told to call again rather
+        // than opening another session beside it); a stop with no wait (one made inside an answer, at a fault, or by
+        // the wallet itself) does not wait, and one made inside an answer must not: that answer is among the open streams
+        if !wait.is_zero() {
+            let streams_by = Instant::now() + wait.max(STOP_STREAMS_WAIT);
+            while hs.streaming.load(Ordering::SeqCst) > 0 && Instant::now() < streams_by {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         {
             let slot = lock(&self.ticket_http).get(&hs.origin).cloned();
             if let Some(slot) = slot {
@@ -4666,9 +4801,15 @@ impl Signer {
             }
             self.ticket_slot_drop(&hs.origin);
         }
+        let still_streaming = hs.streaming.load(Ordering::SeqCst) > 0;
         let stopped = {
             let _g = self.lock();
-            self.ticket_stop_locked(&json!({"session": hs.sid, "why": why}))
+            let stopped = self.ticket_stop_locked(&json!({"session": hs.sid, "why": why}));
+            // the book's own state says it from here (kept where the book could not be written: it stays refused)
+            if self.ticket_session(&hs.sid).is_none_or(|s| s.state != SState::Open) {
+                lock(&self.ticket_stopping).remove(&hs.sid);
+            }
+            stopped
         };
         let asked: Vec<String> = stopped.get("cancel").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.as_str().map(str::to_string)).collect();
         let mut sent = false;
@@ -4677,8 +4818,16 @@ impl Signer {
         }
         let still = self.ticket_wait_cancelled(&hs.sid, if sent { wait } else { Duration::ZERO });
         // what the seller was paid and did not serve: under one ticket, since a ticket is released only when
-        // the balance does not cover the next request. It is the seller's now; the owner sees it here and in the audit
-        let left = hs.balance();
+        // the balance does not cover the next request. It is the seller's now; the owner sees it here and in the audit.
+        // A stream that would not end in time is still drawing: the wallet's own count of it, not only the seller's
+        // last receipt, comes off what is told as left
+        let left = if still_streaming {
+            // one lock of the money for both: `balance` takes it too
+            let m = lock_money(hs);
+            m.est_balance().min(m.acct.balance())
+        } else {
+            hs.balance()
+        };
         if left > 0 {
             self.ticket_audit("ticket_left_with_seller", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "origin": hs.origin,
                                                                 "left_msat": left.to_string(), "why": why}));
@@ -4978,7 +5127,7 @@ mod tests {
                 Ok(1)
             }
         }
-        let ans = WireAnswer { status: 200, headers: vec![], length: None, body: Box::new(Slow(100)) };
+        let ans = WireAnswer { status: 200, headers: vec![], length: None, body: Box::new(Slow(100)), closer: None };
         let started = Instant::now();
         assert!(ans.read_small_by(1 << 20, Instant::now() + Duration::from_secs(1)).is_err());
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -5103,7 +5252,7 @@ mod tests {
         for bad in ["bytes 19-10/100", "bytes 10-100/100", "bytes */100", "10-19/100", "bytes 10-19"] {
             assert_eq!(content_range(bad), None, "{bad}");
         }
-        let ans = |status: u16, cr: &str, length: Option<u64>| WireAnswer { status, headers: vec![("CONTENT-RANGE".into(), cr.into())], length, body: Box::new(std::io::empty()) };
+        let ans = |status: u16, cr: &str, length: Option<u64>| WireAnswer { status, headers: vec![("CONTENT-RANGE".into(), cr.into())], length, body: Box::new(std::io::empty()), closer: None };
         let asked = ByteRange::parse("bytes=10-");
         let mut a = ans(206, "bytes 10-19/100", None);
         let (v, refused) = answer_head(&mut a, asked);

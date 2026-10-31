@@ -132,6 +132,11 @@ pub const STALE_FAILING: u32 = 3;
 pub struct Polls {
     pub answered: u32,
     pub failing_since: Option<Instant>,
+    /// The wallet already said once that the seller counts too little ([`undercount`]).
+    pub undercount_told: bool,
+    /// Newer counts in a row that were far below the wallet's ([`undercount`]): one may be a
+    /// receipt signed a moment before a burst; two in a row are a meter not counting.
+    pub under_in_a_row: u32,
 }
 
 impl Polls {
@@ -146,8 +151,46 @@ impl Polls {
     }
     /// A newer count: the seller is counting.
     pub fn counted(&mut self) {
-        *self = Polls::default();
+        *self = Polls { undercount_told: self.undercount_told, under_in_a_row: self.under_in_a_row, ..Polls::default() };
     }
+
+    /// A newer count, and whether it was far below the wallet's: the words to say, once, after
+    /// [`UNDER_IN_A_ROW`] of them in a row.
+    pub fn under(&mut self, seen: &Seen) -> Option<String> {
+        match undercount(seen) {
+            Some(words) => {
+                self.under_in_a_row = self.under_in_a_row.saturating_add(1);
+                (self.under_in_a_row >= UNDER_IN_A_ROW && !self.undercount_told).then(|| {
+                    self.undercount_told = true;
+                    words
+                })
+            }
+            None => {
+                self.under_in_a_row = 0;
+                None
+            }
+        }
+    }
+}
+
+/// How far below the wallet's own count a seller's may fall before the wallet says so: its count
+/// trails the wallet's by what passed since it signed (at most a MiB's price or 10 s of bytes), so
+/// only a count under half the wallet's, past this many bytes, points at a meter that is not
+/// counting. Not a fault: a seller counting too little charges the buyer less.
+pub const UNDERCOUNT_FROM: u64 = 32 << 20;
+/// How many newer counts in a row must be far below the wallet's before it says so.
+pub const UNDER_IN_A_ROW: u32 = 2;
+
+/// A seller's count of an open answer far below the wallet's own (see [`UNDERCOUNT_FROM`]): the words
+/// for the wallet's log, never a fault. `own_at` is the wallet's count when it first saw that part.
+pub fn undercount(seen: &Seen) -> Option<String> {
+    let theirs = seen.up.saturating_add(seen.down);
+    (seen.own_at >= UNDERCOUNT_FROM && theirs < seen.own_at / 2).then(|| {
+        format!(
+            "the seller counted {theirs} bytes of an open answer where the wallet counted {}: its meter may not be counting (it charges less, not more)",
+            seen.own_at
+        )
+    })
 }
 
 pub fn stale(last: &Option<Seen>, polls: &Polls, own: u64, now: Instant, after: Duration) -> Option<String> {
@@ -251,16 +294,44 @@ mod tests {
     fn a_seller_that_stops_counting_while_bytes_flow_is_found() {
         let now = Instant::now();
         // the seller answered status twice with nothing newer
-        let answered = Polls { answered: STALE_ANSWERS, failing_since: None };
+        let answered = Polls { answered: STALE_ANSWERS, ..Polls::default() };
         assert_eq!(stale(&None, &answered, 1 << 30, now, INTERIM_STALE), None, "a seller that never sent one is held to the usual rules");
         let seen = Some(Seen { part: 1, charged: 0, up: 0, down: 0, at: now, own_at: 1 << 20 });
         assert_eq!(stale(&seen, &answered, 100 << 20, now + Duration::from_secs(5), INTERIM_STALE), None, "not long enough");
         assert_eq!(stale(&seen, &answered, (1 << 20) + 1000, now + Duration::from_secs(60), INTERIM_STALE), None, "a quiet link");
         assert!(stale(&seen, &answered, 100 << 20, now + Duration::from_secs(31), INTERIM_STALE).is_some());
         // a status that failed for a short while is a slow link, not a seller that stopped counting
-        let failing = Polls { answered: 0, failing_since: Some(now + Duration::from_secs(20)) };
+        let failing = Polls { failing_since: Some(now + Duration::from_secs(20)), ..Polls::default() };
         assert_eq!(stale(&seen, &failing, 100 << 20, now + Duration::from_secs(31), INTERIM_STALE), None, "an honest seller behind a slow status");
         // one answering only errors for long enough is caught all the same
         assert!(stale(&seen, &failing, 100 << 20, now + Duration::from_secs(20 + 90), INTERIM_STALE).is_some());
+    }
+
+    #[test]
+    fn a_seller_counting_far_less_than_passed_is_told_and_not_a_fault() {
+        let mut last = None;
+        // 100 MiB passed by the wallet's count; the seller signs for 1 MiB, and charges for that
+        let r = receipt(1, 0, 1 << 20, cost(1 << 20));
+        assert_eq!(check(&r, 7, "d", 101, 0, 100 << 20, &price(), u64::MAX, &mut last), Ok(true), "not a fault");
+        assert!(undercount(last.as_ref().unwrap()).is_some_and(|w| w.contains("1048576") && w.contains("104857600")));
+        // a count just behind the wallet's (bytes on their way), and a short answer, are not
+        let r = receipt(2, 0, 95 << 20, cost(95 << 20));
+        assert_eq!(check(&r, 7, "d", 101, 0, 100 << 20, &price(), u64::MAX, &mut last), Ok(true));
+        assert_eq!(undercount(last.as_ref().unwrap()), None);
+        let mut short = None;
+        check(&receipt(1, 0, 1 << 20, cost(1 << 20)), 7, "d", 101, 0, 8 << 20, &price(), u64::MAX, &mut short).unwrap();
+        assert_eq!(undercount(short.as_ref().unwrap()), None, "under the threshold");
+        // said only after two newer counts in a row far below, and once
+        let low = |part, own: u64| Seen { part, charged: 0, up: 0, down: 1 << 20, at: Instant::now(), own_at: own };
+        let fine = Seen { part: 3, charged: 0, up: 0, down: 99 << 20, at: Instant::now(), own_at: 100 << 20 };
+        let mut p = Polls::default();
+        assert_eq!(p.under(&low(1, 100 << 20)), None, "one may be a receipt signed before a burst");
+        assert_eq!(p.under(&fine), None, "an honest one after it starts again");
+        assert_eq!(p.under(&low(4, 200 << 20)), None);
+        p.counted();
+        assert!(p.under(&low(5, 300 << 20)).is_some(), "two in a row");
+        assert_eq!(p.under(&low(6, 400 << 20)), None, "said once");
+        p.counted();
+        assert!(p.undercount_told);
     }
 }

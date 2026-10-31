@@ -179,6 +179,37 @@ mod tests {
     use super::*;
     use crate::book::Rec;
 
+    /// What the seller earned outlives a compaction through the journal's own file: the dropped
+    /// sessions' sum is in the snapshot, so a restart after any compaction counts all of it, once.
+    #[test]
+    fn earnings_of_dropped_sessions_outlive_compactions_and_restarts() {
+        use crate::book::{tests::caps, Book};
+        let d = tempfile::tempdir().unwrap();
+        let mark = |id: &str, spent| Rec::Mark { session: id.into(), next_seq: 1, seqs_ahead: 0, spent_msat: spent, pledge: None };
+        let session = |id: &str| Rec::Session { id: id.into(), key: [1; 32], addr: "x".into() };
+        {
+            let (mut s, _) = Store::open(d.path()).unwrap();
+            s.append(&[session("a"), mark("a", 294_967), session("b"), mark("b", 1_000), Rec::Drop { session: "a".into() }]).unwrap();
+            s.handle().sync_data().unwrap();
+        }
+        for round in 0..3 {
+            let (mut s, recs) = Store::open(d.path()).unwrap();
+            let book = Book::restore(caps(), &recs, 0).unwrap();
+            assert_eq!(book.charged_msat(), 295_967, "after restart {round}");
+            s.compact(&book.snapshot()).unwrap();
+        }
+        // a session dropped after the last compaction adds to it, and a further compaction keeps it
+        let (mut s, recs) = Store::open(d.path()).unwrap();
+        s.append(&[Rec::Drop { session: "b".into() }]).unwrap();
+        let book = Book::restore(caps(), &[recs, vec![Rec::Drop { session: "b".into() }]].concat(), 0).unwrap();
+        assert_eq!((book.sessions(), book.charged_msat()), (0, 295_967));
+        s.compact(&book.snapshot()).unwrap();
+        drop(s);
+        let (_, recs) = Store::open(d.path()).unwrap();
+        assert_eq!(Book::restore(caps(), &recs, 0).unwrap().charged_msat(), 295_967);
+        assert!(!d.path().join("charged.json").exists(), "no second file to lose or misread");
+    }
+
     #[test]
     fn a_journal_is_read_back_whole_and_a_torn_last_line_is_dropped() {
         let d = tempfile::tempdir().unwrap();

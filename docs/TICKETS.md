@@ -1580,6 +1580,16 @@ wallet that starts again has stopped every session (section 3); it asks each sel
 once, to cancel what it left locked. Stopping gives up the session's balance: the unused part of
 the last ticket.
 
+From the moment a session starts to stop, no ticket is released in it, no new call is made in it,
+and its open answers end: a body read as it comes is read no further, an answer priced by the
+second stops at the second it has paid for, and a WebSocket (a VPN tunnel) is closed both ways.
+Each takes its last receipt as it ends. The owner's own `ticket_stop` waits for those last
+receipts, up to 15 s, before it says what the session spent and what it leaves with the seller,
+so a tunnel open at the stop is counted with every byte it carried. A stop the wallet makes itself
+(a seller fault, changed terms, an idle session) does not wait: one made at a fault is made inside
+the faulty answer, which is among the open ones. A stream that has not ended when the wait is up
+is counted at the wallet's own count of it.
+
 **The most a dishonest seller can take, in one place.** In short: **a cheating shop can take what
 your app has paid it ahead (about one to two tickets for each answer it is sending you at the
 time; a ticket is 1,000 sat by default), and a small allowance for each request: 16 MiB of data
