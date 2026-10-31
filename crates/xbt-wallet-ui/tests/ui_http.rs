@@ -875,8 +875,10 @@ fn the_starter_policy_turns_the_rail_and_tickets_on_and_is_low_on_mainnet() {
     assert_eq!(m["ln"]["split_height"], json!(xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT));
     assert!(m["max_per_tx_sats"].as_i64().unwrap() <= 2000 && m["daily_budget_sats"].as_i64().unwrap() <= 10000);
     assert!(m["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() <= 10000);
-    // renting miners pays under its own task: there from the start, low on mainnet, and only to listed sellers
-    assert!(m["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() <= 5000 && t["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() > 0);
+    // renting miners pays under its own task: there from the start, and only to listed sellers. On mainnet it's a rental
+    // task (Mike's decision for 0.2.0): a budget of 200,000 sat, tickets of at most 10,000 sat, 600 sends an hour
+    assert_eq!(m["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}));
+    assert!(t["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() > 0);
     assert!(m["tickets"]["tasks"]["hashrate"].get("admit").is_none());
     // the signer takes both
     for p in [t, m] {
