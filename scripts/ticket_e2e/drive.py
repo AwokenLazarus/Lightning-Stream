@@ -2529,7 +2529,11 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
                            env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="39000"),
                            capture_output=True, text=True, timeout=400)
         line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+        # the wallet's last word on the tunnel is on stderr: why it ended, if it ended on its own
+        said = next((ln for ln in r.stderr.splitlines() if ln.startswith("the wallet:")), r.stderr[-400:])
+        ended = re.search(r'"ended":"[^"]*"|"(?:rule|reason)":"[^"]*"', said)
         out.update(json.loads(line) if line else {"stderr": r.stderr[-800:]})
+        out["wallet_said"] = ended.group(0) if ended else said[:300]
 
     t = threading.Thread(target=fetch)
     t.start()
@@ -2559,7 +2563,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
         m1 = money()
         m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
         check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False,
-              f"{e}: at that moment {json.dumps(at_timeout)[:900]}; once ended, fetch {json.dumps(out)[:400]}, money since the start {json.dumps(m)[:600]}")
+              f"{e}: at that moment {json.dumps(at_timeout)[:900]}; once ended, fetch {json.dumps(out)[:700]}, money since the start {json.dumps(m)[:600]}")
         return
     sid = next((p["session"] for p in status().get("paying", []) if p.get("origin") == origin), None)
     if sid is None:
