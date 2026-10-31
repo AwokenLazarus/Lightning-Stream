@@ -40,7 +40,7 @@
 #            for, with the wallet's limit for an answer read whole set to 3 s: it comes whole, its
 #            sha256 the file's, the money agreeing. long_download_relay (by name only): the same
 #            from a relay-only shop, through our relay
-#   paused_player  a player paused past the 30 s the app gives a client that takes nothing: it loses
+#   paused_player  a player paused past the 90 s or so the app gives a client that takes nothing: it loses
 #            its connection, and asks again by Range from where it was. The file whole, the money agreeing
 #   jellyfin (by name only) a seller's whole web app: the real Jellyfin web client in Chrome,
 #            through the wallet app's app port, the connector and the signer, to a gateway that

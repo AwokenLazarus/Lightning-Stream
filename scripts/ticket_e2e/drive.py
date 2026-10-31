@@ -1781,8 +1781,8 @@ class RangeFiles(BaseHTTPRequestHandler):
 
 
 def paused_player() -> None:
-    """A player paused with its buffer full, past the 30 s the app gives a client that takes nothing:
-    its connection ends and the wallet stops paying for that answer. Going on, it asks again from
+    """A player paused with its buffer full, past what the app gives a client that takes nothing (about
+    90 s, three writes of 30 s): its connection ends and the wallet stops paying for that answer. Going on, it asks again from
     where it was, by `Range`: the file comes whole between the two answers, its sha256 the file's, and
     the money agrees, the seller paid for the bytes and what was on its way, less than two tickets more."""
     want = huge_file()
@@ -1826,9 +1826,9 @@ def paused_player() -> None:
                 got += len(chunk)
                 digest.update(chunk)
                 if not paused and got >= 32 << 20:
-                    # the player's buffer is full: it takes nothing past the app's 30 s
+                    # the player's buffer is full: it takes nothing past what the app gives it
                     paused = True
-                    time.sleep(40)
+                    time.sleep(110)
             if resp.length:
                 first_end = f"short of its length by {resp.length} bytes"
         except (http.client.IncompleteRead, OSError) as e:
@@ -1868,7 +1868,7 @@ def paused_player() -> None:
     inv["same_tickets"] = paid == settled
     price_msat = -(-HUGE * HUGE_BYTE_MSAT // PER_BYTES)
     paid_for = price_msat <= m["seller_node_received_msat"] < price_msat + 2 * TICKET_MSAT
-    check("paused_player: a player paused past the 30 s the app gives a client that takes nothing loses its connection, and asking again by Range from where it was gets the rest: the file whole, its sha256 the file's, the money agreeing, the seller paid for its bytes and less than two tickets more",
+    check("paused_player: a player paused past the 90 s or so the app gives a client that takes nothing loses its connection, and asking again by Range from where it was gets the rest: the file whole, its sha256 the file's, the money agreeing, the seller paid for its bytes and less than two tickets more",
           first_status == 200 and bool(first_end) and second_status == 206 and not second_end and got == HUGE and digest.hexdigest() == want and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
           {"first": first_status, "first_end": first_end, "second": second_status, "second_end": second_end, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "price_msat": price_msat, **inv, "money": m})
     PROCS["gateway-range"].terminate()

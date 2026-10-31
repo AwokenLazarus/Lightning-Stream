@@ -934,9 +934,11 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   a ticket being paid) does not count, and an AI model reasoning behind keep-alives is not cut for
   those minutes. An answer the wallet ends early, for any reason, reaches the client cut short
   (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
-- A client that takes nothing for 30 s (`stream_write`), such as a player paused with its buffer
-  full, loses its connection, and the wallet stops paying for that answer. What was on its way when
-  it stopped is paid for. A player that can seek resumes by asking again from where it was (`Range`).
+- A client that takes nothing for about 90 s, such as a player paused with its buffer full, loses its
+  connection, and the wallet stops paying for that answer. (Each write has 30 s, `stream_write`; a
+  stalled socket still takes a little at each of the first two, so it is the third that fails:
+  measured on Linux loopback, 9 s for a 3 s limit.) What was on its way when it stopped is paid for. A
+  player that can seek resumes by asking again from where it was (`Range`).
 - A session of draws takes one answer at a time, and one streamed on may run for hours. Another call
   to that seller waits up to 50 s behind it and is then told `ticket_busy`. A stop ends the open
   answer at once and gives no new value; wins already drawn are still paid.

@@ -40,7 +40,8 @@ pub struct Limits {
     /// proxy or tunnel in front of the server, which brings every client over its own address.
     /// At most [`MAX_PROXIES`]; [`Limits::with_proxies`] fills it.
     pub proxies: [Option<IpAddr>; MAX_PROXIES],
-    /// One write of a [`Streamed`] body: a client that takes nothing for this long ends the stream.
+    /// One write of a [`Streamed`] body: a client that takes nothing ends the stream after about three
+    /// of these (a stalled socket still takes a little at each of the first two).
     pub stream_write: Duration,
 }
 
