@@ -5688,6 +5688,29 @@ fn a_websocket_open_does_not_hold_up_other_requests_to_the_seller() {
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+/// A small use of a seller (a VPN exit's region check, a hashrate trial slice) is charged no more
+/// than its `max_charge_sats`, while `max_sats` bounds what may leave for it: the seller's whole
+/// ticket is bought, and what the use leaves of it stays as the session's credit with that seller.
+#[test]
+fn a_call_may_buy_a_whole_ticket_and_be_charged_only_its_max_charge() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let call = |path: &str, charge: i64| r.call("xbt402_pay", json!({"url": r.shop.url(path), "max_sats": CALL, "max_charge_sats": charge, "task": "film"}));
+    // a page costs 2.5 sat: over a charge cap of 2, nothing is paid
+    let over = call("/page/10", 2);
+    assert_eq!((over["verdict"].as_str(), over["rule"].as_str(), over["tickets_released"].as_u64()), (Some("deny"), Some("max_sats"), Some(0)), "{over}");
+    assert_eq!(over["charged_sats"].as_i64(), Some(0), "no ticket was released for it: {over}");
+    // within a cap of 3: the seller's 1,000 sat ticket is bought, and the page charged its 2.5
+    let small = call("/page/10", 3);
+    assert_eq!((small["status"].as_u64(), small["price_msat"].as_str(), small["tickets_released"].as_u64()), (Some(200), Some("2500"), Some(1)), "{small}");
+    assert_eq!(small["balance_msat"].as_str(), Some((TICKET - 2_500).to_string().as_str()), "the rest is credit with the seller: {small}");
+    // a film priced by its bytes ends where its charge reaches the cap: 30 sat at 20 sat a MiB
+    let film = call(&format!("/hd20/{}", 30 * MIB), 30);
+    assert_eq!(film["complete"].as_bool(), Some(false), "{film}");
+    let charged: u64 = film["price_msat"].as_str().unwrap().parse().unwrap();
+    assert!(charged <= 30_000 && charged > 20_000, "charged {charged} msat for a cap of 30 sat: {film}");
+}
+
 /// A session stopped while a paid WebSocket is open (a VPN's tunnel, held for as long as the VPN
 /// runs): the socket ends first and its last receipt is taken, so what the stop says the session
 /// spent and left with the seller counts every byte the socket carried, at the route's price, by

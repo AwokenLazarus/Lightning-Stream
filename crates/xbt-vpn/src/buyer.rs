@@ -122,7 +122,9 @@ pub const PROBE_EVERY: Duration = Duration::from_secs(15);
 /// with it if it does so often) instead of being paid to open again at once.
 pub const YOUNG: Duration = Duration::from_secs(10);
 pub const YOUNG_BYTES: u64 = 16 * 1024;
-/// The most a region check of a priced exit may cost (sats): it reads four small pages.
+/// The most a region check of a priced exit may be charged (sats): it reads four small pages. The
+/// wallet may buy that exit's whole ticket for it (within the tunnel's `max_sats`): a ticket is far
+/// more than this, and what the check does not use stays as credit with the exit's shop.
 pub const REGION_CHECK_MAX_SATS: u64 = 20;
 /// How long an exit whose terms are above what it announced is not used (bait and switch).
 pub use crate::holds::MISPRICED_HOLD;
@@ -287,10 +289,10 @@ impl Buyer {
     }
 
     /// Opens a paid tunnel to `id` at `url`, paying no more than its announced price (and, for a
-    /// one-off check, no more than `max_sats`). An exit whose terms are above its announcement is
+    /// one-off check, charged no more than `max_charge_sats`). An exit whose terms are above its announcement is
     /// held off for a day.
     /// `cap`: what the day's openings are counted by (a device and the exit, or a region check of it).
-    async fn open_paid(&self, id: &str, cap: &str, url: &str, price: u64, max_sats: Option<u64>) -> Option<crate::paid::Tunnel> {
+    async fn open_paid(&self, id: &str, cap: &str, url: &str, price: u64, max_charge_sats: Option<u64>) -> Option<crate::paid::Tunnel> {
         let mut w = (*self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone()?).clone();
         // held off, or opened enough today: each opening pays its head, so none more
         let op = self.operator_of(id);
@@ -301,8 +303,10 @@ impl Buyer {
                 return None;
             }
         }
-        if let Some(m) = max_sats {
-            w.max_sats = w.max_sats.min(m);
+        // the check's own charge is capped, not what may leave for it: capping that below the shop's
+        // ticket would leave a buyer with no credit there unable to ever check the exit
+        if let Some(m) = max_charge_sats {
+            w.max_charge_sats = Some(m.min(w.max_sats));
         }
         match tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, url, Some(crate::paid::ceiling(price)))).await {
             Ok(Ok(t)) => {

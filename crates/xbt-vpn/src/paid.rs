@@ -32,6 +32,10 @@ pub struct Wallet {
     /// The most one tunnel may cost (sats); a tunnel that reaches it ends, and the next flow opens
     /// another, so the owner's rules are asked again.
     pub max_sats: u64,
+    /// The most the tunnel itself may be charged, where that is less than `max_sats` (a region check):
+    /// the wallet may still buy the exit's whole ticket within `max_sats`, and what the check does
+    /// not use stays as credit with that exit's shop for the next tunnel.
+    pub max_charge_sats: Option<u64>,
 }
 
 impl Wallet {
@@ -45,6 +49,7 @@ impl Wallet {
             stream_dir: var("B2_STREAM_DIR")?.into(),
             task: var("XBT_VPN_TASK").unwrap_or_else(|| "default".into()),
             max_sats: var("XBT_VPN_TUNNEL_MAX_SATS").and_then(|v| v.parse().ok()).unwrap_or(10_000),
+            max_charge_sats: None,
         })
     }
 }
@@ -99,6 +104,9 @@ fn open_blocking(w: &Wallet, url: &str, ceiling: Option<Value>) -> io::Result<Op
     if let Some(m) = params.as_object_mut() {
         if let Some(c) = ceiling {
             m.insert("price_ceiling".into(), c);
+        }
+        if let Some(c) = w.max_charge_sats {
+            m.insert("max_charge_sats".into(), c.into());
         }
         xbt_wallet_mcp::wallet::with_transport(m);
     }

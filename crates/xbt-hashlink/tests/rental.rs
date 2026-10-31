@@ -196,6 +196,7 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
         url: "https://hashmaker.example/hashrate".into(),
         task: "hashrate".into(),
         max_sats: 600,
+        max_charge_sats: None,
         session: None,
         ceiling: Some(xbt_hashlink::rail::slice_ceiling(terms().price_msat)),
         wait_for_signer: std::time::Duration::from_secs(5),
@@ -439,4 +440,158 @@ fn a_rental_survives_a_moment_without_its_link() {
     assert_eq!(r.hashmaker["receiptsDisagree"].as_u64().unwrap(), 0);
     assert!(!r.hashmaker["stopped"]["reason"].as_str().unwrap_or("").starts_with("link lost"), "{}", r.hashmaker);
     assert_eq!(r.hashtaker["closed"], "no accepted work", "it ended when the miners stopped, not when the link dropped");
+}
+
+/// A seller's ticket, as the hashmaker's shop sells them: far more than one slice.
+const TICKET_MSAT: u64 = 900_000;
+
+/// What [`ticket_wallet`] holds: the session's credit with the shop, the tickets bought, and what
+/// the paid slices were charged.
+#[derive(Default, Debug)]
+struct Book {
+    credit_msat: u64,
+    tickets: u64,
+    charged_msat: u64,
+}
+
+/// [`fake_wallet`] with the signer's money rules: a slice is paid from the session's credit, and a
+/// ticket ([`TICKET_MSAT`]) is bought only where the call's `max_sats` takes a whole one; the slice
+/// is charged only within its `max_charge_sats` (else `max_sats`). Credit stays with the shop
+/// between rentals, as a session's balance does.
+fn ticket_wallet(dir: &std::path::Path, slices: String, book: Arc<Mutex<Book>>) -> PathBuf {
+    let sock = dir.join("signer.sock");
+    let l = UnixListener::bind(&sock).unwrap();
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(c) = c else { continue };
+            let mut line = String::new();
+            BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let p = &req["params"];
+            let price = terms().price_msat;
+            let max_msat = p["max_sats"].as_u64().unwrap_or(0) * 1000;
+            let charge_msat = p["max_charge_sats"].as_u64().map_or(max_msat, |c| c * 1000);
+            let result = match req["method"].as_str() {
+                Some("xbt402_pay") if price > charge_msat => json!({"verdict": "deny", "rule": "max_sats", "charged_sats": 0}),
+                Some("xbt402_pay") => {
+                    let mut b = book.lock().unwrap();
+                    if b.credit_msat < price {
+                        // a whole ticket, and up to a tenth more in routing fees, must fit the call's max_sats
+                        if TICKET_MSAT + TICKET_MSAT / 10 > max_msat {
+                            let r = json!({"verdict": "deny", "rule": "max_sats", "charged_sats": 0});
+                            drop(b);
+                            let mut w = c;
+                            writeln!(w, "{}", json!({"id": 1, "result": r})).unwrap();
+                            continue;
+                        }
+                        b.credit_msat += TICKET_MSAT;
+                        b.tickets += 1;
+                    }
+                    drop(b);
+                    let url = p["url"].as_str().unwrap();
+                    let path = &url[url.find("/hashrate").unwrap()..];
+                    let body = p["body"].as_str().unwrap();
+                    let mut s = TcpStream::connect(&slices).unwrap();
+                    write!(s, "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+                    let mut out = String::new();
+                    s.read_to_string(&mut out).unwrap();
+                    let status: u64 = out.split_whitespace().nth(1).unwrap().parse().unwrap();
+                    if status == 200 {
+                        let mut b = book.lock().unwrap();
+                        b.credit_msat -= price;
+                        b.charged_msat += price;
+                    }
+                    json!({"verdict": "allow", "rail": "ticket", "status": status, "session": "s1", "charged_sats": if status == 200 { price / 1000 } else { 0 }})
+                }
+                _ => json!({"ok": true}),
+            };
+            let mut w = c;
+            writeln!(w, "{}", json!({"id": 1, "result": result})).unwrap();
+        }
+    });
+    sock
+}
+
+/// A trial slice from a buyer with no credit at the shop, then a rental of at least ten slices:
+/// the trial is paid (its budget, one slice, is far under the shop's ticket, so it buys one and is
+/// charged only the slice), and every slice of both is charged its price, by the hashmaker's count
+/// and the wallet's, with the ticket's rest carried from the trial to the rental.
+#[test]
+fn a_trial_slice_from_no_credit_is_paid_and_a_rental_after_it_pays_every_slice() {
+    let _serial = serial();
+    let [pool_a, link_a, miners_a, slices_a] = ports::<4>();
+    let dir = tempdir();
+    thread::spawn({
+        let a = pool_a.clone();
+        move || standin::pool(standin::PoolConfig { listen: a, diff: DIFF, job_every: Duration::from_millis(700), report: None })
+    });
+    wait_for(&pool_a);
+    let hk = noise::fresh_key();
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+    // one hashmaker serving both rentals, each on the lab's rail
+    let cfg = hashmaker::Config { miners: miners_a.clone(), link: link_a.clone(), key: hk, terms: terms(), report: None,
+                                  slices: Some(slices_a.clone()), fallback: None, rentable: None };
+    let h = hashmaker::Hashmaker::start(cfg, Box::new(|| Box::<LabSeller>::default())).unwrap();
+    wait_for(&link_a);
+    let book: Arc<Mutex<Book>> = Arc::default();
+    let sock = ticket_wallet(&dir, slices_a.clone(), book.clone());
+    let price_sats = terms().price_msat / 1000;
+    // the miners run through both rentals
+    let miners: Vec<_> = (0..2)
+        .map(|i| {
+            let a = miners_a.clone();
+            thread::spawn(move || {
+                standin::miner(standin::MinerConfig { pool: a, user: format!("hashmaker.m{i}"), max_rate: 8.0, bad_every: 7,
+                                                      duration: Some(Duration::from_secs(60)), reconnect: true, extranonce_subscribe: false, bind: None })
+            })
+        })
+        .collect();
+    let rent = |id: &str, budget_sats: u64, trial: bool| {
+        let (max_sats, max_charge_sats) = if trial { xbt_hashlink::rail::trial_pay_caps(budget_sats) } else { (budget_sats, None) };
+        let payer = SignerPayer { sock: sock.clone(), url: "https://hashmaker.example/hashrate".into(), task: "hashrate".into(), max_sats, max_charge_sats,
+                                  session: None, ceiling: Some(xbt_hashlink::rail::slice_ceiling(terms().price_msat)),
+                                  wait_for_signer: Duration::from_secs(5) };
+        let cfg = hashtaker::Config { hashmaker: link_a.clone(), hashmaker_key: hpub, key: noise::fresh_key(), upstream: pool_a.clone(),
+                                      user: "hashtaker.rented".into(), terms: terms(), rental: id.into(), listing: "lab".into(), stop_paying_after: None,
+                                      idle: Duration::from_secs(3), duration: Some(Duration::from_secs(40)), report: None, payer: Some(payer), miners: 0,
+                                      budget_msat: Some(budget_sats * 1000), cut: None, live: None };
+        hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap()
+    };
+    // the trial: one slice's budget, from no credit
+    let trial = rent("trial-1", price_sats, true);
+    let paid_trial = trial["released"].as_u64().unwrap();
+    let b = format!("{:?}", book.lock().unwrap());
+    assert_eq!(paid_trial, 1, "the trial slice was paid: {trial} {b}");
+    assert!(trial["pays"].as_array().unwrap().iter().all(|p| p["ok"] == true), "{trial}");
+    {
+        let b = book.lock().unwrap();
+        assert_eq!((b.tickets, b.charged_msat, b.credit_msat), (1, terms().price_msat, TICKET_MSAT - terms().price_msat),
+                   "one ticket bought, one slice charged, the rest credit with the shop: {b:?}");
+    }
+    // a rental of twelve slices after it, on the ticket the trial bought
+    let rental = rent("rental-2", 12 * price_sats, false);
+    let paid_rental = rental["released"].as_u64().unwrap();
+    assert!(paid_rental >= 10, "{paid_rental} slices: {rental}");
+    assert!(rental["pays"].as_array().unwrap().iter().all(|p| p["ok"] == true), "{rental}");
+    // the hashmaker's own reports of the two rentals
+    let mut reports = vec![];
+    for _ in 0..200 {
+        reports = h.finished();
+        if reports.len() >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    h.shutdown();
+    for m in miners {
+        let _ = m.join();
+    }
+    let maker_paid: u64 = reports.iter().map(|r| r["paid"].as_u64().unwrap_or(0)).sum();
+    let b = book.lock().unwrap();
+    // charged = slices × price, by the wallet's book and the hashmaker's count of paid slices
+    let slices = paid_trial + paid_rental;
+    assert_eq!(b.charged_msat, slices * terms().price_msat, "{b:?}");
+    let brief: Vec<_> = reports.iter().map(|r| (r["rental"].clone(), r["paid"].clone(), r["slicesDone"].as_array().map(Vec::len), r["receiptsAgree"].clone(), r["closing"].clone(), r["stopped"].clone())).collect();
+    assert_eq!((reports.len(), maker_paid), (2, slices), "{brief:?}");
+    assert_eq!((b.tickets, b.credit_msat), (1, TICKET_MSAT - slices * terms().price_msat), "{b:?}");
 }

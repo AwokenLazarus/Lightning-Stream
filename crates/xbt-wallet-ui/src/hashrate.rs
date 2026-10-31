@@ -441,7 +441,8 @@ impl App {
                     let history = history_panel(&x["history"]);
                     let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
                         <input type=\"hidden\" name=\"key\" value=\"{}\"><p class=\"hint\">Not sure yet? Rent one machine for one piece of work, \
-                        about {}, and see what your own DATUM Gateway accepts before renting more.</p>\
+                        about {}, and see what your own DATUM Gateway accepts before renting more. Your wallet may buy one ticket from this shop for it; \
+                        what the slice doesn't use stays as credit there for a rental after it.</p>\
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
                         esc(x["linkKey"].as_str().unwrap_or("")), sats_n(price.ceil()), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\

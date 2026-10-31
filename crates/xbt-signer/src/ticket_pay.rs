@@ -1541,6 +1541,10 @@ struct Call<'a> {
     /// ticket (`credit_only`): a web app's other requests while one of them buys. Its `max_sats`
     /// stays the most the answer may charge, which the seller is told.
     credit_only: bool,
+    /// The most the answer itself may charge (`max_charge_sats`), at most `max_sats`: a small check
+    /// (a VPN exit's region, a hashrate trial) may buy the seller's whole ticket within `max_sats`
+    /// and still be charged only its own use, the rest staying as credit with that seller.
+    charge_sats: i64,
 }
 
 impl Call<'_> {
@@ -2341,6 +2345,14 @@ impl Signer {
         };
         let upgrade = p.get("upgrade").and_then(Value::as_bool) == Some(true);
         let credit_only = p.get("credit_only").and_then(Value::as_bool) == Some(true);
+        let charge_sats = match p.get("max_charge_sats").filter(|v| !v.is_null()) {
+            None => max_sats,
+            Some(v) => match py_int(Some(v)) {
+                Some(n) if n > 0 => n.min(max_sats),
+                Some(_) => return deny("amount", "max_charge_sats must be > 0"),
+                None => return deny("amount", "max_charge_sats must be an integer"),
+            },
+        };
         if upgrade && (stream_to.is_none() || method != "GET" || range.is_some()) {
             return deny("upgrade", "a WebSocket (upgrade) is a GET with stream_to, and no range");
         }
@@ -2462,7 +2474,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
@@ -2578,7 +2590,7 @@ impl Signer {
         }
         let paid = {
             let _g = self.lock();
-            self.ln_pay_locked(&json!({"invoice": invoice.trim(), "max_sats": c.max_sats}))
+            self.ln_pay_locked(&json!({"invoice": invoice.trim(), "max_sats": c.charge_sats}))
         };
         if paid["verdict"] != "allow" {
             return match str_or_empty(paid.get("rule")).as_str() {
@@ -3878,7 +3890,8 @@ impl Signer {
     /// receipt, its body as it arrives.
     fn ticket_request(&self, hs: &Arc<HttpSession>, c: &Call, price: &Price) -> Value {
         let tp = self.ticket_policy();
-        let max_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
+        // what the answer may charge; what may leave for it (a whole ticket included) is `max_sats`, in `spent`
+        let max_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
         let dest = format!("ln:{}", hs.terms.terms.payee);
         let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
         let about = |hs: &HttpSession, spent: &Spent| {
@@ -3892,7 +3905,7 @@ impl Signer {
             return fail(hs, &spent, refusal("ticket_terms", "the route's price does not fit an amount, or the request is not one the route takes (by the token: a JSON object)"))
         };
         if reserve > max_msat {
-            return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > max_sats {}", sats_ceil(reserve), c.max_sats)));
+            return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > max_sats {}", sats_ceil(reserve), c.charge_sats)));
         }
         // a call that found the session as it was being stopped goes no further in it
         if hs.ending.load(Ordering::SeqCst) {
@@ -3954,8 +3967,8 @@ impl Signer {
                 let mut headers = c.headers();
                 headers.push(("PAYMENT-SIGNATURE".into(), header));
                 // the most this answer may charge the session's balance: the call's own limit
-                if c.max_sats > 0 {
-                    headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.max_sats as u64).saturating_mul(1000).to_string()));
+                if c.charge_sats > 0 {
+                    headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.charge_sats as u64).saturating_mul(1000).to_string()));
                 }
                 // the price the wallet counts this request at: a seller that checks it refuses another unpaid
                 headers.push((xbt402::ticket::PRICE_HEADER.into(),

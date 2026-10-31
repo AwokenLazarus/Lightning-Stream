@@ -135,7 +135,10 @@ rules ask for that region and would otherwise take it, and under one budget
 (`xbt_vpn::holds::CheckGate`): 100 sats a day for all such checks together (each held to 20 sats), one
 check of an exit a day, none more that day for an operator (the exit's Nostr key) whose checks failed
 twice, and the exits seen longest first, so a crowd of new announcements can't spend the budget or
-push the others out.
+push the others out. A check is charged at most 20 sats (`max_charge_sats`), but the wallet may buy
+that exit's whole ticket for it, within the tunnel's own `max_sats` and the owner's rules: a ticket
+is far more than 20 sats, and a buyer with no credit at an exit could otherwise never check it.
+What the check leaves of the ticket stays as credit with the exit's shop, for the tunnel after it.
 Until the table has loaded, no region is verified, and a device whose rules name a country is told
 no exit qualifies rather than sent to one that may be elsewhere. Each exit's result is in
 `status.json` (`exits`), in plain words, and on the VPN page.

@@ -280,6 +280,7 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
             url: f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
             task: need(f, "task")?.into(),
             max_sats: num(f, "max-sats", None)?,
+            max_charge_sats: None,
             session: None,
             // the offer's price per slice: the most the shop is paid for one
             ceiling: Some(xbt_hashlink::rail::slice_ceiling(t.price_msat)),

@@ -566,7 +566,7 @@ fn fake_wallet_with(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
             });
         }
     });
-    let wallet = xbt_vpn::paid::Wallet { signer: sock, stream_dir: streams, task: "vpn".into(), max_sats: 10_000 };
+    let wallet = xbt_vpn::paid::Wallet { signer: sock, stream_dir: streams, task: "vpn".into(), max_sats: 10_000, max_charge_sats: None };
     FakeWallet { wallet, opened, carried, asked, _dir: dir }
 }
 
@@ -601,7 +601,7 @@ fn refusing_wallet() -> (xbt_vpn::paid::Wallet, Arc<std::sync::atomic::AtomicUsi
             let _ = conn.write_all(b"{\"id\":1,\"result\":{\"verdict\":\"deny\",\"rule\":\"price_ceiling\",\"reason\":\"the seller asks more than the price it was shown\"}}\n");
         }
     });
-    (xbt_vpn::paid::Wallet { signer: sock, stream_dir: streams, task: "vpn".into(), max_sats: 10_000 }, asked, dir)
+    (xbt_vpn::paid::Wallet { signer: sock, stream_dir: streams, task: "vpn".into(), max_sats: 10_000, max_charge_sats: None }, asked, dir)
 }
 
 #[test]
@@ -738,4 +738,27 @@ fn a_priced_exit_is_not_used_without_a_wallet_to_pay_it() {
     s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
     let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(8)));
     assert_eq!(got, 0, "nothing gets out unpaid");
+}
+
+/// A region check of a priced exit is charged at most `REGION_CHECK_MAX_SATS`, but the wallet may
+/// buy that exit's whole ticket for it (within the tunnel's `max_sats`): a seller's ticket is far
+/// more than a check, and a cap of 20 sats on what may leave would never buy one, so an exit the
+/// buyer holds no credit with could never be checked.
+#[test]
+fn a_region_check_is_charged_little_but_may_buy_the_exits_ticket() {
+    use xbt_vpn::region::GeoTable;
+    let s = setup(120, false, None);
+    let at = paid_exit(&s.rt, Arc::new(Meter::default()));
+    let w = fake_wallet(at, None);
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
+    s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
+    s.buyer.set_egress_echo(trace_page(), "trace.test", "/cdn-cgi/trace");
+    let ip = lan_ip();
+    s.buyer.set_geo(GeoTable::from_csv(&format!("{ip},{ip},DE\n")));
+    let _ = s.rt.block_on(s.buyer.verify_region("paid-exit", "DE"));
+    let asked = w.asked.lock().unwrap().clone();
+    assert!(!asked.is_empty(), "the check opened a paid tunnel");
+    assert_eq!((asked[0]["max_sats"].as_u64(), asked[0]["max_charge_sats"].as_u64()),
+               (Some(10_000), Some(xbt_vpn::buyer::REGION_CHECK_MAX_SATS)), "{asked:?}");
 }

@@ -319,7 +319,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     };
     // the offer's price per slice is the most the wallet pays the shop for one ([`SignerPayer::ceiling`])
     let ceiling = Some(xbt_hashlink::rail::slice_ceiling(h.terms.price_msat));
-    let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats: budget_sats, session: None, ceiling,
+    let (max_sats, max_charge_sats) = if trial { xbt_hashlink::rail::trial_pay_caps(budget_sats) } else { (budget_sats, None) };
+    let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats, max_charge_sats, session: None, ceiling,
                                                        wait_for_signer: std::time::Duration::from_millis(h.terms.grace_ms / 2) });
     let cfg = hashtaker::Config {
         hashmaker: addr,
@@ -371,7 +372,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         done.store(true, Ordering::Relaxed);
         eprintln!("hashtaker: rental with {} ended", hex::encode(hashmaker_key.serialize()));
     });
-    (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes}))
+    // a trial may buy the shop's ticket: what of it the slice does not use stays with that shop as credit
+    (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes, "mayBuyTicketUpToSats": max_charge_sats.map(|_| max_sats)}))
 }
 
 /// Publish the signed delivery record of a rental that ended (the hashtaker's choice, per rental).
