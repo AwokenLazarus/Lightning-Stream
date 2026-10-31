@@ -53,6 +53,16 @@ pub fn sellers_entries(ai: &[Service], old: &Value, mut get: impl FnMut(&str) ->
     let mut problems = vec![];
     for s in ai {
         let route = route_of(s);
+        // a shop reached by key has no web address to fetch its listing from: its listing came from
+        // Nostr, checked against its key when it was added or updated, and its prices are kept with it
+        if xbt402::shop::key_of(&s.seller).is_some() {
+            if s.prices.is_object() {
+                out.push(json!({"name": s.name, "route": route, "prices": s.prices, "max_output": 0}));
+            } else {
+                problems.push(format!("{}: its listing named no prices; press Check for updates on Sellers", s.name));
+            }
+            continue;
+        }
         let prices = match xbt402::listing::fetch(&s.seller, &mut get) {
             Ok(l) => {
                 let path = route.strip_prefix(&services::http_origin(&s.seller).unwrap_or_default()).unwrap_or("/").to_string();
@@ -306,5 +316,19 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["prices"]["per_1k_output_msat"], 7000);
         assert_eq!(problems.len(), 2);
+    }
+
+    #[test]
+    fn a_shop_reached_by_key_uses_the_prices_of_its_checked_listing_and_is_not_fetched() {
+        let pk = [2u8; 32];
+        let origin = xbt402::shop::origin_for(&pk);
+        let mut s = ai("Model", &origin, &format!("{origin}/laz-mini"));
+        s.prices = json!({"per_1k_output_msat": "10000"});
+        let (out, problems) = sellers_entries(&[s.clone()], &json!({}), |u| panic!("fetched {u}"));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!((out[0]["route"].as_str(), &out[0]["prices"]), (Some(format!("{origin}/laz-mini/").as_str()), &json!({"per_1k_output_msat": "10000"})));
+        s.prices = Value::Null;
+        let (out, problems) = sellers_entries(&[s], &json!({}), |u| panic!("fetched {u}"));
+        assert!(out.is_empty() && problems.len() == 1);
     }
 }
