@@ -1008,6 +1008,13 @@ pub fn prepaid_size(terms: &Terms, pol: &TicketPolicy) -> Result<u64, Refusal> {
 /// Whether a prepaid ticket of `msat` may be bought in session `s`: its seller's size, or a
 /// smaller one inside what the seller's terms let the wallet ask for. A session that pays by
 /// draws pays its win size only.
+/// Why a session whose prepaid ticket had no final answer in time was stopped: not the seller's fault.
+pub const PREPAY_PENDING_WHY: &str = "the payment of a prepaid ticket has no final answer from the wallet's node yet: it is booked as spent until the node shows it \
+                                      failed, and a later call takes up its credit with this seller once the node shows it paid";
+/// How long past a prepaid invoice's life the wallet waits for the seller to follow its payment: the
+/// gateway's 15 s after an invoice's life before its sweep, and a round of that sweep.
+pub const PREPAY_FOLLOW_GRACE_S: f64 = 15.0 + 10.0;
+
 pub fn prepaid_size_ok(s: &Session, msat: u64) -> Result<(), Refusal> {
     if msat == s.prepaid_msat || (s.draws.is_none() && s.prepaid_min_msat > 0 && (s.prepaid_min_msat..=s.prepaid_msat).contains(&msat)) {
         return Ok(());
@@ -1589,6 +1596,37 @@ impl Book {
     pub fn held_less(&self, payee: &str, now: f64) -> Option<&Session> {
         self.sessions.values().filter(|s| s.payee == payee && HOLD_SHORT.contains(&s.hold_why.as_str()) && s.hold_why != "ticket_dust")
             .filter(|s| s.hold_until > now - SLOT_WAIT_MAX_S).max_by(|a, b| a.hold_until.total_cmp(&b.hold_until).then_with(|| a.opened_ts.total_cmp(&b.opened_ts)))
+    }
+
+    /// A prepaid ticket another session bought of this payee that the seller may yet credit there,
+    /// and how many seconds from `now` the wallet stops waiting for it: not final on the wallet's
+    /// node, or settled after its call was stopped for having no final answer
+    /// ([`PREPAY_PENDING_WHY`]), which the seller credits when the preimage is shown or on its own
+    /// sweep. Until then a ticket bought in another session would be a second one, and the first's
+    /// credit left behind. Bounded by the invoice's life and [`PREPAY_FOLLOW_GRACE_S`], so that a
+    /// payment stuck at a hop does not hold the buyer back for longer. Not one of the seller session
+    /// `own`: taken over, its credit is this session's.
+    pub fn prepaid_unfollowed(&self, payee: &str, session: &str, own: Option<&str>, now: f64) -> Option<(&Ticket, f64)> {
+        self.tickets.values().filter(|t| t.prepaid && t.win == 0 && t.payee == payee && t.session != session && t.invoice_expires > 0.0).filter_map(|t| {
+            let s = self.sessions.get(&t.session)?;
+            let waits = match t.state {
+                TState::Released | TState::Sending | TState::Locked => true,
+                // (a session's reason is kept cut short)
+                TState::Settled => s.why.starts_with(&PREPAY_PENDING_WHY[..50]),
+                _ => false,
+            };
+            let until = t.invoice_expires.min(t.sent_ts + f64::from(xbt402::ticket::INVOICE_EXPIRY_S)) + PREPAY_FOLLOW_GRACE_S;
+            let taken_over = own.is_some() && s.http.as_ref().map(|h| h.id.as_str()) == own;
+            (waits && !taken_over && now <= until).then_some((t, until - now))
+        }).max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// Prepaid tickets of stopped sessions whose payment the node still calls in flight, past the
+    /// wait of [`Book::prepaid_unfollowed`]: a hop, or the seller, holds them.
+    pub fn prepaid_overdue(&self, now: f64) -> Vec<(Ticket, Session)> {
+        self.tickets.values().filter(|t| t.prepaid && t.win == 0 && t.state == TState::Released && t.invoice_expires > 0.0)
+            .filter(|t| now > t.invoice_expires.min(t.sent_ts + f64::from(xbt402::ticket::INVOICE_EXPIRY_S)) + PREPAY_FOLLOW_GRACE_S)
+            .filter_map(|t| self.sessions.get(&t.session).filter(|s| s.state != SState::Open).map(|s| (t.clone(), s.clone()))).collect()
     }
 
     /// A prepaid ticket of the session whose payment is not final: the next is bought only after it.

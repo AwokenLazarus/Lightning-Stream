@@ -1143,7 +1143,7 @@ impl Signer {
             t.fee_limit_msat = fee_limit_msat;
             t.invoice_expires = inv.expires_at() as f64;
             rows.push(t.row());
-            sends.push((hash.clone(), HeldSend { invoice: invoice.clone(), fee_limit_msat: fee_limit_msat.max(1), timeout_s: lp.timeout_s.max(1),
+            sends.push((hash.clone(), HeldSend { invoice: invoice.clone(), fee_limit_msat: fee_limit_msat.max(1), timeout_s: lp.timeout_s.max(1), http_margin_s: crate::ln::HTTP_MARGIN_S,
                                                  cltv_limit: tp.max_htlc_blocks, outgoing_chan_ids: ids.to_vec(), tag: seed.tag(&t.nonce, &raw).to_vec() }));
             n += 1;
             sent_last_hour += 1;
@@ -1657,7 +1657,7 @@ impl Signer {
             Err(e) => return Some(refusal("ticket", e.msg)),
         };
         // the invoice is paid, never the offer: paying the offer would fetch another invoice
-        let req = OfferPayRequest { invoice: lni, fee_limit_msat: send.fee_limit_msat, timeout_s: send.timeout_s };
+        let req = OfferPayRequest { invoice: lni, fee_limit_msat: send.fee_limit_msat, timeout_s: send.timeout_s, http_margin_s: send.http_margin_s };
         let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, booked_sats, false, inside, &|| ln.pay_offer(&req));
         // the offer's invoice could not be reached (its blinded path enters through a node this wallet has no route to,
         // while a channel straight to the seller could pay the seller's own invoice): the seller's invoice is tried
@@ -1877,6 +1877,36 @@ impl Signer {
         }
     }
 
+    /// The refusal of a new prepaid ticket while the seller may yet credit one of another session
+    /// ([`crate::ticket::Book::prepaid_unfollowed`]), with when to ask again.
+    fn prepaid_followed_first(book: &crate::ticket::Book, payee: &str, sid: &str, own: Option<&str>, now: f64) -> Option<Value> {
+        let (t, wait) = book.prepaid_unfollowed(payee, sid, own, now)?;
+        Some(with(refusal("ticket_prepaid_pending", "an earlier prepaid ticket with this seller is not final, or the seller has not credited it yet: nothing more is bought \
+                                                     until it has, so that its credit is not left behind. Nothing was spent; call again in a moment"),
+                  json!({"session": sid, "hash": t.hash, "retry_after_s": wait.ceil().max(1.0) as u64})))
+    }
+
+    /// [`Self::prepaid_followed_first`] for a session that has just opened (`sid`) and taken over nothing.
+    pub(crate) fn ticket_prepaid_unfollowed(&self, payee: &str, sid: &str) -> Option<Value> {
+        let now = self.engine.now();
+        let g = self.ticket_store().ok()?;
+        Self::prepaid_followed_first(&g.as_ref()?.book, payee, sid, None, now)
+    }
+
+    /// Prepaid tickets past the wait for them and still in flight, with their sessions.
+    pub(crate) fn ticket_prepaid_overdue(&self) -> Vec<(Ticket, Session)> {
+        let now = self.engine.now();
+        self.ticket_store().ok().and_then(|g| g.as_ref().map(|st| st.book.prepaid_overdue(now))).unwrap_or_default()
+    }
+
+    /// What the book says left the wallet in the seller session `http_id`, as [`Self::ticket_resumable`] counts it.
+    pub(crate) fn ticket_sent_in(&self, http_id: &str) -> u64 {
+        let Ok(g) = self.ticket_store() else { return 0 };
+        let Some(st) = g.as_ref() else { return 0 };
+        st.book.sessions.values().filter(|s| s.http.as_ref().is_some_and(|h| h.id == http_id)).flat_map(|s| st.book.of_session(&s.id))
+            .filter(|t| matches!(t.state, TState::Released | TState::Settled)).fold(0u64, |a, t| a.saturating_add(t.msat))
+    }
+
     /// The rules and the two rows of a prepaid ticket, or of a win (the caller holds the spend
     /// lock): what [`Self::ticket_release_locked`] checks of a held ticket's release, then the
     /// book row, then the ledger row, then the signature log. Returns the send; an `Err` inside is
@@ -1927,6 +1957,10 @@ impl Signer {
                 if let Some(t) = st.book.prepaid_pending(sid) {
                     return Ok(Err(with(refusal("ticket_prepaid_pending", "an earlier prepaid ticket of this session is not final on the wallet's node: the next is bought after it"),
                                        json!({"session": sid, "hash": t.hash}))));
+                }
+                // or one of another session with this seller, which a second ticket would leave behind
+                if let Some(d) = Self::prepaid_followed_first(&st.book, &s.payee, sid, s.http.as_ref().map(|h| h.id.as_str()), now) {
+                    return Ok(Err(d));
                 }
             }
             Some(w) => {
@@ -1994,6 +2028,7 @@ impl Signer {
         self.sigaudit.record(kind, &[], "", &dest, json!({"payment_hash": hash, "session": sid, "booked_sats": sats, "win": win_draw}))?;
         self.ticket_audit(kind, json!({"session": sid, "dest": dest, "payment_hash": hash, "booked_sats": sats, "task": s.task, "win": win_draw}));
         Ok(Ok(HeldSend { invoice: invoice.to_string(), fee_limit_msat: fee_limit_msat.max(1), timeout_s: lp.timeout_s.clamp(1, i64::from(xbt402::ticket::ORDINARY_PAY_S)),
+                         http_margin_s: crate::ln::ORDINARY_HTTP_MARGIN_S,
                          cltv_limit: tp.max_htlc_blocks,
                          outgoing_chan_ids: ids.to_vec(), tag: seed.prepaid_tag(&nonce, &raw).to_vec() }))
     }

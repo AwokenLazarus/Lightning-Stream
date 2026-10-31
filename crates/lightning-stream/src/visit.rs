@@ -47,14 +47,14 @@ const LONG_OPEN: Duration = Duration::from_secs(30);
 /// all of its share stays spent ([`Visit::settle`]). After the stop the signer may still, one after
 /// another: wait for the seller's next byte (its `tickets.read_timeout_s`, at most an hour) before it
 /// ends a call whose answer is gone; finish a ticket being paid beside the reading (the wait for a
-/// ready seller, a minute, and the Lightning payment, at most `lightning.timeout_s` of 600 s and 5 s
-/// more); and wait for the answer's last receipt, at most 10 s and a second since each `status` call
+/// ready seller, a minute, and the Lightning payment, at most [`xbt402::ticket::ORDINARY_PAY_S`] and
+/// 5 s more); and wait for the answer's last receipt, at most 10 s and a second since each `status` call
 /// is cut to what is left of that wait. Then its reply, within [`FIRST_BYTE`] twice. That is what
 /// it usually takes at most, not a bound: a release waiting on other answers' releases, a refill, or
 /// a seller that answers byte by byte can take longer. A signer that takes longer leaves the share
 /// spent, the safe side: the visit's budget is held, no money moves. The share is counted apart while
 /// it waits, so nothing else waits for it.
-const SETTLE_WAIT: Duration = Duration::from_secs(3600 + 60 + 605 + 11 + 2 * FIRST_BYTE.as_secs());
+const SETTLE_WAIT: Duration = Duration::from_secs(3600 + 60 + xbt402::ticket::ORDINARY_PAY_S as u64 + 5 + 11 + 2 * FIRST_BYTE.as_secs());
 /// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
 /// ends, then only what it cost, with room for a ticket beside it as for [`ANSWER_SHARE`].
 const SOCKET_SHARE: i64 = 1_000;

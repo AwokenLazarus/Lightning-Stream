@@ -905,16 +905,15 @@ fn a_slow_opening_from_no_credit_still_verifies() {
     assert_eq!(gate.spent_today(), 800);
 }
 
-/// The wallet's answer tells of a seller's fault or a payment with no final answer before the tunnel
-/// opens (the signer's answer when a prepaid ticket's payment is held unsettled by the seller: its
-/// `charged_sats` leaves that ticket out): what left is not known, and the check counts its most.
+/// The wallet's answer tells of a seller's fault or a payment it did not count before the tunnel
+/// opens: what left is not known, and the check counts its most.
 #[test]
 fn a_region_check_answered_with_a_seller_fault_counts_its_most() {
     use xbt_vpn::buyer::{CheckWaits, REGION_CHECK_TICKET_SATS};
     use xbt_vpn::holds::CheckGate;
     use xbt_vpn::region::RegionCheck;
     let answers = [
-        r#"{"verdict":"deny","rule":"ticket_seller_fault","reason":"the session with this seller was stopped: the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed","rail":"ticket","charged_sats":0,"session":"s1","stopped":true}"#,
+        r#"{"verdict":"deny","rule":"ticket_seller_fault","reason":"the session with this seller was stopped: it charged past the call's limit","rail":"ticket","charged_sats":0}"#,
         r#"{"verdict":"pending","rail":"ticket","charged_sats":0}"#,
         r#"{"verdict":"deny","rule":"ticket","reason":"the release was not confirmed","rail":"ticket","charged_sats":0,"unconfirmed_release":"ab12"}"#,
         r#"{"verdict":"allow","status":101,"charged_sats":0,"seller_fault":"it charged past the call's limit"}"#,
@@ -929,6 +928,24 @@ fn a_region_check_answered_with_a_seller_fault_counts_its_most() {
         assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &e)), Some(RegionCheck::Unknown), "answer {i}");
         assert_eq!(gate.spent_today(), REGION_CHECK_TICKET_SATS, "answer {i}: a seller's fault says nothing true of what left: its most is counted");
     }
+}
+
+/// The wallet refuses the tunnel having paid for it (a prepaid ticket with no final answer yet, which
+/// its `charged_sats` counts): the check counts what the answer says left, not nothing and not its most.
+#[test]
+fn a_region_check_refused_with_a_pending_ticket_counts_what_the_answer_says() {
+    use xbt_vpn::buyer::CheckWaits;
+    use xbt_vpn::holds::CheckGate;
+    let (s, at) = region_check_setup(170);
+    s.buyer.set_check_waits(CheckWaits { open: Duration::from_secs(5), read: Duration::from_secs(5), answer: Duration::from_secs(2) });
+    let answer = r#"{"verdict":"deny","rule":"ticket_prepay_pending","reason":"no final answer yet","rail":"ticket","charged_sats":1003}"#;
+    let w = fake_wallet_full(at, None, false, Some(700), Ends::AnswersFirst(answer));
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    let e = german_exit(&s, at, "paid-exit", 2_000_000);
+    let mut gate = CheckGate::default();
+    s.rt.block_on(s.buyer.check_region(&mut gate, &e));
+    assert_eq!(gate.spent_today(), 1003);
+    assert!(xbt_vpn::paid::left_sats(&serde_json::from_str(answer).unwrap()) == Some(1003));
 }
 
 /// A check's most is counted, and on disk, before its tunnel is asked for: the wallet, called, finds

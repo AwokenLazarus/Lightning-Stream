@@ -62,7 +62,10 @@ impl Wallet {
     }
 }
 
-/// How long the wallet may take to pay a tunnel's opening and hand over its stream.
+/// How long the wallet may take to pay a tunnel's opening and hand over its stream. Shorter than
+/// the wallet's own wait for a payment (60 s and 5 more): a tunnel whose first ticket takes longer is
+/// given up here and tried again. Nothing is lost: the answer that comes later says what left, and
+/// the ticket's credit stays with the seller for the next opening.
 pub const OPEN_WAIT: Duration = Duration::from_secs(45);
 
 /// A paid tunnel, open, and what the wallet said when it ended (the receiver gets the signer's
@@ -205,10 +208,11 @@ pub fn left_of(e: &io::Error) -> Option<u64> {
 
 /// What left the wallet for a call, by its answer: the tickets it released for the call
 /// (`charged_sats`: bought for it, or held as credit and spent on it), or nothing where it refused the
-/// call before paying (`verdict` deny). `None` where the answer says neither, and where it tells of a
-/// seller's fault or a payment with no final answer (`rule` ticket_seller_fault, `verdict` pending,
-/// a `seller_fault` or an `unconfirmed_release`): a ticket whose payment the seller holds unsettled is
-/// not in the answer's count, so that count may be less than what left.
+/// call before paying (`verdict` deny), and a refusal that says it did pay counts what it says: a
+/// prepaid ticket with no final answer yet (`rule` ticket_prepay_pending) is in its `charged_sats`.
+/// `None` where the answer says neither, and where it tells of a seller's fault or a payment it did
+/// not count (`rule` ticket_seller_fault, `verdict` pending, a `seller_fault` or an
+/// `unconfirmed_release`): that count may be less than what left.
 pub fn left_sats(v: &Value) -> Option<u64> {
     let says = |k: &str| v.get(k).is_some_and(|x| !x.is_null());
     if v.get("rule").and_then(Value::as_str) == Some("ticket_seller_fault")
@@ -239,7 +243,12 @@ fn refused(d: &Result<Value, String>) -> String {
     match d {
         Ok(v) => {
             let reason = v.get("reason").and_then(Value::as_str).or_else(|| v.get("error").and_then(Value::as_str)).unwrap_or("no reason given");
-            format!("the wallet did not pay for the tunnel ({}: {reason})", v.get("rule").and_then(Value::as_str).unwrap_or("refused"))
+            let rule = v.get("rule").and_then(Value::as_str).unwrap_or("refused");
+            // a refusal may come after a payment: not "did not pay" where it says something left
+            match v.get("charged_sats").and_then(Value::as_i64).filter(|n| *n > 0) {
+                Some(n) => format!("the wallet paid {n} sat and the tunnel did not open ({rule}: {reason})"),
+                None => format!("the wallet did not pay for the tunnel ({rule}: {reason})"),
+            }
         }
         Err(e) => format!("the wallet could not be asked ({e})"),
     }

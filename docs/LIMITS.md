@@ -910,8 +910,13 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A prepaid payment (or a win) of a call is given the node for the Lightning rail's
   `timeout_s`, but never more than 60 s, the life of the invoice it pays. One whose fate the
   node cannot tell within that and 5 seconds stays booked as spent, and the session is stopped,
-  not as the seller's fault: once the node shows it paid (a preimage slow on its way back, say),
-  the next call to that seller takes up its credit. The booking goes when the node shows the
+  not as the seller's fault, and the owner's record says so (`ticket_prepay_pending`): once the
+  node shows it paid (a preimage slow on its way back, say) and the seller has credited it, the
+  next call to that seller takes up its credit. Until then, for the invoice's life and 25 s, a
+  call to that seller is refused `ticket_prepaid_pending` with `retry_after_s`, having spent
+  nothing, so that no second ticket leaves the first's credit behind. Past that wait a payment
+  still in flight holds nobody back: a seller that has not credited it is named in the owner's
+  record (`ticket_prepay_overdue`), since a hop on the route, or the seller, holds it. The booking goes when the node shows the
   payment failed, or, for a payment the node never had, 60 seconds after the timeout. Until
   0.1.20 the wait was the whole `timeout_s` (up to 600 s), and such a session was stopped as the
   seller's fault, which left its credit with the seller.

@@ -2860,7 +2860,15 @@ impl Signer {
                                                    cancel_asked: Mutex::new(HashSet::new()) });
                     // a balance the wallet left with this seller in a session it stopped (a restart, or an idle stop) is
                     // used first, not left there while a new ticket is bought
-                    self.ticket_resume(&h);
+                    // and where it could not be taken over because the seller has yet to follow a prepaid ticket of that session,
+                    // nothing is bought beside it. The session ends here with no seller side, so that the next call still finds
+                    // the earlier one to take over
+                    if !self.ticket_resume(&h) {
+                        if let Some(d) = self.ticket_prepaid_unfollowed(&h.terms.terms.payee, &h.sid) {
+                            let stopped = self.ticket_http_stop(&h, "an earlier prepaid ticket with this seller is not followed yet", Duration::ZERO);
+                            break 'open Err(Tried::Done(with(d, json!({"stopped": stopped}))));
+                        }
+                    }
                     // the first pool, before the call goes on. A session that holds nothing, or that found no slot
                     // and waits, goes on where the seller offers prepaid tickets: the call buys one when it needs it
                     let filled = self.ticket_fill(&h);
@@ -3334,10 +3342,12 @@ impl Signer {
             // fault (a preimage slow on its way back through a hop, say): a later session takes up the ticket's credit with
             // this seller once the node shows it paid ([`Signer::ticket_resumable`]), where a fault would strand it. The
             // caller's answer says what is booked for it (`spent`, counted above)
-            let why = "the payment of a prepaid ticket has no final answer from the wallet's node yet: it is booked as spent until the node shows it \
-                       failed, and a later call takes up its credit with this seller once the node shows it paid";
+            let why = crate::ticket::PREPAY_PENDING_WHY;
+            // the owner's record of it, in case the seller is what holds the payment ([`Signer::ticket_prepaid_overdue_tick`])
+            self.ticket_audit("ticket_prepay_pending", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee), "hash": str_or_empty(r.get("hash")),
+                                                              "reason": why, "account": hs.public()}));
             let stopped = self.ticket_http_stop(hs, why, Duration::ZERO);
-            return Err(with(refusal("ticket_prepay_pending", why), json!({"session": hs.sid, "stopped": stopped})));
+            return Err(with(refusal("ticket_prepay_pending", why), json!({"session": hs.sid, "hash": str_or_empty(r.get("hash")), "stopped": stopped})));
         }
         if r["verdict"] != "allow" {
             return Err(r);
@@ -5236,6 +5246,51 @@ impl Signer {
 
     /// Ask the seller of a session on record to cancel all its tickets: for a session this process
     /// did not open (the wallet started again). The answer is not checked: the node's word is.
+    fn ticket_seller_released(&self, s: &crate::ticket::Session) -> Option<u64> {
+        let http = s.http.as_ref()?;
+        let origin = origin_of(&http.base).map(|o| normalize_dest(&o)).unwrap_or_default();
+        if origin.is_empty() || normalize_dest(&s.origin) != origin || seller_url(&origin, &http.base).is_err() || !self.ticket_may_reach(&origin, &s.task) {
+            return None;
+        }
+        let net = self.ticket_net().ok().and_then(|n| xbt402::ticket::legacy_network_id(&n)).unwrap_or_default();
+        let accepted = json!({"scheme": xbt402::ticket::SCHEME, "network": net});
+        let url = format!("{}/status", http.base);
+        let raw = b"{}".to_vec();
+        let mut seq = 0u64;
+        for _ in 0..2 {
+            let auth = xbt402::ticket::request_auth(&http.key, &http.id, seq, "", "", &request_digest_v2("POST", &url, &raw));
+            let header = b64json(&payment_payload(&accepted, &json!({"session": http.id, "seq": seq, "auth": auth})));
+            let ans = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], Duration::from_secs(10)).ok()?;
+            let status = ans.status;
+            let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+            match (status, v.get("nextSeq").and_then(Value::as_u64)) {
+                (200, _) => return v.get("session").and_then(|x| x.get("releasedMsat")).and_then(|x| crate::ticket::outside_u64(Some(x))),
+                (_, Some(next)) => seq = next,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Names the seller of a prepaid ticket still in flight past its invoice's life and the wait for
+    /// it, that has not credited it: a hop or the seller holds the payment, and only the owner's
+    /// record can say so, since the session was stopped as nobody's fault. Once a ticket, at most.
+    fn ticket_prepaid_overdue_tick(&self) {
+        for (t, s) in self.ticket_prepaid_overdue() {
+            if !lock(&self.ticket_cancel_tried).insert(format!("overdue:{}", t.hash)) {
+                continue;
+            }
+            let released = self.ticket_seller_released(&s);
+            let sent = s.http.as_ref().map_or(0, |h| self.ticket_sent_in(&h.id));
+            if released.is_some_and(|r| r >= sent) {
+                continue;
+            }
+            self.ticket_audit("ticket_prepay_overdue", json!({"session": s.id, "origin": s.origin, "dest": format!("ln:{}", t.payee), "hash": t.hash, "invoice_expired": crate::pyjson::ts_value(t.invoice_expires),
+                                                              "seller_released_msat": released.map(|r| r.to_string()), "sent_msat": sent.to_string(),
+                                                              "reason": "a prepaid ticket's payment is still in flight past its invoice's life, and this seller has not credited it: a hop on the route, or the seller, holds it"}));
+        }
+    }
+
     fn ticket_cancel_recorded(&self, s: &crate::ticket::Session, wait: Duration) -> Value {
         let Some(http) = &s.http else { return Value::Null };
         {
@@ -5303,6 +5358,7 @@ impl Signer {
             }
             out.push(json!({"ticket_cancel_asked": self.ticket_cancel_recorded(&s, Duration::ZERO)}));
         }
+        self.ticket_prepaid_overdue_tick();
         out.extend(self.draw_http_tick());
         out
     }

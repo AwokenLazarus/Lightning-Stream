@@ -757,6 +757,8 @@ struct PayState {
     /// A payment the seller's node has settled is still shown in flight here (its preimage slow on
     /// its way back through a hop), for as long as this is set.
     held_back: bool,
+    /// Slow payments stay on their way, whatever the clock says, for as long as this is set.
+    hold_arrivals: bool,
     /// The next sends are in flight on this node and never reach the seller's (the node dies as it
     /// sends them); once `stranded_off_channel` is set, no channel of the node carries them and
     /// the node goes on calling them in flight.
@@ -803,7 +805,7 @@ impl PayLn {
     fn refresh(&self, s: &mut PayState) {
         let lost = s.preimage_lost;
         let now = self.clock.load(Ordering::SeqCst);
-        let held_back = s.held_back;
+        let (held_back, hold_arrivals) = (s.held_back, s.hold_arrivals);
         for p in s.payments.iter_mut().filter(|p| p["status"] == "IN_FLIGHT" && p["stranded"] != true) {
             if p["late_fail"] == true {
                 p["status"] = "FAILED".into();
@@ -815,7 +817,7 @@ impl PayLn {
             let raw: Hash = hex::decode(&hash).unwrap().try_into().unwrap();
             // a slow payment reaches the seller's node now: a lapsed invoice is cancelled there, and the payment refused
             if let Some(at) = p["arrives_at"].as_u64() {
-                if now < at {
+                if now < at || hold_arrivals {
                     continue;
                 }
                 p["arrives_at"] = Value::Null;
@@ -4141,11 +4143,13 @@ fn a_calls_ordinary_payment_is_given_the_node_for_as_long_as_its_invoice_lives()
 
 /// A prepaid ticket the seller's node settled, whose payment the wallet's node still shows in
 /// flight when the wallet's wait for it ends (its preimage slow on its way back): the session is
-/// stopped, not as the seller's fault, and once the node shows the payment done the next call to
-/// that seller takes up its credit and buys nothing. One ticket on every side.
+/// stopped, not as the seller's fault, and the call says what is booked. A call right after it buys
+/// nothing beside it: refused, with when to ask again, while the payment is not final and while the
+/// seller has yet to credit it. Once the seller has, the next call takes up its credit. One ticket
+/// on every side, all along.
 ///
-/// FAILS before: the session was stopped as the seller's fault, which no later session resumes, so
-/// the next call bought another ticket and the first one's credit was left with the seller.
+/// FAILS before: the session was stopped as the seller's fault, which no later session resumes; and
+/// without the guard the call right after it bought a second ticket and left the first's credit.
 #[test]
 fn a_prepaid_ticket_with_no_final_answer_in_time_leaves_its_credit_to_the_next_call() {
     let _g = env_lock();
@@ -4156,14 +4160,27 @@ fn a_prepaid_ticket_with_no_final_answer_in_time_leaves_its_credit_to_the_next_c
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_prepay_pending")), "{v}");
     assert_eq!(v["charged_sats"].as_i64(), Some(BOOKING), "the call says the ticket booked as spent among what it charged: {v}");
     assert!(r.audit("ticket_seller_fault").is_empty(), "the seller is not blamed");
+    let said = r.audit("ticket_prepay_pending");
+    assert_eq!((said.len(), &said[0]["hash"], said[0]["dest"].as_str()), (1, &v["hash"], Some(format!("ln:{}", r.shop.id()).as_str())), "the owner's record: {said:?}");
     assert_eq!(r.shop.settled(), 1, "the seller's node took it");
     assert_eq!(r.ln.state().payments.len(), 1, "and nothing more was paid once the session was stopped");
+    // called again at once, the payment not final: nothing is bought beside it
+    let early = r.pay("/page/10", CALL);
+    assert_eq!((early["rule"].as_str(), early["charged_sats"].as_i64()), (Some("ticket_prepaid_pending"), Some(0)), "{early}");
+    assert_eq!(r.ln.state().payments.len(), 1, "no second ticket: {early}");
     // the node's word comes: paid. The seller follows a prepaid ticket only when its preimage is shown, or on its own
-    // sweep once the ticket's life is over (75 s), when its node says it was paid: then it credits it
+    // sweep once the ticket's life is over: until then a call is told when to come back, and buys nothing
     r.ln.st.lock().unwrap().held_back = false;
     wait_for("the payment to show paid", || r.ln.paid_msat() == TICKET);
     r.tick();
-    r.clock.fetch_add(80, Ordering::SeqCst);
+    let early = r.pay("/page/10", CALL);
+    assert_eq!(early["rule"].as_str(), Some("ticket_prepaid_pending"), "{early}");
+    let wait = early["retry_after_s"].as_u64().unwrap();
+    assert!(wait > 0 && wait <= 85, "{early}");
+    assert_eq!(r.ln.state().payments.len(), 1, "still one ticket: {early}");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    // when it said: the seller's sweep has credited it, and the next call takes it up and buys nothing
+    r.clock.fetch_add(wait + 1, Ordering::SeqCst);
     r.shop.gw.tick();
     let next = r.pay("/page/10", CALL);
     assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64()), (Some(200), Some(0)), "the credit is taken up: {next}");
@@ -4171,6 +4188,100 @@ fn a_prepaid_ticket_with_no_final_answer_in_time_leaves_its_credit_to_the_next_c
     wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
     r.assert_booked();
+}
+
+/// A pending prepaid ticket the node then shows failed: the booking goes, nothing was paid on either
+/// side, nothing holds the next call back, and it pays.
+#[test]
+fn a_pending_prepaid_ticket_the_node_then_shows_failed_costs_nothing_and_the_next_call_pays() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, strict_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.slow_next, s.arrives_after_s, s.hold_arrivals) = (1, 70, true);
+    }
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("ticket_prepay_pending"), Some(BOOKING)), "{v}");
+    assert_eq!(r.ledger_sum(), BOOKING, "booked for as long as the node cannot say");
+    r.ln.st.lock().unwrap().hold_arrivals = false;
+    wait_for("the payment to fail", || r.ln.by_status("FAILED").len() == 1);
+    r.tick();
+    assert_eq!(r.money(), (0, 0, 0, 0), "the booking goes: nothing was paid on either side");
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{next}");
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
+/// The same with credit left from an earlier ticket of the session: once the pending one has failed,
+/// the next call takes up that credit too, and only what it still needs is bought.
+#[test]
+fn a_pending_prepaid_ticket_that_fails_leaves_the_sessions_earlier_credit_to_the_next_call() {
+    let _g = env_lock();
+    const SMALL: u64 = 64_000;
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, json!({"tickets": {"ticket_msat": SMALL, "settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    // 25 pages at 2,500 msat leave 1,500 msat: less than the next page
+    for _ in 0..25 {
+        assert_eq!(r.pay("/page/1000", CALL)["status"].as_u64(), Some(200));
+    }
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.slow_next, s.arrives_after_s, s.hold_arrivals) = (1, 70, true);
+    }
+    let v = r.pay("/page/1000", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    r.ln.st.lock().unwrap().hold_arrivals = false;
+    wait_for("the payment to fail", || r.ln.by_status("FAILED").len() == 1);
+    r.tick();
+    assert_eq!((r.ln.paid_msat(), r.shop.settled() as u64), (SMALL, 1), "one ticket paid and taken");
+    let next = r.pay("/page/1000", CALL);
+    assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{next}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1, "the earlier credit is taken up");
+    assert_eq!(next["balance_msat"].as_str(), Some("63000"), "1,500 left, 64,000 bought, 2,500 spent: {next}");
+    assert_eq!((r.ln.paid_msat(), r.shop.settled() as u64), (2 * SMALL, 2));
+    r.assert_booked();
+}
+
+/// A prepaid payment stuck past its invoice's life and the wait for it, with no credit at the seller:
+/// the owner's record names that seller, once, and the buyer is not held back any longer.
+#[test]
+fn a_prepaid_ticket_stuck_past_its_life_names_its_seller_once_and_holds_nobody_back() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, strict_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.slow_next, s.arrives_after_s, s.hold_arrivals) = (1, 5, true);
+    }
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    r.tick();
+    assert!(r.audit("ticket_prepay_overdue").is_empty(), "not while the invoice lives");
+    r.clock.fetch_add(90, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let named = r.audit("ticket_prepay_overdue");
+    assert_eq!((named.len(), named[0]["dest"].as_str(), named[0]["sent_msat"].as_str()), (1, Some(format!("ln:{}", r.shop.id()).as_str()), Some("1000000")), "{named:?}");
+    assert_eq!(named[0]["hash"], v["hash"]);
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{next}");
+    assert_eq!(r.ledger_sum(), BOOKING + SETTLED, "the stuck one stays booked beside the one that paid");
+}
+
+/// A node slow to take a call's prepaid payment: the wallet's wait is counted from before the send,
+/// so the call is answered when it ends, not that long after the send returned.
+#[test]
+fn a_node_slow_to_take_a_prepaid_payment_does_not_lengthen_the_wait_for_it() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, strict_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.held_back, s.send_takes) = (true, Duration::from_secs(8));
+    }
+    let t = Instant::now();
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    assert!(t.elapsed() < Duration::from_secs(12), "answered after {:?}: 8 s of send and no further wait", t.elapsed());
 }
 
 /// An owner who gives the node 300 s for a payment: a call whose prepaid ticket has no final

@@ -1170,7 +1170,7 @@ fn only_this_wallets_tag_makes_a_node_payment_a_ticket_and_the_list_is_read_befo
     let their_hash = foreign.hash(&nonce);
     for (hash, tag) in [(their_hash, foreign.tag(&nonce, &their_hash).to_vec()), ([0x21; 32], vec![]), ([0x22; 32], vec![1, 2, 3])] {
         let inv = r.seller.invoice(r.now(), &hex::encode(hash), &Inv::default());
-        r.ln.record(&HeldSend { invoice: inv, fee_limit_msat: 1, timeout_s: 1, cltv_limit: 500, outgoing_chan_ids: vec![], tag }, "IN_FLIGHT").unwrap();
+        r.ln.record(&HeldSend { invoice: inv, fee_limit_msat: 1, timeout_s: 1, http_margin_s: 30, cltv_limit: 500, outgoing_chan_ids: vec![], tag }, "IN_FLIGHT").unwrap();
     }
     r.call("watch_tick", json!({}));
     let st = r.status();
@@ -1617,7 +1617,7 @@ fn restore(r: &mut Rig, b: &tempfile::TempDir) {
 }
 
 fn held(r: &Rig, hash: &str) -> HeldSend {
-    HeldSend { invoice: r.seller.invoice(r.now(), hash, &Inv::default()), fee_limit_msat: 1, timeout_s: 1, cltv_limit: 500, outgoing_chan_ids: vec![], tag: vec![] }
+    HeldSend { invoice: r.seller.invoice(r.now(), hash, &Inv::default()), fee_limit_msat: 1, timeout_s: 1, http_margin_s: 30, cltv_limit: 500, outgoing_chan_ids: vec![], tag: vec![] }
 }
 
 #[test]

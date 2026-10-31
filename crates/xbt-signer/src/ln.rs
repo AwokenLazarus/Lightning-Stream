@@ -243,7 +243,14 @@ pub struct OfferPayRequest {
     /// Never 0: the node reads 0 as its own default limit.
     pub fee_limit_msat: u64,
     pub timeout_s: i64,
+    /// How much longer than `timeout_s` the node's answer is waited for.
+    pub http_margin_s: i64,
 }
+
+/// How much longer than its `timeout_s` a node is waited for on most payments.
+pub const HTTP_MARGIN_S: i64 = 30;
+/// [`HTTP_MARGIN_S`] for an ordinary payment of a call: the wallet's own wait for it.
+pub const ORDINARY_HTTP_MARGIN_S: i64 = 5;
 
 /// A stream ticket's payment ([`crate::ticket_rail`]): a hold invoice the node locks and does not
 /// see settle until the buyer releases the secret.
@@ -254,6 +261,9 @@ pub struct HeldSend {
     pub fee_limit_msat: u64,
     /// How long the node may look for a route.
     pub timeout_s: i64,
+    /// How much longer than that the node's first word on it is waited for: an ordinary payment of a
+    /// call waits [`ORDINARY_HTTP_MARGIN_S`], as the call's caller is waiting too.
+    pub http_margin_s: i64,
     pub cltv_limit: i64,
     /// The only channels the payment may leave through (never empty).
     pub outgoing_chan_ids: Vec<String>,
@@ -646,7 +656,7 @@ impl LnBackend for LndRest {
         let body = json!({"payment_request": r.invoice, "timeout_seconds": r.timeout_s.max(1), "fee_limit_msat": r.fee_limit_msat.max(1).to_string(),
                           "cltv_limit": r.cltv_limit, "outgoing_chan_ids": r.outgoing_chan_ids, "no_inflight_updates": false,
                           "allow_self_payment": false, "amp": false, "max_parts": 1, "dest_custom_records": records});
-        let resp = self.req("POST", "/v2/router/send").timeout(Duration::from_secs(r.timeout_s.max(1) as u64 + 30))
+        let resp = self.req("POST", "/v2/router/send").timeout(Duration::from_secs((r.timeout_s.max(1) + r.http_margin_s.max(1)) as u64))
             .set("Content-Type", "application/json").send_string(&body.to_string());
         let resp = match Self::sent(resp)? {
             Ok(x) => x,
@@ -684,8 +694,9 @@ impl LnBackend for LndRest {
     }
 
     fn pay_offer(&self, r: &OfferPayRequest) -> Result<Value> {
-        let v = self.post("/v2/offers/pay", &json!({"invoice": r.invoice, "fee_limit_msat": r.fee_limit_msat.max(1).to_string(),
-                                                    "timeout_seconds": r.timeout_s.max(1)}), r.timeout_s)?;
+        let body = json!({"invoice": r.invoice, "fee_limit_msat": r.fee_limit_msat.max(1).to_string(), "timeout_seconds": r.timeout_s.max(1)});
+        let v = Self::answer(Self::sent(self.req("POST", "/v2/offers/pay").timeout(Duration::from_secs((r.timeout_s.max(1) + r.http_margin_s.max(1)) as u64))
+            .set("Content-Type", "application/json").send_string(&body.to_string()))?)?;
         // PayOffer answers only when the payment settled
         Ok(json!({"payment_hash": bytes_hex(v.get("payment_hash")), "status": "SUCCEEDED", "value_msat": u64_of(v.get("amount_msat")).to_string(),
                   "fee_msat": u64_of(v.get("fee_msat")).to_string(), "payment_preimage": bytes_hex(v.get("payment_preimage")), "htlcs": []}))

@@ -2338,20 +2338,26 @@ fn agp082_the_rest_client_speaks_fetchinvoice_and_pay_as_lightning_fork_does() {
                                                 "fee_msat": "1500"}).to_string().into_boxed_str());
     let (node, asked) = http_stub("200 OK", String::new(), answer);
     let ln = LndRest::new(&node, &mac, None).unwrap();
-    let p = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60 }).unwrap();
+    let p = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60, http_margin_s: 30 }).unwrap();
+    // a node that never answers is waited for its time and the margin the payment names, no longer
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let quiet = LndRest::new(&format!("http://{}", silent.local_addr().unwrap()), &mac, None).unwrap();
+    let t = std::time::Instant::now();
+    assert!(quiet.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 1, http_margin_s: 1 }).is_err());
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
     assert_eq!(p, json!({"payment_hash": hex::encode(hash), "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "1500",
                          "payment_preimage": hex::encode(pre), "htlcs": []}));
     let head = asked.lock().unwrap()[0].clone();
     assert!(head.starts_with("POST /v2/offers/pay HTTP/1.1"), "{head}");
     assert_eq!(body_of(&head), json!({"invoice": "lni1xyz", "fee_limit_msat": "3000", "timeout_seconds": 60}));
     // a fee limit of 0 would be the node's default limit: never sent
-    let _ = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 0, timeout_s: 0 });
+    let _ = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 0, timeout_s: 0, http_margin_s: 30 });
     assert_eq!(body_of(&asked.lock().unwrap()[1]), json!({"invoice": "lni1xyz", "fee_limit_msat": "1", "timeout_seconds": 1}));
     // a failed payment is an error that carries the node's words, for the caller to look the hash up: apart from
     // the wallet's own (AGP-128: the node's words can repeat the payee's, and `msg` goes into a `reason`)
     let (node, _) = http_stub("409 Conflict", String::new(), "{\"code\": 10, \"message\": \"payment failed: no route; payment hash 5a5a\"}");
     let ln = LndRest::new(&node, &mac, None).unwrap();
-    let e = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60 }).unwrap_err();
+    let e = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60, http_margin_s: 30 }).unwrap_err();
     assert_eq!(e.msg, "LN node HTTP 409");
     assert_eq!(e.seller.as_deref(), Some("payment failed: no route; payment hash 5a5a"));
     assert!(ln.fetch_invoice("lno1abc", 0, 60).is_err());
