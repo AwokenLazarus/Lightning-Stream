@@ -7256,9 +7256,12 @@ fn credit_one_task_left_with_a_seller_is_not_taken_over_by_another_task() {
     wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
     r.tick();
     assert_eq!((ledger_of("film"), ledger_of("swarm")), (film_before, SETTLED), "swarm's spend is booked to swarm, film's is unchanged: {:?}", r.ledger());
-    // film's credit is still there for film
+    // film's credit is still there for film, once swarm's session is stopped (while it is open, a call to the same
+    // address is served by it whatever its task: a path of its own, not a takeover)
+    r.call("ticket_stop", json!({"session": b["session"]}));
     let again = r.pay("/page/10", 2_000);
     assert_eq!((again["status"].as_u64(), again["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "film pays from what it left: {again}");
+    assert_ne!(again["session"], b["session"]);
     assert_eq!(r.audit("ticket_resumed").iter().filter(|e| e["seller_session"].as_str() == Some(a_seller.as_str())).count(), 1, "taken over by its own task");
 }
 
