@@ -35,6 +35,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A file is never paid past the size its listing shows.
+- A new zero-conf channel carries payments once its funding confirms.
 - The price a shop shows in its listing is now the most your wallet will pay it: one that asks more
   than it advertised is refused before anything is paid. This covers web apps, Files, AI, hashrate
   and VPN exits.
@@ -60,8 +62,13 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - The bundled country table is readable again, so exits' regions are checked as intended.
 - The VPN page says why a device is blocked.
 - The VPN page shows which exit each device goes out through and what it has spent.
+- Paid VPN tunnels open: before, each one closed as it opened, after its ticket was bought.
+- Restarting the app no longer stops the VPN service opening paid tunnels.
+- A shop that sells only its VPN exit is listed, so buyers can find it by its key.
 
 **Hashrate**
+- A rental shows "Connecting…" until its link opens; one that never opens says why, and that
+  nothing was paid.
 - Rentals run over the encrypted link.
 - A hashtaker can buy a short paid test slice before renting, and a hashmaker publishes a signed
   history of what it delivered.
@@ -73,6 +80,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   gets a silent connection that does no work.
 
 **The app**
+- A shop's settings no longer show the values of headers it sends (they can hold secrets).
 - On Umbrel and StartOS the Sell page shows whether your shop is selling, instead of always
   "Starting, or stopped".
 - Clicking the background sends lightning down two streams only when you click between them; near
