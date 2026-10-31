@@ -65,7 +65,7 @@
 #            exit (vpn_region_check): one ticket bought, charged at most 20 sats, the trace page read
 #            through the exit, and what the wallet says left it equal to what its node paid. Then a
 #            100 MiB download through a tunnel that the agent stops while it is open, after about
-#            57 MiB, at 500,000 sat a GiB and again at 1,000 (under one ticket): the seller's book and
+#            60 MiB, at 500,000 sat a GiB and again at 1,000 (under one ticket): the seller's book and
 #            the wallet's account each charge the tunnel's bytes at the listed price, never below it and at most 3% and 1 MiB above (framing, and bytes on their way at the stop: one flow's 512 KiB window). Ports BASE+17 to BASE+19
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #

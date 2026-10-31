@@ -2375,7 +2375,7 @@ def vpn() -> None:
           {"fetch": out, "file": url, "seconds": round(took, 1), "mbit_s": mbit, "interim_faults": faults, "exit": {k: exit_status.get(k) for k in ("offered", "paid", "down_bytes", "up_bytes")},
            "tickets": len(paid), **inv, "money": m})
     vpn_money(origin, vdir, VPN_SAT_GB)
-    # the same at 1,000 sat a GiB, where ~57 MiB cost under one ticket: no ticket is released while the
+    # the same at 1,000 sat a GiB, where ~60 MiB cost under one ticket: no ticket is released while the
     # tunnel runs, so nothing but the stop's own count tells what the tunnel drew (the shortfall's regime)
     with open(f"{RUN}/gateway-vpn.json") as f:
         cfg = json.load(f)
@@ -2395,15 +2395,15 @@ def vpn() -> None:
 
 VPN_BIG_FILES = ["http://speed.cloudflare.com/__down?bytes=104857600", "http://ipv4.download.thinkbroadband.com/100MB.zip"]
 #: The tunnel is stopped once this much has come down through it (the exit's own count).
-VPN_STOP_AT_BYTES = 57 << 20
+VPN_STOP_AT_BYTES = 60 << 20
 VPN_CHEAP_SAT_GB = 1_000
 
 
 def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     """A VPN tunnel's money over a realistic amount, stopped as a VPN that is turned off stops it: a 100 MiB
     public download, started again as it ends, through a tunnel paid at `sat_gb` sat a GiB, and the agent
-    stops the session while the tunnel is still open, once about 57 MiB have come down (by the wallet's
-    released tickets, or the exit's count where 57 MiB cost under two tickets). What the seller charged
+    stops the session while the tunnel is still open, once about 60 MiB have come down (by the wallet's
+    released tickets, or the exit's count where 60 MiB cost under two tickets). What the seller charged
     (its gateway's book) and what the wallet says the
     session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
     the stop says is left with the seller; both nodes and the book agree. Usage is the bytes the buyer took
@@ -2449,7 +2449,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
 
     t = threading.Thread(target=fetch)
     t.start()
-    # when the tunnel's 57 MiB cost two tickets or more, the wallet's own released count says when they have
+    # when the tunnel's 60 MiB cost two tickets or more, the wallet's own released count says when they have
     # passed, at once; below that (the cheap run) no ticket moves, and the exit's count does (every 5 s)
     stop_msat = price_of(VPN_STOP_AT_BYTES, sat_gb * 1000, 1 << 30)
 
@@ -2462,7 +2462,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
         return exit_down() - down0 >= VPN_STOP_AT_BYTES
 
     try:
-        lab.wait("the tunnel to carry about 57 MiB", 300, drawn, every=0.1)
+        lab.wait("the tunnel to carry about 60 MiB", 300, drawn, every=0.1)
     except LabError as e:
         stopped.set()
         t.join(400)
