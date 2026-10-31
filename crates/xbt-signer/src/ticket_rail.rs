@@ -1842,16 +1842,30 @@ impl Signer {
     fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), String> {
         let until = from + crate::ln::CHANNEL_BACK_WAIT;
         let chan = (ids.len() == 1).then(|| ids[0].as_str());
+        // when this payment first found no route, on the wallet's clock, for the record of the wait
+        let mut none_since: Option<f64> = None;
+        let waited = |none_since: Option<f64>, back: bool| {
+            if let Some(at) = none_since {
+                self.ticket_audit("ticket_route_waited", json!({"session": sid, "dest": format!("ln:{payee}"), "no_route_from": at,
+                                                                "route_back_at": back.then(|| self.engine.now()), "waited_s": self.engine.now() - at}));
+            }
+        };
         loop {
             let asked = Instant::now();
             let found = ln.has_route(payee, msat, chan, final_cltv);
             self.ticket_pace.queried(asked.elapsed());
             match found {
-                Ok(true) | Err(_) => return Ok(()),
-                Ok(false) => {}
+                Ok(true) | Err(_) => {
+                    waited(none_since, true);
+                    return Ok(());
+                }
+                Ok(false) => {
+                    none_since.get_or_insert_with(|| self.engine.now());
+                }
             }
             let stopped = self.ticket_is_stopping(sid) || self.ticket_session(sid).is_some_and(|s| s.state != SState::Open);
             if Instant::now() >= until || stopped {
+                waited(none_since, false);
                 return Err(format!("the wallet's node found no route to the seller for {:.1} s: nothing was sent", from.elapsed().as_secs_f64()));
             }
             std::thread::sleep(crate::ln::CHANNEL_BACK_POLL.min(until.saturating_duration_since(Instant::now())));

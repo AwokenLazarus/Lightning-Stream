@@ -526,6 +526,46 @@ def link_drops(since: float) -> list[tuple[float, str]]:
     return sorted(out)
 
 
+def links_back(since: float) -> list[tuple[float, float, str]]:
+    """Each drop since `since` and when that node had the connection again (its next "Finalizing connection")."""
+    out = []
+    for node in (BUYER, HOP, SELLER):
+        dropped: float | None = None
+        for line in lab.dc("logs", "--no-color", "--timestamps", node, check=False).splitlines():
+            stamp = line.split("|", 1)[-1].strip().split(" ", 1)[0]
+            try:
+                at = datetime.datetime.fromisoformat(stamp[:26].rstrip("Z") + "+00:00").timestamp()
+            except ValueError:
+                continue
+            if at < since:
+                continue
+            if "PEER:" in line and "disconnecting" in line:
+                dropped = at
+            elif dropped is not None and "Finalizing connection" in line:
+                out.append((dropped, at, node))
+                dropped = None
+    return sorted(out)
+
+
+def route_waits(since: float) -> list[dict[str, Any]]:
+    """The wallet's waits for a route, each against the link that was back last before its route came back:
+    how long after the link the node's route query found a route again (mission control may keep it longer)."""
+    back = links_back(since)
+    out = []
+    for e in e2e.events("ticket_route_waited"):
+        start = float(e.get("no_route_from") or 0)
+        if start < since:
+            continue
+        found = e.get("route_back_at")
+        row: dict[str, Any] = {"waited_s": round(float(e.get("waited_s") or 0), 2), "route_found": found is not None}
+        links = [b for b in back if b[0] <= start + 1.0]
+        if links and found is not None:
+            row["route_back_after_link_s"] = round(float(found) - links[-1][1], 2)
+            row["link"] = links[-1][2]
+        out.append(row)
+    return out
+
+
 def failed_by_drop(before: set[str], drops: list[tuple[float, str]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """The payments that failed since `before`, as those a link drop explains and those it does not. Each says the
     drop nearest it and how long after that drop it was sent (`sent_after_drop_s`, negative: before it)."""
@@ -606,7 +646,7 @@ def swarm_of(n: int) -> None:
                "link_drops": len(drops), "failed_in_a_drop": len(in_drop), "last_failure_after_its_drop_s": tail, "failed_outside_a_drop": outside[:10], "seconds": round(secs, 1), "bad": bad[:3]})
         measured(f"swarm{n}_link_drops", {"drops": [(round(d - wall0, 1), node) for d, node in drops], "failed_in_a_drop": in_drop[:20],
                                          "last_failure_after_its_drop_s": tail, "failed_outside_a_drop": outside[:20],
-                                         "route_query_ms": status().get("route_query_ms")})
+                                         "route_query_ms": status().get("route_query_ms"), "route_waits": route_waits(wall0)[:40]})
         check(f"swarm: with {n} sellers the wallet never had more than 8 payments on its channel at once (30 slots), held nothing between wins, and an ordinary payment over that channel succeeded meanwhile",
               s["most_pending"] <= 9 and not s["not_a_win_in_flight"] and ordinary.get("paid") is True and lab.pending_htlcs(BUYER) == 0 and e2e.held() == 0,
               {**s, "ordinary_payment": ordinary})
