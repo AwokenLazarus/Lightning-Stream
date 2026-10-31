@@ -262,7 +262,13 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     b
 }
 
+/// A seller as the pages show it: its web address's host, or for a shop reached by its key, that key
+/// shortened (its made-up `<key>.shop.invalid` name means nothing to a person, and is too long for a line).
 pub(crate) fn host(url: &str) -> String {
+    if let Some(pk) = xbt402::shop::key_of(url) {
+        let npub = xbt402::shop::npub(&pk);
+        return format!("{}…{}", &npub[..13], &npub[npub.len() - 4..]);
+    }
     services::http_origin(url).unwrap_or_else(|| url.to_string()).trim_start_matches("https://").trim_start_matches("http://").to_string()
 }
 

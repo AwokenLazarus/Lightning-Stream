@@ -251,18 +251,19 @@ impl App {
         }
         let host = crate::app::stream_pages::host(&svc.seller);
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
-            <div class=\"offer-head\"><h2>{}</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
+            <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
             <p>{} &middot; {} \
             <form method=\"post\" action=\"./app-stop\" class=\"inline\">{}<input type=\"hidden\" name=\"visit\" value=\"{}\"><button class=\"danger\">Stop</button></form></p>\
             <iframe class=\"seller-app\" title=\"{}\" sandbox=\"allow-scripts allow-same-origin allow-forms allow-downloads allow-modals allow-pointer-lock\" \
             allow=\"fullscreen; autoplay; encrypted-media; picture-in-picture\" referrerpolicy=\"no-referrer\"></iframe>\
             <p class=\"hint\" data-visit-note>{}'s own page. It cannot see your wallet. Close this page or press Stop to end the visit.</p></section>",
-            esc(&visit), esc(&code), esc(&svc.name),
+            esc(&visit), esc(&code),
             if preview { "Your own shop, free: nothing is paid".to_string() } else { format!("<span data-visit-spent>0</span> of <strong>{limit} sat</strong> spent on this visit") },
             esc(&svc.price_text), App::csrf_input(ctx), esc(&visit), esc(&svc.name), esc(&host));
         let frames: String = self.app_ports().iter().map(|p| format!(" http://*:{p} https://*:{p}")).collect();
         let csp = format!("{}; media-src 'self'; frame-src{frames}", crate::server::CSP);
-        self.page(&format!("{}'s app", host), ctx, b).header("Content-Security-Policy", &csp)
+        // the shop's own name, as Browse shows it; the seller's address or key is in the line below
+        self.page(&svc.name, ctx, b).header("Content-Security-Policy", &csp)
     }
 
     /// `POST /app-stop`.

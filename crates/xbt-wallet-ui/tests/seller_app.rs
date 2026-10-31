@@ -522,6 +522,63 @@ fn the_owner_previews_their_own_shops_page_for_free() {
     assert!(paid_urls.lock().unwrap().is_empty(), "the preview went through the connector");
 }
 
+/// A shop reached by its key: the pages before and during the visit name it by its name and its
+/// shortened key, never by its made-up `<52 characters>.shop.invalid` address, which means nothing to
+/// a person and ran off the side of the page.
+#[test]
+fn a_visit_to_a_shop_reached_by_key_is_headed_by_the_shops_name() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let (pay_sock, _) = signer(dir.path());
+    let crun = lightning_stream::serve(lightning_stream::Config { signer: pay_sock, stream_dir: dir.path().to_path_buf(), task: "app".into(), max_sats: 2_000 },
+                                       std::net::TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
+    let rig = Rig::new(json!({}), true);
+    let sock_path = rig.dir.path().join("signer.sock");
+    let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
+    let pk = [7u8; 32];
+    let shop = xbt402::shop::origin_for(&pk);
+    let npub = xbt402::shop::npub(&pk);
+    let base = format!("{shop}/");
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("ui")).unwrap();
+    std::fs::write(data.path().join("ui/services.json"), json!([
+        {"name": "Home films", "kind": "video", "seller": shop, "price_text": "20 sat a MiB", "items": [], "app": format!("{base}web/"), "app_base": base}]).to_string()).unwrap();
+    let (srv, _) = spawn_ui(1, |ports| {
+        let mut cfg = Config::for_test(sock_path.clone(), data.path().join("ui"), "127.0.0.1:0");
+        cfg.connector = format!("http://{}", crun.addr);
+        cfg.app_ports = ports;
+        cfg
+    });
+    let wallet = format!("http://{}", srv.addr);
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let r = agent.post(&format!("{wallet}/setup-password")).set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&format!("code={}&password=a+long+box+password&password2=a+long+box+password", code.trim()));
+    let r = match r { Ok(x) | Err(ureq::Error::Status(_, x)) => x, Err(e) => panic!("{e}") };
+    let session = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let enc = xbt_wallet_ui::services::urlenc;
+    let q = format!("u={}&b={}", enc(&format!("{base}web/")), enc(&base));
+    // what a person reads: the heading, and the text outside tags and form values
+    let shown = |page: &str| -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in page.chars() {
+            match c { '<' => in_tag = true, '>' => { in_tag = false; out.push(' ') } _ if !in_tag => out.push(c), _ => {} }
+        }
+        out
+    };
+    let heading = |page: &str| -> String { let i = page.find("<h1>").unwrap() + 4; page[i..i + page[i..].find("</h1>").unwrap()].to_string() };
+    let short = format!("{}…{}", &npub[..13], &npub[npub.len() - 4..]);
+    let page = agent.get(&format!("{wallet}/app?{q}")).set("Cookie", &session).call().unwrap().into_string().unwrap();
+    assert!(!shown(&page).contains(".shop.invalid") && shown(&page).contains(&short), "before the visit: {}", shown(&page));
+    let csrf = { let i = page.find("name=\"csrf\" value=\"").unwrap() + 19; page[i..i + page[i..].find('"').unwrap()].to_string() };
+    let page = agent.post(&format!("{wallet}/app")).set("Cookie", &session).set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&format!("csrf={csrf}&{q}&limit=500")).unwrap().into_string().unwrap();
+    assert!(page.contains("data-visit=\""), "the visit opened: {page}");
+    assert_eq!(heading(&page), "Home films", "headed by the shop's name");
+    assert!(!shown(&page).contains(".shop.invalid") && shown(&page).contains(&short), "during the visit: {}", shown(&page));
+}
+
 /// One seller, two apps (a media server and a podcast player), opened by one buyer at once: each is
 /// its own visit with its own limit, on its own port, so neither page sees the other's cookies, and
 /// stopping one leaves the other open.
