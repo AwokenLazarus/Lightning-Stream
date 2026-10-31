@@ -649,6 +649,28 @@ fn a_phone_downloads_through_a_paid_tunnel_its_wallet_opens() {
 }
 
 #[test]
+fn a_device_shows_the_exit_it_goes_out_through_and_what_its_tunnel_has_cost() {
+    let n = 2 << 20;
+    let to = tcp_server(n);
+    let s = setup(86, false, None);
+    assert_eq!(s.buyer.device_use(IpAddr::V4(PHONE_IP)), (None, 0), "nothing used yet");
+    let at = paid_exit(&s.rt, Arc::new(Meter::default()));
+    let w = fake_wallet(at, None);
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
+    s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
+    assert_eq!(s.rt.block_on(phone_download(&s, to, Duration::from_secs(60))), n);
+    let (exit, used) = s.buyer.device_use(IpAddr::V4(PHONE_IP));
+    assert_eq!(exit.as_deref(), Some("paid-exit"));
+    // its bytes both ways at the announced 2,000,000 msat a GiB: at least the download, and not much more
+    let floor = xbt_vpn::buyer::cost_msat(n as u64, 2_000_000);
+    assert!(used >= floor && used <= floor + floor / 10 + 1_000, "used {used} msat for {n} bytes (floor {floor})");
+    let line = xbt_vpn::service::with_use(serde_json::json!({"id": "x"}), exit.as_deref(), used);
+    assert_eq!(line["exit"], "paid-exit");
+    assert_eq!(line["used_msat"], used);
+}
+
+#[test]
 fn a_paid_tunnel_is_paid_no_more_than_the_price_its_exit_announced() {
     let to = tcp_server(64 << 10);
     let s = setup(110, false, None);
