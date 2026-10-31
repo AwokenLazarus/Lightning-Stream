@@ -142,9 +142,9 @@ export const FILE_BROWSER = {
   volumeId: 'data',
   // what File Browser serves (its /srv); the rest of the volume is its config and database
   subpath: 'data',
-  // File Browser writes its files as its own user (1000) with 0640/0750; the mount asks StartOS to show
-  // them as the UI's (10005). StartOS 0.4.0.1 does not apply it yet: there, only files others can read
-  // are shared
+  // File Browser writes its files as its own user (1000) with 0640/0750. The UI reads them through its
+  // group, 1000 (xbt-shared-files in the images' base layer); the mount's idmap below asks StartOS to show
+  // them as the UI's (10005) as well, which StartOS 0.4.0.1 does not apply yet
   ownerId: 1000,
   uiId: 10005,
   minVersion: '2.63.18:0',
