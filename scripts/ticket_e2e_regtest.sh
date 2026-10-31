@@ -116,6 +116,9 @@ R=
 
 cleanup() {
   if [ -n "$R" ]; then pkill -f "$R/" 2>/dev/null || true; fi
+  # the vpn checks' NAT rule to their far side (drive.py's FarSide), even where the driver was killed outright
+  sudo -n iptables -w -t nat -S OUTPUT 2>/dev/null | grep -- 'ticket-e2e-far-side' | sed 's/^-A /-D /' |
+    while read -r rule; do eval "sudo -n iptables -w -t nat $rule" 2>/dev/null || true; done
   if [ "${TICKET_E2E_KEEP:-0}" != 1 ]; then
     if [ -d "$LAB" ]; then
       # unchecked: on the way out there is nobody to tell, and the next run removes what is left

@@ -2497,7 +2497,8 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     seller's receipts say was spent, or the exit's count where 60 MiB cost under two tickets). What the seller charged
     (its gateway's book) and what the wallet says the
     session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
-    the stop says is left with the seller; both nodes and the book agree. Usage is the bytes the buyer took
+    the stop says is left with the seller, and that is under two tickets (the wallet pays at most about 1.5
+    ahead of use); both nodes and the book agree. Usage is the bytes the buyer took
     out of the tunnel (B): the seller charges for at least those, and for at most B plus 3% and 1 MiB (the
     tunnel's own framing and requests, 3%; and bytes on their way when the stop came, which the tunnel's
     flow window holds to 512 KiB with one flow, plus the paid-ahead chunks). The wallet's account is
@@ -2594,11 +2595,11 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     # (at least 1 msat: the two may round the same bytes' price apart by one)
     near = abs(spent - seller) <= max(1, price_of(64 << 10, byte_msat, 1 << 30))
     exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
-    ok = (took >= 50 << 20 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 3 * TICKET_MSAT and agrees(m, receipts=True))
+    ok = (took >= 50 << 20 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 2 * TICKET_MSAT and agrees(m, receipts=True))
     measured(f"vpn_money_{sat_gb}_mib", round(took / 2**20, 1))
     check(f"vpn: a tunnel stopped while open, after 50 MiB or more: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 3% and 1 MiB above for "
           "framing and bytes on their way, never below), the wallet's account says the same within 64 KiB's price, what was paid is what was spent and what is left with the "
-          "seller, and both nodes and the book agree",
+          "seller (under two tickets: what the wallet pays ahead), and both nodes and the book agree",
           ok, {"bytes_through": took, "served_by_far_side": FAR_SIDE.served - served0, "file": url, "usage_low_msat": low, "usage_high_msat": high, "seller_book_charged_msat": seller, "wallet_spent_msat": spent,
                "left_with_seller_msat": left, "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
                "receipts_released_msat": m["receipts_released_msat"],
@@ -2894,4 +2895,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # a run stopped from outside (stream-lab, the shell's trap) still unwinds, so the far side's NAT rule goes with it
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(129))
     sys.exit(main())
