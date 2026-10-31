@@ -2876,8 +2876,20 @@ fn a_seller_that_charges_past_the_calls_limit_is_stopped_and_said_so() {
 fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
+    // the seller's own record of each answer that ended (its status lists them: the bytes its socket took, and the
+    // signed charge), as the wallet fetches it to close the cut answer
+    let finals = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let kept = finals.clone();
     // the connection dies after 7 MiB of a 30 MiB file
-    r.tap.set(Box::new(|seen, real| {
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path.ends_with("/x402/ticket/status") {
+            let (status, headers, body) = whole(real().ok()?);
+            if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+                kept.lock().unwrap().extend(v["responses"].as_array().into_iter().flatten().cloned());
+            }
+            let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+            return Some(Ok(answer(status, headers, body)));
+        }
         if !(seen.paid && seen.path.starts_with("/files/")) {
             return None;
         }
@@ -2903,9 +2915,28 @@ fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
     // 7 MiB is 1,400 sat: two tickets were released for it, and no third
     assert_eq!((v["tickets_released"].as_u64(), r.tap.secrets().len()), (Some(2), 2), "{v}");
     assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
-    // the session goes on: the seller's signed balance is what is left
+    // the seller charged the cut answer for the bytes its socket took and not one more: the 7 MiB read and what the
+    // kernel buffered ahead of a reader that then stopped, up to the credit released (a little on a quiet machine, all
+    // 10 MiB on a loaded one). A seller that kept the credit it had reserved, or billed the rest of it on the cut,
+    // charges past its own count of bytes
+    let cut = finals.lock().unwrap().iter().find(|f| f["complete"] == false).cloned().unwrap_or_else(|| panic!("no record of the cut answer: {v}"));
+    let wrote = cut["bytes"].as_u64().unwrap();
+    let charged: u64 = cut["charged"].as_str().and_then(|s| s.parse().ok()).unwrap_or_else(|| panic!("{cut}"));
+    assert!(wrote >= 7 * MIB as u64, "the seller wrote less than was read: {cut}");
+    assert_eq!(charged, (wrote * 200_000).div_ceil(MIB as u64), "charged for exactly the {wrote} bytes it wrote: {cut}");
+    // the session goes on: the seller's signed balance is what is left. So the next call is paid from what is left
+    // where that covers it and buys one ticket where it does not, and either way to the msat
     let next = r.pay("/page/10", CALL);
-    assert_eq!((next["status"].as_u64(), next["tickets_released"].as_u64()), (Some(200), Some(0)), "{next}");
+    let num = |k: &str| next[k].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| panic!("{k}: {next}"));
+    let (credited, balance, page) = (num("credited_msat"), num("balance_msat"), num("price_msat"));
+    let released_next = next["tickets_released"].as_u64().unwrap();
+    assert_eq!(credited, (2 + released_next) * TICKET, "{next}");
+    let cut_cost = credited - balance - page;
+    assert_eq!(cut_cost, charged, "the signed balance is the seller's own count: {next}");
+    assert!(cut_cost <= 2 * TICKET, "the cut answer cost {cut_cost} msat, past the 2 tickets released for it: {next}");
+    let needed = u64::from(2 * TICKET - cut_cost < page);
+    assert_eq!((next["status"].as_u64(), released_next), (Some(200), needed), "the credit left pays first: {next}");
+    assert_eq!(r.money(), ((2 + needed) * TICKET, (2 + needed) * TICKET, (2 + needed) * TICKET, (2 + needed) as i64 * SETTLED));
     r.assert_booked();
 }
 
@@ -4434,26 +4465,28 @@ fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
 #[test]
 fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for() {
     let _g = env_lock();
-    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 2 s here,
-    // where the gateway ships 10), and 20 sellers beside it that serve on whatever is unpaid: their wins fill the
-    // wallet's gate, 8 at a time, and no answer waits for one of them
-    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2}});
+    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 8 s here,
+    // where the gateway ships 10: the test's clock does not move, so it stands still for its whole grace), and 20
+    // sellers beside it that serve on whatever is unpaid: their wins fill the wallet's gate, 8 at a time, and no
+    // answer waits for one of them
+    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 8}});
     let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0},
                          "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
     let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
                        "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
     let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
-    // a payment takes 200 ms through the hop: the gate lets 40 through in a second. (100 ms and a grace of 1 s
-    // failed now and then on a shared machine with two cores, where the hurried win's own path took more than a
-    // second; the wins that wait still take longer than the grace to pass, so a gate in order of arrival fails)
-    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(200);
+    // a payment takes 1 s through the hop: the gate lets 8 through in a second, and the 120 wins that wait below take
+    // 15 s to pass, twice the strict seller's 8 s, so a gate in order of arrival fails. The hurried win's own path
+    // (the wallet sees the seller stand still, the win passes the gate, the payment goes) took 4.5 s on a lab VM
+    // starved of CPU, with 200 ms payments: a grace of 2 s failed there every time, and 8 s leaves room for it.
+    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(1_000);
     let size = 64 * PIECE;
     let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
     let (strict_one, others) = std::thread::scope(|sc| {
-        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, eight seconds of the gate
+        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, forty seconds of the gate
         let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
-        // once three seconds' worth of them wait (the node has an invoice for each, and no payment yet), the file from
-        // the strict seller: its third unpaid win stops its answer, which is cut after two seconds
+        // once fifteen seconds' worth of them wait (the node has an invoice for each, and no payment yet), the file from
+        // the strict seller: its third unpaid win stops its answer, which is cut after eight seconds
         // the two counts one after the other, never one lock inside the other ([`PayLn`] takes `preimages` under `st`)
         wait_for("120 wins waiting at the gate", || {
             let invoiced = r.shop.node.preimages.lock().unwrap().len();
