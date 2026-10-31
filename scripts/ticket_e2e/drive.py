@@ -2530,10 +2530,14 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
                            capture_output=True, text=True, timeout=400)
         line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
         # the wallet's last word on the tunnel is on stderr: why it ended, if it ended on its own
-        said = next((ln for ln in r.stderr.splitlines() if ln.startswith("the wallet:")), r.stderr[-400:])
-        ended = re.search(r'"ended":"[^"]*"|"(?:rule|reason)":"[^"]*"', said)
+        said = next((ln.removeprefix("the wallet:").strip() for ln in r.stderr.splitlines() if ln.startswith("the wallet:")), r.stderr[-400:])
+        try:
+            answer = json.loads(said)
+            said = {k: answer.get(k) for k in ("ended", "rule", "reason", "complete", "seller_fault", "charged_sats", "credited_msat", "balance_msat")}
+        except ValueError:
+            pass
         out.update(json.loads(line) if line else {"stderr": r.stderr[-800:]})
-        out["wallet_said"] = ended.group(0) if ended else said[:300]
+        out["wallet_said"] = said
 
     t = threading.Thread(target=fetch)
     t.start()
