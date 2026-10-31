@@ -1666,7 +1666,7 @@ impl Signer {
         };
         // the invoice is paid, never the offer: paying the offer would fetch another invoice
         let req = OfferPayRequest { invoice: lni, fee_limit_msat: send.fee_limit_msat, timeout_s: send.timeout_s };
-        let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, booked_sats, inside, &|| ln.pay_offer(&req));
+        let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, booked_sats, inside, false, &|| ln.pay_offer(&req));
         // the offer's invoice could not be reached (its blinded path enters through a node this wallet has no route to,
         // while a channel straight to the seller could pay the seller's own invoice): the seller's invoice is tried
         // instead. Only when the node says the payment failed for good, with nothing of it in flight, and the book holds
@@ -1774,7 +1774,7 @@ impl Signer {
             Ok(Err(d)) => return d,
             Err(e) => return refusal("ticket", e.msg),
         };
-        self.ticket_ordinary_sent(&*ln, &lp, &sid, &dest, &hash, win, booked_sats, inside, &|| ln.send_held(&send))
+        self.ticket_ordinary_sent(&*ln, &lp, &sid, &dest, &hash, win, booked_sats, inside, true, &|| ln.send_held(&send))
     }
 
     /// What the book holds booked for the ticket `hash` (0 where it holds none, or cannot be read).
@@ -1787,10 +1787,11 @@ impl Signer {
     /// returns), once more outside it, and brought into the book. No lock is held while the node
     /// routes it. Every answer that leaves the booking in place says it in `charged_sats`: paid,
     /// `pending` (not final yet, paid without the preimage that proves it, or a word of the node's
-    /// the book could not record), never a refusal that counts it as nothing.
+    /// the book could not record), never a refusal that counts it as nothing. `may_resend` is false
+    /// for a payment by offer: its failure falls back on the seller's invoice, which may go again.
     #[allow(clippy::too_many_arguments)]
     fn ticket_ordinary_sent(&self, ln: &dyn LnBackend, lp: &LnPolicy, sid: &str, dest: &str, hash: &str, win: Option<&xbt402::lottery::Win>, booked_sats: i64,
-                            inside: PaceGuard<'_>, send: &dyn Fn() -> Result<Value>) -> Value {
+                            inside: PaceGuard<'_>, may_resend: bool, send: &dyn Fn() -> Result<Value>) -> Value {
         // the names of the two things this pays, for its refusals and its log lines
         let (failed, pending, unproven, paid_kind, what) = match win {
             None => ("ticket_prepay_failed", "ticket_prepay_pending", "ticket_prepay_unproven", "ticket_prepaid", "the prepaid ticket"),
@@ -1804,7 +1805,7 @@ impl Signer {
         // once more: a payment the book held failed is one whose booking has gone
         let queued = Queued::new(&self.ticket_queued, vec![hash.clone()]);
         let mut pmt = {
-            let mut again = true;
+            let mut again = may_resend;
             loop {
                 unsent = None;
                 let mut pmt = match send() {
