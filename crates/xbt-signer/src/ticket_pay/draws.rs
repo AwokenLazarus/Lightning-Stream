@@ -368,8 +368,11 @@ impl Signer {
         let mut headers = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&ds.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth}))))];
         headers.extend(extra);
         let sent = self.wire(method, url, body, &headers, timeout);
-        // the seq is used up once the request has left, answered or not
-        link.next_seq = seq.saturating_add(1);
+        // the seq is used up once the request has left, answered or not; but not by a 408, which the seller's HTTP
+        // layer gives before any of its handlers sees the request ([`unsigned_and_no_fault`]): the next request takes it
+        // again (`link` is held, so no other has)
+        let late = sent.as_ref().is_ok_and(|a| a.status == 408);
+        link.next_seq = if late { seq } else { seq.saturating_add(1) };
         let ans = sent?;
         let receipt = DrawReceipt::read(ans.header("PAYMENT-RESPONSE"), &ds.terms.receipt_key, &link.seller_sid, seq, &digest, ans.status);
         Ok((seq, digest, ans, receipt))
@@ -379,10 +382,16 @@ impl Signer {
     fn draw_call(&self, ds: &DrawSession, what: &str, body: &Value) -> Result<(u16, Value, std::result::Result<DrawReceipt, String>)> {
         let url = format!("{}/{what}", ds.base);
         let raw = body.to_string().into_bytes();
-        for _ in 0..3 {
+        let mut late = 0;
+        for _ in 0..4 {
             let (_, _, ans, receipt) = self.draw_send(ds, "POST", &url, &raw, vec![("Content-Type".into(), "application/json".into())])?;
             let status = ans.status;
             let v: Value = serde_json::from_slice(&ans.read_small(SMALL_BODY)?).unwrap_or(Value::Null);
+            // the seller's HTTP layer gave up on it (408): nothing was served, and the same request goes once more
+            if receipt.is_err() && status == 408 && late == 0 {
+                late += 1;
+                continue;
+            }
             if receipt.is_err() && status == 402 && v.get("error").and_then(Value::as_str) == Some("bad_seq") {
                 // a seq only orders requests: the seller's is adopted, which costs nothing
                 if let Some(n) = v.get("nextSeq").and_then(Value::as_u64) {
@@ -779,6 +788,7 @@ impl Signer {
         self.lottery_touch(&ds.sid);
         let started = Instant::now();
         let mut tries = 0;
+        let mut late = false;
         let (seq, digest, ans, head) = loop {
             tries += 1;
             let (seq, digest, ans, receipt) = match self.draw_send(ds, c.method, c.url, c.body, c.headers()) {
@@ -796,6 +806,11 @@ impl Signer {
                             lock(&ds.link).next_seq = n;
                             continue;
                         }
+                    }
+                    // the seller's HTTP layer gave up on it (408) before anything served it: once more, with its seq
+                    if status == 408 && !late {
+                        late = true;
+                        continue;
                     }
                     if unsigned_and_no_fault(status) {
                         return fail(ds, with(refused("ticket_seller", format!("the seller answered HTTP {status} without a receipt")), json!({"status": status})));
