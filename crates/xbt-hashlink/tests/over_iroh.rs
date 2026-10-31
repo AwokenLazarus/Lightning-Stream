@@ -75,7 +75,7 @@ fn tempdir() -> PathBuf {
 }
 
 fn terms() -> Terms {
-    Terms { slice_work: 6 * share_work(DIFF), price_msat: 5_000, grace_ms: 2500, start_slices: 0 }
+    Terms { slice_work: 6 * share_work(DIFF), price_msat: 300_000, grace_ms: 2500, start_slices: 0 }
 }
 
 struct Pool {

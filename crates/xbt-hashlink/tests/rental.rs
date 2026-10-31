@@ -60,7 +60,7 @@ fn wait_for(addr: &str) {
 }
 
 fn terms() -> Terms {
-    Terms { slice_work: SHARES_PER_SLICE * share_work(DIFF), price_msat: 5_000, grace_ms: 1500, start_slices: 0 }
+    Terms { slice_work: SHARES_PER_SLICE * share_work(DIFF), price_msat: 300_000, grace_ms: 1500, start_slices: 0 }
 }
 
 fn tempdir() -> PathBuf {

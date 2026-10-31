@@ -134,9 +134,10 @@ impl Buyer {
     /// Pay this slice over the link, ahead of its work.
     fn pay(&self, slice: u64) {
         let pre = [slice as u8; 32];
-        self.tx.send(&Msg::Lock { slice, hash: hex::encode(sha256(&pre)) }).unwrap();
+        // a link the hashmaker has closed takes nothing more: what happened is read from its report
+        let _ = self.tx.send(&Msg::Lock { slice, hash: hex::encode(sha256(&pre)) });
         let receipt = Receipt { rental: self.rental.clone(), slice, work: 0, accepted: 0, rejected: 0, at_ms: 1 }.sign(&self.key);
-        self.tx.send(&Msg::Pay { slice, preimage: hex::encode(pre), receipt }).unwrap();
+        let _ = self.tx.send(&Msg::Pay { slice, preimage: hex::encode(pre), receipt });
     }
 
     /// Read until a miner's channel is open and has its first job.
@@ -330,7 +331,7 @@ fn run_until_ended(a: &App, b: &mut Buyer, id: &str, within: Duration) -> Value 
 #[test]
 fn a_hello_with_no_payment_gets_no_miner_reserves_none_and_ends_on_time() {
     let _s = serial();
-    let terms = Terms { slice_work: 8 * share_work(DIFF), price_msat: 5_000, grace_ms: 2_000, start_slices: 0 };
+    let terms = Terms { slice_work: 8 * share_work(DIFF), price_msat: 300_000, grace_ms: 2_000, start_slices: 0 };
     let a = app(&terms);
     let m = scripted_miner(&a.miners, 4, Duration::from_millis(20), Sends::Real(1.0));
     thread::sleep(Duration::from_millis(300));
@@ -355,7 +356,7 @@ fn verdicts_set_nothing_and_a_rental_stops_as_proven_work_passes_paid() {
     let _s = serial();
     let sw = share_work(DIFF);
     for verdicts in [Verdicts::None, Verdicts::RejectAll, Verdicts::AcceptEvery(5), Verdicts::AcceptAll] {
-        let terms = Terms { slice_work: 4 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+        let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
         let a = app(&terms);
         let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
         b.verdicts = verdicts;
@@ -377,7 +378,7 @@ fn verdicts_set_nothing_and_a_rental_stops_as_proven_work_passes_paid() {
 fn a_share_waiting_for_payment_goes_on_when_it_comes() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 2 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
     b.pay(1);
@@ -401,7 +402,7 @@ fn a_share_waiting_for_payment_goes_on_when_it_comes() {
 fn a_start_fee_is_paid_first_and_buys_no_work() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 2 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 2 };
+    let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 2 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
     b.pay(1);
@@ -414,7 +415,7 @@ fn a_start_fee_is_paid_first_and_buys_no_work() {
     assert_eq!(r["stopped"]["reason"], "unpaid", "{r}");
     assert_eq!(b.shares, 2, "one slice's worth");
     assert_eq!(r["meter"]["work"], (2 * sw).to_string(), "{r}");
-    assert_eq!(r["earnedMsat"], 15_000, "{r}");
+    assert_eq!(r["earnedMsat"], 900_000, "{r}");
     a.h.shutdown();
 }
 
@@ -425,7 +426,7 @@ fn a_start_fee_is_paid_first_and_buys_no_work() {
 fn a_renter_walking_after_its_first_step_with_new_keys_gets_no_work_it_did_not_pay_for() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 4 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 1 };
+    let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 1 };
     let a = app(&terms);
     for k in 0..3 {
         let id = format!("walk{k}");
@@ -437,7 +438,7 @@ fn a_renter_walking_after_its_first_step_with_new_keys_gets_no_work_it_did_not_p
         let r = run_until_ended(&a, &mut b, &id, Duration::from_secs(20));
         eprintln!("{id}: stopped {} with {} shares forwarded, {} earned", r["stopped"]["reason"], b.shares, r["earnedMsat"]);
         assert_eq!(r["stopped"]["reason"], "unpaid", "{r}");
-        assert_eq!(r["earnedMsat"], 10_000, "the fee and one slice: {r}");
+        assert_eq!(r["earnedMsat"], 600_000, "the fee and one slice: {r}");
         assert_eq!(r["meter"]["work"], (4 * sw).to_string(), "one slice of work and no more: {r}");
         assert_eq!(r["stopped"]["unpaidWork"], "0", "{r}");
         assert_eq!(b.shares, 4);
@@ -453,7 +454,7 @@ fn a_renter_walking_after_its_first_step_with_new_keys_gets_no_work_it_did_not_p
 fn measure_a_renter_stopping_partway_ends_within_the_clock() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 4 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "part", hello("part", &terms));
     b.verdicts = Verdicts::AcceptAll;
@@ -493,7 +494,7 @@ fn bargain_kept(r: &Value, terms: &Terms, share: u128) {
 fn a_resume_loop_under_the_limit_ends_unpaid_with_the_bargain_kept() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 20 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 20 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let bk = noise::fresh_key();
     let (mut b, _) = connect(&a.link, bk, a.hpub, "loop", hello("loop", &terms));
@@ -534,7 +535,7 @@ fn a_resume_loop_past_the_limit_ends_on_it_with_the_bargain_kept() {
     let _s = serial();
     let sw = share_work(DIFF);
     // ten slices of 2000 shares each: far more than the miner sends here
-    let terms = Terms { slice_work: 2000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 2000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let bk = noise::fresh_key();
     let (b, _) = connect(&a.link, bk, a.hpub, "limit", hello("limit", &terms));
@@ -575,7 +576,7 @@ fn a_resume_loop_past_the_limit_ends_on_it_with_the_bargain_kept() {
 fn a_renter_resuming_after_one_paid_slice_gets_that_slice_and_no_more() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 6 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 6 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let bk = noise::fresh_key();
     let (mut b, _) = connect(&a.link, bk, a.hpub, "one", hello("one", &terms));
@@ -609,7 +610,7 @@ fn a_renter_resuming_after_one_paid_slice_gets_that_slice_and_no_more() {
 #[test]
 fn resumes_with_nothing_to_show_end_the_rental() {
     let _s = serial();
-    let terms = Terms { slice_work: 60 * share_work(DIFF), price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 60 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let bk = noise::fresh_key();
     let (b, _) = connect(&a.link, bk, a.hpub, "r", hello("r", &terms));
@@ -644,7 +645,7 @@ fn fallback_pool() -> (String, std::path::PathBuf) {
 fn a_renter_saying_paying_and_never_paying_ends_within_the_wait_with_the_miners_on_the_fallback() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 2 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let (fb, fb_report) = fallback_pool();
     let a = app_full(&terms, hashmaker::MIN_SLICE_TIME, Some(fb));
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "say", hello("say", &terms));
@@ -687,7 +688,7 @@ fn hashmaker_wait() -> Duration {
 fn a_renter_saying_paying_past_the_limit_ends() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 2 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let (fb, _) = fallback_pool();
     let a = app_full(&terms, hashmaker::MIN_SLICE_TIME, Some(fb));
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "lim", hello("lim", &terms));
@@ -828,7 +829,7 @@ fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
 fn a_share_nobody_hashed_is_not_sent_on_and_the_miner_gets_a_rejection() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
     b.pay(1);
@@ -852,7 +853,7 @@ fn a_share_nobody_hashed_is_not_sent_on_and_the_miner_gets_a_rejection() {
 fn a_repeated_share_counts_once() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
     b.pay(1);
@@ -873,7 +874,7 @@ fn a_repeated_share_counts_once() {
 fn shares_harder_than_the_difficulty_end_the_rental() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "hard", hello("hard", &terms));
     b.verdicts = Verdicts::AcceptAll;
@@ -892,7 +893,7 @@ fn a_slice_paid_with_no_jobs_or_jobs_too_fast_to_work_ends_on_its_paid_time() {
     let _s = serial();
     let sw = share_work(DIFF);
     for (case, jobs_a_second) in [("no jobs", 0u64), ("19 clean jobs a second", 19)] {
-        let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+        let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
         // a second a slice, four times over
         let a = app_with(&terms, Duration::from_secs(1));
         let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
@@ -921,7 +922,7 @@ fn a_slice_paid_with_no_jobs_or_jobs_too_fast_to_work_ends_on_its_paid_time() {
 fn clean_jobs_flooded_end_the_rental() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
     b.pay(1);
@@ -947,7 +948,7 @@ fn clean_jobs_flooded_end_the_rental() {
 fn shares_flooded_at_a_tiny_difficulty_end_the_rental() {
     let _s = serial();
     let d = 1.0 / (1u64 << 31) as f64;
-    let terms = Terms { slice_work: 1 << 40, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1 << 40, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
     b.pay(1);
@@ -983,7 +984,7 @@ fn a_line_that_cannot_be_checked_ends_the_rental_before_a_miner_hashes_on_it() {
         (no_difficulty, "a job this app can't check"),
         (extranonce, "the hashtaker changed the extranonce"),
     ] {
-        let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+        let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
         let a = app(&terms);
         let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
         b.pay(1);
@@ -1020,7 +1021,7 @@ fn the_difficulty_limit_is_four_slices_a_share() {
 fn a_huge_difficulty_ends_that_rental_and_the_app_and_other_rentals_go_on() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 4 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "bad", hello("bad", &terms));
     b.pay(1);
@@ -1064,7 +1065,7 @@ fn a_huge_difficulty_ends_that_rental_and_the_app_and_other_rentals_go_on() {
 #[test]
 fn a_resume_with_someone_elses_key_is_refused() {
     let _s = serial();
-    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 5_000, grace_ms: 30_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 30_000, start_slices: 0 };
     let a = app(&terms);
     let (b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "r", hello("r", &terms));
     b.pay(1);
@@ -1079,7 +1080,7 @@ fn a_resume_with_someone_elses_key_is_refused() {
 #[test]
 fn a_rental_with_a_silent_hashtaker_ends_on_the_limit_for_a_quiet_link() {
     let _s = serial();
-    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let (b, w) = connect(&a.link, noise::fresh_key(), a.hpub, "quiet", hello("quiet", &terms));
     assert!(matches!(w, Msg::Welcome { .. }), "{w:?}");
@@ -1097,7 +1098,7 @@ fn a_rental_with_a_silent_hashtaker_ends_on_the_limit_for_a_quiet_link() {
 #[test]
 fn a_hello_with_no_proof_is_refused_and_no_money_moves() {
     let _s = serial();
-    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let old = Msg::Hello { rental: "old".into(), listing: "lab".into(), terms: terms.clone(), miners: 1, proof: None };
     let (_b, w) = connect(&a.link, noise::fresh_key(), a.hpub, "old", old);
@@ -1243,7 +1244,7 @@ fn pool_report(p: &std::path::Path) -> Value {
 fn a_hashmaker_inventing_shares_gets_nothing_for_them() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 4 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let (pool, report) = start_pool(Duration::from_secs(30));
     let (addr, hpub, got) = scripted_maker(Some(PROOF));
     let cfg = taker_config(&addr, hpub, &terms, &pool, "r", 30);
@@ -1279,7 +1280,7 @@ fn a_hashmaker_inventing_shares_gets_nothing_for_them() {
 fn a_hashmaker_repeating_a_real_share_is_paid_for_it_once() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 4 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let (pool, report) = start_pool(Duration::from_secs(30));
     let (addr, hpub, got) = scripted_maker(Some(PROOF));
     let cfg = taker_config(&addr, hpub, &terms, &pool, "r", 30);
@@ -1305,7 +1306,7 @@ fn a_hashmaker_repeating_a_real_share_is_paid_for_it_once() {
 fn a_hashmaker_holding_shares_back_is_caught_by_their_age() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     let (pool, _report) = start_pool(Duration::from_secs(60));
     let (addr, hpub, got) = scripted_maker(Some(PROOF));
     let cfg = taker_config(&addr, hpub, &terms, &pool, "r", 60);
@@ -1338,7 +1339,7 @@ fn a_hashmaker_holding_shares_back_is_caught_by_their_age() {
 fn a_hashmaker_on_a_superseded_job_is_stopped_at_its_second_share() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     // a gateway that says clean_jobs: a new block each second
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let up = l.local_addr().unwrap().to_string();
@@ -1394,7 +1395,7 @@ fn a_hashmaker_on_a_superseded_job_is_stopped_at_its_second_share() {
 fn a_gateway_rejecting_most_shares_ends_the_rental_from_the_hashtakers_side() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 1000 * sw, price_msat: 5_000, grace_ms: 5_000, start_slices: 0 };
+    let terms = Terms { slice_work: 1000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
     // a gateway that turns down every share
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let up = l.local_addr().unwrap().to_string();
@@ -1443,7 +1444,7 @@ fn a_gateway_rejecting_most_shares_ends_the_rental_from_the_hashtakers_side() {
 fn a_hashmaker_that_takes_the_first_slice_and_vanishes_gets_no_second() {
     let _s = serial();
     let sw = share_work(DIFF);
-    let terms = Terms { slice_work: 4 * sw, price_msat: 5_000, grace_ms: 1_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 1_000, start_slices: 0 };
     let (pool, _report) = start_pool(Duration::from_secs(30));
     let (addr, hpub, got) = scripted_maker(Some(PROOF));
     let cfg = taker_config(&addr, hpub, &terms, &pool, "r", 2);
@@ -1460,7 +1461,7 @@ fn a_hashmaker_that_takes_the_first_slice_and_vanishes_gets_no_second() {
 #[test]
 fn a_hashtaker_refuses_a_hashmaker_that_does_not_prove_shares() {
     let _s = serial();
-    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 5_000, grace_ms: 1_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 1_000, start_slices: 0 };
     let (pool, _report) = start_pool(Duration::from_secs(30));
     let (addr, hpub, got) = scripted_maker(None);
     let cfg = taker_config(&addr, hpub, &terms, &pool, "r", 2);
@@ -1475,7 +1476,7 @@ fn a_hashtaker_refuses_a_hashmaker_that_does_not_prove_shares() {
 /// updating, not that no welcome came.
 #[test]
 fn a_hashtaker_tells_an_older_hashmaker_needs_updating() {
-    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 5_000, grace_ms: 1_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 1_000, start_slices: 0 };
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap().to_string();
     let hk = noise::fresh_key();
@@ -1494,7 +1495,7 @@ fn a_hashtaker_tells_an_older_hashmaker_needs_updating() {
 /// With no way to check a gateway's blinding, and nobody asking to rent without it, a rental doesn't start.
 #[test]
 fn a_rental_with_no_way_to_check_blinding_does_not_start() {
-    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 5_000, grace_ms: 1_000, start_slices: 0 };
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 1_000, start_slices: 0 };
     let mut cfg = taker_config("127.0.0.1:1", PublicKey::from_secret_key(secp256k1::SECP256K1, &noise::fresh_key()), &terms, "127.0.0.1:1", "r", 2);
     cfg.allow_unblinded = false;
     let e = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap_err();
