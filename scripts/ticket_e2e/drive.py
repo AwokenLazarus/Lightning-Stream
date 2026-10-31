@@ -2471,7 +2471,9 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     except LabError as e:
         stopped.set()
         t.join(400)
-        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}; last seen {json.dumps(seen)[:900]}")
+        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}; last seen {json.dumps(seen)[:900]}; "
+              f"seller charged since the start {int(json.loads(send('GET', '/x402/ticket/health', gw_port)[2]).get('chargedMsat', -1)) - book0} msat; "
+              f"exit's status file {time.time() - os.path.getmtime(f'{vdir}/exit-status.json'):.0f} s old")
         return
     stopped.set()
     sid = next((p["session"] for p in status().get("paying", []) if p.get("origin") == origin), None)
