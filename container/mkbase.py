@@ -35,6 +35,8 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
                     both the UI and the connector (which runs as the signer's user) write, the sellers the UI's AI
                     page writes, and the sellers' health the endpoint writes; the group (10014, a group only; 10011 to 10013 are reserved for xbt-compute) has
                     the signer and the UI in it, never the MCP
+  xbt-shared-files (1000, a group only) has the UI in it: the gid another app's files carry when the Files
+                    service shares them read-only (File Browser's on StartOS, Umbrel's Downloads)
 Uid 10004 is not used: it was the retired hub's, and the other uids keep their numbers.
     python3 container/mkbase.py OUT.tar
 """
@@ -54,7 +56,12 @@ GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 100
           ("xbt-relay-status", 10017, "xbt-stream-relay,xbt-wallet-ui"),
           ("xbt-vpn-status", 10019, "xbt-vpn,xbt-wallet-ui"),
           ("xbt-ai", 10014, "xbt-signer,xbt-wallet-ui"),
-          ("xbt-streams", 10020, "xbt-signer,xbt-vpn")]
+          ("xbt-streams", 10020, "xbt-signer,xbt-vpn"),
+          # files another app keeps for the owner, mounted read-only for the Files service: File Browser on
+          # StartOS writes them as 1000:1000 with 0640/0750 (and Umbrel's Downloads are 1000's too); the UI
+          # reads them through this group. StartOS 0.4.0.1 does not apply a mount's idmap, so this is how
+          # they are readable there at all; the mount stays read-only
+          ("xbt-shared-files", 1000, "xbt-wallet-ui")]
 
 passwd = "root:x:0:0:root:/:/nonexistent\n" + "".join(f"{n}:x:{u}:{u}:{n}:{HOME[n]}:/nonexistent\n" for n, u in USERS)
 group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in USERS)

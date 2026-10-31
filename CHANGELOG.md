@@ -31,8 +31,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   shares a folder: buyers pay per GB to download a file or open it in their own player.
 - On Umbrel, Files shares a folder from the box's Downloads, which the Files app shows; read-only.
 - On StartOS, Files can share a folder from File Browser, read-only; File Browser stays optional.
-- Files from File Browser shares only File Browser's own folder; files File Browser keeps private
-  (its uploads) can't be shared yet on StartOS: use the app's own folder for those.
+- Files from File Browser shares only File Browser's own folder, including the files you upload to
+  it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
 - The price a shop shows in its listing is now the most your wallet will pay it: one that asks more

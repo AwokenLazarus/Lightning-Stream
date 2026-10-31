@@ -40,7 +40,10 @@ StartOS package reads File Browser for media. The *Files folder* action (Actions
 dashboard) chooses File Browser: StartOS then asks for File Browser to be installed (it need not be
 running), and the UI mounts File Browser's `data` volume, what File Browser shows, **read-only** at
 `/mnt/filebrowser` (`XBT_UI_FILES_ROOT`). The owner puts files in File Browser and picks the folder on
-the Sell page, held to it as on Umbrel. Without that choice (the default) Stream needs no File Browser,
+the Sell page, held to it as on Umbrel. File Browser writes its files as its own user (1000) and keeps
+uploads readable by that user's group only (0640, folders 0750); the UI's user is in a group with that id
+(`xbt-shared-files`, 1000, in the images' base layer), so it reads them, on a mount that stays read-only.
+Without that choice (the default) Stream needs no File Browser,
 and the folder stays in the package's own volume, reached with StartOS's file tools.
 
 ### How it is served
