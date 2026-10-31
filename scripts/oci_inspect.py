@@ -22,6 +22,8 @@ WANT = {("amd64", ""): 0x3E, ("arm64", ""): 0xB7, ("arm", "v7"): 0x28}
 ROOT_ONESHOTS = {"xbt-init"}
 # binaries an image carries beside its own, in the same layer
 COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"]}
+# data an image's binary layer carries beside its binaries, each read-only and not a program
+DATA = {"xbt-vpn": ["usr/share/xbt-vpn/ATTRIBUTION", "usr/share/xbt-vpn/dbip-country-lite.csv.gz"]}
 ELF_CLASS = {0x3E: 2, 0xB7: 2, 0x28: 1}
 
 
@@ -91,7 +93,14 @@ def inspect(path, image):
                 probs.append(f"{len(layers)} layers (want base + binary)")
             else:
                 files = layer_files(blob(tar, layers[1]["digest"]))
-                bins = {k: v for k, v in files.items() if v[1] is not None}
+                data = DATA.get(image, [])
+                for name in data:
+                    member, body = files.get(name, (None, None))
+                    if body is None:
+                        probs.append(f"binary layer lacks {name}")
+                    elif member.mode & 0o7777 != 0o444 or body[:4] == b"\x7fELF":
+                        probs.append(f"{name} is not read-only data ({oct(member.mode)})")
+                bins = {k: v for k, v in files.items() if v[1] is not None and k not in data}
                 want = f"usr/bin/{image}"
                 expected = sorted([want] + [f"usr/bin/{c}" for c in COMPANIONS.get(image, [])])
                 if sorted(bins) != expected:

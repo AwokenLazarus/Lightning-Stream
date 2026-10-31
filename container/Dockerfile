@@ -126,9 +126,10 @@ HEALTHCHECK NONE
 FROM base AS xbt-vpn
 ARG TARGETARCH
 ARG TARGETVARIANT
-COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-vpn /usr/bin/xbt-vpn
-# the country table exits' regions are checked against, shipped so a box needs no download (CC BY 4.0)
-COPY --chmod=0444 geo/dbip-country-lite.csv.gz geo/ATTRIBUTION /usr/share/xbt-vpn/
+# the binary and the country table exits' regions are checked against, shipped so a box needs no
+# download (CC BY 4.0), in one layer: a root scripts/oci_build.sh stages with its modes (binary 0555,
+# table 0444, its folder 0555)
+COPY bin/${TARGETARCH}${TARGETVARIANT}/xbt-vpn.root/ /
 USER xbt-vpn
 ENV XBT_VPN_DIR=/data/run/vpn XBT_VPN_STATUS=/data/run/vpn-status XBT_VPN_KEYS=/data/vpn XBT_VPN_WG_LISTEN=0.0.0.0:51820 XBT_VPN_TUNNEL_LISTEN=0.0.0.0:51880 RUST_LOG=warn NO_COLOR=1
 ENTRYPOINT ["/usr/bin/xbt-vpn", "serve"]

@@ -143,6 +143,18 @@ if want xbt-vpn; then
   gzip -t "$CTX/geo/dbip-country-lite.csv.gz" || { echo "oci_build: the country table is not gzip" >&2; exit 1; }
   printf 'IP to Country Lite by DB-IP (https://db-ip.com), %s, licensed under CC BY 4.0\n(https://creativecommons.org/licenses/by/4.0/).\n' "$month" > "$CTX/geo/ATTRIBUTION"
   echo "== country table: DB-IP $month, $(stat -c %s "$CTX/geo/dbip-country-lite.csv.gz") bytes, sha256 $(sha256sum "$CTX/geo/dbip-country-lite.csv.gz" | cut -c1-16)"
+  # one layer for the binary and its table (base + one layer, as every image): a root to COPY whole, its
+  # modes set here (COPY keeps them), the table's folder 0555 as the base layer makes it
+  for d in "$CTX"/bin/*/; do
+    [ -x "$d/xbt-vpn" ] || continue
+    r="$d/xbt-vpn.root"
+    if [ -d "$r" ]; then chmod -R u+w "$r"; fi
+    rm -rf "$r" && mkdir -p "$r/usr/bin" "$r/usr/share/xbt-vpn"
+    cp "$d/xbt-vpn" "$r/usr/bin/xbt-vpn" && chmod 0555 "$r/usr/bin/xbt-vpn"
+    cp "$CTX/geo/dbip-country-lite.csv.gz" "$CTX/geo/ATTRIBUTION" "$r/usr/share/xbt-vpn/"
+    chmod 0444 "$r/usr/share/xbt-vpn/"*
+    chmod 0755 "$r/usr" "$r/usr/bin" "$r/usr/share" && chmod 0555 "$r/usr/share/xbt-vpn"
+  done
 fi
 
 SRC=https://github.com/AwokenLazarus/Lightning-Stream
