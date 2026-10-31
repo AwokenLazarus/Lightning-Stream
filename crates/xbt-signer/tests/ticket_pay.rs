@@ -761,6 +761,12 @@ struct PayState {
     /// How many times `down` turned away a question about the node itself (`GetInfo`, which the
     /// wallet asks before it begins a payment).
     turned_away: usize,
+    /// The next sends reach the seller, but the node answers before it lists the payment's HTLC (a
+    /// loaded node, or a payment stream that breaks): the send returns no record, and for
+    /// `unseen_for` the node's record of the payment shows no HTLC, though the seller holds it.
+    unseen_next: usize,
+    unseen_for: Duration,
+    unseen_until: HashMap<String, Instant>,
 }
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
@@ -926,6 +932,12 @@ impl LnBackend for PayLn {
                        "failure_reason": if arrives { "FAILURE_REASON_NONE" } else { "FAILURE_REASON_NO_ROUTE" },
                        "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late, "stranded": stranded});
         s.payments.push(p.clone());
+        if arrives && !late && !stranded && s.unseen_next > 0 {
+            s.unseen_next -= 1;
+            let until = Instant::now() + s.unseen_for;
+            s.unseen_until.insert(hash, until);
+            return Err(node_err("the LN node's payment stream ended before the payment was locked"));
+        }
         Ok(p)
     }
 
@@ -934,7 +946,14 @@ impl LnBackend for PayLn {
         if s.down || s.router_down {
             return Err(node_err("LN node unreachable"));
         }
-        Ok(s.payments.iter().rev().find(|p| p["payment_hash"] == hash).cloned())
+        let p = s.payments.iter().rev().find(|p| p["payment_hash"] == hash).cloned();
+        // a payment the node has not yet listed an HTLC for: in flight, nothing on its way to show
+        Ok(p.map(|mut p| {
+            if s.unseen_until.get(hash).is_some_and(|until| Instant::now() < *until) && p["status"] == "IN_FLIGHT" {
+                p["htlcs"] = json!([]);
+            }
+            p
+        }))
     }
 
     fn payments_after(&self, after: u64, max: u64) -> xbt402::Result<Vec<Value>> {
@@ -2763,6 +2782,37 @@ fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_t
     assert_eq!((paid, taken, book), (paid, paid, paid), "the buyer's node, the seller's node and the book: {paid} {taken} {book}");
     assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
     assert_eq!(r.status()["locked"]["tickets"], 0);
+    r.assert_booked();
+}
+
+#[test]
+fn a_file_waits_for_a_ticket_the_node_has_not_yet_shown_locked_rather_than_ending() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    // a session, its pool of eight locked
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!((first["status"].as_u64(), first["complete"].as_bool()), (Some(200), Some(true)), "{first}");
+    // from now on the wallet's node answers each send before it lists the payment's HTLC, as a loaded node does
+    // (or a payment stream that breaks): the ticket reaches the seller, but for 3 s the node shows it on no way.
+    // The refills behind the file below are all such tickets, and the file needs more than the pool it starts with
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(3);
+    }
+    // 40 MiB at 200 sat a MiB: 8,000 sat, more than the seven tickets left and the 800 sat of balance
+    let n = 40 * MIB;
+    let v = r.pay(&format!("/files/{n}"), 12_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert!(v["ended"].is_null(), "the file is not ended for want of a ticket the node has yet to show locked: {v}");
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["body"].as_str()), (Some("8000000"), Some("as signed")), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n));
+    // what the buyer's node paid, what the seller's node took and what the book released are one number
+    wait_for("the node to show every ticket it sent", || r.ln.state().unseen_until.values().all(|u| Instant::now() >= *u));
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "the buyer's node, the seller's node and the book: {paid} {taken} {book}");
+    assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
+    assert!(paid >= 8 * TICKET, "{paid}");
     r.assert_booked();
 }
 
