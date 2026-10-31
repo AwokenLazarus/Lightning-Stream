@@ -9238,7 +9238,7 @@ fn a_request_refused_for_a_win_waits_for_the_sellers_next_invoice_and_is_served(
 fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pays_it() {
     let _g = env_lock();
     // a seller that serves on while wins take their 3 s: this is about the invoice, not its answer standing still
-    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+    let r = Rig::shipped(json!({"tickets": {"lottery": {"max_odds_den": 2}}}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
                                                "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
     r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
     let (ln, clock, node, standin, once) = (r.ln.clone(), r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
@@ -9266,6 +9266,7 @@ fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pay
     // a win in every fourth piece: far more than the 8 the gate lets on the way before the first has arrived
     let size = 128 * PIECE;
     let v = r.pay(&format!("/hot/{size}"), 4_000);
+    assert_eq!(v["rail"].as_str(), Some("lottery"), "{v}");
     assert_eq!(r.ln.by_status("FAILED").len(), 0, "nothing was sent that could not arrive: {v}");
     assert_paid_after_lapses(&r, &v, size, 1);
     assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
