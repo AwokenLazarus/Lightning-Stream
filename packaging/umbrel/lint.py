@@ -25,8 +25,14 @@ and writes only the hand-over folder run/node-keys. `init` (xbt-init) is the onl
 most CHOWN/FOWNER/DAC_OVERRIDE.
 Shape: the compose file is read strictly (a key written twice is refused) and its keys are allowed, not refused
 (no extends, include, build, secrets, configs, env_file, hooks, ...); an entrypoint only where one is pinned; no
-`..` in a mount. Every rule on what a container reaches is checked again on the model `docker compose config`
-resolves, with the host's folders marked, so that nothing written can hide a mount from it.
+`..` in a mount; ${NAME}, ${NAME:-} and a slot's ${SLOT:-${FALLBACK}} the only substitutions (no default); a name
+is a string; xbt-init is one service, init, mounting the data dir alone; a network namespace is joined only where
+pinned; the node-keys one-shots run no healthcheck, and the baker's environment is exactly its own. Every rule on what
+a container reaches is checked again on the model `docker compose config` resolves (no .env read), with the host's
+folders marked, in each environment lint resolves (this store's apps, and a slot's node alone), so that nothing
+written can hide a mount from it. Package: an app's folder holds its manifest, compose file, exports.sh, the icon and
+gallery it names, and named others, and no link; exports.sh holds comments and `export NAME="literal"` lines (the
+stand-in node's derive_entropy line named as the one exception).
     python3 packaging/umbrel/lint.py [STORE_DIR]
 """
 from __future__ import annotations
@@ -152,6 +158,24 @@ ENTRYPOINTS = {("lazarus-lightning-stream", "signer"): SIGNER_ENTRYPOINT, ("laza
 NODE_KEYS_BAKE_ENV = {"XBT_KEYS_NODE_REST": "https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}",
                       "XBT_KEYS_TLS_CERT": "/node/tls.cert", "XBT_KEYS_ADMIN": "/node/data/chain", "XBT_KEYS_RAIL_DIR": "/data/run/ln",
                       "XBT_KEYS_GW_DIR": "/data/run/gateway", "XBT_KEYS_BAKE_TO": "/data/run/node-keys", "XBT_KEYS_RETRY_MAX_S": "30"}
+# the one network namespace a service may join: the connector shares the UI's (loopback only)
+NETNS = {("lazarus-lightning-stream", "connector"): "service:ui"}
+# xbt-init (root, CHOWN/FOWNER/DAC_OVERRIDE): one service, `init`, its own command, the data dir alone
+INIT_VOLUMES = ["${APP_DATA_DIR}/data:/data"]
+# a one-shot node-keys runs nothing else in its container: no healthcheck command
+ONESHOT_HEALTH = {"disable": True}
+# ${...} as written: a variable, an empty default, or a slot's variable with its fallback; no default
+# value (it would hold whatever path or address a missing variable lets in) and no other form
+SUBST = re.compile(r"\$\{[A-Z0-9_]+:-\$\{[A-Z0-9_]+\}\}|\$\{[A-Z0-9_]+(?::-)?\}")
+# The files of an app's folder umbrelOS acts on (it copies the folder into the box's app data, runs
+# hooks/, renders templates, sources exports.sh as shell): these, the icon and gallery the manifest
+# names, and per app the named others; never a link.
+APP_FILES = {"umbrel-app.yml", "docker-compose.yml", "exports.sh"}
+EXTRA_FILES = {"lazarus-lightning-stream-gateway": {"data/.gitkeep"}, "lazarus-xbt-agent-wallet": {"data/.gitkeep"},
+               "lazarus-xbt-knots": {"README.md", "conf/peers.conf", "conf/xbt.conf", "data/knots/.gitkeep"}}
+# exports.sh: comments and `export NAME="literal"` lines, and this one line of the stand-in node's
+# (umbrelOS's derive_entropy: a per-box secret from the box seed and the label)
+EXPORTS_EXCEPTIONS = {"lazarus-xbt-knots": {'export APP_XBT_KNOTS_RPC_PASS="$(derive_entropy "lazarus-xbt-knots-rpc-${APP_XBT_KNOTS_RPC_USER}")"'}}
 # stand-ins for the host's folders in the resolved model, so that each mount's source says whose it is
 MARKS = {"APP_DATA_DIR": "/__app_data__", "APP_LIGHTNING_FORK_NODE_DATA_DIR": "/__lightning_fork_data__", "UMBREL_ROOT": "/__umbrel_root__"}
 
@@ -175,12 +199,58 @@ class StrictLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
+def package_files(folder: str, here: Path, m: dict) -> None:
+    """Only the app's own files, and no link: umbrelOS acts on more of the folder than the compose file."""
+    allowed = APP_FILES | {Path(str(u)).name for u in [m.get("icon"), *(m.get("gallery") or [])] if u} | EXTRA_FILES.get(folder, set())
+    for dirpath, dirs, files in os.walk(here):
+        for n in dirs + files:
+            p = Path(dirpath) / n
+            rel = p.relative_to(here).as_posix()
+            if p.is_symlink():
+                bad(f"{folder}: {rel} is a link (umbrelOS copies the app's folder as it is)")
+            elif p.is_file() and rel not in allowed:
+                bad(f"{folder}: {rel} is not one of the app's files ({', '.join(sorted(allowed))})")
+    ex = here / "exports.sh"
+    if ex.is_file() and not ex.is_symlink():
+        for i, line in enumerate(ex.read_text().splitlines(), 1):
+            t = line.strip()
+            if not t or t.startswith("#") or t in EXPORTS_EXCEPTIONS.get(folder, set()):
+                continue
+            if not re.fullmatch(r'export [A-Z][A-Z0-9_]*="[^"$`\\]*"', t):
+                bad(f"{folder}: exports.sh line {i} is not export NAME=\"literal\" (it is sourced as shell): {t[:120]}")
+
+
+def substitutions(folder: str, text_nc: str) -> None:
+    """Every $ in the compose file is ${NAME}, ${NAME:-} or a slot's ${SLOT:-${FALLBACK}}."""
+    for mm in re.finditer(r"\$\S{0,60}", SUBST.sub("", text_nc)):
+        bad(f"{folder}: {mm.group(0)!r}: only ${{NAME}}, ${{NAME:-}} and a slot's ${{SLOT:-${{FALLBACK}}}} (no default, no other form)")
+
+
 def raw_shape(folder: str, c: dict, svcs: dict) -> None:
     """The compose file as written: only known keys, a pinned entrypoint, and no `..` in a mount."""
+    for k in [*c, *svcs]:
+        if not isinstance(k, str):
+            bad(f"{folder}: the name {k!r} is not a string (YAML 1.1 reads on, yes, no and numbers as other things)")
     for k in c:
         if k not in TOP_KEYS and not str(k).startswith("x-"):
             bad(f"{folder}: top-level {k!r} is not allowed (version, services and x- fields only)")
+    inits = [n for n, sv in svcs.items() if base_of(str(sv.get("image", ""))) == "xbt-init"]
+    if inits and inits != ["init"]:
+        bad(f"{folder}: xbt-init runs as one service, named init, not {inits}")
+    for n in inits:
+        if svcs[n].get("command") not in (None, ["init"]) or svcs[n].get("volumes") != INIT_VOLUMES:
+            bad(f"{folder}/{n}: xbt-init runs its own command (init) and mounts {INIT_VOLUMES} alone")
+    if NODE_KEYS_BAKE in svcs:
+        env = svcs[NODE_KEYS_BAKE].get("environment") or {}
+        env = dict(str(e).split("=", 1) for e in env) if isinstance(env, list) else {str(k): str(v) for k, v in env.items()}
+        if env != NODE_KEYS_BAKE_ENV:
+            bad(f"{folder}/{NODE_KEYS_BAKE}: its environment is not exactly {NODE_KEYS_BAKE_ENV}")
     for name, sv in svcs.items():
+        nm = sv.get("network_mode")
+        if nm not in (None, "none") and nm != NETNS.get((folder, name)):
+            bad(f"{folder}/{name}: network_mode {nm!r}: none, or the namespace pinned for it ({NETNS.get((folder, name))})")
+        if sv.get("command") == ["node-keys"] and sv.get("healthcheck") != ONESHOT_HEALTH:
+            bad(f"{folder}/{name}: a node-keys one-shot's healthcheck is exactly {ONESHOT_HEALTH}")
         allowed = APP_PROXY_KEYS if name == "app_proxy" else SERVICE_KEYS
         for k in sv:
             if k not in allowed:
@@ -193,7 +263,7 @@ def raw_shape(folder: str, c: dict, svcs: dict) -> None:
                 bad(f"{folder}/{name}: mount {src!r} climbs out with ..")
 
 
-def resolved_shape(folder: str, cfg: dict, svcs: dict) -> None:
+def resolved_shape(folder: str, cfg: dict, svcs: dict, env: dict) -> None:
     """The model `docker compose config` resolves, with MARKS for the host's folders: every rule on what
     a container may reach is checked again here, where nothing written can hide from it."""
     app, node, umbrel = (MARKS[k] for k in ("APP_DATA_DIR", "APP_LIGHTNING_FORK_NODE_DATA_DIR", "UMBREL_ROOT"))
@@ -216,12 +286,23 @@ def resolved_shape(folder: str, cfg: dict, svcs: dict) -> None:
             bad(f"{folder}/{name}: resolved, entrypoint {sv['entrypoint']!r} is not the one pinned for it")
         if set(map(str, sv.get("security_opt") or [])) - {"no-new-privileges:true"}:
             bad(f"{folder}/{name}: resolved, security_opt may only be no-new-privileges:true")
+        nm = sv.get("network_mode")
+        if nm not in (None, "none") and nm != NETNS.get((folder, name)):
+            bad(f"{folder}/{name}: resolved, network_mode {nm!r}: none, or the namespace pinned for it")
+        if sv.get("command") == ["node-keys"] and sv.get("healthcheck") != ONESHOT_HEALTH:
+            bad(f"{folder}/{name}: resolved, a node-keys one-shot's healthcheck is exactly {ONESHOT_HEALTH}")
         img = str(sv.get("image", ""))
+        if base_of(img) == "xbt-init":
+            vols = [(v.get("type"), v.get("source"), v.get("target"), v.get("read_only") is True, v.get("bind") or {}) for v in sv.get("volumes") or []]
+            if name != "init" or sv.get("command") not in (None, ["init"]) or vols != [("bind", app + "/data", "/data", False, {})]:
+                bad(f"{folder}/{name}: resolved, xbt-init is the service init, its own command, the data dir alone")
         for v in sv.get("volumes") or []:
             src, tgt, ro = str(v.get("source") or ""), v.get("target"), v.get("read_only") is True
             never = (v.get("bind") or {}).get("create_host_path") is False
             if v.get("type") != "bind":
                 bad(f"{folder}/{name}: resolved, a {v.get('type')} mount (bind mounts only): {v}")
+            elif set(v.get("bind") or {}) - {"create_host_path"}:
+                bad(f"{folder}/{name}: resolved, bind options {v.get('bind')} (none but create_host_path)")
             elif os.path.normpath(src) != src:
                 bad(f"{folder}/{name}: resolved, mount source {src!r} is not a plain path")
             elif src == node or src.startswith(node + "/"):
@@ -238,14 +319,14 @@ def resolved_shape(folder: str, cfg: dict, svcs: dict) -> None:
             want = {(app + "/data/run/ln", "/data/run/ln", True), (app + "/data/run/gateway", "/data/run/gateway", True),
                     (app + "/data/run/node-keys", "/data/run/node-keys", False), (node, "/node", True)}
             got = {(v.get("source"), v.get("target"), v.get("read_only") is True) for v in sv.get("volumes") or []}
-            env = {k: str(v) for k, v in (sv.get("environment") or {}).items()}
-            fixed = {k: v for k, v in NODE_KEYS_BAKE_ENV.items() if "${" not in v}
+            got_env = {k: str(v) for k, v in (sv.get("environment") or {}).items()}
+            want_env = {k: re.sub(r"\$\{([A-Z0-9_]+)\}", lambda mm: str(env.get(mm.group(1), "")), v) for k, v in NODE_KEYS_BAKE_ENV.items()}
             if base_of(img) != "xbt-wallet-ui" or sv.get("entrypoint") is not None or sv.get("command") != ["node-keys"]:
                 bad(f"{folder}/{name}: resolved, node-keys-bake is node-keys from the UI's image, with no entrypoint")
             if str(sv.get("user")) != NODE_KEYS_BAKE_USER or set(map(str, sv.get("group_add") or [])) != NODE_KEYS_BAKE_GROUPS:
                 bad(f"{folder}/{name}: resolved, node-keys-bake runs as {NODE_KEYS_BAKE_USER} in exactly the groups {sorted(NODE_KEYS_BAKE_GROUPS)}")
-            if set(env) != set(NODE_KEYS_BAKE_ENV) or any(env.get(k) != v for k, v in fixed.items()):
-                bad(f"{folder}/{name}: resolved, node-keys-bake's environment is not exactly {sorted(NODE_KEYS_BAKE_ENV)}: {sorted(env)}")
+            if got_env != want_env:
+                bad(f"{folder}/{name}: resolved, node-keys-bake's environment is not exactly {want_env}: {got_env}")
             if sv.get("restart") != "no" or sv.get("read_only") is not True or sv.get("cap_drop") != ["ALL"] or sv.get("cap_add") \
                     or sv.get("ports") or "network_mode" in sv or got != want:
                 bad(f"{folder}/{name}: resolved, node-keys-bake is a read-only one-shot with no capability or port, and exactly its four mounts")
@@ -348,6 +429,7 @@ def main() -> int:
         for g in m["gallery"] or []:
             served(folder, mp.parent, "gallery", g, (".png", ".jpg", ".jpeg"))
         icon = served(folder, mp.parent, "icon", m["icon"], (".svg", ".png"))
+        package_files(folder, mp.parent, m)
         if icon and icon.suffix == ".svg":
             plain_svg(folder, icon)
         for d in m["dependencies"] or []:
@@ -392,6 +474,7 @@ def main() -> int:
         dep.update({k: v for d in m["dependencies"] or [] for k, v in OTHER_STORES.get(d, {}).items()})
         slot = {k: v for d in m["dependencies"] or [] for k, v in SLOTS.get(d, {}).items()}
         text_nc = re.sub(r"(?m)^\s*#.*$", "", text)
+        substitutions(folder, text_nc)
         used = set(re.findall(r"\$\{([A-Z0-9_]+)\}", text_nc)) | set(re.findall(r"\$\{([A-Z0-9_]+):-\}", text_nc))
         for v, fallback in re.findall(r"\$\{([A-Z0-9_]+):-\$\{([A-Z0-9_]+)\}\}", text_nc):
             if v not in slot:
@@ -421,9 +504,6 @@ def main() -> int:
             # other container's or the host's network
             if set(map(str, s.get("security_opt") or [])) - {"no-new-privileges:true"}:
                 bad(f"{folder}/{name}: security_opt may only be no-new-privileges:true")
-            nm = s.get("network_mode")
-            if nm is not None and nm != "none" and not (str(nm).startswith("service:") and str(nm)[8:] in svcs):
-                bad(f"{folder}/{name}: network_mode {nm!r}: only none, or another service of this app")
             if name == "app_proxy":
                 continue
             img = str(s.get("image", ""))
@@ -531,26 +611,36 @@ def main() -> int:
             # app_proxy is injected by umbrelOS; give it an image so compose validates the file
             ov = Path(t) / "ov.yml"
             ov.write_text("services:\n  app_proxy:\n    image: umbrel-app-proxy-stub\n")
-            r = subprocess.run(["docker", "compose", "-f", str(compose_p), "-f", str(ov), "config", "-q"], capture_output=True, text=True,
+            r = subprocess.run(["docker", "compose", "--env-file", "/dev/null", "-f", str(compose_p), "-f", str(ov), "config", "-q"], capture_output=True, text=True,
                                env={**os.environ, **envs}, cwd=mp.parent)
             if r.returncode != 0:
                 bad(f"{folder}: docker compose config: {r.stderr.strip()[-400:]}")
             else:
                 # the model compose resolves, the host's folders marked: every rule again, on what would run
-                r = subprocess.run(["docker", "compose", "-f", str(compose_p), "-f", str(ov), "config", "--format", "json"], capture_output=True,
+                r = subprocess.run(["docker", "compose", "--env-file", "/dev/null", "-f", str(compose_p), "-f", str(ov), "config", "--format", "json"], capture_output=True,
                                    text=True, env={**os.environ, **envs, **MARKS}, cwd=mp.parent)
                 try:
-                    resolved_shape(folder, json.loads(r.stdout), svcs)
+                    resolved_shape(folder, json.loads(r.stdout), svcs, {**envs, **MARKS})
                 except ValueError:
                     bad(f"{folder}: docker compose config --format json: {r.stderr.strip()[-400:]}")
             if slot:
                 # the slot's node alone (no app of this store installed): the slot's values reach the services
                 other = {k for d in m["dependencies"] or [] for k in OTHER_STORES.get(d, {})}
                 base = {k: v for k, v in envs.items() if k not in dep or k in other}
-                r = subprocess.run(["docker", "compose", "-f", str(compose_p), "-f", str(ov), "config"], capture_output=True, text=True,
+                r = subprocess.run(["docker", "compose", "--env-file", "/dev/null", "-f", str(compose_p), "-f", str(ov), "config"], capture_output=True, text=True,
                                    env={**{k: v for k, v in os.environ.items() if not k.startswith("APP_")}, **base, **slot}, cwd=mp.parent)
                 if r.returncode != 0 or not all(v in r.stdout for v in slot.values()):
                     bad(f"{folder}: with only the slot's node, compose does not get its values: {r.stderr.strip()[-300:]}")
+                else:
+                    # and every rule again, on what the slot's node alone resolves
+                    alone = {**base, **slot, **MARKS}
+                    r = subprocess.run(["docker", "compose", "--env-file", "/dev/null", "-f", str(compose_p), "-f", str(ov), "config", "--format", "json"],
+                                       capture_output=True, text=True,
+                                       env={**{k: v for k, v in os.environ.items() if not k.startswith("APP_")}, **alone}, cwd=mp.parent)
+                    try:
+                        resolved_shape(folder, json.loads(r.stdout), svcs, alone)
+                    except ValueError:
+                        bad(f"{folder}: with only the slot's node, docker compose config --format json: {r.stderr.strip()[-300:]}")
         print(f"  manifest + compose checked ({len(svcs)} services)")
     for w in warnings:
         print(f"  warn {w}")
