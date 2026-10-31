@@ -18,7 +18,7 @@
 //! | Nothing a seller says is booked. | The ledger rows are the book's. A seller's totals only move the wallet's count of the balance, and only where [`crate::ticket_http::Account::absorb`] finds them inside the wallet's own. |
 //! | A ticket is released for an answer only when the balance does not cover its next piece. | [`Stream::due_bytes`] and [`Stream::due_time`], on the bytes and seconds this module counted itself. |
 //! | No ticket is released into a session whose last answer the seller has not closed. | [`Signer::ticket_release_one`] waits for the answer's last receipt in the seller's signed `status` (5 s a call, the session given up after 30 s). A seller waiting for a refill of an answer the wallet stopped reading would take the next ticket for bytes nobody reads. |
-//! | A call uses at most `max_sats`, by the wallet's own count, and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above it; [`Stream::over`] cuts the body where its price reaches it or its time is up. |
+//! | A call is charged at most its charge cap (`max_charge_sats`, else `max_sats`), by the wallet's own count, moves at most `max_sats` (whole tickets with their fees), and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above the charge cap, and [`Spent::room`] any ticket past `max_sats`; [`Stream::over`] cuts the body where its price reaches the charge cap or its time is up. |
 //! | Held tickets first; a prepaid one only where none can be held, or before any is. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, a wait after a lock that found no slot, or a session whose first ticket is a prepaid one: a seller the owner has not named, or one that answered `prepaid_first`). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
 //! | A seller that says `slots_short` is waited for. | [`Signer::ticket_lock_call`] sets the session's wait from the seller's `retryAfter` and offers it no hash until then. |
 //! | A session that can release nothing more is ended, and said so. | [`Signer::ticket_forgotten`]: the seller's unsigned `session_unknown` to a lock or a `status` stops the session, as an unsigned answer to a paid request does. [`Signer::ticket_release_one`]: a ticket the seller has not shown after `ready_wait_ms` that the wallet's own node carries on no channel ([`Signer::ticket_stranded`]) stops it too. Neither releases or books anything. |
@@ -1538,8 +1538,8 @@ struct Call<'a> {
     /// stream both ways through `stream_to`, every byte either way paid for as the body's are.
     upgrade: bool,
     /// The call may draw only on the credit the seller already holds for the session and buys no
-    /// ticket (`credit_only`): a web app's other requests while one of them buys. Its `max_sats`
-    /// stays the most the answer may charge, which the seller is told.
+    /// ticket (`credit_only`): a web app's other requests while one of them buys. Its charge cap
+    /// (`charge_sats`) stays the most the answer may charge, which the seller is told.
     credit_only: bool,
     /// The most the answer itself may charge (`max_charge_sats`), at most `max_sats`: a small check
     /// (a VPN exit's region, a hashrate trial) may buy the seller's whole ticket within `max_sats`
@@ -3554,7 +3554,7 @@ impl Signer {
         lock(&hs.evidence).get_or_insert_with(|| receipt.clone());
         self.ticket_audit("ticket_over_cap", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
                                                     "charged_msat": charged.to_string(), "max_msat": max_msat.to_string(), "receipt": receipt}));
-        format!("the seller charged {charged} msat for one answer, more than the {max_msat} msat (max_sats {}) the call allowed and named to it; \
+        format!("the seller charged {charged} msat for one answer, more than the {max_msat} msat (the call's charge cap of {} sat) the call allowed and named to it; \
                  it is paid nothing more, and its signed receipt is kept in the wallet's log", max_msat / 1000)
     }
 
