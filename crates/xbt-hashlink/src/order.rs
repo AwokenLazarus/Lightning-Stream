@@ -73,8 +73,9 @@ impl Standing {
     }
 
     /// The renter's rule: pay another slice now? Always for the first (with its start fee), and always when the next
-    /// share wouldn't fit. One share ahead of that too, so a payment's time doesn't hold a share up, as far as
-    /// the step allows.
+    /// share wouldn't fit. Past that, as far ahead as the step allows: a payment that buys a new ticket takes seconds
+    /// (measured 4 s on the regtest's first), longer than the hashmaker waits for a share that doesn't fit, so the
+    /// renter keeps what the step allows paid ahead and buys the next ticket while that lasts.
     pub fn pay_next(&self) -> bool {
         if !ready_to_serve(self.paid, self.start_slices) {
             return true;
@@ -85,7 +86,7 @@ impl Standing {
             return true;
         }
         let after = covered + self.slice_work;
-        self.proven + 2 * share > covered && self.msat_of(after.saturating_sub(self.proven)) <= self.step_msat()
+        self.msat_of(after.saturating_sub(self.proven)) <= self.step_msat()
     }
 
     /// The largest ticket worth buying for the payment that's due. With the start fee on the first, whose share
@@ -175,6 +176,15 @@ mod tests {
         assert!(!s.pay_next(), "not without measured output");
         s.msat_a_second = 100_000.0;
         assert!(s.pay_next());
+    }
+
+    /// Cheap slices: the renter keeps the whole first step paid ahead, so the next ticket is bought while it lasts,
+    /// and no further.
+    #[test]
+    fn the_renter_keeps_the_step_paid_ahead_and_no_more() {
+        let s = |paid| Standing { proven: 0, largest_share: 100, paid, start_slices: 0, slice_work: 1000, price_msat: 100_000, msat_a_second: 0.0 };
+        assert!(s(1).pay_next() && s(4).pay_next(), "up to 500 sat unused, under the 546 sat step");
+        assert!(!s(5).pay_next(), "600 sat unused would pass the step");
     }
 
     #[test]
