@@ -57,6 +57,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   an exit only its own shop's gateway can open, and exits that waste a buyer's money held off.
 - The bundled country table is readable again, so exits' regions are checked as intended.
 - The VPN page says why a device is blocked.
+- The VPN page shows which exit each device goes out through and what it has spent.
 
 **Hashrate**
 - Rentals run over the encrypted link.
