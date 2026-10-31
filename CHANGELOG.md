@@ -30,6 +30,10 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   relayed buyers share several connections instead of one.
 
 **Sellers' own web apps**
+- A web app that keeps buyer accounts opens when the buyer's session began on another of the shop's
+  routes, or the shop has restarted: the wallet says who it is and asks again, instead of showing a
+  raw 403. A buyer who stays anonymous at a shop stays so on all its routes and is told why such a
+  page is refused, with nothing charged for that request.
 - A seller's whole web app, for example Jellyfin with its full interface, can be sold through
   Stream, paid as it is used, with an account made for each buyer.
 - The built-in player is gone. A media server is shared as a web app, and a new **Files** service
@@ -50,8 +54,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
   begins, and a prepaid ticket or win paid without its proof now counts in what the call charged.
 - A file is never read past the size its listing shows. From a 0.1.20 shop, a file that grew after
-  it was listed is refused before any of it is sent and costs nothing, and one whose server states
-  no size is stopped at the listed size. From an older shop, the wallet stops at the listed size and
+  it was listed is refused before any of it is sent, costing nothing on a route priced by size, such
+  as Files, and only the request's price on a route with one; one whose server states no size is
+  stopped at the listed size. From an older shop, the wallet stops at the listed size and
   pays only for what was already on its way.
 - A new zero-conf channel carries payments once its funding confirms.
 - The price a shop shows in its listing is now the most your wallet will pay it: one that asks more
@@ -122,6 +127,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   failed until the wallet was made.
 
 **Linux**
+- A shop's gateway on a port of your own (LS_GW_PORT) no longer shows as unhealthy.
 - An update keeps every setting in .env (including ones added by hand), LS_* settings given to
   install.sh win over .env, also with --yes, and the Files folder has its own port setting,
   LS_FILES_PORT. install.sh and the Sell page say plainly when another program holds it.
