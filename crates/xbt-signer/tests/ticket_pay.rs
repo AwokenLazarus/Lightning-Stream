@@ -2391,6 +2391,52 @@ fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_
     r.assert_booked();
 }
 
+/// A caller that asks (`stream_paid`, the AI address) is told on its socket when its request is
+/// paid for, before the seller's head: `{"paid":true}` as the first line, the head after it, then
+/// the body. It times the seller from there, not from a payment that took long over a slow route.
+/// A caller that does not ask gets the head first, as before. The money is one ticket either way.
+#[test]
+fn a_call_that_asks_is_told_on_its_socket_when_it_is_paid_for_before_the_head() {
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    let read = |name: &'static str, lines: usize| {
+        let l = UnixListener::bind(dir.path().join(name)).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut b = BufReader::new(s);
+            let mut got = vec![];
+            for _ in 0..lines {
+                let mut line = String::new();
+                b.read_line(&mut line).unwrap();
+                got.push(serde_json::from_str::<Value>(&line).unwrap());
+            }
+            let mut rest = vec![];
+            b.read_to_end(&mut rest).unwrap();
+            (got, rest)
+        })
+    };
+    // the first call buys the session's prepaid ticket, then sends the request: told so in between
+    let sock = read("paid", 2);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "paid", "stream_head": true, "stream_paid": true}));
+    let (lines, body) = sock.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    assert_eq!(lines[0], json!({"paid": true}));
+    assert_eq!((lines[1]["status"].as_u64(), body.len() as u64), (Some(200), v["bytes"].as_u64().unwrap()), "{lines:?}");
+    // a call that does not ask: the head first, as before
+    let sock = read("plain", 1);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "plain", "stream_head": true}));
+    let (lines, _) = sock.join().unwrap();
+    assert_eq!((v["status"].as_u64(), lines[0]["status"].as_u64()), (Some(200), Some(200)), "{lines:?}");
+    std::env::remove_var("B2_STREAM_DIR");
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
 /// A seller's own web page, used inside the app (docs/SELLER-APPS.md): the caller's headers (its
 /// cookies, its login) reach the service, the seller's guest login wins over a forged one, the
 /// page the service serves only compressed comes back plain, and the seller's response headers come
