@@ -39,7 +39,7 @@ DEPS=(
   "libsodium-1.0.20.tar.gz https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19"
   "jansson-2.14.tar.gz https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz 5798d010e41cf8d76b66236cfb2f2543c8d082181d16bc3085ab49538d4b9929"
   "curl-8.11.1.tar.xz https://curl.se/download/curl-8.11.1.tar.xz c7ca7db48b0909743eaef34250da02c19bc61d4f1dcedd6603f109409536ab56"
-  "libmicrohttpd-1.0.1.tar.gz https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94"
+  "libmicrohttpd-1.0.1.tar.gz https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz|https://ftpmirror.gnu.org/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94"
   "argp-standalone-1.5.0.tar.gz https://github.com/argp-standalone/argp-standalone/archive/refs/tags/1.5.0.tar.gz c29eae929dfebd575c38174f2c8c315766092cec99a8f987569d0cad3c6d64f6"
 )
 for d in "${DEPS[@]}"; do
@@ -47,7 +47,13 @@ for d in "${DEPS[@]}"; do
   f=$CACHE/$name
   if [ ! -f "$f" ] || [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sum" ]; then
     echo "== fetch $name"
-    curl -fsSL --max-time 300 -o "$f.part" "$url"
+    # the url may list mirrors, |-separated: the first that serves it wins
+    got=0
+    IFS='|' read -r -a urls <<<"$url"
+    for u in "${urls[@]}"; do
+      if curl -fsSL --retry 3 --retry-delay 5 --max-time 300 -o "$f.part" "$u"; then got=1; break; fi
+    done
+    [ $got = 1 ] || { echo "datum_gateway_build: $name could not be fetched" >&2; exit 1; }
     mv "$f.part" "$f"
   fi
   got=$(sha256sum "$f" | cut -d' ' -f1)
