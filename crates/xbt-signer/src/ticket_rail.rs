@@ -82,6 +82,8 @@ const LIST_PAGES: usize = 50;
 /// 30 pending payments took 200 small payments sent 8 at a time without a failure, and failed 139
 /// of 200 sent 64 at a time (`docs/TICKETS.md` section 11).
 pub const SEND_PARALLEL: usize = 8;
+/// How many payments' times on the way [`Pace::send_margin`] goes by.
+const FLOWN_KEPT: usize = 32;
 
 /// The gate every ticket payment passes on its way to the node's router: at most
 /// [`SEND_PARALLEL`] are inside at once. A held ticket leaves when its send returns (it is locked,
@@ -109,6 +111,8 @@ struct PaceState {
     next: u64,
     /// Who waits, in order of arrival.
     waiting: Vec<Waiter>,
+    /// How long the latest wins took on the way, in seconds ([`Pace::send_margin`]).
+    flown: std::collections::VecDeque<f64>,
 }
 
 struct Waiter {
@@ -135,6 +139,27 @@ impl Pace {
 
     /// Enter to pay the win of `win` (the book's session and the draw), or a ticket (None).
     /// `first`: a seller stands still for this payment already.
+    /// A payment that arrived, and the time it took.
+    fn flew(&self, took: Duration) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.flown.len() == FLOWN_KEPT {
+            s.flown.pop_front();
+        }
+        s.flown.push_back(took.as_secs_f64());
+    }
+
+    /// How much of its life an invoice of `life` seconds must have left for a win to be sent on it:
+    /// twice the longest of the latest payments on the way, and never less than the 5 s every prepaid
+    /// invoice must have, nor more than half its life. A win sent with less fails at the seller, whose
+    /// node has cancelled the invoice by the time it arrives; held back, it costs nobody anything, and the
+    /// seller's next invoice pays it. (Lab, 8 GB: 2.8 s on the way at the median, 8.5 s at the longest, 5
+    /// wins sent with 4 to 6 s left on an invoice of 60 s, all failed.)
+    pub fn send_margin(&self, life: f64) -> f64 {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let longest = s.flown.iter().copied().fold(0.0, f64::max);
+        (2.0 * longest).min(life / 2.0).max(ticket::PREPAID_EXPIRY_MARGIN_S)
+    }
+
     pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool) -> PaceGuard<'_> {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mine = s.next;
@@ -1755,6 +1780,12 @@ impl Signer {
         if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, msat, &tp_now, now) {
             return refuse(&hash, rule, why);
         }
+        if win.is_some() {
+            let (left, margin) = (inv.expires_at() as f64 - now, self.ticket_pace.send_margin(inv.expiry_s as f64));
+            if left < margin {
+                return refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it would have ended first (held to {margin:.0} s)"));
+            }
+        }
         match ln.decode(&invoice) {
             Ok(d) => {
                 if let Err(why) = cross_check(&inv, &d) {
@@ -1808,6 +1839,7 @@ impl Signer {
             let mut again = may_resend;
             loop {
                 unsent = None;
+                let sent_at = Instant::now();
                 let mut pmt = match send() {
                     Ok(p) => Some(p),
                     Err(e) => {
@@ -1825,6 +1857,9 @@ impl Signer {
                 // no route, and nothing of it ever left the node: what a channel out for a moment does to a payment that
                 // passed the checks just before. Nothing was spent, and the seller holds this invoice open: sent once
                 // more, when a channel is back. Should it fail again, it failed
+                if pmt.as_ref().is_some_and(|p| str_or_empty(p.get("status")) == "SUCCEEDED") {
+                    self.ticket_pace.flew(sent_at.elapsed());
+                }
                 if !std::mem::take(&mut again) || !pmt.as_ref().is_some_and(never_left_the_node) {
                     break pmt;
                 }

@@ -674,7 +674,7 @@ impl Signer {
                 // never had the time to be paid is still its own doing.)
                 let lapsed = matches!(rule.as_str(), "ln_expired" | "ticket_expiry") && crate::bolt11::decode(invoice).is_ok_and(|i| {
                     let (life, left) = (i.expires_at() as f64 - i.timestamp as f64, i.expires_at() as f64 - self.engine.now());
-                    life > crate::ticket::PREPAID_EXPIRY_MARGIN_S && left < crate::ticket::PREPAID_EXPIRY_MARGIN_S
+                    life > crate::ticket::PREPAID_EXPIRY_MARGIN_S && left < self.ticket_pace.send_margin(life)
                 });
                 let retry = rule == "ln_expired" || rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
                     | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
@@ -720,7 +720,9 @@ impl Signer {
     /// whose invoice ran out at the gate stayed unpaid when its answer had already ended, for a next
     /// call that may never come, and that call was refused `win_unpaid`.
     fn draw_pay_owed(&self, ds: &DrawSession, first: bool, counted: &Mutex<Counted>) -> std::result::Result<(), Value> {
-        let until = Instant::now() + OWED_WAIT;
+        // up to the invoice's end where the measured time on the way kept it from being sent (`Pace::send_margin`)
+        let wait = OWED_WAIT.max(Duration::from_secs_f64(self.ticket_pace.send_margin(f64::MAX) + 5.0));
+        let until = Instant::now() + wait;
         let unsettled = || !lock(&ds.state).owed.is_empty() && ds.fault().is_none() && !lock(counted).halt;
         for tries in 1.. {
             if !unsettled() {
@@ -735,14 +737,18 @@ impl Signer {
             if !unsettled() {
                 break;
             }
-            let due = lock(&ds.state).next_invoice_after - self.engine.now() < OWED_WAIT.as_secs_f64();
+            let due = lock(&ds.state).next_invoice_after - self.engine.now() < wait.as_secs_f64();
             let waits = due && lock(&ds.state).next_invoice_after > 0.0 && Instant::now() < until;
             if tries >= 3 && !waits {
                 break;
             }
             std::thread::sleep(if waits { OWED_POLL } else { ROUND_WAIT });
         }
-        lock(&ds.state).next_invoice_after = 0.0;
+        // kept while a win is owed: the session's next call is what its seller's next invoice is for
+        let mut s = lock(&ds.state);
+        if s.owed.is_empty() {
+            s.next_invoice_after = 0.0;
+        }
         Ok(())
     }
 

@@ -9192,7 +9192,7 @@ fn a_call_whose_answer_has_ended_waits_for_the_next_invoice_of_a_win_that_ran_ou
     let _g = env_lock();
     let r = draws_rig(json!({}));
     lapse_at_wins_after(&r, 1, 28, Duration::from_millis(1_500));
-    let size = 64 * PIECE;
+    let size = 256 * PIECE;
     let v = r.pay(&format!("/pieces/{size}"), 1_000);
     assert_paid_after_lapses(&r, &v, size, 1);
 }
@@ -9221,4 +9221,38 @@ fn a_request_refused_for_a_win_waits_for_the_sellers_next_invoice_and_is_served(
     let again = r.pay("/tiny/10", 5);
     assert_eq!((again["status"].as_u64(), again["session"].as_str()), (Some(200), Some(sid.as_str())), "{again}");
     assert_each_win_paid_once(&r, &sid, v["wins"].as_u64().unwrap() + again["wins"].as_u64().unwrap());
+}
+
+/// Wins are taking 3 s on the way, and one's invoice has 5 s left when its turn comes: it would have ended
+/// on the way. It is not sent, and the seller's next invoice pays that win; no payment fails.
+///
+/// FAILS before: it was sent on the 5 s every prepaid invoice must have, and failed at the seller (5 of 314 on a lab).
+#[test]
+fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pays_it() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
+    let (ln, clock, node, standin, once) = (r.ln.clone(), r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
+    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+        if ln.by_status("SUCCEEDED").is_empty() {
+            return;
+        }
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
+        if !open.is_empty() && !once.swap(true, Ordering::SeqCst) {
+            clock.fetch_add(25, Ordering::SeqCst);
+            let standin = standin.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1_500));
+                for h in &open {
+                    standin.expire_unpaid(h);
+                }
+            });
+        }
+    }));
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "nothing was sent that could not arrive: {v}");
+    assert_paid_after_lapses(&r, &v, size, 1);
+    assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
 }
