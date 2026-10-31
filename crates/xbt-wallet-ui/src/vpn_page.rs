@@ -260,6 +260,12 @@ impl App {
         Resp::redirect("./vpn")
     }
 
+    /// What the shop's gateway says it charged its buyers in all (`chargedMsat` of its health), if it answers.
+    fn shop_charged_msat(&self) -> Option<u64> {
+        let Some(Ok((200, body))) = self.cfg.gw.health() else { return None };
+        charged_in(&body)
+    }
+
     pub(crate) fn sell_vpn_page(&self, ctx: &Ctx) -> Resp {
         let e = read(&self.cfg.vpn.dir.join("exit.json"));
         let st = read(&self.cfg.vpn.status_dir.join("exit-status.json"));
@@ -277,7 +283,9 @@ impl App {
             if let Some(w) = st["paid_tunnels_closed_because"].as_str() {
                 unlisted.push_str(&format!("<p class=\"hint warn\">Buyers can't use your exit yet: {}.</p>", esc(w)));
             }
-            format!("<p>Carried for buyers so far: {gb:.2} GB. Earned: {} sats.</p>{unlisted}", st["earned_msat"].as_u64().unwrap_or(0) / 1000)
+            // what the shop's gateway charged its buyers (it meters the tunnels; the exit only counts bytes)
+            let earned = st["earned_msat"].as_u64().or_else(|| self.shop_charged_msat()).unwrap_or(0);
+            format!("<p>Carried for buyers so far: {gb:.2} GB. Your shop has earned {} sats.</p>{unlisted}", earned / 1000)
         } else {
             String::new()
         };
@@ -427,9 +435,21 @@ fn device_line<'a>(status: &'a Value, id: &str) -> (&'a Value, Option<&'a str>) 
     (st, st["blocked"].as_str().or(st["why_blocked"].as_str()))
 }
 
+/// `chargedMsat` of a gateway's health answer.
+fn charged_in(health: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(health).ok()?.get("chargedMsat")?.as_str()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_shop_earned_is_read_from_its_gateway() {
+        assert_eq!(charged_in(r#"{"height": 900000, "chargedMsat": "294967"}"#), Some(294_967));
+        assert_eq!(charged_in(r#"{"height": 900000}"#), None, "a gateway of before");
+        assert_eq!(charged_in("not json"), None);
+    }
 
     #[test]
     fn why_a_device_is_blocked_is_read_from_the_vpn_services_own_status() {

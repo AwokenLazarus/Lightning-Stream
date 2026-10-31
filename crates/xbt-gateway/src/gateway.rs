@@ -116,6 +116,8 @@ pub struct Stats {
     /// The longest time from a secret's arrival to the node's yes, in microseconds.
     pub settle_max_us: u64,
     pub height: Option<u32>,
+    /// What the sessions on the book were charged in all ([`crate::book::Book::charged_msat`]).
+    pub charged_msat: u64,
 }
 
 pub struct Gateway {
@@ -493,6 +495,7 @@ impl Gateway {
             settled: self.settled.load(Ordering::SeqCst),
             settle_max_us: self.settle_max_us.load(Ordering::SeqCst),
             height: self.known_height(),
+            charged_msat: st.book.charged_msat(),
         }
     }
 
@@ -1544,6 +1547,7 @@ impl Gateway {
             &json!({"height": s.height, "sessions": s.sessions, "activeSessions": s.active_sessions, "heldTickets": s.held_tickets,
                     "maxHeld": s.max_held, "prepaidTickets": s.prepaid_tickets,
                     "heldMsat": (s.held_tickets as u64).saturating_mul(self.cfg.caps.ticket_msat).to_string(), "settled": s.settled, "settleMaxUs": s.settle_max_us,
+                    "chargedMsat": s.charged_msat.to_string(),
                     "lottery": self.lottery_health(), "offer": self.offer_text()}),
         )
     }

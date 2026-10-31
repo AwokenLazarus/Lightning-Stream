@@ -80,6 +80,9 @@ fn a_paid_websocket_charges_every_byte_either_way() {
         assert!(std::time::Instant::now() < deadline, "spent {} msat, not {want}: {st}", st["session"]["spentMsat"]);
         std::thread::sleep(Duration::from_millis(50));
     }
+    // and the operator's health counts it in what the shop charged (the seller's "Earned")
+    let h = http(&rig.addr, "GET", "/x402/ticket/health", &[], b"", None).json();
+    assert_eq!(h["chargedMsat"].as_str(), Some(want.to_string().as_str()), "{h}");
 }
 
 /// When the balance stops covering the next byte and no ticket comes within the refill wait, the

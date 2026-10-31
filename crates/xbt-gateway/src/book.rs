@@ -407,6 +407,12 @@ impl Book {
         self.sessions.len()
     }
 
+    /// What the sessions on the book were charged in all: the seller's earnings from them, as far as
+    /// the book still holds them (a session forgotten unused was charged nothing).
+    pub fn charged_msat(&self) -> u64 {
+        self.sessions.values().fold(0u64, |a, s| a.saturating_add(s.spent_msat))
+    }
+
     /// Sessions that hold a ticket or have a response open: the ones the cap counts.
     pub fn active_sessions(&self) -> usize {
         self.sessions

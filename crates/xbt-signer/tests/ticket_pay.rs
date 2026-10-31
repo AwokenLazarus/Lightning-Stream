@@ -5610,6 +5610,57 @@ fn a_websocket_open_does_not_hold_up_other_requests_to_the_seller() {
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+/// A session stopped while a paid WebSocket is open (a VPN's tunnel, held for as long as the VPN
+/// runs): the socket ends first and its last receipt is taken, so what the stop says is left with
+/// the seller counts every byte the socket carried, not only the price of its opening.
+#[test]
+fn a_session_stopped_with_a_websocket_open_counts_what_the_socket_drew() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    let l = UnixListener::bind(dir.path().join("sock")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // the caller: 64 KiB out and the same back, then it keeps the socket open until the wallet ends it
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        let out: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        w.write_all(&out).unwrap();
+        let mut back = vec![0u8; out.len()];
+        rd.read_exact(&mut back).unwrap();
+        assert_eq!(back, out);
+        tx.send(()).unwrap();
+        let mut rest = vec![];
+        let _ = rd.read_to_end(&mut rest);
+    });
+    std::thread::scope(|sc| {
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/ws/chat"), "max_sats": CALL, "task": "film", "stream_to": "sock", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        rx.recv_timeout(Duration::from_secs(20)).expect("the echo came back");
+        let t = Instant::now();
+        let stop = r.call("ticket_stop", json!({"session": sid}));
+        assert!(t.elapsed() < Duration::from_secs(10), "stopped in {:?}", t.elapsed());
+        let w = ws.join().unwrap();
+        // 2,500 msat to open, and 128 KiB at 1,000 msat a KiB, beside the page's 2,500
+        let socket = 2_500 + 128 * 1_000;
+        assert_eq!(w["receipt"]["last"]["charged"].as_str(), Some(socket.to_string().as_str()), "{w}");
+        let left: u64 = stop["http"]["left_with_seller_msat"].as_str().unwrap().parse().unwrap();
+        assert_eq!(left, TICKET - 2_500 - socket, "what the stop says is left counts the socket's bytes: {stop}");
+        assert_eq!(stop["http"]["account"]["spent_msat"].as_str(), Some((2_500 + socket).to_string().as_str()), "the page, and the socket: {stop}");
+    });
+    caller.join().unwrap();
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
 /// Films side by side in one session draw on one balance. Each answer pays the next ticket when
 /// the balance no longer covers it, counting what the others drew: no answer waits for bytes the
 /// seller will not send, a ticket that two find due at once is released once, and each answer is

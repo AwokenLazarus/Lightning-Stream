@@ -108,6 +108,9 @@ const TAIL_WAIT: Duration = Duration::from_secs(5);
 const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
+/// How long a stop waits for the session's open streams to end and take their last receipts: past
+/// a closed answer's wait for its last receipt (FINAL_WAIT for one cut short), with room to spare.
+pub const STOP_STREAMS_WAIT: Duration = Duration::from_secs(15);
 /// Refusals of `ticket_open` that mean "not this rail": the next entry of the 402 is tried.
 const NEXT_RAIL: [&str; 14] = ["ticket_disabled", "ticket_mainnet", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
                                "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL, "ticket_prepaid_first"];
@@ -1423,6 +1426,9 @@ pub(crate) struct HttpSession {
     money: Mutex<Money>,
     /// How many answers priced as they go are open: the seller's `spentMsat` moves between receipts.
     streaming: AtomicUsize,
+    /// The session is being stopped: an open stream (a WebSocket, a VPN tunnel) ends now, so its last
+    /// receipt is taken before what the session leaves with the seller is told ([`Signer::ticket_http_stop`]).
+    ending: AtomicBool,
     refilling: AtomicBool,
     /// The wallet's clock at the last paid request.
     used: Mutex<f64>,
@@ -2678,7 +2684,7 @@ impl Signer {
                                                    over_cap: AtomicBool::new(false), evidence: Mutex::new(None),
                                                    prepaid: prepaid_terms.clone(), offer, base, visit: c.url.strip_prefix(c.origin).unwrap_or("/").to_string(), calls: RwLock::new(()),
                                                    paying: Mutex::new(()), order: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
-                                                   money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), refilling: AtomicBool::new(false),
+                                                   money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), ending: AtomicBool::new(false), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
                                                    cancel_asked: Mutex::new(HashSet::new()) });
                     // a balance the wallet left with this seller in a session it stopped (a restart, or an idle stop) is
@@ -3463,6 +3469,15 @@ impl Signer {
             polls.answered();
         } else {
             polls.failed(now);
+        }
+        // a seller counting far too little: told once in the wallet's log, never a fault (it charges less, not more)
+        if !polls.undercount_told {
+            if let Some(words) = last.as_ref().and_then(crate::ticket_interim::undercount) {
+                polls.undercount_told = true;
+                eprintln!("b2-signer: {}: {words}", hs.origin);
+                self.ticket_audit("ticket_interim_undercount", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
+                                                                      "reason": words, "own_up": own_up, "own_down": own_down}));
+            }
         }
         let found = found.or_else(|| crate::ticket_interim::stale(last, polls, own_up.saturating_add(own_down), now, crate::ticket_interim::stale_after()).map(|w| (w, Value::Null)));
         let (why, receipt) = found?;
@@ -4251,6 +4266,12 @@ impl Signer {
                         stop();
                         return;
                     }
+                    // the session is being stopped: the stream ends here, and its last receipt is taken as it closes
+                    if hs.ending.load(Ordering::SeqCst) {
+                        s.1.get_or_insert_with(|| "the session was stopped".to_string());
+                        stop();
+                        return;
+                    }
                     let total = s.0.saturating_add(up.load(Ordering::SeqCst));
                     account(st.cost(total));
                     let rate = total as f64 / st.started.elapsed().as_secs_f64().max(0.001);
@@ -4655,6 +4676,14 @@ impl Signer {
     /// the seller is asked to cancel what is locked, and the wallet's own node is watched for up
     /// to `wait` until those tickets show failed. The wallet believes its node, not the answer.
     pub(crate) fn ticket_http_stop(&self, hs: &HttpSession, why: &str, wait: Duration) -> Value {
+        // open streams (a WebSocket, a VPN tunnel) end first, while the seller still serves the session: each takes
+        // its last receipt as it closes, so what the session leaves with the seller below counts what they drew
+        hs.ending.store(true, Ordering::SeqCst);
+        let streams_by = Instant::now() + wait.max(STOP_STREAMS_WAIT);
+        while hs.streaming.load(Ordering::SeqCst) > 0 && Instant::now() < streams_by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let still_streaming = hs.streaming.load(Ordering::SeqCst) > 0;
         {
             let slot = lock(&self.ticket_http).get(&hs.origin).cloned();
             if let Some(slot) = slot {
@@ -4677,8 +4706,10 @@ impl Signer {
         }
         let still = self.ticket_wait_cancelled(&hs.sid, if sent { wait } else { Duration::ZERO });
         // what the seller was paid and did not serve: under one ticket, since a ticket is released only when
-        // the balance does not cover the next request. It is the seller's now; the owner sees it here and in the audit
-        let left = hs.balance();
+        // the balance does not cover the next request. It is the seller's now; the owner sees it here and in the audit.
+        // A stream that would not end in time is still drawing: the wallet's own count of it, not only the seller's
+        // last receipt, comes off what is told as left
+        let left = if still_streaming { lock_money(hs).est_balance().min(hs.balance()) } else { hs.balance() };
         if left > 0 {
             self.ticket_audit("ticket_left_with_seller", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "origin": hs.origin,
                                                                 "left_msat": left.to_string(), "why": why}));
