@@ -115,6 +115,9 @@ class NodeDataRule(unittest.TestCase):
             "it asks a node elsewhere": (lambda s: s[BAKE]["environment"].__setitem__("XBT_KEYS_NODE_REST", "https://203.0.113.9:443"), env),
             "it asks a loopback address": (lambda s: s[BAKE]["environment"].__setitem__("XBT_KEYS_NODE_REST", "http://127.0.0.1:8402"), env),
             "another service joins its network": (lambda s: s["witness"].__setitem__("network_mode", "service:node-keys-bake"), "the namespace pinned for it"),
+            "its environment passes a variable through": (lambda s: s[BAKE].__setitem__("environment",
+                ["XBT_KEYS_NODE_REST"] + [f"{k}={v}" for k, v in s[BAKE]["environment"].items() if k != "XBT_KEYS_NODE_REST"]),
+                "passes a variable through from the host's"),
             # LOW-2: a healthcheck is a command run in the container
             "its healthcheck runs the UI server": (lambda s: s[BAKE].__setitem__("healthcheck", {"test": ["CMD", "/usr/bin/xbt-wallet-ui", "serve"]}), health),
             "the taker's healthcheck runs a command": (lambda s: s["node-keys"].__setitem__("healthcheck", {"test": ["CMD", "/usr/bin/xbt-wallet-ui", "serve"]}), health),
@@ -160,6 +163,7 @@ class NodeDataRule(unittest.TestCase):
         exports = 'is not export NAME="literal"'
         ui_mount = "      - ${APP_DATA_DIR}/data/ui:/data/ui\n"
         init_mount = "      - ${APP_DATA_DIR}/data:/data\n"
+        ui_env = "    environment:\n      XBT_UI_BIND: 0.0.0.0:8482\n"
         cases = {
             "extends the baker, as xbt-init": (lambda t: t.rstrip() + "\n" + evil(
                 f"    extends:\n      service: node-keys-bake\n    image: {init}\n    user: \"0:0\"\n    restart: \"no\"\n    network_mode: none\n"
@@ -206,6 +210,27 @@ class NodeDataRule(unittest.TestCase):
             "a link in the app's folder": (lambda t: t, {"data/run/ln": ("link", "../../../paulscode-lightning-fork/data/lnd/data/chain/bitcoin/mainnet")}, "data/run/ln is a link"),
             "shell in exports.sh": (lambda t: t, {"exports.sh": ("append", 'export APP_LAZARUS_LS_KEYS="data/run/keys"\nAPP_LAZARUS_LS_KEYS="../paulscode-lightning-fork/data/lnd"\n')}, exports),
             "a command in exports.sh": (lambda t: t, {"exports.sh": ("append", 'export APP_LAZARUS_LS_KEYS="$(printf %s ../paulscode-lightning-fork/data/lnd)"\n')}, exports),
+            "an escaped dollar": (lambda t: t.replace(ui_mount, ui_mount.replace("data/ui:", "data/ui$$x:", 1), 1), {}, subst),
+            # F3: what the loaded file holds, though its text shows no $ or hides it in a "comment"
+            "a YAML escape for $ with a default": (lambda t: t.replace(ui_env, ui_env + '      PROBE: "\\x24{APP_XBT_KNOTS_CHAIN:-../../paulscode-lightning-fork}"\n', 1), {},
+                ("/services/ui/environment/PROBE", subst)),
+            "a YAML escape for $ without braces": (lambda t: t.replace(ui_env, ui_env + '      PROBE: "\\u0024NOPE"\n', 1), {}, ("/services/ui/environment/PROBE", subst)),
+            "a block scalar line that looks like a comment": (lambda t: t.replace(ui_env, ui_env + "      PROBE: |\n        # ${NOPE:-default}\n", 1), {},
+                ("/services/ui/environment/PROBE", subst)),
+            # F1: exports.sh as bash reads it
+            "a vertical tab in exports.sh": (lambda t: t, {"exports.sh": ("append_bytes", b'export APP_LIGHTNING_STREAM_APP_PROBE="x"\x0b# ; echo PWNED\n')},
+                "exports.sh holds bytes other than printable ASCII and newline (0x0b)"),
+            "a leading \\x1f in exports.sh": (lambda t: t, {"exports.sh": ("append_bytes", b"\x1f# ; echo PWNED\n")},
+                "exports.sh holds bytes other than printable ASCII and newline (0x1f)"),
+            "a carriage return in exports.sh": (lambda t: t, {"exports.sh": ("append_bytes", b'export APP_LIGHTNING_STREAM_APP_PROBE="x"\r# ; echo PWNED\n')},
+                "exports.sh holds bytes other than printable ASCII and newline (0x0d)"),
+            # F2: an app's exports set its own names only
+            "PATH in exports.sh": (lambda t: t, {"exports.sh": ("append", 'export PATH="/home/umbrel/umbrel/app-data/lazarus-lightning-stream/data/ui:/usr/bin"\n')},
+                "sets PATH: this app's names start with APP_LIGHTNING_STREAM_APP_"),
+            "the Lightning node's address in this app's exports": (lambda t: t, {"exports.sh": ("append", 'export APP_LIGHTNING_FORK_NODE_IP="203.0.113.9"\n')},
+                ("sets APP_LIGHTNING_FORK_NODE_IP", "node-keys-bake's environment is not exactly")),
+            # F5: an app folder that is a link to another
+            "an app folder that is a link": (lambda t: t, {"../lazarus-link": ("link", "lazarus-lightning-stream")}, "store: lazarus-link is a link"),
             # LOW-5: YAML 1.1 reads `on:` as true
             "a service named on": (lambda t: t.rstrip() + f"\n\n  on:\n    <<: *service\n    image: {ui}\n", {}, "is not a string"),
         }
@@ -223,6 +248,9 @@ class NodeDataRule(unittest.TestCase):
                         f.symlink_to(content[1])
                     elif isinstance(content, tuple) and content[0] == "append":
                         f.write_text(f.read_text() + content[1])
+                    elif isinstance(content, tuple) and content[0] == "append_bytes":
+                        with open(f, "ab") as fh:
+                            fh.write(content[1])
                     else:
                         f.write_text(content)
                 ok, out = lint(self.store)

@@ -31,8 +31,10 @@ pinned; the node-keys one-shots run no healthcheck, and the baker's environment 
 a container reaches is checked again on the model `docker compose config` resolves (no .env read), with the host's
 folders marked, in each environment lint resolves (this store's apps, and a slot's node alone), so that nothing
 written can hide a mount from it. Package: an app's folder holds its manifest, compose file, exports.sh, the icon and
-gallery it names, and named others, and no link; exports.sh holds comments and `export NAME="literal"` lines (the
-stand-in node's derive_entropy line named as the one exception).
+gallery it names, and named others, and no link (nor is any entry of the store a link); exports.sh is printable ASCII
+read line by line as bash reads it, and holds comments and `export NAME="literal"` lines setting the app's own names
+(its prefix), the stand-in node's derive_entropy line named as the one exception. The substitution rule holds for
+every string of the loaded file as well (a YAML escape or a block scalar's line is what compose reads).
     python3 packaging/umbrel/lint.py [STORE_DIR]
 """
 from __future__ import annotations
@@ -173,6 +175,10 @@ SUBST = re.compile(r"\$\{[A-Z0-9_]+:-\$\{[A-Z0-9_]+\}\}|\$\{[A-Z0-9_]+(?::-)?\}"
 APP_FILES = {"umbrel-app.yml", "docker-compose.yml", "exports.sh"}
 EXTRA_FILES = {"lazarus-lightning-stream-gateway": {"data/.gitkeep"}, "lazarus-xbt-agent-wallet": {"data/.gitkeep"},
                "lazarus-xbt-knots": {"README.md", "conf/peers.conf", "conf/xbt.conf", "data/knots/.gitkeep"}}
+# the names an app's exports.sh may set: its own, under its own prefix (not another app's, umbrelOS's or
+# the shell's: PATH, BASH_ENV, LD_PRELOAD, APP_DATA_DIR, a dependency's APP_LIGHTNING_FORK_NODE_IP)
+EXPORT_PREFIX = {"lazarus-lightning-stream": "APP_LIGHTNING_STREAM_APP_", "lazarus-lightning-stream-gateway": "APP_LIGHTNING_STREAM_GATEWAY_",
+                 "lazarus-xbt-agent-wallet": "APP_XBT_AGENT_WALLET_", "lazarus-xbt-knots": "APP_XBT_KNOTS_"}
 # exports.sh: comments and `export NAME="literal"` lines, and this one line of the stand-in node's
 # (umbrelOS's derive_entropy: a per-box secret from the box seed and the label)
 EXPORTS_EXCEPTIONS = {"lazarus-xbt-knots": {'export APP_XBT_KNOTS_RPC_PASS="$(derive_entropy "lazarus-xbt-knots-rpc-${APP_XBT_KNOTS_RPC_USER}")"'}}
@@ -212,18 +218,51 @@ def package_files(folder: str, here: Path, m: dict) -> None:
                 bad(f"{folder}: {rel} is not one of the app's files ({', '.join(sorted(allowed))})")
     ex = here / "exports.sh"
     if ex.is_file() and not ex.is_symlink():
-        for i, line in enumerate(ex.read_text().splitlines(), 1):
-            t = line.strip()
+        # read as bash reads it: printable ASCII and \n only (Python would also break lines at \r, VT, FF,
+        # U+2028 ..., and strip \x1f or a no-break space, where bash sees one line and runs what follows)
+        raw = ex.read_bytes()
+        odd = sorted({b for b in raw if b != 0x0A and not 0x20 <= b <= 0x7E})
+        if odd:
+            bad(f"{folder}: exports.sh holds bytes other than printable ASCII and newline ({', '.join(f'0x{b:02x}' for b in odd[:8])})")
+        prefix = EXPORT_PREFIX.get(folder)
+        for i, line in enumerate(raw.decode("ascii", "replace").split("\n"), 1):
+            t = line.strip(" \t")
             if not t or t.startswith("#") or t in EXPORTS_EXCEPTIONS.get(folder, set()):
                 continue
-            if not re.fullmatch(r'export [A-Z][A-Z0-9_]*="[^"$`\\]*"', t):
-                bad(f"{folder}: exports.sh line {i} is not export NAME=\"literal\" (it is sourced as shell): {t[:120]}")
+            mm = re.fullmatch(r'export ([A-Z][A-Z0-9_]*)="[^"$`\\]*"', t)
+            if not mm:
+                bad(f"{folder}: exports.sh line {i} is not export NAME=\"literal\" (it is sourced as shell): {t[:120]!r}")
+            elif not prefix or not mm.group(1).startswith(prefix):
+                bad(f"{folder}: exports.sh line {i} sets {mm.group(1)}: this app's names start with {prefix}")
 
 
 def substitutions(folder: str, text_nc: str) -> None:
     """Every $ in the compose file is ${NAME}, ${NAME:-} or a slot's ${SLOT:-${FALLBACK}}."""
     for mm in re.finditer(r"\$\S{0,60}", SUBST.sub("", text_nc)):
         bad(f"{folder}: {mm.group(0)!r}: only ${{NAME}}, ${{NAME:-}} and a slot's ${{SLOT:-${{FALLBACK}}}} (no default, no other form)")
+
+
+def env_of(sv) -> dict:
+    """A service's environment as a mapping, whichever form it is written in (an item with no = passes the
+    host's value through: it maps to None)."""
+    env = sv.get("environment") if isinstance(sv, dict) else None
+    if isinstance(env, list):
+        return {pr[0]: (pr[1] if len(pr) == 2 else None) for pr in (str(e).split("=", 1) for e in env)}
+    return {str(k): v for k, v in env.items()} if isinstance(env, dict) else {}
+
+
+def loaded_substitutions(folder: str, node, where: str = "") -> None:
+    """The same rule on every string of the loaded file, keys too: a YAML escape (\\x24, \\u0024) or a block
+    scalar's '#' line is a $ or a line compose reads, though the text shows neither."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            loaded_substitutions(folder, k, where)
+            loaded_substitutions(folder, v, f"{where}/{k}")
+    elif isinstance(node, list):
+        for v in node:
+            loaded_substitutions(folder, v, where)
+    elif isinstance(node, str) and "$" in SUBST.sub("", node):
+        bad(f"{folder}: {where or 'a key'}: {node[:80]!r}: only ${{NAME}}, ${{NAME:-}} and a slot's ${{SLOT:-${{FALLBACK}}}} (no default, no other form)")
 
 
 def raw_shape(folder: str, c: dict, svcs: dict) -> None:
@@ -241,8 +280,10 @@ def raw_shape(folder: str, c: dict, svcs: dict) -> None:
         if svcs[n].get("command") not in (None, ["init"]) or svcs[n].get("volumes") != INIT_VOLUMES:
             bad(f"{folder}/{n}: xbt-init runs its own command (init) and mounts {INIT_VOLUMES} alone")
     if NODE_KEYS_BAKE in svcs:
-        env = svcs[NODE_KEYS_BAKE].get("environment") or {}
-        env = dict(str(e).split("=", 1) for e in env) if isinstance(env, list) else {str(k): str(v) for k, v in env.items()}
+        env = env_of(svcs[NODE_KEYS_BAKE])
+        if any(v is None for v in env.values()):
+            bad(f"{folder}/{NODE_KEYS_BAKE}: its environment passes a variable through from the host's (an item with no value)")
+        env = {k: str(v) for k, v in env.items()}
         if env != NODE_KEYS_BAKE_ENV:
             bad(f"{folder}/{NODE_KEYS_BAKE}: its environment is not exactly {NODE_KEYS_BAKE_ENV}")
     for name, sv in svcs.items():
@@ -275,7 +316,7 @@ def resolved_shape(folder: str, cfg: dict, svcs: dict, env: dict) -> None:
             bad(f"{folder}: resolved, network {n!r} is not the app's plain default one")
     rs = cfg.get("services") or {}
     if set(rs) != set(svcs):
-        bad(f"{folder}: resolved, the services {sorted(set(rs) ^ set(svcs))} are not the ones written here (include, extends)")
+        bad(f"{folder}: resolved, the services {sorted(set(rs) ^ set(svcs), key=str)} are not the ones written here (include, extends)")
     for name, sv in rs.items():
         allowed = RESOLVED_APP_PROXY_KEYS if name == "app_proxy" else RESOLVED_SERVICE_KEYS
         for k, v in sv.items():
@@ -293,8 +334,9 @@ def resolved_shape(folder: str, cfg: dict, svcs: dict, env: dict) -> None:
             bad(f"{folder}/{name}: resolved, a node-keys one-shot's healthcheck is exactly {ONESHOT_HEALTH}")
         img = str(sv.get("image", ""))
         if base_of(img) == "xbt-init":
-            vols = [(v.get("type"), v.get("source"), v.get("target"), v.get("read_only") is True, v.get("bind") or {}) for v in sv.get("volumes") or []]
-            if name != "init" or sv.get("command") not in (None, ["init"]) or vols != [("bind", app + "/data", "/data", False, {})]:
+            plain = ({}, {"create_host_path": True})
+            vols = [(v.get("type"), v.get("source"), v.get("target"), v.get("read_only") is True, (v.get("bind") or {}) in plain) for v in sv.get("volumes") or []]
+            if name != "init" or sv.get("command") not in (None, ["init"]) or vols != [("bind", app + "/data", "/data", False, True)]:
                 bad(f"{folder}/{name}: resolved, xbt-init is the service init, its own command, the data dir alone")
         for v in sv.get("volumes") or []:
             src, tgt, ro = str(v.get("source") or ""), v.get("target"), v.get("read_only") is True
@@ -320,7 +362,9 @@ def resolved_shape(folder: str, cfg: dict, svcs: dict, env: dict) -> None:
                     (app + "/data/run/node-keys", "/data/run/node-keys", False), (node, "/node", True)}
             got = {(v.get("source"), v.get("target"), v.get("read_only") is True) for v in sv.get("volumes") or []}
             got_env = {k: str(v) for k, v in (sv.get("environment") or {}).items()}
-            want_env = {k: re.sub(r"\$\{([A-Z0-9_]+)\}", lambda mm: str(env.get(mm.group(1), "")), v) for k, v in NODE_KEYS_BAKE_ENV.items()}
+            # Lightning Fork's own exports, never this app's: the admin macaroon goes nowhere else
+            lf = {**OTHER_STORES["paulscode-lightning-fork"], **MARKS}
+            want_env = {k: re.sub(r"\$\{([A-Z0-9_]+)\}", lambda mm: str(lf.get(mm.group(1), "")), v) for k, v in NODE_KEYS_BAKE_ENV.items()}
             if base_of(img) != "xbt-wallet-ui" or sv.get("entrypoint") is not None or sv.get("command") != ["node-keys"]:
                 bad(f"{folder}/{name}: resolved, node-keys-bake is node-keys from the UI's image, with no entrypoint")
             if str(sv.get("user")) != NODE_KEYS_BAKE_USER or set(map(str, sv.get("group_add") or [])) != NODE_KEYS_BAKE_GROUPS:
@@ -395,6 +439,10 @@ def exports_vars(p: Path) -> dict[str, str]:
 
 def main() -> int:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parent).resolve()
+    # no link anywhere umbrelOS reads: an app folder that is a link is another folder's files
+    for e in sorted(root.iterdir()):
+        if e.is_symlink():
+            bad(f"store: {e.name} is a link")
     store = yaml.safe_load((root / "umbrel-app-store.yml").read_text()) or {}
     if "id" not in store or "name" not in store:
         bad("umbrel-app-store.yml needs id and name")
@@ -453,8 +501,9 @@ def main() -> int:
             continue
         svcs = c.get("services") or {}
         raw_shape(folder, c, svcs)
+        loaded_substitutions(folder, c)
         # --- app_proxy
-        env = (svcs.get("app_proxy") or {}).get("environment") or {}
+        env = env_of(svcs.get("app_proxy") or {})
         host, aport = env.get("APP_HOST"), env.get("APP_PORT")
         mh = re.fullmatch(rf"{re.escape(m['id'])}_([a-z0-9-]+)_1", str(host or ""))
         if not mh or mh.group(1) not in svcs:
@@ -537,7 +586,7 @@ def main() -> int:
                 if "macaroon" in str(v) or "LIGHTNING" in src:
                     bad(f"{folder}/{name}: mounts the Lightning node's data or a macaroon of it: {v}")
             if baker:
-                env = s.get("environment") or {}
+                env = env_of(s)
                 if base != "xbt-wallet-ui" or not node_keys:
                     bad(f"{folder}/{name}: node-keys-bake is node-keys (command [\"node-keys\"]) from the UI's image")
                 if not s.get("read_only") or s.get("cap_drop") != ["ALL"] or "no-new-privileges:true" not in (s.get("security_opt") or []):
