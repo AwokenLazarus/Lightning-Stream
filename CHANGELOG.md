@@ -87,9 +87,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   20 s. A payment that still arrives after its invoice lapsed is refused, with nothing paid, and the
   buyer is told so instead of seeing a timeout.
 - A call's prepaid ticket (or lottery win) gives your node at most 60 s to pay it, whatever your
-  Lightning timeout, so the app always has the wallet's answer in time. A payment with no final
-  answer by then no longer blames the seller: its credit is taken up by your next call once your
-  node shows it paid.
+  Lightning timeout, so that web apps and Files show the wallet's answer rather than a timeout. A
+  payment with no final answer by then no longer blames the seller: nothing more is bought from
+  that seller for up to about 85 s, and your next call takes up the ticket's credit once your node
+  shows it paid and the seller has credited it. A seller that keeps the money without crediting it
+  is named in your wallet's history.
 
 **VPN exits**
 - A priced exit's region check now runs for a buyer with no credit at that exit. Each check is

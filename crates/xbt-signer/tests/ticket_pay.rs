@@ -4190,6 +4190,56 @@ fn a_prepaid_ticket_with_no_final_answer_in_time_leaves_its_credit_to_the_next_c
     r.assert_booked();
 }
 
+/// A seller that settles a prepaid ticket held past the wallet's wait and never credits it (here its
+/// sweep does not come round): the wait ends, so the next call buys what it needs, and the owner's
+/// record names that seller, once. Every ticket is one number on both sides.
+///
+/// FAILS before: past the wait a settled ticket was in no record but the promise that a later call
+/// would take up its credit, and the seller was named nowhere.
+#[test]
+fn a_seller_that_settles_a_pending_prepaid_ticket_and_does_not_credit_it_is_named() {
+    let _g = env_lock();
+    let shop = json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true, "unpaid_secs": 100000, "first_use_secs": 100000}});
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, shop);
+    r.ln.st.lock().unwrap().held_back = true;
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    r.ln.st.lock().unwrap().held_back = false;
+    wait_for("the payment to show paid", || r.ln.paid_msat() == TICKET);
+    r.tick();
+    assert!(r.audit("ticket_prepay_overdue").is_empty(), "not during the wait");
+    r.clock.fetch_add(120, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let named = r.audit("ticket_prepay_overdue");
+    assert_eq!((named.len(), named[0]["dest"].as_str(), named[0]["sent_msat"].as_str(), named[0]["seller_released_msat"].as_str()),
+               (1, Some(format!("ln:{}", r.shop.id()).as_str()), Some("1000000"), Some("0")), "{named:?}");
+    assert_eq!(named[0]["hash"], v["hash"]);
+    assert!(named[0]["reason"].as_str().unwrap().contains("has the money"), "{named:?}");
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{next}");
+    assert!(r.audit("ticket_resumed").is_empty(), "nothing to take over");
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
+    r.tick();
+    assert_eq!(r.audit("ticket_prepay_overdue").len(), 1, "once");
+}
+
+/// The guard holds for the seller, whatever its address: a call to a second address of the same
+/// seller, beside a prepaid ticket still pending at the first, buys nothing.
+#[test]
+fn a_call_to_a_second_address_of_the_seller_buys_nothing_beside_a_pending_prepaid_ticket() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true}, "alias": true}));
+    r.ln.st.lock().unwrap().held_back = true;
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    let other = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10").replace("127.0.0.1", "localhost"), "max_sats": CALL, "task": "film"}));
+    assert_eq!((other["rule"].as_str(), other["charged_sats"].as_i64()), (Some("ticket_prepaid_pending"), Some(0)), "{other}");
+    assert!(other["retry_after_s"].as_u64().is_some_and(|w| w > 0), "{other}");
+    assert_eq!((r.ln.state().payments.len(), r.shop.settled()), (1, 1), "one ticket, at the seller and on the node");
+}
+
 /// A pending prepaid ticket the node then shows failed: the booking goes, nothing was paid on either
 /// side, nothing holds the next call back, and it pays.
 #[test]

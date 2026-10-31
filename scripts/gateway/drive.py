@@ -81,6 +81,7 @@ MID = 10_000_000
 BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
 REQUEST_MSAT = 2_500
 FIRST_USE_S = 15
+FIRST_LOCK_S = 20
 # how long an answer whose balance ran out waits for the next release before it ends: the gateway's
 # shipped default (times.refill_wait_ms; 3 s until 2026-10-25, then 15 s for a proxy that holds back
 # a paused answer's tail), written into the config so that the fetch check's bound is the config's
@@ -427,10 +428,11 @@ def write_config(path: str, chain: str, macaroon: str, info_macaroon: str, chann
         # time to first use than the default 60 s, so that an unused session is closed within the run; every
         # buyer here comes from one address. The checks of the ticket mechanics lock held tickets at once: the
         # shipped rule that a session's first ticket is a prepaid one has a check of its own (paidfirst)
-        # a first lock's invoice lapses in 5 s here (60 s as shipped): an unpaid one is kept for its life and 15 s more
-        # whatever first_use_secs says, and the checks of the caps wait for unused sessions to close
+        # a first lock's invoice lapses in 20 s here (60 s as shipped), long enough for this lab's payments under load: an
+        # unpaid one is kept for its life and 15 s more whatever first_use_secs says, and the checks of the caps wait for
+        # unused sessions to close
         "caps": {"sessions_per_address": 0, "first_use_secs": FIRST_USE_S, "held_after_paid": False, "unpaid_per_address": 0,
-                 "first_lock_secs": 5},
+                 "first_lock_secs": FIRST_LOCK_S},
         "times": {"height_max_age_secs": 5, "refill_wait_ms": REFILL_WAIT_S * 1000},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
@@ -857,12 +859,12 @@ def flood() -> None:
           and retry == {30})
     check(f"flood: of 2,000 lock requests {HELD_CAP} tickets were issued, half of the channel's {SLOTS} slots; every other buyer was told slots_short and to come back in 30 s, has no session, and the node was asked for nothing more",
           ok, {"answers": tallies, "held_tickets": h["heldTickets"], "unpaid_invoices": pending, "sessions_made": h["sessions"] - before["sessions"], "retry_after": sorted(retry)})
-    lab.wait("the unused sessions to be closed and forgotten", FIRST_USE_S + 20, lambda: health()["activeSessions"] == 0 and health()["sessions"] <= before["sessions"], every=0.5)
+    lab.wait("the unused sessions to be closed and forgotten", max(FIRST_USE_S, FIRST_LOCK_S + 15) + 20, lambda: health()["activeSessions"] == 0 and health()["sessions"] <= before["sessions"], every=0.5)
     gone = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"]) - pending_before
     after = health()
     # (sessions of earlier checks that had used up their balance are forgotten in the same sweep)
     ok = gone <= 0 and after["heldTickets"] == 0 and after["sessions"] <= before["sessions"]
-    check(f"flood: sessions that never paid were closed after {FIRST_USE_S} s, their invoices cancelled on the node, and nothing of them is kept", ok, {"unpaid_invoices_left": gone, "sessions_before": before["sessions"], "sessions_after": after["sessions"]})
+    check(f"flood: sessions that never paid were closed once their invoices' life was over ({FIRST_LOCK_S + 15} s), their invoices cancelled on the node, and nothing of them is kept", ok, {"unpaid_invoices_left": gone, "sessions_before": before["sessions"], "sessions_after": after["sessions"]})
     # a buyer that pays for its tickets and never releases one
     b = Buyer()
     b.learn("/small.txt")

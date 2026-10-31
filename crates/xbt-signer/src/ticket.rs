@@ -1005,9 +1005,6 @@ pub fn prepaid_size(terms: &Terms, pol: &TicketPolicy) -> Result<u64, Refusal> {
     Ok(terms.ticket_msat)
 }
 
-/// Whether a prepaid ticket of `msat` may be bought in session `s`: its seller's size, or a
-/// smaller one inside what the seller's terms let the wallet ask for. A session that pays by
-/// draws pays its win size only.
 /// Why a session whose prepaid ticket had no final answer in time was stopped: not the seller's fault.
 pub const PREPAY_PENDING_WHY: &str = "the payment of a prepaid ticket has no final answer from the wallet's node yet: it is booked as spent until the node shows it \
                                       failed, and a later call takes up its credit with this seller once the node shows it paid";
@@ -1015,6 +1012,9 @@ pub const PREPAY_PENDING_WHY: &str = "the payment of a prepaid ticket has no fin
 /// gateway's 15 s after an invoice's life before its sweep, and a round of that sweep.
 pub const PREPAY_FOLLOW_GRACE_S: f64 = 15.0 + 10.0;
 
+/// Whether a prepaid ticket of `msat` may be bought in session `s`: its seller's size, or a
+/// smaller one inside what the seller's terms let the wallet ask for. A session that pays by
+/// draws pays its win size only.
 pub fn prepaid_size_ok(s: &Session, msat: u64) -> Result<(), Refusal> {
     if msat == s.prepaid_msat || (s.draws.is_none() && s.prepaid_min_msat > 0 && (s.prepaid_min_msat..=s.prepaid_msat).contains(&msat)) {
         return Ok(());
@@ -1621,12 +1621,15 @@ impl Book {
         }).max_by(|a, b| a.1.total_cmp(&b.1))
     }
 
-    /// Prepaid tickets of stopped sessions whose payment the node still calls in flight, past the
-    /// wait of [`Book::prepaid_unfollowed`]: a hop, or the seller, holds them.
+    /// Prepaid tickets of stopped sessions past the wait of [`Book::prepaid_unfollowed`] that the
+    /// seller may not have credited: the node still calls the payment in flight (a hop, or the seller,
+    /// holds it), or shows it paid after its call was stopped for having no final answer (the seller
+    /// has the money, and may have kept it).
     pub fn prepaid_overdue(&self, now: f64) -> Vec<(Ticket, Session)> {
-        self.tickets.values().filter(|t| t.prepaid && t.win == 0 && t.state == TState::Released && t.invoice_expires > 0.0)
+        self.tickets.values().filter(|t| t.prepaid && t.win == 0 && matches!(t.state, TState::Released | TState::Settled) && t.invoice_expires > 0.0)
             .filter(|t| now > t.invoice_expires.min(t.sent_ts + f64::from(xbt402::ticket::INVOICE_EXPIRY_S)) + PREPAY_FOLLOW_GRACE_S)
-            .filter_map(|t| self.sessions.get(&t.session).filter(|s| s.state != SState::Open).map(|s| (t.clone(), s.clone()))).collect()
+            .filter_map(|t| self.sessions.get(&t.session).filter(|s| s.state != SState::Open).map(|s| (t.clone(), s.clone())))
+            .filter(|(t, s)| t.state == TState::Released || s.why.starts_with(&PREPAY_PENDING_WHY[..50])).collect()
     }
 
     /// A prepaid ticket of the session whose payment is not final: the next is bought only after it.

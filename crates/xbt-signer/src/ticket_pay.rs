@@ -5244,8 +5244,8 @@ impl Signer {
         self.ticket_stop_locked(p)
     }
 
-    /// Ask the seller of a session on record to cancel all its tickets: for a session this process
-    /// did not open (the wallet started again). The answer is not checked: the node's word is.
+    /// What the seller says it has credited in the seller session of `s`, as its `status` answers
+    /// (`None`: no answer): for the owner's record, unsigned as read here.
     fn ticket_seller_released(&self, s: &crate::ticket::Session) -> Option<u64> {
         let http = s.http.as_ref()?;
         let origin = origin_of(&http.base).map(|o| normalize_dest(&o)).unwrap_or_default();
@@ -5272,9 +5272,10 @@ impl Signer {
         None
     }
 
-    /// Names the seller of a prepaid ticket still in flight past its invoice's life and the wait for
-    /// it, that has not credited it: a hop or the seller holds the payment, and only the owner's
-    /// record can say so, since the session was stopped as nobody's fault. Once a ticket, at most.
+    /// Names the seller of a prepaid ticket past its invoice's life and the wait for it that has not
+    /// credited it: in flight (a hop or the seller holds the payment), or paid (the seller has the
+    /// money). Only the owner's record can say so, since the session was stopped as nobody's fault.
+    /// Once a ticket, at most.
     fn ticket_prepaid_overdue_tick(&self) {
         for (t, s) in self.ticket_prepaid_overdue() {
             if !lock(&self.ticket_cancel_tried).insert(format!("overdue:{}", t.hash)) {
@@ -5287,10 +5288,16 @@ impl Signer {
             }
             self.ticket_audit("ticket_prepay_overdue", json!({"session": s.id, "origin": s.origin, "dest": format!("ln:{}", t.payee), "hash": t.hash, "invoice_expired": crate::pyjson::ts_value(t.invoice_expires),
                                                               "seller_released_msat": released.map(|r| r.to_string()), "sent_msat": sent.to_string(),
-                                                              "reason": "a prepaid ticket's payment is still in flight past its invoice's life, and this seller has not credited it: a hop on the route, or the seller, holds it"}));
+                                                              "reason": if t.state == crate::ticket::TState::Settled {
+                                                                  "the wallet's node shows a prepaid ticket paid, and past the wait for it this seller has not credited it: it has the money, and the ticket's credit is not to be had"
+                                                              } else {
+                                                                  "a prepaid ticket's payment is still in flight past its invoice's life, and this seller has not credited it: a hop on the route, or the seller, holds it"
+                                                              }}));
         }
     }
 
+    /// Ask the seller of a session on record to cancel all its tickets: for a session this process
+    /// did not open (the wallet started again). The answer is not checked: the node's word is.
     fn ticket_cancel_recorded(&self, s: &crate::ticket::Session, wait: Duration) -> Value {
         let Some(http) = &s.http else { return Value::Null };
         {
