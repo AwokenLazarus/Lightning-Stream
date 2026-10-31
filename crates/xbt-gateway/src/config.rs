@@ -224,6 +224,10 @@ pub struct Config {
     /// names its own.
     pub upstream: Option<String>,
     pub state_dir: PathBuf,
+    /// A secret the app beside the gateway sends (`X-Xbt402-Health-Token`) to read the operator's view
+    /// (`/x402/ticket/health`) from another container: Umbrel's and StartOS's apps reach the gateway over
+    /// their private network, not its loopback. At least 32 characters; unset, loopback only.
+    pub health_token: Option<String>,
     /// `regtest` unless the file says otherwise. Another test chain's name with `network` given,
     /// or `main`, which also needs `mainnet_ack` ([`MAINNET_ACK`]).
     pub chain: String,
@@ -490,6 +494,7 @@ impl Config {
                 "listing",
                 "nostr",
                 "link",
+                "health_token",
             ],
         )?;
         // a file that names no chain is a regtest file: mainnet is never what a missing key means
@@ -904,6 +909,11 @@ impl Config {
             None | Some(Value::Null) => None,
             Some(l) => Some(LinkConfig::parse(l)?),
         };
+        let health_token = match opt_str(top, "health_token")? {
+            Some(t) if t.len() >= 32 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => Some(t.to_string()),
+            Some(_) => return Err("health_token: at least 32 letters, digits, - or _".into()),
+            None => None,
+        };
         if nostr.as_ref().is_some_and(|n| n.publish) && listing.is_none() {
             return Err("nostr.publish publishes the listing: write a listing section, or leave publish out".into());
         }
@@ -914,6 +924,7 @@ impl Config {
             public_aliases,
             upstream: up,
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
+            health_token,
             chain,
             network,
             node,
@@ -1596,6 +1607,20 @@ mod tests {
             assert!(with(json!({}), json!({"first_lock_secs": bad})).unwrap_err().to_string().contains("first_lock_secs"), "{bad}");
         }
         assert_eq!(with(json!({}), json!({"first_lock_secs": 15, "unpaid_per_address": 0})).unwrap().caps.unpaid_per_address, 0);
+    }
+
+    #[test]
+    fn a_health_token_is_long_and_plain_or_refused() {
+        let with = |t: Value| {
+            let mut v = base();
+            v["health_token"] = t;
+            Config::from_json(&v)
+        };
+        assert_eq!(Config::from_json(&base()).unwrap().health_token, None);
+        let good = "abcdefghij-ABCDEFGHIJ_0123456789xy";
+        assert_eq!(with(json!(good)).unwrap().health_token.as_deref(), Some(good));
+        assert!(with(json!("short")).unwrap_err().to_string().contains("health_token"));
+        assert!(with(json!("abcdefghij ABCDEFGHIJ 0123456789xy")).unwrap_err().to_string().contains("health_token"));
     }
 
     #[test]

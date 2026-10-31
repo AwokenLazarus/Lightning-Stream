@@ -711,6 +711,7 @@ impl App {
             .is_none_or(|o| o.starts_with("http://127.") || o.starts_with("http://localhost") || o.starts_with("http://[::1]"));
         let open = public_url.starts_with("https://") || (shop.direct && !app_beside);
         c.insert("listen".into(), json!(if open { format!("0.0.0.0:{}", gw.port) } else { format!("127.0.0.1:{}", gw.port) }));
+        crate::setup::keep_health_token(&mut c, None);
         // a shop that moves keeps answering at its old address, for the buyers that saved it
         let mut aliases: Vec<String> = c.get("public_aliases").and_then(Value::as_array).into_iter().flatten()
             .filter_map(Value::as_str).map(str::to_string).collect();
@@ -1106,7 +1107,7 @@ impl App {
             Err(missing) => st("warn", "Not selling yet", &missing),
             Ok(_) if shop.offers.is_empty() => st("warn", "Not selling yet", "Add something to sell."),
             Ok(_) if shop.offers.iter().all(|o| o.paused) => st("warn", "Paused", "Everything is paused. Resume a service to sell again."),
-            Ok(_) => match self.cfg.gw.health_url.as_deref().map(crate::app::http_get) {
+            Ok(_) => match self.cfg.gw.health() {
                 Some(Ok((200, _))) | None => {
                     if each.values().any(|s| s.class == "bad") {
                         st("bad", "Selling, with a problem", "One of your services can't be reached: see below.")

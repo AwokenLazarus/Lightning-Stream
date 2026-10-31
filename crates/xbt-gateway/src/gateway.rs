@@ -839,6 +839,16 @@ impl Gateway {
         Some(client.map_or(peer, |a| a.to_canonical()))
     }
 
+    /// Whether a request carries the app's `health_token` (`X-Xbt402-Health-Token`), compared in
+    /// constant time: the operator's view for the app beside the gateway in another container.
+    fn health_token_ok(&self, req: &Request) -> bool {
+        let (Some(want), Some(got)) = (self.cfg.health_token.as_deref(), req.header("x-xbt402-health-token")) else {
+            return false;
+        };
+        let (a, b) = (want.as_bytes(), got.trim().as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+    }
+
     /// The origin a request came in on: an alias its `Host` names (`public_aliases`), else
     /// `public_url`. A payment binds the URL the buyer used, so each origin's terms name it.
     fn origin_of(&self, req: &Request) -> &str {
@@ -2330,7 +2340,7 @@ impl Handler for Service {
         let path = req.path().to_string();
         if let Some(call) = self.session_path(&path) {
             // behind a named proxy on this machine every socket is loopback: the address it reports decides
-            let loopback = gw.client_ip(&req).is_some_and(|a| a.is_loopback());
+            let loopback = gw.client_ip(&req).is_some_and(|a| a.is_loopback()) || gw.health_token_ok(&req);
             return Reply::Whole(match (req.method.as_str(), call) {
                 ("POST", "lock") => gw.lock_tickets(&req),
                 ("POST", "release" | "cancel" | "status" | "identify") => gw.session_call(&req, call),
