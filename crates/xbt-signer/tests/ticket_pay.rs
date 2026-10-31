@@ -7151,6 +7151,219 @@ fn a_websocket_under_a_charge_cap_ends_at_it_and_the_honest_seller_is_not_blocke
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+// --- money over realistic amounts: what the seller charged and what the buyer paid, against usage x price ---
+
+/// A reader of a body streamed to `dir/name` (`stream_to`): how many bytes reached it.
+fn drain(dir: &std::path::Path, name: &str) -> std::thread::JoinHandle<usize> {
+    let l = std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap();
+    std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut n = 0usize;
+        let mut buf = vec![0u8; 256 << 10];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => return n,
+                Ok(k) => n += k,
+            }
+        }
+    })
+}
+
+fn msat(v: &Value) -> u64 {
+    v.as_str().unwrap_or_else(|| panic!("not a msat string: {v}")).parse().unwrap()
+}
+
+/// Stop `sid` and check the money on both sides against `usage_msat` (what was used, at the listed
+/// price, worked out by the test from what it asked for): the seller's book (the gateway's
+/// charged total) and the wallet's account each within `slack_msat` of it; the buyer's node, the
+/// seller's node and the wallet's book one number; and every msat paid either spent or told as left
+/// with the seller, under `most_left` (a ticket for answers paid as they are asked; for an answer
+/// that runs open the wallet releases ahead of it, so it is not cut while a ticket settles). Returns
+/// the stop.
+fn assert_paid_for_usage(r: &Rig, what: &str, sid: &str, usage_msat: u64, slack_msat: u64, most_left: u64) -> Value {
+    let stop = r.call("ticket_stop", json!({"session": sid}));
+    let seller = r.shop.gw.stats().charged_msat;
+    let spent = msat(&stop["http"]["account"]["spent_msat"]);
+    let left = msat(&stop["http"]["left_with_seller_msat"]);
+    let (paid, taken, book, _) = r.money();
+    let near = |x: u64| x.abs_diff(usage_msat) <= slack_msat;
+    assert!(near(seller), "{what}: the seller's book charged {seller} msat for usage worth {usage_msat} (slack {slack_msat})");
+    assert!(near(spent), "{what}: the wallet's account spent {spent} msat for usage worth {usage_msat} (slack {slack_msat}): {stop}");
+    assert_eq!((taken, book), (paid, paid), "{what}: the seller's node took {taken}, the wallet booked {book}, the buyer's node paid {paid}");
+    assert_eq!(paid, spent + left, "{what}: paid {paid} msat is what was spent ({spent}) and what is left with the seller ({left}): {stop}");
+    assert!(left < most_left, "{what}: {left} msat left with the seller, {most_left} or more: {stop}");
+    stop
+}
+
+/// Files, as a player reads one (docs/FILES.md): 64 MiB in sixteen 4 MiB ranges and the same file
+/// whole once more, 128 MiB in all at 200 sat a MiB. Each part's price is its bytes' price to the
+/// msat; the seller's book and the wallet's account are each the sum, with no slack: the price of a
+/// part is fixed by its size; and the nodes and the book agree.
+#[test]
+fn files_read_in_parts_and_whole_are_charged_their_bytes_at_the_listed_price_on_both_sides() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let size = 64 * MIB;
+    let part = 4 * MIB;
+    let per_mib = 200_000u64;
+    let mut usage = 0u64;
+    let mut sid = String::new();
+    for i in 0..size / part {
+        let name = format!("part-{i}");
+        let reader = drain(dir.path(), &name);
+        let (a, b) = (i * part, (i + 1) * part - 1);
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{size}")), "max_sats": CALL, "task": "film", "range": format!("bytes={a}-{b}"), "stream_to": name}));
+        let got = reader.join().unwrap();
+        let price = (part as u64 * per_mib).div_ceil(MIB as u64);
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), got), (Some(206), Some(true), part), "part {i}: {v}");
+        assert_eq!(v["price_msat"].as_str(), Some(price.to_string().as_str()), "part {i}: {v}");
+        usage += price;
+        sid = v["session"].as_str().unwrap().to_string();
+    }
+    let reader = drain(dir.path(), "whole");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{size}")), "max_sats": 20_000, "task": "film", "stream_to": "whole"}));
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), reader.join().unwrap()), (Some(200), Some(true), size), "{v}");
+    assert_eq!(v["session"].as_str(), Some(sid.as_str()), "one session: {v}");
+    usage += (size as u64 * per_mib).div_ceil(MIB as u64);
+    assert_eq!(usage, 25_600_000);
+    assert_paid_for_usage(&r, "files", &sid, usage, 0, TICKET);
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// A seller's web app, as a browser uses one: 200 page requests at 2.5 sat each, between 40 media
+/// segments of 1 to 2.5 MiB at 20 sat a MiB (about 70 MiB). The seller's book and the wallet's
+/// account are each the requests' and the bytes' price, exactly.
+#[test]
+fn a_web_apps_many_requests_and_segments_are_charged_at_the_listed_price_on_both_sides() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let mut usage = 0u64;
+    let (mut sid, mut bytes) = (String::new(), 0usize);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |lo: usize, hi: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        lo + (seed as usize) % (hi - lo + 1)
+    };
+    for i in 0..240 {
+        let v = if i % 6 == 5 {
+            let n = next(MIB, 5 * MIB / 2);
+            let name = format!("seg-{i}");
+            let reader = drain(dir.path(), &name);
+            let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/hd20/{n}")), "max_sats": CALL, "task": "film", "stream_to": name}));
+            assert_eq!(reader.join().unwrap(), n, "segment {i}: {v}");
+            usage += (n as u64 * 20_000).div_ceil(MIB as u64);
+            bytes += n;
+            v
+        } else {
+            let v = r.pay(&format!("/page/{}", next(200, 40_000)), CALL);
+            usage += 2_500;
+            v
+        };
+        assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "request {i}: {v}");
+        let s = v["session"].as_str().unwrap();
+        assert!(sid.is_empty() || sid == s, "one session");
+        sid = s.to_string();
+    }
+    assert!(bytes >= 50 << 20, "{bytes} bytes of segments");
+    assert_paid_for_usage(&r, "web app", &sid, usage, 0, TICKET);
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// AI by the token: 80 replies, streamed and whole, of 10 to 490 tokens each (about 18,000 out),
+/// at 4 sat per 1,000 tokens in and 20 out. Each reply's price is its tokens' (7 in, n out), and the
+/// seller's book and the wallet's account are the sum, exactly.
+#[test]
+fn ai_replies_by_the_token_are_charged_their_tokens_at_the_listed_price_on_both_sides() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let mut usage = 0u64;
+    let mut sid = String::new();
+    let mut tokens_out = 0u64;
+    for i in 0..80u64 {
+        let n = 10 + (i * 37) % 481;
+        let body = json!({"messages": [{"role": "user", "content": "hello"}], "stream": i % 2 == 0, "x_n": n});
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/v1/chat/completions"), "method": "POST", "body": body.to_string(), "max_sats": CALL, "task": "film"}));
+        let price = (7 * 4_000u64).div_ceil(1000) + (n * 20_000).div_ceil(1000);
+        assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some(price.to_string().as_str())), "reply {i} of {n} tokens: {v}");
+        assert!(v.get("seller_fault").is_none(), "{v}");
+        usage += price;
+        tokens_out += n;
+        sid = v["session"].as_str().unwrap().to_string();
+    }
+    assert!(tokens_out >= 15_000, "{tokens_out} tokens out");
+    assert_paid_for_usage(&r, "AI", &sid, usage, 0, TICKET);
+    r.assert_booked();
+}
+
+/// A VPN tunnel's shape: a WebSocket priced at 500,000 sat a GiB either way, 25 MiB out and the same
+/// echoed back (50 MiB through the seller), and the session stopped while it is still open, as a
+/// VPN that is turned off stops it. The seller's book and the wallet's account (what the stop says
+/// was spent, and so what it says is left) are each the 50 MiB's price, to the msat. (The stop of a
+/// session whose socket drew on a balance it already held, with no ticket released meanwhile, is
+/// a_session_stopped_with_a_websocket_open_counts_what_the_socket_drew.)
+#[test]
+fn a_tunnel_stopped_while_open_is_charged_its_bytes_at_the_listed_price_on_both_sides() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let each = 25 * MIB;
+    let l = UnixListener::bind(dir.path().join("tunnel")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        let writer = std::thread::spawn(move || {
+            let chunk: Vec<u8> = (0..64 << 10).map(pattern).collect();
+            for _ in 0..each / chunk.len() {
+                w.write_all(&chunk).unwrap();
+            }
+            w
+        });
+        let mut back = 0usize;
+        let mut buf = vec![0u8; 256 << 10];
+        while back < each {
+            let k = rd.read(&mut buf).unwrap();
+            assert!(k > 0, "the echo ended at {back} bytes");
+            back += k;
+        }
+        let _w = writer.join().unwrap();
+        tx.send(back).unwrap();
+        // the tunnel stays open until the wallet ends it
+        let mut rest = vec![];
+        let _ = rd.read_to_end(&mut rest);
+    });
+    std::thread::scope(|sc| {
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/wsgb/vpn"), "max_sats": 40_000, "task": "film", "stream_to": "tunnel", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(120)).expect("25 MiB came back"), each);
+        let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
+        // 50 MiB at 500,000 sat a GiB
+        let usage = ((2 * each) as u64 * 500_000_000).div_ceil(1 << 30);
+        assert_eq!(usage, 24_414_063);
+        assert_paid_for_usage(&r, "tunnel", &sid, usage, 0, 2 * TICKET);
+        let w = ws.join().unwrap();
+        assert_eq!(w["receipt"]["last"]["charged"].as_str(), Some(usage.to_string().as_str()), "the tunnel's last receipt: {w}");
+    });
+    caller.join().unwrap();
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
 /// A web app's WebSocket stays open for as long as the page keeps it (a media server's live
 /// updates, say), not for the owner's `max_answer_s` of an answer: it has its own limit,
 /// `tickets.max_socket_s`, and is paid as its bytes pass all the while. `SOCKET_HOLD_S` sets how
@@ -11178,217 +11391,4 @@ fn the_credit_left_behind_is_reached_in_ordinary_use() {
     assert!(!old_id.is_empty());
     assert_eq!(used.first(), Some(&old_id), "the credit of the first seller session is the first to be used: {used:?}");
     assert_eq!(r.ln.paid_msat(), 2 * TICKET, "no ticket beyond the two");
-}
-
-// --- money over realistic amounts: what the seller charged and what the buyer paid, against usage x price ---
-
-/// A reader of a body streamed to `dir/name` (`stream_to`): how many bytes reached it.
-fn drain(dir: &std::path::Path, name: &str) -> std::thread::JoinHandle<usize> {
-    let l = std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap();
-    std::thread::spawn(move || {
-        let (mut s, _) = l.accept().unwrap();
-        let mut n = 0usize;
-        let mut buf = vec![0u8; 256 << 10];
-        loop {
-            match s.read(&mut buf) {
-                Ok(0) | Err(_) => return n,
-                Ok(k) => n += k,
-            }
-        }
-    })
-}
-
-fn msat(v: &Value) -> u64 {
-    v.as_str().unwrap_or_else(|| panic!("not a msat string: {v}")).parse().unwrap()
-}
-
-/// Stop `sid` and check the money on both sides against `usage_msat` (what was used, at the listed
-/// price, worked out by the test from what it asked for): the seller's book (the gateway's
-/// charged total) and the wallet's account each within `slack_msat` of it; the buyer's node, the
-/// seller's node and the wallet's book one number; and every msat paid either spent or told as left
-/// with the seller, under `most_left` (a ticket for answers paid as they are asked; for an answer
-/// that runs open the wallet releases ahead of it, so it is not cut while a ticket settles). Returns
-/// the stop.
-fn assert_paid_for_usage(r: &Rig, what: &str, sid: &str, usage_msat: u64, slack_msat: u64, most_left: u64) -> Value {
-    let stop = r.call("ticket_stop", json!({"session": sid}));
-    let seller = r.shop.gw.stats().charged_msat;
-    let spent = msat(&stop["http"]["account"]["spent_msat"]);
-    let left = msat(&stop["http"]["left_with_seller_msat"]);
-    let (paid, taken, book, _) = r.money();
-    let near = |x: u64| x.abs_diff(usage_msat) <= slack_msat;
-    assert!(near(seller), "{what}: the seller's book charged {seller} msat for usage worth {usage_msat} (slack {slack_msat})");
-    assert!(near(spent), "{what}: the wallet's account spent {spent} msat for usage worth {usage_msat} (slack {slack_msat}): {stop}");
-    assert_eq!((taken, book), (paid, paid), "{what}: the seller's node took {taken}, the wallet booked {book}, the buyer's node paid {paid}");
-    assert_eq!(paid, spent + left, "{what}: paid {paid} msat is what was spent ({spent}) and what is left with the seller ({left}): {stop}");
-    assert!(left < most_left, "{what}: {left} msat left with the seller, {most_left} or more: {stop}");
-    stop
-}
-
-/// Files, as a player reads one (docs/FILES.md): 64 MiB in sixteen 4 MiB ranges and the same file
-/// whole once more, 128 MiB in all at 200 sat a MiB. Each part's price is its bytes' price to the
-/// msat; the seller's book and the wallet's account are each the sum, with no slack: the price of a
-/// part is fixed by its size; and the nodes and the book agree.
-#[test]
-fn files_read_in_parts_and_whole_are_charged_their_bytes_at_the_listed_price_on_both_sides() {
-    let _g = env_lock();
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("B2_STREAM_DIR", dir.path());
-    let r = Rig::new(json!({}));
-    let size = 64 * MIB;
-    let part = 4 * MIB;
-    let per_mib = 200_000u64;
-    let mut usage = 0u64;
-    let mut sid = String::new();
-    for i in 0..size / part {
-        let name = format!("part-{i}");
-        let reader = drain(dir.path(), &name);
-        let (a, b) = (i * part, (i + 1) * part - 1);
-        let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{size}")), "max_sats": CALL, "task": "film", "range": format!("bytes={a}-{b}"), "stream_to": name}));
-        let got = reader.join().unwrap();
-        let price = (part as u64 * per_mib).div_ceil(MIB as u64);
-        assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), got), (Some(206), Some(true), part), "part {i}: {v}");
-        assert_eq!(v["price_msat"].as_str(), Some(price.to_string().as_str()), "part {i}: {v}");
-        usage += price;
-        sid = v["session"].as_str().unwrap().to_string();
-    }
-    let reader = drain(dir.path(), "whole");
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{size}")), "max_sats": 20_000, "task": "film", "stream_to": "whole"}));
-    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), reader.join().unwrap()), (Some(200), Some(true), size), "{v}");
-    assert_eq!(v["session"].as_str(), Some(sid.as_str()), "one session: {v}");
-    usage += (size as u64 * per_mib).div_ceil(MIB as u64);
-    assert_eq!(usage, 25_600_000);
-    assert_paid_for_usage(&r, "files", &sid, usage, 0, TICKET);
-    std::env::remove_var("B2_STREAM_DIR");
-    r.assert_booked();
-}
-
-/// A seller's web app, as a browser uses one: 200 page requests at 2.5 sat each, between 40 media
-/// segments of 1 to 2.5 MiB at 20 sat a MiB (about 70 MiB). The seller's book and the wallet's
-/// account are each the requests' and the bytes' price, exactly.
-#[test]
-fn a_web_apps_many_requests_and_segments_are_charged_at_the_listed_price_on_both_sides() {
-    let _g = env_lock();
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("B2_STREAM_DIR", dir.path());
-    let r = Rig::new(json!({}));
-    let mut usage = 0u64;
-    let (mut sid, mut bytes) = (String::new(), 0usize);
-    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = |lo: usize, hi: usize| {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        lo + (seed as usize) % (hi - lo + 1)
-    };
-    for i in 0..240 {
-        let v = if i % 6 == 5 {
-            let n = next(MIB, 5 * MIB / 2);
-            let name = format!("seg-{i}");
-            let reader = drain(dir.path(), &name);
-            let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/hd20/{n}")), "max_sats": CALL, "task": "film", "stream_to": name}));
-            assert_eq!(reader.join().unwrap(), n, "segment {i}: {v}");
-            usage += (n as u64 * 20_000).div_ceil(MIB as u64);
-            bytes += n;
-            v
-        } else {
-            let v = r.pay(&format!("/page/{}", next(200, 40_000)), CALL);
-            usage += 2_500;
-            v
-        };
-        assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "request {i}: {v}");
-        let s = v["session"].as_str().unwrap();
-        assert!(sid.is_empty() || sid == s, "one session");
-        sid = s.to_string();
-    }
-    assert!(bytes >= 50 << 20, "{bytes} bytes of segments");
-    assert_paid_for_usage(&r, "web app", &sid, usage, 0, TICKET);
-    std::env::remove_var("B2_STREAM_DIR");
-    r.assert_booked();
-}
-
-/// AI by the token: 80 replies, streamed and whole, of 10 to 490 tokens each (about 18,000 out),
-/// at 4 sat per 1,000 tokens in and 20 out. Each reply's price is its tokens' (7 in, n out), and the
-/// seller's book and the wallet's account are the sum, exactly.
-#[test]
-fn ai_replies_by_the_token_are_charged_their_tokens_at_the_listed_price_on_both_sides() {
-    let _g = env_lock();
-    let r = Rig::new(json!({}));
-    let mut usage = 0u64;
-    let mut sid = String::new();
-    let mut tokens_out = 0u64;
-    for i in 0..80u64 {
-        let n = 10 + (i * 37) % 481;
-        let body = json!({"messages": [{"role": "user", "content": "hello"}], "stream": i % 2 == 0, "x_n": n});
-        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/v1/chat/completions"), "method": "POST", "body": body.to_string(), "max_sats": CALL, "task": "film"}));
-        let price = (7 * 4_000u64).div_ceil(1000) + (n * 20_000).div_ceil(1000);
-        assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some(price.to_string().as_str())), "reply {i} of {n} tokens: {v}");
-        assert!(v.get("seller_fault").is_none(), "{v}");
-        usage += price;
-        tokens_out += n;
-        sid = v["session"].as_str().unwrap().to_string();
-    }
-    assert!(tokens_out >= 15_000, "{tokens_out} tokens out");
-    assert_paid_for_usage(&r, "AI", &sid, usage, 0, TICKET);
-    r.assert_booked();
-}
-
-/// A VPN tunnel's shape: a WebSocket priced at 500,000 sat a GiB either way, 25 MiB out and the same
-/// echoed back (50 MiB through the seller), and the session stopped while it is still open, as a
-/// VPN that is turned off stops it. The seller's book and the wallet's account (what the stop says
-/// was spent, and so what it says is left) are each the 50 MiB's price, to the msat. (The stop of a
-/// session whose socket drew on a balance it already held, with no ticket released meanwhile, is
-/// a_session_stopped_with_a_websocket_open_counts_what_the_socket_drew.)
-#[test]
-fn a_tunnel_stopped_while_open_is_charged_its_bytes_at_the_listed_price_on_both_sides() {
-    use std::io::{BufRead as _, Write as _};
-    use std::os::unix::net::UnixListener;
-    let _g = env_lock();
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("B2_STREAM_DIR", dir.path());
-    let r = Rig::new(json!({}));
-    let each = 25 * MIB;
-    let l = UnixListener::bind(dir.path().join("tunnel")).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let caller = std::thread::spawn(move || {
-        let (s, _) = l.accept().unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
-        let mut line = String::new();
-        rd.read_line(&mut line).unwrap();
-        let mut w = s;
-        let writer = std::thread::spawn(move || {
-            let chunk: Vec<u8> = (0..64 << 10).map(pattern).collect();
-            for _ in 0..each / chunk.len() {
-                w.write_all(&chunk).unwrap();
-            }
-            w
-        });
-        let mut back = 0usize;
-        let mut buf = vec![0u8; 256 << 10];
-        while back < each {
-            let k = rd.read(&mut buf).unwrap();
-            assert!(k > 0, "the echo ended at {back} bytes");
-            back += k;
-        }
-        let _w = writer.join().unwrap();
-        tx.send(back).unwrap();
-        // the tunnel stays open until the wallet ends it
-        let mut rest = vec![];
-        let _ = rd.read_to_end(&mut rest);
-    });
-    std::thread::scope(|sc| {
-        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/wsgb/vpn"), "max_sats": 40_000, "task": "film", "stream_to": "tunnel", "stream_head": true,
-                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(120)).expect("25 MiB came back"), each);
-        let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
-        // 50 MiB at 500,000 sat a GiB
-        let usage = ((2 * each) as u64 * 500_000_000).div_ceil(1 << 30);
-        assert_eq!(usage, 24_414_063);
-        assert_paid_for_usage(&r, "tunnel", &sid, usage, 0, 2 * TICKET);
-        let w = ws.join().unwrap();
-        assert_eq!(w["receipt"]["last"]["charged"].as_str(), Some(usage.to_string().as_str()), "the tunnel's last receipt: {w}");
-    });
-    caller.join().unwrap();
-    std::env::remove_var("B2_STREAM_DIR");
-    r.assert_booked();
 }
