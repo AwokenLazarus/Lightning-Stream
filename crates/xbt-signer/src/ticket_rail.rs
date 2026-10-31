@@ -2253,8 +2253,9 @@ impl Signer {
         st.commit(&rows)
     }
 
-    /// The stopped seller sessions of the seller `payee` that may still hold a balance, oldest first,
-    /// since the oldest is the first to lapse: those stopped in the last [`RESUME_WITHIN_S`], other
+    /// The stopped seller sessions of the seller `payee` that may still hold a balance: those opened
+    /// at `origin` first, which can answer for themselves here, and oldest first within that, since the oldest is
+    /// the first to lapse. Those stopped in the last [`RESUME_WITHIN_S`], other
     /// than `sid`, with their seller side on record. Keyed on the seller's node, not its address: a shop reached under
     /// another name (an alias, or an address it moved from) is the same seller. The caller checks
     /// the rest against the seller's signed `status`, under the receipt key of its terms now. With it, what the wallet's own book says left the wallet in
@@ -2299,9 +2300,11 @@ impl Signer {
             let sent = tickets().filter(|t| matches!(t.state, TState::Released | TState::Settled)).fold(0u64, |a, t| a.saturating_add(t.msat));
             let proven = tickets().any(|t| t.state == TState::Settled && t.note != SETTLED_UNPROVEN);
             let held = group.iter().map(|o| (o.id.clone(), st.book.of_session(&o.id).into_iter().filter(|t| t.may_take_a_place(now)).map(|t| t.hash.clone()).collect())).collect();
-            out.push(Resumable { http, sent, proven, held, newest: s.id.clone() });
+            let here = group.iter().any(|o| o.origin == origin);
+            out.push(Resumable { http, sent, proven, held, newest: s.id.clone(), here });
         }
         out.reverse();
+        out.sort_by_key(|found| !found.here);
         out
     }
 
@@ -2816,6 +2819,8 @@ pub(crate) struct Resumable {
     pub(crate) held: Vec<(String, Vec<String>)>,
     /// The last session of this wallet that used it, to name it by.
     pub(crate) newest: String,
+    /// Opened at the address of the call that asks.
+    pub here: bool,
 }
 
 /// The most one ticket may book, its fee limit included, in sats: below `human_threshold_sats`,

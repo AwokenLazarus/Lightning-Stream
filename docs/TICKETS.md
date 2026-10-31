@@ -2030,8 +2030,8 @@ fit, and says which limit and by how much.
 signer starting again) may leave prepaid credit at the seller, which keeps a session with a balance
 for a day (section 4). Credit is the seller's, not its address's: when the next call opens a session
 with the same seller (its node), under any address, the wallet first looks through the seller
-sessions it stopped in the last 20 hours, oldest first since the oldest lapses first, asking four at
-most. A session the seller has forgotten (`session_unknown`, from the address it was opened at) is
+sessions it stopped in the last 20 hours, those opened at this address first and the oldest first
+within that, since the oldest lapses first, asking four at most. A session the seller has forgotten (`session_unknown`, from the address it was opened at) is
 given up and not asked about again. One it still holds open under
 another address (an alias of the shop, or the address it moved from) is stopped first, unless a call
 is using it right now. If the seller's `status` for one, signed with the receipt key of the seller's terms now,
