@@ -135,6 +135,10 @@ for T in "${TS[@]}"; do
 #define HAVE_STRCASECMP 1
 #define HAVE_DECL_PROGRAM_INVOCATION_NAME 1
 #define HAVE_DECL_PROGRAM_INVOCATION_SHORT_NAME 1
+/* what argp's own configure adds (meson_config.h.in): its sources use these */
+#define NORETURN __attribute__ ((__noreturn__))
+#define PRINTF_STYLE(f, a) __attribute__ ((__format__ (__printf__, f, a)))
+#define UNUSED __attribute__ ((__unused__))
 EOF
   (cd "$W/argp" && for c in argp-ba argp-eexst argp-fmtstream argp-help argp-parse argp-pv argp-pvh; do
       "$CC" $CFLAGS -D_GNU_SOURCE -DHAVE_CONFIG_H=1 -I. -c "$c.c" -o "$c.o" || exit 1
