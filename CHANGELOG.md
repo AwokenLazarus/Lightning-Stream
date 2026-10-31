@@ -224,6 +224,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   miners, or a gateway slow to answer, no longer come out of it.
 - Mining solo, each offer says one machine's chance of finding a block in an hour, from your own node's
   difficulty, and how often a block comes at that speed on average. Through a pool it says nothing.
+- A hashmaker's listing more than two days old is no longer offered: it is from a hashmaker that has stopped
+  publishing. Listings now carry an expiry other Nostr clients read too.
 
 **The app**
 - A visit to a shop reached by its key is headed by the shop's name, and pages show such a shop by
