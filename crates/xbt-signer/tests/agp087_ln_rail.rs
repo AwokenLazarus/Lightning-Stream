@@ -754,6 +754,19 @@ fn only_unified_non_taproot_post_split_channels_carry_payments() {
     let why: Vec<String> = r["channels"].as_array().unwrap().iter().map(|c| c["refused"].as_str().unwrap().to_string()).collect();
     assert!(why[0].contains("not unified") && why[1].contains("below the split") && why[2].contains("zero-conf") && why[3].contains("inactive"), "{why:?}");
     assert_eq!(rig.ln.sent(), 0);
+    // a zero-conf channel whose funding has since confirmed (lnd keeps zero_conf true and sets
+    // zero_conf_confirmed_scid) carries payments; its height is the confirmed scid's, not the alias's
+    let mut alias = 17_592_186_044_416_000_000u64;
+    let mut confirmed = chan(&alias.to_string(), "ANCHORS", true);
+    confirmed["zero_conf"] = true.into();
+    confirmed["zero_conf_confirmed_scid"] = scid(6_300, 1).into();
+    alias += 1;
+    let mut early = chan(&alias.to_string(), "ANCHORS", true);
+    early["zero_conf"] = true.into();
+    early["zero_conf_confirmed_scid"] = scid(5_999, 2).into();
+    let (ok, report) = xbt_signer::ln::usable_channels(&[confirmed, early], 6_000);
+    assert_eq!(ok, ["17592186044416000000"], "{report:?}");
+    assert!(report[1]["refused"].as_str().unwrap().contains("below the split"), "{report:?}");
     // node coins below the split are reported, never used to fund a channel (this wallet opens none)
     rig.ln.set(|s| s.utxos = vec![json!({"amount_sat": "5000", "confirmations": "1000", "outpoint": {"txid_str": "aa".repeat(32), "output_index": 0}}),
                                   json!({"amount_sat": "7000", "confirmations": "3", "outpoint": {"txid_str": "bb".repeat(32), "output_index": 1}})]);
