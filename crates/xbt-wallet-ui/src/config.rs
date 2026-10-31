@@ -279,8 +279,8 @@ impl Default for StreamGwSetup {
     }
 }
 
-/// The guide a renter without a DATUM Gateway is sent to.
-pub const DATUM_GUIDE: &str = "https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/P2P-HASH-TRY-IT.md#your-datum-gateway";
+/// The guide a renter is sent to about gateways.
+pub const DATUM_GUIDE: &str = "https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/P2P-HASH-TRY-IT.md#your-gateway";
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())

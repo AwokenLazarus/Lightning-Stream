@@ -123,9 +123,21 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 
 **Hashrate**
 - Renting needs masked jobs, solo or through a pool, so a hashmaker can't keep back the shares that would be blocks.
-  The app comes with a DATUM Gateway that masks its jobs and rents into it. The Rent page checks the gateway's jobs
-  when it opens and before each rental; if they aren't masked (the gateway isn't running, or the app is set to
-  another gateway), it says so and rents nothing.
+  The app comes with its own gateway, the Stream Gateway (DATUM-compatible), which masks its jobs, and rents into it.
+  The Rent page checks the gateway's jobs when it opens and before each rental; if they aren't masked (the gateway
+  isn't set up or running, or the app is set to another gateway), it says so and rents nothing.
+- *Your gateway* on the Hashrate page sets the Stream Gateway up: solo to your own XBT address (the default), or
+  through Lazarus Pool. The address is checked for your node's network first (bc1q, bc1p or a legacy address on
+  mainnet). The page shows the gateway running, connected to your node, and masking its jobs.
+- Lazarus Pool mode masks its jobs once Lazarus Pool takes gateway-held keys; until then renting stays off in that
+  mode, and solo works. In that mode your gateway holds the key, so it could hide a block it finds from the pool,
+  the same as any DATUM miner can today. Pools that hold the key themselves (CONVOY-style) come later.
+- The gateway's config holds no secret: the node's RPC credentials go to a cookie file only the gateway reads, its
+  API has no admin password (every admin page is off), and it listens on 127.0.0.1 only. A block it finds is kept
+  on disk even if the node's submitblock fails.
+- An app set to another gateway before this version is moved to the Stream Gateway once, and the Hashrate page
+  offers the old one back. On armv7 the app has no Stream Gateway: the Rent page says the gateway isn't masking,
+  and selling hashrate works as before.
 - Both apps check every share's hash themselves, from the Stratum lines alone. A share counts only
   if it proves its work; neither side takes the other's word, and a renter's verdicts set nothing.
 - Renters: paid as you use it, seconds at a time. You never have more paid for and not yet received
