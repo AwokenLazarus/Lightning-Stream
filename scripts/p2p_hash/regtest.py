@@ -274,10 +274,18 @@ def drop_check() -> None:
 
     def during() -> None:
         lab.wait("three slices paid before the drop", 120, lambda: paid_slices() >= 3, every=0.2)
-        # what the hashmaker sends is lost for a stretch: shares its side counted and the hashtaker's never read
+        # what the hashmaker sends is lost for a stretch: shares its side counted and the hashtaker's never read. The
+        # link is cut only once the hashmaker has sent a share into the loss, so the drop always lands with one in flight
         road.lose = True
         outage["lost_from_ms"] = int(time.time() * 1000)
-        time.sleep(3)
+
+        def sent_into_the_loss() -> int:
+            h = report("hasher")
+            shares = (h.get("rentals") or [h])[0].get("provenShares", [])
+            return sum(1 for x in shares if int(x["atMs"]) >= outage["lost_from_ms"])
+
+        lab.wait("a share sent into the loss", 30, lambda: sent_into_the_loss() >= 1, every=0.2)
+        outage["sent_into_the_loss"] = sent_into_the_loss()
         road.refuse = True
         outage["at"] = time.time()
         road.cut()
@@ -294,9 +302,10 @@ def drop_check() -> None:
     evs = hz["events"]
     backs = [e["atMs"] for e in evs if e["ev"] == "hashtaker back, rental resumed"]
     after = [e["slice"] for e in evs if e["ev"] == "paid slice" and backs and e["atMs"] > backs[0]]
-    check("drop: the link dropped with shares lost, the hashtaker counted them when they were sent again, and the rental carried on",
-          len(backs) == 1 and bz["resentCounted"] >= 1 and len(after) >= 2 and bz["closed"] == "no proven work",
-          {"resumed": len(backs), "shares counted from a resend": bz["resentCounted"], "slices paid after the resume": after, "closed": bz["closed"], "stopped": (hz.get("stopped") or {}).get("reason")})
+    check("drop: the link dropped with shares lost, the hashtaker counted them when they were sent again, once each, and the rental carried on",
+          len(backs) == 1 and bz["resentCounted"] >= 1 and bz["meter"]["repeats"] == 0 and len(after) >= 2 and bz["closed"] == "no proven work",
+          {"resumed": len(backs), "shares sent into the loss": outage.get("sent_into_the_loss"), "shares counted from a resend": bz["resentCounted"],
+           "the hashtaker's repeats": bz["meter"]["repeats"], "slices paid after the resume": after, "closed": bz["closed"], "stopped": (hz.get("stopped") or {}).get("reason")})
     slices = [p["slice"] for p in oks]
     proven = lambda m: (m["work"], m["proven"])  # noqa: E731
     check("drop: every slice paid once, both proven counts equal, none past what's paid",
