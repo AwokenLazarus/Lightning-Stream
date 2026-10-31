@@ -932,9 +932,10 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - **A whole call has one deadline** (`tickets.max_answer_s`, 50 s), and answers plainly within about
   55 s, before its caller's 60 s. A question to a node or a seller that hangs goes on behind on a
   thread of its own and the call answers without it, and no secret leaves after the deadline, so a
-  caller that asks again does not pay twice. Two paths can still run past it: a prepaid ticket's
-  payment, which waits as long as `ln.timeout_s` (60 s), and the checks of the wallet's nodes that begin
-  a call, each up to its client's 30 s, before there is a session to pay.
+  caller that asks again does not pay twice. Three paths can still run past it: a prepaid ticket's
+  payment, which waits as long as `ln.timeout_s` (60 s); the checks of the wallet's nodes that begin
+  a call, each up to its client's 30 s, before there is a session to pay; and the watcher's reconcile
+  on a Lightning node that hangs, which asks after each ticket holding the book and the spend lock.
 - A ticket stuck in `sending` (the node calls it in flight and shows it on no way) for more than
   `ln.timeout_s` and 30 s, 90 s as shipped, is taken for stranded: the session ends (`ticket_session_ended`). Until then each call
   waits up to 12 s for it.

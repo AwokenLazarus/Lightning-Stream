@@ -412,6 +412,18 @@ impl Signer {
         *self.human_pubkey.write().unwrap_or_else(|p| p.into_inner()) = k;
     }
 
+    /// [`Self::lock`], given up at `by`: whoever holds it may be waiting on a node that hangs.
+    pub(crate) fn lock_by(&self, by: std::time::Instant) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            match self.spend.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() >= by => return None,
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
     pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
         match self.spend.lock() {
             Ok(g) => g,

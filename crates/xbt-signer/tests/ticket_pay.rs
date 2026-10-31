@@ -3191,8 +3191,9 @@ fn a_seller_that_never_shows_a_ticket_is_left_after_a_few_pauses() {
         }
         assert!(calls.len() < 4, "{calls:?}");
     }
-    // one to a pause: the file's second try, where the ticket was due, had none of its pause left, and is not another
-    assert!(calls.len() >= 2, "{calls:?}");
+    // one to a pause: the file's bytes after its early try cleared that one, and its second try, where the ticket was due,
+    // had none of its pause left and is not another. So three calls more
+    assert_eq!(calls.len(), 3, "{calls:?}");
     assert_ne!(r.session(&sid)["sessions"][0]["state"], "open", "{calls:?}");
     r.shop.standin.hold_streams(false);
     wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
@@ -3920,6 +3921,8 @@ fn a_lookup_answered_before_the_node_failed_a_ticket_changes_nothing_after() {
     let v = std::thread::scope(|sc| {
         let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 20_000));
         wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+        // the sends behind it have ended, and asked the node their own questions
+        std::thread::sleep(Duration::from_secs(1));
         {
             let mut s = r.ln.st.lock().unwrap();
             s.lookup_takes = Duration::from_secs(2);

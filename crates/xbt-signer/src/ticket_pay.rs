@@ -4069,7 +4069,10 @@ impl Signer {
             // asked for a ticket that cannot exist, so that it cannot release one a refill locked in this instant.
             // Where the pool is empty because the last fill was refused, that refusal is the reason
             let r = {
-                let _g = self.lock();
+                let Some(_g) = self.lock_by(due.call_by) else {
+                    return Err(with(refusal("ticket_busy", "the wallet's book is held up, by a node that does not answer: no secret was released; call again"),
+                                    json!({"session": hs.sid})));
+                };
                 self.ticket_release_locked(&json!({"session": hs.sid, "hash": "none"}))
             };
             let unfilled = lock(&hs.unfilled).clone().filter(|_| r["rule"] == "ticket_none");
@@ -4172,9 +4175,12 @@ impl Signer {
             return Err(with(refusal("ticket_call_deadline", "the call has reached its deadline (tickets.max_answer_s): no secret was released; call again"),
                             json!({"session": hs.sid})));
         }
-        // 2. the book: booked, then the secret exists here
+        // 2. the book: booked, then the secret exists here. Its lock waited for no later than the call's deadline
         let r = {
-            let _g = self.lock();
+            let Some(_g) = self.lock_by(due.call_by) else {
+                return Err(with(refusal("ticket_busy", "the wallet's book is held up, by a node that does not answer: no secret was released; call again"),
+                                json!({"session": hs.sid})));
+            };
             self.ticket_release_locked(&json!({"session": hs.sid, "hash": hash}))
         };
         if r["verdict"] != "allow" {

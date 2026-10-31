@@ -984,6 +984,12 @@ impl Signer {
                 hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(err("ln_send", "the send did not return")))).collect::<Vec<_>>()
             }));
         }
+        // did those that failed reach the router? The node's own record says; with no answer one stays `sending`. Asked with
+        // no lock held: a node that hangs here would hold up the whole wallet, a release's book among it
+        let outcomes: Vec<(Option<Value>, Option<crate::Error>)> = sends.iter().zip(outcomes).map(|((hash, _), sent)| match sent {
+            Ok(p) => (Some(p), None),
+            Err(e) => (ln.lookup(hash).ok().flatten(), Some(e)),
+        }).collect();
         // what the node made of each
         let _g = self.lock();
         let mut tickets = vec![];
@@ -992,12 +998,7 @@ impl Signer {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             let (mut locked, mut slot_failed) = (0usize, 0usize);
-            for ((hash, _), sent) in sends.iter().zip(outcomes) {
-                let (pmt, unsent) = match sent {
-                    Ok(p) => (Some(p), None),
-                    // did it reach the router? The node's own record says; with no answer it stays `sending`
-                    Err(e) => (ln.lookup(hash).ok().flatten(), Some(e)),
-                };
+            for ((hash, _), (pmt, unsent)) in sends.iter().zip(outcomes) {
                 // an error the node's record did not replace: it goes with the ticket's row
                 let unsent = unsent.filter(|_| pmt.is_none());
                 if let Some(pmt) = &pmt {
