@@ -906,11 +906,14 @@ CHECKS = {"terms": terms, "file": file, "page": page, "swarm": swarm, "cheat": c
 
 
 def main() -> int:
-    names = sys.argv[1:] or list(CHECKS)
-    unknown = [n for n in names if n not in CHECKS]
+    asked = sys.argv[1:] or list(CHECKS)
+    unknown = [n for n in asked if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)
         return 2
+    # in their own order, whatever the order asked: kill last, since a node killed while it sent a payment can leave it
+    # in flight with nothing on its channel for good (settle_down), and the checks after it wait for a quiet channel
+    names = [n for n in CHECKS if n in asked]
     t0 = time.time()
     try:
         setup()

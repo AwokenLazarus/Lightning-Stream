@@ -49,7 +49,7 @@
 # Report: run/lottery_regtest.json and run/lottery_regtest.log.
 #
 #   scripts/lottery_regtest.sh              every check
-#   scripts/lottery_regtest.sh file swarm   only these
+#   scripts/lottery_regtest.sh file swarm   only these (always in the order above: kill last)
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$PWD
