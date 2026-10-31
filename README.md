@@ -57,7 +57,9 @@ money**, and allow a seller. Our demo shop, **Lightning Stream Genesis**, has th
   free); paid relays come in an update.
 - **Rent hashrate.** A *hashmaker* lists its miners and a *hashtaker* rents them into its own
   DATUM Gateway, paid as it uses them, seconds at a time. Both apps check every share's hash
-  themselves, and the renter's gateway hides which shares win. ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
+  themselves, and the renter's gateway hides which shares win. Selling works now; renting needs a
+  DATUM Gateway that masks its jobs, which comes in a follow-up release with Lazarus Pool support.
+  ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
 - **Agents.** An AI agent pays through the same wallet over MCP and never holds a key.
 - **A local AI address.** The app gives the box an OpenAI-compatible address on the owner's network.
   Any AI app or agent that speaks that API uses the sellers' models through it, paid per token, each

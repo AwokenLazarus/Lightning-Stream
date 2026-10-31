@@ -759,12 +759,20 @@ impl App {
         };
         // the buyer's own DATUM Gateway: where rented work goes
         let datum = st["datum"]["addr"].as_str().unwrap_or("");
-        let ready = st["datum"]["reachable"] == true;
+        let reachable = st["datum"]["reachable"] == true;
+        // renting needs a gateway that hides which shares win: checked from its jobs when this page loads, whatever pool
+        let masked = st["blinding"]["state"] == "blinded";
+        let ready = reachable && masked;
         let found: Vec<String> = st["datum"]["found"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
         let (class, head, next) = if datum.is_empty() {
             ("warn", "No DATUM Gateway yet", "Rented work goes to your own DATUM Gateway, which builds the blocks and is paid through your pool. Set its address below.")
-        } else if !ready {
+        } else if !reachable {
             ("bad", "Can't reach your DATUM Gateway", "Check that it is running, and that its address below is right.")
+        } else if !masked {
+            ("warn", "Renting needs a gateway that masks its jobs",
+             "Rented work goes to your own DATUM Gateway, and it has to hide which shares win, so a hashmaker can't keep back the ones that would be blocks. \
+              Yours doesn't do that yet. A gateway app that does is coming soon. Until then renting stays off here, and nothing is paid. \
+              Renting out your own miners works now.")
         } else {
             ("good", "Ready to rent", "")
         };
@@ -853,8 +861,10 @@ impl App {
             }
         }
 
-        // what its jobs show: from the jobs themselves, for whatever pool it mines to
-        b.push_str(&blinding_card(&st["blinding"]));
+        // what its jobs show, once they show it: the notice above says what's needed when they don't
+        if masked {
+            b.push_str(&blinding_card(&st["blinding"]));
+        }
         // the DATUM Gateway's address
         b.push_str(&format!("<section class=\"card\"><h2>Your DATUM Gateway</h2><form method=\"post\" action=\"./hashrate\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"datum\">\
@@ -878,6 +888,9 @@ impl App {
         let g = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
         let n = |k: &str| g(k).parse::<u64>().unwrap_or(0);
         let r: Result<String, String> = match g("action").as_str() {
+            "rent" | "trial" if call(&base, &token, "GET", "/status", None).is_ok_and(|st| st["blinding"]["state"] != "blinded") => {
+                Err("Renting needs a DATUM Gateway that masks its jobs. Nothing was paid.".into())
+            }
             "rent" => {
                 if n("budget") == 0 {
                     Err("Set the most this rental may cost.".into())

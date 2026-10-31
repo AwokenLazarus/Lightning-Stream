@@ -291,6 +291,11 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                 .collect();
             drop(g);
             let found: Vec<&String> = candidates.iter().filter(|a| reachable(a)).collect();
+            // looked at again when the renter's page asks and the last look is old or of another gateway
+            let stale = lock(r).shown.as_ref().is_none_or(|(d, _, at)| *d != datum || xbt_hashlink::now_ms().saturating_sub(*at) > LOOK_EVERY.as_millis() as u64);
+            if stale && !datum.is_empty() && reachable(&datum) {
+                look_at_upstream(r);
+            }
             let blinding = lock(r).shown.as_ref().filter(|(for_datum, ..)| *for_datum == datum).map(|(_, shown, at)| {
                 let mut v = shown.to_json();
                 v["checkedMs"] = json!(at);

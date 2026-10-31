@@ -2386,6 +2386,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     let (renter, rseen) = control_standin(|m, p| match (m, p) {
         ("GET", "/status") => json!({
             "datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
+            "blinding": {"state": "blinded", "why": "solo", "words": "Blinded: a hashmaker can't tell which shares win, so it can't drop those."},
             "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
                          "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12},
                                   "walletMovedSats": 1002, "leftWithSellerMsat": 800000}}]}),
@@ -3889,12 +3890,67 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     assert!(!br.get("/sell-hashrate").body.contains("Below mining value"));
 }
 
+/// A renter whose DATUM Gateway doesn't mask its jobs (a stock gateway: nothing to open them, so they can't be checked) is
+/// told plainly before any click, every Rent is off, and a rent sent anyway is refused with nothing paid. One whose
+/// gateway does mask can rent.
+#[test]
+fn renting_waits_for_a_gateway_that_masks_its_jobs() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    fn offers() -> Value {
+        json!({"offers": [{"name": "Big miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+                           "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": "https://miners.example/hashrate", "payNode": "02aa"}]})
+    }
+    for masked in [false, true] {
+        let (renter, rseen) = if masked {
+            control_standin(|m, p| match (m, p) {
+                ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                             "blinding": {"state": "blinded", "why": "solo", "words": "Blinded: a hashmaker can't tell which shares win."}}),
+                ("GET", "/offers") => offers(),
+                ("POST", "/rent") => json!({"ok": true, "rental": "r1"}),
+                _ => json!({"error": "no"}),
+            })
+        } else {
+            control_standin(|m, p| match (m, p) {
+                ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                             "blinding": {"state": "can't be checked", "why": "the gateway's API: connection refused", "words": "This can't be checked."}}),
+                ("GET", "/offers") => offers(),
+                ("POST", "/rent") => json!({"ok": true, "rental": "r1"}),
+                _ => json!({"error": "no"}),
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let rtok = dir.path().join("renter-token");
+        std::fs::write(&rtok, "r".repeat(64)).unwrap();
+        let bx = start(json!({}), false, |c| {
+            c.hash.renter = Some(renter.clone());
+            c.hash.renter_token = Some(rtok.clone());
+        });
+        let mut br = logged_in(&bx);
+        let p = br.get("/hashrate");
+        let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
+        let card = &card[..card.find("</section>").unwrap()];
+        if masked {
+            assert!(p.body.contains("Ready to rent") && !p.body.contains("masks its jobs"), "{}", p.body);
+            assert!(card.contains("<button>Rent</button>"), "{card}");
+        } else {
+            assert!(p.body.contains("Renting needs a gateway that masks its jobs") && p.body.contains("A gateway app that does is coming soon")
+                    && p.body.contains("nothing is paid"), "{}", p.body);
+            assert!(card.contains("<button disabled>Rent</button>"), "{card}");
+            assert!(!p.body.contains("can't be checked") && !p.body.contains("refused"), "no scary words: {}", p.body);
+            let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("budget", "1000"), ("minutes", "60"), ("miners", "1")]);
+            assert!(br.flash_after(&r).contains("Nothing was paid"));
+            assert!(!rseen.lock().unwrap().iter().any(|(m, p, _, _)| m == "POST" && p == "/rent"), "no rent reached the renter's service");
+        }
+    }
+}
+
 /// The renter's offer card says the start fee, in sats and seconds, and a trial and a budget include it.
 #[test]
 fn an_offer_shows_its_start_fee() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let (renter, _rseen) = control_standin(|m, p| match (m, p) {
-        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": []}),
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
         ("GET", "/offers") => json!({"offers": [
             {"name": "Big miners", "linkKey": "02bb", "priceMsat": 3_235_000, "sliceWork": (1u128 << 48).to_string(), "startSlices": 2, "proves": true,
              "miners": 1, "freeMiners": 1, "freeHs": "41000000000000", "payUrl": "https://miners.example/hashrate", "payNode": "02aa"},

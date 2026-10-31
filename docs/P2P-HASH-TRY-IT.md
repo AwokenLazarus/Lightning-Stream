@@ -1,6 +1,8 @@
 # p2p-hash: try it
 
 Rent BLAKE2b hashrate from someone, or rent yours out, paid in sats as you use it, seconds at a time.
+
+**In 0.2.0:** Renting hashrate needs a DATUM Gateway that masks its jobs (hides which shares win), so a hashmaker can't keep back the shares that would be blocks. No released gateway does that yet: a gateway app that does is coming in a follow-up release, and Lazarus Pool support with it. Until then the app checks your gateway, says so, and rents nothing. Selling hashrate (renting out your own miners) works now.
 The hashtaker's own DATUM Gateway makes the jobs. Nobody holds anyone's money. How it works:
 [P2P-HASH.md](P2P-HASH.md).
 
