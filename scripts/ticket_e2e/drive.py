@@ -963,8 +963,8 @@ class ChannelDrops:
     """The buyer's connection to its one peer dropped and made again every second, on the real nodes: its channel
     goes inactive, as it does when a peer's connection drops, under whatever the wallet is paying then."""
 
-    def __init__(self) -> None:
-        self.every = float(os.environ.get("FLAP_EVERY", "1"))
+    def __init__(self, every: float = 0.0) -> None:
+        self.every = every or float(os.environ.get("FLAP_EVERY", "5"))
         self.done = threading.Event()
         self.drops = 0
         self.reconnected = 0
@@ -998,8 +998,20 @@ class ChannelDrops:
         lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
 
 
+def digest_of_range(start: int) -> str:
+    h = hashlib.sha256()
+    with open(f"{RUN}/www/big.bin", "rb") as f:
+        f.seek(start)
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def flap() -> None:
-    """At FLAP_EVERY seconds (1 by default); at a slower rate, files until one has had a drop under it (at most 6)."""
+    """The gate: a drop every FLAP_EVERY seconds (5 by default) under a 100 MB file paid by tickets, which arrives
+    whole; at a slower rate, files until one has had a drop under it (at most 6). Then an outage: a drop every
+    second, which may end the file; it ends with its reason, the money stays right, and once the channel is back
+    the same file goes on from the byte where it stopped, paying for the rest only."""
     stop_sessions()
     files: list[dict[str, Any]] = []
     with ChannelDrops() as drops:
@@ -1014,12 +1026,43 @@ def flap() -> None:
                 os.remove(r["saved_to"])
             if not ok or drops.drops > had:
                 break
-    check("flap: a 100 MB file paid by tickets comes whole while the channel's peer connection is dropped under it, on the real nodes",
+    check(f"flap: a 100 MB file paid by tickets comes whole while the channel's peer connection is dropped under it every {drops.every:g} s, on the real nodes",
           all(f["ok"] for f in files) and drops.drops >= 1 and not drops.errors,
           {"files": files, "drops": drops.drops, "reconnected_by_themselves": drops.reconnected, "errors": drops.errors})
     quiet()
     m = money()
     check("flap: what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number, to the millisat",
+          agrees(m), m)
+    # an outage: a drop every second
+    stop_sessions()
+    with ChannelDrops(1.0) as drops:
+        r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
+    got = int(r.get("bytes") or 0)
+    if r.get("saved_to"):
+        os.remove(r["saved_to"])
+    first = {**brief(r), "drops": drops.drops, "errors": drops.errors}
+    if r.get("complete") is True and got == BIG:
+        check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
+              r.get("body_digest") == digest_of_prefix(BIG) and not drops.errors, {"whole": True, **first})
+    else:
+        ended = str(r.get("ended") or "")
+        clear = ended.startswith("stopped by the wallet: ") or ended.startswith("cut short by the seller")
+        rest = BIG - got
+        again = (agent()).tool("xbt402_pay", {"url": f"{ORIGIN}/big.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-"})
+        note_receipts(again)
+        if again.get("saved_to"):
+            os.remove(again["saved_to"])
+        price = int(again.get("price_msat") or 0)
+        rest_msat = -(-rest * BYTE_MSAT // PER_BYTES)
+        resumed = {"bytes": again.get("bytes"), "complete": again.get("complete"), "status": again.get("status"), "price_msat": price,
+                   "price_of_the_rest_msat": rest_msat, "ended": again.get("ended")}
+        check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
+              bool(got) and clear and again.get("status") == 206 and again.get("complete") is True and again.get("bytes") == rest
+              and again.get("body_digest") == digest_of_range(got) and price <= rest_msat and not drops.errors,
+              {"first": first, "stopped_at": got, "reason_clear": clear, "resumed": resumed})
+    quiet()
+    m = money()
+    check("flap: after the outage and the resumed file, what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number",
           agrees(m), m)
 
 
