@@ -41,6 +41,8 @@ pub struct State {
     /// Every this many `getblockcount`s one fails, as a busy node's does; 0: none.
     pub height_fails_every: u64,
     pub height_asked: u64,
+    /// Every call hangs this long and then fails, as a hung node does at its client's timeout.
+    pub hang_ms: u64,
 }
 
 pub struct FakeChain {
@@ -224,6 +226,12 @@ impl Node for FakeChain {
         {
             let mut s = self.st.lock().unwrap();
             s.calls.push(method.into());
+            let hang = s.hang_ms;
+            if hang > 0 {
+                drop(s);
+                std::thread::sleep(std::time::Duration::from_millis(hang));
+                return Err(rpc_err("timed out"));
+            }
             if s.down {
                 return Err(rpc_err("connection refused"));
             }

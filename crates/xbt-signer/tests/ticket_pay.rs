@@ -790,6 +790,8 @@ struct PayState {
     /// How long the node takes to say what became of a payment, and how many times it was asked.
     lookup_takes: Duration,
     lookups: usize,
+    /// The hashes asked of the node, in the order answered.
+    lookup_log: Vec<String>,
 }
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
@@ -975,7 +977,8 @@ impl LnBackend for PayLn {
             s.lookup_takes
         };
         std::thread::sleep(takes);
-        let s = self.state();
+        let mut s = self.state();
+        s.lookup_log.push(hash.to_string());
         if s.down || s.router_down {
             return Err(node_err("LN node unreachable"));
         }
@@ -1101,6 +1104,10 @@ struct Tap {
     drop_cap: AtomicBool,
     /// Leave out the size the buyer was shown (`X-Xbt402-Max-Size`): the seller then sends as one that ignores it.
     drop_size: AtomicBool,
+    /// The next `status`, and the next `cancel`, are this slow, held as a real one is to the read timeout it was sent with.
+    status_slow_ms: AtomicU64,
+    cancel_slow_ms: AtomicU64,
+    drop_none: AtomicU64,
 }
 
 impl TicketWire for Tap {
@@ -1122,6 +1129,13 @@ impl TicketWire for Tap {
         let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
                           cap_msat: cap_of(headers) };
         self.log.lock().unwrap().push(seen.clone());
+        let slow = if seen.path.starts_with("/x402/ticket/status") { &self.status_slow_ms } else if seen.path.starts_with("/x402/ticket/cancel") { &self.cancel_slow_ms } else { &self.drop_none };
+        let d = Duration::from_millis(slow.swap(0, Ordering::SeqCst));
+        if d > read_timeout {
+            std::thread::sleep(read_timeout);
+            return Err(xbt402::ChannelError::new("timeout", "the seller did not answer within the wallet's wait".to_string()));
+        }
+        std::thread::sleep(d);
         let kept: Vec<(String, String)> = headers.iter().filter(|(k, _)| !(self.drop_cap.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)))
             .filter(|(k, _)| !(self.drop_size.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_SIZE_HEADER)))
             .cloned().collect();
@@ -3160,11 +3174,13 @@ fn a_seller_that_never_shows_a_ticket_is_left_after_a_few_pauses() {
     assert!(file["ended"].as_str().unwrap().contains("ticket_not_ready"), "{file}");
     let polled = r.tap.seen("/x402/ticket/status").len() - polls;
     assert!(polled < 25, "{polled} questions in one pause");
+    // a seller slow to answer the cancel of a stop made inside a release does not keep the caller for it
+    r.tap.cancel_slow_ms.store(8_000, Ordering::SeqCst);
     let mut calls = vec![];
     loop {
         let t = Instant::now();
         let next = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
-        assert!(t.elapsed() < Duration::from_secs(6), "{:?} {next}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_millis(6_500), "{:?} {next}", t.elapsed());
         let said = format!("{} {}", str_of(&next["rule"]), str_of(&next["ended"]));
         calls.push(said.clone());
         if said.contains("ticket_seller_stalled") {
@@ -3182,7 +3198,7 @@ fn a_seller_that_never_shows_a_ticket_is_left_after_a_few_pauses() {
 #[test]
 fn calls_side_by_side_do_not_wait_one_pause_after_another() {
     let _g = env_lock();
-    let r = seller_waits_as_shipped(json!({}));
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 2_000}}));
     r.shop.standin.hold_streams(true);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..5u64).map(|i| {
@@ -3196,7 +3212,7 @@ fn calls_side_by_side_do_not_wait_one_pause_after_another() {
         }).collect();
         for h in hs {
             let (took, v) = h.join().unwrap();
-            assert!(took < Duration::from_secs(30), "{took:?} {v}");
+            assert!(took < Duration::from_secs(14), "{took:?} {v}");
             assert_eq!(v["verdict"], "deny", "{v}");
             assert!(!str_of(&v["rule"]).is_empty(), "a plain answer: {v}");
         }
@@ -3527,6 +3543,346 @@ fn the_waits_of_a_release_end_at_the_calls_deadline() {
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_not_ready")), "{v}");
     assert_eq!(r.tap.secrets().len(), 0);
     r.shop.standin.hold_streams(false);
+}
+
+/// [`shipped_with_pool_filled`], with the owner's `extra`.
+fn shipped_by(extra: Value) -> Rig {
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(extra, 30, shipped_shop());
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((v["complete"].as_bool(), v["balance_msat"].as_str()), (Some(true), Some("0")), "{v}");
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    r
+}
+
+/// Nothing more leaves once the call has answered, whatever it left going on behind.
+fn assert_nothing_leaves_after(r: &Rig, v: &Value) {
+    let secrets = r.tap.secrets().len();
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(r.tap.secrets().len(), secrets, "a secret left after the call answered: {v}");
+}
+
+/// The chain RPC hangs in the middle of a file (30 s and then an error, as its client's timeout gives): the last tip stands,
+/// the tickets at hand go, the refill goes on behind on its own thread, and the caller has a plain answer inside the pause.
+#[test]
+fn a_chain_node_that_hangs_during_a_file_costs_the_caller_one_pause() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let hung_at = Cell::new(Instant::now());
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        hung_at.set(Instant::now());
+        r.node.chain.st.lock().unwrap().hang_ms = 30_000;
+    });
+    assert!(hung_at.get().elapsed() < Duration::from_secs(20), "{:?} {v}", hung_at.get().elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].is_string(), "{v}");
+    assert_nothing_leaves_after(&r, &v);
+    r.node.chain.st.lock().unwrap().hang_ms = 0;
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// At the shipped deadline: the chain RPC hangs at 42 s of a long answer by the second, where a question of 30 s would run
+/// past the caller's 60 s, charged for all of it. It answers by the deadline and the wait for its last receipt.
+#[test]
+fn a_chain_node_that_hangs_late_in_a_long_answer_leaves_the_caller_its_answer() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let t0 = Instant::now();
+    let v = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(42).saturating_sub(t0.elapsed()));
+            r.node.chain.st.lock().unwrap().hang_ms = 30_000;
+        });
+        r.pay("/timed/1000000", 30_000)
+    });
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(57), "{took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].is_string(), "{v}");
+    let price = v["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+    assert!(price <= (took.as_secs() + 1) * 400_000, "{price} msat in {took:?}: {v}");
+    assert_nothing_leaves_after(&r, &v);
+    r.node.chain.st.lock().unwrap().hang_ms = 0;
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// The lookups of the wallet's node hang late in an answer: the same, at a short deadline.
+#[test]
+fn a_lightning_node_that_hangs_late_in_an_answer_leaves_the_caller_its_answer() {
+    let _g = env_lock();
+    let r = shipped_by(json!({"tickets": {"max_answer_s": 8}}));
+    let t0 = Instant::now();
+    let v = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(4));
+            let mut s = r.ln.st.lock().unwrap();
+            s.lookup_takes = Duration::from_secs(30);
+            s.down = true;
+        });
+        r.pay("/timed/1000000", 30_000)
+    });
+    assert!(t0.elapsed() < Duration::from_secs(15), "{:?} {v}", t0.elapsed());
+    assert!(v["ended"].is_string() || v["rule"].is_string(), "{v}");
+    assert_nothing_leaves_after(&r, &v);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.lookup_takes = Duration::ZERO;
+        s.down = false;
+    }
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// A seller slow to answer `status` (28 s, inside the read timeout), where a release asks it and where the last receipt
+/// is asked for: what is left of the deadline is all it gets. Shown with a deadline of 8 s.
+#[test]
+fn a_seller_slow_with_its_status_does_not_spend_the_callers_limit() {
+    let _g = env_lock();
+    for at_poll in [true, false] {
+        let r = shipped_by(json!({"tickets": {"max_answer_s": 8}}));
+        let t0 = Instant::now();
+        let v = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                if at_poll {
+                    std::thread::sleep(Duration::from_secs(2));
+                    r.shop.standin.hold_streams(true);
+                    std::thread::sleep(Duration::from_secs(1));
+                } else {
+                    std::thread::sleep(Duration::from_millis(7_800));
+                }
+                r.tap.status_slow_ms.store(28_000, Ordering::SeqCst);
+            });
+            r.pay("/timed/1000000", 30_000)
+        });
+        assert!(t0.elapsed() < Duration::from_secs(16), "at_poll {at_poll}: {:?} {v}", t0.elapsed());
+        assert!(v["ended"].is_string(), "{v}");
+        assert_nothing_leaves_after(&r, &v);
+        r.shop.standin.hold_streams(false);
+        stop_and_wait_for_tickets_back(&r, &v["session"]);
+        assert_money_agrees(&r);
+    }
+}
+
+/// A seller slow with its 402, up to the call's deadline: no secret is released for a call whose caller is about to give up.
+#[test]
+fn no_secret_leaves_past_the_calls_deadline() {
+    let _g = env_lock();
+    UPSTREAM_WAIT_SECS.store(40, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 3}}));
+    UPSTREAM_WAIT_SECS.store(UPSTREAM_WAIT_DEFAULT_SECS, Ordering::SeqCst);
+    first_call_with_the_pool_shown(&r);
+    // 800 sat left: spent, so that the next call needs a ticket
+    let spent = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+    assert_eq!(spent["complete"].as_bool(), Some(true), "{spent}");
+    let before = r.tap.secrets().len();
+    let mut once = true;
+    r.tap.set(Box::new(move |seen, _real| {
+        if !seen.paid && seen.path.starts_with("/latehead/") && std::mem::take(&mut once) {
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        None
+    }));
+    let t0 = Instant::now();
+    let v = r.pay("/latehead/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(7), "{:?} {v}", t0.elapsed());
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_call_deadline")), "{v}");
+    assert_eq!(r.tap.secrets().len(), before, "{v}");
+    assert_eq!(r.tap.seen("/latehead/").iter().filter(|s| s.paid).count(), 0, "{v}");
+    r.tap.clear();
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// The try on new terms keeps the first's deadline: a first ask of 5 s, of a deadline of 6 s, then a head of 25 s.
+#[test]
+fn the_try_on_new_terms_keeps_the_calls_deadline() {
+    let _g = env_lock();
+    UPSTREAM_WAIT_SECS.store(40, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 6}}));
+    UPSTREAM_WAIT_SECS.store(UPSTREAM_WAIT_DEFAULT_SECS, Ordering::SeqCst);
+    first_call_with_the_pool_shown(&r);
+    let mut once = true;
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || !seen.path.starts_with("/latehead/") || !std::mem::take(&mut once) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["amount"] = "998000".into();
+                e["extra"]["price"]["requestMsat"] = "998000".into();
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let t0 = Instant::now();
+    let v = r.pay("/latehead/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?} {v}", t0.elapsed());
+    r.tap.clear();
+}
+
+/// One slow stretch does not end a healthy session. Three small calls side by side at a seller late with its next tickets by
+/// more than one pause: each call's pause begins when its turn comes, one stall is counted, and the next call's ticket is shown.
+#[test]
+fn one_slow_stretch_with_calls_side_by_side_leaves_the_session_open() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 2_000}}));
+    let first = first_call_with_the_pool_shown(&r);
+    let sid = first["session"].as_str().unwrap().to_string();
+    r.shop.standin.hold_streams(true);
+    // the pool and the credit used up, whole
+    let drained = r.pay(&format!("/files/{}", 39 * MIB), 20_000);
+    assert_eq!(drained["complete"].as_bool(), Some(true), "{drained}");
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(3));
+            r.shop.standin.hold_streams(false);
+        });
+        let hs: Vec<_> = (0..3u64).map(|i| {
+            let r = &r;
+            sc.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100 * i));
+                r.pay("/page/10", CALL)
+            })
+        }).collect();
+        let answers: Vec<Value> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(answers.iter().all(|v| v["rule"] != "ticket_seller_stalled"), "{answers:?}");
+        assert!(answers.iter().any(|v| v["status"] == 200), "the ticket went once it was shown: {answers:?}");
+    });
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "open");
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["session"].as_str()), (Some(200), Some(sid.as_str())), "{next}");
+    assert_money_agrees_after_stop(&r, &next["session"]);
+}
+
+fn assert_money_agrees_after_stop(r: &Rig, session: &Value) {
+    stop_and_wait_for_tickets_back(r, session);
+    assert_money_agrees(r);
+}
+
+/// Calls queued behind others' pauses for as long as they may wait: refused at their own deadline, not kept for a turn.
+#[test]
+fn a_call_queued_behind_others_answers_at_its_own_deadline() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 3, "ready_wait_ms": 2_500}}));
+    r.shop.standin.hold_streams(true);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..4u64).map(|i| {
+            let r = &r;
+            sc.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50 * i));
+                let at = Instant::now();
+                let v = r.pay("/page/10", CALL);
+                (at.elapsed(), v)
+            })
+        }).collect();
+        for h in hs {
+            let (took, v) = h.join().unwrap();
+            assert!(took < Duration::from_secs(6), "{took:?} {v}");
+            assert_eq!(v["verdict"], "deny", "{v}");
+        }
+    });
+    assert_eq!(r.tap.secrets().len(), 0);
+    r.shop.standin.hold_streams(false);
+}
+
+/// A pool of 2, a refill due and nothing on its way, and the Lightning node away for a few seconds: the seller is waiting
+/// for this ticket, so the refill is asked again inside the pause, and the file comes through.
+#[test]
+fn a_lightning_node_away_with_a_refill_due_does_not_end_the_file() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        r.ln.st.lock().unwrap().down = true;
+        std::thread::sleep(Duration::from_secs(4));
+        r.ln.st.lock().unwrap().down = false;
+    });
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
+/// Its router alone away: the sends do not reach it, and hold their places in the pool until they are given up (the limit in
+/// `CHANGELOG.md`). The file ends in plain words, with no advice to cancel stale tickets there are none of.
+#[test]
+fn a_router_away_with_a_refill_due_ends_the_file_in_plain_words() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        r.ln.st.lock().unwrap().router_down = true;
+        std::thread::sleep(Duration::from_secs(4));
+        r.ln.st.lock().unwrap().router_down = false;
+    });
+    assert_eq!(v["complete"], false, "{v}");
+    let ended = v["ended"].as_str().unwrap();
+    assert!(!ended.contains("stale"), "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// The node's word on a ticket, old by the time it is applied: the book has moved on, and nothing is retired or booked for it.
+#[test]
+fn a_lookup_answered_before_the_node_failed_a_ticket_changes_nothing_after() {
+    let _g = env_lock();
+    let audit_count = |r: &Rig, what: &str| {
+        let mut n = 0;
+        let mut dirs = vec![r.root.clone(), r.root.join(".run")];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.path().is_file() {
+                    if let Ok(text) = std::fs::read(e.path()) {
+                        n += String::from_utf8_lossy(&text).matches(what).count();
+                    }
+                }
+            }
+        }
+        n
+    };
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(120);
+    }
+    let n = 60 * MIB;
+    let v = std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 20_000));
+        wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+        {
+            let mut s = r.ln.st.lock().unwrap();
+            s.lookup_takes = Duration::from_millis(200);
+            s.lookup_log.clear();
+        }
+        // a round asks after each ticket in turn: the first of it has been answered, and the rest of the round is still to come
+        wait_for("a round to be under way", || r.ln.st.lock().unwrap().lookup_log.len() == 1);
+        let h = r.ln.st.lock().unwrap().lookup_log[0].clone();
+        {
+            let mut s = r.ln.st.lock().unwrap();
+            let p = s.payments.iter_mut().rev().find(|p| p["payment_hash"] == h.as_str()).unwrap();
+            p["status"] = "FAILED".into();
+            p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
+            p["htlcs"] = json!([]);
+        }
+        // the watcher: the book brought to the node
+        r.status();
+        let (ledger, retired) = (r.ledger_sum(), audit_count(&r, "ticket_retired"));
+        std::thread::sleep(Duration::from_millis(1_200));
+        assert_eq!((r.ledger_sum(), audit_count(&r, "ticket_retired")), (ledger, retired), "the stale word on {h} was applied");
+        r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
+        r.ln.st.lock().unwrap().unseen_until.clear();
+        t.join().unwrap()
+    });
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
 }
 
 #[test]
