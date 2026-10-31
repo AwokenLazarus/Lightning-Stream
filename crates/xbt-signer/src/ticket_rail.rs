@@ -58,11 +58,21 @@ use crate::{err, Result};
 /// default (the gateway's `lottery.invoice_secs`), and a busy issuer can leave a request
 /// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
 const OFFER_FETCH_S: i64 = 5;
+/// `f` on a thread of its own, its answer waited for until `by`: a node that hangs takes that thread, not the caller, and
+/// what it was asked for goes on there. `None`: no answer by then.
+pub(crate) fn within<T: Send + 'static>(by: Instant, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new().name("ticket-within".into()).spawn(move || {
+        let _ = tx.send(f());
+    }).ok()?;
+    rx.recv_timeout(by.saturating_duration_since(Instant::now())).ok()
+}
+
 /// How many times more a lock round asks for checks a chain node that fails now and then refused.
 const NODE_CHECK_TRIES: usize = 3;
-/// How long a ticket may be in `sending` before it is taken for stranded: past the node's own timeout for a send (60 s
-/// as shipped) and well past any wait for it, so that it is no ticket a slow route is still carrying.
-const SENDING_STRANDED_S: f64 = 90.0;
+/// How far past the node's own timeout for a send (`ln.timeout_s`, 60 s as shipped) a ticket may be in `sending` before it
+/// is taken for stranded: well past any wait for it, so that it is no ticket a slow route is still carrying.
+const SENDING_STRANDED_PAST_TIMEOUT_S: f64 = 30.0;
 
 /// Why the book books nothing more for a session whose stop has begun ([`Signer::ticket_is_stopping`]).
 const STOPPING: &str = "the session is being stopped: nothing more is released, locked or bought for it";
@@ -1205,9 +1215,10 @@ impl Signer {
             };
             let next = st.book.usable(&sid, tip).filter(|t| named.is_empty() || t.hash == named).cloned();
             let Some(mut t) = next else {
-                return Ok(with(refusal("ticket_none", "no locked ticket of this session can be released now: lock more (ticket_offer), and ask the \
-                                                       seller to cancel the stale ones"),
-                               json!({"session": sid, "stale": st.book.stale(&sid, tip), "want": st.book.want(&s, now)})));
+                let stale = st.book.stale(&sid, tip);
+                let advice = if stale.is_empty() { "lock more (ticket_offer)" } else { "lock more (ticket_offer), and ask the seller to cancel the stale ones" };
+                return Ok(with(refusal("ticket_none", format!("no locked ticket of this session can be released now: {advice}")),
+                               json!({"session": sid, "stale": stale, "want": st.book.want(&s, now)})));
             };
             let dest = format!("ln:{}", s.payee);
             let sats = booking_sats(t.msat, t.fee_limit_msat);
@@ -2164,12 +2175,43 @@ impl Signer {
         }
     }
 
-    /// Ask the wallet's node about the tickets of this session not yet released, and bring the book to what it says. Each
-    /// is asked with no lock held, so that a slow node holds up nobody else, and the asking ends at `stop`. Returns whether
-    /// a ticket is on its way and not yet one a release can take: one the node calls in flight and has not shown locked,
-    /// locked with no expiry the node has reported, or one the node gave no answer about. A send the node has no record
-    /// of gives nothing to wait for.
-    pub(crate) fn ticket_refresh_coming(&self, sid: &str, stop: &dyn Fn() -> bool) -> bool {
+    /// Ask the wallet's node about the tickets of this session not yet released, and bring the book to what it says. On a
+    /// thread of its own, one round at a time for a session, so that a node that hangs takes that thread and not the
+    /// caller: the round's answer is waited for until `by`, and `stop` ends the waiting. Returns whether a ticket is on its
+    /// way and not yet one a release can take ([`Signer::ticket_refresh_round`]); a node that has not answered in time
+    /// has said nothing of it, and it may be.
+    pub(crate) fn ticket_refresh_coming(&self, sid: &str, stop: &dyn Fn() -> bool, by: Instant) -> bool {
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else { return self.ticket_refresh_round(sid) };
+        if !self.ticket_refreshing.lock().unwrap_or_else(|p| p.into_inner()).insert(sid.to_string()) {
+            return true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let own = sid.to_string();
+        let spawned = std::thread::Builder::new().name("ticket-refresh".into()).spawn(move || {
+            let coming = me.ticket_refresh_round(&own);
+            me.ticket_refreshing.lock().unwrap_or_else(|p| p.into_inner()).remove(&own);
+            let _ = tx.send(coming);
+        });
+        if spawned.is_err() {
+            self.ticket_refreshing.lock().unwrap_or_else(|p| p.into_inner()).remove(sid);
+            return true;
+        }
+        loop {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(coming) => return coming,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if stop() => return false,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() >= by => return true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    /// One round: each ticket asked about with no lock held, so that a slow node holds up nobody else, until the session is
+    /// being stopped. Returns whether a ticket is one the node calls in flight and has not shown locked, locked with no
+    /// expiry the node has reported, or one the node gave no answer about. A send the node has no record of gives nothing
+    /// to wait for.
+    fn ticket_refresh_round(&self, sid: &str) -> bool {
         let Some(ln) = self.ln.clone() else { return false };
         let hashes: Vec<String> = {
             let Ok(g) = self.ticket_store() else { return false };
@@ -2178,7 +2220,7 @@ impl Signer {
         };
         let mut said = vec![];
         for h in hashes {
-            if stop() {
+            if self.ticket_is_stopping(sid) {
                 return false;
             }
             let a = ln.lookup(&h);
@@ -2189,7 +2231,8 @@ impl Signer {
         let Some(st) = g.as_mut() else { return false };
         let mut coming = false;
         for (h, a) in said {
-            if let Ok(Some(p)) = &a {
+            // what the node said may be old by now: a ticket the book has moved on from is the reconcile's, which asks afresh
+            if let (Ok(Some(p)), true) = (&a, st.book.tickets.get(&h).is_some_and(|t| t.state.unreleased())) {
                 // unchecked: a row that cannot be written now is asked about again at the next round
                 let _ = self.ticket_apply(st, &h, p);
             }
@@ -2206,15 +2249,19 @@ impl Signer {
 
     /// A ticket of the session in `sending` for longer than a send can take, that the node calls in flight and shows on no
     /// way, and that is not waiting its turn to be sent: it will never be locked, and the pool counts it. A node that gives
-    /// no answer says nothing.
-    pub(crate) fn ticket_sending_stranded(&self, sid: &str) -> Option<String> {
-        let ln = self.ln.clone()?;
+    /// no answer by `by` says nothing.
+    pub(crate) fn ticket_sending_stranded(&self, sid: &str, by: Instant) -> Option<String> {
+        let (ln, me) = (self.ln.clone()?, self.me.get().and_then(std::sync::Weak::upgrade)?);
         let now = self.engine.now();
+        let most = LnPolicy::from_map(&self.config().ln).timeout_s as f64 + SENDING_STRANDED_PAST_TIMEOUT_S;
         let old: Vec<String> = {
             let g = self.ticket_store().ok()?;
-            g.as_ref()?.book.of_session(sid).iter().filter(|t| t.state == TState::Sending && now - t.sent_ts > SENDING_STRANDED_S).map(|t| t.hash.clone()).collect()
+            g.as_ref()?.book.of_session(sid).iter().filter(|t| t.state == TState::Sending && now - t.sent_ts > most).map(|t| t.hash.clone()).collect()
         };
-        old.into_iter().find(|h| !self.ticket_is_queued(h) && matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT" && !htlcs_in_flight(&p)))
+        if old.is_empty() {
+            return None;
+        }
+        within(by, move || old.into_iter().find(|h| !me.ticket_is_queued(h) && matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT" && !htlcs_in_flight(&p)))).flatten()
     }
 
     /// Whether the wallet's own node calls a ticket's payment in flight and carries it on none of
