@@ -872,4 +872,74 @@ mod tests {
         let h = trust::aggregate(&b, "", 4_000_000_000_000, &events);
         assert_eq!((h["keys"].as_u64(), h["counted"].as_u64(), h["recent"].as_array().map(Vec::len)), (Some(1), Some(trust::PER_KEY as u64), Some(1)), "{h}");
     }
+
+    /// A gateway that says nothing for `delay` after each connection opens, then carries everything both ways.
+    fn slow_to_answer(to: String, delay: Duration) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let Ok(up) = TcpStream::connect(&to) else { continue };
+                let (mut c2, mut up2) = (c.try_clone().unwrap(), up.try_clone().unwrap());
+                let (mut c, mut up) = (c, up);
+                std::thread::spawn(move || std::io::copy(&mut c, &mut up));
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    std::io::copy(&mut up2, &mut c2)
+                });
+            }
+        });
+        addr
+    }
+
+    /// The seconds before the first accepted share (connecting, moving the miners, a slow gateway) are not taken
+    /// from a rental's time, and the money holds: every slice paid once, no work past what was paid.
+    #[test]
+    fn a_rentals_time_starts_at_its_first_accepted_share() {
+        let (h, listing) = hashmaker_with_two_miners();
+        let terms = listing.terms.clone();
+        let (delay, duration) = (Duration::from_secs(4), Duration::from_secs(3));
+        let cfg = hashtaker::Config {
+            hashmaker: listing.link_addr.clone(),
+            hashmaker_key: listing.link_key,
+            key: noise::fresh_key(),
+            upstream: slow_to_answer(pool(), delay),
+            user: "late.rented".into(),
+            terms: terms.clone(),
+            rental: "late".into(),
+            listing: "lab".into(),
+            stop_paying_after: None,
+            idle: Duration::from_secs(30),
+            duration: Some(duration),
+            report: None,
+            payer: None,
+            miners: 1,
+            budget_msat: None,
+            cut: None,
+            live: None,
+            gateway_api: None,
+            allow_unblinded: true,
+        };
+        let t0 = xbt_hashlink::now_ms();
+        let report = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap();
+        let ended = xbt_hashlink::now_ms();
+        assert_eq!(report["closed"], "rental time over", "{report}");
+        let first = report["firstAcceptedMs"].as_u64().unwrap_or_else(|| panic!("no share was accepted: {report}"));
+        assert!(first >= t0 + delay.as_millis() as u64, "the gateway said nothing for {delay:?}: {first} from {t0}");
+        assert!(ended >= first + duration.as_millis() as u64, "the rental ran its {duration:?} from the first accepted share: {first} to {ended}");
+        assert!(ended < first + duration.as_millis() as u64 + 3000, "and stopped then: {first} to {ended}");
+        // the money: each slice paid once, as both sides count them, and no work served past what was paid
+        let t1 = Instant::now();
+        while h.finished().is_empty() {
+            assert!(t1.elapsed() < Duration::from_secs(30), "the hashmaker never ended it: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let fin = &h.finished()[0];
+        let paid = fin["paid"].as_u64().unwrap();
+        assert!(paid > terms.start_slices, "{fin}");
+        assert_eq!(report["paidSlices"].as_u64(), Some(paid), "{report} / {fin}");
+        let served: u128 = fin["meter"]["work"].as_str().unwrap().parse().unwrap();
+        assert!(served <= xbt_hashlink::order::paid_work(paid, terms.start_slices, terms.slice_work), "served {served} past what {paid} slices pay for: {fin}");
+    }
+
 }

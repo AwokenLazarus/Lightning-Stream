@@ -220,6 +220,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A hashmaker's published summary carries counts and totals only: rentals, slices and sats paid, and work. Before,
   it listed each renter's app key and the hour each rental ended, without the renter's say. It now goes out at
   most every six hours, dated to the hour; the rental-by-rental list stays on the hashmaker's box.
+- A rental's time runs from the first share your gateway accepts, so the seconds spent connecting and moving the
+  miners, or a gateway slow to answer, no longer come out of it.
 
 **The app**
 - A visit to a shop reached by its key is headed by the shop's name, and pages show such a shop by
