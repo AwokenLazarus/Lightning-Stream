@@ -9243,6 +9243,8 @@ fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pay
         let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
         let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
         if !open.is_empty() && !once.swap(true, Ordering::SeqCst) {
+            // (the wallet has seen that payment end by now, and knows how long it took)
+            std::thread::sleep(Duration::from_millis(300));
             // an invoice is dated a second back: 5 s left, which every prepaid invoice may have and these wins may not
             clock.fetch_add(24, Ordering::SeqCst);
             let standin = standin.clone();
