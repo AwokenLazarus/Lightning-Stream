@@ -6344,6 +6344,31 @@ fn a_session_stopped_while_an_event_stream_by_the_second_is_quiet_ends_it_at_onc
     });
 }
 
+/// An answer priced by the second whose seller has gone quiet, under a charge cap its session's
+/// credit already covers: no ticket is due for it, so nothing but the wallet's own clock can end
+/// it. That clock cuts it where the seconds reach the cap, not where the seller's wait runs out.
+///
+/// FAILS before the clock checked the cap: the call waits out the quiet seller (30 s).
+#[test]
+fn a_quiet_answer_by_the_second_is_cut_at_its_charge_cap() {
+    let _g = env_lock();
+    let r = patient_seller(|| Rig::new(json!({})));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    let secrets = r.tap.secrets().len();
+    let q0 = QUIET.load(Ordering::SeqCst);
+    let at = Instant::now();
+    // 1 sat a second, a cap of 3 sat: the third second started is the cap
+    let out = r.call("xbt402_pay", json!({"url": r.shop.url("/quiettick/10"), "max_sats": CALL, "max_charge_sats": 3, "task": "film"}));
+    let took = at.elapsed();
+    assert!(QUIET.load(Ordering::SeqCst) > q0, "the seller went quiet: {out}");
+    assert!(took < Duration::from_secs(8), "cut by the wallet's clock at the cap, not after the seller's 30 s: {took:?}: {out}");
+    assert!(out["ended"].as_str().is_some_and(|e| e.contains("charge cap")), "{out}");
+    let charged: u64 = out["price_msat"].as_str().unwrap().parse().unwrap();
+    assert!(charged <= 3_000, "charged {charged} msat for a cap of 3 sat: {out}");
+    assert_eq!(r.tap.secrets().len(), secrets, "no ticket for it: the session's credit covers its cap");
+}
+
 /// A session stopped with several VPN tunnels open at once (two devices, each with its own): each
 /// ends and takes its last receipt, and the stop counts all their bytes at the route's price.
 #[test]

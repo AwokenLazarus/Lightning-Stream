@@ -4421,6 +4421,14 @@ impl Signer {
                     }
                     // the seconds started are drawn on the balance as they start, bytes or none
                     account(st.cost(s.0));
+                    // the call's charge cap is used up by this clock, bytes or none (or the answer has been open as long
+                    // as the owner allows): it ends here. A quiet answer whose credit covers its cap is due no ticket, and
+                    // its read would otherwise wait on for the seller
+                    if let Some(why) = st.over(s.0) {
+                        s.1.get_or_insert(why);
+                        wake.notify_all();
+                        return;
+                    }
                     // paid for in the last fifth of the second before it
                     let into = u64::from(st.started.elapsed().subsec_millis());
                     let seen = credited();

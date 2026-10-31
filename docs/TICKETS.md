@@ -1553,8 +1553,9 @@ the invoice and every rule of a release, the ledger row, the payment, and then t
 `max_sats` bounds what the call books, whole tickets and their fee limits included; its charge cap
 (`max_charge_sats`, else `max_sats`) bounds what it uses. Money moves a ticket at a time, and a
 ticket is released or bought for a call only when it fits what is left of the call's `max_sats`,
-its fee limit included, and only while what the call's tickets have credited does not already
-cover its charge cap: the call could never be charged for one more. Where the seller's own size
+its fee limit included, and, for an answer priced as it goes, only while the credit it can draw
+(the session's balance at its head with what its call released, less what answers beside it drew)
+does not already cover its charge cap: the call could never be charged for one more. Where the seller's own size
 does not fit and its terms let the wallet ask for a smaller one (`minTicketMsat`), the wallet asks
 for the largest that fits, in whole sats, and no larger than the call's charge cap needs: a ticket
 of that cap with its fee limit, or, where that is larger, the seller's smallest for a prepaid
