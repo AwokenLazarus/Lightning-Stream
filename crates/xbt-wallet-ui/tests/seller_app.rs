@@ -639,10 +639,11 @@ fn two_apps_of_one_seller_are_two_visits_on_two_origins() {
         assert_eq!(st, 302);
         (visit, port, cookie_of(&h, "__ls_visit_").unwrap(), csrf)
     };
-    // the media server keeps each buyer's history, and says so before it opens; the podcast player does not
+    // the media server keeps each buyer's history, and says so before it opens. The choice is the shop's (the wallet
+    // keeps it per shop, and an app's pages reach the shop's other routes): the podcast player of the same shop shows it too
     let page_of = |entry: &str, base: &str| send("GET", &format!("{wallet}/app?u={}&b={}", enc(entry), enc(base)), &session, None).2;
     assert!(page_of(&format!("{jf}web/"), &jf).contains("keeps your watch history"));
-    assert!(!page_of(&pod, &pod).contains("watch history"));
+    assert!(page_of(&pod, &pod).contains("keeps your watch history"));
     // staying anonymous there is the owner's choice, kept by the wallet
     let p = page_of(&format!("{jf}web/"), &jf);
     let csrf0 = { let i = p.find("name=\"csrf\" value=\"").unwrap() + 19; p[i..i + p[i..].find('"').unwrap()].to_string() };
