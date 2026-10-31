@@ -41,6 +41,7 @@ tmpfs `/tmp`.
   hashrate/        agp  uid 10010  0700  p2p-hash: the hasher's link and Nostr keys, the renter's key and its saved DATUM Gateway address
   stream-relay/    agp  uid 10016  0700  the built-in Stream relay: its Let's Encrypt certificates (certs/) and attempt log
   vpn/             agp  uid 10018  0700  the VPN service: its keys (WireGuard, the exit's link, Nostr) and category lists (lists/)
+  datum/           agp  uid 10021  0700  the Stream Gateway (DATUM-compatible): submitblocks/, every block it submitted, kept for a resubmit
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
   cmpd/            cmp  uid 10012  0700  device runtime state, secrets/
   cmpd-cache/      cmp  uid 10012  0700  the model span cache: LARGE, its own mount (CMP_CACHE_DIR), safe to prune
@@ -69,6 +70,9 @@ tmpfs `/tmp`.
                    VPN pages, read by the VPN service
   run/vpn-status/  uid 10018, gid 10019 (xbt-vpn-status), 0750: endpoint.json, status.json, exit-status.json
                    (0640), written by the VPN service, read by the UI; the group has the service and the UI in it
+  run/datum/       uid 10005, gid 10021 (xbt-datum), 0750: config.json (0640), the Stream Gateway's config, written by
+                   the UI's Hashrate page (no secret in it); rpc.cookie (0600, uid 10021), the node's RPC user:password
+                   with no newline, written by init from the credentials the signer gets, read by the gateway only
   run/ai/          uid 10005, gid 10014 (xbt-ai), 0770: the AI endpoint's files (docs/INFERENCE.md):
                    credentials.json (0660), the store of AI keys and local links, edited by the UI's AI page and
                    booked by the connector; sellers.json (0640), written by the AI page; state.json (0640), the
@@ -132,6 +136,7 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10017 | (group xbt-relay-status only) | |
 | 10018 | xbt-vpn | xbt-vpn (the VPN service: the owner's devices' WireGuard endpoint, and an exit if offered) |
 | 10019 | (group xbt-vpn-status only) | |
+| 10021 | xbt-datum | xbt-datum-gateway (the Stream Gateway, DATUM-compatible: masks the renter's jobs; the UI is in its group, for run/datum) |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |
