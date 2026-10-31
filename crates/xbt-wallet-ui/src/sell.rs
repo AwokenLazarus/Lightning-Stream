@@ -909,8 +909,12 @@ impl App {
             routes.push(r);
         }
         // this box's VPN exit, when it is offered: buyers' wallets open paid tunnels here (announced on Nostr with the exit)
+        // and listed, so a shop that sells only its exit still has a listing: a shop reached by its key is
+        // found, and reached (its transport document travels with the listing), through nothing else.
+        // Kind "api", which every app reads: a buyer's VPN service opens the tunnel, not Browse
         if let Some(r) = self.vpn_route() {
             routes.retain(|x| x.get("path") != r.get("path"));
+            sections.push(json!({"name": "VPN exit", "kind": "api", "path": r["path"], "items": []}));
             routes.push(r);
         }
         c.insert("routes".into(), Value::Array(routes));
