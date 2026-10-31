@@ -425,6 +425,7 @@ def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
             if sid not in FORGOTTEN:
                 gave_up = signer("ticket_stop", {"session": sid, "forget_credit": True})
                 FORGOTTEN.add(sid)
+                GAVE_UP[sid] = str(gave_up.get("left_with_seller_msat"))
                 # the seller's own count for that seller session: what a call that died before its receipt could not note
                 if gave_up.get("seller_released_msat") is not None:
                     RECEIPTS[sid] = max(RECEIPTS.get(sid, 0), int(gave_up["seller_released_msat"]))
@@ -436,6 +437,7 @@ def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
 
 
 CREDIT_TOLD: list[dict[str, Any]] = []  # credit given up, as both sides count it
+GAVE_UP: dict[str, str] = {}  # what the seller said it held of a session, when the session's credit was given up
 
 
 def credit_told_alike() -> list[dict[str, Any]]:
@@ -1339,6 +1341,10 @@ def kill() -> None:
             credit = credit_left_or_taken_over(str(under_way.get("session")), "")
             credit["ok"] = bool(credit["logged"]) or credit["taken_over"] > 0
         stop_sessions()
+        # nothing logged and nothing taken over is right only where the seller itself says that session holds nothing: spent to its last msat
+        if credit is not None:
+            credit["seller_left_msat"] = GAVE_UP.get(str(under_way.get("session")))
+            credit["ok"] = credit["ok"] or credit["seller_left_msat"] == "0"
         inv, m, waited = never_sent_settled(booked_and_once(), money())
         how = result.get("error") or result.get("ended") or ("complete" if result.get("complete") else brief(result))
         ok = not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m)
