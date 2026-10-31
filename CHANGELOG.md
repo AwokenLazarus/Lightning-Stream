@@ -122,10 +122,10 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that sells only its VPN exit is listed, so buyers can find it by its key.
 
 **Hashrate**
-- Selling hashrate (renting out your miners) works now. Renting needs masked jobs, solo or through a pool, so a
-  hashmaker can't keep back the shares that would be blocks. No released gateway shows that yet: a gateway app that
-  masks, and support for pools that mask (Lazarus Pool first), come in a follow-up release. Until then the Rent page
-  checks your gateway when it opens, says so, and rents nothing.
+- Renting needs masked jobs, solo or through a pool, so a hashmaker can't keep back the shares that would be blocks.
+  The app comes with a DATUM Gateway that masks its jobs and rents into it. The Rent page checks the gateway's jobs
+  when it opens and before each rental; if they aren't masked (the gateway isn't running, or the app is set to
+  another gateway), it says so and rents nothing.
 - Both apps check every share's hash themselves, from the Stratum lines alone. A share counts only
   if it proves its work; neither side takes the other's word, and a renter's verdicts set nothing.
 - Renters: paid as you use it, seconds at a time. You never have more paid for and not yet received

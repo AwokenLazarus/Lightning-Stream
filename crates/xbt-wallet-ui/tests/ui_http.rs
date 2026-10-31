@@ -3930,11 +3930,11 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
         let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
         let card = &card[..card.find("</section>").unwrap()];
         if masked {
-            assert!(p.body.contains("Ready to rent") && !p.body.contains("masks its jobs"), "{}", p.body);
+            assert!(p.body.contains("Ready to rent") && !p.body.contains("masking its jobs"), "{}", p.body);
             assert!(card.contains("<button>Rent</button>"), "{card}");
         } else {
-            assert!(p.body.contains("Renting needs a gateway that masks its jobs") && p.body.contains("A gateway app that masks its jobs, and support for pools that mask, are")
-                    && p.body.contains("nothing is paid"), "{}", p.body);
+            assert!(p.body.contains("Your gateway isn&#39;t masking its jobs") || p.body.contains("Your gateway isn't masking its jobs"), "{}", p.body);
+            assert!(p.body.contains("the gateway that comes with this app is running") && p.body.contains("nothing is paid") && !p.body.contains("coming soon"), "{}", p.body);
             assert!(card.contains("<button disabled>Rent</button>"), "{card}");
             assert!(!p.body.contains("can't be checked") && !p.body.contains("refused"), "no scary words: {}", p.body);
             let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("budget", "1000"), ("minutes", "60"), ("miners", "1")]);

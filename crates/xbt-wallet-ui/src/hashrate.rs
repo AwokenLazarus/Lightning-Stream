@@ -769,10 +769,10 @@ impl App {
         } else if !reachable {
             ("bad", "Can't reach your DATUM Gateway", "Check that it is running, and that its address below is right.")
         } else if !masked {
-            ("warn", "Renting needs a gateway that masks its jobs",
-             "Rented work goes to your own DATUM Gateway, and its jobs have to hide which shares win, so a hashmaker can't keep back the ones that would \
-              be blocks, solo or through a pool. Yours doesn't show that yet. A gateway app that masks its jobs, and support for pools that mask, are \
-              coming soon. Until then renting stays off here, and nothing is paid. Renting out your own miners works now.")
+            ("warn", "Your gateway isn't masking its jobs",
+             "Rented work goes to your DATUM Gateway, and its jobs have to hide which shares win, so a hashmaker can't keep back the ones that would \
+              be blocks. The gateway this app is set to isn't showing that. Check that the gateway that comes with this app is running, \
+              or, if you set the address below to another gateway, set it back to that one. Renting stays off until then, and nothing is paid.")
         } else {
             ("good", "Ready to rent", "")
         };
