@@ -280,6 +280,30 @@ pub struct WireAnswer {
     pub length: Option<u64>,
     /// The body as it arrives. A body cut short ends in an error or before `length`.
     pub body: Box<dyn Read + Send>,
+    /// Ends the connection the body arrives on, from any thread: a read waiting on a quiet seller
+    /// returns at once. `None`: a wire with no such handle, whose body ends only as its seller ends it.
+    pub closer: Option<Closer>,
+}
+
+/// [`WireAnswer::closer`].
+pub type Closer = Arc<dyn Fn() + Send + Sync>;
+
+/// Shut this process's TCP connection from `local` to `peer`, wherever its socket is held (ureq
+/// keeps an answer's to itself): found among the open files by its two addresses, which no other
+/// connection shares while it is open.
+fn shut_connection(local: std::net::SocketAddr, peer: std::net::SocketAddr) {
+    use std::os::fd::{BorrowedFd, RawFd};
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd").or_else(|_| std::fs::read_dir("/dev/fd")) else { return };
+    for fd in dir.flatten().filter_map(|e| e.file_name().to_str()?.parse::<RawFd>().ok()) {
+        // SAFETY: borrowed for these calls only. A descriptor closed meanwhile fails them; one reused
+        // meanwhile by another file is not a socket between these two addresses, and is left alone
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let s = socket2::SockRef::from(&fd);
+        if s.local_addr().ok().and_then(|a| a.as_socket()) == Some(local) && s.peer_addr().ok().and_then(|a| a.as_socket()) == Some(peer) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    }
 }
 
 impl WireAnswer {
@@ -303,8 +327,8 @@ impl WireAnswer {
     /// [`WireAnswer::read_small`], the whole of it read by `deadline`: past it, the answer is cut
     /// off however slowly its bytes still come.
     fn read_small_by(self, cap: u64, deadline: Instant) -> Result<Vec<u8>> {
-        let WireAnswer { status, headers, length, body } = self;
-        WireAnswer { status, headers, length, body: Box::new(ByDeadline { inner: body, deadline }) }.read_small(cap)
+        let WireAnswer { status, headers, length, body, closer } = self;
+        WireAnswer { status, headers, length, body: Box::new(ByDeadline { inner: body, deadline }), closer }.read_small(cap)
     }
 }
 
@@ -468,8 +492,10 @@ impl UreqWire {
         let headers: Vec<(String, String)> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_uppercase(), v.to_string()))).collect();
         let bodiless = method.eq_ignore_ascii_case("HEAD") || matches!(status, 100..=199 | 204 | 304);
         let length = if bodiless { Some(0) } else { resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()) };
+        let (local, peer) = (resp.local_addr(), resp.remote_addr());
+        let closer: Option<Closer> = (!bodiless).then(|| Arc::new(move || shut_connection(local, peer)) as Closer);
         let body: Box<dyn Read + Send> = if bodiless { Box::new(std::io::empty()) } else { Box::new(resp.into_reader()) };
-        Ok(WireAnswer { status, headers, length, body })
+        Ok(WireAnswer { status, headers, length, body, closer })
     }
 
     /// A TCP connection to a seller's `host`:`port`, as ureq's own calls reach it: a seller's link
@@ -751,7 +777,7 @@ impl TicketWire for UreqWire {
                     None => body,
                 }, None)
             };
-            WireUpgrade { answer: WireAnswer { status, headers, length: if status == 101 { None } else { length }, body }, writer }
+            WireUpgrade { answer: WireAnswer { status, headers, length: if status == 101 { None } else { length }, body, closer: None }, writer }
         };
         if !https {
             let mut s = sock;
@@ -3972,7 +3998,7 @@ impl Signer {
                             continue;
                         }
                     }
-                    break (WireAnswer { status: 402, length: None, headers: vec![], body: Box::new(std::io::Cursor::new(serde_json::to_vec(&v).unwrap_or_default())) },
+                    break (WireAnswer { status: 402, length: None, headers: vec![], body: Box::new(std::io::Cursor::new(serde_json::to_vec(&v).unwrap_or_default())), closer: None },
                            receipt);
                 }
                 break (ans, receipt);
@@ -4053,7 +4079,7 @@ impl Signer {
                     return fail(hs, &spent, with(refusal("ticket_refused", "the seller asks to know who this wallet is first, and could not be told"), json!({"status": 403})));
                 }
                 // any other refusal the seller signed (a path it does not serve, say) is its answer, handed on as it is
-                ans = WireAnswer { status: 403, length: Some(body.len() as u64), headers, body: Box::new(std::io::Cursor::new(body)) };
+                ans = WireAnswer { status: 403, length: Some(body.len() as u64), headers, body: Box::new(std::io::Cursor::new(body)), closer: None };
             }
             if matches!(ans.status, 402 | 503) {
                 let status = ans.status;
@@ -4188,6 +4214,7 @@ impl Signer {
             .saturating_add(m.reserved.saturating_sub(held));
         let length = ans.length;
         let mut body = ans.body;
+        let closer = ans.closer;
         // shared with the timer of an answer priced by the second: how far the body is, and why it stopped
         let state: Mutex<(u64, Option<String>, bool)> = Mutex::new((0, stop, false));
         let wake = Condvar::new();
@@ -4321,6 +4348,30 @@ impl Signer {
                         return;
                     }
                     let _ = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner());
+                });
+            }
+            if let Some(close) = closer.as_ref().filter(|_| !ws) {
+                // an answer read as it arrives waits in its read on a quiet seller (one at the edge of its credit, waiting
+                // for a ticket that is not coming): stopped (the session, or a ticket that could not go), its connection
+                // ends here, so the read returns now and not after the seller's own wait. A WebSocket's watcher does this
+                // for a socket
+                let (state, wake) = (&state, &wake);
+                scope.spawn(move || {
+                    let mut s = lock(state);
+                    loop {
+                        if s.2 {
+                            return;
+                        }
+                        if hs.ending.load(Ordering::SeqCst) {
+                            s.1.get_or_insert_with(|| "ticket_session: the session was stopped".to_string());
+                        }
+                        if s.1.is_some() {
+                            break;
+                        }
+                        s = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner()).0;
+                    }
+                    drop(s);
+                    close();
                 });
             }
             if price.second_msat > 0 {
@@ -5062,7 +5113,7 @@ mod tests {
                 Ok(1)
             }
         }
-        let ans = WireAnswer { status: 200, headers: vec![], length: None, body: Box::new(Slow(100)) };
+        let ans = WireAnswer { status: 200, headers: vec![], length: None, body: Box::new(Slow(100)), closer: None };
         let started = Instant::now();
         assert!(ans.read_small_by(1 << 20, Instant::now() + Duration::from_secs(1)).is_err());
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -5187,7 +5238,7 @@ mod tests {
         for bad in ["bytes 19-10/100", "bytes 10-100/100", "bytes */100", "10-19/100", "bytes 10-19"] {
             assert_eq!(content_range(bad), None, "{bad}");
         }
-        let ans = |status: u16, cr: &str, length: Option<u64>| WireAnswer { status, headers: vec![("CONTENT-RANGE".into(), cr.into())], length, body: Box::new(std::io::empty()) };
+        let ans = |status: u16, cr: &str, length: Option<u64>| WireAnswer { status, headers: vec![("CONTENT-RANGE".into(), cr.into())], length, body: Box::new(std::io::empty()), closer: None };
         let asked = ByteRange::parse("bytes=10-");
         let mut a = ans(206, "bytes 10-19/100", None);
         let (v, refused) = answer_head(&mut a, asked);
