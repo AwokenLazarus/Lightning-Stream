@@ -789,6 +789,10 @@ impl App {
             b.push_str("</div>");
         }
 
+        // a solo renter's odds of a block come from its own node's difficulty, asked only when its jobs show solo
+        let solo = st["blinding"]["state"] == "blinded" && st["blinding"]["why"] == "solo";
+        let tip = if solo { self.mining_tip().ok() } else { None };
+
         // the offers: the main action
         b.push_str("<h2>Miners for rent</h2>");
         match call(&base, &token, "GET", "/offers", None) {
@@ -830,6 +834,7 @@ impl App {
                         ""
                     };
                     let history = history_panel(&x["history"]);
+                    let odds = solo_odds(&st["blinding"], tip.as_ref(), per_miner);
                     // what may leave the wallet for a trial's first ticket, as the hashtaker sets it (rail::caps_at),
                     // is said beside its price; a longer rental's tickets grow with its work, so it names no figure
                     let ticket = |k: &str| match x[k].as_u64() {
@@ -844,7 +849,7 @@ impl App {
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{old}{history}{allow}{trial}\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
@@ -997,6 +1002,30 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
              <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
+}
+
+/// The chance that `hs` hashes a second for `secs` find at least one block at `difficulty`: a block takes
+/// `difficulty × 2^32` hashes on average, and blocks come as a Poisson process.
+fn block_chance(hs: f64, secs: f64, difficulty: f64) -> f64 {
+    if hs <= 0.0 || secs <= 0.0 || difficulty <= 0.0 {
+        return 0.0;
+    }
+    -(-(hs * secs) / (difficulty * 4_294_967_296.0)).exp_m1()
+}
+
+/// A renter mining solo (its own gateway builds the blocks, as its jobs show) is told one machine's odds of a
+/// block in an hour, from its own node's difficulty. A pool shares its blocks out, so there it says nothing.
+fn solo_odds(blinding: &Value, tip: Option<&Tip>, hs: f64) -> String {
+    let (Some(tip), true) = (tip, blinding["state"] == "blinded" && blinding["why"] == "solo") else { return String::new() };
+    let p = block_chance(hs, 3600.0, tip.difficulty);
+    if p <= 0.0 {
+        return String::new();
+    }
+    let odds = if p >= 0.01 { format!("about {}", pct(p)) } else { format!("about 1 in {}", crate::html::group3((1.0 / p).round() as u64)) };
+    let days = tip.difficulty * 4_294_967_296.0 / hs / 86_400.0;
+    format!("<p class=\"small\">Mining solo, one machine's hour has {odds} chance of finding a block, by your node's difficulty now: at {} \
+             a block comes about every {} days on average, and most hours find none.</p>",
+            speed(hs), crate::html::group3(days.round() as u64))
 }
 
 /// A whole percentage.
@@ -1167,6 +1196,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_solo_renter_is_told_its_odds_of_a_block_from_its_own_nodes_difficulty() {
+        // 4 TH/s at difficulty 6.33e9: a block every 78.7 days on average
+        let tip = Tip { difficulty: 6.33e9, subsidy_sats: 312_500_000, height: 1 };
+        let mean_days = tip.difficulty * 4_294_967_296.0 / 4e12 / 86_400.0;
+        assert!((mean_days - 78.7).abs() < 0.05, "{mean_days}");
+        let hour = block_chance(4e12, 3600.0, tip.difficulty);
+        assert!((hour - 5.296e-4).abs() < 1e-6, "{hour}");
+        assert!((block_chance(4e12, mean_days * 86_400.0, tip.difficulty) - (1.0 - (-1f64).exp())).abs() < 1e-9, "one mean's time: 63%");
+        assert_eq!(block_chance(0.0, 3600.0, tip.difficulty), 0.0);
+        let solo = json!({"state": "blinded", "why": "solo"});
+        let w = solo_odds(&solo, Some(&tip), 4e12);
+        assert!(w.contains("about 1 in 1,888 chance of finding a block") && w.contains("at 4.00 TH/s a block comes about every 79 days"), "{w}");
+        assert!(solo_odds(&solo, Some(&tip), 4e18).contains("about 100% chance"), "a huge machine");
+        // through a pool, or with jobs not shown solo, or with no difficulty from the node: nothing said
+        for b in [json!({"state": "blinded", "why": "pool-key"}), json!({"state": "blinded", "why": "abw"}), json!({"state": "not blinded", "why": "solo"}), Value::Null] {
+            assert_eq!(solo_odds(&b, Some(&tip), 4e12), "", "{b}");
+        }
+        assert_eq!(solo_odds(&solo, None, 4e12), "");
+    }
 
     #[test]
     fn a_history_and_a_test_slice_read_plainly() {
