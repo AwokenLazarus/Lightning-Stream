@@ -731,6 +731,9 @@ struct PayState {
     peak: usize,
     /// The next sends fail as a full channel does, however many this says.
     fail_next: usize,
+    /// The next payment fails each time it is sent, as to a hop that stays full; `failing` is its hash.
+    fail_one: bool,
+    failing: Option<String>,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
     late_fail: usize,
@@ -917,7 +920,10 @@ impl LnBackend for PayLn {
             return Err(node_err("payment already exists"));
         }
         // a ticket of 40 blocks through one hop of 80 and the node's 3: no route inside a smaller limit
-        let failing = s.hop_full || s.fail_next > 0;
+        if std::mem::take(&mut s.fail_one) {
+            s.failing = Some(hash.clone());
+        }
+        let failing = s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str());
         s.fail_next = s.fail_next.saturating_sub(1);
         let late = !failing && s.late_fail > 0;
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
@@ -5271,7 +5277,7 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     let _g = env_lock();
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
     // the first payment finds no route, and again when it is sent once more: nothing is spent, and the win stays owed
-    r.ln.st.lock().unwrap().fail_next = 2;
+    r.ln.st.lock().unwrap().fail_one = true;
     let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
     // (the seller serves on for its grace of 64 pieces and then stops this buyer: the file may be cut short)
     let wins = v["wins"].as_u64().unwrap();
@@ -9019,11 +9025,17 @@ fn lapse_at(r: &Rig, looks: &[usize], secs: u64) {
     }));
 }
 
-/// Pays on until no win of the session is owed: what the wallet does for a buyer who goes on.
-fn pay_on(r: &Rig, sid: &str, wins: u64) -> u64 {
-    let again = r.pay("/tiny/10", 5);
-    assert_eq!((again["status"].as_u64(), again["session"].as_str()), (Some(200), Some(sid)), "{again}");
-    wins + again["wins"].as_u64().unwrap()
+/// The file is whole, every win of it is paid on one payment, and the wallet's checks refused at
+/// least `lapsed` invoices for having run out on the way.
+fn assert_paid_after_lapses(r: &Rig, v: &Value, size: usize, lapsed: usize) {
+    assert!(!v.to_string().contains("the owner's bounds") && !v.to_string().contains("lottery_seller_fault"), "{v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+    let refused = r.audit("ticket_refused");
+    let ran_out = refused.iter().filter(|e| e["rule"] == "ln_expired" || e["rule"] == "ticket_expiry").count();
+    assert!(ran_out >= lapsed, "{ran_out} invoices ran out, of {refused:?}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_wins(r, wins);
 }
 
 /// A win's invoice lapses in the wallet's queue: no bound of the owner's was met, and the win is
@@ -9033,20 +9045,11 @@ fn pay_on(r: &Rig, sid: &str, wins: u64) -> u64 {
 #[test]
 fn a_win_whose_invoice_lapsed_in_the_wallets_queue_is_paid_by_the_sellers_next_invoice() {
     let _g = env_lock();
-    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let r = draws_rig(json!({}));
     lapse_at(&r, &[1], 31);
-    let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
-    assert!(!v.to_string().contains("the owner's bounds"), "{v}");
-    let unpaid: Vec<&str> = v["wins_unpaid"].as_array().unwrap().iter().filter_map(|w| w["rule"].as_str()).collect();
-    assert!(unpaid.contains(&"ln_expired"), "{v}");
-    let sid = v["session"].as_str().unwrap().to_string();
-    let wins = pay_on(&r, &sid, v["wins"].as_u64().unwrap());
-    assert_wins(&r, wins);
-    let rows = win_tickets(&r, &sid);
-    let mut paid: Vec<u64> = rows.iter().filter(|t| t["state"] == "settled").map(|t| t["win"].as_u64().unwrap()).collect();
-    paid.sort_unstable();
-    paid.dedup();
-    assert_eq!(paid.len() as u64, wins, "every win paid, each once: {rows:?}");
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_paid_after_lapses(&r, &v, size, 1);
 }
 
 /// Three invoices that ran out in the wallet's queue are not three bad invoices of the seller's.
@@ -9055,14 +9058,10 @@ fn a_win_whose_invoice_lapsed_in_the_wallets_queue_is_paid_by_the_sellers_next_i
 #[test]
 fn invoices_that_lapsed_in_the_wallets_queue_are_no_fault_of_the_sellers() {
     let _g = env_lock();
-    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let r = draws_rig(json!({}));
     // 2 s short of the end of an invoice of 30 s: inside the 5 s a prepaid invoice must have left, `ticket_expiry`
     lapse_at(&r, &[1, 2, 3, 4], 28);
-    let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
-    let unpaid: Vec<&str> = v["wins_unpaid"].as_array().unwrap().iter().filter_map(|w| w["rule"].as_str()).collect();
-    assert!(unpaid.iter().any(|u| *u == "ticket_expiry" || *u == "ln_expired"), "{v}");
-    assert!(!v.to_string().contains("lottery_seller_fault") && !v.to_string().contains("the owner's bounds"), "{v}");
-    let sid = v["session"].as_str().unwrap().to_string();
-    let wins = pay_on(&r, &sid, v["wins"].as_u64().unwrap());
-    assert_wins(&r, wins);
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_paid_after_lapses(&r, &v, size, 3);
 }
