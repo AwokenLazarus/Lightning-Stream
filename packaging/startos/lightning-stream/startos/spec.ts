@@ -265,6 +265,8 @@ export function services(cfg: Config): ServiceSpec[] {
         B2_STREAM_DIR: '/data/run/signer/streams',
         // a copy of the one-time enrolment code for the setup page (run/enroll: the signer and the UI only)
         B2_ENROLL_CODE_COPY: '/data/run/enroll/enroll-code',
+        // shops reached by key: read for callers that pass no transport document (the AI address, agents)
+        XBT_SHOPS_FILE: '/data/run/shops/shops.json',
       },
       // run/ln: the rail macaroon (group xbt-ln-rail: the UI writes it, the signer reads it, the MCP cannot)
       mounts: [
@@ -273,6 +275,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/anchor', '/data/run/anchor', true),
         vol('run/ln', '/data/run/ln', true),
         vol('run/enroll', '/data/run/enroll'),
+        vol('run/shops', '/data/run/shops', true),
         ...cert,
       ],
       requires: ['witness'],
