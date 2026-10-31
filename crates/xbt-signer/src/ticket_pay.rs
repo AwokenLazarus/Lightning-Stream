@@ -1649,6 +1649,9 @@ struct Spent {
     booked_sats: i64,
     prepaid: usize,
     limit_sats: Option<i64>,
+    /// The call's charge cap (`max_charge_sats`, else its `max_sats`): a prepaid ticket bought for
+    /// it is sized to it where the seller lets the wallet choose ([`Signer::ticket_prepaid_size`]).
+    charge_sats: Option<i64>,
     /// No ticket may be released for the call (its `credit_only`).
     credit_only: bool,
     /// What the tickets released for the call come to, in msat: the credit its own answer may have
@@ -2712,7 +2715,7 @@ impl Signer {
                     let o = {
                         let _g = self.lock();
                         self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
-                                                                 "fit_sats": c.max_sats.max(0)}))
+                                                                 "fit_sats": c.max_sats.max(0), "charge_sats": c.charge_sats.max(0)}))
                     };
                     if o["verdict"] != "allow" {
                         let rule = str_or_empty(o.get("rule"));
@@ -3094,7 +3097,7 @@ impl Signer {
         // the call's max_sats bounds what leaves for it, a whole ticket included: a smaller ticket is asked for where
         // the seller's own does not fit and its terms allow one that does, and the call is refused before anything
         // is asked of the seller where none fits
-        let size = self.ticket_prepaid_size(&hs.sid, spent.left());
+        let size = self.ticket_prepaid_size(&hs.sid, spent.left(), spent.charge_sats);
         spent.room(size.map(|(_, face, booked)| (face, booked)), true)?;
         let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
@@ -3788,7 +3791,7 @@ impl Signer {
         // the call's max_sats bounds what leaves for it, a whole ticket included. A held ticket that does not fit
         // gives way to a smaller prepaid one where the seller sells those and one fits
         if let Err(d) = spent.room(self.ticket_next_booking(&hs.sid, &hash), false) {
-            let prepaid = self.ticket_prepaid_size(&hs.sid, spent.left());
+            let prepaid = self.ticket_prepaid_size(&hs.sid, spent.left(), spent.charge_sats);
             if prepaid.is_some_and(|(_, face, booked)| spent.room(Some((face, booked)), true).is_ok()) {
                 return self.ticket_buy_prepaid(hs, spent);
             }
@@ -3894,7 +3897,7 @@ impl Signer {
         // what the answer may charge; what may leave for it (a whole ticket included) is `max_sats`, in `spent`
         let max_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
         let dest = format!("ln:{}", hs.terms.terms.payee);
-        let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
+        let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), charge_sats: Some(c.charge_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
         let about = |hs: &HttpSession, spent: &Spent| {
             json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
                    "tickets_prepaid": spent.prepaid,
