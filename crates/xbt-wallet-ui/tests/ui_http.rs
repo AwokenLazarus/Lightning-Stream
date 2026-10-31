@@ -2024,6 +2024,7 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!(bx._app.refresh_shop_config(), Some("written"));
     assert!(listing().services.iter().any(|s| s.kind == "hashrate"));
     assert_eq!(tickets()["min_ticket_msat"], json!(546_000), "{}", tickets());
+    assert_eq!(top(&conf()), json!(100_000_000), "the route's top ticket, written at start too: {}", conf());
     assert_eq!(bx._app.refresh_shop_config(), Some("unchanged"), "and only once");
     // a relay named by hand is kept after the app's, and publishing written off stays off
     let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
