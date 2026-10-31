@@ -2492,8 +2492,7 @@ fn a_paid_request_answered_5xx_without_a_receipt_says_it_was_sent() {
     let v = r.pay("/page/10", CALL);
     r.tap.clear();
     assert_eq!((v["rule"].as_str(), v["status"].as_u64(), v["request_sent"].as_bool()), (Some("ticket_seller"), Some(524), Some(true)), "{v}");
-    // a request the seller refused unserved over its own signature (a short balance, say) is not one that left: the
-    // next call is served, and says so
+    // the session goes on: the next call is served, and says it was sent
     let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(true)), "{v}");
 }
