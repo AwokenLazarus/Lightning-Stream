@@ -70,8 +70,10 @@ def base_of(img):
 STREAM_MOUNT = "${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams"
 # image -> (component sub-dir or None, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
-    # run/enroll: the copy of the one-time enrolment code the signer writes for the setup page
-    "xbt-signer": ("signer", {"signer", "enroll"}, {"anchor", "ln"}),
+    # run/enroll: the copy of the one-time enrolment code the signer writes for the setup page. run/shops,
+    # read-only: the shops reached by key, for callers that hand it no transport document (the AI
+    # address, agents)
+    "xbt-signer": ("signer", {"signer", "enroll"}, {"anchor", "ln", "shops"}),
     "xbt-anchor-witness": ("witness", {"anchor"}, set()),
     # run/ui holds the UI-owned MCP token; the MCP may only read it. run/shops: the shops without a
     # web address the UI keeps, read by the connector and the MCP to hand to the signer
