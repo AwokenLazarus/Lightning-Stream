@@ -14,7 +14,8 @@ use serde_json::{json, Map, Value};
 use xbt_gateway::config::{Config as GatewayConfig, MAINNET_ACK, MAINNET_NOTICE, MAX_NOSTR_RELAYS};
 use xbt_gateway::node::{checked_macaroon, INFO_OPS, INVOICE_OPS};
 
-use crate::setup::{decode_macaroon, pin_card, pin_cert, write_shared, GATEWAY_CONNECTIONS, GW_CONFIG, GW_INFO, GW_INVOICES, MAINNET_CAPS, TEST_CAPS};
+use crate::setup::{decode_macaroon, pin_card, pin_cert, write_shared, GATEWAY_CONNECTIONS, GW_CONFIG, GW_INFO, GW_INVOICES, GW_SIGN, MAINNET_CAPS, TEST_CAPS};
+use crate::node_keys::{SIGN_ENTITY_OPS, SIGN_OPS};
 use super::{App, Ctx};
 use crate::html::{esc, json_block};
 use crate::server::Resp;
@@ -1082,8 +1083,13 @@ impl App {
         let t = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let npub = t("npub");
         let state = if !t("sign_error").is_empty() {
+            // no sign key: the node can't vouch until the owner gives one (StartOS: pasted, see step 1)
+            let paste = if self.cfg.gw.dir.join(GW_SIGN).is_file() { "" } else {
+                " Make a link signing key in your Lightning node's app (permission <code>message:write</code> only) and paste it under \
+                 Advanced settings, Replace the node keys."
+            };
             format!("<p><span class=\"pill warn\">Not yet reachable</span> Your Lightning node has not vouched for this shop's link: {}. \
-                     Buyers' apps refuse a link their seller's node has not vouched for.</p>", esc(&t("sign_error")))
+                     Buyers' apps refuse a link their seller's node has not vouched for.{paste}</p>", esc(&t("sign_error")))
         } else if v.get("signed_until").and_then(Value::as_u64).is_some() {
             let how = if v.get("private").and_then(Value::as_bool).unwrap_or(false) { "through a relay only (private)" } else { "directly when the networks allow, through a relay when not" };
             format!("<p><span class=\"pill good\">Reachable</span> Buyers' apps connect {how}, encrypted end to end.</p>")
@@ -1208,10 +1214,13 @@ impl App {
                 <form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"connect\">\
                 <label>First key: payment requests<textarea name=\"invoices_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\" required></textarea></label>\
                 <label>Second key: network time<textarea name=\"info_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\" required></textarea></label>\
+                <label>Third key: link signing <small>(needed to be reached directly through the app)</small><textarea name=\"sign_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\"></textarea></label>\
                 <details><summary>How do I make them?</summary><p>In your Lightning node's app (Lightning Fork), open the page called <em>Macaroons</em> \
-                and make two, each with exactly these permissions:</p><ul><li>First key: <code>{}</code></li><li>Second key: <code>{}</code></li></ul>\
+                and make three, each with exactly these permissions:</p><ul><li>First key: <code>{}</code></li><li>Second key: <code>{}</code></li>\
+                <li>Third key: <code>{}</code> (or <code>{}</code>). It lets your node vouch for your shop's link, so buyers' apps can check it is yours. \
+                It signs messages and does nothing else. Without it your shop can sell only at an https address of its own.</li></ul>\
                 <p class=\"hint\">Give each its own root key, so you can revoke it alone. The app refuses a key with more permissions than these.</p></details>\
-                <button>Connect</button></form></section>", INVOICE_OPS.join(" "), INFO_OPS.join(" ")));
+                <button>Connect</button></form></section>", INVOICE_OPS.join(" "), INFO_OPS.join(" "), SIGN_ENTITY_OPS.join(" "), SIGN_OPS.join(" ")));
         }
         b.push_str(&pin_card(&csrf, gw.node_pin, gw.node_rest.as_deref(), gw.node_tls_cert.as_deref(), "./sell"));
 
@@ -1461,6 +1470,7 @@ impl App {
             <form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"connect\"><h3>Replace the node keys</h3>\
             <label>Payment requests key<textarea name=\"invoices_macaroon\" rows=\"2\" class=\"mono\" autocomplete=\"off\"></textarea></label>\
             <label>Network time key<textarea name=\"info_macaroon\" rows=\"2\" class=\"mono\" autocomplete=\"off\"></textarea></label>\
+            <label>Link signing key <small>(<code>message:write</code> only)</small><textarea name=\"sign_macaroon\" rows=\"2\" class=\"mono\" autocomplete=\"off\"></textarea></label>\
             <button class=\"secondary\">Replace</button></form>\
             {}</details>",
             esc(&shop.proxies), esc(&shop.network),
@@ -1481,6 +1491,17 @@ impl App {
             }
             "connect" => (|| {
                 let mut macs = vec![];
+                // the link signing key is optional: without it the node never vouches for the shop's direct
+                // link, so the shop sells at a web address only (the shop key card says so)
+                let sign = g("sign_macaroon");
+                if !sign.is_empty() {
+                    let what = "The link signing key";
+                    let mac = decode_macaroon(&sign).map_err(|_| format!("{what} is not a key: copy it again, whole."))?;
+                    checked_macaroon(&mac, what, &SIGN_OPS, true)
+                        .or_else(|_| checked_macaroon(&mac, what, &SIGN_ENTITY_OPS, true))
+                        .map_err(|e| format!("{what} does not fit: {e}"))?;
+                    macs.push((GW_SIGN, mac));
+                }
                 for (field, file, ops, what) in [("invoices_macaroon", GW_INVOICES, &INVOICE_OPS[..], "The payment requests key"),
                                                  ("info_macaroon", GW_INFO, &INFO_OPS[..], "The network time key")] {
                     let text = g(field);

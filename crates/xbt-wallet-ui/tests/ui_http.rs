@@ -1706,6 +1706,59 @@ fn a_request_from_another_page_of_the_same_site_is_refused_and_home_still_opens(
     assert_eq!(br.send("POST", "/logout", Some(&format!("csrf={}", enc(&csrf))), &[("Sec-Fetch-Site", "same-origin")]).status, 303);
 }
 
+/// A box whose node keys are pasted (StartOS: Lightning Fork grants the wallet's key only) gives the
+/// gateway its link signing key on Sell too, or its node never vouches for the shop's direct link and
+/// no buyer can allow it. The key is optional, checked to sign messages and nothing else, and either
+/// way lnd writes that (the URI permission, or the `message:write` entity Lightning Fork bakes).
+#[cfg(unix)]
+#[test]
+fn a_pasted_link_signing_key_lets_the_node_vouch_for_the_direct_link() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    });
+    let mut br = logged_in(&bx);
+    let page = br.get("/sell").body;
+    assert!(page.contains("name=\"sign_macaroon\""), "step 1 asks for the link signing key: {page}");
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    let sign_uri = mac(&[("uri", &["/lnrpc.Lightning/SignMessage"])]);
+    let sign_entity = mac(&[("message", &["write"])]);
+    let sign = dir.join("sign.macaroon");
+
+    // a key that can do more than sign is refused, and nothing is written
+    let wide = mac(&[("message", &["write"]), ("invoices", &["write"])]);
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &wide)]);
+    assert!(br.flash_after(&r).contains("does not fit"));
+    assert!(!sign.exists() && !dir.join("invoices.macaroon").exists(), "nothing written when one key is refused");
+    // an invoices key in the signing field is refused
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", &inv)]);
+    assert!(br.flash_after(&r).contains("does not fit"));
+    assert!(!sign.exists());
+
+    // without it the shop connects (it can sell at a web address), and the page says what is missing
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info), ("sign_macaroon", "")]);
+    assert!(br.flash_after(&r).contains("connected"));
+    assert!(!sign.exists());
+    let page = br.get("/sell").body;
+    assert!(page.contains("name=\"sign_macaroon\""), "the replace form takes it later: {page}");
+
+    // Lightning Fork's kind (message:write) is taken on its own, the other keys kept
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("sign_macaroon", &sign_entity)]);
+    assert!(br.flash_after(&r).contains("connected"));
+    assert_eq!(hex::encode(std::fs::read(&sign).unwrap()), sign_entity);
+    assert_eq!(hex::encode(std::fs::read(dir.join("invoices.macaroon")).unwrap()), inv);
+    // and the URI kind, as Umbrel and Linux bake it, replaces it
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("sign_macaroon", &sign_uri)]);
+    assert!(br.flash_after(&r).contains("connected"));
+    assert_eq!(hex::encode(std::fs::read(&sign).unwrap()), sign_uri);
+}
+
 /// The one Lightning Stream app (`XBT_UI_SELL=1`): Sell sets up the gateway beside the wallet in
 /// plain words, one service at a time, and writes a config the gateway takes.
 #[cfg(unix)]

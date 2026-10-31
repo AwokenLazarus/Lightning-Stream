@@ -45,6 +45,9 @@ use crate::setup::{write_shared, GW_INFO, GW_INVOICES, GW_SIGN, RAIL_MACAROON, R
 /// What the gateway's sign key holds: lnd's SignMessage and no other call (a URI permission), so it
 /// can sign the statement that vouches for its link key and nothing that moves coins.
 pub const SIGN_OPS: [&str; 1] = ["uri:/lnrpc.Lightning/SignMessage"];
+/// The same key as lnd's entity permission: `message:write` allows SignMessage and no other call. A
+/// node app that bakes no URI permissions (Lightning Fork's) makes this one; the Sell page takes either.
+pub const SIGN_ENTITY_OPS: [&str; 1] = ["message:write"];
 
 /// The file beside the keys that says they were made by this tool.
 pub const AUTO_KEYS: &str = "auto-keys.json";

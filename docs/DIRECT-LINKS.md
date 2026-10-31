@@ -80,8 +80,11 @@ bakes it beside the gateway's other keys (`sign.macaroon` in the gateway's key f
 will not bake it leaves the other keys alone: the shop then sells over its web address only, and
 the Sell page says why its link is not reachable.
 
-On StartOS, Lightning Fork's app grant gives the wallet its key and no gateway keys; the gateway's
-keys, the sign key among them, are pasted on the Sell page until the node package grants them.
+On StartOS, Lightning Fork's app grant gives the wallet its key and no gateway keys (one grant per
+package, and the wallet's must stay a key that only pays). The gateway's keys, the sign key among
+them, are pasted on the Sell page until the node package grants them. Lightning Fork bakes entity
+permissions only, so the Sell page takes the sign key as lnd's `message:write` (which allows
+SignMessage and no other call) as well as the URI permission.
 
 ### One shop, several link keys
 

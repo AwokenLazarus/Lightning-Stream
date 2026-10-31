@@ -33,6 +33,13 @@ Buyers reach your shop by its key over an encrypted link, so no domain or port f
 want an https address too, add a public domain to the *Gateway for buyers* interface and type it as the
 shop's address.
 
+- **Your shop's node keys**: Lightning Fork grants this app the wallet's key only, so Sell's first step
+  asks for three keys you make in Lightning Fork's dashboard (*Macaroons*), each with its own root key:
+  payment requests (`invoices:read invoices:write`), network time (`info:read`), and link signing
+  (`message:write`). The link signing key lets your node vouch for your shop's link, so buyers' apps can
+  check it is yours; it signs messages and does nothing else. Without it the shop can be reached only at
+  an https address of its own.
+
 - **Share files** (Files): to share files you keep in File Browser, run the *Files folder* action and
   choose File Browser (install it first if StartOS asks). Then put files in File Browser and choose the
   folder on the Sell page. Stream only reads them: it never changes or deletes your files. Without File
