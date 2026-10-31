@@ -49,6 +49,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A paid download or film no longer ends when a loaded node or a slow route is late with its next
+  ticket. The wallet waits up to 20 s for a ticket on its way, while the seller keeps the answer open.
+  A stop still ends the answer at once.
 - A small payment works from no credit at a shop: the wallet buys a ticket sized to what the call may
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop

@@ -734,7 +734,7 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   next ticket is sent after every release, so a node that dies right after a paid request is
   more likely to be caught in that instant than it was with a pool of 8.
 - Such a ticket never arrives at the seller, and it is the oldest of its session. The first
-  release that waits for it (`tickets.ready_wait_ms`, 3 s) finds it on none of the node's
+  release that waits for it (`tickets.ready_wait_ms`, 20 s) finds it on none of the node's
   channels and ends the session (`ticket_session_ended`); the next call opens another. The
   ticket stays locked in the book. A new session's pool is sized inside what the owner's cap on
   tickets locked with one seller (2 as shipped) has left, so after one such ticket the wallet

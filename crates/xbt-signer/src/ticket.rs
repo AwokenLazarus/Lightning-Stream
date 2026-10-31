@@ -93,8 +93,9 @@ pub const HOLD_SHORT: [&str; 4] = ["ticket_slots", "ticket_dust", ROUTE_FULL, "t
 /// minutes, so that the wallet cancels before the seller does.
 pub const HTTP_IDLE_S: i64 = 120;
 /// The default of `tickets.ready_wait_ms`: how long a release waits for the seller's own word that
-/// the ticket is locked on its node.
-pub const READY_WAIT_MS: i64 = 3_000;
+/// the ticket is locked on its node. A little past the 15 s a seller as shipped keeps a paused answer
+/// open: a ticket takes its time over a slow route, and until it is shown the answer only waits.
+pub const READY_WAIT_MS: i64 = 20_000;
 /// The default of `tickets.max_answer_s`: the longest the wallet keeps an answer that is paid for
 /// as it arrives open while the call reads it whole for its caller, or one priced by the second
 /// (its clock bills whether bytes come or not). Below the 60 seconds a caller of the signer's socket
