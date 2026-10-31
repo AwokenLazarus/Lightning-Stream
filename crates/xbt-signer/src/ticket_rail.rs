@@ -2268,7 +2268,9 @@ impl Signer {
     /// One whose receipt key on record is another's is another shop on the same node, and is passed over.
     /// One with no key on record (killed before its first signed receipt, or from before 0.1.20) has
     /// nothing to know its seller by but where it was opened: only a call to that `origin` may take it.
-    pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, origin: &str, sid: &str) -> Vec<Resumable> {
+    /// And one any session of another `task` used is passed over: its credit was bought under that
+    /// task's budget, and stays with that task (it waits for a session of it, or lapses).
+    pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, origin: &str, task: &str, sid: &str) -> Vec<Resumable> {
         let now = self.engine.now();
         let Ok(g) = self.ticket_store() else { return vec![] };
         let Some(st) = g.as_ref() else { return vec![] };
@@ -2285,11 +2287,13 @@ impl Signer {
             }
             let group: Vec<&Session> = st.book.sessions.values().filter(|o| o.http.as_ref().is_some_and(|h| h.id == http.id)).collect();
             let on_record = group.iter().filter_map(|o| o.http.as_ref()).map(|h| h.receipt_key.as_str()).find(|k| !k.is_empty()).unwrap_or("").to_string();
-            // another shop on the same node; one a session still has open; and one given up, or stopped for what the seller
+            // another shop on the same node; credit another task bought (booked to that task's budget, so not this one's
+            // to spend); one a session still has open; and one given up, or stopped for what the seller
             // did (a fault, terms that changed under it): nothing more is released to a seller in such a session, and its
             // balance is not spent either
             if (!on_record.is_empty() && on_record != receipt_key)
                 || (on_record.is_empty() && !group.iter().any(|o| o.origin == origin))
+                || group.iter().any(|o| o.task != task)
                 || group.iter().any(|o| o.state == SState::Open || o.why.contains(CREDIT_GIVEN_UP) || o.why.starts_with("seller fault") || o.why.contains("terms changed")) {
                 continue;
             }

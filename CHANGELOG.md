@@ -102,6 +102,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that will not say what an earlier session left with it no longer has a new ticket bought
   beside that credit: the call is refused with a time to retry. After two minutes a new session starts,
   your wallet's history names what may be left, and the next session uses that credit first, oldest first.
+- Credit one task leaves with a shop is no longer spent by another task's calls, which could take
+  that task past its own budget. The credit now waits for a call of its own task, for up to about
+  20 hours, and another task's call to that shop buys its own ticket.
 - A kill or a lost answer no longer buys a second ticket when the first was paid: the next call waits
   for the shop to take it, for two minutes at most. Long answers open for over ten minutes are no longer
   cut by a second call to the same shop.
