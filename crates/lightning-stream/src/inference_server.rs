@@ -48,6 +48,12 @@ const LONGEST: Duration = Duration::from_secs(3600);
 /// The longest head line the signer writes before the body.
 const HEAD_LINE: u64 = 4096;
 
+/// How long a paid call waits for the wallet to have paid for it, before the seller's own time
+/// (`first_byte`) begins: longer than the wallet's own wait for a ticket's payment (the node's
+/// `lightning.timeout_s`, 60 s by default, and 5 s more) after the lock. A buyer on a slow route
+/// pays a first ticket in tens of seconds; that is not the seller being slow.
+const PAY_WAIT: Duration = Duration::from_secs(90);
+
 /// `max_tokens` when a request names none, for the bound of what it may cost.
 const DEFAULT_MAX_TOKENS: u64 = 1024;
 
@@ -160,7 +166,9 @@ struct Failed {
 }
 
 /// Has the signer pay for one call and stream its body to a socket of ours; waits for the head
-/// and the first byte of the body, at most `first_byte`.
+/// and the first byte of the body, at most `first_byte` from when the call is paid for (the
+/// signer's `paid` line; a call that pays nothing, or a rail that sends no such line, from the start),
+/// and for the payment itself at most [`PAY_WAIT`].
 /// `ceiling`: the seller's listed prices, the most the wallet pays it (none for a free read).
 fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration, ceiling: Option<&Value>) -> Result<Begun, Failed> {
     let fail = |status: u16, message: String| Failed { status, message, final_answer: None };
@@ -175,6 +183,11 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
     }
     if let Some(c) = ceiling {
         params["price_ceiling"] = c.clone();
+    }
+    // told when it is paid for: the seller's time is counted from there
+    let paid_call = max_sats > 0;
+    if paid_call {
+        params["stream_paid"] = true.into();
     }
     let signer = cfg.signer.clone();
     std::thread::spawn(move || {
@@ -198,26 +211,48 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
             };
             return Err(fail(502, why));
         }
-        if started.elapsed() > first_byte {
+        // a paid call: the socket opens once it is paid for, which a slow route makes long
+        if started.elapsed() > if paid_call { PAY_WAIT } else { first_byte } {
             let _ = std::fs::remove_file(&path);
-            return Err(fail(504, format!("the seller sent nothing within {} s", first_byte.as_secs())));
+            return Err(fail(504, format!("the seller sent nothing within {} s", started.elapsed().as_secs())));
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     let _ = std::fs::remove_file(&path);
     let _ = src.set_nonblocking(false);
-    let left = first_byte.saturating_sub(started.elapsed()).max(Duration::from_millis(100));
-    let _ = src.set_read_timeout(Some(left));
     let mut src = BufReader::new(src);
-    let mut line = String::new();
-    let head: Value = match (&mut src).take(HEAD_LINE).read_line(&mut line) {
-        Ok(_) if line.ends_with('\n') => serde_json::from_str(&line).unwrap_or(Value::Null),
-        _ => Value::Null,
+    // the seller's time: from the wallet's `paid` line where it sends one, from the start where not
+    let mut since = started;
+    let mut paid_line = false;
+    let head: Value = loop {
+        let _ = src.get_ref().set_read_timeout(Some(first_byte.saturating_sub(since.elapsed()).max(Duration::from_millis(100))));
+        let mut line = String::new();
+        match (&mut src).take(HEAD_LINE).read_line(&mut line) {
+            Ok(_) if line.ends_with('\n') => {
+                let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                if !paid_line && v.get("paid").and_then(Value::as_bool) == Some(true) {
+                    (since, paid_line) = (Instant::now(), true);
+                    continue;
+                }
+                break v;
+            }
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return Err(fail(504, format!("the seller sent nothing within {} s of being paid", first_byte.as_secs())));
+            }
+            // the socket closed with no head: the wallet ended the call after paying (a seller fault, say), and says why
+            _ => break Value::Null,
+        }
     };
     let Some(status) = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s)) else {
-        return Err(fail(502, "the wallet sent no head for the seller's answer".into()));
+        let why = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(v)) => v.get("reason").and_then(Value::as_str).map(str::to_string),
+            Ok(Err(e)) => Some(e),
+            Err(_) => None,
+        };
+        return Err(fail(502, why.unwrap_or_else(|| "the wallet sent no head for the seller's answer".into())));
     };
     let content_type = head.get("content_type").and_then(Value::as_str).filter(|t| t.len() <= 128 && t.bytes().all(|b| b.is_ascii_graphic() || b == b' ')).map(str::to_string);
+    let _ = src.get_ref().set_read_timeout(Some(first_byte.saturating_sub(since.elapsed()).max(Duration::from_millis(100))));
     let mut first = vec![0u8; 16 << 10];
     let n = loop {
         match src.read(&mut first) {
@@ -240,7 +275,8 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
     if n == 0 {
         return Err(fail(502, "the seller's answer was empty".into()));
     }
-    Ok(Begun { status, content_type, first, rest: src, done: rx, ttft: started.elapsed() })
+    // the seller's own speed, its payment apart
+    Ok(Begun { status, content_type, first, rest: src, done: rx, ttft: since.elapsed() })
 }
 
 /// The sellers' model lists, asked of them through the signer with nothing to spend (or, for a

@@ -1545,6 +1545,11 @@ struct Call<'a> {
     stream_to: Option<PathBuf>,
     /// The head of the answer goes to that socket first, as one line of JSON (`stream_head`).
     stream_head: bool,
+    /// With `stream_head`, on the ticket rail: the socket is opened, and `{"paid":true}` written as
+    /// its first line, once the request's tickets are paid and before the request leaves for the
+    /// seller (`stream_paid`), so that a caller that times the seller counts from there and not
+    /// from a payment that took long over a slow route. The head line follows it.
+    stream_paid: bool,
     /// The byte range asked for (`range`), sent as the `Range` header of every request for the URL.
     range: Option<ByteRange>,
     /// The caller's own request headers (`headers`, [`caller_headers`]), sent on every request of
@@ -2448,6 +2453,7 @@ impl Signer {
             Err(why) => return deny("headers", why),
         };
         let head_headers = stream_head && p.get("head_headers").and_then(Value::as_bool) == Some(true);
+        let stream_paid = stream_head && p.get("stream_paid").and_then(Value::as_bool) == Some(true);
         // the price the buyer was shown where it chose this seller: terms above it are paid nothing
         let ceiling = match PriceCeiling::parse(p.get("price_ceiling")) {
             Ok(c) => c,
@@ -2593,7 +2599,8 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats, max_size };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, extra, head_headers, upgrade,
+                          credit_only, charge_sats, max_size };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // a route that gives each buyer an account is paid with tickets only: draws serve no buyer as its account
@@ -4132,6 +4139,8 @@ impl Signer {
         // the most a ticket of this seller adds to the balance: how many rounds of releases a head's reserve takes
         let ticket_msat = hs.terms.terms.ticket_msat.max(1);
         let most_rounds = reserve.div_ceil(ticket_msat).saturating_add(2).min(64);
+        // the caller's socket, opened once the request is paid for where it asked to be told (`stream_paid`)
+        let mut early: Option<Sink> = None;
         let (rid, seq, digest, ans, head, mark, streaming) = loop {
             // whole tickets until the seller's balance covers what it wants before it serves. The balance
             // by the wallet's count: answers open beside this one draw on it as they go
@@ -4156,6 +4165,12 @@ impl Signer {
             // (`ending` first: a stop sets it before it closes the session on the book)
             if hs.ending.load(Ordering::SeqCst) || !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
                 return fail(hs, &spent, refusal("ticket_session", "the session with this seller was stopped while this call waited: call again"));
+            }
+            // paid for: from here the seller's time is the seller's, whatever the payment took
+            if c.stream_paid && early.is_none() {
+                let mut s = Sink::for_call(c);
+                s.head(&json!({"paid": true}));
+                early = Some(s);
             }
             let digest = request_digest_v2(c.method, c.url, c.body);
             let order = lock_order(hs);
@@ -4346,7 +4361,7 @@ impl Signer {
         let mut ans = ans;
         let status = ans.status;
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
-        let mut sink = Sink::for_call(c);
+        let mut sink = early.take().unwrap_or_else(|| Sink::for_call(c));
         // a 206 for another range than was asked is not read: what it has cost is what its head charged
         let (head_fields, not_read) = c.head(&mut ans, &mut sink);
         out = with(out, head_fields);
