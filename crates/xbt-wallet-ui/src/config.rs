@@ -171,6 +171,22 @@ pub struct GatewaySetup {
     pub proxies: Vec<String>,
 }
 
+impl GatewaySetup {
+    /// The gateway's health (`health_url`), asked with the token this app wrote into the gateway's
+    /// config: on Umbrel and StartOS the app reaches it over the app's private network, where the
+    /// gateway answers its operator's view only to that token (loopback needs none). `None`: no URL.
+    pub fn health(&self) -> Option<Result<(u16, String), String>> {
+        let url = self.health_url.as_deref()?;
+        let token = std::fs::read_to_string(self.dir.join(crate::setup::GW_CONFIG)).ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("health_token").and_then(|t| t.as_str()).map(str::to_string));
+        Some(match token {
+            Some(t) => crate::app::http_get_with(url, &[("X-Xbt402-Health-Token", &t)]),
+            None => crate::app::http_get(url),
+        })
+    }
+}
+
 /// The folder a Files service shares (`docs/FILES.md`).
 #[derive(Debug, Clone, Default)]
 pub struct FilesSetup {
@@ -439,5 +455,53 @@ impl Config {
                              state: PathBuf::from("/nonexistent/ai/state.json") },
                vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), status_dir: PathBuf::from("/nonexistent/vpn"), endpoint: None, tunnel_upstream: None },
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
+    }
+}
+
+#[cfg(test)]
+mod health_token_tests {
+    use super::GatewaySetup;
+    use std::io::{Read, Write};
+
+    /// A gateway stand-in that, like the real one from another container, answers its health
+    /// only to the token: 200 with it, 404 without.
+    fn gateway(token: &'static str) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in l.incoming().take(4) {
+                let mut s = s.unwrap();
+                let mut b = [0u8; 4096];
+                let n = s.read(&mut b).unwrap_or(0);
+                let req = String::from_utf8_lossy(&b[..n]).to_ascii_lowercase();
+                let ok = req.contains(&format!("x-xbt402-health-token: {}", token.to_ascii_lowercase()));
+                let status = if ok { "200 OK" } else { "404 Not Found" };
+                let _ = s.write_all(format!("HTTP/1.0 {status}\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes());
+            }
+        });
+        format!("http://{addr}/x402/ticket/health")
+    }
+
+    #[test]
+    fn the_app_reads_its_gateways_health_with_the_token_it_wrote() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let dir = tempfile::tempdir().unwrap();
+        let gw = GatewaySetup { dir: dir.path().into(), health_url: Some(gateway(TOKEN)), ..Default::default() };
+        // no token written yet: the gateway's operator view is closed to another container
+        assert_eq!(gw.health().unwrap().unwrap().0, 404);
+        std::fs::write(dir.path().join(crate::setup::GW_CONFIG), format!(r#"{{"health_token":"{TOKEN}"}}"#)).unwrap();
+        assert_eq!(gw.health().unwrap().unwrap().0, 200);
+    }
+
+    #[test]
+    fn a_gateway_config_keeps_its_health_token_and_gets_one_when_new() {
+        let mut fresh = serde_json::Map::new();
+        crate::setup::keep_health_token(&mut fresh, None);
+        let made = fresh["health_token"].as_str().unwrap().to_string();
+        assert!(made.len() >= 32 && made.chars().all(|c| c.is_ascii_hexdigit()));
+        // rewriting the config (a new form, or Sell's rebuild) keeps the token the gateway already has
+        let mut next = serde_json::Map::new();
+        crate::setup::keep_health_token(&mut next, Some(&serde_json::Value::Object(fresh)));
+        assert_eq!(next["health_token"].as_str(), Some(made.as_str()));
     }
 }

@@ -1101,3 +1101,21 @@ fn a_win_paid_by_offer_with_its_own_note_is_paid_once_and_its_invoice_cancelled(
     assert_eq!(st["session"]["paidMsat"].as_str(), Some(b.win_msat.to_string().as_str()));
     assert_eq!(rig.gw.stats().prepaid_tickets, 0);
 }
+
+#[test]
+fn the_operators_view_answers_the_app_in_another_container_by_its_token_only() {
+    // Umbrel's and StartOS's apps reach the gateway over their private network, never its loopback:
+    // the token the app wrote into the gateway's config is what lets it read the operator's view
+    const TOKEN: &str = "app-health-token-0123456789abcdefghijklmnop";
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["http"] = json!({"forwarded_address": {"header": "X-Real-IP", "proxies": ["127.0.0.1"]}});
+        v["health_token"] = json!(TOKEN);
+    });
+    let health = |headers: &[(&str, &str)]| http(&rig.addr, "GET", "/x402/ticket/health", headers, b"", None).status;
+    let elsewhere = ("X-Real-IP", "10.21.0.4");
+    assert_eq!(health(&[elsewhere]), 404, "another container without the token");
+    assert_eq!(health(&[elsewhere, ("X-Xbt402-Health-Token", "app-health-token-0123456789abcdefghijklmnoX")]), 404, "a wrong token");
+    assert_eq!(health(&[elsewhere, ("X-Xbt402-Health-Token", TOKEN)]), 200, "the app's token");
+    assert_eq!(health(&[("X-Real-IP", "127.0.0.1")]), 200, "this machine, as before");
+}

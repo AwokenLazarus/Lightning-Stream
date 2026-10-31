@@ -1755,6 +1755,11 @@ fn mode_bits(_: &std::fs::Metadata) -> u32 {
 
 /// A plain-HTTP GET with a short timeout (the status page is on the box's own network).
 pub fn http_get(url: &str) -> Result<(u16, String), String> {
+    http_get_with(url, &[])
+}
+
+/// [`http_get`] with extra request headers (the gateway's health token).
+pub fn http_get_with(url: &str, headers: &[(&str, &str)]) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
     let rest = url.strip_prefix("http://").ok_or("only http:// URLs are probed")?;
     let (hostport, path) = match rest.find('/') {
@@ -1766,7 +1771,8 @@ pub fn http_get(url: &str) -> Result<(u16, String), String> {
     let t = std::time::Duration::from_secs(3);
     let mut s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(t)).ok();
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {hostport}\r\nConnection: close\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
+    let extra: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {hostport}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     s.take(64 * 1024).read_to_end(&mut buf).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&buf).to_string();

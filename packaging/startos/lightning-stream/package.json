@@ -5,7 +5,8 @@
     "build": "rm -rf ./javascript && ncc build startos/index.ts -o ./javascript",
     "prettier": "prettier --write startos",
     "check": "tsc --noEmit",
-    "spec": "node --experimental-strip-types --no-warnings test/spec-json.mjs"
+    "spec": "node --experimental-strip-types --no-warnings test/spec-json.mjs",
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.mjs"
   },
   "dependencies": {
     "@start9labs/start-sdk": "2.0.9"

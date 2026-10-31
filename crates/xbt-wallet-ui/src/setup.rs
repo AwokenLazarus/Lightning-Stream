@@ -24,6 +24,14 @@ pub const MAINNET_ACK_FILE: &str = "mainnet-ack";
 /// What every page says while the owner has yet to confirm paying with real money (mainnet).
 pub const ACK_NEEDED: &str = "One last step: confirm that the app may pay with real money. Until you do, it pays nothing.";
 pub const GW_CONFIG: &str = "config.json";
+
+/// The gateway config's `health_token`, kept if it has one: what lets this app read the gateway's
+/// health from another container ([`crate::config::GatewaySetup::health`]).
+pub fn keep_health_token(c: &mut serde_json::Map<String, Value>, old: Option<&Value>) {
+    let had = c.get("health_token").or_else(|| old.and_then(|o| o.get("health_token"))).and_then(Value::as_str)
+        .filter(|t| t.len() >= 32).map(str::to_string);
+    c.insert("health_token".into(), json!(had.unwrap_or_else(|| hex::encode(crate::random_bytes::<32>()))));
+}
 pub const GW_INVOICES: &str = "invoices.macaroon";
 pub const GW_INFO: &str = "info.macaroon";
 /// The gateway's key for one call only, lnd's SignMessage: its node vouches for its link key with it
@@ -472,6 +480,8 @@ impl App {
         let chain = g("chain");
         let mut c = Map::new();
         c.insert("listen".into(), json!(listen));
+        let old: Option<Value> = std::fs::read_to_string(gw.dir.join(GW_CONFIG)).ok().and_then(|t| serde_json::from_str(&t).ok());
+        keep_health_token(&mut c, old.as_ref());
         c.insert("public_url".into(), json!(public_url));
         c.insert("upstream".into(), json!(g("upstream").trim_end_matches('/')));
         c.insert("state_dir".into(), json!(gw.state_dir));
@@ -529,7 +539,7 @@ impl App {
         b.push_str("<p class=\"lead\">Sell a service from this box, paid a little at a time over Lightning. Buyers pay before each piece, \
             and this app passes each paid request on to your service.</p>");
         b.push_str(&pin_card(&App::csrf_input(ctx), gw.node_pin, gw.node_rest.as_deref(), gw.node_tls_cert.as_deref(), "./gateway"));
-        let health = gw.health_url.as_deref().map(crate::app::http_get);
+        let health = gw.health();
         let (class, head, next) = match (&health, saved) {
             (_, false) => ("warn", "Not selling yet", "Fill in the form below and save it."),
             (Some(Ok((200, _))) | None, true) => ("ok", "Selling", "Buyers can pay and use your service."),
