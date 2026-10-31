@@ -125,6 +125,20 @@ impl App {
         Ok(problems)
     }
 
+    /// After the Services page added, updated or removed the seller at `origin`: the sellers file the AI
+    /// address reads follows at once, when that seller sells (or sold) a model. Otherwise a seller allowed
+    /// later would never be offered until the owner pressed "Read the sellers' prices again".
+    pub(crate) fn ai_sellers_follow(&self, origin: &str) {
+        let sold = self.ai_services().iter().any(|s| services::same_origin(&s.seller, origin));
+        let listed = read_sellers(&self.cfg.ai.sellers)["sellers"].as_array().into_iter().flatten()
+            .filter_map(|e| e["route"].as_str()).any(|r| services::same_origin(r, origin));
+        if sold || listed {
+            if let Err(e) = self.ai_write_sellers() {
+                eprintln!("xbt-wallet-ui: the AI sellers file was not written: {e}");
+            }
+        }
+    }
+
     pub(crate) fn ai_page(&self, ctx: &Ctx) -> Resp {
         // the first visit writes the sellers file, so the endpoint has sellers without a click
         if !self.cfg.ai.sellers.exists() && !self.ai_services().is_empty() {

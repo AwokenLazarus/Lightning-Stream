@@ -168,6 +168,7 @@ impl App {
         let n = new.len();
         all.extend(new);
         services::save(&self.cfg.services_path(), &all)?;
+        self.ai_sellers_follow(&listing.seller);
         let allowed = self.seller_allowed(&listing.seller);
         Ok(format!("{} {}: {n} service{} on Browse now.{}", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" },
                    if allowed { "" } else { " To let the app pay this seller, press \"Allow this seller to be paid\" below." }))
@@ -188,6 +189,7 @@ impl App {
         shops.insert(listing.seller.clone(), crate::shops::Shop { receipt_key: listing.receipt_key.clone(), transport: found.transport });
         crate::shops::save(&self.cfg.shops_path(), &shops)?;
         services::save(&self.cfg.services_path(), &all)?;
+        self.ai_sellers_follow(&listing.seller);
         let allowed = self.seller_allowed(&listing.seller);
         Ok(format!("{} {}: {n} service{} on Browse now.{}", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" },
                    if allowed { "" } else { " To let the app pay this seller, press \"Allow this seller to be paid\" below." }))
@@ -240,6 +242,7 @@ impl App {
             return Err("That seller is not in the list.".into());
         }
         services::save(&self.cfg.services_path(), &all)?;
+        self.ai_sellers_follow(url);
         Ok("Seller removed. Their services are no longer on Browse.".into())
     }
 }
