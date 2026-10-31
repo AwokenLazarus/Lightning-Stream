@@ -339,12 +339,16 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
         }))
     })?;
     println!("{report}");
-    // the tunnel ends here; the wallet answers once its last receipt is in (its stop waits up to 15 s for it)
-    drop(way);
-    if let Some(done) = said {
-        match done.recv_timeout(Duration::from_secs(30)) {
-            Ok(r) => eprintln!("the wallet: {}", r.map(|v| v.to_string()).unwrap_or_else(|e| e)),
-            Err(_) => eprintln!("the wallet: no answer within 30 s of the tunnel's end"),
+    // the tunnel is ended here (a Mux runs on until closed), and the wallet answers once its last receipt is in
+    // (its stop waits up to 15 s for it): the runtime drives the close while the answer is waited for
+    if let (Way::Tunnel(xbt_vpn::flow::Carrier::Tunnel(m)), Some(done)) = (&way, said) {
+        m.close();
+        let answer = link.runtime().block_on(async move {
+            tokio::task::spawn_blocking(move || done.recv_timeout(Duration::from_secs(30))).await.ok().and_then(Result::ok)
+        });
+        match answer {
+            Some(r) => eprintln!("the wallet: {}", r.map(|v| v.to_string()).unwrap_or_else(|e| e)),
+            None => eprintln!("the wallet: no answer within 30 s of the tunnel's end"),
         }
     }
     Ok(())
