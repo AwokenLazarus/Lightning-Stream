@@ -1778,31 +1778,39 @@ fn open_limit(tp: &TicketPolicy, socket: bool, streamed: bool, price: &Price) ->
     }
 }
 
-/// Whether a streamed answer still delivers: at least [`PROGRESS_FLOOR_BYTES`] in each
-/// `tickets.read_timeout_s`, counted from its first byte. `Some`: why it ends here.
+/// Whether a streamed answer still delivers: past `tickets.stream_floor_after_s`, at least
+/// [`PROGRESS_FLOOR_BYTES`] in each `tickets.read_timeout_s` the wallet spends waiting on its seller.
+/// Only that waiting counts: time the wallet holds the answer up itself (its reader stalled, a ticket
+/// being paid) is not the seller's.
 struct Progress {
     window: Duration,
+    after: Duration,
     /// Only an answer held open by `max_stream_s`.
     on: bool,
-    from: Option<(Instant, u64)>,
+    opened: Instant,
+    waited: Duration,
+    got: u64,
 }
 
 impl Progress {
     fn new(tp: &TicketPolicy, limit: &str) -> Self {
-        Self { window: Signer::ticket_read_timeout(tp), on: limit == "max_stream_s", from: None }
+        Self { window: Signer::ticket_read_timeout(tp), after: Duration::from_secs(tp.stream_floor_after_s.max(0) as u64), on: limit == "max_stream_s",
+               opened: Instant::now(), waited: Duration::ZERO, got: 0 }
     }
 
-    fn at(&mut self, bytes: u64) -> Option<String> {
-        if !self.on || bytes == 0 {
+    /// A read of the seller's answer took `took` and brought `n` bytes. `Some`: why the answer ends here.
+    fn read(&mut self, took: Duration, n: u64) -> Option<String> {
+        if !self.on {
             return None;
         }
-        let now = Instant::now();
-        let (since, had) = *self.from.get_or_insert((now, bytes));
-        if now.duration_since(since) < self.window {
+        self.waited += took;
+        self.got = self.got.saturating_add(n);
+        if self.waited < self.window {
             return None;
         }
-        self.from = Some((now, bytes));
-        (bytes.saturating_sub(had) < PROGRESS_FLOOR_BYTES).then(|| {
+        let short = self.got < PROGRESS_FLOOR_BYTES;
+        (self.waited, self.got) = (Duration::ZERO, 0);
+        (short && self.opened.elapsed() >= self.after).then(|| {
             format!("max_stream_s: fewer than {PROGRESS_FLOOR_BYTES} bytes arrived in {} s", self.window.as_secs())
         })
     }
@@ -4671,6 +4679,8 @@ impl Signer {
                     *lock(&hs.used) = self.engine.now();
                     self.session_touch(&hs.sid);
                 }
+                let asked = Instant::now();
+                let was_paying = paying.load(Ordering::SeqCst);
                 let n = match body.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => n,
@@ -4679,6 +4689,9 @@ impl Signer {
                         break;
                     }
                 };
+                // a seller at the edge of its credit waits for the ticket being paid: that time is not its own
+                let took = if was_paying || paying.load(Ordering::SeqCst) { Duration::ZERO } else { asked.elapsed() };
+                let slow = progress.read(took, n as u64);
                 sink.put(&buf[..n]);
                 if let Some((_, max_output)) = tokens {
                     if event_stream {
@@ -4719,7 +4732,7 @@ impl Signer {
                     // a WebSocket is paid for by its watcher
                     continue;
                 }
-                if let Some(why) = st.over(bytes).or_else(|| progress.at(bytes)) {
+                if let Some(why) = st.over(bytes).or(slow) {
                     lock(&state).1.get_or_insert(why);
                     break;
                 }

@@ -928,9 +928,18 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   not. Any other answer the wallet streams on to its caller as it arrives (the connector's downloads
   and films, a visit's pages, the AI address's streams) stays open while it delivers, within the
   call's limits and `tickets.max_stream_s` (6 hours). A seller that stops sending is ended after
-  `tickets.read_timeout_s` (30 s) without a byte, and one that sends fewer than 256 bytes in that
-  span is ended too. An answer the wallet ends early, for any reason, reaches the client cut short
+  `tickets.read_timeout_s` (30 s) without a byte. After its first 10 minutes
+  (`tickets.stream_floor_after_s`) a stream must also bring 16 KiB in each 30 s the wallet waits on
+  its seller, which is far below any film; time the wallet holds it up itself (its reader stalled,
+  a ticket being paid) does not count, and an AI model reasoning behind keep-alives is not cut for
+  those minutes. An answer the wallet ends early, for any reason, reaches the client cut short
   (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
+- A client that takes nothing for 30 s (`stream_write`), such as a player paused with its buffer
+  full, loses its connection, and the wallet stops paying for that answer. What was on its way when
+  it stopped is paid for. A player that can seek resumes by asking again from where it was (`Range`).
+- A session of draws takes one answer at a time, and one streamed on may run for hours. Another call
+  to that seller waits up to 50 s behind it and is then told `ticket_busy`. A stop ends the open
+  answer at once and gives no new value; wins already drawn are still paid.
   A WebSocket has its own limit, `tickets.max_socket_s` (6 hours, as the gateway's): a web app keeps
   one open while its page is.
 - An answer priced by the second is paid up to a fifth of a second early, and the wallet counts

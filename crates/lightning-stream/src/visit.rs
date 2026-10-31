@@ -41,6 +41,8 @@ const IDLE: Duration = Duration::from_secs(30 * 60);
 pub const MAX_BODY: usize = 1 << 20;
 /// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
+/// An answer open this long may run for hours (a film): a request waiting to run alone does not wait for it.
+const LONG_OPEN: Duration = Duration::from_secs(30);
 /// How long a request whose answer has stopped waits for the signer to say what it cost, past which
 /// all of its share stays spent ([`Visit::settle`]). After the stop the signer may still, one after
 /// another: wait for the seller's next byte (its `tickets.read_timeout_s`, at most an hour) before it
@@ -107,8 +109,26 @@ struct State {
     alone: u32,
     /// The stream sockets of the answers open now: a stop shuts them, which is what stops the signer
     /// paying ([`Visit::stop`]).
-    streams: HashMap<u64, UnixStream>,
+    streams: HashMap<u64, OpenStream>,
     next_stream: u64,
+    /// The buyer stopped the visit (`ended` says so too, or the limit it reached first).
+    stopped: bool,
+}
+
+/// An answer open now in a visit.
+struct OpenStream {
+    socket: UnixStream,
+    /// The share it holds, where it holds one apart from [`State::sockets`].
+    share: i64,
+    opened: Instant,
+}
+
+impl State {
+    /// The shares of answers that have been open a while: a film may run for hours, so a request
+    /// waiting to run alone does not wait for them ([`Visit::reserve_alone`]).
+    fn long_open(&self) -> i64 {
+        self.streams.values().filter(|o| o.opened.elapsed() >= LONG_OPEN).map(|o| o.share).sum()
+    }
 }
 
 pub struct Visit {
@@ -130,33 +150,30 @@ impl Visit {
     /// more is paid for it.
     fn stop(&self) {
         let mut s = self.lock();
+        s.stopped = true;
         s.ended.get_or_insert_with(|| "Stopped.".into());
         for (_, open) in s.streams.drain() {
-            let _ = open.shutdown(std::net::Shutdown::Both);
+            let _ = open.socket.shutdown(std::net::Shutdown::Both);
         }
         drop(s);
         self.turn.notify_all();
     }
 
-    /// An answer's stream socket, for [`Visit::stop`] to shut; one that arrives after a stop is shut
-    /// at once. What [`Visit::forget`] takes when the answer has ended.
-    fn track(&self, src: &UnixStream) -> u64 {
+    /// An answer's stream socket, for [`Visit::stop`] to shut until the guard is dropped; one that
+    /// arrives after a stop is shut at once. `share`: what it holds apart from a WebSocket's.
+    fn track(self: &Arc<Self>, src: &UnixStream, share: i64) -> Tracked {
         let open = src.try_clone().ok();
         let mut s = self.lock();
         s.next_stream += 1;
         let id = s.next_stream;
-        if let Some(open) = open {
-            if s.ended.as_deref() == Some("Stopped.") {
-                let _ = open.shutdown(std::net::Shutdown::Both);
+        if let Some(socket) = open {
+            if s.stopped {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
             } else {
-                s.streams.insert(id, open);
+                s.streams.insert(id, OpenStream { socket, share, opened: Instant::now() });
             }
         }
-        id
-    }
-
-    fn forget(&self, id: u64) {
-        self.lock().streams.remove(&id);
+        Tracked { visit: Arc::clone(self), id }
     }
 
     fn report(&self) -> Value {
@@ -214,13 +231,14 @@ impl Visit {
         s.alone += 1;
         let until = Instant::now() + TURN_WAIT;
         let mut timed_out = false;
-        while s.held > s.sockets + s.settling && s.ended.is_none() {
+        while s.held > s.sockets + s.settling + s.long_open() && s.ended.is_none() {
             let now = Instant::now();
             if now >= until {
                 timed_out = true;
                 break;
             }
-            s = self.turn.wait_timeout(s, until - now).unwrap_or_else(|p| p.into_inner()).0;
+            // an answer open now becomes a long one without a word: looked at again in a while
+            s = self.turn.wait_timeout(s, (until - now).min(Duration::from_secs(1))).unwrap_or_else(|p| p.into_inner()).0;
         }
         drop(s);
         let got = if timed_out { Err("The page asked for too much at once: try again.".into()) } else { self.reserve_as(most, true) };
@@ -315,7 +333,8 @@ impl Visits {
         let mut m = self.open.lock().unwrap_or_else(|p| p.into_inner());
         m.retain(|_, v| {
             let s = v.lock();
-            s.ended.is_none() && s.last.is_none_or(|t| t.elapsed() < IDLE)
+            // an answer still open keeps its visit, however long ago it was asked for, so that a stop finds it
+            !s.streams.is_empty() || (s.ended.is_none() && s.last.is_none_or(|t| t.elapsed() < IDLE))
         });
         if m.len() >= MAX_VISITS {
             return Err("too many visits open".into());
@@ -492,8 +511,8 @@ impl Connector {
             }
         }
         let length = head.get("content_length").and_then(Value::as_u64);
-        let stream = visit.track(&src);
-        let mut settle = Settle { visit, share, stream, src: Some(src), done: Some(done) };
+        let tracked = visit.track(&src, share);
+        let mut settle = Settle { visit, share, tracked: Some(tracked), src: Some(src), done: Some(done) };
         Reply::Stream(Streamed {
             status,
             headers: out_headers,
@@ -565,12 +584,12 @@ impl Connector {
             .filter(|(k, _)| k.to_ascii_lowercase().starts_with("sec-websocket-"))
             .chain(std::iter::once(("Upgrade".to_string(), "websocket".to_string())))
             .collect();
-        let stream = visit.track(&src);
+        let tracked = visit.track(&src, 0);
         Reply::Upgrade(xbt_svc::http::Upgraded {
             headers,
             run: Box::new(move |client, early| {
                 join_socket(client, early, src, first);
-                visit.forget(stream);
+                drop(tracked);
                 visit.settle(share, Some(done), true);
             }),
         })
@@ -657,10 +676,23 @@ struct Started {
 
 /// When an answer has been handed on (or its reader has gone): the stream is closed, so the signer
 /// stops paying, then what the signer charged stays spent and the rest of the share goes back.
+/// An answer's place in [`State::streams`], for as long as it is open.
+struct Tracked {
+    visit: Arc<Visit>,
+    id: u64,
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.visit.lock().streams.remove(&self.id);
+        self.visit.turn.notify_all();
+    }
+}
+
 struct Settle {
     visit: Arc<Visit>,
     share: i64,
-    stream: u64,
+    tracked: Option<Tracked>,
     src: Option<UnixStream>,
     done: Option<mpsc::Receiver<Result<Value, String>>>,
 }
@@ -681,7 +713,7 @@ impl Settle {
 impl Drop for Settle {
     fn drop(&mut self) {
         drop(self.src.take());
-        self.visit.forget(self.stream);
+        drop(self.tracked.take());
         // the signer's count of what left the wallet for this answer; nothing known is the whole share, kept spent
         self.visit.settle(self.share, self.done.take(), false);
     }

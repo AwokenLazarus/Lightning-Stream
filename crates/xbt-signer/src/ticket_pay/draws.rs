@@ -41,6 +41,11 @@ const ROUND_WAIT: Duration = Duration::from_millis(40);
 /// How long the drawer goes on once the answer has ended: for the reveals of the values still open
 /// and the invoices of the wins owed. A seller that gives neither in this time is given up on.
 const DONE_WAIT: Duration = Duration::from_secs(60);
+/// How long a call waits behind an answer open on its session of draws: under the 60 s a caller of
+/// the signer's socket waits.
+const QUEUE_WAIT: Duration = Duration::from_secs(50);
+/// How long a stop waits for the answer open on its session of draws to end.
+const STOP_WAIT: Duration = Duration::from_secs(15);
 
 fn refused(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "lottery", "charged_sats": 0}))
@@ -130,6 +135,8 @@ pub(crate) struct DrawSession {
     /// The URL of the session endpoints: the origin and the terms' path.
     base: String,
     busy: Mutex<()>,
+    /// A stop has begun: the answer open now ends here, no new value is given, and no new request starts.
+    ending: AtomicBool,
     link: Mutex<Link>,
     state: Mutex<State>,
     /// The wallet's clock at the last paid request.
@@ -145,6 +152,22 @@ impl DrawSession {
         let s = lock(&self.state);
         json!({"session": self.sid, "origin": self.origin, "rail": "lottery", "win_msat": self.win_msat.to_string(), "draws": s.draws, "wins": s.wins,
                "wins_paid": s.wins_paid, "wins_owed": s.owed.len(), "price_msat": s.used_msat.to_string(), "paid_sats": s.paid_sats, "fault": s.fault})
+    }
+}
+
+/// The session's turn, within `wait`.
+fn turn_of(ds: &DrawSession, wait: Duration) -> Option<MutexGuard<'_, ()>> {
+    let until = Instant::now() + wait;
+    loop {
+        match ds.busy.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -242,7 +265,14 @@ impl Signer {
                 },
             };
             let out = {
-                let _busy = lock(&ds.busy);
+                // one answer at a time on a session of draws, and one streamed on may run for hours: a call behind it is
+                // told so, in the time a caller waits, and not left queued
+                let Some(_busy) = turn_of(&ds, QUEUE_WAIT) else {
+                    return Tried::Done(refused("ticket_busy", "another answer from this seller is open on a session of draws, which takes one at a time: call again when it ends"));
+                };
+                if ds.ending.load(Ordering::SeqCst) {
+                    return Tried::Done(refused("ticket_busy", "the session with this seller is being stopped: nothing was asked of the seller in it; call again"));
+                }
                 self.draw_request(&ds, c, &terms.price)
             };
             // a seller that has forgotten the session (it went quiet, or the seller started again without its journal): this one is over, and
@@ -270,7 +300,7 @@ impl Signer {
         }
         let sid = str_or_empty(o.get("session"));
         let win_msat = crate::ticket::outside_u64(o.get("win_msat")).unwrap_or(0);
-        let ds = Arc::new(DrawSession { origin: c.origin.into(), sid: sid.clone(), task, terms: terms.clone(), win_msat, base, busy: Mutex::new(()),
+        let ds = Arc::new(DrawSession { origin: c.origin.into(), sid: sid.clone(), task, terms: terms.clone(), win_msat, base, busy: Mutex::new(()), ending: AtomicBool::new(false),
                                         link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                         state: Mutex::new(State::default()), used: Mutex::new(self.engine.now()) });
         let give_up = |why: String| {
@@ -387,7 +417,10 @@ impl Signer {
     /// `ticket_stop` for a session of draws, if `sid` is one this process pays.
     pub(super) fn draw_stop_by_id(&self, sid: &str) -> Option<Value> {
         let ds = self.draw_http_of(sid)?;
-        let _busy = lock(&ds.busy);
+        // said before any lock: the answer open now sees it, and ends
+        ds.ending.store(true, Ordering::SeqCst);
+        // its wins already drawn are paid as it ends; a stop does not wait on that past STOP_WAIT
+        let _busy = turn_of(&ds, STOP_WAIT);
         Some(self.draw_stop(&ds, "stopped by the caller", true))
     }
 
@@ -871,6 +904,7 @@ impl Signer {
         let piece = |kind: Kind, k: u64, amount_msat: u64| Piece { id: PieceId { seq, kind, k }, req, amount_msat };
         let length = ans.length;
         let whole = !head.body_hash.is_empty();
+        let closer = ans.closer;
         let mut body = ans.body;
         // pieces that are here and have no value yet, voids, whether the reader is done, and why the wallet stopped
         struct Shared {
@@ -889,10 +923,29 @@ impl Signer {
         let stop_now = |why: String| {
             lock(counted).stop.get_or_insert(why);
         };
-        let stopped = || lock(counted).stop.is_some() || ds.fault().is_some();
+        let stopped = || {
+            if ds.ending.load(Ordering::SeqCst) {
+                lock(counted).stop.get_or_insert_with(|| "ticket_session: the session was stopped".to_string());
+            }
+            lock(counted).stop.is_some() || ds.fault().is_some()
+        };
         let mut read_error: Option<String> = None;
         let mut mismatch: Option<u64> = None;
         std::thread::scope(|scope| {
+            // stopped, its connection ends here: the read returns now, not after a quiet seller's own wait
+            if let Some(close) = &closer {
+                let (shared, stopped) = (&shared, &stopped);
+                scope.spawn(move || loop {
+                    if lock(shared).done {
+                        return;
+                    }
+                    if stopped() {
+                        close();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                });
+            }
             // the drawer: values out, reveals checked, wins paid
             scope.spawn(|| {
                 let mut seconds = 0u64;
@@ -909,6 +962,10 @@ impl Signer {
                         if s.pending.len() < batch && s.void.is_empty() && !s.done && tries == 0 {
                             // not a batch yet: wait for more, but not long, since the seller serves only a window ahead
                             s = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner()).0;
+                        }
+                        // a stop has begun: no new value is given, and what has none yet is named as void at the end
+                        if ds.ending.load(Ordering::SeqCst) {
+                            s.pending.clear();
                         }
                         // while a round is being sent again, no new value is given: what is open goes first
                         let pieces = if tries == 0 { std::mem::take(&mut s.pending) } else { vec![] };
@@ -1021,16 +1078,13 @@ impl Signer {
                     stop_now(format!("{limit}: the answer has been open for {} s", max_open.as_secs()));
                     break;
                 }
-                if let Some(why) = progress.at(sink.bytes) {
-                    stop_now(why);
-                    break;
-                }
                 // the call's limit, by the wallet's own count of what has arrived: it reads no further, and draws for what it has
                 let seconds = if price.second_msat > 0 { head_at.elapsed().as_secs().saturating_add(1) } else { 0 };
                 if price.metered() && price.cost(sink.bytes, seconds).unwrap_or(u64::MAX) >= max_msat {
                     stop_now("max_sats: the call's charge cap is used up".into());
                     break;
                 }
+                let asked = Instant::now();
                 let n = match body.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => n,
@@ -1039,6 +1093,9 @@ impl Signer {
                         break;
                     }
                 };
+                if let Some(why) = progress.read(asked.elapsed(), n as u64) {
+                    stop_now(why);
+                }
                 let mut off = 0;
                 while off < n {
                     let have = sink.bytes;

@@ -31,8 +31,8 @@
 //! ```
 //!
 //! and the connector answers its client with that status, `Content-Range` and `Content-Length`
-//! (the body that follows is then framed by its length, so a client sees an answer the wallet
-//! stopped as cut short). A head with `error` is an answer the signer will not read (a 206 for
+//! (the body that follows is then framed by its length, or chunked where the head states none; either
+//! way a client sees an answer the wallet stopped as cut short, [`whole`]). A head with `error` is an answer the signer will not read (a 206 for
 //! another range than was asked): the client gets 502. One socket, one line, no second round trip
 //! to the signer and no second request to the seller.
 
@@ -56,8 +56,9 @@ pub use visit::Visits;
 
 /// How long a call may wait for the seller's first byte, the payment included.
 pub(crate) const FIRST_BYTE: Duration = Duration::from_secs(60);
-/// The longest one paid answer is followed (a film).
-pub(crate) const LONGEST: Duration = Duration::from_secs(6 * 3600);
+/// The longest one paid answer is followed (a film): past the most an owner can set
+/// `tickets.max_stream_s` to, so that the wallet ends an answer and says so before this gives up on it.
+pub(crate) const LONGEST: Duration = Duration::from_secs(25 * 3600);
 /// The longest head line the signer writes before the body.
 pub(crate) const HEAD_LINE: u64 = 4096;
 /// How long a streamed body's end waits for the signer's account of the call: it takes the session's
@@ -65,17 +66,20 @@ pub(crate) const HEAD_LINE: u64 = 4096;
 /// slow link or behind other calls of the session.
 pub(crate) const ACCOUNT_WAIT: Duration = Duration::from_secs(120);
 
-/// Whether a streamed answer that has ended was whole (`Ok`). All of an announced length handed on
-/// is whole, and nothing is waited for; otherwise it is whole only by the signer's account of the
-/// call (`account`, asked only then). An answer the wallet ended early, for any reason, or with no
-/// account in time, is an error, so that the client sees a body cut short (a `Content-Length` body
-/// short of its length, or a chunked one with no last chunk), never a short file that looks whole.
+/// Whether a streamed answer that has ended was whole (`Ok`). With a length announced its bytes say,
+/// and nothing is waited for; with none it is whole only by the signer's account of the call
+/// (`account`, asked only then). An answer the wallet ended early, for any reason, or with no account
+/// in time, is an error, so that the client sees a body cut short (a `Content-Length` body short of
+/// its length, or a chunked one with no last chunk), never a short file that looks whole.
 pub(crate) fn whole(length: Option<u64>, sent: u64, account: impl FnOnce() -> Option<Result<Value, String>>) -> io::Result<()> {
-    if length.is_some_and(|l| sent >= l) {
-        return Ok(());
+    match length {
+        Some(l) if sent >= l => return Ok(()),
+        // short of what was announced: cut, whatever the account says, and it is not waited for
+        Some(l) => return Err(io::Error::other(format!("the answer was cut short after {sent} bytes of {l}"))),
+        None => {}
     }
     match account() {
-        Some(Ok(v)) if v.get("complete").and_then(Value::as_bool) == Some(true) && length.is_none() => Ok(()),
+        Some(Ok(v)) if v.get("complete").and_then(Value::as_bool) == Some(true) => Ok(()),
         Some(Ok(v)) => {
             let why = v.get("ended").and_then(Value::as_str).or_else(|| v.get("error").and_then(Value::as_str)).unwrap_or("the wallet stopped reading it");
             Err(io::Error::other(format!("the answer was cut short after {sent} bytes: {why}")))
@@ -374,8 +378,8 @@ mod tests {
         assert!(whole(None, 10, said(json!({"complete": true}))).is_ok());
         let cut = whole(None, 10, said(json!({"complete": false, "ended": "max_sats"}))).unwrap_err().to_string();
         assert!(cut.contains("max_sats") && cut.contains("10 bytes"), "{cut}");
-        // short of a stated length is cut, whatever the account says
-        assert!(whole(Some(20), 10, said(json!({"complete": true}))).is_err());
+        // short of a stated length is cut, and no account is waited for
+        assert!(whole(Some(20), 10, never).is_err());
         // an error from the signer, or no account in time, is not whole
         assert!(whole(None, 10, || Some(Err("gone".to_string()))).is_err());
         assert!(whole(None, 10, || None).unwrap_err().to_string().contains("did not say"));

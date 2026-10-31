@@ -102,13 +102,19 @@ pub const READY_WAIT_MS: i64 = 3_000;
 pub const MAX_ANSWER_S: i64 = 50;
 /// The default of `tickets.max_stream_s`: the longest the wallet keeps open an answer it streams on
 /// to its caller as it arrives (a film, a download, an AI stream), paid for what arrives. As long as
-/// the connector follows one. A seller that stops sending is ended sooner, by `tickets.read_timeout_s`
-/// between bytes and [`PROGRESS_FLOOR_BYTES`] in each such span.
+/// the connector follows one by default. A seller that stops sending is ended sooner, by
+/// `tickets.read_timeout_s` between bytes, and past [`STREAM_FLOOR_AFTER_S`] by [`PROGRESS_FLOOR_BYTES`].
 pub const MAX_STREAM_S: i64 = 21_600;
+/// The default of `tickets.stream_floor_after_s`: how long an answer streamed on to its caller runs
+/// before [`PROGRESS_FLOOR_BYTES`] applies. An AI model reasoning behind keep-alives sends next to
+/// nothing for minutes, and only the wait for the next byte holds it to account until then.
+pub const STREAM_FLOOR_AFTER_S: i64 = 600;
 /// The least of an answer held open by [`MAX_STREAM_S`] that must arrive in each
-/// `tickets.read_timeout_s`: a seller that drips a byte at a time, just inside the wait for the next
-/// byte, does not hold a call and its session for hours.
-pub const PROGRESS_FLOOR_BYTES: u64 = 256;
+/// `tickets.read_timeout_s` the wallet spends waiting on its seller: well below any film, so that a
+/// seller that drips bytes, each just inside the wait for the next one, cannot hold a call and its
+/// session for hours. Time the wallet itself holds the answer up (its reader stalled, a ticket being
+/// paid) does not count.
+pub const PROGRESS_FLOOR_BYTES: u64 = 16 << 10;
 /// The default of `tickets.max_socket_s`: the longest the wallet keeps a WebSocket open, paid as its
 /// bytes pass. A web app keeps one open while its page is (live updates); the seller's gateway ends
 /// one after six hours too.
@@ -392,6 +398,7 @@ pub struct TicketPolicy {
     /// The longest a WebSocket stays open, in seconds.
     pub max_socket_s: i64,
     pub max_stream_s: i64,
+    pub stream_floor_after_s: i64,
     /// The fee rate a held ticket's floor is sized for where a channel without anchors may be on
     /// its route, in sat per 1,000 weight units; 0: the chain's default ([`FEERATE_CAP_MAIN`],
     /// [`FEERATE_CAP_TEST`]).
@@ -438,7 +445,7 @@ impl Default for TicketPolicy {
                seller_max_locked_sats: POOL_FEW as i64 * 1_000, max_sellers: half,
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
-               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, max_socket_s: MAX_SOCKET_S, max_stream_s: MAX_STREAM_S, feerate_cap_sat_per_kw: 0,
+               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, max_socket_s: MAX_SOCKET_S, max_stream_s: MAX_STREAM_S, stream_floor_after_s: STREAM_FLOOR_AFTER_S, feerate_cap_sat_per_kw: 0,
                lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, offers: true, seller_tls: BTreeMap::new(), mainnet_ack: false, mainnet_off: None,
                tasks: BTreeMap::new() }
     }
@@ -498,10 +505,10 @@ pub fn mainnet_ack_file() -> bool {
 pub const MAINNET_DEFAULTS: [(&str, i64); 5] = [("max_locked_tickets", 4), ("max_locked_sats", 4_000), ("max_sellers", 4), ("max_new_sellers_per_min", 4),
                                                ("max_sends_per_hour", 120)];
 
-pub const TICKET_INT_KEYS: [&str; 22] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
+pub const TICKET_INT_KEYS: [&str; 23] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
                                          "max_new_sellers_per_min", "max_sends_per_hour", "pool", "pool_many", "many_sellers", "floor_ticket_sats",
-                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "max_socket_s", "max_stream_s", "feerate_cap_sat_per_kw"];
+                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "max_socket_s", "max_stream_s", "stream_floor_after_s", "feerate_cap_sat_per_kw"];
 pub const TASK_INT_KEYS: [&str; 8] = ["budget_sats", "window_s", "max_locked_sats", "max_locked_tickets", "max_sellers",
                                       "unlisted_max_spend_sats", "unlisted_max_tickets", "unlisted_max_locked_sats"];
 /// The longest window a task's budget can be read over: what the ledger keeps.
@@ -537,6 +544,7 @@ impl TicketPolicy {
                            read_timeout_s: i(m, "read_timeout_s", d.read_timeout_s), max_answer_s: i(m, "max_answer_s", d.max_answer_s),
                            max_socket_s: i(m, "max_socket_s", d.max_socket_s),
                            max_stream_s: i(m, "max_stream_s", d.max_stream_s),
+                           stream_floor_after_s: i(m, "stream_floor_after_s", d.stream_floor_after_s),
                            feerate_cap_sat_per_kw: i(m, "feerate_cap_sat_per_kw", d.feerate_cap_sat_per_kw),
                            // an entry that is not an object is no permission: the lottery is off
                            lottery: match m.get("lottery").filter(|v| !v.is_null()) {
