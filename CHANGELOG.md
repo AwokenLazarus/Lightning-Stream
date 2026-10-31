@@ -38,7 +38,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - On StartOS, Files can share a folder from File Browser, read-only; File Browser stays optional.
 - On StartOS, a shop reached directly through the app can be bought from: Sell asks for a third key,
   link signing (`message:write` only), so the node vouches for the shop's link. Before, no buyer could
-  allow such a shop.
+  allow such a shop. A link signing key pasted on a running shop is used within 15 s, with no restart.
 - Files from File Browser shares only File Browser's own folder, including the files you upload to
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
