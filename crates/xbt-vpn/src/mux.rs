@@ -71,6 +71,8 @@ struct Inner {
     closed: AtomicBool,
     /// Bytes read from the other side, frames and all.
     received: std::sync::atomic::AtomicU64,
+    /// Bytes written to the other side, frames and all.
+    sent: std::sync::atomic::AtomicU64,
 }
 
 impl Inner {
@@ -122,6 +124,7 @@ impl Mux {
             dgram_queued: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             received: std::sync::atomic::AtomicU64::new(0),
+            sent: std::sync::atomic::AtomicU64::new(0),
         });
         tokio::spawn(write_loop(wr, out_rx, inner.clone()));
         tokio::spawn(read_loop(rd, early, inner.clone(), acc_tx, dg_tx));
@@ -183,6 +186,11 @@ impl Mux {
         self.inner.received.load(Ordering::Relaxed)
     }
 
+    /// The bytes written to the other side so far (frames and all).
+    pub fn sent(&self) -> u64 {
+        self.inner.sent.load(Ordering::Relaxed)
+    }
+
     /// Ends the tunnel: every flow on it ends, and the byte stream with them (for a paid tunnel,
     /// the wallet's call ends and nothing more is paid).
     pub fn close(&self) {
@@ -215,6 +223,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut wr: W, mut rx: mpsc::UnboundedRec
         if wr.write_all(&buf).await.is_err() || wr.flush().await.is_err() {
             break 'outer;
         }
+        inner.sent.fetch_add(buf.len() as u64, Ordering::Relaxed);
         buf.clear();
     }
     let _ = wr.shutdown().await;

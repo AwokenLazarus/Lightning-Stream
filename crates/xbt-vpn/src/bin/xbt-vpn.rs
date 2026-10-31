@@ -560,7 +560,8 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
                 let ip = IpAddr::V4(e.tunnel_ip);
                 let c = buyer.device(ip).map(|d| d.meter.counts());
                 let why = rt.block_on(buyer.why_blocked(ip));
-                device_status(e, c.as_ref().map_or(0, |c| c.up_bytes), c.as_ref().map_or(0, |c| c.down_bytes), why)
+                let (exit, used_msat) = buyer.device_use(ip);
+                service::with_use(device_status(e, c.as_ref().map_or(0, |c| c.up_bytes), c.as_ref().map_or(0, |c| c.down_bytes), why), exit.as_deref(), used_msat)
             })
             .collect();
         // each exit's region check, in plain words, for the page

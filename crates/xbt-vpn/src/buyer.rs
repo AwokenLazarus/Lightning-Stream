@@ -183,6 +183,29 @@ pub struct Buyer {
     opening: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Exits (and operators) not to open paid tunnels to for a while, and each exit's openings today.
     holds: std::sync::Mutex<crate::holds::Holds>,
+    /// What each device goes out through and what its paid tunnels cost, for the status page.
+    spend: std::sync::Mutex<HashMap<IpAddr, DeviceSpend>>,
+    next_tunnel: AtomicU64,
+}
+
+/// A device's exit and its spending on paid tunnels: what the wallet said the ended ones cost, and
+/// the open ones' bytes (both ways, frames and all) at their price, as the exit's gateway counts them.
+#[derive(Default)]
+struct DeviceSpend {
+    exit: Option<String>,
+    closed_msat: u64,
+    open: HashMap<u64, (crate::mux::Mux, u64)>,
+}
+
+/// What `bytes` cost at `price_msat_per_gb` (msat a GiB, the unit the exit's route is priced in).
+pub fn cost_msat(bytes: u64, price_msat_per_gb: u64) -> u64 {
+    ((bytes as u128 * price_msat_per_gb as u128).div_ceil(1u128 << 30)) as u64
+}
+
+/// What an ended paid tunnel cost by the wallet's answer (`charged_msat`, else `charged_sats`).
+fn charged_msat(v: &serde_json::Value) -> Option<u64> {
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
+    n("charged_msat").or_else(|| n("charged_sats").map(|s| s.saturating_mul(1000)))
 }
 
 
@@ -221,6 +244,8 @@ impl Buyer {
             tunnels: RwLock::new(HashMap::new()),
             opening: std::sync::Mutex::new(HashMap::new()),
             holds: std::sync::Mutex::new(crate::holds::Holds::default()),
+            spend: std::sync::Mutex::new(HashMap::new()),
+            next_tunnel: AtomicU64::new(1),
         })
     }
 
@@ -541,6 +566,19 @@ impl Buyer {
         self.devices.get(&ip).cloned()
     }
 
+    /// The exit `ip`'s latest flow went out through, and what its paid tunnels have cost so far (msat):
+    /// the ended ones by the wallet's word, the open ones by their bytes at their price.
+    pub fn device_use(&self, ip: IpAddr) -> (Option<String>, u64) {
+        let g = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = g.get(&ip) else { return (None, 0) };
+        let open: u64 = d.open.values().map(|(m, price)| cost_msat(m.sent() + m.received(), *price)).sum();
+        (d.exit.clone(), d.closed_msat + open)
+    }
+
+    fn spend_of<R>(&self, ip: IpAddr, f: impl FnOnce(&mut DeviceSpend) -> R) -> R {
+        f(self.spend.lock().unwrap_or_else(|e| e.into_inner()).entry(ip).or_default())
+    }
+
     /// The connection to an exit, made on first use. A failed connection marks the exit failed in
     /// the router.
     async fn exit(self: &Arc<Self>, device: IpAddr, id: &str) -> Option<Arc<ExitConn>> {
@@ -576,15 +614,21 @@ impl Buyer {
                 return None;
             };
             let (mux, opened_at, me, exit_id) = (t.mux.clone(), Instant::now(), self.clone(), id.to_string());
+            let tid = self.next_tunnel.fetch_add(1, Ordering::Relaxed);
+            self.spend_of(device, |d| d.open.insert(tid, (t.mux.clone(), price)));
             let conn = Carrier::Tunnel(t.mux);
-            // what the wallet said when the tunnel ended (charged, or why it stopped), for the log; a
-            // tunnel that died young holds its exit off, so its opening is not paid for again and again
+            // what the wallet said when the tunnel ended (charged, or why it stopped), for the log and
+            // the device's spending; a tunnel that died young holds its exit off, so its opening is
+            // not paid for again and again
             std::thread::spawn(move || {
-                if let Ok(Ok(v)) = t.done.recv() {
-                    if let Some(why) = v.get("ended").and_then(serde_json::Value::as_str) {
-                        eprintln!("a paid tunnel ended: {why}");
-                    }
+                let said = t.done.recv().ok().and_then(Result::ok);
+                if let Some(why) = said.as_ref().and_then(|v| v.get("ended")).and_then(serde_json::Value::as_str) {
+                    eprintln!("a paid tunnel ended: {why}");
                 }
+                me.spend_of(device, |d| {
+                    let counted = d.open.remove(&tid).map_or(0, |(m, p)| cost_msat(m.sent() + m.received(), p));
+                    d.closed_msat += said.as_ref().and_then(charged_msat).unwrap_or(counted);
+                });
                 if opened_at.elapsed() < YOUNG && mux.received() < YOUNG_BYTES {
                     me.holds().young(&exit_id, &operator, Instant::now());
                 } else {
@@ -634,6 +678,7 @@ impl Buyer {
         for _ in 0..3 {
             let id = self.router_for(device).lock().await.pick(dst.ip(), Instant::now())?;
             if let Some(e) = self.exit(device, &id).await {
+                self.spend_of(device, |d| d.exit = Some(id.clone()));
                 return Some((id, e));
             }
         }
@@ -922,6 +967,25 @@ impl AsyncWrite for PacketPipe {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod spend_tests {
+    use super::*;
+
+    #[test]
+    fn bytes_cost_what_the_exits_route_charges_per_gib() {
+        assert_eq!(cost_msat(1 << 30, 1_000_000), 1_000_000, "a GiB at 1,000 sat a GB");
+        assert_eq!(cost_msat(1, 1_000_000), 1, "a part of a msat rounds up");
+        assert_eq!(cost_msat(0, 1_000_000), 0);
+    }
+
+    #[test]
+    fn what_an_ended_tunnel_cost_is_read_from_the_wallets_answer() {
+        assert_eq!(charged_msat(&serde_json::json!({"charged_msat": "1234"})), Some(1234));
+        assert_eq!(charged_msat(&serde_json::json!({"charged_sats": 3})), Some(3000));
+        assert_eq!(charged_msat(&serde_json::json!({"status": 101})), None);
     }
 }
 

@@ -140,6 +140,15 @@ pub fn device_status(d: &DeviceEntry, up: u64, down: u64, why_blocked: Option<St
     })
 }
 
+/// A device's line with where it goes out and what it has spent: `exit` (the exit its latest flow
+/// took, none before its first) and `used_msat` (its paid tunnels' cost so far,
+/// [`crate::buyer::Buyer::device_use`]), which the buyer's VPN page shows.
+pub fn with_use(mut line: Value, exit: Option<&str>, used_msat: u64) -> Value {
+    line["exit"] = json!(exit);
+    line["used_msat"] = json!(used_msat);
+    line
+}
+
 /// Writes `v` to `path` whole (a new file renamed over the old one, so a page never reads half), with
 /// the folder's group (the one the app's pages read by) and mode 0640.
 pub fn write_json(path: &Path, v: &Value) -> std::io::Result<()> {
