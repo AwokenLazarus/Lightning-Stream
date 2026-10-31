@@ -9254,8 +9254,9 @@ fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pay
             // an invoice is dated a second back: 5 s left, which every prepaid invoice may have and these wins may not
             clock.fetch_add(24, Ordering::SeqCst);
             let standin = standin.clone();
+            // lapsed with the seller once the payments already on their way have arrived: they went in good time
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(1_500));
+                std::thread::sleep(Duration::from_millis(4_500));
                 for h in &open {
                     standin.expire_unpaid(h);
                 }
