@@ -5711,6 +5711,44 @@ fn a_call_may_buy_a_whole_ticket_and_be_charged_only_its_max_charge() {
     assert!(charged <= 30_000 && charged > 20_000, "charged {charged} msat for a cap of 30 sat: {film}");
 }
 
+/// A hashrate trial's payments, as `xbt-hashlink`'s `SignerPayer` makes them (`trial_caps`: `max_sats`
+/// 2,000 so the shop's whole ticket may be bought, `max_charge_sats` the trial's 40 sat), from no
+/// credit: the first slice buys one ticket, every slice after is paid from it, each is charged its
+/// own price, and the buyer's node, the seller's node, the receipts and the ledger agree on it.
+/// (The trial before the charge cap called with `max_sats` 40, which buys no ticket of 1,000 sat: it
+/// paid nothing at all. That call is still denied `max_sats`, as the first assertion here shows.)
+#[test]
+fn a_trial_from_no_credit_buys_one_ticket_and_pays_every_slice_from_it() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let slice = |n: u64| r.call("xbt402_pay", json!({"url": r.shop.url("/api"), "method": "POST", "body": json!({"slice": n}).to_string(),
+                                                   "max_sats": 2_000, "max_charge_sats": 40, "task": "film"}));
+    let old = r.call("xbt402_pay", json!({"url": r.shop.url("/api"), "method": "POST", "body": "{}", "max_sats": 40, "task": "film"}));
+    assert_eq!((old["verdict"].as_str(), old["rule"].as_str(), r.ln.paid_msat()), (Some("deny"), Some("max_sats"), 0), "{old}");
+    const SLICES: u64 = 12;
+    const SLICE_MSAT: u64 = 2_500;
+    let mut sessions = std::collections::HashSet::new();
+    for n in 0..SLICES {
+        let v = slice(n);
+        assert_eq!((v["verdict"].as_str(), v["status"].as_u64(), v["price_msat"].as_str()), (Some("allow"), Some(200), Some("2500")), "slice {n}: {v}");
+        assert_eq!(v["tickets_released"].as_u64(), Some(u64::from(n == 0)), "only the first slice buys a ticket: slice {n}: {v}");
+        assert_eq!(v["balance_msat"].as_str(), Some((TICKET - (n + 1) * SLICE_MSAT).to_string().as_str()), "slice {n}: {v}");
+        sessions.insert(v["session"].as_str().unwrap().to_string());
+    }
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    // the seller's signed count: every slice at its price, and no more
+    let sid = sessions.into_iter().next().unwrap();
+    let stop = r.call("ticket_stop", json!({"session": sid}));
+    assert_eq!(stop["http"]["account"]["spent_msat"].as_str(), Some((SLICES * SLICE_MSAT).to_string().as_str()), "{stop}");
+    assert_eq!(stop["http"]["left_with_seller_msat"].as_str(), Some((TICKET - SLICES * SLICE_MSAT).to_string().as_str()), "the rest is credit with the seller: {stop}");
+    // what left: one ticket, which the seller's node took
+    r.tick();
+    assert_eq!((r.ln.paid_msat(), r.shop.settled()), (TICKET, 1));
+    let booked = r.ledger_sum();
+    assert!((TICKET / 1000) as i64 <= booked && booked <= (TICKET / 1000) as i64 + 15, "{booked}");
+    r.assert_booked();
+}
+
 /// A seller that ignores a small use's `max_charge_sats` (a region check's 20 sat, from no credit,
 /// where the call may buy the whole ticket within `max_sats`) and charges past it: the wallet reads no
 /// further than the cap by its own count, the receipt over the cap is the seller's fault, the session
