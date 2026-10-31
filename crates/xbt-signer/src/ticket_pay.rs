@@ -2559,7 +2559,8 @@ impl Signer {
         let Some(draw) = draw else { return false };
         let task = c.task.as_deref().unwrap_or("");
         let payee = draw.payee.clone();
-        let expect_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
+        // what the answer is expected to use: its charge cap, not what may leave for a ticket
+        let expect_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
         // the win a session would be opened with, as the book sizes it
         let listed = self.ticket_listed(&self.config(), &draw.payee, c.origin);
         let win_msat = crate::lottery::win_size(&draw, &tp.lottery, listed, expect_msat, self.ln_direct_to(&draw.payee)).unwrap_or(0);
@@ -3905,7 +3906,7 @@ impl Signer {
             return fail(hs, &spent, refusal("ticket_terms", "the route's price does not fit an amount, or the request is not one the route takes (by the token: a JSON object)"))
         };
         if reserve > max_msat {
-            return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > max_sats {}", sats_ceil(reserve), c.charge_sats)));
+            return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > the call's charge cap of {} sats", sats_ceil(reserve), c.charge_sats)));
         }
         // a call that found the session as it was being stopped goes no further in it
         if hs.ending.load(Ordering::SeqCst) {

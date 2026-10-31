@@ -18,7 +18,7 @@
 //! | A win that is handed out has a payer. | Every caller of [`Signer::draw_round`] gives the wins it returns to [`Signer::draw_pay`], the round that names void pieces through [`Signer::draw_pay_late`], which puts back as owed what a halted call does not pay. |
 //! | A win is paid once, by its own invoice, after every check of an invoice. | [`Signer::draw_pay`]: a draw is handed to the payer once (`State::handed`); the book refuses a second payment for a win and a second payment for a hash; the invoice must name the seller's node, the session's win size and its CLTV delta, carry bit 512 and a payment secret, and not be expired. |
 //! | What is booked is what the node paid. | The ledger rows are the book's, written before a payment is sent and made exact when the node shows it settled. A seller's `wonMsat` or `paidMsat` moves nothing. |
-//! | A call uses at most `max_sats` by the wallet's own count, and pays at most the luck cap above it. | [`Signer::draw_stream`] stops reading when the pieces it gave values for cost `max_sats`, or when the wins of the call reach [`xbt402::lottery::luck_cap_msat`]; the task's budget and the caps per seller refuse a payment whatever the draws did. |
+//! | A call uses at most its charge cap (`max_charge_sats`, else `max_sats`) by the wallet's own count, and pays at most the luck cap above it. | [`Signer::draw_stream`] stops reading when the pieces it gave values for cost that cap, or when the wins of the call reach [`xbt402::lottery::luck_cap_msat`]; the task's budget and the caps per seller refuse a payment whatever the draws did. |
 //! | At most 8 payments are with the router at once. | Every win goes through [`crate::ticket_rail::Pace`], with every ticket. |
 //! | A win the seller's answer stands still for is paid before the wins no seller waits for. | [`Signer::draw_hurry`], by the wallet's own count against the seller's terms (`maxUnpaidWins`, `gracePieces`): while an answer is being read, and for a request the seller refused `win_unpaid`. A seller's word moves no payment forward. |
 //! | No request leaves for a host the owner did not allow, and none over a channel others can read. | [`Signer::ticket_may_reach`] before every request; `private_channel` before a session is opened (the session key comes back in the open's answer). |
@@ -262,7 +262,7 @@ impl Signer {
         let base = seller_url(c.origin, &terms.session_path).map_err(|e| Tried::Next(e.msg))?;
         let o = {
             let _g = self.lock();
-            self.lottery_open_locked(&json!({"terms": acc, "task": &task, "origin": c.origin, "expect_sats": c.max_sats}))
+            self.lottery_open_locked(&json!({"terms": acc, "task": &task, "origin": c.origin, "expect_sats": c.charge_sats}))
         };
         if o["verdict"] != "allow" {
             let rule = str_or_empty(o.get("rule"));
@@ -711,7 +711,8 @@ impl Signer {
     /// a value for every piece, and every win paid.
     fn draw_request(&self, ds: &Arc<DrawSession>, c: &Call, price: &Price) -> Value {
         let tp = self.ticket_policy();
-        let max_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
+        // what the answer may use: its charge cap (`max_charge_sats`, at most `max_sats`)
+        let max_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
         let dest = format!("ln:{}", ds.terms.payee);
         let counted = Mutex::new(Counted::default());
         let about = |ds: &DrawSession, counted: &Mutex<Counted>| {
@@ -722,7 +723,7 @@ impl Signer {
         };
         let fail = |ds: &DrawSession, d: Value| with(d, about(ds, &counted));
         if price.request_msat > max_msat {
-            return fail(ds, deny("max_sats", format!("quoted {} sats > max_sats {}", sats_ceil(price.request_msat), c.max_sats)));
+            return fail(ds, deny("max_sats", format!("quoted {} sats > the call's charge cap of {} sats", sats_ceil(price.request_msat), c.charge_sats)));
         }
         // every piece of this route below the session's win, at odds the owner allows: a route of the same seller may cost more than the one the session was opened on
         let dearest = price.request_msat.max(price.second_msat).max(price.for_bytes(ds.terms.piece_bytes).unwrap_or(u64::MAX));
@@ -946,8 +947,8 @@ impl Signer {
                     // drawn for owes no win
                     if lock(counted).wins.saturating_mul(ds.win_msat) > luck_cap {
                         let mut cn = lock(counted);
-                        cn.stop.get_or_insert(format!("lottery_luck_cap: the wins of this call come to more than {} sat, the most a call of max_sats {} is let to pay by luck",
-                                                      luck_cap / 1000, c.max_sats));
+                        cn.stop.get_or_insert(format!("lottery_luck_cap: the wins of this call come to more than {} sat, the most a call charged at most {} sat is let to pay by luck",
+                                                      luck_cap / 1000, c.charge_sats));
                         cn.halt = true;
                         return;
                     }
@@ -1018,7 +1019,7 @@ impl Signer {
                 // the call's limit, by the wallet's own count of what has arrived: it reads no further, and draws for what it has
                 let seconds = if price.second_msat > 0 { head_at.elapsed().as_secs().saturating_add(1) } else { 0 };
                 if price.metered() && price.cost(sink.bytes, seconds).unwrap_or(u64::MAX) >= max_msat {
-                    stop_now("max_sats: the call's limit is used up".into());
+                    stop_now("max_sats: the call's charge cap is used up".into());
                     break;
                 }
                 let n = match body.read(&mut buf) {

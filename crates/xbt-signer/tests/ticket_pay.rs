@@ -5711,6 +5711,23 @@ fn a_call_may_buy_a_whole_ticket_and_be_charged_only_its_max_charge() {
     assert!(charged <= 30_000 && charged > 20_000, "charged {charged} msat for a cap of 30 sat: {film}");
 }
 
+/// The draw rail keeps a call's `max_charge_sats` as the ticket rail does: the answer is read no
+/// further than it, while `max_sats` stays what may leave (here, a whole win of 64 sat).
+///
+/// FAILS before: the draws used `max_sats` for all three, so a 10 sat use with 1,000 sat that may
+/// leave read its whole 128 sat file.
+#[test]
+fn a_call_paid_by_draws_is_charged_only_its_max_charge() {
+    let _g = env_lock();
+    let r = draws_rig(json!({"tickets": {"lottery": {"min_expected_wins": 0}}}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{}", 64 * PIECE)), "max_sats": 1_000, "max_charge_sats": 10, "task": "film"}));
+    assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool()), (Some("lottery"), Some(200), Some(false)), "{v}");
+    let used: u64 = v["price_msat"].as_str().unwrap().parse().unwrap();
+    assert!((8_000..=12_000).contains(&used), "{used} msat used of a 10 sat charge cap: {v}");
+    assert!(v["ended"].as_str().unwrap().contains("charge cap"), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
 /// A session stopped while a paid WebSocket is open (a VPN's tunnel, held for as long as the VPN
 /// runs): the socket ends first and its last receipt is taken, so what the stop says the session
 /// spent and left with the seller counts every byte the socket carried, at the route's price, by
