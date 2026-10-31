@@ -238,7 +238,8 @@ impl Node for FakeChain {
                        "difficulty": s.difficulty.unwrap_or(6.33e9), "time": now})
             }
             "getblockstats" => match self.st.lock().unwrap().subsidy {
-                Some(None) => return Err(rpc_err("Block not available (pruned data)")),
+                // what Knots v29.4.2 answers for a block it pruned: a JSON-RPC error, code -1 (RPC_MISC_ERROR)
+                Some(None) => return Err(refused(r#"{"code":-1,"message":"Block not available (pruned data)"}"#)),
                 Some(Some(sats)) => json!({"subsidy": sats}),
                 None => json!({"subsidy": 312_500_000u64}),
             },

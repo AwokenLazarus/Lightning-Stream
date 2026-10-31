@@ -497,9 +497,11 @@ impl Signer {
                 Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
             },
             // what a hashmaker's price follows (Sell → Hashrate): the tip's difficulty and subsidy as the node says them.
-            // What it does not say is left out, for the caller to refuse: nothing here is made up. A node that can't
-            // read the tip's block for `getblockstats` (`subsidyError`) still says the height and its chain, and the
-            // subsidy is then the chain's own schedule at that height (`subsidyFrom`: "schedule")
+            // What it does not say is left out, for the caller to refuse: nothing here is made up. A node that won't
+            // answer `getblockstats` for the tip (`subsidyError`) still says the height and its chain, and the subsidy is
+            // then the chain's own schedule at that height (`subsidyFrom`: "schedule"). A pruned Knots keeps the tip and
+            // answers it (Knots v29.4.2, -prune=550, regtest: only a pruned height gives "Block not available (pruned
+            // data)"); this is for one that refuses it all the same (an older node, an RPC whitelist)
             "mining_tip" => match self.node.call("getblockchaininfo", json!([])) {
                 Ok(i) => {
                     let height = i.get("blocks").and_then(Value::as_u64);

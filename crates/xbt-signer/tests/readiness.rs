@@ -114,8 +114,8 @@ fn p6_the_signer_never_asks_for_txindex() {
             "{calls:?}");
 }
 
-/// Many Umbrel and StartOS nodes are pruned. When the node can't give `getblockstats` for the tip (it answers
-/// with an error, as Knots does for a block it no longer has), `mining_tip` still says the subsidy: the chain's
+/// Many Umbrel and StartOS nodes are pruned. When the node won't give `getblockstats` for the tip (it answers
+/// with Knots' error for a block it no longer has), `mining_tip` still says the subsidy: the chain's
 /// own schedule at the tip's height, which is what `getblockstats` would have said. The difficulty is still the
 /// node's, so the hashmaker's market price comes out the same as on a full node.
 #[test]
