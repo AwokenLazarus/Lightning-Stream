@@ -1055,6 +1055,8 @@ def flap() -> None:
     if origin not in LINK_ORIGINS:
         LINK_ORIGINS.append(origin)
     WALLET_PROC.write_policy()
+    # the owner's policy is read at the signer's start: the new seller is on its allowlist from then on
+    restart_signer()
     shutil.copyfile(f"{RUN}/www/big.bin", f"{RUN}/www/flap.bin")
     try:
         with ChannelDrops(1.0) as drops:
