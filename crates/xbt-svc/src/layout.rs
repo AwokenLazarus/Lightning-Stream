@@ -141,11 +141,14 @@ pub struct Provision {
     pub node_rpc_auth: Option<String>,
     /// The UI's login password.
     pub ui_password: Option<String>,
+    /// Umbrel: the Lightning app's uid, which owns `run/node-keys/` (the hand-over of the keys its
+    /// node bakes, shared with the UI by group, 0770). `None`: no hand-over folder.
+    pub node_keys_uid: Option<u32>,
 }
 
 impl std::fmt::Debug for Provision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Provision(node_rpc_auth: {}, ui_password: {})", self.node_rpc_auth.is_some(), self.ui_password.is_some())
+        write!(f, "Provision(node_rpc_auth: {}, ui_password: {}, node_keys_uid: {:?})", self.node_rpc_auth.is_some(), self.ui_password.is_some(), self.node_keys_uid)
     }
 }
 
@@ -160,7 +163,8 @@ fn file_or_env(file_var: &str, var: &str) -> Result<Option<String>, String> {
 impl Provision {
     /// `XBT_INIT_NODE_RPC_AUTH_FILE` / `XBT_INIT_NODE_RPC_AUTH` (`user:password`), or
     /// `XBT_INIT_NODE_RPC_USER` + `XBT_INIT_NODE_RPC_PASS` (Umbrel: a dependency's exports);
-    /// `XBT_INIT_UI_PASSWORD_FILE` / `XBT_INIT_UI_PASSWORD` (Umbrel: `${APP_PASSWORD}`).
+    /// `XBT_INIT_UI_PASSWORD_FILE` / `XBT_INIT_UI_PASSWORD` (Umbrel: `${APP_PASSWORD}`);
+    /// `XBT_INIT_NODE_KEYS_UID` (Umbrel: the Lightning app's user, 1000).
     ///
     /// These are plain env values on purpose: `xbt-init` is the installer's step, it exits before any
     /// service starts, and the services themselves still read only files (production mode).
@@ -180,7 +184,11 @@ impl Provision {
         if ui_password.as_deref().is_some_and(|p| p.chars().count() < 8) {
             return Err("the UI password is shorter than 8 characters".into());
         }
-        Ok(Self { node_rpc_auth, ui_password })
+        let node_keys_uid = match crate::env("XBT_INIT_NODE_KEYS_UID") {
+            Some(u) => Some(u.parse::<u32>().ok().filter(|u| *u != 0).ok_or("XBT_INIT_NODE_KEYS_UID must be a uid other than root's")?),
+            None => None,
+        };
+        Ok(Self { node_rpc_auth, ui_password, node_keys_uid })
     }
 }
 
@@ -199,7 +207,7 @@ fn lchown(p: &Path, uid: u32, gid: u32) -> io::Result<()> {
 /// Open `p` itself: O_NOFOLLOW refuses a symlink in its last component (ELOOP), O_NONBLOCK keeps
 /// a FIFO from blocking. AGP-063 K1: owner and mode then change through this fd, never by path.
 #[cfg(unix)]
-fn open_nofollow(p: &Path, dir: bool) -> io::Result<std::fs::File> {
+pub fn open_nofollow(p: &Path, dir: bool) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | if dir { libc::O_DIRECTORY } else { 0 };
     std::fs::OpenOptions::new().read(true).custom_flags(flags).open(p)
@@ -392,6 +400,11 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
             dirs.push(own_dir_gid(&run.join(sd.dir), uid_of(w), gid, sd.mode, true)?);
         }
     }
+    // Umbrel: the hand-over of the keys the Lightning app's user has its node bake: that user writes,
+    // the UI takes them (and removes them) by group
+    if let (Some(u), Some(ui)) = (prov.node_keys_uid, comps.iter().find(|c| c.name == crate::UI)) {
+        dirs.push(own_dir_gid(&run.join(crate::RUN_NODE_KEYS), u, uid_of(ui), 0o770, true)?);
+    }
     let mut secrets = vec![];
     let mut put = |comp: &str, name: &str, value: &[u8]| -> Result<(), String> {
         let c = component(comp).expect("known");
@@ -515,7 +528,13 @@ mod tests {
         assert_eq!(Provision::from_env().unwrap().node_rpc_auth.as_deref(), Some("u:p"));
         std::env::remove_var("XBT_INIT_NODE_RPC_USER");
         std::env::remove_var("XBT_INIT_NODE_RPC_PASS");
-        assert!(!format!("{:?}", Provision { node_rpc_auth: Some("u:secret".into()), ui_password: None }).contains("secret"));
+        // the hand-over's owner: a uid, never root's (in this test: the environment is the process's)
+        std::env::set_var("XBT_INIT_NODE_KEYS_UID", "0");
+        assert!(Provision::from_env().is_err());
+        std::env::set_var("XBT_INIT_NODE_KEYS_UID", "1000");
+        assert_eq!(Provision::from_env().unwrap().node_keys_uid, Some(1000));
+        std::env::remove_var("XBT_INIT_NODE_KEYS_UID");
+        assert!(!format!("{:?}", Provision { node_rpc_auth: Some("u:secret".into()), ui_password: None, node_keys_uid: None }).contains("secret"));
     }
 
     /// As an unprivileged user the chown steps only succeed for our own uid, so run the whole flow as
@@ -531,7 +550,7 @@ mod tests {
         let root = t.path().join("data");
         // stand-in: the code path is the same with every uid = ours
         let names: Vec<String> = ["signer", "mcp", "ui"].iter().map(|s| s.to_string()).collect();
-        let prov = Provision { node_rpc_auth: Some("xbt:pw".into()), ui_password: Some("correct horse".into()) };
+        let prov = Provision { node_rpc_auth: Some("xbt:pw".into()), ui_password: Some("correct horse".into()), node_keys_uid: None };
         let r = init_as(&root, &names, &prov, uid).unwrap();
         assert_eq!(r["ok"], true);
         // AGP-042: with the UI, the token is the UI's run/ui/mcp-http-token (0640, the MCP reads it by group)
@@ -577,6 +596,28 @@ mod tests {
         std::fs::create_dir_all(&root2).unwrap();
         std::os::unix::fs::symlink(t.path().join("elsewhere"), root2.join("signer")).unwrap();
         assert!(init_as(&root2, &["signer".to_string()], &Provision::default(), uid).is_err());
+    }
+
+    /// Umbrel: the hand-over of the node's baked keys is the Lightning app user's, shared with the UI by
+    /// group (0770); without that user, or without the UI, there is none.
+    #[test]
+    fn the_node_keys_hand_over_is_made_only_with_its_owner_and_the_ui() {
+        let uid = me();
+        if uid == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("data");
+        let names: Vec<String> = ["signer", "ui"].iter().map(|s| s.to_string()).collect();
+        init_as(&root, &names, &Provision::default(), uid).unwrap();
+        assert!(!root.join("run/node-keys").exists(), "no hand-over without its owner");
+        let prov = Provision { node_keys_uid: Some(uid), ..Provision::default() };
+        init_as(&root, &["signer".to_string()], &prov, uid).unwrap();
+        assert!(!root.join("run/node-keys").exists(), "no hand-over without the UI");
+        let r = init_as(&root, &names, &prov, uid).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        let md = std::fs::metadata(root.join("run/node-keys")).unwrap();
+        assert_eq!((md.uid(), md.mode() & 0o7777), (uid, 0o770));
     }
 
     /// An AGP-040 data dir (the token in mcp/secrets and a copy in ui/secrets) upgrades with the same token;

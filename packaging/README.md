@@ -158,8 +158,19 @@ The UI writes `run/ln/rail.macaroon` (group `xbt-ln-rail`: the signer and the UI
 `run/gateway/{config.json, invoices.macaroon, info.macaroon}` (group `xbt-gateway`), each 0640.
 `xbt-supervise` restarts the signer when the rail macaroon or the certificate changes, and starts the
 gateway once its config exists and again when it or a macaroon changes. The Lightning node's REST address
-comes from the platform (Umbrel: Lightning Fork's exports; StartOS: its container address); the owner
-types only the macaroons, baked in Lightning Fork's dashboard. No admin macaroon is mounted or kept.
+comes from the platform (Umbrel: Lightning Fork's exports; StartOS: its container address).
+
+On Umbrel the owner types no macaroon: create your Lightning wallet in Lightning Fork first; Lightning
+Stream picks it up automatically, also when the wallet is made after the install, with no restart. Two
+one-shots do it. `node-keys-bake` runs as Lightning Fork's user (1000), the only user that can enter its
+data (0700), which it mounts read-only (the one container that may; `lint.py` and `lint_test.py` hold
+every other to `tls.cert` alone). It waits for the admin macaroon, has the node bake the app's narrow
+macaroons (the wallet's, and the gateway's invoices, info and SignMessage keys), each under a root key of
+its own, and writes them only to `run/node-keys/` (Lightning Fork's user and the UI's group, 0770, made by
+`init`). It reads `run/ln` and `run/gateway` by group, to bake only what is missing and nothing the owner
+disconnected. `node-keys`, as the UI, moves each key into place with its root key id and removes it from
+the hand-over. The admin macaroon is never written anywhere. On StartOS the owner pastes the macaroons, or
+Lightning Fork grants them.
 
 `init` gives each sub-dir to its uid (Umbrel bind mounts arrive owned by uid 1000, StartOS volumes owned by
 root), writes the node credentials, and makes the MCP token once, as the UI's `run/ui/mcp-http-token`

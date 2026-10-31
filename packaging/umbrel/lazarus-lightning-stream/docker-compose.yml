@@ -10,7 +10,7 @@
 # (xbt-supervise --wait). The owner turns it on from the Sell page of the app's own page
 # (XBT_UI_SELL=1), which writes the gateway's config and its two narrow macaroons. The gateway mounts
 # only those. The signer is the only service that can spend. Of the Lightning node's data the
-# services mount only tls.cert; the one-shot node-keys alone reads its admin macaroon, once, to have
+# services mount only tls.cert; the one-shot node-keys-bake alone reads its admin macaroon, to have
 # the node bake the narrow macaroons (below), and keeps nothing of it.
 #
 # Hashrate: two services of the xbt-hashlink image, as xbt-hashrate. The hasher takes this box's
@@ -50,12 +50,13 @@ x-service: &service
       condition: service_completed_successfully
 
 x-lightning-data: &lightning-data
-  # the Lightning node's mainnet admin macaroon, the file alone: mounted into node-keys only. The
-  # directories above it are its owner's alone (0700), so a mount of the directory could not be read
-  # by node-keys' group; the file itself is readable by the group (0640)
+  # the Lightning node's data folder, read-only: mounted into node-keys-bake only, which runs as the
+  # Lightning app's user (1000) because its directories are that user's alone (0700). The folder
+  # always exists (tls.cert is in it); the admin macaroon in it appears when the owner makes the wallet,
+  # which a mount of that one file could not wait for (Docker refuses to start on a missing file)
   type: bind
-  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain/bitcoin/mainnet/admin.macaroon
-  target: /node/admin.macaroon
+  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}
+  target: /node
   read_only: true
   bind:
     create_host_path: false
@@ -94,6 +95,8 @@ services:
       XBT_INIT_NODE_RPC_USER: ${APP_BITCOIN_RPC_USER:-${APP_XBT_KNOTS_RPC_USER}}
       XBT_INIT_NODE_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-${APP_XBT_KNOTS_RPC_PASS}}
       XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
+      # run/node-keys: the hand-over of the keys node-keys-bake (the Lightning app's user) has the node bake
+      XBT_INIT_NODE_KEYS_UID: "1000"
     volumes:
       - ${APP_DATA_DIR}/data:/data
 
@@ -176,6 +179,8 @@ services:
       XBT_UI_MCP_URL: http://${DEVICE_DOMAIN_NAME}:33511/mcp
       XBT_UI_LN_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
       XBT_UI_LN_TLS_CERT: /data/lightning/tls.cert
+      # node-keys-bake brings the app's keys once the owner has made the wallet in Lightning Fork
+      XBT_UI_LN_AUTO: "1"
       # the connector shares this container's network namespace and listens on loopback only
       XBT_UI_CONNECTOR: http://127.0.0.1:8484
       # a seller's own web page, opened inside the app: one origin per port (docs/SELLER-APPS.md). A
@@ -251,33 +256,70 @@ services:
       - ${APP_DATA_DIR}/data/run/enroll:/data/run/enroll:ro
       - *lightning-cert
 
-  # One-shot: connects the app to the box's Lightning node with no step by the owner. It reads the
-  # node's admin macaroon (the Lightning app's data, read-only, here and in no other service) and asks
-  # the node to bake the app's narrow macaroons, each under a root key of its own: the wallet's
-  # (info:read offchain:read offchain:write onchain:read) and the gateway's two (invoices; info:read).
-  # It writes only those, where the setup pages would, and exits. A key already there is kept; a key
-  # the owner disconnected is not made again. The Lightning app's files are its user's (1000), hence
-  # the group. It waits for the node (starting, or its wallet still locked) and asks again.
+  # Connects the app to the box's Lightning node with no step by the owner, in two one-shots, either of
+  # which may start first: the owner can install Lightning Stream before making the wallet in Lightning
+  # Fork, and the keys arrive when it is made, with no restart.
+  # node-keys-bake runs as the Lightning app's user (1000), the only user that can enter its data
+  # (read-only, here and in no other service). It waits for the admin macaroon (the owner making the
+  # wallet), and asks the node to bake the app's narrow macaroons, each under a root key of its own: the
+  # wallet's (info:read offchain:read offchain:write onchain:read) and the gateway's three (invoices;
+  # info:read; SignMessage alone, which vouches for the shop's direct link). It writes them only to
+  # run/node-keys, the hand-over it shares with the UI, and exits. It reads run/ln and run/gateway (by
+  # their groups) only to see what is there already and what the owner turned off: a key already there
+  # is kept, and a key the owner disconnected is not made again. Once its keys are made it exits, and
+  # nothing restarts it (restart: "no"). It needs the node's REST, so it is on the app's network:
+  # umbrelOS joins an app's containers to its one shared network, where Lightning Fork's node is, and a
+  # network of this app's own could not hold another app's container (no narrower network to give it).
+  node-keys-bake:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-12b8182c0bf6@sha256:2162a817631271904dc3f32d561f98a31537383420d88a2fdf0a1c0d155654f0
+    command: ["node-keys"]
+    user: "1000:1000"
+    restart: "no"
+    group_add:
+      # the hand-over's group (the UI's), run/gateway's (the gateway's) and run/ln's (the rail's)
+      - "10005"
+      - "10007"
+      - "10008"
+    healthcheck:
+      disable: true
+    environment:
+      XBT_KEYS_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      XBT_KEYS_TLS_CERT: /node/tls.cert
+      XBT_KEYS_ADMIN: /node/data/chain
+      XBT_KEYS_RAIL_DIR: /data/run/ln
+      XBT_KEYS_GW_DIR: /data/run/gateway
+      XBT_KEYS_BAKE_TO: /data/run/node-keys
+      # a wallet the owner is making is noticed within half a minute
+      XBT_KEYS_RETRY_MAX_S: "30"
+    volumes:
+      - ${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro
+      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway:ro
+      - ${APP_DATA_DIR}/data/run/node-keys:/data/run/node-keys
+      - *lightning-data
+
+  # node-keys runs as the UI and reads nothing of the Lightning app: it moves each key node-keys-bake
+  # leaves in run/node-keys to where the setup pages would write it (run/ln, run/gateway), with its root
+  # key id, removes it from the hand-over, and exits once every key is in place.
   node-keys:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-12b8182c0bf6@sha256:2162a817631271904dc3f32d561f98a31537383420d88a2fdf0a1c0d155654f0
     command: ["node-keys"]
     restart: "no"
-    group_add:
-      - "1000"
+    # it only moves files: no network at all (the node's address below is only what the tool asks for)
+    network_mode: none
     healthcheck:
       disable: true
     environment:
       XBT_KEYS_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
-      XBT_KEYS_TLS_CERT: /data/lightning/tls.cert
-      XBT_KEYS_ADMIN: /node/admin.macaroon
+      XBT_KEYS_TAKE_FROM: /data/run/node-keys
+      XBT_KEYS_WATCH_S: "5"
       XBT_KEYS_RAIL_DIR: /data/run/ln
       XBT_KEYS_GW_DIR: /data/run/gateway
     volumes:
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
-      - *lightning-data
-      - *lightning-cert
+      - ${APP_DATA_DIR}/data/run/node-keys:/data/run/node-keys
 
   connector:
     <<: *service

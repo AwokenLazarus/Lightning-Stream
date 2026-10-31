@@ -104,6 +104,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Clicking the background sends lightning down two streams only when you click between them; near
   one stream, only that one.
 
+**Umbrel**
+- Lightning Stream installs before your Lightning wallet exists. Create your Lightning wallet in
+  Lightning Fork; Lightning Stream picks it up automatically, with no restart. Before, the install
+  failed until the wallet was made.
+
 **Linux**
 - An update keeps every setting in .env (including ones added by hand), LS_* settings given to
   install.sh win over .env, also with --yes, and the Files folder has its own port setting,

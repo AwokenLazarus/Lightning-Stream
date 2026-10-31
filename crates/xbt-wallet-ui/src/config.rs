@@ -155,6 +155,9 @@ pub struct LnSetup {
     /// The node's own app grants this app its key when the owner approves a request there
     /// (`XBT_UI_LN_GRANT=1`: StartOS with Lightning Fork's grant-app-access); the page says so.
     pub grant: bool,
+    /// The box has its node bake this app's keys once the owner has made the node's wallet
+    /// (`XBT_UI_LN_AUTO=1`: Umbrel, `node-keys-bake`); with no key yet, the page says to make the wallet.
+    pub auto: bool,
 }
 
 /// The gateway page: where it writes, and the node and paths as the gateway's container sees them.
@@ -317,6 +320,7 @@ impl Config {
             tls_cert: env("XBT_UI_LN_TLS_CERT").map(PathBuf::from),
             pin: env("XBT_UI_LN_TLS_PIN").as_deref() == Some("1"),
             grant: env("XBT_UI_LN_GRANT").as_deref() == Some("1"),
+            auto: env("XBT_UI_LN_AUTO").as_deref() == Some("1"),
         };
         let gw = GatewaySetup {
             dir: env("XBT_UI_GW_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("gateway")),

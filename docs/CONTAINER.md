@@ -13,8 +13,10 @@ Status: **proposal**, not yet agreed with the xbt-compute project (sent 2026-09-
 takes its Lightning rail from the environment (`B2_LN_REST`, `B2_LN_TLS_CERT`, `B2_LN_MACAROON`: a file).
 `scripts/container_test.sh` runs both on regtest with a paid buy over stream tickets (section 7), and the
 Umbrel and StartOS packages wire them to the box's Lightning Fork node (`packaging/DESIGN.md`). Neither the
-images nor the packages hold an admin macaroon: of the Lightning node's data they mount only its
-`tls.cert`, and the macaroons are narrow ones the owner bakes.
+images nor the packages hold an admin macaroon: of the Lightning node's data the services mount only its
+`tls.cert`, and the macaroons are narrow ones. On Umbrel the one-shot `node-keys-bake` (as Lightning Fork's
+user, its data read-only) has the node bake them once the owner has made the wallet, and keeps nothing of
+the admin macaroon (`packaging/README.md`).
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
 code is in the git history (last at commit 0911cc0). Its image, user and data dir are gone from this

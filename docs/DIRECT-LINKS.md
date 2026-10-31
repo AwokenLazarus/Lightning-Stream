@@ -76,7 +76,8 @@ that node, and pays only it.
 The gateway signs its own statement and renews it before it expires, with a key that holds one
 permission: lnd's `SignMessage` (a URI permission, `uri:/lnrpc.Lightning/SignMessage`). The key
 can sign messages and do nothing else; it cannot move coins or read the node. The box's key tool
-bakes it beside the gateway's other keys (`sign.macaroon` in the gateway's key folder). A node that
+bakes it beside the gateway's other keys (`sign.macaroon` in the gateway's key folder); on Umbrel, once
+the owner has made the wallet in Lightning Fork, whether before or after installing the app. A node that
 will not bake it leaves the other keys alone: the shop then sells over its web address only, and
 the Sell page says why its link is not reachable.
 
