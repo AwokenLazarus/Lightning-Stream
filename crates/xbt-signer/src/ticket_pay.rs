@@ -165,6 +165,8 @@ const FINAL_PAST_CALL: Duration = Duration::from_secs(5);
 /// How long past the call's deadline a secret that has left is asked after: it has left, and is delivered again by the
 /// next release if this is not the end of it, so the caller is not kept for it.
 const DELIVER_PAST_CALL: Duration = Duration::from_secs(2);
+/// The least a fill is waited for, however little of the pause is left.
+const FILL_MOMENT: Duration = Duration::from_secs(1);
 /// How long a stop made inside a release is waited for: it goes on behind, and the answer ends here.
 const STOP_INSIDE_WAIT: Duration = Duration::from_secs(2);
 
@@ -3984,7 +3986,8 @@ impl Signer {
                 if let Some(g) = Refilling::take(hs.clone()) {
                     break Arc::new(g);
                 }
-                if Instant::now() >= pause_by {
+                // (a moment at least: the fill behind this release's last try may be about to end)
+                if Instant::now() >= pause_by.max(turn + FILL_MOMENT) {
                     return Err(refusal("ticket_busy", "a refill of this session's tickets has not ended: call again"));
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -4244,7 +4247,8 @@ impl Signer {
     fn ticket_fill_by(&self, hs: &Arc<HttpSession>, by: Instant, keep: impl Send + Sync + 'static) -> std::result::Result<usize, Value> {
         let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else { return self.ticket_fill(hs) };
         let h = hs.clone();
-        crate::ticket_rail::within(by, move || {
+        // a moment at least: a fill asked for as the pause runs out says what it came to, rather than being left behind
+        crate::ticket_rail::within(by.max(Instant::now() + FILL_MOMENT), move || {
             let _keep = keep;
             me.ticket_fill(&h)
         }).unwrap_or_else(|| Err(with(refusal("ticket_busy", "the wallet's node or the seller has not yet answered for this session's next tickets: no secret was released; call again"),
