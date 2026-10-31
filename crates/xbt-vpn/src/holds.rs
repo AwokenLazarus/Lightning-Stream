@@ -183,8 +183,26 @@ impl CheckGate {
     /// The gate kept in `file` (made if missing): what it holds is read back. A check reserved and
     /// never settled (the service stopped during it) is counted in full, and that exit not checked
     /// again that day.
+    /// A file that is there but can't be read or parsed does not start the budget again: the day's
+    /// budget counts as spent from now (no paid check until a day has passed), and the bad file is
+    /// kept beside it (`.bad`) for a look.
     pub fn load(file: &Path) -> CheckGate {
-        let v: Value = std::fs::read(file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+        let v: Value = match std::fs::read(file).map(|b| serde_json::from_slice::<Value>(&b)) {
+            Ok(Ok(v)) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+            bad => {
+                let why = match bad {
+                    Err(e) => e.to_string(),
+                    Ok(Err(e)) => e.to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                eprintln!("region checks: {} could not be read ({why}): no paid region check for a day", file.display());
+                let _ = std::fs::copy(file, file.with_extension("bad"));
+                let g = CheckGate { file: Some(file.to_path_buf()), spent: Some((unix(SystemTime::now()), CHECK_SATS_PER_DAY)), ..CheckGate::default() };
+                let _ = g.save();
+                return g;
+            }
+        };
         let n = |v: &Value| v.as_u64().unwrap_or(0);
         let mut g = CheckGate { file: Some(file.to_path_buf()), ..CheckGate::default() };
         if let Some(a) = v["spent"].as_array() {
@@ -443,6 +461,30 @@ mod tests {
         g.reserve("b", "op2", now).unwrap();
         g.settle(700, true, now);
         assert_eq!(CheckGate::load(&f).spent_today(), REGION_CHECK_TICKET_SATS + 700, "settled, it counts what left");
+    }
+
+    /// A gate file that is there but can't be read (corrupt, or not a file) does not start the day's
+    /// budget again: no paid check until a day has passed.
+    #[test]
+    fn a_gate_file_that_cannot_be_read_spends_the_day_not_resets_it() {
+        let (_d, f) = gate_file("gate");
+        let now = SystemTime::now();
+        let mut g = CheckGate::load(&f);
+        g.reserve("a", "op", now).unwrap();
+        g.settle(1_000, true, now);
+        std::fs::write(&f, b"{\"spent\": [1, 10").unwrap();
+        let mut g = CheckGate::load(&f);
+        assert_eq!(g.spent_today(), CHECK_SATS_PER_DAY, "a corrupt file counts the day as spent");
+        assert!(!g.may("b", "op2", now + Duration::from_secs(60)));
+        assert!(g.may("b", "op2", now + DAY + Duration::from_secs(60)), "a new day");
+        assert!(f.with_extension("bad").exists(), "the bad file is kept for a look");
+        // not a file at all
+        let (d, _) = gate_file("gate");
+        let dir = d.path().join("gate.json");
+        std::fs::create_dir(&dir).unwrap();
+        let mut g = CheckGate::load(&dir);
+        assert!(!g.may("b", "op2", now + Duration::from_secs(60)));
+        assert!(g.reserve("b", "op2", now).is_err(), "and it can't be paid for either");
     }
 
     /// A reservation that can't be written is not paid for: the gate says so, and counts nothing.

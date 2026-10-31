@@ -42,7 +42,8 @@
 //! xbt-vpn fetch --tunnel URL --url http://HOST/PATH [--flows N] [--secs S] [--once] [--max-charge-sats N] [--region-check]
 //!     The same through a priced exit's paid tunnel at URL, opened by the wallet of B2_SIGNER_SOCK
 //!     and B2_STREAM_DIR (as the app's buyer side opens it). `--once`: each flow downloads the URL
-//!     once, to its end. `--region-check`: the tunnel is opened as a region check's (no more than one
+//!     once, to its end. `--max-charge-sats N`: the tunnel is charged no more than N while the
+//!     wallet may still buy the exit's whole ticket. `--region-check`: the tunnel is opened as a region check's (no more than one
 //!     ticket may leave the wallet for it, and it is charged no more than 20 sats), and the line adds
 //!     the wallet's answer when it ended (`wallet`), the sats that left the wallet (`left_sats`; null
 //!     where the answer does not say, which the service's region checks count as the full 2,000) and

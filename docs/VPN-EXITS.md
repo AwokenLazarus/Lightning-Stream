@@ -145,9 +145,11 @@ check). Where that is not known (no answer, an error, an opening given up, or th
 during the check) the full 2,000 stays counted. The budget is kept in wall-clock time in that file,
 so the service starting again (as it does at every change of its settings) does not start the day
 again. So the day's checks never move more than 4,000 sats, however many exits are announced, under
-how many keys, or how often the service starts; with shops whose ticket is T sats, that is
-1 + ⌊2,000 / T⌋ checks a day (T counting the routing fee): 2 for a ticket over 1,000 sats, 3 at
-1,000, 4 at 546. An exit's opening and the
+how many keys, or how often the service starts. If the file is there but can't be read, the day's
+budget counts as spent (no paid check until a day has passed) rather than starting again. With shops
+whose ticket and its routing fee come to T sats, that is 1 + ⌊2,000 / T⌋ checks a day: 2 when T is
+over 1,000 (so a 1,000-sat ticket with any fee), 3 when T is 667 to 1,000, 4 when T is 501 to 666.
+An exit's opening and the
 check's reads through it are each given their own time (45 s and 30 s), so a slow opening from no
 credit is not cut short. Also one check of an exit a day, none more that day for an operator (the
 exit's Nostr key) whose checks failed twice, and the exits seen longest first, so a crowd of new
