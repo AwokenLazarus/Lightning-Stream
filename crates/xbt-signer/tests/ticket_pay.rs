@@ -748,6 +748,10 @@ struct PayState {
     failing: Option<String>,
     /// Invoices whose payments fail as well (a win's next invoice, in the same drop).
     fail_also: Vec<String>,
+    /// The node finds no route to the seller (a link along the way was replaced a moment ago): a payment
+    /// sent now fails at once, with no route and no attempt, and the node's route query says the same.
+    no_route: bool,
+    route_queries: usize,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
     late_fail: usize,
@@ -882,6 +886,12 @@ impl LnBackend for PayLn {
                   "timestamp": d.timestamp.to_string(), "expiry": d.expiry_s.to_string(), "features": features}))
     }
 
+    fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64) -> xbt402::Result<bool> {
+        let mut s = self.st.lock().unwrap();
+        s.route_queries += 1;
+        Ok(!s.no_route && !s.down)
+    }
+
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
         let (takes, look, on_look) = {
             let mut s = self.st.lock().unwrap();
@@ -940,7 +950,7 @@ impl LnBackend for PayLn {
         }
         // its own channel down: as the real node says it, no balance, and no attempt on its record
         let down = s.channel["active"] != true;
-        let failing = down || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
+        let failing = down || s.no_route || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
         s.fail_next = s.fail_next.saturating_sub(1);
         let late = !failing && s.late_fail > 0;
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
@@ -9514,5 +9524,51 @@ fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
     assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 2, "{v}");
     assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "no failed invoice sent again: {v}");
     assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+}
+
+/// A link along the route is replaced, and for a while the node finds no route to the seller: a payment sent
+/// then fails at once. The wallet asks the node for a route first and waits for one, within 8 s: a window of
+/// 3 s costs no failed payment and no win; one of 10 s ends the wait at 8 s with its reason, and still no payment
+/// fails, and the win is paid on its own invoice once the route is back.
+///
+/// FAILS with no route query: each win sent in the window fails, and its invoice has to be replaced.
+#[test]
+fn a_moment_with_no_route_to_the_seller_is_waited_for_and_costs_no_failed_payment() {
+    let _g = env_lock();
+    for window in [Duration::from_secs(3), Duration::from_secs(10)] {
+        let r = patient_draws_rig(json!({}));
+        let (ln, once, when) = (r.ln.clone(), AtomicBool::new(false), Arc::new(Mutex::new(None::<Instant>)));
+        let w = when.clone();
+        r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+            if !ln.by_status("SUCCEEDED").is_empty() && !once.swap(true, Ordering::SeqCst) {
+                ln.st.lock().unwrap().no_route = true;
+                *w.lock().unwrap() = Some(Instant::now());
+                let ln = ln.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(window);
+                    ln.st.lock().unwrap().no_route = false;
+                });
+            }
+        }));
+        let size = 256 * PIECE;
+        let v = r.pay(&format!("/pieces/{size}"), 1_000);
+        assert!(when.lock().unwrap().is_some(), "the window never came: {v}");
+        assert_eq!(r.ln.by_status("FAILED").len(), 0, "{window:?}: nothing was sent that could not be routed: {v}");
+        assert!(r.ln.st.lock().unwrap().route_queries > 0);
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+        let wins = v["wins"].as_u64().unwrap();
+        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{window:?}: {v}");
+        assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+        let no_route: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ln_no_route").collect();
+        if window > Duration::from_secs(8) {
+            assert!(!no_route.is_empty(), "past 8 s the wait ends with its reason");
+            for e in &no_route {
+                let secs: f64 = e["reason"].as_str().unwrap().split("for ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+                assert!(secs <= 8.6, "waited {secs} s: {e}");
+            }
+        } else {
+            assert!(no_route.is_empty(), "a window of 3 s is waited out: {no_route:?}");
+        }
+    }
 }
 

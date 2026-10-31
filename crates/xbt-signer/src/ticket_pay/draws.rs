@@ -730,7 +730,7 @@ impl Signer {
                     | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
                 // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
                 // the same invoice is good the next time the seller lists it
-                let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_unavailable");
+                let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_no_route" | "ln_unavailable");
                 if c.unpaid.len() < UNPAID_LISTED {
                     c.unpaid.push(json!({"draw": win.draw(), "rule": rule}));
                 }

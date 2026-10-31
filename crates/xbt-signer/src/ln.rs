@@ -279,6 +279,13 @@ pub trait LnBackend: Send + Sync {
     fn lookup(&self, payment_hash: &str) -> Result<Option<Value>>;
     /// `GET /v1/utxos`: the node's on-chain coins.
     fn utxos(&self) -> Result<Vec<Value>>;
+    /// `GET /v1/graph/routes/{payee}/{amt}` (`offchain:read`): whether the node finds a route of
+    /// `amt_msat` to `payee` out through `outgoing_chan_id`, as its own payment would look for one
+    /// (mission control included). Nothing is sent. `Ok(false)` only for the node's own "no path";
+    /// any other failure to answer is an error.
+    fn has_route(&self, _payee: &str, _amt_msat: u64, _outgoing_chan_id: Option<&str>, _final_cltv: u64) -> Result<bool> {
+        Err(err("ln_backend", "this backend does not look for routes"))
+    }
     /// Stream tickets, `POST /v2/router/send` for a hold invoice: the `Payment` as soon as it is
     /// locked (IN_FLIGHT with an HTLC out) or over (FAILED, SUCCEEDED). The payment goes on in the
     /// node after this returns; an error means its fate is not known ([`Self::lookup`] then says).
@@ -567,6 +574,22 @@ impl LnBackend for LndRest {
         Ok(self.get("/v1/channels")?.get("channels").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
+    fn has_route(&self, payee: &str, amt_msat: u64, outgoing_chan_id: Option<&str>, final_cltv: u64) -> Result<bool> {
+        if payee.len() != 66 || !payee.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(err("ln_backend", "a route is looked for to a node key only"));
+        }
+        let mut path = format!("/v1/graph/routes/{payee}/0?amt_msat={amt_msat}&final_cltv_delta={final_cltv}&use_mission_control=true");
+        if let Some(c) = outgoing_chan_id.filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())) {
+            path.push_str(&format!("&outgoing_chan_id={c}"));
+        }
+        match self.get(&path) {
+            Ok(v) => Ok(v.get("routes").and_then(Value::as_array).is_some_and(|r| !r.is_empty())),
+            // the node's own word that it has no path: no route, and no error
+            Err(e) if e.msg.contains("LN node HTTP") && e.seller.as_deref().is_some_and(|m| m.contains("unable to find a path")) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn send(&self, r: &SendRequest) -> Result<Value> {
         let body = json!({"payment_request": r.invoice, "timeout_seconds": r.timeout_s, "fee_limit_sat": r.fee_limit_sats.to_string(),
                           "cltv_limit": r.cltv_limit, "outgoing_chan_ids": r.outgoing_chan_ids, "no_inflight_updates": true,
@@ -804,8 +827,8 @@ pub fn channel_refusal(c: &Value, split_height: i64) -> Option<String> {
 
 /// How long the ticket rail's checks wait for an inactive channel ([`Signer::ln_channels_back`]): less
 /// than the 10 s a seller's answer stands still for a win, with room left to pay it.
-const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
-const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
+pub(crate) const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
+pub(crate) const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
 /// Longer than the wait's polls, and than the moment between one refused payment and the next behind it.
 const CHANNEL_OUT_FORGOTTEN: Duration = Duration::from_secs(1);
 
@@ -2121,5 +2144,39 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged, "the records it holds are not replaced");
             assert!(book.halted().is_some_and(|h| h["reason"].as_str().unwrap().contains("ln_payments.json")), "the rail is halted");
         }
+    }
+
+    /// The node's route query: a route found, the node's own "no path", and an error it could not answer, told
+    /// apart; and the question as the node's REST API takes it.
+    #[test]
+    fn a_route_query_tells_no_path_from_no_answer() {
+        use std::io::{BufRead as _, Write as _};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = asked.clone();
+        std::thread::spawn(move || {
+            let answers = [(200, r#"{"routes":[{"total_time_lock":150,"hops":[]}]}"#), (500, r#"{"code":2,"message":"unable to find a path to destination"}"#),
+                           (500, r#"{"code":2,"message":"database is locked"}"#)];
+            for (code, body) in answers {
+                let (mut s, _) = l.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(s.try_clone().unwrap()).read_line(&mut line).unwrap();
+                seen.lock().unwrap().push(line.split_whitespace().nth(1).unwrap_or("").to_string());
+                write!(s, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mac = dir.path().join("m");
+        std::fs::write(&mac, [1u8, 2, 3]).unwrap();
+        let ln = LndRest::new(&url, &mac, None).unwrap();
+        let payee = format!("02{}", "ab".repeat(32));
+        assert!(ln.has_route(&payee, 64_000, Some("123"), 40).unwrap());
+        assert!(!ln.has_route(&payee, 64_000, None, 40).unwrap());
+        assert!(ln.has_route(&payee, 64_000, None, 40).is_err(), "a node that cannot answer is no 'no route'");
+        assert!(ln.has_route("not/a/key", 1, None, 40).is_err());
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked[0], format!("/v1/graph/routes/{payee}/0?amt_msat=64000&final_cltv_delta=40&use_mission_control=true&outgoing_chan_id=123"));
+        assert_eq!(asked.len(), 3);
     }
 }

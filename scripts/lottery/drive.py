@@ -500,38 +500,44 @@ def page() -> None:
     stop_sessions()
 
 
-# A payment on its way when the buyer's link to its peer drops fails, whatever the wallet does: one sent no
-# earlier than this before the drop (the longest a win has been seen on its way is 13.6 s) and no later than a
-# second after it is counted as the drop's, and reported, not failed.
-DROP_BEFORE_S, DROP_AFTER_S = 15.0, 1.0
+# A payment on its way when a link of its route drops fails, whatever the wallet does, and for some seconds after a
+# link along the way was replaced the buyer's node finds no route at all (9.9 s seen on an 8 GB lab). One sent from
+# this long before a drop (the longest a win has been seen on its way is 13.6 s) to this long after is counted as
+# the drop's, and reported, not failed; how long after the drop the last such failure came is reported too.
+DROP_BEFORE_S, DROP_AFTER_S = 15.0, 15.0
 
 
-def link_drops(since: float) -> list[float]:
-    """When the buyer's node dropped a connection to a peer since `since` (epoch seconds), by its own log: the
-    nodes do this by themselves (lf1's peer bootstrapper dials lf2 again and the node replaces the connection)."""
+def link_drops(since: float) -> list[tuple[float, str]]:
+    """When a node of the route (the buyer's, the hop's, the seller's) dropped a connection to a peer since `since`
+    (epoch seconds), by each node's own log: the nodes do this by themselves (each one's peer bootstrapper dials a
+    peer it is connected to again, and the node replaces the connection). Each drop is logged by both its ends."""
     out = []
-    for line in lab.dc("logs", "--no-color", "--timestamps", BUYER, check=False).splitlines():
-        if "PEER:" not in line or "disconnecting" not in line:
-            continue
-        stamp = line.split("|", 1)[-1].strip().split(" ", 1)[0]
-        try:
-            at = datetime.datetime.fromisoformat(stamp[:26].rstrip("Z") + "+00:00").timestamp()
-        except ValueError:
-            continue
-        if at >= since:
-            out.append(at)
-    return out
+    for node in (BUYER, HOP, SELLER):
+        for line in lab.dc("logs", "--no-color", "--timestamps", node, check=False).splitlines():
+            if "PEER:" not in line or "disconnecting" not in line:
+                continue
+            stamp = line.split("|", 1)[-1].strip().split(" ", 1)[0]
+            try:
+                at = datetime.datetime.fromisoformat(stamp[:26].rstrip("Z") + "+00:00").timestamp()
+            except ValueError:
+                continue
+            if at >= since:
+                out.append((at, node))
+    return sorted(out)
 
 
-def failed_by_drop(before: set[str], drops: list[float]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """The payments that failed since `before`, as those a link drop explains and those it does not."""
+def failed_by_drop(before: set[str], drops: list[tuple[float, str]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The payments that failed since `before`, as those a link drop explains and those it does not. Each says the
+    drop nearest it and how long after that drop it was sent (`sent_after_drop_s`, negative: before it)."""
     in_drop, outside = [], []
     for h, p in e2e.buyer_payments().items():
         if h in before or h in FOREIGN or p["status"] != "FAILED":
             continue
         sent = int(p.get("creation_time_ns") or 0) / 1e9
-        near = [round(d - sent, 1) for d in drops if d - DROP_BEFORE_S <= sent <= d + DROP_AFTER_S]
-        row = {"hash": h[:12], "reason": p.get("failure_reason"), "msat": p.get("value_msat"), "drop_after_send_s": near[:1]}
+        near = sorted((abs(sent - d), round(sent - d, 1), node) for d, node in drops if d - DROP_BEFORE_S <= sent <= d + DROP_AFTER_S)
+        row = {"hash": h[:12], "reason": p.get("failure_reason"), "msat": p.get("value_msat")}
+        if near:
+            row.update({"sent_after_drop_s": near[0][1], "drop_logged_by": near[0][2]})
         (in_drop if near else outside).append(row)
     return in_drop, outside
 
@@ -586,6 +592,7 @@ def swarm_of(n: int) -> None:
         drops = link_drops(wall0)
         in_drop, outside = failed_by_drop(paid_already, drops)
         dropped_hashes = {f["hash"] for f in in_drop}
+        tail = max((f["sent_after_drop_s"] for f in in_drop), default=None)
         s = sampler.report()
         # a win's payment that a drop failed was a win on its way, as any other
         s["not_a_win_in_flight"] = [h for h in s["not_a_win_in_flight"] if h[:12] not in dropped_hashes]
@@ -596,8 +603,10 @@ def swarm_of(n: int) -> None:
               not bad and not outside and sum(r.get("wins_paid", 0) for r in results) == wins and paid_msat == wins * WIN_MSAT
               and sum(r.get("draws", 0) for r in results) == n * rounds * 64,
               {"sellers": n, "sessions_open": sessions, "wins": wins, "expected_wins": n * rounds, "paid_msat": paid_msat, "failed_payments": m["failed_payments"] - before["failed_payments"],
-               "link_drops": len(drops), "failed_in_a_drop": len(in_drop), "failed_outside_a_drop": outside[:10], "seconds": round(secs, 1), "bad": bad[:3]})
-        measured(f"swarm{n}_link_drops", {"drops": [round(d - wall0, 1) for d in drops], "failed_in_a_drop": in_drop[:20], "failed_outside_a_drop": outside[:20]})
+               "link_drops": len(drops), "failed_in_a_drop": len(in_drop), "last_failure_after_its_drop_s": tail, "failed_outside_a_drop": outside[:10], "seconds": round(secs, 1), "bad": bad[:3]})
+        measured(f"swarm{n}_link_drops", {"drops": [(round(d - wall0, 1), node) for d, node in drops], "failed_in_a_drop": in_drop[:20],
+                                         "last_failure_after_its_drop_s": tail, "failed_outside_a_drop": outside[:20],
+                                         "route_query_ms": status().get("route_query_ms")})
         check(f"swarm: with {n} sellers the wallet never had more than 8 payments on its channel at once (30 slots), held nothing between wins, and an ordinary payment over that channel succeeded meanwhile",
               s["most_pending"] <= 9 and not s["not_a_win_in_flight"] and ordinary.get("paid") is True and lab.pending_htlcs(BUYER) == 0 and e2e.held() == 0,
               {**s, "ordinary_payment": ordinary})
