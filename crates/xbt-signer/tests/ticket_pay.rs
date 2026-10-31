@@ -5839,12 +5839,15 @@ fn a_call_charged_less_than_it_may_move_buys_a_ticket_sized_to_its_charge() {
     // what the call booked: that ticket and its fee limit (10 sat and 0.5%), not 1,002
     assert!(v["charged_sats"].as_i64().unwrap() <= 31 && r.ledger_sum() <= 31, "what left: {v}, ledger {}", r.ledger_sum());
     r.assert_booked();
-    // held, the sell page's smallest (546 sat): the seller's smallest, not its own 1,000
+    // held, the sell page's smallest (546 sat): the smallest the wallet may hold on its channels (their dust
+    // limit, here above 546), not the seller's own 1,000
     let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-use"]), Some(546_000)));
     let v = pay(&r, Some(20));
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
-    let booked = v["charged_sats"].as_i64().unwrap();
-    assert!((546..=561).contains(&booked) && asked(&r).iter().all(|m| *m == 546_000), "the seller's smallest ticket: booked {booked}, asked {:?}: {v}", asked(&r));
+    let (booked, sizes) = (v["charged_sats"].as_i64().unwrap(), asked(&r));
+    let size = sizes.first().copied().unwrap_or(1_000_000);
+    assert!((546_000..1_000_000).contains(&size) && sizes.iter().all(|m| *m == size) && booked < 1_000 && booked >= (size / 1000) as i64,
+            "the smallest ticket that may be held: booked {booked}, asked {sizes:?}: {v}");
     // the same call without a charge cap: the seller's own size, as before
     let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), Some(1_000)));
     let v = pay(&r, None);

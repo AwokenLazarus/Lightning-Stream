@@ -707,9 +707,10 @@ impl Signer {
                 // approval: where the seller's terms let the wallet choose a size, its tickets are no larger than
                 // both allow, their fee limit included
                 let fit = Some(fit_sats.map_or(ceiling, |f| f.min(ceiling)));
-                // and a call charged less than it may move holds tickets of about its charge, the seller's
-                // smallest at the least, rather than a size its charge could never use
-                let fit = fit.map(|f| charge_sats.map_or(f, |c| f.min(charge_fit(&lp_open, c, t.min_ticket_msat.unwrap_or(0)))));
+                // and a call charged less than it may move holds tickets of about its charge, the smallest
+                // the seller sells and the wallet may hold at the least, rather than a size its charge could never use
+                let smallest = t.min_ticket_msat.unwrap_or(0).max(ticket::held_floor_msat(&tp, limits.dust_msat));
+                let fit = fit.map(|f| charge_sats.map_or(f, |c| f.min(charge_fit(&lp_open, c, smallest))));
                 match (t.min_ticket_msat, fit.and_then(|f| fitting_msat(&lp_open, t.min_ticket_msat.unwrap_or(0), sized.ticket_msat, f))) {
                     (Some(_), Some(fit)) if fit < sized.ticket_msat => {
                         sizing(&Terms { ticket_msat: fit, ..t.clone() }, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room).or(Ok(sized))
