@@ -1101,37 +1101,33 @@ fn once_input() -> String {
     format!("<input type=\"hidden\" name=\"once\" value=\"{}\">", hex::encode(crate::random_bytes::<16>()))
 }
 
-/// A hashmaker's delivery history, as the offer shows it.
+/// A hashmaker's delivery records, as the offer shows them: counted, with the keys that signed them, and the
+/// newest one line per key, each saying its own figures. No score is made of them, since this app checks none
+/// of them: anyone can publish a record, under as many keys as they like, and a hashmaker can vouch for its own.
 fn history_panel(h: &Value) -> String {
     let records = h["records"].as_u64().unwrap_or(0);
     let says = &h["hashmakerSays"];
-    if records == 0 {
-        let own = if says.is_null() { String::new() } else {
-            format!(" The hashmaker says it served {} rental{} ({} TH-hours), but no hashtaker has published a record yet.",
-                    says["rentals"].as_u64().unwrap_or(0), if says["rentals"].as_u64() == Some(1) { "" } else { "s" }, th_hours(says["thHours"].as_f64().unwrap_or(0.0)))
-        };
-        return format!("<p class=\"small history\">No delivery history yet.{own} Try one slice first to see for yourself.</p>");
-    }
-    let confirmed = h["confirmed"].as_u64().unwrap_or(0);
-    let vs = h["deliveredVsAdvertised"].as_f64().map(|x| format!(" · delivered about {} of what it advertised", pct(x))).unwrap_or_default();
-    let disputed = match h["disputed"].as_u64().unwrap_or(0) {
-        0 => String::new(),
-        n => format!(" · <strong>{n} disputed</strong> (the hashtaker and the hashmaker disagree on what was paid)"),
+    let own = if says.is_null() { String::new() } else {
+        format!(" The hashmaker's own list says it served {} rental{} ({} TH-hours).",
+                says["rentals"].as_u64().unwrap_or(0), if says["rentals"].as_u64() == Some(1) { "" } else { "s" }, th_hours(says["thHours"].as_f64().unwrap_or(0.0)))
     };
+    if records == 0 {
+        return format!("<p class=\"small history\">No delivery records yet.{own} Try one slice first to see for yourself.</p>");
+    }
+    let keys = h["keys"].as_u64().unwrap_or(0);
     let recent: Vec<String> = h["recent"]
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|r| format!("{}{} ({}{})", speed(num(&r["deliveredHs"])), if r["trial"] == true { " test slice" } else { "" },
-                                 pct(r["ratio"].as_f64().unwrap_or(0.0)), if r["confirmed"] == true { ", confirmed" } else { "" }))
+                .map(|r| format!("{}{} ({})", speed(num(&r["deliveredHs"])), if r["trial"] == true { " test slice" } else { "" }, pct(r["ratio"].as_f64().unwrap_or(0.0))))
                 .collect()
         })
         .unwrap_or_default();
-    format!("<details class=\"history\"><summary>Delivery history: {} TH-hours confirmed by both sides · {records} record{} ({confirmed} confirmed){vs}{disputed}</summary>\
-             <p class=\"small\">Recent: {}.</p><p class=\"hint\">Records are signed by the hashtakers who rented, and confirmed when the hashmaker's \
-             own signed summary agrees. Lightning payments are private, so this is a signal, not proof: records the hashmaker did not confirm, \
-             and records from keys that never rented elsewhere, count for less.</p></details>",
-            th_hours(h["verifiedThHours"].as_f64().unwrap_or(0.0)), if records == 1 { "" } else { "s" }, esc(&recent.join("; ")))
+    format!("<details class=\"history\"><summary>Delivery records: {records} from {keys} key{}. Anyone can publish these.</summary>\
+             <p class=\"small\">Newest, one for each key, delivered against advertised: {}.{own}</p><p class=\"hint\">Each record is signed by whoever \
+             published it, and this app checks none of them: one person can write records under many keys, and a hashmaker can vouch for its own. \
+             What you pay never depends on them: you pay as the work arrives. A test slice is checked by your own DATUM Gateway.</p></details>",
+            if keys == 1 { "" } else { "s" }, esc(&recent.join("; ")))
 }
 
 fn th_hours(x: f64) -> String {
@@ -1174,18 +1170,21 @@ mod tests {
 
     #[test]
     fn a_history_and_a_test_slice_read_plainly() {
-        assert!(history_panel(&json!({"records": 0})).contains("No delivery history yet"));
+        assert!(history_panel(&json!({"records": 0})).contains("No delivery records yet"));
         let says = history_panel(&json!({"records": 0, "hashmakerSays": {"rentals": 3, "thHours": 12.4}}));
-        assert!(says.contains("served 3 rentals (12 TH-hours)"), "{says}");
+        assert!(says.contains("own list says it served 3 rentals (12 TH-hours)"), "{says}");
         let h = history_panel(&json!({
-            "records": 4, "confirmed": 3, "disputed": 1, "verifiedThHours": 2.5, "deliveredVsAdvertised": 0.97,
-            "recent": [{"deliveredHs": "3900000000000", "ratio": 0.97, "confirmed": true, "trial": true}],
+            "records": 4, "keys": 2, "confirmed": 3, "disputed": 1, "verifiedThHours": 2.5, "deliveredVsAdvertised": 0.97,
+            "recent": [{"deliveredHs": "3900000000000", "ratio": 0.97, "trial": true}, {"deliveredHs": "2000000000000", "ratio": 0.5}],
         }));
-        assert!(h.contains("2.5 TH-hours confirmed by both sides"), "{h}");
-        assert!(h.contains("4 records (3 confirmed)"));
-        assert!(h.contains("delivered about 97% of what it advertised"));
-        assert!(h.contains("1 disputed"));
-        assert!(h.contains("3.90 TH/s test slice (97%, confirmed)"), "{h}");
+        let summary = &h[h.find("<summary>").unwrap()..h.find("</summary>").unwrap()];
+        assert_eq!(summary, "<summary>Delivery records: 4 from 2 keys. Anyone can publish these.", "the headline counts, and vouches for nothing");
+        // no score, and nothing says a record was checked or confirmed: each says its own figures
+        for claim in ["confirmed", "both sides", "verified", "trusted", "delivered about", "disputed"] {
+            assert!(!h.to_lowercase().contains(claim), "{claim}: {h}");
+        }
+        assert!(h.contains("3.90 TH/s test slice (97%); 2.00 TH/s (50%)"), "{h}");
+        assert!(h.contains("this app checks none of them") && h.contains("What you pay never depends on them"), "{h}");
         let r = result_box(&json!({"deliveredHs": 3_900_000_000_000u64, "advertisedHs": 4_000_000_000_000u64, "ratio": 0.975,
                                     "staleShare": 0.01, "rejectedShare": 0.02, "latencyMsP50": 110, "latencyMsP95": 300}), true);
         assert!(r.contains("What the test slice showed"), "{r}");
