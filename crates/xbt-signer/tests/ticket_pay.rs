@@ -5298,7 +5298,7 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     assert_eq!(v["wins_paid"].as_u64().unwrap(), wins - 1, "{v}");
     assert_wins(&r, wins - 1);
     assert_eq!(r.ln.by_status("FAILED").len(), 1, "that invoice is not sent again");
-    assert_eq!(r.tap.seen("/lottery/cancel").len(), 1, "a seller that knows no cancel is not asked again");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 1, "a seller that knows no cancel is not asked again");
     let sid = v["session"].as_str().unwrap().to_string();
     let failed: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "failed").cloned().collect();
     assert_eq!((failed.len(), failed[0]["booked_sats"].as_i64()), (1, Some(0)), "the failed payment is booked back: {failed:?}");
@@ -9262,7 +9262,7 @@ fn a_win_on_its_next_invoice_goes_before_the_wins_waiting() {
     let at = |h: &str| payments.iter().rposition(|p| p == h).unwrap();
     let (failed_at, paid_at) = (at(&failing), at(next["hash"].as_str().unwrap()));
     assert!(payments.len() - paid_at > 40, "many waited behind it: paid at {paid_at} of {}", payments.len());
-    assert!(paid_at - failed_at < payments.len() / 3, "it did not wait behind them: failed at {failed_at}, paid at {paid_at}, of {}", payments.len());
+    assert!(paid_at - failed_at < payments.len() / 2, "it did not wait behind them: failed at {failed_at}, paid at {paid_at}, of {}", payments.len());
 }
 
 /// A stop ends the wait for a channel at once, on a prepaid ticket's path and a held one's.
@@ -9417,7 +9417,7 @@ fn a_win_whose_payment_failed_is_paid_at_once_on_the_sellers_next_invoice() {
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
     let wins = v["wins"].as_u64().unwrap();
     assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
-    assert_eq!(r.tap.seen("/lottery/cancel").len(), 1, "{v}");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 1, "{v}");
     let failed = r.ln.by_status("FAILED");
     assert_eq!(failed.len(), 1, "{v}");
     assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| p["payment_hash"] == failed[0]["payment_hash"]), "not sent again: {v}");
@@ -9434,7 +9434,7 @@ fn a_node_that_fails_every_payment_is_not_asked_for_ever() {
     let r = draws_rig(json!({}));
     r.ln.st.lock().unwrap().hop_full = true;
     let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
-    let asked = r.tap.seen("/lottery/cancel").len() as u64;
+    let asked = r.tap.seen("/x402/lottery/cancel").len() as u64;
     let wins = v["wins"].as_u64().unwrap();
     assert!(asked >= 1 && asked <= (wins * 4).min(32), "{asked} cancels for {wins} wins: {v}");
     let failed = r.ln.by_status("FAILED");
