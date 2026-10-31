@@ -5447,6 +5447,54 @@ fn a_websocket_is_carried_both_ways_and_every_byte_paid() {
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+/// A paid WebSocket under a small use's `max_charge_sats` (a VPN region check's tunnel, 20 sat, from
+/// no credit): the honest gateway stops the socket at the cap, its last receipt is within it, and the
+/// wallet finds no fault: the seller is not blocked, and the next call to it goes through.
+///
+/// FAILS before the gateway's socket path read the cap: it relayed and charged past it, and the
+/// wallet called an honest seller over-cap and blocked it, the ticket left with it.
+#[test]
+fn a_websocket_under_a_charge_cap_ends_at_it_and_the_honest_seller_is_not_blocked() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let l = UnixListener::bind(dir.path().join("capped")).unwrap();
+    // the caller: the head line, then 64 KiB out, then whatever comes back until the socket ends
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        let _ = w.write_all(&vec![5u8; 64 * 1024]);
+        let mut back = vec![];
+        let _ = rd.read_to_end(&mut back);
+        back.len()
+    });
+    let started = Instant::now();
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/chat"), "max_sats": CALL, "max_charge_sats": 10, "task": "film", "stream_to": "capped", "stream_head": true,
+                                       "head_headers": true, "upgrade": true, "headers": [["Sec-WebSocket-Key", "k1"], ["Sec-WebSocket-Version", "13"]]}));
+    let back = caller.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(30), "the call ends promptly: {:?}", started.elapsed());
+    assert_eq!(v["status"], 101, "{v}");
+    // the seller's word: within the cap (2,500 msat to open, then 1,000 msat a KiB either way)
+    let charged: u64 = v["receipt"]["last"]["charged"].as_str().unwrap_or("0").parse().unwrap();
+    assert!(charged <= 10_000 && charged > 2_500, "the last receipt charged {charged} msat under a 10,000 msat cap: {v}");
+    assert!(back < 7_680, "{back} bytes came back: more than the cap pays for");
+    // no fault, nothing blocked, and the seller is called again as before
+    assert!(v["seller_fault"].is_null(), "an honest seller at the cap is no fault: {v}");
+    assert!(r.audit("ticket_over_cap").is_empty(), "nothing over the cap was seen");
+    let blocked = std::fs::read_to_string(r.root.join(".run").join("blocked_sellers.json")).unwrap_or_default();
+    assert!(!blocked.contains(&r.shop.id()), "the seller is not blocked: {blocked}");
+    let next = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film"}));
+    assert_eq!(next["status"], 200, "{next}");
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
 /// A web app's WebSocket stays open for as long as the page keeps it (a media server's live
 /// updates, say), not for the owner's `max_answer_s` of an answer: it has its own limit,
 /// `tickets.max_socket_s`, and is paid as its bytes pass all the while. `SOCKET_HOLD_S` sets how
