@@ -73,6 +73,9 @@ const NODE_CHECK_TRIES: usize = 3;
 /// How far past the node's own timeout for a send (`ln.timeout_s`, 60 s as shipped) a ticket may be in `sending` before it
 /// is taken for stranded: well past any wait for it, so that it is no ticket a slow route is still carrying.
 const SENDING_STRANDED_PAST_TIMEOUT_S: f64 = 30.0;
+/// How long a ticket must be seen in flight on the node and on none of its channels, every channel up each time it is
+/// looked at, before it is taken for stranded: past the time a link that dropped takes to come back and list its HTLCs.
+const STRANDED_SEEN_S: f64 = 20.0;
 
 /// Why the book books nothing more for a session whose stop has begun ([`Signer::ticket_is_stopping`]).
 const STOPPING: &str = "the session is being stopped: nothing more is released, locked or bought for it";
@@ -2262,7 +2265,12 @@ impl Signer {
         if old.is_empty() {
             return None;
         }
-        within(by, move || old.into_iter().find(|h| !me.ticket_is_queued(h) && matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT" && !htlcs_in_flight(&p)))).flatten()
+        // and not while a channel is down: a link that dropped may yet carry it
+        within(by, move || {
+            let all_up = ln.channels().is_ok_and(|cs| cs.iter().all(|c| c.get("active") == Some(&Value::Bool(true))));
+            old.into_iter().find(|h| all_up && !me.ticket_is_queued(h)
+                                     && matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT" && !htlcs_in_flight(&p)))
+        }).flatten()
     }
 
     /// Whether the wallet's own node calls a ticket's payment in flight and carries it on none of
@@ -2272,10 +2280,20 @@ impl Signer {
     pub(crate) fn ticket_stranded(&self, hash: &str) -> bool {
         let Some(ln) = self.ln.clone() else { return false };
         let Ok(Some(p)) = ln.lookup(hash) else { return false };
-        if str_or_empty(p.get("status")) != "IN_FLIGHT" {
+        let Ok(cs) = ln.channels() else { return false };
+        let on_a_way = htlc_locks(&cs, &|_| true).list.iter().any(|h| str_or_empty(h.get("payment_hash")) == hash);
+        // a channel down, or one that came back and has not listed its HTLCs again yet (a link that drops, a node
+        // resyncing): a ticket missing from it may still come. Only a ticket seen missing with every channel up, for as
+        // long as such a gap lasts, is taken for stranded
+        let all_up = cs.iter().all(|c| c.get("active") == Some(&Value::Bool(true)));
+        let now = self.engine.now();
+        let mut seen = self.ticket_off_channel.lock().unwrap_or_else(|p| p.into_inner());
+        if str_or_empty(p.get("status")) != "IN_FLIGHT" || on_a_way || !all_up {
+            seen.remove(hash);
             return false;
         }
-        ln.channels().is_ok_and(|cs| !htlc_locks(&cs, &|_| true).list.iter().any(|h| str_or_empty(h.get("payment_hash")) == hash))
+        let since = *seen.entry(hash.to_string()).or_insert(now);
+        now - since >= STRANDED_SEEN_S
     }
 
     /// Held tickets of a session whose invoice was sent to the node and whose payment failed: the

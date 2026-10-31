@@ -6995,6 +6995,10 @@ fn a_ticket_that_is_on_none_of_the_nodes_channels_ends_its_session_and_the_next_
     r.ln.st.lock().unwrap().stranded_off_channel = true;
     let st = r.status();
     assert_eq!((st["locked"]["tickets"].as_i64(), st["node"]["in_book_not_on_node"].as_array().map(Vec::len), r.shop.held()), (Some(2), Some(2), 0), "{st}");
+    // seen so once: a link that dropped may still list it. Seen so for longer than such a gap lasts, every channel up
+    let first = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!(first["rule"].as_str(), Some("ticket_not_ready"), "{first}");
+    r.clock.fetch_add(21, Ordering::SeqCst);
     let ended = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
     assert_eq!((ended["verdict"].as_str(), ended["rule"].as_str(), ended["tickets_released"].as_u64()), (Some("deny"), Some("ticket_session_ended"), Some(0)), "{ended}");
     assert_ne!(r.session(&sid)["sessions"][0]["state"], "open");
@@ -7010,6 +7014,41 @@ fn a_ticket_that_is_on_none_of_the_nodes_channels_ends_its_session_and_the_next_
     let stranded: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "locked").cloned().collect();
     assert_eq!((stranded.len(), stranded.iter().map(|t| t["booked_sats"].as_i64().unwrap()).sum::<i64>()), (2, 0),
                "locked for as long as the node calls them in flight, and no secret of theirs left: {stranded:?}");
+}
+
+/// A channel that drops while a ticket is held on it (a link that flaps): the node calls the payment in flight and lists
+/// it on no channel while the link is down or listing its HTLCs again. That is no stranded ticket, however long it lasts
+/// with a channel down, and the session is not ended for it; the answer waits within its pause.
+#[test]
+fn a_ticket_missing_from_a_channel_that_is_down_is_not_stranded() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"tickets": {"ready_wait_ms": 300}}), 30, shipped_shop());
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!(v["complete"].as_bool(), Some(true), "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    r.ln.st.lock().unwrap().strand_next = 2;
+    let cut = r.pay(&format!("/files/{}", 15 * MIB), 5_000);
+    assert_eq!(cut["complete"].as_bool(), Some(false), "{cut}");
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.stranded_off_channel = true;
+        s.channel["active"] = false.into();
+    }
+    for _ in 0..3 {
+        let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+        assert_ne!(v["rule"].as_str(), Some("ticket_session_ended"), "{v}");
+        r.clock.fetch_add(21, Ordering::SeqCst);
+    }
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "open", "a link that is down says nothing of the ticket");
+    // the link up again, the ticket still on no channel: seen so once, then past the gap, and the session ends
+    r.ln.st.lock().unwrap().channel["active"] = true.into();
+    let first = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_ne!(first["rule"].as_str(), Some("ticket_session_ended"), "{first}");
+    r.clock.fetch_add(21, Ordering::SeqCst);
+    let ended = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!(ended["rule"].as_str(), Some("ticket_session_ended"), "{ended}");
+    r.assert_booked();
 }
 
 // --- paying by the seller's BOLT 12 offer (docs/TICKETS.md, section 15) ---------------------------------
