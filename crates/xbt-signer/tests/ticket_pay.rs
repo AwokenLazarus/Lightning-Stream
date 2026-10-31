@@ -9102,3 +9102,72 @@ fn invoices_that_lapsed_in_the_wallets_queue_are_no_fault_of_the_sellers() {
     let v = r.pay(&format!("/pieces/{size}"), 1_000);
     assert_paid_after_lapses(&r, &v, size, 3);
 }
+/// A tunnel whose refill finds the channel out for a moment: `active` false for 1.5 s while the
+/// wallet's pool is empty (the refill a release has to wait for), and again with a held ticket's
+/// HTLC pending on the channel, as a VPN tunnel saw. Nothing refuses, the tunnel carries all of it,
+/// and the node, the seller, the book and the seller's signed count agree.
+///
+/// FAILS before: the check refused `ln_no_safe_channel` in that moment, and on the socket path that
+/// ended the tunnel (about 5 of 28 VPN runs on a lab).
+#[test]
+fn a_channel_out_for_a_moment_ends_no_tunnel_whether_an_htlc_is_pending_or_the_pool_is_empty() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    for pending in [false, true] {
+        let r = Rig::new(json!({}));
+        // with the pool empty: its first locks find no slot, and for the wait that follows the tunnel pays by prepaid
+        // tickets, each a refill its release waits for, with nothing held on the channel
+        r.ln.st.lock().unwrap().fail_next = if pending { 0 } else { 2 };
+        let (ln, came) = (r.ln.clone(), Arc::new(AtomicBool::new(false)));
+        let told = came.clone();
+        r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+            let (in_flight, paid) = (ln.by_status("IN_FLIGHT").len(), ln.by_status("SUCCEEDED").len());
+            if (in_flight > 0) == pending && (pending || paid > 0) && !told.swap(true, Ordering::SeqCst) {
+                ln.st.lock().unwrap().channel["active"] = false.into();
+                let ln = ln.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    ln.st.lock().unwrap().channel["active"] = true.into();
+                });
+            }
+        }));
+        let name = format!("tunnel{}", u8::from(pending));
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        // the caller: 3 MiB out and the same back, 64 KiB at a time, then it hangs up: six tickets' worth
+        let caller = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+            let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            let mut w = s;
+            let out: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+            let mut back = vec![0u8; out.len()];
+            let mut whole = 0;
+            for _ in 0..48 {
+                if w.write_all(&out).is_err() || rd.read_exact(&mut back).is_err() || back != out {
+                    break;
+                }
+                whole += 1;
+            }
+            w.shutdown(std::net::Shutdown::Both).unwrap();
+            whole
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/chat"), "max_sats": 20_000, "task": "film", "stream_to": name, "stream_head": true,
+                                           "head_headers": true, "upgrade": true, "headers": [["Sec-WebSocket-Key", "k1"], ["Sec-WebSocket-Version", "13"]]}));
+        assert_eq!(caller.join().unwrap(), 48, "pending {pending}: the tunnel carried all of it: {v}");
+        assert!(came.load(Ordering::SeqCst), "pending {pending}: the channel never went out: {v}");
+        let log = r.call("history", json!({"limit": 5000})).to_string();
+        assert!(!v.to_string().contains("ln_no_safe_channel") && !log.contains("ln_no_safe_channel"), "pending {pending}: a moment taken for an outage: {v}");
+        // 2,500 msat to open, and 6 MiB at 1,000 msat a KiB, by the wallet's count and the seller's signed one
+        let want = (2_500 + 6 * 1024 * 1_000).to_string();
+        assert_eq!((v["status"].as_u64(), v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str()), (Some(101), Some(want.as_str()), Some(want.as_str())), "{v}");
+        let (paid, taken, book, ledger) = r.money();
+        assert!(paid >= 6 * TICKET, "{v}");
+        assert_eq!((taken, book, ledger), (paid, paid, (paid / TICKET) as i64 * SETTLED), "{v}");
+    }
+    std::env::remove_var("B2_STREAM_DIR");
+}
