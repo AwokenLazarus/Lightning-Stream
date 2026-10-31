@@ -502,7 +502,8 @@ impl Book {
 
     /// How long an answer that is being sent may stand still for the session's oldest unpaid win,
     /// in seconds: what is left of `grace_seconds` since it was drawn, and `pay_wait_secs` at the
-    /// most. 0: none is unpaid, or the time is up.
+    /// most. 0: none is unpaid, or the time is up. The gateway waits the larger of this and its
+    /// `refill_wait`, 15 s as shipped.
     pub fn grace_left(&self, session: &str, now: u64) -> u64 {
         let Some(s) = self.sessions.get(session) else { return 0 };
         let left = s.unpaid.iter().map(|w| w.drawn_at).min().map_or(0, |at| (at + u64::from(self.cfg.grace_seconds)).saturating_sub(now));

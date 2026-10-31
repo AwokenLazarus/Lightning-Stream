@@ -1154,8 +1154,8 @@ The seller goes first, and these are what bound it:
 - **The grace.** While a win is unpaid the seller serves on: for `graceSeconds`, for
   `gracePieces` pieces after that win, and with at most `maxUnpaidWins` wins unpaid. Beyond any
   of the three a request is refused `win_unpaid`, with the unpaid wins and their invoices, and
-  an answer that is being sent stands still for the payment (10 s at the gateway, and never
-  beyond the grace) and is then cut short. Service goes on when the seller's node shows the wins
+  an answer that is being sent stands still for the payment (15 s at the gateway as shipped: the larger of `refill_wait`, 15 s, and what is left of the
+  win's grace up to `pay_wait_secs`, 10 s; so past the grace when little of it is left) and is then cut short. Service goes on when the seller's node shows the wins
   paid. A file of 64 pieces at one win expected draws three or more wins 8 times in 100,
   and its answer then stands still at the third until the first is paid: what that takes is the
   buyer's to keep short (section 9.5).
@@ -1324,7 +1324,7 @@ wins differ from run to run. The report of the latest run is `reports/lottery_re
   item).
 - The gateway's grace of 10 s was sized for wins that are not paced. Paced 8 at a time, the last
   of 100 sellers' wins waited 13 s. The default is 30 s, and an answer that is being sent stands
-  still for a payment for 10 s at the most.
+  still for a payment for 15 s (`refill_wait`, the larger of it and `pay_wait_secs`, 10 s).
 - A wallet killed between the two writes that book a win kept a ledger row for a payment that
   was never sent. The book's row is now written first. The same was true of a prepaid ticket.
 - A wallet that stopped reading an answer left pieces open with the seller, and the session's

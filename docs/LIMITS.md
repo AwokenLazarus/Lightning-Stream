@@ -313,7 +313,7 @@ involved no node.
   for goes first. On one 30-slot channel that paid the wins of 100
   sellers of one buyer at 14 wins a second, with no payment failed; a buyer whose wins come
   faster than that keeps its sellers waiting: a seller serves on for its grace of 30 s, and an
-  answer it is sending stands still for a payment for 10 s at the most before it is cut. Before the wallet kept a win inside that limit until it had settled, 24 payments were
+  answer it is sending stands still for a payment for 15 s before it is cut (`refill_wait`, the larger of it and `pay_wait_secs`, 10 s). Before the wallet kept a win inside that limit until it had settled, 24 payments were
   pending on the channel at once and 47 of 313 failed: found on the lab, and what the limit is
   for.
 - What those two waits bound, reasoned from the lab's rate and not run beyond 100 sellers. A
