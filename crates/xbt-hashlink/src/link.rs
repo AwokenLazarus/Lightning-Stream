@@ -69,6 +69,22 @@ pub struct Link {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the hashtaker waits for the hashmaker's address to answer. Without it a link that never
+/// opens (an address that drops packets, a router without NAT reflection) waits on the system's TCP
+/// timeout, minutes, and the rental looks live all that time.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A TCP connection to `addr` (host:port), each of its addresses tried for at most `wait`.
+pub fn connect_within(addr: &str, wait: Duration) -> std::io::Result<TcpStream> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("{addr} resolves to nothing"));
+    for a in std::net::ToSocketAddrs::to_socket_addrs(addr)? {
+        match TcpStream::connect_timeout(&a, wait) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
 
 fn split(stream: TcpStream, t: noise::Transport) -> Result<Link, Error> {
     stream.set_read_timeout(None)?;
@@ -83,7 +99,7 @@ fn split(stream: TcpStream, t: noise::Transport) -> Result<Link, Error> {
 
 /// The hashtaker's side: connect to the hashmaker, whose static key is known.
 pub fn dial(addr: &str, me: SecretKey, hashmaker: PublicKey) -> Result<Link, Error> {
-    let mut s = TcpStream::connect(addr)?;
+    let mut s = connect_within(addr, CONNECT_TIMEOUT)?;
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let t = noise::connect(&mut s, noise::PROLOGUE, me, hashmaker)?;
     split(s, t)
@@ -95,3 +111,19 @@ pub fn answer(mut s: TcpStream, me: SecretKey) -> Result<Link, Error> {
     let t = noise::accept(&mut s, noise::PROLOGUE, me)?;
     split(s, t)
 }
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    #[test]
+    fn an_address_that_never_answers_fails_within_the_wait_not_the_systems_timeout() {
+        // TEST-NET-1 (RFC 5737): routed nowhere, so it either drops (timeout) or is refused at once
+        let t = std::time::Instant::now();
+        assert!(connect_within("192.0.2.1:23341", Duration::from_millis(300)).is_err());
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(connect_within(&l.local_addr().unwrap().to_string(), Duration::from_secs(1)).is_ok());
+    }
+}
+

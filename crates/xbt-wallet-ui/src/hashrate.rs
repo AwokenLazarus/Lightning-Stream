@@ -534,8 +534,21 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let hs = num(&live["lastRate"]["hs"]);
     let paid = live["paidSlices"].as_u64().unwrap_or(0);
     let spent = num(&live["spentMsat"]) / 1000.0;
-    let pill = if ended { "<span class=\"pill\">Ended</span>".to_string() } else { "<span class=\"pill good\">Hashing</span>".to_string() };
-    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}</p>", esc(&ended_words(w)))).unwrap_or_default();
+    // a rental is "connecting" until its link to the hashmaker is up (the service then reports its
+    // role and meter); one whose link never opened ended before any work, and nothing was paid
+    let failed = live["closed"].as_str().is_some_and(|w| w.starts_with("could not start"));
+    let connecting = !ended && live.get("role").is_none() && live.get("meter").is_none();
+    let pill = if failed {
+        "<span class=\"pill bad\">Could not start</span>".to_string()
+    } else if ended {
+        "<span class=\"pill\">Ended</span>".to_string()
+    } else if connecting {
+        "<span class=\"pill\">Connecting…</span>".to_string()
+    } else {
+        "<span class=\"pill good\">Hashing</span>".to_string()
+    };
+    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}{}</p>", esc(&ended_words(w)),
+                                                     if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
     let cut = if ended {
         String::new()
     } else {
@@ -631,6 +644,19 @@ fn th_hours(x: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rental_is_connecting_until_its_link_opens_and_one_that_never_opens_says_why() {
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let card = |live: Value, ended: bool| rental_card(&ctx, &json!({"rental": "r1", "hasher": "Hashrate", "budgetSats": 1500, "ended": ended, "live": live}), "hashrate");
+        let c = card(json!({"closed": null}), false);
+        assert!(c.contains("Connecting…") && !c.contains("Hashing"), "{c}");
+        let c = card(json!({"role": "buyer", "meter": {"accepted": 3}, "closed": null}), false);
+        assert!(c.contains("Hashing"), "{c}");
+        let c = card(json!({"closed": "could not start: link i/o: Operation timed out (os error 110)"}), true);
+        assert!(c.contains("Could not start") && c.contains("It could not start: link i/o: Operation timed out") && c.contains("Nothing was paid."), "{c}");
+        assert!(!c.contains("Hashing") && !c.contains(">Cut<"), "{c}");
+    }
+
     use super::*;
 
     #[test]
