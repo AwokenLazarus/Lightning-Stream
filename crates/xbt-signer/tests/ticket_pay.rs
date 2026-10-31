@@ -9230,7 +9230,9 @@ fn a_request_refused_for_a_win_waits_for_the_sellers_next_invoice_and_is_served(
 #[test]
 fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pays_it() {
     let _g = env_lock();
-    let r = draws_rig(json!({}));
+    // a seller that serves on while wins take their 3 s: this is about the invoice, not its answer standing still
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                                               "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
     r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
     let (ln, clock, node, standin, once) = (r.ln.clone(), r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
     r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
