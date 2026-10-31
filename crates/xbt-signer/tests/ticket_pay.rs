@@ -8023,6 +8023,7 @@ fn a_seller_session_the_seller_has_forgotten_is_not_asked_again() {
     let first = r.pay("/page/1", CALL);
     assert_eq!(first["status"].as_u64(), Some(200), "{first}");
     wait_refill(&r, "two tickets held", 2);
+    let forgotten = r.status()["paying"][0]["seller_session"].as_str().unwrap().to_string();
     r.restart();
     r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/status").then(|| Ok(answer(402, vec![], json!({"error": "session_unknown"}).to_string().into_bytes())))));
     let v = r.pay("/page/1", CALL);
@@ -8030,10 +8031,12 @@ fn a_seller_session_the_seller_has_forgotten_is_not_asked_again() {
     assert_eq!(r.audit("ticket_seller_forgot").len(), 1);
     r.tap.clear();
     r.call("ticket_stop", json!({"session": v["session"]}));
-    let n = r.tap.seen("/x402/ticket/status").len();
     let w = r.pay("/page/1", CALL);
     assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "{w}");
-    assert_eq!(r.tap.seen("/x402/ticket/status").len(), n + 1, "only the session it still knows was asked");
+    let resumed = r.audit("ticket_resumed");
+    assert_eq!(resumed.len(), 1, "{resumed:?}");
+    assert_ne!(resumed[0]["seller_session"].as_str(), Some(forgotten.as_str()), "the one it forgot, which it would have answered for here, was not asked");
+    assert_eq!(r.audit("ticket_seller_forgot").len(), 1);
     assert_eq!(both_sides_of(&r, &new_sid_of(&w)), TICKET - 2 * 2_500);
 }
 
@@ -8075,23 +8078,43 @@ fn a_shop_merely_naming_the_same_receipt_key_is_not_shown_a_preimage() {
     let url = r.shop.url("/page/1");
     let hash = killed_with_a_prepaid_ticket_that_then_settles(&mut r, url);
     let other = r.more[0].url("/page/1");
-    // its unsigned `session_unknown` says nothing of a session opened elsewhere: nothing bought on its word, up to the bound
-    let v = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
-    assert_eq!((v["rule"].as_str(), r.ln.paid_msat()), (Some("ticket_seller_unanswered"), TICKET), "{v}");
-    assert!(!r.tap.secrets().iter().any(|s| sha(s) == hash), "the first shop's preimage went to the shop beside it");
-    assert!(r.audit("ticket_prepaid_given_up").is_empty(), "nothing given up on that shop's word");
-    assert!(r.audit("ticket_resumed").is_empty());
-    r.clock.fetch_add(121, Ordering::SeqCst);
+    // that session has no key on record yet: this address is not where it was opened, so it is not taken up here
     let v = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a ticket of that shop's own: {v}");
     assert_eq!(r.ln.paid_msat(), 2 * TICKET);
-    assert!(!r.tap.secrets().iter().any(|s| sha(s) == hash), "still not shown there");
+    assert!(!r.tap.secrets().iter().any(|s| sha(s) == hash), "the first shop's preimage went to the shop beside it");
+    assert!(r.audit("ticket_prepaid_given_up").is_empty(), "nothing given up on that shop's word");
+    assert!(r.audit("ticket_resumed").is_empty());
     let w = r.pay("/page/1", CALL);
     assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "back at the first shop, paid from its credit: {w}");
     assert_eq!(r.tap.secrets().iter().filter(|s| sha(s) == hash).count(), 1);
     assert_eq!(r.audit("ticket_resumed").len(), 1);
     assert_eq!(r.ln.paid_msat(), 2 * TICKET, "one ticket for each shop, no third");
     assert_eq!(both_sides_of(&r, &new_sid_of(&w)), TICKET - 2_500);
+}
+
+/// With a key on record, a second gateway naming that key is asked. Its unsigned `session_unknown`
+/// cannot speak for a session opened elsewhere: nothing is bought on its word up to the bound, then
+/// that shop sells its own ticket, and the credit is found at the true shop, one ticket each.
+#[test]
+fn an_unsigned_session_unknown_from_another_address_ends_no_wait() {
+    let _g = env_lock();
+    let mut r = Rig::with_more(json!({}), true, true, 30, strict_shop(), &[strict_shop()]);
+    let first = r.pay("/page/1", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_refill(&r, "two tickets held", 2);
+    r.restart();
+    let other = r.more[0].url("/page/1");
+    let v = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
+    assert_eq!((v["rule"].as_str(), r.ln.paid_msat()), (Some("ticket_seller_unanswered"), TICKET), "{v}");
+    assert!(r.audit("ticket_seller_forgot").is_empty(), "nothing given up on that shop's word");
+    r.clock.fetch_add(121, Ordering::SeqCst);
+    let v = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let w = r.pay("/page/1", CALL);
+    assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "{w}");
+    assert_eq!(r.ln.paid_msat(), 2 * TICKET, "one ticket for each shop, no third");
+    assert_eq!(both_sides_of(&r, &new_sid_of(&w)), TICKET - 2 * 2_500);
 }
 
 /// An unsigned answer to a late preimage at a takeover is the end of nothing: not "shown", not given
@@ -10625,7 +10648,9 @@ fn a_long_answer_and_other_calls(same_origin: bool, path: String, tag: &str) {
         assert_eq!(open_answer, 1, "{tag}: the long answer is still open");
         r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"}));
         let out = film.join().unwrap();
-        assert_eq!((out["status"].as_u64(), out["complete"].as_bool(), out.get("seller_fault")), (Some(200), Some(true), None), "{tag}: {out}");
+        // (the quiet seller sends a quarter of what it states and closes: all of that arrived, cut by nothing of the wallet's)
+        let whole = if path.starts_with("/quiet") { out["bytes"].as_u64() == Some(MIB as u64) } else { out["complete"] == true };
+        assert!(out["status"].as_u64() == Some(200) && whole && out.get("seller_fault").is_none(), "{tag}: {out}");
         let later = r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"}));
         assert_eq!(later["status"].as_u64(), Some(200), "{tag}: {later}");
         assert_eq!(hit, 0, "{tag}: a session whose answer is open had its tickets named");
