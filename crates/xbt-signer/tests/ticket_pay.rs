@@ -2903,9 +2903,21 @@ fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
     // 7 MiB is 1,400 sat: two tickets were released for it, and no third
     assert_eq!((v["tickets_released"].as_u64(), r.tap.secrets().len()), (Some(2), 2), "{v}");
     assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
-    // the session goes on: the seller's signed balance is what is left
+    // the session goes on: the seller's signed balance is what is left. The seller charges what it has sent, and its
+    // socket took the 7 MiB read and what the kernel buffered ahead of a reader that then stopped, up to the credit
+    // released: a little on a quiet machine, the whole 2,000 sat on a loaded one (CI on a lab VM). So the next call is
+    // paid from what is left where that covers it and buys one ticket where it does not, and either way to the msat
     let next = r.pay("/page/10", CALL);
-    assert_eq!((next["status"].as_u64(), next["tickets_released"].as_u64()), (Some(200), Some(0)), "{next}");
+    let num = |k: &str| next[k].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| panic!("{k}: {next}"));
+    let (credited, balance, page) = (num("credited_msat"), num("balance_msat"), num("price_msat"));
+    let released_next = next["tickets_released"].as_u64().unwrap();
+    assert_eq!(credited, (2 + released_next) * TICKET, "{next}");
+    let cut_cost = credited - balance - page;
+    let read = 7 * 200_000;
+    assert!((read..=2 * TICKET).contains(&cut_cost), "the cut answer cost {cut_cost} msat: at least the {read} read, at most the 2 tickets released for it: {next}");
+    let needed = u64::from(2 * TICKET - cut_cost < page);
+    assert_eq!((next["status"].as_u64(), released_next), (Some(200), needed), "the credit left pays first: {next}");
+    assert_eq!(r.money(), ((2 + needed) * TICKET, (2 + needed) * TICKET, (2 + needed) * TICKET, (2 + needed) as i64 * SETTLED));
     r.assert_booked();
 }
 
