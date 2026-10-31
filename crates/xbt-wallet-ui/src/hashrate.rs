@@ -910,7 +910,7 @@ impl App {
                 }),
             "attest" => call(&base, &token, "POST", "/attest", Some(&json!({"rental": g("rental")})))
                 .and_then(|v| if v["ok"] == true {
-                    Ok("Published. Other hashtakers see this rental in the hashmaker's delivery history.".into())
+                    Ok("Published. Other hashtakers see this rental among the hashmaker's delivery records.".into())
                 } else {
                     Err(v["error"].as_str().map(|e| format!("Not published: {e}.")).unwrap_or_else(|| "Not published: no relay took it.".into()))
                 }),

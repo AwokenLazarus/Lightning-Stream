@@ -13,12 +13,13 @@
 //! signed work receipts behind the payments. It names no pool, payout, user name or address, and
 //! its time is rounded down to the hour.
 //!
-//! **A hashmaker's summary** ([`Summary`]) is its own signed list of the rentals it served, by the
-//! same commitment, with what it was paid and the same receipts hash. It is signed by the Nostr key
-//! its listing is bound to. A record that matches an entry in the summary is confirmed by both sides.
+//! **A hashmaker's summary** ([`Summary`]) is the list of the rentals it served, kept on its own box. What
+//! it publishes of it ([`Totals`]) is counts and totals only: how many rentals, slices and millisatoshis
+//! paid, and work. It names no renter's key, no rental and no time, so nobody can follow a renter from it.
+//! It is signed by the Nostr key its listing is bound to, and says what the hashmaker says, nothing more.
 //!
 //! **Neither proves anything to a third party**: Lightning payments are private, and keys are free, so one
-//! person can write records under many keys and confirm them as the hashmaker. [`aggregate`] makes no score
+//! person can write records under many keys and vouch for them as the hashmaker. [`aggregate`] makes no score
 //! of them: it counts records and the keys that signed them, drops a hashmaker's records about itself, counts
 //! each key for at most a few rentals, and shows one line per key. The only evidence this app checks is the
 //! hashtaker's own rentals, a test slice first. Payment never depends on any of it ([`crate::order`]).
@@ -35,9 +36,8 @@ pub const ATTEST_TOPIC: &str = "lightning-stream-hash-attest";
 pub const SUMMARY_TOPIC: &str = "lightning-stream-hash-summary";
 /// The longest content a record may have (the relay refuses more).
 pub const ATTEST_MAX: usize = 2048;
-/// The longest content a summary may have, and how many rentals it lists at most.
-pub const SUMMARY_MAX: usize = 16384;
-pub const SUMMARY_RENTALS: usize = 40;
+/// The longest content a published summary may have.
+pub const SUMMARY_MAX: usize = 1024;
 /// Rentals counted per hashtaker key for one hashmaker (its most recent).
 pub const PER_KEY: usize = 3;
 /// Hashes in one TH-hour.
@@ -238,13 +238,21 @@ impl Summary {
         Some(Summary { hashmaker: parse_key(v.get("hashmaker")?.as_str()?)?, rentals })
     }
 
-    /// The summary as a Nostr event by `nostr`, the key the hashmaker's listing is bound to. The
-    /// newest [`SUMMARY_RENTALS`] rentals are kept.
+    /// What is published of it: counts and totals, nothing about any one rental or renter.
+    pub fn totals(&self) -> Totals {
+        Totals {
+            hashmaker: self.hashmaker,
+            rentals: self.rentals.len() as u64,
+            paid_slices: self.rentals.iter().map(|r| r.paid_slices).sum(),
+            paid_msat: self.rentals.iter().map(|r| r.paid_msat).sum(),
+            work: self.rentals.iter().map(|r| r.work).sum(),
+        }
+    }
+
+    /// The summary as a Nostr event by `nostr`, the key the hashmaker's listing is bound to: its
+    /// [`Totals`] only, dated `created_at` rounded down to the hour.
     pub fn event(&self, nostr: &Keys, created_at: u64) -> Result<Event, String> {
-        let mut s = self.clone();
-        s.rentals.sort_by_key(|r| std::cmp::Reverse(r.ended_at));
-        s.rentals.truncate(SUMMARY_RENTALS);
-        let content = s.to_json().to_string();
+        let content = self.totals().to_json().to_string();
         if content.len() > SUMMARY_MAX {
             return Err("the summary is too long".into());
         }
@@ -253,12 +261,42 @@ impl Summary {
             tag("t", SUMMARY_TOPIC),
             tag("p", &hex::encode(xonly(&self.hashmaker).serialize())),
         ];
-        Ok(Event::sign(nostr, created_at, KIND, tags, content))
+        Ok(Event::sign(nostr, hour(created_at), KIND, tags, content))
+    }
+}
+
+/// What a hashmaker publishes of the rentals it served: counts and totals (see the module documentation).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Totals {
+    pub hashmaker: PublicKey,
+    pub rentals: u64,
+    pub paid_slices: u64,
+    pub paid_msat: u64,
+    pub work: u128,
+}
+
+impl Totals {
+    pub fn to_json(&self) -> Value {
+        json!({"v": 2, "hashmaker": hex::encode(self.hashmaker.serialize()), "rentals": self.rentals, "paidSlices": self.paid_slices,
+               "paidMsat": self.paid_msat, "work": self.work.to_string()})
+    }
+
+    pub fn from_json(v: &Value) -> Option<Totals> {
+        if v.get("v")?.as_u64()? != 2 {
+            return None;
+        }
+        Some(Totals {
+            hashmaker: parse_key(v.get("hashmaker")?.as_str()?)?,
+            rentals: v.get("rentals")?.as_u64()?,
+            paid_slices: v.get("paidSlices")?.as_u64()?,
+            paid_msat: v.get("paidMsat")?.as_u64()?,
+            work: v.get("work")?.as_str()?.parse().ok()?,
+        })
     }
 
     /// Read and check a summary event; `listing_author` is the Nostr key the hashmaker's listing is
     /// bound to (a summary by any other key is not the hashmaker's).
-    pub fn read_event(ev: &Event, listing_author: &str) -> Result<Summary, String> {
+    pub fn read_event(ev: &Event, listing_author: &str) -> Result<Totals, String> {
         if ev.kind != KIND || !ev.verify() {
             return Err("not a signed application-data event".into());
         }
@@ -268,7 +306,7 @@ impl Summary {
         if ev.pubkey != listing_author {
             return Err("not signed by the key the listing is bound to".into());
         }
-        let s = Summary::from_json(&serde_json::from_str(&ev.content).map_err(|_| "not JSON")?).ok_or("not a hashmaker summary")?;
+        let s = Totals::from_json(&serde_json::from_str(&ev.content).map_err(|_| "not JSON")?).ok_or("not a hashmaker summary")?;
         if ev.tag("d") != Some(format!("{SUMMARY_TOPIC}:{}", hex::encode(s.hashmaker.serialize())).as_str()) {
             return Err("the d tag is not the summary's hashmaker".into());
         }
@@ -296,9 +334,9 @@ pub fn filters(hashmakers: &[(PublicKey, String)]) -> Vec<Value> {
     out
 }
 
-/// One hashmaker's delivery records as the app shows them, from the records and the hashmaker's summary.
-/// Nothing in a record is checked by this app: anyone can sign one, under as many keys as they like, and a
-/// hashmaker can confirm its own. So no score is made of them. They are counted, with the keys that signed
+/// One hashmaker's delivery records as the app shows them, with what its summary says. Nothing in a record
+/// is checked by this app: anyone can sign one, under as many keys as they like, and a hashmaker can vouch
+/// for its own. So no score is made of them. They are counted, with the keys that signed
 /// them, each key for at most [`PER_KEY`] of its newest; the newest few are shown one for each key, so one
 /// key's many records fill no more than one line.
 pub fn aggregate(hashmaker: &PublicKey, listing_author: &str, advertised_hs: u64, events: &[Event]) -> Value {
@@ -306,7 +344,7 @@ pub fn aggregate(hashmaker: &PublicKey, listing_author: &str, advertised_hs: u64
     let summary = events
         .iter()
         .filter(|e| e.tag("t") == Some(SUMMARY_TOPIC))
-        .filter_map(|e| Summary::read_event(e, listing_author).ok().filter(|s| s.hashmaker == *hashmaker).map(|s| (e.created_at, s)))
+        .filter_map(|e| Totals::read_event(e, listing_author).ok().filter(|s| s.hashmaker == *hashmaker).map(|s| (e.created_at, s)))
         .max_by_key(|(t, _)| *t)
         .map(|(_, s)| s);
     let records: Vec<Attestation> = events.iter().filter(|e| e.tag("t") == Some(ATTEST_TOPIC)).filter_map(|e| Attestation::read_event(e).ok()).collect();
@@ -321,8 +359,8 @@ pub fn aggregate(hashmaker: &PublicKey, listing_author: &str, advertised_hs: u64
     let mut seen_commit = BTreeSet::new();
     mine.retain(|a| seen_commit.insert(a.commit.clone()));
     let mut per_key: BTreeMap<[u8; 33], usize> = BTreeMap::new();
-    let (mut verified_work, mut all_work) = (0f64, 0f64);
-    let (mut counted, mut confirmed, mut disputed) = (0u64, 0u64, 0u64);
+    let mut all_work = 0f64;
+    let mut counted = 0u64;
     let mut recent = Vec::new();
     for a in &mine {
         let n = per_key.entry(a.hashtaker.serialize()).or_default();
@@ -331,14 +369,6 @@ pub fn aggregate(hashmaker: &PublicKey, listing_author: &str, advertised_hs: u64
             continue;
         }
         counted += 1;
-        let matched = summary.as_ref().and_then(|s| s.rentals.iter().find(|r| r.commit == a.commit && r.hashtaker == a.hashtaker));
-        let ok = matched.is_some_and(|r| r.paid_slices == a.paid_slices && r.receipts_hash == a.receipts_hash);
-        if matched.is_some() && !ok {
-            disputed += 1;
-        }
-        if ok {
-            confirmed += 1;
-        }
         let ratio = if a.advertised_hs > 0 { (a.delivered_hs as f64 / a.advertised_hs as f64).clamp(0.0, 2.0) } else { 0.0 };
         if recent.len() < 5 && *n == 1 {
             recent.push(json!({
@@ -346,20 +376,12 @@ pub fn aggregate(hashmaker: &PublicKey, listing_author: &str, advertised_hs: u64
                 "paidSats": a.paid_msat / 1000, "staleShare": stale_share(a),
             }));
         }
-        let work = matched.filter(|_| ok).map(|r| r.work.min(a.work)).unwrap_or(a.work) as f64;
-        all_work += work;
-        if ok {
-            verified_work += work;
-        }
+        all_work += a.work as f64;
     }
     json!({
-        "records": mine.len(), "keys": per_key.len(), "counted": counted, "confirmed": confirmed, "disputed": disputed,
-        "verifiedThHours": verified_work / TH_HOUR, "claimedThHours": all_work / TH_HOUR,
+        "records": mine.len(), "keys": per_key.len(), "counted": counted, "claimedThHours": all_work / TH_HOUR,
         "advertisedHs": advertised_hs.to_string(), "recent": recent,
-        "hashmakerSays": summary.map(|s| json!({
-            "rentals": s.rentals.len(), "paidSats": s.rentals.iter().map(|r| r.paid_msat).sum::<u64>() / 1000,
-            "thHours": s.rentals.iter().map(|r| r.work as f64).sum::<f64>() / TH_HOUR,
-        })),
+        "hashmakerSays": summary.map(|s| json!({"rentals": s.rentals, "paidSats": s.paid_msat / 1000, "thHours": s.work as f64 / TH_HOUR})),
     })
 }
 
@@ -522,17 +544,35 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_counts_only_from_the_listings_key() {
+    fn a_published_summary_names_no_renter_and_no_rental() {
         let maker = Keys::new(sk(20));
-        let s = Summary { hashmaker: pk(2), rentals: vec![Served { commit: "c".into(), hashtaker: pk(1), paid_slices: 1, paid_msat: 12_000, work: 1 << 47, receipts_hash: "h".into(), ended_at: 3_700 }] };
-        let ev = s.event(&maker, 9_000).unwrap();
-        assert_eq!(Summary::read_event(&ev, &maker.public_hex()).unwrap().rentals[0].ended_at, 3_600);
-        assert!(Summary::read_event(&ev, &Keys::new(sk(21)).public_hex()).is_err());
-        // the newest rentals are kept when there are many
-        let many = Summary { hashmaker: pk(2), rentals: (0..100).map(|i| Served { ended_at: i * 3600, ..s.rentals[0].clone() }).collect() };
-        let back = Summary::read_event(&many.event(&maker, 1).unwrap(), &maker.public_hex()).unwrap();
-        assert_eq!(back.rentals.len(), SUMMARY_RENTALS);
-        assert_eq!(back.rentals[0].ended_at, 99 * 3600);
+        let served = |taker: u8, rental: &str, paid: u64, ended: u64| Served {
+            commit: commit(rental, &pk(taker), &pk(2)), hashtaker: pk(taker), paid_slices: paid, paid_msat: paid * 12_000, work: (paid as u128) << 47,
+            receipts_hash: receipts_hash(&receipts(paid), paid), ended_at: ended,
+        };
+        // times no total could contain by chance
+        let s = Summary { hashmaker: pk(2), rentals: vec![served(1, "r1", 3, 3_700_013), served(3, "r2", 2, 7_399_031), served(1, "r3", 1, 50_061_047)] };
+        let ev = s.event(&maker, 90_000_100).unwrap();
+        // no renter's key in any form, no rental's commitment, receipts or time, in the content or the tags
+        let all = format!("{} {:?} {}", ev.content, ev.tags, ev.created_at);
+        for r in &s.rentals {
+            for leak in [hex::encode(r.hashtaker.serialize()), hex::encode(xonly(&r.hashtaker).serialize()), r.commit.clone(), r.receipts_hash.clone(),
+                         r.ended_at.to_string(), hour(r.ended_at).to_string()] {
+                assert!(!all.contains(&leak), "{leak} in {all}");
+            }
+        }
+        for word in ["hashtaker", "commit", "endedAt", "receipts"] {
+            assert!(!ev.content.contains(word), "{word}: {}", ev.content);
+        }
+        assert_eq!(ev.created_at, 90_000_000, "dated to the hour");
+        // counts and totals, read back from the listing's key only
+        let t = Totals::read_event(&ev, &maker.public_hex()).unwrap();
+        assert_eq!(t, Totals { hashmaker: pk(2), rentals: 3, paid_slices: 6, paid_msat: 72_000, work: 6 << 47 });
+        assert!(Totals::read_event(&ev, &Keys::new(sk(21)).public_hex()).is_err());
+        // the box keeps its own list, with each rental, to count from after a restart
+        let kept = Summary::from_json(&s.to_json()).unwrap();
+        assert_eq!(kept.rentals.iter().map(|r| (r.commit.clone(), r.hashtaker)).collect::<Vec<_>>(),
+                   s.rentals.iter().map(|r| (r.commit.clone(), r.hashtaker)).collect::<Vec<_>>());
     }
 
     #[test]
@@ -540,41 +580,34 @@ mod tests {
         let maker_nostr = Keys::new(sk(20));
         let maker = pk(2);
         let good = record(1, 2, "r1", 4, 4_000_000_000_000, 10_000);
-        let unconfirmed = record(3, 2, "r2", 4, 2_000_000_000_000, 9_000);
+        let other = record(3, 2, "r2", 4, 2_000_000_000_000, 9_000);
         // the hashmaker's own key writing records about itself
         let selfish = record(2, 2, "r3", 100, 8_000_000_000_000, 8_000);
-        // key 1 also rented from another hashmaker: it has history
+        // key 1 also rented from another hashmaker
         let elsewhere = record(1, 7, "r4", 1, 1_000_000_000_000, 7_000);
         let summary = Summary {
             hashmaker: maker,
             rentals: vec![Served { commit: good.commit.clone(), hashtaker: pk(1), paid_slices: 4, paid_msat: 48_000, work: good.work, receipts_hash: good.receipts_hash.clone(), ended_at: 10_000 }],
         };
-        let mut events = vec![
+        let events = vec![
             good.event(&sk(1), 1).unwrap(),
-            unconfirmed.event(&sk(3), 1).unwrap(),
+            other.event(&sk(3), 1).unwrap(),
             selfish.event(&sk(2), 1).unwrap(),
             elsewhere.event(&sk(1), 1).unwrap(),
             summary.event(&maker_nostr, 1).unwrap(),
         ];
         let h = aggregate(&maker, &maker_nostr.public_hex(), 4_000_000_000_000, &events);
         assert_eq!(h["records"], 2, "its own record about itself is dropped");
-        assert_eq!(h["confirmed"], 1);
-        assert_eq!(h["disputed"], 0);
         assert_eq!(h["keys"], 2);
-        let verified = h["verifiedThHours"].as_f64().unwrap();
-        assert!((verified - ((4u128 << 47) as f64 / TH_HOUR)).abs() < 1e-9, "{verified}");
-        // no score made of them: each record says its own
-        assert!(h.get("deliveredVsAdvertised").is_none(), "{h}");
+        let claimed = h["claimedThHours"].as_f64().unwrap();
+        assert!((claimed - ((8u128 << 47) as f64 / TH_HOUR)).abs() < 1e-9, "{claimed}");
+        // no score made of them, and none called confirmed: each record says its own
+        for k in ["deliveredVsAdvertised", "confirmed", "disputed", "verifiedThHours"] {
+            assert!(h.get(k).is_none(), "{k}: {h}");
+        }
         let ratios: Vec<f64> = h["recent"].as_array().unwrap().iter().map(|r| r["ratio"].as_f64().unwrap()).collect();
         assert_eq!(ratios, [1.0, 0.5]);
-        assert_eq!(h["hashmakerSays"]["rentals"], 1);
-
-        // a summary that disagrees on what was paid: disputed, not confirmed
-        let mut wrong = summary.clone();
-        wrong.rentals[0].paid_slices = 9;
-        events.push(wrong.event(&maker_nostr, 2).unwrap());
-        let h = aggregate(&maker, &maker_nostr.public_hex(), 4_000_000_000_000, &events);
-        assert_eq!((h["confirmed"].as_u64(), h["disputed"].as_u64()), (Some(0), Some(1)));
+        assert_eq!((h["hashmakerSays"]["rentals"].as_u64(), h["hashmakerSays"]["paidSats"].as_u64()), (Some(1), Some(48)));
 
         // one key's many rentals count for at most PER_KEY
         let flood: Vec<Event> = (0..10).map(|i| record(5, 2, &format!("f{i}"), 1, 4_000_000_000_000, 1000 + i).event(&sk(5), 1).unwrap()).collect();
@@ -586,8 +619,7 @@ mod tests {
         let h = aggregate(&maker, &maker_nostr.public_hex(), 4_000_000_000_000, &mixed);
         assert_eq!(h["recent"].as_array().unwrap().len(), 2, "{h}");
         // a summary by another key than the listing's is not the hashmaker's
-        let h = aggregate(&maker, &Keys::new(sk(21)).public_hex(), 4_000_000_000_000, &events[..5]);
-        assert_eq!(h["confirmed"], 0);
+        let h = aggregate(&maker, &Keys::new(sk(21)).public_hex(), 4_000_000_000_000, &events);
         assert!(h["hashmakerSays"].is_null());
     }
 
