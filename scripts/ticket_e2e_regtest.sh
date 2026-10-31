@@ -49,7 +49,10 @@
 #   vpn      (by name only) a VPN exit sold as a Stream service: the exit's VPN service behind the
 #            seller's gateway (/vpn/, WebSockets priced per byte), and a buyer's paid tunnel opened by
 #            the wallet carrying a 10 MiB public download: whole, interim receipts checked with no
-#            fault, the money agreeing. Ports BASE+17 to BASE+19
+#            fault, the money agreeing. First, from no credit at that shop, a region check of the
+#            exit (vpn_region_check): one ticket bought, charged at most 20 sats, the trace page read
+#            through the exit, and what the wallet says left it equal to what its node paid. Ports
+#            BASE+17 to BASE+19
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab

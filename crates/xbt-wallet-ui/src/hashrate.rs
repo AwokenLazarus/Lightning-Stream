@@ -439,22 +439,30 @@ impl App {
                     };
                     let can = ready && allowed && (free > 0 || total == 0);
                     let history = history_panel(&x["history"]);
+                    // a budget under the shop's ticket may still buy a whole one: what may leave the wallet, as
+                    // the hashtaker sets it (rail::pay_caps), is said beside the budget
+                    let ticket = |k: &str| match x[k].as_u64() {
+                        Some(n) => format!("may buy a ticket of up to {} from this shop", sats_n(n as f64)),
+                        None => "may buy a ticket from this shop".into(),
+                    };
                     let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
                         <input type=\"hidden\" name=\"key\" value=\"{}\"><p class=\"hint\">Not sure yet? Rent one machine for one piece of work, \
-                        about {}, and see what your own DATUM Gateway accepts before renting more.</p>\
+                        about {}, and see what your own DATUM Gateway accepts before renting more. It is charged at most that, but your wallet {}; \
+                        unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
-                        esc(x["linkKey"].as_str().unwrap_or("")), sats_n(price.ceil()), if can { "" } else { " disabled" });
+                        esc(x["linkKey"].as_str().unwrap_or("")), sats_n(price.ceil()), ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
                         <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
-                        <p class=\"hint\">About an hour of one machine. The rental ends when this much is spent.</p>\
+                        <p class=\"hint\">About an hour of one machine. The rental ends when this much is spent, but however small it is, your wallet {}; \
+                        unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button{}>Rent</button></form></section>",
                         esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
-                        esc(x["linkKey"].as_str().unwrap_or("")), if can { "" } else { " disabled" }));
+                        esc(x["linkKey"].as_str().unwrap_or("")), ticket("mayBuyTicketUpToSats"), if can { "" } else { " disabled" }));
                 }
                 b.push_str("</div>");
             }
@@ -489,14 +497,14 @@ impl App {
                 } else {
                     call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1)})))
                         .and_then(|v| match v["rental"].as_str() {
-                            Some(_) => Ok("Renting. The miners start on your DATUM Gateway in a few seconds; you pay as their work is accepted.".into()),
+                            Some(_) => Ok(format!("Renting. The miners start on your DATUM Gateway in a few seconds; you pay as their work is accepted.{}", may_buy(&v))),
                             None => Err(v["error"].as_str().map(|e| format!("Not rented: {e}.")).unwrap_or_else(|| "Not rented.".into())),
                         })
                 }
             }
             "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true})))
                 .and_then(|v| match v["rental"].as_str() {
-                    Some(_) => Ok(format!("Trying one slice, at most {}. When it is done, its result shows under Your rentals.", sats_n(num(&v["budgetSats"])))),
+                    Some(_) => Ok(format!("Trying one slice, at most {}.{} When it is done, its result shows under Your rentals.", sats_n(num(&v["budgetSats"])), may_buy(&v))),
                     None => Err(v["error"].as_str().map(|e| format!("Not started: {e}.")).unwrap_or_else(|| "Not started.".into())),
                 }),
             "attest" => call(&base, &token, "POST", "/attest", Some(&json!({"rental": g("rental")})))
@@ -567,8 +575,20 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
         _ => String::new(),
     };
     let title = if trial { "Test slice from" } else { "Hashrate from" };
+    // what left the wallet for it (a ticket bought whole, which a small rental uses only part of) and, once
+    // the wallet's session with the shop stopped, what of it stays there as credit
+    let moved = live["walletMovedSats"].as_u64().unwrap_or(0);
+    let wallet = if moved > 0 {
+        let left = match live["leftWithSellerMsat"].as_u64() {
+            Some(m) if m > 0 => format!("; {} of it stays with this seller as credit for about 20 hours, for a later rental there", sats_n(m as f64 / 1000.0)),
+            _ => String::new(),
+        };
+        format!("<p class=\"small\">Left your wallet: <span class=\"money\">{}</span>, a ticket bought whole from this shop{left}.</p>", sats_n(moved as f64))
+    } else {
+        String::new()
+    };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
-             <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
+             <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
 }
@@ -576,6 +596,17 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
 /// A whole percentage.
 fn pct(x: f64) -> String {
     format!("{:.0}%", (x * 100.0).max(0.0))
+}
+
+/// What a rental may take from the wallet beyond its budget, as the hashtaker answered it: a ticket
+/// bought whole, its unused part staying with that seller as credit.
+fn may_buy(v: &Value) -> String {
+    match v["mayBuyTicketUpToSats"].as_u64() {
+        Some(n) if n > v["budgetSats"].as_u64().unwrap_or(0) => {
+            format!(" Your wallet may buy a ticket of up to {} from this shop for it; unused credit stays with this seller for about 20 hours, for a later rental there.", sats_n(n as f64))
+        }
+        _ => String::new(),
+    }
 }
 
 /// What a finished rental, or a test slice, showed: delivered against advertised speed, stale and

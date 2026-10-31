@@ -55,6 +55,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -1717,6 +1718,59 @@ def link_relay() -> None:
 VPN_SAT_GB = 500_000  # 500,000 sat a GiB (about 488 sat a MiB): a 10 MiB download is about 4,900 sat, five or six tickets
 VPN_FILES = ["http://speed.cloudflare.com/__down?bytes=10485760", "http://ipv4.download.thinkbroadband.com/10MB.zip"]
 VPN_BYTES = 10_485_760
+# a region check's page: it answers, over plain HTTP, with the address the request came from
+VPN_TRACE = "http://checkip.amazonaws.com/"
+REGION_CHECK_TICKET_SATS = 2_000  # xbt_vpn::holds::REGION_CHECK_TICKET_SATS
+REGION_CHECK_MAX_SATS = 20  # xbt_vpn::buyer::REGION_CHECK_MAX_SATS
+
+
+def trace_ip(page: str) -> str:
+    """The address the page says the request came from (its body, after any HTTP head)."""
+    return page.split("\r\n\r\n", 1)[-1].strip() if " 200 " in page.split("\r\n", 1)[0] or "\r\n" not in page else ""
+
+
+def vpn_region_check(origin: str) -> None:
+    """A priced exit's region check from NO credit at its shop (docs/VPN-EXITS.md), opened as the
+    buyer's region check opens it (`xbt-vpn fetch --region-check`: no more than one ticket may leave
+    the wallet for it, and it is charged no more than 20 sats). It reads the address page through the
+    exit, which sees the exit's address. The wallet buys one whole ticket; the check is charged only
+    what it carried (its bytes at the exit's price, with the tunnel's framing) and no more than 20 sats;
+    the rest stays as credit with that shop; what the wallet's answer says left it is exactly what the
+    buyer's node paid (what the region checks' daily budget counts); and both sides' books agree."""
+    pays0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    m0 = money()
+    r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", VPN_TRACE, "--once", "--secs", "60", "--region-check"],
+                       env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="40000"),
+                       capture_output=True, text=True, timeout=180)
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+    out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
+    time.sleep(3)
+    stop_sessions()
+    m1 = money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    new = [p for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED" and h not in pays0]
+    paid_sats = sum(cost_sats(p) for p in new)
+    with urllib.request.urlopen(VPN_TRACE, timeout=15) as f:
+        direct = f.read().decode().strip()
+    wallet = out.get("wallet") or {}
+    charged = int(wallet["price_msat"]) / 1000 if wallet.get("price_msat") is not None else None
+    left = out.get("left_sats")
+    got = int(out.get("bytes") or 0)
+    # what the bytes carried come to at the exit's price, both ways, with the tunnel's own framing:
+    # the charge must be about that (at least 1 msat a byte-page rounds to), never more than the cap
+    expect = got * VPN_SAT_GB / (1 << 30)
+    fair = charged is not None and 0 < charged <= max(expect * 1.6, expect + 2)
+    check("vpn_region_check: a priced exit's region check from no credit at its shop buys one ticket (no more than "
+          f"{REGION_CHECK_TICKET_SATS} sats may leave), is charged only what it carried and no more than {REGION_CHECK_MAX_SATS} sats, "
+          "reads the address page through the exit, what the wallet answered left it is what the buyer's node paid, and the money agrees",
+          got > 0 and bool(direct) and trace_ip(out.get("page") or "") == direct
+          and len(new) == 1 and isinstance(left, int) and left == paid_sats and 0 < left <= REGION_CHECK_TICKET_SATS
+          and charged is not None and charged <= REGION_CHECK_MAX_SATS and fair and not wallet.get("seller_fault")
+          and agrees(m, receipts=False),
+          {"fetch": {k: v for k, v in out.items() if k not in ("wallet", "page")}, "page": (out.get("page") or "")[-200:],
+           "wallet": {k: wallet.get(k) for k in ("charged_sats", "price_msat", "tickets_released", "tickets_prepaid", "ended", "seller_fault", "credited_msat")},
+           "tickets": len(new), "node_paid_sats": paid_sats, "expected_sats": round(expect, 3), "charged_sats": charged,
+           "address_direct": direct, "money": m})
 
 
 def vpn() -> None:
@@ -1760,6 +1814,8 @@ def vpn() -> None:
     WALLET_PROC.write_policy()
     restart_signer()
     faults0 = len([e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_interim_fault"])
+    # first, with no credit at this shop yet: a region check of the exit
+    vpn_region_check(origin)
     out, url = None, ""
     t0 = time.monotonic()
     for url in VPN_FILES:

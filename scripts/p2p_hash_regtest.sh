@@ -6,8 +6,9 @@
 #
 # Lab: the ticket lab's (scripts/ticket_e2e/compose.yml on lightning-fork-lab, three Lightning Fork
 # nodes on one Knots BLAKE2b regtest), in its own compose project (p2phash) and on its own ports:
-# P2P_HASH_PORT_BASE (default 19961) to BASE+9. P2P_HASH_LAB: a lightning-fork-lab checkout with
-# its node binaries built (default run/lightning-fork-lab, cloned and built when missing). The
+# P2P_HASH_PORT_BASE (default 19961) to BASE+10 (BASE+10: a second gateway, a shop the wallet has no
+# credit with). P2P_HASH_LAB: a lightning-fork-lab checkout with its node binaries built (default
+# run/lightning-fork-lab, cloned and built when missing). The
 # lab's containers and volumes are removed on exit. About 10 minutes.
 # Report: run/p2p_hash_regtest.json and run/p2p_hash_regtest.log.
 set -euo pipefail
@@ -46,7 +47,7 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
 # shellcheck disable=SC2046 # the port list is meant to split
-python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 9)))
+python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 10)))
 (cd "$LAB" && docker compose build -q lf1 && docker compose up -d fees knots-b2b)
 
 export LAB RUN=$R OUT=$ROOT/run BIN

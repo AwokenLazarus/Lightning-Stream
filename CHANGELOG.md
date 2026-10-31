@@ -64,6 +64,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   a refused buyer is sold nothing.
 - WebSockets (for example a web app's live updates) stay open for up to six hours, paid as their
   bytes pass, instead of ending with an ordinary answer's limit.
+- A paid WebSocket is charged no more than the limit the buyer set for it: the shop's gateway ends
+  it there.
 - Higher default limits for a shop: 100 sessions and 512 connections. A shop behind a tunnel is
   limited as a whole, not as if all its buyers were one address.
 

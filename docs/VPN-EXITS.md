@@ -131,11 +131,35 @@ link, as its licence asks. No lookup about an exit or a buyer leaves the box. If
 country allows is caught too; the app never looks the owner's country up from the network. An exit
 whose region does not check out is not offered for that region, and is checked again every 6 hours.
 A **priced** exit's region is read through a paid tunnel, so it is checked only when a device's own
-rules ask for that region and would otherwise take it, and under one budget
-(`xbt_vpn::holds::CheckGate`): 100 sats a day for all such checks together (each held to 20 sats), one
-check of an exit a day, none more that day for an operator (the exit's Nostr key) whose checks failed
-twice, and the exits seen longest first, so a crowd of new announcements can't spend the budget or
-push the others out.
+rules ask for that region and would otherwise take it. A check is charged at most 20 sats
+(`max_charge_sats`), but a buyer with no credit at the exit's shop must first buy one of its
+tickets, so the wallet may move up to 2,000 sats out for one check (the check tunnel's `max_sats`,
+within the owner's rules); a shop whose ticket is bigger can't be checked. A shop whose terms let
+the wallet choose a smaller ticket (`minTicketMsat`) is asked for one of about the check's charge,
+its fee limit included, and no smaller than the shop's smallest (or, for a ticket the wallet holds
+rather than pays at once, than the smallest it holds: docs/TICKETS.md). What the check leaves of the ticket
+stays as credit with that shop, for the tunnel after it. Every check through a paid
+tunnel (an exit that named one, whatever price it announced) shares one budget
+(`xbt_vpn::holds::CheckGate`): at most 4,000 sats may leave the wallet for them in a budget day, the
+24 hours from the first check after the last budget day ran out (a fixed window, so 24 hours that
+straddle two of them may see up to 8,000). A check starts only if the budget day's spend plus its
+2,000 still fits. Its 2,000 is counted, and written to `region-checks.json` in the keys dir
+(readable by the service's own user only), before the wallet is asked for its tunnel; once it is
+done, what actually left for it is counted instead, as the wallet's answer says (the tickets it
+bought or released for the check). Where that is not known (no answer, an error, an answer that
+tells of a seller's fault or of a payment with no final answer, an opening given up, or the service
+stopped during the check) the full 2,000 stays counted. The budget is kept in wall-clock time in
+that file, so the service starting again (as it does at every change of its settings) does not
+start the budget day again: the checks never move more than 4,000 sats in a budget day, however
+many exits are announced, under how many keys, or how often the service starts. If the file is
+there but can't be read, or isn't a gate's, the budget day counts as spent (no paid check for 24
+hours) rather than starting again. With shops whose ticket and its routing fee come to T sats, that
+is 1 + ⌊2,000 / T⌋ checks a budget day: 2 when T is over 1,000 (so a 1,000-sat ticket with any fee),
+3 when T is 667 to 1,000, 4 when T is 501 to 666. An exit's opening, the check's reads through it
+and the wallet's answer after are each given their own time (45 s, 30 s and 30 s), so a slow
+opening from no credit is not cut short. Also one check of an exit in 24 hours, none more for 24
+hours for an operator (the exit's Nostr key) whose checks failed twice within them, and the exits
+seen longest first, so a crowd of new announcements can't push the others out.
 Until the table has loaded, no region is verified, and a device whose rules name a country is told
 no exit qualifies rather than sent to one that may be elsewhere. Each exit's result is in
 `status.json` (`exits`), in plain words, and on the VPN page.

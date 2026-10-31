@@ -17,6 +17,8 @@ xbt-nostr.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util", "net"] }
 bytes = "1"
 hex.workspace = true
+# the region checks' gate file, read back into its typed shape
+serde.workspace = true
 serde_json.workspace = true
 # a userspace TCP/IP stack: the buyer's app ends its devices' connections on its own side and carries
 # each as a flow

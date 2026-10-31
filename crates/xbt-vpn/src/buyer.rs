@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
@@ -122,8 +122,11 @@ pub const PROBE_EVERY: Duration = Duration::from_secs(15);
 /// with it if it does so often) instead of being paid to open again at once.
 pub const YOUNG: Duration = Duration::from_secs(10);
 pub const YOUNG_BYTES: u64 = 16 * 1024;
-/// The most a region check of a priced exit may cost (sats): it reads four small pages.
+/// The most a region check of a priced exit may be charged (sats): it reads four small pages. The
+/// wallet may buy that exit's whole ticket for it, up to [`REGION_CHECK_TICKET_SATS`]: a ticket is far
+/// more than this, and what the check does not use stays as credit with the exit's shop.
 pub const REGION_CHECK_MAX_SATS: u64 = 20;
+pub use crate::holds::REGION_CHECK_TICKET_SATS;
 /// How long an exit whose terms are above what it announced is not used (bait and switch).
 pub use crate::holds::MISPRICED_HOLD;
 
@@ -171,6 +174,9 @@ pub struct Buyer {
     /// A plain trace page to read exits' egress address from instead of [`region::EGRESS_SOURCES`]
     /// (address, Host, path): tests only.
     egress_echo: RwLock<Option<(SocketAddr, String, String)>>,
+    /// How long a paid tunnel may take to open, a region check's reads through it may take, and the
+    /// wallet may take to answer once it has ended ([`CheckWaits`]).
+    waits: RwLock<CheckWaits>,
     /// What each exit's last region check found, for the status page: (announced, result, when).
     regions: RwLock<HashMap<String, (String, RegionCheck, std::time::SystemTime)>>,
     /// The owner's wallet, which pays for priced exits; none: only free exits are used.
@@ -201,6 +207,29 @@ struct DeviceSpend {
 pub fn cost_msat(bytes: u64, price_msat_per_gb: u64) -> u64 {
     ((bytes as u128 * price_msat_per_gb as u128).div_ceil(1u128 << 30)) as u64
 }
+
+/// How long a paid tunnel may take to open ([`crate::paid::OPEN_WAIT`]), a region check's reads
+/// through its carrier, once open, may take ([`REGION_CHECK_READ_WAIT`]), and the wallet may take to
+/// answer once a check's tunnel has ended ([`crate::paid::ANSWER_WAIT`]). Each is bounded on its
+/// own: a slow opening from no credit leaves the reads their whole time.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckWaits {
+    pub open: Duration,
+    pub read: Duration,
+    pub answer: Duration,
+}
+
+impl Default for CheckWaits {
+    fn default() -> CheckWaits {
+        CheckWaits { open: crate::paid::OPEN_WAIT, read: REGION_CHECK_READ_WAIT, answer: crate::paid::ANSWER_WAIT }
+    }
+}
+
+/// How long a region check's reads through an exit may take, once its carrier is open.
+pub const REGION_CHECK_READ_WAIT: Duration = Duration::from_secs(30);
+
+/// The wallet's answer to a paid tunnel, when it ends.
+type Answer = std::sync::mpsc::Receiver<Result<serde_json::Value, String>>;
 
 /// What an ended paid tunnel cost by the wallet's answer (`charged_msat`, else `charged_sats`).
 fn charged_msat(v: &serde_json::Value) -> Option<u64> {
@@ -239,6 +268,7 @@ impl Buyer {
             geo: RwLock::new(None),
             home_country: RwLock::new(None),
             egress_echo: RwLock::new(None),
+            waits: RwLock::new(CheckWaits::default()),
             regions: RwLock::new(HashMap::new()),
             wallet: RwLock::new(None),
             tunnels: RwLock::new(HashMap::new()),
@@ -287,47 +317,50 @@ impl Buyer {
     }
 
     /// Opens a paid tunnel to `id` at `url`, paying no more than its announced price (and, for a
-    /// one-off check, no more than `max_sats`). An exit whose terms are above its announcement is
-    /// held off for a day.
+    /// region check, `check`, with the wallet's [`crate::paid::Wallet::for_region_check`] limits). An
+    /// exit whose terms are above its announcement is held off for a day.
     /// `cap`: what the day's openings are counted by (a device and the exit, or a region check of it).
-    async fn open_paid(&self, id: &str, cap: &str, url: &str, price: u64, max_sats: Option<u64>) -> Option<crate::paid::Tunnel> {
-        let mut w = (*self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone()?).clone();
+    /// `Err`: not opened, and what left the wallet for it (`None`: not known).
+    async fn open_paid(&self, id: &str, cap: &str, url: &str, price: u64, check: bool) -> Result<crate::paid::Tunnel, Option<u64>> {
+        let Some(w) = self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone() else { return Err(Some(0)) };
+        // the check's own charge is capped, and what may leave for it is one ticket of the exit's shop:
+        // capping that at the charge would leave a buyer with no credit there unable to ever check it
+        let w = if check { w.for_region_check() } else { (*w).clone() };
         // held off, or opened enough today: each opening pays its head, so none more
         let op = self.operator_of(id);
         {
             let mut h = self.holds();
             let now = Instant::now();
             if h.held(id, &op, now) || !h.may_open(cap, now) {
-                return None;
+                return Err(Some(0));
             }
         }
-        if let Some(m) = max_sats {
-            w.max_sats = w.max_sats.min(m);
-        }
-        match tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, url, Some(crate::paid::ceiling(price)))).await {
+        match tokio::time::timeout(self.waits().open, crate::paid::open(&w, url, Some(crate::paid::ceiling(price)))).await {
             Ok(Ok(t)) => {
                 // its opening was paid: only now does it count toward the day's cap
                 self.holds().opened(cap, Instant::now());
-                Some(t)
+                Ok(t)
             }
             Ok(Err(e)) => {
                 if e.to_string().contains("price_ceiling") {
                     eprintln!("exit {}…: its terms are above the price it announced; not used for a day", &id[..12.min(id.len())]);
                     self.holds().mispriced(id, &op, price, Instant::now());
                 }
-                None
+                Err(crate::paid::left_of(&e))
             }
-            Err(_) => None,
+            // the wallet may still pay for it: what left is not known
+            Err(_) => Err(None),
         }
     }
 
-    /// What carries flows to `id` for a one-off use (a region check): its paid tunnel, held to
-    /// [`REGION_CHECK_MAX_SATS`], or the link.
-    async fn carrier_once(&self, id: &str) -> Option<Carrier> {
+    /// What carries flows to `id` for a one-off use (a region check): its paid tunnel, held to the
+    /// region check's limits, with the wallet's answer to come when it ends; or the link. `Err`:
+    /// none, and what left the wallet for it (`None`: not known).
+    async fn carrier_once(&self, id: &str) -> Result<(Carrier, Option<Answer>), Option<u64>> {
         match self.tunnel_of(id) {
-            Some(_) if self.is_held_off(id) => None,
-            Some((url, price, _)) => Some(Carrier::Tunnel(self.open_paid(id, &format!("check#{id}"), &url, price, Some(REGION_CHECK_MAX_SATS)).await?.mux)),
-            None => self.link.connect_conn_async(id).await.ok().map(Carrier::Link),
+            Some(_) if self.is_held_off(id) => Err(Some(0)),
+            Some((url, price, _)) => self.open_paid(id, &format!("check#{id}"), &url, price, true).await.map(|t| (Carrier::Tunnel(t.mux), Some(t.done))),
+            None => self.link.connect_conn_async(id).await.map(|c| (Carrier::Link(c), None)).map_err(|_| Some(0)),
         }
     }
 
@@ -351,6 +384,15 @@ impl Buyer {
     /// The owner's own country (two letters), for the round-trip check; `None` skips that check.
     pub fn set_home_country(&self, cc: Option<String>) {
         *self.home_country.write().unwrap_or_else(|e| e.into_inner()) = cc.map(|c| c.to_ascii_uppercase());
+    }
+
+    /// Shorter waits for a paid tunnel's opening, a check's reads and the wallet's answer (tests).
+    pub fn set_check_waits(&self, w: CheckWaits) {
+        *self.waits.write().unwrap_or_else(|e| e.into_inner()) = w;
+    }
+
+    fn waits(&self) -> CheckWaits {
+        *self.waits.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Reads exits' egress addresses from one plain trace page instead of the HTTPS sources (tests).
@@ -389,16 +431,45 @@ impl Buyer {
         region::parse_egress(rest, trace)
     }
 
+    /// Checks `e`'s announced region. A check through a paid tunnel (an exit that named one, whatever
+    /// price it announced) is paid for under `gate`: only if some device's own policy would take
+    /// the exit ([`Self::region_wanted`]), it is not held off, and the most a check may move out of
+    /// the wallet still fits the day's budget; that most is counted, and on disk, before the tunnel
+    /// opens, and what actually left is counted after. `None`: not checked now.
+    pub async fn check_region(self: &Arc<Self>, gate: &mut crate::holds::CheckGate, e: &ExitInfo) -> Option<RegionCheck> {
+        if self.tunnel_of(&e.id).is_none() || self.geo.read().unwrap_or_else(|e| e.into_inner()).is_none() {
+            return Some(self.verify_region(&e.id, &e.region).await.0);
+        }
+        if !(self.region_wanted(e) && !self.is_held_off(&e.id) && gate.may(&e.id, &e.operator, SystemTime::now())) {
+            return None;
+        }
+        if let Err(err) = gate.reserve(&e.id, &e.operator, SystemTime::now()) {
+            eprintln!("exit {}…: region check not paid for: its cost could not be kept ({err})", &e.id[..12.min(e.id.len())]);
+            return None;
+        }
+        let (result, left) = self.verify_region(&e.id, &e.region).await;
+        gate.settle(left, result == RegionCheck::Verified, SystemTime::now());
+        Some(result)
+    }
+
     /// Checks the region an exit announced: its egress address, read through the exit itself, must
     /// be in that country by the offline table, and the round trip to it must not be faster than the
     /// distance from the owner's country allows. Nothing about the buyer leaves the box: the trace
-    /// page sees only the exit's address.
-    pub async fn verify_region(self: &Arc<Self>, id: &str, announced: &str) -> RegionCheck {
-        let Some(geo) = self.geo.read().unwrap_or_else(|e| e.into_inner()).clone() else { return RegionCheck::Unknown };
+    /// page sees only the exit's address. Also the sats that left the wallet for it: what the
+    /// wallet's answer says it bought or released for the check's tunnel, or the most a check may
+    /// move ([`REGION_CHECK_TICKET_SATS`]) where that is not known (no answer, an error, an opening
+    /// given up). Only through [`Self::check_region`], which counts them.
+    async fn verify_region(self: &Arc<Self>, id: &str, announced: &str) -> (RegionCheck, u64) {
+        let Some(geo) = self.geo.read().unwrap_or_else(|e| e.into_inner()).clone() else { return (RegionCheck::Unknown, 0) };
         let test_echo = self.egress_echo.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let waits = self.waits();
+        // the carrier first: a paid tunnel's opening has its own bound, and the reads theirs after it
+        let (conn, answer) = match self.carrier_once(id).await {
+            Ok(c) => c,
+            Err(left) => return (self.noted(id, announced, RegionCheck::Unknown), left.unwrap_or(REGION_CHECK_TICKET_SATS)),
+        };
         let read = async {
-            let conn = self.carrier_once(id).await?;
-            let egress = match test_echo {
+            match test_echo {
                 Some((echo, host, path)) => Self::egress_from(&conn, echo, &host, &path, true, None).await.map(|a| (a, None)),
                 None => {
                     // the sources' names are looked up here, by the buyer's own resolver; the requests go through the exit
@@ -422,20 +493,25 @@ impl Buyer {
                     let v6 = region::egress_quorum(&[e, f, g, h], 2).filter(std::net::IpAddr::is_ipv6);
                     region::egress_quorum(&[a, b, c, d], 2).map(|v4| (v4, v6))
                 }
-            };
-            if let Carrier::Tunnel(m) = &conn {
-                m.close();
             }
-            egress
         };
-        let Some((egress, egress_v6)) = tokio::time::timeout(Duration::from_secs(30), read).await.ok().flatten() else { return self.noted(id, announced, RegionCheck::Unknown) };
+        let read = tokio::time::timeout(waits.read, read).await.ok().flatten();
+        // the tunnel ends here, and the wallet answers what left it for the check
+        let left = match (&conn, answer) {
+            (Carrier::Tunnel(m), Some(answer)) => {
+                m.close();
+                tokio::task::spawn_blocking(move || crate::paid::left_after(&answer, waits.answer)).await.ok().flatten().unwrap_or(REGION_CHECK_TICKET_SATS)
+            }
+            _ => 0,
+        };
+        let Some((egress, egress_v6)) = read else { return (self.noted(id, announced, RegionCheck::Unknown), left) };
         let rtt = self.link.path(id).map(|p| match p {
             xbt_iroh_link::Path::Direct { rtt_ms, .. } | xbt_iroh_link::Path::Relay { rtt_ms, .. } => rtt_ms as f64,
         });
         let home = self.home_country.read().unwrap_or_else(|e| e.into_inner()).clone();
         let km = home.and_then(|h| region::km_between(&h, announced));
         let v6 = egress_v6.map(|a| region::check(&geo, announced, a, None, None));
-        self.noted(id, announced, region::both_families(region::check(&geo, announced, egress, rtt, km), v6))
+        (self.noted(id, announced, region::both_families(region::check(&geo, announced, egress, rtt, km), v6)), left)
     }
 
     fn noted(&self, id: &str, announced: &str, r: RegionCheck) -> RegionCheck {
@@ -608,7 +684,7 @@ impl Buyer {
             if let Some(e) = self.exits.lock().await.get(&key).filter(|e| !e.conn.is_closed()) {
                 return Some(e.clone());
             }
-            let Some(t) = self.open_paid(id, &key, &url, price, None).await else {
+            let Ok(t) = self.open_paid(id, &key, &url, price, false).await else {
                 // a priced exit with no wallet to pay it, or one the wallet would not pay: not usable
                 self.fail_exit(id).await;
                 return None;

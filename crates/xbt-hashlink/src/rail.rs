@@ -90,6 +90,10 @@ pub struct SignerPayer {
     pub url: String,
     pub task: String,
     pub max_sats: u64,
+    /// The most one slice's payment may be charged, where that is less than `max_sats` (a rental's
+    /// budget, while `max_sats` lets the wallet buy the shop's whole ticket, the rest staying as
+    /// credit with that shop: [`pay_caps`]).
+    pub max_charge_sats: Option<u64>,
     pub session: Option<String>,
     /// The most the hashmaker's signed offer said a slice costs, as the wallet's `price_ceiling`: a
     /// shop whose terms ask more than the offer it was rented from is paid nothing.
@@ -97,6 +101,21 @@ pub struct SignerPayer {
     /// How long a slice's payment waits for a signer whose socket is not there (a wallet that
     /// starts again): within the hashmaker's grace, so the slice is still paid in time.
     pub wait_for_signer: std::time::Duration,
+}
+
+/// What may leave the wallet for a rental whose budget is smaller: enough for a shop's whole ticket
+/// and its routing fees, since a ticket (some 500 to 1,000 sat) is far more than a slice.
+pub const TICKET_ROOM_SATS: u64 = 2_000;
+
+/// A rental's `max_sats` and `max_charge_sats` ([`SignerPayer`]), a trial's (one slice) and every
+/// other: `max_sats`, what may leave the wallet for a slice, is at least [`TICKET_ROOM_SATS`], so a
+/// budget smaller than the shop's ticket can still buy one from no credit; `max_charge_sats`, what
+/// a slice may be charged and what the shop is told, is the budget (none for a budget of 0, a free
+/// trial: a charge cap of 0 is no cap the wallet takes, and the price ceiling refuses any price). What
+/// the rental does not use of the ticket stays as credit with that shop for a later rental there,
+/// within about 20 hours. The rental's own count stops it at its budget.
+pub fn pay_caps(budget_sats: u64) -> (u64, Option<u64>) {
+    (TICKET_ROOM_SATS.max(budget_sats), (budget_sats > 0).then_some(budget_sats))
 }
 
 /// Whether a failed [`signer_call`] never reached the signer: its socket was missing or refused
@@ -130,6 +149,9 @@ impl SignerPayer {
         });
         if let Some(c) = &self.ceiling {
             params["price_ceiling"] = c.clone();
+        }
+        if let Some(c) = self.max_charge_sats {
+            params["max_charge_sats"] = c.into();
         }
         // a signer that is starting again is waited for, with growing pauses, as long as the call never
         // reached it: a call that reached it is never made a second time
@@ -220,7 +242,7 @@ mod signer_wait_tests {
                 writeln!(w, "{}", serde_json::json!({"id": 1, "result": {"verdict": "allow", "status": 200, "session": "s1"}})).unwrap();
             }
         });
-        let mut p = SignerPayer { sock, url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, session: None,
+        let mut p = SignerPayer { sock, url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, max_charge_sats: None, session: None,
                                   ceiling: None, wait_for_signer: Duration::from_secs(10) };
         let t0 = Instant::now();
         let r = p.pay("r1", 0, &serde_json::json!({}));
@@ -248,11 +270,27 @@ mod signer_wait_tests {
                 writeln!(w, "{}", serde_json::json!({"id": 1, "result": {"verdict": "deny", "rule": "price_ceiling"}})).unwrap();
             }
         });
-        let mut p = SignerPayer { sock, url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, session: None,
+        let mut p = SignerPayer { sock, url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, max_charge_sats: None, session: None,
                                   ceiling: Some(serde_json::json!({"request_msat": 40_000})), wait_for_signer: Duration::from_secs(2) };
         let _ = p.pay("r1", 0, &serde_json::json!({}));
         let v = seen.lock().unwrap().clone();
         assert_eq!(v["params"]["price_ceiling"]["request_msat"], 40_000, "{v}");
+        assert!(v["params"].get("max_charge_sats").is_none(), "none unless set: {v}");
+        // a trial's: the slice's charge capped, the ticket it may buy not
+        p.max_sats = 2_000;
+        p.max_charge_sats = Some(40);
+        let _ = p.pay("r1", 0, &serde_json::json!({}));
+        let v = seen.lock().unwrap().clone();
+        assert_eq!((v["params"]["max_sats"].as_u64(), v["params"]["max_charge_sats"].as_u64()), (Some(2_000), Some(40)), "{v}");
+    }
+
+    /// A rental's caps: at least a ticket's room may move, the budget is the charge cap, and a budget
+    /// of nothing (a free trial) sets no charge cap, which the wallet would refuse as 0.
+    #[test]
+    fn a_rentals_caps_come_from_its_budget_and_a_free_trial_sets_no_charge_cap() {
+        assert_eq!(pay_caps(0), (TICKET_ROOM_SATS, None));
+        assert_eq!(pay_caps(40), (TICKET_ROOM_SATS, Some(40)));
+        assert_eq!(pay_caps(5_000), (5_000, Some(5_000)));
     }
 
     /// Past the wait, the payment fails plainly: a signer that does not come back is not waited for
@@ -260,7 +298,7 @@ mod signer_wait_tests {
     #[test]
     fn a_signer_that_does_not_come_back_is_not_waited_for_beyond_the_wait() {
         let dir = scratch("gone");
-        let mut p = SignerPayer { sock: dir.join("none.sock"), url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10,
+        let mut p = SignerPayer { sock: dir.join("none.sock"), url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, max_charge_sats: None,
                                   session: None, ceiling: None, wait_for_signer: Duration::from_millis(800) };
         let t0 = Instant::now();
         let r = p.pay("r1", 0, &serde_json::json!({}));

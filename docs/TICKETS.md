@@ -1175,8 +1175,8 @@ One function in the wallet decides, when a seller's 402 has a ticket entry and a
 | A session with this seller is open | what that session pays by |
 | The seller offers one of the two, the owner turned the lottery off (`tickets.lottery.enabled`), or the task says (`meter`: `tickets` or `draws`) | that one |
 | A piece of the route costs one ticket or more | tickets |
-| The call expects fewer wins than the owner's `min_expected_wins` (4): what it may use (`max_sats`) is less than that many wins of the size a session would be opened with, and the seller's ticket entry has prepaid tickets beside it | tickets: a held one where the seller is named and one fits; a prepaid one first for a seller the owner has not named (section 6.4) |
-| The call may use four tickets' worth or more with this seller (`max_sats`), and a held ticket fits (the slot budget of section 11 and the owner's caps have room) | tickets |
+| The call expects fewer wins than the owner's `min_expected_wins` (4): what it may be charged (`max_charge_sats`, else `max_sats`) is less than that many wins of the size a session would be opened with, and the seller's ticket entry has prepaid tickets beside it | tickets: a held one where the seller is named and one fits; a prepaid one first for a seller the owner has not named (section 6.4) |
+| The call may be charged four tickets' worth or more with this seller (`max_charge_sats`, else `max_sats`), and a held ticket fits (the slot budget of section 11 and the owner's caps have room) | tickets |
 | Anything smaller, and whenever no held ticket fits | draws |
 | Draws were chosen and no win size fits the owner's bounds | tickets, and with them the prepaid ticket of section 5 where none can be held |
 
@@ -1221,11 +1221,13 @@ budgets, `max_sellers`, `max_new_sellers_per_min`, `max_sends_per_hour`.
 
 - **Spend is what the node paid.** A win and its routing fee, booked before the payment leaves.
   Never an expected value.
-- **`max_sats` bounds what a call uses**, by the wallet's own count of the pieces it gave values
-  for. What the call pays is uneven: nothing, or several wins. The wallet asks for no more pieces
-  when the wins of a call come to more than `max_sats`, plus 3.1 times the square root of
-  `max_sats` times the win, plus one win. For a call of 1,000 sat on 64-sat wins that is 1,848
-  sat. The task's budget is the bound that holds whatever the draws do.
+- **The call's charge cap bounds what it uses** (`max_charge_sats`, else `max_sats`), by the
+  wallet's own count of the pieces it gave values for. What the call pays is uneven: nothing, or
+  several wins. The wallet asks for no more pieces when the wins of a call come to more than the
+  charge cap, plus 3.1 times the square root of the cap times the win, plus one win (the luck cap).
+  For a call of 1,000 sat on 64-sat wins that is 1,848 sat. `max_sats` does not bound the wins:
+  where the charge cap is `max_sats`, they may come to the luck cap, above it. The task's budget is
+  the bound that holds whatever the draws do.
 - **A budget below one win and its fee pays nothing at all.** The wallet says so when the session
   would open, before it asks the seller for anything.
 - **A session counts once** for `velocity_max` (`tickets.velocity: "session"`, the default),
@@ -1451,7 +1453,8 @@ reads the smaller of the two numbers, sees 30 in both cases.
 
 ## 12. The wallet's side: `xbt402_pay`
 
-An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)`. Everything else
+An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)`, with an optional
+`max_charge_sats` beside `max_sats` (below: two limits, not one). Everything else
 is the wallet's signer's (`crates/xbt-signer/src/ticket_pay.rs`): it sends the request once without
 paying, reads the 402 itself, and chooses the rail. Who the seller is therefore comes from what
 the signer fetched from the URL's own origin, never from its caller.
@@ -1535,7 +1538,8 @@ entry for an origin off the allowlist, which is never used, is warned of the sam
    answer priced as it goes is read as it arrives; the next ticket is released when everything
    the released ones pay for has arrived (by the second: in the last fifth of the second before
    the unpaid one), and the wallet stops reading when the book refuses a release, when the call's
-   `max_sats` is used up by its own count of bytes and seconds, or when the answer has been open
+   charge cap (`max_charge_sats`, else `max_sats`) is used up by its own count of bytes and
+   seconds, or when the answer has been open
    for `tickets.max_answer_s` (50 s by default). It then asks `status` for the last receipt and
    checks it against what arrived.
 6. The pool is refilled behind the call when half of it or fewer are left: with the default of
@@ -1546,10 +1550,18 @@ prepaid ticket instead: a lock with `settle: "on-arrival"` and a count of 1, the
 the invoice and every rule of a release, the ledger row, the payment, and then the preimage in
 `release`. One at a time, and none ahead of need.
 
-`max_sats` bounds what the call books, and so what it uses. Money moves a ticket at a time, and a
+`max_sats` bounds what the call books, whole tickets and their fee limits included; its charge cap
+(`max_charge_sats`, else `max_sats`) bounds what it uses. Money moves a ticket at a time, and a
 ticket is released or bought for a call only when it fits what is left of the call's `max_sats`,
-its fee limit included. Where the seller's own size does not fit and its terms let the wallet ask
-for a smaller one (`minTicketMsat`), the wallet asks for the largest that fits, in whole sats: a
+its fee limit included, and, for an answer priced as it goes, only while the credit it can draw
+(the session's balance at its head with what its call released, less what answers beside it drew)
+does not already cover its charge cap: the call could never be charged for one more. Where the seller's own size
+does not fit and its terms let the wallet ask for a smaller one (`minTicketMsat`), the wallet asks
+for the largest that fits, in whole sats, and no larger than the call's charge cap needs: a ticket
+of that cap with its fee limit, or, where that is larger, the seller's smallest for a prepaid
+ticket, and for a held one the larger of the seller's smallest and the smallest the wallet holds
+(the largest of 546 sat, the owner's `tickets.floor_ticket_sats` and the channels' dust limit:
+section 11). A
 prepaid ticket is sized for each purchase, a session's held tickets once, to the call that opens
 it, and a held ticket that does not fit a later call gives way to a smaller prepaid one where the
 seller sells those. Where nothing fits, nothing is paid and the call is refused (`max_sats`, with
@@ -1560,6 +1572,40 @@ wallet's count of that balance, and only where it stands inside the wallet's own
 released total never above what the wallet released, a charge never above the price by the terms
 of what was asked for and received). The ledger holds the wallet's own tickets and the fees its
 node reports, and nothing else.
+
+**Two limits: what may leave the wallet, and what the call may be charged.** A call names
+`max_sats`, and may name `max_charge_sats` beside it. They bound different things:
+
+| | `max_sats` | `max_charge_sats` (default: `max_sats`; never above it) |
+|---|---|---|
+| Bounds | What may leave the wallet for the call on the ticket rail: the tickets it releases or buys, whole, with their routing fees. Not a call paid by draws: its wins are bounded by the charge cap's luck cap and the task's budget (section 9.8) | What the call's answer may be charged by the seller |
+| Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the gateway ends the answer there, a body or a paid WebSocket (gateways before 0.1.20 did not stop a WebSocket at it: bytes in flight past it were charged, and the wallet takes such a receipt as the seller's fault) |
+| Checked by the wallet | Before a ticket is released or bought: it must fit what is left of `max_sats` | A quoted price above it is refused before anything is paid (`max_sats`); a metered answer is cut there; a receipt that charges more is a seller fault (`ticket_over_cap`) |
+| Where the difference goes | — | It stays as credit with that seller. A later session with it takes it over within 20 hours of the stop (the newest stopped session only, and only where the seller's signed count agrees); after that it is lost |
+
+They differ where a use is smaller than the seller's ticket. Tickets run to some 500 to 1,000 sat
+or more, so a call whose `max_sats` is its own small price fits no ticket and, with no credit at
+that seller, is refused before anything is paid. Such a call names a `max_sats` that a whole
+ticket fits, and its own price as `max_charge_sats`. With no credit, a ticket leaves the wallet:
+of about the charge cap where the seller lets the wallet choose the size (its smallest at the
+least), else the seller's own, and never more than `max_sats`. The call is charged at most
+`max_charge_sats` of it; the rest is credit with that seller, which only a later session with that
+seller within 20 hours can use: past that it is lost. More leaves the wallet than the call costs,
+and a page that starts such a call says so: "may buy a ticket of up to N sats; unused credit stays
+with this seller for about 20 hours". The callers in this repository:
+
+- **A VPN exit's region check** (`docs/VPN-EXITS.md`): charged at most 20 sat, and may buy the
+  exit's ticket.
+- **A hashrate rental** (`crates/xbt-hashlink/src/rail.rs`, `pay_caps`). This covers a trial (one
+  slice) and every other rental. `max_charge_sats` is the rental's budget. `max_sats` is the
+  larger of the budget and 2,000 sat (a ticket and its fees), so a 60-sat rental of twelve slices
+  can start from no credit. The rental's own count of what its slices were charged stops it at its
+  budget, whatever is left of the ticket. The hashtaker's offers and its answer to `/rent` give
+  the figure (`mayBuyTicketUpToSats`), and the wallet's Hashrate page shows it.
+
+The owner's limits are never raised by either one. The task's budget, the cap per seller and the
+caps on locked funds count what leaves the wallet, so a ticket bought for a small call counts in
+full.
 
 **A seller that ignores the call's limit.** Each paid request names the call's limit to the seller
 (`X-Xbt402-Max-Msat`), and a seller that reads it never charges the answer more. One that does not
@@ -1619,7 +1665,8 @@ past what the wallet has counted of it** (`uncounted_most` in `ticket_pay.rs`):
   up to that quote and stays counted as drawn, so no other answer is believed for the same credit;
   one cut after its final counts, or that arrives whole, is believed only for what its counts come to.
 - **Priced by the second:** the seconds a seller counts are not the wallet's to know, so such a
-  request may add up to its call's limit (`max_sats`). Keep `max_sats` near what it should cost.
+  request may add up to its call's charge cap (`max_charge_sats`, else `max_sats`). Keep it near
+  what it should cost.
 - **A request whose answer is lost** (the connection fails after the request left, which a seller
   can cause) is held, until a quiet point after `LOST_GRACE` (two minutes), to what could have
   arrived of it: by size, its request and 16 MiB priced; by the token, its quote; by the second, the
@@ -1632,7 +1679,7 @@ past what the wallet has counted of it** (`uncounted_most` in `ticket_pay.rs`):
   of one session (`LOST_CHARGED_MOST`) is over-charging; ones the wallet timed out are not counted. A seller whose connection drops before its answer reaches
   the wallet is paid only for what could have arrived: honest sellers lose that request's charge
   past it, which is the trade for not trusting a seller's word for a request nobody saw answered.
-- **Never past a call's own limit** (`max_sats`), whatever it is.
+- **Never past a call's own charge cap** (`max_charge_sats`, else `max_sats`), whatever it is.
 - **What cheating inside these bounds costs:** the seller takes them and is not caught, once per
   request: the wallet cannot tell such a charge from an honest one. Over a day, the owner's
   spending rules cap what any one seller is paid (`per_counterparty_daily_sats`: 20,000 sat on a
@@ -1924,7 +1971,8 @@ Found buying from a mainnet seller behind a web tunnel, with the starter rules a
 
 **A limit for each answer** (`X-Xbt402-Max-Msat`). A paid request may name the most, in msat, its
 answer may charge the session's balance. A seller that reads it charges the answer no more and ends
-the body there; one that ignores it charges as before. The wallet sends the call's `max_sats`. Why: a
+the body there; one that ignores it charges as before. The wallet sends the call's charge cap
+(`max_charge_sats`, else `max_sats`). Why: a
 seller that meters what it writes counts bytes that sit in a proxy's or tunnel's buffers once the
 buyer stops reading. A buyer that stopped at its 200-sat limit was charged 345 sat that way, out of
 credit it had prepaid. The header fixes the bound before anything is sent, so it gives the buyer no

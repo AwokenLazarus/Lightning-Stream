@@ -261,6 +261,12 @@ struct Metered {
     cap_msat: Option<u64>,
 }
 
+/// The most the buyer lets an answer to `req` charge, in msat ([`xbt402::ticket::MAX_MSAT_HEADER`]);
+/// None: no limit named, or one that is not a number.
+fn buyers_cap(req: &Request) -> Option<u64> {
+    req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)).and_then(|(_, v)| v.trim().parse::<u64>().ok())
+}
+
 impl Metered {
     /// What the buyer's cap leaves for this answer after `charged` msat of its own; no cap: all.
     fn room(&self, charged: u64) -> u64 {
@@ -1958,8 +1964,7 @@ impl Gateway {
             first_second,
             started: Instant::now(),
             tokens: prepared.as_ref().map(|p| TokenCall { body_len: req.body.len() as u64, max_output: p.max_output }),
-            cap_msat: req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER))
-                .and_then(|(_, v)| v.trim().parse::<u64>().ok()),
+            cap_msat: buyers_cap(&req),
         };
         let event_stream = answer.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().starts_with("text/event-stream"));
         // a body priced by the token has no length known before it is counted

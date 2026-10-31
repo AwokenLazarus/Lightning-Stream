@@ -102,3 +102,45 @@ fn a_websocket_ends_where_the_balance_does() {
     let _ = s.read_to_end(&mut rest);
     assert!(back.len() + rest.len() <= 1024);
 }
+
+/// A paid WebSocket whose buyer names the most it may charge (`X-Xbt402-Max-Msat`, a call's
+/// `max_charge_sats`) is charged no more, as a body is: a large frame is cut at the cap, both
+/// connections close there, and the seller's own count (the session's spend) stays within it,
+/// however much the balance holds. FAILS before the socket path read the cap: an honest seller
+/// went on relaying and charged the whole frame, and the buyer's wallet called it over its cap.
+#[test]
+fn a_paid_websocket_is_charged_no_more_than_the_buyers_limit_for_it() {
+    let (rig, _d) = start(&|_| {});
+    let mut b = Buyer::new(&rig, 1);
+    let secrets = b.lock(&rig, 2);
+    let sig = b.sign("GET", "/ws/chat", b"", Some(&secrets[0]), None);
+    // 10 sat: 2,500 msat to open leaves 7,500 msat, 7.5 KiB at 1,000 msat a KiB, either way
+    let (head, mut s) = open(&rig.addr, "/ws/chat", &[("PAYMENT-SIGNATURE", &sig), (xbt402::ticket::MAX_MSAT_HEADER, "10000")]);
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    // one frame of 64 KiB, far past the cap, sent whole
+    let msg = vec![9u8; 64 * 1024];
+    let back = echo(&mut s, &msg);
+    let mut rest = vec![];
+    let _ = s.read_to_end(&mut rest);
+    let carried = back.len() + rest.len();
+    assert!(carried < 7_680, "{carried} bytes came back: the socket went past the cap");
+    drop(s);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let spent = loop {
+        let st = b.status();
+        let spent: u64 = st["session"]["spentMsat"].as_str().unwrap().parse().unwrap();
+        // settled once the socket's last receipt is in: what it charged no longer grows
+        std::thread::sleep(Duration::from_millis(200));
+        let again: u64 = b.status()["session"]["spentMsat"].as_str().unwrap().parse().unwrap();
+        if spent == again && spent > 2_500 {
+            break spent;
+        }
+        assert!(std::time::Instant::now() < deadline, "the socket's charge never settled: {st}");
+    };
+    assert!(spent <= 10_000, "charged {spent} msat for a socket whose buyer allowed 10,000");
+    // it used what it was allowed: up to the cap, not cut short of it by more than a chunk's worth
+    assert!(spent >= 2_500 + 4_000, "charged only {spent} msat");
+    let h = http(&rig.addr, "GET", "/x402/ticket/health", &[], b"", None).json();
+    let earned: u64 = h["chargedMsat"].as_str().unwrap().parse().unwrap();
+    assert_eq!(earned, spent, "the shop's count is the session's: {h}");
+}

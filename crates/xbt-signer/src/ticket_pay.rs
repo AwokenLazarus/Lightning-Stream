@@ -18,7 +18,7 @@
 //! | Nothing a seller says is booked. | The ledger rows are the book's. A seller's totals only move the wallet's count of the balance, and only where [`crate::ticket_http::Account::absorb`] finds them inside the wallet's own. |
 //! | A ticket is released for an answer only when the balance does not cover its next piece. | [`Stream::due_bytes`] and [`Stream::due_time`], on the bytes and seconds this module counted itself. |
 //! | No ticket is released into a session whose last answer the seller has not closed. | [`Signer::ticket_release_one`] waits for the answer's last receipt in the seller's signed `status` (5 s a call, the session given up after 30 s). A seller waiting for a refill of an answer the wallet stopped reading would take the next ticket for bytes nobody reads. |
-//! | A call uses at most `max_sats`, by the wallet's own count, and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above it; [`Stream::over`] cuts the body where its price reaches it or its time is up. |
+//! | A call is charged at most its charge cap (`max_charge_sats`, else `max_sats`), by the wallet's own count, moves at most `max_sats` (whole tickets with their fees), and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above the charge cap, and [`Spent::room`] any ticket past `max_sats`; [`Stream::over`] cuts the body where its price reaches the charge cap or its time is up. |
 //! | Held tickets first; a prepaid one only where none can be held, or before any is. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, a wait after a lock that found no slot, or a session whose first ticket is a prepaid one: a seller the owner has not named, or one that answered `prepaid_first`). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
 //! | A seller that says `slots_short` is waited for. | [`Signer::ticket_lock_call`] sets the session's wait from the seller's `retryAfter` and offers it no hash until then. |
 //! | A session that can release nothing more is ended, and said so. | [`Signer::ticket_forgotten`]: the seller's unsigned `session_unknown` to a lock or a `status` stops the session, as an unsigned answer to a paid request does. [`Signer::ticket_release_one`]: a ticket the seller has not shown after `ready_wait_ms` that the wallet's own node carries on no channel ([`Signer::ticket_stranded`]) stops it too. Neither releases or books anything. |
@@ -1538,9 +1538,13 @@ struct Call<'a> {
     /// stream both ways through `stream_to`, every byte either way paid for as the body's are.
     upgrade: bool,
     /// The call may draw only on the credit the seller already holds for the session and buys no
-    /// ticket (`credit_only`): a web app's other requests while one of them buys. Its `max_sats`
-    /// stays the most the answer may charge, which the seller is told.
+    /// ticket (`credit_only`): a web app's other requests while one of them buys. Its charge cap
+    /// (`charge_sats`) stays the most the answer may charge, which the seller is told.
     credit_only: bool,
+    /// The most the answer itself may charge (`max_charge_sats`), at most `max_sats`: a small check
+    /// (a VPN exit's region, a hashrate trial) may buy the seller's whole ticket within `max_sats`
+    /// and still be charged only its own use, the rest staying as credit with that seller.
+    charge_sats: i64,
 }
 
 impl Call<'_> {
@@ -1645,6 +1649,9 @@ struct Spent {
     booked_sats: i64,
     prepaid: usize,
     limit_sats: Option<i64>,
+    /// The call's charge cap (`max_charge_sats`, else its `max_sats`): a prepaid ticket bought for
+    /// it is sized to it where the seller lets the wallet choose ([`Signer::ticket_prepaid_size`]).
+    charge_sats: Option<i64>,
     /// No ticket may be released for the call (its `credit_only`).
     credit_only: bool,
     /// What the tickets released for the call come to, in msat: the credit its own answer may have
@@ -1726,12 +1733,13 @@ struct Stream {
 }
 
 impl Stream {
-    /// Why the wallet reads no further, if it does not: the call's `max_sats` is used up by its
-    /// own count, or the answer has been open for as long as the owner allows.
+    /// Why the wallet reads no further, if it does not: the call's charge cap (`max_charge_sats`,
+    /// else its `max_sats`) is used up by its own count, or the answer has been open for as long as
+    /// the owner allows.
     fn over(&self, bytes: u64) -> Option<String> {
         // a body with a price of its own only: one paid for at its head costs nothing more however long it is
         if self.price.metered() && self.cost(bytes) >= self.max_msat {
-            return Some("max_sats: the call's limit is used up".into());
+            return Some("max_sats: the call's charge cap is used up".into());
         }
         (self.started.elapsed() >= self.max_open).then(|| format!("{}: the answer has been open for {} s", self.limit, self.max_open.as_secs()))
     }
@@ -1753,6 +1761,14 @@ impl Stream {
         credited.saturating_sub(self.base_spent)
     }
 
+    /// The credit released so far already covers all the request may be charged (its charge cap):
+    /// no ticket more is due for it, whatever its body does. Without this a capped call at a seller
+    /// of small tickets bought a second one as the body neared the end of the first, which it could
+    /// never be charged for.
+    fn capped(&self, credited: u64) -> bool {
+        self.avail(credited) >= self.max_msat
+    }
+
     /// What does not depend on the body's size: the request and the seconds started.
     fn fixed(&self) -> u64 {
         self.price.request_msat.saturating_add(self.price.for_seconds(self.seconds()).unwrap_or(u64::MAX))
@@ -1769,7 +1785,7 @@ impl Stream {
     /// an answer that pauses, and the seller pauses where the balance runs out, so a wallet that
     /// waited for every paid byte would wait for bytes the seller is waiting to be paid to push.
     fn due_bytes(&self, credited: u64, bytes: u64, length: Option<u64>) -> bool {
-        if self.price.byte_msat == 0 {
+        if self.price.byte_msat == 0 || self.capped(credited) {
             return false;
         }
         let covered = self.covered(credited);
@@ -1783,7 +1799,7 @@ impl Stream {
     /// before the body reaches the end of what is paid for, so a payment that takes a second or two
     /// does not hold the body up. `lead` is the caller's, and at most half of what one ticket covers.
     fn due_bytes_ahead(&self, credited: u64, bytes: u64, length: Option<u64>, lead: u64) -> bool {
-        if self.price.byte_msat == 0 {
+        if self.price.byte_msat == 0 || self.capped(credited) {
             return false;
         }
         let covered = self.covered(credited);
@@ -1795,7 +1811,7 @@ impl Stream {
 
     /// A body priced by the second: the balance does not cover the second that starts next.
     fn due_time(&self, credited: u64) -> bool {
-        self.price.second_msat > 0 && self.avail(credited) < self.fixed().saturating_add(self.price.second_msat)
+        self.price.second_msat > 0 && !self.capped(credited) && self.avail(credited) < self.fixed().saturating_add(self.price.second_msat)
     }
 
     /// The most the seller may charge an answer cut short after `read` bytes both ways and `secs`
@@ -2341,6 +2357,14 @@ impl Signer {
         };
         let upgrade = p.get("upgrade").and_then(Value::as_bool) == Some(true);
         let credit_only = p.get("credit_only").and_then(Value::as_bool) == Some(true);
+        let charge_sats = match p.get("max_charge_sats").filter(|v| !v.is_null()) {
+            None => max_sats,
+            Some(v) => match py_int(Some(v)) {
+                Some(n) if n > 0 => n.min(max_sats),
+                Some(_) => return deny("amount", "max_charge_sats must be > 0"),
+                None => return deny("amount", "max_charge_sats must be an integer"),
+            },
+        };
         if upgrade && (stream_to.is_none() || method != "GET" || range.is_some()) {
             return deny("upgrade", "a WebSocket (upgrade) is a GET with stream_to, and no range");
         }
@@ -2462,7 +2486,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
@@ -2547,7 +2571,8 @@ impl Signer {
         let Some(draw) = draw else { return false };
         let task = c.task.as_deref().unwrap_or("");
         let payee = draw.payee.clone();
-        let expect_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
+        // what the answer is expected to use: its charge cap, not what may leave for a ticket
+        let expect_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
         // the win a session would be opened with, as the book sizes it
         let listed = self.ticket_listed(&self.config(), &draw.payee, c.origin);
         let win_msat = crate::lottery::win_size(&draw, &tp.lottery, listed, expect_msat, self.ln_direct_to(&draw.payee)).unwrap_or(0);
@@ -2578,7 +2603,7 @@ impl Signer {
         }
         let paid = {
             let _g = self.lock();
-            self.ln_pay_locked(&json!({"invoice": invoice.trim(), "max_sats": c.max_sats}))
+            self.ln_pay_locked(&json!({"invoice": invoice.trim(), "max_sats": c.charge_sats}))
         };
         if paid["verdict"] != "allow" {
             return match str_or_empty(paid.get("rule")).as_str() {
@@ -2699,7 +2724,7 @@ impl Signer {
                     let o = {
                         let _g = self.lock();
                         self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
-                                                                 "fit_sats": c.max_sats.max(0)}))
+                                                                 "fit_sats": c.max_sats.max(0), "charge_sats": c.charge_sats.max(0)}))
                     };
                     if o["verdict"] != "allow" {
                         let rule = str_or_empty(o.get("rule"));
@@ -3081,7 +3106,7 @@ impl Signer {
         // the call's max_sats bounds what leaves for it, a whole ticket included: a smaller ticket is asked for where
         // the seller's own does not fit and its terms allow one that does, and the call is refused before anything
         // is asked of the seller where none fits
-        let size = self.ticket_prepaid_size(&hs.sid, spent.left());
+        let size = self.ticket_prepaid_size(&hs.sid, spent.left(), spent.charge_sats);
         spent.room(size.map(|(_, face, booked)| (face, booked)), true)?;
         let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
@@ -3538,7 +3563,7 @@ impl Signer {
         lock(&hs.evidence).get_or_insert_with(|| receipt.clone());
         self.ticket_audit("ticket_over_cap", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
                                                     "charged_msat": charged.to_string(), "max_msat": max_msat.to_string(), "receipt": receipt}));
-        format!("the seller charged {charged} msat for one answer, more than the {max_msat} msat (max_sats {}) the call allowed and named to it; \
+        format!("the seller charged {charged} msat for one answer, more than the {max_msat} msat (the call's charge cap of {} sat) the call allowed and named to it; \
                  it is paid nothing more, and its signed receipt is kept in the wallet's log", max_msat / 1000)
     }
 
@@ -3775,7 +3800,7 @@ impl Signer {
         // the call's max_sats bounds what leaves for it, a whole ticket included. A held ticket that does not fit
         // gives way to a smaller prepaid one where the seller sells those and one fits
         if let Err(d) = spent.room(self.ticket_next_booking(&hs.sid, &hash), false) {
-            let prepaid = self.ticket_prepaid_size(&hs.sid, spent.left());
+            let prepaid = self.ticket_prepaid_size(&hs.sid, spent.left(), spent.charge_sats);
             if prepaid.is_some_and(|(_, face, booked)| spent.room(Some((face, booked)), true).is_ok()) {
                 return self.ticket_buy_prepaid(hs, spent);
             }
@@ -3878,9 +3903,10 @@ impl Signer {
     /// receipt, its body as it arrives.
     fn ticket_request(&self, hs: &Arc<HttpSession>, c: &Call, price: &Price) -> Value {
         let tp = self.ticket_policy();
-        let max_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
+        // what the answer may charge; what may leave for it (a whole ticket included) is `max_sats`, in `spent`
+        let max_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
         let dest = format!("ln:{}", hs.terms.terms.payee);
-        let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
+        let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), charge_sats: Some(c.charge_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
         let about = |hs: &HttpSession, spent: &Spent| {
             json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
                    "tickets_prepaid": spent.prepaid,
@@ -3892,7 +3918,7 @@ impl Signer {
             return fail(hs, &spent, refusal("ticket_terms", "the route's price does not fit an amount, or the request is not one the route takes (by the token: a JSON object)"))
         };
         if reserve > max_msat {
-            return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > max_sats {}", sats_ceil(reserve), c.max_sats)));
+            return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > the call's charge cap of {} sats", sats_ceil(reserve), c.charge_sats)));
         }
         // a call that found the session as it was being stopped goes no further in it
         if hs.ending.load(Ordering::SeqCst) {
@@ -3954,8 +3980,8 @@ impl Signer {
                 let mut headers = c.headers();
                 headers.push(("PAYMENT-SIGNATURE".into(), header));
                 // the most this answer may charge the session's balance: the call's own limit
-                if c.max_sats > 0 {
-                    headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.max_sats as u64).saturating_mul(1000).to_string()));
+                if c.charge_sats > 0 {
+                    headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.charge_sats as u64).saturating_mul(1000).to_string()));
                 }
                 // the price the wallet counts this request at: a seller that checks it refuses another unpaid
                 headers.push((xbt402::ticket::PRICE_HEADER.into(),
@@ -4395,6 +4421,14 @@ impl Signer {
                     }
                     // the seconds started are drawn on the balance as they start, bytes or none
                     account(st.cost(s.0));
+                    // the call's charge cap is used up by this clock, bytes or none (or the answer has been open as long
+                    // as the owner allows): it ends here. A quiet answer whose credit covers its cap is due no ticket, and
+                    // its read would otherwise wait on for the seller
+                    if let Some(why) = st.over(s.0) {
+                        s.1.get_or_insert(why);
+                        wake.notify_all();
+                        return;
+                    }
                     // paid for in the last fifth of the second before it
                     let into = u64::from(st.started.elapsed().subsec_millis());
                     let seen = credited();
@@ -4747,9 +4781,10 @@ impl Signer {
         }
         // the price of the answer: the seller's signed charge where it stands inside the wallet's own count, else that count
         // (one cut short: as far as the wallet believed it, but for a charge past the call's limit, which is said as
-        // the seller made it, with its fault)
+        // the seller made it, with its fault). The wallet's own count is never past the call's charge cap, which it read
+        // no further than: by the second, the seconds since the cut would count on here otherwise
         let price_msat = last.as_ref().map(|r| r.charged).filter(|c| *c <= own_cost || !complete)
-            .map(|c| if complete || c > max_msat { c } else { believed_at.map_or(c, |b| c.min(b)) }).unwrap_or_else(|| st.cost(sink.bytes));
+            .map(|c| if complete || c > max_msat { c } else { believed_at.map_or(c, |b| c.min(b)) }).unwrap_or_else(|| st.cost(sink.bytes).min(max_msat));
         let mut m = json!({"complete": complete, "ended": ended, "price_msat": price_msat.to_string()});
         if let Some(why) = fault {
             m["seller_fault"] = self.ticket_fault(hs, &why)["reason"].clone();
@@ -5157,6 +5192,27 @@ mod tests {
     }
     use super::*;
 
+    /// Once the credit released for a request covers its charge cap, no ticket more is due for it,
+    /// however far its body goes or however long it runs: it could never be charged for one.
+    #[test]
+    fn no_ticket_is_due_once_the_credit_covers_the_charge_cap() {
+        let per_mib = Price { request_msat: 0, byte_msat: 20_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
+        let st = Stream { price: per_mib, base_spent: 5_000, started: Instant::now(), max_msat: 30_000, max_open: Duration::from_secs(50), limit: "max_answer_s" };
+        let cap_bytes = per_mib.bytes_for(30_000);
+        // 20 sat credited for it, below its 30-sat cap: due near the end of what that pays for, as always
+        assert!(st.due_bytes(25_000, cap_bytes, None) && st.due_bytes_ahead(25_000, 0, None, cap_bytes));
+        // 30 sat credited, the cap: never, though the body goes on past what the credit pays for
+        assert!(!st.due_bytes(35_000, cap_bytes, None) && !st.due_bytes(35_000, 4 * cap_bytes, None));
+        assert!(!st.due_bytes_ahead(35_000, cap_bytes, None, cap_bytes));
+        // and the body is read no further than the cap
+        assert!(st.over(cap_bytes).is_some_and(|w| w.contains("charge cap")) && st.over(cap_bytes / 2).is_none());
+        // by the second: the next second is not paid for, but the credit already covers the cap
+        let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: 10_000, tokens: xbt402::tokens::TokenRule::NONE };
+        let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: 15_000, max_open: Duration::from_secs(50), limit: "max_answer_s" };
+        assert!(st.due_time(10_000), "one second paid, below the cap");
+        assert!(!st.due_time(15_000), "the cap is paid for");
+    }
+
     #[test]
     fn a_ticket_is_due_only_when_the_balance_does_not_cover_the_next_piece() {
         let per_mib = Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
@@ -5184,8 +5240,8 @@ mod tests {
         assert_eq!(st.seconds(), 1, "the first second has started");
         assert!(st.due_time(100_000), "one second paid, the second is not");
         assert!(!st.due_time(200_000) && !st.due_bytes(100_000, 1 << 30, None));
-        // a price that does not fit is due at once and costs the most there is
-        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50), limit: "max_answer_s" };
+        // a price that does not fit is due at once and costs the most there is, over even the largest limit
+        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50), limit: "max_answer_s" };
         assert_eq!(huge.cost(1), u64::MAX);
         assert!(huge.due_bytes(1_000_000, 0, None));
         assert!(huge.over(0).is_some_and(|w| w.starts_with("max_sats")), "and is over any limit");

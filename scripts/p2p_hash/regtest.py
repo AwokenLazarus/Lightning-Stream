@@ -15,6 +15,13 @@ Checks:
   no-hash   the miners stop: no payment after that, the wallet's session stopped, nothing left held
   unpaid    the hashtaker stops paying after slice 3: the hashmaker stops within one slice past the
             unpaid slice, and the gateway charges nothing more
+  small     a rental whose budget (500 sat) is under the shop's ticket (1,000 sat), from no credit at a
+            second gateway on the same node, with the app's caps (rail::pay_caps: 2,000 sat may leave a
+            slice, the budget is the most it is charged): the old caps (max_sats = the budget) are
+            refused with nothing paid; the app's buy one whole ticket and pay every slice of the budget
+            from it; slices x price = the wallet's spent = the seller's signed spent, the credit left
+            = the ticket - spent, and the seller's node settled exactly the one ticket the wallet's
+            node paid; the rental's report says what left and what stays with the seller
 Report: run/p2p_hash_regtest.json.
 """
 from __future__ import annotations
@@ -35,6 +42,10 @@ RUN, OUT, BIN = d.RUN, d.OUT, d.BIN
 B = d.BASE
 GW, SLICES, RELAY, POOL, LINK, MINERS = B + 4, B + 5, B + 6, B + 7, B + 8, B + 9
 ORIGIN = f"http://127.0.0.1:{GW}"
+# a second gateway on the same seller node and slice route: a shop the wallet has no credit with
+GW2 = B + 10
+ORIGIN2 = f"http://127.0.0.1:{GW2}"
+SMALL_BUDGET_SATS = 500
 RELAY_URL = f"ws://127.0.0.1:{RELAY}"
 DIFF = 4
 SHARE = DIFF * 2**32
@@ -54,8 +65,8 @@ def check(name: str, ok: bool, saw: Any) -> None:
 def policy() -> dict[str, Any]:
     pk = lab.pubkey(d.SELLER)
     return {
-        "allowlist": [ORIGIN],
-        "counterparties": {ORIGIN: {"ln_node": pk}},
+        "allowlist": [ORIGIN, ORIGIN2],
+        "counterparties": {ORIGIN: {"ln_node": pk}, ORIGIN2: {"ln_node": pk}},
         "max_per_tx_sats": 10_000,
         "daily_budget_sats": 100_000,
         "weekly_budget_sats": 200_000,
@@ -112,11 +123,14 @@ def setup() -> None:
         "routes": [{"path": "/hashrate/", "upstream": f"http://127.0.0.1:{SLICES}", "methods": ["POST"], "max_body": 8192,
                     "price": {"request_msat": PRICE_MSAT}}],
     }
-    with open(f"{RUN}/gateway.json", "w") as f:
-        json.dump(cfg, f, indent=1)
-    with open(f"{RUN}/gateway.log", "ab") as log:
-        PROCS.append(subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/gateway.json"], stdout=log, stderr=log))
-    lab.wait("the gateway", 60, lambda: json.loads(d.send("GET", "/x402/ticket/health", GW)[2])["height"] is not None, every=0.2)
+    cfg2 = {**cfg, "listen": f"127.0.0.1:{GW2}", "public_url": ORIGIN2, "state_dir": f"{RUN}/state-gateway2"}
+    for name, c in (("gateway", cfg), ("gateway2", cfg2)):
+        with open(f"{RUN}/{name}.json", "w") as f:
+            json.dump(c, f, indent=1)
+        with open(f"{RUN}/{name}.log", "ab") as log:
+            PROCS.append(subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/{name}.json"], stdout=log, stderr=log))
+    for port in (GW, GW2):
+        lab.wait(f"the gateway at {port}", 60, lambda p=port: json.loads(d.send("GET", "/x402/ticket/health", p)[2])["height"] is not None, every=0.2)
     status, headers, _ = d.send("POST", "/hashrate/probe/1", GW, body=b"{}")
     REPORT["terms_402"] = {"status": status, "accepts": json.loads(base64.b64decode(headers.get("payment-required", "e30="))).get("accepts")}
     d.Wallet.policy = lambda self: policy()  # the lab's wallet, with this lab's one seller and task
@@ -137,20 +151,21 @@ def spawn(name: str, args: list[str]) -> subprocess.Popen[bytes]:
     return p
 
 
-def rental(name: str, stop_after: int | None, miner_secs: int, rate: float) -> dict[str, Any]:
+def rental(name: str, stop_after: int | None, miner_secs: int, rate: float, origin: str = ORIGIN,
+           caps: tuple[str, ...] = ("--max-sats", "1500")) -> dict[str, Any]:
     pool = spawn(f"{name}-pool", ["standin-pool", "--listen", f"127.0.0.1:{POOL}", "--diff", str(DIFF), "--job-ms", "1000", "--report", f"{RUN}/{name}-pool.json"])
     t = ["--slice-work", str(SLICE_WORK), "--price-msat", str(PRICE_MSAT), "--grace-ms", str(GRACE_MS)]
     hashmaker = spawn(f"{name}-hashmaker", ["hashmaker", "--key", f"{RUN}/keys/hasher.key", "--miners", f"127.0.0.1:{MINERS}", "--link", f"127.0.0.1:{LINK}",
                                       "--slices", f"127.0.0.1:{SLICES}", *t, "--report", f"{RUN}/{name}-hasher.json",
                                       "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hashmaker",
-                                      "--link-public", f"127.0.0.1:{LINK}", "--pay-url", f"{ORIGIN}/hashrate", "--pay-node", lab.pubkey(d.SELLER),
+                                      "--link-public", f"127.0.0.1:{LINK}", "--pay-url", f"{origin}/hashrate", "--pay-node", lab.pubkey(d.SELLER),
                                       "--hashrate-hs", "4000000000000", "--listing-out", f"{RUN}/{name}-listing.json"])
     lab.wait("the hashmaker's listing", 30, lambda: os.path.exists(f"{RUN}/{name}-listing.json"), every=0.2)
     time.sleep(0.5)
     extra = ["--stop-paying-after", str(stop_after)] if stop_after is not None else []
     hashtaker = spawn(f"{name}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
                                     "--found-out", f"{RUN}/{name}-found.json", "--upstream", f"127.0.0.1:{POOL}", "--user", "buyer.rented",
-                                    "--signer", d.SOCK, "--task", "hashrate", "--max-sats", "1500", "--rental", f"rt-{name}",
+                                    "--signer", d.SOCK, "--task", "hashrate", *caps, "--rental", f"rt-{name}",
                                     "--idle-s", "15", "--report", f"{RUN}/{name}-buyer.json", *extra])
     time.sleep(2)
     miners = [spawn(f"{name}-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{MINERS}", "--user", f"hasher.m{i}", "--rate", str(rate),
@@ -243,6 +258,59 @@ def main() -> int:
         oks = [p for p in bz["pays"] if p.get("ok")]
         check("unpaid: the wallet paid 3 slices and no more", len(oks) == 3 and sum(int(p["wallet"].get("price_msat", 0)) for p in oks) == 3 * PRICE_MSAT,
               {"pays": [(p["slice"], p.get("ok")) for p in bz["pays"]]})
+
+        # a rental smaller than the shop's ticket, from no credit at the second gateway
+        inv0, pay0 = d.seller_invoices(), d.buyer_payments()
+        # the hashtaker's own call with the old caps (max_sats = the budget, no charge cap): no ticket fits
+        old = d.signer("xbt402_pay", {"url": f"{ORIGIN2}/hashrate/rt-old/1", "method": "POST", "body": "{}",
+                                      "max_sats": SMALL_BUDGET_SATS, "task": "hashrate"})
+        old.pop("untrusted_provider_response", None)
+        moved = {h: p["status"] for h, p in d.buyer_payments().items() if h not in pay0}
+        check("small: with the old caps (max_sats = the 500-sat budget) a slice from no credit is refused, nothing paid",
+              old.get("verdict") != "allow" and int(old.get("charged_sats", 0)) == 0 and not moved and d.held() == 0,
+              {"verdict": old.get("verdict"), "rule": old.get("rule"), "reason": str(old.get("reason"))[:200],
+               "charged_sats": old.get("charged_sats"), "payments": moved})
+        expect = SMALL_BUDGET_SATS * 1000 // PRICE_MSAT
+        r = rental("small", None, 70, 1.5, origin=ORIGIN2, caps=("--budget-sats", str(SMALL_BUDGET_SATS)))
+        hz, bz = r["hasher"], r["buyer"]
+        oks = [p for p in bz["pays"] if p.get("ok")]
+        REPORT["small_pays"] = bz["pays"]
+        paid = hz["paid"]
+        check("small: every slice of the budget paid once through the wallet, then the rental stopped at its budget",
+              paid == len(oks) == expect and not bz["payFailed"] and bz["closed"] == "budget used up"
+              and hz["receiptsAgree"] == paid and hz["receiptsDisagree"] == 0 and hz["meter"] == bz["meter"],
+              {"hashmaker paid": paid, "wallet ok": len(oks), "expected": expect, "closed": bz["closed"],
+               "agree": hz["receiptsAgree"], "meter": hz["meter"]})
+        priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
+        last_w = oks[-1]["wallet"] if oks else {}
+        credited, balance = int(last_w.get("credited_msat", 0)), int(last_w.get("balance_msat", 0))
+        spent = credited - balance
+        moved_sats = sum(int(p["wallet"].get("charged_sats", 0)) for p in oks)
+        inv1, pay1 = d.seller_invoices(), d.buyer_payments()
+        new_inv = {h: i for h, i in inv1.items() if h not in inv0}
+        new_pay = {h: p for h, p in pay1.items() if h not in pay0}
+        settled = {h: i for h, i in new_inv.items() if i["state"] == "SETTLED"}
+        succeeded = {h: p for h, p in new_pay.items() if p["status"] == "SUCCEEDED"}
+        node_out_msat = sum(int(p["value_msat"]) + int(p["fee_msat"]) for p in succeeded.values())
+        REPORT["small_tickets"] = [{"hash": h, "state": i["state"], "value_msat": i.get("value_msat"), "paid_msat": i.get("amt_paid_msat")} for h, i in new_inv.items()]
+        REPORT["small_payments"] = [{"hash": h, "status": p["status"], "value_msat": p["value_msat"], "fee_msat": p["fee_msat"]} for h, p in new_pay.items()]
+        check("small: slices x price = the wallet's spent = the seller's signed spent; one whole ticket bought at slice 1, "
+              "the credit left = the ticket - spent",
+              priced == spent == paid * PRICE_MSAT and credited == TICKET_MSAT and balance == TICKET_MSAT - spent
+              and [p["slice"] for p in oks if int(p["wallet"].get("tickets_prepaid", 0)) > 0] == [1]
+              and all(int(p["wallet"].get("price_msat", 0)) <= SMALL_BUDGET_SATS * 1000 for p in oks),
+              {"slices x price msat": paid * PRICE_MSAT, "wallet priced msat": priced, "seller's signed spent msat": spent,
+               "credited msat": credited, "credit left msat": balance, "ticket msat": TICKET_MSAT})
+        check("small: the seller's node settled exactly the one ticket the wallet's node paid; what left the wallet is that "
+              "ticket and its fee, within the 2,000 sat a slice may move; nothing held",
+              len(settled) == 1 and list(settled) == list(succeeded) and int(next(iter(settled.values()))["amt_paid_msat"]) == TICKET_MSAT
+              and node_out_msat <= moved_sats * 1000 < node_out_msat + 1000 and moved_sats <= 2_000 and d.held() == 0,
+              {"settled": len(settled), "succeeded": len(succeeded), "node out msat": node_out_msat, "wallet booked sats": moved_sats,
+               "other tickets": sorted({i["state"] for h, i in new_inv.items() if h not in settled}), "held": d.held()})
+        check("small: the rental's report (the wallet app's card) says what left the wallet and what stays with the seller as credit",
+              bz.get("walletMovedSats") == moved_sats and bz.get("leftWithSellerMsat") == balance,
+              {"walletMovedSats": bz.get("walletMovedSats"), "leftWithSellerMsat": bz.get("leftWithSellerMsat"),
+               "wallet booked sats": moved_sats, "credit left msat": balance})
     except (lab.LabError, OSError, KeyError, IndexError, ValueError, subprocess.TimeoutExpired) as e:
         check("ran to its end", False, f"{type(e).__name__}: {e}")
     finally:

@@ -915,7 +915,7 @@ pub struct Sizing {
 pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_msat: Option<u64>, cap_tickets: i64, cap_locked_sats: i64, dust_msat: u64,
               slot_room: i64) -> Result<Sizing, Refusal> {
     let many = sellers_in_task as i64 > pol.many_sellers;
-    let floor_msat = (pol.floor_ticket_sats.max(0) as u64).saturating_mul(1000).max(dust_msat).max(FLOOR_MSAT);
+    let floor_msat = held_floor_msat(pol, dust_msat);
     let pool_of = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
     if i64::from(terms.ticket_blocks) > pol.max_ticket_blocks {
         return refuse("ticket_blocks", format!("ticketBlocks {} is above the owner's tickets.max_ticket_blocks {}", terms.ticket_blocks, pol.max_ticket_blocks));
@@ -960,6 +960,12 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
                                        caps on held tickets allow: no further ticket is held");
     }
     Ok(Sizing { ticket_msat, pool: pool as u32 })
+}
+
+/// The smallest ticket [`sizing`] holds: the owner's floor, the channels' dust limit
+/// ([`Limits::dust_msat`]) and [`FLOOR_MSAT`], whichever is largest.
+pub fn held_floor_msat(pol: &TicketPolicy, dust_msat: u64) -> u64 {
+    (pol.floor_ticket_sats.max(0) as u64).saturating_mul(1000).max(dust_msat).max(FLOOR_MSAT)
 }
 
 /// The size of a prepaid ticket with this seller, from its `on-arrival` terms: the seller's one

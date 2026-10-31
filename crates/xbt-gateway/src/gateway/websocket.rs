@@ -143,7 +143,8 @@ impl Gateway {
             first_second: 0,
             started: Instant::now(),
             tokens: None,
-            cap_msat: None,
+            // the buyer's own limit for this answer holds for a socket as for a body: its bytes stop there
+            cap_msat: super::buyers_cap(req),
         };
         let gw = self.clone();
         Reply::Upgrade(Upgraded {

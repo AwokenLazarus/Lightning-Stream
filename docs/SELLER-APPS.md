@@ -67,6 +67,12 @@ again. So tickets are bought only within the limit, however many requests run at
 remains: an answer running on credit that runs out of it part-way ends there, since it may not
 buy; the page asks for it again.
 
+A call may also name `max_charge_sats` beside `max_sats`: then `max_sats` bounds what may leave the
+wallet for it (a whole ticket included), and `max_charge_sats` what its answer may charge (the
+seller is told that figure). A small use of a seller, such as a VPN exit's region check or a
+hashrate trial slice, buys the seller's ticket and is charged only its own use; the rest stays as
+the session's credit with that seller.
+
 ## The seller's side
 
 On Sell, a service gets **Buyers can open its own web page**, with:

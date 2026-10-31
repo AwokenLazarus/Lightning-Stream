@@ -609,6 +609,11 @@ impl Signer {
             (Ok(e), Ok(m), Ok(f)) => (e, m.unwrap_or(0), f),
             (Err(d), _, _) | (_, Err(d), _) | (_, _, Err(d)) => return d,
         };
+        // the most the opening call may be charged, where that is less than what may leave for it
+        let charge_sats = match amount("charge_sats") {
+            Ok(c) => c,
+            Err(d) => return d,
+        };
         let net = match node::network(&*self.node, &self.chain, None) {
             Ok(n) => n,
             Err(e) => return refusal("ticket_network", e.msg),
@@ -702,6 +707,10 @@ impl Signer {
                 // approval: where the seller's terms let the wallet choose a size, its tickets are no larger than
                 // both allow, their fee limit included
                 let fit = Some(fit_sats.map_or(ceiling, |f| f.min(ceiling)));
+                // and a call charged less than it may move holds tickets of about its charge, the smallest
+                // the seller sells and the wallet may hold at the least, rather than a size its charge could never use
+                let smallest = t.min_ticket_msat.unwrap_or(0).max(ticket::held_floor_msat(&tp, limits.dust_msat));
+                let fit = fit.map(|f| charge_sats.map_or(f, |c| f.min(charge_fit(&lp_open, c, smallest))));
                 match (t.min_ticket_msat, fit.and_then(|f| fitting_msat(&lp_open, t.min_ticket_msat.unwrap_or(0), sized.ticket_msat, f))) {
                     (Some(_), Some(fit)) if fit < sized.ticket_msat => {
                         sizing(&Terms { ticket_msat: fit, ..t.clone() }, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room).or(Ok(sized))
@@ -2090,12 +2099,13 @@ impl Signer {
     }
 
     /// The size of a session's next prepaid ticket for a call with `left` sats of its `max_sats`
-    /// unspent (`None`: no limit), and what it books, its fee limit included: (msat, face sats,
-    /// booked sats). The seller's own size where it fits; else the largest smaller one, in whole
-    /// sats, that the seller's terms let the wallet ask for (`minTicketMsat`) and that fits; else
-    /// the seller's own size, which the call's limit then refuses. `None`: the session buys no
-    /// prepaid tickets.
-    pub(crate) fn ticket_prepaid_size(&self, sid: &str, left: Option<i64>) -> Option<(u64, i64, i64)> {
+    /// unspent (`None`: no limit) and charged at most `charge_sats` (`None`: its `max_sats`), and
+    /// what it books, its fee limit included: (msat, face sats, booked sats). The seller's own size
+    /// where it fits; else the largest smaller one, in whole sats, that the seller's terms let the
+    /// wallet ask for (`minTicketMsat`) and that fits, no larger than the call's charge needs (the
+    /// seller's smallest at the least: [`charge_fit`]); else the seller's own size, which the call's
+    /// limit then refuses. `None`: the session buys no prepaid tickets.
+    pub(crate) fn ticket_prepaid_size(&self, sid: &str, left: Option<i64>, charge_sats: Option<i64>) -> Option<(u64, i64, i64)> {
         let lp = LnPolicy::from_map(&self.config().ln);
         let s = self.ticket_session(sid)?;
         if s.prepaid_msat == 0 {
@@ -2104,6 +2114,7 @@ impl Signer {
         // no ticket may need the owner's approval, nor be above the most one payment may be
         let ceiling = ticket_ceiling(&self.config());
         let left = Some(left.map_or(ceiling, |l| l.min(ceiling)));
+        let left = left.map(|l| charge_sats.map_or(l, |c| l.min(charge_fit(&lp, c, s.prepaid_min_msat))));
         let msat = match left {
             Some(left) if s.prepaid_min_msat > 0 && s.draws.is_none() => fitting_msat(&lp, s.prepaid_min_msat, s.prepaid_msat, left).unwrap_or(s.prepaid_msat),
             _ => s.prepaid_msat,
@@ -2586,6 +2597,14 @@ fn dropped(t: &Ticket, now: f64) -> Value {
 fn booking_of(lp: &LnPolicy, msat: u64) -> (i64, i64) {
     let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
     (sats_ceil(msat), booking_sats(msat, fee_limit_msat))
+}
+
+/// The most a ticket for a call charged at most `charge_sats` need book, in sats, its fee limit
+/// included: a ticket of the charge, or the seller's smallest (`min_msat`) where that is larger. A
+/// call that may move more than it may be charged (a region check, a hashrate slice) asks the
+/// seller for that size where its terms let the wallet choose one, not for the seller's own.
+fn charge_fit(lp: &LnPolicy, charge_sats: i64, min_msat: u64) -> i64 {
+    booking_of(lp, (charge_sats.max(0) as u64).saturating_mul(1000)).1.max(booking_of(lp, min_msat).1)
 }
 
 /// How long after a session stopped the wallet still looks for its balance at the seller: a seller

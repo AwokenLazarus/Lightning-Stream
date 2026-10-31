@@ -173,6 +173,11 @@ impl St {
             "lastRate": self.rate, "closed": self.closed, "payFailed": self.pay_failed, "events": self.events,
             "paidSlices": self.paid_slices(), "spentMsat": self.paid_slices() * self.terms.price_msat,
             "miners": self.upstreams.len(), "budgetMsat": self.budget_msat,
+            // what left the wallet for the rental (tickets bought whole, with their fees), and what its stop
+            // said stays with the seller as credit: a ticket bought for a small rental is more than it uses
+            "walletMovedSats": self.pays.iter().filter_map(|p| p["wallet"]["charged_sats"].as_u64()).sum::<u64>(),
+            "leftWithSellerMsat": self.events.iter().rev().find(|e| e["ev"] == "wallet session stopped")
+                .and_then(|e| e["result"]["http"]["left_with_seller_msat"].as_str()).and_then(|s| s.parse::<u64>().ok()),
         })
     }
 }
