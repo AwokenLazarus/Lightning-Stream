@@ -38,6 +38,9 @@ pub struct State {
     pub deployments: Option<Value>,
     /// How long `scantxoutset` takes (a scan of the UTXO set can take minutes on mainnet).
     pub scan_ms: u64,
+    /// Every this many `getblockcount`s one fails, as a busy node's does; 0: none.
+    pub height_fails_every: u64,
+    pub height_asked: u64,
 }
 
 pub struct FakeChain {
@@ -223,6 +226,12 @@ impl Node for FakeChain {
             s.calls.push(method.into());
             if s.down {
                 return Err(rpc_err("connection refused"));
+            }
+            if method == "getblockcount" && s.height_fails_every > 0 {
+                s.height_asked += 1;
+                if s.height_asked.is_multiple_of(s.height_fails_every) {
+                    return Err(rpc_err("work queue depth exceeded"));
+                }
             }
         }
         let chain = self.st.lock().unwrap().chain.clone();

@@ -11,6 +11,7 @@
 //! The same pass lines run against real nodes in `scripts/ticket_e2e_regtest.sh`.
 mod common;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpListener;
@@ -2882,6 +2883,202 @@ fn a_stop_ends_the_wait_for_a_ticket_the_node_has_not_yet_shown_locked() {
         out
     });
     assert_eq!(out["complete"], false, "{out}");
+}
+
+/// A rig whose seller keeps a paused answer open as long as it does as shipped.
+fn seller_waits_as_shipped(extra: Value) -> Rig {
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::new(extra);
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    r
+}
+
+/// What the buyer's node paid, what the seller's node took, the book and the ledger are one number, and every secret that left is one of them.
+fn assert_money_agrees(r: &Rig) {
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "the buyer's node, the seller's node and the book: {paid} {taken} {book}");
+    assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
+    assert_eq!(paid, r.tap.secrets().len() as u64 * TICKET, "what was paid is what the secrets that left pay for");
+    r.assert_booked();
+}
+
+/// The answer under way, then `during` beside it, then what the call came to.
+fn under_way(r: &Rig, route: &str, max_sats: i64, during: impl FnOnce()) -> Value {
+    std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(route, max_sats));
+        wait_for("the answer to be under way", || r.tap.seen("/slow/").iter().any(|s| s.paid) && r.status()["paying"][0]["answer_open"] == true);
+        during();
+        t.join().unwrap()
+    })
+}
+
+/// A chain node that stops answering for longer than the pool lasts: a busy node, or one restarting. Its height is
+/// not 0: the last it gave holds, the refill waits for it, and the file comes through whole.
+#[test]
+fn a_file_comes_through_a_chain_node_that_stops_answering_for_a_while() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    // 60 MiB at 200 sat a MiB: twelve tickets, more than the pool, at about 4 MiB a second
+    let n = 60 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || {
+        r.node.chain.st.lock().unwrap().down = true;
+        std::thread::sleep(Duration::from_secs(11));
+        r.node.chain.st.lock().unwrap().down = false;
+    });
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert!(v["ended"].is_null(), "{v}");
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["body"].as_str()), (Some("12000000"), Some("as signed")), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n));
+    assert_money_agrees(&r);
+}
+
+/// A chain node that fails now and then, as a loaded one does: each failure used to end the file, whichever call it hit.
+#[test]
+fn a_file_comes_through_a_chain_node_that_fails_every_other_question() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    let n = 60 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || r.node.chain.st.lock().unwrap().height_fails_every = 2);
+    r.node.chain.st.lock().unwrap().height_fails_every = 0;
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert!(v["ended"].is_null(), "{v}");
+    assert_eq!(v["price_msat"].as_str(), Some("12000000"), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n));
+    assert_money_agrees(&r);
+}
+
+/// No tip is known at all, the last being too old to go by: the release waits for one, and goes on.
+#[test]
+fn a_file_waits_for_a_tip_nobody_knows() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    // four tickets of the seven left: no refill is needed
+    let n = 20 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || {
+        r.node.chain.st.lock().unwrap().down = true;
+        r.clock.fetch_add(301, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(3));
+        r.node.chain.st.lock().unwrap().down = false;
+    });
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n));
+    assert_money_agrees(&r);
+}
+
+/// A tip that stays unknown ends the answer within the wait, and says why: not `ticket_none`, and nothing is released.
+#[test]
+fn a_tip_that_stays_unknown_ends_the_answer_and_says_why() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    let n = 40 * MIB;
+    let before = Cell::new(0);
+    let began = Cell::new(Instant::now());
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || {
+        began.set(Instant::now());
+        r.node.chain.st.lock().unwrap().down = true;
+        r.clock.fetch_add(301, Ordering::SeqCst);
+        before.set(r.tap.secrets().len());
+    });
+    assert!(began.get().elapsed() < Duration::from_secs(30), "{:?}", began.get().elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_chain"), "{v}");
+    // at most the one on its way as the node went away
+    assert!(r.tap.secrets().len() <= before.get() + 1, "{v}");
+    let got = v["bytes"].as_u64().unwrap();
+    assert_eq!(v["body_digest"], pattern_digest(got as usize));
+    r.node.chain.st.lock().unwrap().down = false;
+    r.call("ticket_stop", json!({"session": v["session"]}));
+    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
+    assert_money_agrees(&r);
+}
+
+/// The wait for the chain node is no wait for a stop.
+#[test]
+fn a_stop_ends_the_wait_for_a_tip_nobody_knows() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true));
+    let n = 40 * MIB;
+    let stopped_at = Cell::new(Instant::now());
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || {
+        r.node.chain.st.lock().unwrap().down = true;
+        r.clock.fetch_add(301, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(1));
+        stopped_at.set(Instant::now());
+        r.call("ticket_stop", json!({"session": first["session"]}));
+    });
+    assert!(stopped_at.get().elapsed() < Duration::from_secs(5), "the answer ended {:?} after the stop", stopped_at.get().elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    r.node.chain.st.lock().unwrap().down = false;
+}
+
+/// The worst case the waits make of one release: the ticket comes late from the wallet's own node, and then the
+/// seller does not show it. The caller gets a plain answer inside its 60 s, with what arrived, and nothing is
+/// charged past that: the release that never happened moved no money.
+#[test]
+fn both_waits_of_one_release_end_in_a_plain_answer_inside_the_callers_limit() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true));
+    r.shop.standin.hold_streams(true);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(18);
+    }
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    assert!(took > Duration::from_secs(30), "both waits ran: {took:?} {v}");
+    assert!(took < Duration::from_secs(60), "inside the caller's limit: {took:?} {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(false)), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_not_ready"), "{v}");
+    let got = v["bytes"].as_u64().unwrap();
+    assert_eq!(v["body_digest"], pattern_digest(got as usize));
+    // what arrived is within what was released, and the charge within both
+    let released = v["tickets_released"].as_u64().unwrap();
+    let price = v["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+    assert!(got * 200_000 / (1 << 20) <= (released + 1) * TICKET, "{got} bytes for {released} tickets: {v}");
+    assert!(price <= got * 200_000 / (1 << 20) + 1, "charged for what arrived: {price} for {got} bytes: {v}");
+    assert_eq!(r.tap.secrets().len() as u64, 1 + released, "one for the first call, and those of this one: {v}");
+    r.shop.standin.hold_streams(false);
+    r.call("ticket_stop", json!({"session": v["session"]}));
+    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
+    assert_money_agrees(&r);
+}
+
+/// A release that begins late in an answer waits no longer than the answer may stay open: 50 s as shipped, so that
+/// its caller's 60 s are not spent. Shown here with 10 s: both waits together would be nearly 40.
+#[test]
+fn the_waits_of_a_release_end_where_the_answers_own_limit_does() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 10}}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    r.shop.standin.hold_streams(true);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(18);
+    }
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(15), "{took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].is_string(), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(v["bytes"].as_u64().unwrap() as usize));
+    r.shop.standin.hold_streams(false);
+    r.call("ticket_stop", json!({"session": v["session"]}));
+    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
+    assert_money_agrees(&r);
 }
 
 #[test]
