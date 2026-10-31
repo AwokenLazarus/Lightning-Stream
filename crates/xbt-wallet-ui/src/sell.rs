@@ -1129,8 +1129,15 @@ impl App {
         });
         for o in &shop.offers {
             let up = probes.iter().any(|(id, ok)| id == &o.id && *ok);
+            let files_error = if o.kind == Kind::Files { self.files_error.lock().unwrap_or_else(|p| p.into_inner()).clone() } else { None };
             each.insert(o.id.clone(), if o.paused {
                 st("warn", "Paused", "Buyers cannot buy it. Resume it to sell again.")
+            } else if let Some(e) = files_error {
+                // its address answering is no sign of the folder: another program may hold it
+                st("bad", "Your shared folder isn't served", &format!(
+                    "The app could not serve it at {} ({e}): another program uses that address. Stop that program, \
+                     or give the folder another port (on Linux: LS_FILES_PORT in the app's .env, then run install.sh again), \
+                     and restart the app.", self.cfg.files.bind))
             } else if !up {
                 st("bad", &format!("Can't reach {}", o.kind.thing()), &format!("Check that {} is running and that its address is right.", o.kind.thing()))
             } else {

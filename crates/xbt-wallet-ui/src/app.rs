@@ -48,6 +48,8 @@ pub struct App {
     pub relays: crate::relay::RelayLinks,
     /// Where the shared folder of a Files service is served, once it is ([`crate::files`]).
     pub files_addr: std::sync::Mutex<Option<std::net::SocketAddr>>,
+    /// Why the shared folder is not served (its address taken by another program, say), for the Sell page.
+    pub files_error: std::sync::Mutex<Option<String>>,
     /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
     pub nostr: crate::nostr::NostrCache,
     /// Stream relays: the owner's choices, those announced on Nostr, and their probes ([`crate::relaynet`]).
@@ -218,7 +220,8 @@ impl App {
             Ok(false) => {}
             Err(e) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret was left as it was: {e}"),
         }
-        Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None), nostr, relay_net, platform,
+        Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None),
+                         files_error: std::sync::Mutex::new(None), nostr, relay_net, platform,
                          apps: Default::default() }))
     }
 

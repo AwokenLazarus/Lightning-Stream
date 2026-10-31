@@ -2943,6 +2943,43 @@ fn a_shared_folder_is_sold_per_gb_with_each_file_listed_and_served_only_to_the_g
     assert_eq!(xbt_wallet_ui::services::price_words(&json!({"byte_msat": "1000000", "per_bytes": "1000000000"})), "1000 sat a GB");
 }
 
+/// The folder's address is taken by another program (a clash on 8486): the Sell page says so on the
+/// Files service, with the setting that moves it, and does not call it selling because that other
+/// program answers.
+#[test]
+fn a_shared_folder_whose_port_is_taken_says_so_plainly() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let shared = tempfile::tempdir().unwrap();
+    std::fs::write(shared.path().join("film.mkv"), b"frames").unwrap();
+    let sdir = shared.path().to_path_buf();
+    // another program on the folder's port, answering anything
+    let other = mock_http(|_| (200, "someone else"));
+    let taken = other.to_string();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.files.dir = sdir.clone();
+        c.files.bind = taken.clone();
+    });
+    assert!(bx._srv.files_addr.is_none(), "the folder cannot be served where another program listens");
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    br.act("/sell", "/sell", &[("action", "service"), ("kind", "files"), ("address", ""), ("price", "1000"), ("unit", "gb"), ("name", "My files")]);
+    let page = br.get("/sell").body;
+    assert!(page.contains("Your shared folder isn&#39;t served") || page.contains("Your shared folder isn't served"), "{page}");
+    assert!(page.contains(&format!("serve it at {taken}")) && page.contains("LS_FILES_PORT"), "{page}");
+    assert!(page.contains("Selling, with a problem"), "not plain selling while the folder is not served: {page}");
+}
+
 /// A direct shop (no web address, reached by its key) selling its media server as a web app, a
 /// shared folder, a model and its miners: the Sell page lists each where it opens from the shop's
 /// own root, and the gateway lists those at the shop's name once it has named itself by its key.

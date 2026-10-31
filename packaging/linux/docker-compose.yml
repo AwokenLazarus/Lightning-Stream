@@ -126,6 +126,8 @@ services:
     environment:
       # loopback only: from another machine, use an ssh tunnel (docs/LINUX.md)
       XBT_UI_BIND: 127.0.0.1:${LS_UI_PORT:-8482}
+      # the Files folder, served to the shop's gateway on this machine only
+      XBT_UI_FILES_BIND: 127.0.0.1:${LS_FILES_PORT:-8486}
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
       XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
       XBT_UI_MCP_URL: http://127.0.0.1:${LS_MCP_PORT:-33511}/mcp

@@ -34,9 +34,9 @@ OUT = os.path.abspath(sys.argv[1])
 BASE = int(os.environ.get("LS_TEST_PORT_BASE", "24600"))
 P = {"lf1": BASE + 50, "lf2": BASE + 51, "rpc": BASE + 52, "relay": BASE + 53, "fallback": BASE + 54, "datum": BASE + 55}
 INSTALLS = {
-    # name: (node, hashmaker, ui, mcp, connector, gateway, hashtaker control)
-    "taker": ("lf1", False, BASE + 10, BASE + 11, BASE + 12, BASE + 13, BASE + 14),
-    "maker": ("lf2", True, BASE + 20, BASE + 21, BASE + 22, BASE + 23, BASE + 24),
+    # name: (node, hashmaker, ui, mcp, connector, gateway, hashtaker control, files)
+    "taker": ("lf1", False, BASE + 10, BASE + 11, BASE + 12, BASE + 13, BASE + 14, BASE + 15),
+    "maker": ("lf2", True, BASE + 20, BASE + 21, BASE + 22, BASE + 23, BASE + 24, BASE + 25),
 }
 RELAYS = f"ws://127.0.0.1:{P['relay']}"
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
@@ -75,7 +75,7 @@ def admin_macaroon(node, path):
 
 
 def install(name, lab):
-    node, maker, ui, mcp, conn, gw, ctl = INSTALLS[name]
+    node, maker, ui, mcp, conn, gw, ctl, files = INSTALLS[name]
     d = os.path.join(OUT, name)
     os.makedirs(d, exist_ok=True)
     if IMAGES == "local-ui":
@@ -89,12 +89,15 @@ def install(name, lab):
                LS_ADMIN_MACAROON=admin, LS_BITCOIN_CONF="/nonexistent", LS_CHAIN="regtest", LS_NODE_RPC_HOST="127.0.0.1", LS_NODE_RPC_PORT=str(P["rpc"]),
                LS_NODE_RPC_USER="lab", LS_NODE_RPC_PASS="lab", LS_DATUM=f"127.0.0.1:{P['datum']}", LS_DATUM_USER="rented",
                LS_HASHMAKER="1" if maker else "0", LS_LAN_HOST="127.0.0.1", LS_UI_PORT=str(ui), LS_MCP_PORT=str(mcp),
-               LS_CONNECTOR_PORT=str(conn), LS_GW_PORT=str(gw), LS_HASHTAKER_CONTROL_PORT=str(ctl), LS_RELAYS=RELAYS, LS_SKIP_PULL="1")
+               LS_CONNECTOR_PORT=str(conn), LS_GW_PORT=str(gw), LS_HASHTAKER_CONTROL_PORT=str(ctl), LS_FILES_PORT=str(files),
+               LS_RELAYS=RELAYS, LS_SKIP_PULL="1")
     t0 = time.time()
     r = subprocess.run([os.path.join(PKG, "install.sh"), "--yes", "--dir", d], env=env, capture_output=True, text=True, timeout=900)
     with open(os.path.join(OUT, f"install-{name}.log"), "w") as f:
         f.write(r.stdout + r.stderr)
     check("I", f"{name}: install.sh --yes installs and starts the app ({time.time() - t0:.0f} s)", r.returncode == 0, (r.stdout + r.stderr)[-1500:])
+    check("I", f"{name}: its Files folder is served on its own port ({files}), nothing said about it",
+          "Files folder" not in r.stdout + r.stderr and f"LS_FILES_PORT={files}\n" in open(os.path.join(d, ".env")).read(), (r.stdout + r.stderr)[-600:])
     check("I", f"{name}: .env is private (0600) and its password survives quoting ($ and a space)",
           oct(os.stat(os.path.join(d, ".env")).st_mode & 0o777) == "0o600" and "pw-" + name + "-$ x" in open(os.path.join(d, ".env")).read())
     envtext = open(os.path.join(d, ".env")).read()
