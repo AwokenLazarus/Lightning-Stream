@@ -361,29 +361,36 @@ fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>, li
         }
     }
     // and one that sends more than that without saying so is cut there
-    let mut left = limit.map_or(u64::MAX, |(size, _)| size);
+    let left = limit.map_or(u64::MAX, |(size, _)| size);
     let mut src = resp.into_reader();
     xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed {
         status,
         headers,
         length,
-        body: Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| {
-            let mut buf = vec![0u8; 64 << 10];
-            loop {
-                let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
-                if want == 0 {
-                    return Ok(());
-                }
-                let n = std::io::Read::read(&mut src, &mut buf[..want])?;
-                if n == 0 {
-                    return Ok(());
-                }
-                left -= n as u64;
-                // a reader that has gone: the connection to the connector closes, and the wallet stops paying
-                out.send(&buf[..n])?;
-            }
-        }),
+        body: Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| send_within(&mut src, left, out)),
     })
+}
+
+/// A relayed body, at most `left` bytes of it. One that has more than that ends in an error, so that
+/// its reader sees a cut and not a whole file of the listed size.
+fn send_within(src: &mut dyn std::io::Read, mut left: u64, out: &mut dyn xbt_svc::http::BodyWriter) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        if left == 0 {
+            return match src.read(&mut buf[..1])? {
+                0 => Ok(()),
+                _ => Err(std::io::Error::other("the seller sends more than the size its listing shows")),
+            };
+        }
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = src.read(&mut buf[..want])?;
+        if n == 0 {
+            return Ok(());
+        }
+        left -= n as u64;
+        // a reader that has gone: the connection to the connector closes, and the wallet stops paying
+        out.send(&buf[..n])?;
+    }
 }
 
 /// A running server; stops when dropped.
@@ -467,6 +474,28 @@ mod tests {
         assert!(!more_than_listed(404, Some("5000"), None, size), "not a 2xx: not the file");
         assert!(!more_than_listed(200, None, None, size), "no length said: cut at the listed size as it streams");
         assert_eq!((range_len("bytes=0-99"), range_len("bytes=10-9"), range_len("bytes=5-")), (Some(100), None, None));
+    }
+
+    /// A body that goes past the listed size is sent up to it and ends in an error, never as a whole
+    /// file of that size; one of the size, or less, ends cleanly.
+    #[test]
+    fn a_body_past_the_listed_size_is_a_cut_not_a_clean_end() {
+        struct Out(Vec<u8>);
+        impl xbt_svc::http::BodyWriter for Out {
+            fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                self.0.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+        let send = |len: usize, size: u64| {
+            let mut out = Out(vec![]);
+            let r = send_within(&mut std::io::Cursor::new(vec![7u8; len]), size, &mut out);
+            (r.is_ok(), out.0.len())
+        };
+        assert_eq!(send(1_001, 1_000), (false, 1_000), "past the size");
+        assert_eq!(send(200_000, 100_000), (false, 100_000), "past it, over several reads");
+        assert_eq!(send(1_000, 1_000), (true, 1_000), "the size");
+        assert_eq!(send(999, 1_000), (true, 999), "less");
     }
 
     #[test]

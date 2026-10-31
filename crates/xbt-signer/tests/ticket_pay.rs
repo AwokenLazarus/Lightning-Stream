@@ -1846,6 +1846,14 @@ fn a_file_larger_than_the_buyer_was_shown_is_refused_before_its_body_and_costs_n
     assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(412), Some("0")), "{v}");
     let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 3 * MIB)), "method": "HEAD", "max_sats": CALL, "task": "film", "max_size": shown}));
     assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some("0")), "{v}");
+    // a HEAD of a page priced by the request, refused for its size: it has no body to carry the code, its price is
+    // charged in both books as for the GET, and an honest seller is not faulted or blocked for it
+    let before_head = seller_spent(&r);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/100"), "method": "HEAD", "max_sats": CALL, "task": "film", "max_size": 1}));
+    // (a seller that was blocked or stopped for it answers no page in this session: this would panic or fall)
+    let head_charged = seller_spent(&r) - before_head - 2500;
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str(), head_charged), (Some(412), Some("2500"), 2500), "{v}");
+    assert_eq!((v.get("seller_fault"), v["receipt"]["body"].as_str()), (None, Some("none: a HEAD")), "{v}");
     // a file whose server states no size: the seller sends no more than the size shown, and ends it cut short,
     // never as a whole one; what was sent is what both books charge (3 MiB at 200 sat a MiB)
     let before_cut = seller_spent(&r);
@@ -1871,13 +1879,13 @@ fn a_file_larger_than_the_buyer_was_shown_is_refused_before_its_body_and_costs_n
     // stops; what that seller pushed past it before the stop is charged, the same in both books
     let before_old_cut = seller_spent(&r);
     r.tap.drop_size.store(true, Ordering::SeqCst);
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/unsized/{}", 4 * MIB)), "max_sats": 5_000, "task": "film", "max_size": shown}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/unsized/{}", 16 * MIB)), "max_sats": 5_000, "task": "film", "max_size": shown}));
     r.tap.drop_size.store(false, Ordering::SeqCst);
     let old_cut = seller_spent(&r) - before_old_cut - 2500;
     assert_eq!((v["complete"].as_bool(), v["bytes"].as_u64()), (Some(false), Some(shown)), "{v}");
     assert!(v["ended"].as_str().unwrap_or("").contains("passed the size the buyer was shown"), "{v}");
     assert_eq!(v["price_msat"].as_str(), Some(old_cut.to_string().as_str()), "the wallet's count is the seller's: {v}");
-    assert!((600_000..=800_000).contains(&old_cut), "the size shown, and at most what was in flight past it: {old_cut} msat");
+    assert!((600_000..=1_000_000).contains(&old_cut), "the size shown and at most 2 MiB in flight past it, not the 16 MiB file's 3,200 sat: {old_cut} msat");
     std::env::remove_var("B2_STREAM_DIR");
     r.assert_booked();
 }

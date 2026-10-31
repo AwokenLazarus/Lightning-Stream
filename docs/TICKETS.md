@@ -1627,8 +1627,10 @@ app judge an answer by one rule: a `206` by the total in its `Content-Range`, an
 taking the smallest size named, and refuses an answer that states more before any of its body is
 sent: `412` `larger_than_shown`. It charges the request's price, as for an answer with no body: on a
 route priced only by the byte or the second (a file) that is nothing; on one priced by the request
-the size is no way to have the service's work for nothing. The wallet takes the request's price for
-such a `412` (a GET or HEAD that named a size, with that code), and nothing for any other error.
+the size is no way to have the service's work for nothing. The wallet takes up to the request's
+price for a `412` to a GET or HEAD that named a size, by its status alone (a HEAD has no body to
+carry the code), and nothing for any other error; a seller's charge is never above that price. A
+HEAD's receipt may sign the body its GET would have had: with no body to compare, that is no fault.
 
 On the lottery rail a route with no price per request sends no piece of such an answer (`412`, no
 draw owed, nothing charged). A route priced by the request is not judged by the seller there, since

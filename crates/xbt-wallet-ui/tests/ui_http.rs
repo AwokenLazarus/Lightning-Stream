@@ -3661,17 +3661,17 @@ fn a_file_is_paid_no_further_than_its_listed_size() {
         };
         let status = resp.status();
         let mut body = vec![];
-        resp.into_reader().read_to_end(&mut body).unwrap();
-        (status, body)
+        let clean = resp.into_reader().read_to_end(&mut body).is_ok();
+        (status, body, clean)
     };
     // 1.0 KB stands for at most 1,050 bytes: 1,000 msat a request + 1,050 msat, +2%, is 3 sats, +1
-    let (status, body) = get(OK);
-    assert_eq!((status, body.len()), (200, 1000));
+    let (status, body, clean) = get(OK);
+    assert_eq!((status, body.len(), clean), (200, 1000, true));
     assert_eq!(max_sats.lock().unwrap().last().unwrap().1.as_deref(), Some("4"), "the call's cap is the listed size's price");
-    let (status, body) = get(BIG);
+    let (status, body, _) = get(BIG);
     assert_eq!(status, 502, "a seller saying it sends 5,000 bytes of a 1.0 KB file is refused");
     assert!(String::from_utf8_lossy(&body).contains("more than the size its listing shows"));
-    let (status, body) = get(QUIET);
+    let (status, body, clean) = get(QUIET);
     assert_eq!(status, 200);
-    assert_eq!(body.len(), 1050, "one that sends more without saying so is cut at the listed size");
+    assert_eq!((body.len(), clean), (1050, false), "one that sends more without saying so is cut at the listed size, and its reader sees a cut");
 }

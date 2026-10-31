@@ -2546,6 +2546,43 @@ mod tests {
         }
     }
 
+    /// A body that goes past the size the buyer was shown ends cut short, even where the size falls
+    /// inside its last read and nothing comes after: never `Ok`, which would sign fewer bytes as a whole
+    /// answer. One of exactly that size, or less, ends `Ok`.
+    #[test]
+    fn a_body_past_the_size_shown_ends_cut_short_even_inside_its_last_read() {
+        struct Out(Vec<u8>);
+        impl BodyWriter for Out {
+            fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+                self.0.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = json!({"listen": "127.0.0.1:0", "public_url": "http://gateway.test:8402", "upstream": "http://127.0.0.1:1", "state_dir": dir.path(),
+                         "chain": "regtest", "network": "bip122:00000000000000000000000000000001",
+                         "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
+                         "tickets": {"max_tickets": 8},
+                         "caps": {"sessions_per_address": 0, "inbound_slots": 483, "held_after_paid": false, "unpaid_per_address": 0},
+                         "times": {"refill_wait_ms": 300, "upstream_wait_secs": 2, "tick_ms": 50},
+                         "routes": [{"path": "/f/", "price": {"request_msat": 1000}}]});
+        let gw = Gateway::start(Config::from_json(&cfg).unwrap(), Arc::new(crate::standin::StandIn::new(100)), SecretKey::from_slice(&[9u8; 32]).unwrap(), Box::new(|| 1_000_000)).unwrap();
+        let session = gw.lock().book.open_session("v4:127.0.0.1", &[7u8; 48], 1_000_000).ok().unwrap().session;
+        let pump = |len: usize, most: u64| {
+            let m = Metered { session: session.clone(), seq: 1, digest: String::new(), status: 200, route: gw.cfg.routes[0].clone(), at_head: 0, first_second: 0,
+                              started: Instant::now(), tokens: None, cap_msat: None, max_bytes: Some(most) };
+            let open = OpenResponse { gw: gw.clone(), session: session.clone(), slot: None };
+            let mut out = Out(vec![]);
+            // all of it in one read, then the end
+            let r = gw.pump(m, Box::new(io::Cursor::new(vec![7u8; len])), &mut out, open);
+            (r.map_err(|e| e.to_string()), out.0.len())
+        };
+        const _: () = assert!(10_000 < CHUNK, "the body comes in one read");
+        assert_eq!(pump(10_000, 6_000), (Err(PASSED_SHOWN.to_string()), 6_000));
+        assert_eq!(pump(6_000, 6_000), (Ok(()), 6_000), "exactly the size");
+        assert_eq!(pump(5_000, 6_000), (Ok(()), 5_000), "less");
+    }
+
     /// The size the buyer was shown, against what an answer states: a whole one's length, a
     /// part's total in its `Content-Range` (not the part's own length), and nothing where the
     /// request names no size, sends work (not a GET or HEAD), or the answer states none. Several

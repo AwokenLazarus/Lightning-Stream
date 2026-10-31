@@ -4023,7 +4023,7 @@ impl Signer {
             };
             let seq_deadline = Instant::now() + SEQ_WAIT;
             let mut sent_epoch;
-            let (ans, receipt) = loop {
+            let (mut ans, receipt) = loop {
                 let auth = xbt402::ticket::request_auth(&key, &sid, seq, "", "", &digest);
                 let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": sid, "seq": seq, "auth": auth})));
                 let mut headers = c.headers();
@@ -4107,21 +4107,13 @@ impl Signer {
                     return fail(hs, &spent, with(d, json!({"status": status})));
                 }
             };
-            // the seller's refusal of an answer larger than the size this GET or HEAD named (`larger_than_shown`):
-            // charged as an answer with no body, at the request's price. Its short body is read for its code here,
-            // and kept for the reply
-            let (mut ans, size_refusal) = if ans.status == 412 && c.max_size.is_some() && (c.method.eq_ignore_ascii_case("GET") || c.method.eq_ignore_ascii_case("HEAD")) {
-                let (status, headers, length) = (ans.status, ans.headers.clone(), ans.length);
-                let body = ans.read_small(SMALL_BODY).unwrap_or_default();
-                let code = serde_json::from_slice::<Value>(&body).ok().is_some_and(|v| protocol_code(v.get("error")) == "larger_than_shown");
-                (WireAnswer { status, headers, length, body: Box::new(std::io::Cursor::new(body)), closer: None }, code)
-            } else {
-                (ans, false)
-            };
             // the receipt's totals, inside what the wallet can account for ([`Money::take`])
             let metered = head.body_hash.is_empty() && ans.status < 400;
             let charged_max = match ans.status {
-                _ if size_refusal => price.request_msat,
+                // the seller's refusal of an answer larger than the size this GET or HEAD named (`larger_than_shown`):
+                // charged as an answer with no body, at the request's price. Its status is what is judged: a HEAD has
+                // no body to carry the code, and an honest gateway charges nothing for the service's own errors
+                412 if c.max_size.is_some() && (c.method.eq_ignore_ascii_case("GET") || c.method.eq_ignore_ascii_case("HEAD")) => price.request_msat,
                 s if s >= 400 => 0,
                 _ if metered => price.request_msat.saturating_add(price.second_msat),
                 _ => price.request_msat,
@@ -4211,6 +4203,9 @@ impl Signer {
             let digest_now = hex::encode(sink.hash.clone().finalize());
             let note = if !complete {
                 json!({"signed": true, "body": "cut short"})
+            } else if digest_now != head.body_hash && c.method.eq_ignore_ascii_case("HEAD") {
+                // a HEAD has no body to hash, and a seller may sign the one its GET would have had (an error's)
+                json!({"signed": true, "body": "none: a HEAD"})
             } else if digest_now != head.body_hash {
                 let why = "the body is not the one the receipt signs";
                 out["seller_fault"] = self.ticket_fault(hs, why)["reason"].clone();
