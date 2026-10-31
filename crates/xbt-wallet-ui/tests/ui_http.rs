@@ -2741,6 +2741,68 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
     assert!(br.flash_after(&r).contains("could not be found"));
 }
 
+/// An AI seller added after the AI address already has one reaches it at once: the sellers file the
+/// endpoint reads follows each add, update and removal on the Services page, with no visit to the AI
+/// page and no "read the prices again" press.
+#[test]
+fn ai_sellers_added_or_removed_later_reach_the_ai_address_at_once() {
+    use xbt_nostr::{event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    // a shop reached by its key, selling one model at `out` msat per 1,000 tokens written
+    let publish = |name: &str, out: u64| {
+        let keys = Keys::generate();
+        let shop = xbt402::shop::origin_for(&keys.public.serialize());
+        let (sk, pk) = receipt_key(name.as_bytes());
+        let d = xbt402::listing::parse_draft(&json!({
+            "name": name, "services": [{"name": "Model", "kind": "ai", "path": "/ai/", "prices": {"per_1k_output_msat": out}, "items": []}],
+            "updated": "2026-10-31",
+        })).unwrap();
+        let doc = xbt402::listing::sign(&sk, &xbt402::listing::document(&d, &shop, &pk));
+        let bind = xbt402::listing::bind(&sk, &keys.public.serialize(), &shop);
+        let ev = market::listing_event_with(&keys, &doc, &bind, None, xbt_nostr::now()).unwrap();
+        assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+        (xbt402::shop::npub(&keys.public.serialize()), shop)
+    };
+    let (npub_a, _) = publish("First shop", 10_000);
+    let (npub_b, shop_b) = publish("Second shop", 7_000);
+    let dir = tempfile::tempdir().unwrap();
+    let ai = dir.path().join("ai");
+    let bx = start(json!({}), false, |c| {
+        c.nostr_relays = relays.clone();
+        c.ai = xbt_wallet_ui::config::AiSetup { endpoint: Some("http://box.local:33540/v1".into()), sellers: ai.join("sellers.json"),
+                                                credentials: ai.join("credentials.json"), state: ai.join("state.json") };
+    });
+    let mut br = logged_in(&bx);
+    let sellers = || -> Vec<(String, Value)> {
+        let v: Value = serde_json::from_slice(&std::fs::read(ai.join("sellers.json")).unwrap_or_default()).unwrap_or(json!({}));
+        let mut s: Vec<(String, Value)> = v["sellers"].as_array().into_iter().flatten()
+            .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e["prices"]["per_1k_output_msat"].clone())).collect();
+        s.sort_by(|a, b| a.0.cmp(&b.0));
+        s
+    };
+    let added = |br: &mut B, npub: &str| {
+        let r = br.act("/services", "/services", &[("action", "add"), ("url", npub)]);
+        let f = br.flash_after(&r);
+        assert!(f.contains("1 service on Browse now"), "{f}");
+    };
+    // the first seller, and the AI page seen once (the file is made)
+    added(&mut br, &npub_a);
+    assert!(br.get("/ai").body.contains("First shop"));
+    assert_eq!(sellers().len(), 1, "{:?}", sellers());
+    // a second seller added later: in the file at once, at its own price
+    added(&mut br, &npub_b);
+    let s = sellers();
+    assert_eq!(s.len(), 2, "the second seller reaches the AI address without a visit or a press: {s:?}");
+    assert!(s.iter().any(|(n, p)| n.starts_with("Second shop") && p.as_str() == Some("7000")), "{s:?}");
+    // removed: gone from the file at once
+    let r = br.act("/services", "/services", &[("action", "remove"), ("url", &shop_b)]);
+    assert!(br.flash_after(&r).contains("Seller removed"));
+    let s = sellers();
+    assert!(s.len() == 1 && s[0].0.starts_with("First shop"), "{s:?}");
+}
+
 /// A seller who picks "Directly, through the app": no web address is written, the gateway gets a
 /// link section (the app's relays, the private switch) and the listing goes to Nostr anyway.
 /// Needs the gateway to read the `link` section (the direct-links transport work).
