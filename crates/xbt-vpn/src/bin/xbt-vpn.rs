@@ -39,10 +39,13 @@
 //!     the path, the bytes and the throughput. A tool for measuring: it looks the host name up
 //!     itself; the app's buyer side does DNS through the tunnel. With `--hop`, every flow is sealed for
 //!     the exit and goes through that first hop (two hops).
-//! xbt-vpn fetch --tunnel URL --url http://HOST/PATH [--flows N] [--secs S] [--once] [--max-charge-sats N]
+//! xbt-vpn fetch --tunnel URL --url http://HOST/PATH [--flows N] [--secs S] [--once] [--max-charge-sats N] [--region-check]
 //!     The same through a priced exit's paid tunnel at URL, opened by the wallet of B2_SIGNER_SOCK
 //!     and B2_STREAM_DIR (as the app's buyer side opens it). `--once`: each flow downloads the URL
-//!     once, to its end.
+//!     once, to its end. `--region-check`: the tunnel is opened as a region check's (no more than one
+//!     ticket may leave the wallet for it, and it is charged no more than 20 sats), and the line adds
+//!     the wallet's answer when it ended (`wallet`), the sats that left the wallet (`left_sats`) and the
+//!     page's first 4 KiB (`page`).
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -265,6 +268,9 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
         link.learn(&exit_id, Hints { relays: strings("relays"), direct })?;
     }
     let hop_id = arg(args, "--hop");
+    // `--region-check`: the tunnel's wallet as a region check's, and its answer reported in the line
+    let region_check = args.iter().any(|a| a == "--region-check");
+    let mut checked = None;
     let (way, via, said) = match (&tunnel, &hop_id) {
         (Some(url), _) => {
             let mut w = xbt_vpn::paid::Wallet::from_env().ok_or_else(|| std::io::Error::other("--tunnel needs B2_SIGNER_SOCK and B2_STREAM_DIR"))?;
@@ -276,9 +282,23 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
             }
             // the exit's announced price a GB, if given, is the most the wallet pays it
             let ceiling = arg(args, "--price-msat-gb").and_then(|p| p.parse().ok()).map(xbt_vpn::paid::ceiling);
-            let t = link.runtime().block_on(xbt_vpn::paid::open(&w, url, ceiling))?;
-            // what the wallet says when the tunnel ends is printed once it does, before the fetch exits
-            (Way::Tunnel(xbt_vpn::flow::Carrier::Tunnel(t.mux)), String::new(), Some(t.done))
+            let w = if region_check { w.for_region_check() } else { w };
+            let t = match link.runtime().block_on(xbt_vpn::paid::open(&w, url, ceiling)) {
+                Ok(t) => t,
+                Err(e) if region_check => {
+                    println!("{}", serde_json::json!({"bytes": 0, "error": e.to_string(), "left_sats": xbt_vpn::paid::left_of(&e)}));
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            if region_check {
+                // a region check's answer goes in the line it prints, not after it
+                checked = Some((t.mux.clone(), t.done));
+                (Way::Tunnel(xbt_vpn::flow::Carrier::Tunnel(t.mux)), String::new(), None)
+            } else {
+                // what the wallet says when the tunnel ends is printed once it does, before the fetch exits
+                (Way::Tunnel(xbt_vpn::flow::Carrier::Tunnel(t.mux)), String::new(), Some(t.done))
+            }
         }
         (None, Some(hop_id)) => {
             let hh: serde_json::Value = serde_json::from_str(&arg(args, "--hop-hints").expect("--hop-hints JSON")).map_err(std::io::Error::other)?;
@@ -296,11 +316,13 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
         let to = tokio::net::lookup_host(format!("{host}:80")).await?.find(|a| a.is_ipv4()).ok_or_else(|| std::io::Error::other("no IPv4 address"))?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         let total = Arc::new(AtomicU64::new(0));
+        // a region check's page, kept to show what came back through the exit
+        let page = Arc::new(std::sync::Mutex::new(Vec::new()));
         let start = Instant::now();
         let deadline = start + Duration::from_secs(secs);
         let mut tasks = Vec::new();
         for _ in 0..flows {
-            let (way, total, host, path) = (way.clone(), total.clone(), host.clone(), path.clone());
+            let (way, total, host, path, page) = (way.clone(), total.clone(), host.clone(), path.clone(), page.clone());
             tasks.push(tokio::spawn(async move {
                 while Instant::now() < deadline {
                     let Some(mut s) = way.open(to).await else { return };
@@ -314,6 +336,11 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 total.fetch_add(n as u64, Ordering::Relaxed);
+                                if region_check {
+                                    let mut p = page.lock().unwrap_or_else(|e| e.into_inner());
+                                    let room = (4096 - p.len().min(4096)).min(n);
+                                    p.extend_from_slice(&buf[..room]);
+                                }
                             }
                         }
                     }
@@ -328,7 +355,7 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
         }
         let secs = start.elapsed().as_secs_f64();
         let bytes = total.load(Ordering::Relaxed);
-        Ok::<_, std::io::Error>(serde_json::json!({
+        Ok::<_, std::io::Error>((page, serde_json::json!({
             "path": link.path(&via).map(|p| p.kind()),
             "two_hops": hop_id.is_some(),
             "private": private,
@@ -336,8 +363,17 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
             "bytes": bytes,
             "secs": secs,
             "mbit_s": bytes as f64 * 8.0 / secs / 1e6,
-        }))
+        })))
     })?;
+    let (page, mut report) = report;
+    if let Some((mux, done)) = checked {
+        // the tunnel ended: what the wallet answered, and what left it for the tunnel
+        mux.close();
+        let answer = done.recv_timeout(xbt_vpn::paid::ANSWER_WAIT).ok().map(|r| r.unwrap_or_else(|e| serde_json::json!({"error": e})));
+        report["left_sats"] = answer.as_ref().and_then(xbt_vpn::paid::left_sats).into();
+        report["wallet"] = answer.into();
+        report["page"] = String::from_utf8_lossy(&page.lock().unwrap_or_else(|e| e.into_inner())).into_owned().into();
+    }
     println!("{report}");
     // the tunnel is ended here (a Mux runs on until closed), and the wallet answers once its last receipt is in
     // (its stop waits up to 15 s for it): the runtime drives the close while the answer is waited for
@@ -543,14 +579,8 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
                         }
                         let region = a.exit.region.clone();
                         let stale = checked.get(&a.exit.id).is_none_or(|(r, _, at)| *r != region || at.elapsed() > Duration::from_secs(6 * 3600));
-                        let priced = a.exit.price_msat_per_gb > 0;
-                        let cost = xbt_vpn::buyer::REGION_CHECK_MAX_SATS;
-                        let worth = !priced || (buyer.region_wanted(&a.exit) && !buyer.is_held_off(&a.exit.id) && gate.may(&a.exit.id, &a.exit.operator, cost, std::time::Instant::now()));
-                        if stale && region.len() == 2 && worth {
-                            let result = rt.block_on(buyer.verify_region(&a.exit.id, &region));
-                            if priced {
-                                gate.record(&a.exit.id, &a.exit.operator, cost, result == xbt_vpn::region::RegionCheck::Verified, std::time::Instant::now());
-                            }
+                        let result = if stale && region.len() == 2 { rt.block_on(buyer.check_region(&mut gate, &a.exit)) } else { None };
+                        if let Some(result) = result {
                             if result != xbt_vpn::region::RegionCheck::Verified {
                                 eprintln!("exit {}…: region {region} not verified ({result:?})", &a.exit.id[..12.min(a.exit.id.len())]);
                             }

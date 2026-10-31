@@ -52,6 +52,14 @@ impl Wallet {
             max_charge_sats: None,
         })
     }
+
+    /// This wallet as a region check uses it: no more than [`crate::holds::REGION_CHECK_TICKET_SATS`]
+    /// may leave it for the check (one ticket of the exit's shop, for a buyer with no credit there),
+    /// and the check is charged no more than [`crate::buyer::REGION_CHECK_MAX_SATS`].
+    pub fn for_region_check(&self) -> Wallet {
+        let max_sats = self.max_sats.min(crate::holds::REGION_CHECK_TICKET_SATS);
+        Wallet { max_sats, max_charge_sats: Some(crate::buyer::REGION_CHECK_MAX_SATS.min(max_sats)), ..self.clone() }
+    }
 }
 
 /// How long the wallet may take to pay a tunnel's opening and hand over its stream.
@@ -128,7 +136,11 @@ fn open_blocking(w: &Wallet, url: &str, ceiling: Option<Value>) -> io::Result<Op
         }
         if let Ok(d) = done.try_recv() {
             let _ = std::fs::remove_file(&path);
-            return Err(io::Error::other(refused(&d)));
+            let left = match &d {
+                Ok(v) => left_sats(v),
+                Err(_) => None,
+            };
+            return Err(io::Error::other(NotOpened { why: refused(&d), left_sats: left }));
         }
         if started.elapsed() > OPEN_WAIT {
             let _ = std::fs::remove_file(&path);
@@ -168,6 +180,47 @@ fn let_the_signer_in(sock: &std::path::Path, dir: &std::path::Path) -> io::Resul
         let _ = std::os::unix::fs::chown(sock, None, Some(gid));
     }
     std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o660))
+}
+
+/// A tunnel the wallet did not open: why, in words, and what the wallet's answer says left it for
+/// the tunnel (sats; `None`: not known, as when it gave no answer before the opening was given up).
+#[derive(Debug)]
+pub struct NotOpened {
+    pub why: String,
+    pub left_sats: Option<u64>,
+}
+
+impl std::fmt::Display for NotOpened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for NotOpened {}
+
+/// What left the wallet for a tunnel [`open`] did not open, by the wallet's answer (`None`: not known).
+pub fn left_of(e: &io::Error) -> Option<u64> {
+    e.get_ref().and_then(|x| x.downcast_ref::<NotOpened>()).and_then(|n| n.left_sats)
+}
+
+/// What left the wallet for a call, by its answer: the tickets it released for the call
+/// (`charged_sats`: bought for it, or held as credit and spent on it), or nothing where it refused the
+/// call before paying (`verdict` deny). `None` where the answer says neither.
+pub fn left_sats(v: &Value) -> Option<u64> {
+    match v.get("charged_sats") {
+        Some(n) => n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())).or_else(|| n.as_i64().map(|i| i.max(0) as u64)),
+        None => (v.get("verdict").and_then(Value::as_str) == Some("deny")).then_some(0),
+    }
+}
+
+/// How long a tunnel's end may take to be answered by the wallet: it waits for the seller's last
+/// receipt first.
+pub const ANSWER_WAIT: Duration = Duration::from_secs(30);
+
+/// What left the wallet for a tunnel, by its answer once the tunnel has ended (`None`: no answer in
+/// [`ANSWER_WAIT`], or one that does not say). Blocks.
+pub fn left_after(done: &std::sync::mpsc::Receiver<Result<Value, String>>) -> Option<u64> {
+    done.recv_timeout(ANSWER_WAIT).ok()?.ok().as_ref().and_then(left_sats)
 }
 
 /// The signer's answer to a call that ended before its stream opened, in words.

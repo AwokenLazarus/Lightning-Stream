@@ -131,14 +131,19 @@ link, as its licence asks. No lookup about an exit or a buyer leaves the box. If
 country allows is caught too; the app never looks the owner's country up from the network. An exit
 whose region does not check out is not offered for that region, and is checked again every 6 hours.
 A **priced** exit's region is read through a paid tunnel, so it is checked only when a device's own
-rules ask for that region and would otherwise take it, and under one budget
-(`xbt_vpn::holds::CheckGate`): 100 sats a day for all such checks together (each held to 20 sats), one
-check of an exit a day, none more that day for an operator (the exit's Nostr key) whose checks failed
-twice, and the exits seen longest first, so a crowd of new announcements can't spend the budget or
-push the others out. A check is charged at most 20 sats (`max_charge_sats`), but the wallet may buy
-that exit's whole ticket for it, within the tunnel's own `max_sats` and the owner's rules: a ticket
-is far more than 20 sats, and a buyer with no credit at an exit could otherwise never check it.
-What the check leaves of the ticket stays as credit with the exit's shop, for the tunnel after it.
+rules ask for that region and would otherwise take it. A check is charged at most 20 sats
+(`max_charge_sats`), but a buyer with no credit at the exit's shop must first buy one of its
+tickets, so the wallet may move up to 2,000 sats out for one check (the check tunnel's `max_sats`,
+within the owner's rules); a shop whose ticket is bigger can't be checked. What the check leaves of
+the ticket stays as credit with that shop, for the tunnel after it. All checks share one budget
+(`xbt_vpn::holds::CheckGate`): at most 4,000 sats a day may leave the wallet for them. A check
+starts only if the day's spend plus its 2,000 still fits, and then counts what actually left for
+it, as the wallet's answer says (the tickets it bought or released for the check; the full 2,000
+where the wallet gave no answer). So the day's checks never move more than 4,000 sats, however many
+exits are announced or under how many keys; with the usual ticket of under 1,000 sats that is three
+or four checks a day. Also one check of an exit a day, none more that day for an operator (the exit's
+Nostr key) whose checks failed twice, and the exits seen longest first, so a crowd of new
+announcements can't push the others out.
 Until the table has loaded, no region is verified, and a device whose rules name a country is told
 no exit qualifies rather than sent to one that may be elsewhere. Each exit's result is in
 `status.json` (`exits`), in plain words, and on the VPN page.

@@ -125,8 +125,15 @@ impl Holds {
     }
 }
 
-/// The most the buyer pays for region checks in a day, across all exits (sats).
-pub const CHECK_SATS_PER_DAY: u64 = 100;
+/// The most one region check of a priced exit may move out of the wallet (sats): the check tunnel's
+/// `max_sats`. It is charged far less (`REGION_CHECK_MAX_SATS`), but a buyer with no credit at the
+/// exit's shop must buy one of its tickets first, and what the check leaves of it stays there as
+/// credit. A shop whose ticket is bigger than this can't be checked.
+pub const REGION_CHECK_TICKET_SATS: u64 = 2_000;
+/// The most region checks may move out of the wallet in a day, across all exits (sats): two checks
+/// that each bought a whole [`REGION_CHECK_TICKET_SATS`] ticket. A check starts only if the day's
+/// spend plus that most still fits, and counts what actually left for it.
+pub const CHECK_SATS_PER_DAY: u64 = 2 * REGION_CHECK_TICKET_SATS;
 /// How often one priced exit's region is checked (paid for) at most.
 pub const CHECK_EVERY: Duration = DAY;
 /// Region checks of one operator's exits that may fail in a day before its exits are checked no more.
@@ -149,13 +156,14 @@ impl CheckGate {
         *self.first_seen.entry(id.to_string()).or_insert(now)
     }
 
-    /// Whether `id`, run by `operator`, may be checked now at a cost of `cost` sats.
-    pub fn may(&mut self, id: &str, operator: &str, cost: u64, now: Instant) -> bool {
+    /// Whether `id`, run by `operator`, may be checked now: the most a check may move out of the
+    /// wallet ([`REGION_CHECK_TICKET_SATS`]) must still fit in the day's budget.
+    pub fn may(&mut self, id: &str, operator: &str, now: Instant) -> bool {
         let spent = self.spent.get_or_insert((now, 0));
         if now.saturating_duration_since(spent.0) >= DAY {
             *spent = (now, 0);
         }
-        if spent.1.saturating_add(cost) > CHECK_SATS_PER_DAY {
+        if spent.1.saturating_add(REGION_CHECK_TICKET_SATS) > CHECK_SATS_PER_DAY {
             return false;
         }
         if self.last.get(id).is_some_and(|t| now.saturating_duration_since(*t) < CHECK_EVERY) {
@@ -164,10 +172,12 @@ impl CheckGate {
         !self.fails.get_mut(operator).is_some_and(|f| *today(f, now) >= CHECK_FAILS_PER_OPERATOR)
     }
 
-    /// `id` was checked at a cost of up to `cost` sats; `ok`: its region held.
-    pub fn record(&mut self, id: &str, operator: &str, cost: u64, ok: bool, now: Instant) {
+    /// `id` was checked, and `left` sats left the wallet for it (the tickets the wallet bought or
+    /// released for the check, by its answer; the check's most where that is not known); `ok`: its
+    /// region held.
+    pub fn record(&mut self, id: &str, operator: &str, left: u64, ok: bool, now: Instant) {
         let spent = self.spent.get_or_insert((now, 0));
-        spent.1 = spent.1.saturating_add(cost);
+        spent.1 = spent.1.saturating_add(left);
         self.last.insert(id.to_string(), now);
         if !ok && !operator.is_empty() {
             *today(self.fails.entry(operator.to_string()).or_insert((now, 0)), now) += 1;
@@ -240,24 +250,32 @@ mod tests {
 
     #[test]
     fn region_checks_share_one_daily_budget_and_failing_operators_get_no_more() {
-        let (mut g, now) = (CheckGate::default(), Instant::now());
-        let cost = 20;
-        let mut checked = 0;
-        for i in 0..20 {
-            let id = format!("sybil{i}");
-            if g.may(&id, &format!("op{i}"), cost, now) {
-                g.record(&id, &format!("op{i}"), cost, true, now);
-                checked += 1;
+        // a crowd of exits under fresh keys, each check buying a whole ticket of its shop: the day's
+        // checks move no more than the budget out of the wallet, whatever their tickets cost
+        for ticket in [REGION_CHECK_TICKET_SATS, 1_000, 546, 21] {
+            let (mut g, now) = (CheckGate::default(), Instant::now());
+            let (mut checked, mut left) = (0, 0);
+            for i in 0..100 {
+                let id = format!("sybil{i}");
+                if g.may(&id, &format!("op{i}"), now) {
+                    g.record(&id, &format!("op{i}"), ticket, true, now);
+                    checked += 1;
+                    left += ticket;
+                }
             }
+            assert!(left <= CHECK_SATS_PER_DAY, "ticket {ticket}: {left} sats left in a day");
+            // every check that still fits its most is allowed: the budget is not spent on guesses
+            assert_eq!(checked, 1 + (CHECK_SATS_PER_DAY - REGION_CHECK_TICKET_SATS) / ticket, "ticket {ticket}");
+            assert!(!g.may("sybil-late", "op-late", now + Duration::from_secs(3600)), "ticket {ticket}: the rest of the day");
+            assert!(g.may("sybil-late", "op-late", now + DAY), "ticket {ticket}: a new day");
         }
-        assert_eq!(checked, (CHECK_SATS_PER_DAY / cost) as usize, "however many exits appear, a day's checks cost at most the budget");
         let (mut g, now) = (CheckGate::default(), Instant::now());
-        g.record("a", "op", cost, false, now);
-        g.record("b", "op", cost, false, now);
-        assert!(!g.may("c", "op", cost, now), "an operator whose checks failed twice today gets no more");
-        assert!(g.may("c", "op", cost, now + DAY), "a new day");
-        g.record("z", "other", cost, true, now);
-        assert!(!g.may("z", "other", cost, now + Duration::from_secs(3600)), "one check of an exit a day");
+        g.record("a", "op", 20, false, now);
+        g.record("b", "op", 20, false, now);
+        assert!(!g.may("c", "op", now), "an operator whose checks failed twice today gets no more");
+        assert!(g.may("c", "op", now + DAY), "a new day");
+        g.record("z", "other", 20, true, now);
+        assert!(!g.may("z", "other", now + Duration::from_secs(3600)), "one check of an exit a day");
         // the longest seen first
         let mut g = CheckGate::default();
         let older = g.seen("old", now);
