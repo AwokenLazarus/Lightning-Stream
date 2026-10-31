@@ -187,6 +187,10 @@ impl Account {
     }
 }
 
+/// The seller's refusal of the request itself, said to the client as it said it: its status, its
+/// body and its content type.
+type SellersRefusal = (u16, Vec<u8>, Option<String>);
+
 /// How a call failed before any byte of its answer.
 struct Failed {
     /// Said to the client when no seller is left.
@@ -194,7 +198,7 @@ struct Failed {
     message: String,
     /// The seller refused the request itself (a 4xx other than payment): no other seller is tried,
     /// since the request would fare no better there.
-    final_answer: Option<Box<(u16, Vec<u8>, Option<String>)>>,
+    final_answer: Option<Box<SellersRefusal>>,
     /// The request may have reached this seller, and be served or charged by it: no other seller
     /// is tried, so that one answer is never paid to two.
     paid: bool,
