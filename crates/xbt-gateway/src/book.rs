@@ -64,7 +64,8 @@ pub struct Caps {
     pub unpaid_per_address: u32,
     /// Hold invoices only to a session that has paid something.
     pub held_after_paid: bool,
-    /// A session that has never released a secret is closed after this many seconds.
+    /// A session that has never released a secret is closed after this many seconds, once none of
+    /// its invoices is still payable: an unpaid one is kept for its life and 15 s more.
     pub first_use_secs: u64,
     /// A session's tickets are cancelled after this many seconds without a paid request.
     pub idle_secs: u64,
@@ -1098,7 +1099,13 @@ impl Book {
             let expiring = t.state == TicketState::Accepted
                 && height.is_some()
                 && Self::outside_margin(&caps, t, height).is_err();
-            let idle = self.sessions.get(&t.session).is_none_or(quiet);
+            // an unpaid invoice lives its whole life and the 15 s after, however soon its session is called idle
+            // (`first_use_secs`): a payment over a slow route can arrive near its end, and the seller's node would refuse
+            // one for an invoice cancelled under it. Its life: a first lock's `first_lock_secs`, any other's 60 s (a
+            // ticket read back after a restart is not known to be a first lock's, and has the longer)
+            let invoice_life = if t.first { caps.first_lock_secs } else { u64::from(xbt402::ticket::INVOICE_EXPIRY_S) };
+            let paying = t.state == TicketState::Open && !unpaid && now.saturating_sub(t.issued_at) <= invoice_life.saturating_add(15);
+            let idle = !paying && self.sessions.get(&t.session).is_none_or(quiet);
             if unpaid || expiring || idle {
                 out.cancel.push(*h);
             }
@@ -2227,6 +2234,26 @@ pub(crate) mod tests {
         assert_eq!(b.lock("a", None, &[hash(5), hash(6)], false, &ent(4), 0).unwrap().issue.len(), 2);
         // a lock asks for as many as are left to the address
         assert_eq!(b.lock("a", None, &[hash(7)], false, &ent(5), 0), Err(Refusal::TooManyTickets));
+    }
+
+    /// As shipped (a first lock's invoices live 60 s): an unpaid one is kept for its whole life and
+    /// the 15 s after, whatever `first_use_secs` says, and given up then. A first lock set to lapse
+    /// sooner (`first_lock_secs` 5) is given up at 20 s, however long `unpaid_secs` is.
+    ///
+    /// FAILS before: the first-use sweep gave it up at `first_use_secs` (61 s as shipped, 16 s with
+    /// the lab's 15), before its invoice lapsed, so a payment over a slow route met a cancelled one.
+    #[test]
+    fn an_unpaid_first_lock_lives_its_whole_life_however_soon_a_session_is_called_idle() {
+        for first_use in [15, 60] {
+            let mut b = Book::new(Caps { max_tickets: 2, first_lock_secs: 60, first_use_secs: first_use, ..caps() });
+            b.lock("a", None, &[hash(1)], true, &ent(1), 100).unwrap();
+            assert!(b.sweep(175, None).cancel.is_empty(), "first_use_secs {first_use}");
+            assert_eq!(b.sweep(176, None).cancel, vec![hash(1)], "first_use_secs {first_use}");
+        }
+        let mut b = Book::new(Caps { max_tickets: 2, first_lock_secs: 5, first_use_secs: 15, unpaid_secs: 600, ..caps() });
+        b.lock("a", None, &[hash(1)], true, &ent(1), 100).unwrap();
+        assert!(b.sweep(120, None).cancel.is_empty());
+        assert_eq!(b.sweep(121, None).cancel, vec![hash(1)], "5 s and 15 s: given up by the first-use sweep from 21 s");
     }
 
     /// The invoices of a first lock lapse sooner than those of an authenticated one.

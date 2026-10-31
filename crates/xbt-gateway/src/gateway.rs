@@ -1387,7 +1387,8 @@ impl Gateway {
                 return busy(&b);
             }
         }
-        // a first lock is nobody's yet: its invoices lapse sooner, so that unpaid ones give their places back
+        // a first lock is nobody's yet: its invoices may be set to lapse sooner (caps.first_lock_secs), so that unpaid
+        // ones give their places back; by default they live as long as any, for a payment over a slow route
         let expiry = if g.key.is_some() {
             u32::try_from(self.cfg.caps.first_lock_secs).unwrap_or(INVOICE_EXPIRY_S).min(INVOICE_EXPIRY_S)
         } else {

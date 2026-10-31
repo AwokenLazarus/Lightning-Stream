@@ -59,6 +59,11 @@ pub const SETTLE_MARGIN_BLOCKS: u32 = HOLD_EXPIRY_DELTA + SETTLE_CHAIN_BLOCKS;
 pub const MIN_TICKET_BLOCKS: u32 = 24;
 /// How long an unpaid ticket invoice may wait to be paid, in seconds.
 pub const INVOICE_EXPIRY_S: u32 = 60;
+/// The longest a wallet's node is given for an ordinary payment of a call (a prepaid ticket, a
+/// win), in seconds, whatever its owner's `ln.timeout_s`: as long as the invoice it pays lives.
+/// The wallet waits 5 s more for the node's final word, and a caller of the wallet that waits for
+/// a call's first answer waits longer than both.
+pub const ORDINARY_PAY_S: u32 = INVOICE_EXPIRY_S;
 /// What a seller's config (`mainnet_ack`) and a buyer's policy (`tickets.mainnet_ack`) must say,
 /// word for word, before tickets or draws move funds on mainnet.
 pub const MAINNET_ACK: &str = "real funds, software tested on mainnet with small amounts only";

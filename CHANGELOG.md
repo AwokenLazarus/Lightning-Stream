@@ -82,6 +82,14 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it there.
 - Higher default limits for a shop: 100 sessions and 512 connections. A shop behind a tunnel is
   limited as a whole, not as if all its buyers were one address.
+- A buyer whose first payment takes more than 20 s to reach a shop (a slow route) can now open a
+  session: a session's first ticket invoice stays payable for 60 s, as every other does, instead of
+  20 s. A payment that still arrives after its invoice lapsed is refused, with nothing paid, and the
+  buyer is told so instead of seeing a timeout.
+- A call's prepaid ticket (or lottery win) gives your node at most 60 s to pay it, whatever your
+  Lightning timeout, so the app always has the wallet's answer in time. A payment with no final
+  answer by then no longer blames the seller: its credit is taken up by your next call once your
+  node shows it paid.
 
 **VPN exits**
 - A priced exit's region check now runs for a buyer with no credit at that exit. Each check is

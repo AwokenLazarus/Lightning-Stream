@@ -130,8 +130,10 @@ kinds (`caps.held_after_paid`). Without such a rule a hold invoice costs whoever
 HTTP request, and the seller's held places can be taken by anyone who reaches it from enough
 addresses. Such a seller says so in its terms (`heldAfterPaid`, section 1), and a buyer that reads
 them buys one prepaid ticket first. A buyer told `prepaid_first` buys one prepaid ticket, and holds after it is credited.
-The invoices of a first lock lapse sooner than others (20 s in the gateway, `caps.first_lock_secs`,
-against 60), and one client address has at most 2 unpaid invoices (`caps.unpaid_per_address`). A request names
+The invoices of a first lock lapse after 60 s in the gateway, as others do (`caps.first_lock_secs`
+may set them sooner, down to 5 s: a payment that reaches the seller after its invoice lapsed is
+refused there, with nothing paid, so a short one shuts out buyers on slow routes), and one client
+address has at most 2 unpaid invoices (`caps.unpaid_per_address`). A request names
 at most `maxTickets` hashes. A hash the seller's node will not issue (it has had an invoice for
 that hash before, in any session) comes back under `refused`; a first lock that issues nothing
 makes no session.
@@ -442,7 +444,8 @@ a ticket is free when its payment shows `FAILED` there. The seller SHOULD also c
 of a session that has been idle for some minutes, and SHOULD cancel a ticket that has reached its
 margin, which it can no longer use. Held tickets cost it inbound capacity, and they are what
 closes its channel if its node goes down (section 6). The gateway cancels after 5 minutes without
-a paid request, after 1 minute for a session that has never released a secret, and at the margin.
+a paid request, after 1 minute for a session that has never released a secret (but not an
+invoice of it that is still payable: that is kept for its life and 15 s more), and at the margin.
 
 Cancelling needs the seller. A seller that does nothing leaves the buyer's tickets locked until
 they end by block height.
@@ -739,7 +742,7 @@ too, and holds after it.
 | Held tickets on one channel, all sessions together | Half of the channel's slots: 15 of 30 | The other half is for ordinary payments, for settles on their way and for everyone else (section 11). |
 | Ticket life (`ticketBlocks`) | 40 blocks | The node takes no less than 24. The seller's node cancels at 18 before expiry, the seller stops accepting at 24 before, and the payer's node adds 3: so 19 usable blocks, and at most 25 blocks locked behind a silent seller. |
 | Seller's margin | 24 blocks before expiry | 18, when its node cancels the ticket itself, and 6 more for a settle that has to go on chain (the node starts that 16 blocks before expiry). The 18 is the node's `invoices.holdexpirydelta`, a setting of the node's runner: 18 on the Lightning Fork node at its default, 12 on upstream lnd. The node does not tell it, so the gateway takes it from its config (`node.hold_expiry_delta`, 18 unless the runner says otherwise) and refuses to start when it is above 18: the margin is one number for both sides (a buyer stops releasing a ticket at 25 blocks), so it is not moved to fit a node. |
-| Invoice time expiry | 60 s; 20 s for the invoices of a first lock | Long enough to pay through a few hops (0.5 s through two), short enough that unpaid invoices do not pile up. A first lock is nobody's yet: its invoices give their places back sooner. |
+| Invoice time expiry | 60 s, a first lock's included | Long enough to pay through a few hops on a slow route (a hop held a payment 8 to 22 s on a loaded lab node, and a first lock's 20 s, before 0.1.20, refused such buyers every time), short enough that unpaid invoices do not pile up. What bounds a stranger's unpaid places is the caps by address. |
 | Tickets in flight per channel | 30 on a Core Lightning channel, 483 at most | 483 is the protocol's limit and Lightning Fork's default; 30 is Core Lightning's default, each way, set when the channel opens. Between Lightning Fork nodes, of 520 offered at once 483 locked in 8 s and 37 failed on the buyer's node (`INSUFFICIENT_BALANCE`) with nothing held; to a Core Lightning node, of 40 offered 30 locked and 10 failed the same way. 483 tickets take a commitment transaction from 1,116 to 84,200 weight units. |
 | Macaroons | Buyer: `info:read`, `offchain:read`, `offchain:write`, `onchain:read`. Seller: one with `invoices:read`, `invoices:write`, and one with `info:read`. | The buyer's was enough for its side. The seller's invoice macaroon makes, follows, settles and cancels tickets and cannot read the block height; the second one reads it. Neither could send coins, pay, open a channel, read the wallet or bake another. |
 | Seller's caps (the gateway's defaults in this tree) | 15 held tickets for all sessions together, 2 a session, 30 sessions, 2 from one address, 2 unpaid invoices from one address; hold invoices only to a session that has paid a ticket | What buyers can hold of the seller's inbound capacity at no cost to them: 15,000 sat and half of one 30-slot channel. A runner whose inbound channels all carry more says so (`caps.inbound_slots`), and one with several channels may raise the cap past half of one (`caps.held_over_half`). Until 2026-10-13 the defaults were 8 a session and 240 in all. |

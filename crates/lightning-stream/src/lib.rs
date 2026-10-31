@@ -56,6 +56,14 @@ pub use visit::Visits;
 
 /// How long a call may wait for the seller's first byte, the payment included.
 pub(crate) const FIRST_BYTE: Duration = Duration::from_secs(60);
+/// How long a call waits for the signer to begin the answer, or to say why it will not: longer than
+/// the signer's own wait for a call's ordinary payment (`xbt402::ticket::ORDINARY_PAY_S`, 60 s,
+/// whatever the owner's `ln.timeout_s`, and 5 s more, counted from before the payment is sent) and
+/// the lock before it, so that a payment refused at the seller (an invoice that lapsed on a slow
+/// route) is told to the buyer in the signer's words, not as a bare timeout.
+pub(crate) const FIRST_ANSWER: Duration = Duration::from_secs(90);
+// the wallet's own wait for a call's ordinary payment ends first, whatever the owner's policy says
+const _: () = assert!(FIRST_ANSWER.as_secs() > xbt402::ticket::ORDINARY_PAY_S as u64 + 5);
 /// The longest one paid answer is followed (a film): past the most an owner can set
 /// `tickets.max_stream_s` to, so that the wallet ends an answer and says so before this gives up on it.
 pub(crate) const LONGEST: Duration = Duration::from_secs(25 * 3600);
@@ -158,9 +166,9 @@ impl Connector {
                 let _ = std::fs::remove_file(&path);
                 return Reply::Whole(refused(done));
             }
-            if started.elapsed() > FIRST_BYTE {
+            if started.elapsed() > FIRST_ANSWER {
                 let _ = std::fs::remove_file(&path);
-                return Reply::Whole(json_response(504, &json!({"error": "the seller sent nothing within 60 s"})));
+                return Reply::Whole(json_response(504, &json!({"error": format!("the seller sent nothing within {} s", FIRST_ANSWER.as_secs())})));
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -374,6 +382,13 @@ mod tests {
     use super::{listen_stream, whole};
     use serde_json::{json, Value};
     use std::os::unix::fs::PermissionsExt;
+
+    /// A call's first answer is waited for longer than the wallet waits for the call's payment, so
+    /// that a payment refused at the seller is told in the wallet's words, not as a timeout.
+    #[test]
+    fn a_call_waits_for_its_first_answer_longer_than_the_wallet_waits_for_its_payment() {
+        assert!(super::FIRST_ANSWER.as_secs() > u64::from(xbt402::ticket::ORDINARY_PAY_S) + 5);
+    }
 
     #[test]
     fn an_answer_is_whole_by_its_length_or_the_signers_account_and_otherwise_cut() {

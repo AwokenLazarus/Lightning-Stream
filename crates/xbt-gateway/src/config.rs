@@ -27,7 +27,7 @@ pub const MAINNET_NOTICE: [&str; 9] = [
     "- A held ticket of 1,000 sat can be below a channel's dust limit at mainnet fee rates on a channel without anchors: it then has no output there, and is lost to the miners if that channel is force-closed while it is held. The gateway does not read its channels' dust limits.",
     "- Claiming settled tickets on chain after a force close cost 900 to 1,700 sat for three tickets at 1 sat/vB; at higher fee rates one ticket costs more to claim than it is worth.",
     "- Held tickets take pending-payment slots of every channel on their route for no fee, on your node and on the routing nodes before it. Nothing but this software keeps buyers to half of a channel's slots.",
-    "- A session's first ticket is a prepaid one (caps.held_after_paid), so a hold invoice costs whoever asks for it one paid ticket; but a first lock still costs nothing, and whoever reaches the gateway from enough addresses can take every session place with prepaid invoices it never pays, for 20 s at a time (caps.first_lock_secs).",
+    "- A session's first ticket is a prepaid one (caps.held_after_paid), so a hold invoice costs whoever asks for it one paid ticket; but a first lock still costs nothing, and whoever reaches the gateway from enough addresses can take every session place with prepaid invoices it never pays, two places an address (caps.unpaid_per_address), each for up to 75 s at a time (caps.first_lock_secs, caps.unpaid_secs).",
     "- With a lottery section you serve first, and nothing makes a buyer pay a win.",
     "- The gateway speaks an lnd-family node's REST interface and no other; a Core Lightning seller is not supported.",
     "- The gateway speaks plain HTTP: buyers must reach it through a TLS proxy, with public_url set to the https origin they use.",
@@ -741,7 +741,10 @@ impl Config {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err("caps.held_after_paid is true or false".into()),
         };
-        let first_lock_secs = num(c, "first_lock_secs", 20)?;
+        // as long as any ticket invoice: a buyer's payment can take tens of seconds to reach the seller over a
+        // slow route, and an invoice that lapsed on the way is refused at the seller with nothing paid. What bounds
+        // a stranger's unpaid places is the caps on them by address, not how soon each lapses
+        let first_lock_secs = num(c, "first_lock_secs", u64::from(xbt402::ticket::INVOICE_EXPIRY_S))?;
         if !(5..=u64::from(xbt402::ticket::INVOICE_EXPIRY_S)).contains(&first_lock_secs) {
             return Err(format!("caps.first_lock_secs is from 5 to {}: how long the invoices of a session's first lock stay payable", xbt402::ticket::INVOICE_EXPIRY_S));
         }
@@ -1590,7 +1593,7 @@ mod tests {
     #[test]
     fn hold_invoices_go_to_a_session_that_has_paid_by_default_where_prepaid_tickets_are_offered() {
         let c = Config::from_json(&base()).unwrap();
-        assert_eq!((c.caps.held_after_paid, c.caps.first_lock_secs, c.caps.unpaid_per_address), (true, 20, 2));
+        assert_eq!((c.caps.held_after_paid, c.caps.first_lock_secs, c.caps.unpaid_per_address), (true, 60, 2));
         let with = |tickets: Value, caps: Value| {
             let mut v = base();
             v["tickets"] = tickets;

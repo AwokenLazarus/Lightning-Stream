@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Reply, Request, Response, Streamed};
 
-use crate::{listen_stream, one_range, random_hex, whole, Connector, FIRST_BYTE, HEAD_LINE, LONGEST};
+use crate::{listen_stream, one_range, random_hex, whole, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
 
 /// The most visits open at once; an idle one ends after [`IDLE`].
 const MAX_VISITS: usize = 32;
@@ -631,9 +631,9 @@ impl Connector {
                 let unknown = d.is_err() && !unsent.load(Ordering::SeqCst);
                 return Err(Failed { v: d.unwrap_or_else(|e| json!({"error": e})), done: None, unknown });
             }
-            if started.elapsed() > FIRST_BYTE {
+            if started.elapsed() > FIRST_ANSWER {
                 let _ = std::fs::remove_file(&path);
-                return Err(Failed { v: json!({"error": "the seller sent nothing within 60 s"}), done: Some(done), unknown: false });
+                return Err(Failed { v: json!({"error": format!("the seller sent nothing within {} s", FIRST_ANSWER.as_secs())}), done: Some(done), unknown: false });
             }
             std::thread::sleep(Duration::from_millis(10));
         };

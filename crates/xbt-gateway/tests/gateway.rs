@@ -1516,7 +1516,8 @@ fn shipped(v: &mut Value) {
 
 /// As shipped: a lock for held tickets that nobody authenticated, or of a session that has paid
 /// nothing, is refused `prepaid_first` and asks the node for nothing; a session's first lock is
-/// for a prepaid ticket, whose invoice lapses in 20 s; once that ticket is paid and presented the
+/// for a prepaid ticket, whose invoice lapses in 60 s as any does (20 s before 0.1.20, which shut
+/// out buyers on slow routes); once that ticket is paid and presented the
 /// session is issued hold invoices; and one address has at most 2 unpaid invoices.
 ///
 /// FAILS before: a first lock carried no authentication and was issued hold invoices that lived
@@ -1533,11 +1534,11 @@ fn a_hold_invoice_goes_only_to_a_session_that_has_paid_a_ticket() {
     let got = b.lock_raw(&secrets);
     assert_eq!((got.status, got.error()), (402, "prepaid_first".to_string()), "{}", got.json());
     assert_eq!((rig.node.calls("add_hold"), rig.gw.stats().sessions), (0, 0), "nothing asked of the node, no session made");
-    // the first lock buys a prepaid ticket and makes the session; its invoice lapses sooner than a later one's
+    // the first lock buys a prepaid ticket and makes the session; its invoice lives as long as any
     let got = b.lock_prepaid(1);
     assert_eq!(got.status, 200, "{}", got.json());
     let hash = xbt402::ticket::hex32(got.json()["tickets"][0]["hash"].as_str().unwrap()).unwrap();
-    assert_eq!(rig.node.expiry_of(&hash), Some(20));
+    assert_eq!(rig.node.expiry_of(&hash), Some(60));
     // a held lock of the session before its ticket is paid: refused, in a signed answer
     let one = b.fresh_secrets(1);
     let early = b.lock_raw(&one);

@@ -32,7 +32,9 @@ section 8). Pointed at a node that answers `getinfo` in Core Lightning's names, 
    full on arrival), and hold invoices are issued only to a session that has paid one: a lock
    for held tickets before that is `402 prepaid_first`, and asks your node for nothing
    (`caps.held_after_paid`, on wherever you offer both kinds; `false` turns it off). A first
-   lock's invoice lapses after 20 s (`caps.first_lock_secs`), and one client address has at most
+   lock's invoice lapses after 60 s, as any ticket invoice does (`caps.first_lock_secs`, from 5 to
+   60: a buyer's payment over a slow route can take tens of seconds to reach you, and one that
+   arrives after the invoice lapsed is refused with nothing paid), and one client address has at most
    2 unpaid invoices at once (`caps.unpaid_per_address`, 0 for no cap: the address is the
    socket's unless `http.forwarded_address` names your proxy).
 3. The buyer releases a ticket by sending its secret: in `POST /x402/ticket/release`, which is

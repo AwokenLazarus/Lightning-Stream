@@ -745,6 +745,18 @@ struct PayState {
     /// How long the node takes to list its channels: the checks the wallet makes of them before a
     /// payment (a busy node, a slow disk).
     checks_take: Duration,
+    /// The next sends reach the seller's node `arrives_after_s` seconds after they are sent (a slow
+    /// route): in flight when sent, while the clock moves on by as much, and brought to the seller
+    /// when the node is next asked. An invoice that has lapsed by then (its expiry passed) is
+    /// refused there, as lnd refuses one: it cancels the invoice, and the payer is told incorrect
+    /// payment details.
+    slow_next: usize,
+    arrives_after_s: u64,
+    /// The `timeout_s` of each send, as the node was given it.
+    sent_timeouts: Vec<i64>,
+    /// A payment the seller's node has settled is still shown in flight here (its preimage slow on
+    /// its way back through a hop), for as long as this is set.
+    held_back: bool,
     /// The next sends are in flight on this node and never reach the seller's (the node dies as it
     /// sends them); once `stranded_off_channel` is set, no channel of the node carries them and
     /// the node goes on calling them in flight.
@@ -790,6 +802,8 @@ impl PayLn {
     /// Bring every payment in flight to what the seller's node has made of its invoice.
     fn refresh(&self, s: &mut PayState) {
         let lost = s.preimage_lost;
+        let now = self.clock.load(Ordering::SeqCst);
+        let held_back = s.held_back;
         for p in s.payments.iter_mut().filter(|p| p["status"] == "IN_FLIGHT" && p["stranded"] != true) {
             if p["late_fail"] == true {
                 p["status"] = "FAILED".into();
@@ -799,7 +813,20 @@ impl PayLn {
             }
             let hash = p["payment_hash"].as_str().unwrap().to_string();
             let raw: Hash = hex::decode(&hash).unwrap().try_into().unwrap();
+            // a slow payment reaches the seller's node now: a lapsed invoice is cancelled there, and the payment refused
+            if let Some(at) = p["arrives_at"].as_u64() {
+                if now < at {
+                    continue;
+                }
+                p["arrives_at"] = Value::Null;
+                if p["invoice_expires"].as_u64().is_some_and(|e| e < at) {
+                    self.seller.expire_unpaid(&raw);
+                } else {
+                    self.seller.pay_msat(&raw, p["amount_msat"].as_u64());
+                }
+            }
             match self.seller.state_of(&raw) {
+                Some(InvoiceState::Settled) if held_back => {}
                 Some(InvoiceState::Settled) => {
                     let Some(pre) = self.preimages.lock().unwrap().get(&hash).cloned() else { continue };
                     p["status"] = "SUCCEEDED".into();
@@ -913,7 +940,12 @@ impl LnBackend for PayLn {
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
         let stranded = !failing && !late && s.strand_next > 0;
         s.strand_next = s.strand_next.saturating_sub(usize::from(stranded));
-        let arrives = !failing && r.cltv_limit >= 123 && (late || stranded || self.seller.pay_msat(&raw, d.amount_msat));
+        // on its way for a while: in flight now, at the seller when the node is next asked ([`PayLn::refresh`])
+        s.sent_timeouts.push(r.timeout_s);
+        let slow = !failing && !late && !stranded && s.slow_next > 0 && r.cltv_limit >= 123;
+        s.slow_next = s.slow_next.saturating_sub(usize::from(slow));
+        let arrives_at = slow.then(|| self.clock.fetch_add(s.arrives_after_s, Ordering::SeqCst) + s.arrives_after_s);
+        let arrives = !failing && r.cltv_limit >= 123 && (late || stranded || slow || self.seller.pay_msat(&raw, d.amount_msat));
         let status = if arrives { "IN_FLIGHT" } else { "FAILED" };
         let in_flight = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT").count() + usize::from(arrives);
         s.peak = s.peak.max(in_flight);
@@ -924,7 +956,8 @@ impl LnBackend for PayLn {
         let p = json!({"payment_hash": hash, "payment_index": s.next_index.to_string(), "status": status, "value_msat": d.amount_msat.unwrap_or(0).to_string(),
                        "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                        "failure_reason": if arrives { "FAILURE_REASON_NONE" } else { "FAILURE_REASON_NO_ROUTE" },
-                       "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late, "stranded": stranded});
+                       "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late, "stranded": stranded,
+                       "arrives_at": arrives_at, "invoice_expires": d.timestamp + d.expiry_s, "amount_msat": d.amount_msat});
         s.payments.push(p.clone());
         Ok(p)
     }
@@ -4071,6 +4104,149 @@ fn a_seller_that_holds_only_after_a_prepaid_ticket_is_paid_one_first_and_then_he
     r.assert_booked();
 }
 
+/// A buyer whose payment takes 30 s to reach the seller (a slow route: a loaded hop held one 8 to
+/// 22 s on the lab route) opens a session with a seller as shipped, and both sides hold the ticket.
+///
+/// FAILS before: a first lock's invoices lapsed after 20 s (`caps.first_lock_secs`), so the seller's
+/// node refused every such payment as one for an expired invoice: nothing was paid, and that buyer
+/// could never open a session with the shop.
+#[test]
+fn a_first_ticket_whose_payment_takes_30_s_to_reach_the_seller_is_paid() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.slow_next, s.arrives_after_s) = (1, 30);
+    }
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    wait_refill(&r, "two tickets held after the prepaid one", 2);
+    // the buyer's node paid one ticket, the seller's node took it, and the wallet's book and ledger hold it
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
+/// An owner whose policy gives the node 300 s for a payment: a call's prepaid ticket is still
+/// given 60 s (`ORDINARY_PAY_S`), as long as its invoice lives, so the wallet's answer to the call
+/// comes before its caller stops waiting for one.
+#[test]
+fn a_calls_ordinary_payment_is_given_the_node_for_as_long_as_its_invoice_lives() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 300}}), 30, strict_shop());
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let sent = r.ln.state().sent_timeouts.clone();
+    assert_eq!(sent.first(), Some(&i64::from(xbt402::ticket::ORDINARY_PAY_S)), "the prepaid ticket's send: {sent:?}");
+}
+
+/// A prepaid ticket the seller's node settled, whose payment the wallet's node still shows in
+/// flight when the wallet's wait for it ends (its preimage slow on its way back): the session is
+/// stopped, not as the seller's fault, and once the node shows the payment done the next call to
+/// that seller takes up its credit and buys nothing. One ticket on every side.
+///
+/// FAILS before: the session was stopped as the seller's fault, which no later session resumes, so
+/// the next call bought another ticket and the first one's credit was left with the seller.
+#[test]
+fn a_prepaid_ticket_with_no_final_answer_in_time_leaves_its_credit_to_the_next_call() {
+    let _g = env_lock();
+    // the node is given 1 s for the payment, and the wallet waits 6 s for its word
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, strict_shop());
+    r.ln.st.lock().unwrap().held_back = true;
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_prepay_pending")), "{v}");
+    assert_eq!(v["charged_sats"].as_i64(), Some(BOOKING), "the call says the ticket booked as spent among what it charged: {v}");
+    assert!(r.audit("ticket_seller_fault").is_empty(), "the seller is not blamed");
+    assert_eq!(r.shop.settled(), 1, "the seller's node took it");
+    assert_eq!(r.ln.state().payments.len(), 1, "and nothing more was paid once the session was stopped");
+    // the node's word comes: paid. The seller follows a prepaid ticket only when its preimage is shown, or on its own
+    // sweep once the ticket's life is over (75 s), when its node says it was paid: then it credits it
+    r.ln.st.lock().unwrap().held_back = false;
+    wait_for("the payment to show paid", || r.ln.paid_msat() == TICKET);
+    r.tick();
+    r.clock.fetch_add(80, Ordering::SeqCst);
+    r.shop.gw.tick();
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64()), (Some(200), Some(0)), "the credit is taken up: {next}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1);
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
+/// An owner who gives the node 300 s for a payment: a call whose prepaid ticket has no final
+/// answer is answered within `ORDINARY_PAY_S` and 5 s of the payment, so the app, which waits
+/// 90 s for a call's first answer, has the wallet's word and not a bare timeout.
+///
+/// FAILS without the clamp: the wallet waited 305 s.
+#[test]
+fn a_call_whose_payment_has_no_final_answer_is_answered_within_the_apps_wait() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 300}}), 30, strict_shop());
+    r.ln.st.lock().unwrap().held_back = true;
+    let t = Instant::now();
+    let v = r.pay("/page/10", CALL);
+    let took = t.elapsed();
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    assert!(took < Duration::from_secs(u64::from(xbt402::ticket::ORDINARY_PAY_S) + 15), "answered after {took:?}");
+}
+
+/// The edge of a first lock's invoice as shipped (60 s, from a second before the lock): a payment
+/// that reaches the seller 59 s after it is sent is paid, and both sides hold one ticket; one that
+/// reaches it at 61 s is refused there as lapsed, and nothing is paid or booked on either side.
+#[test]
+fn a_first_ticket_reaching_the_seller_at_59_s_is_paid_and_at_61_s_is_refused_as_lapsed() {
+    let _g = env_lock();
+    for (after, paid) in [(59, true), (61, false)] {
+        let r = Rig::shipped(json!({}), 30, strict_shop());
+        {
+            let mut s = r.ln.st.lock().unwrap();
+            (s.slow_next, s.arrives_after_s) = (1, after);
+        }
+        let v = r.pay("/page/10", CALL);
+        if paid {
+            assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{after} s: {v}");
+            wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+            assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "{after} s");
+            r.assert_booked();
+        } else {
+            assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("ticket_invoice_lapsed"), Some(0)), "{after} s: {v}");
+            assert_eq!(r.money(), (0, 0, 0, 0), "{after} s");
+        }
+    }
+}
+
+/// A seller set to let a first lock's invoices lapse sooner (`caps.first_lock_secs` 20), paid over
+/// a route that takes 30 s: its node refuses the payment, and the buyer is told why (the payment
+/// most likely reached the seller after the invoice lapsed) and that nothing was spent. Nothing is
+/// paid or booked on either side, and the next call, over a quick route, pays.
+///
+/// FAILS before: the refusal said only "failed (FAILURE_REASON_INCORRECT_PAYMENT_DETAILS)", under
+/// the rule of any failed payment.
+#[test]
+fn a_payment_that_reaches_the_seller_after_its_invoice_lapsed_is_refused_saying_so_and_costs_nothing() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true, "first_lock_secs": 20}}));
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.slow_next, s.arrives_after_s) = (1, 30);
+    }
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("ticket_invoice_lapsed"), Some(0)), "{v}");
+    let said = v["reason"].as_str().unwrap();
+    assert!(said.contains("reached the seller after the invoice lapsed") && said.contains("Nothing was spent; call again"), "{v}");
+    assert_eq!(r.ln.by_status("FAILED")[0]["failure_reason"], "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS");
+    // nothing left the buyer's node, the seller's node took nothing, and the book and the ledger hold nothing
+    assert_eq!(r.money(), (0, 0, 0, 0));
+    assert_eq!(r.shop.held(), 0);
+    // the buyer calls again over a quick route, and is served
+    let again = r.pay("/page/10", CALL);
+    assert_eq!((again["status"].as_u64(), again["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{again}");
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    // one ticket paid, taken, and booked: the refused one is nowhere
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
 /// A seller the owner has not named, whose terms offer no prepaid tickets, is not held with at
 /// all: its first ticket would have to be a held one.
 #[test]
@@ -4716,11 +4892,12 @@ fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_
     assert_eq!((v["complete"].as_bool(), v["tickets_prepaid"].as_u64()), (Some(false), Some(1)), "{v}");
     assert!(v["ended"].as_str().unwrap().contains("ticket_task_budget"), "{v}");
     assert_eq!((r.ln.state().payments.len(), r.ledger_sum()), (1, SETTLED));
-    // the wallet's node goes away as the payment is sent: its fate is not known, so it is booked as spent and the session stops
+    // the wallet's node goes away as the payment is sent: its fate is not known, so it is booked as spent and the session
+    // stops, not as the seller's fault (`ticket_prepay_pending`)
     let r = Rig::shipped(json!({"ln": {"enabled": true, "split_height": 6000, "max_fee_base_sats": 2, "max_fee_ppm": 1000, "timeout_s": 1}}), 30, prepaid_only());
     r.ln.st.lock().unwrap().router_down = true;
     let v = r.pay("/page/1000", CALL);
-    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_seller_fault")), "{v}");
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_prepay_pending")), "{v}");
     assert_eq!(r.ledger_sum(), BOOKING, "the ticket is in the ledger before the node was asked to pay it: {v}");
     assert_eq!(v["charged_sats"].as_i64(), Some(BOOKING), "the call says the ticket booked as spent among what it charged: {v}");
     assert!(r.tap.secrets().is_empty());

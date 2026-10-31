@@ -544,8 +544,15 @@ wallet) and against a stand-in node in its tests.
   with nothing locked at that moment waits for a place. Since 2026-10-17, with the default caps,
   such locks are for prepaid tickets: an unauthenticated lock for held ones is refused
   `prepaid_first`, so the 15 held places go only to sessions that have paid one ticket each; the
-  invoices of a first lock lapse after 20 s (`caps.first_lock_secs`, and the session's place 15 s
-  after that); and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`).
+  invoices of a first lock lapse after 60 s (`caps.first_lock_secs`), and the gateway gives one up
+  unpaid 15 s after that, at 75 s, with its session's place, whatever `caps.first_use_secs` says
+  (before the fix, the first-use sweep cancelled it at 61 s as shipped, and at 16 s with a
+  `first_use_secs` of 15); and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`). Until
+  0.1.20 a first lock's invoices lapsed after 20 s: a buyer whose payment took longer than that to
+  reach the seller over a slow route was refused at the seller's node every time, with nothing
+  paid, and could never open a session (measured on the lab route at 8 to 22 s a hop under load).
+  The steady number of places a stranger holds is set by the caps by address, not by how soon each
+  lapses: from A addresses, at most 2A places, 75 s each, asked for again as each is given back.
   Before, 2,000 lock requests from one client took every held place in half a second (measured).
   An unpaid invoice still counts against the cap on held tickets from when it is issued: not
   counting it until paid would let the node hold more than the cap, and with paid-first it is not
@@ -900,10 +907,14 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   (`scripts/ticket_e2e_regtest.sh`, `slots`), where a held ticket that is already locked costs
   one request. An answer priced as it goes is slower by that much per
   ticket, and a seller that waits less than that for a refill would cut it.
-- A prepaid payment whose fate the wallet's node cannot tell within the Lightning rail's
-  `timeout_s` and 5 seconds stays booked as spent, and the session is stopped as faulty. The
-  booking goes when the node shows the payment failed, or, for a payment the node never had,
-  60 seconds after the timeout.
+- A prepaid payment (or a win) of a call is given the node for the Lightning rail's
+  `timeout_s`, but never more than 60 s, the life of the invoice it pays. One whose fate the
+  node cannot tell within that and 5 seconds stays booked as spent, and the session is stopped,
+  not as the seller's fault: once the node shows it paid (a preimage slow on its way back, say),
+  the next call to that seller takes up its credit. The booking goes when the node shows the
+  payment failed, or, for a payment the node never had, 60 seconds after the timeout. Until
+  0.1.20 the wait was the whole `timeout_s` (up to 600 s), and such a session was stopped as the
+  seller's fault, which left its credit with the seller.
 - The wallet keeps a prepaid ticket's preimage in memory until the seller has credited it. A
   signer killed in between has paid for a ticket whose balance it then gives up with the
   session, as it gives up any balance at a restart. The gateway credits the session all the

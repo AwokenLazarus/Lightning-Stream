@@ -3325,14 +3325,19 @@ impl Signer {
         // that the call says it among what it charged. A payment that failed books nothing
         spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
         if r["verdict"] == "pending" {
-            // booked, and neither paid nor failed by the node's word (or paid without the preimage that proves it): nothing
-            // more is paid in this session
-            let why = if str_or_empty(r.get("rule")).ends_with("_unproven") {
-                "the wallet's node shows a prepaid ticket paid without the preimage of its hash: it is booked as spent, and nothing can be shown to the seller"
-            } else {
-                "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"
-            };
-            return Err(self.ticket_fault(hs, why));
+            // paid without the preimage that proves it: booked as spent, nothing can be shown to the seller, and nothing more
+            // is paid in this session
+            if str_or_empty(r.get("rule")).ends_with("_unproven") {
+                return Err(self.ticket_fault(hs, "the wallet's node shows a prepaid ticket paid without the preimage of its hash: it is booked as spent, and nothing can be shown to the seller"));
+            }
+            // booked, and neither paid nor failed by the node's word: nothing more is paid in this session. Not the seller's
+            // fault (a preimage slow on its way back through a hop, say): a later session takes up the ticket's credit with
+            // this seller once the node shows it paid ([`Signer::ticket_resumable`]), where a fault would strand it. The
+            // caller's answer says what is booked for it (`spent`, counted above)
+            let why = "the payment of a prepaid ticket has no final answer from the wallet's node yet: it is booked as spent until the node shows it \
+                       failed, and a later call takes up its credit with this seller once the node shows it paid";
+            let stopped = self.ticket_http_stop(hs, why, Duration::ZERO);
+            return Err(with(refusal("ticket_prepay_pending", why), json!({"session": hs.sid, "stopped": stopped})));
         }
         if r["verdict"] != "allow" {
             return Err(r);

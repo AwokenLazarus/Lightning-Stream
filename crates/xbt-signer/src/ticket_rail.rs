@@ -1658,7 +1658,7 @@ impl Signer {
         };
         // the invoice is paid, never the offer: paying the offer would fetch another invoice
         let req = OfferPayRequest { invoice: lni, fee_limit_msat: send.fee_limit_msat, timeout_s: send.timeout_s };
-        let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, booked_sats, inside, &|| ln.pay_offer(&req));
+        let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, booked_sats, false, inside, &|| ln.pay_offer(&req));
         // the offer's invoice could not be reached (its blinded path enters through a node this wallet has no route to,
         // while a channel straight to the seller could pay the seller's own invoice): the seller's invoice is tried
         // instead. Only when the node says the payment failed for good, with nothing of it in flight, and the book holds
@@ -1766,7 +1766,8 @@ impl Signer {
             Ok(Err(d)) => return d,
             Err(e) => return refusal("ticket", e.msg),
         };
-        self.ticket_ordinary_sent(&*ln, &lp, &sid, &dest, &hash, win, booked_sats, inside, &|| ln.send_held(&send))
+        // a prepaid ticket by the seller's own invoice: one that lapsed on a slow route is said so
+        self.ticket_ordinary_sent(&*ln, &lp, &sid, &dest, &hash, win, booked_sats, win.is_none(), inside, &|| ln.send_held(&send))
     }
 
     /// What the book holds booked for the ticket `hash` (0 where it holds none, or cannot be read).
@@ -1780,8 +1781,10 @@ impl Signer {
     /// routes it. Every answer that leaves the booking in place says it in `charged_sats`: paid,
     /// `pending` (not final yet, paid without the preimage that proves it, or a word of the node's
     /// the book could not record), never a refusal that counts it as nothing.
+    /// `lapsable`: a prepaid ticket paid by the seller's own invoice, whose failure as unknown to the
+    /// seller's node after the invoice's expiry is told as a lapsed invoice (`ticket_invoice_lapsed`).
     #[allow(clippy::too_many_arguments)]
-    fn ticket_ordinary_sent(&self, ln: &dyn LnBackend, lp: &LnPolicy, sid: &str, dest: &str, hash: &str, win: Option<&xbt402::lottery::Win>, booked_sats: i64,
+    fn ticket_ordinary_sent(&self, ln: &dyn LnBackend, lp: &LnPolicy, sid: &str, dest: &str, hash: &str, win: Option<&xbt402::lottery::Win>, booked_sats: i64, lapsable: bool,
                             inside: PaceGuard<'_>, send: &dyn Fn() -> Result<Value>) -> Value {
         // the names of the two things this pays, for its refusals and its log lines
         let (failed, pending, unproven, paid_kind, what) = match win {
@@ -1790,7 +1793,9 @@ impl Signer {
         };
         let hash = hash.to_string();
         // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for,
-        // still inside the gate
+        // still inside the gate: from before the send, so that however long the node takes to answer it the wait is
+        // over within `ORDINARY_PAY_S` and 5 s, and the call's caller has its answer before it stops waiting for one
+        let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, i64::from(xbt402::ticket::ORDINARY_PAY_S)) as u64 + 5);
         let mut unsent: Option<crate::Error> = None;
         let mut pmt = {
             let mut pmt = match send() {
@@ -1800,7 +1805,6 @@ impl Signer {
                     ln.lookup(&hash).ok().flatten()
                 }
             };
-            let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
             while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
                 if let Ok(Some(p)) = ln.lookup(&hash) {
@@ -1852,6 +1856,13 @@ impl Signer {
                 // the preimage is what the buyer shows the seller for its credit: it moves no money any more
                 with(json!({"verdict": "allow", "ticket_secret": hex::encode(&preimage), "charged_sats": t.booked_sats}), about)
             }
+            // the seller's node took the payment for no invoice it would settle, and the invoice had lapsed by the time the
+            // node said so: it reached the seller after its expiry (a slow route). Said so, for the buyer to call again
+            TState::Failed if lapsable && t.note == "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS" && t.invoice_expires > 0.0
+                && self.engine.now() > t.invoice_expires => node_failure(
+                with(refusal("ticket_invoice_lapsed", format!("the seller's node refused the payment of {what}: it most likely reached the seller after \
+                                                               the invoice lapsed (a slow route). Nothing was spent; call again")), about),
+                pmt.as_ref()),
             TState::Failed => node_failure(with(refusal(failed, format!("the payment of {what} failed ({}): nothing was spent", t.note)), about), pmt.as_ref()),
             // not final within the wait: booked, and the node's word decides later
             _ => {
@@ -1982,7 +1993,8 @@ impl Signer {
         let kind = if win.is_some() { "lottery_win_pay" } else { "ticket_prepay" };
         self.sigaudit.record(kind, &[], "", &dest, json!({"payment_hash": hash, "session": sid, "booked_sats": sats, "win": win_draw}))?;
         self.ticket_audit(kind, json!({"session": sid, "dest": dest, "payment_hash": hash, "booked_sats": sats, "task": s.task, "win": win_draw}));
-        Ok(Ok(HeldSend { invoice: invoice.to_string(), fee_limit_msat: fee_limit_msat.max(1), timeout_s: lp.timeout_s.max(1), cltv_limit: tp.max_htlc_blocks,
+        Ok(Ok(HeldSend { invoice: invoice.to_string(), fee_limit_msat: fee_limit_msat.max(1), timeout_s: lp.timeout_s.clamp(1, i64::from(xbt402::ticket::ORDINARY_PAY_S)),
+                         cltv_limit: tp.max_htlc_blocks,
                          outgoing_chan_ids: ids.to_vec(), tag: seed.prepaid_tag(&nonce, &raw).to_vec() }))
     }
 

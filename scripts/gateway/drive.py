@@ -427,7 +427,10 @@ def write_config(path: str, chain: str, macaroon: str, info_macaroon: str, chann
         # time to first use than the default 60 s, so that an unused session is closed within the run; every
         # buyer here comes from one address. The checks of the ticket mechanics lock held tickets at once: the
         # shipped rule that a session's first ticket is a prepaid one has a check of its own (paidfirst)
-        "caps": {"sessions_per_address": 0, "first_use_secs": FIRST_USE_S, "held_after_paid": False, "unpaid_per_address": 0},
+        # a first lock's invoice lapses in 5 s here (60 s as shipped): an unpaid one is kept for its life and 15 s more
+        # whatever first_use_secs says, and the checks of the caps wait for unused sessions to close
+        "caps": {"sessions_per_address": 0, "first_use_secs": FIRST_USE_S, "held_after_paid": False, "unpaid_per_address": 0,
+                 "first_lock_secs": 5},
         "times": {"height_max_age_secs": 5, "refill_wait_ms": REFILL_WAIT_S * 1000},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
@@ -991,7 +994,7 @@ def paidfirst() -> None:
     with open(f"{RUN}/paidfirst.json") as f:
         cfg = json.load(f)
     # as shipped, but for the address cap on sessions (every buyer here has one address)
-    for k in ("held_after_paid", "unpaid_per_address"):
+    for k in ("held_after_paid", "unpaid_per_address", "first_lock_secs"):
         cfg["caps"].pop(k)
     with open(f"{RUN}/paidfirst.json", "w") as f:
         json.dump(cfg, f, indent=1)
@@ -1017,7 +1020,10 @@ def paidfirst() -> None:
     secret, _ = b.buy_prepaid()
     inv = b.tickets[hashlib.sha256(secret).hexdigest()].invoice
     expiry = int(lab.get(BUYER, "/v1/payreq/" + inv, MAC["buyer"]).get("expiry", 0))
-    check("paidfirst: a first lock buys a prepaid ticket, whose invoice is payable for 20 s", expiry == 20, {"expiry": expiry})
+    # the gateway's own default where the config names none (caps.first_lock_secs: as long as any ticket invoice, 60 s)
+    want = int(cfg["caps"].get("first_lock_secs", 60))
+    check(f"paidfirst: a first lock buys a prepaid ticket, whose invoice is payable for {want} s, as long as any ticket's",
+          expiry == want, {"expiry": expiry, "first_lock_secs": want})
     early, _ = b.ask(POOL)
     released = b.release(secret).json().get("released")
     s = b.lock(POOL)
