@@ -153,7 +153,7 @@ EOF
       -DCMAKE_FIND_ROOT_PATH="$P" -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
       -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
       -DARGP_INCLUDE_DIR="$P/include" -DARGP_LIBRARY="$P/lib/libargp.a" \
-      -DCMAKE_C_FLAGS="$CFLAGS -ffile-prefix-map=$B=/build" -DCMAKE_EXE_LINKER_FLAGS="-static" >>"$log" 2>&1 \
+      -DCMAKE_C_FLAGS="$CFLAGS -ffile-prefix-map=$B=/build" -DCMAKE_EXE_LINKER_FLAGS="-static -s" >>"$log" 2>&1 \
     && cmake --build "$B" -j"$J" >>"$log" 2>&1) \
     || { tail -40 "$log" >&2; echo "datum_gateway_build: the gateway failed for $T ($log)" >&2; exit 1; }
 
