@@ -20,6 +20,7 @@
 //!                     ( --hashmaker ADDR --hashmaker-key HEX --slice-work W --price-msat P [--grace-ms G]
 //!                     | --find URL,URL [--expect-node HEX] [--max-price-msat P] [--found-out F] )
 //!                     [--signer SOCK --task T --max-sats N [--pay-url URL]]   pay through the wallet
+//!                         (without --max-sats, --budget-sats sets the app's caps: rail::pay_caps)
 //! xbt-hashlink relay  --listen ADDR                 a stand-in Nostr relay (in memory, for a lab or a rehearsal)
 //! xbt-hashlink healthcheck [ADDR ...]              the image's HEALTHCHECK (it has no shell or curl): exit 0
 //!                                                  when a control page answers on one of ADDR (default
@@ -274,13 +275,19 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
             (need(f, "hashmaker")?.to_string(), PublicKey::from_slice(&hk).map_err(|_| "--hashmaker-key: not a public key")?, terms(f)?, None)
         }
     };
+    let budget_sats = f.get("budget-sats").map(|v| v.parse::<u64>()).transpose().map_err(|_| "--budget-sats")?;
+    // --max-sats: what a slice may move, uncapped in charge; else a budget's caps, as the app's rentals
+    let (max_sats, max_charge_sats) = match (f.get("max-sats"), budget_sats) {
+        (None, Some(b)) => xbt_hashlink::rail::pay_caps(b),
+        _ => (num(f, "max-sats", None)?, None),
+    };
     let payer = match f.get("signer") {
         Some(sock) => Some(SignerPayer {
             sock: PathBuf::from(sock),
             url: f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
             task: need(f, "task")?.into(),
-            max_sats: num(f, "max-sats", None)?,
-            max_charge_sats: None,
+            max_sats,
+            max_charge_sats,
             session: None,
             // the offer's price per slice: the most the shop is paid for one
             ceiling: Some(xbt_hashlink::rail::slice_ceiling(t.price_msat)),
@@ -290,7 +297,7 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
     };
     let cfg = hashtaker::Config {
         miners: num(f, "miners", Some(0))?,
-        budget_msat: f.get("budget-sats").map(|v| v.parse::<u64>().map(|s| s * 1000)).transpose().map_err(|_| "--budget-sats")?,
+        budget_msat: budget_sats.map(|s| s * 1000),
         cut: None,
         live: None,
         hashmaker,
