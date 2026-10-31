@@ -4134,12 +4134,8 @@ impl Signer {
                 let not_ready = with(refusal("ticket_not_ready", format!("the seller has not shown the ticket locked on its node within {} ms of the wait: no secret was released",
                                                                           pause_by.saturating_duration_since(due.waiting_since.unwrap_or(turn)).as_millis())),
                                      json!({"session": hs.sid, "hash": hash}));
-                // one stall to a pause: a second try where the ticket is due, with none of the pause left, is not another
-                return Err(if turn.elapsed() >= QUIET_BEFORE_ASKING.min(Duration::from_millis(tp.ready_wait_ms.clamp(0, 600_000) as u64 / 2)) && pause_by > turn {
-                    self.ticket_stalled(hs, not_ready)
-                } else {
-                    not_ready
-                });
+                // one to a pause: the pause began when this release's turn came, and a byte delivered since the last clears the count
+                return Err(self.ticket_stalled(hs, not_ready));
             }
             std::thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
             wait = (wait * 2).min(PAUSE_POLL_MOST);

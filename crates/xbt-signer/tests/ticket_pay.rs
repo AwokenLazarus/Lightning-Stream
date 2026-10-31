@@ -3815,9 +3815,39 @@ fn a_lookup_that_hangs_during_the_wait_is_given_up_on_at_the_end_of_the_pause() 
     let v = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
     assert!(t0.elapsed() < Duration::from_secs(12), "{:?} {v}", t0.elapsed());
     assert_eq!(v["complete"], false, "{v}");
-    assert!(v["ended"].as_str().unwrap().contains("ticket_not_ready"), "{v}");
+    // the ticket not shown, or the refill behind it still asking the node: either way a plain answer, and nothing more out
+    let ended = v["ended"].as_str().unwrap();
+    assert!(ended.contains("ticket_not_ready") || ended.contains("ticket_busy"), "{v}");
     assert_nothing_leaves_after(&r, &v);
     assert_eq!(r.tap.secrets().len(), 8, "{v}");
+}
+
+/// The first fill of a new session, on a node that takes 20 s to send each ticket: it goes on behind on its own thread, and
+/// the call answers at its deadline; the tickets it locked are the session's when they come.
+#[test]
+fn a_first_fill_on_a_slow_node_is_given_up_on_at_the_calls_deadline() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 4}}));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_secs(20);
+    let t0 = Instant::now();
+    let v = r.pay("/page/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(8), "{:?} {v}", t0.elapsed());
+    assert_eq!(v["verdict"], "deny", "{v}");
+    assert_eq!(r.tap.secrets().len(), 0, "{v}");
+    r.ln.st.lock().unwrap().send_takes = Duration::ZERO;
+    wait_for_long("the sends to end", Duration::from_secs(45), || !r.ln.state().payments.is_empty() && r.status()["tickets"]["sending"].is_null());
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+fn wait_for_long(what: &str, most: Duration, mut f: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !f() {
+        assert!(t.elapsed() < most, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A seller slow with its 402: the ask gets what is left of the call's deadline.
