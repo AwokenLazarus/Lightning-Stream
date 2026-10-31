@@ -3079,3 +3079,81 @@ fn the_ai_page_makes_a_key_shown_once_and_keeps_its_hash_and_writes_pins_for_the
     let mut br2 = logged_in(&bx2);
     assert!(br2.get("/ai").body.contains("does not serve an AI address yet"));
 }
+
+/// A Files item listed at `1.0 KB`, bought through the relay: the connector is told the most this
+/// file can cost (its listed size at the listed price, with 2% slack); a seller that says it sends
+/// more than the listing shows is refused before any of the body is read; one that sends more
+/// without saying so is cut at the listed size.
+#[test]
+fn a_file_is_paid_no_further_than_its_listed_size() {
+    use std::io::{Read, Write};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    const OK: &str = "https://files.example/f/ok.bin";
+    const BIG: &str = "https://files.example/f/big.bin";
+    const QUIET: &str = "https://files.example/f/quiet.bin";
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connector = format!("http://{}", l.local_addr().unwrap());
+    let max_sats: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = max_sats.clone();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut head = [0u8; 8192];
+            let n = s.read(&mut head).unwrap_or(0);
+            let asked = String::from_utf8_lossy(&head[..n]).to_string();
+            let path = asked.split(' ').nth(1).unwrap_or("").to_string();
+            let cap = asked.lines().find_map(|l| l.strip_prefix("X-Max-Sats: ").or_else(|| l.strip_prefix("x-max-sats: "))).map(str::to_string);
+            log.lock().unwrap().push((path.clone(), cap));
+            let body = vec![7u8; 5_000];
+            if path == format!("/s/{OK}") {
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(&body[..1000]);
+            } else if path == format!("/s/{BIG}") {
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(&body);
+            } else if path == format!("/s/{QUIET}") {
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(&body);
+            } else {
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[
+        {{"name": "Files", "kind": "files", "seller": "https://files.example", "price_text": "1 sat a KB",
+         "prices": {{"request_msat": 1000, "byte_msat": 1, "per_bytes": 1}},
+         "items": [{{"title": "ok", "year": 2020, "url": "{OK}", "credit": "1.0 KB"}},
+                   {{"title": "big", "year": 2020, "url": "{BIG}", "credit": "1.0 KB"}},
+                   {{"title": "quiet", "year": 2020, "url": "{QUIET}", "credit": "1.0 KB"}}]}}
+    ]"#)).unwrap();
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+    });
+    let mut br = logged_in(&b);
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let id = xbt_wallet_ui::services::load(&path).unwrap()[0].id();
+    let get = |item: &str| {
+        let resp = match ureq::AgentBuilder::new().redirects(0).build().get(&format!("{}/s/~{st}.{id}/{item}", b.base)).set("Cookie", &br.cookie).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("{item}: {e}"),
+        };
+        let status = resp.status();
+        let mut body = vec![];
+        resp.into_reader().read_to_end(&mut body).unwrap();
+        (status, body)
+    };
+    // 1.0 KB stands for at most 1,050 bytes: 1,000 msat a request + 1,050 msat, +2%, is 3 sats, +1
+    let (status, body) = get(OK);
+    assert_eq!((status, body.len()), (200, 1000));
+    assert_eq!(max_sats.lock().unwrap().last().unwrap().1.as_deref(), Some("4"), "the call's cap is the listed size's price");
+    let (status, body) = get(BIG);
+    assert_eq!(status, 502, "a seller saying it sends 5,000 bytes of a 1.0 KB file is refused");
+    assert!(String::from_utf8_lossy(&body).contains("more than the size its listing shows"));
+    let (status, body) = get(QUIET);
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), 1050, "one that sends more without saying so is cut at the listed size");
+}
