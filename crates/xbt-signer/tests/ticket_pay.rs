@@ -9269,3 +9269,44 @@ fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pay
     assert_paid_after_lapses(&r, &v, size, 1);
     assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
 }
+
+/// A win whose first invoice came to nothing goes before the wins no seller waits for when its next
+/// invoice comes: behind a hundred others, that invoice runs out too.
+///
+/// FAILS before: the next invoice joined the end of the queue, and lapsed in it again (an 8 GB lab, 100 sellers).
+#[test]
+fn a_win_on_its_next_invoice_goes_before_the_wins_waiting() {
+    let _g = env_lock();
+    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
+    let r = Rig::with_more(owner, true, true, 30, patient.clone(), &vec![patient; 20]);
+    let mut st = r.ln.st.lock().unwrap();
+    st.send_takes = Duration::from_millis(1_000);
+    st.fail_one = true;
+    drop(st);
+    let size = 64 * PIECE;
+    let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    let all: Vec<Value> = std::thread::scope(|sc| {
+        let calls: Vec<_> = r.more.iter().chain(std::iter::once(&r.shop)).map(|shop| sc.spawn(move || buy(shop))).collect();
+        // the payment fails, is sent once more and fails again: the seller's node then shows its invoice lapsed
+        wait_for("the failing win's two sends", || r.ln.by_status("FAILED").len() == 2);
+        let failing: Hash = hex::decode(r.ln.st.lock().unwrap().failing.clone().unwrap()).unwrap().try_into().unwrap();
+        for shop in r.more.iter().chain(std::iter::once(&r.shop)) {
+            shop.standin.expire_unpaid(&failing);
+        }
+        calls.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let failing = r.ln.st.lock().unwrap().failing.clone().unwrap();
+    // the win that failed, by the book, and the invoice that paid it
+    let rows: Vec<Vec<Value>> = all.iter().filter_map(|v| v["session"].as_str()).map(|sid| win_tickets(&r, sid)).collect();
+    let (draw, row) = rows.iter().find_map(|rows| rows.iter().find(|t| t["hash"] == failing.as_str()).map(|t| (t["win"].as_u64().unwrap(), rows))).expect("the failed win's row");
+    let next = row.iter().find(|t| t["win"].as_u64() == Some(draw) && t["state"] == "settled").expect("the win was paid on its next invoice");
+    let payments: Vec<String> = r.ln.state().payments.iter().map(|p| p["payment_hash"].as_str().unwrap().to_string()).collect();
+    let at = |h: &str| payments.iter().rposition(|p| p == h).unwrap();
+    let (failed_at, paid_at) = (at(&failing), at(next["hash"].as_str().unwrap()));
+    assert!(payments.len() - paid_at > 40, "many waited behind it: paid at {paid_at} of {}", payments.len());
+    assert!(paid_at - failed_at < 40, "it did not wait behind them: failed at {failed_at}, paid at {paid_at}, of {}", payments.len());
+}
+

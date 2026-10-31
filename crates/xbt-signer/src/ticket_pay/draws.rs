@@ -127,6 +127,9 @@ struct State {
     paid_sats: i64,
     /// Invoices of this seller's that the wallet's checks refused (another payee, another amount, no bit 512).
     bad_invoices: u32,
+    /// Wins whose invoice ran out or whose payment failed: their next invoice goes before the wins no seller
+    /// waits for. Behind them it can run out too: on an 8 GB lab, a win lapsed twice waiting behind wins of 100 sellers.
+    again: HashSet<u64>,
     /// When the latest invoice of a win that is owed again ends: the seller's next one comes after that.
     next_invoice_after: f64,
     /// Why this session draws no more.
@@ -617,7 +620,11 @@ impl Signer {
             let _ = self.draw_fault(ds, "the seller is blocked for over-charging: no win is paid to it");
             return;
         }
-        lock(&ds.state).paying.insert(win.draw());
+        let first = {
+            let mut s = lock(&ds.state);
+            s.paying.insert(win.draw());
+            first || s.again.contains(&win.draw())
+        };
         // the seller's offer first, where its terms name one, with the note that names this session and draw; its
         // invoice where the offer cannot be fetched
         let (key, seller_session) = {
@@ -704,6 +711,7 @@ impl Signer {
                         s.owed.push(w);
                     }
                     if retry {
+                        s.again.insert(win.draw());
                         let ends = crate::bolt11::decode(invoice).map_or(0.0, |i| i.expires_at() as f64);
                         s.next_invoice_after = s.next_invoice_after.max(ends);
                     }
