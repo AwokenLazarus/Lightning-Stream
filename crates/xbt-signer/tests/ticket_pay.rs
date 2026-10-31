@@ -10420,7 +10420,7 @@ fn a_kill_at_any_step_then_a_call_at_once(shop: fn() -> Value, jump: u64, tag: &
         }
         seen += 1;
         r.clock.fetch_add(jump, Ordering::SeqCst);
-        let next = r.pay("/page/10", CALL);
+        r.pay("/page/10", CALL);
         if r.ln.paid_msat() != TICKET {
             double.push(step);
         }
@@ -10462,7 +10462,7 @@ fn a_ticket_settled_after_a_kill_is_known_at_a_prepaid_only_open_before_any_tick
     let _hash = killed_with_a_prepaid_ticket_that_then_settles(&mut r, url);
     r.clock.fetch_add(100, Ordering::SeqCst);
     let v = r.pay("/page/1", CALL);
-    assert_eq!(r.ln.paid_msat(), TICKET, "a second ticket");
+    assert_eq!(r.ln.paid_msat(), TICKET, "a second ticket: {v}");
 }
 
 /// A stranger on its own key naming the real node, at a takeover of a session with no key on record.
@@ -10497,9 +10497,11 @@ fn a_stranger_with_its_own_key_cannot_take_a_row_with_no_key() {
         Some(Ok(answer(200, vec![("PAYMENT-RESPONSE".into(), header)], body.to_string().into_bytes())))
     }));
     let other = r.more[0].url("/page/1");
-    let v = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
+    r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
     let told = r.tap.secrets().iter().any(|s| sha(s) == hash);
     let taken = r.audit("ticket_resumed").len();
+    // (that shop's own ticket, if it sold one, is its own)
+    let paid = r.ln.paid_msat();
     let open: Vec<String> = r.status()["sessions"].as_array().unwrap().iter().filter(|s| s["state"] == "open").map(|s| s["session"].as_str().unwrap().to_string()).collect();
     for s in &open {
         r.call("ticket_stop", json!({"session": s}));
@@ -10508,7 +10510,9 @@ fn a_stranger_with_its_own_key_cannot_take_a_row_with_no_key() {
     let w = r.pay("/page/1", CALL);
     assert!(!told, "the stranger was shown the preimage");
     assert_eq!(taken, 0, "the stranger took the seller session over");
-    assert_eq!(r.ln.paid_msat(), TICKET, "back at the true shop a second ticket was bought: the first's credit is passed over");
+    assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "{w}");
+    assert_eq!(r.ln.paid_msat(), paid, "back at the true shop a second ticket was bought: the first's credit is passed over: {w}");
+    assert_eq!(r.audit("ticket_resumed").len(), 1, "taken over at the true shop");
 }
 
 /// Refusals at a takeover use up the owner's cap on new sessions a minute.
@@ -10612,9 +10616,16 @@ fn a_long_answer_and_other_calls(same_origin: bool, path: String, tag: &str) {
         r.tap.clear();
         let named: Vec<String> = r.tap.seen("/x402/ticket/cancel").iter().flat_map(|s| serde_json::from_str::<Value>(&s.body).unwrap()["hashes"].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect::<Vec<_>>()).collect();
         let hit = named.iter().filter(|h| mine.contains(h)).count();
+        if same_origin {
+            assert_eq!(b["status"].as_u64(), Some(200), "{tag}: side by side with it: {b}");
+        } else {
+            assert_eq!((b["rule"].as_str(), b["retry_after_s"].as_u64().is_some()), (Some("ticket_session_exists"), true), "{tag}: {b}");
+        }
         let open_answer = r.status()["paying"].as_array().map_or(0, |p| p.iter().filter(|x| x["answer_open"] == true).count());
-        let again = r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"}));
+        assert_eq!(open_answer, 1, "{tag}: the long answer is still open");
+        r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"}));
         let out = film.join().unwrap();
+        assert_eq!((out["status"].as_u64(), out["complete"].as_bool(), out.get("seller_fault")), (Some(200), Some(true), None), "{tag}: {out}");
         let later = r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film"}));
         assert_eq!(later["status"].as_u64(), Some(200), "{tag}: {later}");
         assert_eq!(hit, 0, "{tag}: a session whose answer is open had its tickets named");
@@ -10690,14 +10701,13 @@ fn the_credit_left_behind_is_reached_in_ordinary_use() {
     assert_eq!(fresh["status"].as_u64(), Some(200), "{fresh}");
     r.tap.clear();
     r.call("ticket_stop", json!({"session": new_sid_of(&fresh)}));
-    for i in 0..4 {
+    for _ in 0..4 {
         let w = r.pay("/page/1", CALL);
+        assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "{w}");
         r.call("ticket_stop", json!({"session": new_sid_of(&w)}));
     }
     let used: Vec<String> = r.audit("ticket_resumed").iter().map(|e| e["seller_session"].as_str().unwrap().to_string()).collect();
-    // 20 hours on: what the first left
-    r.clock.fetch_add(20 * 3600 + 60, Ordering::SeqCst);
-    let late = r.pay("/page/1", CALL);
     assert!(!old_id.is_empty());
-    assert!(used.contains(&old_id), "the credit of the first seller session was not reached in four later sessions");
+    assert_eq!(used.first(), Some(&old_id), "the credit of the first seller session is the first to be used: {used:?}");
+    assert_eq!(r.ln.paid_msat(), 2 * TICKET, "no ticket beyond the two");
 }
