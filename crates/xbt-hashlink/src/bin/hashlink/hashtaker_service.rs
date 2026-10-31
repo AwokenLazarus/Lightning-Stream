@@ -224,8 +224,8 @@ fn offers(r: &Mutex<R>, fresh: bool) -> Vec<(Hashrate, String)> {
     o
 }
 
-/// The delivery records and hashmakers' summaries on the relays (read at most once a minute).
-fn history_events(r: &Mutex<R>) -> Vec<xbt_nostr::event::Event> {
+/// The delivery records and summaries on the relays for the hashmakers on show (read at most once a minute).
+fn history_events(r: &Mutex<R>, offers: &[(Hashrate, String)]) -> Vec<xbt_nostr::event::Event> {
     {
         let g = lock(r);
         if let Some((t, e)) = &g.history {
@@ -234,10 +234,24 @@ fn history_events(r: &Mutex<R>) -> Vec<xbt_nostr::event::Event> {
             }
         }
     }
-    let relays = lock(r).relays.clone();
-    let (events, _) = xbt_nostr::oneshot::query(&relays, &trust::filter(500), Duration::from_secs(10));
+    let (relays, authors) = {
+        let g = lock(r);
+        (g.relays.clone(), g.authors.clone())
+    };
+    let shown: Vec<(PublicKey, String)> = offers.iter().map(|(h, _)| (h.link_key, authors.get(&hex::encode(h.link_key.serialize())).cloned().unwrap_or_default())).collect();
+    let events = records_for(&relays, &shown);
     lock(r).history = Some((Instant::now(), events.clone()));
     events
+}
+
+/// Each of [`trust::filters`] asked on its own, at once: a relay's newest answer to one hashmaker's filter can't be
+/// pushed out by records about another.
+fn records_for(relays: &[String], hashmakers: &[(PublicKey, String)]) -> Vec<xbt_nostr::event::Event> {
+    let mut seen = std::collections::BTreeSet::new();
+    std::thread::scope(|s| {
+        let asks: Vec<_> = trust::filters(hashmakers).into_iter().map(|f| s.spawn(move || xbt_nostr::oneshot::query(relays, &f, Duration::from_secs(10)).0)).collect();
+        asks.into_iter().flat_map(|a| a.join().unwrap_or_default()).filter(|e| seen.insert(e.id.clone())).collect()
+    })
 }
 
 /// A listing's advertised speed for each machine: its free machines' speed shared out, or its
@@ -316,7 +330,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
         }
         ("GET", "/offers") => {
             let o = offers(r, path.contains("fresh=1"));
-            let events = history_events(r);
+            let events = history_events(r, &o);
             let authors = lock(r).authors.clone();
             let list: Vec<Value> = o
                 .iter()
@@ -817,5 +831,55 @@ mod tests {
         for n in &names {
             handle(&r, &[], "POST", "/cut", json!({"rental": n}).to_string().as_bytes());
         }
+    }
+
+    fn record(taker: &SecretKey, maker: &PublicKey, rental: &str, ended: u64) -> xbt_nostr::event::Event {
+        let t = PublicKey::from_secret_key(secp256k1::SECP256K1, taker);
+        trust::Attestation {
+            hashmaker: *maker,
+            hashtaker: t,
+            commit: trust::commit(rental, &t, maker),
+            paid_slices: 2,
+            paid_msat: 10_000,
+            slice_work: 1 << 47,
+            work: 2 << 47,
+            duration_s: 600,
+            accepted: 50,
+            rejected: 0,
+            stale: 0,
+            advertised_hs: 4_000_000_000_000,
+            delivered_hs: 4_000_000_000_000,
+            latency_ms_p50: None,
+            receipts_hash: "h".into(),
+            trial: false,
+            ended_at: ended,
+        }
+        .event(taker, ended)
+        .unwrap()
+    }
+
+    /// Records about other hashmakers, as many as anyone cares to publish and all newer, don't hide a
+    /// hashmaker's own from its offer.
+    #[test]
+    fn a_flood_of_records_about_others_hides_no_hashmakers_own() {
+        let relay = xbt_nostr::standin::StandinRelay::start().unwrap();
+        let relays = vec![relay.url.clone()];
+        let (a, b) = (noise::fresh_key(), noise::fresh_key());
+        let (a, b) = (PublicKey::from_secret_key(secp256k1::SECP256K1, &a), PublicKey::from_secret_key(secp256k1::SECP256K1, &b));
+        let real = record(&noise::fresh_key(), &a, "real", 3_600);
+        xbt_nostr::oneshot::publish(&relays, &real, Duration::from_secs(5));
+        let junk_key = noise::fresh_key();
+        for i in 0..520u64 {
+            let ev = record(&junk_key, &b, &format!("junk{i}"), 7_200 + i);
+            xbt_nostr::oneshot::publish(&relays, &ev, Duration::from_secs(5));
+        }
+        assert_eq!(relay.events(trust::KIND).len(), 521, "the relay keeps them all");
+        let shown = [(a, String::new()), (b, String::new())];
+        let events = records_for(&relays, &shown);
+        let h = trust::aggregate(&a, "", 4_000_000_000_000, &events);
+        assert_eq!((h["records"].as_u64(), h["keys"].as_u64()), (Some(1), Some(1)), "the hashmaker's own record is there: {h}");
+        // and the flood itself is one key's: at most a few counted, one line shown
+        let h = trust::aggregate(&b, "", 4_000_000_000_000, &events);
+        assert_eq!((h["keys"].as_u64(), h["counted"].as_u64(), h["recent"].as_array().map(Vec::len)), (Some(1), Some(trust::PER_KEY as u64), Some(1)), "{h}");
     }
 }

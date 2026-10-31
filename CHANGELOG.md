@@ -202,6 +202,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   these two reasons.
 - Rent sent twice (a double click, or the browser sending the form again) starts one rental and pays one start
   fee. Before, each send started a rental of its own, with its own start fee.
+- An offer's delivery records say what they are: how many, from how many keys, and that anyone can publish
+  them. No score is made of them and none is called confirmed. Before, the offer led with "TH-hours confirmed by
+  both sides", which one person with two keys could fill at no cost.
+- Records about other hashmakers no longer hide a hashmaker's own. Before, 500 records about anyone, free to
+  publish, pushed every other record out of view.
 
 **The app**
 - A visit to a shop reached by its key is headed by the shop's name, and pages show such a shop by
