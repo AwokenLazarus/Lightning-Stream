@@ -81,7 +81,7 @@ ORIGIN = f"http://127.0.0.1:{GW_PORT}"
 LIAR = f"http://127.0.0.1:{PROXY_PORT}"
 SPLIT = 125  # the regtest stand-in for the height the chains split at
 TICKET_MSAT = 1_000_000
-ON_THE_WAY_MSAT = 10_000_000  # measured below; see `kill`
+ON_THE_WAY_MSAT = 1_000_000  # what a seller may have charged for bytes still in the sockets as a wallet died (`kill`): 364,222 msat, 1.9 MB, measured; one ticket allowed
 BIG = 100_000_000
 BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
 #: The long_download checks' file: a download that runs well past the wallet's limit for an answer read whole,
