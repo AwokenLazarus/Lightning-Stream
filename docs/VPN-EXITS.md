@@ -204,8 +204,8 @@ moves the device to another exit), the tunnels close first and each one's last r
 up to 15 s, before the stop says what the session spent and what it leaves with the exit's shop
 (`docs/TICKETS.md`, "Stop"). What a tunnel cost is its bytes both ways at the announced price.
 The seller's VPN page shows what its shop has earned: the gateway's `chargedMsat` in its health,
-counted across every session there has been, those the gateway no longer keeps included
-(`charged.json` beside its journal).
+counted across every session there has been, those the gateway no longer keeps included (a
+compacted journal carries their sum, so it is written with the rest of the book, at once).
 
 If the exit's signed counts fall far below the wallet's own count of an open tunnel (under half,
 past 32 MiB, on two counts in a row), the wallet says so once in its log and audit
