@@ -5809,8 +5809,9 @@ fn a_prepaid_ticket_paid_without_its_preimage_is_said_among_what_the_call_charge
     assert_eq!(v["verdict"].as_str(), Some("deny"), "{v}");
     assert!(v.to_string().contains("without the preimage"), "{v}");
     assert!(r.tap.secrets().is_empty(), "nothing was shown to the seller: {v}");
-    assert_eq!(r.ledger_sum(), SETTLED, "the ticket stays booked as spent: {v}");
-    assert_eq!(v["charged_sats"].as_i64(), Some(SETTLED), "the call says what its ticket booked: {v}");
+    // booked as it was before the payment (the node's fee is not taken from a payment it cannot prove)
+    assert_eq!(r.ledger_sum(), BOOKING, "the ticket stays booked as spent: {v}");
+    assert_eq!(v["charged_sats"].as_i64(), Some(BOOKING), "the call says what its ticket booked: {v}");
 }
 
 /// A stop that comes while a prepaid ticket is on its way to its payment (asked of the seller, past
