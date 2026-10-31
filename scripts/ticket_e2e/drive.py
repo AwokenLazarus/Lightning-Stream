@@ -43,6 +43,7 @@ Environment: LAB, RUN, OUT, BIN, TICKET_E2E_PORT_BASE (see the shell script).
 
 from __future__ import annotations
 
+import atexit
 import base64
 import glob
 import hashlib
@@ -51,6 +52,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import socket
 import statistics
@@ -2244,12 +2246,102 @@ def long_download(relay: bool) -> None:
 # --- a VPN exit, paid as it is used --------------------------------------------------------------------------
 
 VPN_SAT_GB = 500_000  # 500,000 sat a GiB (about 488 sat a MiB): a 10 MiB download is about 4,900 sat, five or six tickets
-VPN_FILES = ["http://speed.cloudflare.com/__down?bytes=10485760", "http://ipv4.download.thinkbroadband.com/10MB.zip"]
 VPN_BYTES = 10_485_760
+# The far side of the exit, served by this lab: an exit refuses non-public addresses and its own networks, so
+# a rule in the lab sends this public-looking address to the server below, and no packet for it leaves the machine.
+VPN_FAR = "11.66.0.2"
+VPN_FAR_RULE = "ticket-e2e-far-side"
+# a steady 40 Mbit: what a public download gave. The wallet buys ahead by rate times how long a payment takes
+VPN_FAR_BYTES_PER_S = 5_000_000
+VPN_FILE = f"http://{VPN_FAR}/file?bytes={VPN_BYTES}"
 # a region check's page: it answers, over plain HTTP, with the address the request came from
-VPN_TRACE = "http://checkip.amazonaws.com/"
+VPN_TRACE = f"http://{VPN_FAR}/trace"
 REGION_CHECK_TICKET_SATS = 2_000  # xbt_vpn::holds::REGION_CHECK_TICKET_SATS
 REGION_CHECK_MAX_SATS = 20  # xbt_vpn::buyer::REGION_CHECK_MAX_SATS
+
+
+class FarSide:
+    """The files the VPN checks fetch through the exit, on this machine: their pass or fail hangs on no third
+    party answering a VPN address. `served` is what it has sent, for comparing with what each side counted."""
+
+    def __init__(self) -> None:
+        self.served = 0
+        self.nonce = os.urandom(8).hex()
+        self.block = os.urandom(1 << 20)
+        self.server: ThreadingHTTPServer | None = None
+
+    @staticmethod
+    def iptables(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["sudo", "-n", "iptables", "-w", "-t", "nat", *args], capture_output=True, text=True, timeout=30)
+
+    def clear_rules(self) -> None:
+        listed = self.iptables("-S", "OUTPUT")
+        for line in listed.stdout.splitlines():
+            if VPN_FAR_RULE in line:
+                self.iptables(*shlex.split(line.replace("-A", "-D", 1)))
+
+    def start(self, port: int) -> None:
+        far = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:
+                if self.path == "/trace":
+                    body = f"{self.client_address[0]}\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("X-Far-Side", far.nonce)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                want = int(self.path.rsplit("bytes=", 1)[-1])
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(want))
+                self.end_headers()
+                sent, t0 = 0, time.monotonic()
+                try:
+                    while sent < want:
+                        n = min(64 << 10, want - sent)
+                        at = sent % ((1 << 20) - n)
+                        self.wfile.write(far.block[at:at + n])
+                        sent += n
+                        far.served += n
+                        time.sleep(max(0.0, t0 + sent / VPN_FAR_BYTES_PER_S - time.monotonic()))
+                except OSError:
+                    pass
+
+        # this machine's address on the way out, which the exit's connection comes from once the rule has rewritten it
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("1.1.1.1", 80))
+        here = probe.getsockname()[0]
+        probe.close()
+        self.server = ThreadingHTTPServer((here, port), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.clear_rules()
+        added = self.iptables("-I", "OUTPUT", "1", "-d", f"{VPN_FAR}/32", "-p", "tcp", "--dport", "80", "-m", "comment", "--comment", VPN_FAR_RULE,
+                              "-j", "DNAT", "--to-destination", f"{here}:{port}")
+        if added.returncode != 0:
+            raise LabError(f"the VPN checks' far side needs a NAT rule, and sudo iptables refused it: {added.stderr.strip()[:300]}")
+        try:
+            with urllib.request.urlopen(VPN_TRACE, timeout=10) as f:
+                ours = f.headers.get("X-Far-Side") == self.nonce
+        except OSError as e:
+            raise LabError(f"the VPN checks' far side does not answer at {VPN_FAR}: {e}") from None
+        if not ours:
+            raise LabError(f"something other than this lab answered at {VPN_FAR}: the NAT rule is not in effect")
+
+    def close(self) -> None:
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+        self.clear_rules()
+
+
+FAR_SIDE = FarSide()
 
 
 def trace_ip(page: str) -> str:
@@ -2305,8 +2397,8 @@ def vpn() -> None:
     """A VPN exit sold as a Stream service (docs/VPN-EXITS.md): the exit's VPN service (`xbt-vpn serve`,
     offering a private exit at a price) behind the seller's gateway, which sells `/vpn/` as WebSockets
     priced per byte both ways; and a buyer's paid tunnel opened by the wallet (`xbt-vpn fetch --tunnel`,
-    as the buyer's VPN service opens it), carrying a 10 MiB download from the internet. The exit refuses
-    this machine's own networks, so the file is a public one. The download comes whole through the
+    as the buyer's VPN service opens it), carrying a 10 MiB download from the far side of the exit
+    ([`FarSide`]), by the exit's own rules. The download comes whole through the
     tunnel; the wallet pays as the bytes pass and checks the exit's interim receipts as it runs, with no
     fault; every ticket the seller took is booked once and the money agrees."""
     stop_sessions()
@@ -2317,6 +2409,8 @@ def vpn() -> None:
     origin = f"http://127.0.0.1:{gw_port}"
     vdir = f"{RUN}/vpn"
     os.makedirs(vdir, exist_ok=True)
+    FAR_SIDE.start(BASE + 20)
+    atexit.register(FAR_SIDE.close)
     with open(f"{vdir}/exit.json", "w") as f:
         json.dump({"offer": True, "kind": "private", "sat_per_gb": VPN_SAT_GB, "country": "XX", "tunnel_url": f"{origin}/vpn/tunnel"}, f)
     # the secret the gateway and the exit's tunnel endpoint share, as the wallet app writes it with the
@@ -2344,16 +2438,13 @@ def vpn() -> None:
     faults0 = len([e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_interim_fault"])
     # first, with no credit at this shop yet: a region check of the exit
     vpn_region_check(origin)
-    out, url = None, ""
+    url = VPN_FILE
     t0 = time.monotonic()
-    for url in VPN_FILES:
-        r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", url, "--once", "--secs", "180"],
-                           env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="40000"),
-                           capture_output=True, text=True, timeout=300)
-        line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
-        out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
-        if VPN_BYTES <= int(out.get("bytes") or 0) <= VPN_BYTES + 4096:
-            break
+    r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", url, "--once", "--secs", "180"],
+                       env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="40000"),
+                       capture_output=True, text=True, timeout=300)
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+    out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
     took = time.monotonic() - t0
     # the tunnel ended as the fetch did: its last receipt closed it
     time.sleep(3)
@@ -2391,9 +2482,9 @@ def vpn() -> None:
     for name in ("gateway-vpn", "vpn"):
         PROCS[name].terminate()
         PROCS[name].wait(10)
+    FAR_SIDE.close()
 
 
-VPN_BIG_FILES = ["http://speed.cloudflare.com/__down?bytes=104857600", "http://ipv4.download.thinkbroadband.com/100MB.zip"]
 #: The tunnel is stopped once this much has come down through it (the exit's own count).
 VPN_STOP_AT_BYTES = 60 << 20
 VPN_CHEAP_SAT_GB = 1_000
@@ -2401,9 +2492,9 @@ VPN_CHEAP_SAT_GB = 1_000
 
 def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     """A VPN tunnel's money over a realistic amount, stopped as a VPN that is turned off stops it: a 100 MiB
-    public download, started again as it ends, through a tunnel paid at `sat_gb` sat a GiB, and the agent
-    stops the session while the tunnel is still open, once about 60 MiB have come down (by the wallet's
-    released tickets, or the exit's count where 60 MiB cost under two tickets). What the seller charged
+    download from the far side of the exit ([`FarSide`]), through a tunnel paid at `sat_gb` sat a GiB, and the
+    agent stops the session while the tunnel is still open, once about 60 MiB have come down (by what the
+    seller's receipts say was spent, or the exit's count where 60 MiB cost under two tickets). What the seller charged
     (its gateway's book) and what the wallet says the
     session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
     the stop says is left with the seller; both nodes and the book agree. Usage is the bytes the buyer took
@@ -2429,53 +2520,47 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     down0 = exit_down()
     m0 = money()
     out: dict[str, Any] = {}
-    url = VPN_BIG_FILES[0]
-
-    stopped = threading.Event()
+    url = f"http://{VPN_FAR}/file?bytes={100 << 20}"
+    served0 = FAR_SIDE.served
 
     def fetch() -> None:
-        # not --once: the download starts again as each ends, so the tunnel stays busy and open until the
-        # stop ends it (a fast link can bring the whole file before the stop is due)
-        for u in VPN_BIG_FILES:
-            r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", u, "--secs", "280"],
-                               env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="39000"),
-                               capture_output=True, text=True, timeout=400)
-            line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
-            out.clear()
-            out.update(json.loads(line) if line else {"stderr": r.stderr[-800:]})
-            out["url"] = u
-            if stopped.is_set() or int(out.get("bytes") or 0) >= 50 << 20:
-                return
+        # not --once: the download starts again as it ends, so the tunnel stays busy and open until the stop ends it
+        r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", url, "--secs", "280"],
+                           env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="39000"),
+                           capture_output=True, text=True, timeout=400)
+        line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+        out.update(json.loads(line) if line else {"stderr": r.stderr[-800:]})
 
     t = threading.Thread(target=fetch)
     t.start()
-    # when the tunnel's 60 MiB cost two tickets or more, the wallet's own released count says when they have
-    # passed, at once; below that (the cheap run) no ticket moves, and the exit's count does (every 5 s)
+    # when the tunnel's 60 MiB cost two tickets or more, what the seller's receipts say was spent tells when they
+    # have passed (released tickets run ahead of it by rate times a payment's time); below that (the cheap run) no
+    # ticket moves, and the exit's count does (every 5 s)
     stop_msat = price_of(VPN_STOP_AT_BYTES, sat_gb * 1000, 1 << 30)
 
-    # what the wait last saw while the tunnel ran: by its end the fetch has closed, and the wallet's view with it
-    seen: dict[str, Any] = {}
-
     def drawn() -> bool:
-        paying = status().get("paying", [])
-        seen.update(exit_down_since=exit_down() - down0, paying=paying)
-        open_ = [p for p in paying if p.get("origin") == origin and p.get("answer_open")]
+        open_ = [p for p in status().get("paying", []) if p.get("origin") == origin and p.get("answer_open")]
         if not open_:
             return False
         if stop_msat >= 2 * TICKET_MSAT:
-            return int(open_[0].get("released_msat") or 0) >= stop_msat // TICKET_MSAT * TICKET_MSAT
+            return int(open_[0].get("spent_msat") or 0) >= stop_msat // TICKET_MSAT * TICKET_MSAT
         return exit_down() - down0 >= VPN_STOP_AT_BYTES
 
     try:
         lab.wait("the tunnel to carry about 60 MiB", 300, drawn, every=0.1)
     except LabError as e:
-        stopped.set()
+        # every count at this one moment; then the tunnel ended, and where the money went
+        paying = status().get("paying", [])
+        at_timeout = {"paying": paying, "exit_down_since": exit_down() - down0, "served_since": FAR_SIDE.served - served0,
+                      "seller_charged_since": int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1)) - book0}
+        stop_sessions()
         t.join(400)
-        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False, f"{e}: fetch {json.dumps(out)[:600]}; last seen {json.dumps(seen)[:900]}; "
-              f"seller charged since the start {int(json.loads(send('GET', '/x402/ticket/health', gw_port)[2]).get('chargedMsat', -1)) - book0} msat; "
-              f"exit's status file {time.time() - os.path.getmtime(f'{vdir}/exit-status.json'):.0f} s old")
+        quiet()
+        m1 = money()
+        m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False,
+              f"{e}: at that moment {json.dumps(at_timeout)[:900]}; once ended, fetch {json.dumps(out)[:400]}, money since the start {json.dumps(m)[:600]}")
         return
-    stopped.set()
     sid = next((p["session"] for p in status().get("paying", []) if p.get("origin") == origin), None)
     if sid is None:
         raise LabError(f"vpn money at {sat_gb:,} sat a GiB: no wallet session pays {origin}: paying {json.dumps(status().get('paying'))[:400]}")
@@ -2485,7 +2570,6 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     book = int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1))
     note_receipts(stop.get("http") or {})
     t.join(400)
-    url = out.get("url", url)
     signer("ticket_stop", {"session": sid, "forget_credit": True})
     quiet()
     m1 = money()
@@ -2507,7 +2591,7 @@ def vpn_money(origin: str, vdir: str, sat_gb: int) -> None:
     check(f"vpn: a tunnel stopped while open, after 50 MiB or more: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 3% and 1 MiB above for "
           "framing and bytes on their way, never below), the wallet's account says the same within 64 KiB's price, what was paid is what was spent and what is left with the "
           "seller, and both nodes and the book agree",
-          ok, {"bytes_through": took, "file": url, "usage_low_msat": low, "usage_high_msat": high, "seller_book_charged_msat": seller, "wallet_spent_msat": spent,
+          ok, {"bytes_through": took, "served_by_far_side": FAR_SIDE.served - served0, "file": url, "usage_low_msat": low, "usage_high_msat": high, "seller_book_charged_msat": seller, "wallet_spent_msat": spent,
                "left_with_seller_msat": left, "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
                "receipts_released_msat": m["receipts_released_msat"],
                "wallet_book_settled_msat": m["wallet_book_settled_msat"], "tickets": m["tickets"],
