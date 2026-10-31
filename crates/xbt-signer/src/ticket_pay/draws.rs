@@ -49,10 +49,11 @@ const QUEUE_WAIT: Duration = Duration::from_secs(50);
 const LONG_HOLD: Duration = Duration::from_secs(30);
 /// How long a stop waits for the answer open on its session of draws to end.
 const STOP_WAIT: Duration = Duration::from_secs(15);
-/// How long a call waits for the seller's next invoice of a win whose last one is about to lapse or has:
-/// the seller makes the next one only when its node shows the first cancelled, and the wallet refuses an
-/// invoice within 5 s of its end. An invoice with longer to live than this is not waited for.
-const OWED_WAIT: Duration = Duration::from_secs(10);
+/// How long a call waits for the seller's next invoice of a win whose last one is about to lapse, has, or
+/// was cancelled at the wallet's asking: the seller makes the next one only when its node shows the first
+/// cancelled, and the wallet refuses an invoice within 5 s of its end. An invoice with longer to live than this
+/// is not waited for. The seller's answer waits 15 s for a payment as shipped (`refill_wait`), and so does this.
+const OWED_WAIT: Duration = Duration::from_secs(15);
 const OWED_POLL: Duration = Duration::from_millis(250);
 /// How many of a win's invoices, and of a session's, the wallet asks to have cancelled after failed payments.
 /// Past these it waits for them to lapse: a seller's node that fails every payment is not asked for ever.
@@ -754,8 +755,11 @@ impl Signer {
                     }
                     if retry {
                         s.again.insert(win.draw());
-                        let ends = crate::bolt11::decode(invoice).map_or(0.0, |i| i.expires_at() as f64);
-                        s.next_invoice_after = s.next_invoice_after.max(ends);
+                        // the next invoice comes when this one ends, or at once where the seller is to be asked to
+                        // cancel it: a second failure in the same drop is then waited for as the first was
+                        let cancelling = s.to_cancel.iter().any(|(d, _)| *d == win.draw());
+                        let ends = if cancelling { self.engine.now() } else { crate::bolt11::decode(invoice).map_or(0.0, |i| i.expires_at() as f64) };
+                        s.next_invoice_after = if cancelling { ends } else { s.next_invoice_after.max(ends) };
                     }
                 } else {
                     c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
