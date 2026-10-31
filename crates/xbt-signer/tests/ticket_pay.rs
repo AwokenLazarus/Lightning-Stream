@@ -6745,7 +6745,6 @@ fn a_socket_busy_both_ways_at_once_is_counted_honestly() {
 /// A seller whose signed count of an open socket charges more than the bytes it passed is caught
 /// while the socket runs: a seller fault, the socket ends, and the session with it.
 #[test]
-#[ignore = "deadlock, fixing in next commit"]
 fn a_seller_that_overcharges_an_open_socket_is_caught_while_it_runs() {
     let _g = env_lock();
     let dir = tempfile::tempdir().unwrap();

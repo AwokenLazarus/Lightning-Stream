@@ -4734,7 +4734,13 @@ impl Signer {
         // the balance does not cover the next request. It is the seller's now; the owner sees it here and in the audit.
         // A stream that would not end in time is still drawing: the wallet's own count of it, not only the seller's
         // last receipt, comes off what is told as left
-        let left = if still_streaming { lock_money(hs).est_balance().min(hs.balance()) } else { hs.balance() };
+        let left = if still_streaming {
+            // one lock of the money for both: `balance` takes it too
+            let m = lock_money(hs);
+            m.est_balance().min(m.acct.balance())
+        } else {
+            hs.balance()
+        };
         if left > 0 {
             self.ticket_audit("ticket_left_with_seller", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "origin": hs.origin,
                                                                 "left_msat": left.to_string(), "why": why}));
