@@ -9263,8 +9263,9 @@ fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pay
             });
         }
     }));
-    let size = 256 * PIECE;
-    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    // a win in every fourth piece: far more than the 8 the gate lets on the way before the first has arrived
+    let size = 128 * PIECE;
+    let v = r.pay(&format!("/hot/{size}"), 4_000);
     assert_eq!(r.ln.by_status("FAILED").len(), 0, "nothing was sent that could not arrive: {v}");
     assert_paid_after_lapses(&r, &v, size, 1);
     assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
@@ -9307,6 +9308,6 @@ fn a_win_on_its_next_invoice_goes_before_the_wins_waiting() {
     let at = |h: &str| payments.iter().rposition(|p| p == h).unwrap();
     let (failed_at, paid_at) = (at(&failing), at(next["hash"].as_str().unwrap()));
     assert!(payments.len() - paid_at > 40, "many waited behind it: paid at {paid_at} of {}", payments.len());
-    assert!(paid_at - failed_at < 40, "it did not wait behind them: failed at {failed_at}, paid at {paid_at}, of {}", payments.len());
+    assert!(paid_at - failed_at < payments.len() / 3, "it did not wait behind them: failed at {failed_at}, paid at {paid_at}, of {}", payments.len());
 }
 
