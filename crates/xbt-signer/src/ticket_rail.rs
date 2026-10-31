@@ -2136,13 +2136,22 @@ impl Signer {
         }
     }
 
-    /// Whether a ticket of the session is on its way and not yet one a release can take: sent and not
-    /// shown locked by the wallet's node, or locked with no expiry the node has reported. A release
-    /// that finds the pool empty waits for such a ticket rather than ending its answer.
+    /// Whether a ticket of the session is on its way and not yet one a release can take: one the
+    /// wallet's node calls in flight and has not shown locked, or locked with no expiry the node has
+    /// reported. A release that finds the pool empty waits for such a ticket rather than ending its
+    /// answer. A node that cannot be asked, or that has no record of a send, gives nothing to wait for.
     pub(crate) fn ticket_coming(&self, sid: &str) -> bool {
-        let Ok(g) = self.ticket_store() else { return false };
-        let Some(st) = g.as_ref() else { return false };
-        st.book.of_session(sid).iter().any(|t| t.state == TState::Sending || (t.state == TState::Locked && t.final_expiry == 0))
+        let sending: Vec<String> = {
+            let Ok(g) = self.ticket_store() else { return false };
+            let Some(st) = g.as_ref() else { return false };
+            let tickets = st.book.of_session(sid);
+            if tickets.iter().any(|t| t.state == TState::Locked && t.final_expiry == 0) {
+                return true;
+            }
+            tickets.iter().filter(|t| t.state == TState::Sending).map(|t| t.hash.clone()).collect()
+        };
+        let Some(ln) = self.ln.clone() else { return false };
+        sending.iter().any(|h| matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT"))
     }
 
     /// Whether the wallet's own node calls a ticket's payment in flight and carries it on none of

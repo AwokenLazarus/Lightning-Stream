@@ -2788,7 +2788,10 @@ fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_t
 #[test]
 fn a_file_waits_for_a_ticket_the_node_has_not_yet_shown_locked_rather_than_ending() {
     let _g = env_lock();
+    // the seller keeps a paused answer open as it ships
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
     let r = Rig::new(json!({}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
     // a session, its pool of eight locked
     let first = r.pay(&format!("/files/{}", MIB), 5_000);
     assert_eq!((first["status"].as_u64(), first["complete"].as_bool()), (Some(200), Some(true)), "{first}");
@@ -2814,6 +2817,38 @@ fn a_file_waits_for_a_ticket_the_node_has_not_yet_shown_locked_rather_than_endin
     assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
     assert!(paid >= 8 * TICKET, "{paid}");
     r.assert_booked();
+}
+
+/// The wait for a ticket on its way is no wait for a stop: the answer ends at once, and nothing more is released.
+#[test]
+fn a_stop_ends_the_wait_for_a_ticket_the_node_has_not_yet_shown_locked() {
+    let _g = env_lock();
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::new(json!({}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true), "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(60);
+    }
+    let n = 40 * MIB;
+    let out = std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 12_000));
+        // every ticket the session held is released, and the file waits for those the node has yet to show
+        wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+        std::thread::sleep(Duration::from_millis(500));
+        let before = r.tap.secrets().len();
+        let stopped_at = Instant::now();
+        r.call("ticket_stop", json!({"session": sid}));
+        let out = t.join().unwrap();
+        assert!(stopped_at.elapsed() < Duration::from_secs(10), "the answer ended {:?} after the stop", stopped_at.elapsed());
+        assert_eq!(r.tap.secrets().len(), before, "nothing is released once the stop has begun");
+        out
+    });
+    assert_eq!(out["complete"], false, "{out}");
 }
 
 #[test]

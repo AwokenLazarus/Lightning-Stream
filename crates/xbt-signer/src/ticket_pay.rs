@@ -152,6 +152,10 @@ impl Drop for MoneyGuard<'_> {
 
 /// The most a release waits for a refill of its session that is out ([`Refilling`]).
 const REFILL_WAIT: Duration = Duration::from_secs(60);
+/// How long a release that found no locked ticket waits for one the wallet's node has yet to show
+/// locked: a little past the 15 s a seller as shipped keeps a paused answer open
+/// (`times.refill_wait_ms`), after which there is no answer left to pay for.
+const COMING_WAIT: Duration = Duration::from_secs(20);
 
 /// A session's `refilling` flag, taken: one refill at a time. Cleared when dropped, however the
 /// refill ended.
@@ -3920,8 +3924,8 @@ impl Signer {
             // a ticket sent and not yet shown locked by the wallet's own node (a loaded node answers the send, or its
             // payment stream breaks, before it lists the HTLC): the pool counts it, so no fill sends another, and the
             // answer would end for want of one that is on its way. It is waited for, the node asked again, for as long
-            // as a refill is; a stop ends the wait, and one the node fails is let go by the book
-            let until = Instant::now() + REFILL_WAIT;
+            // as the seller keeps a paused answer open; a stop ends the wait, and one the node fails is let go by the book
+            let until = Instant::now() + COMING_WAIT;
             while next.is_none() && self.ticket_coming(&hs.sid) && Instant::now() < until {
                 if hs.ending.load(Ordering::SeqCst) {
                     return Err(stopping_refusal());
