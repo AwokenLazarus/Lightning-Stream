@@ -1109,9 +1109,13 @@ before the node is asked (so that a win paid across a restart is seen paid), mak
 for a win at a time, and makes another only
 when the node shows the first cancelled (it lapsed unpaid).
 
-A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
-invoice again: the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed. A win's invoice lives as long as the seller's grace
+A payment that fails (no route, a fee limit) is not a spent one. The wallet sends that invoice
+again only where its node found no route and nothing of the payment ever left the node, which is
+what a channel out for a moment does, and only once, when a channel is back (an inactive channel
+is waited for, at most 8 s from when the wallet first saw it out, before any payment of the rail).
+Otherwise the win stays owed until the seller sends another invoice for it, which the
+gateway does when the first has lapsed. An invoice that lapsed while its win waited its turn at
+the wallet's gate is treated the same way, and does not count against the seller. A win's invoice lives as long as the seller's grace
 (`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`

@@ -193,6 +193,12 @@ fn payment_over(p: &Value) -> bool {
     status == "SUCCEEDED" || (status == "FAILED" && !htlcs_in_flight(p))
 }
 
+/// A payment the node found no route for, with no attempt of it ever sent to a peer.
+fn never_left_the_node(p: &Value) -> bool {
+    str_or_empty(p.get("status")) == "FAILED" && str_or_empty(p.get("failure_reason")) == "FAILURE_REASON_NO_ROUTE"
+        && p.get("htlcs").and_then(Value::as_array).is_none_or(Vec::is_empty)
+}
+
 /// The book on disk: `tickets.jsonl`, an append-only log ([`crate::applog`]) of whole sessions and
 /// tickets, folded into a [`Book`]. A change is durable before it is in memory, and before
 /// anything is built on it.
@@ -878,7 +884,7 @@ impl Signer {
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
         };
@@ -1377,6 +1383,8 @@ impl Signer {
             let live: Vec<Ticket> = st.book.tickets.values().filter(|t| t.state.in_flight()).cloned().collect();
             for t in live {
                 match ln.lookup(&t.hash) {
+                    // a failure of a payment still being sent is that call's to judge: it may send it once more
+                    Ok(Some(pmt)) if str_or_empty(pmt.get("status")) == "FAILED" && self.ticket_is_queued(&t.hash) => {}
                     Ok(Some(pmt)) => self.ticket_apply(st, &t.hash, &pmt)?,
                     // the node never had it: a crash or an error between the write-ahead row and the send. Only
                     // a ticket the node never showed locked is given up, and only once no channel holds an HTLC for it
@@ -1618,7 +1626,7 @@ impl Signer {
             return passed("ln_node", "the wallet's Lightning node failed its checks".into());
         }
         // PayOffer takes no set of outgoing channels: every channel of the node must pass
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", true) {
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", true) {
             Ok(r) => r,
             Err(d) => return passed(&str_or_empty(d.get("rule")), "a payment by offer may leave on any channel of the node, and not every one passes the guards".into()),
         };
@@ -1718,7 +1726,7 @@ impl Signer {
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
         };
@@ -1791,24 +1799,39 @@ impl Signer {
         let hash = hash.to_string();
         // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for,
         // still inside the gate
-        let mut unsent: Option<crate::Error> = None;
+        let mut unsent: Option<crate::Error>;
+        // the book's reconciling leaves a failure of this payment to this call while it is being sent, as it may go
+        // once more: a payment the book held failed is one whose booking has gone
+        let queued = Queued::new(&self.ticket_queued, vec![hash.clone()]);
         let mut pmt = {
-            let mut pmt = match send() {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    unsent = Some(e);
-                    ln.lookup(&hash).ok().flatten()
+            let mut again = true;
+            loop {
+                unsent = None;
+                let mut pmt = match send() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        unsent = Some(e);
+                        ln.lookup(&hash).ok().flatten()
+                    }
+                };
+                let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
+                while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                    if let Ok(Some(p)) = ln.lookup(&hash) {
+                        pmt = Some(p);
+                    }
                 }
-            };
-            let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
-            while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-                if let Ok(Some(p)) = ln.lookup(&hash) {
-                    pmt = Some(p);
+                // no route, and nothing of it ever left the node: what a channel out for a moment does to a payment that
+                // passed the checks just before. Nothing was spent, and the seller holds this invoice open: sent once
+                // more, when a channel is back. Should it fail again, it failed
+                if !std::mem::take(&mut again) || !pmt.as_ref().is_some_and(never_left_the_node) {
+                    break pmt;
                 }
+                std::thread::sleep(crate::ln::CHANNEL_BACK_POLL);
+                let _ = ln.channels().and_then(|c| self.ln_channels_back(ln, lp.split(&self.chain), c));
             }
-            pmt
         };
+        drop(queued);
         drop(inside);
         // once more outside the gate, for a payment whose end the node had not shown inside the wait
         if pmt.as_ref().is_none_or(|p| !payment_over(p)) {
@@ -2037,7 +2060,7 @@ impl Signer {
         };
         let dest = format!("ln:{payee}");
         self.ln_node_checks(&*ln, &lp, &dest, "").map_err(|d| with(d, json!({"rail": "ticket"})))?;
-        self.ln_route_checks(&*ln, &lp, &dest, "", false).map_err(|d| with(d, json!({"rail": "ticket"})))?;
+        self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false).map_err(|d| with(d, json!({"rail": "ticket"})))?;
         Ok(())
     }
 

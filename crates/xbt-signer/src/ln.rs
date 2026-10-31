@@ -45,7 +45,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE as B64URL};
 use base64::Engine as _;
@@ -803,6 +803,11 @@ pub fn channel_refusal(c: &Value, split_height: i64) -> Option<String> {
 }
 
 /// Every channel with its verdict: `(usable ids, report)`.
+/// How long a payment of the ticket rail waits for an inactive channel ([`Signer::ln_channels_back`]):
+/// less than the 10 s a seller's answer stands still for a win, with room left to pay it.
+pub(crate) const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
+pub(crate) const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
+
 pub fn usable_channels(chans: &[Value], split_height: i64) -> (Vec<String>, Vec<Value>) {
     let mut ok = vec![];
     let report = chans.iter().map(|c| {
@@ -1540,6 +1545,49 @@ impl Signer {
     /// payments go on, confined to the proven channels.
     pub(crate) fn ln_route_checks(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool) -> std::result::Result<LnRoutes, Value> {
         let chans = ln.channels().map_err(|e| node_said(self.ln_refuse("ln_backend", &e.msg, dest, hash), &e))?;
+        self.ln_routes_of(ln, pol, dest, hash, every, chans)
+    }
+
+    /// [`Self::ln_route_checks`] for a payment of the ticket rail, whose seller is waiting and whose
+    /// answer ends if it is refused: a channel out for a moment is waited for
+    /// ([`Self::ln_channels_back`]). The caller holds no lock.
+    pub(crate) fn ln_route_checks_waiting(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool) -> std::result::Result<LnRoutes, Value> {
+        let chans = ln.channels().and_then(|c| self.ln_channels_back(ln, pol.split(&self.chain), c))
+            .map_err(|e| node_said(self.ln_refuse("ln_backend", &e.msg, dest, hash), &e))?;
+        self.ln_routes_of(ln, pol, dest, hash, every, chans)
+    }
+
+    /// The node's channels, once one that could pay is active again. A channel goes inactive for a
+    /// moment whenever its peer's connection drops, and comes back by itself; a payment refused in
+    /// that moment ended a paid answer that a few seconds would have saved. So where every channel
+    /// that could pay is only inactive, they are read again for at most [`CHANNEL_BACK_WAIT`], which
+    /// is less than a seller stands still for a win. That time is counted from when the wallet first
+    /// saw them out, for all its payments together: 100 wins queued behind a channel that stays down
+    /// do not wait in turn. The channels as they stand are returned, and the checks judge them.
+    pub(crate) fn ln_channels_back(&self, ln: &dyn LnBackend, split: i64, mut chans: Vec<Value>) -> Result<Vec<Value>> {
+        loop {
+            let now = Instant::now();
+            let up = !usable_channels(&chans, split).0.is_empty();
+            let as_active: Vec<Value> = if up { vec![] } else { chans.iter().map(|c| with(c.clone(), json!({"active": true}))).collect() };
+            let mut out = self.ln_channels_out.lock().unwrap_or_else(|p| p.into_inner());
+            if up || usable_channels(&as_active, split).0.is_empty() {
+                *out = None;
+                return Ok(chans);
+            }
+            // out since an earlier look, unless nothing has looked for so long that they may have been back since
+            let since = out.filter(|(_, seen)| now.duration_since(*seen) <= CHANNEL_BACK_WAIT).map_or(now, |(since, _)| since);
+            *out = Some((since, now));
+            drop(out);
+            let left = CHANNEL_BACK_WAIT.saturating_sub(now.duration_since(since));
+            if left.is_zero() {
+                return Ok(chans);
+            }
+            std::thread::sleep(CHANNEL_BACK_POLL.min(left));
+            chans = ln.channels()?;
+        }
+    }
+
+    fn ln_routes_of(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool, chans: Vec<Value>) -> std::result::Result<LnRoutes, Value> {
         // the cap counts channels only, so a payment does not wait on the node's coin list
         let (exposure, over) = self.ln_exposure(pol, &chans, None);
         if let Some(why) = over {

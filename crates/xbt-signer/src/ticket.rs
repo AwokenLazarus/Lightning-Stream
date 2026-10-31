@@ -1035,6 +1035,9 @@ pub fn slot_failure(reason: &str) -> bool {
     ["INSUFFICIENT_BALANCE", "NO_ROUTE", "FAILURE_REASON_ERROR"].iter().any(|k| r.contains(k)) || r == "ERROR"
 }
 
+/// A prepaid ticket's or a win's invoice is refused this close to its expiry: the payment needs the time to arrive.
+pub(crate) const PREPAID_EXPIRY_MARGIN_S: f64 = 5.0;
+
 /// How long nothing is locked after the `fails`-th failed round in a row: 30 s, doubling to 10 minutes.
 pub fn slot_wait_s(fails: u32) -> f64 {
     (SLOT_WAIT_S * f64::from(2u32.saturating_pow(fails.saturating_sub(1).min(16)))).min(SLOT_WAIT_MAX_S)
@@ -1665,7 +1668,7 @@ pub fn check_ticket_invoice(inv: &crate::bolt11::Invoice, s: &Session, pol: &Tic
         return refuse("ticket_expiry", format!("the invoice stays payable for {} s, above the owner's tickets.max_invoice_expiry_s {}", inv.expiry_s,
                                                pol.max_invoice_expiry_s));
     }
-    if (inv.expires_at() as f64) < now + 5.0 {
+    if (inv.expires_at() as f64) < now + PREPAID_EXPIRY_MARGIN_S {
         return refuse("ticket_expiry", "the invoice has expired, or does within 5 s");
     }
     if inv.payment_secret.is_none() {
@@ -1700,7 +1703,7 @@ pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, msat: u6
         return refuse("ticket_expiry", format!("the invoice stays payable for {} s, above the owner's tickets.max_invoice_expiry_s {}", inv.expiry_s,
                                                pol.max_invoice_expiry_s));
     }
-    if (inv.expires_at() as f64) < now + 5.0 {
+    if (inv.expires_at() as f64) < now + PREPAID_EXPIRY_MARGIN_S {
         return refuse("ticket_expiry", "the invoice has expired, or does within 5 s");
     }
     if inv.payment_secret.is_none() {

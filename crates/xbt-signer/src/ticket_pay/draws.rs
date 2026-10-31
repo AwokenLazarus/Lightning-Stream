@@ -662,7 +662,14 @@ impl Signer {
                 c.paid_sats = c.paid_sats.saturating_add(charged);
                 // not paid. An invoice the checks refused, or a payment that failed, leaves the win open for the seller's
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
-                let retry = rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
+                // an invoice that lapsed while its win waited its turn at the wallet's gate is no fault of the seller's, and
+                // no bound of the owner's: the seller's next invoice pays the same win. (A seller's invoice that
+                // never had the time to be paid is still its own doing.)
+                let lapsed = matches!(rule.as_str(), "ln_expired" | "ticket_expiry") && crate::bolt11::decode(invoice).is_ok_and(|i| {
+                    let (life, left) = (i.expires_at() as f64 - i.timestamp as f64, i.expires_at() as f64 - self.engine.now());
+                    life > crate::ticket::PREPAID_EXPIRY_MARGIN_S && left < crate::ticket::PREPAID_EXPIRY_MARGIN_S
+                });
+                let retry = rule == "ln_expired" || rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
                     | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
                 // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
                 // the same invoice is good the next time the seller lists it
@@ -675,7 +682,7 @@ impl Signer {
                 }
                 // an invoice the wallet's checks refused is the seller's doing. After three, the session is over: a
                 // seller that cannot make an invoice for its own node at its own win size is not asked again
-                if retry && rule != "lottery_win_failed" {
+                if retry && !lapsed && rule != "lottery_win_failed" {
                     s.bad_invoices += 1;
                     if s.bad_invoices >= BAD_INVOICES_MAX {
                         let why = format!("{} invoices of this seller failed the wallet's checks (the last: {rule})", s.bad_invoices);
