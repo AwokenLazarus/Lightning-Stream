@@ -1,7 +1,8 @@
 #!/bin/bash
 # The Linux package test's images that have no published digest yet, for this machine (amd64) only:
-#   xbt-wallet-ui:linux-test, xbt-hashlink:linux-test   the published images with this tree's binaries in
-#       them (static musl, as oci_build.sh builds them): the renter's masking check, the Hashrate page;
+#   xbt-init:linux-test, xbt-wallet-ui:linux-test, xbt-hashlink:linux-test   the published images with this
+#       tree's binaries in them (static musl, as oci_build.sh builds them): the init that knows the compose's
+#       components, the renter's masking check, the Hashrate page;
 #   xbt-datum-gateway:linux-test        the Stream Gateway from third_party/datum_gateway at HEAD
 #       (stream-gateway.Dockerfile: a stand-in for the gateway lane's image);
 #   xbt-datum-gateway:linux-test-stock  the same from the vendor commit, unmodified: an owner's own stock
@@ -16,11 +17,11 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 lock() { awk -v n="$1" '$1 == n {print $2}' packaging/images.lock; }
 
-echo "== this tree's xbt-wallet-ui and xbt-hashlink (x86_64 musl)"
+echo "== this tree's xbt-init, xbt-wallet-ui and xbt-hashlink (x86_64 musl)"
 TGT=${CARGO_TARGET_DIR:-target}
 cargo build -q -j "${CARGO_BUILD_JOBS:-6}" --release --locked --target x86_64-unknown-linux-musl \
-  -p xbt-wallet-ui -p xbt-hashlink --bin xbt-wallet-ui --bin xbt-hashlink
-for img in xbt-wallet-ui xbt-hashlink; do
+  -p xbt-wallet-ui -p xbt-hashlink -p xbt-svc --bin xbt-wallet-ui --bin xbt-hashlink --bin xbt-init
+for img in xbt-init xbt-wallet-ui xbt-hashlink; do
   mkdir -p "$T/$img"
   cp "$TGT/x86_64-unknown-linux-musl/release/$img" "$T/$img/$img"
   printf 'FROM %s\nCOPY --chmod=0555 %s /usr/bin/%s\n' "$(lock "$img")" "$img" "$img" > "$T/$img/Dockerfile"

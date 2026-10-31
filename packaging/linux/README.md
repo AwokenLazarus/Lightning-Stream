@@ -54,4 +54,6 @@ can follow if testers ask.
 - **A login password of the app's own**, set at install (random unless the owner gives one). There is
   no platform login on Linux, and no setting that trusts a header instead of the password.
 - **Several installs on one machine** need a different `COMPOSE_PROJECT_NAME`, different ports in
-  `.env`, and the hashmaker on in one of them only. The test does this; an owner normally has one.
+  `.env` (`LS_DATUM_API_PORT` among them), the hashmaker on in one of them only, and the Stream Gateway
+  set up in one of them only: its stratum is 127.0.0.1:23339 on every install. The test does this; an
+  owner normally has one.

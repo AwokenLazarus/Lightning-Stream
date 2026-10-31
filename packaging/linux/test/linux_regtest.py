@@ -52,7 +52,8 @@ INSTALLS = {
 STRATUM = 23339  # the Stream Gateway's stratum, the same on every install (the UI writes it); one gateway at a time has a config here
 DATUM_UID, UI_UID = 10021, 10005
 INIT_DATUM = os.environ.get("LS_TEST_INIT_DATUM") == "1"  # the init in the images makes run/datum and the cookie
-LOCAL = {"hashtaker": "xbt-hashlink:linux-test", "hashmaker": "xbt-hashlink:linux-test", "datum": "xbt-datum-gateway:linux-test"}
+LOCAL = {"init": "xbt-init:linux-test", "hashtaker": "xbt-hashlink:linux-test", "hashmaker": "xbt-hashlink:linux-test",
+         "datum": "xbt-datum-gateway:linux-test"}
 OWN_GW = "xbt-datum-gateway:linux-test-stock"
 HG = os.environ.get("P2P_HASH_GATEWAYS", os.path.expanduser("~/xbt-rnd/hash-gateways"))  # stratum-grind, a CPU miner of real shares
 RELAYS = f"ws://127.0.0.1:{P['relay']}"
@@ -92,16 +93,15 @@ def admin_macaroon(node, path):
     return r.stdout
 
 
+# The 0.1 package an owner updates from: rel/0119 (12b8182c), the last whose pinned images start. rel/0120's
+# Linux compose lists the stream-relay and vpn components, but pins an init (12b8182c) that refuses them
+# ("unknown component stream-relay"), so as pinned it does not start; this tree's does with the test's init.
+OLD_REF = os.environ.get("LS_TEST_OLD_REF", "12b8182c0bf6")
+
+
 def old_package():
-    """The last package before the Stream Gateway (0.1): packaging/linux at the newest commit whose compose file has
-    no datum service, unpacked into OUT/old-package (LS_TEST_OLD_REF names another)."""
-    ref = os.environ.get("LS_TEST_OLD_REF")
-    if not ref:
-        for c in sh("git", "-C", ROOT, "log", "--format=%H", "--", "packaging/linux/docker-compose.yml").stdout.split():
-            text = sh("git", "-C", ROOT, "show", f"{c}:packaging/linux/docker-compose.yml", check_rc=False).stdout
-            if text and "\n  datum:\n" not in text:
-                ref = c
-                break
+    """The 0.1 package (OLD_REF's packaging/linux), unpacked into OUT/old-package."""
+    ref = sh("git", "-C", ROOT, "rev-parse", OLD_REF).stdout.strip()
     d = os.path.join(OUT, "old-package")
     os.makedirs(d, exist_ok=True)
     subprocess.run(f"git -C {ROOT} archive {ref} packaging/linux | tar -x -C {d}", shell=True, check=True)
@@ -109,14 +109,17 @@ def old_package():
 
 
 def override(d):
-    """The test's images (build_images.sh): this tree's UI and hashlink, the Stream Gateway's stand-in; and, while the
-    images' init doesn't know the "datum" component, init without it (this test then makes run/datum, see datum_files)."""
+    """The test's images (build_images.sh): this tree's init, UI and hashlink (the pinned init refuses the components
+    this compose lists), the Stream Gateway's stand-in; and, while the init doesn't know the "datum" component, init
+    without it (this test then makes run/datum, see datum_files)."""
     svc = dict(LOCAL)
     if IMAGES == "local-ui":
         svc.update(ui=LOCAL_UI, **{"node-keys": LOCAL_UI})
-    text = "services:\n" + "".join(f"  {k}:\n    image: {v}\n" for k, v in svc.items())
-    if not INIT_DATUM:
-        text += "  init:\n    environment:\n      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay,vpn\n"
+    text = "services:\n"
+    for k, v in svc.items():
+        text += f"  {k}:\n    image: {v}\n"
+        if k == "init" and not INIT_DATUM:
+            text += "    environment:\n      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay,vpn\n"
     with open(os.path.join(d, "docker-compose.override.yml"), "w") as f:
         f.write(text)
 
@@ -136,15 +139,16 @@ def install(name, lab, package=PKG, extra=None):
                LS_NODE_RPC_USER="lab", LS_NODE_RPC_PASS="lab", LS_DATUM_USER="rented",
                LS_HASHMAKER="1" if maker else "0", LS_LAN_HOST="127.0.0.1", LS_UI_PORT=str(ui), LS_MCP_PORT=str(mcp),
                LS_CONNECTOR_PORT=str(conn), LS_GW_PORT=str(gw), LS_HASHTAKER_CONTROL_PORT=str(ctl), LS_FILES_PORT=str(files),
-               LS_DATUM_API_PORT=str(api), LS_RELAYS=RELAYS, LS_SKIP_PULL="1", **(extra or {}))
+               LS_DATUM_API_PORT=str(api), LS_RELAYS=RELAYS, LS_SKIP_PULL="1" if package == PKG else "0", **(extra or {}))
     t0 = time.time()
     r = subprocess.run([os.path.join(package, "install.sh"), "--yes", "--dir", d], env=env, capture_output=True, text=True, timeout=900)
     with open(os.path.join(OUT, f"install-{name}{'-0.1' if package != PKG else ''}.log"), "w") as f:
         f.write(r.stdout + r.stderr)
     check("I", f"{name}: install.sh --yes {'of the 0.1 package ' if package != PKG else ''}installs and starts the app ({time.time() - t0:.0f} s)",
           r.returncode == 0, (r.stdout + r.stderr)[-1500:])
-    check("I", f"{name}: its Files folder is served on its own port ({files}), nothing said about it",
-          "Files folder" not in r.stdout + r.stderr and f"LS_FILES_PORT={files}\n" in open(os.path.join(d, ".env")).read(), (r.stdout + r.stderr)[-600:])
+    if package == PKG:
+        check("I", f"{name}: its Files folder is served on its own port ({files}), nothing said about it",
+              "Files folder" not in r.stdout + r.stderr and f"LS_FILES_PORT={files}\n" in open(os.path.join(d, ".env")).read(), (r.stdout + r.stderr)[-600:])
     check("I", f"{name}: .env is private (0600) and its password survives quoting ($ and a space)",
           oct(os.stat(os.path.join(d, ".env")).st_mode & 0o777) == "0o600" and "pw-" + name + "-$ x" in open(os.path.join(d, ".env")).read())
     envtext = open(os.path.join(d, ".env")).read()
@@ -168,7 +172,8 @@ def update(name, d, old_env):
     before = env_file(d)
     override(d)
     base = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "LN_TICKET_", "PKG_LAB_", "LAB", "RUN", "ACTIVATION_", "LS_"))}
-    env = dict(base, LS_SKIP_PULL="1", LS_DATUM_API_PORT=str(INSTALLS[name][8]))
+    # settings this version adds, given as an owner gives them to an unattended update: the test's ports
+    env = dict(base, LS_SKIP_PULL="1", LS_DATUM_API_PORT=str(INSTALLS[name][8]), LS_FILES_PORT=str(INSTALLS[name][7]))
     t0 = time.time()
     r = subprocess.run([os.path.join(PKG, "install.sh"), "--yes", "--dir", d], env=env, capture_output=True, text=True, timeout=900)
     out = r.stdout + r.stderr
