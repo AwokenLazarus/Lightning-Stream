@@ -5012,8 +5012,13 @@ fn draws_shop() -> Value {
 /// A seller that serves on while a win waits for its next invoice: what a test is about is the invoice,
 /// not the seller's answer standing still for its grace.
 fn patient_draws_rig(extra: Value) -> Rig {
-    Rig::shipped(extra, 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
-                                   "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}))
+    // and that waits for the wallet's values as it does as shipped (15 s), not the tests' 2 s: a busy machine is not
+    // what these tests are about
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(extra, 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                                           "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    r
 }
 
 /// The wallet as it ships on a 30-slot channel, paying a seller that offers the lottery.
