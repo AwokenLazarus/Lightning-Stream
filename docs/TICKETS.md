@@ -1572,7 +1572,7 @@ node reports, and nothing else.
 | | `max_sats` | `max_charge_sats` (default: `max_sats`; never above it) |
 |---|---|---|
 | Bounds | What may leave the wallet for the call on the ticket rail: the tickets it releases or buys, whole, with their routing fees. Not a call paid by draws: its wins are bounded by the charge cap's luck cap and the task's budget (section 9.8) | What the call's answer may be charged by the seller |
-| Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the gateway ends an HTTP answer there. A paid WebSocket is not yet ended there: bytes in flight past it are charged, and the wallet takes that receipt as the seller's fault |
+| Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the gateway ends the answer there, a body or a paid WebSocket (gateways before 0.1.20 did not stop a WebSocket at it: bytes in flight past it were charged, and the wallet takes such a receipt as the seller's fault) |
 | Checked by the wallet | Before a ticket is released or bought: it must fit what is left of `max_sats` | A quoted price above it is refused before anything is paid (`max_sats`); a metered answer is cut there; a receipt that charges more is a seller fault (`ticket_over_cap`) |
 | Where the difference goes | — | It stays as credit with that seller. A later session with it takes it over within 20 hours of the stop (the newest stopped session only, and only where the seller's signed count agrees); after that it is lost |
 
