@@ -218,7 +218,8 @@ impl Handler for Service {
             }));
         }
         if let Some(n) = sized("/dearbytes/") {
-            return stream(n, None, body(n, 1 << 10, Duration::ZERO));
+            // 1 KiB every 50 ms, well above the floor of a stream while the seller has credit to send on
+            return stream(n, None, body(n, 1 << 10, Duration::from_millis(50)));
         }
         if let Some(n) = sized("/stall/") {
             // a seller that sends n bytes, with no length stated, and then nothing more for a minute
@@ -1969,8 +1970,8 @@ fn a_stop_ends_a_quiet_answer_on_draws_at_once() {
 
 /// Past the first minutes of a stream, the floor counts only the time the wallet waits on the seller:
 /// a seller at the edge of its credit, waiting for a ticket being paid over a slow route, is not to
-/// blame for the bytes that do not come. Here 4 KiB a ticket, each ticket taking 1.5 s, against 16 KiB
-/// in each 3 s: it comes whole, each ticket paid.
+/// blame for the bytes that do not come. Here 4 KiB a ticket, each ticket taking 1.5 s, so about 7 KiB
+/// in each 3 s against a floor of 16 KiB: it comes whole, each ticket paid.
 #[test]
 fn the_floor_does_not_count_the_time_a_ticket_is_being_paid() {
     let _g = env_lock();
@@ -2101,9 +2102,14 @@ fn a_stop_ends_an_answer_streaming_on_draws_and_a_call_behind_it_is_told() {
         }));
         std::thread::sleep(Duration::from_millis(1500));
         let at = Instant::now();
+        // what was on its way as the stop began has reached the tap a moment after it; the next round, a second behind
+        // the one under way, carries only what is given from then on
+        let given = sc.spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            values_given(&r)
+        });
         let stop = r.call("ticket_stop", json!({"session": sid}));
-        // what was on its way as the stop began has reached the tap by now
-        let given_at_stop = values_given(&r);
+        let given_at_stop = given.join().unwrap();
         let (got, body_ended) = reader.join().unwrap();
         let out = t.join().unwrap();
         assert!(body_ended.duration_since(at) < Duration::from_millis(1500), "the body ended {:?} after the stop", body_ended.duration_since(at));
