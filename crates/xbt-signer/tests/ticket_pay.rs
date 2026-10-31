@@ -8056,6 +8056,60 @@ fn a_seller_session_this_process_still_holds_is_not_taken_over_beside_it() {
     assert!(named.iter().all(|h| !mine.contains(h)), "its tickets named: {named:?} {mine:?}");
 }
 
+/// A takeover goes on past a seller session it cannot take to the next: the first the seller has
+/// forgotten, the second's credit pays, in the same call.
+#[test]
+fn a_takeover_goes_on_to_the_next_session_where_the_first_holds_nothing() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, strict_shop());
+    let first = r.pay("/page/1", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    wait_refill(&r, "two tickets held", 2);
+    let older = r.status()["paying"][0]["seller_session"].as_str().unwrap().to_string();
+    r.restart();
+    r.tap.set(Box::new(|seen, _real| seen.path.ends_with("/status").then(|| Ok(answer(503, vec![], b"{}".to_vec())))));
+    assert_eq!(r.pay("/page/1", CALL)["rule"].as_str(), Some("ticket_seller_unanswered"));
+    r.clock.fetch_add(121, Ordering::SeqCst);
+    let fresh = r.pay("/page/1", CALL);
+    assert_eq!((fresh["status"].as_u64(), fresh["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{fresh}");
+    r.call("ticket_stop", json!({"session": fresh["session"]}));
+    let once = Arc::new(AtomicBool::new(false));
+    let o = once.clone();
+    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/status") && !o.swap(true, Ordering::SeqCst)).then(|| Ok(answer(402, vec![], json!({"error": "session_unknown"}).to_string().into_bytes())))));
+    let w = r.pay("/page/1", CALL);
+    r.tap.clear();
+    assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the second: {w}");
+    assert_eq!(r.audit("ticket_seller_forgot")[0]["seller_session"].as_str(), Some(older.as_str()));
+    assert_ne!(r.audit("ticket_resumed")[0]["seller_session"].as_str(), Some(older.as_str()));
+    assert_eq!(r.ln.paid_msat(), 2 * TICKET);
+    assert_eq!(both_sides_of(&r, &new_sid_of(&w)), TICKET - 2 * 2_500);
+}
+
+/// The sessions opened at the call's own address are asked first, however old another's is: one opened
+/// elsewhere cannot answer for itself here, and need not hold the call up while there is credit of its own.
+#[test]
+fn a_call_asks_the_sessions_opened_at_its_own_address_first() {
+    let _g = env_lock();
+    let mut r = Rig::with_more(json!({}), true, true, 30, strict_shop(), &[strict_shop()]);
+    let other = r.more[0].url("/page/1");
+    let beside = r.call("xbt402_pay", json!({"url": other, "max_sats": CALL, "task": "film"}));
+    assert_eq!(beside["status"].as_u64(), Some(200), "{beside}");
+    r.call("ticket_stop", json!({"session": beside["session"]}));
+    // its own session here: the first call waits out what the shop beside cannot say
+    assert_eq!(r.pay("/page/1", CALL)["rule"].as_str(), Some("ticket_seller_unanswered"));
+    r.clock.fetch_add(121, Ordering::SeqCst);
+    let own = r.pay("/page/1", CALL);
+    assert_eq!((own["status"].as_u64(), own["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{own}");
+    r.call("ticket_stop", json!({"session": own["session"]}));
+    // a start forgets what was waited out
+    r.restart();
+    r.clock.fetch_add(60, Ordering::SeqCst);
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "its own credit, with no wait: {v}");
+    assert_eq!(r.ln.paid_msat(), 2 * TICKET);
+    assert_eq!(both_sides_of(&r, &new_sid_of(&v)), TICKET - 2 * 2_500);
+}
+
 /// A seller session the seller has forgotten stops using up the asks: the next takeover goes to the
 /// next session's credit.
 #[test]
