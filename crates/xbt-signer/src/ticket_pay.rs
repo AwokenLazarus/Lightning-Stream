@@ -300,6 +300,14 @@ fn refusal(rule: &str, reason: impl Into<String>) -> Value {
 }
 
 /// Why nothing more is released into a session being stopped ([`HttpSession::ending`]).
+/// Whether a ticket's refusal (`rule: reason`, as a paid answer words it) can pass by itself: the seller slow to show a
+/// ticket locked, busy, or short of slots for a moment, a refill under way, an answer not yet closed, or the wallet's
+/// channel out for a moment. Any other (a stopped session, a blocked seller, the owner's limits) stands.
+fn passing_refusal(why: &str) -> bool {
+    let rule = why.split(':').next().unwrap_or_default();
+    ["ticket_not_ready", "ticket_busy", "ticket_answer_open", "ticket_seller", "ln_no_safe_channel", "ln_backend"].contains(&rule) || HOLD_SHORT.contains(&rule)
+}
+
 fn stopping_refusal() -> Value {
     refusal("ticket_session", "the session is being stopped: no ticket is released")
 }
@@ -3913,7 +3921,8 @@ impl Signer {
     #[allow(clippy::too_many_arguments)]
     fn ticket_interim(&self, hs: &HttpSession, seq: u64, digest: &str, own: &dyn Fn() -> (u64, u64), price: &Price, max_msat: u64,
                       last: &mut Option<crate::ticket_interim::Seen>, polls: &mut crate::ticket_interim::Polls) -> Option<String> {
-        let v = self.ticket_status_of(hs, false).ok();
+        // the seller's totals taken as a release's are, so the session's spend (the owner's "Used") moves as the socket runs
+        let v = self.ticket_status_of(hs, true).ok();
         let (own_up, own_down) = own();
         let sid = lock_link(hs).seller_sid.clone();
         let before = last.as_ref().map(|l| l.part);
@@ -4830,8 +4839,10 @@ impl Signer {
                     }
                 });
                 let lead = &lead;
-                // a ticket that went early and was refused: asked for again when it is due, not before
-                let at_due = AtomicBool::new(false);
+                // a ticket that went early and was refused for a moment: asked for again when it is due, not before. Kept
+                // with the credit it was refused at: credit that comes from elsewhere meanwhile (another answer's release)
+                // ends it, and the next ticket goes with its lead again
+                let at_due: Mutex<Option<u64>> = Mutex::new(None);
                 scope.spawn(move || loop {
                     let mut s = lock(state);
                     if s.2 {
@@ -4853,8 +4864,9 @@ impl Signer {
                     let rate = total as f64 / st.started.elapsed().as_secs_f64().max(0.001);
                     let seen = credited();
                     // before any payment of this socket was timed: what passes in [`FIRST_PAY_S`], within half of what is paid for
+                    let waiting = lock(&at_due).is_some_and(|at| seen <= at);
                     let ahead = match *lock(lead) {
-                        _ if at_due.load(Ordering::SeqCst) => 0,
+                        _ if waiting => 0,
                         0 => ((rate * FIRST_PAY_S) as u64).min(st.covered(seen) / 2),
                         l => l,
                     };
@@ -4871,10 +4883,13 @@ impl Signer {
                         if span > 0 {
                             *lock(lead) = ((rate * asked.elapsed().as_secs_f64() * 2.0) as u64).min(span / 2);
                         }
-                        at_due.store(r.is_some() && early, Ordering::SeqCst);
+                        // one refused for a moment while what is paid for still runs goes again when it is due, as an answer's
+                        // does. One that will not change (a stopped session, a blocked seller, the owner's limits) ends the
+                        // socket now, not at the edge of what is paid for
+                        let again = early && r.as_deref().is_some_and(passing_refusal) && !hs.ending.load(Ordering::SeqCst) && hs.fault().is_none();
+                        *lock(&at_due) = again.then_some(seen);
                         s = lock(state);
-                        // one refused while what is paid for still ran goes again when it is due, as an answer's does
-                        if let Some(why) = r.filter(|_| !early) {
+                        if let Some(why) = r.filter(|_| !again) {
                             s.1.get_or_insert(why);
                         }
                     }
