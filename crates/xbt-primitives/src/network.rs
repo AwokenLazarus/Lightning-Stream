@@ -67,6 +67,25 @@ impl Chain {
             _ => None,
         }
     }
+
+    /// Blocks between halvings of the block subsidy: Knots' `consensus.nSubsidyHalvingInterval`
+    /// (`src/kernel/chainparams.cpp`), 150 on regtest and 210,000 on every other chain. XBT kept it.
+    pub fn halving_interval(self) -> u64 {
+        match self {
+            Chain::Regtest => 150,
+            _ => 210_000,
+        }
+    }
+
+    /// The block subsidy at `height`, in sats: Knots' `GetBlockSubsidy` (`src/validation.cpp`), 50 coins
+    /// halved once every [`Chain::halving_interval`] blocks, and none from the 64th halving on. What a node
+    /// that can no longer read a block (a pruned one) would say `getblockstats` gave, from the height alone.
+    pub fn block_subsidy(self, height: u64) -> u64 {
+        match height / self.halving_interval() {
+            h if h >= 64 => 0,
+            h => 5_000_000_000 >> h,
+        }
+    }
 }
 
 /// CAIP-2 `bip122:<first 32 hex characters of the anchor block hash>`.
@@ -94,5 +113,22 @@ mod tests {
         assert!(network_for(Chain::Main, &"11".repeat(32)).is_err());
         assert_eq!(Chain::Regtest.hrp(), "bcrt");
         assert_eq!(Chain::from_name("main").unwrap().hrp(), "bc");
+    }
+
+    #[test]
+    fn subsidy_halves_as_knots_says() {
+        let m = Chain::Main;
+        assert_eq!((m.block_subsidy(0), m.block_subsidy(209_999), m.block_subsidy(210_000)), (5_000_000_000, 5_000_000_000, 2_500_000_000));
+        assert_eq!((m.block_subsidy(839_999), m.block_subsidy(840_000)), (625_000_000, 312_500_000));
+        // XBT's first BLAKE2b block, and the tip when the hashmaker's price was set: 3.125 XBT
+        assert_eq!((m.block_subsidy(MAINNET_ANCHOR_HEIGHT as u64), m.block_subsidy(1_049_999), m.block_subsidy(1_050_000)),
+                   (312_500_000, 312_500_000, 156_250_000));
+        assert_eq!((m.block_subsidy(32 * 210_000), m.block_subsidy(33 * 210_000), m.block_subsidy(64 * 210_000), m.block_subsidy(u64::MAX)),
+                   (1, 0, 0, 0));
+        for c in [Chain::Test, Chain::Testnet4, Chain::Signet] {
+            assert_eq!(c.block_subsidy(840_000), 312_500_000);
+        }
+        let r = Chain::Regtest;
+        assert_eq!((r.block_subsidy(149), r.block_subsidy(150), r.block_subsidy(1_000), r.block_subsidy(6_720)), (5_000_000_000, 2_500_000_000, 78_125_000, 0));
     }
 }
