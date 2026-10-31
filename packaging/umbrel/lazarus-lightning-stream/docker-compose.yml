@@ -124,8 +124,11 @@ services:
       B2_STREAM_DIR: /data/run/signer/streams
       # a copy of the one-time enrolment code for the setup page (run/enroll: the signer and the UI only)
       B2_ENROLL_CODE_COPY: /data/run/enroll/enroll-code
+      # shops reached by key: read for callers that pass no transport document (the AI address, agents)
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       - ${APP_DATA_DIR}/data/signer:/data/signer
+      - ${APP_DATA_DIR}/data/run/shops:/data/run/shops:ro
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer
       - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor:ro
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro

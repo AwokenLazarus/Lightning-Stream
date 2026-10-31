@@ -90,8 +90,12 @@ services:
       B2_LN_TLS_CERT: /data/lightning/tls.cert
       B2_STREAM_DIR: /data/run/signer/streams
       B2_ENROLL_CODE_COPY: /data/run/enroll/enroll-code
+      # shops reached by key (no web address): their transport documents, written by the ui; the
+      # signer reads them for callers that pass none (the AI address, agents)
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       - ${LS_DATA_DIR}/signer:/data/signer
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
       - ${LS_DATA_DIR}/run/signer:/data/run/signer
       - ${LS_DATA_DIR}/run/anchor:/data/run/anchor:ro
       - ${LS_DATA_DIR}/run/ln:/data/run/ln:ro
