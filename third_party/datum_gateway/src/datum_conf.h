@@ -1,0 +1,217 @@
+/*
+ *
+ * DATUM Gateway
+ * Decentralized Alternative Templates for Universal Mining
+ *
+ * This file is part of CONVOY's Bitcoin mining decentralization
+ * project, DATUM.
+ *
+ * https://convoy.xyz
+ *
+ * ---
+ *
+ * Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and individual contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+#ifndef _DATUM_CONF_H_
+#define _DATUM_CONF_H_
+
+#define DATUM_CONFIG_MAX_ARRAY_ENTRIES 32
+#define DATUM_MAX_BLOCK_SUBMITS DATUM_CONFIG_MAX_ARRAY_ENTRIES
+#define DATUM_MAX_SUBMIT_URL_LEN 512
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <jansson.h>
+
+#include "datum_blocktemplates.h"
+#include "datum_coinbaser.h"
+#include "datum_utils.h"
+
+enum datum_conf_vartype {
+	// NOTE: Keep in sync with datum_conf_var_type_text
+	DATUM_CONF_BOOL,
+	DATUM_CONF_INT,
+	DATUM_CONF_STRING,
+	DATUM_CONF_STRING_ARRAY,
+	DATUM_CONF_USERNAME_MODS,
+	DATUM_CONF_DIFFICULTY,
+};
+
+typedef struct {
+	char category[32];
+	char name[64];
+	char description[512];
+	const char *example;
+	bool example_default;
+	enum datum_conf_vartype var_type;
+	union {
+		int default_int;
+		bool default_bool;
+		struct {
+			int max_string_len;
+			const char *default_string[1];
+		};
+	};
+	
+	void *ptr;
+	
+	bool required;
+} T_DATUM_CONFIG_ITEM;
+
+const T_DATUM_CONFIG_ITEM *datum_config_get_option_info(const char *category, size_t category_len, const char *name, size_t name_len);
+const T_DATUM_CONFIG_ITEM *datum_config_get_option_info2(const char *category, const char *name);
+int datum_config_parse_difficulty(int *out, json_t *item);
+
+struct datum_addr_range {
+	char *addr;
+	size_t addr_len;
+	uint16_t max;
+};
+
+struct datum_username_mod {
+	size_t sz;
+	char *modname;
+	size_t modname_len;
+	struct datum_addr_range ranges[];
+};
+
+int datum_config_parse_username_mods(struct datum_username_mod **umods_p, json_t *item, bool log_errors);
+struct datum_username_mod *datum_username_mods_next(struct datum_username_mod *prev_umod);
+struct datum_username_mod *datum_username_mods_find(struct datum_username_mod *umod, const char *modname, size_t modname_len);
+
+// Globally accessable config options
+typedef struct {
+	char bitcoind_rpcuserpass[256];
+	char bitcoind_rpccookiefile[1024];
+	char bitcoind_rpcuser[128];
+	char bitcoind_rpcpassword[128];
+	char bitcoind_rpcurl[256];
+	int bitcoind_work_update_seconds;
+	bool bitcoind_notify_fallback;
+	
+	char stratum_v1_listen_addr[128];
+	int stratum_v1_listen_port;
+	int stratum_v1_max_clients;
+	int stratum_v1_max_threads;
+	int stratum_v1_max_clients_per_thread;
+	int stratum_v1_trust_proxy;
+	
+	int stratum_v1_vardiff_min;
+	int stratum_v1_vardiff_target_shares_min;
+	int stratum_v1_vardiff_quickdiff_count;
+	int stratum_v1_vardiff_quickdiff_delta;
+	int stratum_v1_share_stale_seconds;
+	bool stratum_v1_fingerprint_miners;
+	int stratum_v1_idle_timeout_no_subscribe;
+	int stratum_v1_idle_timeout_no_share;
+	int stratum_v1_idle_timeout_max_last_work;
+	
+	void *stratum_username_mod;
+	
+	char mining_pool_address[256];
+	char mining_coinbase_tag_primary[64];
+	char mining_coinbase_tag_secondary[64];
+	char mining_save_submitblocks_dir[256];
+	bool mining_allow_hasher_time_rolling;
+	bool mining_abw_verify_all_shares_on_disclosure;
+	int coinbase_unique_id;
+	
+	char api_admin_password[72];
+	size_t api_admin_password_len;
+	char api_csrf_token[65];
+	char api_listen_addr[128];
+	int api_listen_port;
+	bool api_allow_insecure_auth;
+	bool api_modify_conf;
+	json_t *config_json;
+	
+	int extra_block_submissions_count;
+	char extra_block_submissions_urls[DATUM_MAX_BLOCK_SUBMITS][DATUM_MAX_SUBMIT_URL_LEN];
+	
+	bool clog_to_file;
+	bool clog_to_console;
+	int clog_level_console;
+	int clog_level_file;
+	bool clog_calling_function;
+	bool clog_to_stderr;
+	bool clog_rotate_daily;
+	char clog_file[1024];
+	
+	char datum_pool_host[1024];
+	int datum_pool_port;
+	char datum_pool_migration_host[1024];
+	int datum_pool_migration_port;
+	char datum_pool_migration_pubkey[129];
+	uint64_t datum_pool_migration_deadline_ms;
+	int datum_pool_migration_max_seconds;
+	bool datum_pool_pass_workers;
+	bool datum_pool_pass_full_users;
+	bool datum_always_pay_self;
+	bool datum_pooled_mining_only;
+	char datum_pool_pubkey[1024];
+	int datum_protocol_global_timeout;
+	uint64_t datum_protocol_global_timeout_ms;
+	
+	uint64_t prime_id;
+	uint8_t override_mining_pool_scriptpubkey[MAX_OUTPUT_SCRIPT_LEN];
+	uint8_t override_mining_pool_scriptpubkey_len;
+	char override_mining_coinbase_tag_primary[MAX_COINBASE_TAG_SPACE + 1];
+	uint64_t override_vardiff_min;
+} global_config_t;
+
+extern global_config_t datum_config;
+
+int datum_read_config(const char *conffile);
+void datum_gateway_help(const char *argv0);
+void datum_gateway_example_conf(void);
+
+static inline
+size_t datum_expected_n_global_nonstale_shares(const global_config_t * const cfg) {
+	// NOTE: If we use size_t too early, 32-bit gets capped at a mere 71 MB
+	uint64_t job_stale_seconds;
+	uint64_t c = 0;
+	bool overflow =
+		ckd_add(&job_stale_seconds, cfg->stratum_v1_share_stale_seconds, cfg->bitcoind_work_update_seconds) ||
+		ckd_mul(&c, cfg->stratum_v1_max_clients_per_thread,
+		               cfg->stratum_v1_vardiff_target_shares_min) ||
+		ckd_mul(&c, c, job_stale_seconds) ||
+		ckd_mul(&c, c, 16) ||
+		ckd_add(&c, c, 59);
+	c /= 60;  // seconds per minute
+	overflow |= (c > SIZE_MAX);  // check *after* division
+	
+	// The floor is because stratum.max_clients_per_thread is range checked for an upper
+	// bound and not a lower one, and this is the product of three configured values. A zero
+	// or a negative sizes the table at nothing, and nothing is not a table that merely
+	// overflows quickly: the expand grows it by 25%, 25% of zero is zero, and the gateway
+	// takes a share it then has nowhere to put. Sixteen is also the point below which the
+	// same rounding stops the table growing at all.
+	if (c < 16) c = 16;
+	
+	return overflow ? 0 : (size_t)c;
+}
+
+#endif
