@@ -1719,6 +1719,49 @@ VPN_FILES = ["http://speed.cloudflare.com/__down?bytes=10485760", "http://ipv4.d
 VPN_BYTES = 10_485_760
 
 
+VPN_CHECK_SATS = 20  # what a region check of a priced exit may be charged (xbt_vpn::buyer::REGION_CHECK_MAX_SATS)
+VPN_CHECK_BYTES = 20_000  # a region check reads a few small pages: about 9 sat at VPN_SAT_GB, inside the cap
+
+
+def vpn_region_check(origin: str) -> None:
+    """A priced exit's region check from NO credit at that exit (its gateway is new: the seller holds
+    nothing of this buyer's). The check is charged at most VPN_CHECK_SATS, far below the shop's ticket;
+    the wallet buys one whole ticket for it, is charged only what the check carried (its bytes at the
+    exit's price), and the rest stays as credit with that shop. Before 0.1.20 the check's cap was the
+    call's max_sats, so it could never buy the ticket and never ran."""
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    m0 = money()
+    r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", f"http://speed.cloudflare.com/__down?bytes={VPN_CHECK_BYTES}",
+                        "--once", "--secs", "60", "--max-charge-sats", str(VPN_CHECK_SATS)],
+                       env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="40000"),
+                       capture_output=True, text=True, timeout=120)
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+    out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
+    # the tunnel ends with the fetch; the wallet's last word on it is printed as it does
+    time.sleep(3)
+    said = next((ln.split("the wallet: ", 1)[1] for ln in r.stderr.splitlines() if "the wallet: " in ln), "{}")
+    try:
+        wallet = json.loads(said)
+    except ValueError:
+        wallet = {"said": said[:400]}
+    stop_sessions()
+    m1 = money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    got = int(out.get("bytes") or 0)
+    # `price_msat` is what the answer (the tunnel) was charged; `charged_sats` is what left the wallet: the whole ticket
+    charged = int(wallet.get("price_msat") or 0) / 1000 if wallet.get("verdict") == "allow" and wallet.get("price_msat") is not None else None
+    # what the bytes carried come to at the exit's price, both ways, with the tunnel's own framing:
+    # the charge must be about that, never more than the cap
+    expect = got * VPN_SAT_GB / (1 << 30)
+    fair = charged is not None and expect * 0.9 <= charged <= max(expect * 1.6, expect + 2)
+    check("vpn: a region check of a priced exit from no credit there was paid: the wallet bought one whole ticket, was charged only what the check "
+          f"carried (its bytes at the exit's price) and no more than {VPN_CHECK_SATS} sat, and the money agrees",
+          got >= VPN_CHECK_BYTES and len(paid) == 1 and charged is not None and charged <= VPN_CHECK_SATS and fair and agrees(m, receipts=False),
+          {"fetch": out, "wallet": {k: wallet.get(k) for k in ("verdict", "rule", "reason", "price_msat", "charged_sats", "tickets_released", "tickets_prepaid", "balance_msat")},
+           "tickets_bought": len(paid), "expected_sats": round(expect, 3), "charged_sats": charged, "money": m})
+
+
 def vpn() -> None:
     """A VPN exit sold as a Stream service (docs/VPN-EXITS.md): the exit's VPN service (`xbt-vpn serve`,
     offering a private exit at a price) behind the seller's gateway, which sells `/vpn/` as WebSockets
@@ -1760,6 +1803,7 @@ def vpn() -> None:
     WALLET_PROC.write_policy()
     restart_signer()
     faults0 = len([e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_interim_fault"])
+    vpn_region_check(origin)
     out, url = None, ""
     t0 = time.monotonic()
     for url in VPN_FILES:

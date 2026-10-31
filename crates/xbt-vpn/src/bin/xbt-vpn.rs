@@ -39,7 +39,7 @@
 //!     the path, the bytes and the throughput. A tool for measuring: it looks the host name up
 //!     itself; the app's buyer side does DNS through the tunnel. With `--hop`, every flow is sealed for
 //!     the exit and goes through that first hop (two hops).
-//! xbt-vpn fetch --tunnel URL --url http://HOST/PATH [--flows N] [--secs S] [--once]
+//! xbt-vpn fetch --tunnel URL --url http://HOST/PATH [--flows N] [--secs S] [--once] [--max-charge-sats N]
 //!     The same through a priced exit's paid tunnel at URL, opened by the wallet of B2_SIGNER_SOCK
 //!     and B2_STREAM_DIR (as the app's buyer side opens it). `--once`: each flow downloads the URL
 //!     once, to its end.
@@ -267,7 +267,12 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
     let hop_id = arg(args, "--hop");
     let (way, via) = match (&tunnel, &hop_id) {
         (Some(url), _) => {
-            let w = xbt_vpn::paid::Wallet::from_env().ok_or_else(|| std::io::Error::other("--tunnel needs B2_SIGNER_SOCK and B2_STREAM_DIR"))?;
+            let mut w = xbt_vpn::paid::Wallet::from_env().ok_or_else(|| std::io::Error::other("--tunnel needs B2_SIGNER_SOCK and B2_STREAM_DIR"))?;
+            // `--max-charge-sats N`: the tunnel is charged no more than N, as a region check's is,
+            // while the wallet may still buy the exit's whole ticket within `max_sats`
+            if let Some(c) = arg(args, "--max-charge-sats").and_then(|c| c.parse::<u64>().ok()) {
+                w.max_charge_sats = Some(c.min(w.max_sats));
+            }
             // the exit's announced price a GB, if given, is the most the wallet pays it
             let ceiling = arg(args, "--price-msat-gb").and_then(|p| p.parse().ok()).map(xbt_vpn::paid::ceiling);
             let t = link.runtime().block_on(xbt_vpn::paid::open(&w, url, ceiling))?;
