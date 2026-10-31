@@ -411,7 +411,8 @@ fn a_seller_whose_list_is_not_free_is_listed_with_the_models_its_entry_names() {
     // the rig's endpoint read the sellers file when it started: one more endpoint on the changed file
     let cfg = lightning_stream::inference_server::Config {
         signer: r._dir.path().join("signer.sock"), stream_dir: r._dir.path().to_path_buf(), task: "ai".into(), max_sats: 2000,
-        credentials: r.creds.clone(), sellers: list, state: r._dir.path().join("ai-state-2.json"), first_byte: Duration::from_millis(1000), allowed_hosts: vec![],
+        credentials: r.creds.clone(), sellers: list, state: r._dir.path().join("ai-state-2.json"), first_byte: Duration::from_millis(1000),
+        pay_wait: lightning_stream::inference_server::PAY_WAIT, allowed_hosts: vec![],
     };
     let run = lightning_stream::inference_server::serve(cfg, TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
     let addr = run.addr.to_string();
