@@ -607,10 +607,19 @@ impl Signer {
                 if let Some(h) = s.handed.get_mut(&win.draw()) {
                     h.1 = true;
                 }
+                // one the node shows paid without the preimage that proves it: nothing more is paid in the call
+                if rule.ends_with("_unproven") {
+                    c.stop.get_or_insert(format!("{rule}: the wallet's node shows a win paid without the preimage of its hash"));
+                    c.halt = true;
+                }
             }
             // the book has a payment for this win already: it is paid, or being paid, and this invoice is not
             _ if rule == "lottery_win_paid" => {}
             _ => {
+                // whatever such an answer booked left all the same (an answer that books says pending; this one is for
+                // any that did not)
+                s.paid_sats = s.paid_sats.saturating_add(charged);
+                c.paid_sats = c.paid_sats.saturating_add(charged);
                 // not paid. An invoice the checks refused, or a payment that failed, leaves the win open for the seller's
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
                 let retry = rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"

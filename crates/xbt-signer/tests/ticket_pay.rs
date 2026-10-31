@@ -4448,6 +4448,23 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
 /// call held to 1.8 s, the test failed under a full workspace run: the call of 16 MiB and 256
 /// draws took 2 to 8 s there, where alone it takes 0.8 s. The wallet asks again every 100 ms, so
 /// the 10 s are slack, and a wallet that never asks again is still cut.)
+/// A win the node shows paid without the preimage that proves it stays booked as spent, and the
+/// call says it among what it charged; nothing more is paid in the call.
+///
+/// FAILS before: the call's charged_sats left it out (a refusal, counted as nothing).
+#[test]
+fn a_win_paid_without_its_preimage_is_said_among_what_the_call_charged() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    r.ln.st.lock().unwrap().preimage_lost = true;
+    // 256 pieces of 2 sat, on wins of 1 in 32: the first win's payment shows no preimage
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let booked = r.ledger_sum();
+    assert!(booked > 0, "a win's payment left: {v}");
+    assert_eq!(v["charged_sats"].as_i64(), Some(booked), "the call says what its wins booked: {v}");
+    assert!(v.to_string().contains("lottery_win_unproven"), "{v}");
+}
+
 #[test]
 fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
     let _g = env_lock();

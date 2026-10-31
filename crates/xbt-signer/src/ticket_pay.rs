@@ -3121,8 +3121,14 @@ impl Signer {
         // that the call says it among what it charged. A payment that failed books nothing
         spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
         if r["verdict"] == "pending" {
-            // booked, and neither paid nor failed by the node's word: nothing more is paid in this session
-            return Err(self.ticket_fault(hs, "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"));
+            // booked, and neither paid nor failed by the node's word (or paid without the preimage that proves it): nothing
+            // more is paid in this session
+            let why = if str_or_empty(r.get("rule")).ends_with("_unproven") {
+                "the wallet's node shows a prepaid ticket paid without the preimage of its hash: it is booked as spent, and nothing can be shown to the seller"
+            } else {
+                "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"
+            };
+            return Err(self.ticket_fault(hs, why));
         }
         if r["verdict"] != "allow" {
             return Err(r);
