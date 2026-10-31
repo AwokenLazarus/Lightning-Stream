@@ -103,14 +103,20 @@ the guest. Accounts already made go on with their own logins.
 
 - the key and its proof: `Seed::buyer_key` (signer), `xbt402::ticket::buyer_message`, the wallet's
   `identify` after a session's first lock, and once more on `403 identify_first` on a route whose
-  terms ask it; the seller sessions it identified in (`.run/identified.json`), which a session at a
-  shop the owner now stays anonymous at does not resume;
+  terms ask it, noted on the ticket book's seller session (`identified`) before it is said; a
+  session at a shop the owner now stays anonymous at does not resume an identified one (its credit is
+  given up), turning anonymous stops the sessions open with that seller, and a choices file that
+  cannot be read keeps the wallet anonymous everywhere;
 - the gateway: route `accounts`, the session call `identify`, `gateway/accounts.rs`;
 - tests: `a_buyer_key_is_the_same_at_one_seller_and_unrelated_at_another` (signer),
   `a_wallet_tells_a_seller_with_accounts_who_it_is_and_stays_anonymous_when_told` (signer, through
   a real gateway), `a_page_on_a_route_with_accounts_is_served_after_the_wallet_says_who_it_is`,
   `an_anonymous_wallet_is_told_why_a_route_with_accounts_refuses_it`,
-  `a_session_the_wallet_was_known_by_is_not_resumed_once_the_owner_stays_anonymous` (signer),
+  `a_session_the_wallet_was_known_by_is_not_resumed_once_the_owner_stays_anonymous`,
+  `a_session_whose_identify_answer_was_lost_counts_as_identified`,
+  `turning_anonymous_at_a_seller_stops_the_session_open_with_it`,
+  `turning_anonymous_at_a_seller_stops_its_session_under_another_address`,
+  `draws_offered_on_a_route_with_accounts_are_not_paid` (signer),
   `a_route_with_accounts_is_not_drawn_for` (gateway), `tests/accounts_jellyfin.rs` (gateway, a real
   Jellyfin, not run by default), `a_shop_keeps_accounts_where_any_of_its_routes_does` (wallet UI), and
   the note and choice in `two_apps_of_one_seller_are_two_visits_on_two_origins` (wallet UI).

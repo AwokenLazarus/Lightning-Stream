@@ -159,7 +159,7 @@ impl App {
     /// The note, and the choice, for a shop that keeps an account for each buyer of the app at
     /// `base` (docs/BUYER-ACCOUNTS.md); nothing for a shop that does not.
     fn identity_card(&self, ctx: &Ctx, seller: &str, base: &str, entry: &str) -> String {
-        if !shop_keeps_accounts(seller, base) {
+        if !shop_keeps_accounts(seller) {
             return String::new();
         }
         let origin = crate::services::http_origin(seller).unwrap_or_default();
@@ -583,7 +583,7 @@ impl AppOrigin {
 
 /// Whether the shop's route for the app at `base` gives each buyer an account: its `/services`
 /// says so. Asked when the page is shown; a shop that does not answer is taken to keep none.
-fn shop_keeps_accounts(seller: &str, _base: &str) -> bool {
+fn shop_keeps_accounts(seller: &str) -> bool {
     let Some(origin) = crate::services::http_origin(seller) else { return false };
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(4)).redirects(0).build();
     let Ok(r) = agent.get(&format!("{}/services", origin.trim_end_matches('/'))).call() else { return false };

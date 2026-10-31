@@ -1257,6 +1257,10 @@ pub struct SellerSession {
     pub id: String,
     pub key: [u8; 32],
     pub base: String,
+    /// The wallet told the seller who it is in this session (`identify`, docs/BUYER-ACCOUNTS.md),
+    /// or was about to: set and on disk before the call goes out. A session the owner has since
+    /// chosen to stay anonymous at is not taken over by a later one.
+    pub identified: bool,
 }
 
 impl std::fmt::Debug for SellerSession {
@@ -1273,6 +1277,10 @@ impl Session {
                "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why});
         if let Some(h) = &self.http {
             r["http"] = json!({"id": h.id, "key": hex::encode(h.key), "base": h.base});
+            // written only when set: a row from before reads as a session nothing was said in
+            if h.identified {
+                r["http"]["identified"] = true.into();
+            }
         }
         // written only when set: a row from before reads as a session that holds and waits for nothing
         if self.prepaid_msat > 0 {
@@ -1353,7 +1361,11 @@ impl Session {
                         None => None,
                         // a row that names a seller session names all of it, or the row is damage
                         Some(h) => Some(SellerSession { id: str_or_empty(h.get("id")), key: hex::decode(str_or_empty(h.get("key"))).ok()?.try_into().ok()?,
-                                                        base: str_or_empty(h.get("base")) }),
+                                                        base: str_or_empty(h.get("base")),
+                                                        identified: match h.get("identified") {
+                                                            None => false,
+                                                            Some(v) => v.as_bool()?,
+                                                        } }),
                     },
                     prepaid_msat: match r.get("prepaid_msat") {
                         None => 0,
@@ -2155,9 +2167,17 @@ mod tests {
     fn the_sellers_side_of_a_session_is_kept_in_its_row_and_a_damaged_one_refuses_the_row() {
         let mut s = session("s1", 8);
         assert_eq!(Session::from_row(&s.row()), Some(s.clone()), "a row from before the HTTP binding has no seller side");
-        s.http = Some(SellerSession { id: "ab".repeat(16), key: [7u8; 32], base: "https://seller.example/x402/ticket".into() });
+        s.http = Some(SellerSession { id: "ab".repeat(16), key: [7u8; 32], base: "https://seller.example/x402/ticket".into(), identified: false });
         let row = s.row();
         assert_eq!(Session::from_row(&row), Some(s.clone()));
+        assert!(row["http"].get("identified").is_none(), "unset, not written: a row as before");
+        // the wallet said who it is in it: kept, and a row that says it some other way is damage
+        let mut known = s.clone();
+        known.http.as_mut().unwrap().identified = true;
+        assert_eq!(Session::from_row(&known.row()), Some(known.clone()));
+        let mut odd = known.row();
+        odd["http"]["identified"] = "yes".into();
+        assert_eq!(Session::from_row(&odd), None);
         assert_eq!(s.public()["http"], true);
         assert!(!s.public().to_string().contains(&hex::encode([7u8; 32])), "the key is not in what a caller is shown");
         assert!(!format!("{s:?}").contains("0707"), "nor in a debug print");
