@@ -516,7 +516,7 @@ impl Signer {
             let (Some(draw), invoice) = (w.get("draw").and_then(Value::as_u64), w.get("invoice").and_then(Value::as_str)) else { continue };
             let mine = s.owed.iter().any(|o| o.draw() == draw);
             if !mine && !s.handed.contains_key(&draw) {
-                lied.get_or_insert(format!("the seller lists draw {draw} as a win: by the wallet's own draw it is not one"));
+                lied.get_or_insert(format!("the seller lists draw {draw} as a win that no reveal it gave shows: the wallet pays only wins it can check"));
                 continue;
             }
             match invoice {
