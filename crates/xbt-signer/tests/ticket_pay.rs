@@ -9358,11 +9358,14 @@ fn invoices_that_keep_lapsing_end_the_session_by_name() {
 fn a_win_sent_as_the_channel_drops_is_paid_once_on_its_next_invoice() {
     let _g = env_lock();
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
-    let (ln, once) = (r.ln.clone(), AtomicBool::new(false));
+    let (ln, node, standin, once) = (r.ln.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
     let mut st = r.ln.st.lock().unwrap();
     st.send_takes = Duration::from_millis(200);
     st.on_look = Some(Arc::new(move |_| {
-        if !once.swap(true, Ordering::SeqCst) {
+        // a look with an invoice open is a win's own check, which this passes: the channel goes as its payment is sent
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open = known.iter().any(|h| standin.state_of(&hex::decode(h).unwrap().try_into().unwrap()) == Some(InvoiceState::Open));
+        if open && !once.swap(true, Ordering::SeqCst) {
             let ln = ln.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
