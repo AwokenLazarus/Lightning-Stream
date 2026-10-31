@@ -754,6 +754,12 @@ struct PayState {
     /// sent now fails at once, with no route and no attempt, and the node's route query says the same.
     no_route: bool,
     route_queries: usize,
+    /// From this route query on (counted from 1), no route for `no_route_for`: the window opens as a win is
+    /// about to be sent. `no_route_answers` counts the queries answered "no route".
+    no_route_at_query: usize,
+    no_route_for: Duration,
+    no_route_until: Option<Instant>,
+    no_route_answers: usize,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
     late_fail: usize,
@@ -891,7 +897,12 @@ impl LnBackend for PayLn {
     fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64) -> xbt402::Result<bool> {
         let mut s = self.st.lock().unwrap();
         s.route_queries += 1;
-        Ok(!s.no_route && !s.down)
+        if s.route_queries == s.no_route_at_query {
+            s.no_route_until = Some(Instant::now() + s.no_route_for);
+        }
+        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u);
+        s.no_route_answers += usize::from(none);
+        Ok(!none)
     }
 
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
@@ -952,7 +963,7 @@ impl LnBackend for PayLn {
         }
         // its own channel down: as the real node says it, no balance, and no attempt on its record
         let down = s.channel["active"] != true;
-        let failing = down || s.no_route || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
+        let failing = down || s.no_route || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
         s.fail_next = s.fail_next.saturating_sub(1);
         let late = !failing && s.late_fail > 0;
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
@@ -9542,24 +9553,16 @@ fn a_moment_with_no_route_to_the_seller_is_waited_for_and_costs_no_failed_paymen
     let _g = env_lock();
     for window in [Duration::from_secs(3), Duration::from_secs(10)] {
         let r = patient_draws_rig(json!({}));
-        let (ln, once, when) = (r.ln.clone(), AtomicBool::new(false), Arc::new(Mutex::new(None::<Instant>)));
-        let w = when.clone();
-        r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
-            if !ln.by_status("SUCCEEDED").is_empty() && !once.swap(true, Ordering::SeqCst) {
-                ln.st.lock().unwrap().no_route = true;
-                *w.lock().unwrap() = Some(Instant::now());
-                let ln = ln.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(window);
-                    ln.st.lock().unwrap().no_route = false;
-                });
-            }
-        }));
+        {
+            // the window opens at the second win's route query: that win, and those behind it, meet it
+            let mut st = r.ln.st.lock().unwrap();
+            st.no_route_at_query = 2;
+            st.no_route_for = window;
+        }
         let size = 256 * PIECE;
         let v = r.pay(&format!("/pieces/{size}"), 1_000);
-        assert!(when.lock().unwrap().is_some(), "the window never came: {v}");
+        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "{window:?}: no payment met the window: {v}");
         assert_eq!(r.ln.by_status("FAILED").len(), 0, "{window:?}: nothing was sent that could not be routed: {v}");
-        assert!(r.ln.st.lock().unwrap().route_queries > 0);
         assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
         let wins = v["wins"].as_u64().unwrap();
         assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{window:?}: {v}");
