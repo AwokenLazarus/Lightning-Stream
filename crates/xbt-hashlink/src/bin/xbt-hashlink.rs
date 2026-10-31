@@ -20,7 +20,7 @@
 //!                     ( --hashmaker ADDR --hashmaker-key HEX --slice-work W --price-msat P [--grace-ms G]
 //!                     | --find URL,URL [--expect-node HEX] [--max-price-msat P] [--found-out F] )
 //!                     [--signer SOCK --task T --max-sats N [--pay-url URL]]   pay through the wallet
-//!                         (without --max-sats, --budget-sats sets the app's caps: rail::pay_caps)
+//!                         (tickets are the step the rental has earned: order::Standing; --max-sats is the most one payment may move)
 //! xbt-hashlink relay  --listen ADDR                 a stand-in Nostr relay (in memory, for a lab or a rehearsal)
 //! xbt-hashlink healthcheck [ADDR ...]              the image's HEALTHCHECK (it has no shell or curl): exit 0
 //!                                                  when a control page answers on one of ADDR (default
@@ -89,6 +89,7 @@ fn terms(f: &HashMap<String, String>) -> Result<Terms, String> {
         slice_work: num(f, "slice-work", None)?,
         price_msat: num(f, "price-msat", None)?,
         grace_ms: num(f, "grace-ms", Some(3000))?,
+        start_slices: num(f, "start-slices", Some(0))?,
     })
 }
 
@@ -215,6 +216,7 @@ fn hashmaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         slices: f.get("slices").cloned(),
         fallback: None,
         rentable: None,
+        min_slice_time: f.get("min-slice-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--min-slice-s")?.unwrap_or(hashmaker::MIN_SLICE_TIME),
     };
     let r = hashmaker::run(cfg, Box::<LabSeller>::default())?;
     eprintln!("hashmaker: done: {}", r["stopped"]);
@@ -241,6 +243,7 @@ pub(crate) fn listing_of(f: &HashMap<String, String>, key: &SecretKey, t: &Terms
         pay_url: need(f, "pay-url")?.into(),
         pay_node: need(f, "pay-node")?.into(),
         terms: t.clone(),
+        proof: Some(xbt_hashlink::msg::PROOF.into()),
         capacity,
     })
 }
@@ -278,26 +281,21 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
     let budget_sats = f.get("budget-sats").map(|v| v.parse::<u64>()).transpose().map_err(|_| "--budget-sats")?;
     let payer = match f.get("signer") {
         Some(sock) => {
-            // what a slice may move and what it may be charged: a budget alone sets the app's caps (as the
-            // app's rentals); --max-sats sets what may move, and a budget beside it is still the charge cap
-            let (max_sats, max_charge_sats) = match (f.get("max-sats"), budget_sats) {
-                (None, Some(b)) => xbt_hashlink::rail::pay_caps(b),
-                (_, b) => {
-                    let m: u64 = num(f, "max-sats", None)?;
-                    (m, b.map(|b| b.min(m)).filter(|c| *c > 0))
-                }
+            // tickets are the step the rental has earned (order::Standing), inside a budget if there is one;
+            // --max-sats is the most any one payment may move, however large the step
+            let most_sats = match (f.get("max-sats"), budget_sats) {
+                (None, Some(_)) => None,
+                _ => Some(num(f, "max-sats", None)?),
             };
-            Some(SignerPayer {
-                sock: PathBuf::from(sock),
-                url: f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
-                task: need(f, "task")?.into(),
-                max_sats,
-                max_charge_sats,
-                session: None,
-                // the offer's price per slice: the most the shop is paid for one
-                ceiling: Some(xbt_hashlink::rail::slice_ceiling(t.price_msat)),
-                wait_for_signer: std::time::Duration::from_secs(num(f, "wait-for-signer-s", Some(15))?),
-            })
+            Some(SignerPayer::new(
+                PathBuf::from(sock),
+                f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
+                need(f, "task")?.into(),
+                t.price_msat,
+                budget_sats,
+                most_sats,
+                std::time::Duration::from_secs(num(f, "wait-for-signer-s", Some(15))?),
+            ))
         }
         None => None,
     };
@@ -319,6 +317,8 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         duration: f.get("duration-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--duration-s")?,
         report: f.get("report").map(PathBuf::from),
         payer,
+        gateway_api: f.get("gateway-api").cloned(),
+        allow_unblinded: f.contains_key("allow-unblinded"),
     };
     let r = hashtaker::run(cfg, Box::<LabHashtaker>::default())?;
     eprintln!("hashtaker: done: released {} slices, {}", r["released"], r["closed"]);

@@ -150,7 +150,9 @@ the buyer, which knows that from the terms, does not ask. The same field in a lo
 settled on arrival (section 5) sizes those tickets, and a prepaid ticket paid by offer (section 15)
 is credited at the amount its note names, inside the same bounds. A size outside them is answered
 `400 bad_request`. The gateway built here offers smaller sizes only where its runner sets
-`tickets.min_ticket_msat`; it records each ticket's size and credits it for that size. A buyer drops a hash it got no invoice
+`tickets.min_ticket_msat`; it records each ticket's size and credits it for that size. A route's
+`top_ticket_msat` lets a buyer ask for a prepaid ticket larger than `ticketMsat`, up to the
+`topTicketMsat` its prepaid entry states; a held ticket stays at `ticketMsat` or below. A buyer drops a hash it got no invoice
 for after two minutes: an invoice that arrives later is not paid.
 
 Before paying each invoice the buyer MUST check all of these. They are the whole of the buyer's
@@ -1602,12 +1604,24 @@ with this seller for about 20 hours". The callers in this repository:
 
 - **A VPN exit's region check** (`docs/VPN-EXITS.md`): charged at most 20 sat, and may buy the
   exit's ticket.
-- **A hashrate rental** (`crates/xbt-hashlink/src/rail.rs`, `pay_caps`). This covers a trial (one
-  slice) and every other rental. `max_charge_sats` is the rental's budget. `max_sats` is the
-  larger of the budget and 2,000 sat (a ticket and its fees), so a 60-sat rental of twelve slices
-  can start from no credit. The rental's own count of what its slices were charged stops it at its
-  budget, whatever is left of the ticket. The hashtaker's offers and its answer to `/rent` give
-  the figure (`mayBuyTicketUpToSats`), and the wallet's Hashrate page shows it.
+- **A hashrate rental** (`crates/xbt-hashlink/src/rail.rs`, `caps_at`, and `order.rs`). This covers a
+  trial and every other rental. A ticket is a whole payment that cannot be recalled, so a renter
+  buys only the step it has earned: `max_charge_sats`, which sizes the ticket, is
+  `order::Standing::ticket_msat`, inside what is left of its budget, and `max_sats` is that and its
+  fee limit. A shop sells such a ticket through `tickets.min_ticket_msat`, and a larger one on the
+  hashrate route through `top_ticket_msat`; one whose smallest does not fit is refused with
+  nothing paid, and the rental's card says why. Under the starter rules the task is a rental
+  task: see below.
+
+**A rental task** (`tickets.tasks.<task>.rental`: `max_ticket_sats`, `max_sends_per_hour`). Market
+price for a 4 TH/s miner is about 165,000 sat an hour, which no wallet-wide limit of the starter
+rules lets through. So a task the owner signs this for pays by prepaid tickets only, locking nothing;
+each is at most its `max_ticket_sats`, clamped there where the seller's size is above it and its
+smallest is not; its sends count against its own `max_sends_per_hour`; and the task's `budget_sats` is
+what bounds it. The wallet's limits for one payment, a day, a week and one seller, its velocity and
+its approval threshold don't apply to it, and its payments don't count against them, so every other
+use of the wallet stands as it did. This is the one exception to "a budget is one budget". A wallet
+whose rules don't say so pays a rental like any other task.
 
 The owner's limits are never raised by either one. The task's budget, the cap per seller and the
 caps on locked funds count what leaves the wallet, so a ticket bought for a small call counts in

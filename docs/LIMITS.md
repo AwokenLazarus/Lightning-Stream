@@ -1209,6 +1209,25 @@ untrusted field.
   its address does not start until its owner removes one; neither is dropped.
 - The pay-with-work rail binds a payment to no host; run it over TLS.
 
+### Hashrate rentals
+
+How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is protected".
+
+- A hashtaker can have paid for and not yet received up to a minute of the miner's hashing or 546 sat, whichever
+  is more, plus the start fee shown on the offer. That is what it loses to a hashmaker that takes a payment and
+  vanishes. Its app stops paying a seller after two first steps that delivered little.
+- A hashmaker forwards no share past what's paid. A renter that stops paying gets nothing more, and the miners go
+  home 2 s after the first share that doesn't fit. A renter that walks away still cost the miners their move:
+  that is what the start fee is for, and its right size is not yet measured on real firmware.
+- The renter's protection against a hashmaker dropping winning shares depends on its upstream: a gateway that
+  blinds every job, checked job by job. A miner pointed straight at a pool can't be checked, and is refused.
+- Blinding doesn't stop delay. The checks for it (shares late on a superseded job, shares too old, too few
+  accepted) catch a hashmaker that does it much; a little delay can go unseen.
+- A pool-held key may last across templates. If a pool re-used a key a win had revealed, this check wouldn't see it.
+- These figures assume firmware that hashes what Stratum gives it and honours `mining.set_difficulty`. No real
+  firmware has been run against the check yet.
+- Writes to a miner and to the hashtaker's gateway have no time limit (from reading the code, not measured).
+
 ### Signature hash and replay
 
 - The annex and codeseparator sighash vectors were generated with Knots' Python and not executed

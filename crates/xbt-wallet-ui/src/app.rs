@@ -30,7 +30,7 @@ mod nostr_pages;
 #[path = "relay_pages.rs"]
 mod relay_pages;
 #[path = "hashrate.rs"]
-pub(crate) mod hashrate;
+pub mod hashrate;
 #[path = "inference_page.rs"]
 pub(crate) mod inference_page;
 #[path = "vpn_page.rs"]
@@ -119,6 +119,10 @@ pub fn stream_token(csrf: &str) -> String {
     hex::encode(&Sha256::digest(format!("xbt-wallet-ui/stream|{csrf}").as_bytes())[..16])
 }
 
+/// What the starter rules let rented hashrate cost on mainnet in any 24 hours: about 70 minutes of a
+/// 4 TH/s miner at market. The owner's limit: a rental's own budget is inside it.
+pub const STARTER_RENTAL_BUDGET_SATS: i64 = 200_000;
+
 /// The least `ln.exposure_cap_sats` the starter rules set on mainnet.
 pub const STARTER_EXPOSURE_CAP_SATS: i64 = 100_000;
 
@@ -165,7 +169,9 @@ pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
         p["ln"]["split_height"] = json!(MAINNET_SPLIT_HEIGHT);
         p["ln"]["exposure_cap_sats"] = json!(starter_exposure_cap(held.unwrap_or(0)));
         p["tickets"]["tasks"]["default"]["budget_sats"] = json!(10000);
-        p["tickets"]["tasks"]["hashrate"]["budget_sats"] = json!(5000);
+        // market price for a 4 TH/s miner is about 165,000 sat an hour, which no limit above would let through: the
+        // task pays by its own (`tickets.tasks.*.rental`), and the rest of the wallet stands
+        p["tickets"]["tasks"]["hashrate"] = json!({"budget_sats": STARTER_RENTAL_BUDGET_SATS, "rental": {"max_ticket_sats": 50_000, "max_sends_per_hour": 600}});
     }
     p
 }

@@ -476,7 +476,9 @@ impl Signer {
 
     /// The owner's caps for one seller under a task: `(tickets locked, sats locked, sats paid, the window of the last)`.
     fn ticket_seller_caps(cfg: &PolicyConfig, tp: &TicketPolicy, task: &TaskPolicy, listed: bool) -> (i64, i64, i64, f64) {
-        if listed {
+        if listed && task.rental.is_some() {
+            (tp.seller_max_tickets, tp.seller_max_locked_sats, task.budget_sats, task.window_s as f64)
+        } else if listed {
             (tp.seller_max_tickets, tp.seller_max_locked_sats, cfg.per_counterparty_cap_sats, WEEK_S)
         } else {
             (task.unlisted_max_tickets.min(tp.seller_max_tickets), task.unlisted_max_locked_sats.min(tp.seller_max_locked_sats),
@@ -489,8 +491,16 @@ impl Signer {
     fn ticket_spent(&self, now: f64, task: &str, task_window: f64, dest: &str, seller_window: f64) -> Result<Spent> {
         let mut s = Spent { daily: 0, weekly: 0, task: 0, seller: 0 };
         let add = |slot: &mut i64, n: i64| *slot = slot.saturating_add(n.max(0));
+        let tp = self.ticket_policy();
+        let this_is_rental = tp.is_rental(task);
         for p in self.engine.store.payments()? {
             let age = now - p.ts;
+            // a rental task's payments count only against that task, and it counts only its own: as the policy
+            // engine reads them
+            let of_rental = ticket::is_ledger_id(&p.txid) && ticket::memo_task(&p.memo).is_some_and(|t| tp.is_rental(t));
+            if of_rental != this_is_rental {
+                continue;
+            }
             if age <= DAY_S {
                 add(&mut s.daily, p.amount_sats);
             }
@@ -639,15 +649,22 @@ impl Signer {
             Settle::OnArrival => (None, Some(first.clone())),
         };
         let terms = first;
+        // the largest ticket this route's prepaid entry sells, where it says so. Not in `Terms`: it is the route's, and a
+        // session goes on across a seller's routes
+        let prepaid_top = (if prepaid.as_ref().is_some_and(|_| held.is_some()) { p.get("prepaid_terms") } else { p.get("terms") })
+            .and_then(|e| e.get("extra")).and_then(|x| crate::ticket::outside_u64(x.get("topTicketMsat")));
         let prepaid_msat = match &prepaid {
             None => 0,
-            Some(t) => match (ticket::prepaid_size(t, &tp), &held) {
+            Some(t) => match (task.rental.as_ref().map_or_else(|| ticket::prepaid_size(t, &tp), |r| ticket::rental_prepaid_size(t, prepaid_top, r, &tp)), &held) {
                 (Ok(m), _) => m,
                 // prepaid tickets the owner's bounds refuse are not on offer; with nothing else, the seller is refused
                 (Err(_), Some(_)) => 0,
                 (Err((rule, why)), None) => return refusal(rule, why),
             },
         };
+        if task.rental.is_some() && prepaid_msat == 0 {
+            return refusal("ticket_prepaid_only", format!("task {task_name:?} pays by prepaid tickets only, and this seller's terms offer none of a size the owner allows"));
+        }
         let cfg = self.config();
         let origin = str_or_empty(p.get("origin"));
         let listed = self.ticket_listed(&cfg, &terms.payee, &origin);
@@ -668,7 +685,7 @@ impl Signer {
         let lp_open = LnPolicy::from_map(&cfg.ln);
         // the most one ticket may book, its fee limit included: below the owner's approval threshold (no
         // one can approve a release as it happens) and within the most one payment may be
-        let ceiling = ticket_ceiling(&cfg);
+        let ceiling = task.rental.as_ref().map_or_else(|| ticket_ceiling(&cfg), |r| booking_of(&lp_open, r.max_ticket_msat()).1);
         // the smallest prepaid ticket the seller lets the wallet ask for, below its own size
         let prepaid_min_msat = prepaid.as_ref().and_then(|t| t.min_ticket_msat).map(|m| m.max(1000)).filter(|m| *m < prepaid_msat).unwrap_or(0);
         let out = (|| -> Result<Value> {
@@ -701,7 +718,8 @@ impl Signer {
                 .min(cap_tickets.saturating_sub(st.book.locked(|t| t.payee == terms.payee).tickets));
             // what an earlier session with this seller learnt about its route, if it is recent
             let before = st.book.held_less(&terms.payee, now).cloned();
-            let held_size = held.as_ref().map(|t| {
+            // a rental task holds nothing: it buys prepaid tickets, one at a time
+            let held_size = held.as_ref().filter(|_| task.rental.is_none()).map(|t| {
                 if let Some(b) = before.as_ref().filter(|b| b.hold_why == ROUTE_FULL && now < b.hold_until) {
                     return Err((ROUTE_FULL, format!("three lock rounds in a row found no slot on the route to this seller: no ticket is held with it for another {:.0} s",
                                                     b.hold_until - now)));
@@ -1069,7 +1087,7 @@ impl Signer {
         let session_booked = st.book.of_session(sid).iter().fold(0i64, |a, t| a.saturating_add(t.booked_sats));
         let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(s.ticket_msat)).max(0) as u64).saturating_mul(1000);
         let (face, each) = (sats_ceil(s.ticket_msat), booking_sats(s.ticket_msat, fee_limit_msat));
-        let mut sent_last_hour = st.book.sends_since(now - 3600.0) as i64;
+        let mut sent_last_hour = st.book.sends_since_where(now - 3600.0, |t| !tp.is_rental(t)) as i64;
         let (mut n, mut rows, mut sends) = (0i64, vec![], vec![]);
         // the two limits of the channels these payments may leave on, as the node lists them in this round
         let limits = ticket::channel_limits(chans, ids, &s.payee, tp.feerate_cap(&self.chain));
@@ -1989,8 +2007,13 @@ impl Signer {
                 }
             }
         }
-        if tp.max_sends_per_hour > 0 && st.book.sends_since(now - 3600.0) as i64 >= tp.max_sends_per_hour {
-            return Ok(Err(refusal("ticket_rate_limit", format!("already {} ticket payments sent to the node in the last hour (tickets.max_sends_per_hour)", tp.max_sends_per_hour))));
+        // a rental task's sends count only against its own limit, and no other's against it
+        let (sent, most_sends, name) = match &task.rental {
+            Some(r) => (st.book.sends_since_where(now - 3600.0, |t| t == s.task), r.max_sends_per_hour, "its rental.max_sends_per_hour"),
+            None => (st.book.sends_since_where(now - 3600.0, |t| !tp.is_rental(t)), tp.max_sends_per_hour, "tickets.max_sends_per_hour"),
+        };
+        if most_sends > 0 && sent as i64 >= most_sends {
+            return Ok(Err(refusal("ticket_rate_limit", format!("already {most_sends} ticket payments sent to the node in the last hour ({name})"))));
         }
         let dest = format!("ln:{}", s.payee);
         let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
@@ -2006,7 +2029,7 @@ impl Signer {
         }
         // the wallet's own rules: per payment, daily and weekly budgets, the counterparty cap, velocity, the human threshold
         let pay = Payment::new(&dest, sats, &ticket::memo(&s.task, &s.id));
-        let d = self.engine.evaluate_admitted(&pay, sats)?;
+        let d = if task.rental.is_some() { self.engine.evaluate_rental(&pay, sats)? } else { self.engine.evaluate_admitted(&pay, sats)? };
         if !d.allowed() {
             if let Some(tok) = &d.approval_token {
                 self.engine.store.pop_approval(tok)?;
@@ -2178,8 +2201,9 @@ impl Signer {
     /// what it books, its fee limit included: (msat, face sats, booked sats). The seller's own size
     /// where it fits; else the largest smaller one, in whole sats, that the seller's terms let the
     /// wallet ask for (`minTicketMsat`) and that fits, no larger than the call's charge needs (the
-    /// seller's smallest at the least: [`charge_fit`]); else the seller's own size, which the call's
-    /// limit then refuses. `None`: the session buys no prepaid tickets.
+    /// seller's smallest at the least: [`charge_fit`]); else the seller's smallest, or where it has
+    /// one size that size, which the call's limit then refuses and names. `None`: the session buys no
+    /// prepaid tickets.
     pub(crate) fn ticket_prepaid_size(&self, sid: &str, left: Option<i64>, charge_sats: Option<i64>) -> Option<(u64, i64, i64)> {
         let lp = LnPolicy::from_map(&self.config().ln);
         let s = self.ticket_session(sid)?;
@@ -2187,11 +2211,12 @@ impl Signer {
             return None;
         }
         // no ticket may need the owner's approval, nor be above the most one payment may be
-        let ceiling = ticket_ceiling(&self.config());
+        let rental = self.ticket_policy().tasks.get(&s.task).and_then(|t| t.rental.clone());
+        let ceiling = rental.map_or_else(|| ticket_ceiling(&self.config()), |r| booking_of(&lp, r.max_ticket_msat()).1);
         let left = Some(left.map_or(ceiling, |l| l.min(ceiling)));
         let left = left.map(|l| charge_sats.map_or(l, |c| l.min(charge_fit(&lp, c, s.prepaid_min_msat))));
         let msat = match left {
-            Some(left) if s.prepaid_min_msat > 0 && s.draws.is_none() => fitting_msat(&lp, s.prepaid_min_msat, s.prepaid_msat, left).unwrap_or(s.prepaid_msat),
+            Some(left) if s.prepaid_min_msat > 0 && s.draws.is_none() => fitting_msat(&lp, s.prepaid_min_msat, s.prepaid_msat, left).unwrap_or(s.prepaid_min_msat),
             _ => s.prepaid_msat,
         };
         let (face, booked) = booking_of(&lp, msat);

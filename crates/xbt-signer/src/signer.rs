@@ -496,6 +496,17 @@ impl Signer {
                 Ok(h) => json!({"reachable": true, "chain": self.chain, "height": h}),
                 Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
             },
+            // what a hashmaker's price follows (Sell → Hashrate): the tip's difficulty and subsidy as the node says them.
+            // What it does not say is left out, for the caller to refuse: nothing here is made up
+            "mining_tip" => match self.node.call("getblockchaininfo", json!([])) {
+                Ok(i) => {
+                    let height = i.get("blocks").and_then(Value::as_u64);
+                    let subsidy = height.and_then(|h| self.node.call("getblockstats", json!([h, ["subsidy"]])).ok()).and_then(|s| s.get("subsidy").and_then(Value::as_u64));
+                    json!({"reachable": true, "chain": self.chain, "height": height, "headers": i.get("headers"), "difficulty": i.get("difficulty"),
+                           "tipTime": i.get("time"), "syncing": i.get("initialblockdownload"), "subsidySats": subsidy})
+                }
+                Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
+            },
             "channels" => {
                 // `channels` lists what an earlier version's on-chain channel book holds; this version adds none
                 let mut out = json!({"channels": self.legacy_channels.public(), "legacy_channels": self.legacy_channels.notice(), "height": self.height_safe()});

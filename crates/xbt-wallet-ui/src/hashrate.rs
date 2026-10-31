@@ -11,6 +11,15 @@
 //! time. Rentals also show on Live connections.
 //!
 //! Both talk to their service's control page on the box's own network, with its token.
+//!
+//! **The hashmaker's price.** By default a piece of work costs what it is worth when mined at the chain's
+//! difficulty now, `subsidy * work / (difficulty * 2^32)`, at a percent the owner sets (100%). Of the services on the
+//! box only the signer reads the XBT node, so the difficulty and the block reward come from it (`mining_tip`). A
+//! piece is about one share of the fastest miner here, and a renter pays a start fee, in whole pieces, before the
+//! miners move. The price is worked out here, written into the hasher's settings and into the shop's route for
+//! paid pieces, which must say the same: a new price waits (`holdNew`, no new rental) until the rentals going on
+//! end, since the shop restarts to charge it and a rental keeps the terms it was made with
+//! ([`App::hash_reprice`]). No live price: no new rental; a price the owner typed needs none.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,11 +31,188 @@ use crate::html::{esc, short};
 use crate::server::Resp;
 
 const WAIT: Duration = Duration::from_secs(6);
-/// Suggested price of a piece of work, and its size: about half a minute of a 4 TH/s miner.
-pub const SUGGESTED_PRICE_SAT: u64 = 40;
-pub const SLICE_WORK: u128 = 1 << 47;
-/// The miner speed estimates are given for.
+/// What a rental pays before the miners move, in seconds of their work: it pays for moving them. The S11
+/// run sets the real value.
+pub const START_FEE_SECONDS: f64 = 12.0;
+/// A piece of work is about one share: a gateway's vardiff aims at 8 shares a minute.
+const SHARE_SECONDS: f64 = 7.5;
+/// The miner speed estimates are given for, and pieces are sized to until a miner has hashed here: an S11.
 const EXAMPLE_HS: f64 = 4e12;
+/// The default price: what the work is worth when mined, in percent.
+pub const MARKET_PCT: u64 = 100;
+/// The smallest piece of work.
+const MIN_SLICE_WORK: u128 = 1 << 32;
+/// A node whose tip is older than this has stopped following the chain: its difficulty is not today's.
+const TIP_MAX_AGE_S: u64 = 24 * 3600;
+/// How often a live price is confirmed in the settings at most (the hasher takes no new rental after an
+/// hour without).
+const PRICE_CONFIRM_MS: u64 = 600_000;
+/// A piece keeps its size until one share moves this far from it, in powers of two: a wobbling speed
+/// changes nothing.
+const SLICE_STAYS: f64 = 0.8;
+/// The price this page once suggested: a settings file that has it was not priced by its owner.
+const OLD_SUGGESTED_SAT: u64 = 40;
+/// The piece of work of a settings file from before pieces were sized to the miners.
+const OLD_SLICE_WORK: u128 = 1 << 47;
+
+/// The chain's tip, as a price follows it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tip {
+    pub difficulty: f64,
+    pub subsidy_sats: u64,
+    pub height: u64,
+}
+
+/// The signer's `mining_tip`, checked: a tip a price can follow, or why not, in the owner's words.
+pub fn tip_of(v: &Value, now_s: u64) -> Result<Tip, String> {
+    if v["reachable"] != true {
+        return Err("your XBT node does not answer".into());
+    }
+    let difficulty = v["difficulty"].as_f64().filter(|d| d.is_finite() && *d > 0.0).ok_or("your XBT node did not say the difficulty")?;
+    let subsidy_sats = v["subsidySats"].as_u64().filter(|s| *s > 0).ok_or("your XBT node did not say the block reward")?;
+    let height = v["height"].as_u64().ok_or("your XBT node did not say its height")?;
+    if v["syncing"] != false || v["headers"].as_u64().is_some_and(|h| h > height + 1) {
+        return Err("your XBT node is still catching up with the chain".into());
+    }
+    if v["tipTime"].as_u64().is_none_or(|t| now_s.saturating_sub(t) > TIP_MAX_AGE_S) {
+        return Err("your XBT node has seen no new block for over a day".into());
+    }
+    Ok(Tip { difficulty, subsidy_sats, height })
+}
+
+/// What `work` hashes are worth when mined at `tip`, in sats.
+pub fn worth_sat(work: u128, tip: &Tip) -> f64 {
+    tip.subsidy_sats as f64 * work as f64 / (tip.difficulty * 4_294_967_296.0)
+}
+
+/// A piece of work for a miner of `hs`: the power of two nearest one share, kept at `now` while a share
+/// stays near it.
+pub fn slice_for(hs: f64, now: Option<u128>) -> u128 {
+    let target = (hs.max(1.0) * SHARE_SECONDS).log2();
+    if let Some(w) = now.filter(|w| w.is_power_of_two() && *w >= MIN_SLICE_WORK) {
+        if (target - w.trailing_zeros() as f64).abs() <= SLICE_STAYS {
+            return w;
+        }
+    }
+    1u128 << (target.round().clamp(32.0, 100.0) as u32)
+}
+
+/// The start fee in whole pieces: about [`START_FEE_SECONDS`] of a miner's work at `hs`, at least one. The fee
+/// in force (`now`) is kept while it stays within half of that either way: a wobbling speed changes nothing.
+pub fn start_slices_for(hs: f64, slice_work: u128, now: Option<u64>) -> u64 {
+    let secs = |n: u64| n as f64 * slice_work.max(1) as f64 / hs.max(1.0);
+    if let Some(n) = now.filter(|n| *n >= 1 && (START_FEE_SECONDS * 0.5..=START_FEE_SECONDS * 1.5).contains(&secs(*n))) {
+        return n;
+    }
+    ((START_FEE_SECONDS * hs.max(1.0) / slice_work.max(1) as f64).round() as u64).max(1)
+}
+
+/// How a hashmaker prices: a percent of what the work is worth when mined, or sats for a piece of `per` hashes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pricing {
+    Market(u64),
+    Fixed { sat: u64, per: u128 },
+}
+
+fn work_of(v: &Value) -> Option<u128> {
+    v.as_str().and_then(|w| w.parse().ok()).filter(|w: &u128| *w > 0)
+}
+
+/// How the settings price. A file from before: a price its owner typed is kept, and the old suggestion goes.
+pub fn pricing(s: &Value) -> Pricing {
+    match s["priceMode"].as_str() {
+        Some("fixed") => Pricing::Fixed { sat: s["fixedPriceSat"].as_u64().unwrap_or(1).max(1), per: work_of(&s["fixedSliceWork"]).unwrap_or(OLD_SLICE_WORK) },
+        Some(_) => Pricing::Market(s["pricePct"].as_u64().unwrap_or(MARKET_PCT).max(1)),
+        None => match s["priceSat"].as_u64() {
+            Some(p) if p > 0 && p != OLD_SUGGESTED_SAT => Pricing::Fixed { sat: p, per: work_of(&s["sliceWork"]).unwrap_or(OLD_SLICE_WORK) },
+            _ => Pricing::Market(MARKET_PCT),
+        },
+    }
+}
+
+/// A rental's terms as the settings ask for them: the price of a piece, its work and the start fee.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Want {
+    pub price_sat: u64,
+    pub slice_work: u128,
+    pub start_slices: u64,
+}
+
+impl Want {
+    /// What is in force, as written for the hasher. None: no price yet.
+    fn applied(s: &Value) -> Option<Want> {
+        let price_sat = s["priceSat"].as_u64().filter(|p| *p > 0)?;
+        Some(Want { price_sat, slice_work: work_of(&s["sliceWork"])?, start_slices: s["startSlices"].as_u64().unwrap_or(0) })
+    }
+
+    fn write(&self, s: &mut Value) {
+        s["priceSat"] = json!(self.price_sat);
+        s["sliceWork"] = json!(self.slice_work.to_string());
+        s["startSlices"] = json!(self.start_slices);
+    }
+
+    fn to_json(self) -> Value {
+        json!({"priceSat": self.price_sat, "sliceWork": self.slice_work.to_string(), "startSlices": self.start_slices})
+    }
+}
+
+/// The terms the settings ask for, for miners of `hs` at the most (none measured: an S11's speed), at
+/// `tip`. A market price needs the tip; a fixed one scales with the piece.
+pub fn want(s: &Value, tip: Result<&Tip, &str>, hs: Option<f64>) -> Result<Want, String> {
+    let hs = hs.filter(|h| *h > 0.0).unwrap_or(EXAMPLE_HS);
+    let now = work_of(&s["sliceWork"]);
+    let slice_work = match now {
+        Some(w) if s["sliceFixed"] == true => w,
+        _ => slice_for(hs, now),
+    };
+    let price = match pricing(s) {
+        Pricing::Market(pct) => worth_sat(slice_work, tip.map_err(str::to_string)?) * pct as f64 / 100.0,
+        Pricing::Fixed { sat, per } => sat as f64 * slice_work as f64 / per as f64,
+    };
+    // the fee in force, for the piece in force
+    let start_now = s["startSlices"].as_u64().filter(|_| now == Some(slice_work));
+    Ok(Want { price_sat: (price.round().min(u64::MAX as f64) as u64).max(1), slice_work, start_slices: start_slices_for(hs, slice_work, start_now) })
+}
+
+/// What the hasher's status says that a price follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Seen {
+    /// The fastest miner here, measured.
+    hs: Option<f64>,
+    /// Miners are here, none measured yet: a piece can't be sized to them.
+    measuring: bool,
+    rentals: usize,
+    /// It takes no new rental now.
+    paused: bool,
+}
+
+fn seen(st: &Value) -> Seen {
+    let live: Vec<f64> = st["miners"].as_array().into_iter().flatten().filter(|m| m["connected"] == true).map(|m| num(&m["hashrateHs"])).collect();
+    let fastest = live.iter().copied().fold(0.0, f64::max);
+    Seen {
+        hs: (fastest > 0.0).then_some(fastest),
+        measuring: !live.is_empty() && fastest <= 0.0,
+        rentals: st["rentals"].as_array().map(Vec::len).unwrap_or(0),
+        paused: st["paused"].is_string(),
+    }
+}
+
+/// What a re-price did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Repriced {
+    /// Renting is off, or the hasher could not be asked.
+    Off,
+    /// The price in force is what the settings ask for (confirmed, if live).
+    Same,
+    /// A new price is written, and the shop charges it once it has restarted.
+    Applied,
+    /// The new price waits for this many rentals going on to end: no new rental till then.
+    Held(usize),
+    /// No new rental while the shop starts with the new price.
+    Waiting,
+    /// No live price: why.
+    NoPrice(String),
+}
 
 /// One call to a service's control page.
 fn call(base: &str, token: &Option<PathBuf>, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
@@ -98,6 +284,18 @@ fn sats_n(n: f64) -> String {
     format!("{o} {}", if n == 1 { "sat" } else { "sats" })
 }
 
+/// Whether a hashmaker could drop the shares that win on this upstream, as its jobs show. Nothing here names a pool:
+/// a pool that adds a key shows as blinded by itself.
+fn blinding_card(b: &Value) -> String {
+    let Some(words) = b["words"].as_str() else { return String::new() };
+    let (class, head) = match b["state"].as_str() {
+        Some("blinded") => ("good", "Winning shares are hidden"),
+        Some("not blinded") => ("bad", "Winning shares can be seen"),
+        _ => ("warn", "Can't check your upstream"),
+    };
+    format!("<section class=\"card\"><p><span class=\"pill {class}\">{head}</span></p><p>{}</p></section>", esc(words))
+}
+
 /// A closed rental's reason, in words.
 fn ended_words(why: &str) -> String {
     // the earlier role names too: a hashlink from before the rename words its reasons with them
@@ -106,10 +304,24 @@ fn ended_words(why: &str) -> String {
         "cut by the hashtaker" | "cut by the buyer" => "You cut it.".into(),
         "budget used up" => "Its budget is used up.".into(),
         "rental time over" => "Its time is up.".into(),
-        "no accepted work" => "The miners stopped sending work.".into(),
+        "no proven work" | "no accepted work" => "The miners stopped sending work.".into(),
         "unpaid" => "A piece of work was not paid in time.".into(),
         "stopped by the hashmaker" | "stopped by the hasher" => "The hashmaker stopped it.".into(),
         "no miners free now" => "The hashmaker has no miners free.".into(),
+        "a difficulty too high for the slice" => "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.".into(),
+        "no first payment" => "The first piece of work was not paid in time.".into(),
+        "the first slice could not be paid" => "Your wallet could not pay for the first piece of work.".into(),
+        "paid time used up" => "The hashmaker stopped it: the miners had the paid work's time and your pool gave them too little to do.".into(),
+        "too many jobs" | "too many shares" => "The hashmaker stopped it: your pool sent more than a rental needs.".into(),
+        "a job this app can't check" => "Your pool sent work that can't be checked, so the rental stopped.".into(),
+        "the hashtaker changed the extranonce" | "the gateway changed the extranonce" => "Your pool changed the work in a way that can't be checked, so the rental stopped.".into(),
+        "shares harder than the difficulty said" => "The hashmaker stopped it: its miners' work looked harder than your pool said.".into(),
+        "the gateway's jobs aren't blinded" => "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.".into(),
+        "shares on an old job" => "The miners kept working on an out-of-date job, so the rental stopped.".into(),
+        "too many resumes" => "The connection to the hashmaker came and went too often, so it stopped.".into(),
+        "shares arrive too old" => "The miners' work kept arriving late, so the rental stopped.".into(),
+        "shares that don't prove" => "The hashmaker sent work that doesn't check out, so the rental stopped.".into(),
+        "the gateway accepted too few shares" => "Your pool turned down too much of the work, so the rental stopped.".into(),
         w if w.starts_with("link lost") => "The connection to the hashmaker was lost.".into(),
         w if w.starts_with("could not start") => format!("It could not start: {}", w.trim_start_matches("could not start: ")),
         w => format!("Ended: {w}."),
@@ -139,8 +351,122 @@ impl App {
         if s["enabled"] != true {
             return None;
         }
-        let price = s["priceSat"].as_u64().unwrap_or(SUGGESTED_PRICE_SAT) * 1000;
+        // the price of a piece, as the hasher's terms say it: no price yet, no route (a route without one would be free)
+        let price = s["priceSat"].as_u64().filter(|p| *p > 0)?.checked_mul(1000)?;
         Some(json!({"path": "/hashrate/", "upstream": slices, "methods": ["POST"], "max_body": 65536, "price": {"request_msat": price}}))
+    }
+
+    /// The chain's tip, as the signer reads it from the XBT node.
+    pub(crate) fn mining_tip(&self) -> Result<Tip, String> {
+        let v = self.call("mining_tip", json!({})).map_err(|_| "this app's signer can't read it: update the app".to_string())?;
+        tip_of(&v, crate::now().max(0) as u64)
+    }
+
+    /// Whether the shop charges `price_sat` a piece of work now (its `/services`). A shop this app can't ask
+    /// (no health address) is taken at its config.
+    fn shop_charges(&self, price_sat: u64) -> bool {
+        let Some(origin) = self.cfg.gw.health_url.as_deref().and_then(crate::services::http_origin) else { return true };
+        let Ok((200, body)) = crate::app::http_get(&format!("{origin}{}", xbt_gateway::config::SERVICES_PATH)) else { return false };
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let charged = v["routes"].as_array().into_iter().flatten().find(|r| r["path"] == "/hashrate/")
+            .and_then(|r| r["price"]["requestMsat"].as_str()).and_then(|p| p.parse::<u64>().ok());
+        charged == price_sat.checked_mul(1000)
+    }
+
+    /// Price the hashmaker's work again: at the chain's difficulty (a market price) and the speed its miners show.
+    /// Run every minute and at each Save (`saving`). A rental keeps the terms it was made with, and the shop
+    /// charges one price, which it takes by restarting (a payment then fails, and the rental ends). So a new
+    /// price is put in force only with no rental going on and none starting: first the hasher is told to take
+    /// no new rental (`holdNew`, with the new terms `pending`), then, its rentals ended, the terms and the
+    /// shop's route are written, and new rentals start again once the shop charges the new price.
+    pub fn hash_reprice(&self, saving: bool) -> Repriced {
+        let mut s = self.hash_settings();
+        if s["enabled"] != true {
+            return Repriced::Off;
+        }
+        let st = match &self.cfg.hash.hasher {
+            None => Value::Null,
+            Some(base) => match call(base, &self.cfg.hash.hasher_token, "GET", "/status", None) {
+                Ok(v) => v,
+                // a hasher that does not answer runs no rental; but its rentals are not known otherwise
+                Err(_) if saving => Value::Null,
+                Err(_) => return Repriced::Off,
+            },
+        };
+        let seen = seen(&st);
+        let before = s.clone();
+        let mode = pricing(&s);
+        if s.get("priceMode").is_none() {
+            match mode {
+                Pricing::Market(pct) => {
+                    s["priceMode"] = json!("market");
+                    s["pricePct"] = json!(pct);
+                }
+                Pricing::Fixed { sat, per } => {
+                    s["priceMode"] = json!("fixed");
+                    s["fixedPriceSat"] = json!(sat);
+                    s["fixedSliceWork"] = json!(per.to_string());
+                }
+            }
+        }
+        let live = matches!(mode, Pricing::Market(_));
+        let now_ms = crate::now().max(0) as u64 * 1000;
+        s["awaitSpeed"] = json!(seen.measuring && s["sliceFixed"] != true);
+        let tip = if live { self.mining_tip() } else { Err(String::new()) };
+        let applied = Want::applied(&s);
+        let r = match want(&s, tip.as_ref().map_err(String::as_str), seen.hs) {
+            // the price in force ages out at the hasher, within the hour; the rentals going on keep theirs
+            Err(why) => Repriced::NoPrice(why),
+            Ok(w) if Some(w) == applied => {
+                if let Some(m) = s.as_object_mut() {
+                    m.remove("pending");
+                }
+                if s["holdNew"] == true && self.shop_charges(w.price_sat) {
+                    s["holdNew"] = json!(false);
+                }
+                if live && s["priceSeenMs"].as_u64().is_none_or(|t| now_ms.saturating_sub(t) >= PRICE_CONFIRM_MS) {
+                    s["priceSeenMs"] = json!(now_ms);
+                }
+                if s["holdNew"] == true {
+                    Repriced::Waiting
+                } else {
+                    Repriced::Same
+                }
+            }
+            // nothing priced yet, or no rental going on and none starting (or the owner saving): in force now
+            Ok(w) if applied.is_none() || (seen.rentals == 0 && (saving || seen.paused)) => {
+                w.write(&mut s);
+                if let Some(m) = s.as_object_mut() {
+                    m.remove("pending");
+                }
+                // till the shop charges it, when it can be asked
+                s["holdNew"] = json!(self.cfg.gw.health_url.is_some());
+                if live {
+                    s["priceSeenMs"] = json!(now_ms);
+                }
+                Repriced::Applied
+            }
+            Ok(w) => {
+                s["pending"] = w.to_json();
+                s["holdNew"] = json!(true);
+                Repriced::Held(seen.rentals)
+            }
+        };
+        if !live {
+            if let Some(m) = s.as_object_mut() {
+                m.remove("priceSeenMs");
+            }
+        }
+        if s != before {
+            if let Err(e) = write_settings(&self.cfg.hash.settings, &s) {
+                return Repriced::NoPrice(e);
+            }
+        }
+        if r == Repriced::Applied {
+            // the shop's route at the new price: its gateway restarts to take it
+            let _ = self.commit(&self.shop(), "");
+        }
+        r
     }
 
     // --- Sell → Hashrate ------------------------------------------------------------------------
@@ -220,8 +546,18 @@ impl App {
         }
 
         // the main action: turn renting on, or change it
-        let price = pick("priceSat").and_then(|v| v.as_u64()).unwrap_or(SUGGESTED_PRICE_SAT);
-        let slice: f64 = pick("sliceWork").map(|v| num(&v)).filter(|w| *w > 0.0).unwrap_or(SLICE_WORK as f64);
+        let seen = st.as_ref().map(seen).unwrap_or_default();
+        let mode = pricing(&saved);
+        let tip = self.mining_tip();
+        let wanted = want(&saved, tip.as_ref().map_err(String::as_str), seen.hs);
+        let (pct, fixed) = match mode {
+            Pricing::Market(p) => (p, String::new()),
+            Pricing::Fixed { sat, .. } => (MARKET_PCT, sat.to_string()),
+        };
+        let price_block = price_words(&wanted, tip.as_ref().ok(), seen.hs, matches!(mode, Pricing::Market(_)));
+        let paused = st.as_ref().ok().and_then(|s| s["paused"].as_str()).map(paused_words).unwrap_or_default();
+        let slice_typed = saved["sliceFixed"] == true;
+        let slice_now = wanted.as_ref().map(|w| w.slice_work).unwrap_or_else(|_| slice_for(seen.hs.unwrap_or(EXAMPLE_HS), None)) as f64;
         let rentable = pick("rentable").and_then(|v| v.as_u64()).map(|n| n.to_string()).unwrap_or_default();
         let name = pick("name").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
         let link_public = pick("linkPublic").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
@@ -259,21 +595,29 @@ impl App {
             <label>Your own pool, where your miners hash when nobody rents them<input name=\"fallback\" value=\"{}\" required class=\"mono\" \
             pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:23334\" placeholder=\"192.168.1.20:23334\"></label>\
             <p class=\"hint\">Your DATUM Gateway or your pool, as your miners use it today. Every miner nobody rents keeps hashing there.</p>\
-            <label>Price for each piece of work, in sats<input name=\"price\" value=\"{price}\" required inputmode=\"numeric\" pattern=\"[0-9]+\" title=\"A whole number of sats\"></label>\
-            <p class=\"hint\">At this price a {} miner earns about <strong>{}</strong> an hour while it is rented. That is about <strong>{}</strong> a day for each 1 TH/s of speed.</p>\
+            <fieldset><legend>Price for each piece of work</legend>\
+            <label class=\"choice\"><input type=\"radio\" name=\"price_mode\" value=\"market\"{}><span><strong>Follow the market</strong>\
+            <small>A percent of what the work is worth when mined at today's difficulty</small></span></label>\
+            <label>Percent of that<input name=\"price_pct\" value=\"{pct}\" inputmode=\"numeric\" pattern=\"[0-9]+\" title=\"A whole percent, like 100\"></label>\
+            <label class=\"choice\"><input type=\"radio\" name=\"price_mode\" value=\"fixed\"{}><span><strong>A fixed price</strong>\
+            <small>Sats for each piece of work, whatever the difficulty</small></span></label>\
+            <label>Fixed price, in sats<input name=\"price\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\" title=\"A whole number of sats\"></label></fieldset>\
+            {price_block}{paused}\
             <label>Miners to rent out at most <small>(empty: all of them)</small><input name=\"rentable\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label>\
             <label>Name, as hashtakers see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
             {}\
             <label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{}> Rent out my miners</label>\
+            <p class=\"hint\">Your node checks every share's hash itself, so a renter's word doesn't set what the work is worth.</p>\
             <details><summary>Advanced</summary>\
-            <label>Work in each piece (hashes)<input name=\"slice_work\" value=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]+\" class=\"mono\"></label>\
+            <label>Work in each piece (hashes) <small>(empty: about one share of your fastest miner)</small><input name=\"slice_work\" value=\"{}\" placeholder=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]*\" class=\"mono\"></label>\
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             {}</details><div class=\"row\"><button>{}</button></div></form></section>",
-            if on { "Change renting" } else { "Rent out your miners" }, esc(&fallback), speed(EXAMPLE_HS), sats_n(per_hour(price as f64, slice, EXAMPLE_HS)),
-            sats_n(per_ths_day(price as f64, slice)),
-            esc(&rentable), esc(&name), reach, if on || saved.get("enabled").is_none() { " checked" } else { "" }, slice,
+            if on { "Change renting" } else { "Rent out your miners" }, esc(&fallback),
+            if matches!(mode, Pricing::Market(_)) { " checked" } else { "" }, if matches!(mode, Pricing::Fixed { .. }) { " checked" } else { "" }, esc(&fixed),
+            esc(&rentable), esc(&name), reach, if on { " checked" } else { "" },
+            if slice_typed { format!("{slice_now:.0}") } else { String::new() }, slice_now,
             if direct { forwarded.as_str() } else { "" },
-            if on { "Save" } else { "Save and start renting" }));
+            "Save"));
         if let Ok(s) = &st {
             match s["listing"].get("ok") {
                 Some(Value::Bool(true)) => b.push_str(&format!(
@@ -305,13 +649,20 @@ impl App {
                 if !fallback.contains(':') || fallback.contains(['/', ' ']) {
                     return Err("Write your own pool's address with its port, like 192.168.1.20:23334.".into());
                 }
-                let price: u64 = g("price").parse().map_err(|_| "The price is a whole number of sats.".to_string())?;
-                if price == 0 {
-                    return Err("Set a price above 0 sats.".into());
+                // a form from before the choice names a price only: a fixed one
+                let market = g("price_mode") == "market" || (g("price_mode").is_empty() && g("price").is_empty());
+                let pct: u64 = if g("price_pct").is_empty() { MARKET_PCT } else { g("price_pct").parse().map_err(|_| "The percent is a whole number, like 100.".to_string())? };
+                if market && !(1..=1000).contains(&pct) {
+                    return Err("Set a percent from 1 to 1000.".into());
+                }
+                let price: u64 = if market { 0 } else { g("price").parse().map_err(|_| "The fixed price is a whole number of sats.".to_string())? };
+                if !market && price == 0 {
+                    return Err("Set a fixed price above 0 sats.".into());
                 }
                 let rentable: Option<u64> = if g("rentable").is_empty() { None } else { Some(g("rentable").parse().map_err(|_| "Miners to rent out is a whole number, or empty.".to_string())?) };
-                let slice: u128 = if g("slice_work").is_empty() { SLICE_WORK } else { g("slice_work").parse().map_err(|_| "The work in each piece is a whole number.".to_string())? };
-                if slice < 1 << 32 {
+                let slice: Option<u128> =
+                    if g("slice_work").is_empty() { None } else { Some(g("slice_work").parse().map_err(|_| "The work in each piece is a whole number.".to_string())?) };
+                if slice.is_some_and(|w| w < MIN_SLICE_WORK) {
                     return Err("Each piece of work is at least 4,294,967,296 hashes.".into());
                 }
                 let grace: u64 = if g("grace_s").is_empty() { 45 } else { g("grace_s").parse().map_err(|_| "The wait is a whole number of seconds.".to_string())? };
@@ -319,9 +670,21 @@ impl App {
                 let shop = self.shop();
                 v["enabled"] = json!(g("enabled") == "1");
                 v["fallback"] = json!(fallback);
-                v["priceSat"] = json!(price);
+                if market {
+                    v["priceMode"] = json!("market");
+                    v["pricePct"] = json!(pct);
+                } else {
+                    // a fixed price is for a piece the size it is now, and scales with it
+                    let per = slice.or_else(|| work_of(&v["sliceWork"])).unwrap_or_else(|| slice_for(EXAMPLE_HS, None));
+                    v["priceMode"] = json!("fixed");
+                    v["fixedPriceSat"] = json!(price);
+                    v["fixedSliceWork"] = json!(per.to_string());
+                }
                 v["rentable"] = json!(rentable);
-                v["sliceWork"] = json!(slice.to_string());
+                v["sliceFixed"] = json!(slice.is_some());
+                if let Some(w) = slice {
+                    v["sliceWork"] = json!(w.to_string());
+                }
                 v["graceMs"] = json!(grace.clamp(5, 600) * 1000);
                 v["name"] = json!(if g("name").is_empty() { "Hashrate".to_string() } else { g("name").chars().take(80).collect() });
                 let link = g("link_public");
@@ -334,10 +697,18 @@ impl App {
                     v["payUrl"] = json!(format!("{}/hashrate", shop.public_url.trim_end_matches('/')));
                 }
                 write_settings(&self.cfg.hash.settings, &v)?;
+                // priced now, unless rentals are going on: the price they pay stays till they end
+                let priced = self.hash_reprice(true);
                 // the shop sells each piece of work: its route follows these settings
                 let words = self.commit(&shop, "")?;
                 Ok(if v["enabled"] == true {
-                    format!("Saved. Renting is on. {}", words.trim())
+                    let price = match priced {
+                        Repriced::Held(n) => format!(" The new price starts once the {n} rental{} going on end{}. No new rental starts till then.",
+                                                     if n == 1 { "" } else { "s" }, if n == 1 { "s" } else { "" }),
+                        Repriced::NoPrice(why) => format!(" No rental starts yet: there is no price, because {why}."),
+                        _ => String::new(),
+                    };
+                    format!("Saved. Renting is on.{price} {}", words.trim())
                 } else {
                     "Saved. Renting is off: every miner hashes for your own pool.".into()
                 })
@@ -425,7 +796,12 @@ impl App {
                     let total = x["miners"].as_u64().unwrap_or(0);
                     let free_hs = num(&x["freeHs"]);
                     let per_miner = if free > 0 && free_hs > 0.0 { free_hs / free as f64 } else { EXAMPLE_HS };
-                    let budget = per_hour(price, slice, per_miner).ceil().max(price) as u64;
+                    let start = x["startSlices"].as_u64().unwrap_or(0);
+                    let fee = price * start as f64;
+                    let budget = (per_hour(price, slice, per_miner) + fee).ceil().max(price + fee) as u64;
+                    let fee_words = start_fee_words(price, start, slice, per_miner);
+                    // a hashmaker whose app doesn't prove its work is refused when renting: said, and Rent waits
+                    let old = x["proves"] == false;
                     // the spending rules list who the app may pay: a hashmaker not on them is allowed first, with the
                     // node its signed listing names (the rules page shows the change to sign)
                     let pay_url = x["payUrl"].as_str().unwrap_or("");
@@ -437,37 +813,46 @@ impl App {
                             crate::services::urlenc(&o), esc(n)),
                         _ => String::new(),
                     };
-                    let can = ready && allowed && (free > 0 || total == 0);
+                    let can = ready && allowed && !old && (free > 0 || total == 0);
+                    let old = if old {
+                        "<p class=\"hint\"><span class=\"pill warn\">Needs updating</span> This hashmaker's app doesn't prove the work it sells, so it can't be rented.</p>"
+                    } else {
+                        ""
+                    };
                     let history = history_panel(&x["history"]);
-                    // a budget under the shop's ticket may still buy a whole one: what may leave the wallet, as
-                    // the hashtaker sets it (rail::pay_caps), is said beside the budget
+                    // what may leave the wallet for a trial's first ticket, as the hashtaker sets it (rail::caps_at),
+                    // is said beside its price; a longer rental's tickets grow with its work, so it names no figure
                     let ticket = |k: &str| match x[k].as_u64() {
                         Some(n) => format!("may buy a ticket of up to {} from this shop", sats_n(n as f64)),
                         None => "may buy a ticket from this shop".into(),
                     };
                     let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
-                        <input type=\"hidden\" name=\"key\" value=\"{}\"><p class=\"hint\">Not sure yet? Rent one machine for one piece of work, \
+                        <input type=\"hidden\" name=\"key\" value=\"{}\"><p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
                         about {}, and see what your own DATUM Gateway accepts before renting more. It is charged at most that, but your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
-                        esc(x["linkKey"].as_str().unwrap_or("")), sats_n(price.ceil()), ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
+                        esc(x["linkKey"].as_str().unwrap_or("")), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
+                        ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{history}{allow}{trial}\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{old}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
-                        <p class=\"hint\">About an hour of one machine. The rental ends when this much is spent, but however small it is, your wallet {}; \
+                        <p class=\"hint\">About an hour of one machine{}. The rental ends when this much is spent, but however small it is, your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button{}>Rent</button></form></section>",
                         esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
-                        esc(x["linkKey"].as_str().unwrap_or("")), ticket("mayBuyTicketUpToSats"), if can { "" } else { " disabled" }));
+                        esc(x["linkKey"].as_str().unwrap_or("")), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
+                        if can { "" } else { " disabled" }));
                 }
                 b.push_str("</div>");
             }
         }
 
+        // what its jobs show: from the jobs themselves, for whatever pool it mines to
+        b.push_str(&blinding_card(&st["blinding"]));
         // the DATUM Gateway's address
         b.push_str(&format!("<section class=\"card\"><h2>Your DATUM Gateway</h2><form method=\"post\" action=\"./hashrate\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"datum\">\
@@ -557,6 +942,11 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     };
     let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}{}</p>", esc(&ended_words(w)),
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
+    // a payment the wallet refused: the hashmaker will only say a piece went unpaid, and the reason is this wallet's,
+    // in words where it has them (xbt_hashlink::rail::BIG_TICKETS_ONLY and those beside it)
+    const WORDS: [&str; 3] = ["This hashmaker's smallest ticket is", "What is left of this rental's budget", "Your wallet's rules stopped this payment"];
+    let refused = live["pays"].as_array().into_iter().flatten().rev().find_map(|p| p["why"].as_str().filter(|w| WORDS.iter().any(|s| w.starts_with(s))))
+        .map(|w| format!("<p class=\"hint\">{}</p>", esc(w))).unwrap_or_default();
     let cut = if ended {
         String::new()
     } else {
@@ -588,7 +978,7 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
         String::new()
     };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
-             <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
+             <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
 }
@@ -607,6 +997,63 @@ fn may_buy(v: &Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// A rental's start fee on the renter's offer: in sats, and in seconds of a machine's work.
+fn start_fee_words(price_sat: f64, start: u64, slice_work: f64, per_miner_hs: f64) -> String {
+    if start == 0 {
+        return String::new();
+    }
+    let secs = if per_miner_hs > 0.0 { format!(", about {:.0} seconds of a machine's work", start as f64 * slice_work / per_miner_hs) } else { String::new() };
+    format!("<p class=\"fee\">Start fee: <strong>{}</strong>{secs}. It is paid first, with the first piece of work, and pays the hashmaker \
+             for moving the miners to you. They don't move until it arrives.</p>", sats_n(price_sat * start as f64))
+}
+
+/// The price, its start fee and what the work is worth when mined, as the hashmaker's form says them, and a
+/// warning when the price is below that worth. `market`: the price follows the difficulty.
+fn price_words(w: &Result<Want, String>, tip: Option<&Tip>, hs: Option<f64>, market: bool) -> String {
+    let w = match w {
+        Ok(w) => w,
+        Err(why) => {
+            let fixed = if market { " A fixed price works without it." } else { "" };
+            return format!("<p class=\"hint\"><span class=\"pill warn\">No live price</span> This app can't read today's difficulty: {}. \
+                            Following the market needs it, so no new rental starts until it can. Rentals going on keep their price.{fixed}</p>", esc(why));
+        }
+    };
+    let (miner, at) = match hs {
+        Some(h) => (format!("your fastest miner ({})", speed(h)), h),
+        None => (format!("a {} miner, until one of yours has hashed here", speed(EXAMPLE_HS)), EXAMPLE_HS),
+    };
+    let slice = w.slice_work as f64;
+    let worth = tip.map(|t| worth_sat(w.slice_work, t));
+    let mined = worth.map(|v| format!(" Mined at today's difficulty it is worth about {}.", sats_n(v))).unwrap_or_default();
+    let mut b = format!("<p class=\"hint\">A piece of work is about one share of {miner}, about {:.0} seconds of its work. It costs <strong>{}</strong>.{mined} \
+        While rented, a {} miner earns about <strong>{}</strong> an hour, about <strong>{}</strong> a day for each 1 TH/s of speed.</p>\
+        <p class=\"hint\">Renters also pay a start fee of <strong>{}</strong> ({} piece{} of work, about {:.0} seconds of a miner's work) before your \
+        miners move. It pays for moving them.</p>",
+        slice / at, sats_n(w.price_sat as f64), speed(at), sats_n(per_hour(w.price_sat as f64, slice, at)), sats_n(per_ths_day(w.price_sat as f64, slice)),
+        sats_n((w.price_sat * w.start_slices) as f64), w.start_slices, if w.start_slices == 1 { "" } else { "s" }, w.start_slices as f64 * slice / at);
+    // a price rounded to the sat is not below it
+    if let Some(v) = worth.filter(|v| w.price_sat as f64 + 0.5 < *v) {
+        b.push_str(&format!("<p><span class=\"pill warn\">Below mining value</span> This price is below what the work is worth when mined at today's \
+            difficulty, about {} a piece. Your own pool likely pays close to that, less its fee, so renting at this price may earn you less than \
+            mining. This app can't see what your pool pays you, so it compares your price with the mining value only.</p>", sats_n(v)));
+    }
+    b
+}
+
+/// Why the hasher takes no new rental, in the owner's words.
+fn paused_words(why: &str) -> String {
+    let w = match why {
+        "no price yet" => "There is no price yet, so no rental starts.",
+        "no miner measured yet" => "Your miners are being measured, to size the pieces of work to them. Renting starts in a couple of minutes.",
+        "a new price waits for the rentals going on to end" => {
+            "Your new price starts once the rentals going on end and your shop has restarted with it. No new rental starts till then."
+        }
+        w if w.contains("not been confirmed") => "The live price could not be checked against your XBT node for over an hour, so no new rental starts until it can.",
+        _ => "No new rental starts for now.",
+    };
+    format!("<p><span class=\"pill warn\">No new rentals</span> {w}</p>")
 }
 
 /// What a finished rental, or a test slice, showed: delivered against advertised speed, stale and
@@ -676,6 +1123,19 @@ fn th_hours(x: f64) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_rental_refused_for_a_shops_big_tickets_says_so_and_no_other_reason_is_shown_raw() {
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let card = |pays: Value| rental_card(&ctx, &json!({"rental": "r1", "hasher": "Hashrate", "budgetSats": 1500, "ended": true,
+                                                          "live": {"role": "buyer", "meter": {}, "closed": "hashmaker closed: unpaid", "pays": pays}}), "hashrate");
+        let c = card(json!([{"slice": 1, "ok": false, "why": "This hashmaker's smallest ticket is 900 sats, and 559 sats may leave your wallet for this payment. Nothing was paid for this piece of work."}]));
+        assert!(c.contains("smallest ticket is 900 sats") && c.contains("Nothing was paid") && c.contains("not paid in time"), "{c}");
+        let c = card(json!([{"slice": 9, "ok": false, "why": "Your wallet's rules stopped this payment: the task's budget_sats. Nothing more was paid."}]));
+        assert!(c.contains("budget_sats"), "{c}");
+        let c = card(json!([{"slice": 1, "ok": false, "why": "{\"verdict\":\"deny\",\"rule\":\"price_ceiling\"}"}]));
+        assert!(!c.contains("price_ceiling"), "{c}");
+    }
+
+    #[test]
     fn a_rental_is_connecting_until_its_link_opens_and_one_that_never_opens_says_why() {
         let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
         let card = |live: Value, ended: bool| rental_card(&ctx, &json!({"rental": "r1", "hasher": "Hashrate", "budgetSats": 1500, "ended": ended, "live": live}), "hashrate");
@@ -714,14 +1174,172 @@ mod tests {
     }
 
     #[test]
+    fn the_upstreams_blinding_is_said_plainly_and_names_no_pool() {
+        assert_eq!(blinding_card(&Value::Null), "", "not looked at yet");
+        let c = blinding_card(&json!({"state": "blinded", "why": "solo", "words": "Blinded: a hashmaker can't tell which shares win, so it can't drop those."}));
+        assert!(c.contains("pill good") && c.contains("Winning shares are hidden") && c.contains("Blinded:"), "{c}");
+        let c = blinding_card(&json!({"state": "not blinded", "words": "Not blinded: its key is null. <refused>"}));
+        assert!(c.contains("pill bad") && c.contains("&lt;refused&gt;"), "{c}");
+        assert!(blinding_card(&json!({"state": "can't be checked", "words": "w"})).contains("pill warn"));
+    }
+
+    const MAINNET: Tip = Tip { difficulty: 6.33e9, subsidy_sats: 312_500_000, height: 970_000 };
+
+    fn tip_json(now: u64) -> Value {
+        json!({"reachable": true, "chain": "main", "height": 970_000, "headers": 970_000, "difficulty": 6.33e9, "tipTime": now - 600,
+               "syncing": false, "subsidySats": 312_500_000u64})
+    }
+
+    #[test]
+    fn a_piece_is_priced_at_what_it_is_worth_when_mined() {
+        // subsidy * work / (difficulty * 2^32): 1,617.7 sat for 2^47 at 6.33e9 and 3.125 XBT, 404.4 for 2^45
+        assert!((worth_sat(1 << 47, &MAINNET) - 1617.69).abs() < 0.01);
+        assert!((worth_sat(1 << 45, &MAINNET) - 404.42).abs() < 0.01);
+        let market = json!({"priceMode": "market", "pricePct": 100});
+        assert_eq!(want(&market, Ok(&MAINNET), Some(4e12)).unwrap(), Want { price_sat: 404, slice_work: 1 << 45, start_slices: 1 });
+        // a percent of it
+        let half = json!({"priceMode": "market", "pricePct": 50});
+        assert_eq!(want(&half, Ok(&MAINNET), Some(4e12)).unwrap().price_sat, 202);
+        // the default, and a settings file from before (the old 40 sat suggestion goes)
+        assert_eq!(pricing(&json!({})), Pricing::Market(100));
+        assert_eq!(pricing(&json!({"priceSat": 40, "sliceWork": "140737488355328"})), Pricing::Market(100));
+        // a price an owner typed before is kept, for the piece it was typed for
+        assert_eq!(pricing(&json!({"priceSat": 60, "sliceWork": "140737488355328"})), Pricing::Fixed { sat: 60, per: 1 << 47 });
+    }
+
+    #[test]
+    fn a_new_difficulty_gives_a_new_price() {
+        let market = json!({"priceMode": "market", "sliceWork": "35184372088832"});
+        let at = |d: f64| want(&market, Ok(&Tip { difficulty: d, ..MAINNET }), Some(4e12)).unwrap();
+        assert_eq!(at(6.33e9).price_sat, 404);
+        assert_eq!(at(7.0e9).price_sat, 366, "harder: worth less");
+        assert_eq!(at(5.0e9).price_sat, 512);
+        // and a halving halves it
+        assert_eq!(want(&market, Ok(&Tip { subsidy_sats: 156_250_000, ..MAINNET }), Some(4e12)).unwrap().price_sat, 202);
+    }
+
+    #[test]
+    fn with_no_live_difficulty_a_market_price_is_none_and_a_fixed_one_is_kept() {
+        let now = 2_000_000_000;
+        assert_eq!(tip_of(&tip_json(now), now).unwrap(), MAINNET);
+        let bad = |k: &str, v: Value| {
+            let mut t = tip_json(now);
+            t[k] = v;
+            tip_of(&t, now).unwrap_err()
+        };
+        assert!(bad("reachable", json!(false)).contains("does not answer"));
+        assert!(bad("difficulty", Value::Null).contains("difficulty"));
+        assert!(bad("difficulty", json!(0.0)).contains("difficulty"));
+        assert!(bad("subsidySats", Value::Null).contains("block reward"), "no subsidy is no price: none is made up");
+        assert!(bad("syncing", json!(true)).contains("catching up"));
+        assert!(bad("syncing", Value::Null).contains("catching up"), "a node that doesn't say is not taken as synced");
+        assert!(bad("headers", json!(970_010)).contains("catching up"));
+        assert!(bad("tipTime", json!(now - 2 * 86_400)).contains("no new block"));
+        // an older signer has no `mining_tip`: what it answers instead is no tip
+        assert!(tip_of(&json!({"error": "unknown method"}), now).is_err());
+        let market = json!({"priceMode": "market"});
+        assert_eq!(want(&market, Err("your XBT node does not answer"), Some(4e12)).unwrap_err(), "your XBT node does not answer");
+        let fixed = json!({"priceMode": "fixed", "fixedPriceSat": 300, "fixedSliceWork": "35184372088832"});
+        assert_eq!(want(&fixed, Err("down"), Some(4e12)).unwrap(), Want { price_sat: 300, slice_work: 1 << 45, start_slices: 1 });
+        let words = price_words(&Err("your XBT node does not answer".into()), None, None, true);
+        assert!(words.contains("No live price") && words.contains("no new rental starts") && words.contains("A fixed price works without it"), "{words}");
+    }
+
+    #[test]
+    fn a_fixed_price_is_kept_and_scales_with_the_piece() {
+        let fixed = json!({"priceMode": "fixed", "fixedPriceSat": 300, "fixedSliceWork": "35184372088832"});
+        // whatever the difficulty
+        for d in [1e9, 6.33e9, 9e9] {
+            assert_eq!(want(&fixed, Ok(&Tip { difficulty: d, ..MAINNET }), Some(4e12)).unwrap().price_sat, 300);
+        }
+        // a faster miner: a piece eight times bigger, at eight times the price (the same price per hash)
+        assert_eq!(want(&fixed, Ok(&MAINNET), Some(41e12)).unwrap(), Want { price_sat: 2400, slice_work: 1 << 48, start_slices: 2 });
+        // a piece the owner typed stays its size
+        let typed = json!({"priceMode": "fixed", "fixedPriceSat": 300, "fixedSliceWork": "35184372088832", "sliceFixed": true, "sliceWork": "35184372088832"});
+        assert_eq!(want(&typed, Ok(&MAINNET), Some(100e12)).unwrap().slice_work, 1 << 45);
+    }
+
+    #[test]
+    fn the_piece_and_the_start_fee_at_1_4_41_and_100_th() {
+        let market = json!({"priceMode": "market"});
+        let at = |ths: f64| want(&market, Ok(&MAINNET), Some(ths * 1e12)).unwrap();
+        // (piece, price, start fee in pieces): a piece is about 7.5 s, the fee about 12 s in whole pieces
+        assert_eq!(at(1.0), Want { price_sat: 101, slice_work: 1 << 43, start_slices: 1 });
+        assert_eq!(at(4.0), Want { price_sat: 404, slice_work: 1 << 45, start_slices: 1 });
+        assert_eq!(at(41.0), Want { price_sat: 3235, slice_work: 1 << 48, start_slices: 2 });
+        assert_eq!(at(100.0), Want { price_sat: 6471, slice_work: 1 << 49, start_slices: 2 });
+        // the fee in seconds of the miner's work
+        for (ths, lo, hi) in [(1.0, 8.0, 9.0), (4.0, 8.0, 9.0), (41.0, 13.0, 14.0), (100.0, 11.0, 12.0)] {
+            let w = at(ths);
+            let secs = w.start_slices as f64 * w.slice_work as f64 / (ths * 1e12);
+            assert!((lo..hi).contains(&secs), "{ths} TH/s: {secs} s");
+        }
+        // not measured yet: sized as for an S11
+        assert_eq!(want(&market, Ok(&MAINNET), None).unwrap(), at(4.0));
+        // what the owner reads
+        let words = price_words(&Ok(at(41.0)), Some(&MAINNET), Some(41e12), true);
+        assert!(words.contains("It costs <strong>3,235 sats</strong>") && words.contains("start fee of <strong>6,470 sats</strong> (2 pieces of work, about 14 seconds"), "{words}");
+    }
+
+    #[test]
+    fn a_speed_that_wobbles_keeps_the_piece_its_size() {
+        let now = Some(1u128 << 45);
+        for hs in [2.8e12, 3.3e12, 4.1e12, 4.9e12, 5.5e12] {
+            assert_eq!(slice_for(hs, now), 1 << 45, "{hs}");
+        }
+        // a miner far off it: resized
+        assert_eq!(slice_for(2.0e12, now), 1 << 44);
+        assert_eq!(slice_for(41e12, now), 1 << 48);
+        // and the price with it: a wobble changes neither
+        let market = json!({"priceMode": "market", "sliceWork": "35184372088832", "startSlices": 1});
+        for hs in [2.8e12, 3.0e12, 4.1e12, 5.0e12, 5.5e12] {
+            assert_eq!(want(&market, Ok(&MAINNET), Some(hs)).unwrap(), Want { price_sat: 404, slice_work: 1 << 45, start_slices: 1 }, "{hs}");
+        }
+        // the fee alone, far off its seconds: set again
+        assert_eq!(start_slices_for(4e12, 1 << 45, Some(5)), 1);
+        assert_eq!(start_slices_for(5e12, 1 << 45, None), 2, "with nothing in force, the nearest");
+    }
+
+    #[test]
+    fn the_hashmaker_is_warned_below_mining_value_and_not_at_it() {
+        let worth_404 = Want { price_sat: 404, slice_work: 1 << 45, start_slices: 1 };
+        let at = price_words(&Ok(worth_404), Some(&MAINNET), Some(4e12), true);
+        assert!(!at.contains("Below mining value"), "rounded to the sat is not below: {at}");
+        assert!(at.contains("worth about 404 sats"), "{at}");
+        let low = price_words(&Ok(Want { price_sat: 40, ..worth_404 }), Some(&MAINNET), Some(4e12), false);
+        assert!(low.contains("Below mining value") && low.contains("about 404 sats a piece") && low.contains("compares your price with the mining value only"), "{low}");
+        assert!(!low.contains('\u{2014}'), "no em dash: {low}");
+        assert!(!price_words(&Ok(Want { price_sat: 500, ..worth_404 }), Some(&MAINNET), Some(4e12), false).contains("Below mining value"));
+        // with no tip there is nothing to compare with
+        assert!(!price_words(&Ok(Want { price_sat: 40, ..worth_404 }), None, None, false).contains("Below mining value"));
+    }
+
+    #[test]
+    fn the_offer_shows_its_start_fee() {
+        assert_eq!(start_fee_words(404.0, 0, (1u128 << 45) as f64, 4e12), "");
+        let f = start_fee_words(3235.0, 2, (1u128 << 48) as f64, 41e12);
+        assert!(f.contains("Start fee: <strong>6,470 sats</strong>, about 14 seconds of a machine") && f.contains("paid first"), "{f}");
+    }
+
+    #[test]
+    fn what_the_hasher_shows_sizes_the_piece() {
+        let st = json!({"miners": [{"connected": true, "hashrateHs": 4.1e12}, {"connected": true, "hashrateHs": 41e12}, {"connected": false, "hashrateHs": 99e12}],
+                        "rentals": [{"rental": "r1"}], "paused": null});
+        assert_eq!(seen(&st), Seen { hs: Some(41e12), measuring: false, rentals: 1, paused: false });
+        let new = json!({"miners": [{"connected": true, "hashrateHs": 0.0}], "rentals": [], "paused": "no miner measured yet"});
+        assert_eq!(seen(&new), Seen { hs: None, measuring: true, rentals: 0, paused: true });
+        assert_eq!(seen(&Value::Null), Seen::default());
+    }
+
+    #[test]
     fn speeds_and_prices_read_plainly() {
         assert_eq!(speed(4.1e12), "4.10 TH/s");
         assert_eq!(speed(8.5e11), "850.00 GH/s");
         assert_eq!(speed(0.0), "—");
         // 12 sats a piece of 2^47 hashes: about 307 sats an hour for 1 TH/s, about 7,367 a day
-        assert_eq!(per_ths_day(12.0, SLICE_WORK as f64).round(), 7367.0);
+        assert_eq!(per_ths_day(12.0, OLD_SLICE_WORK as f64).round(), 7367.0);
         // 40 sats a piece of 2^47 hashes, at 4 TH/s: about 4,093 sats an hour
-        let h = per_hour(40.0, SLICE_WORK as f64, 4e12);
+        let h = per_hour(40.0, OLD_SLICE_WORK as f64, 4e12);
         assert!((h - 4093.0).abs() < 1.0, "{h}");
         assert_eq!(sats_n(4093.4), "4,093 sats");
         assert_eq!(sats_n(1.0), "1 sat");
@@ -729,5 +1347,9 @@ mod tests {
         assert_eq!(ended_words("cut by the buyer"), "You cut it.");
         assert_eq!(ended_words("hashtaker closed: cut by the hashtaker"), "You cut it.");
         assert_eq!(ended_words("hashmaker closed: stopped by the hashmaker"), "The hashmaker stopped it.");
+        // the words xbt_hashlink::hashmaker ends these with
+        assert_eq!(ended_words("hashmaker closed: no first payment"), "The first piece of work was not paid in time.");
+        assert_eq!(ended_words("the gateway's jobs aren't blinded"), "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.");
+        assert_eq!(ended_words("hashmaker closed: a difficulty too high for the slice"), "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.");
     }
 }

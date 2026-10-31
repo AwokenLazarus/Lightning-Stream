@@ -19,7 +19,11 @@ impl Sender {
     pub fn send(&self, m: &Msg) -> Result<(), Error> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let frame = g.1.encrypt(&m.to_bytes())?;
-        g.0.write_all(&frame)?;
+        if let Err(e) = g.0.write_all(&frame) {
+            // past WRITE_TIMEOUT, or a closed link: part of a frame may have gone, so nothing more can follow it
+            let _ = g.0.shutdown(std::net::Shutdown::Both);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -59,6 +63,15 @@ impl Receiver {
         let b = noise::read_msg(&mut self.stream, &mut self.cipher)?;
         Ok(Msg::from_bytes(&b))
     }
+
+    /// As [`Receiver::recv`], for an answer that is due: past `wait` it is an error, and the link is
+    /// closed, however the bytes came (a read's own timeout starts afresh with each byte).
+    pub fn recv_within(&mut self, wait: Duration) -> Result<Option<Msg>, Error> {
+        let done = close_after(self.stream.try_clone()?, wait);
+        let r = self.recv();
+        drop(done);
+        r
+    }
 }
 
 /// A link made: both halves and the peer's static key.
@@ -68,7 +81,12 @@ pub struct Link {
     pub remote: PublicKey,
 }
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// The most a handshake, and the answer that follows it, may take.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// A send that makes no progress for this long fails and closes the link. Each side sends while
+/// holding its one lock, the hashmaker's over all its rentals and miners, and a link that stalled
+/// with its buffers full would otherwise hold that lock for good.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the hashtaker waits for the hashmaker's address to answer. Without it a link that never
 /// opens (an address that drops packets, a router without NAT reflection) waits on the system's TCP
 /// timeout, minutes, and the rental looks live all that time.
@@ -86,8 +104,20 @@ pub fn connect_within(addr: &str, wait: Duration) -> std::io::Result<TcpStream> 
     Err(last)
 }
 
+/// Closes `s` once `wait` is over, unless what this returns is dropped first.
+fn close_after(s: TcpStream, wait: Duration) -> std::sync::mpsc::Sender<()> {
+    let (done, over) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if over.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    done
+}
+
 fn split(stream: TcpStream, t: noise::Transport) -> Result<Link, Error> {
     stream.set_read_timeout(None)?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.set_nodelay(true)?;
     let w = stream.try_clone()?;
     Ok(Link {
@@ -99,16 +129,26 @@ fn split(stream: TcpStream, t: noise::Transport) -> Result<Link, Error> {
 
 /// The hashtaker's side: connect to the hashmaker, whose static key is known.
 pub fn dial(addr: &str, me: SecretKey, hashmaker: PublicKey) -> Result<Link, Error> {
-    let mut s = connect_within(addr, CONNECT_TIMEOUT)?;
-    s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    dial_within(addr, me, hashmaker, HANDSHAKE_TIMEOUT.max(CONNECT_TIMEOUT))
+}
+
+/// As [`dial`], with the connection and the handshake each given at most `wait`.
+pub fn dial_within(addr: &str, me: SecretKey, hashmaker: PublicKey, wait: Duration) -> Result<Link, Error> {
+    let wait = wait.max(Duration::from_millis(1));
+    let mut s = connect_within(addr, wait.min(CONNECT_TIMEOUT))?;
+    s.set_read_timeout(Some(wait.min(HANDSHAKE_TIMEOUT)))?;
+    let done = close_after(s.try_clone()?, wait.min(HANDSHAKE_TIMEOUT));
     let t = noise::connect(&mut s, noise::PROLOGUE, me, hashmaker)?;
+    drop(done);
     split(s, t)
 }
 
 /// The hashmaker's side: complete the handshake on an accepted stream.
 pub fn answer(mut s: TcpStream, me: SecretKey) -> Result<Link, Error> {
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let done = close_after(s.try_clone()?, HANDSHAKE_TIMEOUT);
     let t = noise::accept(&mut s, noise::PROLOGUE, me)?;
+    drop(done);
     split(s, t)
 }
 
@@ -124,6 +164,35 @@ mod connect_tests {
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         assert!(connect_within(&l.local_addr().unwrap().to_string(), Duration::from_secs(1)).is_ok());
+    }
+
+    /// A peer that stops reading, with the connection open: sending ends in an error within a bound
+    /// instead of blocking for good (each side sends while holding its one lock), and the link is closed,
+    /// since a frame may have gone half out.
+    #[test]
+    fn a_send_to_a_peer_that_stopped_reading_fails_within_a_bound_and_closes_the_link() {
+        let hk = noise::fresh_key();
+        let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        // answers the handshake and never reads again
+        let _peer = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let lk = answer(s, hk).unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+            drop(lk);
+        });
+        let Link { tx, mut rx, .. } = dial(&addr, noise::fresh_key(), hpub).unwrap();
+        let (done, ended) = std::sync::mpsc::channel();
+        let sender = tx.clone();
+        std::thread::spawn(move || {
+            let line = "x".repeat(60_000);
+            while sender.send(&Msg::Up { chan: 1, line: line.clone() }).is_ok() {}
+            let _ = done.send(());
+        });
+        assert!(ended.recv_timeout(Duration::from_secs(30)).is_ok(), "a send to a peer that stopped reading is still blocked");
+        assert!(tx.send(&Msg::Ping { n: 1 }).is_err(), "the link is closed after that");
+        assert!(rx.recv().is_err(), "and its reader ends");
     }
 }
 

@@ -33,6 +33,10 @@ pub struct State {
     pub reject: Option<String>,
     pub mined_by_signer: u64,
     pub down: bool,
+    /// `getblockchaininfo`'s difficulty; None: 6.33e9, as on mainnet when the hashmaker's price was set.
+    pub difficulty: Option<f64>,
+    /// `getblockstats`'s subsidy; None: 3.125 XBT. `Some(None)`: the node does not answer it.
+    pub subsidy: Option<Option<u64>>,
     pub coinbase: std::collections::HashSet<String>,
     /// `getdeploymentinfo`; None: the node does not answer it.
     pub deployments: Option<Value>,
@@ -229,8 +233,15 @@ impl Node for FakeChain {
         Ok(match method {
             "getblockchaininfo" => {
                 let s = self.st.lock().unwrap();
-                json!({"chain": s.chain, "blocks": s.height, "initialblockdownload": false, "pruned": true})
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                json!({"chain": s.chain, "blocks": s.height, "headers": s.height, "initialblockdownload": false, "pruned": true,
+                       "difficulty": s.difficulty.unwrap_or(6.33e9), "time": now})
             }
+            "getblockstats" => match self.st.lock().unwrap().subsidy {
+                Some(None) => return Err(rpc_err("Block not available (pruned data)")),
+                Some(Some(sats)) => json!({"subsidy": sats}),
+                None => json!({"subsidy": 312_500_000u64}),
+            },
             "getblockcount" => json!(self.height()),
             "getblockhash" => {
                 let h = p[0].as_u64().unwrap_or(0);

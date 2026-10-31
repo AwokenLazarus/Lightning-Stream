@@ -400,6 +400,7 @@ mod tests {
             websocket: false,
             accounts: None,
             capacity: Default::default(),
+            top_ticket_msat: None,
             service: String::new(),
         };
         let h = |v: &[(&str, &str)]| {

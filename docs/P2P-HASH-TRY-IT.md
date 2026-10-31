@@ -74,16 +74,19 @@ target/release/xbt-hashlink keygen hashtaker.key      # the hashtaker's link key
        "macaroon": "invoices.macaroon",
        "info_macaroon": "info.macaroon"
      },
-     "tickets": { "ticket_msat": 546000, "max_tickets": 2, "ticket_blocks": 40, "settle": ["on-use", "on-arrival"] },
+     "tickets": { "ticket_msat": 546000, "min_ticket_msat": 546000, "max_tickets": 2, "ticket_blocks": 40, "settle": ["on-use", "on-arrival"] },
      "routes": [
        { "path": "/hashrate/", "upstream": "http://127.0.0.1:34943", "methods": ["POST"],
-         "max_body": 8192, "price": { "request_msat": 40000 } }
+         "max_body": 8192, "price": { "request_msat": 40000 }, "top_ticket_msat": 100000000 }
      ]
    }
    ```
 
-   `request_msat` is the price of one slice, and it must equal `--price-msat` below. Check the config
-   against the node, then run it:
+   `request_msat` is the price of one slice, and it must equal `--price-msat` below.
+   `min_ticket_msat` is the smallest ticket you sell, and a renter's first step: 546 sat. A gateway
+   whose smallest is more is refused by renters, with nothing paid. `top_ticket_msat` is the largest
+   prepaid ticket this route sells, for a big miner's tickets; it doesn't raise what is held.
+   Check the config against the node, then run it:
 
    ```
    target/release/xbt-gateway --check gateway.json

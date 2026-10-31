@@ -136,6 +136,29 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   Buyers are charged only for work that reaches their pool.
 - A hashmaker rents out only miners that have connected and named themselves, so a rental never
   gets a silent connection that does no work.
+- After a break in the link, a rental keeps going even if a share's result was lost in the break.
+  Before, the hashmaker stayed one share behind for the rest of the rental. With shares more than
+  3 seconds apart it refused the next slice and ended the rental as unpaid: the wallet was charged
+  nothing, and the hashmaker went unpaid for that work.
+- A hashtaker that reconnects before the hashmaker has noticed the break carries on. Before, it was
+  refused and the rental ended.
+- A hashtaker reconnecting over a link that has gone silent now gives up when its time to come back
+  runs out, and its unused tickets go back. Before, it could wait for good with them still held.
+- A slice paid as the link breaks now waits up to 8 seconds for the rental to resume, and is paid and
+  charged once. Before, a break of 2 seconds could refuse it and end the rental as unpaid.
+- A renter can no longer hang a hashmaker's whole app by asking for an impossibly high difficulty. A
+  difficulty of two slices a share or more now ends that rental at once, whichever of its miners it was said to,
+  with all of that rental's miners; other rentals carry on. That is 65,536 and up at the default slice: about 56
+  TH/s on a miner at 0.2 shares a second, or any miner if the renter's gateway starts there. Larger slices are the
+  hashmaker's setting.
+- A rental whose renter never accepts a share ends after 8 slices' worth or 60 seconds, across link breaks too.
+  Before, it could keep a hashmaker's miners with nothing counted and nothing paid.
+- A hashmaker has to trust its renter's word for what it delivered. A renter's answers are the meter and can't be
+  checked yet, so a dishonest renter that accepts a few shares can underpay without limit while the rental runs,
+  and rent again. See docs/P2P-HASH.md.
+- Sell, Hashrate says this beside "Rent out my miners", and the box starts unticked for an owner who has never
+  saved the form; one who has keeps their choice. A rental card says in plain words why the hashmaker ended it for
+  these two reasons.
 
 **The app**
 - A visit to a shop reached by its key is headed by the shop's name, and pages show such a shop by

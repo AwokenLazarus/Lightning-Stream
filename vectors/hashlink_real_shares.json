@@ -1,0 +1,231 @@
+{
+ "comment": "Stratum lines of real rentals through xbt-hashlink at 6fc3b05930a7 and d313732ca4b0, captured by a tee between the miner and the hashmaker: stratum-grind (a real CPU miner of this chain, ~/Bitcoin prime/primed) into datum_gateway (convoy master 971af86), Knots v29.4.2 regtest with blake2b@101. hash is what the gateway logged.",
+ "runs": [
+  {
+   "name": "solo: gateway with no pool, hash as its BLOCK FOUND line",
+   "subscribe_answer": {
+    "error": null,
+    "id": 1,
+    "result": [
+     [
+      [
+       "mining.notify",
+       "b14cf00d1"
+      ],
+      [
+       "mining.set_difficulty",
+       "b14cf00d2"
+      ]
+     ],
+     "b14cf00d",
+     8
+    ]
+   },
+   "shares": [
+    {
+     "notify": {
+      "id": null,
+      "method": "mining.notify",
+      "params": [
+       "6ae62ec70cc0d504",
+       "000000000000c08d54b6383e826abb6aecc3860058f3ff32c2c49ab85b05e96a",
+       "000000d817b9c100782ec9d7444cadf9ae2d7ddc56dd0d76c7dd386184fc395e50a66700000000",
+       "",
+       [],
+       "a0000000",
+       "1d00ffff",
+       "0000000000000000",
+       false
+      ]
+     },
+     "submit": {
+      "id": 100,
+      "method": "mining.submit",
+      "params": [
+       "mma15BcFXFkBLzt6LMUrcYsZNMPeKZpC2h",
+       "6ae62ec70cc0d504",
+       "54f029fde5e6dd78",
+       "0000000000000000",
+       "c2a00e0500000000"
+      ]
+     },
+     "difficulty": 0.9999847412109375,
+     "hash": "00000000f33bd196b99593fede94d23c77091d4014621bb8ef5c13634d9de80f"
+    },
+    {
+     "notify": {
+      "id": null,
+      "method": "mining.notify",
+      "params": [
+       "6ae62ee413c0cc04",
+       "00000000000043a6b4b0a30e1ce986b0b11a2aa5fe11e240d25825008db6980f",
+       "00000011ffe7c0f23ce7e3c6223a6493845b95c9d0c9cc330b49968855cdbc4627d62500000000",
+       "",
+       [],
+       "a0000000",
+       "1d00ffff",
+       "0000000000000000",
+       false
+      ]
+     },
+     "submit": {
+      "id": 100,
+      "method": "mining.submit",
+      "params": [
+       "mma15BcFXFkBLzt6LMUrcYsZNMPeKZpC2h",
+       "6ae62ee413c0cc04",
+       "2af894fe72f36e3c",
+       "0000000000000000",
+       "c2a5290400000000"
+      ]
+     },
+     "difficulty": 0.9999847412109375,
+     "hash": "000000001e84ef8faa4a61a44e1a0106c057f88192dc95df674e6da2a50c3ead"
+    },
+    {
+     "notify": {
+      "id": null,
+      "method": "mining.notify",
+      "params": [
+       "6ae62f101dc0c204",
+       "000000000000c7e2844b7eeba1cc3afb808ae525fd69e651c96c5984c80390b1",
+       "0000006b9ce7617e7ad3ce25b6e654670ba7a51b7dd6c74e6ca81d6b04c9fa9a6bafb500000000",
+       "",
+       [],
+       "a0000000",
+       "1d00ffff",
+       "0000000000000000",
+       false
+      ]
+     },
+     "submit": {
+      "id": 100,
+      "method": "mining.submit",
+      "params": [
+       "mma15BcFXFkBLzt6LMUrcYsZNMPeKZpC2h",
+       "6ae62f101dc0c204",
+       "2af894fe72f36e3c",
+       "0000000000000000",
+       "1e75a20e00000000"
+      ]
+     },
+     "difficulty": 0.9999847412109375,
+     "hash": "0000000020b27cdcbaf0ad32e420434296724e836e28cacb763e68d4780bec6f"
+    }
+   ]
+  },
+  {
+   "name": "pool: gateway to primed 0.1.0 over DATUM (ABW disabled), hash as its BLOCK FOUND line; primed accepted all 3",
+   "subscribe_answer": {
+    "error": null,
+    "id": 1,
+    "result": [
+     [
+      [
+       "mining.notify",
+       "b14cf00d1"
+      ],
+      [
+       "mining.set_difficulty",
+       "b14cf00d2"
+      ]
+     ],
+     "b14cf00d",
+     8
+    ]
+   },
+   "shares": [
+    {
+     "notify": {
+      "id": null,
+      "method": "mining.notify",
+      "params": [
+       "6ae637870dc0d204",
+       "000000000000b0233dcb1bf05534fcb5903afa59c8352e5424a9aef2dbf29385",
+       "0000006186fea0970db95cb964d15b824b407dc96deb79fe67a80ed8a1e507b85b7edb00000000",
+       "",
+       [],
+       "b0000000",
+       "1d00ffff",
+       "0000000000000000",
+       false
+      ]
+     },
+     "submit": {
+      "id": 100,
+      "method": "mining.submit",
+      "params": [
+       "bcrt1ql6rfh8evlzc24mns5mqvelmv48jc3e96utmjyk",
+       "6ae637870dc0d204",
+       "0000000000000000",
+       "0000000000000000",
+       "9800730d00000000"
+      ]
+     },
+     "difficulty": 0.9999847412109375,
+     "hash": "00000000a4c9c6f60d128d3e2f1915e6cb827a8345c68fc9c61990698adc8a2b"
+    },
+    {
+     "notify": {
+      "id": null,
+      "method": "mining.notify",
+      "params": [
+       "6ae637ca1bc0c404",
+       "0000000000005521079902744ae5d67235601fb850a6b3c735f23d4320e9f11f",
+       "0000007ec2676fb711e36b3cd9501a2d462f2a3f9caf16685deb354916a963b026dd6800000000",
+       "",
+       [],
+       "b0000000",
+       "1d00ffff",
+       "0000000000000000",
+       false
+      ]
+     },
+     "submit": {
+      "id": 100,
+      "method": "mining.submit",
+      "params": [
+       "bcrt1ql6rfh8evlzc24mns5mqvelmv48jc3e96utmjyk",
+       "6ae637ca1bc0c404",
+       "54f029fde5e6dd78",
+       "0000000000000000",
+       "ac797f0c00000000"
+      ]
+     },
+     "difficulty": 0.9999847412109375,
+     "hash": "00000000d242f98ea0a198383281ffbafb1a054b90254c11bc028b07ef7cdc46"
+    },
+    {
+     "notify": {
+      "id": null,
+      "method": "mining.notify",
+      "params": [
+       "6ae6384634c0ed04",
+       "0000000000000c1d30e1edee2bbadfaf9d571a4c70df17586b7b5419b5616f0f",
+       "00000000dd30863aceb2843954400bd8a10f36d031f8657660c9a038b1fe2ceab88af700000000",
+       "",
+       [],
+       "b0000000",
+       "1d00ffff",
+       "0000000000000000",
+       false
+      ]
+     },
+     "submit": {
+      "id": 100,
+      "method": "mining.submit",
+      "params": [
+       "bcrt1ql6rfh8evlzc24mns5mqvelmv48jc3e96utmjyk",
+       "6ae6384634c0ed04",
+       "696c747c9f601517",
+       "0000000000000000",
+       "ed59960b00000000"
+      ]
+     },
+     "difficulty": 0.9999847412109375,
+     "hash": "00000000835e44081c36eec9ff130c9650de936794b411361063587c3e3254bd"
+    }
+   ]
+  }
+ ]
+}
