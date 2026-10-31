@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -65,8 +66,11 @@ FACTS = {}
 def spec(rpc_host):
     cfg = {"node": {"host": rpc_host, "port": RPC, "user": "lab", "password": RPC_PASS, "chain": "regtest"},
            "mcpUrls": [], "lightningRest": "", "proxies": [], "lanHost": ""}
-    r = subprocess.run(["node", "--experimental-strip-types", "--no-warnings", "test/spec-json.mjs", json.dumps(cfg)], cwd=PKG,
-                       capture_output=True, text=True, check=True)
+    js = ["node", "--experimental-strip-types", "--no-warnings", "test/spec-json.mjs", json.dumps(cfg)]
+    if not shutil.which("node"):
+        # no node on the lab: the same command in a node image, on the package's sources read-only
+        js = ["docker", "run", "--rm", "--network", "none", "-v", f"{PKG}:/p:ro", "-w", "/p", "node:22-slim", *js]
+    r = subprocess.run(js, cwd=PKG, capture_output=True, text=True, check=True)
     return json.loads(r.stdout)
 
 

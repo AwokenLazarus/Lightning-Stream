@@ -19,7 +19,6 @@ mkdir -p "$OUT"
 for b in bitcoind bitcoin-cli stratum-grind datum_gateway-blind lib/libmicrohttpd.so.12; do
   [ -e "$HG/$b" ] || { echo "datum_regtest: $HG/$b missing" >&2; exit 1; }
 done
-command -v node >/dev/null || { echo "datum_regtest: node missing" >&2; exit 1; }
 
 echo "== build: xbt-hashlink, xbt-init, xbt-supervise from this tree"
 nice -n 19 cargo build -q -j"${JOBS:-6}" --release --locked -p xbt-hashlink --bin xbt-hashlink -p xbt-svc --bin xbt-init --bin xbt-supervise
