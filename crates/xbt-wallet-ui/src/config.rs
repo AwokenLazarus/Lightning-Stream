@@ -342,6 +342,7 @@ impl Config {
             Some(o) => return Err(format!("XBT_UI_ROLE {o}: wallet or gateway")),
         };
         let run_dir = |name: &str| env("XBT_DATA_DIR").map(|d| PathBuf::from(d).join("run").join(name)).unwrap_or_else(|| data_dir.join(name));
+        let datum_dir = env("XBT_UI_DATUM_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("datum"));
         let ln = LnSetup {
             dir: env("XBT_UI_LN_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("ln")),
             rest: env("XBT_UI_LN_REST"),
@@ -452,7 +453,7 @@ impl Config {
                         Some(_) => return Err("XBT_UI_DATUM_RPCURL: the node's RPC address, http://host:port".into()),
                         None => None,
                     },
-                    dir: env("XBT_UI_DATUM_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("datum")),
+                    dir: datum_dir,
                     api_port: match env("XBT_UI_DATUM_API_PORT") {
                         Some(p) => p.parse().ok().filter(|p| *p > 0).ok_or("XBT_UI_DATUM_API_PORT: a port")?,
                         None => 7152,
