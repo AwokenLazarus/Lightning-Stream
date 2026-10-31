@@ -19,12 +19,19 @@ exports; `docker compose config` accepts the file with those values, and with th
 Hardening (docs/CONTAINER.md): the agentpay services run read-only, cap_drop ALL, no-new-privileges, under an init
 (init: true), as their image's non-root user, and mount only their own sub-dir plus the dirs they need (a peer's read-only); of the
 Lightning node's data, only its tls.cert, read-only, as a bind that never creates a missing path; no
-admin macaroon. The one exception is the one-shot `node-keys-bake`, by name: as the Lightning app's user
-it mounts that app's data folder read-only, and writes only the hand-over folder run/node-keys. `init` (xbt-init) is the only root container: no network, at most CHOWN/FOWNER/DAC_OVERRIDE.
+admin macaroon. The one exception is the one-shot `node-keys-bake`, node-keys from the UI's image with no
+entrypoint and exactly its environment: as the Lightning app's user it mounts that app's data folder read-only,
+and writes only the hand-over folder run/node-keys. `init` (xbt-init) is the only root container: no network, at
+most CHOWN/FOWNER/DAC_OVERRIDE.
+Shape: the compose file is read strictly (a key written twice is refused) and its keys are allowed, not refused
+(no extends, include, build, secrets, configs, env_file, hooks, ...); an entrypoint only where one is pinned; no
+`..` in a mount. Every rule on what a container reaches is checked again on the model `docker compose config`
+resolves, with the host's folders marked, so that nothing written can hide a mount from it.
     python3 packaging/umbrel/lint.py [STORE_DIR]
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -122,6 +129,126 @@ NODE_KEYS_BAKE_GROUPS = {"10005", "10007", "10008"}
 # hand-over into run/ln and run/gateway
 NODE_KEYS_MOUNTS = {"${APP_DATA_DIR}/data/run/ln:/data/run/ln", "${APP_DATA_DIR}/data/run/gateway:/data/run/gateway",
                     "${APP_DATA_DIR}/data/run/node-keys:/data/run/node-keys"}
+
+# The compose shape a store app may take, checked twice: as written (anchors and merges applied), and
+# as `docker compose config` resolves it (extends, include and env_file applied too). Keys are allowed,
+# not refused: one these rules do not know (build, secrets, configs, post_start, use_api_socket, ...)
+# cannot carry another app's data or this box's in.
+TOP_KEYS = {"version", "services"}  # and x- extension fields
+SERVICE_KEYS = {"image", "command", "entrypoint", "user", "restart", "init", "read_only", "tmpfs", "cap_drop", "cap_add",
+                "security_opt", "depends_on", "environment", "volumes", "ports", "healthcheck", "stop_grace_period",
+                "network_mode", "group_add"}
+APP_PROXY_KEYS = {"environment"}
+# what `docker compose config` writes of its own: the project name and its default network
+RESOLVED_TOP_KEYS = {"name", "networks", "services"}
+RESOLVED_SERVICE_KEYS = SERVICE_KEYS | {"networks"}
+RESOLVED_APP_PROXY_KEYS = {"image", "environment", "networks"}
+# an entrypoint replaces what the image runs: only these, exactly
+SIGNER_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--",
+                     "/usr/bin/xbt-signer"]
+ENTRYPOINTS = {("lazarus-lightning-stream", "signer"): SIGNER_ENTRYPOINT, ("lazarus-xbt-agent-wallet", "signer"): SIGNER_ENTRYPOINT,
+               ("lazarus-xbt-knots", "node"): ["bitcoind"]}
+# the baker's whole environment, as written (nothing more reaches it: no env_file)
+NODE_KEYS_BAKE_ENV = {"XBT_KEYS_NODE_REST": "https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}",
+                      "XBT_KEYS_TLS_CERT": "/node/tls.cert", "XBT_KEYS_ADMIN": "/node/data/chain", "XBT_KEYS_RAIL_DIR": "/data/run/ln",
+                      "XBT_KEYS_GW_DIR": "/data/run/gateway", "XBT_KEYS_BAKE_TO": "/data/run/node-keys", "XBT_KEYS_RETRY_MAX_S": "30"}
+# stand-ins for the host's folders in the resolved model, so that each mount's source says whose it is
+MARKS = {"APP_DATA_DIR": "/__app_data__", "APP_LIGHTNING_FORK_NODE_DATA_DIR": "/__lightning_fork_data__", "UMBREL_ROOT": "/__umbrel_root__"}
+
+
+class StrictLoader(yaml.SafeLoader):
+    """yaml.safe_load that refuses a key written twice in one mapping: PyYAML keeps the last, so a second
+    `user:` or a second service of the same name would be what lint reads but not what was written.
+    Keys a merge (<<) brings in are not the mapping's own and may be overridden, as Compose allows."""
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            seen = set()
+            for k, _ in node.value:
+                # a merged pair's key sits in the anchored mapping, outside this one's text
+                if k.tag == "tag:yaml.org,2002:merge" or not node.start_mark.index <= k.start_mark.index <= node.end_mark.index:
+                    continue
+                key = self.construct_object(k, deep=deep)
+                if key in seen:
+                    raise yaml.constructor.ConstructorError(None, None, f"{key!r} is written twice", k.start_mark)
+                seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
+def raw_shape(folder: str, c: dict, svcs: dict) -> None:
+    """The compose file as written: only known keys, a pinned entrypoint, and no `..` in a mount."""
+    for k in c:
+        if k not in TOP_KEYS and not str(k).startswith("x-"):
+            bad(f"{folder}: top-level {k!r} is not allowed (version, services and x- fields only)")
+    for name, sv in svcs.items():
+        allowed = APP_PROXY_KEYS if name == "app_proxy" else SERVICE_KEYS
+        for k in sv:
+            if k not in allowed:
+                bad(f"{folder}/{name}: {k!r} is not allowed (allowed: {sorted(allowed)})")
+        if "entrypoint" in sv and sv["entrypoint"] != ENTRYPOINTS.get((folder, name)):
+            bad(f"{folder}/{name}: entrypoint {sv['entrypoint']!r} is not the one pinned for it")
+        for v in sv.get("volumes") or []:
+            src = str(v.get("source", "")) if isinstance(v, dict) else str(v).split(":")[0]
+            if ".." in src.replace("\\", "/").split("/"):
+                bad(f"{folder}/{name}: mount {src!r} climbs out with ..")
+
+
+def resolved_shape(folder: str, cfg: dict, svcs: dict) -> None:
+    """The model `docker compose config` resolves, with MARKS for the host's folders: every rule on what
+    a container may reach is checked again here, where nothing written can hide from it."""
+    app, node, umbrel = (MARKS[k] for k in ("APP_DATA_DIR", "APP_LIGHTNING_FORK_NODE_DATA_DIR", "UMBREL_ROOT"))
+    for k in cfg:
+        if k not in RESOLVED_TOP_KEYS and not str(k).startswith("x-"):
+            bad(f"{folder}: resolved, top-level {k!r} is not allowed")
+    for n, net in (cfg.get("networks") or {}).items():
+        if n != "default" or set(net or {}) - {"name", "ipam"} or (net or {}).get("ipam"):
+            bad(f"{folder}: resolved, network {n!r} is not the app's plain default one")
+    rs = cfg.get("services") or {}
+    if set(rs) != set(svcs):
+        bad(f"{folder}: resolved, the services {sorted(set(rs) ^ set(svcs))} are not the ones written here (include, extends)")
+    for name, sv in rs.items():
+        allowed = RESOLVED_APP_PROXY_KEYS if name == "app_proxy" else RESOLVED_SERVICE_KEYS
+        for k, v in sv.items():
+            # compose writes some keys it was not given as null
+            if v is not None and k not in allowed:
+                bad(f"{folder}/{name}: resolved, {k!r} is not allowed")
+        if sv.get("entrypoint") is not None and sv["entrypoint"] != ENTRYPOINTS.get((folder, name)):
+            bad(f"{folder}/{name}: resolved, entrypoint {sv['entrypoint']!r} is not the one pinned for it")
+        if set(map(str, sv.get("security_opt") or [])) - {"no-new-privileges:true"}:
+            bad(f"{folder}/{name}: resolved, security_opt may only be no-new-privileges:true")
+        img = str(sv.get("image", ""))
+        for v in sv.get("volumes") or []:
+            src, tgt, ro = str(v.get("source") or ""), v.get("target"), v.get("read_only") is True
+            never = (v.get("bind") or {}).get("create_host_path") is False
+            if v.get("type") != "bind":
+                bad(f"{folder}/{name}: resolved, a {v.get('type')} mount (bind mounts only): {v}")
+            elif os.path.normpath(src) != src:
+                bad(f"{folder}/{name}: resolved, mount source {src!r} is not a plain path")
+            elif src == node or src.startswith(node + "/"):
+                cert = src == node + "/tls.cert" and tgt == "/data/lightning/tls.cert" and ro and never
+                folder_mount = name == NODE_KEYS_BAKE and src == node and tgt == "/node" and ro and never
+                if not (cert or folder_mount):
+                    bad(f"{folder}/{name}: resolved, mounts the Lightning node's data ({src} -> {tgt}): its tls.cert only, or node-keys-bake's read-only folder")
+            elif src == umbrel or src.startswith(umbrel + "/"):
+                if src != umbrel + "/data/storage/downloads" or tgt != "/downloads" or not ro or base_of(img) not in DOWNLOADS_IMAGES:
+                    bad(f"{folder}/{name}: resolved, mounts the box's own files ({src}): Umbrel's Downloads only, read-only, for the UI")
+            elif not src.startswith(app + "/"):
+                bad(f"{folder}/{name}: resolved, mount source {src!r} is not under the app's data")
+        if name == NODE_KEYS_BAKE:
+            want = {(app + "/data/run/ln", "/data/run/ln", True), (app + "/data/run/gateway", "/data/run/gateway", True),
+                    (app + "/data/run/node-keys", "/data/run/node-keys", False), (node, "/node", True)}
+            got = {(v.get("source"), v.get("target"), v.get("read_only") is True) for v in sv.get("volumes") or []}
+            env = {k: str(v) for k, v in (sv.get("environment") or {}).items()}
+            fixed = {k: v for k, v in NODE_KEYS_BAKE_ENV.items() if "${" not in v}
+            if base_of(img) != "xbt-wallet-ui" or sv.get("entrypoint") is not None or sv.get("command") != ["node-keys"]:
+                bad(f"{folder}/{name}: resolved, node-keys-bake is node-keys from the UI's image, with no entrypoint")
+            if str(sv.get("user")) != NODE_KEYS_BAKE_USER or set(map(str, sv.get("group_add") or [])) != NODE_KEYS_BAKE_GROUPS:
+                bad(f"{folder}/{name}: resolved, node-keys-bake runs as {NODE_KEYS_BAKE_USER} in exactly the groups {sorted(NODE_KEYS_BAKE_GROUPS)}")
+            if set(env) != set(NODE_KEYS_BAKE_ENV) or any(env.get(k) != v for k, v in fixed.items()):
+                bad(f"{folder}/{name}: resolved, node-keys-bake's environment is not exactly {sorted(NODE_KEYS_BAKE_ENV)}: {sorted(env)}")
+            if sv.get("restart") != "no" or sv.get("read_only") is not True or sv.get("cap_drop") != ["ALL"] or sv.get("cap_add") \
+                    or sv.get("ports") or "network_mode" in sv or got != want:
+                bad(f"{folder}/{name}: resolved, node-keys-bake is a read-only one-shot with no capability or port, and exactly its four mounts")
 
 # apps of another community store a dependency may name, and what their exports give a dependent (Paul's
 # umbrel-store, paulscode-lightning-fork/exports.sh)
@@ -237,8 +364,13 @@ def main() -> int:
             bad(f"{folder}: submission {m['submission']!r} is not a URL into {SUBMISSION} (a store submission is the project owner's decision)")
         compose_p = mp.parent / "docker-compose.yml"
         text = compose_p.read_text()
-        c = yaml.safe_load(text)
+        try:
+            c = yaml.load(text, Loader=StrictLoader)
+        except yaml.YAMLError as e:
+            bad(f"{folder}: docker-compose.yml: {e}")
+            continue
         svcs = c.get("services") or {}
+        raw_shape(folder, c, svcs)
         # --- app_proxy
         env = (svcs.get("app_proxy") or {}).get("environment") or {}
         host, aport = env.get("APP_HOST"), env.get("APP_PORT")
@@ -285,19 +417,14 @@ def main() -> int:
             bad(f"{folder}: uses ${{APP_PASSWORD}} without deterministicPassword: true")
         # --- services
         for name, s in svcs.items():
-            # every container, umbrelOS's app_proxy too: no way into another's processes, files or
-            # privileges (each named one is checked below where it is allowed)
-            for k in ("volumes_from", "pid", "ipc", "privileged", "devices", "userns_mode"):
-                if k in s:
-                    bad(f"{folder}/{name}: {k} is not allowed")
+            # every container, umbrelOS's app_proxy too (its keys: raw_shape): no looser privileges, no
+            # other container's or the host's network
             if set(map(str, s.get("security_opt") or [])) - {"no-new-privileges:true"}:
                 bad(f"{folder}/{name}: security_opt may only be no-new-privileges:true")
             nm = s.get("network_mode")
             if nm is not None and nm != "none" and not (str(nm).startswith("service:") and str(nm)[8:] in svcs):
                 bad(f"{folder}/{name}: network_mode {nm!r}: only none, or another service of this app")
             if name == "app_proxy":
-                if s.get("volumes") or s.get("cap_add"):
-                    bad(f"{folder}/{name}: umbrelOS's app_proxy mounts nothing and adds no capability")
                 continue
             img = str(s.get("image", ""))
             pin = REF.match(img)
@@ -408,6 +535,14 @@ def main() -> int:
                                env={**os.environ, **envs}, cwd=mp.parent)
             if r.returncode != 0:
                 bad(f"{folder}: docker compose config: {r.stderr.strip()[-400:]}")
+            else:
+                # the model compose resolves, the host's folders marked: every rule again, on what would run
+                r = subprocess.run(["docker", "compose", "-f", str(compose_p), "-f", str(ov), "config", "--format", "json"], capture_output=True,
+                                   text=True, env={**os.environ, **envs, **MARKS}, cwd=mp.parent)
+                try:
+                    resolved_shape(folder, json.loads(r.stdout), svcs)
+                except ValueError:
+                    bad(f"{folder}: docker compose config --format json: {r.stderr.strip()[-400:]}")
             if slot:
                 # the slot's node alone (no app of this store installed): the slot's values reach the services
                 other = {k for d in m["dependencies"] or [] for k in OTHER_STORES.get(d, {})}

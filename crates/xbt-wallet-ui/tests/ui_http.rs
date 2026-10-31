@@ -2474,6 +2474,30 @@ fn a_disconnect_on_a_box_that_makes_the_key_is_not_undone_unless_asked() {
     assert_eq!(xbt_wallet_ui::node_keys::make_keys(&s, &mut |_, _| Ok(hex::decode(&rail).unwrap())).unwrap().made, vec!["rail.macaroon"]);
 }
 
+/// Umbrel: the owner's own key removed on a box that makes its key: the page says the app makes one
+/// when it restarts (the baker ran at the start and is gone), not "within a minute".
+#[cfg(unix)]
+#[test]
+fn removing_the_owners_own_key_on_a_box_that_makes_one_says_to_restart() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let dir = ln.path().to_path_buf();
+    let rail = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
+    std::fs::write(dir.join("rail.macaroon"), hex::decode(&rail).unwrap()).unwrap();
+    let b = start(json!({}), false, |c| {
+        c.ln.dir = dir.clone();
+        c.ln.rest = Some("https://10.21.21.66:8180".into());
+        c.ln.auto = true;
+    });
+    let mut br = logged_in(&b);
+    let r = br.act("/lightning", "/lightning", &[("action", "remove")]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("removed") && said.contains("makes its own key when it restarts"), "{said}");
+    let page = br.get("/lightning").body;
+    assert!(page.contains("makes its key again when it restarts") && !page.contains("within a minute"), "{page}");
+    assert!(!xbt_wallet_ui::node_keys::turned_off(&dir), "not turned off: the next start makes the app's key");
+}
+
 /// The box's own login proxy (here: the loopback peer, named `localhost`) is the owner, already logged
 /// in by the box: no app password. A box whose proxy is another peer still asks for it.
 #[test]

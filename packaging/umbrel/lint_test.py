@@ -122,5 +122,57 @@ class NodeDataRule(unittest.TestCase):
                 self.fresh()
                 self.refused(change, why)
 
+    def test_compose_shapes_that_could_reach_the_node_data(self):
+        """Shapes a check of the file as written would miss, each giving a container the Lightning node's
+        data, the docker socket or root: lint reads the file strictly and the model compose resolves."""
+        c = yaml.safe_load(self.compose.read_text())["services"]
+        ui, init = c["ui"]["image"], c["init"]["image"]
+        bake_cmd = '    command: ["node-keys"]\n    user: "1000:1000"\n'
+        evil = lambda extra: "\n  evil:\n" + extra
+        node_mount = "      - ${APP_LIGHTNING_FORK_NODE_DATA_DIR}:/node:ro\n"
+        cases = {
+            "extends the baker, as xbt-init": (lambda t: t.rstrip() + "\n" + evil(
+                f"    extends:\n      service: node-keys-bake\n    image: {init}\n    user: \"0:0\"\n    restart: \"no\"\n    network_mode: none\n"
+                "    read_only: true\n    cap_drop: [ALL]\n    cap_add: [DAC_OVERRIDE]\n    volumes:\n      - ${APP_DATA_DIR}/data:/data\n"), None),
+            "extends a service of another file": (lambda t: t.rstrip() + "\n" + evil(
+                f"    <<: *service\n    extends:\n      file: lf.yml\n      service: lf\n    image: {ui}\n    command: [\"serve\"]\n"),
+                ("lf.yml", 'services:\n  lf:\n    user: "1000:1000"\n    volumes:\n' + node_mount)),
+            "the taker extends the baker": (lambda t: t.replace("  node-keys:\n    <<: *service\n",
+                "  node-keys:\n    <<: *service\n    extends:\n      service: node-keys-bake\n", 1), None),
+            "the baker runs the UI server": (lambda t: t.replace(bake_cmd,
+                '    command: ["node-keys"]\n    entrypoint: ["/usr/bin/xbt-wallet-ui", "serve"]\n    user: "1000:1000"\n', 1), None),
+            "secrets from the node's folder": (lambda t: t.replace("  ui:\n    <<: *service\n", "  ui:\n    <<: *service\n    secrets: [node]\n", 1).rstrip()
+                + "\nsecrets:\n  node:\n    file: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain/bitcoin/mainnet/wallet.db\n", None),
+            "a config of the node's folder": (lambda t: t.replace("  mcp:\n    <<: *service\n", "  mcp:\n    <<: *service\n    configs: [{source: node, target: /node}]\n", 1).rstrip()
+                + "\nconfigs:\n  node:\n    file: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}\n", None),
+            "include": (lambda t: t.replace('version: "3.7"\n', 'version: "3.7"\ninclude:\n  - extra.yml\n', 1),
+                ("extra.yml", f'services:\n  evil:\n    image: {ui}\n    user: "1000:1000"\n    volumes:\n' + node_mount)),
+            "a build context of the node's folder": (lambda t: t.replace("    image: xbt-vpn:0.1.0\n",
+                "    image: xbt-vpn:0.1.0\n    build:\n      context: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}\n", 1), None),
+            "a mount that climbs out with ..": (lambda t: t.rstrip() + "\n" + evil(
+                f"    image: {init}\n    restart: \"no\"\n    network_mode: none\n    read_only: true\n    cap_drop: [ALL]\n    cap_add: [DAC_OVERRIDE]\n"
+                "    security_opt: [no-new-privileges:true]\n    volumes:\n      - ${APP_DATA_DIR}/../paulscode-lightning-fork/data/lnd:/lnd\n"), None),
+            "the docker socket": (lambda t: t.replace("  ui:\n    <<: *service\n", "  ui:\n    <<: *service\n    use_api_socket: true\n", 1), None),
+            "a post_start hook in the baker": (lambda t: t.replace(bake_cmd, bake_cmd + "    post_start:\n      - command: [\"/usr/bin/xbt-wallet-ui\", \"serve\"]\n"
+                "        user: \"0:0\"\n        privileged: true\n", 1), None),
+            "an env_file into the baker": (lambda t: t.replace(bake_cmd, '    command: ["node-keys"]\n    env_file: [bake.env]\n    user: "1000:1000"\n', 1),
+                ("bake.env", "XBT_KEYS_GRANT_DIR=/node\n")),
+            "the baker written twice": (lambda t: t.replace("  node-keys-bake:\n", f"  node-keys-bake:\n    image: {init}\n    volumes: [*lightning-data]\n  node-keys-bake:\n", 1), None),
+            "the baker's user written twice": (lambda t: t.replace('    user: "1000:1000"\n', '    user: "0:0"\n    user: "1000:1000"\n', 1), None),
+            "a named volume": (lambda t: t.rstrip() + "\nvolumes:\n  node:\n    driver_opts:\n      type: none\n      o: bind\n"
+                "      device: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}\n", None),
+        }
+        for why, (change, extra) in cases.items():
+            with self.subTest(why=why):
+                self.fresh()
+                text = self.compose.read_text()
+                changed = change(text)
+                self.assertNotEqual(changed, text, f"{why}: the case did not apply")
+                self.compose.write_text(changed)
+                if extra:
+                    (self.compose.parent / extra[0]).write_text(extra[1])
+                ok, out = lint(self.store)
+                self.assertFalse(ok, f"lint passed a store with {why}:\n{out[-1500:]}")
+
 if __name__ == "__main__":
     unittest.main()

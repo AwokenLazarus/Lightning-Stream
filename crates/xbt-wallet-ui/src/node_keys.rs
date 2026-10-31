@@ -38,9 +38,13 @@
 //!
 //! * `node-keys-bake` runs as that user (`XBT_KEYS_BAKE_TO`): it waits until the node's admin
 //!   macaroon exists, has the node bake the keys missing from the app's dirs (which it reads, never
-//!   writes), and writes them, with their record, to a hand-over folder only it and the UI share;
-//! * `node-keys` runs as the UI (`XBT_KEYS_TAKE_FROM`, with `XBT_KEYS_WATCH_S`): it moves each key
-//!   from the hand-over folder into its dir, with its root key id, and removes it there.
+//!   writes; the sign key too, which a box set up by 0.1.19 lacks), writes them, with their record
+//!   first, to a hand-over folder only it and the UI share, and exits;
+//! * `node-keys` runs as the UI (`XBT_KEYS_TAKE_FROM`, with `XBT_KEYS_WATCH_S`, no network): it moves
+//!   each key from the hand-over folder into its dir, with its root key id, and removes it there. The
+//!   hand-over is the node app's user's to write, so a link there is never followed, nothing past
+//!   64 KiB is read, and a key moves only with exactly the permissions its file name says. It stops
+//!   once every key is in place, or turned off, or one the node would not bake (the baker says so).
 //!
 //! A key that is already there (the owner's own, or one made before) is left alone. Beside the keys,
 //! `auto-keys.json` says they came from the box and names their root key ids (no secret), so the
@@ -292,12 +296,22 @@ pub fn take_handover(s: &Settings, out: &mut Outcome) -> Result<(), String> {
         // read after the key is seen: the baker writes the record first, so it is there
         let from = read_record(h);
         let dir = if rail { &s.rail_dir } else { &s.gw_dir };
+        let mac = match read_nofollow(&src) {
+            Ok(m) => m,
+            Err(e) => {
+                gone(src.as_path())?;
+                out.skipped.push((file.to_string(), format!("unreadable, removed: {e}")));
+                continue;
+            }
+        };
         let Some(dir) = dir.as_ref().filter(|d| !is_off(d) && !d.join(file).is_file()) else {
             gone(src.as_path())?;
-            out.skipped.push((file.to_string(), format!("not needed here; revoke {} on the node", rec_line(&from, file))));
+            // the very key already in place (moved before, its copy left): nothing to revoke
+            let same = dir.as_ref().and_then(|d| read_nofollow(&d.join(file)).ok()).is_some_and(|k| k == mac);
+            out.skipped.push((file.to_string(), if same { "already in place".into() }
+                                                else { format!("not needed here; revoke {} on the node", rec_line(&from, file)) }));
             continue;
         };
-        let mac = read_nofollow(&src)?;
         if mac.is_empty() {
             // being written: the next look takes it
             continue;
@@ -315,28 +329,45 @@ pub fn take_handover(s: &Settings, out: &mut Outcome) -> Result<(), String> {
         write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())?;
         write_shared(dir, file, &mac)?;
         gone(src.as_path())?;
+        // the owner turned this dir off while the key moved: it does not stay
+        if is_off(dir) {
+            let _ = std::fs::remove_file(dir.join(file));
+            out.skipped.push((file.to_string(), format!("turned off meanwhile: removed; revoke {} on the node", rec_line(&from, file))));
+            continue;
+        }
         out.made.push(file.to_string());
     }
     Ok(())
 }
 
-/// A file in the hand-over, read without following a link in its last component.
+/// The most a key or a record may hold: lnd's macaroons and these records are far smaller.
+const MOST: u64 = 64 << 10;
+
+/// A file of the hand-over or a key dir, read without following a link in its last component, and
+/// refused past [`MOST`] bytes.
 #[cfg(unix)]
 fn read_nofollow(p: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let ctx = |e: std::io::Error| format!("{}: {e}", p.display());
-    let mut f = xbt_svc::layout::open_nofollow(p, false).map_err(ctx)?;
+    let f = xbt_svc::layout::open_nofollow(p, false).map_err(ctx)?;
     if !f.metadata().map_err(ctx)?.is_file() {
         return Err(format!("{}: not a plain file", p.display()));
     }
     let mut v = vec![];
-    f.read_to_end(&mut v).map_err(ctx)?;
+    f.take(MOST + 1).read_to_end(&mut v).map_err(ctx)?;
+    if v.len() as u64 > MOST {
+        return Err(format!("{}: longer than {MOST} bytes", p.display()));
+    }
     Ok(v)
 }
 
 #[cfg(not(unix))]
 fn read_nofollow(p: &Path) -> Result<Vec<u8>, String> {
-    std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
+    let v = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    if v.len() as u64 > MOST {
+        return Err(format!("{}: longer than {MOST} bytes", p.display()));
+    }
+    Ok(v)
 }
 
 /// Whether a dir still lacks a key the hand-over could bring (the taker stops watching once none does).
@@ -411,6 +442,11 @@ pub fn run(s: &Settings) -> Result<Outcome, String> {
 
 /// [`run`], with the admin macaroon given (read from standard input) rather than read from `s.admin`.
 pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
+    run_baking(s, given, &mut |admin, ops, id| bake_macaroon(&s.rest, s.tls_cert.as_deref(), admin, ops, id))
+}
+
+/// [`run_with`], the node's bake given (with the admin macaroon read): tests stand in for the node.
+fn run_baking(s: &Settings, given: Option<&[u8]>, bake: &mut dyn FnMut(&[u8], &[&str], u64) -> Result<Vec<u8>, String>) -> Result<Outcome, String> {
     // the node's own grant first: then no admin macaroon is read for what it gave
     let mut granted = Outcome::default();
     take_grants(s, &mut granted)?;
@@ -419,7 +455,9 @@ pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
     // hand-over and not taken yet counts as there)
     let there = |d: &Path, f: &str| d.join(f).is_file() || s.bake_to.as_ref().is_some_and(|h| h.join(f).is_file());
     let missing = s.rail_dir.as_ref().is_some_and(|d| !is_off(d) && !there(d, RAIL_MACAROON))
-        || s.gw_dir.as_ref().is_some_and(|d| !is_off(d) && (!there(d, GW_INVOICES) || !there(d, GW_INFO)));
+        // the sign key too: a box set up before it existed (0.1.19) has the other two, and its shop's
+        // direct link is vouched for only with it
+        || s.gw_dir.as_ref().is_some_and(|d| !is_off(d) && [GW_INVOICES, GW_INFO, GW_SIGN].iter().any(|f| !there(d, f)));
     if !missing {
         return Ok(if granted.made.is_empty() && granted.revoked.is_empty() && granted.skipped.is_empty() { Outcome { kept: vec!["all".into()], ..Outcome::default() } } else { granted });
     }
@@ -437,15 +475,17 @@ pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
             &read
         }
     };
-    let mut out = make_keys(s, &mut |ops, id| bake_macaroon(&s.rest, s.tls_cert.as_deref(), admin, ops, id))?;
+    let mut out = make_keys(s, &mut |ops, id| bake(admin, ops, id))?;
     out.made.splice(0..0, granted.made);
     out.revoked = granted.revoked;
     Ok(out)
 }
 
+/// A record (`auto-keys.json`): read without following a link and at most [`MOST`] bytes; one that is
+/// not there, too long or not a JSON object reads as empty.
 fn read_record(dir: &Path) -> serde_json::Value {
-    std::fs::read_to_string(dir.join(AUTO_KEYS)).ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    read_nofollow(&dir.join(AUTO_KEYS)).ok()
+        .and_then(|t| serde_json::from_slice::<serde_json::Value>(&t).ok())
         .filter(|v| v.is_object()).unwrap_or_else(|| json!({}))
 }
 
@@ -482,6 +522,19 @@ pub fn turn_on(dir: &Path) -> Result<(), String> {
         return Ok(());
     }
     write_shared(dir, AUTO_KEYS, format!("{r:#}\n").as_bytes())
+}
+
+/// The owner removed the key on a box that makes its own (with no record of one made here): the page
+/// then says the app makes one at its next start, not "within a minute".
+pub fn note_removed(dir: &Path) -> Result<(), String> {
+    let mut r = read_record(dir);
+    r["removed"] = json!(true);
+    write_shared(dir, AUTO_KEYS, format!("{r:#}\n").as_bytes())
+}
+
+/// Whether the owner removed a key here (see [`note_removed`]).
+pub fn removed(dir: &Path) -> bool {
+    read_record(dir)["removed"] == true
 }
 
 /// Whether keys were made here before (by this tool), whatever is there now.
@@ -828,5 +881,71 @@ mod tests {
         let mut o = Outcome::default();
         take_handover(&taker, &mut o).unwrap();
         assert_eq!(o.made, vec![GW_SIGN]);
+    }
+
+    /// A box set up by 0.1.19 has the gateway's invoices and info keys but no sign key: the baker's
+    /// start makes the sign key (before, it said "kept all" while the taker waited forever), and the
+    /// taker then stops waiting.
+    #[test]
+    fn an_upgraded_box_without_the_sign_key_gets_one() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let gw = shared_dir(t.path(), "gateway");
+        let h = shared_dir(t.path(), "node-keys");
+        let chain = shared_dir(t.path(), "node/data/chain/bitcoin/mainnet");
+        std::fs::write(chain.join("admin.macaroon"), b"admin").unwrap();
+        // 0.1.19's keys: the rail's and the gateway's two, made by the box
+        for (d, f, ops) in [(&rail, RAIL_MACAROON, &RAIL_OPS[..]), (&gw, GW_INVOICES, &INVOICE_OPS[..]), (&gw, GW_INFO, &INFO_OPS[..])] {
+            write_shared(d, f, &mac_of(ops)).unwrap();
+            record(d, f, 7, ops).unwrap();
+        }
+        let baker = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("node/data/chain"), grant: None,
+                               rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: Some(h.clone()), take_from: None };
+        let taker = Settings { admin: PathBuf::new(), bake_to: None, take_from: Some(h.clone()), ..baker.clone() };
+        assert!(handover_wanted(&taker));
+        let mut asked: Vec<Vec<String>> = vec![];
+        let out = run_baking(&baker, None, &mut |admin, ops, _| {
+            assert_eq!(admin, b"admin");
+            asked.push(ops.iter().map(|o| o.to_string()).collect());
+            Ok(mac_of(ops))
+        }).unwrap();
+        assert_eq!(out.made, vec![GW_SIGN]);
+        assert_eq!(asked, vec![SIGN_OPS.iter().map(|o| o.to_string()).collect::<Vec<_>>()], "only the sign key is baked");
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert_eq!(o.made, vec![GW_SIGN]);
+        assert!(!handover_wanted(&taker));
+        // and the next start has nothing to make
+        assert_eq!(run_baking(&baker, None, &mut |_, _, _| panic!("baked again")).unwrap().kept, vec!["all"]);
+    }
+
+    /// A record that is a link, too long, or not JSON reads as empty; the key it sits beside is still
+    /// checked and moved, and a key already in place is not called one to revoke.
+    #[cfg(unix)]
+    #[test]
+    fn a_bad_record_reads_as_empty_and_a_key_in_place_is_not_revoked() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let gw = shared_dir(t.path(), "gateway");
+        let h = shared_dir(t.path(), "node-keys");
+        std::os::unix::fs::symlink(t.path().join("elsewhere.json"), h.join(AUTO_KEYS)).unwrap();
+        std::fs::write(t.path().join("elsewhere.json"), b"{\"rail.macaroon\": {\"root_key_id\": \"1\"}}").unwrap();
+        assert_eq!(read_record(&h), json!({}), "a link is not followed");
+        std::fs::remove_file(h.join(AUTO_KEYS)).unwrap();
+        std::fs::write(h.join(AUTO_KEYS), vec![b' '; (MOST + 1) as usize]).unwrap();
+        assert_eq!(read_record(&h), json!({}), "too long");
+        let taker = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: None,
+                               rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: None, take_from: Some(h.clone()) };
+        let key = mac_of(&RAIL_OPS);
+        std::fs::write(h.join(RAIL_MACAROON), &key).unwrap();
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert_eq!(o.made, vec![RAIL_MACAROON]);
+        // the same key left in the hand-over again (a move whose removal failed): not one to revoke
+        std::fs::write(h.join(RAIL_MACAROON), &key).unwrap();
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert_eq!(o.skipped, vec![(RAIL_MACAROON.to_string(), "already in place".to_string())]);
+        assert!(!h.join(RAIL_MACAROON).exists());
     }
 }

@@ -308,8 +308,9 @@ impl App {
             // the baker and the taker make nothing the owner disconnected: no automatic reconnect to promise
             else if ln.auto && crate::node_keys::turned_off(&ln.dir) { "You disconnected the key the app made. Paste a key below, \
                  or have the app make its key again.".into() }
-            else if ln.auto && crate::node_keys::made_before(&ln.dir) { format!("The app makes its key again when it restarts: {}.",
-                 esc(&self.cfg.restart_hint)) }
+            // a key made before, or the owner's own removed: the baker ran at the start and is gone
+            else if ln.auto && (crate::node_keys::made_before(&ln.dir) || crate::node_keys::removed(&ln.dir)) {
+                format!("The app makes its key again when it restarts: {}.", esc(&self.cfg.restart_hint)) }
             else if ln.auto { "Create your Lightning wallet in Lightning Fork first. Lightning Stream picks it up automatically, \
                  within a minute and with no restart. Or paste a key below.".into() }
             else { "Make the key in your node's app and paste it below.".into() }));
@@ -404,7 +405,14 @@ impl App {
                 let _ = remove_shared(dir, MAINNET_ACK_FILE);
                 // a key the app made itself is not made again at the next start
                 let _ = crate::node_keys::turn_off(dir);
-                if had { "Your node is disconnected: its key was removed from this box, and the app pays nothing now.".to_string() } else { "Your node was not connected.".into() }
+                // the owner's own key, on a box that makes one: the next start makes the app's
+                let next = had && self.cfg.ln.auto && !crate::node_keys::made_before(dir);
+                if next {
+                    let _ = crate::node_keys::note_removed(dir);
+                }
+                if next { format!("Your node is disconnected: its key was removed from this box, and the app pays nothing now. \
+                                   The app makes its own key when it restarts: {}.", self.cfg.restart_hint) }
+                else if had { "Your node is disconnected: its key was removed from this box, and the app pays nothing now.".to_string() } else { "Your node was not connected.".into() }
             }),
             // undoes a disconnect where the box makes the key (Umbrel's node-keys-bake), at the next start
             Some("auto_on") if self.cfg.ln.auto => crate::node_keys::turn_on(dir).map(|()| {
