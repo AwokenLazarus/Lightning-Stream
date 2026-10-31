@@ -25,6 +25,8 @@ use serde_json::{json, Value};
 enum Plan {
     /// Streams `ANSWER` and is paid `price_msat`.
     Answer(u64),
+    /// Part of an answer that is not a stream of events, then the wallet says it was cut.
+    CutWhole(u64),
     /// The wallet refuses to pay it (nothing reaches the socket).
     Refused,
     /// Sends nothing for longer than the endpoint waits.
@@ -247,6 +249,13 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                             // the call to the signer ends with no answer
                             return;
                         }
+                        Plan::CutWhole(msat) => {
+                            let Some(mut s) = opened() else { return_gone(&conn, &gone); return };
+                            serve();
+                            writeln!(s, "{}", head(200, "application/json")).unwrap();
+                            s.write_all(b"{\"choices\":[{\"mess").unwrap();
+                            json!({"verdict": "allow", "status": 200, "complete": false, "price_msat": msat.to_string(), "request_sent": true})
+                        }
                         Plan::Cut(msat) => {
                             let Some(mut s) = opened() else { return_gone(&conn, &gone); return };
                             serve();
@@ -333,7 +342,8 @@ fn call(addr: &str, method: &str, path: &str, auth: Option<&str>, extra: &str, b
         let mut out = vec![];
         let mut rest = &body[..];
         loop {
-            let nl = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            // a body cut short has no last chunk ([`chat_raw`] tells them apart)
+            let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") else { break };
             let n = usize::from_str_radix(std::str::from_utf8(&rest[..nl]).unwrap().trim(), 16).unwrap();
             if n == 0 {
                 break;
@@ -348,6 +358,17 @@ fn call(addr: &str, method: &str, path: &str, auth: Option<&str>, extra: &str, b
 
 fn chat(r: &Rig, model: &str) -> (u16, String, String) {
     call(&r.addr, "POST", "/v1/chat/completions", Some(&r.key), "", &json!({"model": model, "stream": true, "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}).to_string())
+}
+
+/// One chat, as it came: the bytes after the head, its chunks' framing included.
+fn chat_raw(r: &Rig, model: &str) -> Vec<u8> {
+    let mut s = std::net::TcpStream::connect(&r.addr).unwrap();
+    let body = json!({"model": model, "stream": true, "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}).to_string();
+    write!(s, "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", r.addr, r.key, body.len()).unwrap();
+    let mut all = vec![];
+    s.read_to_end(&mut all).unwrap();
+    let split = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    all[split + 4..].to_vec()
 }
 
 fn spent(r: &Rig) -> u64 {
@@ -635,6 +656,24 @@ fn an_answer_cut_mid_way_is_not_moved_says_so_and_is_paid_for_what_arrived() {
     assert_eq!(sellers_called(&r), ["cheap.example"], "never switched mid-answer");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(spent(&r), 300);
+}
+
+/// An answer cut mid-way never reaches the client as a whole one: a stream of events says so in an
+/// event and has no last chunk, and an answer that is not a stream of events, with no event to say
+/// it in, has no last chunk either. A whole answer ends with its last chunk.
+#[test]
+fn an_answer_cut_mid_way_has_no_last_chunk_stream_of_events_or_not() {
+    let r = rig(Plan::Cut(300), Plan::Answer(1), 100);
+    let raw = chat_raw(&r, "llama");
+    assert!(String::from_utf8_lossy(&raw).contains("answer_cut"), "{}", String::from_utf8_lossy(&raw));
+    assert!(!raw.ends_with(b"0\r\n\r\n"), "a cut stream of events ended as whole");
+    let r = rig(Plan::CutWhole(300), Plan::Answer(1), 100);
+    let raw = chat_raw(&r, "llama");
+    assert!(!raw.ends_with(b"0\r\n\r\n"), "a cut answer that is not a stream of events ended as whole");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(spent(&r), 300, "and it is paid for what arrived");
+    let r = rig(Plan::Answer(1), Plan::Answer(1), 100);
+    assert!(chat_raw(&r, "llama").ends_with(b"0\r\n\r\n"), "a whole answer has its last chunk");
 }
 
 #[test]

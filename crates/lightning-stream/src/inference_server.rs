@@ -45,8 +45,8 @@ pub const CATALOGUE_RETRY: Duration = Duration::from_secs(2);
 /// The largest request body accepted.
 pub const MAX_BODY: usize = 4 << 20;
 
-/// The longest one answer is followed.
-const LONGEST: Duration = Duration::from_secs(3600);
+/// The longest one answer is followed: as long as the wallet keeps one open (`tickets.max_stream_s`).
+const LONGEST: Duration = Duration::from_secs(6 * 3600);
 
 /// The longest head line the signer writes before the body.
 const HEAD_LINE: u64 = 4096;
@@ -750,12 +750,16 @@ impl AiServer {
             body: Box::new(move |out: &mut dyn BodyWriter| {
                 let mut wrote = out.send(&first);
                 let mut buf = vec![0u8; 32 << 10];
+                let mut read_failed = false;
                 while wrote.is_ok() {
                     match rest.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => wrote = out.send(&buf[..n]),
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                        Err(_) => break,
+                        Err(_) => {
+                            read_failed = true;
+                            break;
+                        }
                     }
                 }
                 // a client gone: dropping the socket tells the signer to stop paying
@@ -777,11 +781,18 @@ impl AiServer {
                         true
                     }
                 };
-                if !complete && sse && wrote.is_ok() {
+                let cut = !complete || read_failed;
+                if cut && sse && wrote.is_ok() {
                     let ev = json!({"error": {"message": format!("The seller {seller} stopped mid-answer. What arrived was paid for; nothing more."), "type": "api_error", "code": "answer_cut"}});
                     let _ = out.send(format!("data: {ev}\n\n").as_bytes());
                 }
-                wrote.map(|_| ())
+                wrote?;
+                // an answer cut short ends cut short (a chunked body with no last chunk), never as a whole one: all an answer
+                // that is not a stream of events has to say so, and for a stream of events beside its event
+                if cut {
+                    return Err(io::Error::other(format!("the seller {seller} stopped mid-answer")));
+                }
+                Ok(())
             }),
         })
     }
