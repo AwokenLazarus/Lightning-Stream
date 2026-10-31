@@ -66,6 +66,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   limited as a whole, not as if all its buyers were one address.
 
 **VPN exits**
+- Stopping a session waits for its open answers' last receipts, so a VPN tunnel's spend is reported
+  in full; the VPN seller page shows what was charged.
 - Sell or buy a VPN exit, paid as you use it: a buyer's devices go out through another box's internet
   connection over Stream, by the GB, with no account; exits are checked for the country they claim,
   an exit only its own shop's gateway can open, and exits that waste a buyer's money held off.
