@@ -1971,13 +1971,17 @@ fn a_stop_ends_a_quiet_answer_on_draws_at_once() {
 /// Past the first minutes of a stream, the floor counts only the time the wallet waits on the seller:
 /// a seller at the edge of its credit, waiting for a ticket being paid over a slow route, is not to
 /// blame for the bytes that do not come. Here 4 KiB a ticket, each ticket taking 1.5 s, so about 7 KiB
-/// in each 3 s against a floor of 16 KiB: it comes whole, each ticket paid.
+/// in each 3 s against a floor of 16 KiB: it comes whole, each ticket paid. The wallet waits for a ticket that is due
+/// between its reads, so a floor on the clock would end this answer, and one on the reads does not.
 #[test]
 fn the_floor_does_not_count_the_time_a_ticket_is_being_paid() {
     let _g = env_lock();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("B2_STREAM_DIR", dir.path());
+    // the gateway waits for a ticket as long as it does as shipped (15 s), not the tests' 2 s: a busy machine is not what ends this answer
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
     let r = Rig::shipped(json!({"tickets": {"read_timeout_s": 3, "stream_floor_after_s": 0}}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
     r.ln.st.lock().unwrap().send_takes = Duration::from_millis(1500);
     let n = 32 << 10;
     let (v, got, took) = streamed_call(&r, dir.path(), "dl-dear", r.shop.url(&format!("/dearbytes/{n}")), 12_000, None);
