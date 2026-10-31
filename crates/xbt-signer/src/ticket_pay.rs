@@ -2598,10 +2598,12 @@ impl Signer {
                 // a seller whose service is full turns a new visit away before it is sold anything
                 if probe.status == 503 {
                     let v: Value = probe.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                    // refused unserved: another seller may serve the request (`request_sent` false)
                     if let Some(d) = seller_busy(&v) {
                         return d;
                     }
-                    return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"), json!({"status": 503, "charged_sats": 0}));
+                    return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"),
+                                json!({"status": 503, "charged_sats": 0, "request_sent": false}));
                 }
                 if probe.status != 402 {
                     let status = probe.status;
@@ -4300,6 +4302,8 @@ impl Signer {
                                 Some(s) => seq = s,
                                 None => std::thread::sleep(Duration::from_millis(10)),
                             }
+                            // refused unserved, and signed so: it is sent again below, or not at all
+                            spent.sent = false;
                             continue;
                         }
                     }
@@ -5453,7 +5457,8 @@ pub(crate) fn seller_busy(v: &Value) -> Option<Value> {
         "bandwidth" => format!("This shop is busy{}. Try again in a moment.", counts("Mbit/s carried")),
         _ => "This shop is busy. Try again in a moment.".to_string(),
     };
-    Some(with(deny("seller_busy", words), json!({"status": 503, "charged_sats": 0, "seller_code": "busy",
+    // turned away unserved, before anything was paid for it: another seller may serve the request (`request_sent` false)
+    Some(with(deny("seller_busy", words), json!({"status": 503, "charged_sats": 0, "seller_code": "busy", "request_sent": false,
                                                     "busy": {"scope": scope, "inUse": in_use, "limit": limit, "retryAfter": retry}})))
 }
 

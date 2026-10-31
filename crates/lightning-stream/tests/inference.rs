@@ -53,6 +53,8 @@ enum Plan {
     LateReceipt(u64, u64),
     /// Answers whole; the wallet's account never comes (the call to the signer fails).
     Lost,
+    /// Its service is full: it turns the request away before anything is paid or served.
+    Busy,
 }
 
 /// The caller's socket is still there (as the signer checks before it sends).
@@ -154,6 +156,8 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                                    "request_sent": true})
                         }
                         Plan::Refused => json!({"verdict": "deny", "rule": "allowlist", "reason": "destination not on allowlist", "charged_sats": 0}),
+                        Plan::Busy => json!({"verdict": "deny", "rule": "seller_busy", "reason": "the seller's service is full (30 of 30 buyers): nothing was paid",
+                                             "status": 503, "charged_sats": 0, "request_sent": false}),
                         Plan::Silent => {
                             // paid for and sent: the seller has it, and says nothing for longer than the endpoint waits
                             let _s = opened();
@@ -399,7 +403,7 @@ fn a_seller_that_is_refused_or_broken_hands_the_request_to_the_next() {
 
 /// A seller paid for and sent the request, then silent past its time: it may still be serving the
 /// request, and charge for it, so no other seller is tried. The client is told; one seller had the
-/// request; with no receipt to say what it drew, what the wallet paid for the call is booked.
+/// request; with no receipt to say what it drew, the most the request may cost is booked.
 ///
 /// FAILS before: the next seller was tried, and both could serve and charge one answer.
 #[test]
@@ -410,7 +414,7 @@ fn a_seller_paid_for_and_silent_is_not_followed_by_another() {
     assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
     std::thread::sleep(Duration::from_millis(2700));
     assert_eq!(served(&r), ["cheap.example"], "one seller had the request");
-    assert_eq!(spent(&r), 900_000, "no receipt: what the wallet paid for the call, the most the seller could draw, is booked");
+    assert_eq!(spent(&r), 500, "no receipt: the most the request may cost (100 tokens out at 5 sat the 1,000) is booked");
 }
 
 /// A request that left, answered by a proxy in front of the seller with a 524 and no receipt: the
@@ -426,7 +430,23 @@ fn a_proxys_524_after_the_request_left_is_not_followed_by_another_seller() {
     assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(served(&r), ["cheap.example"]);
-    assert_eq!(spent(&r), 900_000);
+    assert_eq!(spent(&r), 500, "no receipt: the most the request may cost");
+}
+
+/// A seller whose service is full turns the request away before anything is paid or served: the
+/// next seller serves, and is the only one paid or booked.
+///
+/// FAILS before (the status alone read as a request that left): the call ended 502 with no other
+/// seller tried.
+#[test]
+fn a_busy_seller_hands_the_request_to_the_next() {
+    let r = rig(Plan::Busy, Plan::Answer(777), 100);
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!((status, body.as_str()), (200, ANSWER));
+    assert_eq!(sellers_called(&r), ["cheap.example", "dear.example"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!((served(&r), r.sellers.lock().unwrap().paid.clone()), (vec!["dear.example".to_string()], vec!["dear.example".to_string()]));
+    assert_eq!(spent(&r), 777);
 }
 
 /// The wallet's account of a whole answer comes after the endpoint's wait for it (the signer waits

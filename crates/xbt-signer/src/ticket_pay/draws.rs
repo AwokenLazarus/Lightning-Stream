@@ -783,7 +783,9 @@ impl Signer {
             tries += 1;
             let (seq, digest, ans, receipt) = match self.draw_send(ds, c.method, c.url, c.body, c.headers()) {
                 Ok(x) => x,
-                Err(e) => return fail(ds, with(refused("ticket_seller", format!("the seller gave no answer to the request: {}", e.msg)), json!({"status": null}))),
+                // it may have reached the seller, and be served yet (`request_sent`, as on the ticket rail)
+                Err(e) => return fail(ds, with(refused("ticket_seller", format!("the seller gave no answer to the request: {}", e.msg)),
+                                               json!({"status": null, "request_sent": true}))),
             };
             let head = match receipt {
                 Ok(r) => r,
@@ -798,12 +800,14 @@ impl Signer {
                         }
                     }
                     if status >= 500 {
-                        return fail(ds, with(refused("ticket_seller", format!("the seller answered HTTP {status} without a receipt")), json!({"status": status})));
+                        // a proxy's, it may be: the request may be served behind it
+                        return fail(ds, with(refused("ticket_seller", format!("the seller answered HTTP {status} without a receipt")),
+                                             json!({"status": status, "request_sent": true})));
                     }
                     if status == 402 && code == "session_unknown" {
                         self.draw_stop(ds, "the seller has forgotten the session", false);
                         return fail(ds, with(refused("lottery_session_ended", "the seller has forgotten this session: it ended; nothing was served for this request"),
-                                             json!({"status": status})));
+                                             json!({"status": status, "request_sent": false})));
                     }
                     let d = self.draw_fault(ds, &format!("an answer to a request (HTTP {status} {code}) without a valid receipt: {why}"));
                     return fail(ds, with(d, json!({"status": status})));
@@ -836,7 +840,7 @@ impl Signer {
                 if code == "too_many_voids" {
                     self.draw_stop(ds, "the seller takes no more voids in this session", true);
                     return fail(ds, with(refused("lottery_session_ended", "the seller ended this session: too many of its pieces were given no value; nothing was served \
-                                                                           for this request"), json!({"status": status, "seller_code": code})));
+                                                                           for this request"), json!({"status": status, "seller_code": code, "request_sent": false})));
                 }
                 // the seller waits for wins this wallet will not pay again: each has a payment in its book that has not
                 // failed (its node cannot say what became of it). Such a session cannot go on. It ends, and the next
@@ -851,11 +855,12 @@ impl Signer {
                     if !listed.is_empty() && handed.len() == listed.len() && handed.iter().all(|d| self.lottery_win_live(&ds.sid, *d)) {
                         let stopped = self.draw_stop(ds, "a win's payment is not final on the wallet's node", true);
                         return fail(ds, with(refused("lottery_win_in_doubt", "the seller waits for a win whose payment this wallet has booked and its node has neither                                                                               completed nor failed: it is not paid a second time. The session was ended; call again"),
-                                             json!({"status": status, "seller_code": code, "stopped": stopped})));
+                                             json!({"status": status, "seller_code": code, "stopped": stopped, "request_sent": false})));
                     }
                 }
+                // refused unserved, and signed so (`request_sent` false: another seller may serve it)
                 return fail(ds, with(refused("lottery_refused", format!("the seller refused the request: HTTP {status} {code}; no piece was served for it")),
-                                     json!({"status": status, "seller_code": code})));
+                                     json!({"status": status, "seller_code": code, "request_sent": false})));
             }
             break (seq, digest, ans, head);
         };

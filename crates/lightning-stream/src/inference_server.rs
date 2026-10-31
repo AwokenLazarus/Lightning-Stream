@@ -236,17 +236,16 @@ fn price_of(v: &Value) -> Option<u64> {
     v.get("price_msat").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
 }
 
-/// What a call cost, in msat, by the wallet's account of it: the seller's receipt; where there is
-/// none and the request may have left, what the wallet paid for the call (`charged_sats`, the most
-/// the seller could have drawn on); nothing where the request never left.
-fn cost_msat(v: &Value) -> u64 {
-    if let Some(p) = price_of(v) {
-        return p;
+/// What a call cost, in msat, by the wallet's account of it: the seller's receipt; nothing where
+/// the request never left (or never may have: [`another_may_serve`]); where it may have left with
+/// no receipt to say, `bound`, the most the request may cost. Not what the wallet paid for the call:
+/// a ticket it bought is credit with the seller, which later calls spend and are booked for.
+fn cost_msat(v: &Value, bound: u64) -> u64 {
+    match price_of(v) {
+        Some(p) => p,
+        None if another_may_serve(Some(v)) => 0,
+        None => bound,
     }
-    if v.get("request_sent").and_then(Value::as_bool) == Some(false) {
-        return 0;
-    }
-    v.get("charged_sats").and_then(Value::as_u64).unwrap_or(0).saturating_mul(1000)
 }
 
 /// A seller's answer that is a failure of its own: another seller may serve the request.
@@ -654,7 +653,7 @@ impl AiServer {
                 Err(Failed { status, message, final_answer, paid, paying, account }) => {
                     // whatever the call cost this seller is booked to the key, now or when the wallet says; where it
                     // never says and the request may have reached the seller, the most the request may cost
-                    self.book_later(key_id, today, account, paid.then_some(bound));
+                    self.book_later(key_id, today, account, bound, paid);
                     if let Some((status, whole, ct)) = final_answer.map(|b| *b) {
                         // the seller refused the request itself: said to the client as the seller said it
                         let headers = vec![("Content-Type".into(), ct.unwrap_or_else(|| "application/json".into())), ("Cache-Control".into(), "no-store".into())];
@@ -679,16 +678,17 @@ impl AiServer {
 
     /// Books what a call the client got no answer from cost the key, by the wallet's account of it:
     /// at once where it was said, and where the call goes on, once the wallet says (for as long as
-    /// one answer is followed). An account never had: `unknown`, where given.
-    fn book_later(&self, key_id: &str, today: u64, account: Account, unknown: Option<u64>) {
+    /// one answer is followed). `bound`: the most the request may cost, booked where the request may
+    /// have reached the seller (`paid`) and nothing says what it cost.
+    fn book_later(&self, key_id: &str, today: u64, account: Account, bound: u64, paid: bool) {
         let (credentials, inner, key_id) = (self.cfg.credentials.clone(), Arc::clone(&self.inner), key_id.to_string());
-        let unknown = unknown.unwrap_or(0);
+        let unknown = if paid { bound } else { 0 };
         match account {
-            Account::Said(v) => book(&credentials, &inner, &key_id, today, cost_msat(&v)),
+            Account::Said(v) => book(&credentials, &inner, &key_id, today, cost_msat(&v, bound)),
             Account::Pending(rx) => {
                 std::thread::spawn(move || {
                     let cost = match rx.recv_timeout(LONGEST) {
-                        Ok(Ok(v)) => cost_msat(&v),
+                        Ok(Ok(v)) => cost_msat(&v, bound),
                         _ => unknown,
                     };
                     book(&credentials, &inner, &key_id, today, cost);
@@ -777,7 +777,7 @@ impl Settle {
     /// Whether it was whole.
     fn account(&self, account: &Value, ttft_ms: u64) -> bool {
         let complete = account.get("complete").and_then(Value::as_bool).unwrap_or(false);
-        book(&self.credentials, &self.inner, &self.key_id, self.today, cost_msat(account));
+        book(&self.credentials, &self.inner, &self.key_id, self.today, cost_msat(account, self.bound));
         let mut g = lock(&self.inner);
         g.router.record(&self.seller, if complete { Outcome::Answered { ttft_ms } } else { Outcome::CutMidAnswer }, credentials::now());
         let _ = write_atomic(&self.state, &state_json(&g.router));

@@ -130,7 +130,8 @@ to pay, or it says the request never left, or the seller answered with a failure
 402, 408, 429). Once the wallet has said a request is paid for and leaving, a seller that is then
 silent, or slow to its first byte after a 2xx head, is not followed by another: it may still be
 serving the request, and one answer is never paid to two sellers. Whatever such a call cost is
-booked to the key when the wallet says it, and where it never says, the most the request may cost. At most 8 calls wait on a payment at once; more are
+booked to the key when the wallet says it; where it never says, or the request may have left with
+no receipt, the most the request may cost. At most 8 calls wait on a payment at once; more are
 answered 503 at once, so the endpoint's other requests keep threads to answer on.
 
 The AI page's settings are `XBT_UI_AI_ENDPOINT` (the address it shows), `XBT_UI_AI_SELLERS`,

@@ -4502,6 +4502,8 @@ fn a_shop_that_fills_before_this_wallet_buys_sells_it_nothing() {
         }));
         let v = r.pay("/page/100", CALL);
         assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("seller_busy"), Some(0)), "{v}");
+        // refused unserved: a caller (the AI address) may take the request to another seller
+        assert_eq!(v["request_sent"].as_bool(), Some(false), "{v}");
         let lock = r.tap.seen("/x402/ticket/lock");
         assert_eq!(serde_json::from_str::<Value>(&lock[0].body).unwrap()["path"], "/page/100", "the first lock names the address");
         assert_eq!((r.ln.paid_msat(), r.shop.settled(), r.shop.held()), (0, 0, 0), "nothing sold");
@@ -7700,7 +7702,7 @@ fn a_call_to_a_seller_whose_session_is_being_stopped_is_told_to_call_again() {
         std::thread::sleep(Duration::from_millis(500));
         let during = r.pay("/page/12", CALL);
         assert_eq!(during["rule"].as_str(), Some("ticket_busy"), "a call while the session is being stopped: {during}");
-        assert_eq!(during["charged_sats"].as_i64(), Some(0), "{during}");
+        assert_eq!((during["charged_sats"].as_i64(), during["request_sent"].as_bool()), (Some(0), Some(false)), "{during}");
         let stop = stop.join().unwrap();
         let _ = tunnel.join().unwrap();
         slow.store(false, Ordering::SeqCst);
