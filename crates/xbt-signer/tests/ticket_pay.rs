@@ -350,6 +350,8 @@ fn routes() -> Value {
         {"path": "/wsfree/", "free": true, "websocket": true},
         // a VPN exit's tunnel: 1,000 sat a GiB either way, nothing to open
         // a WebSocket priced as a VPN exit's tunnel is: 500,000 sat a GiB either way
+        // a tunnel at a middle price: 50,000 sat a GiB either way, 20 MiB a ticket
+        {"path": "/wsmid/", "price": {"byte_msat": 50_000_000, "per_bytes": 1u64 << 30}, "websocket": true},
         {"path": "/wsfast/", "price": {"byte_msat": 500_000_000, "per_bytes": 1u64 << 30}, "websocket": true},
         {"path": "/wsvpn/", "price": {"byte_msat": 1_000_000, "per_bytes": 1_073_741_824}, "websocket": true},
         // a buyer's own account (docs/BUYER-ACCOUNTS.md), made by the seller's hook: its headers say who the buyer is
@@ -6906,6 +6908,132 @@ fn a_paid_tunnel_asks_again_when_due_for_a_ticket_refused_early() {
     });
     caller.join().unwrap();
     REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// A tunnel's caller: `each` bytes out and the same back, at `per_s` bytes a second each way, then held open
+/// until the wallet ends it. Sends how far it got before the wallet ended it, if it did.
+fn tunnel_caller(dir: &std::path::Path, each: usize, per_s: usize) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<usize>) {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let l = std::os::unix::net::UnixListener::bind(dir.join("tunnel")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        let chunk: Vec<u8> = (0..64 << 10).map(pattern).collect();
+        let mut back = vec![0u8; chunk.len()];
+        let start = std::time::Instant::now();
+        let mut through = 0;
+        for i in 1..=each / chunk.len() {
+            if w.write_all(&chunk).is_err() || rd.read_exact(&mut back).is_err() {
+                break;
+            }
+            through += chunk.len();
+            std::thread::sleep(Duration::from_secs_f64((i * chunk.len()) as f64 / per_s as f64).saturating_sub(start.elapsed()));
+        }
+        tx.send(through).unwrap();
+        let mut rest = vec![];
+        let _ = rd.read_to_end(&mut rest);
+    });
+    (caller, rx)
+}
+
+/// A refusal that will not pass (here the task's budget, which lets one ticket be locked) ends a tunnel when its early try is
+/// refused, not after the tunnel has run on to the end of what was paid for and been refused again. At 50,000 sat a
+/// GiB a ticket covers 20 MiB, and the next goes at about half of it: the tunnel ends near there, with what it used
+/// charged on both sides and the rest left with the seller.
+#[test]
+fn a_paid_tunnel_ends_at_once_on_a_refusal_that_will_not_pass() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({"tickets": {"enabled": true, "tasks": {"film": {"budget_sats": 1_500}}}}));
+    let (caller, rx) = tunnel_caller(dir.path(), 20 * MIB, 5 * MIB / 2);
+    std::thread::scope(|sc| {
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/wsmid/vpn"), "max_sats": 40_000, "task": "film", "stream_to": "tunnel", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        let w = ws.join().unwrap();
+        let through = rx.recv_timeout(Duration::from_secs(60)).expect("the caller finished");
+        assert!(w["ended"].as_str().unwrap_or_default().contains("budget_sats"), "ended {:?} at {through} bytes each way", w["ended"]);
+        let seller = r.shop.gw.stats().charged_msat;
+        let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
+        let stop = r.call("ticket_stop", json!({"session": sid}));
+        let of = |v: &Value| v.as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| panic!("not msat: {v}"));
+        let (spent, left) = (of(&stop["http"]["account"]["spent_msat"]), of(&stop["http"]["left_with_seller_msat"]));
+        let (paid, taken, book, _) = r.money();
+        assert_eq!((paid, taken, book), (TICKET, TICKET, TICKET), "one ticket, inside the budget");
+        // ended at its early try, about half way through the ticket: not at its end (20 MiB, the whole ticket)
+        assert!(seller < 9 * TICKET / 10, "the tunnel ran on to {seller} msat of its {TICKET} msat ticket before it ended: {w}");
+        assert_eq!((spent, spent + left), (seller, paid), "used is what the seller charged, and paid is used and left: {stop}");
+    });
+    caller.join().unwrap();
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// The owner's "Used" for a tunnel moves as it runs, from the seller's signed interim counts: at 1,000 sat a GiB a
+/// ticket lasts a GiB, so no release comes to update it, and before it stayed at nothing until the stop. Read
+/// while the tunnel is still open, it is what the seller has charged within the price of the bytes between two
+/// interim receipts, never more; no fault is found; and once stopped, both sides agree to the msat.
+#[test]
+fn a_paid_tunnels_used_moves_while_it_runs() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    std::env::set_var("B2_INTERIM_POLL_MS", "200");
+    let r = Rig::new(json!({}));
+    let (caller, rx) = tunnel_caller(dir.path(), 20 * MIB, 10 * MIB);
+    std::thread::scope(|sc| {
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/wsvpn/vpn"), "max_sats": 10_000, "task": "film", "stream_to": "tunnel", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        // Used, then what the seller has charged by then: never more than it, and within a few interim receipts of it
+        // (one each 1 MiB of charge, read every 200 ms: at 20 MiB a second, 6 MiB both ways at 1,000 sat a GiB)
+        let step = (6u64 << 20) * 1_000_000 / (1 << 30);
+        let used = |r: &Rig| -> (u64, u64) {
+            let spent = r.status()["paying"][0]["spent_msat"].as_str().unwrap_or("0").parse().unwrap();
+            (spent, r.shop.gw.stats().charged_msat)
+        };
+        let caught_up = |r: &Rig, when: &str| -> u64 {
+            let t = Instant::now();
+            loop {
+                let (spent, seller) = used(r);
+                assert!(spent <= seller, "{when}: Used {spent} msat, more than the {seller} the seller has charged");
+                if spent > 0 && seller - spent <= step {
+                    return spent;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "{when}: Used {spent} msat, the seller charged {seller}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        // under way (8 MiB through), and again once all has passed with the tunnel still open
+        let t = Instant::now();
+        while r.shop.gw.stats().charged_msat < (16u64 << 20) * 1_000_000 / (1 << 30) {
+            assert!(t.elapsed() < Duration::from_secs(60), "the tunnel never got under way");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mid = caught_up(&r, "under way");
+        let through = rx.recv_timeout(Duration::from_secs(120)).expect("the caller finished");
+        assert_eq!(through, 20 * MIB);
+        let end = caught_up(&r, "all passed");
+        assert!(mid < end, "Used moved: {mid} then {end}");
+        assert!(r.audit("ticket_interim_fault").is_empty(), "{:?}", r.audit("ticket_interim_fault"));
+        let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
+        let stop = r.call("ticket_stop", json!({"session": sid}));
+        let of = |v: &Value| v.as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| panic!("not msat: {v}"));
+        let usage = ((40u64 << 20) * 1_000_000).div_ceil(1 << 30);
+        let (seller, spent, left) = (r.shop.gw.stats().charged_msat, of(&stop["http"]["account"]["spent_msat"]), of(&stop["http"]["left_with_seller_msat"]));
+        let (paid, taken, book, _) = r.money();
+        assert_eq!((seller, spent), (usage, usage), "{stop}");
+        assert_eq!((taken, book, paid), (paid, paid, spent + left), "{stop}");
+        ws.join().unwrap();
+    });
+    caller.join().unwrap();
+    std::env::remove_var("B2_INTERIM_POLL_MS");
     std::env::remove_var("B2_STREAM_DIR");
     r.assert_booked();
 }
