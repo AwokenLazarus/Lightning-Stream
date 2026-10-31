@@ -9033,6 +9033,12 @@ fn a_prepaid_ticket_the_node_found_no_route_for_is_sent_once_more_and_paid_once(
 /// wallet is about to pay a win) the clock moves `secs`, and those invoices lapse with the seller:
 /// a win's invoice runs out while the win waits its turn at the wallet's gate.
 fn lapse_at_wins(r: &Rig, times: usize, secs: u64) {
+    lapse_at_wins_after(r, times, secs, Duration::ZERO);
+}
+
+/// [`lapse_at_wins`], with the seller's node showing them lapsed only `shown` later: until then the
+/// seller has no next invoice to give.
+fn lapse_at_wins_after(r: &Rig, times: usize, secs: u64, shown: Duration) {
     let left = AtomicUsize::new(times);
     let (clock, node, standin) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone());
     r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
@@ -9040,9 +9046,13 @@ fn lapse_at_wins(r: &Rig, times: usize, secs: u64) {
         let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
         if !open.is_empty() && left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
             clock.fetch_add(secs, Ordering::SeqCst);
-            for h in &open {
-                standin.expire_unpaid(h);
-            }
+            let standin = standin.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(shown);
+                for h in &open {
+                    standin.expire_unpaid(h);
+                }
+            });
         }
     }));
 }
@@ -9170,4 +9180,45 @@ fn a_channel_out_for_a_moment_ends_no_tunnel_whether_an_htlc_is_pending_or_the_p
         assert_eq!((taken, book, ledger), (paid, paid, (paid / TICKET) as i64 * SETTLED), "{v}");
     }
     std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// The seller's next invoice comes only when its node shows the first lapsed, which may be after the
+/// answer has ended: the call waits for it, and returns with every win paid.
+///
+/// FAILS before: the list was asked three times in 120 ms, and the call returned with the win owed
+/// (`wins_unpaid`: `ticket_expiry`), as 100 sellers at once did on a loaded lab.
+#[test]
+fn a_call_whose_answer_has_ended_waits_for_the_next_invoice_of_a_win_that_ran_out() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    lapse_at_wins_after(&r, 1, 28, Duration::from_millis(1_500));
+    let size = 64 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_paid_after_lapses(&r, &v, size, 1);
+}
+
+/// A request the seller refuses `win_unpaid` while its next invoice is not there yet: the call waits
+/// for it, pays it, and is served.
+///
+/// FAILS before: the request was refused twice within a moment, and the call ended `lottery_refused`.
+#[test]
+fn a_request_refused_for_a_win_waits_for_the_sellers_next_invoice_and_is_served() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    r.ln.st.lock().unwrap().fail_one = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(v["wins"].as_u64().unwrap() >= 1, "{v}");
+    assert_eq!(v["wins_unpaid"][0]["rule"], "lottery_win_failed", "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    // the grace has gone by, and the seller's node shows the failed win's invoice lapsed only a moment later
+    r.clock.fetch_add(31, Ordering::SeqCst);
+    let failing: Hash = hex::decode(r.ln.st.lock().unwrap().failing.clone().unwrap()).unwrap().try_into().unwrap();
+    let standin = r.shop.standin.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1_500));
+        standin.expire_unpaid(&failing);
+    });
+    let again = r.pay("/tiny/10", 5);
+    assert_eq!((again["status"].as_u64(), again["session"].as_str()), (Some(200), Some(sid.as_str())), "{again}");
+    assert_each_win_paid_once(&r, &sid, v["wins"].as_u64().unwrap() + again["wins"].as_u64().unwrap());
 }

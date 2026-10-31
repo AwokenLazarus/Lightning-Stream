@@ -49,6 +49,11 @@ const QUEUE_WAIT: Duration = Duration::from_secs(50);
 const LONG_HOLD: Duration = Duration::from_secs(30);
 /// How long a stop waits for the answer open on its session of draws to end.
 const STOP_WAIT: Duration = Duration::from_secs(15);
+/// How long a call waits for the seller's next invoice of a win whose last one is about to lapse or has:
+/// the seller makes the next one only when its node shows the first cancelled, and the wallet refuses an
+/// invoice within 5 s of its end. An invoice with longer to live than this is not waited for.
+const OWED_WAIT: Duration = Duration::from_secs(10);
+const OWED_POLL: Duration = Duration::from_millis(250);
 
 fn refused(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "lottery", "charged_sats": 0}))
@@ -122,6 +127,8 @@ struct State {
     paid_sats: i64,
     /// Invoices of this seller's that the wallet's checks refused (another payee, another amount, no bit 512).
     bad_invoices: u32,
+    /// When the latest invoice of a win that is owed again ends: the seller's next one comes after that.
+    next_invoice_after: f64,
     /// Why this session draws no more.
     fault: Option<String>,
 }
@@ -696,12 +703,59 @@ impl Signer {
                     if let Some((w, _)) = s.handed.remove(&win.draw()) {
                         s.owed.push(w);
                     }
+                    if retry {
+                        let ends = crate::bolt11::decode(invoice).map_or(0.0, |i| i.expires_at() as f64);
+                        s.next_invoice_after = s.next_invoice_after.max(ends);
+                    }
                 } else {
                     c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
                     c.halt = true;
                 }
             }
         }
+    }
+
+    /// Asks the seller's list and pays what it brings for the wins that are owed: a few times, and
+    /// for up to [`OWED_WAIT`] where the seller's next invoice is due by then. Without that wait, a win
+    /// whose invoice ran out at the gate stayed unpaid when its answer had already ended, for a next
+    /// call that may never come, and that call was refused `win_unpaid`.
+    fn draw_pay_owed(&self, ds: &DrawSession, first: bool, counted: &Mutex<Counted>) -> std::result::Result<(), Value> {
+        let until = Instant::now() + OWED_WAIT;
+        let unsettled = || !lock(&ds.state).owed.is_empty() && ds.fault().is_none() && !lock(counted).halt;
+        for tries in 1.. {
+            if !unsettled() {
+                break;
+            }
+            let r = self.draw_round(ds, &[], &[], true, counted)?;
+            for (w, inv) in &r.wins {
+                if let Some(inv) = inv {
+                    self.draw_pay(ds, w, inv, first, counted);
+                }
+            }
+            if !unsettled() {
+                break;
+            }
+            let due = lock(&ds.state).next_invoice_after - self.engine.now() < OWED_WAIT.as_secs_f64();
+            let waits = due && lock(&ds.state).next_invoice_after > 0.0 && Instant::now() < until;
+            if tries >= 3 && !waits {
+                break;
+            }
+            std::thread::sleep(if waits { OWED_POLL } else { ROUND_WAIT });
+        }
+        lock(&ds.state).next_invoice_after = 0.0;
+        Ok(())
+    }
+
+    /// What a request refused for values or a win does: one round even with no win owed, since it
+    /// sends the values that are open, and then what [`Self::draw_pay_owed`] does.
+    fn draw_pay_owed_or_round(&self, ds: &DrawSession, counted: &Mutex<Counted>) -> std::result::Result<(), Value> {
+        let r = self.draw_round(ds, &[], &[], true, counted)?;
+        for (w, inv) in &r.wins {
+            if let Some(inv) = inv {
+                self.draw_pay(ds, w, inv, true, counted);
+            }
+        }
+        self.draw_pay_owed(ds, true, counted)
     }
 
     /// The wins of a round that was made after the answer had ended (the round that names void
@@ -823,19 +877,12 @@ impl Signer {
                 // signed by the seller: it waits for values or for a win's payment. A round sends what is open and pays
                 // what its answer lists for wins the wallet found; then the request once more
                 if matches!(code, "win_unpaid" | "value_missing") && tries <= 2 {
-                    match self.draw_round(ds, &[], &[], true, &counted) {
-                        Ok(r) => {
-                            for (w, inv) in &r.wins {
-                                if let Some(inv) = inv {
-                                    // the seller serves this request when they are paid: they go first
-                                    self.draw_pay(ds, w, inv, true, &counted);
-                                }
-                            }
-                            if lock(&counted).stop.is_none() {
-                                continue;
-                            }
-                        }
-                        Err(d) => return fail(ds, d),
+                    // the seller serves this request when they are paid: they go first
+                    if let Err(d) = self.draw_pay_owed_or_round(ds, &counted) {
+                        return fail(ds, d);
+                    }
+                    if lock(&counted).stop.is_none() {
+                        continue;
                     }
                 }
                 // the seller takes no more voids in this session (pieces of answers this wallet stopped reading): the
@@ -1172,25 +1219,8 @@ impl Signer {
         *lock(&ds.answer_since) = None;
         // the connection is closed here: a seller that was still sending stops within its window
         drop(body);
-        // wins the seller had sent no invoice for: it is asked for its list, a few times, and what it lists is paid
-        for _ in 0..3 {
-            if lock(&ds.state).owed.is_empty() || ds.fault().is_some() || lock(counted).halt {
-                break;
-            }
-            match self.draw_round(ds, &[], &[], true, counted) {
-                Ok(r) => {
-                    for (w, inv) in &r.wins {
-                        if let Some(inv) = inv {
-                            self.draw_pay(ds, w, inv, false, counted);
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-            if !lock(&ds.state).owed.is_empty() {
-                std::thread::sleep(ROUND_WAIT);
-            }
-        }
+        // wins the seller had sent no invoice for, or whose last one ran out: it is asked for its list, and what it lists is paid
+        let _ = self.draw_pay_owed(ds, false, counted);
         let stop = lock(counted).stop.clone();
         let complete = stop.is_none() && mismatch.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);
         // an answer that did not arrive whole: the seller may hold pieces of it open that will get no value (it
