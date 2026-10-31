@@ -194,7 +194,7 @@ struct Failed {
     message: String,
     /// The seller refused the request itself (a 4xx other than payment): no other seller is tried,
     /// since the request would fare no better there.
-    final_answer: Option<(u16, Vec<u8>, Option<String>)>,
+    final_answer: Option<Box<(u16, Vec<u8>, Option<String>)>>,
     /// The request may have reached this seller, and be served or charged by it: no other seller
     /// is tried, so that one answer is never paid to two.
     paid: bool,
@@ -409,7 +409,7 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
         let mut whole = first;
         let _ = (&mut src).take(1 << 20).read_to_end(&mut whole);
         drop(src);
-        return Err(Failed { final_answer: Some((status, whole, content_type)), account: Account::Pending(rx), ..fail(status, String::new()) });
+        return Err(Failed { final_answer: Some(Box::new((status, whole, content_type))), account: Account::Pending(rx), ..fail(status, String::new()) });
     }
     if n == 0 {
         drop(src);
@@ -616,7 +616,7 @@ impl AiServer {
                 Err(Failed { status, message, final_answer, paid, paying, account }) => {
                     // whatever the call cost this seller is booked to the key, now or when the wallet says
                     self.book_later(key_id, today, account);
-                    if let Some((status, whole, ct)) = final_answer {
+                    if let Some((status, whole, ct)) = final_answer.map(|b| *b) {
                         // the seller refused the request itself: said to the client as the seller said it
                         let headers = vec![("Content-Type".into(), ct.unwrap_or_else(|| "application/json".into())), ("Cache-Control".into(), "no-store".into())];
                         return Reply::Whole(Response::new(status, headers, whole));

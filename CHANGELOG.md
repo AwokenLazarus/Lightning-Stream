@@ -78,7 +78,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   a refused buyer is sold nothing.
 - On a slow route the AI address no longer gives up on a seller while the wallet is still paying it,
   and pays a second seller for the same answer: a seller's time to answer is counted from when its
-  call is paid for (up to 90 s for the payment).
+  call is paid for (up to 90 s for the payment, `LS_AI_PAY_WAIT_S`). A seller that has the request
+  and is then silent is no longer followed by another; whatever a failed call cost is booked to its
+  AI key.
 - A lottery win paid over a slow route reaches the seller before its invoice lapses: the seller's
   grace, and with it a win's invoice, is 60 s by default instead of 30 s.
 - WebSockets (for example a web app's live updates) stay open for up to six hours, paid as their
