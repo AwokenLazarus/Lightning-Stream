@@ -7038,6 +7038,69 @@ fn a_paid_tunnels_used_moves_while_it_runs() {
     r.assert_booked();
 }
 
+/// The most credit a tunnel has had released and not yet charged, sampled every 3 ms until `done`.
+fn most_ahead(r: &Rig, done: &AtomicBool) -> u64 {
+    let mut most = 0;
+    while !done.load(Ordering::SeqCst) {
+        let released = r.status()["paying"].as_array().and_then(|a| a.first()).and_then(|p| p["released_msat"].as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        most = most.max(released.saturating_sub(r.shop.gw.stats().charged_msat));
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    most
+}
+
+/// What a paid tunnel pays ahead of what the seller has charged stays under one and a half tickets (the ticket in use,
+/// and a lead of at most half a ticket: docs/TICKETS.md), flat out from its start and with a seller slow to show
+/// every ticket locked. Without the half-ticket caps on the lead, both measured about 1.9.
+#[test]
+fn a_paid_tunnel_pays_at_most_one_and_a_half_tickets_ahead() {
+    for delays in [false, true] {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("B2_STREAM_DIR", dir.path());
+        REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+        let r = if delays {
+            Rig::new(json!({"tickets": {"enabled": true, "ready_wait_ms": 12_000, "tasks": {"film": {"budget_sats": 40_000}}}}))
+        } else {
+            Rig::new(json!({}))
+        };
+        // 60 MiB both ways: about 29,300 sat, inside the call's max_sats and the task's budget (40,000)
+        let each = 30 * MIB;
+        let (caller, rx) = tunnel_caller(dir.path(), each, if delays { 5 * MIB / 2 } else { usize::MAX });
+        let done = AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/wsfast/vpn"), "max_sats": 40_000, "task": "film", "stream_to": "tunnel", "stream_head": true,
+                                                           "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+            let most = sc.spawn(|| most_ahead(&r, &done));
+            // a seller that shows each ticket locked only after 1.5 s
+            let holds = sc.spawn(|| {
+                while delays && !done.load(Ordering::SeqCst) {
+                    r.shop.standin.hold_streams(true);
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    r.shop.standin.hold_streams(false);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+            let through = rx.recv_timeout(Duration::from_secs(240)).expect("the caller finished");
+            done.store(true, Ordering::SeqCst);
+            let most = most.join().unwrap();
+            holds.join().unwrap();
+            eprintln!("credit ahead, {}: at most {:.3} tickets, {through} bytes each way", if delays { "a slow seller" } else { "flat out" }, most as f64 / TICKET as f64);
+            assert_eq!(through, each);
+            assert!(most < 16 * TICKET / 10, "{} the wallet paid {most} msat ahead of what the seller charged", if delays { "a seller slow to show tickets:" } else { "flat out:" });
+            let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
+            let stop = r.call("ticket_stop", json!({"session": sid}));
+            let (paid, taken, book, _) = r.money();
+            assert_eq!((taken, book), (paid, paid), "{stop}");
+            ws.join().unwrap();
+        });
+        caller.join().unwrap();
+        REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+        std::env::remove_var("B2_STREAM_DIR");
+        r.assert_booked();
+    }
+}
+
 /// A paid WebSocket under a small use's `max_charge_sats` (a VPN region check's tunnel, 20 sat, from
 /// no credit): the honest gateway stops the socket at the cap, its last receipt is within it, and the
 /// wallet finds no fault: the seller is not blocked, and the next call to it goes through.
