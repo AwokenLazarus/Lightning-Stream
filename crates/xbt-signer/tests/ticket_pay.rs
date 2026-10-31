@@ -641,6 +641,9 @@ struct PayState {
     offer_note_lie: bool,
     /// The payer notes of the invoices fetched from offers, in order.
     fetched_notes: Vec<String>,
+    /// How many times `down` turned away a question about the node itself (`GetInfo`, which the
+    /// wallet asks before it begins a payment).
+    turned_away: usize,
 }
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
@@ -714,8 +717,12 @@ impl PayLn {
 
 impl LnBackend for PayLn {
     fn get_info(&self) -> xbt402::Result<Value> {
-        if self.st.lock().unwrap().down {
-            return Err(node_err("LN node unreachable"));
+        {
+            let mut s = self.st.lock().unwrap();
+            if s.down {
+                s.turned_away += 1;
+                return Err(node_err("LN node unreachable"));
+            }
         }
         let h = self.chain.height();
         Ok(json!({"identity_pubkey": "02".to_string() + &"11".repeat(32), "alias": "buyer", "version": "0.21.3-beta-blake2b.17",
@@ -4373,10 +4380,19 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
 /// FAILS before the drawer asked the seller again for an owed win: the seller waited for the
 /// payment, the wallet for the next piece, and the answer stood still until the seller's grace
 /// was over and it cut the answer. Seen on the lab with 100 sellers: one file of 300.
+///
+/// The seller's grace is the clock here: it cuts an answer whose win stays unpaid for longer, so
+/// an answer that arrives whole had its win paid while it waited. The grace is the 10 s an answer
+/// stands still at the gateway as shipped (`pay_wait_secs`). (With a grace of 2 s and the whole
+/// call held to 1.8 s, the test failed under a full workspace run: the call of 16 MiB and 256
+/// draws took 2 to 8 s there, where alone it takes 0.8 s. The wallet asks again every 100 ms, so
+/// the 10 s are slack, and a wallet that never asks again is still cut.)
 #[test]
 fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
     let _g = env_lock();
-    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let mut shop = draws_shop();
+    shop["lottery"]["grace_seconds"] = json!(10);
+    let r = Rig::shipped(json!({"tickets": {"lottery": {"max_odds_den": 2}}}), 30, shop);
     let (ln, armed) = (r.ln.clone(), Arc::new(AtomicUsize::new(0)));
     r.tap.set(Box::new(move |seen, real| {
         if !seen.path.starts_with("/x402/lottery/draw") {
@@ -4384,24 +4400,34 @@ fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
         }
         let (status, headers, body) = whole(real().unwrap());
         let v: Value = serde_json::from_slice(&body).unwrap();
-        // the wallet's node is away when the first win is to be paid, and back 300 ms later
+        // the wallet's node is away when the first win is to be paid, and back once it has turned the wallet away
+        // (300 ms at the least): on a loaded machine the wallet may not reach the payment inside a fixed 300 ms
         if v["wins"].as_array().is_some_and(|w| !w.is_empty()) && armed.fetch_add(1, Ordering::SeqCst) == 0 {
-            ln.st.lock().unwrap().down = true;
+            let away_from = {
+                let mut s = ln.st.lock().unwrap();
+                s.down = true;
+                s.turned_away
+            };
             let back = ln.clone();
             std::thread::spawn(move || {
+                let t = Instant::now();
                 std::thread::sleep(Duration::from_millis(300));
+                while back.st.lock().unwrap().turned_away == away_from && t.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
                 back.st.lock().unwrap().down = false;
             });
         }
         let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
         Some(Ok(answer(status, headers, body)))
     }));
-    let t = Instant::now();
     let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
     let wins = v["wins"].as_u64().unwrap();
     assert!(wins >= 1, "{v}");
-    assert_eq!((v["complete"].as_bool(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(wins), Some(0)), "{v}");
-    assert!(t.elapsed() < Duration::from_millis(1_800), "the answer did not stand still for the seller's grace of 2 s: {:?}", t.elapsed());
+    assert!(r.ln.st.lock().unwrap().turned_away >= 1, "the node was never away when the wallet asked it: {v}");
+    // whole, and not cut by the seller at the end of its grace: the win was paid while the answer stood still for it
+    assert_eq!((v["complete"].as_bool(), v["ended"].as_str(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)),
+               (Some(true), None, Some(wins), Some(0)), "{v}");
     assert_wins(&r, wins);
 }
 
