@@ -81,6 +81,14 @@ pub fn sellers_entries(ai: &[Service], old: &Value, mut get: impl FnMut(&str) ->
     (out, problems)
 }
 
+/// A seller in a few characters: its shop key's start, or its web address's host.
+fn seller_tag(seller: &str) -> String {
+    match xbt402::shop::key_of(seller) {
+        Some(pk) => format!("{}…", xbt402::shop::npub(&pk).chars().take(14).collect::<String>()),
+        None => services::http_origin(seller).map(|o| o.split("://").nth(1).unwrap_or(&o).trim_end_matches('/').to_string()).unwrap_or_else(|| seller.to_string()),
+    }
+}
+
 fn health_html(state: &Value, name: &str) -> String {
     let h = &state["health"][name];
     let ok = h["ok"].as_u64().unwrap_or(0);
@@ -112,8 +120,16 @@ fn key_row(ctx: &Ctx, e: &Entry, today: u64) -> String {
 }
 
 impl App {
+    /// The AI services, each under a name of its own: pins, blocks, health and the `<seller>/<model>`
+    /// route are kept by name, so two shops that call themselves the same are told apart by their key
+    /// (or their address), and only where they clash, so a name the owner pinned stays as it was.
     fn ai_services(&self) -> Vec<Service> {
-        self.file_services().unwrap_or_default().into_iter().filter(|s| s.kind == services::Kind::Ai).collect()
+        let mut ai: Vec<Service> = self.file_services().unwrap_or_default().into_iter().filter(|s| s.kind == services::Kind::Ai).collect();
+        let clash: Vec<String> = ai.iter().map(|s| s.name.clone()).filter(|n| ai.iter().filter(|s| &s.name == n).count() > 1).collect();
+        for s in ai.iter_mut().filter(|s| clash.contains(&s.name)) {
+            s.name = format!("{} ({})", s.name, seller_tag(&s.seller));
+        }
+        ai
     }
 
     /// Writes the sellers file from the AI services and their listings, keeping the owner's pins

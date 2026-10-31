@@ -2803,6 +2803,70 @@ fn ai_sellers_added_or_removed_later_reach_the_ai_address_at_once() {
     assert!(s.len() == 1 && s[0].0.starts_with("First shop"), "{s:?}");
 }
 
+/// Two shops that call themselves the same, each selling a model: the AI page and the sellers file
+/// the AI address reads tell them apart by their keys, and preferring or blocking one leaves the
+/// other as it was.
+#[test]
+fn two_ai_shops_with_one_name_are_told_apart_and_pinned_or_blocked_one_at_a_time() {
+    use xbt_nostr::{event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    let publish = |name: &str, out: u64| {
+        let keys = Keys::generate();
+        let shop = xbt402::shop::origin_for(&keys.public.serialize());
+        let (sk, pk) = receipt_key(format!("{name}{out}").as_bytes());
+        let d = xbt402::listing::parse_draft(&json!({
+            "name": name, "services": [{"name": "Model", "kind": "ai", "path": "/ai/", "prices": {"per_1k_output_msat": out}, "items": []}],
+            "updated": "2026-10-31",
+        })).unwrap();
+        let doc = xbt402::listing::sign(&sk, &xbt402::listing::document(&d, &shop, &pk));
+        let bind = xbt402::listing::bind(&sk, &keys.public.serialize(), &shop);
+        let ev = market::listing_event_with(&keys, &doc, &bind, None, xbt_nostr::now()).unwrap();
+        assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+        xbt402::shop::npub(&keys.public.serialize())
+    };
+    let (a, b) = (publish("Money round shop", 10_000), publish("Money round shop", 7_000));
+    let dir = tempfile::tempdir().unwrap();
+    let ai = dir.path().join("ai");
+    let bx = start(json!({}), false, |c| {
+        c.nostr_relays = relays.clone();
+        c.ai = xbt_wallet_ui::config::AiSetup { endpoint: Some("http://box.local:33540/v1".into()), sellers: ai.join("sellers.json"),
+                                                credentials: ai.join("credentials.json"), state: ai.join("state.json") };
+    });
+    let mut br = logged_in(&bx);
+    for npub in [&a, &b] {
+        let r = br.act("/services", "/services", &[("action", "add"), ("url", npub)]);
+        assert!(br.flash_after(&r).contains("on Browse now"));
+    }
+    let r = br.act("/ai", "/ai", &[("do", "refresh")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    let file = || -> Value { serde_json::from_slice(&std::fs::read(ai.join("sellers.json")).unwrap()).unwrap() };
+    let named: Vec<(String, String)> = file()["sellers"].as_array().unwrap().iter()
+        .map(|e| (e["name"].as_str().unwrap().to_string(), e["prices"]["per_1k_output_msat"].as_str().unwrap_or("").to_string())).collect();
+    assert_eq!(named.len(), 2, "{named:?}");
+    let name_of = |npub: &str, price: &str| -> String {
+        let n = named.iter().find(|(_, p)| p == price).unwrap().0.clone();
+        assert!(n.contains("Money round shop") && n.contains(&npub[..14]), "named by its key: {n}");
+        n
+    };
+    let (na, nb) = (name_of(&a, "10000"), name_of(&b, "7000"));
+    assert_ne!(na, nb, "each its own name");
+    let page = unescape(&br.get("/ai").body);
+    assert!(page.contains(&na) && page.contains(&nb), "{page}");
+    // preferring one prefers that one only; blocking the other blocks it only
+    br.act("/ai", "/ai", &[("do", "pin"), ("seller", &na)]);
+    br.act("/ai", "/ai", &[("do", "block"), ("seller", &nb)]);
+    let f = file();
+    assert_eq!((f["pinned"].clone(), f["blocked"].clone()), (json!([na]), json!([nb])));
+    // and a name that is not shared stays as it was (a pin made before keeps working)
+    let c = publish("Other shop", 5_000);
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &c)]);
+    assert!(br.flash_after(&r).contains("on Browse now"));
+    br.act("/ai", "/ai", &[("do", "refresh")]);
+    assert!(file()["sellers"].as_array().unwrap().iter().any(|e| e["name"] == json!("Other shop")), "{}", file());
+}
+
 /// A seller who picks "Directly, through the app": no web address is written, the gateway gets a
 /// link section (the app's relays, the private switch) and the listing goes to Nostr anyway.
 /// Needs the gateway to read the `link` section (the direct-links transport work).
