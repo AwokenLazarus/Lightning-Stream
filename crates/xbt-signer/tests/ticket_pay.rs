@@ -8983,12 +8983,13 @@ fn lapse_at_wins(r: &Rig, times: usize, secs: u64) {
 /// [`lapse_at_wins`], with the seller's node showing them lapsed only `shown` later: until then the
 /// seller has no next invoice to give.
 fn lapse_at_wins_after(r: &Rig, times: usize, secs: u64, shown: Duration) {
-    let left = AtomicUsize::new(times);
+    let left = Mutex::new(times);
     let (clock, node, standin) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone());
     r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
         let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
         let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
-        if !open.is_empty() && left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        let take_one = |n: &mut usize| n.checked_sub(1).map(|less| *n = less).is_some();
+        if !open.is_empty() && take_one(&mut left.lock().unwrap()) {
             clock.fetch_add(secs, Ordering::SeqCst);
             let standin = standin.clone();
             std::thread::spawn(move || {
