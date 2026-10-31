@@ -65,7 +65,8 @@ program's choice.
 
 A long answer must keep arriving. After its first 10 minutes it must bring 16 KiB in every 30 s the
 wallet waits on the seller (546 bytes a second). A fast model never comes near that, but a slow CPU
-model at 3 or 4 tokens a second does: its answer is cut at that point, and reported as cut. The
+model can: at 3 or 4 tokens a second where a token's event takes about 150 bytes, and at more or
+fewer as the seller's format takes fewer or more. Its answer is cut at that point, and reported as cut. The
 wallet's owner changes when this starts with `tickets.stream_floor_after_s` in its policy.
 
 ## What you pay
