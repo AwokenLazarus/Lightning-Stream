@@ -45,6 +45,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A small payment works from no credit at a shop: the wallet buys a ticket sized to what the call may
+  be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
   begins, and a prepaid ticket or win paid without its proof now counts in what the call charged.
 - A file is never paid past the size its listing shows.
@@ -70,6 +72,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   limited as a whole, not as if all its buyers were one address.
 
 **VPN exits**
+- A priced exit's region check now runs for a buyer with no credit at that exit. Each check is
+  charged at most 20 sats, and the day's checks share a budget that survives a restart.
 - Stopping a session waits for its open answers' last receipts, so a VPN tunnel's spend is reported
   in full; the VPN seller page shows what was charged.
 - Sell or buy a VPN exit, paid as you use it: a buyer's devices go out through another box's internet
@@ -83,6 +87,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that sells only its VPN exit is listed, so buyers can find it by its key.
 
 **Hashrate**
+- A trial slice and a rental smaller than the shop's ticket are paid from no credit, instead of
+  being refused; credit left with a seller lasts about 20 hours, and the rental card says what left
+  the wallet.
 - A rental shows "Connecting…" until its link opens; one that never opens says why, and that
   nothing was paid.
 - Rentals run over the encrypted link.
