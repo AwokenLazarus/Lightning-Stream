@@ -254,6 +254,8 @@ fn routes() -> Value {
         // WebSockets: 2.5 sat to open and 1 sat a KiB either way, and a free one
         {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
         {"path": "/wsfree/", "free": true, "websocket": true},
+        // a VPN exit's tunnel: 1,000 sat a GiB either way, nothing to open
+        {"path": "/wsvpn/", "price": {"byte_msat": 1_000_000, "per_bytes": 1_073_741_824}, "websocket": true},
         // a buyer's own account (docs/BUYER-ACCOUNTS.md), made by the seller's hook: its headers say who the buyer is
         {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK},
          "deny_paths": ["/acct/admin"]},
@@ -5611,12 +5613,14 @@ fn a_websocket_open_does_not_hold_up_other_requests_to_the_seller() {
 }
 
 /// A session stopped while a paid WebSocket is open (a VPN's tunnel, held for as long as the VPN
-/// runs): the socket ends first and its last receipt is taken, so what the stop says is left with
-/// the seller counts every byte the socket carried, not only the price of its opening.
+/// runs): the socket ends first and its last receipt is taken, so what the stop says the session
+/// spent and left with the seller counts every byte the socket carried, at the route's price, by
+/// the seller's signed count and the wallet's own. Here a VPN's 200 MiB at 1,000 sat a GiB.
 #[test]
-fn a_session_stopped_with_a_websocket_open_counts_what_the_socket_drew() {
+fn a_session_stopped_with_a_vpn_tunnel_open_counts_every_byte_it_carried() {
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::net::UnixListener;
+    const GIB_MSAT: u64 = 1_000_000;
     let _g = env_lock();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("B2_STREAM_DIR", dir.path());
@@ -5625,37 +5629,48 @@ fn a_session_stopped_with_a_websocket_open_counts_what_the_socket_drew() {
     let sid = first["session"].as_str().unwrap().to_string();
     let l = UnixListener::bind(dir.path().join("sock")).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    // the caller: 64 KiB out and the same back, then it keeps the socket open until the wallet ends it
+    // the device: 200 MiB out through the tunnel and the same back (the echo), 1 MiB at a time; then
+    // it keeps the tunnel open until the wallet ends it
+    let total: u64 = 200 << 20;
     let caller = std::thread::spawn(move || {
         let (s, _) = l.accept().unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
         let mut line = String::new();
         rd.read_line(&mut line).unwrap();
         let mut w = s;
-        let out: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
-        w.write_all(&out).unwrap();
-        let mut back = vec![0u8; out.len()];
-        rd.read_exact(&mut back).unwrap();
-        assert_eq!(back, out);
+        let chunk: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+        let mut back = vec![0u8; chunk.len()];
+        for _ in 0..total >> 20 {
+            w.write_all(&chunk).unwrap();
+            rd.read_exact(&mut back).unwrap();
+        }
         tx.send(()).unwrap();
         let mut rest = vec![];
         let _ = rd.read_to_end(&mut rest);
     });
     std::thread::scope(|sc| {
-        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/ws/chat"), "max_sats": CALL, "task": "film", "stream_to": "sock", "stream_head": true,
-                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
-        rx.recv_timeout(Duration::from_secs(20)).expect("the echo came back");
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/wsvpn/tunnel"), "max_sats": 10_000, "task": "film", "stream_to": "sock",
+                                                       "stream_head": true, "upgrade": true,
+                                                       "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        rx.recv_timeout(Duration::from_secs(120)).expect("the 200 MiB went both ways");
         let t = Instant::now();
         let stop = r.call("ticket_stop", json!({"session": sid}));
         assert!(t.elapsed() < Duration::from_secs(10), "stopped in {:?}", t.elapsed());
         let w = ws.join().unwrap();
-        // 2,500 msat to open, and 128 KiB at 1,000 msat a KiB, beside the page's 2,500
-        let socket = 2_500 + 128 * 1_000;
-        assert_eq!(w["receipt"]["last"]["charged"].as_str(), Some(socket.to_string().as_str()), "{w}");
+        // 400 MiB in all (200 MiB each way) at 1,000 sat a GiB: about 390.6 sat
+        let want = (2 * total * GIB_MSAT).div_ceil(1 << 30);
+        let socket: u64 = w["receipt"]["last"]["charged"].as_str().unwrap().parse().unwrap();
+        assert!(socket >= want && socket <= want + 1_000, "the seller signed {socket} msat for the tunnel, its bytes cost {want}: {w}");
+        let price: u64 = w["price_msat"].as_str().unwrap().parse().unwrap();
+        assert!(price.abs_diff(socket) <= 1_000, "the wallet's own count {price} msat, the seller's {socket}: {w}");
+        // what the stop says: the page and the tunnel spent, and the rest of what was released left with the seller
+        let spent: u64 = stop["http"]["account"]["spent_msat"].as_str().unwrap().parse().unwrap();
+        let released: u64 = stop["http"]["account"]["released_msat"].as_str().unwrap().parse().unwrap();
         let left: u64 = stop["http"]["left_with_seller_msat"].as_str().unwrap().parse().unwrap();
-        assert_eq!(left, TICKET - 2_500 - socket, "what the stop says is left counts the socket's bytes: {stop}");
-        assert_eq!(stop["http"]["account"]["spent_msat"].as_str(), Some((2_500 + socket).to_string().as_str()), "the page, and the socket: {stop}");
+        assert_eq!(spent, 2_500 + socket, "the stop's spent counts the tunnel's bytes: {stop}");
+        assert_eq!(left, released - spent, "{stop}");
+        assert!(socket > 390_000, "the tunnel was charged its bytes, not only its opening: {socket}");
     });
     caller.join().unwrap();
     std::env::remove_var("B2_STREAM_DIR");
