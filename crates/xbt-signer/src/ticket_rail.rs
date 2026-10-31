@@ -60,6 +60,9 @@ use crate::{err, Result};
 const OFFER_FETCH_S: i64 = 5;
 /// How many times more a lock round asks for checks a chain node that fails now and then refused.
 const NODE_CHECK_TRIES: usize = 3;
+/// How long a ticket may be in `sending` before it is taken for stranded: past the node's own timeout for a send (60 s
+/// as shipped) and well past any wait for it, so that it is no ticket a slow route is still carrying.
+const SENDING_STRANDED_S: f64 = 90.0;
 
 /// Why the book books nothing more for a session whose stop has begun ([`Signer::ticket_is_stopping`]).
 const STOPPING: &str = "the session is being stopped: nothing more is released, locked or bought for it";
@@ -2161,22 +2164,57 @@ impl Signer {
         }
     }
 
-    /// Whether a ticket of the session is on its way and not yet one a release can take: one the
-    /// wallet's node calls in flight and has not shown locked, or locked with no expiry the node has
-    /// reported. A release that finds the pool empty waits for such a ticket rather than ending its
-    /// answer. A node that cannot be asked, or that has no record of a send, gives nothing to wait for.
-    pub(crate) fn ticket_coming(&self, sid: &str) -> bool {
-        let sending: Vec<String> = {
+    /// Ask the wallet's node about the tickets of this session not yet released, and bring the book to what it says. Each
+    /// is asked with no lock held, so that a slow node holds up nobody else, and the asking ends at `stop`. Returns whether
+    /// a ticket is on its way and not yet one a release can take: one the node calls in flight and has not shown locked,
+    /// locked with no expiry the node has reported, or one the node gave no answer about. A send the node has no record
+    /// of gives nothing to wait for.
+    pub(crate) fn ticket_refresh_coming(&self, sid: &str, stop: &dyn Fn() -> bool) -> bool {
+        let Some(ln) = self.ln.clone() else { return false };
+        let hashes: Vec<String> = {
             let Ok(g) = self.ticket_store() else { return false };
             let Some(st) = g.as_ref() else { return false };
-            let tickets = st.book.of_session(sid);
-            if tickets.iter().any(|t| t.state == TState::Locked && t.final_expiry == 0) {
-                return true;
-            }
-            tickets.iter().filter(|t| t.state == TState::Sending).map(|t| t.hash.clone()).collect()
+            st.book.of_session(sid).iter().filter(|t| t.state.unreleased()).map(|t| t.hash.clone()).collect()
         };
-        let Some(ln) = self.ln.clone() else { return false };
-        sending.iter().any(|h| matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT"))
+        let mut said = vec![];
+        for h in hashes {
+            if stop() {
+                return false;
+            }
+            let a = ln.lookup(&h);
+            said.push((h, a));
+        }
+        let _g = self.lock();
+        let Ok(mut g) = self.ticket_store() else { return false };
+        let Some(st) = g.as_mut() else { return false };
+        let mut coming = false;
+        for (h, a) in said {
+            if let Ok(Some(p)) = &a {
+                // unchecked: a row that cannot be written now is asked about again at the next round
+                let _ = self.ticket_apply(st, &h, p);
+            }
+            let Some(t) = st.book.tickets.get(&h) else { continue };
+            coming |= match (t.state, &a) {
+                (TState::Locked, _) => t.final_expiry == 0,
+                (TState::Sending, Err(_)) => true,
+                (TState::Sending, Ok(Some(p))) => str_or_empty(p.get("status")) == "IN_FLIGHT",
+                _ => false,
+            };
+        }
+        coming
+    }
+
+    /// A ticket of the session in `sending` for longer than a send can take, that the node calls in flight and shows on no
+    /// way, and that is not waiting its turn to be sent: it will never be locked, and the pool counts it. A node that gives
+    /// no answer says nothing.
+    pub(crate) fn ticket_sending_stranded(&self, sid: &str) -> Option<String> {
+        let ln = self.ln.clone()?;
+        let now = self.engine.now();
+        let old: Vec<String> = {
+            let g = self.ticket_store().ok()?;
+            g.as_ref()?.book.of_session(sid).iter().filter(|t| t.state == TState::Sending && now - t.sent_ts > SENDING_STRANDED_S).map(|t| t.hash.clone()).collect()
+        };
+        old.into_iter().find(|h| !self.ticket_is_queued(h) && matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT" && !htlcs_in_flight(&p)))
     }
 
     /// Whether the wallet's own node calls a ticket's payment in flight and carries it on none of

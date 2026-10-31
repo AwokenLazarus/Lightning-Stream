@@ -52,6 +52,8 @@ struct State {
     lose_settle_answer: bool,
     /// Streams deliver nothing while this is set: a stream that has fallen behind.
     streams_held: bool,
+    /// How many times a stream has told its reader of an invoice paid and held, and the reader has taken it.
+    told_held: usize,
     /// A cancel of a settled invoice answers success and changes nothing. Not what the node was
     /// seen to do: a fault, to show the gateway takes no cancel's yes for the invoice's state.
     cancel_yes_for_settled: bool,
@@ -191,6 +193,11 @@ impl StandIn {
             h.inv.state = InvoiceState::Canceled;
         }
         self.touch(&mut s);
+    }
+
+    /// How many times a stream has told its reader of an invoice paid and held, and the reader has taken it.
+    pub fn told_held(&self) -> usize {
+        self.lock().told_held
     }
 
     /// Hold every invoice stream back (true) or let them catch up (false). Calls are still answered.
@@ -489,6 +496,7 @@ impl Node for StandIn {
                     return Ok(());
                 }
                 s = self.lock();
+                s.told_held += usize::from(inv.state == InvoiceState::Accepted);
                 continue;
             }
             let version = s.version;

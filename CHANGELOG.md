@@ -50,9 +50,14 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 
 **Paying**
 - A paid download or film no longer ends when a loaded node or a slow route is late with its next
-  ticket, or when the wallet's chain node stops answering for a moment. The wallet waits up to 20 s
-  while the seller keeps the answer open, and never past the answer's own limit, so its caller still
-  gets a plain answer in time. A stop still ends the answer at once.
+  ticket, or when the wallet's chain or Lightning node stops answering for a moment. The wallet waits
+  up to 12 s, all told, while the seller keeps the answer open, and releases nothing for an answer the
+  seller has closed. A whole paid call now has one deadline of 50 s, so its caller gets a plain answer
+  in time, and a stop ends the answer at once.
+- An answer priced by the second is charged for that wait, by the clock: at 400 sat a second, an answer
+  of about 3,600 sat came to 4,800 sat with its ticket 11 s late.
+- A seller that keeps not showing the wallet's tickets, and a ticket stuck on its way for over 90 s,
+  now end the session, and the reply says which.
 - A small payment works from no credit at a shop: the wallet buys a ticket sized to what the call may
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
