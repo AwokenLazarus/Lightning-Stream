@@ -161,4 +161,18 @@ EOF
     tail -3 "$W/test.log"
   fi
 done
+# what the image ships beside the binary (usr/share/xbt-datum-gateway): our notice, the gateway's licence and
+# each statically linked library's (libmicrohttpd and argp-standalone are LGPL: the notice says where the
+# source and this script are, so the binary can be rebuilt and relinked)
+L=$OUT/licenses
+rm -rf "$L" && mkdir -p "$L"
+cp "$ROOT/container/datum-gateway-NOTICE" "$L/NOTICE"
+cp "$ROOT/third_party/datum_gateway/LICENSE" "$L/datum_gateway.LICENSE"
+tar xOf "$CACHE/libsodium-1.0.20.tar.gz" libsodium-1.0.20/LICENSE > "$L/libsodium.LICENSE"
+tar xOf "$CACHE/jansson-2.14.tar.gz" jansson-2.14/LICENSE > "$L/jansson.LICENSE"
+tar xOf "$CACHE/curl-8.11.1.tar.xz" curl-8.11.1/COPYING > "$L/curl.COPYING"
+tar xOf "$CACHE/libmicrohttpd-1.0.1.tar.gz" libmicrohttpd-1.0.1/COPYING > "$L/libmicrohttpd.COPYING"
+# argp-standalone ships no licence file: its sources' own notice (GNU Library GPL, version 2 or later)
+tar xOf "$CACHE/argp-standalone-1.5.0.tar.gz" argp-standalone-1.5.0/argp-parse.c | sed -n '1,/\*\//p' > "$L/argp-standalone.NOTICE"
+for f in "$L"/*; do [ -s "$f" ] || { echo "datum_gateway_build: $f is empty" >&2; exit 1; }; done
 echo "datum_gateway_build: OK ($XBT_DATUM_BUILD_NAME)"
