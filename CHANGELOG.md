@@ -40,6 +40,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   link signing (`message:write` only), so the node vouches for the shop's link. Before, no buyer could
   allow such a shop. A link signing key pasted on a running shop is used within a minute, with no restart.
 - Saving the shop with nothing changed no longer restarts it (it cut buyers' sessions), even on a later day.
+- A shop switched from being reached directly to a web address no longer keeps serving its direct link.
 - Files from File Browser shares only File Browser's own folder, including the files you upload to
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 

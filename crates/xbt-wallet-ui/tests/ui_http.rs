@@ -740,23 +740,24 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     assert!(page.contains("aria-current=\"page\">AI agents") && page.contains("Rotate the token"), "{page}");
     // AGP-042: the real MCP HTTP transport, reading the same file (the UI never calls it to rotate)
     let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock")));
-    let mut cfg = xbt_wallet_mcp::transport::HttpConfig::new("127.0.0.1:34202");
+    // a port of its own (0: the system picks a free one), bound before the server starts, so a request
+    // is taken as soon as it is sent: nothing to wait for, however loaded the machine
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mcp_addr = listener.local_addr().unwrap();
+    let mut cfg = xbt_wallet_mcp::transport::HttpConfig::new(mcp_addr.to_string());
     cfg.token_file = Some(tok.clone());
     let server = std::sync::Arc::new(xbt_wallet_mcp::mcp::Server::new(wallet));
-    std::thread::spawn(move || xbt_wallet_mcp::transport::serve_http(server, cfg));
+    let _mcp = xbt_wallet_mcp::transport::serve_listener(server, cfg, listener).unwrap();
     let mcp_init = |t: &str| {
-        for _ in 0..100 {
-            let r = ureq::post("http://127.0.0.1:34202/mcp").set("Accept", "application/json, text/event-stream")
-                .set("Authorization", &format!("Bearer {t}"))
-                .send_string(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26",
-                                     "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}).to_string());
-            match r {
-                Ok(x) => return x.status(),
-                Err(ureq::Error::Status(c, _)) => return c,
-                Err(_) => std::thread::sleep(Duration::from_millis(50)),
-            }
+        let r = ureq::post(&format!("http://{mcp_addr}/mcp")).set("Accept", "application/json, text/event-stream")
+            .set("Authorization", &format!("Bearer {t}"))
+            .send_string(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26",
+                                 "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}).to_string());
+        match r {
+            Ok(x) => x.status(),
+            Err(ureq::Error::Status(c, _)) => c,
+            Err(e) => panic!("mcp at {mcp_addr}: {e}"),
         }
-        panic!("mcp not listening")
     };
     assert_eq!(mcp_init(&"ab".repeat(32)), 200);
     // no confirmation box: nothing changes
@@ -1825,7 +1826,7 @@ fn a_sign_key_pasted_on_a_running_shop_leaves_its_config_as_it_is_from_any_day()
     // the config as the gateway runs it, written yesterday (or any earlier day)
     let mut c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(c["listing"]["updated"].is_string() && c["link"].is_object(), "{c}");
-    c["listing"]["updated"] = json!("2026-10-30");
+    c["listing"]["updated"] = json!("2000-01-01");
     let yesterday = serde_json::to_string_pretty(&c).unwrap() + "\n";
     std::fs::write(&path, &yesterday).unwrap();
 
@@ -1836,6 +1837,23 @@ fn a_sign_key_pasted_on_a_running_shop_leaves_its_config_as_it_is_from_any_day()
     assert_eq!(hex::encode(std::fs::read(dir.join("sign.macaroon")).unwrap()), sign);
     assert!(said.contains("signing key is in") && said.contains("within a minute") && said.contains("keeps running")
             && !said.contains("restarts"), "{said}");
+    // the payment requests key pasted again as it is: nothing changed, the shop keeps running
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv)]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("keeps running") && !said.contains("restarts"), "{said}");
+    // a new one: the config is the same, but the gateway's supervisor watches that key and restarts it
+    let new_inv = hex::encode(xbt402::macaroon::lnd_macaroon_for_tests(&[("invoices", &["read", "write"])], &["time-before 2099-01-01T00:00:00Z"]));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &new_inv)]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("restarts with it") && !said.contains("keeps running"), "{said}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), yesterday, "the config itself is still as it was");
+    assert_eq!(hex::encode(std::fs::read(dir.join("invoices.macaroon")).unwrap()), new_inv);
+    // so with the network time key, given with the sign key
+    let new_info = hex::encode(xbt402::macaroon::lnd_macaroon_for_tests(&[("info", &["read"])], &["time-before 2099-01-01T00:00:00Z"]));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("info_macaroon", &new_info), ("sign_macaroon", &sign)]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("restarts with it"), "{said}");
     // a save that changes nothing leaves it too, and says the shop keeps running
     let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct")]);
     let said = br.flash_after(&r);
@@ -1846,7 +1864,7 @@ fn a_sign_key_pasted_on_a_running_shop_leaves_its_config_as_it_is_from_any_day()
     assert!(br.flash_after(&r).contains("restarts with it"));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(c["listing"]["name"], "Home films and more");
-    assert_ne!(c["listing"]["updated"], "2026-10-30");
+    assert_ne!(c["listing"]["updated"], "2000-01-01");
 }
 
 /// The one Lightning Stream app (`XBT_UI_SELL=1`): Sell sets up the gateway beside the wallet in
@@ -3048,11 +3066,12 @@ fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     let page = br.get("/sell").body;
     assert!(page.contains("value=\"direct\" checked") && page.contains("name=\"private\" value=\"1\" checked"), "{page}");
     assert!(page.contains("Your shop key"));
-    // back to a web address: the link goes, the address comes back
+    // back to a web address: the link goes (the gateway neither serves it nor has it vouched for), the address comes back
     let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "web"), ("public_url", "https://films.example")]);
     assert!(br.flash_after(&r).contains("restarts"));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     assert_eq!(c["public_url"], "https://films.example");
+    assert!(c["link"].is_null(), "{c}");
 }
 
 /// The order the Sell page leads a seller through: the shop saved first, with nothing to sell, then

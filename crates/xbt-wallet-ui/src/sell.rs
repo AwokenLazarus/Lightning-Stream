@@ -769,6 +769,9 @@ impl App {
             link["private"] = json!(shop.private);
             c.insert("link".into(), link);
         } else {
+            // a shop sold at a web address has no link: one kept from when it was reached directly
+            // would still be served, and vouched for by its node
+            c.remove("link");
             c.insert("public_url".into(), json!(public_url));
         }
         // every route names its own service
@@ -1017,7 +1020,7 @@ impl App {
             Ok(cfg) => {
                 let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())? + "\n";
                 write_shared(&self.cfg.gw.dir, GW_CONFIG, text.as_bytes())?;
-                Ok(format!("{done} Your shop restarts with it in a few seconds."))
+                Ok(format!("{done} {RESTARTS}"))
             }
             Err(missing) => Ok(format!("{done} Not selling yet: {missing}")),
         }
@@ -1519,10 +1522,17 @@ impl App {
                     return Err("Paste at least one key to replace.".into());
                 }
                 let only_sign = macs.iter().all(|(file, _)| *file == GW_SIGN);
+                // the gateway's supervisor watches its invoices and info keys: a new one restarts it,
+                // whatever the config
+                let new_watched = macs.iter().any(|(file, mac)| *file != GW_SIGN
+                    && std::fs::read(self.cfg.gw.dir.join(file)).ok().as_deref() != Some(mac.as_slice()));
                 for (file, mac) in macs {
                     write_shared(&self.cfg.gw.dir, file, &mac)?;
                 }
                 let words = self.commit(&shop, "Your Lightning node is connected.")?;
+                if new_watched && words.ends_with(KEEPS_RUNNING) {
+                    return Ok(words.replace(KEEPS_RUNNING, RESTARTS));
+                }
                 // the gateway reads the sign key itself at its next look at the link: nothing restarts
                 // for it. Only a shop reached directly has a link for the node to vouch for
                 Ok(match (only_sign, words.ends_with(KEEPS_RUNNING), shop.direct) {
@@ -1748,6 +1758,8 @@ const KNOWN_SERVICES: &[(&str, &str)] = &[
 
 /// What `commit` says when the gateway's config is unchanged, so the shop is not restarted.
 const KEEPS_RUNNING: &str = "Your shop keeps running: nothing it reads changed.";
+/// What it says when the config, or a key the gateway's supervisor watches, changed.
+const RESTARTS: &str = "Your shop restarts with it in a few seconds.";
 
 /// A gateway config without the listing's date, which changes each day and is no change to the shop.
 fn undated(v: &Value) -> Value {
