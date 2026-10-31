@@ -390,17 +390,21 @@ def quiet(secs: float = 120) -> float:
 
 
 ORPHANS: set[str] = set()  # payments the buyer's node calls in flight with nothing on its channel
+FORGOTTEN: set[str] = set()  # sessions whose credit with the seller was given up
 
 
 def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
     """The agent stops every session that is open, and the tickets come back. With `forget` (each
     check starts clean with the seller), the credit a session leaves there is given up as well, so
-    the next session starts with none instead of taking it over."""
+    the next session starts with none instead of taking it over: a session stopped earlier in a
+    check (by the agent, or its call's max_sats) included, since a stop that ends its answer at once
+    leaves the rest of the last ticket with the seller."""
     for s in status().get("sessions", []):
         if s["state"] == "open":
             note_receipts((who or agent()).tool("ticket_stop", {"session": s["session"]}).get("http") or {})
-            if forget:
-                signer("ticket_stop", {"session": s["session"], "forget_credit": True})
+        if forget and s["session"] not in FORGOTTEN:
+            signer("ticket_stop", {"session": s["session"], "forget_credit": True})
+            FORGOTTEN.add(s["session"])
     quiet()
 
 
