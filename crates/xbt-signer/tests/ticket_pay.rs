@@ -2222,8 +2222,15 @@ fn a_seller_that_stalls_mid_answer_is_ended_by_the_read_timeout_and_charged_what
     assert!(started.elapsed() < Duration::from_secs(15), "a stalled seller held the call {:?}", started.elapsed());
     assert_eq!((v["complete"].as_bool(), got), (Some(false), MIB), "{v}");
     assert!(v["ended"].as_str().unwrap_or("").contains("cut short"), "the call does not say why it ended: {v}");
-    // what arrived: 1 MiB at 200 sat a MiB, by both counts
-    assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str()), (Some("200000"), Some("200000")), "{v}");
+    // what arrived: 1 MiB at 200 sat a MiB, by the wallet's count; and by the seller's, once it has given up on its
+    // quiet service too (it does not know the buyer has gone until then, so no last receipt could say so)
+    assert_eq!(v["price_msat"].as_str(), Some("200000"), "{v}");
+    let waited = Instant::now();
+    while r.shop.gw.stats().charged_msat < 200_000 {
+        assert!(waited.elapsed() < QUIET_FOR + Duration::from_secs(10), "the seller's charge: {}", r.shop.gw.stats().charged_msat);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(r.shop.gw.stats().charged_msat, 200_000, "the seller's charge");
     r.assert_booked();
     std::env::remove_var("B2_STREAM_DIR");
 }

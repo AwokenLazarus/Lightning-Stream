@@ -1159,6 +1159,8 @@ impl Signer {
             }
             lock(&shared).done = true;
             wake.notify_all();
+            // the reader's socket too: its client is done now, not after the rounds still to come with a slow seller
+            sink.out = None;
         });
         *lock(&ds.answer_since) = None;
         // the connection is closed here: a seller that was still sending stops within its window
