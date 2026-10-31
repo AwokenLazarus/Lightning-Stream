@@ -21,7 +21,7 @@ Checks:
             refused with nothing paid; the app's buy one whole ticket and pay every slice of the budget
             from it; slices x price = the wallet's spent = the seller's signed spent, the credit left
             = the ticket - spent, and the seller's node settled exactly the one ticket the wallet's
-            node paid
+            node paid; the rental's report says what left and what stays with the seller
 Report: run/p2p_hash_regtest.json.
 """
 from __future__ import annotations
@@ -307,6 +307,10 @@ def main() -> int:
               and node_out_msat <= moved_sats * 1000 < node_out_msat + 1000 and moved_sats <= 2_000 and d.held() == 0,
               {"settled": len(settled), "succeeded": len(succeeded), "node out msat": node_out_msat, "wallet booked sats": moved_sats,
                "other tickets": sorted({i["state"] for h, i in new_inv.items() if h not in settled}), "held": d.held()})
+        check("small: the rental's report (the wallet app's card) says what left the wallet and what stays with the seller as credit",
+              bz.get("walletMovedSats") == moved_sats and bz.get("leftWithSellerMsat") == balance,
+              {"walletMovedSats": bz.get("walletMovedSats"), "leftWithSellerMsat": bz.get("leftWithSellerMsat"),
+               "wallet booked sats": moved_sats, "credit left msat": balance})
     except (lab.LabError, OSError, KeyError, IndexError, ValueError, subprocess.TimeoutExpired) as e:
         check("ran to its end", False, f"{type(e).__name__}: {e}")
     finally:

@@ -2197,7 +2197,8 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
         ("GET", "/status") => json!({
             "datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
             "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
-                         "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12}}}]}),
+                         "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12},
+                                  "walletMovedSats": 1002, "leftWithSellerMsat": 800000}}]}),
         ("GET", "/offers") => json!({"offers": [{"name": "Basement miners", "linkKey": "02bb", "priceMsat": 40000, "sliceWork": "140737488355328",
                                                   "miners": 2, "freeMiners": 1, "freeHs": "4000000000000",
                                                   "trialMayBuyTicketUpToSats": 2000, "mayBuyTicketUpToSats": 2000},
@@ -2275,8 +2276,14 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     // a trial (40 sats) and a small rental may buy the shop's whole ticket: what may leave the wallet is said
     let basement = &p.body[p.body.find("Hashrate</span><h3>Basement miners</h3>").unwrap()..];
     let basement = &basement[..basement.find("</section>").unwrap()];
-    assert_eq!(basement.matches("your wallet may buy a ticket of up to 2,000 sats from this shop; unused credit stays with this seller").count(), 2,
+    assert_eq!(basement.matches("your wallet may buy a ticket of up to 2,000 sats from this shop; unused credit stays with this seller for about 20 hours, \
+                                 for a later rental there").count(), 2,
                "the trial's text and the rental's: {basement}");
+    // the rental's card says what left the wallet (a ticket bought whole) and what stays with the seller, not only the slices
+    let card = &p.body[p.body.find("Hashrate from Basement miners").unwrap()..];
+    let card = &card[..card.find("</section>").unwrap()];
+    assert!(card.contains("Left your wallet: <span class=\"money\">1,002 sats</span>, a ticket bought whole from this shop; 800 sats of it stays \
+                           with this seller as credit for about 20 hours"), "{card}");
     assert!(basement.contains("about 40 sats") && basement.contains("charged at most that"), "{basement}");
     let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);
     assert!(br.flash_after(&r).starts_with("Renting."));
@@ -2286,7 +2293,8 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert_eq!(rent.2, format!("Bearer {}", "r".repeat(64)));
     let r = br.act("/hashrate", "/hashrate", &[("action", "trial"), ("key", "02bb")]);
     let said = br.flash_after(&r);
-    assert!(said.starts_with("Trying one slice, at most 40 sats. Your wallet may buy a ticket of up to 2,000 sats from this shop for it; unused credit stays with this seller."),
+    assert!(said.starts_with("Trying one slice, at most 40 sats. Your wallet may buy a ticket of up to 2,000 sats from this shop for it; unused credit stays \
+                              with this seller for about 20 hours, for a later rental there."),
             "{said}");
     // Live connections shows the rental, with its Cut button
     let p = br.get("/connections");
