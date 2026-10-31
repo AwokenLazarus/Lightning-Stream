@@ -193,6 +193,9 @@ fn root_key_id() -> u64 {
 /// Asks the node for a macaroon with these permissions under this root key id.
 pub type Bake<'a> = dyn FnMut(&[&str], u64) -> Result<Vec<u8>, String> + 'a;
 
+/// [`Bake`] with the node's admin macaroon given (what [`run_with`] does with the one it read).
+type BakeWith<'a> = dyn FnMut(&[u8], &[&str], u64) -> Result<Vec<u8>, String> + 'a;
+
 /// A key dir and the files made in it, each with its permissions.
 type Group<'a> = (&'a Option<PathBuf>, &'a [(&'a str, &'a [&'a str])]);
 
@@ -446,7 +449,7 @@ pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
 }
 
 /// [`run_with`], the node's bake given (with the admin macaroon read): tests stand in for the node.
-fn run_baking(s: &Settings, given: Option<&[u8]>, bake: &mut dyn FnMut(&[u8], &[&str], u64) -> Result<Vec<u8>, String>) -> Result<Outcome, String> {
+fn run_baking(s: &Settings, given: Option<&[u8]>, bake: &mut BakeWith) -> Result<Outcome, String> {
     // the node's own grant first: then no admin macaroon is read for what it gave
     let mut granted = Outcome::default();
     take_grants(s, &mut granted)?;
