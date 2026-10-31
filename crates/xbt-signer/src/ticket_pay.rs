@@ -269,6 +269,12 @@ fn stopping_refusal() -> Value {
     refusal("ticket_session", "the session is being stopped: no ticket is released")
 }
 
+/// Whether a route's terms ask to know who the buyer is: the route gives each buyer an account
+/// (docs/BUYER-ACCOUNTS.md).
+fn identify_asked(accepted: &Value) -> bool {
+    accepted["extra"]["identify"] == true
+}
+
 // --- HTTP as this module needs it ---------------------------------------------------------------------
 
 /// The head of an answer, and its body still to be read.
@@ -2798,7 +2804,7 @@ impl Signer {
         let out = {
             // shared: other requests to this seller run beside this one
             let _call = hs.calls.read().unwrap_or_else(|p| p.into_inner());
-            self.ticket_request(&hs, c, &terms.price)
+            self.ticket_request(&hs, c, &terms)
         };
         // the pool is filled again behind the call
         self.ticket_refill_later(&hs);
@@ -3041,7 +3047,7 @@ impl Signer {
     /// Whether to tell this seller who this wallet is: its terms ask (`identify`), and the owner has
     /// not chosen to stay anonymous there (docs/BUYER-ACCOUNTS.md).
     fn identify_wanted(&self, hs: &HttpSession) -> bool {
-        hs.terms.accepted["extra"]["identify"] == true && !self.anonymous_at(&hs.origin)
+        identify_asked(&hs.terms.accepted) && !self.anonymous_at(&hs.origin)
     }
 
     /// The sellers the owner stays anonymous at, by origin (`identity.json`).
@@ -3901,7 +3907,8 @@ impl Signer {
 
     /// One paid request of a session: the balance topped up by whole tickets, the request, its
     /// receipt, its body as it arrives.
-    fn ticket_request(&self, hs: &Arc<HttpSession>, c: &Call, price: &Price) -> Value {
+    fn ticket_request(&self, hs: &Arc<HttpSession>, c: &Call, terms: &PayTerms) -> Value {
+        let price = &terms.price;
         let tp = self.ticket_policy();
         // what the answer may charge; what may leave for it (a whole ticket included) is `max_sats`, in `spent`
         let max_msat = (c.charge_sats.max(0) as u64).saturating_mul(1000);
@@ -4094,8 +4101,10 @@ impl Signer {
             if let Some(why) = hs.fault() {
                 return fail(hs, &spent, with(self.ticket_fault(hs, &why), json!({"status": ans.status})));
             }
-            // a seller that gives accounts and has not been told who this wallet is (it restarted, say): told, and asked again, once
-            if ans.status == 403 && !identified_again && self.identify_wanted(hs) {
+            // a seller that gives accounts and has not been told who this wallet is (it restarted, say, or the session
+            // opened on a route without accounts): told, and asked again, once. Asked by this request's route or the
+            // session's, so a page on a route with accounts never gets the seller's refusal in place of its answer
+            if ans.status == 403 && !identified_again && (identify_asked(&terms.accepted) || identify_asked(&hs.terms.accepted)) {
                 let headers = ans.headers.clone();
                 // an answer that cannot be read may be the seller asking who this wallet is: not handed on as an empty one
                 let Ok(body) = ans.read_small(SMALL_BODY) else {
@@ -4104,6 +4113,13 @@ impl Signer {
                 };
                 let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 if v.get("error").and_then(Value::as_str) == Some("identify_first") {
+                    // the owner chose to stay anonymous here, and this service has no guest for such buyers: said in the
+                    // wallet's own words, not handed on as the seller's refusal
+                    if self.anonymous_at(&hs.origin) {
+                        return fail(hs, &spent, with(refusal("ticket_refused", "this service gives each buyer an account, and this wallet stays anonymous at \
+                                                                               this seller (identity): it serves no anonymous buyer. Nothing was charged"),
+                                                     json!({"status": 403})));
+                    }
                     identified_again = true;
                     if self.ticket_identify(hs).is_ok() {
                         continue;

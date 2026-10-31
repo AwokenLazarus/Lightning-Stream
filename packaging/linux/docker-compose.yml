@@ -238,6 +238,15 @@ services:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-12b8182c0bf6@sha256:feaf8a21dd394273760916757c7b80ac93c600a93a90d2e2453f960b60b93eb6
     stop_grace_period: 30s
+    # probed at the port the Sell page gives the gateway (LS_GW_PORT), not the image's default 8402: a gateway on
+    # another port was shown unhealthy forever
+    healthcheck:
+      test: ["CMD", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:${LS_GW_PORT:-8402}/x402/ticket/health",
+             "--waiting-for", "/data/run/gateway/config.json"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     volumes:
       - ${LS_DATA_DIR}/gateway:/data/gateway
       - ${LS_DATA_DIR}/run/gateway:/data/run/gateway:ro
