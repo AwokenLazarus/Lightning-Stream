@@ -723,8 +723,8 @@ impl Signer {
     /// The wins of this session that the seller's answer stands still for, by the wallet's own
     /// count against the seller's terms: they go through the gate before the wins no seller waits
     /// for. A seller serves on beside `maxUnpaidWins` unpaid wins, and beside a win for
-    /// `gracePieces` pieces after it; beyond either its answer stands still, for 10 s at the
-    /// gateway, and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
+    /// `gracePieces` pieces after it; beyond either its answer stands still, for 15 s at the
+    /// gateway as shipped (`refill_wait`), and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
     /// that are above that number go first; and a win goes first when the pieces the wallet has
     /// given values for since it are within the seller's `window` of `gracePieces` (the seller is
     /// that many pieces ahead of the wallet's values at the most). Called while an answer is being
