@@ -51,13 +51,18 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 **Paying**
 - A paid download or film no longer ends when a loaded node or a slow route is late with its next
   ticket, or when the wallet's chain or Lightning node stops answering for a moment. The wallet waits
-  up to 12 s, all told, while the seller keeps the answer open, and releases nothing for an answer the
-  seller has closed. A whole paid call now has one deadline of 50 s, so its caller gets a plain answer
-  in time, and a stop ends the answer at once.
-- An answer priced by the second is charged for that wait, by the clock: at 400 sat a second, an answer
-  of about 3,600 sat came to 4,800 sat with its ticket 11 s late.
+  up to 12 s for each ticket while the seller keeps the answer open, and releases nothing for an answer
+  the seller has closed, or after the call's deadline. Where only the Lightning node's router was away,
+  tickets it never got hold their places for up to two minutes, and the file ends with `ticket_none`.
+- A whole paid call now has one deadline of 50 s, and answers plainly within about 55 s, before its
+  caller's 60 s, even if a node or the seller hangs: asking again then does not pay twice. Two things
+  can still run past that: paying a prepaid ticket, which waits as long as the Lightning node's own
+  timeout (60 s), and the checks of the nodes that begin a call, each up to its own 30 s.
+- An answer priced by the second is charged for that wait, by the clock, and each ticket can wait: at
+  400 sat a second, an answer of 3,600 sat came to 4,800 sat with the seller's word held back to 11 s,
+  and to 7,600 sat with its ticket 11 s past due.
 - A seller that keeps not showing the wallet's tickets, and a ticket stuck on its way for over 90 s,
-  now end the session, and the reply says which.
+  now end the session, and the reply says which. A stop ends the answer at once.
 - A small payment works from no credit at a shop: the wallet buys a ticket sized to what the call may
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop

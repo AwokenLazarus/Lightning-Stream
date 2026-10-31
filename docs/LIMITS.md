@@ -921,14 +921,22 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A release pauses for 12 s at most, all told, whatever it waits for (`tickets.ready_wait_ms`):
   under the 15 s a seller as shipped keeps a paused answer open, so that no secret leaves for an
   answer already over; just before the book the seller's signed `status` is asked whether it is.
-  A seller that closes a paused answer sooner than that is caught there, not before.
-- **An answer priced by the second is charged for the pause.** It is the clock's price: the
-  seconds run while the ticket is late, whether anything arrives or not. A ticket that takes the
-  whole 12 s adds 12 s of the route's price to what the same bytes cost: measured at 400 sat a
-  second, an answer of about 3,600 sat came to 4,800 sat with its ticket 11 s late. The wallet
-  does not try to tell this from an answer that is merely slow.
+  A seller that closes a paused answer sooner than that is caught there, not before. For an answer
+  by the byte the 12 s run from its last byte, for a request from when its turn comes, and for an
+  answer by the second from each release, since each second's ticket can wait in its turn.
+- **An answer priced by the second is charged for the pauses.** It is the clock's price: the
+  seconds run while a ticket is late, whether anything arrives or not, and every ticket due meanwhile
+  can be late too. Measured at 400 sat a second: an answer of 3,600 sat came to 4,800 sat with the
+  seller's word held back to 11 s, and to 7,600 sat with its ticket 11 s past due. The wallet does not
+  try to tell this from an answer that is merely slow.
+- **A whole call has one deadline** (`tickets.max_answer_s`, 50 s), and answers plainly within about
+  55 s, before its caller's 60 s. A question to a node or a seller that hangs goes on behind on a
+  thread of its own and the call answers without it, and no secret leaves after the deadline, so a
+  caller that asks again does not pay twice. Two paths can still run past it: a prepaid ticket's
+  payment, which waits as long as `ln.timeout_s` (60 s), and the checks of the wallet's nodes that begin
+  a call, each up to its client's 30 s, before there is a session to pay.
 - A ticket stuck in `sending` (the node calls it in flight and shows it on no way) for more than
-  90 s is taken for stranded: the session ends (`ticket_session_ended`). Until then each call
+  `ln.timeout_s` and 30 s, 90 s as shipped, is taken for stranded: the session ends (`ticket_session_ended`). Until then each call
   waits up to 12 s for it.
 - One paid request per seller at a time: a long answer delays every other call to that seller,
   and one session per seller node, so two origins of one node cannot be paid at once.
