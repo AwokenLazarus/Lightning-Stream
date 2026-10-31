@@ -1,11 +1,15 @@
 #!/bin/bash
 # Verify the Linux package (packaging/linux): install.sh's checks in a bare ubuntu:24.04, then two
-# installs on this machine against a regtest lab, a hashmaker and a hashtaker, one paid rental between
-# them, and uninstall.sh (packaging/linux/test/linux_regtest.py). Prints RESULT PASS|FAIL.
-# Needs the lab (run/lightning-fork-lab, cloned and built when missing), the pinned images (pulled), and
-# with LS_TEST_IMAGES=local-ui (the default) the tree's wallet-ui as xbt-wallet-ui:linux-test
-# (scripts/oci_build.sh --only xbt-wallet-ui --load, then docker tag xbt-wallet-ui:0.1.0 xbt-wallet-ui:linux-test).
-# Ports: 127.0.0.1 LS_TEST_PORT_BASE (24600) + 10..55, and the hashmaker's 23340-23344. Evidence: run/linux-test/<stamp>/.
+# installs on this machine against a regtest lab, a hashmaker (installed from the 0.1 package, then
+# updated) and a hashtaker (a first install), each one's Stream Gateway shown masked, one paid rental of
+# real work on masked solo jobs between them, the owner's own stock DATUM gateway refused, and
+# uninstall.sh (packaging/linux/test/linux_regtest.py). Prints RESULT PASS|FAIL.
+# Needs the lab (run/lightning-fork-lab, cloned and built when missing), the pinned images (pulled), the
+# test's images (packaging/linux/test/build_images.sh: this tree's wallet-ui and hashlink, the Stream
+# Gateway's stand-in and a stock gateway; LS_TEST_BUILD=0 uses the ones already built), and stratum-grind
+# in P2P_HASH_GATEWAYS (~/xbt-rnd/hash-gateways, as the p2p_hash regtest's real gateway mode).
+# Ports: 127.0.0.1 LS_TEST_PORT_BASE (24600) + 10..57, the Stream Gateway's 23339, and the hashmaker's
+# 23340-23344. Evidence: run/linux-test/<stamp>/.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
@@ -26,6 +30,10 @@ echo "   both refused with the right words"
 for ref in $(awk '!/^#/ && NF == 2 {print $2}' packaging/images.lock); do
   docker image inspect "$ref" >/dev/null 2>&1 || docker pull -q "$ref" >/dev/null
 done
+if [ "${LS_TEST_BUILD:-1}" = 1 ]; then
+  packaging/linux/test/build_images.sh 2>&1 | tee "$OUT/build-images.txt"
+  [ "${PIPESTATUS[0]}" = 0 ] || { echo "RESULT FAIL"; exit 1; }
+fi
 python3 packaging/linux/test/linux_regtest.py "$OUT"
 python3 - "$OUT/results.json" <<'PY'
 import json, sys
