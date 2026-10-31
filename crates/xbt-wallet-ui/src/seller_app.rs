@@ -583,17 +583,19 @@ impl AppOrigin {
 
 /// Whether the shop's route for the app at `base` gives each buyer an account: its `/services`
 /// says so. Asked when the page is shown; a shop that does not answer is taken to keep none.
-fn shop_keeps_accounts(seller: &str, base: &str) -> bool {
+fn shop_keeps_accounts(seller: &str, _base: &str) -> bool {
     let Some(origin) = crate::services::http_origin(seller) else { return false };
-    let path = base.strip_prefix(origin.trim_end_matches('/')).unwrap_or("/");
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(4)).redirects(0).build();
     let Ok(r) = agent.get(&format!("{}/services", origin.trim_end_matches('/'))).call() else { return false };
     let v: Value = serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or(Value::Null);
-    // the route the app's base falls under: the longest that covers it
-    v.get("routes").and_then(Value::as_array).into_iter().flatten()
-        .filter(|r| r.get("path").and_then(Value::as_str).is_some_and(|p| path.starts_with(p)))
-        .max_by_key(|r| r.get("path").and_then(Value::as_str).map_or(0, str::len))
-        .is_some_and(|r| r.get("accounts") == Some(&json!(true)))
+    routes_keep_accounts(&v)
+}
+
+/// Whether any route of a shop's list of what it sells keeps buyers' accounts. Any, not the one the app's
+/// base falls under: an app's pages reach the shop's other routes too (a Jellyfin listed at `/films/` asks
+/// `/` for its accounts), so the owner is offered the choice wherever an account can be made.
+fn routes_keep_accounts(services: &Value) -> bool {
+    services.get("routes").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("accounts") == Some(&json!(true)))
 }
 
 /// A text answer a page's own links are in: HTML, scripts, styles, JSON, SVG and manifests. Video,
@@ -680,6 +682,16 @@ pub fn spawn(app: &Arc<App>, strict: bool) -> Result<Vec<(u16, xbt_svc::http::Ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owner is offered "Stay anonymous here" for a shop where any route keeps accounts, not only
+    /// the one its app is listed under: a Jellyfin listed at `/films/` asks `/` for its accounts.
+    #[test]
+    fn a_shop_keeps_accounts_where_any_of_its_routes_does() {
+        let jellyfin = json!({"routes": [{"path": "/files/"}, {"path": "/films/"}, {"path": "/", "accounts": true}]});
+        assert!(routes_keep_accounts(&jellyfin));
+        assert!(!routes_keep_accounts(&json!({"routes": [{"path": "/files/"}, {"path": "/", "accounts": false}]})));
+        assert!(!routes_keep_accounts(&json!({})));
+    }
 
     #[test]
     fn the_seller_gets_only_its_own_cookies_and_the_wallets_stay_here() {

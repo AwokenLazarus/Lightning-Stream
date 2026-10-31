@@ -219,7 +219,9 @@ impl Gateway {
     /// session costs nothing to open, and would read the service's headers for nothing.
     pub(super) fn lottery_entry(&self, route: &Route, head: bool) -> Option<Value> {
         let cfg = self.cfg.lottery.as_ref()?;
-        if !cfg.offers(&route.price) || (head && route.price.request_msat == 0) {
+        // a route that gives each buyer an account is paid with tickets only: the draws path serves no buyer as
+        // its account (docs/BUYER-ACCOUNTS.md), and a draw there would be served as nobody
+        if route.accounts.is_some() || !cfg.offers(&route.price) || (head && route.price.request_msat == 0) {
             return None;
         }
         let release = match route.release {
@@ -714,7 +716,8 @@ impl Gateway {
         self.lottery_refresh(l, &a.session);
         let (blocked, win_msat, dearest, offered) = {
             let b = l.lock();
-            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price), b.cfg().offers(&route.price))
+            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price),
+             route.accounts.is_none() && b.cfg().offers(&route.price))
         };
         if let Some(why) = blocked {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), why.code()));

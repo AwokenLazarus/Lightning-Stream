@@ -5651,8 +5651,11 @@ fn a_page_on_a_route_with_accounts_is_served_after_the_wallet_says_who_it_is() {
     let me = guest(&v);
     assert!(me.starts_with("buyer-"), "the buyer's own account served the page: {v}");
     assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1);
-    // charged once, for the answer served: the seller's refusal cost nothing
-    assert_eq!(v["price_msat"].as_str(), Some("2500"), "{v}");
+    // charged once, for the answer served: the seller's refusal cost nothing. No ticket was released for it, and the
+    // balance with the seller fell by the page's price alone
+    let bal = |v: &Value| v["balance_msat"].as_str().and_then(|b| b.parse::<u64>().ok()).unwrap_or(0);
+    assert_eq!((v["price_msat"].as_str(), v["tickets_released"].as_u64(), v["charged_sats"].as_i64()), (Some("2500"), Some(0), Some(0)), "{v}");
+    assert_eq!((bal(&first), bal(&v)), (997_500, 995_000), "{first} {v}");
     // the seller starts again and forgets who the wallet is; the page's next request is streamed as a page's is
     r.shop.restart();
     let dir = tempfile::tempdir().unwrap();
@@ -5671,7 +5674,7 @@ fn a_page_on_a_route_with_accounts_is_served_after_the_wallet_says_who_it_is() {
     assert_eq!((v["status"].as_u64(), v.get("seller_fault"), v["session"] == first["session"]), (Some(200), None, true), "{v}");
     assert!(!page.contains("identify_first") && page.contains(&me), "the page got the service's answer as the same buyer, not the seller's refusal: {page}");
     assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 2, "told again after the restart");
-    assert_eq!(v["price_msat"].as_str(), Some("2500"), "{v}");
+    assert_eq!((v["price_msat"].as_str(), v["tickets_released"].as_u64(), v["charged_sats"].as_i64(), bal(&v)), (Some("2500"), Some(0), Some(0), 992_500), "{v}");
     // and the same once the wallet itself starts again: the same wallet is the same buyer there
     r.restart();
     let v = r.pay_known("/acct/echo", CALL);
@@ -5692,10 +5695,46 @@ fn an_anonymous_wallet_is_told_why_a_route_with_accounts_refuses_it() {
     let quiet = Rig::new(json!({}));
     let set = quiet.call("identity_set", json!({"origin": quiet.shop.origin, "anonymous": true}));
     assert_eq!(set["ok"], true, "{set}");
+    // the session opens on a route without accounts, then a page asks the route with accounts: the route's own
+    // terms ask who the wallet is, and the owner's choice holds there too
+    let first = quiet.pay_known("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
     let v = quiet.pay_known("/acct/echo", CALL);
-    assert_eq!((v["status"].as_u64(), v["rule"].as_str(), v.get("seller_fault")), (Some(403), Some("ticket_refused"), None), "{v}");
-    assert!(v["reason"].as_str().is_some_and(|r| r.contains("anonymous")), "{v}");
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str(), v.get("seller_fault"), v["session"] == first["session"]),
+               (Some(403), Some("ticket_refused"), None, true), "{v}");
+    assert!(v["reason"].as_str().is_some_and(|r| r.contains("anonymous") && r.contains("Nothing was charged for this request")), "{v}");
     assert!(quiet.tap.seen("/x402/ticket/identify").is_empty(), "an anonymous wallet says nothing");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
+}
+
+/// An owner who chose to stay anonymous at a seller after the wallet had told it who it is: a later
+/// session does not take over the seller session the wallet was known by (its credit stays there),
+/// so the owner is not served as their account through it.
+#[test]
+fn a_session_the_wallet_was_known_by_is_not_resumed_once_the_owner_stays_anonymous() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let first = r.pay_known("/acct/echo", CALL);
+    assert_eq!((first["status"].as_u64(), first["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{first}");
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1, "known to the seller by this session");
+    // nothing for 11 minutes: the session stops, with credit left at the seller
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    assert_ne!(r.session(first["session"].as_str().unwrap())["sessions"][0]["state"], "open");
+    // the owner now stays anonymous there; the next call does not take that seller session over
+    let set = r.call("identity_set", json!({"origin": r.shop.origin, "anonymous": true}));
+    assert_eq!(set["ok"], true, "{set}");
+    let v = r.pay_known("/acct/echo", CALL);
+    assert_eq!((v["status"].as_u64(), v["rule"].as_str()), (Some(403), Some("ticket_refused")), "not served as the account: {v}");
+    assert!(r.audit("ticket_resumed").is_empty(), "the seller session the wallet was known by was not taken over");
+    assert_eq!(r.audit("ticket_resume_skipped").len(), 1);
+    assert_eq!(r.tap.seen("/x402/ticket/identify").len(), 1, "and nothing more said");
     let _ = std::fs::remove_file(ACCOUNT_HOOK);
 }
 

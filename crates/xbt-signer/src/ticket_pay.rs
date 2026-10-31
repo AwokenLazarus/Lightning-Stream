@@ -1856,6 +1856,11 @@ fn forward_up(mut from: std::os::unix::net::UnixStream, mut writer: Box<dyn Writ
 
 /// The sellers the owner stays anonymous at (docs/BUYER-ACCOUNTS.md), in the wallet's run directory.
 const IDENTITY_FILE: &str = "identity.json";
+/// The seller sessions this wallet told who it is (`identify`): a session the owner has since chosen to
+/// stay anonymous at is not taken over by a later one ([`Signer::ticket_resume`]), since the seller still
+/// knows the wallet by it. The newest [`IDENTIFIED_KEPT`] are kept; a session is resumed within a day.
+const IDENTIFIED_FILE: &str = "identified.json";
+const IDENTIFIED_KEPT: usize = 4096;
 
 /// How long a ticket's payment is taken to last before one of the answer has been timed: a
 /// Lightning payment across a route or two.
@@ -2495,6 +2500,11 @@ impl Signer {
         let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
+        // a route that gives each buyer an account is paid with tickets only: draws serve no buyer as its account
+        // (docs/BUYER-ACCOUNTS.md), so a seller from before that rule that offers them there is not paid by them
+        if ways.iter().any(|o| matches!(o, Offer::Ticket(acc, _) if identify_asked(acc))) {
+            ways.retain(|o| !matches!(o, Offer::Lottery(_)));
+        }
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
         if self.draws_first(&call, &ways, &lightning, &tp) {
             if let Some(i) = ways.iter().position(|o| matches!(o, Offer::Lottery(_))) {
@@ -3061,6 +3071,26 @@ impl Signer {
         self.anonymous_origins().contains(&normalize_dest(origin))
     }
 
+    /// The seller sessions this wallet identified itself in ([`IDENTIFIED_FILE`]).
+    fn identified_sessions(&self) -> Vec<String> {
+        std::fs::read_to_string(self.run.join(IDENTIFIED_FILE)).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default()
+    }
+
+    /// Note that this wallet told the seller who it is in seller session `seller_sid`. A note that cannot be
+    /// written is audited: the session may then be resumed after the owner turns anonymous there.
+    fn identified_note(&self, seller_sid: &str) {
+        let mut all = self.identified_sessions();
+        if all.iter().any(|s| s == seller_sid) {
+            return;
+        }
+        all.push(seller_sid.to_string());
+        let over = all.len().saturating_sub(IDENTIFIED_KEPT);
+        all.drain(..over);
+        if let Err(e) = write_private(&self.run.join(IDENTIFIED_FILE), &json!(all).to_string()) {
+            self.engine.audit.append(json!({"type": "identified_note_failed", "why": e.msg}));
+        }
+    }
+
     /// `identity_set`: stay anonymous at a seller (`anonymous: true`), or let it recognise this
     /// wallet. Read again by every session that opens after it.
     pub(crate) fn identity_set(&self, p: &Value) -> Value {
@@ -3091,7 +3121,10 @@ impl Signer {
         let pubkey = xbt402::xbt_primitives::secp256k1::PublicKey::from_secret_key(&secp, &sk);
         let body = json!({"buyer": hex::encode(pubkey.serialize()), "sig": hex::encode(xbt402::xbt_primitives::ecdsa::sign(&sk, &msg))});
         match self.ticket_call(hs, "identify", &body, false) {
-            Ok((200, _, _)) => Ok(()),
+            Ok((200, _, _)) => {
+                self.identified_note(&session);
+                Ok(())
+            }
             Ok((status, v, _)) => Err(format!("the seller refused identify: HTTP {status} {}", protocol_code(v.get("error")))),
             Err(e) => Err(e.msg),
         }
@@ -3402,6 +3435,12 @@ impl Signer {
     /// `true`: taken over.
     fn ticket_resume(&self, hs: &HttpSession) -> bool {
         let Some((old, sent)) = self.ticket_resumable(&hs.terms.terms.payee, &hs.sid) else { return false };
+        // a seller session the wallet said who it is in, where the owner now stays anonymous: the seller still
+        // knows the wallet by it, so it is left with its credit (the owner's choice outweighs that balance)
+        if self.anonymous_at(&hs.origin) && self.identified_sessions().contains(&old.id) {
+            self.ticket_audit("ticket_resume_skipped", json!({"session": hs.sid, "origin": hs.origin, "why": "anonymous here now; that seller session was identified"}));
+            return false;
+        }
         // the seller as it is reached now: its id and key, at this call's address
         let old = SellerSession { base: hs.base.clone(), ..old };
         if sent == 0 {
@@ -4117,7 +4156,7 @@ impl Signer {
                     // wallet's own words, not handed on as the seller's refusal
                     if self.anonymous_at(&hs.origin) {
                         return fail(hs, &spent, with(refusal("ticket_refused", "this service gives each buyer an account, and this wallet stays anonymous at \
-                                                                               this seller (identity): it serves no anonymous buyer. Nothing was charged"),
+                                                                               this seller (identity): it serves no anonymous buyer. Nothing was charged for this request"),
                                                      json!({"status": 403})));
                     }
                     identified_again = true;
