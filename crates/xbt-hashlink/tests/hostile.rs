@@ -802,7 +802,7 @@ fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
         let v = live.lock().unwrap().clone();
         let (paid, work) = (v["paidSlices"].as_u64().unwrap_or(0) as i64, v["meter"]["work"].as_str().and_then(|w| w.parse::<i64>().ok()).unwrap_or(0));
         let ahead = paid * terms.price_msat as i64 - work * terms.price_msat as i64 / terms.slice_work as i64;
-        let step = 546_000i64.max(work * terms.price_msat as i64 / terms.slice_work as i64).min(30 * 200_000).max(546_000);
+        let step = (work * terms.price_msat as i64 / terms.slice_work as i64).clamp(546_000, 30 * 200_000);
         worst = worst.max(ahead - step);
     }
     let r = taker.join().unwrap();

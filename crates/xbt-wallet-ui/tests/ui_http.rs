@@ -3898,7 +3898,7 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     fn offers() -> Value {
         json!({"offers": [{"name": "Big miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
-                           "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": "https://miners.example/hashrate", "payNode": "02aa"}]})
+                           "miners": 1, "freeMiners": 1, "freeHs": "4000000000000"}]})
     }
     for masked in [false, true] {
         let (renter, rseen) = if masked {
