@@ -5,7 +5,7 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
-## 0.1.20 (in progress, not yet released)
+## 0.1.20 (2026-10-31)
 
 **Shops without a web address**
 - A shop can be reached by its key alone, over an encrypted direct link, with no hostname,

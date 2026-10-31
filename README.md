@@ -37,7 +37,8 @@ You need a synced Knots-BLAKE2b node (a first sync takes days, and Lightning For
 - **Linux:** Docker Compose beside your own nodes: [`docs/LINUX.md`](docs/LINUX.md).
 
 Then, in the app: make your approval key, sign the safe starter rules, confirm **Pay with real
-money**, and allow a seller. Our test shop is `https://stream.lazarus-xbt.xyz`. The
+money**, and allow a seller. Our demo shop, **Lightning Stream Genesis**, has the shop key
+`npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a`: paste it under Sellers. The
 [setup page](https://lazarus-xbt.xyz/stream/start/) has each step, and how to get a channel.
 
 ## What it does
