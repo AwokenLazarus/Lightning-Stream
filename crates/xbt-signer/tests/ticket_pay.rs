@@ -1107,6 +1107,8 @@ struct Tap {
     /// The next `status`, and the next `cancel`, are this slow, held as a real one is to the read timeout it was sent with.
     status_slow_ms: AtomicU64,
     cancel_slow_ms: AtomicU64,
+    /// And the next unpaid ask of `/latehead/`.
+    ask_slow_ms: AtomicU64,
     drop_none: AtomicU64,
 }
 
@@ -1129,7 +1131,8 @@ impl TicketWire for Tap {
         let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
                           cap_msat: cap_of(headers) };
         self.log.lock().unwrap().push(seen.clone());
-        let slow = if seen.path.starts_with("/x402/ticket/status") { &self.status_slow_ms } else if seen.path.starts_with("/x402/ticket/cancel") { &self.cancel_slow_ms } else { &self.drop_none };
+        let slow = if seen.path.starts_with("/x402/ticket/status") { &self.status_slow_ms } else if seen.path.starts_with("/x402/ticket/cancel") { &self.cancel_slow_ms }
+                   else if seen.path.starts_with("/latehead/") && !seen.paid { &self.ask_slow_ms } else { &self.drop_none };
         let d = Duration::from_millis(slow.swap(0, Ordering::SeqCst));
         if d > read_timeout {
             std::thread::sleep(read_timeout);
@@ -3186,8 +3189,10 @@ fn a_seller_that_never_shows_a_ticket_is_left_after_a_few_pauses() {
         if said.contains("ticket_seller_stalled") {
             break;
         }
-        assert!(calls.len() < 3, "{calls:?}");
+        assert!(calls.len() < 4, "{calls:?}");
     }
+    // one to a pause: the file's second try, where the ticket was due, had none of its pause left, and is not another
+    assert!(calls.len() >= 2, "{calls:?}");
     assert_ne!(r.session(&sid)["sessions"][0]["state"], "open", "{calls:?}");
     r.shop.standin.hold_streams(false);
     wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
@@ -3767,30 +3772,88 @@ fn assert_money_agrees_after_stop(r: &Rig, session: &Value) {
     assert_money_agrees(r);
 }
 
-/// Calls queued behind others' pauses for as long as they may wait: refused at their own deadline, not kept for a turn.
+/// A call queued behind another that holds `paying` past this call's own deadline (the one ahead is asking a hung node
+/// whether its ticket is stranded, a little past its deadline): it answers at its deadline, and is not kept for a turn.
 #[test]
-fn a_call_queued_behind_others_answers_at_its_own_deadline() {
+fn a_call_queued_behind_another_answers_at_its_own_deadline() {
     let _g = env_lock();
-    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 3, "ready_wait_ms": 2_500}}));
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 6, "ready_wait_ms": 20_000}}));
+    first_call_with_the_pool_shown(&r);
     r.shop.standin.hold_streams(true);
+    let drained = r.pay(&format!("/files/{}", 39 * MIB), 20_000);
+    assert_eq!(drained["complete"].as_bool(), Some(true), "{drained}");
+    r.ln.st.lock().unwrap().lookup_takes = Duration::from_secs(30);
     std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..4u64).map(|i| {
-            let r = &r;
-            sc.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50 * i));
-                let at = Instant::now();
-                let v = r.pay("/page/10", CALL);
-                (at.elapsed(), v)
-            })
-        }).collect();
-        for h in hs {
-            let (took, v) = h.join().unwrap();
-            assert!(took < Duration::from_secs(6), "{took:?} {v}");
-            assert_eq!(v["verdict"], "deny", "{v}");
-        }
+        let ahead = sc.spawn(|| r.pay("/page/10", CALL));
+        std::thread::sleep(Duration::from_millis(200));
+        let at = Instant::now();
+        let v = r.pay("/page/10", CALL);
+        assert!(at.elapsed() < Duration::from_secs(7), "{:?} {v}", at.elapsed());
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_busy")), "{v}");
+        ahead.join().unwrap();
     });
-    assert_eq!(r.tap.secrets().len(), 0);
+    assert_eq!(r.tap.secrets().len(), 8);
+    r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
     r.shop.standin.hold_streams(false);
+}
+
+/// The lookups hang while a ticket is on its way: the round goes on behind, the caller has its answer at the end of the pause,
+/// and the release is not kept for 30 s a question.
+#[test]
+fn a_lookup_that_hangs_during_the_wait_is_given_up_on_at_the_end_of_the_pause() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 3_000}}));
+    first_call_with_the_pool_shown(&r);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(60);
+        s.lookup_takes = Duration::from_secs(30);
+    }
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
+    assert!(t0.elapsed() < Duration::from_secs(12), "{:?} {v}", t0.elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_not_ready"), "{v}");
+    assert_nothing_leaves_after(&r, &v);
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+}
+
+/// A seller slow with its 402: the ask gets what is left of the call's deadline.
+#[test]
+fn a_seller_slow_with_its_402_is_a_plain_answer_inside_the_calls_deadline() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 3}}));
+    r.tap.ask_slow_ms.store(28_000, Ordering::SeqCst);
+    let t0 = Instant::now();
+    let v = r.pay("/latehead/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(6), "{:?} {v}", t0.elapsed());
+    assert_eq!(v["verdict"], "deny", "{v}");
+    assert_eq!(r.tap.secrets().len(), 0, "{v}");
+}
+
+/// An answer that came whole just inside the deadline and is never listed as closed: its last receipt is waited for a few
+/// seconds past the deadline, not the whole wait it would get with time to spare.
+#[test]
+fn a_last_receipt_never_listed_is_waited_for_only_a_little_past_the_deadline() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 8}}));
+    first_call_with_the_pool_shown(&r);
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.starts_with("/x402/ticket/status") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let mut v: Value = serde_json::from_slice(&body).ok()?;
+        v.as_object_mut()?.remove("responses");
+        let headers = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+        Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
+    }));
+    // about 7 s at about 4 MiB a second
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/slow/{}", 28 * MIB), 20_000);
+    assert!(t0.elapsed() < Duration::from_secs(15), "the deadline and 5 s, not 7 s and 10 s: {:?} {v}", t0.elapsed());
+    r.tap.clear();
 }
 
 /// A pool of 2, a refill due and nothing on its way, and the Lightning node away for a few seconds: the seller is waiting
@@ -3859,14 +3922,15 @@ fn a_lookup_answered_before_the_node_failed_a_ticket_changes_nothing_after() {
         wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
         {
             let mut s = r.ln.st.lock().unwrap();
-            s.lookup_takes = Duration::from_millis(200);
+            s.lookup_takes = Duration::from_secs(2);
             s.lookup_log.clear();
         }
-        // a round asks after each ticket in turn: the first of it has been answered, and the rest of the round is still to come
+        // a round asks after each ticket in turn: the first of it has been answered, and the next question is out for 2 s
         wait_for("a round to be under way", || r.ln.st.lock().unwrap().lookup_log.len() == 1);
         let h = r.ln.st.lock().unwrap().lookup_log[0].clone();
         {
             let mut s = r.ln.st.lock().unwrap();
+            s.lookup_takes = Duration::ZERO;
             let p = s.payments.iter_mut().rev().find(|p| p["payment_hash"] == h.as_str()).unwrap();
             p["status"] = "FAILED".into();
             p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
@@ -3875,9 +3939,9 @@ fn a_lookup_answered_before_the_node_failed_a_ticket_changes_nothing_after() {
         // the watcher: the book brought to the node
         r.status();
         let (ledger, retired) = (r.ledger_sum(), audit_count(&r, "ticket_retired"));
-        std::thread::sleep(Duration::from_millis(1_200));
+        // the round ends, with what it was told of that ticket before the node failed it
+        std::thread::sleep(Duration::from_secs(3));
         assert_eq!((r.ledger_sum(), audit_count(&r, "ticket_retired")), (ledger, retired), "the stale word on {h} was applied");
-        r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
         r.ln.st.lock().unwrap().unseen_until.clear();
         t.join().unwrap()
     });
