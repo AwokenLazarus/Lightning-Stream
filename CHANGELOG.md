@@ -82,6 +82,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   gets a silent connection that does no work.
 
 **The app**
+- Sell: services added in any order each get a path of their own. Only a media server takes the shop's
+  root, and a clash names the service that holds the path.
 - A shop's settings no longer show the values of headers it sends (they can hold secrets).
 - On Umbrel and StartOS the Sell page shows whether your shop is selling, instead of always
   "Starting, or stopped".
