@@ -7607,6 +7607,13 @@ fn prepaid_only_shop() -> Value {
     json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}})
 }
 
+/// [`prepaid_only_shop`] whose own sweeps never act within a test: an unpaid invoice is not given up,
+/// nor a quiet session forgotten. A test of what the wallet reconciles at an open uses it, so that the
+/// seller's janitor cannot hide a reconcile that did not happen.
+fn prepaid_only_shop_without_janitor() -> Value {
+    json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0, "unpaid_secs": 100000, "first_use_secs": 100000}})
+}
+
 /// The signer is killed with a prepaid ticket on its way, which then settles. With no tick in
 /// between, the next call shows the seller its preimage before the takeover reads the seller's
 /// count, and is paid from that credit: no second ticket is bought, and the credit goes on paying.
@@ -10569,14 +10576,14 @@ fn a_kill_at_any_step_at_a_prepaid_only_shop_buys_no_second_ticket() {
 #[test]
 fn a_kill_at_any_step_at_a_prepaid_only_shop_and_a_call_100_s_later_buys_no_second_ticket() {
     let _g = env_lock();
-    a_kill_at_any_step_then_a_call_at_once(prepaid_only_shop, 100, "p2d prepaid-only no tick 100 s");
+    a_kill_at_any_step_then_a_call_at_once(prepaid_only_shop_without_janitor, 100, "p2d prepaid-only no tick 100 s");
 }
 
 /// The node paid, the book not yet told (prepaid-only: no reconcile at open), the signer back after 100 s.
 #[test]
 fn a_ticket_settled_after_a_kill_is_known_at_a_prepaid_only_open_before_any_tick() {
     let _g = env_lock();
-    let mut r = Rig::shipped(json!({}), 30, prepaid_only_shop());
+    let mut r = Rig::shipped(json!({}), 30, prepaid_only_shop_without_janitor());
     let url = r.shop.url("/page/1");
     let _hash = killed_with_a_prepaid_ticket_that_then_settles(&mut r, url);
     r.clock.fetch_add(100, Ordering::SeqCst);
