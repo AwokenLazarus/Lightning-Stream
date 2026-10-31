@@ -4829,6 +4829,7 @@ impl Signer {
                         }
                     }
                 });
+                let lead = &lead;
                 scope.spawn(move || loop {
                     let mut s = lock(state);
                     if s.2 {
@@ -4849,12 +4850,23 @@ impl Signer {
                     account(st.cost(total));
                     let rate = total as f64 / st.started.elapsed().as_secs_f64().max(0.001);
                     let seen = credited();
-                    let ahead = ((rate * FIRST_PAY_S) as u64).min(st.covered(seen) / 2);
+                    // before any payment of this socket was timed: what passes in [`FIRST_PAY_S`], within half of what is paid for
+                    let ahead = match *lock(lead) {
+                        0 => ((rate * FIRST_PAY_S) as u64).min(st.covered(seen) / 2),
+                        l => l,
+                    };
                     if let Some(why) = st.over(total) {
                         s.1.get_or_insert(why);
                     } else if st.due_bytes_ahead(seen, total, None, ahead) {
                         drop(s);
+                        let (before, asked) = (st.covered(seen), Instant::now());
                         let r = pay(total, &|c| st.due_bytes_ahead(c, total, None, ahead));
+                        let span = st.covered(credited()).saturating_sub(before);
+                        // twice what passed while this payment took, at most half a ticket's worth. A try that bought
+                        // nothing times nothing
+                        if span > 0 {
+                            *lock(lead) = ((rate * asked.elapsed().as_secs_f64() * 2.0) as u64).min(span / 2);
+                        }
                         s = lock(state);
                         if let Some(why) = r {
                             s.1.get_or_insert(why);
