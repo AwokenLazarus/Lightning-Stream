@@ -60,6 +60,30 @@ pub(crate) const FIRST_BYTE: Duration = Duration::from_secs(60);
 pub(crate) const LONGEST: Duration = Duration::from_secs(6 * 3600);
 /// The longest head line the signer writes before the body.
 pub(crate) const HEAD_LINE: u64 = 4096;
+/// How long a streamed body's end waits for the signer's account of the call: it takes the session's
+/// order first, then asks the seller for the last receipt (5 s a try, given up after 30 s), on a
+/// slow link or behind other calls of the session.
+pub(crate) const ACCOUNT_WAIT: Duration = Duration::from_secs(120);
+
+/// Whether a streamed answer that has ended was whole (`Ok`). All of an announced length handed on
+/// is whole, and nothing is waited for; otherwise it is whole only by the signer's account of the
+/// call (`account`, asked only then). An answer the wallet ended early, for any reason, or with no
+/// account in time, is an error, so that the client sees a body cut short (a `Content-Length` body
+/// short of its length, or a chunked one with no last chunk), never a short file that looks whole.
+pub(crate) fn whole(length: Option<u64>, sent: u64, account: impl FnOnce() -> Option<Result<Value, String>>) -> io::Result<()> {
+    if length.is_some_and(|l| sent >= l) {
+        return Ok(());
+    }
+    match account() {
+        Some(Ok(v)) if v.get("complete").and_then(Value::as_bool) == Some(true) && length.is_none() => Ok(()),
+        Some(Ok(v)) => {
+            let why = v.get("ended").and_then(Value::as_str).or_else(|| v.get("error").and_then(Value::as_str)).unwrap_or("the wallet stopped reading it");
+            Err(io::Error::other(format!("the answer was cut short after {sent} bytes: {why}")))
+        }
+        Some(Err(e)) => Err(io::Error::other(format!("the answer was cut short after {sent} bytes: {e}"))),
+        None => Err(io::Error::other(format!("the answer ended after {sent} bytes and the wallet did not say it was whole"))),
+    }
+}
 
 pub struct Config {
     /// The signer's socket.
@@ -173,6 +197,7 @@ impl Connector {
             length,
             body: Box::new(move |out: &mut dyn BodyWriter| {
                 out.send(&head)?;
+                let mut sent = head.len() as u64;
                 let mut buf = vec![0u8; 64 << 10];
                 loop {
                     let n = src.read(&mut buf)?;
@@ -181,11 +206,11 @@ impl Connector {
                     }
                     // a program that stopped reading: dropping the socket tells the signer to stop paying
                     out.send(&buf[..n])?;
+                    sent += n as u64;
                 }
                 drop(src);
-                // the signer's account of the call, for the log; the body has been handed on already
-                let _ = done_rx.recv_timeout(Duration::from_secs(5));
-                Ok(())
+                // the signer's account of the call: an answer it ended early is cut short for the client too
+                whole(length, sent, || done_rx.recv_timeout(ACCOUNT_WAIT).ok())
             }),
         })
     }

@@ -1539,9 +1539,10 @@ entry for an origin off the allowlist, which is never used, is warned of the sam
    the released ones pay for has arrived (by the second: in the last fifth of the second before
    the unpaid one), and the wallet stops reading when the book refuses a release, when the call's
    charge cap (`max_charge_sats`, else `max_sats`) is used up by its own count of bytes and
-   seconds, or when the answer has been open
-   for `tickets.max_answer_s` (50 s by default). It then asks `status` for the last receipt and
-   checks it against what arrived.
+   seconds, when nothing has arrived for `tickets.read_timeout_s` (30 s), or when the answer has
+   been open for `tickets.max_answer_s` (50 s by default; `tickets.max_socket_s`, 6 hours, for an
+   answer streamed on to the caller as it arrives, or a WebSocket). It then asks `status` for the
+   last receipt and checks it against what arrived.
 6. The pool is refilled behind the call when half of it or fewer are left: with the default of
    2, when 1 is left.
 

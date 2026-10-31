@@ -186,6 +186,26 @@ impl Handler for Service {
                 Ok(())
             }) });
         }
+        if let Some(n) = sized("/trickle/") {
+            // a download on a slow link: n bytes, 64 KiB every 250 ms, with no length stated
+            return stream(n, None, body(n, 64 << 10, Duration::from_millis(250)));
+        }
+        if let Some(n) = sized("/tricklepieces/") {
+            // the same, at the draws' price
+            return stream(n, None, body(n, 64 << 10, Duration::from_millis(250)));
+        }
+        if let Some(n) = sized("/drip/") {
+            // a seller that holds an answer open a byte at a time, each inside the wallet's wait for the next
+            return stream(n, None, body(n, 1, Duration::from_millis(300)));
+        }
+        if let Some(n) = sized("/stall/") {
+            // a seller that sends n bytes, with no length stated, and then nothing more for a minute
+            return stream(n, None, Box::new(move |out| {
+                out.send(&(0..n).map(pattern).collect::<Vec<u8>>())?;
+                std::thread::sleep(Duration::from_secs(60));
+                Ok(())
+            }));
+        }
         if let Some(n) = sized("/timed/").or_else(|| sized("/tick/")) {
             // n bytes, 1 KiB every 100 ms, with no length stated
             return stream(n, None, body(n, 1 << 10, Duration::from_millis(100)));
@@ -275,6 +295,10 @@ fn routes() -> Value {
         {"path": "/broken", "price": {"request_msat": 2500}},
         {"path": "/files/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/slow/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
+        {"path": "/trickle/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
+        {"path": "/drip/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
+        {"path": "/tricklepieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
+        {"path": "/stall/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/timed/", "price": {"second_msat": 400_000}},
         {"path": "/quiet/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/quiettick/", "price": {"second_msat": 1000}},
@@ -1651,6 +1675,214 @@ fn a_streamed_body_ends_for_its_reader_before_the_sellers_last_receipt_is_fetche
     assert!(statuses > 0, "the seller's status was never asked: {:?}", r.tap.seen(""));
     assert!(returned.duration_since(ended) >= Duration::from_millis(1000),
             "the reader's body ended only {:?} before the call returned: it waited for the seller's status", returned.duration_since(ended));
+}
+
+/// A download streamed on to its caller (`stream_to`) is not cut while it delivers, however long
+/// it takes: a slow link's 1 MiB over 4 s comes in whole past an owner's `max_answer_s` of 2, paid
+/// exactly for its bytes on both sides. The same answer read whole by the call (no `stream_to`),
+/// whose caller waits for it, is still held to `max_answer_s`.
+#[test]
+fn a_streamed_download_that_keeps_delivering_is_not_cut_at_max_answer_s() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 2}}));
+    let l = UnixListener::bind(dir.path().join("dl-slow")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        s.read_to_end(&mut all).unwrap();
+        all
+    });
+    let started = Instant::now();
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/trickle/{MIB}")), "max_sats": 5_000, "task": "film", "stream_to": "dl-slow"}));
+    let got = reader.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), got.len()), (Some(200), Some(true), MIB), "{v}");
+    assert!(started.elapsed() > Duration::from_secs(3), "the trickle came too fast to test the limit: {:?}", started.elapsed());
+    assert_eq!(hex::encode(Sha256::digest(&got)), pattern_digest(MIB));
+    // 1 MiB at 200 sat a MiB, by the wallet's count and by the seller's signed word
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str()), (Some("200000"), Some("200000")), "{v}");
+    // one ticket, paid by the buyer's node, taken by the seller's, settled in the book, and in the ledger with its fee
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+    // read whole by the call: the owner's limit still ends it, and it says so
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/trickle/{MIB}")), "max_sats": 5_000, "task": "film"}));
+    assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
+    assert!(v["ended"].as_str().unwrap_or("").contains("max_answer_s"), "{v}");
+    assert_eq!(v["price_msat"], v["receipt"]["last"]["charged"], "{v}");
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// As [`a_streamed_download_that_keeps_delivering_is_not_cut_at_max_answer_s`], paid by draws: the
+/// lottery rail is the one a small call or a lottery-only shop is paid on, and its answer streamed
+/// on is not cut either. Every piece gets its value, and the wins are paid.
+#[test]
+fn a_streamed_download_paid_by_draws_is_not_cut_at_max_answer_s() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = draws_rig(json!({"tickets": {"max_answer_s": 2, "lottery": {"min_expected_wins": 0}}}));
+    let l = UnixListener::bind(dir.path().join("dl-draws")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        s.read_to_end(&mut all).unwrap();
+        all
+    });
+    let started = Instant::now();
+    let n = 16 * PIECE;
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/tricklepieces/{n}")), "max_sats": 1_000, "task": "film", "stream_to": "dl-draws"}));
+    let got = reader.join().unwrap();
+    assert_eq!((v["rail"].as_str(), v["complete"].as_bool(), got.len()), (Some("lottery"), Some(true), n), "{v}");
+    assert!(started.elapsed() > Duration::from_secs(3), "the trickle came too fast to test the limit: {:?}", started.elapsed());
+    assert_eq!(hex::encode(Sha256::digest(&got)), pattern_digest(n));
+    // 16 pieces of 2 sat by the wallet's count; what its node paid is the wins, one number on every side
+    assert_eq!(v["price_msat"].as_str(), Some("32000"), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A seller that drips an answer a byte at a time, each just inside the wallet's wait for the next
+/// byte, does not hold the call open for hours: fewer than the floor in a `read_timeout_s` ends it,
+/// and it costs what arrived, by both counts.
+#[test]
+fn a_streamed_answer_that_barely_delivers_is_ended_and_charged_what_arrived() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({"tickets": {"read_timeout_s": 2}}));
+    let l = UnixListener::bind(dir.path().join("dl-drip")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        all.len()
+    });
+    let started = Instant::now();
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/drip/{MIB}")), "max_sats": 5_000, "task": "film", "stream_to": "dl-drip"}));
+    let got = reader.join().unwrap();
+    assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
+    assert!(v["ended"].as_str().unwrap_or("").contains("max_stream_s: fewer than"), "{v}");
+    assert!(started.elapsed() < Duration::from_secs(20), "the drip held the call {:?}", started.elapsed());
+    assert!(got > 0 && got < 256, "{got} bytes reached the reader");
+    // what arrived, by the wallet's count; the seller's may be a byte or two ahead, still on its way
+    let (ours, theirs): (u64, u64) = (v["price_msat"].as_str().unwrap().parse().unwrap(), v["receipt"]["last"]["charged"].as_str().unwrap().parse().unwrap());
+    assert_eq!(ours, (got as u64 * 200_000).div_ceil(1 << 20), "{v}");
+    assert!(theirs >= ours && theirs - ours <= 10, "the seller charged {theirs} msat for what the wallet counts as {ours}: {v}");
+    r.assert_booked();
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// An answer priced by the second stays on `max_answer_s` even when it is streamed on: its clock
+/// bills whether bytes come or not, so a long stay is not bought with a trickle. Ended there, and
+/// charged for its seconds, within the one second the wallet's clock may run ahead of the seller's.
+#[test]
+fn a_streamed_answer_priced_by_the_second_is_held_to_max_answer_s() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 2}}));
+    let l = UnixListener::bind(dir.path().join("dl-timed")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        all.len()
+    });
+    let started = Instant::now();
+    // a 100 s answer at 400 sat a second: 40,000 sat if nothing ended it
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/timed/{}", 1000 << 10)), "max_sats": 50_000, "task": "film", "stream_to": "dl-timed"}));
+    let got = reader.join().unwrap();
+    assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
+    assert!(v["ended"].as_str().unwrap_or("").contains("max_answer_s"), "{v}");
+    assert!(started.elapsed() < Duration::from_secs(10) && got > 0, "{:?}, {got} bytes", started.elapsed());
+    let (ours, theirs): (u64, u64) = (v["price_msat"].as_str().unwrap().parse().unwrap(), v["receipt"]["last"]["charged"].as_str().unwrap().parse().unwrap());
+    assert!(ours >= theirs && ours - theirs <= 400_000, "the wallet counts {ours} msat, the seller {theirs}: {v}");
+    assert!(ours <= 5 * 400_000, "{ours} msat for an answer ended at 2 s: {v}");
+    r.assert_booked();
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A stop ends a streamed answer that is open past `max_answer_s` as it ends any other: the reader's
+/// body ends about at once, no ticket goes out after, and what the stop says was spent counts what
+/// arrived.
+#[test]
+fn a_stop_ends_a_streamed_answer_open_past_max_answer_s_at_once() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 1}}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    let l = UnixListener::bind(dir.path().join("dl-stop")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        (all.len(), Instant::now())
+    });
+    std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/trickle/{}", 16 * MIB)), "max_sats": 100_000, "task": "film", "stream_to": "dl-stop"})));
+        // well past the limit, and the answer still open
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!t.is_finished(), "the answer did not outlive max_answer_s");
+        let at = Instant::now();
+        let stop = r.call("ticket_stop", json!({"session": sid}));
+        let after_stop = r.tap.secrets().len();
+        let (got, body_ended) = reader.join().unwrap();
+        let out = t.join().unwrap();
+        assert!(body_ended.duration_since(at) < Duration::from_millis(1500), "the body ended {:?} after the stop", body_ended.duration_since(at));
+        assert_eq!(out["complete"], false, "{out}");
+        assert!(out["ended"].as_str().unwrap_or_default().contains("ticket_session"), "{out}");
+        assert_eq!(out["bytes"].as_u64(), Some(got as u64), "{out}");
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(r.tap.secrets().len(), after_stop, "a ticket went out after the stop");
+        // the page and what arrived, by the wallet's count; the stop's spent is the seller's, which may count what was on its way
+        let own = 2_500 + (got as u64 * 200_000).div_ceil(1 << 20);
+        let spent: u64 = stop["http"]["account"]["spent_msat"].as_str().unwrap().parse().unwrap();
+        assert!(spent >= own && spent - own <= 200_000, "the stop says {spent} msat, the wallet counts {own}: {stop}");
+    });
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A seller that stops sending mid-answer is ended by the wallet's wait for the next byte
+/// (`tickets.read_timeout_s`), not left open: the call says it was cut and why, and is charged
+/// exactly the bytes that arrived, by both counts.
+#[test]
+fn a_seller_that_stalls_mid_answer_is_ended_by_the_read_timeout_and_charged_what_arrived() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({"tickets": {"read_timeout_s": 2}}));
+    let l = UnixListener::bind(dir.path().join("dl-stall")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        all.len()
+    });
+    let started = Instant::now();
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/stall/{MIB}")), "max_sats": 5_000, "task": "film", "stream_to": "dl-stall"}));
+    let got = reader.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(30), "a stalled seller held the call {:?}", started.elapsed());
+    assert_eq!((v["complete"].as_bool(), got), (Some(false), MIB), "{v}");
+    assert!(!v["ended"].as_str().unwrap_or("").is_empty(), "the call does not say why it ended: {v}");
+    // what arrived: 1 MiB at 200 sat a MiB, by both counts
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str()), (Some("200000"), Some("200000")), "{v}");
+    r.assert_booked();
+    std::env::remove_var("B2_STREAM_DIR");
 }
 
 /// A body streamed on as it is paid for (`stream_to`), as a local player needs it: the reader at

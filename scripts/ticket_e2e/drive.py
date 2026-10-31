@@ -81,6 +81,14 @@ SPLIT = 125  # the regtest stand-in for the height the chains split at
 TICKET_MSAT = 1_000_000
 BIG = 100_000_000
 BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
+#: The long_download checks' file: a download that runs well past the wallet's limit for an answer read whole,
+#: at 20 sat a MiB (about 6,100 sat for all of it)
+HUGE, HUGE_BYTE_MSAT = 320_000_000, 20_000
+#: The wallet's limit for an answer read whole while long_download runs, and how fast its client reads (as a player
+#: does: no faster than it plays), so that the download is open several times that limit on any lab host
+LONG_LIMIT_S, LONG_READ_BPS = 2, 40_000_000
+#: What a check sets in the wallet's `tickets` policy over the lab's own, for as long as it runs
+TICKET_OVERRIDES: dict[str, Any] = {}
 REQUEST_MSAT = 2_500
 SOCK = f"{RUN}/signer.sock"
 WALLET = f"{RUN}/wallet"
@@ -177,7 +185,7 @@ class Wallet:
             # as shipped a session is one payment for velocity_max (a 100 MB file is twenty releases), a session holds
             # 2 tickets and the wallet 15 in all: none of that is set here
             "tickets": {"enabled": True, "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
-                        "tasks": {"film": {"budget_sats": 3_000_000}}},
+                        "tasks": {"film": {"budget_sats": 3_000_000}}, **TICKET_OVERRIDES},
         }
 
     def write_policy(self) -> None:
@@ -492,6 +500,7 @@ def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | Non
         "times": {"height_max_age_secs": 5},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
+            {"path": "/huge.bin", "price": {"byte_msat": HUGE_BYTE_MSAT, "per_bytes": PER_BYTES}},
             {"path": "/small.txt", "price": {"request_msat": page_msat or REQUEST_MSAT}},
             {"path": "/free/", "free": True},
         ],
@@ -1635,6 +1644,27 @@ def link_check(relay: bool) -> None:
     m0 = money()
     paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
     settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    origin, doc = link_gateway(relay)
+    if relay:
+        os.environ["XBT_LINK_PRIVATE"] = "1"
+    try:
+        restart_signer()
+        for m in AGENT:
+            m.close()
+        AGENT.clear()
+        price_msat = -(-BIG * BYTE_MSAT // PER_BYTES)
+        t0 = time.monotonic()
+        r = pay(f"{origin}/big.bin", max_sats=25_000)
+        took = time.monotonic() - t0
+    finally:
+        os.environ.pop("XBT_LINK_PRIVATE", None)
+    link_check_end(relay, mode, m0, paid0, settled0, origin, doc, r, price_msat, took)
+
+
+def link_gateway(relay: bool) -> tuple[str, dict[str, Any]]:
+    """The link gateway started for a shop with no web address (`relay`: relay-only, private), its
+    transport document read, and the shop put in the app's shops file and the wallet's policy:
+    its origin and that document."""
     # the seller's node vouches for the link key: a macaroon that may only sign
     with open(f"{RUN}/sign.macaroon", "wb") as f:
         f.write(bytes.fromhex(lab.bake(SELLER, ("uri:/lnrpc.Lightning/SignMessage",))))
@@ -1669,19 +1699,12 @@ def link_check(relay: bool) -> None:
     if origin not in LINK_ORIGINS:
         LINK_ORIGINS.append(origin)
     WALLET_PROC.write_policy()
-    if relay:
-        os.environ["XBT_LINK_PRIVATE"] = "1"
-    try:
-        restart_signer()
-        for m in AGENT:
-            m.close()
-        AGENT.clear()
-        price_msat = -(-BIG * BYTE_MSAT // PER_BYTES)
-        t0 = time.monotonic()
-        r = pay(f"{origin}/big.bin", max_sats=25_000)
-        took = time.monotonic() - t0
-    finally:
-        os.environ.pop("XBT_LINK_PRIVATE", None)
+    return origin, doc
+
+
+def link_check_end(relay: bool, mode: str, m0: dict[str, Any], paid0: set[str], settled0: set[str], origin: str, doc: dict[str, Any],
+                   r: dict[str, Any], price_msat: int, took: float) -> None:
+    """The link check's verdict on the 100 MB file `r` paid through `origin`."""
     stored = r.get("saved_to", "")
     same_file = bool(stored) and os.path.getsize(stored) == BIG and hashlib.sha256(open(stored, "rb").read()).hexdigest() == r.get("body_digest")
     if stored:
@@ -1710,6 +1733,100 @@ def link() -> None:
 
 def link_relay() -> None:
     link_check(relay=True)
+
+
+def huge_file() -> str:
+    """The long_download checks' 320 MB file in the service's directory (made once), and its sha256."""
+    path = f"{RUN}/www/huge.bin"
+    if not os.path.exists(path) or os.path.getsize(path) != HUGE:
+        block = os.urandom(1 << 20)
+        with open(path, "wb") as f:
+            f.writelines((hashlib.sha256(block[:64] + i.to_bytes(8, "big")).digest() + block)[: min(len(block), HUGE - i)] for i in range(0, HUGE, len(block)))
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def long_download(relay: bool) -> None:
+    """A download that takes longer than the wallet's limit for an answer read whole (here 2 s, the
+    default 50 s): the 320 MB file through the connector, which streams it on as it is paid for. It
+    comes whole, its sha256 the file's, and the money agrees, the seller paid for every byte and no
+    more than a ticket past them. `relay`: from a shop with no web address, relay-only, as a Private
+    shop is reached. Before 0.1.20 such a download was cut at max_answer_s and the client kept a
+    short file that looked whole."""
+    mode = "relay" if relay else "direct"
+    want = huge_file()
+    stop_sessions()
+    # what earlier checks paid (the offers check pays another seller's node) is left out: this check's own
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    origin = link_gateway(relay)[0] if relay else ORIGIN
+    TICKET_OVERRIDES["max_answer_s"] = LONG_LIMIT_S
+    WALLET_PROC.write_policy()
+    if relay:
+        os.environ["XBT_LINK_PRIVATE"] = "1"
+    os.makedirs(f"{RUN}/stream", exist_ok=True)
+    conn_port = BASE + 21
+    got, digest, cut, took, status, early = 0, hashlib.sha256(), "", 0.0, 0, b""
+    try:
+        restart_signer()
+        with open(f"{RUN}/connector-dl.log", "ab") as log:
+            PROCS["connector-dl"] = subprocess.Popen([f"{BIN}/lightning-stream"], env=dict(os.environ, LS_LISTEN=f"127.0.0.1:{conn_port}", B2_SIGNER_SOCK=SOCK,
+                                                     B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="film", LS_MAX_SATS="20000", XBT_SHOPS_FILE=SHOPS_FILE),
+                                                     stdout=log, stderr=log)
+        lab.wait("the connector", 60, lambda: PROCS["connector-dl"].poll() is None and send("GET", "/health", conn_port)[0] == 200, every=0.2)
+        t0 = time.monotonic()
+        c = http.client.HTTPConnection("127.0.0.1", conn_port, timeout=120)
+        c.request("GET", f"/s/{origin}/huge.bin", headers={"X-Max-Sats": "20000"})
+        resp = c.getresponse()
+        status = resp.status
+        try:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                if got < 512:
+                    early += chunk[: 512 - got]
+                got += len(chunk)
+                digest.update(chunk)
+                # read as a player does, no faster than it plays: the answer stays open well past the limit
+                ahead = got / LONG_READ_BPS - (time.monotonic() - t0)
+                if ahead > 0:
+                    time.sleep(ahead)
+        except (http.client.IncompleteRead, OSError) as e:
+            cut = f"{type(e).__name__}: {e}"[:200]
+        took = time.monotonic() - t0
+        c.close()
+    finally:
+        os.environ.pop("XBT_LINK_PRIVATE", None)
+        if "connector-dl" in PROCS:
+            PROCS["connector-dl"].terminate()
+            PROCS["connector-dl"].wait(10)
+        TICKET_OVERRIDES.clear()
+        WALLET_PROC.write_policy()
+    stop_sessions()
+    restart_signer()
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
+    price_msat = -(-HUGE * HUGE_BYTE_MSAT // PER_BYTES)
+    mbit = round(got * 8 / took / 1e6, 1) if took else None
+    measured(f"long_download_{mode}_s", round(took, 2))
+    measured(f"long_download_{mode}_mbit_s", mbit)
+    whole = got == HUGE and digest.hexdigest() == want and not cut
+    paid_for = price_msat <= m["seller_node_received_msat"] < price_msat + 2 * TICKET_MSAT
+    check(f"long_download ({mode}): a 320 MB download through the connector{', from a relay-only shop,' if relay else ''} that runs past the wallet's limit for an answer read whole ({LONG_LIMIT_S} s here, read at {LONG_READ_BPS // 1_000_000} MB/s as a player reads) comes whole, its sha256 the file's, every ticket booked once and the money agreeing, the seller paid for its bytes and less than two tickets more",
+          whole and took > 2 * LONG_LIMIT_S and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {"status": status, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "cut": cut,
+           **({"answer": early.decode("utf-8", "replace")} if status != 200 else {}), "seconds": round(took, 2), "mbit_s": mbit, "price_msat": price_msat, **inv, "money": m})
+    if relay:
+        PROCS["gateway-link"].terminate()
+        PROCS["gateway-link"].wait(10)
 
 
 
@@ -2098,7 +2215,7 @@ def jellyfin(link: str = "") -> None:
         pass
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "pruned": pruned, "jellyfin": jellyfin,
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "pruned": pruned, "jellyfin": jellyfin,
           "vpn": vpn,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
@@ -2107,7 +2224,7 @@ def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
     # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
     # (vpn downloads a public file through the exit: run by name only)
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn")])
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

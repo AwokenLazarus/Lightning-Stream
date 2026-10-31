@@ -21,6 +21,8 @@ struct Session {
     credit: i64,
     charged: i64,
     calls: Vec<Value>,
+    /// The socket of an answer still being written went away ([`signer_at`]'s `/endless/`).
+    reader_gone: bool,
 }
 
 /// The stand-in signer: one thread per connection, so a page's requests run at once.
@@ -90,6 +92,33 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                 };
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 let mut out = UnixStream::connect(stream_dir.join(p["stream_to"].as_str().unwrap())).unwrap();
+                // a film that goes on until its reader goes away, which is what stops the signer paying
+                if url.contains("/endless/") {
+                    let _ = writeln!(out, "{}", json!({"status": 200, "content_type": "video/mp4", "headers": [["Content-Type", "video/mp4"]]}));
+                    let chunk = vec![7u8; 16 << 10];
+                    while out.write_all(&chunk).is_ok() {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    session.lock().unwrap().reader_gone = true;
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 200, "charged_sats": charged, "complete": false, "ended": "stopped by the buyer"}}));
+                    return;
+                }
+                // a film's range that the wallet ends half-way (its limit, a seller gone quiet): `/cut/` with the part's length
+                // stated, `/cutchunked/` with none. Half of it is written, and the call says it was not whole
+                if url.contains("/cut/") || url.contains("/cutchunked/") {
+                    let part: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+                    let mut head = json!({"status": 206, "content_type": "video/mp4", "content_range": format!("bytes 0-{}/{}", part.len() - 1, 4 * part.len()),
+                                          "headers": [["Content-Type", "video/mp4"], ["Accept-Ranges", "bytes"]]});
+                    if url.contains("/cut/") {
+                        head["content_length"] = part.len().into();
+                    }
+                    let _ = writeln!(out, "{head}");
+                    let _ = out.write_all(&part[..part.len() / 2]);
+                    drop(out);
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 206, "charged_sats": charged, "complete": false,
+                                                                            "ended": "max_answer_s: the answer has been open for 50 s"}}));
+                    return;
+                }
                 use base64::Engine as _;
                 let body = p["body_b64"].as_str().map(|b| base64::engine::general_purpose::STANDARD.decode(b).unwrap()).unwrap_or_default();
                 let echo = json!({"url": p["url"], "method": p["method"], "headers": p["headers"], "body": String::from_utf8_lossy(&body)}).to_string();
@@ -363,4 +392,61 @@ fn a_request_that_must_run_alone_gets_its_turn_on_a_busy_page() {
     });
     let calls = session.lock().unwrap().calls.clone();
     assert!(calls.iter().any(|c| c["url"].as_str().unwrap().contains("/dear/") && c["max_sats"].as_i64().unwrap() >= 2_500), "{calls:?}");
+}
+
+/// One read of a whole answer, as it came: the head (lower-cased) and every byte after it.
+fn raw(addr: &str, target: &str, extra: &str) -> (String, Vec<u8>) {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+    write!(s, "GET {target} HTTP/1.1\r\nHost: x\r\n{extra}Connection: close\r\n\r\n").unwrap();
+    let mut all = vec![];
+    let _ = s.read_to_end(&mut all);
+    let split = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    (String::from_utf8_lossy(&all[..split]).to_ascii_lowercase(), all[split + 4..].to_vec())
+}
+
+/// A range of a film that the wallet ended half-way is never handed to the page as a whole one,
+/// which a player takes for the end of the file and stops the film there: with the part's length
+/// stated the body falls short of it; with none, the chunked body has no last chunk.
+///
+/// FAILS before for the chunked part: it ended with its last chunk, as if the range were whole.
+#[test]
+fn a_range_the_wallet_ended_half_way_reaches_the_page_cut_short_never_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, _session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 5_000);
+    let (head, body) = raw(&addr, &format!("/v/{visit}/cut/film.mp4"), "Range: bytes=0-\r\n");
+    assert!(head.starts_with("http/1.1 206") && head.contains("content-length: 262144"), "{head}");
+    assert!(body.len() < 262_144, "a range cut half-way came whole: {} bytes", body.len());
+    let (head, body) = raw(&addr, &format!("/v/{visit}/cutchunked/film.mp4"), "Range: bytes=0-\r\n");
+    assert!(head.starts_with("http/1.1 206") && head.contains("transfer-encoding: chunked"), "{head}");
+    assert!(!body.ends_with(b"0\r\n\r\n"), "a range cut half-way ended with its last chunk, as if whole");
+}
+
+/// Stopping a visit ends the answers open in it, even one its page is still reading: the signer's
+/// socket closes, which is what stops it paying, so that "nothing more is paid" holds at once.
+#[test]
+fn stopping_a_visit_shuts_its_open_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 5_000);
+    let reading = { let (addr, visit) = (addr.clone(), visit.clone()); std::thread::spawn(move || raw(&addr, &format!("/v/{visit}/endless/film.mp4"), "")) };
+    let waited = std::time::Instant::now();
+    while session.lock().unwrap().calls.is_empty() {
+        assert!(waited.elapsed() < std::time::Duration::from_secs(10), "the call never reached the signer");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!session.lock().unwrap().reader_gone, "the answer ended before the stop");
+    let at = std::time::Instant::now();
+    let (st, _, _) = ask(&addr, "POST", &format!("/visits/{visit}/stop"), "", b"");
+    assert_eq!(st, 200);
+    while !session.lock().unwrap().reader_gone {
+        assert!(at.elapsed() < std::time::Duration::from_secs(2), "the signer's socket was still open {:?} after the stop", at.elapsed());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (_, body) = reading.join().unwrap();
+    assert!(!body.ends_with(b"0\r\n\r\n"), "an answer ended by a stop reached the page as whole");
 }

@@ -863,7 +863,9 @@ impl Signer {
         let tp = self.ticket_policy();
         let piece_bytes = ds.terms.piece_bytes.max(1);
         let by_bytes = price.byte_msat > 0;
-        let max_open = Duration::from_secs(tp.max_answer_s.clamp(1, 86_400) as u64);
+        let (open_s, limit) = super::open_limit(&tp, false, sink.out.is_some(), price);
+        let max_open = Duration::from_secs(open_s.clamp(1, 86_400) as u64);
+        let mut progress = super::Progress::new(&tp, limit);
         let luck_cap = lottery::luck_cap_msat(max_msat, ds.win_msat, tp.lottery.luck_tenths.max(0) as u64);
         let batch = (tp.lottery.ahead.max(1) as usize).div_ceil(2);
         let piece = |kind: Kind, k: u64, amount_msat: u64| Piece { id: PieceId { seq, kind, k }, req, amount_msat };
@@ -1016,7 +1018,11 @@ impl Signer {
                     break;
                 }
                 if head_at.elapsed() >= max_open {
-                    stop_now(format!("max_answer_s: the answer has been open for {} s", max_open.as_secs()));
+                    stop_now(format!("{limit}: the answer has been open for {} s", max_open.as_secs()));
+                    break;
+                }
+                if let Some(why) = progress.at(sink.bytes) {
+                    stop_now(why);
                     break;
                 }
                 // the call's limit, by the wallet's own count of what has arrived: it reads no further, and draws for what it has

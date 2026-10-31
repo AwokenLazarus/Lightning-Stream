@@ -18,7 +18,7 @@
 //! | Nothing a seller says is booked. | The ledger rows are the book's. A seller's totals only move the wallet's count of the balance, and only where [`crate::ticket_http::Account::absorb`] finds them inside the wallet's own. |
 //! | A ticket is released for an answer only when the balance does not cover its next piece. | [`Stream::due_bytes`] and [`Stream::due_time`], on the bytes and seconds this module counted itself. |
 //! | No ticket is released into a session whose last answer the seller has not closed. | [`Signer::ticket_release_one`] waits for the answer's last receipt in the seller's signed `status` (5 s a call, the session given up after 30 s). A seller waiting for a refill of an answer the wallet stopped reading would take the next ticket for bytes nobody reads. |
-//! | A call is charged at most its charge cap (`max_charge_sats`, else `max_sats`), by the wallet's own count, moves at most `max_sats` (whole tickets with their fees), and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above the charge cap, and [`Spent::room`] any ticket past `max_sats`; [`Stream::over`] cuts the body where its price reaches the charge cap or its time is up. |
+//! | A call is charged at most its charge cap (`max_charge_sats`, else `max_sats`), by the wallet's own count, moves at most `max_sats` (whole tickets with their fees), and ends within the owner's limit for an answer read that way ([`open_limit`]: `max_answer_s`, `max_stream_s` or `max_socket_s`). | [`Signer::ticket_request`] refuses a head price above the charge cap, and [`Spent::room`] any ticket past `max_sats`; [`Stream::over`] cuts the body where its price reaches the charge cap or its time is up. |
 //! | Held tickets first; a prepaid one only where none can be held, or before any is. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, a wait after a lock that found no slot, or a session whose first ticket is a prepaid one: a seller the owner has not named, or one that answered `prepaid_first`). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
 //! | A seller that says `slots_short` is waited for. | [`Signer::ticket_lock_call`] sets the session's wait from the seller's `retryAfter` and offers it no hash until then. |
 //! | A session that can release nothing more is ended, and said so. | [`Signer::ticket_forgotten`]: the seller's unsigned `session_unknown` to a lock or a `status` stops the session, as an unsigned answer to a paid request does. [`Signer::ticket_release_one`]: a ticket the seller has not shown after `ready_wait_ms` that the wallet's own node carries on no channel ([`Signer::ticket_stranded`]) stops it too. Neither releases or books anything. |
@@ -1763,6 +1763,51 @@ struct Mark {
     metered: bool,
 }
 
+/// How long an answer paid as it arrives stays open, and which of the owner's limits that is. A
+/// WebSocket: as long as its page keeps it. An answer streamed on to its caller as it arrives (a film,
+/// a download, an AI stream): as long as it delivers. Any other is read whole for a caller that waits
+/// 60 s for it; and one priced by the second is held to that too, streamed or not, since its clock
+/// bills whether bytes come or not.
+fn open_limit(tp: &TicketPolicy, socket: bool, streamed: bool, price: &Price) -> (i64, &'static str) {
+    if socket {
+        (tp.max_socket_s, "max_socket_s")
+    } else if streamed && price.second_msat == 0 {
+        (tp.max_stream_s, "max_stream_s")
+    } else {
+        (tp.max_answer_s, "max_answer_s")
+    }
+}
+
+/// Whether a streamed answer still delivers: at least [`PROGRESS_FLOOR_BYTES`] in each
+/// `tickets.read_timeout_s`, counted from its first byte. `Some`: why it ends here.
+struct Progress {
+    window: Duration,
+    /// Only an answer held open by `max_stream_s`.
+    on: bool,
+    from: Option<(Instant, u64)>,
+}
+
+impl Progress {
+    fn new(tp: &TicketPolicy, limit: &str) -> Self {
+        Self { window: Signer::ticket_read_timeout(tp), on: limit == "max_stream_s", from: None }
+    }
+
+    fn at(&mut self, bytes: u64) -> Option<String> {
+        if !self.on || bytes == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let (since, had) = *self.from.get_or_insert((now, bytes));
+        if now.duration_since(since) < self.window {
+            return None;
+        }
+        self.from = Some((now, bytes));
+        (bytes.saturating_sub(had) < PROGRESS_FLOOR_BYTES).then(|| {
+            format!("max_stream_s: fewer than {PROGRESS_FLOOR_BYTES} bytes arrived in {} s", self.window.as_secs())
+        })
+    }
+}
+
 struct Stream {
     price: Price,
     /// The seller's `spentMsat` before this request.
@@ -1770,8 +1815,7 @@ struct Stream {
     /// Before the request was sent, so that the seconds counted here are never fewer than the seller's.
     started: Instant,
     max_msat: u64,
-    /// The longest the answer stays open (the owner's `tickets.max_answer_s`, or `tickets.max_socket_s`
-    /// for a WebSocket), and which of the two it is.
+    /// The longest the answer stays open ([`open_limit`]), and which of the owner's limits that is.
     max_open: Duration,
     limit: &'static str,
 }
@@ -4368,9 +4412,8 @@ impl Signer {
         // a streamed answer by the token whose final counts (`usage` with no choices) or end (`[DONE]`) were read: its cost
         // is known, cut or not
         let mut counts_read = false;
-        // a WebSocket is open for as long as its page keeps it, paid as its bytes pass: its own limit
         let tp = self.ticket_policy();
-        let (open_s, limit) = if up_writer.is_some() { (tp.max_socket_s, "max_socket_s") } else { (tp.max_answer_s, "max_answer_s") };
+        let (open_s, limit) = open_limit(&tp, up_writer.is_some(), sink.out.is_some(), price);
         let st = Stream { price: *price, base_spent: mark.base_spent, started, max_msat, max_open: Duration::from_secs(open_s.clamp(1, 86_400) as u64), limit };
         // what this answer has drawn past its head, by this count: added to the session's as it grows, and taken off
         // what the request may still add to the seller's spend ([`Money::open`])
@@ -4446,6 +4489,7 @@ impl Signer {
             }
         };
         let mut read_error: Option<String> = None;
+        let mut progress = Progress::new(&tp, limit);
         // a ticket being paid beside the reading, what it came to, and how far ahead the next one goes
         let paying = AtomicBool::new(false);
         let paid: Mutex<Option<(Option<String>, bool)>> = Mutex::new(None);
@@ -4675,7 +4719,7 @@ impl Signer {
                     // a WebSocket is paid for by its watcher
                     continue;
                 }
-                if let Some(why) = st.over(bytes) {
+                if let Some(why) = st.over(bytes).or_else(|| progress.at(bytes)) {
                     lock(&state).1.get_or_insert(why);
                     break;
                 }

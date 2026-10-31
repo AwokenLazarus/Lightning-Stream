@@ -58,6 +58,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   as Files, and only the request's price on a route with one; one whose server states no size is
   stopped at the listed size. From an older shop, the wallet stops at the listed size and
   pays only for what was already on its way.
+- A download, film or AI answer streamed to you is no longer cut after 50 seconds while it is still
+  arriving: it runs as long as it delivers, within its limit. A seller that goes quiet is stopped
+  after 30 seconds, and any answer the wallet stops early now reaches your program as cut short,
+  never as a smaller file that looks whole.
+- A file is never paid past the size its listing shows.
 - A new zero-conf channel carries payments once its funding confirms.
 - The price a shop shows in its listing is now the most your wallet will pay it: one that asks more
   than it advertised is refused before anything is paid. This covers web apps, Files, AI, hashrate

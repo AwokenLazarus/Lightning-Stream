@@ -922,11 +922,14 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   and one session per seller node, so two origins of one node cannot be paid at once.
 - The ticket rail needs https, or http to the wallet's own machine. The wallet does not pin a
   seller's certificate: it trusts the system's roots, as its HTTP client does.
-- An answer priced as it goes is cut by the wallet after 50 s (`tickets.max_answer_s`), because
-  whoever calls the signer's socket waits 60 s by default. An owner who streams longer raises
-  both; if the caller's wait ends first, the caller sees an error while the signer goes on paying
-  for the answer until `max_sats` or `max_answer_s`. A WebSocket has its own limit,
-  `tickets.max_socket_s` (6 hours, as the gateway's): a web app keeps one open while its page is.
+- An answer priced as it goes that the call reads whole for its caller is cut by the wallet after
+  50 s (`tickets.max_answer_s`), because whoever calls the signer's socket waits 60 s for it by
+  default. An answer the wallet streams on to its caller as it arrives (the connector's downloads
+  and films, a visit's pages, the AI address's streams) is not: it stays open while it delivers,
+  within the call's `max_sats` and `tickets.max_socket_s` (6 hours, the WebSocket's limit too), and
+  a seller that stops sending is ended after `tickets.read_timeout_s` (30 s) without a byte. An
+  answer the wallet ends early, for any reason, reaches the client cut short (short of its
+  `Content-Length`, or a chunked body with no last chunk), never as a whole one.
 - An answer priced by the second is paid up to a fifth of a second early, and the wallet counts
   its seconds from before it sent the request, so it can pay for one second the seller did not
   charge.

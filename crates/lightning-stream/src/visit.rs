@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Reply, Request, Response, Streamed};
 
-use crate::{listen_stream, one_range, random_hex, Connector, FIRST_BYTE, HEAD_LINE, LONGEST};
+use crate::{listen_stream, one_range, random_hex, whole, Connector, FIRST_BYTE, HEAD_LINE, LONGEST};
 
 /// The most visits open at once; an idle one ends after [`IDLE`].
 const MAX_VISITS: usize = 32;
@@ -105,6 +105,10 @@ struct State {
     /// Requests waiting to run alone ([`Visit::reserve_alone`]): no new share is handed out while
     /// one waits, so that the running ones can end and it gets its turn.
     alone: u32,
+    /// The stream sockets of the answers open now: a stop shuts them, which is what stops the signer
+    /// paying ([`Visit::stop`]).
+    streams: HashMap<u64, UnixStream>,
+    next_stream: u64,
 }
 
 pub struct Visit {
@@ -120,6 +124,39 @@ pub struct Visit {
 impl Visit {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The visit is stopped: no new request, and every answer open now ends here, so that nothing
+    /// more is paid for it.
+    fn stop(&self) {
+        let mut s = self.lock();
+        s.ended.get_or_insert_with(|| "Stopped.".into());
+        for (_, open) in s.streams.drain() {
+            let _ = open.shutdown(std::net::Shutdown::Both);
+        }
+        drop(s);
+        self.turn.notify_all();
+    }
+
+    /// An answer's stream socket, for [`Visit::stop`] to shut; one that arrives after a stop is shut
+    /// at once. What [`Visit::forget`] takes when the answer has ended.
+    fn track(&self, src: &UnixStream) -> u64 {
+        let open = src.try_clone().ok();
+        let mut s = self.lock();
+        s.next_stream += 1;
+        let id = s.next_stream;
+        if let Some(open) = open {
+            if s.ended.as_deref() == Some("Stopped.") {
+                let _ = open.shutdown(std::net::Shutdown::Both);
+            } else {
+                s.streams.insert(id, open);
+            }
+        }
+        id
+    }
+
+    fn forget(&self, id: u64) {
+        self.lock().streams.remove(&id);
     }
 
     fn report(&self) -> Value {
@@ -326,8 +363,7 @@ impl Connector {
                 if req.method != "POST" {
                     return Some(Reply::Whole(json_response(405, &json!({"error": "POST to stop"}))));
                 }
-                v.lock().ended.get_or_insert_with(|| "Stopped.".into());
-                v.turn.notify_all();
+                v.stop();
             }
             return Some(Reply::Whole(json_response(200, &v.report())));
         }
@@ -456,13 +492,15 @@ impl Connector {
             }
         }
         let length = head.get("content_length").and_then(Value::as_u64);
-        let mut settle = Settle { visit, share, src: Some(src), done: Some(done) };
+        let stream = visit.track(&src);
+        let mut settle = Settle { visit, share, stream, src: Some(src), done: Some(done) };
         Reply::Stream(Streamed {
             status,
             headers: out_headers,
             length,
             body: Box::new(move |out: &mut dyn BodyWriter| {
                 out.send(&first)?;
+                let mut sent = first.len() as u64;
                 let mut buf = vec![0u8; 64 << 10];
                 while let Some(src) = settle.src.as_mut() {
                     let n = src.read(&mut buf)?;
@@ -470,8 +508,11 @@ impl Connector {
                         break;
                     }
                     out.send(&buf[..n])?;
+                    sent += n as u64;
                 }
-                Ok(())
+                drop(settle.src.take());
+                // the signer's account, where the length does not say: an answer it ended early is cut short for the page too
+                whole(length, sent, || settle.account())
             }),
         })
     }
@@ -524,10 +565,12 @@ impl Connector {
             .filter(|(k, _)| k.to_ascii_lowercase().starts_with("sec-websocket-"))
             .chain(std::iter::once(("Upgrade".to_string(), "websocket".to_string())))
             .collect();
+        let stream = visit.track(&src);
         Reply::Upgrade(xbt_svc::http::Upgraded {
             headers,
             run: Box::new(move |client, early| {
                 join_socket(client, early, src, first);
+                visit.forget(stream);
                 visit.settle(share, Some(done), true);
             }),
         })
@@ -617,13 +660,28 @@ struct Started {
 struct Settle {
     visit: Arc<Visit>,
     share: i64,
+    stream: u64,
     src: Option<UnixStream>,
     done: Option<mpsc::Receiver<Result<Value, String>>>,
+}
+
+impl Settle {
+    /// The signer's account of the call, within [`SETTLE_WAIT`]: the one wait for it, whose answer
+    /// the settling that follows reads.
+    fn account(&mut self) -> Option<Result<Value, String>> {
+        let done = self.done.take()?;
+        let account = done.recv_timeout(SETTLE_WAIT).ok()?;
+        let (tx, rx) = mpsc::channel();
+        let _ = tx.send(account.clone());
+        self.done = Some(rx);
+        Some(account)
+    }
 }
 
 impl Drop for Settle {
     fn drop(&mut self) {
         drop(self.src.take());
+        self.visit.forget(self.stream);
         // the signer's count of what left the wallet for this answer; nothing known is the whole share, kept spent
         self.visit.settle(self.share, self.done.take(), false);
     }
