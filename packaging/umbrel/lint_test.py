@@ -88,6 +88,11 @@ class NodeDataRule(unittest.TestCase):
             "it bakes outside the hand-over": lambda s: s[BAKE]["environment"].pop("XBT_KEYS_BAKE_TO"),
             "it runs another program": lambda s: s[BAKE].__setitem__("command", ["serve"]),
             "the taker joins the Lightning app's group": lambda s: s["node-keys"].__setitem__("group_add", ["1000"]),
+            # M2: the exception is the baker's, not its name's: xbt-init (root, CHOWN/DAC_OVERRIDE, /data
+            # read-write) under the baker's name with the folder mounted
+            "an xbt-init named node-keys-bake": lambda s: s.__setitem__(BAKE, {**s["init"], "volumes": [*s["init"]["volumes"], dict(NODE_DIR)]}),
+            "it adds a capability": lambda s: s[BAKE].__setitem__("cap_add", ["DAC_OVERRIDE"]),
+            "the taker has a network": lambda s: s["node-keys"].pop("network_mode"),
             "the taker mounts the admin macaroon": lambda s: s["node-keys"]["volumes"].append(
                 {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain/bitcoin/mainnet/admin.macaroon",
                  "target": "/node/admin.macaroon", "read_only": True, "bind": {"create_host_path": False}}),
@@ -97,6 +102,25 @@ class NodeDataRule(unittest.TestCase):
                 self.fresh()
                 self.refused(change, why)
 
+
+    def test_every_container_keeps_to_itself(self):
+        """No container reaches into another's processes, files or privileges, umbrelOS's app_proxy included."""
+        cases = {
+            "volumes_from": lambda s: s["ui"].__setitem__("volumes_from", ["signer"]),
+            "pid of another service": lambda s: s["ui"].__setitem__("pid", "service:signer"),
+            "ipc of another service": lambda s: s["mcp"].__setitem__("ipc", "service:signer"),
+            "privileged": lambda s: s["gateway"].__setitem__("privileged", True),
+            "an added capability": lambda s: s["ui"].__setitem__("cap_add", ["NET_ADMIN"]),
+            "a looser security_opt": lambda s: s["signer"]["security_opt"].append("seccomp:unconfined"),
+            "the host's network": lambda s: s["gateway"].__setitem__("network_mode", "host"),
+            "another container's network": lambda s: s["ui"].__setitem__("network_mode", "container:lnd"),
+            "app_proxy mounts a volume": lambda s: s["app_proxy"].__setitem__("volumes", ["${APP_DATA_DIR}/data/signer:/data/signer"]),
+            "app_proxy with pid": lambda s: s["app_proxy"].__setitem__("pid", "service:signer"),
+        }
+        for why, change in cases.items():
+            with self.subTest(why=why):
+                self.fresh()
+                self.refused(change, why)
 
 if __name__ == "__main__":
     unittest.main()

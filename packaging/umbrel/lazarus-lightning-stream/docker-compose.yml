@@ -266,8 +266,10 @@ services:
   # info:read; SignMessage alone, which vouches for the shop's direct link). It writes them only to
   # run/node-keys, the hand-over it shares with the UI, and exits. It reads run/ln and run/gateway (by
   # their groups) only to see what is there already and what the owner turned off: a key already there
-  # is kept, and a key the owner disconnected is not made again. It needs the node's RPC, so it is on
-  # the app's network.
+  # is kept, and a key the owner disconnected is not made again. Once its keys are made it exits, and
+  # nothing restarts it (restart: "no"). It needs the node's REST, so it is on the app's network:
+  # umbrelOS joins an app's containers to its one shared network, where Lightning Fork's node is, and a
+  # network of this app's own could not hold another app's container (no narrower network to give it).
   node-keys-bake:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-12b8182c0bf6@sha256:2162a817631271904dc3f32d561f98a31537383420d88a2fdf0a1c0d155654f0
@@ -304,6 +306,8 @@ services:
     image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-12b8182c0bf6@sha256:2162a817631271904dc3f32d561f98a31537383420d88a2fdf0a1c0d155654f0
     command: ["node-keys"]
     restart: "no"
+    # it only moves files: no network at all (the node's address below is only what the tool asks for)
+    network_mode: none
     healthcheck:
       disable: true
     environment:

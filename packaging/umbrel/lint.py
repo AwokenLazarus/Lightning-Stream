@@ -103,8 +103,13 @@ CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls
 # directories are its user's alone (0700), and its admin macaroon appears only when the owner makes the
 # wallet, so a mount of that one file stops the install until then (Docker refuses a missing file). The
 # baker runs as that user (1000), reads the folder only to have the node bake the app's narrow
-# macaroons, and writes only the hand-over folder; reading the folder gives it nothing the admin
-# macaroon alone (full control of the node) did not. Every other container: tls.cert only.
+# macaroons, writes only the hand-over folder, and exits.
+# What the folder exposes beyond the admin macaroon: wallet.db, macaroons.db and tls.key (and the SHA256
+# bridge node's wallet and its password file). A compromised baker image could take the wallet's seed
+# when the wallet password is known, and Lightning Fork's dashboard uses a fixed default one. Accepted
+# for 0.1.20 because the admin macaroon the baker needs anyway already allows draining the node; the
+# way out is for Lightning Fork to hand narrow macaroons to apps itself (asked of its author for
+# 0.1.21). Every other container: tls.cert only.
 NODE_KEYS_BAKE = "node-keys-bake"
 NODE_DIR_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}", "target": "/node", "read_only": True,
                   "bind": {"create_host_path": False}}
@@ -280,7 +285,19 @@ def main() -> int:
             bad(f"{folder}: uses ${{APP_PASSWORD}} without deterministicPassword: true")
         # --- services
         for name, s in svcs.items():
+            # every container, umbrelOS's app_proxy too: no way into another's processes, files or
+            # privileges (each named one is checked below where it is allowed)
+            for k in ("volumes_from", "pid", "ipc", "privileged", "devices", "userns_mode"):
+                if k in s:
+                    bad(f"{folder}/{name}: {k} is not allowed")
+            if set(map(str, s.get("security_opt") or [])) - {"no-new-privileges:true"}:
+                bad(f"{folder}/{name}: security_opt may only be no-new-privileges:true")
+            nm = s.get("network_mode")
+            if nm is not None and nm != "none" and not (str(nm).startswith("service:") and str(nm)[8:] in svcs):
+                bad(f"{folder}/{name}: network_mode {nm!r}: only none, or another service of this app")
             if name == "app_proxy":
+                if s.get("volumes") or s.get("cap_add"):
+                    bad(f"{folder}/{name}: umbrelOS's app_proxy mounts nothing and adds no capability")
                 continue
             img = str(s.get("image", ""))
             pin = REF.match(img)
@@ -293,10 +310,14 @@ def main() -> int:
             elif pins.get(pin["name"]) != img:
                 bad(f"{folder}/{name}: image {img!r} is not the one packaging/images.lock pins ({pins.get(pin['name'])!r})")
             node_keys = s.get("command") == ["node-keys"]
+            base = pin["name"] if pin else img.split(":")[0]
+            # the name alone is not the exception: the baker's checks below decide, before any other
             baker = name == NODE_KEYS_BAKE
+            if s.get("cap_add") and (baker or base != "xbt-init"):
+                bad(f"{folder}/{name}: cap_add is xbt-init's alone")
             for v in s.get("volumes") or []:
                 if isinstance(v, dict):
-                    if baker and v == NODE_DIR_MOUNT:
+                    if baker and base == "xbt-wallet-ui" and node_keys and v == NODE_DIR_MOUNT:
                         continue
                     if v != CERT_MOUNT:
                         bad(f"{folder}/{name}: a long-form mount is only the Lightning node's tls.cert, read-only, never created: {v}")
@@ -308,14 +329,7 @@ def main() -> int:
                     bad(f"{folder}/{name}: volume {v} is not under ${{APP_DATA_DIR}}")
                 if "macaroon" in str(v) or "LIGHTNING" in src:
                     bad(f"{folder}/{name}: mounts the Lightning node's data or a macaroon of it: {v}")
-            base = pin["name"] if pin else img.split(":")[0]
-            if base == "xbt-init":
-                caps = set(s.get("cap_add") or [])
-                if s.get("network_mode") != "none" or s.get("cap_drop") != ["ALL"] or not caps <= INIT_CAPS or not s.get("read_only"):
-                    bad(f"{folder}/{name}: xbt-init must run with network_mode none, read_only, cap_drop ALL, cap_add within {sorted(INIT_CAPS)}")
-                if s.get("restart") != "no":
-                    bad(f"{folder}/{name}: xbt-init is a one-shot (restart: \"no\")")
-            elif baker:
+            if baker:
                 env = s.get("environment") or {}
                 if base != "xbt-wallet-ui" or not node_keys:
                     bad(f"{folder}/{name}: node-keys-bake is node-keys (command [\"node-keys\"]) from the UI's image")
@@ -331,6 +345,12 @@ def main() -> int:
                 if NODE_DIR_MOUNT not in vols or [v for v in vols if isinstance(v, dict) and v != NODE_DIR_MOUNT] \
                         or {str(v) for v in vols if not isinstance(v, dict)} != NODE_KEYS_BAKE_MOUNTS:
                     bad(f"{folder}/{name}: node-keys-bake mounts the node's data read-only, run/ln and run/gateway read-only, and writes only run/node-keys")
+            elif base == "xbt-init":
+                caps = set(s.get("cap_add") or [])
+                if s.get("network_mode") != "none" or s.get("cap_drop") != ["ALL"] or not caps <= INIT_CAPS or not s.get("read_only"):
+                    bad(f"{folder}/{name}: xbt-init must run with network_mode none, read_only, cap_drop ALL, cap_add within {sorted(INIT_CAPS)}")
+                if s.get("restart") != "no":
+                    bad(f"{folder}/{name}: xbt-init is a one-shot (restart: \"no\")")
             elif node_keys:
                 if base != "xbt-wallet-ui":
                     bad(f"{folder}/{name}: node-keys runs from the UI's image")
@@ -340,6 +360,8 @@ def main() -> int:
                     bad(f"{folder}/{name}: node-keys is a one-shot (restart: \"no\") as its image's user, with no port")
                 if s.get("group_add"):
                     bad(f"{folder}/{name}: node-keys joins no other group (the Lightning app's data is node-keys-bake's alone)")
+                if s.get("network_mode") != "none":
+                    bad(f"{folder}/{name}: node-keys only moves files: network_mode none")
                 vols = s.get("volumes") or []
                 if any(isinstance(v, dict) for v in vols) or {str(v) for v in vols} - NODE_KEYS_MOUNTS:
                     bad(f"{folder}/{name}: node-keys reads nothing of the Lightning app, and writes only run/ln, run/gateway and run/node-keys")

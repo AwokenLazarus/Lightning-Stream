@@ -48,7 +48,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use xbt_gateway::node::{bake_macaroon, INFO_OPS, INVOICE_OPS};
+use xbt_gateway::node::{bake_macaroon, checked_macaroon, INFO_OPS, INVOICE_OPS};
 
 use crate::setup::{write_shared, GW_INFO, GW_INVOICES, GW_SIGN, RAIL_MACAROON, RAIL_OPS};
 
@@ -239,6 +239,12 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
             // older lnd, a node that refuses URI permissions) must not stop the keys the app needs
             let mac = match bake(ops, id) {
                 Err(e) if *file == GW_SIGN => {
+                    // said in the hand-over too, so the taker does not wait for it forever
+                    if let Some(h) = &s.bake_to {
+                        let mut r = read_record(h);
+                        r[*file] = json!({"skipped": &e});
+                        write_shared(h, AUTO_KEYS, format!("{r:#}\n").as_bytes())?;
+                    }
                     out.skipped.push((file.to_string(), e));
                     continue;
                 }
@@ -261,48 +267,85 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
     Ok(out)
 }
 
-/// The keys each dir takes from the hand-over folder, by name.
-const HANDED: [(bool, &str); 4] = [(true, RAIL_MACAROON), (false, GW_INVOICES), (false, GW_INFO), (false, GW_SIGN)];
+/// The keys each dir takes from the hand-over folder, by name, each with the permissions it must hold.
+const HANDED: [(bool, &str, &[&str]); 4] =
+    [(true, RAIL_MACAROON, &RAIL_OPS), (false, GW_INVOICES, &INVOICE_OPS), (false, GW_INFO, &INFO_OPS), (false, GW_SIGN, &SIGN_OPS)];
 
 /// Move the keys baked into the hand-over folder ([`Settings::take_from`]) into their dirs, each with
 /// its record (root key id, permissions), and remove them there. A dir that already has the key (the
 /// owner's own) or that the owner turned off keeps what it has: the baked one is removed, and its
 /// root key id is said, so it can be revoked on the node.
+///
+/// The hand-over is written by the node app's user, so what is there is checked before it moves: a
+/// link is never followed (it is removed), and a key moves only with exactly its permissions.
 pub fn take_handover(s: &Settings, out: &mut Outcome) -> Result<(), String> {
     let Some(h) = &s.take_from else { return Ok(()) };
-    let from = read_record(h);
-    for (rail, file) in HANDED {
+    let gone = |src: &Path| std::fs::remove_file(src).map_err(|e| format!("{}: {e}", src.display()));
+    for (rail, file, ops) in HANDED {
         let src = h.join(file);
-        if !src.is_file() {
+        let Ok(md) = std::fs::symlink_metadata(&src) else { continue };
+        if !md.file_type().is_file() {
+            gone(src.as_path())?;
+            out.skipped.push((file.to_string(), "not a plain file in the hand-over: removed".into()));
             continue;
         }
+        // read after the key is seen: the baker writes the record first, so it is there
+        let from = read_record(h);
         let dir = if rail { &s.rail_dir } else { &s.gw_dir };
         let Some(dir) = dir.as_ref().filter(|d| !is_off(d) && !d.join(file).is_file()) else {
-            std::fs::remove_file(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+            gone(src.as_path())?;
             out.skipped.push((file.to_string(), format!("not needed here; revoke {} on the node", rec_line(&from, file))));
             continue;
         };
-        let mac = std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let mac = read_nofollow(&src)?;
         if mac.is_empty() {
             // being written: the next look takes it
             continue;
         }
-        write_shared(dir, file, &mac)?;
+        // strict on every chain, as the pages are: never the admin key, nor one wider than this file's
+        if let Err(e) = checked_macaroon(&mac, file, ops, true) {
+            gone(src.as_path())?;
+            out.skipped.push((file.to_string(), format!("refused and removed: {e}")));
+            continue;
+        }
+        // the record before the key: a dir never holds a key without its root key id
         let mut rec = read_record(dir);
         rec[file] = from.get(file).cloned().unwrap_or_else(|| json!({}));
         rec["made_by"] = json!("the app, from this box's own Lightning node");
         write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())?;
-        std::fs::remove_file(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+        write_shared(dir, file, &mac)?;
+        gone(src.as_path())?;
         out.made.push(file.to_string());
     }
     Ok(())
 }
 
+/// A file in the hand-over, read without following a link in its last component.
+#[cfg(unix)]
+fn read_nofollow(p: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let ctx = |e: std::io::Error| format!("{}: {e}", p.display());
+    let mut f = xbt_svc::layout::open_nofollow(p, false).map_err(ctx)?;
+    if !f.metadata().map_err(ctx)?.is_file() {
+        return Err(format!("{}: not a plain file", p.display()));
+    }
+    let mut v = vec![];
+    f.read_to_end(&mut v).map_err(ctx)?;
+    Ok(v)
+}
+
+#[cfg(not(unix))]
+fn read_nofollow(p: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
+}
+
 /// Whether a dir still lacks a key the hand-over could bring (the taker stops watching once none does).
+/// A key the node would not bake (the baker says so in the hand-over's record) is not waited for.
 pub fn handover_wanted(s: &Settings) -> bool {
-    HANDED.iter().any(|(rail, file)| {
+    let said = s.take_from.as_deref().map(read_record).unwrap_or_else(|| json!({}));
+    HANDED.iter().any(|(rail, file, _)| {
         let dir = if *rail { &s.rail_dir } else { &s.gw_dir };
-        dir.as_ref().is_some_and(|d| !is_off(d) && !d.join(file).is_file())
+        dir.as_ref().is_some_and(|d| !is_off(d) && !d.join(file).is_file()) && said[*file]["skipped"].is_null()
     })
 }
 
@@ -426,6 +469,26 @@ fn is_off(dir: &Path) -> bool {
     read_record(dir)["off"] == true
 }
 
+/// Whether the owner disconnected a key the app made here (for the pages).
+pub fn turned_off(dir: &Path) -> bool {
+    is_off(dir)
+}
+
+/// The owner asks the app to make its key again: the next start makes it (undoes [`turn_off`]).
+pub fn turn_on(dir: &Path) -> Result<(), String> {
+    let mut r = read_record(dir);
+    let Some(o) = r.as_object_mut() else { return Ok(()) };
+    if o.remove("off").is_none() {
+        return Ok(());
+    }
+    write_shared(dir, AUTO_KEYS, format!("{r:#}\n").as_bytes())
+}
+
+/// Whether keys were made here before (by this tool), whatever is there now.
+pub fn made_before(dir: &Path) -> bool {
+    read_record(dir).as_object().is_some_and(|o| o.keys().any(|k| k.ends_with(".macaroon")))
+}
+
 /// The root key ids of every key this tool made in `dir` (no secret): what to revoke on the node
 /// when the app is uninstalled.
 pub fn root_key_ids(dir: &Path) -> Vec<String> {
@@ -452,6 +515,19 @@ mod tests {
         let d = root.join(name);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A macaroon lnd would bake with exactly these permissions (`entity:action`, a URI one too).
+    fn mac_of(ops: &[&str]) -> Vec<u8> {
+        let mut by: Vec<(&str, Vec<&str>)> = vec![];
+        for (e, a) in ops.iter().map(|o| o.split_once(':').unwrap()) {
+            match by.iter_mut().find(|(x, _)| *x == e) {
+                Some((_, v)) => v.push(a),
+                None => by.push((e, vec![a])),
+            }
+        }
+        let pairs: Vec<(&str, &[&str])> = by.iter().map(|(e, v)| (*e, v.as_slice())).collect();
+        xbt402::macaroon::lnd_macaroon_for_tests(&pairs, &[])
     }
 
     #[test]
@@ -492,7 +568,7 @@ mod tests {
         let mut asked: Vec<(Vec<String>, u64)> = vec![];
         let out = make_keys(&s, &mut |ops, id| {
             asked.push((ops.iter().map(|o| o.to_string()).collect(), id));
-            Ok(format!("mac:{}", ops.join(",")).into_bytes())
+            Ok(mac_of(ops))
         }).unwrap();
         assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
         assert_eq!(asked.iter().map(|(o, _)| o.join(" ")).collect::<Vec<_>>(),
@@ -500,7 +576,7 @@ mod tests {
         let ids: std::collections::HashSet<u64> = asked.iter().map(|(_, id)| *id).collect();
         assert_eq!(ids.len(), 4, "a root key each");
         assert!(ids.iter().all(|id| *id != 0));
-        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), format!("mac:{}", RAIL_OPS.join(",")).into_bytes());
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), mac_of(&RAIL_OPS));
         assert!(made_by_box(&rail) && made_by_box(&gw));
         let rec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(gw.join(AUTO_KEYS)).unwrap()).unwrap();
         assert_eq!(rec[GW_INVOICES]["permissions"], json!(INVOICE_OPS));
@@ -648,7 +724,7 @@ mod tests {
         let mut ids = vec![];
         let out = make_keys(&baker, &mut |ops, id| {
             ids.push(id);
-            Ok(format!("mac:{}", ops.join(",")).into_bytes())
+            Ok(mac_of(ops))
         }).unwrap();
         assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
         for f in [RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN] {
@@ -660,8 +736,8 @@ mod tests {
         let mut o = Outcome::default();
         take_handover(&taker, &mut o).unwrap();
         assert_eq!(o.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
-        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), format!("mac:{}", RAIL_OPS.join(",")).into_bytes());
-        assert_eq!(std::fs::read(gw.join(GW_SIGN)).unwrap(), format!("mac:{}", SIGN_OPS.join(",")).into_bytes());
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), mac_of(&RAIL_OPS));
+        assert_eq!(std::fs::read(gw.join(GW_SIGN)).unwrap(), mac_of(&SIGN_OPS));
         assert!([RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN].iter().all(|f| !h.join(f).exists()), "moved, not copied");
         assert!(made_by_box(&rail) && made_by_box(&gw));
         assert_eq!(root_key_line(&rail, RAIL_MACAROON), format!("root key id {}", ids[0]));
@@ -700,5 +776,57 @@ mod tests {
         assert!(o.skipped[0].1.contains("root key id 77"), "{:?}", o.skipped);
         assert!(std::fs::read_dir(&h).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".macaroon")), "no key left behind");
         assert!(!handover_wanted(&taker));
+    }
+
+    /// The hand-over is written by the node app's user: a link there is removed, never followed (it
+    /// could name one of the UI's own files), and a key moves only with exactly its permissions.
+    #[cfg(unix)]
+    #[test]
+    fn the_taker_follows_no_link_and_moves_only_a_narrow_key() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let gw = shared_dir(t.path(), "gateway");
+        let h = shared_dir(t.path(), "node-keys");
+        let secret = t.path().join("ui-secret");
+        std::fs::write(&secret, b"the UI's own secret").unwrap();
+        std::os::unix::fs::symlink(&secret, h.join(RAIL_MACAROON)).unwrap();
+        // the node's admin key, or one wider than the file's name says
+        std::fs::write(h.join(GW_INVOICES), mac_of(&["invoices:read", "invoices:write", "offchain:write"])).unwrap();
+        std::fs::write(h.join(GW_INFO), mac_of(&INFO_OPS)).unwrap();
+        let taker = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: None,
+                               rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: None, take_from: Some(h.clone()) };
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert_eq!(o.made, vec![GW_INFO]);
+        assert!(!rail.join(RAIL_MACAROON).exists() && !gw.join(GW_INVOICES).exists(), "{o:?}");
+        assert_eq!(std::fs::read(&secret).unwrap(), b"the UI's own secret", "the link's target is untouched");
+        assert!(std::fs::symlink_metadata(h.join(RAIL_MACAROON)).is_err() && !h.join(GW_INVOICES).exists(), "both removed");
+        let why: Vec<&str> = o.skipped.iter().map(|(f, w)| { assert!(f == RAIL_MACAROON || f == GW_INVOICES); w.as_str() }).collect();
+        assert!(why.iter().any(|w| w.contains("not a plain file")) && why.iter().any(|w| w.contains("offchain:write")), "{why:?}");
+    }
+
+    /// A node that will not bake the sign key: the baker says so in the hand-over, and the taker stops
+    /// waiting for it once the other keys are in place.
+    #[test]
+    fn a_sign_key_the_node_will_not_bake_is_not_waited_for() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let gw = shared_dir(t.path(), "gateway");
+        let h = shared_dir(t.path(), "node-keys");
+        let baker = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None,
+                               rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: Some(h.clone()), take_from: None };
+        let taker = Settings { admin: PathBuf::new(), bake_to: None, take_from: Some(h.clone()), ..baker.clone() };
+        let out = make_keys(&baker, &mut |ops, _| if ops == SIGN_OPS { Err("unknown permission".into()) } else { Ok(mac_of(ops)) }).unwrap();
+        assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO]);
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert_eq!(o.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO]);
+        assert!(!gw.join(GW_SIGN).exists());
+        assert!(!handover_wanted(&taker), "the taker would watch forever for a key that never comes");
+        // a node that bakes it later (the baker's next start): taken then, the skip forgotten
+        make_keys(&baker, &mut |ops, _| Ok(mac_of(ops))).unwrap();
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert_eq!(o.made, vec![GW_SIGN]);
     }
 }

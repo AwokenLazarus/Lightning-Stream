@@ -305,9 +305,19 @@ impl App {
                  Grant app access task for Lightning Stream, or paste a key below.".into() }
             else if ln.grant { "Approve Lightning Stream in Lightning Fork: open Lightning Fork's tasks and run Grant app access. \
                  The app connects by itself a few seconds later. Or paste a key below.".into() }
+            // the baker and the taker make nothing the owner disconnected: no automatic reconnect to promise
+            else if ln.auto && crate::node_keys::turned_off(&ln.dir) { "You disconnected the key the app made. Paste a key below, \
+                 or have the app make its key again.".into() }
+            else if ln.auto && crate::node_keys::made_before(&ln.dir) { format!("The app makes its key again when it restarts: {}.",
+                 esc(&self.cfg.restart_hint)) }
             else if ln.auto { "Create your Lightning wallet in Lightning Fork first. Lightning Stream picks it up automatically, \
                  within a minute and with no restart. Or paste a key below.".into() }
             else { "Make the key in your node's app and paste it below.".into() }));
+        if !have && ln.auto && crate::node_keys::turned_off(&ln.dir) {
+            b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card\">{}<input type=\"hidden\" name=\"action\" value=\"auto_on\">\
+                <h2>Reconnect automatically</h2><p>The app makes a new key through this box's Lightning node when it restarts.</p>\
+                <button class=\"secondary\">Reconnect automatically</button></form>", App::csrf_input(ctx)));
+        }
         // the node holds more than the signed cap: one click to the rules with it raised
         if !ready && txt(status.get("reason")).contains("above ln.exposure_cap_sats") {
             b.push_str("<p><a class=\"button-link\" href=\"./policy?fix=cap\">Raise the limit</a></p>");
@@ -395,6 +405,10 @@ impl App {
                 // a key the app made itself is not made again at the next start
                 let _ = crate::node_keys::turn_off(dir);
                 if had { "Your node is disconnected: its key was removed from this box, and the app pays nothing now.".to_string() } else { "Your node was not connected.".into() }
+            }),
+            // undoes a disconnect where the box makes the key (Umbrel's node-keys-bake), at the next start
+            Some("auto_on") if self.cfg.ln.auto => crate::node_keys::turn_on(dir).map(|()| {
+                format!("The app makes its key again when it restarts: {}.", self.cfg.restart_hint)
             }),
             Some("save") => (|| {
                 let chain = self.signer_chain();

@@ -207,7 +207,7 @@ fn lchown(p: &Path, uid: u32, gid: u32) -> io::Result<()> {
 /// Open `p` itself: O_NOFOLLOW refuses a symlink in its last component (ELOOP), O_NONBLOCK keeps
 /// a FIFO from blocking. AGP-063 K1: owner and mode then change through this fd, never by path.
 #[cfg(unix)]
-fn open_nofollow(p: &Path, dir: bool) -> io::Result<std::fs::File> {
+pub fn open_nofollow(p: &Path, dir: bool) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | if dir { libc::O_DIRECTORY } else { 0 };
     std::fs::OpenOptions::new().read(true).custom_flags(flags).open(p)

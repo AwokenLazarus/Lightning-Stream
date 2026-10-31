@@ -2437,6 +2437,43 @@ fn before_the_nodes_wallet_exists_the_page_says_to_make_it_in_lightning_fork() {
             && page.contains("picks it up automatically"), "{page}");
 }
 
+/// Umbrel (node-keys-bake): after the owner disconnects the key the app made, the page promises no
+/// automatic reconnect (the baker makes nothing turned off), and "Reconnect automatically" lets the
+/// next start make it again.
+#[cfg(unix)]
+#[test]
+fn a_disconnect_on_a_box_that_makes_the_key_is_not_undone_unless_asked() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let dir = ln.path().to_path_buf();
+    let s = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: dir.join("none"), grant: None, bake_to: None, take_from: None,
+                                                 rail_dir: Some(dir.clone()), gw_dir: None };
+    let rail = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
+    xbt_wallet_ui::node_keys::make_keys(&s, &mut |_, _| Ok(hex::decode(&rail).unwrap())).unwrap();
+    let b = start(json!({}), false, |c| {
+        c.ln.dir = dir.clone();
+        c.ln.rest = Some("https://10.21.21.66:8180".into());
+        c.ln.auto = true;
+    });
+    let mut br = logged_in(&b);
+    let r = br.act("/lightning", "/lightning", &[("action", "remove")]);
+    assert!(br.flash_after(&r).contains("removed"));
+    let page = br.get("/lightning").body;
+    assert!(page.contains("Not connected") && page.contains("You disconnected the key the app made")
+            && page.contains("Reconnect automatically"), "{page}");
+    assert!(!page.contains("picks it up automatically"), "promises a reconnect that never comes: {page}");
+    // the baker makes nothing turned off
+    assert!(xbt_wallet_ui::node_keys::run(&s).unwrap().made.is_empty());
+    let r = br.act("/lightning", "/lightning", &[("action", "auto_on")]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("makes its key again") && said.contains("restart"), "{said}");
+    assert!(!xbt_wallet_ui::node_keys::turned_off(&dir));
+    let page = br.get("/lightning").body;
+    assert!(page.contains("makes its key again when it restarts") && !page.contains("Reconnect automatically"), "{page}");
+    // and the next start makes it
+    assert_eq!(xbt_wallet_ui::node_keys::make_keys(&s, &mut |_, _| Ok(hex::decode(&rail).unwrap())).unwrap().made, vec!["rail.macaroon"]);
+}
+
 /// The box's own login proxy (here: the loopback peer, named `localhost`) is the owner, already logged
 /// in by the box: no app password. A box whose proxy is another peer still asks for it.
 #[test]
