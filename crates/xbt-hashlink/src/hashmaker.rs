@@ -1063,9 +1063,11 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                 let slice_time = by_speed.max(g.min_slice_time);
                 let why = if !r.ready && r.asked_at.elapsed() > grace {
                     Some("no first payment")
-                } else if r.waiting_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYING) {
-                    Some("unpaid")
-                } else if r.waiting_since.is_none() && r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT) {
+                } else if match r.waiting_since {
+                    // a payment said to be on its way is waited for longer; any other, for the short clock
+                    Some(t) => t.elapsed() > order::WAIT_FOR_PAYING,
+                    None => r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT),
+                } {
                     Some("unpaid")
                 } else if r.served > slice_time.saturating_mul((r.paid.min(1 << 20) as u32) * PAID_TIME_FACTOR) {
                     Some("paid time used up")
