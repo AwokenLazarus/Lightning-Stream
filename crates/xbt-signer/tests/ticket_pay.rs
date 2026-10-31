@@ -3809,15 +3809,23 @@ fn a_lookup_that_hangs_during_the_wait_is_given_up_on_at_the_end_of_the_pause() 
         let mut s = r.ln.st.lock().unwrap();
         s.unseen_next = 1_000;
         s.unseen_for = Duration::from_secs(60);
-        s.lookup_takes = Duration::from_secs(30);
     }
-    let t0 = Instant::now();
-    let v = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
-    assert!(t0.elapsed() < Duration::from_secs(12), "{:?} {v}", t0.elapsed());
+    let t0 = Cell::new(Instant::now());
+    let v = std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{}", 60 * MIB), 20_000));
+        // the refill behind the pool has been sent, and is on its way: the release waits for it, asking the node
+        wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+        wait_for("the refill to be sent", || !r.ln.state().unseen_until.is_empty());
+        let asked = r.ln.state().lookups;
+        wait_for("the release to ask the node", || r.ln.state().lookups > asked + 2);
+        // and now each question takes 30 s
+        r.ln.st.lock().unwrap().lookup_takes = Duration::from_secs(30);
+        t0.set(Instant::now());
+        t.join().unwrap()
+    });
+    assert!(t0.get().elapsed() < Duration::from_secs(5), "the rest of a pause of 3 s, not 30 s a question: {:?} {v}", t0.get().elapsed());
     assert_eq!(v["complete"], false, "{v}");
-    // the ticket not shown, or the refill behind it still asking the node: either way a plain answer, and nothing more out
-    let ended = v["ended"].as_str().unwrap();
-    assert!(ended.contains("ticket_not_ready") || ended.contains("ticket_busy"), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_not_ready"), "{v}");
     assert_nothing_leaves_after(&r, &v);
     assert_eq!(r.tap.secrets().len(), 8, "{v}");
 }
@@ -3868,7 +3876,7 @@ fn a_seller_slow_with_its_402_is_a_plain_answer_inside_the_calls_deadline() {
 #[test]
 fn a_last_receipt_never_listed_is_waited_for_only_a_little_past_the_deadline() {
     let _g = env_lock();
-    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 8}}));
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 3}}));
     first_call_with_the_pool_shown(&r);
     r.tap.set(Box::new(move |seen, real| {
         if !seen.path.starts_with("/x402/ticket/status") {
@@ -3880,10 +3888,11 @@ fn a_last_receipt_never_listed_is_waited_for_only_a_little_past_the_deadline() {
         let headers = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
         Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
     }));
-    // about 7 s at about 4 MiB a second
+    // a file that comes whole at once: its last receipt would be waited for 10 s, and the call has 3 s and 5 past them
     let t0 = Instant::now();
-    let v = r.pay(&format!("/slow/{}", 28 * MIB), 20_000);
-    assert!(t0.elapsed() < Duration::from_secs(15), "the deadline and 5 s, not 7 s and 10 s: {:?} {v}", t0.elapsed());
+    let v = r.pay(&format!("/files/{}", MIB), 20_000);
+    assert_eq!(v["complete"].as_bool(), Some(true), "{v}");
+    assert!(t0.elapsed() < Duration::from_millis(9_500), "the deadline and 5 s, not 10 s from the end: {:?} {v}", t0.elapsed());
     r.tap.clear();
 }
 
