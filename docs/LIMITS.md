@@ -939,6 +939,12 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A ticket stuck in `sending` (the node calls it in flight and shows it on no way) for more than
   `ln.timeout_s` and 30 s, 90 s as shipped, is taken for stranded: the session ends (`ticket_session_ended`). Until then each call
   waits up to 12 s for it.
+- A ticket held on a channel that is down, or just back and not yet listing its HTLCs again (a
+  link that drops), may still come: it is taken for stranded only once seen on no channel with
+  every channel up for 20 s. But each call in that time pauses for its ticket, and three such
+  pauses in a row with no byte between them end the session as `ticket_seller_stalled`, though
+  it was the buyer's link: a link down for about 36 s with calls waiting ends the session, and
+  the next call opens another. Money is exact either way.
 - One paid request per seller at a time: a long answer delays every other call to that seller,
   and one session per seller node, so two origins of one node cannot be paid at once.
 - The ticket rail needs https, or http to the wallet's own machine. The wallet does not pin a

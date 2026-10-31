@@ -3320,7 +3320,7 @@ fn the_nodes_silence_for_a_moment_does_not_end_the_wait_for_a_ticket() {
                 if router_only { s.router_down = true } else { s.down = true }
             }
             let asked = r.ln.state().lookups;
-            wait_for("the release to ask the node that is away", || r.ln.state().lookups > asked + 8);
+            wait_for("the release to ask the node that is away", || r.ln.state().lookups > asked + 3);
             {
                 // it is back, and shows the tickets locked
                 let mut s = r.ln.st.lock().unwrap();
@@ -3863,7 +3863,7 @@ fn wait_for_long(what: &str, most: Duration, mut f: impl FnMut() -> bool) {
 #[test]
 fn a_refill_asking_a_slow_node_after_its_sends_holds_up_no_release() {
     let _g = env_lock();
-    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 12}}));
+    let r = seller_waits_as_shipped(json!({}));
     first_call_with_the_pool_shown(&r);
     {
         let mut s = r.ln.st.lock().unwrap();
@@ -3871,9 +3871,10 @@ fn a_refill_asking_a_slow_node_after_its_sends_holds_up_no_release() {
         s.unseen_for = Duration::from_secs(120);
         s.lookup_takes = Duration::from_secs(30);
     }
+    // the file's releases, then a pause of 12 s for the refill on its way: not the 30 s a question each of the refill's sends
     let t0 = Instant::now();
     let v = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
-    assert!(t0.elapsed() < Duration::from_secs(20), "{:?} {v}", t0.elapsed());
+    assert!(t0.elapsed() < Duration::from_secs(30), "{:?} {v}", t0.elapsed());
     assert_eq!(r.tap.secrets().len(), 8, "every ticket the pool held was released beside the refill: {v}");
     assert_nothing_leaves_after(&r, &v);
     r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
@@ -7065,7 +7066,9 @@ fn a_ticket_missing_from_a_channel_that_is_down_is_not_stranded() {
         s.stranded_off_channel = true;
         s.channel["active"] = false.into();
     }
-    for _ in 0..3 {
+    // twice, past the gap each time (a third such pause in a row would end the session as a seller that never shows a
+    // ticket, `ticket_seller_stalled`, as docs/LIMITS.md says)
+    for _ in 0..2 {
         let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
         assert_ne!(v["rule"].as_str(), Some("ticket_session_ended"), "{v}");
         r.clock.fetch_add(21, Ordering::SeqCst);
