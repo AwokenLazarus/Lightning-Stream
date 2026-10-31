@@ -7,7 +7,8 @@
 //! `--iroh off` turns it off, `--iroh-relays` names relays); one naming only a TCP address, over TCP.
 //!
 //! Control page: `GET /status`, `GET /offers`, `POST /rent {"linkKey", "miners", "budgetSats",
-//! "minutes"}` (or `{"linkKey", "trial": true}`: one slice, to try a hashmaker first), `POST /cut
+//! "minutes", "once"}` (or `{"linkKey", "trial": true, "once"}`: one slice, to try a hashmaker first; a request
+//! sent again with the same `once` starts nothing and answers what the first did), `POST /cut
 //! {"rental"}`, `POST /datum {"addr"}`, `POST /attest {"rental"}` (publish a signed delivery record
 //! of a rental that ended, if the hashtaker chooses to).
 //!
@@ -37,6 +38,9 @@ const HISTORY_FRESH: Duration = Duration::from_secs(60);
 const TRIAL_MIN_MINUTES: u64 = 5;
 const TRIAL_MAX_MINUTES: u64 = 60;
 const KEPT: usize = 50;
+/// How long a Rent request's mark is remembered, and how long a request sent again waits for the first.
+const ONCE_KEPT: Duration = Duration::from_secs(600);
+const ONCE_WAIT: Duration = Duration::from_secs(60);
 
 struct Rental {
     hashmaker: String,
@@ -82,6 +86,9 @@ struct R {
     failed_first: BTreeMap<String, u32>,
     /// What the upstream's jobs show, as last looked at, and for which upstream.
     shown: Option<(String, xbt_hashlink::blind::Shown, u64)>,
+    /// Rent requests by their mark (`once`): the answer of the one that started a rental, or `None` while it
+    /// is starting. A request sent again gets that answer and starts nothing.
+    onces: HashMap<String, (Instant, Option<(u16, Value)>)>,
 }
 
 /// A gateway's API port when nothing says otherwise.
@@ -131,6 +138,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     let failed_first = state.as_ref().and_then(|d| std::fs::read(d.join("failed-first-steps.json")).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let r = Arc::new(Mutex::new(R {
         shown: None,
+        onces: HashMap::new(),
         failed_first,
         key: crate::hashmaker_service::key_file(super::need(f, "key")?)?,
         datum,
@@ -346,9 +354,45 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                 None => (404, json!({"error": "no such rental"})),
             }
         }
-        ("POST", "/rent") => rent(r, &b),
+        ("POST", "/rent") => rent_once(r, &b),
         _ => (404, json!({"error": "GET /status, GET /offers, POST /rent, POST /cut, POST /datum, POST /attest"})),
     }
+}
+
+/// [`rent`], once for each mark (`once`, set by the app's Rent form): the same request sent again, while the first
+/// is starting or after, answers what the first did and starts no second rental, so no second start fee is paid.
+/// A request that started nothing leaves its mark free, to be tried again.
+fn rent_once(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
+    once(r, b, || rent(r, b))
+}
+
+/// [`rent_once`] with what starts the rental given: `start` runs at most once for a mark at a time.
+fn once(r: &Mutex<R>, b: &Value, start: impl FnOnce() -> (u16, Value)) -> (u16, Value) {
+    let Some(once) = b["once"].as_str().filter(|o| !o.is_empty() && o.len() <= 128).map(str::to_string) else { return start() };
+    let t0 = Instant::now();
+    loop {
+        let mut g = lock(r);
+        g.onces.retain(|_, (at, _)| at.elapsed() < ONCE_KEPT);
+        match g.onces.get(&once) {
+            Some((_, Some(answer))) => return answer.clone(),
+            Some((_, None)) if t0.elapsed() < ONCE_WAIT => {}
+            Some((_, None)) => return (409, json!({"error": "this rental is still starting: look at your rentals"})),
+            None => {
+                g.onces.insert(once.clone(), (Instant::now(), None));
+                break;
+            }
+        }
+        drop(g);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let answer = start();
+    let mut g = lock(r);
+    if answer.0 == 200 {
+        g.onces.insert(once, (Instant::now(), Some(answer.clone())));
+    } else {
+        g.onces.remove(&once);
+    }
+    answer
 }
 
 fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
@@ -408,7 +452,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         },
         None => h.link_addr.clone(),
     };
-    let id = format!("r{}", xbt_hashlink::now_ms());
+    // the time, and a random part: two Rents in the same millisecond are two rentals, not one under one name
+    let id = format!("r{}-{}", xbt_hashlink::now_ms(), hex::encode(&xbt_hashlink::noise::fresh_key().secret_bytes()[..4]));
     let live = Arc::new(Mutex::new(json!({"closed": null})));
     let cut = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
@@ -548,5 +593,229 @@ mod tests {
         assert_eq!(trial_minutes(1 << 47, 100_000_000_000), TRIAL_MAX_MINUTES);
         assert_eq!(trial_minutes(1 << 47, 1_000_000_000_000), 8);
         assert_eq!(trial_minutes(1 << 47, 0), TRIAL_MAX_MINUTES);
+    }
+
+    use std::net::TcpListener;
+    use xbt_hashlink::hashmaker::{self, Hashmaker};
+    use xbt_hashlink::listing::Capacity;
+    use xbt_hashlink::meter::share_work;
+    use xbt_hashlink::msg::{Terms, PROOF};
+    use xbt_hashlink::rail::LabSeller;
+    use xbt_hashlink::{noise, standin};
+
+    /// About 4096 hashes a share: a difficulty a CPU reaches.
+    const DIFF: f64 = 1.0 / (1u64 << 20) as f64;
+
+    fn ports<const N: usize>() -> [String; N] {
+        loop {
+            let mut b = [0u8; 2];
+            getrandom::getrandom(&mut b).unwrap();
+            let base = 20_000 + u16::from_le_bytes(b) % 12_000;
+            let ls: Vec<TcpListener> = (0..N as u16).filter_map(|i| TcpListener::bind(("127.0.0.1", base + i * 7)).ok()).collect();
+            if ls.len() == N {
+                return std::array::from_fn(|i| ls[i].local_addr().unwrap().to_string());
+            }
+        }
+    }
+
+    fn wait_for(addr: &str) {
+        for _ in 0..200 {
+            if TcpStream::connect(addr).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("{addr} never came up");
+    }
+
+    fn pool() -> String {
+        let [addr] = ports::<1>();
+        let a = addr.clone();
+        std::thread::spawn(move || standin::pool(standin::PoolConfig { listen: a, diff: DIFF, job_every: Duration::from_millis(2000), report: None }));
+        wait_for(&addr);
+        addr
+    }
+
+    /// A hashmaker with its fallback and two miners hashing there, and its listing as the renter's
+    /// service would have found it on the relays (a start fee of one slice).
+    fn hashmaker_with_two_miners() -> (Hashmaker, Hashrate) {
+        let terms = Terms { slice_work: 6 * share_work(DIFF), price_msat: 300_000, grace_ms: 2500, start_slices: 1 };
+        let fallback = pool();
+        let [link, miners] = ports::<2>();
+        let hk = noise::fresh_key();
+        let h = Hashmaker::start(
+            hashmaker::Config {
+                miners: miners.clone(),
+                link: link.clone(),
+                key: hk,
+                terms: terms.clone(),
+                report: None,
+                slices: None,
+                fallback: Some(fallback),
+                rentable: None,
+                min_slice_time: hashmaker::MIN_SLICE_TIME,
+            },
+            Box::new(|| Box::<LabSeller>::default()),
+        )
+        .unwrap();
+        wait_for(&link);
+        for i in 0..2 {
+            let a = miners.clone();
+            std::thread::spawn(move || {
+                standin::miner(standin::MinerConfig {
+                    pool: a,
+                    user: format!("m{i}"),
+                    max_rate: 4.0,
+                    bad_every: 0,
+                    duration: Some(Duration::from_secs(40)),
+                    reconnect: true,
+                    extranonce_subscribe: false,
+                    bind: None,
+                })
+            });
+        }
+        let t0 = Instant::now();
+        while !h.status()["miners"].as_array().is_some_and(|m| m.len() == 2 && m.iter().all(|m| m["connected"] == true && m["work"] != "0")) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the miners never hashed at the fallback: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let listing = Hashrate {
+            name: "lab".into(),
+            algorithm: "blake2b".into(),
+            hashrate_hs: 1,
+            link_addr: link,
+            link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, &hk),
+            iroh: None,
+            pay_url: String::new(),
+            pay_node: String::new(),
+            terms,
+            proof: Some(PROOF.into()),
+            capacity: Capacity { miners: 2, free_miners: 2, free_hs: 2 },
+        };
+        (h, listing)
+    }
+
+    /// The renter's service, its DATUM Gateway a stand-in pool, the listing already read from the relays.
+    fn renter(listing: Hashrate) -> Arc<Mutex<R>> {
+        let r = bare();
+        {
+            let mut g = lock(&r);
+            g.datum = pool();
+            g.offers = Some((Instant::now(), vec![(listing, "ev".into())]));
+        }
+        r
+    }
+
+    fn bare() -> Arc<Mutex<R>> {
+        Arc::new(Mutex::new(R {
+            shown: None,
+            onces: HashMap::new(),
+            failed_first: BTreeMap::new(),
+            key: noise::fresh_key(),
+            datum: String::new(),
+            user: "rented".into(),
+            gateway_api: None,
+            allow_unblinded: true,
+            relays: Vec::new(),
+            signer: None,
+            task: "hashrate".into(),
+            expect_node: None,
+            state: None,
+            offers: None,
+            authors: HashMap::new(),
+            history: None,
+            rentals: BTreeMap::new(),
+            iroh: None,
+            iroh_off: true,
+            iroh_relays: None,
+        }))
+    }
+
+    /// A Rent sent again while the first is still starting waits for it and starts nothing; one that started
+    /// nothing leaves its mark free; one with no mark is never held back.
+    #[test]
+    fn a_rent_still_starting_is_not_started_again() {
+        use std::sync::atomic::AtomicUsize;
+        let r = bare();
+        let starts = AtomicUsize::new(0);
+        let start = |code: u16| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            (code, json!({"rental": "r1"}))
+        };
+        let b = json!({"once": "m1"});
+        let answers: Vec<(u16, Value)> = std::thread::scope(|s| {
+            let x: Vec<_> = (0..3).map(|_| s.spawn(|| once(&r, &b, || start(200)))).collect();
+            x.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "three at once, one started");
+        assert!(answers.iter().all(|a| *a == (200, json!({"rental": "r1"}))), "{answers:?}");
+        assert_eq!(once(&r, &b, || start(200)).0, 200);
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "and once more after");
+        // a start that failed frees its mark for a retry
+        let f = json!({"once": "m2"});
+        assert_eq!(once(&r, &f, || start(400)).0, 400);
+        assert_eq!(once(&r, &f, || start(200)).0, 200);
+        assert_eq!(starts.load(Ordering::SeqCst), 3);
+        // no mark: each is its own request
+        once(&r, &json!({}), || start(200));
+        once(&r, &json!({}), || start(200));
+        assert_eq!(starts.load(Ordering::SeqCst), 5);
+    }
+
+    /// The same Rent sent twice (a double click, a browser sending the form again, two at once): one
+    /// rental, one start fee. Both answers name that rental.
+    #[test]
+    fn a_rent_sent_twice_starts_one_rental_and_pays_one_start_fee() {
+        let (h, listing) = hashmaker_with_two_miners();
+        let terms = listing.terms.clone();
+        let key = hex::encode(listing.link_key.serialize());
+        let r = renter(listing);
+        let body = json!({"linkKey": key, "miners": 1, "budgetSats": 20000, "minutes": 1, "once": "f00d"}).to_string();
+        // two at once, then once more after both answered
+        let answers: Vec<(u16, Value)> = std::thread::scope(|s| {
+            let a = s.spawn(|| handle(&r, &[], "POST", "/rent", body.as_bytes()));
+            let b = s.spawn(|| handle(&r, &[], "POST", "/rent", body.as_bytes()));
+            vec![a.join().unwrap(), b.join().unwrap()]
+        });
+        let again = handle(&r, &[], "POST", "/rent", body.as_bytes());
+        for (code, v) in answers.iter().chain([&again]) {
+            assert_eq!(*code, 200, "{v}");
+        }
+        let id = answers[0].1["rental"].as_str().unwrap().to_string();
+        assert!(answers.iter().chain([&again]).all(|(_, v)| v["rental"] == id.as_str()), "every answer names the one rental: {answers:?} {again:?}");
+        assert_eq!(lock(&r).rentals.len(), 1);
+        // the hashmaker serves it: its start fee and first slice paid, miners moved
+        let t0 = Instant::now();
+        while !h.status()["rentals"].as_array().is_some_and(|a| a.iter().any(|x| x["paid"].as_u64().unwrap_or(0) > terms.start_slices)) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the rental never started: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        let live = h.status()["rentals"].as_array().cloned().unwrap_or_default();
+        assert_eq!(live.len(), 1, "one rental at the hashmaker, the second miner still on the fallback: {live:?}");
+        // cut it, and look at the money: one rental paid, one start fee among it
+        handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
+        let t0 = Instant::now();
+        while h.finished().is_empty() || !h.status()["rentals"].as_array().is_some_and(|a| a.is_empty()) {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the rental never ended: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let fin = h.finished();
+        assert_eq!(fin.len(), 1, "{fin:?}");
+        let paid = fin[0]["paid"].as_u64().unwrap();
+        assert!(paid > terms.start_slices, "{}", fin[0]);
+        assert_eq!(fin.iter().map(|x| x["earnedMsat"].as_u64().unwrap()).sum::<u64>(), paid * terms.price_msat, "all the money went to the one rental");
+        let report = lock(&r).rentals[&id].live.lock().unwrap().clone();
+        assert_eq!(report["paidSlices"].as_u64(), Some(paid), "both sides count the same slices paid: {report}");
+        // after: two Rents with no mark, in the same instant, are two rentals under two names
+        let names: std::collections::BTreeSet<String> = std::thread::scope(|s| {
+            let x: Vec<_> = (0..2).map(|_| s.spawn(|| rent(&r, &json!({"linkKey": key, "miners": 1, "budgetSats": 20000, "minutes": 1, "trial": false})))).collect();
+            x.into_iter().map(|h| h.join().unwrap().1["rental"].as_str().unwrap_or("").to_string()).collect()
+        });
+        assert_eq!(names.len(), 2, "{names:?}");
+        for n in &names {
+            handle(&r, &[], "POST", "/cut", json!({"rental": n}).to_string().as_bytes());
+        }
     }
 }
