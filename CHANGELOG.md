@@ -122,6 +122,24 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that sells only its VPN exit is listed, so buyers can find it by its key.
 
 **Hashrate**
+- Both apps check every share's hash themselves, from the Stratum lines alone. A share counts only
+  if it proves its work; neither side takes the other's word, and a renter's verdicts set nothing.
+- Renters: paid as you use it, seconds at a time. You never have more paid for and not yet received
+  than a minute of the miner's hashing or 546 sat, whichever is more, plus any start fee shown on
+  the offer. The app stops paying a seller after two first payments that delivered little.
+- Hashmakers: a renter gets no work it hasn't paid for. If it stops paying, your miners go back to
+  your own pool within seconds. Measured on the real-money regtest: stopped with no work past what
+  was paid. Hashmakers set no price by hand by default: it is the mining value at live difficulty.
+- Your gateway hides which shares win (`xor_key`), so a hashmaker can't drop the ones that would be
+  blocks. The renter's page says, for your upstream, whether its jobs are blinded, checked job by
+  job; one that isn't, or can't be checked, is refused. Measured: real masked blocks through a full
+  rental, solo and through Lazarus's pool, each block's share one both sides proved; and over 10,240
+  shares a hashmaker's best guess at which win was at chance (balanced accuracy 0.498).
+- The app also ends a rental on shares held back, shares on an out-of-date job, or a pool turning
+  most shares down.
+- Checking a share costs about 1.7 µs on a lab core, about 7 µs estimated on a Raspberry Pi 4.
+- Old and new versions refuse each other, with nothing paid: update both sides.
+
 - A trial slice and a rental smaller than the shop's ticket are paid from no credit, instead of
   being refused; credit left with a seller lasts about 20 hours, and the rental card says what left
   the wallet.

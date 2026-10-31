@@ -1,6 +1,6 @@
 # p2p-hash: rented hashrate over Lightning Stream (phase 1)
 
-Anyone rents hashrate from anyone, paid as the work arrives, pointed at the hashtaker's own DATUM
+Anyone rents hashrate from anyone, paid as it is used, seconds at a time, pointed at the hashtaker's own DATUM
 Gateway. The hashtaker makes the jobs; the hashmaker runs no gateway. Nobody holds anyone's money.
 
 ```

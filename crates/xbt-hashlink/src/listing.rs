@@ -157,7 +157,7 @@ impl Hashrate {
         let tags = vec![
             tag("d", &hex::encode(self.link_key.serialize())),
             tag("title", &self.name),
-            tag("summary", &format!("{} hashrate, {} sat a slice, paid as accepted work arrives", self.algorithm, price_sat)),
+            tag("summary", &format!("{} hashrate, {} sat a slice, paid as it is used, seconds at a time", self.algorithm, price_sat)),
             tag("published_at", &created_at.to_string()),
             tag("t", TOPIC),
             tag("t", "hashrate"),

@@ -2522,14 +2522,14 @@ fn renting_out_starts_unticked_says_what_a_renter_can_do_and_keeps_a_saved_choic
     let mut br = logged_in(&bx);
     const OFF: &str = "name=\"enabled\" value=\"1\"> Rent out my miners";
     const ON: &str = "name=\"enabled\" value=\"1\" checked> Rent out my miners";
-    const WARNING: &str = "Your node checks every share&#39;s hash itself, so a renter&#39;s word doesn&#39;t set what the work is worth.";
+    const WARNING: &str = "A renter gets no work it hasn&#39;t paid for. If it stops paying, your miners go back to your own pool within seconds. Your node checks every share&#39;s hash itself, so a renter&#39;s word doesn&#39;t set what the work is worth.";
     assert!(!settings.exists(), "nothing saved yet");
     let p = br.get("/sell-hashrate");
     assert!(p.body.contains(OFF) && !p.body.contains(ON), "first view: not ticked: {}", p.body);
     let warning = |body: &str| body.contains(WARNING) || body.contains(&WARNING.replace("&#39;", "'"));
     assert!(warning(&p.body), "the warning, before anything is saved: {}", p.body);
-    assert!(p.body.find("Rent out my miners").unwrap() < p.body.find("Your node checks every share").unwrap(), "next to the choice");
-    assert!(p.body.find("Your node checks every share").unwrap() < p.body.find("<button>Save</button>").unwrap(), "before the save: {}", p.body);
+    assert!(p.body.find("Rent out my miners").unwrap() < p.body.find("A renter gets no work").unwrap(), "next to the choice");
+    assert!(p.body.find("A renter gets no work").unwrap() < p.body.find("<button>Save</button>").unwrap(), "before the save: {}", p.body);
     // saved on, it stays on
     let save = |on: bool| {
         let mut f = vec![("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40")];

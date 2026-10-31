@@ -607,7 +607,7 @@ impl App {
             <label>Name, as hashtakers see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
             {}\
             <label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{}> Rent out my miners</label>\
-            <p class=\"hint\">Your node checks every share's hash itself, so a renter's word doesn't set what the work is worth.</p>\
+            <p class=\"hint\">A renter gets no work it hasn't paid for. If it stops paying, your miners go back to your own pool within seconds. Your node checks every share's hash itself, so a renter's word doesn't set what the work is worth.</p>\
             <details><summary>Advanced</summary>\
             <label>Work in each piece (hashes) <small>(empty: about one share of your fastest miner)</small><input name=\"slice_work\" value=\"{}\" placeholder=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]*\" class=\"mono\"></label>\
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
@@ -746,7 +746,7 @@ impl App {
         let st = call(&base, &token, "GET", "/status", None);
         let csrf = App::csrf_input(ctx);
         let mut b = String::from("<p class=\"lead\">Rent miners from other people, by the piece of work they do, into your own DATUM Gateway. \
-            You pay only for work your gateway accepts, a little at a time, and you can cut a rental at any moment.</p>\
+            You pay only for work both sides have checked. Paid as you use it, seconds at a time: you never have more paid for and not yet received than a minute of the miner's hashing or 546 sat, whichever is more, plus any start fee shown on the offer. You can cut a rental at any moment.</p>\
             <p class=\"hint\">Renting, you are the <strong>hashtaker</strong>: the hash comes to you. The people whose miners you rent are <strong>hashmakers</strong>.</p>");
         let st = match st {
             Ok(s) => s,

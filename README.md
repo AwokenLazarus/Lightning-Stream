@@ -56,8 +56,8 @@ money**, and allow a seller. Our demo shop, **Lightning Stream Genesis**, has th
   and in private mode buyers never learn your box's address. A relay is built in (off by default,
   free); paid relays come in an update.
 - **Rent hashrate.** A *hashmaker* lists its miners and a *hashtaker* rents them into its own
-  DATUM Gateway, paying for each slice of work after it is delivered. Only shares the hashtaker's
-  own gateway accepted are counted. ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
+  DATUM Gateway, paid as it uses them, seconds at a time. Both apps check every share's hash
+  themselves, and the renter's gateway hides which shares win. ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
 - **Agents.** An AI agent pays through the same wallet over MCP and never holds a key.
 - **A local AI address.** The app gives the box an OpenAI-compatible address on the owner's network.
   Any AI app or agent that speaks that API uses the sellers' models through it, paid per token, each

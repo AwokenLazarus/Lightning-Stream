@@ -1,6 +1,6 @@
 # p2p-hash: try it
 
-Rent BLAKE2b hashrate from someone, or rent yours out, paid in sats as accepted work arrives.
+Rent BLAKE2b hashrate from someone, or rent yours out, paid in sats as you use it, seconds at a time.
 The hashtaker's own DATUM Gateway makes the jobs. Nobody holds anyone's money. How it works:
 [P2P-HASH.md](P2P-HASH.md).
 
@@ -115,8 +115,8 @@ target/release/xbt-hashlink keygen hashtaker.key      # the hashtaker's link key
 
    - `--slice-work` is the work in a slice, in hashes. A share at difficulty `d` is `d × 2^32`
      hashes, so 140737488355328 is 8 shares at difficulty 4096: about 34 s of a 4.1 TH/s miner.
-   - `--slices` is where the gateway's paid requests arrive (the route's upstream above). The
-     hashmaker answers 200 only for a slice its own meter counted, so nothing else is charged.
+   - `--slices` is where the gateway's paid requests arrive (the route's upstream above). Each one
+     pays a slice ahead of its work, and the hashmaker sends no share on past what's paid.
    - `--relays` takes `wss://` relays. Plain `ws://` is accepted only on loopback.
 
 5. **Point the miners** at `stratum+tcp://HASHER_HOST:34930`. Keep the usual pool as the fallback
@@ -182,9 +182,9 @@ rented out at once. See [P2P-HASH.md](P2P-HASH.md#the-fallback-pool-and-several-
 
 - `buyer.json` and `hasher.json`: accepted and rejected shares, the work counted, each slice and
   its payment, and why the rental ended.
-- The hashmaker stops serving when a finished slice is not paid within `--grace-ms`, or as soon as
-  a second slice finishes unpaid. The hashtaker stops paying when no accepted work arrives (`--idle-s`)
-  or at `--duration-s`.
+- The hashmaker sends no share on past what's paid: one that doesn't fit waits 2 s for payment, and
+  without it the rental stops and the miners go home. The hashtaker stops paying when no proven work
+  arrives (`--idle-s`) or at `--duration-s`.
 
 ## Known limits
 
