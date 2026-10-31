@@ -967,6 +967,7 @@ class ChannelDrops:
         self.every = float(os.environ.get("FLAP_EVERY", "1"))
         self.done = threading.Event()
         self.drops = 0
+        self.reconnected = 0
         self.errors: list[str] = []
         self.thread = threading.Thread(target=self.run, daemon=True)
 
@@ -978,7 +979,13 @@ class ChannelDrops:
                 self.drops += 1
                 lab.lncli(BUYER, "connect", f"{pk}@{HOP}:9735")
             except LabError as e:
-                self.errors.append(str(e).split("rpc error:")[-1][:160])
+                said = str(e).split("rpc error:")[-1]
+                # the nodes reconnect to a channel's peer by themselves: between this disconnect and connect, or before
+                # the next disconnect. That is what they do, and the drop happened or will; anything else is an error
+                if "already connected to peer" in said or "is not connected" in said:
+                    self.reconnected += 1
+                else:
+                    self.errors.append(said[:160])
 
     def __enter__(self) -> "ChannelDrops":
         self.thread.start()
@@ -992,14 +999,24 @@ class ChannelDrops:
 
 
 def flap() -> None:
+    """At FLAP_EVERY seconds (1 by default); at a slower rate, files until one has had a drop under it (at most 6)."""
     stop_sessions()
+    files: list[dict[str, Any]] = []
     with ChannelDrops() as drops:
-        r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
-    ok = call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG)
+        while len(files) < 6:
+            had = drops.drops
+            r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
+            ok = call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG)
+            # why the book stopped the session, where it did
+            why = [s.get("why") for s in status().get("sessions", []) if s.get("session") == r.get("session") and s.get("state") != "open"]
+            files.append({**brief(r), "ok": ok, "drops_under_it": drops.drops - had, "session_stopped_why": why})
+            if r.get("saved_to"):
+                os.remove(r["saved_to"])
+            if not ok or drops.drops > had:
+                break
     check("flap: a 100 MB file paid by tickets comes whole while the channel's peer connection is dropped under it, on the real nodes",
-          ok and drops.drops >= 1 and not drops.errors, {**brief(r), "drops": drops.drops, "errors": drops.errors})
-    if r.get("saved_to"):
-        os.remove(r["saved_to"])
+          all(f["ok"] for f in files) and drops.drops >= 1 and not drops.errors,
+          {"files": files, "drops": drops.drops, "reconnected_by_themselves": drops.reconnected, "errors": drops.errors})
     quiet()
     m = money()
     check("flap: what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number, to the millisat",

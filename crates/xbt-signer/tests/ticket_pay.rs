@@ -9445,3 +9445,18 @@ fn a_node_that_fails_every_payment_is_not_asked_for_ever() {
     assert_wins(&r, 0);
 }
 
+/// A seller of an earlier version is asked to cancel once, whatever fails after: a 404 says it has no such call.
+///
+/// FAILS with the wallet asking again after a 404.
+#[test]
+fn a_seller_without_cancel_is_asked_once() {
+    let _g = env_lock();
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    old_seller(&r);
+    r.ln.st.lock().unwrap().hop_full = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(r.ln.by_status("FAILED").len() >= 2, "{v}");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 1, "{v}");
+    assert_wins(&r, 0);
+}
+

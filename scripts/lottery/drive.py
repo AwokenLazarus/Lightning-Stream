@@ -449,14 +449,22 @@ def flap() -> None:
     with open(f"{RUN}/www/big.bin", "rb") as f:
         want = hashlib.sha256(f.read()).hexdigest()
     before = money()
+    files: list[dict[str, Any]] = []
     with e2e.ChannelDrops() as drops:
-        r = pay(url, 800)
-    if r.get("saved_to"):
-        os.remove(r["saved_to"])
-    wins = int(r.get("wins") or 0)
+        while len(files) < 6:
+            had = drops.drops
+            r = pay(url, 800)
+            if r.get("saved_to"):
+                os.remove(r["saved_to"])
+            w = int(r.get("wins") or 0)
+            ok = ok_draws(r) and r.get("complete") is True and r.get("body_digest") == want and r.get("wins_paid") == w and not r.get("wins_unpaid")
+            files.append({"ok": ok, "ended": r.get("ended"), "wins": w, "wins_paid": r.get("wins_paid"), "unpaid": r.get("wins_unpaid"), "drops_under_it": drops.drops - had})
+            if not ok or drops.drops > had:
+                break
+    wins = sum(f["wins"] for f in files)
     check("flap: a 100 MB file paid by draws comes whole, every win paid, while the channel's peer connection is dropped under it, on the real nodes",
-          ok_draws(r) and r.get("complete") is True and r.get("body_digest") == want and r.get("wins_paid") == wins and not r.get("wins_unpaid") and drops.drops >= 1 and not drops.errors,
-          {"ended": r.get("ended"), "wins": wins, "wins_paid": r.get("wins_paid"), "unpaid": r.get("wins_unpaid"), "drops": drops.drops, "errors": drops.errors})
+          all(f["ok"] for f in files) and drops.drops >= 1 and not drops.errors,
+          {"files": files, "drops": drops.drops, "reconnected_by_themselves": drops.reconnected, "errors": drops.errors})
     quiet()
     m = money()
     check("flap: what the buyer's node paid is the wins the wallet found and booked, to the millisat, and no payment failed",
