@@ -135,8 +135,22 @@ fn metrics_text() -> String {
 /// (iroh-relay names the client's address in that span).
 pub const LOG_FILTER: &str = "warn,[conn]=off";
 
+/// The container's health check: the service rewrites its status file every [`POLL`], on or off,
+/// so a status file younger than this means its loop is alive.
+const HEALTHY_WITHIN: Duration = Duration::from_secs(120);
+
+/// `xbt-stream-relay healthcheck`: 0 when the status file was written within [`HEALTHY_WITHIN`].
+fn healthcheck() -> i32 {
+    let status = env_path("XBT_RELAY_STATUS", "/data/run/relay-status/status.json");
+    let fresh = std::fs::metadata(&status).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age <= HEALTHY_WITHIN);
+    if fresh { 0 } else { 1 }
+}
+
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        std::process::exit(healthcheck());
+    }
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(LOG_FILTER));
     tracing_subscriber::fmt().with_env_filter(filter).with_ansi(std::env::var_os("NO_COLOR").is_none()).with_writer(std::io::stderr).init();
     let p = Paths {
