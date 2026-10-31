@@ -4830,6 +4830,8 @@ impl Signer {
                     }
                 });
                 let lead = &lead;
+                // a ticket that went early and was refused: asked for again when it is due, not before
+                let at_due = AtomicBool::new(false);
                 scope.spawn(move || loop {
                     let mut s = lock(state);
                     if s.2 {
@@ -4852,6 +4854,7 @@ impl Signer {
                     let seen = credited();
                     // before any payment of this socket was timed: what passes in [`FIRST_PAY_S`], within half of what is paid for
                     let ahead = match *lock(lead) {
+                        _ if at_due.load(Ordering::SeqCst) => 0,
                         0 => ((rate * FIRST_PAY_S) as u64).min(st.covered(seen) / 2),
                         l => l,
                     };
@@ -4859,6 +4862,7 @@ impl Signer {
                         s.1.get_or_insert(why);
                     } else if st.due_bytes_ahead(seen, total, None, ahead) {
                         drop(s);
+                        let early = !st.due_bytes(seen, total, None);
                         let (before, asked) = (st.covered(seen), Instant::now());
                         let r = pay(total, &|c| st.due_bytes_ahead(c, total, None, ahead));
                         let span = st.covered(credited()).saturating_sub(before);
@@ -4867,8 +4871,10 @@ impl Signer {
                         if span > 0 {
                             *lock(lead) = ((rate * asked.elapsed().as_secs_f64() * 2.0) as u64).min(span / 2);
                         }
+                        at_due.store(r.is_some() && early, Ordering::SeqCst);
                         s = lock(state);
-                        if let Some(why) = r {
+                        // one refused while what is paid for still ran goes again when it is due, as an answer's does
+                        if let Some(why) = r.filter(|_| !early) {
                             s.1.get_or_insert(why);
                         }
                     }

@@ -113,6 +113,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   in full; the VPN seller page shows what was charged.
 - A VPN tunnel at a high price pays about one ticket ahead, as other answers do, not three seconds
   of traffic: at 40 Mbit and 500,000 sat a GiB, a stopped tunnel left over six tickets with the seller.
+- A VPN tunnel whose next ticket is refused for a moment (a seller slow to show it locked) asks again
+  when it is due, rather than ending with credit left.
 - Sell or buy a VPN exit, paid as you use it: a buyer's devices go out through another box's internet
   connection over Stream, by the GB, with no account; exits are checked for the country they claim,
   an exit only its own shop's gateway can open, and exits that waste a buyer's money held off.
