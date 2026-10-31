@@ -40,6 +40,8 @@ struct Sellers {
     plans: HashMap<String, Plan>,
     /// Each paid call: (url, body sent).
     calls: Vec<(String, Value)>,
+    /// No seller's model list can be had (the wallet not ready, the links not open yet).
+    models_down: bool,
 }
 
 fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
@@ -64,12 +66,19 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                     s
                 };
                 let head = |status: u16, t: &str| json!({"status": status, "content_type": t}).to_string();
-                let result = if url.ends_with("/v1/models") && seller == "paid.example" {
+                let down = sellers.lock().unwrap().models_down;
+                let result = if url.ends_with("/v1/models") && down {
+                    json!({"verdict": "deny", "rule": "xbt402", "reason": "the seller gave no answer: no link yet", "charged_sats": 0})
+                } else if url.ends_with("/v1/models") && seller == "paid.example" {
                     // a gateway that serves nothing outside a paid session: its list is not free
                     json!({"verdict": "deny", "rule": "max_sats", "reason": "the seller asks to be paid and this call may spend nothing (max_sats 0)", "charged_sats": 0})
                 } else if url.ends_with("/v1/models") {
                     let mut s = connect();
-                    let models = if seller == "cheap.example" { json!({"data": [{"id": "llama"}, {"id": "qwen"}]}) } else { json!({"data": [{"id": "llama"}]}) };
+                    let models = match seller.as_str() {
+                        "cheap.example" => json!({"data": [{"id": "llama"}, {"id": "qwen"}]}),
+                        "third.example" => json!({"data": [{"id": "mistral"}]}),
+                        _ => json!({"data": [{"id": "llama"}]}),
+                    };
                     writeln!(s, "{}", head(200, "application/json")).unwrap();
                     s.write_all(models.to_string().as_bytes()).unwrap();
                     json!({"verdict": "allow", "rule": "free", "status": 200, "complete": true, "charged_sats": 0})
@@ -134,8 +143,14 @@ struct Rig {
 }
 
 fn rig(cheap: Plan, dear: Plan, limit_sats: u64) -> Rig {
+    rig_with(cheap, dear, limit_sats, false)
+}
+
+/// The rig, its sellers' model lists unavailable when its endpoint starts if `models_down`.
+fn rig_with(cheap: Plan, dear: Plan, limit_sats: u64, models_down: bool) -> Rig {
     let dir = tempfile::tempdir().unwrap();
-    let sellers = Arc::new(Mutex::new(Sellers { plans: HashMap::from([("cheap.example".into(), cheap), ("dear.example".into(), dear)]), calls: vec![] }));
+    let sellers = Arc::new(Mutex::new(Sellers { plans: HashMap::from([("cheap.example".into(), cheap), ("dear.example".into(), dear)]), calls: vec![],
+                                                models_down }));
     let sock = signer(dir.path(), Arc::clone(&sellers));
     let creds = dir.path().join("credentials.json");
     let mut store = Store::open(&creds).unwrap();
@@ -359,4 +374,40 @@ fn a_pin_or_a_block_applies_to_the_next_request_and_a_request_too_dear_for_the_k
     assert_eq!(status, 402);
     let m = serde_json::from_str::<Value>(&body).unwrap()["error"]["message"].as_str().unwrap().to_string();
     assert!(m.contains("may cost up to") && m.contains("fewer max_tokens"), "{m}");
+}
+
+fn model_ids(r: &Rig) -> Vec<String> {
+    let (status, _, body) = call(&r.addr, "GET", "/v1/models", Some(&r.key), "", "");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    v["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn sellers_not_reachable_when_the_endpoint_starts_are_asked_again_within_seconds() {
+    // the app and the wallet start together: the first fetch finds no seller, and the next request
+    // after a short while asks again, instead of answering "no such model" for the whole TTL
+    let r = rig_with(Plan::Answer(5), Plan::Answer(9), 100, true);
+    assert!(model_ids(&r).is_empty());
+    r.sellers.lock().unwrap().models_down = false;
+    std::thread::sleep(lightning_stream::inference_server::CATALOGUE_RETRY + Duration::from_millis(300));
+    let (status, _, body) = chat(&r, "qwen");
+    assert_eq!(status, 200, "a request {:?} after the sellers are back is served: {body}", lightning_stream::inference_server::CATALOGUE_RETRY);
+    assert_eq!(sellers_called(&r), ["cheap.example"]);
+}
+
+#[test]
+fn a_seller_added_to_the_sellers_file_is_usable_on_the_next_request() {
+    let r = rig(Plan::Answer(5), Plan::Answer(9), 100);
+    assert!(model_ids(&r).contains(&"qwen".to_string()));
+    r.sellers.lock().unwrap().plans.insert("third.example".into(), Plan::Answer(2));
+    let list = r._dir.path().join("ai-sellers.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&list).unwrap()).unwrap();
+    v["sellers"].as_array_mut().unwrap().push(json!({"name": "third", "route": "https://third.example/ai/", "prices": {"per_1k_output_msat": 3000},
+                                                      "max_output": 1024}));
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(&list, v.to_string()).unwrap();
+    let (status, _, body) = chat(&r, "mistral");
+    assert_eq!(status, 200, "the owner just allowed this seller: {body}");
+    assert_eq!(sellers_called(&r), ["third.example"]);
 }

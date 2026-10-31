@@ -35,6 +35,10 @@ use crate::inference::{error_body, refusal_answer, request_bounds, Catalogue, He
 /// How long the catalogue of models is kept before the sellers are asked again.
 pub const CATALOGUE_TTL: Duration = Duration::from_secs(300);
 
+/// How soon the sellers are asked again after a fetch left one of them without models (its link
+/// not open yet, the wallet still starting): doubled after each such fetch, up to [`CATALOGUE_TTL`].
+pub const CATALOGUE_RETRY: Duration = Duration::from_secs(2);
+
 /// The largest request body accepted.
 pub const MAX_BODY: usize = 4 << 20;
 
@@ -74,6 +78,10 @@ struct Inner {
     store: Store,
     router: Router,
     fetched: Option<Instant>,
+    /// How long the catalogue fetched last is kept: [`CATALOGUE_TTL`], or less while a seller is missing from it.
+    keep: Duration,
+    /// Fetches ended so far: a request that waits for one watches it change.
+    fetches: u64,
     /// A fetch of the catalogue is running in the background.
     fetching: bool,
     /// When the sellers file was last read for the owner's pins and blocks.
@@ -237,10 +245,12 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
 
 /// The sellers' model lists, asked of them through the signer with nothing to spend (or, for a
 /// seller that will not answer that free, the `models` its entry in the sellers file names), and
-/// the owner's pins and blocks, from the sellers file the app writes.
-fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs) {
+/// the owner's pins and blocks, from the sellers file the app writes; and whether a seller of the
+/// file was left without models.
+fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs, bool) {
     let sellers: Value = std::fs::read(&cfg.sellers).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
     let mut cat = Catalogue::default();
+    let mut missing = false;
     for s in sellers.get("sellers").and_then(Value::as_array).into_iter().flatten() {
         let (Some(name), Some(route)) = (s.get("name").and_then(Value::as_str), s.get("route").and_then(Value::as_str)) else { continue };
         if !route.ends_with('/') {
@@ -257,12 +267,13 @@ fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs) {
             serde_json::from_slice::<Value>(&body).ok().filter(|m| m.get("data").is_some_and(Value::is_array))
         });
         let named = s.get("models").and_then(Value::as_array).map(|ids| json!({"data": ids.iter().filter_map(Value::as_str).map(|id| json!({"id": id})).collect::<Vec<_>>()}));
-        if let Some(models) = asked.or(named) {
-            cat.add_seller(name, route, &prices, max_output, &models);
+        match asked.or(named) {
+            Some(models) => cat.add_seller(name, route, &prices, max_output, &models),
+            None => missing = true,
         }
     }
     let strs = |k: &str| sellers.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
-    (cat, Prefs { pinned: strs("pinned"), blocked: strs("blocked") })
+    (cat, Prefs { pinned: strs("pinned"), blocked: strs("blocked") }, missing)
 }
 
 impl AiServer {
@@ -274,7 +285,7 @@ impl AiServer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, fetching: false, sellers_changed: None })) };
+        let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, keep: CATALOGUE_TTL, fetches: 0, fetching: false, sellers_changed: None })) };
         // the sellers' model lists are asked for at once, in the background: the first request does not wait for all of them
         me.fetch_in_background();
         Ok(me)
@@ -291,35 +302,47 @@ impl AiServer {
         }
         let (cfg, inner) = (Arc::clone(&self.cfg), Arc::clone(&self.inner));
         std::thread::spawn(move || {
-            let (cat, prefs) = fetch_catalogue(&cfg);
+            let (cat, prefs, missing) = fetch_catalogue(&cfg);
             let mut g = lock(&inner);
             g.router.catalogue = cat;
             g.router.prefs = prefs;
             g.fetched = Some(Instant::now());
+            g.fetches += 1;
+            // a seller missing (not reachable yet, as when the app and the wallet start together): asked again
+            // soon, then less often; all of them answered: kept the whole while
+            g.keep = if !missing { CATALOGUE_TTL } else if g.keep >= CATALOGUE_TTL { CATALOGUE_RETRY } else { (g.keep * 2).min(CATALOGUE_TTL) };
             g.fetching = false;
         });
     }
 
     /// The catalogue for a request: a stale one is refreshed in the background and used meanwhile;
-    /// before the first fetch has ended, the request waits for it (at most `first_byte`). The owner's
-    /// pins and blocks apply at once: they are read again whenever the sellers file has changed.
+    /// before the first fetch has ended, while the catalogue is empty, or when the sellers file has
+    /// just changed, the request waits for the fetch (at most `first_byte`). The owner's pins and blocks apply at once: they are read again
+    /// whenever the sellers file has changed, and the sellers are asked again then too (a seller
+    /// just allowed is usable on the next request).
     fn refresh(&self) {
         let changed = std::fs::metadata(&self.cfg.sellers).and_then(|m| m.modified()).ok();
+        let mut renew = false;
         if changed.is_some() && changed != lock(&self.inner).sellers_changed {
             let sellers: Value = std::fs::read(&self.cfg.sellers).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
             let strs = |k: &str| sellers.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
             let mut g = lock(&self.inner);
             g.router.prefs = Prefs { pinned: strs("pinned"), blocked: strs("blocked") };
+            // the first read is the file the endpoint started with: only a later change asks the sellers again
+            renew = g.sellers_changed.is_some();
             g.sellers_changed = changed;
         }
-        let fetched = lock(&self.inner).fetched;
+        let (fetched, keep, fetches, empty) = {
+            let g = lock(&self.inner);
+            (g.fetched, g.keep, g.fetches, g.router.catalogue.offers.is_empty())
+        };
         match fetched {
-            Some(t) if t.elapsed() <= CATALOGUE_TTL => {}
-            Some(_) => self.fetch_in_background(),
-            None => {
+            Some(t) if !renew && t.elapsed() <= keep => {}
+            Some(_) if !empty && !renew => self.fetch_in_background(),
+            _ => {
                 self.fetch_in_background();
                 let end = Instant::now() + self.cfg.first_byte.max(Duration::from_secs(2));
-                while lock(&self.inner).fetched.is_none() && Instant::now() < end {
+                while lock(&self.inner).fetches == fetches && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(20));
                 }
             }
