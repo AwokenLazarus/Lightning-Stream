@@ -29,7 +29,7 @@
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
 //! | `XBT_UI_SERVICES` | `<data dir>/services.json` | path of the services JSON Browse reads (a list of `{name, kind, seller, price_text, items}`); the Services page writes it |
 //! | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page (`/sell`), which sets up the gateway beside it (the `XBT_UI_GW_*` settings); the app is then branded Lightning Stream |
-//! | `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (`https://`, comma-separated) the Sellers page and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one |
+//! | `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (`https://`) or shop keys (`npub1…`), comma-separated, the Sellers page and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one |
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
 //! | `XBT_UI_STREAM_RELAY` | our relay, `https://iroh.lazarus-xbt.xyz/` | the Stream relay a direct link falls back to last; the Stream relays page (Settings) keeps the owner's other choices in `<data dir>/relays.json` (`docs/RUN-A-RELAY.md`) |
 //! | `XBT_UI_RELAY_DIR`, `XBT_UI_RELAY_STATUS` | | the package's own relay service: the folder it reads the owner's `relay.json` from, and its status file. Unset: the page offers no built-in relay |
@@ -395,7 +395,7 @@ impl Config {
                 None => crate::relaynet::DEFAULT_RELAY.to_string(),
             },
             suggested_sellers: env("XBT_UI_SUGGESTED_SELLERS").map(|v| v.split(',').map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| crate::services::http_origin(s).is_some()).take(10).collect()).unwrap_or_default(),
+                .filter(|s| suggested_seller_ok(s)).take(10).collect()).unwrap_or_default(),
             platform_login: env("XBT_UI_PLATFORM_LOGIN").filter(|h| h.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
             enroll_code_file: env("XBT_UI_ENROLL_CODE_FILE").map(PathBuf::from),
             restart_hint: env("XBT_UI_RESTART_HINT").map(|h| h.chars().take(300).collect()).unwrap_or_else(|| RESTART_HINT.into()),
@@ -455,6 +455,24 @@ impl Config {
                              state: PathBuf::from("/nonexistent/ai/state.json") },
                vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), status_dir: PathBuf::from("/nonexistent/vpn"), endpoint: None, tunnel_upstream: None },
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
+    }
+}
+
+/// Whether a `XBT_UI_SUGGESTED_SELLERS` entry is one the Sellers page can add: a web address, or a shop
+/// key (`npub1…`) that is a valid one.
+pub(crate) fn suggested_seller_ok(s: &str) -> bool {
+    xbt402::shop::parse(s).is_some_and(|o| crate::services::http_origin(&o).is_some())
+}
+
+#[cfg(test)]
+mod suggested_seller_tests {
+    #[test]
+    fn a_suggested_seller_may_be_a_web_address_or_a_valid_shop_key() {
+        assert!(super::suggested_seller_ok("https://shop.example.com"));
+        assert!(super::suggested_seller_ok("npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a"));
+        // one wrong letter, or not an address at all
+        assert!(!super::suggested_seller_ok("npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6b"));
+        assert!(!super::suggested_seller_ok("not a seller"));
     }
 }
 

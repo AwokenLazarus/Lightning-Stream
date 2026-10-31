@@ -135,7 +135,7 @@ services:
       XBT_UI_GW_NODE_REST: ${LS_LND_REST}
       XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_GW_HEALTH_URL: http://127.0.0.1:${LS_GW_PORT:-8402}/x402/ticket/health
-      XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-https://stream.lazarus-xbt.xyz}
+      XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a}
       XBT_UI_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
       # the hashmaker's pages: set by install.sh only when LS_HASHMAKER=1
       XBT_UI_HASHER: ${LS_UI_HASHMAKER:-}

@@ -315,7 +315,7 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_GW_PORT: String(PORTS.gateway),
         XBT_UI_GW_HEALTH_URL: `http://${local(PORTS.gateway)}/x402/ticket/health`,
         XBT_UI_GW_PROXIES: cfg.proxies.join(','),
-        XBT_UI_SUGGESTED_SELLERS: 'https://stream.lazarus-xbt.xyz',
+        XBT_UI_SUGGESTED_SELLERS: 'npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a',
         // the built-in Stream relay needs the server's public port 443, which StartOS keeps for itself
         XBT_UI_RELAY_UNAVAILABLE:
           "StartOS keeps the server's port 443 for itself, and a relay needs it. Run one with the Linux package on a server with a public address (see the setup guide).",

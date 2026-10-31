@@ -37,10 +37,19 @@ impl App {
     /// One-click forms for the suggested sellers not added yet.
     pub(crate) fn suggested(&self, ctx: &Ctx, have: &[Service]) -> String {
         let mut b = String::new();
-        for url in self.cfg.suggested_sellers.iter().filter(|u| !have.iter().any(|s| services::same_origin(&s.seller, u))) {
+        // a suggestion is a web address or a shop key: matched against the sellers added by the address it names
+        for url in self.cfg.suggested_sellers.iter().filter(|u| {
+            let origin = xbt402::shop::parse(u).unwrap_or_else(|| u.to_string());
+            !have.iter().any(|s| services::same_origin(&s.seller, &origin))
+        }) {
+            let shown = if url.starts_with("npub1") && url.len() > 16 {
+                format!("shop key {}…{}", &url[..10], &url[url.len() - 6..])
+            } else {
+                url.trim_start_matches("https://").to_string()
+            };
             b.push_str(&format!("<form method=\"post\" action=\"./services\" class=\"row suggested\">{}<input type=\"hidden\" name=\"action\" value=\"add\">\
                 <input type=\"hidden\" name=\"url\" value=\"{}\"><span>Suggested: <strong>{}</strong></span><button class=\"secondary\">Add this seller</button></form>",
-                App::csrf_input(ctx), esc(url), esc(url.trim_start_matches("https://"))));
+                App::csrf_input(ctx), esc(url), esc(&shown)));
         }
         b
     }
