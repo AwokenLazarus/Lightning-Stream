@@ -1540,9 +1540,10 @@ entry for an origin off the allowlist, which is never used, is warned of the sam
    the unpaid one), and the wallet stops reading when the book refuses a release, when the call's
    charge cap (`max_charge_sats`, else `max_sats`) is used up by its own count of bytes and
    seconds, when nothing has arrived for `tickets.read_timeout_s` (30 s), or when the answer has
-   been open for `tickets.max_answer_s` (50 s by default; `tickets.max_socket_s`, 6 hours, for an
-   answer streamed on to the caller as it arrives, or a WebSocket). It then asks `status` for the
-   last receipt and checks it against what arrived.
+   been open for `tickets.max_answer_s` (50 s by default). An answer streamed on to the caller as it
+   arrives, unless priced by the second, has `tickets.max_stream_s` instead (6 hours) and must
+   bring 256 bytes in each `read_timeout_s`; a WebSocket has `tickets.max_socket_s` (6 hours). It
+   then asks `status` for the last receipt and checks it against what arrived.
 6. The pool is refilled behind the call when half of it or fewer are left: with the default of
    2, when 1 is left.
 

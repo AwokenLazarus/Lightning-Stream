@@ -272,8 +272,8 @@ hold less and wait (`held_less` in the reply of `ticket_lock`; `hold_until`, `ho
 and `pool` in a session of `ticket_status`). Prepaid tickets (`settle: "on-arrival"` in a seller's
 terms) are bought by the payer under `xbt402_pay` only; `ticket_open` takes the seller's entry for them
 as `prepaid_terms` and answers `prepaid_msat`, and no socket method buys one. For the payer under `xbt402_pay`: `http_idle_s` (120),
-`ready_wait_ms` (3000), `read_timeout_s` (30), `max_answer_s` (50, for an answer read whole; one streamed
-on to the caller, `stream_to`, has `max_socket_s`, 21600). The owner names a seller with
+`ready_wait_ms` (3000), `read_timeout_s` (30), `max_answer_s` (50, for an answer read whole or priced by the second; one streamed
+on to the caller, `stream_to`, has `max_stream_s`, 21600, and must keep delivering), `max_socket_s` (21600). The owner names a seller with
 `ln:<node id>` on the allowlist, or with an allowlisted origin whose `counterparties` entry has
 `ln_node`. The wallet's own rules (the daily and weekly budgets, the per-counterparty cap, velocity,
 the split window) apply to every release; a ticket that would reach the human threshold is refused
