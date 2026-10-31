@@ -800,7 +800,8 @@ impl PayLn {
             if p["late_fail"] == true {
                 p["status"] = "FAILED".into();
                 p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
-                p["htlcs"] = json!([]);
+                // the attempt that left the node stays on its record, failed
+                p["htlcs"][0]["status"] = "FAILED".into();
                 continue;
             }
             let hash = p["payment_hash"].as_str().unwrap().to_string();
@@ -5285,6 +5286,7 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     assert_eq!(v["wins_unpaid"][0]["rule"], "lottery_win_failed", "{v}");
     assert_eq!(v["wins_paid"].as_u64().unwrap(), wins - 1, "{v}");
     assert_wins(&r, wins - 1);
+    assert_eq!(r.ln.by_status("FAILED").len(), 2, "sent once more when no route was found, and no more");
     let sid = v["session"].as_str().unwrap().to_string();
     let failed: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "failed").cloned().collect();
     assert_eq!((failed.len(), failed[0]["booked_sats"].as_i64()), (1, Some(0)), "the failed payment is booked back: {failed:?}");
@@ -8960,10 +8962,29 @@ fn a_win_the_node_found_no_route_for_is_sent_once_more_and_paid_once() {
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
     let wins = v["wins"].as_u64().unwrap();
     assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
-    assert_wins(&r, wins);
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
     let failed = r.ln.by_status("FAILED");
     assert_eq!(failed.len(), 1);
     assert!(r.ln.by_status("SUCCEEDED").iter().any(|p| p["payment_hash"] == failed[0]["payment_hash"]), "the same invoice, sent again");
+}
+
+/// A payment some of which left the node may have met anything on the way: it is the seller's next
+/// invoice that pays that win, never this one again.
+///
+/// Guards the re-send: without the look at its attempts this payment goes twice.
+#[test]
+fn a_payment_that_left_the_node_and_failed_is_not_sent_once_more() {
+    let _g = env_lock();
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    r.ln.st.lock().unwrap().late_fail = 1;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let failed = r.ln.by_status("FAILED");
+    assert_eq!(failed.len(), 1, "sent once: {v}");
+    assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| p["payment_hash"] == failed[0]["payment_hash"]), "{v}");
+    assert_eq!(v["wins_unpaid"][0]["rule"], "lottery_win_failed", "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!(v["wins_paid"].as_u64().unwrap(), wins - 1, "{v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins - 1);
 }
 
 /// While a payment that found no route waits to go once more, the book's reconciling leaves its
@@ -8989,7 +9010,7 @@ fn the_books_reconciling_leaves_a_payment_about_to_be_sent_once_more() {
     assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
     assert_eq!(r.ln.by_status("FAILED").len(), 1, "{v}");
     assert_eq!(r.audit("ticket_failed").len(), 0, "the book never held it failed: {v}");
-    assert_wins(&r, wins);
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
 }
 
 /// The same for a prepaid ticket on the ticket rail.
@@ -9035,7 +9056,22 @@ fn assert_paid_after_lapses(r: &Rig, v: &Value, size: usize, lapsed: usize) {
     assert!(ran_out >= lapsed, "{ran_out} invoices ran out, of {refused:?}");
     let wins = v["wins"].as_u64().unwrap();
     assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_each_win_paid_once(r, v["session"].as_str().unwrap(), wins);
+}
+
+/// The money, and by the book and the node each win on one payment: a win sent again is never paid twice.
+fn assert_each_win_paid_once(r: &Rig, sid: &str, wins: u64) {
     assert_wins(r, wins);
+    let rows = win_tickets(r, sid);
+    let mut draws: Vec<u64> = rows.iter().filter(|t| t["state"] == "settled").map(|t| t["win"].as_u64().unwrap()).collect();
+    draws.sort_unstable();
+    draws.dedup();
+    assert_eq!(draws.len() as u64, wins, "every win paid, each once: {rows:?}");
+    let mut hashes: Vec<String> = r.ln.by_status("SUCCEEDED").iter().map(|p| p["payment_hash"].as_str().unwrap().to_string()).collect();
+    let paid = hashes.len();
+    hashes.sort_unstable();
+    hashes.dedup();
+    assert_eq!((paid as u64, hashes.len() as u64), (wins, wins), "one payment a win, each of its own invoice");
 }
 
 /// A win's invoice lapses in the wallet's queue: no bound of the owner's was met, and the win is
