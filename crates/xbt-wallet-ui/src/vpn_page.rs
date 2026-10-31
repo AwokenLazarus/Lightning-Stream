@@ -160,8 +160,8 @@ impl App {
         let live: Vec<&Value> = devices.iter().filter(|d| d["revoked"].as_bool() != Some(true)).collect();
         let rows: String = live.iter().map(|d| {
             let id = d["id"].as_str().unwrap_or("");
-            let st = &status["devices"][id];
-            let state = match (st["why_blocked"].as_str(), st["exit"].as_str()) {
+            let (st, why) = device_line(&status, id);
+            let state = match (why, st["exit"].as_str()) {
                 (Some(why), _) => format!("<span class=\"tag bad\">blocked</span> <span class=\"small\">{}</span>", esc(why)),
                 (None, Some(exit)) => format!("<span class=\"tag ok\">out through {}</span>", esc(exit)),
                 _ => "<span class=\"tag\">no traffic yet</span>".to_string(),
@@ -419,9 +419,28 @@ pub(crate) fn migrate_tunnel_secret(dir: &std::path::Path) -> Result<bool, Strin
     Ok(true)
 }
 
+/// A device's line in the VPN service's `status.json`, and why its traffic is stopped, if it is. The service
+/// writes `devices` as a list of lines, each with its `id`, the reason as `blocked`
+/// ([`xbt_vpn::service::device_status`]); a map by id with `why_blocked` is read too.
+fn device_line<'a>(status: &'a Value, id: &str) -> (&'a Value, Option<&'a str>) {
+    let st = status["devices"].as_array().and_then(|a| a.iter().find(|x| x["id"].as_str() == Some(id))).unwrap_or(&status["devices"][id]);
+    (st, st["blocked"].as_str().or(st["why_blocked"].as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn why_a_device_is_blocked_is_read_from_the_vpn_services_own_status() {
+        let d = xbt_vpn::service::devices_from(&json!({"devices": [{"id": "aa57dcdaefeb9a90", "name": "phone",
+            "public_key": "Tvq8X4Gcj3JZLBsSi/BPkP7HdQxGYdqI61SoZLAJUhc=", "tunnel_ip": "10.66.0.2"}]})).remove(0);
+        let status = json!({"devices": [xbt_vpn::service::device_status(&d, 0, 0, Some("No exit is verified to be in US.".into()))]});
+        assert_eq!(device_line(&status, "aa57dcdaefeb9a90").1, Some("No exit is verified to be in US."));
+        assert_eq!(device_line(&status, "someone-else").1, None);
+        let old = json!({"devices": {"b2": {"why_blocked": "No exit is verified to be in JP."}}});
+        assert_eq!(device_line(&old, "b2").1, Some("No exit is verified to be in JP."));
+    }
 
     #[test]
     fn a_policy_reads_in_plain_words() {
