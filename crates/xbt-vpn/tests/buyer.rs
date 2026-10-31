@@ -274,15 +274,19 @@ fn an_exits_region_is_verified_from_its_egress_address_read_through_it() {
     let s = setup(82, true, None);
     let id = s.exit_id.clone().unwrap();
     s.buyer.set_egress_echo(trace_page(), "trace.test", "/cdn-cgi/trace");
-    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "DE")), RegionCheck::Unknown, "no table, nothing verified");
+    // a free exit reached over the link: no gate, nothing paid
+    let mut gate = xbt_vpn::holds::CheckGate::default();
+    let mut check = |region: &str| s.rt.block_on(s.buyer.check_region(&mut gate, &ExitInfo { id: id.clone(), region: region.into(), ..ExitInfo::default() })).unwrap();
+    assert_eq!(check("DE"), RegionCheck::Unknown, "no table, nothing verified");
     // the table puts the exit's egress (this machine's address) in Germany
     let ip = lan_ip();
     s.buyer.set_geo(GeoTable::from_csv(&format!("{ip},{ip},DE\n")));
-    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "DE")), RegionCheck::Verified);
-    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "JP")), RegionCheck::Elsewhere("DE".into()), "a claim elsewhere is caught");
+    assert_eq!(check("DE"), RegionCheck::Verified);
+    assert_eq!(check("JP"), RegionCheck::Elsewhere("DE".into()), "a claim elsewhere is caught");
     // an owner in Japan reaching a "German" exit in a millisecond: faster than light allows
     s.buyer.set_home_country(Some("JP".into()));
-    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "DE")), RegionCheck::TooFast);
+    assert_eq!(check("DE"), RegionCheck::TooFast);
+    assert_eq!(gate.spent_today(), 0);
 }
 
 #[test]
@@ -486,17 +490,32 @@ fn fake_wallet(exit_at: SocketAddr, cut_after: Option<u64>) -> FakeWallet {
 /// `die_at_once`: each tunnel answers 101 and ends at once, as a seller that takes the opening's
 /// price and carries nothing would.
 fn fake_wallet_with(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bool) -> FakeWallet {
-    fake_wallet_full(exit_at, cut_after, die_at_once, None)
+    fake_wallet_full(exit_at, cut_after, die_at_once, None, Ends::Answers)
+}
+
+/// How a fake wallet behaves around a tunnel, past the plain case.
+#[derive(Clone, Copy, PartialEq)]
+enum Ends {
+    /// It answers when the tunnel ends, as the signer does.
+    Answers,
+    /// Its answer when the tunnel ends is an error.
+    Errs,
+    /// It never answers once the tunnel has ended.
+    Silent,
+    /// It pays and never hands the tunnel over.
+    NeverOpens,
+    /// It takes this long to open the tunnel (from no credit: buying the ticket first).
+    OpensAfter(Duration),
 }
 
 /// A wallet with no credit at the exit's shop, whose tickets are `ticket` sats: each tunnel buys
 /// one, as the signer does, and only if it fits the call's `max_sats` (else the call is refused
 /// before anything is paid); its answer when the tunnel ends says what left (`charged_sats`).
 fn fake_wallet_selling(exit_at: SocketAddr, ticket: u64) -> FakeWallet {
-    fake_wallet_full(exit_at, None, false, Some(ticket))
+    fake_wallet_full(exit_at, None, false, Some(ticket), Ends::Answers)
 }
 
-fn fake_wallet_full(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bool, ticket: Option<u64>) -> FakeWallet {
+fn fake_wallet_full(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bool, ticket: Option<u64>, ends: Ends) -> FakeWallet {
     use std::io::{BufRead, Read, Write};
     use std::sync::atomic::Ordering;
     let dir = tempdir_lite::Dir::new("wallet");
@@ -532,6 +551,14 @@ fn fake_wallet_full(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
                     }
                     None => String::new(),
                 };
+                match ends {
+                    Ends::NeverOpens => {
+                        std::thread::sleep(Duration::from_secs(600));
+                        return;
+                    }
+                    Ends::OpensAfter(d) => std::thread::sleep(d),
+                    _ => {}
+                }
                 let mut up = std::net::TcpStream::connect(exit_at).unwrap();
                 // as the shop's gateway joins it: with the secret the two share
                 up.write_all(format!("GET /vpn/tunnel HTTP/1.1\r\nHost: shop\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{}: {TUNNEL_TEST_SECRET}\r\n\r\n", xbt_vpn::paid::TUNNEL_HEADER).as_bytes()).unwrap();
@@ -589,7 +616,15 @@ fn fake_wallet_full(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
                 pipe(Box::new(up), Box::new(to_buyer), c, mine, Box::new(stop));
                 let _ = t.join();
                 let mut conn = conn;
-                let _ = conn.write_all(format!("{{\"id\":1,\"result\":{{\"status\":101,\"ended\":\"the tunnel ended\"{charged}}}}}\n").as_bytes());
+                match ends {
+                    Ends::Errs => {
+                        let _ = conn.write_all(b"{\"id\":1,\"error\":{\"message\":\"the signer stopped\"}}\n");
+                    }
+                    Ends::Silent => std::thread::sleep(Duration::from_secs(600)),
+                    _ => {
+                        let _ = conn.write_all(format!("{{\"id\":1,\"result\":{{\"status\":101,\"ended\":\"the tunnel ended\"{charged}}}}}\n").as_bytes());
+                    }
+                }
             });
         }
     });
@@ -767,91 +802,135 @@ fn a_priced_exit_is_not_used_without_a_wallet_to_pay_it() {
     assert_eq!(got, 0, "nothing gets out unpaid");
 }
 
+/// A buyer whose phone's policy asks for Germany, a priced exit there under `operator` whose tunnel
+/// is opened by `w`, and the trace page and table that put the exit's egress in Germany.
+fn region_check_setup(seed: u8) -> (Setup, SocketAddr) {
+    use xbt_vpn::region::GeoTable;
+    let s = setup_with(seed, false, None, Some(Requirements { region: Some("DE".into()), ..Requirements::default() }));
+    let at = paid_exit(&s.rt, Arc::new(Meter::default()));
+    s.buyer.set_egress_echo(trace_page(), "trace.test", "/cdn-cgi/trace");
+    let ip = lan_ip();
+    s.buyer.set_geo(GeoTable::from_csv(&format!("{ip},{ip},DE\n")));
+    (s, at)
+}
+
+fn german_exit(s: &Setup, at: SocketAddr, id: &str, price: u64) -> ExitInfo {
+    let e = ExitInfo { id: id.into(), region: "DE".into(), operator: format!("op-{id}"), price_msat_per_gb: price, ..priced(id) };
+    s.buyer.set_tunnel(&e.id, Some(format!("http://{at}/vpn/tunnel")), e.price_msat_per_gb, &e.operator);
+    s.rt.block_on(s.buyer.upsert_exit(e.clone()));
+    e
+}
+
 /// A region check of a priced exit is charged at most `REGION_CHECK_MAX_SATS`, and no more than one
 /// ticket of the exit's shop (`REGION_CHECK_TICKET_SATS`) may leave the wallet for it: a cap of 20
 /// sats on what may leave would never buy a ticket, so an exit the buyer holds no credit with could
 /// never be checked; the tunnel's own 10,000 would let each check strand five tickets.
-/// From no credit at the exit's shop, the check buys its ticket, verifies the region, and counts
-/// what left as the wallet answered; a wallet whose answer does not say counts the check's most.
+/// From no credit at the exit's shop, the check buys its ticket, verifies the region, and the gate
+/// counts what left as the wallet answered.
 #[test]
 fn a_region_check_from_no_credit_buys_one_ticket_verifies_and_counts_what_left() {
     use std::sync::atomic::Ordering;
     use xbt_vpn::buyer::{REGION_CHECK_MAX_SATS, REGION_CHECK_TICKET_SATS};
-    use xbt_vpn::region::{GeoTable, RegionCheck};
-    let ip = lan_ip();
-    for (seed, ticket, expect) in [(120, Some(1_000), 1_000), (124, None, REGION_CHECK_TICKET_SATS)] {
-        let s = setup(seed, false, None);
-        let at = paid_exit(&s.rt, Arc::new(Meter::default()));
-        let w = match ticket {
-            Some(t) => fake_wallet_selling(at, t),
-            None => fake_wallet(at, None),
-        };
+    use xbt_vpn::holds::CheckGate;
+    use xbt_vpn::region::RegionCheck;
+    let (s, at) = region_check_setup(120);
+    let w = fake_wallet_selling(at, 1_000);
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    let e = german_exit(&s, at, "paid-exit", 2_000_000);
+    let mut gate = CheckGate::default();
+    assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &e)), Some(RegionCheck::Verified));
+    assert_eq!(w.left.load(Ordering::SeqCst), 1_000);
+    assert_eq!(gate.spent_today(), 1_000, "what left, by the wallet's answer");
+    let asked = w.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "one paid tunnel: {asked:?}");
+    assert_eq!((asked[0]["max_sats"].as_u64(), asked[0]["max_charge_sats"].as_u64()),
+               (Some(REGION_CHECK_TICKET_SATS), Some(REGION_CHECK_MAX_SATS)), "{asked:?}");
+}
+
+/// Where the wallet's answer doesn't say what left (it says nothing of it, it is an error, it never
+/// comes), or the tunnel never opens though the wallet may have paid: the check counts its most.
+#[test]
+fn a_region_check_whose_cost_is_not_known_counts_its_most() {
+    use xbt_vpn::buyer::{CheckWaits, REGION_CHECK_TICKET_SATS};
+    use xbt_vpn::holds::CheckGate;
+    use xbt_vpn::region::RegionCheck;
+    let short = CheckWaits { open: Duration::from_secs(2), read: Duration::from_secs(5), answer: Duration::from_secs(2) };
+    for (seed, ends, ticket, verified) in [(130, Ends::Answers, None, true), (132, Ends::Errs, Some(700), true),
+                                           (134, Ends::Silent, Some(700), true), (136, Ends::NeverOpens, Some(700), false)] {
+        let (s, at) = region_check_setup(seed);
+        s.buyer.set_check_waits(short);
+        let w = fake_wallet_full(at, None, false, ticket, ends);
         s.buyer.set_wallet(Some(w.wallet.clone()));
-        s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
-        s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
-        s.buyer.set_egress_echo(trace_page(), "trace.test", "/cdn-cgi/trace");
-        s.buyer.set_geo(GeoTable::from_csv(&format!("{ip},{ip},DE\n")));
-        let (result, left) = s.rt.block_on(s.buyer.verify_region_paid("paid-exit", "DE"));
-        assert_eq!(result, RegionCheck::Verified, "ticket {ticket:?}");
-        assert_eq!(left, expect, "ticket {ticket:?}: what left, by the wallet's answer");
-        assert_eq!(w.left.load(Ordering::SeqCst), ticket.unwrap_or(0));
-        let asked = w.asked.lock().unwrap().clone();
-        assert_eq!(asked.len(), 1, "one paid tunnel: {asked:?}");
-        assert_eq!((asked[0]["max_sats"].as_u64(), asked[0]["max_charge_sats"].as_u64()),
-                   (Some(REGION_CHECK_TICKET_SATS), Some(REGION_CHECK_MAX_SATS)), "{asked:?}");
+        let e = german_exit(&s, at, "paid-exit", 2_000_000);
+        let mut gate = CheckGate::default();
+        let t0 = Instant::now();
+        let got = s.rt.block_on(s.buyer.check_region(&mut gate, &e));
+        assert_eq!(got == Some(RegionCheck::Verified), verified, "seed {seed}: {got:?}");
+        assert_eq!(gate.spent_today(), REGION_CHECK_TICKET_SATS, "seed {seed}: what left is not known: its most is counted");
+        assert!(t0.elapsed() < Duration::from_secs(20), "seed {seed}: the waits are bounded: {:?}", t0.elapsed());
     }
+}
+
+/// A wallet with no credit at the exit's shop may take a while to open the tunnel (it buys the
+/// ticket first): the opening has its own bound, so a slow one still leaves the check's reads their
+/// whole time, and the check verifies and counts what left.
+#[test]
+fn a_slow_opening_from_no_credit_still_verifies() {
+    use xbt_vpn::buyer::CheckWaits;
+    use xbt_vpn::holds::CheckGate;
+    use xbt_vpn::region::RegionCheck;
+    let (s, at) = region_check_setup(138);
+    // the opening takes longer than the reads may
+    s.buyer.set_check_waits(CheckWaits { open: Duration::from_secs(10), read: Duration::from_secs(2), answer: Duration::from_secs(5) });
+    let w = fake_wallet_full(at, None, false, Some(800), Ends::OpensAfter(Duration::from_secs(3)));
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    let e = german_exit(&s, at, "paid-exit", 2_000_000);
+    let mut gate = CheckGate::default();
+    assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &e)), Some(RegionCheck::Verified));
+    assert_eq!(gate.spent_today(), 800);
 }
 
 /// Ten priced exits announced under ten fresh operator keys (so no operator's failures stop them),
 /// each in the region the phone's policy asks for, each shop's ticket 1,500 sats and the buyer with
 /// credit at none: the checks buy tickets, and the day's checks move no more than the day's budget
 /// out of the wallet, counted by what the wallet answered. An exit no policy would take is not
-/// checked at all, and one whose ticket is more than a check may move is refused before paying.
+/// checked at all, one announced free but given a paid tunnel is paid for under the same gate, and
+/// one whose ticket is more than a check may move is refused before paying.
 #[test]
 fn ten_fresh_exits_cannot_spend_past_the_days_region_check_budget() {
     use std::sync::atomic::Ordering;
     use xbt_vpn::buyer::REGION_CHECK_TICKET_SATS;
     use xbt_vpn::holds::{CheckGate, CHECK_SATS_PER_DAY};
-    use xbt_vpn::region::{GeoTable, RegionCheck};
-    let ip = lan_ip();
-    let req = Requirements { region: Some("DE".into()), ..Requirements::default() };
-    let s = setup_with(126, false, None, Some(req));
-    let at = paid_exit(&s.rt, Arc::new(Meter::default()));
+    use xbt_vpn::region::RegionCheck;
+    let (s, at) = region_check_setup(126);
     let w = fake_wallet_selling(at, 1_500);
     s.buyer.set_wallet(Some(w.wallet.clone()));
-    s.buyer.set_egress_echo(trace_page(), "trace.test", "/cdn-cgi/trace");
-    s.buyer.set_geo(GeoTable::from_csv(&format!("{ip},{ip},DE\n")));
-    let exit = |id: &str, region: &str| ExitInfo { id: id.into(), region: region.into(), operator: format!("op-{id}"), ..priced(id) };
     let mut gate = CheckGate::default();
     // not wanted: nobody asked for France
-    let fr = exit("fr", "FR");
-    s.buyer.set_tunnel(&fr.id, Some(format!("http://{at}/vpn/tunnel")), fr.price_msat_per_gb, &fr.operator);
+    let fr = ExitInfo { region: "FR".into(), ..german_exit(&s, at, "fr", 2_000_000) };
     assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &fr)), None);
     assert!(w.asked.lock().unwrap().is_empty(), "an exit no policy would take is never paid to check");
     let mut results = Vec::new();
     for i in 0..10 {
-        let e = exit(&format!("sybil{i}"), "DE");
-        s.buyer.set_tunnel(&e.id, Some(format!("http://{at}/vpn/tunnel")), e.price_msat_per_gb, &e.operator);
-        s.rt.block_on(s.buyer.upsert_exit(e.clone()));
+        // one announced free, its tunnel paid all the same
+        let e = german_exit(&s, at, &format!("sybil{i}"), if i == 0 { 0 } else { 2_000_000 });
         results.push(s.rt.block_on(s.buyer.check_region(&mut gate, &e)));
     }
     let left = w.left.load(Ordering::SeqCst);
     assert!(left <= CHECK_SATS_PER_DAY, "{left} sats left for a day's region checks, the budget is {CHECK_SATS_PER_DAY}");
     // 0 + 2,000 fits 4,000, then 1,500 + 2,000, then 3,000 + 2,000 does not: two checks, 3,000 sats
     assert_eq!(left, 3_000);
+    assert_eq!(gate.spent_today(), left, "the gate counts what left");
     assert_eq!(results.iter().filter(|r| **r == Some(RegionCheck::Verified)).count(), 2, "{results:?}");
     assert_eq!(results.iter().filter(|r| r.is_none()).count(), 8, "{results:?}");
     assert!(w.asked.lock().unwrap().iter().all(|p| p["max_sats"].as_u64() == Some(REGION_CHECK_TICKET_SATS)));
     // a shop whose ticket is more than a check may move: refused before anything is paid, and the
     // check counts nothing against the day
-    let s2 = setup_with(128, false, None, Some(Requirements { region: Some("DE".into()), ..Requirements::default() }));
-    let at2 = paid_exit(&s2.rt, Arc::new(Meter::default()));
+    let (s2, at2) = region_check_setup(128);
     let big = fake_wallet_selling(at2, REGION_CHECK_TICKET_SATS + 1);
     s2.buyer.set_wallet(Some(big.wallet.clone()));
-    s2.buyer.set_egress_echo(trace_page(), "trace.test", "/cdn-cgi/trace");
-    s2.buyer.set_geo(GeoTable::from_csv(&format!("{ip},{ip},DE\n")));
-    let e = exit("big", "DE");
-    s2.buyer.set_tunnel(&e.id, Some(format!("http://{at2}/vpn/tunnel")), e.price_msat_per_gb, &e.operator);
-    assert_eq!(s2.rt.block_on(s2.buyer.verify_region_paid(&e.id, "DE")), (RegionCheck::Unknown, 0));
-    assert_eq!(big.left.load(Ordering::SeqCst), 0);
+    let e = german_exit(&s2, at2, "big", 2_000_000);
+    let mut gate = CheckGate::default();
+    assert_eq!(s2.rt.block_on(s2.buyer.check_region(&mut gate, &e)), Some(RegionCheck::Unknown));
+    assert_eq!((big.left.load(Ordering::SeqCst), gate.spent_today()), (0, 0));
 }

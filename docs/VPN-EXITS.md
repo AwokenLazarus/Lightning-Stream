@@ -135,14 +135,22 @@ rules ask for that region and would otherwise take it. A check is charged at mos
 (`max_charge_sats`), but a buyer with no credit at the exit's shop must first buy one of its
 tickets, so the wallet may move up to 2,000 sats out for one check (the check tunnel's `max_sats`,
 within the owner's rules); a shop whose ticket is bigger can't be checked. What the check leaves of
-the ticket stays as credit with that shop, for the tunnel after it. All checks share one budget
+the ticket stays as credit with that shop, for the tunnel after it. Every check through a paid
+tunnel (an exit that named one, whatever price it announced) shares one budget
 (`xbt_vpn::holds::CheckGate`): at most 4,000 sats a day may leave the wallet for them. A check
-starts only if the day's spend plus its 2,000 still fits, and then counts what actually left for
-it, as the wallet's answer says (the tickets it bought or released for the check; the full 2,000
-where the wallet gave no answer). So the day's checks never move more than 4,000 sats, however many
-exits are announced or under how many keys; with the usual ticket of under 1,000 sats that is three
-or four checks a day. Also one check of an exit a day, none more that day for an operator (the exit's
-Nostr key) whose checks failed twice, and the exits seen longest first, so a crowd of new
+starts only if the day's spend plus its 2,000 still fits. Its 2,000 is counted, and written to
+`region-checks.json` in the keys dir, before its tunnel opens; once it is done, what actually left
+for it is counted instead, as the wallet's answer says (the tickets it bought or released for the
+check). Where that is not known (no answer, an error, an opening given up, or the service stopped
+during the check) the full 2,000 stays counted. The budget is kept in wall-clock time in that file,
+so the service starting again (as it does at every change of its settings) does not start the day
+again. So the day's checks never move more than 4,000 sats, however many exits are announced, under
+how many keys, or how often the service starts; with shops whose ticket is T sats, that is
+1 + ⌊2,000 / T⌋ checks a day (T counting the routing fee): 2 for a ticket over 1,000 sats, 3 at
+1,000, 4 at 546. An exit's opening and the
+check's reads through it are each given their own time (45 s and 30 s), so a slow opening from no
+credit is not cut short. Also one check of an exit a day, none more that day for an operator (the
+exit's Nostr key) whose checks failed twice, and the exits seen longest first, so a crowd of new
 announcements can't push the others out.
 Until the table has loaded, no region is verified, and a device whose rules name a country is told
 no exit qualifies rather than sent to one that may be elsewhere. Each exit's result is in

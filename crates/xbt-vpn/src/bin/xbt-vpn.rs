@@ -44,8 +44,9 @@
 //!     and B2_STREAM_DIR (as the app's buyer side opens it). `--once`: each flow downloads the URL
 //!     once, to its end. `--region-check`: the tunnel is opened as a region check's (no more than one
 //!     ticket may leave the wallet for it, and it is charged no more than 20 sats), and the line adds
-//!     the wallet's answer when it ended (`wallet`), the sats that left the wallet (`left_sats`) and the
-//!     page's first 4 KiB (`page`).
+//!     the wallet's answer when it ended (`wallet`), the sats that left the wallet (`left_sats`; null
+//!     where the answer does not say, which the service's region checks count as the full 2,000) and
+//!     the page's first 4 KiB (`page`).
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -557,19 +558,22 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
     // exits, found on Nostr every 10 minutes; each announced region verified, and checked again every 6 h
     {
         let (buyer, link, nostr, own, relay, rt) = (buyer.clone(), buyer_link.clone(), nostr.clone(), own_exit.clone(), relay.clone(), rt.clone());
+        let gate_file = keys_dir.join("region-checks.json");
         std::thread::spawn(move || {
             let mut checked: HashMap<String, (String, bool, std::time::Instant)> = HashMap::new();
             // priced exits are paid to have their region checked: only those a device's own policy asks
             // for by region (see Buyer::region_wanted), under one daily budget, one check of an exit a
             // day, none more for an operator whose checks keep failing, the longest seen first
-            let mut gate = xbt_vpn::holds::CheckGate::default();
+            // kept in the keys dir: the service starting again (at every change of its settings) does
+            // not start the day's budget again
+            let mut gate = xbt_vpn::holds::CheckGate::load(&gate_file);
             loop {
                 if !nostr.is_empty() {
                     let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
                     let (found, _) = announce::collect(&events, xbt_nostr::now());
                     // a priced exit that names no tunnel can't be paid: not used
                     let mut found: Vec<_> = found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref() && (a.exit.price_msat_per_gb == 0 || a.tunnel.is_some())).collect();
-                    let now = std::time::Instant::now();
+                    let now = std::time::SystemTime::now();
                     found.sort_by_key(|a| gate.seen(&a.exit.id, now));
                     for mut a in found {
                         buyer.set_tunnel(&a.exit.id, a.tunnel.clone(), a.exit.price_msat_per_gb, &a.exit.operator);

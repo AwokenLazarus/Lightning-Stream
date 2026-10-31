@@ -7,7 +7,11 @@
 //! fail their region checks, is held off as a whole.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
 
 /// A day, for the daily caps.
 pub const DAY: Duration = Duration::from_secs(24 * 3600);
@@ -132,7 +136,8 @@ impl Holds {
 pub const REGION_CHECK_TICKET_SATS: u64 = 2_000;
 /// The most region checks may move out of the wallet in a day, across all exits (sats): two checks
 /// that each bought a whole [`REGION_CHECK_TICKET_SATS`] ticket. A check starts only if the day's
-/// spend plus that most still fits, and counts what actually left for it.
+/// spend plus that most still fits, and counts what actually left for it: with tickets of T sats,
+/// 1 + ⌊2,000 / T⌋ checks a day.
 pub const CHECK_SATS_PER_DAY: u64 = 2 * REGION_CHECK_TICKET_SATS;
 /// How often one priced exit's region is checked (paid for) at most.
 pub const CHECK_EVERY: Duration = DAY;
@@ -142,46 +147,142 @@ pub const CHECK_FAILS_PER_OPERATOR: u32 = 2;
 /// The paid region checks of priced exits, under one budget: [`CHECK_SATS_PER_DAY`] in all, one
 /// check of an exit a day, none more for an operator whose checks failed [`CHECK_FAILS_PER_OPERATOR`]
 /// times today, and the exits seen longest first (a crowd of new ones can't push them out).
+///
+/// Kept in wall-clock time and, with [`CheckGate::load`], in a file (written and synced at each
+/// change), so the service starting again (as it does at every change of its settings) does not
+/// start the day's budget again. A check is paid for in two steps: [`CheckGate::reserve`] counts its
+/// most and is on disk before its tunnel opens; [`CheckGate::settle`] then counts what actually left.
+/// A reservation found unsettled at load (the service stopped between the two) stays counted in full.
 #[derive(Debug, Default)]
 pub struct CheckGate {
-    spent: Option<(Instant, u64)>,
-    last: HashMap<String, Instant>,
-    fails: HashMap<String, (Instant, u32)>,
-    first_seen: HashMap<String, Instant>,
+    file: Option<PathBuf>,
+    /// The day's start and what left the wallet for checks since (unix seconds, sats).
+    spent: Option<(u64, u64)>,
+    last: HashMap<String, u64>,
+    fails: HashMap<String, (u64, u32)>,
+    /// The check paid for and not yet settled: the exit, its operator, and the day it was counted in.
+    reserved: Option<(String, String, u64)>,
+    first_seen: HashMap<String, SystemTime>,
+}
+
+/// Unix seconds; a clock before 1970 is 0.
+fn unix(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// `slot`'s count, started again if its day is over (wall-clock seconds; a clock set back counts as
+/// no time passed).
+fn today_at(slot: &mut (u64, u32), now: u64) -> &mut u32 {
+    if now.saturating_sub(slot.0) >= DAY.as_secs() {
+        *slot = (now, 0);
+    }
+    &mut slot.1
 }
 
 impl CheckGate {
+    /// The gate kept in `file` (made if missing): what it holds is read back. A check reserved and
+    /// never settled (the service stopped during it) is counted in full, and that exit not checked
+    /// again that day.
+    pub fn load(file: &Path) -> CheckGate {
+        let v: Value = std::fs::read(file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+        let n = |v: &Value| v.as_u64().unwrap_or(0);
+        let mut g = CheckGate { file: Some(file.to_path_buf()), ..CheckGate::default() };
+        if let Some(a) = v["spent"].as_array() {
+            g.spent = Some((n(&a[0]), a.get(1).map_or(0, n)));
+        }
+        for (id, at) in v["last"].as_object().into_iter().flatten() {
+            g.last.insert(id.clone(), n(at));
+        }
+        for (op, f) in v["fails"].as_object().into_iter().flatten() {
+            g.fails.insert(op.clone(), (n(&f[0]), f.get(1).map_or(0, n) as u32));
+        }
+        if let Some(r) = v["reserved"].as_array() {
+            // its most stays in the day's spend; the exit counts as checked
+            let id = r.first().and_then(Value::as_str).unwrap_or_default().to_string();
+            g.last.insert(id, r.get(2).map_or(0, n));
+            let _ = g.save();
+        }
+        g
+    }
+
+    fn save(&self) -> std::io::Result<()> {
+        let Some(file) = &self.file else { return Ok(()) };
+        let v = json!({"spent": self.spent.map(|(d, s)| json!([d, s])), "last": self.last,
+                       "fails": self.fails.iter().map(|(k, (d, c))| (k.clone(), json!([d, c]))).collect::<serde_json::Map<_, _>>(),
+                       "reserved": self.reserved.as_ref().map(|(id, op, d)| json!([id, op, d]))});
+        let tmp = file.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(v.to_string().as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, file)?;
+        if let Some(dir) = file.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// When `id` was first seen (now, if it is new): checks go to the longest seen first.
-    pub fn seen(&mut self, id: &str, now: Instant) -> Instant {
+    pub fn seen(&mut self, id: &str, now: SystemTime) -> SystemTime {
         *self.first_seen.entry(id.to_string()).or_insert(now)
+    }
+
+    /// What has left the wallet for region checks today, a check under way counted at its most (sats).
+    pub fn spent_today(&self) -> u64 {
+        self.spent.map_or(0, |s| s.1)
     }
 
     /// Whether `id`, run by `operator`, may be checked now: the most a check may move out of the
     /// wallet ([`REGION_CHECK_TICKET_SATS`]) must still fit in the day's budget.
-    pub fn may(&mut self, id: &str, operator: &str, now: Instant) -> bool {
+    pub fn may(&mut self, id: &str, operator: &str, now: SystemTime) -> bool {
+        let now = unix(now);
         let spent = self.spent.get_or_insert((now, 0));
-        if now.saturating_duration_since(spent.0) >= DAY {
+        if now.saturating_sub(spent.0) >= DAY.as_secs() && self.reserved.is_none() {
             *spent = (now, 0);
         }
-        if spent.1.saturating_add(REGION_CHECK_TICKET_SATS) > CHECK_SATS_PER_DAY {
+        if self.reserved.is_some() || spent.1.saturating_add(REGION_CHECK_TICKET_SATS) > CHECK_SATS_PER_DAY {
             return false;
         }
-        if self.last.get(id).is_some_and(|t| now.saturating_duration_since(*t) < CHECK_EVERY) {
+        if self.last.get(id).is_some_and(|t| now.saturating_sub(*t) < CHECK_EVERY.as_secs()) {
             return false;
         }
-        !self.fails.get_mut(operator).is_some_and(|f| *today(f, now) >= CHECK_FAILS_PER_OPERATOR)
+        !self.fails.get_mut(operator).is_some_and(|f| *today_at(f, now) >= CHECK_FAILS_PER_OPERATOR)
     }
 
-    /// `id` was checked, and `left` sats left the wallet for it (the tickets the wallet bought or
-    /// released for the check, by its answer; the check's most where that is not known); `ok`: its
-    /// region held.
-    pub fn record(&mut self, id: &str, operator: &str, left: u64, ok: bool, now: Instant) {
+    /// `id` is about to be checked: its most ([`REGION_CHECK_TICKET_SATS`]) is counted now, and on
+    /// disk before this returns. `Err`: it could not be kept, and the check must not be paid for.
+    pub fn reserve(&mut self, id: &str, operator: &str, now: SystemTime) -> std::io::Result<()> {
+        let now = unix(now);
         let spent = self.spent.get_or_insert((now, 0));
-        spent.1 = spent.1.saturating_add(left);
+        spent.1 = spent.1.saturating_add(REGION_CHECK_TICKET_SATS);
+        self.reserved = Some((id.to_string(), operator.to_string(), spent.0));
         self.last.insert(id.to_string(), now);
-        if !ok && !operator.is_empty() {
-            *today(self.fails.entry(operator.to_string()).or_insert((now, 0)), now) += 1;
+        if let Err(e) = self.save() {
+            // not kept: as if never reserved
+            self.reserved = None;
+            if let Some(s) = &mut self.spent {
+                s.1 = s.1.saturating_sub(REGION_CHECK_TICKET_SATS);
+            }
+            self.last.remove(id);
+            return Err(e);
         }
+        Ok(())
+    }
+
+    /// The check reserved last is done, and `left` sats left the wallet for it (the tickets the
+    /// wallet bought or released for the check, by its answer; its most where that is not known);
+    /// `ok`: its region held.
+    pub fn settle(&mut self, left: u64, ok: bool, now: SystemTime) {
+        let now = unix(now);
+        let Some((_, operator, day)) = self.reserved.take() else { return };
+        if let Some(s) = self.spent.as_mut().filter(|s| s.0 == day) {
+            s.1 = s.1.saturating_sub(REGION_CHECK_TICKET_SATS).saturating_add(left);
+        }
+        if !ok && !operator.is_empty() {
+            *today_at(self.fails.entry(operator).or_insert((now, 0)), now) += 1;
+        }
+        let _ = self.save();
     }
 }
 
@@ -250,36 +351,107 @@ mod tests {
 
     #[test]
     fn region_checks_share_one_daily_budget_and_failing_operators_get_no_more() {
+        let check = |g: &mut CheckGate, id: &str, op: &str, left: u64, ok: bool, now: SystemTime| {
+            g.reserve(id, op, now).unwrap();
+            g.settle(left, ok, now);
+        };
         // a crowd of exits under fresh keys, each check buying a whole ticket of its shop: the day's
         // checks move no more than the budget out of the wallet, whatever their tickets cost
         for ticket in [REGION_CHECK_TICKET_SATS, 1_000, 546, 21] {
-            let (mut g, now) = (CheckGate::default(), Instant::now());
+            let (mut g, now) = (CheckGate::default(), SystemTime::now());
             let (mut checked, mut left) = (0, 0);
             for i in 0..100 {
                 let id = format!("sybil{i}");
                 if g.may(&id, &format!("op{i}"), now) {
-                    g.record(&id, &format!("op{i}"), ticket, true, now);
+                    check(&mut g, &id, &format!("op{i}"), ticket, true, now);
                     checked += 1;
                     left += ticket;
                 }
             }
             assert!(left <= CHECK_SATS_PER_DAY, "ticket {ticket}: {left} sats left in a day");
-            // every check that still fits its most is allowed: the budget is not spent on guesses
+            assert_eq!(g.spent_today(), left, "ticket {ticket}: what left is what is counted");
+            // every check that still fits its most is allowed: 1 + (budget - most) / ticket
             assert_eq!(checked, 1 + (CHECK_SATS_PER_DAY - REGION_CHECK_TICKET_SATS) / ticket, "ticket {ticket}");
             assert!(!g.may("sybil-late", "op-late", now + Duration::from_secs(3600)), "ticket {ticket}: the rest of the day");
             assert!(g.may("sybil-late", "op-late", now + DAY), "ticket {ticket}: a new day");
         }
-        let (mut g, now) = (CheckGate::default(), Instant::now());
-        g.record("a", "op", 20, false, now);
-        g.record("b", "op", 20, false, now);
+        let (mut g, now) = (CheckGate::default(), SystemTime::now());
+        check(&mut g, "a", "op", 20, false, now);
+        check(&mut g, "b", "op", 20, false, now);
         assert!(!g.may("c", "op", now), "an operator whose checks failed twice today gets no more");
         assert!(g.may("c", "op", now + DAY), "a new day");
-        g.record("z", "other", 20, true, now);
+        check(&mut g, "z", "other", 20, true, now);
         assert!(!g.may("z", "other", now + Duration::from_secs(3600)), "one check of an exit a day");
         // the longest seen first
         let mut g = CheckGate::default();
         let older = g.seen("old", now);
         assert!(g.seen("new", now + Duration::from_secs(10)) > older);
         assert_eq!(g.seen("old", now + Duration::from_secs(20)), older);
+    }
+
+    fn gate_file(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(format!("{tag}.json"));
+        (d, f)
+    }
+
+    /// The service starts again at every change of its settings: the day's region-check budget,
+    /// each exit's last check and each operator's failures survive it, in wall-clock time.
+    #[test]
+    fn starting_again_mid_day_does_not_start_the_region_check_budget_again() {
+        let (_d, f) = gate_file("gate");
+        let now = SystemTime::now();
+        let mut g = CheckGate::load(&f);
+        for id in ["a", "b"] {
+            assert!(g.may(id, "op", now));
+            g.reserve(id, "op", now).unwrap();
+            g.settle(100, false, now);
+        }
+        let later = now + Duration::from_secs(3600);
+        let g2 = CheckGate::load(&f);
+        let mut g = g2;
+        assert_eq!(g.spent_today(), 200, "the day's spend survived");
+        assert!(!g.may("c", "op", later), "op's two failures today survived");
+        assert!(!g.may("a", "other-op", later), "a's check today survived");
+        assert!(g.may("c", "fresh-op", later));
+        g.reserve("c", "fresh-op", later).unwrap();
+        g.settle(1_900, true, later);
+        // ten restarts later
+        for _ in 0..10 {
+            g = CheckGate::load(&f);
+        }
+        assert_eq!(g.spent_today(), 2_100);
+        assert!(!g.may("d", "fresh-op2", later), "2,100 + 2,000 is past the 4,000 a day, restarts or not");
+        assert!(g.may("d", "fresh-op2", now + DAY), "a new day: the budget again");
+    }
+
+    /// The service stopped after a check's tunnel was paid for and before what left was counted:
+    /// the check counts its most, in full.
+    #[test]
+    fn a_check_cut_off_between_paying_and_counting_counts_its_most() {
+        let (_d, f) = gate_file("gate");
+        let now = SystemTime::now();
+        let mut g = CheckGate::load(&f);
+        assert!(g.may("a", "op", now));
+        g.reserve("a", "op", now).unwrap();
+        // the service stops here: no settle
+        drop(g);
+        let mut g = CheckGate::load(&f);
+        assert_eq!(g.spent_today(), REGION_CHECK_TICKET_SATS);
+        assert!(!g.may("a", "op", now + Duration::from_secs(60)), "nor is that exit paid to check again today");
+        assert!(g.may("b", "op2", now + Duration::from_secs(60)));
+        g.reserve("b", "op2", now).unwrap();
+        g.settle(700, true, now);
+        assert_eq!(CheckGate::load(&f).spent_today(), REGION_CHECK_TICKET_SATS + 700, "settled, it counts what left");
+    }
+
+    /// A reservation that can't be written is not paid for: the gate says so, and counts nothing.
+    #[test]
+    fn a_check_that_cannot_be_kept_on_disk_is_refused() {
+        let (d, _) = gate_file("gate");
+        let mut g = CheckGate::load(&d.path().join("missing-dir").join("gate.json"));
+        assert!(g.reserve("a", "op", SystemTime::now()).is_err());
+        assert_eq!(g.spent_today(), 0);
+        assert!(g.may("a", "op", SystemTime::now()));
     }
 }

@@ -218,9 +218,9 @@ pub fn left_sats(v: &Value) -> Option<u64> {
 pub const ANSWER_WAIT: Duration = Duration::from_secs(30);
 
 /// What left the wallet for a tunnel, by its answer once the tunnel has ended (`None`: no answer in
-/// [`ANSWER_WAIT`], or one that does not say). Blocks.
-pub fn left_after(done: &std::sync::mpsc::Receiver<Result<Value, String>>) -> Option<u64> {
-    done.recv_timeout(ANSWER_WAIT).ok()?.ok().as_ref().and_then(left_sats)
+/// `wait` ([`ANSWER_WAIT`] in use), an error, or an answer that does not say). Blocks.
+pub fn left_after(done: &std::sync::mpsc::Receiver<Result<Value, String>>, wait: Duration) -> Option<u64> {
+    done.recv_timeout(wait).ok()?.ok().as_ref().and_then(left_sats)
 }
 
 /// The signer's answer to a call that ended before its stream opened, in words.
