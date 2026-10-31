@@ -398,13 +398,18 @@ def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
     check starts clean with the seller), the credit a session leaves there is given up as well, so
     the next session starts with none instead of taking it over: a session stopped earlier in a
     check (by the agent, or its call's max_sats) included, since a stop that ends its answer at once
-    leaves the rest of the last ticket with the seller."""
-    for s in status().get("sessions", []):
+    leaves the rest of the last ticket with the seller. Every session the checks have seen, too: the
+    book no longer lists one whose tickets are all final (closed), and its credit is taken over as
+    an open one's is."""
+    listed = status().get("sessions", [])
+    for s in listed:
         if s["state"] == "open":
             note_receipts((who or agent()).tool("ticket_stop", {"session": s["session"]}).get("http") or {})
-        if forget and s["session"] not in FORGOTTEN:
-            signer("ticket_stop", {"session": s["session"], "forget_credit": True})
-            FORGOTTEN.add(s["session"])
+    if forget:
+        for sid in [s["session"] for s in listed] + list(RECEIPTS):
+            if sid not in FORGOTTEN:
+                signer("ticket_stop", {"session": sid, "forget_credit": True})
+                FORGOTTEN.add(sid)
     quiet()
 
 
