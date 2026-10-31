@@ -82,7 +82,25 @@ The script is short and readable, so read it first if you like. It:
 7. starts the app.
 
 Use `install.sh --dir DIR` to install somewhere other than `~/lightning-stream`. To change an answer
-later, run `install.sh` again: your current answers are the defaults.
+later, run `install.sh` again: your current answers are the defaults. An update keeps every setting in
+`.env`, including any you added by hand (such as `LS_AI_BIND`). An `LS_*` variable you give the run
+wins over `.env` and is written there, also with `--yes`:
+`LS_UI_PORT=9001 packaging/linux/install.sh --yes`.
+
+The app takes these ports on `127.0.0.1`. Each is a setting in `.env`, so move one if another program
+already uses it:
+
+| setting | default | what it is |
+|---|---|---|
+| `LS_UI_PORT` | 8482 | the app's page |
+| `LS_GW_PORT` | 8402 | your shop, where buyers' apps pay and connect |
+| `LS_FILES_PORT` | 8486 | the folder a Files service shares, served to your shop only |
+| `LS_CONNECTOR_PORT` | 8484 | the connector |
+| `LS_MCP_PORT` | 33511 | the MCP server for agents |
+
+If another program holds `LS_FILES_PORT`, `install.sh` says so when it finishes. The Files service on
+the Sell page also shows "Your shared folder isn't served". To fix it, set a free port in `.env` and
+run `install.sh` again.
 
 ## First run
 

@@ -417,6 +417,7 @@ pub fn spawn(app: Arc<App>) -> Result<Running, String> {
         Ok(None) => None,
         Err(e) => {
             eprintln!("xbt-wallet-ui: the shared folder is not served: {e}");
+            *app.files_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
             None
         }
     };

@@ -5,8 +5,8 @@
 #
 #   packaging/linux/install.sh [--dir DIR] [--yes]
 #
-# It checks Docker and its Compose plugin, asks where your nodes are (an answer already in DIR/.env,
-# or an LS_* variable in the environment, is the default), writes DIR/docker-compose.yml and DIR/.env
+# It checks Docker and its Compose plugin, asks where your nodes are (an LS_* variable in the
+# environment, else an answer already in DIR/.env, is the default), writes DIR/docker-compose.yml and DIR/.env
 # (mode 600), has your Lightning node bake the app's narrow macaroons from your admin macaroon (read
 # here and passed on standard input: it is never written anywhere), and starts the app. --yes takes
 # every default without asking. Nothing is downloaded but the app's pinned images.
@@ -50,10 +50,15 @@ esac
 # an existing .env is the default for every answer (an update keeps your settings)
 if [ -f "$DIR/.env" ]; then
   say "keeping the settings in $DIR/.env as defaults"
+  # an LS_* setting given to this run in the environment wins over the one .env holds (an unattended
+  # update that turns something on, or moves a port)
+  given=$(for v in $(compgen -e | grep -E '^LS_'); do declare -p "$v"; done)
+  kept=$(grep -oE '^LS_[A-Z0-9_]+=' "$DIR/.env" | tr -d =)
   set -a
   # shellcheck source=/dev/null
   . "$DIR/.env"
   set +a
+  eval "$given"
 fi
 
 ask() { # VAR "question" default
@@ -154,7 +159,7 @@ case $LS_CHAIN in
 esac
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-lightning-stream}
 LS_UI_PORT=${LS_UI_PORT:-8482} LS_MCP_PORT=${LS_MCP_PORT:-33511} LS_CONNECTOR_PORT=${LS_CONNECTOR_PORT:-8484} LS_APP_PORTS=${LS_APP_PORTS:-33521,33522,33523,33524}
-LS_GW_PORT=${LS_GW_PORT:-8402} LS_HASHTAKER_CONTROL_PORT=${LS_HASHTAKER_CONTROL_PORT:-23343}
+LS_GW_PORT=${LS_GW_PORT:-8402} LS_HASHTAKER_CONTROL_PORT=${LS_HASHTAKER_CONTROL_PORT:-23343} LS_FILES_PORT=${LS_FILES_PORT:-8486}
 LS_RELAYS=${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol} LS_LAN_HOST=${LS_LAN_HOST:-}
 
 # --- 3. the files -------------------------------------------------------------------------------------
@@ -165,18 +170,23 @@ mkdir -p "$LS_DATA_DIR"
   umask 077
   {
     echo "# Lightning Stream: written by install.sh on $(date -u +%Y-%m-%d). It holds passwords: keep it private."
-    for k in COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT LS_NODE_RPC_USER \
-             LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_VPN LS_VPN_PORT LS_VPN_ENDPOINT LS_VPN_REGION LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER \
-             LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_APP_PORTS LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS; do
-      v=${!k:-}
-      case $v in *"'"*) die "$k may not contain a single quote" ;; esac
-      # a plain value as it is, so what you read is what you type (the random password is one); any other in
-      # single quotes, which Compose and the shell both take as they are ($ and spaces included)
-      if plain "$v"; then
-        printf "%s=%s\n" "$k" "$v"
-      else
-        printf "%s='%s'\n" "$k" "$v"
-      fi
+    line() { # KEY: a plain value as it is, so what you read is what you type (the random password is one);
+      # any other in single quotes, which Compose and the shell both take as they are ($ and spaces included)
+      local v=${!1:-}
+      case $v in *"'"*) die "$1 may not contain a single quote" ;; esac
+      if plain "$v"; then printf "%s=%s\n" "$1" "$v"; else printf "%s='%s'\n" "$1" "$v"; fi
+    }
+    asked=" COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT
+            LS_NODE_RPC_USER LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_VPN LS_VPN_PORT LS_VPN_ENDPOINT LS_VPN_REGION
+            LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_APP_PORTS
+            LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS LS_FILES_PORT "
+    for k in $asked; do line "$k"; done
+    # and every other setting the app's compose file reads, or the old .env held (one added by hand, or by a
+    # later version), when it is set: an update keeps it, and one given to this run is written
+    for k in $( { grep -oE '\$\{LS_[A-Z0-9_]+' "$HERE/docker-compose.yml" | cut -c3-; echo "${kept:-}"; } | sort -u); do
+      case $asked in *[[:space:]]"$k"[[:space:]]*) continue ;; esac
+      case $k in LS_SKIP_PULL | LS_ADMIN_MACAROON | LS_BITCOIN_CONF) continue ;; esac
+      if [ -n "${!k+x}" ]; then line "$k"; fi
     done
   } > "$DIR/.env.tmp"
   mv "$DIR/.env.tmp" "$DIR/.env"
@@ -234,6 +244,15 @@ for _ in $(seq 90); do
   sleep 2
 done
 [ "$h" = healthy ] || die "the app's page did not come up; see: docker compose -f $DIR/docker-compose.yml logs ui"
+
+# the shared folder of a Files service is served on 127.0.0.1:LS_FILES_PORT, and answers / with 204: another
+# program on that port keeps it from the app, and would answer buyers in its place
+files=$( { exec 3<>"/dev/tcp/127.0.0.1/$LS_FILES_PORT" && printf 'GET / HTTP/1.0\r\n\r\n' >&3 && timeout 5 head -1 <&3; } 2>/dev/null | tr -d '\r' || true)
+case $files in
+  "HTTP/1."?" 204"*) ;;
+  "") echo "install: warning: nothing serves the Files folder on 127.0.0.1:$LS_FILES_PORT (docker compose -f $DIR/docker-compose.yml logs ui says why)" >&2 ;;
+  *) echo "install: warning: another program uses 127.0.0.1:$LS_FILES_PORT, so the app cannot serve the Files folder there. Set LS_FILES_PORT in $DIR/.env to a free port and run install.sh again (or stop that program)" >&2 ;;
+esac
 
 cat <<EOF
 
