@@ -672,7 +672,7 @@ impl Signer {
                 // not paid. An invoice the checks refused, or a payment that failed, leaves the win open for the seller's
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
                 let retry = rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
-                    | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
+                    | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled" | "ticket_session");
                 // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
                 // the same invoice is good the next time the seller lists it
                 let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_unavailable");
@@ -699,8 +699,20 @@ impl Signer {
                         s.owed.push(w);
                     }
                 } else {
-                    c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
+                    // the session stopped (its caller, a fault), or the owner's bounds, or the wallet's node (one just
+                    // started is not on its chain yet): this call asks for no more. Nothing was booked or sent, so the
+                    // win is owed again, with its invoice, for a later call of the session: a win left handed has no
+                    // payer, and its seller would refuse every later call for it (`win_unpaid`)
+                    if rule == "ticket_session" {
+                        c.stop.get_or_insert("ticket_session: the session was stopped".to_string());
+                    } else {
+                        c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
+                    }
                     c.halt = true;
+                    s.tried.remove(&invoice_mark(invoice));
+                    if let Some((w, _)) = s.handed.remove(&win.draw()) {
+                        s.owed.push(w);
+                    }
                 }
             }
         }
