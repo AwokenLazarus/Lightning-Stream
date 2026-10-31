@@ -3858,6 +3858,27 @@ fn wait_for_long(what: &str, most: Duration, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// A refill whose sends come back with no word from the node, on a node whose every question then takes 30 s: the refill asks
+/// after them with no lock held, so the releases beside it go on, and the answer ends at its deadline with the pool released.
+#[test]
+fn a_refill_asking_a_slow_node_after_its_sends_holds_up_no_release() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 12}}));
+    first_call_with_the_pool_shown(&r);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(120);
+        s.lookup_takes = Duration::from_secs(30);
+    }
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
+    assert!(t0.elapsed() < Duration::from_secs(20), "{:?} {v}", t0.elapsed());
+    assert_eq!(r.tap.secrets().len(), 8, "every ticket the pool held was released beside the refill: {v}");
+    assert_nothing_leaves_after(&r, &v);
+    r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
+}
+
 /// A seller slow with its 402: the ask gets what is left of the call's deadline.
 #[test]
 fn a_seller_slow_with_its_402_is_a_plain_answer_inside_the_calls_deadline() {
