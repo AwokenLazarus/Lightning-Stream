@@ -41,7 +41,7 @@
 #            sha256 the file's, the money agreeing. long_download_relay (by name only): the same
 #            from a relay-only shop, through our relay
 #   paused_player  a player paused past what the app gives a client that takes nothing: it loses its
-#            connection after about 90 s (measured), and asks again by Range from where it was. The file
+#            connection after 60 to 90 s (measured), and asks again by Range from where it was. The file
 #            whole, the money agreeing
 #   jellyfin (by name only) a seller's whole web app: the real Jellyfin web client in Chrome,
 #            through the wallet app's app port, the connector and the signer, to a gateway that

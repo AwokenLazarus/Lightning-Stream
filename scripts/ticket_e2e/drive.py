@@ -1796,8 +1796,8 @@ class RangeFiles(BaseHTTPRequestHandler):
 
 
 def paused_player() -> None:
-    """A player paused with its buffer full, past what the app gives a client that takes nothing (about
-    90 s, three writes of 30 s): its connection ends and the wallet stops paying for that answer. Going on, it asks again from
+    """A player paused with its buffer full, past what the app gives a client that takes nothing (60 to
+    90 s, two or three writes of 30 s): its connection ends and the wallet stops paying for that answer. Going on, it asks again from
     where it was, by `Range`: the file comes whole between the two answers, its sha256 the file's, and
     the money agrees, the seller paid for the bytes and what was on its way, less than two tickets more."""
     want = huge_file()
@@ -1888,8 +1888,8 @@ def paused_player() -> None:
     inv["same_tickets"] = paid == settled
     price_msat = -(-HUGE * HUGE_BYTE_MSAT // PER_BYTES)
     paid_for = price_msat <= m["seller_node_received_msat"] < price_msat + 2 * TICKET_MSAT
-    check("paused_player: a player paused past the 90 s or so the app gives a client that takes nothing loses its connection, and asking again by Range from where it was gets the rest: the file whole, its sha256 the file's, the money agreeing, the seller paid for its bytes and less than two tickets more",
-          first_status == 200 and bool(first_end) and 60 <= cut_after <= 120 and second_status == 206 and not second_end and got == HUGE and digest.hexdigest() == want and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+    check("paused_player: a player paused past the 60 to 90 s the app gives a client that takes nothing loses its connection, and asking again by Range from where it was gets the rest: the file whole, its sha256 the file's, the money agreeing, the seller paid for its bytes and less than two tickets more",
+          first_status == 200 and bool(first_end) and 45 <= cut_after <= 120 and second_status == 206 and not second_end and got == HUGE and digest.hexdigest() == want and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
           {"first": first_status, "first_end": first_end, "cut_after_s": cut_after, "second": second_status, "second_end": second_end, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "price_msat": price_msat, **inv, "money": m})
     PROCS["gateway-range"].terminate()
     PROCS["gateway-range"].wait(10)

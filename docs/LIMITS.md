@@ -936,10 +936,10 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   after 10 minutes, and the answer is reported as cut. An owner who runs such models raises
   `tickets.stream_floor_after_s`. An answer the wallet ends early, for any reason, reaches the client cut short
   (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
-- A client that takes nothing for about 90 s, such as a player paused with its buffer full, loses its
+- A client that takes nothing for 60 to 90 s, such as a player paused with its buffer full, loses its
   connection, and the wallet stops paying for that answer. (Each write has 30 s, `stream_write`; a
-  stalled socket still takes a little at each of the first two, so it is the third that fails:
-  measured on Linux loopback, 9 s for a 3 s limit.) What was on its way when it stopped is paid for. A
+  stalled socket may still take a little at the first ones, so it is the second or third that fails:
+  measured on Linux loopback, 61 s through the app, and 9 s for a bare socket with a 3 s limit.) What was on its way when it stopped is paid for. A
   player that can seek resumes by asking again from where it was (`Range`).
 - A session of draws takes one answer at a time, and one streamed on may run for hours. Another call
   to that seller is told `ticket_busy` once that answer has been open 30 s, at once from then on, and
@@ -947,7 +947,7 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   already drawn are still paid. The stop itself returns within about 45 s at worst: up to 15 s for
   the answer's end, and up to about 30 s to tell a quiet seller.
 - With a client stalled on a stream priced by the second on draws, values go on being given for its
-  seconds until the client's connection is given up on, about 90 s.
+  seconds until the client's connection is given up on, 60 to 90 s.
 - An answer with no length stated (chunked) gets its last chunk only once the wallet says it came
   whole, which takes the seller's last receipt: up to about 10 s after its last byte.
   A WebSocket has its own limit, `tickets.max_socket_s` (6 hours, as the gateway's): a web app keeps
