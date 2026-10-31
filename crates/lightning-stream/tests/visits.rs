@@ -71,6 +71,11 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                     let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 502, "charged_sats": ticket, "complete": false}}));
                     return;
                 }
+                // a seller that has not answered yet: the call holds a handler slot of the connector, waiting
+                if url.contains("/hang/") {
+                    std::thread::sleep(std::time::Duration::from_secs(120));
+                    return;
+                }
                 // the session's credit, or a ticket where the call may spend one
                 let charged = {
                     let mut s = session.lock().unwrap();
@@ -449,4 +454,25 @@ fn stopping_a_visit_shuts_its_open_answers() {
     }
     let (_, body) = reading.join().unwrap();
     assert!(!body.ends_with(b"0\r\n\r\n"), "an answer ended by a stop reached the page as whole");
+}
+
+/// A stop goes past the connector's handler slots: with every one of them held by requests stuck on a
+/// seller, it still answers at once, and the visit is stopped.
+#[test]
+fn a_visit_stops_with_every_handler_slot_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, _session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 100_000);
+    for i in 0..20 {
+        let (addr, visit) = (addr.clone(), visit.clone());
+        std::thread::spawn(move || raw(&addr, &format!("/v/{visit}/hang/{i}"), ""));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let at = std::time::Instant::now();
+    let (st, _, b) = ask(&addr, "POST", &format!("/visits/{visit}/stop"), "", b"");
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+    assert!(at.elapsed() < std::time::Duration::from_secs(2), "the stop waited {:?} behind the stuck requests", at.elapsed());
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["ended"], "Stopped.", "{v}");
 }

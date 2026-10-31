@@ -221,6 +221,12 @@ impl Connector {
 }
 
 impl Handler for Connector {
+    /// Stopping a visit goes past the handler slots: requests stuck on a seller hold them, and the stop
+    /// is what frees the buyer of those.
+    fn urgent(&self, req: &Request) -> bool {
+        req.method == "POST" && req.target.starts_with("/visits/") && req.target.ends_with("/stop")
+    }
+
     fn body_limit(&self, _m: &str, t: &str) -> usize {
         if t.starts_with("/v/") {
             visit::MAX_BODY

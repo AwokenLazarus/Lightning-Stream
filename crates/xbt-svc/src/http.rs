@@ -206,6 +206,11 @@ pub trait Handler: Send + Sync {
     /// The largest body accepted for this request line. A larger Content-Length is 413 before any
     /// body byte is read.
     fn body_limit(&self, method: &str, target: &str) -> usize;
+    /// A request that takes no handler slot: quick by its nature, and able to end what holds the slots
+    /// (a stop), so that it does not wait behind them.
+    fn urgent(&self, _req: &Request) -> bool {
+        false
+    }
     fn handle(&self, req: Request) -> Response;
     /// [`Handler::handle`] for a handler that streams some of its answers.
     fn reply(&self, req: Request) -> Reply {
@@ -592,7 +597,7 @@ fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &
     req.peer = peer;
     let head_only = req.method.eq_ignore_ascii_case("HEAD");
     let r = {
-        let _pass = gate.enter();
+        let _pass = (!handler.urgent(&req)).then(|| gate.enter());
         // a panicking handler costs its request, and its slot is given back
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.reply(req)))
             .unwrap_or_else(|_| Reply::Whole(Response::text(500, "text/plain", "handler panicked")))

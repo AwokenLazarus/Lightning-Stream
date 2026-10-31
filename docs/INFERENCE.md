@@ -63,6 +63,11 @@ paid for twice. If a seller stops mid-answer, your program gets what arrived, pa
 and a streamed answer ends with an error event (`"code": "answer_cut"`). Whether to ask again is the
 program's choice.
 
+A long answer must keep arriving. After its first 10 minutes it must bring 16 KiB in every 30 s the
+wallet waits on the seller (546 bytes a second). A fast model never comes near that, but a slow CPU
+model at 3 or 4 tokens a second does: its answer is cut at that point, and reported as cut. The
+wallet's owner changes when this starts with `tickets.stream_floor_after_s` in its policy.
+
 ## What you pay
 
 Each request is one purchase through the signer, like any other buy in the app:

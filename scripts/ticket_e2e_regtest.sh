@@ -37,11 +37,12 @@
 #            nothing the seller took that the wallet has not booked, nothing paid twice, and the
 #            next call pays or says why not
 #   long_download  a 320 MB download through the connector, which streams it on as it is paid
-#            for, with the wallet's limit for an answer read whole set to 3 s: it comes whole, its
+#            for, with the wallet's limit for an answer read whole set to 2 s: it comes whole, its
 #            sha256 the file's, the money agreeing. long_download_relay (by name only): the same
 #            from a relay-only shop, through our relay
-#   paused_player  a player paused past the 90 s or so the app gives a client that takes nothing: it loses
-#            its connection, and asks again by Range from where it was. The file whole, the money agreeing
+#   paused_player  a player paused past what the app gives a client that takes nothing: it loses its
+#            connection after about 90 s (measured), and asks again by Range from where it was. The file
+#            whole, the money agreeing
 #   jellyfin (by name only) a seller's whole web app: the real Jellyfin web client in Chrome,
 #            through the wallet app's app port, the connector and the signer, to a gateway that
 #            gives each buyer a Jellyfin account of their own, sold by the byte on these nodes: one

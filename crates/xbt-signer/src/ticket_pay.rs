@@ -1768,10 +1768,10 @@ struct Mark {
 /// a download, an AI stream): as long as it delivers. Any other is read whole for a caller that waits
 /// 60 s for it; and one priced by the second is held to that too, streamed or not, since its clock
 /// bills whether bytes come or not.
-fn open_limit(tp: &TicketPolicy, socket: bool, streamed: bool, price: &Price) -> (i64, &'static str) {
+fn open_limit(tp: &TicketPolicy, socket: bool, streamed: bool, by_the_second: bool) -> (i64, &'static str) {
     if socket {
         (tp.max_socket_s, "max_socket_s")
-    } else if streamed && price.second_msat == 0 {
+    } else if streamed && !by_the_second {
         (tp.max_stream_s, "max_stream_s")
     } else {
         (tp.max_answer_s, "max_answer_s")
@@ -4356,7 +4356,7 @@ impl Signer {
             let length = ans.length;
             let ended = match &not_read {
                 Some(why) => Some(format!("not read: {why}")),
-                None => read_all(ans, &mut sink),
+                None => self.read_paid_at_head(hs, ans, &mut sink),
             };
             let complete = ended.is_none() && length.is_none_or(|n| n == sink.bytes);
             let digest_now = hex::encode(sink.hash.clone().finalize());
@@ -4403,6 +4403,72 @@ impl Signer {
         out
     }
 
+    /// The body of an answer paid for at its head: nothing more is paid for it, but a seller that
+    /// holds it open holds the call, and the session with its locked tickets, with it. So it has the
+    /// limits of any other answer ([`open_limit`], [`Progress`]), a stop ends it whatever the seller
+    /// is doing, and its session is marked as used. `Some`: why it ended early.
+    fn read_paid_at_head(&self, hs: &Arc<HttpSession>, ans: WireAnswer, sink: &mut Sink) -> Option<String> {
+        let tp = self.ticket_policy();
+        let (open_s, limit) = open_limit(&tp, false, sink.out.is_some(), false);
+        let max_open = Duration::from_secs(open_s.clamp(1, 86_400) as u64);
+        let mut progress = Progress::new(&tp, limit);
+        let length = ans.length;
+        let closer = ans.closer;
+        let mut body = ans.body;
+        let done = AtomicBool::new(false);
+        let (opened, mut touched) = (Instant::now(), Instant::now());
+        std::thread::scope(|scope| {
+            if let Some(close) = &closer {
+                let done = &done;
+                scope.spawn(move || loop {
+                    if done.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if hs.ending.load(Ordering::SeqCst) {
+                        close();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                });
+            }
+            let mut buf = vec![0u8; 64 << 10];
+            let ended = loop {
+                if hs.ending.load(Ordering::SeqCst) {
+                    break Some("ticket_session: the session was stopped".to_string());
+                }
+                if opened.elapsed() >= max_open {
+                    break Some(format!("{limit}: the answer has been open for {} s", max_open.as_secs()));
+                }
+                if touched.elapsed() >= Duration::from_secs(crate::ticket_rail::TOUCH_EVERY_S) {
+                    touched = Instant::now();
+                    *lock(&hs.used) = self.engine.now();
+                    self.session_touch(&hs.sid);
+                }
+                let asked = Instant::now();
+                let n = match body.read(&mut buf) {
+                    Ok(0) => break length.filter(|l| *l != sink.bytes).map(|l| format!("cut short: {} of {l} bytes", sink.bytes)),
+                    Ok(n) => n,
+                    // a stop shuts the connection: said as the stop, not as the seller's doing
+                    Err(_) if hs.ending.load(Ordering::SeqCst) => break Some("ticket_session: the session was stopped".to_string()),
+                    Err(e) => break Some(format!("cut short: {:?}", e.kind())),
+                };
+                let slow = progress.read(asked.elapsed(), n as u64);
+                sink.put(&buf[..n]);
+                if sink.gone {
+                    break Some(READER_GONE.into());
+                }
+                if sink.passed {
+                    break Some(PASSED_SHOWN.into());
+                }
+                if slow.is_some() {
+                    break slow;
+                }
+            };
+            done.store(true, Ordering::SeqCst);
+            ended
+        })
+    }
+
     /// The body of an answer that is priced as it goes: read as it arrives, a ticket released each
     /// time the balance no longer covers the next piece, and stopped (the connection closed) when
     /// the book refuses a release or the call's `max_sats` is used up. Then the seller's last
@@ -4421,7 +4487,7 @@ impl Signer {
         // is known, cut or not
         let mut counts_read = false;
         let tp = self.ticket_policy();
-        let (open_s, limit) = open_limit(&tp, up_writer.is_some(), sink.out.is_some(), price);
+        let (open_s, limit) = open_limit(&tp, up_writer.is_some(), sink.out.is_some(), price.second_msat > 0);
         let st = Stream { price: *price, base_spent: mark.base_spent, started, max_msat, max_open: Duration::from_secs(open_s.clamp(1, 86_400) as u64), limit };
         // what this answer has drawn past its head, by this count: added to the session's as it grows, and taken off
         // what the request may still add to the seller's spend ([`Money::open`])

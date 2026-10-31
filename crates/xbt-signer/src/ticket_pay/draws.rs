@@ -44,6 +44,9 @@ const DONE_WAIT: Duration = Duration::from_secs(60);
 /// How long a call waits behind an answer open on its session of draws: under the 60 s a caller of
 /// the signer's socket waits.
 const QUEUE_WAIT: Duration = Duration::from_secs(50);
+/// An answer open this long may run for hours: a call behind it is told at once, and does not hold
+/// its caller, and a handler of the connector's, for [`QUEUE_WAIT`].
+const LONG_HOLD: Duration = Duration::from_secs(30);
 /// How long a stop waits for the answer open on its session of draws to end.
 const STOP_WAIT: Duration = Duration::from_secs(15);
 
@@ -137,6 +140,8 @@ pub(crate) struct DrawSession {
     busy: Mutex<()>,
     /// A stop has begun: the answer open now ends here, no new value is given, and no new request starts.
     ending: AtomicBool,
+    /// When the answer open now started: a call behind one open a while is told at once ([`LONG_HOLD`]).
+    answer_since: Mutex<Option<Instant>>,
     link: Mutex<Link>,
     state: Mutex<State>,
     /// The wallet's clock at the last paid request.
@@ -155,8 +160,9 @@ impl DrawSession {
     }
 }
 
-/// The session's turn, within `wait`.
-fn turn_of(ds: &DrawSession, wait: Duration) -> Option<MutexGuard<'_, ()>> {
+/// The session's turn, within `wait`. `behind_answer`: a call, which gives up at once on an answer
+/// that has been open past [`LONG_HOLD`]; a stop waits its time out.
+fn turn_of(ds: &DrawSession, wait: Duration, behind_answer: bool) -> Option<MutexGuard<'_, ()>> {
     let until = Instant::now() + wait;
     loop {
         match ds.busy.try_lock() {
@@ -164,7 +170,8 @@ fn turn_of(ds: &DrawSession, wait: Duration) -> Option<MutexGuard<'_, ()>> {
             Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
-        if Instant::now() >= until {
+        let long = behind_answer && lock(&ds.answer_since).is_some_and(|t| t.elapsed() >= LONG_HOLD);
+        if long || Instant::now() >= until {
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -267,7 +274,7 @@ impl Signer {
             let out = {
                 // one answer at a time on a session of draws, and one streamed on may run for hours: a call behind it is
                 // told so, in the time a caller waits, and not left queued
-                let Some(_busy) = turn_of(&ds, QUEUE_WAIT) else {
+                let Some(_busy) = turn_of(&ds, QUEUE_WAIT, true) else {
                     return Tried::Done(refused("ticket_busy", "another answer from this seller is open on a session of draws, which takes one at a time: call again when it ends"));
                 };
                 if ds.ending.load(Ordering::SeqCst) {
@@ -300,7 +307,7 @@ impl Signer {
         }
         let sid = str_or_empty(o.get("session"));
         let win_msat = crate::ticket::outside_u64(o.get("win_msat")).unwrap_or(0);
-        let ds = Arc::new(DrawSession { origin: c.origin.into(), sid: sid.clone(), task, terms: terms.clone(), win_msat, base, busy: Mutex::new(()), ending: AtomicBool::new(false),
+        let ds = Arc::new(DrawSession { origin: c.origin.into(), sid: sid.clone(), task, terms: terms.clone(), win_msat, base, busy: Mutex::new(()), ending: AtomicBool::new(false), answer_since: Mutex::new(None),
                                         link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                         state: Mutex::new(State::default()), used: Mutex::new(self.engine.now()) });
         let give_up = |why: String| {
@@ -420,7 +427,7 @@ impl Signer {
         // said before any lock: the answer open now sees it, and ends
         ds.ending.store(true, Ordering::SeqCst);
         // its wins already drawn are paid as it ends; a stop does not wait on that past STOP_WAIT
-        let _busy = turn_of(&ds, STOP_WAIT);
+        let _busy = turn_of(&ds, STOP_WAIT, false);
         Some(self.draw_stop(&ds, "stopped by the caller", true))
     }
 
@@ -896,7 +903,7 @@ impl Signer {
         let tp = self.ticket_policy();
         let piece_bytes = ds.terms.piece_bytes.max(1);
         let by_bytes = price.byte_msat > 0;
-        let (open_s, limit) = super::open_limit(&tp, false, sink.out.is_some(), price);
+        let (open_s, limit) = super::open_limit(&tp, false, sink.out.is_some(), price.second_msat > 0);
         let max_open = Duration::from_secs(open_s.clamp(1, 86_400) as u64);
         let mut progress = super::Progress::new(&tp, limit);
         let luck_cap = lottery::luck_cap_msat(max_msat, ds.win_msat, tp.lottery.luck_tenths.max(0) as u64);
@@ -920,6 +927,7 @@ impl Signer {
             lock(&shared).pending.push(piece(Kind::Request, 0, price.request_msat));
         }
         let head_at = Instant::now();
+        *lock(&ds.answer_since) = Some(head_at);
         let stop_now = |why: String| {
             lock(counted).stop.get_or_insert(why);
         };
@@ -1070,9 +1078,16 @@ impl Signer {
                 drop(s);
                 wake.notify_all();
             };
+            let mut touched = Instant::now();
             loop {
                 if stopped() || mismatch.is_some() {
                     break;
+                }
+                // an answer that brings no win for a while still uses its session: the book must not take it for idle
+                if touched.elapsed() >= Duration::from_secs(crate::ticket_rail::TOUCH_EVERY_S) {
+                    touched = Instant::now();
+                    *lock(&ds.used) = self.engine.now();
+                    self.lottery_touch(&ds.sid);
                 }
                 if head_at.elapsed() >= max_open {
                     stop_now(format!("{limit}: the answer has been open for {} s", max_open.as_secs()));
@@ -1145,6 +1160,7 @@ impl Signer {
             lock(&shared).done = true;
             wake.notify_all();
         });
+        *lock(&ds.answer_since) = None;
         // the connection is closed here: a seller that was still sending stops within its window
         drop(body);
         // wins the seller had sent no invoice for: it is asked for its list, a few times, and what it lists is paid

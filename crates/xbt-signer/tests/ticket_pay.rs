@@ -205,6 +205,21 @@ impl Handler for Service {
             // a seller that holds an answer open a byte at a time, each inside the wallet's wait for the next
             return stream(n, None, body(n, 1, Duration::from_millis(300)));
         }
+        if let Some(n) = sized("/hottrickle/") {
+            // at the price of /hot/ (a win in every fourth piece or so): 64 KiB every 100 ms
+            return stream(n, None, body(n, 64 << 10, Duration::from_millis(100)));
+        }
+        if let Some(n) = sized("/stallpieces/") {
+            // n bytes at the draws' price, then nothing for a minute
+            return stream(n, None, Box::new(move |out| {
+                out.send(&(0..n).map(pattern).collect::<Vec<u8>>())?;
+                std::thread::sleep(Duration::from_secs(60));
+                Ok(())
+            }));
+        }
+        if let Some(n) = sized("/dearbytes/") {
+            return stream(n, None, body(n, 1 << 10, Duration::ZERO));
+        }
         if let Some(n) = sized("/stall/") {
             // a seller that sends n bytes, with no length stated, and then nothing more for a minute
             return stream(n, None, Box::new(move |out| {
@@ -306,6 +321,10 @@ fn routes() -> Value {
         {"path": "/drip/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/tricklepieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
         {"path": "/drippieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
+        {"path": "/stallpieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
+        {"path": "/hottrickle/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
+        // 250 sat a KiB: a ticket of 1,000 sat pays for 4 KiB, well under the floor of a stream
+        {"path": "/dearbytes/", "price": {"byte_msat": 250_000, "per_bytes": 1024}},
         {"path": "/keepalive/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/stall/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/timed/", "price": {"second_msat": 400_000}},
@@ -1860,6 +1879,186 @@ fn a_stream_that_reaches_max_stream_s_is_ended_there() {
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+/// The numbers of the values the wallet has given the seller on its sessions of draws so far.
+fn values_given(r: &Rig) -> std::collections::HashSet<u64> {
+    r.tap.seen("/x402/lottery/draw").iter()
+        .filter_map(|s| serde_json::from_str::<Value>(&s.body).ok())
+        .flat_map(|v| v["values"].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v["draw"].as_u64())
+        .collect()
+}
+
+/// A stream on draws that delivers for long is using its session whether a win comes or not: past
+/// a real 30 s it has marked the session used, so the book does not stop it as idle ten minutes after
+/// the session's last win, the wins after that are paid, and the seller is not faulted for them.
+#[test]
+fn a_stream_on_draws_keeps_its_session_though_no_win_comes_for_ten_minutes() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    // the seller's grace is long, so that the clock's jump is not what stops the seller
+    let shop = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 100_000, "pay_wait_secs": 5}});
+    let r = Rig::shipped(json!({"tickets": {"lottery": {"min_expected_wins": 0}}}), 30, shop);
+    let first = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{PIECE}")), "max_sats": 1_000, "task": "film"}));
+    assert_eq!(first["rail"], "lottery", "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
+    let state = || r.status()["sessions"].as_array().unwrap().iter().find(|s| s["session"] == sid).map(|s| s["state"].as_str().unwrap_or("?").to_string()).unwrap_or_else(|| "gone".into());
+    let l = std::os::unix::net::UnixListener::bind(dir.path().join("dl-idle")).unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        all.len()
+    });
+    let n = 400 * PIECE;
+    std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/hottrickle/{n}")), "max_sats": 10_000, "task": "film", "stream_to": "dl-idle"})));
+        // past the touch of the answer, on real time
+        std::thread::sleep(Duration::from_millis(31_500));
+        assert!(!t.is_finished(), "the answer did not outlast the touch");
+        // ten minutes less the time since that touch: past them from the session's last win, within them from its touch
+        r.clock.fetch_add(590, Ordering::SeqCst);
+        r.tick();
+        assert_eq!(state(), "open", "the book stopped the session of an answer still delivering");
+        let out = t.join().unwrap();
+        assert_eq!((out["complete"].as_bool(), reader.join().unwrap()), (Some(true), n), "{out}");
+        assert_eq!(out["seller_fault"], Value::Null, "{out}");
+        assert_eq!(out["wins"], out["wins_paid"], "a win went unpaid: {out}");
+        assert!(out["wins_paid"].as_u64().unwrap() > 0, "{out}");
+        // 400 pieces of 16 sat by the wallet's count; its wins on every side of the money
+        assert_eq!(out["price_msat"].as_str(), Some("6400000"), "{out}");
+        assert_wins(&r, first["wins_paid"].as_u64().unwrap_or(0) + out["wins_paid"].as_u64().unwrap());
+    });
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A stop on draws while the seller says nothing: the wallet's read waits on the seller, so only the
+/// connection's closing can end it, and it does about at once. What arrived is what it cost.
+#[test]
+fn a_stop_ends_a_quiet_answer_on_draws_at_once() {
+    use std::io::Read as _;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = patient_seller(|| draws_rig(json!({"tickets": {"read_timeout_s": 120, "lottery": {"min_expected_wins": 0}}})));
+    let first = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{PIECE}")), "max_sats": 1_000, "task": "film"}));
+    let sid = first["session"].as_str().unwrap().to_string();
+    let l = std::os::unix::net::UnixListener::bind(dir.path().join("dl-quiet")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        (all.len(), Instant::now())
+    });
+    std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/stallpieces/{}", 4 * PIECE)), "max_sats": 5_000, "task": "film", "stream_to": "dl-quiet"})));
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!t.is_finished(), "the answer ended before the stop");
+        let at = Instant::now();
+        r.call("ticket_stop", json!({"session": sid}));
+        let (got, ended) = reader.join().unwrap();
+        let out = t.join().unwrap();
+        assert!(ended.duration_since(at) < Duration::from_millis(1500), "the body ended {:?} after the stop", ended.duration_since(at));
+        assert_eq!((got, out["complete"].as_bool()), (4 * PIECE, Some(false)), "{out}");
+        assert!(out["ended"].as_str().unwrap_or_default().contains("ticket_session"), "{out}");
+        assert_wins(&r, first["wins_paid"].as_u64().unwrap_or(0) + out["wins_paid"].as_u64().unwrap_or(0));
+    });
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// Past the first minutes of a stream, the floor counts only the time the wallet waits on the seller:
+/// a seller at the edge of its credit, waiting for a ticket being paid over a slow route, is not to
+/// blame for the bytes that do not come. Here 4 KiB a ticket, each ticket taking 1.5 s, against 16 KiB
+/// in each 3 s: it comes whole, each ticket paid.
+#[test]
+fn the_floor_does_not_count_the_time_a_ticket_is_being_paid() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::shipped(json!({"tickets": {"read_timeout_s": 3, "stream_floor_after_s": 0}}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(1500);
+    let n = 32 << 10;
+    let (v, got, took) = streamed_call(&r, dir.path(), "dl-dear", r.shop.url(&format!("/dearbytes/{n}")), 12_000, None);
+    assert_eq!((v["complete"].as_bool(), got), (Some(true), n), "{v}");
+    assert!(took > Duration::from_secs(6), "the tickets were paid too fast to test the floor: {took:?}");
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str()), (Some("8000000"), Some("8000000")), "{v}");
+    let (paid, taken, book, _) = r.money();
+    assert!(paid == taken && taken == book && paid >= 8_000_000, "{:?}", r.money());
+    r.assert_booked();
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A seller that holds an answer open after its signed head, a byte at a time: the answer was paid for
+/// at its head, and nothing more is paid, but it holds the call and the session's locked tickets. So it
+/// has the limits of any other answer, and a stop ends it. Its head's price is all it costs, on both sides.
+#[test]
+fn an_answer_paid_at_its_head_has_the_limits_of_any_other() {
+    use std::io::Read;
+    struct Drip(Box<dyn Read + Send>);
+    impl Read for Drip {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(300));
+            let n = buf.len().min(1);
+            self.0.read(&mut buf[..n])
+        }
+    }
+    let drip = |r: &Rig| r.tap.set(Box::new(|seen, real| {
+        if !(seen.paid && seen.path.starts_with("/page/")) {
+            return None;
+        }
+        let ans = real().ok()?;
+        Some(Ok(WireAnswer { status: ans.status, headers: ans.headers, length: ans.length, closer: ans.closer, body: Box::new(Drip(ans.body)) }))
+    }));
+    let page = 100_000;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    // too little in a span of the floor
+    let r = Rig::new(json!({"tickets": {"read_timeout_s": 2, "stream_floor_after_s": 0}}));
+    drip(&r);
+    let (v, got, took) = streamed_call(&r, dir.path(), "flat-floor", r.shop.url(&format!("/page/{page}")), CALL as u64, None);
+    assert!(v["ended"].as_str().unwrap_or("").contains("max_stream_s: fewer than") && got < 100, "{got}: {v}");
+    assert!(took < Duration::from_secs(15), "{took:?}");
+    assert_eq!((v["complete"].as_bool(), v["price_msat"].as_str()), (Some(false), Some("2500")), "{v}");
+    r.tap.clear();
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200), "the session goes on");
+    // the hard limit of a stream, and of an answer read whole
+    let r = Rig::new(json!({"tickets": {"max_stream_s": 2}}));
+    drip(&r);
+    let (v, _, _) = streamed_call(&r, dir.path(), "flat-cap", r.shop.url(&format!("/page/{page}")), CALL as u64, None);
+    assert!(v["ended"].as_str().unwrap_or("").contains("max_stream_s: the answer has been open"), "{v}");
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 2}}));
+    drip(&r);
+    let v = r.pay(&format!("/page/{page}"), CALL);
+    assert!(v["ended"].as_str().unwrap_or("").contains("max_answer_s: the answer has been open"), "{v}");
+    // a stop
+    let r = Rig::new(json!({}));
+    let sid = r.pay("/page/10", CALL)["session"].as_str().unwrap().to_string();
+    drip(&r);
+    let l = std::os::unix::net::UnixListener::bind(dir.path().join("flat-stop")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        Instant::now()
+    });
+    std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/page/{page}")), "max_sats": CALL, "task": "film", "stream_to": "flat-stop"})));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!t.is_finished());
+        let at = Instant::now();
+        r.call("ticket_stop", json!({"session": sid}));
+        let body_ended = reader.join().unwrap();
+        let out = t.join().unwrap();
+        assert!(body_ended.duration_since(at) < Duration::from_millis(1500), "the body ended {:?} after the stop", body_ended.duration_since(at));
+        assert_eq!(out["complete"], false, "{out}");
+        assert!(out["ended"].as_str().unwrap_or_default().contains("ticket_session"), "{out}");
+    });
+    r.tap.clear();
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
 /// A stop on a session of draws with an answer streaming: the answer ends about at once, past its
 /// value no new one is given, the stop does not wait on the answer's turn, and what was drawn is
 /// paid, one number on every side. While it runs, a call behind it is told, not queued for hours.
@@ -1883,14 +2082,28 @@ fn a_stop_ends_an_answer_streaming_on_draws_and_a_call_behind_it_is_told() {
     std::thread::scope(|sc| {
         let t = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/tricklepieces/{}", 1024 * PIECE)), "max_sats": 5_000, "task": "film", "stream_to": "dl-draws-stop"})));
         std::thread::sleep(Duration::from_millis(1500));
-        // behind it: refused within what a caller waits
+        // behind it: refused once the answer has been open a while, and at once after that
         let asked = Instant::now();
         let behind = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{PIECE}")), "max_sats": 1_000, "task": "film"}));
         assert_eq!(behind["rule"], "ticket_busy", "{behind}");
-        assert!(asked.elapsed() < Duration::from_secs(55), "{:?}", asked.elapsed());
+        assert!(asked.elapsed() < Duration::from_secs(35), "{:?}", asked.elapsed());
+        let asked = Instant::now();
+        let behind = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{PIECE}")), "max_sats": 1_000, "task": "film"}));
+        assert_eq!(behind["rule"], "ticket_busy", "{behind}");
+        assert!(asked.elapsed() < Duration::from_secs(5), "behind an answer open this long, told at once: {:?}", asked.elapsed());
         assert!(!t.is_finished(), "the answer did not outlive the wait behind it");
+        // the seller takes a second over each round from here, so that pieces wait for their values as the stop comes
+        r.tap.set(Box::new(|seen, _real| {
+            if seen.path == "/x402/lottery/draw" {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            None
+        }));
+        std::thread::sleep(Duration::from_millis(1500));
         let at = Instant::now();
         let stop = r.call("ticket_stop", json!({"session": sid}));
+        // what was on its way as the stop began has reached the tap by now
+        let given_at_stop = values_given(&r);
         let (got, body_ended) = reader.join().unwrap();
         let out = t.join().unwrap();
         assert!(body_ended.duration_since(at) < Duration::from_millis(1500), "the body ended {:?} after the stop", body_ended.duration_since(at));
@@ -1898,10 +2111,11 @@ fn a_stop_ends_an_answer_streaming_on_draws_and_a_call_behind_it_is_told() {
         assert_eq!(out["complete"], false, "{out}");
         assert!(out["ended"].as_str().unwrap_or_default().contains("ticket_session"), "{out}");
         assert_eq!(out["bytes"].as_u64(), Some(got as u64), "{out}");
+        r.tap.clear();
         // no value past the stop, and what was drawn is paid: node, seller, book and ledger
-        let drew = r.session(&sid)["draws"].clone();
         std::thread::sleep(Duration::from_millis(1000));
-        assert_eq!(r.session(&sid)["draws"], drew, "a value was given after the stop: {stop}");
+        let new: Vec<u64> = values_given(&r).difference(&given_at_stop).copied().collect();
+        assert!(new.is_empty(), "values {new:?} were given after the stop: {stop}");
         assert_wins(&r, first["wins_paid"].as_u64().unwrap_or(0) + out["wins_paid"].as_u64().unwrap_or(0));
     });
     std::env::remove_var("B2_STREAM_DIR");
@@ -1993,7 +2207,8 @@ fn a_seller_that_stalls_mid_answer_is_ended_by_the_read_timeout_and_charged_what
     let _g = env_lock();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("B2_STREAM_DIR", dir.path());
-    let r = Rig::new(json!({"tickets": {"read_timeout_s": 2}}));
+    // the seller waits on its service longer than the wallet waits on it: only the wallet's wait can end this
+    let r = patient_seller(|| Rig::new(json!({"tickets": {"read_timeout_s": 2}})));
     let l = UnixListener::bind(dir.path().join("dl-stall")).unwrap();
     let reader = std::thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
@@ -2004,9 +2219,9 @@ fn a_seller_that_stalls_mid_answer_is_ended_by_the_read_timeout_and_charged_what
     let started = Instant::now();
     let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/stall/{MIB}")), "max_sats": 5_000, "task": "film", "stream_to": "dl-stall"}));
     let got = reader.join().unwrap();
-    assert!(started.elapsed() < Duration::from_secs(30), "a stalled seller held the call {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(15), "a stalled seller held the call {:?}", started.elapsed());
     assert_eq!((v["complete"].as_bool(), got), (Some(false), MIB), "{v}");
-    assert!(!v["ended"].as_str().unwrap_or("").is_empty(), "the call does not say why it ended: {v}");
+    assert!(v["ended"].as_str().unwrap_or("").contains("cut short"), "the call does not say why it ended: {v}");
     // what arrived: 1 MiB at 200 sat a MiB, by both counts
     assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str()), (Some("200000"), Some("200000")), "{v}");
     r.assert_booked();

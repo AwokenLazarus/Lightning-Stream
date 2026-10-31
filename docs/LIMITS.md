@@ -932,7 +932,9 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   (`tickets.stream_floor_after_s`) a stream must also bring 16 KiB in each 30 s the wallet waits on
   its seller, which is far below any film; time the wallet holds it up itself (its reader stalled,
   a ticket being paid) does not count, and an AI model reasoning behind keep-alives is not cut for
-  those minutes. An answer the wallet ends early, for any reason, reaches the client cut short
+  those minutes. That floor, 546 bytes a second, does cut a slow CPU model at 3 or 4 tokens a second
+  after 10 minutes, and the answer is reported as cut. An owner who runs such models raises
+  `tickets.stream_floor_after_s`. An answer the wallet ends early, for any reason, reaches the client cut short
   (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
 - A client that takes nothing for about 90 s, such as a player paused with its buffer full, loses its
   connection, and the wallet stops paying for that answer. (Each write has 30 s, `stream_write`; a
@@ -940,8 +942,14 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   measured on Linux loopback, 9 s for a 3 s limit.) What was on its way when it stopped is paid for. A
   player that can seek resumes by asking again from where it was (`Range`).
 - A session of draws takes one answer at a time, and one streamed on may run for hours. Another call
-  to that seller waits up to 50 s behind it and is then told `ticket_busy`. A stop ends the open
-  answer at once and gives no new value; wins already drawn are still paid.
+  to that seller is told `ticket_busy` once that answer has been open 30 s, at once from then on, and
+  otherwise after 50 s at most. A stop ends the open answer at once and gives no new value; wins
+  already drawn are still paid. The stop itself returns within about 45 s at worst: up to 15 s for
+  the answer's end, and up to about 30 s to tell a quiet seller.
+- With a client stalled on a stream priced by the second on draws, values go on being given for its
+  seconds until the client's connection is given up on, about 90 s.
+- An answer with no length stated (chunked) gets its last chunk only once the wallet says it came
+  whole, which takes the seller's last receipt: up to about 10 s after its last byte.
   A WebSocket has its own limit, `tickets.max_socket_s` (6 hours, as the gateway's): a web app keeps
   one open while its page is.
 - An answer priced by the second is paid up to a fifth of a second early, and the wallet counts

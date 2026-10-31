@@ -1749,6 +1749,10 @@ def huge_file() -> str:
     return h.hexdigest()
 
 
+#: A TCP socket's states once the other side has closed or reset it (Linux's TCP_INFO, its first byte).
+TCP_PEER_GONE = (7, 8)
+
+
 class RangeFiles(BaseHTTPRequestHandler):
     """The service's files with byte ranges, as a media server gives them (the stock server has none)."""
 
@@ -1805,7 +1809,7 @@ def paused_player() -> None:
         LINK_ORIGINS.append(origin)
     WALLET_PROC.write_policy()
     os.makedirs(f"{RUN}/stream", exist_ok=True)
-    digest, got, first_status, second_status, first_end, second_end = hashlib.sha256(), 0, 0, 0, "", ""
+    digest, got, first_status, second_status, first_end, second_end, cut_after = hashlib.sha256(), 0, 0, 0, "", "", -1.0
     try:
         restart_signer()
         with open(f"{RUN}/connector-pause.log", "ab") as log:
@@ -1826,9 +1830,15 @@ def paused_player() -> None:
                 got += len(chunk)
                 digest.update(chunk)
                 if not paused and got >= 32 << 20:
-                    # the player's buffer is full: it takes nothing past what the app gives it
+                    # the player's buffer is full: it takes nothing until the app has given up on it, which the
+                    # socket's state shows (CLOSE_WAIT: the other side has closed) with bytes still unread
                     paused = True
-                    time.sleep(110)
+                    pause_at = time.monotonic()
+                    # (the response holds the socket: an answer with Connection: close leaves the connection object without it)
+                    held = resp.fp.raw._sock
+                    while time.monotonic() - pause_at < 150 and held.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 1)[0] not in TCP_PEER_GONE:
+                        time.sleep(0.5)
+                    cut_after = round(time.monotonic() - pause_at, 1)
             if resp.length:
                 first_end = f"short of its length by {resp.length} bytes"
         except (http.client.IncompleteRead, OSError) as e:
@@ -1869,8 +1879,8 @@ def paused_player() -> None:
     price_msat = -(-HUGE * HUGE_BYTE_MSAT // PER_BYTES)
     paid_for = price_msat <= m["seller_node_received_msat"] < price_msat + 2 * TICKET_MSAT
     check("paused_player: a player paused past the 90 s or so the app gives a client that takes nothing loses its connection, and asking again by Range from where it was gets the rest: the file whole, its sha256 the file's, the money agreeing, the seller paid for its bytes and less than two tickets more",
-          first_status == 200 and bool(first_end) and second_status == 206 and not second_end and got == HUGE and digest.hexdigest() == want and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
-          {"first": first_status, "first_end": first_end, "second": second_status, "second_end": second_end, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "price_msat": price_msat, **inv, "money": m})
+          first_status == 200 and bool(first_end) and 60 <= cut_after <= 120 and second_status == 206 and not second_end and got == HUGE and digest.hexdigest() == want and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {"first": first_status, "first_end": first_end, "cut_after_s": cut_after, "second": second_status, "second_end": second_end, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "price_msat": price_msat, **inv, "money": m})
     PROCS["gateway-range"].terminate()
     PROCS["gateway-range"].wait(10)
     server.shutdown()
