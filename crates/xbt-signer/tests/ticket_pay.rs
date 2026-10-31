@@ -2927,7 +2927,7 @@ fn a_seller_that_charges_past_the_calls_limit_is_stopped_and_said_so() {
     let price: u64 = v["price_msat"].as_str().unwrap_or("0").parse().unwrap();
     assert!(price > 20_000, "the seller charged past the limit here: {v}");
     let fault = v["seller_fault"].as_str().unwrap_or_default();
-    assert!(fault.contains(&format!("charged {price} msat")) && fault.contains("max_sats 20"), "{v}");
+    assert!(fault.contains(&format!("charged {price} msat")) && fault.contains("charge cap of 20 sat"), "{v}");
     assert_eq!(v["tickets_released"].as_u64(), Some(0), "the credit left paid it, and nothing more was released: {v}");
     assert!(price <= 1_000_000, "no more than the credit already released: {v}");
     let sid = v["session"].as_str().unwrap();
