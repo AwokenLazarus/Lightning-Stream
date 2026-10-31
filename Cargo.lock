@@ -5871,6 +5871,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "serde",
  "serde_json",
  "smoltcp",
  "tempfile",

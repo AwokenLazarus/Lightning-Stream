@@ -205,8 +205,19 @@ pub fn left_of(e: &io::Error) -> Option<u64> {
 
 /// What left the wallet for a call, by its answer: the tickets it released for the call
 /// (`charged_sats`: bought for it, or held as credit and spent on it), or nothing where it refused the
-/// call before paying (`verdict` deny). `None` where the answer says neither.
+/// call before paying (`verdict` deny). `None` where the answer says neither, and where it tells of a
+/// seller's fault or a payment with no final answer (`rule` ticket_seller_fault, `verdict` pending,
+/// a `seller_fault` or an `unconfirmed_release`): a ticket whose payment the seller holds unsettled is
+/// not in the answer's count, so that count may be less than what left.
 pub fn left_sats(v: &Value) -> Option<u64> {
+    let says = |k: &str| v.get(k).is_some_and(|x| !x.is_null());
+    if v.get("rule").and_then(Value::as_str) == Some("ticket_seller_fault")
+        || v.get("verdict").and_then(Value::as_str) == Some("pending")
+        || says("seller_fault")
+        || says("unconfirmed_release")
+    {
+        return None;
+    }
     match v.get("charged_sats") {
         Some(n) => n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())).or_else(|| n.as_i64().map(|i| i.max(0) as u64)),
         None => (v.get("verdict").and_then(Value::as_str) == Some("deny")).then_some(0),

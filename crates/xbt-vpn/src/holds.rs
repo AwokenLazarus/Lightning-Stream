@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 
 /// A day, for the daily caps.
 pub const DAY: Duration = Duration::from_secs(24 * 3600);
@@ -170,6 +170,23 @@ fn unix(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// What [`CheckGate`] keeps in its file. Any other shape (or a file that can't be read) is a bad
+/// file: the day's budget counts as spent.
+#[derive(Serialize, Deserialize)]
+struct GateFile {
+    /// The day's start and what has left the wallet for checks since (unix seconds, sats).
+    spent: (u64, u64),
+    /// Each exit's last check (unix seconds).
+    #[serde(default)]
+    last: HashMap<String, u64>,
+    /// Each operator's failed checks: the day's start and how many (unix seconds, count).
+    #[serde(default)]
+    fails: HashMap<String, (u64, u32)>,
+    /// The check paid for and not yet settled: the exit, its operator, and the day it was counted in.
+    #[serde(default)]
+    reserved: Option<(String, String, u64)>,
+}
+
 /// `slot`'s count, started again if its day is over (wall-clock seconds; a clock set back counts as
 /// no time passed).
 fn today_at(slot: &mut (u64, u32), now: u64) -> &mut u32 {
@@ -183,58 +200,68 @@ impl CheckGate {
     /// The gate kept in `file` (made if missing): what it holds is read back. A check reserved and
     /// never settled (the service stopped during it) is counted in full, and that exit not checked
     /// again that day.
-    /// A file that is there but can't be read or parsed does not start the budget again: the day's
-    /// budget counts as spent from now (no paid check until a day has passed), and the bad file is
-    /// kept beside it (`.bad`) for a look.
+    /// The gate kept in `file` (made if missing): what it holds is read back. A check reserved and
+    /// never settled (the service stopped during it) is counted in full, and that exit not checked
+    /// again that day. A file that is there but can't be read, or isn't a gate's (any other shape,
+    /// empty included), does not start the budget again: the day's budget counts as spent from now
+    /// (no paid check until a day has passed), and the bad file is kept beside it (`.bad`) for a look.
     pub fn load(file: &Path) -> CheckGate {
-        let v: Value = match std::fs::read(file).map(|b| serde_json::from_slice::<Value>(&b)) {
-            Ok(Ok(v)) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
-            bad => {
-                let why = match bad {
-                    Err(e) => e.to_string(),
-                    Ok(Err(e)) => e.to_string(),
-                    Ok(Ok(_)) => unreachable!(),
-                };
-                eprintln!("region checks: {} could not be read ({why}): no paid region check for a day", file.display());
-                let _ = std::fs::copy(file, file.with_extension("bad"));
-                let g = CheckGate { file: Some(file.to_path_buf()), spent: Some((unix(SystemTime::now()), CHECK_SATS_PER_DAY)), ..CheckGate::default() };
-                let _ = g.save();
-                return g;
-            }
-        };
-        let n = |v: &Value| v.as_u64().unwrap_or(0);
         let mut g = CheckGate { file: Some(file.to_path_buf()), ..CheckGate::default() };
-        if let Some(a) = v["spent"].as_array() {
-            g.spent = Some((n(&a[0]), a.get(1).map_or(0, n)));
-        }
-        for (id, at) in v["last"].as_object().into_iter().flatten() {
-            g.last.insert(id.clone(), n(at));
-        }
-        for (op, f) in v["fails"].as_object().into_iter().flatten() {
-            g.fails.insert(op.clone(), (n(&f[0]), f.get(1).map_or(0, n) as u32));
-        }
-        if let Some(r) = v["reserved"].as_array() {
-            // its most stays in the day's spend; the exit counts as checked
-            let id = r.first().and_then(Value::as_str).unwrap_or_default().to_string();
-            g.last.insert(id, r.get(2).map_or(0, n));
+        let kept: GateFile = match std::fs::read(file).map(|b| serde_json::from_slice::<GateFile>(&b)) {
+            Ok(Ok(kept)) => kept,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return g,
+            Err(e) => return g.spend_the_day(&e.to_string()),
+            Ok(Err(e)) => return g.spend_the_day(&e.to_string()),
+        };
+        g.spent = Some(kept.spent);
+        g.last = kept.last;
+        g.fails = kept.fails;
+        if let Some((id, _, day)) = kept.reserved {
+            // its most stays in the day's spend; the exit counts as checked when it was (kept), or
+            // from the day's start
+            g.last.entry(id).or_insert(day);
             let _ = g.save();
         }
         g
     }
 
-    fn save(&self) -> std::io::Result<()> {
-        let Some(file) = &self.file else { return Ok(()) };
-        let v = json!({"spent": self.spent.map(|(d, s)| json!([d, s])), "last": self.last,
-                       "fails": self.fails.iter().map(|(k, (d, c))| (k.clone(), json!([d, c]))).collect::<serde_json::Map<_, _>>(),
-                       "reserved": self.reserved.as_ref().map(|(id, op, d)| json!([id, op, d]))});
-        let tmp = file.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(v.to_string().as_bytes())?;
-            f.sync_all()?;
+    /// The gate's file could not be read (`why`): the day's budget counts as spent from now.
+    fn spend_the_day(mut self, why: &str) -> CheckGate {
+        if let Some(file) = &self.file {
+            eprintln!("region checks: {} could not be read ({why}): no paid region check for a day", file.display());
+            let _ = std::fs::copy(file, file.with_extension("bad"));
         }
-        std::fs::rename(&tmp, file)?;
+        self.spent = Some((unix(SystemTime::now()), CHECK_SATS_PER_DAY));
+        let _ = self.save();
+        self
+    }
+
+    /// Writes the gate to its file: whole (a file of its own, synced, then renamed over it), and
+    /// readable by this user only.
+    fn save(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRITES: AtomicU64 = AtomicU64::new(0);
+        let Some(file) = &self.file else { return Ok(()) };
+        let kept = GateFile {
+            spent: self.spent.unwrap_or((unix(SystemTime::now()), 0)),
+            last: self.last.clone(),
+            fails: self.fails.clone(),
+            reserved: self.reserved.clone(),
+        };
+        let body = serde_json::to_vec(&kept).map_err(std::io::Error::other)?;
+        // a name no other write shares
+        let tmp = file.with_extension(format!("{}-{}.tmp", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
+        let written = (|| {
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            f.write_all(&body)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, file)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written?;
         if let Some(dir) = file.parent() {
             std::fs::File::open(dir)?.sync_all()?;
         }
@@ -478,6 +505,16 @@ mod tests {
         assert!(!g.may("b", "op2", now + Duration::from_secs(60)));
         assert!(g.may("b", "op2", now + DAY + Duration::from_secs(60)), "a new day");
         assert!(f.with_extension("bad").exists(), "the bad file is kept for a look");
+        // files of any other shape: read as bad, never a panic, never an empty gate
+        for bad in [&b""[..], b"{}", b"{\"spent\":[]}", b"{\"spent\":[1]}", b"{\"spent\":null}", b"{\"spent\":\"x\"}",
+                    b"{\"spent\":[1,2],\"fails\":{\"op\":[1]}}", b"[1,2]"] {
+            let (_d, f) = gate_file("shape");
+            std::fs::write(&f, bad).unwrap();
+            let mut g = CheckGate::load(&f);
+            let shown = String::from_utf8_lossy(bad);
+            assert_eq!(g.spent_today(), CHECK_SATS_PER_DAY, "{shown}");
+            assert!(!g.may("b", "op2", now + Duration::from_secs(60)), "{shown}");
+        }
         // not a file at all
         let (d, _) = gate_file("gate");
         let dir = d.path().join("gate.json");
@@ -485,6 +522,44 @@ mod tests {
         let mut g = CheckGate::load(&dir);
         assert!(!g.may("b", "op2", now + Duration::from_secs(60)));
         assert!(g.reserve("b", "op2", now).is_err(), "and it can't be paid for either");
+    }
+
+    /// A check cut off between paying and counting keeps the time its exit was checked: that exit is
+    /// not paid to check again until a day after it, not a day after the budget's day began.
+    #[test]
+    fn a_check_cut_off_keeps_when_its_exit_was_checked() {
+        let (_d, f) = gate_file("gate");
+        let day_start = SystemTime::now();
+        let mut g = CheckGate::load(&f);
+        assert!(g.may("x", "op0", day_start));
+        g.reserve("x", "op0", day_start).unwrap();
+        g.settle(10, true, day_start);
+        let later = day_start + Duration::from_secs(5 * 3600);
+        assert!(g.may("a", "op", later));
+        g.reserve("a", "op", later).unwrap();
+        drop(g);
+        let mut g = CheckGate::load(&f);
+        // a new budget day, but less than a day since "a" was checked
+        let next = day_start + DAY + Duration::from_secs(3600);
+        assert!(!g.may("a", "op", next), "a was checked 20 h ago");
+        assert!(g.may("a", "op", later + DAY), "a day after its check");
+    }
+
+    /// The gate's file is this user's alone, and every write is whole: no file of a write is left
+    /// beside it.
+    #[test]
+    fn the_gate_file_is_private_and_written_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, f) = gate_file("gate");
+        let now = SystemTime::now();
+        let mut g = CheckGate::load(&f);
+        for id in ["a", "b"] {
+            g.reserve(id, "op", now).unwrap();
+            g.settle(100, true, now);
+        }
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        let names: Vec<_> = std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![f.file_name().unwrap().to_owned()], "only the gate itself");
     }
 
     /// A reservation that can't be written is not paid for: the gate says so, and counts nothing.

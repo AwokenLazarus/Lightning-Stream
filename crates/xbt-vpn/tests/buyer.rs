@@ -463,6 +463,9 @@ struct FakeWallet {
     asked: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     /// The sats that left it: the tickets it bought ([`fake_wallet_selling`]).
     left: Arc<std::sync::atomic::AtomicU64>,
+    /// A file to read as each call comes in (a region checks' gate), and what it held then.
+    watch: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    seen_on_call: Arc<std::sync::Mutex<Vec<String>>>,
     _dir: tempdir_lite::Dir,
 }
 
@@ -506,6 +509,8 @@ enum Ends {
     NeverOpens,
     /// It takes this long to open the tunnel (from no credit: buying the ticket first).
     OpensAfter(Duration),
+    /// It answers this (the call's `result`) before the tunnel opens, the ticket bought.
+    AnswersFirst(&'static str),
 }
 
 /// A wallet with no credit at the exit's shop, whose tickets are `ticket` sats: each tunnel buys
@@ -525,17 +530,22 @@ fn fake_wallet_full(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
     let carried = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
     let left = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let watch: Arc<std::sync::Mutex<Option<std::path::PathBuf>>> = Arc::new(std::sync::Mutex::new(None));
+    let seen_on_call = Arc::new(std::sync::Mutex::new(Vec::new()));
     let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    let (o, c, sdir, a, lt) = (opened.clone(), carried.clone(), streams.clone(), asked.clone(), left.clone());
+    let (o, c, sdir, a, lt, wt, so) = (opened.clone(), carried.clone(), streams.clone(), asked.clone(), left.clone(), watch.clone(), seen_on_call.clone());
     std::thread::spawn(move || {
         for conn in l.incoming().flatten() {
-            let (o, c, sdir, a, lt) = (o.clone(), c.clone(), sdir.clone(), a.clone(), lt.clone());
+            let (o, c, sdir, a, lt, wt, so) = (o.clone(), c.clone(), sdir.clone(), a.clone(), lt.clone(), wt.clone(), so.clone());
             std::thread::spawn(move || {
                 let mut rd = std::io::BufReader::new(conn.try_clone().unwrap());
                 let mut line = String::new();
                 rd.read_line(&mut line).unwrap();
                 let req: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let p = &req["params"];
+                if let Some(f) = wt.lock().unwrap().clone() {
+                    so.lock().unwrap().push(std::fs::read_to_string(f).unwrap_or_default());
+                }
                 a.lock().unwrap().push(p.clone());
                 assert_eq!(p["upgrade"], true, "{p}");
                 // the ticket is bought first, within the call's max_sats
@@ -557,6 +567,11 @@ fn fake_wallet_full(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
                         return;
                     }
                     Ends::OpensAfter(d) => std::thread::sleep(d),
+                    Ends::AnswersFirst(result) => {
+                        let mut conn = conn;
+                        let _ = conn.write_all(format!("{{\"id\":1,\"result\":{result}}}\n").as_bytes());
+                        return;
+                    }
                     _ => {}
                 }
                 let mut up = std::net::TcpStream::connect(exit_at).unwrap();
@@ -629,7 +644,7 @@ fn fake_wallet_full(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
         }
     });
     let wallet = xbt_vpn::paid::Wallet { signer: sock, stream_dir: streams, task: "vpn".into(), max_sats: 10_000, max_charge_sats: None };
-    FakeWallet { wallet, opened, carried, asked, left, _dir: dir }
+    FakeWallet { wallet, opened, carried, asked, left, watch, seen_on_call, _dir: dir }
 }
 
 /// The secret a test exit and its (fake) shop gateway share.
@@ -888,6 +903,73 @@ fn a_slow_opening_from_no_credit_still_verifies() {
     let mut gate = CheckGate::default();
     assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &e)), Some(RegionCheck::Verified));
     assert_eq!(gate.spent_today(), 800);
+}
+
+/// The wallet's answer tells of a seller's fault or a payment with no final answer before the tunnel
+/// opens (the signer's answer when a prepaid ticket's payment is held unsettled by the seller: its
+/// `charged_sats` leaves that ticket out): what left is not known, and the check counts its most.
+#[test]
+fn a_region_check_answered_with_a_seller_fault_counts_its_most() {
+    use xbt_vpn::buyer::{CheckWaits, REGION_CHECK_TICKET_SATS};
+    use xbt_vpn::holds::CheckGate;
+    use xbt_vpn::region::RegionCheck;
+    let answers = [
+        r#"{"verdict":"deny","rule":"ticket_seller_fault","reason":"the session with this seller was stopped: the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed","rail":"ticket","charged_sats":0,"session":"s1","stopped":true}"#,
+        r#"{"verdict":"pending","rail":"ticket","charged_sats":0}"#,
+        r#"{"verdict":"deny","rule":"ticket","reason":"the release was not confirmed","rail":"ticket","charged_sats":0,"unconfirmed_release":"ab12"}"#,
+        r#"{"verdict":"allow","status":101,"charged_sats":0,"seller_fault":"it charged past the call's limit"}"#,
+    ];
+    for (i, answer) in answers.into_iter().enumerate() {
+        let (s, at) = region_check_setup(140 + 2 * i as u8);
+        s.buyer.set_check_waits(CheckWaits { open: Duration::from_secs(5), read: Duration::from_secs(5), answer: Duration::from_secs(2) });
+        let w = fake_wallet_full(at, None, false, Some(700), Ends::AnswersFirst(answer));
+        s.buyer.set_wallet(Some(w.wallet.clone()));
+        let e = german_exit(&s, at, "paid-exit", 2_000_000);
+        let mut gate = CheckGate::default();
+        assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &e)), Some(RegionCheck::Unknown), "answer {i}");
+        assert_eq!(gate.spent_today(), REGION_CHECK_TICKET_SATS, "answer {i}: a seller's fault says nothing true of what left: its most is counted");
+    }
+}
+
+/// A check's most is counted, and on disk, before its tunnel is asked for: the wallet, called, finds
+/// it reserved in the gate's file; once done, the file counts what left.
+#[test]
+fn a_region_checks_cost_is_on_disk_before_the_wallet_is_asked() {
+    use xbt_vpn::buyer::REGION_CHECK_TICKET_SATS;
+    use xbt_vpn::holds::CheckGate;
+    use xbt_vpn::region::RegionCheck;
+    let (s, at) = region_check_setup(150);
+    let w = fake_wallet_selling(at, 900);
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    let e = german_exit(&s, at, "paid-exit", 2_000_000);
+    let dir = tempdir_lite::Dir::new("gate");
+    let file = dir.0.join("region-checks.json");
+    *w.watch.lock().unwrap() = Some(file.clone());
+    let mut gate = CheckGate::load(&file);
+    assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &e)), Some(RegionCheck::Verified));
+    let seen = w.seen_on_call.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let then: serde_json::Value = serde_json::from_str(&seen[0]).unwrap_or_else(|_| panic!("no gate on disk when the wallet was asked: {seen:?}"));
+    assert_eq!(then["reserved"][0], "paid-exit", "reserved before the wallet was asked: {then}");
+    assert_eq!(then["spent"][1].as_u64(), Some(REGION_CHECK_TICKET_SATS), "its most counted: {then}");
+    let after: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert!(after["reserved"].is_null(), "{after}");
+    assert_eq!(after["spent"][1].as_u64(), Some(900), "settled to what left: {after}");
+}
+
+/// A check whose cost can't be kept on disk is not paid for: the wallet is never asked.
+#[test]
+fn a_region_check_whose_cost_cannot_be_kept_never_asks_the_wallet() {
+    use xbt_vpn::holds::CheckGate;
+    let (s, at) = region_check_setup(152);
+    let w = fake_wallet_selling(at, 900);
+    s.buyer.set_wallet(Some(w.wallet.clone()));
+    let e = german_exit(&s, at, "paid-exit", 2_000_000);
+    let dir = tempdir_lite::Dir::new("gate");
+    let mut gate = CheckGate::load(&dir.0.join("missing-dir").join("region-checks.json"));
+    assert_eq!(s.rt.block_on(s.buyer.check_region(&mut gate, &e)), None);
+    assert!(w.asked.lock().unwrap().is_empty(), "the wallet was asked: {:?}", w.asked.lock().unwrap());
+    assert_eq!((gate.spent_today(), w.left.load(std::sync::atomic::Ordering::SeqCst)), (0, 0));
 }
 
 /// Ten priced exits announced under ten fresh operator keys (so no operator's failures stop them),
