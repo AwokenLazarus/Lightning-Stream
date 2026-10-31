@@ -13,7 +13,9 @@ stand-in Nostr relay, a hashmaker with real stratum-grind behind it.
 What the test changes in the app, and only that (the overlay this writes, OUT/overlay.yml):
   * the images: this tree's amd64 builds from container/Dockerfile, tagged <image>:0.1.0-umbtest (UMB_HASHLINK_IMAGE,
     UMB_DATUM_IMAGE, UMB_INIT_IMAGE);
-  * the renter's --relays: this lab's relay, not the public ones; the rest of its command is the compose's;
+  * the renter's --relays: this lab's relay, not the public ones, on the renter's loopback through a forwarder
+    container in its namespace (the Nostr client takes plain ws:// to loopback only); the rest of its command
+    is the compose's;
   * the renter's run/signer: the lab wallet's socket folder in place of the app's (the signer is the lab's);
   * the network: this run's, as umbrelOS's.
 Without UMB_INIT_IMAGE (an xbt-init that knows the `datum` component), the files init would make are laid
@@ -70,6 +72,7 @@ INIT_IMAGE = os.environ.get("UMB_INIT_IMAGE", "")
 PROBE_IMAGE = "python:3-alpine"
 RENT_MINUTES = int(os.environ.get("UMB_DATUM_RENT_MINUTES", "6"))
 NET = f"umbdatum-{os.getpid()}"
+FWD = f"umbdatum-relayfwd-{os.getpid()}"
 # the run's own files (the app's data dir, the overlay); its report and logs go to OUT/umbrel_datum_* (stream-lab fetches those)
 WORK = os.path.join(OUT, "umbrel-datum")
 DATA = os.path.join(WORK, "app-data", APP)
@@ -210,7 +213,7 @@ def main() -> int:
         net = inspect(NET)
         gw, subnet = net["IPAM"]["Config"][0]["Gateway"], net["IPAM"]["Config"][0]["Subnet"]
         Forward(gw, p.RELAY, p.RELAY)
-        relay = f"ws://{gw}:{p.RELAY}"
+        relay = f"ws://127.0.0.1:{p.RELAY}"
         cli, home = node_up(gw, subnet)
         cli("createwallet", "w")
         cli("-rpcwallet=w", "generatetoaddress", "220", cli("-rpcwallet=w", "getnewaddress", "", "bech32"))
@@ -274,6 +277,9 @@ def main() -> int:
         rn, dn = cname("renter"), cname("datum")
         ri, di = inspect(rn), inspect(dn)
         rip = next(iter(ri["NetworkSettings"]["Networks"].values()))["IPAddress"]
+        # the lab's relay on the renter's loopback (test plumbing; it reaches the host's relay through Forward)
+        sh("docker", "run", "-d", "--rm", "--name", FWD, "--network", f"container:{rn}", "-v", f"{HERE}/datum_probe.py:/probe.py:ro", PROBE_IMAGE,
+           "python", "-I", "/probe.py", "forward", str(p.RELAY), gw, str(p.RELAY))
         check("compose: the gateway runs in the renter's namespace as its image's user, read-only, no capability, no port",
               di["HostConfig"]["NetworkMode"] == f"container:{ri['Id']}" and di["HostConfig"]["ReadonlyRootfs"] and di["HostConfig"]["CapDrop"] == ["ALL"]
               and not di["HostConfig"].get("PortBindings") and str(di["Config"]["User"]).split(":")[0] in (str(DATUM_UID), "xbt-datum"),
@@ -429,6 +435,7 @@ def main() -> int:
             if x is not None and x.poll() is None:
                 x.terminate()
         if gw:
+            sh("docker", "rm", "-f", FWD, check_rc=False)
             for svc in ("renter", "datum", "init"):
                 r = sh("docker", "logs", "--timestamps", cname(svc), check_rc=False)
                 with open(f"{OUT}/umbrel_datum_{svc}.log", "w") as f:
