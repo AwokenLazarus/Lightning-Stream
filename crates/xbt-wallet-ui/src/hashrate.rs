@@ -837,15 +837,15 @@ impl App {
                         None => "may buy a ticket from this shop".into(),
                     };
                     let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
-                        <input type=\"hidden\" name=\"key\" value=\"{}\"><p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
+                        <input type=\"hidden\" name=\"key\" value=\"{}\">{}<p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
                         about {}, and see what your own DATUM Gateway accepts before renting more. It is charged at most that, but your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
-                        esc(x["linkKey"].as_str().unwrap_or("")), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
+                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
                         <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{old}{history}{allow}{trial}\
-                        <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
+                        <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
@@ -854,7 +854,7 @@ impl App {
                         <button{}>Rent</button></form></section>",
                         esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
-                        esc(x["linkKey"].as_str().unwrap_or("")), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
+                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
                         if can { "" } else { " disabled" }));
                 }
                 b.push_str("</div>");
@@ -895,14 +895,15 @@ impl App {
                 if n("budget") == 0 {
                     Err("Set the most this rental may cost.".into())
                 } else {
-                    call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1)})))
+                    call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1),
+                                                                     "once": g("once")})))
                         .and_then(|v| match v["rental"].as_str() {
                             Some(_) => Ok(format!("Renting. The miners start on your DATUM Gateway in a few seconds; you pay as their work is accepted.{}", may_buy(&v))),
                             None => Err(v["error"].as_str().map(|e| format!("Not rented: {e}.")).unwrap_or_else(|| "Not rented.".into())),
                         })
                 }
             }
-            "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true})))
+            "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true, "once": g("once")})))
                 .and_then(|v| match v["rental"].as_str() {
                     Some(_) => Ok(format!("Trying one slice, at most {}.{} When it is done, its result shows under Your rentals.", sats_n(num(&v["budgetSats"])), may_buy(&v))),
                     None => Err(v["error"].as_str().map(|e| format!("Not started: {e}.")).unwrap_or_else(|| "Not started.".into())),
@@ -1092,6 +1093,12 @@ fn result_box(r: &Value, trial: bool) -> String {
     let after = if trial { "<p class=\"hint\">Your own DATUM Gateway checked every share. If this looks right, rent for longer below.</p>" } else { "" };
     format!("<div class=\"result\"><p><strong>{head}:</strong> {}{vs} · stale shares {} · rejected {}{rt}</p>{after}</div>",
             speed(delivered), pct(r["staleShare"].as_f64().unwrap_or(0.0)), pct(r["rejectedShare"].as_f64().unwrap_or(0.0)))
+}
+
+/// A Rent form's mark: the renter's service starts one rental for it however many times the form is sent
+/// (a double click, the browser sending it again). Each form shown has a new one.
+fn once_input() -> String {
+    format!("<input type=\"hidden\" name=\"once\" value=\"{}\">", hex::encode(crate::random_bytes::<16>()))
 }
 
 /// A hashmaker's delivery history, as the offer shows it.
