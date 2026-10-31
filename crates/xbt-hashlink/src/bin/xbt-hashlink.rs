@@ -316,7 +316,7 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         idle: Duration::from_secs(num(f, "idle-s", Some(60))?),
         duration: f.get("duration-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--duration-s")?,
         report: f.get("report").map(PathBuf::from),
-        payer,
+        payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
         gateway_api: f.get("gateway-api").cloned(),
         allow_unblinded: f.contains_key("allow-unblinded"),
     };

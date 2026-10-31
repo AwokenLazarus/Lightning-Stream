@@ -276,6 +276,30 @@ impl SignerPayer {
     }
 }
 
+/// What pays a rental's slices, one at a time, off the relay's path: the wallet's signer ([`SignerPayer`]), or a test's.
+pub trait Payer: Send {
+    /// The ticket the next payment may buy ([`crate::order::Standing::ticket_msat`]).
+    fn caps_for(&mut self, ticket_msat: u64);
+    /// Pay one slice: `Ok` with what the wallet said (`charged_sats` above 0 when it bought a ticket), `Err` why not.
+    fn pay(&mut self, rental: &str, slice: u64, receipt: &serde_json::Value) -> Result<serde_json::Value, String>;
+    /// End the wallet's session with the seller.
+    fn stop(&mut self) -> Option<serde_json::Value>;
+}
+
+impl Payer for SignerPayer {
+    fn caps_for(&mut self, ticket_msat: u64) {
+        SignerPayer::caps_for(self, ticket_msat)
+    }
+
+    fn pay(&mut self, rental: &str, slice: u64, receipt: &serde_json::Value) -> Result<serde_json::Value, String> {
+        SignerPayer::pay(self, rental, slice, receipt)
+    }
+
+    fn stop(&mut self) -> Option<serde_json::Value> {
+        SignerPayer::stop(self)
+    }
+}
+
 /// The lab's seller: every lock is held; settles are counted.
 #[derive(Default)]
 pub struct LabSeller {

@@ -216,7 +216,7 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
             idle: Duration::from_secs(if cut_after.is_some() { 15 } else { 3 }),
             duration: Some(Duration::from_secs(120)),
             report: None,
-            payer,
+            payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
             miners: 0,
             budget_msat: None,
             cut: None,
@@ -661,7 +661,7 @@ impl WalletRental {
             idle,
             duration: Some(Duration::from_secs(120)),
             report: None,
-            payer: Some(payer),
+            payer: Some(Box::new(payer)),
             miners: 0,
             budget_msat: None,
             cut: Some(end.clone()),
@@ -1023,7 +1023,7 @@ impl TicketShop {
                                      Duration::from_secs(5));
         let cfg = hashtaker::Config { hashmaker: self.link.clone(), hashmaker_key: self.hpub, key: noise::fresh_key(), upstream: self.pool.clone(),
                                       user: "hashtaker.rented".into(), terms: terms(), rental: id.into(), listing: "lab".into(), stop_paying_after: None,
-                                      idle: Duration::from_secs(3), duration: Some(Duration::from_secs(40)), report: None, payer: Some(payer), miners: 0,
+                                      idle: Duration::from_secs(3), duration: Some(Duration::from_secs(40)), report: None, payer: Some(Box::new(payer)), miners: 0,
                                       budget_msat: Some(budget_sats * 1000), cut: None, live: None, gateway_api: None, allow_unblinded: true };
         hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap()
     }

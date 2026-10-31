@@ -16,7 +16,7 @@ use crate::link::{self, Sender};
 use crate::meter::{Meter, Receipt};
 use crate::msg::{Msg, Terms, PROOF};
 use crate::order;
-use crate::rail::{sha256, HashtakerRail, SignerPayer};
+use crate::rail::{sha256, HashtakerRail, Payer};
 use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -48,7 +48,7 @@ pub struct Config {
     pub report: Option<PathBuf>,
     /// Slices paid by the wallet through the hashmaker's gateway; without it, over the link (the
     /// lab's stand-in rail).
-    pub payer: Option<SignerPayer>,
+    pub payer: Option<Box<dyn Payer>>,
     /// How many of the hashmaker's miners to rent (0: as many as are free).
     pub miners: u32,
     /// The most the rental may cost: it ends once that much is paid.

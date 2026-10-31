@@ -428,7 +428,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         idle: Duration::from_secs(180),
         duration: Some(Duration::from_secs(minutes * 60)),
         report: None,
-        payer,
+        payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
         miners,
         budget_msat: Some(budget_sats * 1000),
         cut: Some(cut.clone()),

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use xbt_hashlink::hashmaker::{self, Hashmaker};
 use xbt_hashlink::meter::{share_work, Receipt};
 use xbt_hashlink::msg::{Msg, Terms, PROOF};
-use xbt_hashlink::rail::{sha256, LabHashtaker, LabSeller};
+use xbt_hashlink::rail::{sha256, LabHashtaker, LabSeller, Payer};
 use xbt_hashlink::{hashtaker, link, noise, standin};
 
 const DIFF: f64 = 1.0 / (1u64 << 20) as f64;
@@ -719,6 +719,107 @@ fn a_renter_saying_paying_past_the_limit_ends() {
     assert_eq!(r["paymentWaits"].as_u64().unwrap_or(0) as usize, xbt_hashlink::order::PAYING_WAITS_AN_HOUR, "{r}");
     assert_eq!(r["stopped"]["unpaidWork"], "0", "{r}");
     a.h.shutdown();
+    drop(miner);
+}
+
+/// A wallet whose ticket buys take `buy` each: it keeps the credit a ticket left, and pays each slice through the
+/// hashmaker's paid-slice endpoint as the gateway would pass it on.
+struct SlowPayer {
+    slices: String,
+    price_msat: u64,
+    ticket_msat: u64,
+    credit_msat: u64,
+    buy: Duration,
+}
+
+impl Payer for SlowPayer {
+    fn caps_for(&mut self, ticket_msat: u64) {
+        self.ticket_msat = ticket_msat;
+    }
+
+    fn pay(&mut self, rental: &str, slice: u64, receipt: &Value) -> Result<Value, String> {
+        let mut bought = 0;
+        if self.credit_msat < self.price_msat {
+            thread::sleep(self.buy);
+            bought = self.ticket_msat.max(self.price_msat);
+            self.credit_msat += bought;
+        }
+        let body = receipt.to_string();
+        let mut c = TcpStream::connect(&self.slices).map_err(|e| e.to_string())?;
+        write!(c, "POST /hashrate/{rental}/{slice} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+        let mut out = String::new();
+        let _ = std::io::Read::read_to_string(&mut c, &mut out);
+        if !out.starts_with("HTTP/1.1 200") {
+            return Err(format!("slice {slice}: {}", out.lines().last().unwrap_or("")));
+        }
+        self.credit_msat -= self.price_msat;
+        Ok(json!({"verdict": "allow", "charged_sats": bought.div_ceil(1000)}))
+    }
+
+    fn stop(&mut self) -> Option<Value> {
+        None
+    }
+}
+
+/// An honest renter whose every ticket buy takes 8 s, on a large miner: at first its step lasts less than a buy, so it
+/// says `paying` and the hashmaker waits with the miner on its own pool; as delivered work grows, its step outlasts the
+/// buys. Over three minutes on the real link it keeps running, with nothing served unpaid, never more paid ahead than
+/// the step, and no more waits than the hour allows.
+#[test]
+fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
+    let _s = serial();
+    let sw = share_work(DIFF);
+    // 20 sat a slice of 2 shares, the miner at 20 shares a second: 200 sat a second, the 546 sat step 2.7 s
+    let terms = Terms { slice_work: 2 * sw, price_msat: 20_000, grace_ms: 10_000, start_slices: 0 };
+    let (fb, fb_report) = fallback_pool();
+    let [link, miners, slices] = ports::<3>();
+    let hk = noise::fresh_key();
+    let h = Hashmaker::start(
+        hashmaker::Config { miners: miners.clone(), link: link.clone(), key: hk, terms: terms.clone(), report: None, slices: Some(slices.clone()), fallback: Some(fb),
+                            rentable: None, min_slice_time: hashmaker::MIN_SLICE_TIME },
+        Box::new(|| Box::<LabSeller>::default()),
+    )
+    .unwrap();
+    wait_for(&link);
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+    let (pool, _) = start_pool(Duration::from_secs(5));
+    let stop: Arc<AtomicBool> = Arc::default();
+    let (ma, st2) = (miners.clone(), stop.clone());
+    let miner = thread::spawn(move || {
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 20.0, bad_every: 0, duration: Some(Duration::from_secs(200)), reconnect: true, extranonce_subscribe: false, bind: None });
+        st2.store(true, Ordering::SeqCst);
+    });
+    let live: Arc<Mutex<Value>> = Arc::default();
+    let mut cfg = taker_config(&link, hpub, &terms, &pool, "slow", 60);
+    cfg.duration = Some(Duration::from_secs(180));
+    cfg.live = Some(live.clone());
+    cfg.payer = Some(Box::new(SlowPayer { slices, price_msat: terms.price_msat, ticket_msat: 0, credit_msat: 0, buy: Duration::from_secs(8) }));
+    let taker = thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap());
+    // what's paid ahead, sampled, against the step at that moment
+    let mut worst = 0i64;
+    while !taker.is_finished() {
+        thread::sleep(Duration::from_millis(500));
+        let v = live.lock().unwrap().clone();
+        let (paid, work) = (v["paidSlices"].as_u64().unwrap_or(0) as i64, v["meter"]["work"].as_str().and_then(|w| w.parse::<i64>().ok()).unwrap_or(0));
+        let ahead = paid * terms.price_msat as i64 - work * terms.price_msat as i64 / terms.slice_work as i64;
+        let step = 546_000i64.max(work * terms.price_msat as i64 / terms.slice_work as i64).min(30 * 200_000).max(546_000);
+        worst = worst.max(ahead - step);
+    }
+    let r = taker.join().unwrap();
+    stop.store(true, Ordering::SeqCst);
+    let hz = h.wait_finished(1, Duration::from_secs(20)).into_iter().next().expect("the hashmaker's report");
+    let fb_took = pool_report(&fb_report)["accepted"].as_u64().unwrap_or(0);
+    eprintln!("measure: 8 s ticket buys, large miner: closed {}, {} paid, {} waits, fallback took {fb_took} shares, most past the step {worst} msat, dues {}: {}",
+              r["closed"], r["paidSlices"], hz["paymentWaits"], r["dues"], hz["stopped"]);
+    assert_eq!(r["closed"], "rental time over", "{r}");
+    assert_eq!(hz["stopped"]["unpaidWork"], "0", "{hz}");
+    assert!(hz["paymentWaits"].as_u64().unwrap() as usize <= xbt_hashlink::order::PAYING_WAITS_AN_HOUR, "{hz}");
+    assert!(worst <= 0, "never more paid ahead than the step: {worst} msat over");
+    assert!(r["paidSlices"].as_u64().unwrap() > 100, "it kept running: {r}");
+    if hz["paymentWaits"].as_u64().unwrap() > 0 {
+        assert!(fb_took > 0, "the miner hashed for the hashmaker's own pool during the waits");
+    }
+    h.shutdown();
     drop(miner);
 }
 
