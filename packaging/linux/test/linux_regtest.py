@@ -500,6 +500,10 @@ def main():
             b = masked_shown(name)
             check("M", f"{name}{' (updated from 0.1)' if name == 'maker' else ''}: its hashtaker shows the Stream Gateway masking its jobs (solo: the gateway holds the key)",
                   (b or {}).get("state") == "blinded" and b.get("why") == "solo" and "Your gateway holds the key" in b.get("words", ""), b)
+            if INIT_DATUM:
+                bst = renter_status(name).get("bundled") or {}
+                check("M", f"{name}: the hashtaker's status shows the Stream Gateway in use, running, connected to the node and masking",
+                      bst.get("inUse") is True and bst.get("running") is True and bst.get("node") is True and bst.get("masking") is True, bst)
             code, a = job_on_api("127.0.0.1", api)
             check("M", f"{name}: a miner's job, opened on /xbt/job from loopback, is masked: a key that isn't null, solo",
                   code == 200 and a.get("null_key") is False and a.get("mode") == "solo", [code, a])
