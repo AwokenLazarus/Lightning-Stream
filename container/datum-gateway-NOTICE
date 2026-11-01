@@ -7,11 +7,14 @@ block, and each job can be opened (without its key) on the gateway's loopback AP
 renter's check. The licence grants no right to the DATUM name or other marks of their owners: "DATUM" is
 used here only to say which protocol it speaks.
 
+SPDX-License-Identifier: MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)
+(the gateway and what it links, below; xbt-supervise, beside it in the image, is Lightning Stream's: MIT OR Apache-2.0)
+
 It is linked statically with:
   libsodium 1.0.20          ISC licence                     libsodium.LICENSE
   jansson 2.14              MIT licence                     jansson.LICENSE
   libcurl 8.11.1            curl licence (MIT-style)        curl.COPYING
-  libmicrohttpd 1.0.1       GNU LGPL 2.1 or later           libmicrohttpd.COPYING
+  libmicrohttpd 1.0.1       GNU LGPL 2.1 or later (or eCos) libmicrohttpd.COPYING
   argp-standalone 1.5.0     GNU Library GPL 2 or later      argp-standalone.NOTICE
 and with musl libc through zig (MIT).
 

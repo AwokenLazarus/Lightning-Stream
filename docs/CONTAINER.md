@@ -465,7 +465,9 @@ no right to the DATUM name. It is CONVOY's `datum_gateway` (commit 971af86, MIT)
 It is C, so `scripts/datum_gateway_build.sh` builds it, static musl through zig for the three platforms, with
 its libraries from pinned, hash-checked sources. Its image layer carries the binary, `xbt-supervise`, and in
 `/usr/share/xbt-datum-gateway/` a NOTICE and the licence of everything linked in. libmicrohttpd and
-argp-standalone are LGPL; the NOTICE says where the source and the build script are, for relinking.
+argp-standalone are LGPL; the NOTICE says where the source and the build script are, for relinking. Its OCI
+licence label says so: `MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR
+Apache-2.0)` (every other image is `MIT OR Apache-2.0`; `scripts/oci_inspect.py` holds the table and checks it).
 
 It runs as `xbt-datum` in the renter's network namespace (Umbrel `network_mode: service:renter`, a
 StartOS package's shared loopback, the host's loopback on Linux). Its Stratum is on 127.0.0.1:23339 and

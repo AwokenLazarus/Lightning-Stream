@@ -8,9 +8,11 @@ For every image and platform it reads the index, the manifest, the config and th
   * the binary layer holds exactly /usr/bin/<image> (and, for the signer, the gateway and the Stream Gateway
     (xbt-datum-gateway), /usr/bin/xbt-supervise), plus any read-only data an image ships (DATA),
     each a static ELF (no PT_INTERP) for that architecture;
-  * the base layer is the same blob in every image and on every platform (it is stored once).
+  * the base layer is the same blob in every image and on every platform (it is stored once);
+  * the licence label is the image's own (LICENSES: the Stream Gateway's names the C libraries it links).
 It prints a JSON report, writes a markdown table of sizes (--md), and exits 1 if any check fails.
     python3 scripts/oci_inspect.py dist/oci IMAGE... [--md OUT.md] [--rev REV]
+    python3 scripts/oci_inspect.py --license IMAGE     the image's licence (SPDX), for oci_build.sh
 """
 import gzip
 import io
@@ -29,6 +31,16 @@ DATA = {"xbt-vpn": ["usr/share/xbt-vpn/ATTRIBUTION", "usr/share/xbt-vpn/dbip-cou
         "xbt-datum-gateway": [f"usr/share/xbt-datum-gateway/{n}" for n in ("NOTICE", "datum_gateway.LICENSE", "libsodium.LICENSE",
                               "jansson.LICENSE", "curl.COPYING", "libmicrohttpd.COPYING", "argp-standalone.NOTICE")]}
 ELF_CLASS = {0x3E: 2, 0xB7: 2, 0x28: 1}
+# each image's licence (SPDX), as its OCI label and index annotation state it (oci_build.sh reads this with
+# --license IMAGE). Ours is MIT OR Apache-2.0 (Cargo.toml). The Stream Gateway links C code of other licences:
+# datum_gateway MIT, libsodium ISC, jansson MIT, libcurl curl, libmicrohttpd LGPL-2.1-or-later (or eCos-2.0, its
+# dual licence), argp-standalone LGPL-2.0-or-later (GNU Library GPL 2 or later), musl MIT, and xbt-supervise ours
+OURS = "MIT OR Apache-2.0"
+LICENSES = {"xbt-datum-gateway": "MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)"}
+
+
+def license_of(image):
+    return LICENSES.get(image, OURS)
 
 
 def blob(tar, digest):
@@ -93,6 +105,9 @@ def inspect(path, image):
                     probs.append("no ENTRYPOINT or HEALTHCHECK")
             if "XBT_DATA_DIR=/data" not in (p["env"] or []) or "XBT_MODE=production" not in (p["env"] or []):
                 probs.append("XBT_DATA_DIR/XBT_MODE not set")
+            lic = (c.get("Labels") or {}).get("org.opencontainers.image.licenses")
+            if lic != license_of(image):
+                probs.append(f"licence label {lic!r}, want {license_of(image)!r}")
             if len(layers) != 2:
                 probs.append(f"{len(layers)} layers (want base + binary)")
             else:
@@ -133,6 +148,9 @@ def inspect(path, image):
 
 def main():
     args = sys.argv[1:]
+    if args[:1] == ["--license"]:
+        print(license_of(args[1]))
+        return 0
     md = args[args.index("--md") + 1] if "--md" in args else None
     rev = args[args.index("--rev") + 1] if "--rev" in args else ""
     pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--md", "--rev"))]

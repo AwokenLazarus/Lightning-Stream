@@ -9,7 +9,9 @@ import { IMAGES } from '../spec'
 export const manifest = setupManifest({
   id: 'lightning-stream',
   title: 'Lightning Stream',
-  license: 'MIT OR Apache-2.0',
+  // ours, and the Stream Gateway's image, which links C libraries of other licences (two LGPL; its
+  // /usr/share/xbt-datum-gateway has their texts and the NOTICE)
+  license: '(MIT OR Apache-2.0) AND MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later',
   packageRepo: 'https://github.com/AwokenLazarus/Lightning-Stream',
   upstreamRepo: 'https://github.com/AwokenLazarus/Lightning-Stream',
   marketingUrl: 'https://github.com/AwokenLazarus/Lightning-Stream',

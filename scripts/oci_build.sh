@@ -192,15 +192,20 @@ fi
 
 SRC=https://github.com/AwokenLazarus/Lightning-Stream
 LABELS=(--label "org.opencontainers.image.source=$SRC" --label "org.opencontainers.image.revision=$REV$DIRTY"
-        --label "org.opencontainers.image.version=$VERSION" --label "org.opencontainers.image.licenses=MIT OR Apache-2.0")
+        --label "org.opencontainers.image.version=$VERSION")
 # the same on the multi-platform index (a registry's package page reads the index's annotations), and no
 # provenance or SBOM attestation (they would add manifests of their own to the index)
 INDEX=(--annotation "index:org.opencontainers.image.source=$SRC" --annotation "index:org.opencontainers.image.revision=$REV$DIRTY"
-       --annotation "index:org.opencontainers.image.version=$VERSION" --annotation "index:org.opencontainers.image.licenses=MIT OR Apache-2.0"
+       --annotation "index:org.opencontainers.image.version=$VERSION"
        --provenance=false --sbom=false)
 for img in "${IMAGES[@]}"; do
   echo "== buildx $img ($PLATFORMS)"
-  ARCHIVE=(--platform "$PLATFORMS" --target "$img" "${LABELS[@]}" --label "org.opencontainers.image.title=$img" "${INDEX[@]}"
+  # each image's own licence (SPDX; scripts/oci_inspect.py's table, which also checks it): ours, or, for the Stream
+  # Gateway, with the C libraries it links (two LGPL)
+  lic=$(python3 scripts/oci_inspect.py --license "$img")
+  LIC=(--label "org.opencontainers.image.licenses=$lic")
+  ARCHIVE=(--platform "$PLATFORMS" --target "$img" "${LABELS[@]}" "${LIC[@]}" --label "org.opencontainers.image.title=$img" "${INDEX[@]}"
+           --annotation "index:org.opencontainers.image.licenses=$lic"
            --annotation "index:org.opencontainers.image.title=$img"
            --annotation "index:org.opencontainers.image.description=Lightning Stream: $img, a static binary FROM scratch (docs/CONTAINER.md)"
            --build-arg SOURCE_DATE_EPOCH="$EPOCH")
@@ -212,10 +217,10 @@ for img in "${IMAGES[@]}"; do
       --output "type=image,name=$PUSH/$img:$VERSION-$REV,push=true,unpack=false,oci-mediatypes=true,rewrite-timestamp=true" "$CTX" >/dev/null
   fi
   if [ $LOAD = 1 ]; then
-    docker buildx build -q --platform linux/amd64 --target "$img" "${LABELS[@]}" --label "org.opencontainers.image.title=$img" \
+    docker buildx build -q --platform linux/amd64 --target "$img" "${LABELS[@]}" "${LIC[@]}" --label "org.opencontainers.image.title=$img" \
       --build-arg SOURCE_DATE_EPOCH="$EPOCH" -t "$img:agp038" --load "$CTX" >/dev/null
     # every platform under the version tag (Docker's containerd image store keeps a multi-platform index)
-    docker buildx build -q --platform "$PLATFORMS" --target "$img" "${LABELS[@]}" --label "org.opencontainers.image.title=$img" \
+    docker buildx build -q --platform "$PLATFORMS" --target "$img" "${LABELS[@]}" "${LIC[@]}" --label "org.opencontainers.image.title=$img" \
       --build-arg SOURCE_DATE_EPOCH="$EPOCH" -t "$img:$VERSION" --load "$CTX" >/dev/null
   fi
 done
