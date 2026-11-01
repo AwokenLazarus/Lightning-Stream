@@ -358,17 +358,45 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_real_peer_is_looked_at() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let mut p = Peer::new(addr, Instant::now());
+        let mut p = Peer::new(l.local_addr().unwrap(), Instant::now());
         assert_eq!(p.look(), None);
         assert!(p.seen);
+        // the peer's namespace is gone: its address now refuses. A freed port could be taken by any process on a
+        // busy box (and then answer), so the refusing address is one this test holds: bound, never listening
+        let (_held, gone) = refusing_port();
+        p.addr = gone;
+        assert_eq!(p.look(), None);
+        assert_eq!(p.look(), None);
+        assert!(p.look().is_some_and(|w| w.contains("stopped answering")), "three refusals once its listener is gone");
         drop(l);
-        assert_eq!(p.look(), None);
-        assert_eq!(p.look(), None);
-        assert!(p.look().is_some(), "three refusals once its listener is gone");
+    }
+
+    #[cfg(unix)]
+    /// A loopback TCP port that refuses every connection and that no other process can take while the returned
+    /// socket lives: bound, and never listening.
+    fn refusing_port() -> (std::os::fd::OwnedFd, SocketAddr) {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain socket calls on a socket this function owns (handed back as an OwnedFd, which closes it);
+        // the address structures are initialised before use and outlive the calls that read them
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+            let owned = std::os::fd::OwnedFd::from_raw_fd(fd);
+            let mut sa: libc::sockaddr_in = std::mem::zeroed();
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            sa.sin_port = 0;
+            let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(libc::bind(fd, &sa as *const _ as *const libc::sockaddr, len), 0, "bind: {}", std::io::Error::last_os_error());
+            let mut got: libc::sockaddr_in = std::mem::zeroed();
+            let mut got_len = len;
+            assert_eq!(libc::getsockname(fd, &mut got as *mut _ as *mut libc::sockaddr, &mut got_len), 0);
+            (owned, SocketAddr::from(([127, 0, 0, 1], u16::from_be(got.sin_port))))
+        }
     }
 
     /// The whole program: a peer that goes away stops PROGRAM and exits PEER_GONE, waiting for its files or not.
