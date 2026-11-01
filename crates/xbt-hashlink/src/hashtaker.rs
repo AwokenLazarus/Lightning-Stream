@@ -238,6 +238,19 @@ impl St {
         }
     }
 
+    /// The ticker's housekeeping, twice a second: `paying` said for a payment that won't arrive in time, and the
+    /// dropped link's gateway sessions closed once their window for shares sent again is over.
+    fn tick(&mut self, tx: &Sender) {
+        self.say_paying_if_late(tx);
+        if self.guard.retire_until.is_some_and(|t| Instant::now() > t) {
+            self.guard.retire_until = None;
+            self.guard.resend_pending.clear();
+            for (_, u) in self.guard.retired_up.drain() {
+                let _ = u.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
     fn lock_ahead(&mut self, tx: &Sender) {
         if self.queue.is_some() {
             return;
@@ -542,14 +555,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             if g.closed.is_some() {
                 return;
             }
-            g.say_paying_if_late(&tx);
-            if g.guard.retire_until.is_some_and(|t| Instant::now() > t) {
-                g.guard.retire_until = None;
-                g.guard.resend_pending.clear();
-                for (_, u) in g.guard.retired_up.drain() {
-                    let _ = u.shutdown(std::net::Shutdown::Both);
-                }
-            }
+            g.tick(&tx);
             let (s, largest) = (g.terms.slice_work, g.largest_share());
             // the next slice can't be paid: end as the last paid one runs out, before the hashmaker does it
             let no_more = g.budget_msat.is_some_and(|b| (g.released + 1) * g.terms.price_msat > b);
@@ -1122,6 +1128,32 @@ mod come_back_tests {
         let t0 = Instant::now();
         assert!(come_back(&cfg, &tx, &st, "test").is_none());
         assert!(t0.elapsed() < Duration::from_secs(3), "{} ms against a deadline of 1 s", t0.elapsed().as_millis());
+    }
+
+    /// A share waits for payment and the payment on its way is late, past what the quick buys before it said: with no
+    /// second due to remind it, the ticker says `paying` before the hashmaker's 2 s clock runs out.
+    #[test]
+    fn the_ticker_says_paying_for_a_payment_late_past_the_measured_buys() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, peer) = a_link(key, hk);
+        let st = state();
+        {
+            let mut g = lock(&st);
+            // slice 1 on its way for 0.3 s, the buys before it quick, the share waiting 1.2 s
+            g.released = 1;
+            g.in_flight = 1;
+            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(300));
+            g.buys = VecDeque::from([0.2, 0.2]);
+            g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(1200));
+            g.tick(&tx);
+        }
+        let mut lk = peer.join().unwrap();
+        let mut said = false;
+        while let Ok(Some(m)) = lk.rx.recv_within(Duration::from_millis(500)) {
+            said |= matches!(m, Msg::Paying);
+        }
+        assert!(said, "paying said by the ticker");
+        assert!(lock(&st).guard.paying_said);
     }
 
     /// A gateway's API that answers each job id with what it was given: enough for [`blind::Check`].
