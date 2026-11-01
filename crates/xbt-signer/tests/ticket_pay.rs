@@ -13349,23 +13349,39 @@ fn a_new_outage_has_its_own_wait() {
 #[test]
 fn a_win_whose_invoice_runs_out_while_it_waits_for_a_route_is_not_sent() {
     let _g = env_lock();
-    let r = patient_draws_rig(json!({}));
-    // the seller's invoices of 30 s are dated so that each has 8 s left when it is made
-    r.shop.node.backdate.store(22, Ordering::SeqCst);
-    {
-        // the first win's route query opens a moment with no route, of 2 s
-        let mut st = r.ln.st.lock().unwrap();
-        st.no_route_at_query = 1;
-        st.no_route_for = Duration::from_secs(2);
-    }
     let size = 256 * PIECE;
-    let v = std::thread::scope(|sc| {
-        let call = sc.spawn(|| r.pay(&format!("/pieces/{size}"), 1_000));
-        // while the first win waits for its route, 9 s pass: its invoice has run out
-        wait_for("the first win's wait for a route", || r.ln.st.lock().unwrap().no_route_answers > 0);
-        r.clock.fetch_add(9, Ordering::SeqCst);
-        call.join().unwrap()
-    });
+    // a file that draws no win never meets the moment, and is drawn again (1 time in 3,000 at one win in 32)
+    let mut tries = 0;
+    let (r, v) = loop {
+        tries += 1;
+        let r = patient_draws_rig(json!({}));
+        // the seller's invoices of 30 s are dated so that each has 8 s left when it is made
+        r.shop.node.backdate.store(22, Ordering::SeqCst);
+        {
+            // the first win's route query opens a moment with no route, of 2 s
+            let mut st = r.ln.st.lock().unwrap();
+            st.no_route_at_query = 1;
+            st.no_route_for = Duration::from_secs(2);
+        }
+        let met = std::sync::atomic::AtomicBool::new(false);
+        let v = std::thread::scope(|sc| {
+            let call = sc.spawn(|| r.pay(&format!("/pieces/{size}"), 1_000));
+            wait_for_rig("the first win's wait for a route, or the call's end", || r.ln.st.lock().unwrap().no_route_answers > 0 || call.is_finished());
+            if r.ln.st.lock().unwrap().no_route_answers > 0 {
+                met.store(true, Ordering::SeqCst);
+                // while the first win waits for its route, 4 s pass: its invoice has 4 s left, under the 5 s a win must have,
+                // and is held back. The seller's later invoices live their 30 s: what is tested is the one that ran out, not
+                // how a loaded box keeps up with invoices of 8 s
+                r.shop.node.backdate.store(0, Ordering::SeqCst);
+                r.clock.fetch_add(4, Ordering::SeqCst);
+            }
+            call.join().unwrap()
+        });
+        if met.load(Ordering::SeqCst) || tries == 3 {
+            break (r, v);
+        }
+    };
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the moment was met, in {tries} files: {v}");
     assert!(v["wins"].as_u64().unwrap_or(0) >= 1, "{v}");
     assert_eq!(r.ln.by_status("FAILED").len(), 0, "no payment on a lapsed invoice: {v}");
     let held: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ticket_expiry").collect();
