@@ -27,6 +27,8 @@ Checks (results.json):
      (Stratum listens only once the node gave it a template); its readyCommand passes
   L  /xbt/job and Stratum on loopback only: inside the package /xbt/job answers (404 for an unknown job, not 403);
      from the network neither the API nor Stratum can be reached
+  N  the renter doesn't wait for the gateway: its page is live and says in words what the gateway is doing, with no
+     config yet ("not running") and with the node unreachable ("waiting for the node"; W5's renter)
   R  the renter: --upstream auto picks 127.0.0.1:23339; its status says the jobs are masked ("blinded", solo)
   M  a masked solo rental: real blocks reach the node through the rental, each with a key, its id the raw hash XOR the
      mask; each coinbase pays the regtest payout address; the hashtaker held each job to /xbt/job; the gateway kept
@@ -194,13 +196,13 @@ def main():
     d, ht = by["datum"], by["hashtaker"]["command"]
     arg = lambda c, f: c[c.index(f) + 1] if f in c else None  # noqa: E731
     check("S", "the spec: the datum daemon on its image's user, its own folder and run/datum read-only, started by the config and "
-               "restarted by the cookie; the hashtaker tries 127.0.0.1:23339 first, checks jobs on 127.0.0.1:7152, starts after the "
-               "gateway; nothing runs with --allow-unblinded",
+               "restarted by the cookie; the hashtaker tries 127.0.0.1:23339 first, checks jobs on 127.0.0.1:7152, doesn't wait for "
+               "the gateway; nothing runs with --allow-unblinded",
           d["image"] == "datum" and not d.get("user")
           and [(m["subpath"], m["readonly"]) for m in d["mounts"]] == [("datum", False), ("run/datum", True)]
           and d["command"][:6] == ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--"]
           and arg(ht, "--datum-candidates").split(",")[0] == "127.0.0.1:23339" and arg(ht, "--gateway-api") == "127.0.0.1:7152"
-          and arg(ht, "--upstream") == "auto" and "datum" in by["hashtaker"]["requires"]
+          and arg(ht, "--upstream") == "auto" and "datum" not in by["hashtaker"]["requires"]
           and not any("--allow-unblinded" in s["command"] for s in sp["services"]),
           {"datum": d, "hashtaker": ht})
 
@@ -257,7 +259,33 @@ def main():
           running and ready() and not api_open() and not stratum_open(),
           {"running": running})
 
-    log("== the Hashrate page's \"Your gateway\": solo, paid to the regtest address (as the UI writes it)")
+    log("== the renter starts at once: it doesn't wait for the gateway (the stand-in relay; no wallet: no --signer)")
+    docker("run", "-d", "--name", f"{P}-relay", "--network", NET, "--network-alias", "relay", "--entrypoint", "/usr/bin/xbt-hashlink", IMG["hashlink"],
+           "relay", "--listen", "0.0.0.0:7777")
+    # a Nostr client takes plain ws:// only to its own machine: each namespace reaches the stand-in relay through a
+    # loopback forwarder (test-only; on a box the relays are wss://)
+    docker("run", "-d", "--name", f"{P}-fwd-ns", "--network", f"container:{P}-ns", PROBE,
+           "socat", "TCP-LISTEN:7777,bind=127.0.0.1,fork,reuseaddr", "TCP:relay:7777")
+    cmd = list(ht)
+    cmd[cmd.index("--relays") + 1] = "ws://127.0.0.1:7777"
+    i = cmd.index("--signer")
+    del cmd[i:i + 2]
+    FACTS["hashtaker_command"] = cmd
+    FACTS["control_token_mount"] = f"type=volume,src={VOL},dst=/t,volume-subpath=run/hashrate,readonly,volume-nocopy=true"
+    run_service(by["hashtaker"], IMG["hashlink"], command=cmd)
+    wait_until(lambda: control("GET", "/status").get("role") == "renter", 60, "the hashtaker's control API")
+    bundled_state = lambda st: (st.get("bundled") or {}).get("state")  # noqa: E731
+    st = control("GET", "/status")
+    FACTS["status_no_config"] = st
+    check("N", "with the gateway not set up yet the renter's page is live, on the bundled gateway, and says it isn't running "
+               "(W5's renter: its `bundled` state)",
+          st.get("role") == "renter" and st["datum"]["addr"] == "127.0.0.1:23339" and bundled_state(st) == "not running", st)
+
+    def write_config(conf):
+        docker("run", "--rm", "-i", "--network", "none", "--mount", f"type=volume,src={VOL},dst=/v,volume-nocopy=true", PROBE, "sh", "-c",
+               f"cat > /v/run/datum/config.json.tmp && chown {UID_UI}:{UID_DATUM} /v/run/datum/config.json.tmp && chmod 640 /v/run/datum/config.json.tmp "
+               "&& mv /v/run/datum/config.json.tmp /v/run/datum/config.json", input=json.dumps(conf))
+
     conf = {"bitcoind": {"rpccookiefile": "/data/run/datum/rpc.cookie", "rpcurl": by["ui"]["env"]["XBT_UI_DATUM_RPCURL"], "work_update_seconds": 5,
                          "notify_fallback": True},
             "stratum": {"listen_addr": "127.0.0.1", "listen_port": 23339, "vardiff_min": 1, "fingerprint_miners": False},
@@ -270,9 +298,25 @@ def main():
             "xbt": {"mode": "solo"}}
     with open(os.path.join(OUT, "datum-config.json"), "w") as f:
         json.dump(conf, f, indent=1)
-    docker("run", "--rm", "-i", "--network", "none", "--mount", f"type=volume,src={VOL},dst=/v,volume-nocopy=true", PROBE, "sh", "-c",
-           f"cat > /v/run/datum/config.json.tmp && chown {UID_UI}:{UID_DATUM} /v/run/datum/config.json.tmp && chmod 640 /v/run/datum/config.json.tmp "
-           "&& mv /v/run/datum/config.json.tmp /v/run/datum/config.json", input=json.dumps(conf))
+
+    log("== the node can't be reached: the gateway set up with a node address nothing answers on")
+    dead = json.loads(json.dumps(conf))
+    dead["bitcoind"]["rpcurl"] = f"http://{gw}:{RPC + 7}"
+    write_config(dead)
+    try:
+        wait_until(lambda: bundled_state(control("GET", "/status")) == "waiting for the node", 120, "the renter's page saying the gateway waits for the node")
+    except RuntimeError as e:
+        log(f"  {e}")
+    st = control("GET", "/status")
+    FACTS["status_node_unreachable"] = st
+    check("N", "with the node unreachable the gateway runs (its API answers, its readyCommand passes) but serves no work (no Stratum: the "
+               "dashboard says it waits for a block template), and the renter's page stays live and says in words that it waits for the node",
+          api_open() and ready() and not stratum_open() and st.get("role") == "renter" and bundled_state(st) == "waiting for the node"
+          and not (st.get("bundled") or {}).get("masking"),
+          {"bundled": st.get("bundled"), "datum": st.get("datum"), "blinding": st.get("blinding")})
+
+    log("== the Hashrate page's \"Your gateway\": solo, paid to the regtest address, the Node connection action's node (as the UI writes it)")
+    write_config(conf)
     t0 = time.time()
     try:
         wait_until(lambda: stratum_open() and api_open(), 120, "the gateway's Stratum and API")
@@ -281,7 +325,7 @@ def main():
     dt = round(time.time() - t0, 1)
     glog = docker("logs", f"{P}-datum", check_rc=False)
     glog = glog.stdout + glog.stderr
-    check("D", "the config starts it (xbt-supervise); it reaches the node through init's cookie: a block template, then Stratum on "
+    check("D", "the config (rewritten) restarts it (xbt-supervise); it reaches the node through init's cookie: a block template, then Stratum on "
                "127.0.0.1:23339 and the API on 127.0.0.1:7152; its readyCommand passes",
           stratum_open() and api_open() and ready(),
           {"seconds": dt, "log tail": glog[-1500:]})
@@ -297,15 +341,10 @@ def main():
 
     log("== the seller: a stand-in Nostr relay, a hashmaker in a namespace of its own, stratum-grind as its miner")
     docker("volume", "create", SVOL)
-    docker("run", "-d", "--name", f"{P}-relay", "--network", NET, "--network-alias", "relay", "--entrypoint", "/usr/bin/xbt-hashlink", IMG["hashlink"],
-           "relay", "--listen", "0.0.0.0:7777")
     docker("run", "-d", "--name", f"{P}-seller", "--network", NET, "--network-alias", "seller", "-p", f"127.0.0.1:{MINERS}:23340",
            "debian:bookworm-slim", "sleep", "infinity")
-    # a Nostr client takes plain ws:// only to its own machine: each namespace reaches the stand-in relay through a
-    # loopback forwarder (test-only; on a box the relays are wss://)
-    for ns in ("seller", "ns"):
-        docker("run", "-d", "--name", f"{P}-fwd-{ns}", "--network", f"container:{P}-{ns}", PROBE,
-               "socat", "TCP-LISTEN:7777,bind=127.0.0.1,fork,reuseaddr", "TCP:relay:7777")
+    docker("run", "-d", "--name", f"{P}-fwd-seller", "--network", f"container:{P}-seller", PROBE,
+           "socat", "TCP-LISTEN:7777,bind=127.0.0.1,fork,reuseaddr", "TCP:relay:7777")
     for k in ("hasher", "nostr"):
         docker("run", "--rm", "--user", "0:0", "-v", f"{SVOL}:/d", "--entrypoint", "/usr/bin/xbt-hashlink", IMG["hashlink"], "keygen", f"/d/{k}.key")
     docker("run", "-d", "--name", f"{P}-hashmaker", "--network", f"container:{P}-seller", "--user", "0:0", "-v", f"{SVOL}:/d",
@@ -318,21 +357,18 @@ def main():
     wait_until(lambda: docker("run", "--rm", "-v", f"{SVOL}:/d", PROBE, "test", "-s", "/d/listing.json", check_rc=False).returncode == 0, 60,
                "the hashmaker's listing")
 
-    log("== the renter: the spec's hashtaker (the stand-in relay; no wallet: no --signer)")
-    cmd = list(ht)
-    cmd[cmd.index("--relays") + 1] = "ws://127.0.0.1:7777"
-    i = cmd.index("--signer")
-    del cmd[i:i + 2]
-    FACTS["hashtaker_command"] = cmd
-    FACTS["control_token_mount"] = f"type=volume,src={VOL},dst=/t,volume-subpath=run/hashrate,readonly,volume-nocopy=true"
-    run_service(by["hashtaker"], IMG["hashlink"], command=cmd)
-    wait_until(lambda: control("GET", "/status").get("role") == "renter", 60, "the hashtaker's control API")
-    st = wait_until(lambda: (lambda s: s if (s.get("blinding") or {}).get("state") else None)(control("GET", "/status")), 90,
-                    "the renter's look at its gateway")
+    log("== the renter, once the gateway has work")
+    # its last look (at the gateway with no node) is redone after a minute
+    try:
+        wait_until(lambda: (control("GET", "/status").get("blinding") or {}).get("state") == "blinded", 150, "the renter's look at its gateway")
+    except RuntimeError as e:
+        log(f"  {e}")
+    st = control("GET", "/status")
     FACTS["status_before"] = st
-    check("R", "the renter picks the bundled gateway (127.0.0.1:23339) by itself, and its status says the jobs are masked (blinded, solo)",
-          st["datum"]["addr"] == "127.0.0.1:23339" and st["datum"]["reachable"] and st["blinding"]["state"] == "blinded"
-          and st["blinding"]["why"] == "solo", st)
+    check("R", "the renter is on the bundled gateway (127.0.0.1:23339), and its status says the jobs are masked (blinded, solo; the bundled "
+               "gateway's state: masking)",
+          st["datum"]["addr"] == "127.0.0.1:23339" and st["datum"]["reachable"] and (st.get("blinding") or {}).get("state") == "blinded"
+          and st["blinding"]["why"] == "solo" and bundled_state(st) == "masking", st)
 
     log("== a masked solo rental")
     offers = wait_until(lambda: control("GET", "/offers?fresh=1").get("offers"), 90, "the hashmaker's listing at the renter")

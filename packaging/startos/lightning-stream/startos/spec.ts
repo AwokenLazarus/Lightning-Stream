@@ -525,8 +525,10 @@ export function services(cfg: Config): ServiceSpec[] {
       ],
       env: {},
       mounts: [vol('hashrate', '/data/hashrate'), vol('run/hashrate', '/data/run/hashrate', true), vol('run/signer', '/data/run/signer', true)],
-      // after the masking gateway, so `--upstream auto` finds it listening
-      requires: ['signer', 'datum'],
+      // not after the gateway: the renter takes 127.0.0.1:23339 as the bundled gateway whether it answers yet or
+      // not, and its page says in words what the gateway is doing (not running, waiting for the node, masking),
+      // so a node that can't be reached never leaves the renter's page dead
+      requires: ['signer'],
     },
     {
       // the VPN service: the WireGuard endpoint the owner's devices pair with, and this box's exit if the

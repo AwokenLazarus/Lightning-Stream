@@ -82,5 +82,6 @@ test('the hashtaker tries the bundled gateway first, checks every job on its API
   assert.equal(arg(c, '--datum-candidates'), '127.0.0.1:23339,datum-blake2b.startos:23336,datum.startos:23334')
   assert.equal(arg(c, '--gateway-api'), '127.0.0.1:7152')
   for (const s of all) assert.ok(!s.command.includes('--allow-unblinded'), `${s.id} runs with --allow-unblinded`)
-  assert.deepEqual(by('hashtaker').requires, ['signer', 'datum'])
+  // it doesn't wait for the gateway: its page says what the gateway is doing, even with the node unreachable
+  assert.deepEqual(by('hashtaker').requires, ['signer'])
 })

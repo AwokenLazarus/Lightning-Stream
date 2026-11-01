@@ -181,7 +181,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
         subcontainer: sub(hashtaker),
         exec: exec(hashtaker),
         ready: { display: null, fn: () => ({ result: 'success', message: null }) },
-        requires: ['signer', 'datum'],
+        requires: ['signer'],
       })
       .addDaemon('vpn', { subcontainer: sub(vpn), exec: exec(vpn), ready: { display: null, fn: () => ({ result: 'success', message: null }) }, requires: ['init'] })
       // Readiness as the wallet sees it: the MCP's /readyz (the signer is up, the node is reachable and synced,
