@@ -158,6 +158,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A kill or a lost answer no longer buys a second ticket when the first was paid: the next call waits
   for the shop to take it, for two minutes at most. Long answers open for over ten minutes are no longer
   cut by a second call to the same shop.
+- An agent's paid download or payment that takes longer than a minute no longer fails at the MCP with
+  "Resource temporarily unavailable" while the wallet goes on paying for it. The MCP waits for a paying
+  call's answer as long as the wallet works on it; any other call still gives up after `B2_SIGNER_TIMEOUT`.
+  If a paying call's answer is lost (the wallet's signer stopped), the agent is told the call may have paid
+  (`signer_no_answer`, `request_sent: true`) rather than given an error that reads as if nothing happened.
 
 **VPN exits**
 - A priced exit's region check now runs for a buyer with no credit at that exit. Each check is

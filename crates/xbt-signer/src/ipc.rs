@@ -66,6 +66,19 @@ impl Stream {
         }
     }
 
+    /// The read timeout alone (`None`: wait as long as the other end takes), the write timeout as it was.
+    pub fn set_read_timeout(&self, t: Option<Duration>) {
+        match self {
+            Stream::Tcp(s) => {
+                let _ = s.set_read_timeout(t);
+            }
+            #[cfg(unix)]
+            Stream::Unix(s) => {
+                let _ = s.set_read_timeout(t);
+            }
+        }
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         match self {
             Stream::Tcp(s) => s.try_clone().map(Stream::Tcp),

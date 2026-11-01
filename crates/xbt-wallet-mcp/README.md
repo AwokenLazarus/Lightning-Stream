@@ -115,7 +115,7 @@ xbt-wallet-mcp --list-tools                                       # the tool lis
 |---|---|
 | `B2_SIGNER_SOCK` | the signer socket: a path, or `tcp://127.0.0.1:PORT` (Windows) |
 | `B2_ROOT` | if `B2_SIGNER_SOCK` is unset, the socket is `$B2_ROOT/.run/signer.sock` |
-| `B2_SIGNER_TIMEOUT` | seconds per signer call (default 60; a paid call can take as long as its answer) |
+| `B2_SIGNER_TIMEOUT` | seconds to connect, send, and wait for the answer of any call but a paying one (default 60). A paying call (`xbt402_pay`, `ln_pay`) waits for its answer as long as the signer works on it, since a paid download or a payment can take minutes and the signer bounds the call itself. Should a paying call's answer be lost after it was sent (the signer stopped, the socket failed), the tool answers `verdict: "unknown"`, `rule: "signer_no_answer"`, `request_sent: true`: the call may have paid, so look at `ticket_status` or `ln_status` before repeating it |
 | `XBT_MCP_LN`, `XBT_MCP_TICKETS` | `1`: list the Lightning tools, the ticket tools (see Tools) |
 | `XBT_MCP_HTTP_TOKEN` | the bearer token that HTTP requests must carry. AGP-063 X1: HTTP always needs a token. Without this, a token file or a data dir, one is generated on first run in `<signer socket dir>/mcp-http-token` (0600) and read from there on restart |
 | `XBT_MCP_ALLOWED_ORIGINS` | AGP-063 X1: browser origins allowed besides loopback, comma-separated (`https://wallet.example.com`). Checked with or without `--http-allow-remote` |
