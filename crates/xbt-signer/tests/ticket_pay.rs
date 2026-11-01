@@ -802,6 +802,8 @@ struct PayState {
     no_route_for: Duration,
     no_route_until: Option<Instant>,
     no_route_answers: usize,
+    /// How long the node takes to decode an invoice: a slow box under load, whose checks take seconds.
+    decode_takes: Duration,
     /// The seller sits behind a private channel: the node's decode of its invoices shows a route hint, its
     /// route query finds a path only when it is given that hint, and a payment sent with the invoice arrives.
     private_seller: bool,
@@ -981,6 +983,8 @@ impl LnBackend for PayLn {
     }
 
     fn decode(&self, inv: &str) -> xbt402::Result<Value> {
+        let takes = self.st.lock().unwrap().decode_takes;
+        std::thread::sleep(takes);
         let d = xbt_signer::bolt11::decode(inv).map_err(|e| node_err(&e))?;
         let features: serde_json::Map<String, Value> = d.features.iter().map(|b| (b.to_string(), json!({"is_known": true}))).collect();
         let mut out = json!({"destination": d.payee_hex(), "payment_hash": d.payment_hash_hex(), "num_msat": d.amount_msat.unwrap_or(0).to_string(),
@@ -2026,7 +2030,19 @@ fn streamed_call(r: &Rig, dir: &std::path::Path, name: &str, url: String, max_sa
     });
     let started = Instant::now();
     let v = r.call("xbt402_pay", json!({"url": url, "max_sats": max_sats, "task": "film", "stream_to": name}));
+    // a call that ended without opening the reader's socket (refused, or failed before its answer) leaves the reader in
+    // its accept: it is let go, with nothing read, so that the test fails on the call's answer rather than hang
+    let t = Instant::now();
+    while !reader.is_finished() && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !reader.is_finished() {
+        let _ = std::os::unix::net::UnixStream::connect(dir.join(name));
+    }
     let got = reader.join().unwrap();
+    if got == 0 {
+        eprintln!("streamed_call {name}: nothing reached the reader; the call answered {v}");
+    }
     (v, got, started.elapsed())
 }
 
@@ -7616,7 +7632,15 @@ fn a_408_with_wins_unpaid_blames_no_seller() {
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
     // the wallet's router away for a whole file: its wins are booked, sent nowhere, and the answer is cut
     r.ln.st.lock().unwrap().router_down = true;
-    let a = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    // 128 pieces at one win in 32 draw none 1 time in 60: a file with no win is whole and owes nothing, and another is
+    // fetched (up to 5, each on the same session)
+    let mut a = Value::Null;
+    for _ in 0..5 {
+        a = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+        if a["wins"].as_u64() >= Some(1) {
+            break;
+        }
+    }
     r.ln.st.lock().unwrap().router_down = false;
     assert!(a["wins"].as_u64().unwrap() >= 1, "{a}");
     r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/pieces/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
@@ -13984,6 +14008,46 @@ fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
     assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
 }
 
+/// On a slow box the node's checks before a payment take seconds (here its decode of the invoice, 5 s), and then the
+/// node finds no route to the seller for 5 s: the wallet's 8 s for a route are counted from after the checks, so it
+/// waits the 5 s out and pays, with nothing failed and the money right.
+///
+/// FAILS with the 8 s counted from before the checks: 3 s are left of them when the wait begins, the window outlasts
+/// them, and the call ends `ln_no_route`.
+#[test]
+fn the_wait_for_a_route_has_its_whole_8_s_after_a_slow_nodes_checks() {
+    let _g = env_lock();
+    let size = 256 * PIECE;
+    // the moment opens at the first win's route query: a draw with no win never meets it, and is drawn again
+    let mut tries = 0;
+    let (r, v) = loop {
+        tries += 1;
+        let r = patient_draws_rig(json!({}));
+        {
+            let mut st = r.ln.st.lock().unwrap();
+            st.decode_takes = Duration::from_secs(5);
+            st.no_route_at_query = 1;
+            st.no_route_for = Duration::from_secs(5);
+        }
+        let v = r.pay(&format!("/pieces/{size}"), 1_000);
+        r.ln.st.lock().unwrap().decode_takes = Duration::ZERO;
+        if r.ln.st.lock().unwrap().route_queries > 0 || tries == 5 {
+            break (r, v);
+        }
+    };
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the window was met, in {tries} draws: {v}");
+    // the payment that met the moment waited it out: no refusal for want of a route, not even one tried again later.
+    // A win that came while it waited stood back ("another payment to the seller is waiting"), nothing sent, and was
+    // paid after: that is the wait, not one that ran out
+    let refused: Vec<Value> = r.audit("ticket_refused").into_iter()
+        .filter(|e| e["rule"] == "ln_no_route" && e["reason"].as_str().unwrap_or("").contains("has found no route")).collect();
+    assert!(refused.is_empty(), "the wait had its 8 s after the checks, and none ran out: {refused:?}");
+    assert!(!r.audit("ticket_route_waited").is_empty(), "the payment waited for the route: {v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(200), Some(true), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
 /// A link along the route is replaced, and for a while the node finds no route to the seller: a payment sent
 /// then fails at once. The wallet asks the node for a route first and waits for one, within 8 s: a window of
 /// 3 s costs no failed payment and no win; one of 10 s ends the wait at 8 s and the call with `ln_no_route`, the
@@ -14209,15 +14273,25 @@ fn a_whole_body_for_a_range_from_the_first_byte_is_a_whole_answer() {
 fn a_moment_with_no_route_and_many_wins_pays_every_win() {
     let _g = env_lock();
     for (at, secs) in [(2usize, 4u64), (5, 4), (2, 7)] {
-        let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
-        {
-            let mut st = r.ln.st.lock().unwrap();
-            st.no_route_at_query = at;
-            st.no_route_for = Duration::from_secs(secs);
-        }
         let size = 256 * PIECE;
-        let v = r.pay(&format!("/pieces/{size}"), 2_000);
-        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment: {v}");
+        // the moment opens at a win's route query: a draw with fewer wins than that never meets it, and is drawn again
+        // (a new rig: the luck of the draw, not the wallet's doing), a few times at most
+        let mut tries = 0;
+        let (r, v) = loop {
+            tries += 1;
+            let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+            {
+                let mut st = r.ln.st.lock().unwrap();
+                st.no_route_at_query = at;
+                st.no_route_for = Duration::from_secs(secs);
+            }
+            let v = r.pay(&format!("/pieces/{size}"), 2_000);
+            let (met, asked) = { let st = r.ln.st.lock().unwrap(); (st.no_route_answers > 0, st.route_queries) };
+            if met || asked >= at || tries == 5 {
+                break (r, v);
+            }
+        };
+        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment in {tries} draws: {v}");
         // the payments the node had found a route for just before the moment came are sent into it and fail, as
         // they would on a real node; at most the gate's eight, and none is sent again
         let failed = r.ln.by_status("FAILED");
