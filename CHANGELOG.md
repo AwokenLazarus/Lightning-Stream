@@ -62,7 +62,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A channel that drops for a moment no longer ends a paid file or answer: the wallet waits up to
   8 s for it to come back, and as long for a route to the seller (after a link further along the way
   was replaced, a node may find none for some seconds), rather than sending a payment that fails. A seller
-  the node has no route to for good ends the call with `ln_no_route` within those 8 s, and holds up no
+  the node has no route to for good ends the call with `ln_no_route` within 8 s counted from after the
+  node's checks, and holds up no
   other seller's payments. The route is asked for with the invoice's route hints, so a seller reached through a
   private channel (an LSP's, say) is found as its payment finds it, and waited for the same way; an invoice with
   blinded paths, which the route query does not take, is paid at once, as before. A channel that stays down still ends what is paid by tickets, with that

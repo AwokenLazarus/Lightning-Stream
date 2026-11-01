@@ -2016,8 +2016,14 @@ fn a_streamed_download_paid_by_draws_is_not_cut_at_max_answer_s() {
 fn streamed_call(r: &Rig, dir: &std::path::Path, name: &str, url: String, max_sats: u64, reader_stalls: Option<Duration>) -> (Value, usize, Duration) {
     use std::io::Read as _;
     let l = std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap();
+    // set before the harness's own connection that lets a waiting reader go: the reader says whose it took
+    let woken = Arc::new(AtomicBool::new(false));
+    let by_harness = woken.clone();
     let reader = std::thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
+        if by_harness.load(Ordering::SeqCst) {
+            return (0, true);
+        }
         let mut buf = vec![0u8; 64 << 10];
         let mut got = s.read(&mut buf).unwrap_or(0);
         if let Some(stall) = reader_stalls {
@@ -2026,7 +2032,7 @@ fn streamed_call(r: &Rig, dir: &std::path::Path, name: &str, url: String, max_sa
         let mut rest = vec![];
         let _ = s.read_to_end(&mut rest);
         got += rest.len();
-        got
+        (got, false)
     });
     let started = Instant::now();
     let v = r.call("xbt402_pay", json!({"url": url, "max_sats": max_sats, "task": "film", "stream_to": name}));
@@ -2037,11 +2043,14 @@ fn streamed_call(r: &Rig, dir: &std::path::Path, name: &str, url: String, max_sa
         std::thread::sleep(Duration::from_millis(20));
     }
     if !reader.is_finished() {
+        woken.store(true, Ordering::SeqCst);
         let _ = std::os::unix::net::UnixStream::connect(dir.join(name));
     }
-    let got = reader.join().unwrap();
-    if got == 0 {
-        eprintln!("streamed_call {name}: nothing reached the reader; the call answered {v}");
+    let (got, harness) = reader.join().unwrap();
+    if harness {
+        eprintln!("streamed_call {name}: the signer never connected to the reader (the harness let it go); the call answered {v}");
+    } else if got == 0 {
+        eprintln!("streamed_call {name}: the signer connected and sent nothing; the call answered {v}");
     }
     (v, got, started.elapsed())
 }
