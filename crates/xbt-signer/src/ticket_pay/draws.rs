@@ -240,6 +240,18 @@ struct Round {
 }
 
 /// What one call counted: for its reply.
+impl State {
+    /// What a payment of a win came to, for when the win was first seen: once it is paid (`allow`) its place in the
+    /// gate's order is no longer needed, and a long session keeps no entry per win. Only then: a win the book says has a
+    /// payment already (`lottery_win_paid`) may have it still in flight, and should that fail the win is owed again
+    /// with the deadline it had; one booked and waiting on the node's word (`pending`) the same.
+    fn pay_outcome_seen(&mut self, draw: u64, verdict: Option<&str>) {
+        if verdict == Some("allow") {
+            self.seen_at.remove(&draw);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Counted {
     price_msat: u64,
@@ -693,11 +705,10 @@ impl Signer {
         }
         let mut s = lock(&ds.state);
         s.paying.remove(&win.draw());
+        s.pay_outcome_seen(win.draw(), out.get("verdict").and_then(Value::as_str));
         let mut c = lock(counted);
         match out.get("verdict").and_then(Value::as_str) {
             Some("allow") => {
-                // paid: its place in the gate's order is no longer needed, and a long session keeps no entry per win
-                s.seen_at.remove(&win.draw());
                 s.wins_paid += 1;
                 s.paid_sats = s.paid_sats.saturating_add(charged);
                 c.wins_paid += 1;
@@ -724,9 +735,7 @@ impl Signer {
                 }
             }
             // the book has a payment for this win already: it is paid, or being paid, and this invoice is not
-            _ if rule == "lottery_win_paid" => {
-                s.seen_at.remove(&win.draw());
-            }
+            _ if rule == "lottery_win_paid" => {}
             _ => {
                 // whatever such an answer booked left all the same (an answer that books says pending; this one is for
                 // any that did not)
@@ -1426,5 +1435,29 @@ impl Signer {
             m["receipt"] = json!({"signed": true, "body": if complete { "sent as it arrived" } else { "cut short" }});
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A win keeps when it was first seen until it is paid: an answer that the book has a payment for it already
+    /// (`lottery_win_paid`, that payment perhaps still in flight) leaves it, so that a win owed again after that payment
+    /// fails goes in the gate's order by its first deadline.
+    #[test]
+    fn a_win_keeps_its_first_seen_time_until_it_is_paid() {
+        let mut s = State::default();
+        for d in [5, 6, 7] {
+            s.seen_at.insert(d, 100.0 + d as f64);
+        }
+        // the book has a payment for win 5 already, perhaps still in flight: `lottery_win_paid` is a refusal
+        s.pay_outcome_seen(5, Some("deny"));
+        // win 6 booked and waiting on the node's word
+        s.pay_outcome_seen(6, Some("pending"));
+        assert_eq!((s.seen_at.get(&5), s.seen_at.get(&6)), (Some(&105.0), Some(&106.0)), "a win not yet paid keeps its first-seen time");
+        // win 7 paid: it leaves
+        s.pay_outcome_seen(7, Some("allow"));
+        assert_eq!(s.seen_at.get(&7), None);
     }
 }
