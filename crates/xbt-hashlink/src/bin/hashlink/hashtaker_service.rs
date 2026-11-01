@@ -238,7 +238,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     let bundled = bundled_of(f, &candidates);
     let upstream_flag = f.get("upstream").cloned().filter(|u| !u.is_empty() && u != "auto");
     let installer = installer_of(f);
-    let Start { datum: mut datum, api: datum_api, moved_from, installer_won, write } =
+    let Start { mut datum, api: datum_api, moved_from, installer_won, write } =
         start_with(saved.as_ref(), f.get("upstream").map(String::as_str).unwrap_or(""), bundled.as_deref(), &installer);
     if let (Some(w), Some(d)) = (&write, &state) {
         let _ = std::fs::write(d.join("renter.json"), w.to_string());
