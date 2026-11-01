@@ -4291,7 +4291,7 @@ fn another_gateways_api_is_set_on_the_page_and_an_installer_override_is_said() {
     // empty: none sent, the renter uses the host's 7152
     let r = br.act("/hashrate", "/hashrate", &[("action", "datum"), ("addr", "10.0.0.6:23334"), ("api", "")]);
     br.flash_after(&r);
-    let last = seen.lock().unwrap().iter().filter(|(m, p, _, _)| m == "POST" && p == "/datum").last().cloned().unwrap();
+    let last = seen.lock().unwrap().iter().rfind(|(m, p, _, _)| m == "POST" && p == "/datum").cloned().unwrap();
     assert_eq!(serde_json::from_str::<Value>(&last.3).unwrap(), json!({"addr": "10.0.0.6:23334"}));
     // "use it again": the page's earlier choice, sent back
     let r = br.act("/hashrate", "/hashrate", &[("action", "use-previous"), ("addr", "127.0.0.1:23339")]);
