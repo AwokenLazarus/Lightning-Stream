@@ -4,14 +4,15 @@
 // it always sits on them. A click is a short electric discharge: an arc from the pointer to the
 // nearest stream, then a jagged, flickering current racing both ways along it (and, when the click
 // lands about midway between two streams, an arc to the other one too), with a few forks, fading in well under a second. Drawn in a worker on an OffscreenCanvas where the browser has one (the
-// page's thread only forwards the pointer), else in the page. 30 fps while something moves, 6 at
-// rest, none while hidden or a video plays; half resolution; one still frame for reduced motion.
+// page's thread only forwards the pointer), else in the page. 30 fps while something moves, 1.5 at
+// rest (a frame costs the compositor far more than the drawing, and the streams barely move at
+// rest), none while hidden or a video plays; half resolution; one still frame for reduced motion.
 // The streams' shape is a function of the clock, so every page shows the same frame at the same
 // moment: a new page starts where the last one left off, with a first frame drawn before it shows.
 // Colours: --river-* in ui.css.
 (function () {
   "use strict";
-  var STEP = 24, REACH = 140, FAST = 1000 / 30, SLOW = 1000 / 6, IDLE = 8000, FRONT = 0.09, LIFE = 900;
+  var STEP = 24, REACH = 140, FAST = 1000 / 30, SLOW = 1000 / 1.5, IDLE = 8000, FRONT = 0.09, LIFE = 900;
   // a click arcs to the second-nearest stream too only when it is nearly as close as the nearest
   var MIDWAY = 0.75;
 
