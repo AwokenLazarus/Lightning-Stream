@@ -7433,6 +7433,46 @@ fn a_strict_seller_behind_twenty(stands_still: u64, hold: bool, sync_ms: u64) ->
     (r, strict_one, others, before)
 }
 
+/// A seller whose grace is short (10 s, and 1 s more once its answer stands still) and who bears any number of
+/// unpaid wins, beside 20 that give 600 s: its wins are paid before the 120 of theirs that wait at the gate when it
+/// starts, by when each seller's grace ends, and its file is whole. The wallet's own count never hurries such a
+/// seller's wins: it stands still for none of its pieces or wins, only for time.
+///
+/// FAILS with the gate in order of arrival: its wins wait behind the 120 (15 s at 8 a second), past its grace, and
+/// its answer is cut `win_unpaid`.
+#[test]
+fn a_seller_with_a_short_grace_is_paid_before_twenty_that_can_wait() {
+    let _g = env_lock();
+    let short = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 1_000,
+                       "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 10, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let long = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000,
+                      "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 600, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
+    let r = Rig::with_more(owner, true, true, 30, short, &vec![long; 20]);
+    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(1_000);
+    let size = 64 * PIECE;
+    let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    let (short_one, others) = std::thread::scope(|sc| {
+        let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
+        wait_for_rig("120 wins waiting at the gate", || {
+            // the sellers share one node: its invoices, then the buyer node's payments, never one lock inside the other
+            let invoiced = r.shop.node.preimages.lock().unwrap().len();
+            invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
+        });
+        let short_one = sc.spawn(|| buy(&r.shop)).join().unwrap();
+        (short_one, others.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>())
+    });
+    let wins = short_one["wins"].as_u64().unwrap_or(0);
+    assert!(wins >= 1, "a file of 64 pieces that drew no win: {short_one}");
+    assert_eq!((short_one["complete"].as_bool(), short_one["ended"].as_str()), (Some(true), None), "its answer was cut: {short_one}");
+    assert_eq!((short_one["wins_paid"].as_u64(), short_one["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{short_one}");
+    for v in &others {
+        assert_eq!((v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(0)), "{v}");
+    }
+    assert!(r.ln.state().peak <= 8, "{} payments at once", r.ln.state().peak);
+}
+
 /// The strict seller's file is whole, every win is paid once, and one number is on the node, at the seller and in the
 /// ledger, with never more than 8 payments at once.
 fn assert_all_whole_and_paid_once(r: &Rig, strict_one: &Value, others: &[Value]) {

@@ -117,8 +117,11 @@ const QUERIES_KEPT: usize = 2_000;
 /// the owner's `tickets.max_sellers` and each seller's unpaid wins bound the number; each leaves
 /// within what the Lightning rail's `timeout_s` bounds.
 ///
-/// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
-/// that no seller's win waits behind a later one's until that seller's grace has run out. Before
+/// In order of when they are due: with a hundred sellers' wins waiting, the one whose seller's grace ends
+/// first goes first (a prepaid ticket by its invoice's end, a lock round of held tickets as if its seller
+/// gave it 60 s, [`UNTIMED_DUE_S`]), so that no seller's win waits behind one whose seller can wait longer,
+/// and a win whose first invoice came to nothing goes by when it was first won, not by when its next invoice
+/// came. Of two due at once, the one that came first. Before
 /// them all, in their own order of arrival, go the wins a seller's answer stands still for
 /// ([`Pace::hurry`]): a seller waits its grace (60 s as shipped) for a win it serves on beside, and 15 s (`refill_wait`)
 /// for one it has stopped for, so the second cannot wait behind a hundred of the first.
@@ -170,7 +173,13 @@ struct Waiter {
     win: Option<(String, u64)>,
     /// It goes before every waiter that is not `first`.
     first: bool,
+    /// By when it must be paid, in Unix seconds: the earliest goes first among its kind ([`Pace::enter_for`]).
+    due: f64,
 }
+
+/// The time a payment no seller's clock is on (a lock round of held tickets) is taken to have, from when it
+/// comes to the gate: a seller's grace as shipped. It orders that payment among those whose sellers' clocks run.
+const UNTIMED_DUE_S: f64 = 60.0;
 
 /// How many hurried wins go one after another before a payment that is not hurried, through the gate
 /// and at the spend lock, before that payment goes all the same. A seller's hurried wins are few, but
@@ -184,8 +193,8 @@ impl PaceState {
     /// Whose turn it is: the earliest of those that go first, or else the earliest. After
     /// [`FIRST_IN_A_ROW`] of the first, the earliest of the others.
     fn turn(&self) -> Option<u64> {
-        let first = self.waiting.iter().find(|w| w.first);
-        let plain = self.waiting.iter().find(|w| !w.first);
+        let soonest = |first: bool| self.waiting.iter().filter(|w| w.first == first).min_by(|a, b| a.due.total_cmp(&b.due).then(a.n.cmp(&b.n)));
+        let (first, plain) = (soonest(true), soonest(false));
         match (first, plain) {
             (Some(_), Some(p)) if self.first_in_row >= FIRST_IN_A_ROW => Some(p.n),
             (Some(f), _) => Some(f.n),
@@ -205,7 +214,7 @@ pub struct SpendTurn<'a>(&'a Pace);
 
 impl Pace {
     pub fn enter(&self) -> PaceGuard<'_> {
-        self.enter_for(None, false)
+        self.enter_for(None, false, None)
     }
 
     /// Enter to pay the win of `win` (the book's session and the draw), or a ticket (None).
@@ -276,11 +285,16 @@ impl Pace {
         (2.0 * longest).min(life / 2.0).max(ticket::PREPAID_EXPIRY_MARGIN_S)
     }
 
-    pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool) -> PaceGuard<'_> {
+    /// `due`: by when, on the wallet's clock, it must be paid (the seller's: the end of a win's grace, the end of an
+    /// invoice's life; a payment no seller's clock is on is given [`UNTIMED_DUE_S`] from when it comes). Among those
+    /// that go first, and among the others, the earliest due goes first, and of two due at once the one that came
+    /// first. None: after every one with a due, in order of arrival.
+    pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool, due: Option<f64>) -> PaceGuard<'_> {
+        let due = due.filter(|d| d.is_finite()).unwrap_or(f64::INFINITY);
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mine = s.next;
         s.next += 1;
-        s.waiting.push(Waiter { n: mine, win: win.map(|(session, draw)| (session.to_string(), draw)), first });
+        s.waiting.push(Waiter { n: mine, win: win.map(|(session, draw)| (session.to_string(), draw)), first, due });
         while s.inside >= SEND_PARALLEL || s.turn() != Some(mine) {
             s = self.left.wait(s).unwrap_or_else(|p| p.into_inner());
         }
@@ -1167,10 +1181,11 @@ impl Signer {
         let mut outcomes: Vec<Result<Value>> = vec![];
         for chunk in sends.chunks(SEND_PARALLEL) {
             outcomes.extend(std::thread::scope(|sc| {
+                let due = self.engine.now() + UNTIMED_DUE_S;
                 let hs: Vec<_> = chunk.iter().map(|(_, r)| {
                     let (ln, pace) = (&ln, &self.ticket_pace);
                     sc.spawn(move || {
-                        let _inside = pace.enter();
+                        let _inside = pace.enter_for(None, false, Some(due));
                         ln.send_held(r)
                     })
                 }).collect();
@@ -1755,7 +1770,7 @@ impl Signer {
     /// `ticket_msat`, where given: the size asked of the seller for this ticket ([`Signer::ticket_prepaid_size`]).
     pub(crate) fn ticket_prepay(&self, p: &Value) -> Value {
         let msat = crate::ticket::outside_u64(p.get("ticket_msat"));
-        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None, false, msat)
+        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None, false, msat, None)
     }
 
     /// Pay one win of a session that pays by draws: the seller's invoice for it, checked, booked
@@ -1768,11 +1783,13 @@ impl Signer {
     /// the wins no seller waits for ([`Pace`]).
     /// `by`: the seller's offer, where its terms name one; the win is paid by it first, and by
     /// `invoice` where the offer cannot be fetched ([`Signer::ticket_pay_by_offer`]).
-    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool, by: Option<&OfferWay<'_>>) -> Value {
-        if let Some(v) = by.and_then(|b| self.ticket_pay_by_offer(sid, b, Some(win), first, None)) {
+    /// `due`: when the seller's grace for the win ends, on the wallet's clock: the gate pays the win before those
+    /// due later ([`Pace::enter_for`]).
+    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool, by: Option<&OfferWay<'_>>, due: Option<f64>) -> Value {
+        if let Some(v) = by.and_then(|b| self.ticket_pay_by_offer(sid, b, Some(win), first, None, due)) {
             return v;
         }
-        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first, None)
+        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first, None, due)
     }
 
     /// Pay a prepaid ticket (`win` None) or a win by the seller's BOLT 12 offer
@@ -1791,7 +1808,8 @@ impl Signer {
     /// gives it, with `by_offer`; a refusal by the book's rules is final, since the invoice would
     /// meet the same rules.
     /// `msat`: the size of a prepaid ticket asked for, where it is not the seller's own.
-    pub(crate) fn ticket_pay_by_offer(&self, sid: &str, by: &OfferWay<'_>, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>) -> Option<Value> {
+    pub(crate) fn ticket_pay_by_offer(&self, sid: &str, by: &OfferWay<'_>, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>,
+                                      due: Option<f64>) -> Option<Value> {
         if self.ticket_shut().is_some() {
             return None;
         }
@@ -1834,7 +1852,8 @@ impl Signer {
         let purpose = win.map_or(xbt402::offer::Purpose::Ticket, |w| xbt402::offer::Purpose::Win(w.draw()));
         let note = xbt402::offer::note(by.key, by.seller_session, purpose, amount, &random_bytes::<16>());
         // through the gate, as every ordinary payment of the rail, from its checks to its end
-        let inside = self.ticket_pace.enter_for(win.map(|w| (sid, w.draw())), first);
+        let due = due.unwrap_or_else(|| self.engine.now() + UNTIMED_DUE_S);
+        let inside = self.ticket_pace.enter_for(win.map(|w| (sid, w.draw())), first, Some(due));
         if self.ln_node_checks(&*ln, &lp, &dest, "").is_err() {
             return passed("ln_node", "the wallet's Lightning node failed its checks".into());
         }
@@ -1904,7 +1923,8 @@ impl Signer {
 
     /// An ordinary payment of a session, booked before it is sent: a prepaid ticket (`win` None),
     /// or the win of a draw.
-    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>) -> Value {
+    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>,
+                           due: Option<f64>) -> Value {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
@@ -1936,7 +1956,10 @@ impl Signer {
         // no answer from the chain node for 3 of 309 (seen on the lab). And such a payment is pending on the wallet's
         // channel until it has settled, so the gate is also what keeps at most 8 of them there. (Leaving when the
         // send returned, as a held ticket does, let 24 wins be pending on a 30-slot channel, and 47 of 313 failed.)
-        let inside = self.ticket_pace.enter_for(win.map(|w| (sid.as_str(), w.draw())), first);
+        // in the gate's order by when the seller needs it: the end of the win's grace, or of the invoice's life
+        let expires = crate::bolt11::decode(&invoice).ok().map(|i| i.expires_at() as f64);
+        let due = [due, expires].into_iter().flatten().reduce(f64::min).unwrap_or_else(|| self.engine.now() + UNTIMED_DUE_S);
+        let inside = self.ticket_pace.enter_for(win.map(|w| (sid.as_str(), w.draw())), first, Some(due));
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
@@ -3341,8 +3364,8 @@ mod tests {
     fn a_hurried_win_inside_the_gate_has_the_next_turn_at_the_spend_lock() {
         let pace = Pace::default();
         let order = Mutex::new(vec![]);
-        let holder = pace.enter_for(Some(("s0", 1)), false);
-        let inside: Vec<PaceGuard<'_>> = (1..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("s", i)), false)).collect();
+        let holder = pace.enter_for(Some(("s0", 1)), false, None);
+        let inside: Vec<PaceGuard<'_>> = (1..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("s", i)), false, None)).collect();
         std::thread::scope(|sc| {
             // one has the turn; seven in the gate ask for one, and an eighth asks last
             let held = holder.spend_turn();
@@ -3378,6 +3401,35 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_lets_in_the_payment_due_soonest_and_of_two_due_at_once_the_first_that_came() {
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            let mut holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            let (pace, order) = (&pace, &order);
+            // they come in this order, due at these times; the hurried one goes before them all
+            let come = [("late", 300.0, false), ("soon", 100.0, false), ("soon too", 100.0, false), ("between", 200.0, false), ("hurried", 900.0, true)];
+            for (k, (name, due, first)) in come.into_iter().enumerate() {
+                sc.spawn(move || {
+                    let _inside = pace.enter_for(Some((name, 1)), first, Some(due));
+                    order.lock().unwrap().push(name);
+                });
+                while pace.waiting() < k as u64 + 1 {
+                    std::thread::yield_now();
+                }
+            }
+            // one place at a time
+            for left in (0..come.len()).rev() {
+                drop(holders.pop());
+                while pace.waiting() > left as u64 {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        assert_eq!(*order.lock().unwrap(), ["hurried", "soon", "soon too", "between", "late"]);
+    }
+
+    #[test]
     fn a_win_that_went_first_through_the_gate_goes_first_at_the_spend_lock() {
         let pace = Pace::default();
         let order = Mutex::new(vec![]);
@@ -3387,7 +3439,7 @@ mod tests {
             let held = pace.spend_turn();
             let (tx, rx) = std::sync::mpsc::channel();
             sc.spawn(move || {
-                let g = pace.enter_for(Some(("hurried", 9)), false);
+                let g = pace.enter_for(Some(("hurried", 9)), false, None);
                 tx.send(()).unwrap();
                 let _turn = g.spend_turn();
                 order.lock().unwrap().push("hurried");
@@ -3432,7 +3484,7 @@ mod tests {
                 sc.spawn(move || {
                     let mut i = 0;
                     while !done.load(Ordering::SeqCst) && i < 1_000 {
-                        let _inside = pace.enter_for(Some(("hurried", t * 10_000 + i)), true);
+                        let _inside = pace.enter_for(Some(("hurried", t * 10_000 + i)), true, None);
                         turns.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(1));
                         i += 1;
@@ -3450,7 +3502,7 @@ mod tests {
 
         // the spend lock: wins inside the gate, hurried, ask for turns without end; a payment past the gate waits
         let (done, turns) = (std::sync::atomic::AtomicBool::new(false), AtomicUsize::new(0));
-        let inside: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("hurried", i)), true)).collect();
+        let inside: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("hurried", i)), true, None)).collect();
         std::thread::scope(|sc| {
             let (pace, done, turns) = (&pace, &done, &turns);
             let held = pace.spend_turn();
@@ -3520,7 +3572,7 @@ mod tests {
             for i in 0..40u64 {
                 let (pace, order) = (&pace, &order);
                 sc.spawn(move || {
-                    let _inside = pace.enter_for(Some((&format!("s{i}"), 7)), false);
+                    let _inside = pace.enter_for(Some((&format!("s{i}"), 7)), false, None);
                     order.lock().unwrap().push(i);
                     std::thread::sleep(Duration::from_millis(2));
                 });
@@ -3535,7 +3587,7 @@ mod tests {
             // one that comes with its seller standing still already goes with them, behind those that came before it
             let (pace_, order_) = (&pace, &order);
             sc.spawn(move || {
-                let _inside = pace_.enter_for(Some(("late", 1)), true);
+                let _inside = pace_.enter_for(Some(("late", 1)), true, None);
                 order_.lock().unwrap().push(99);
             });
             while pace.waiting() < 41 {

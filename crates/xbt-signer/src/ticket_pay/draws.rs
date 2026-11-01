@@ -153,6 +153,9 @@ struct State {
     /// Wins whose invoice ran out or whose payment failed: their next invoice goes before the wins no seller
     /// waits for. Behind them it can run out too: on an 8 GB lab, a win lapsed twice waiting behind wins of 100 sellers.
     again: HashSet<u64>,
+    /// When the wallet first had each win to pay, on its clock: the seller's grace for it runs from about then,
+    /// and the gate pays the win in that order ([`crate::ticket_rail::Pace::enter_for`]).
+    seen_at: HashMap<u64, f64>,
     /// Invoices to ask the seller to cancel, before its list is next asked for.
     to_cancel: Vec<(u64, String)>,
     /// When the latest invoice of a win that is owed again ends: the seller's next one comes after that.
@@ -658,10 +661,12 @@ impl Signer {
             let _ = self.draw_fault(ds, "the seller is blocked for over-charging: no win is paid to it");
             return;
         }
-        let first = {
+        let (first, due) = {
             let mut s = lock(&ds.state);
             s.paying.insert(win.draw());
-            first || s.again.contains(&win.draw())
+            let now = self.engine.now();
+            let seen = *s.seen_at.entry(win.draw()).or_insert(now);
+            (first || s.again.contains(&win.draw()), seen + f64::from(ds.terms.grace_seconds))
         };
         // the seller's offer first, where its terms name one, with the note that names this session and draw; its
         // invoice where the offer cannot be fetched
@@ -672,7 +677,7 @@ impl Signer {
         let by = xbt402::offer::entry_offer(&ds.terms.accepted)
             .filter(|_| !seller_session.is_empty())
             .map(|offer| crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session });
-        let out = self.lottery_pay_win(&ds.sid, win, invoice, first, by.as_ref());
+        let out = self.lottery_pay_win(&ds.sid, win, invoice, first, by.as_ref(), Some(due));
         let charged = py_int(out.get("charged_sats")).unwrap_or(0).max(0);
         let rule = str_or_empty(out.get("rule"));
         // the book holds this invoice's payment failed, with nothing of it in flight on the wallet's node

@@ -3600,7 +3600,7 @@ impl Signer {
             return None;
         }
         let by = crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session };
-        self.ticket_pay_by_offer(&hs.sid, &by, None, false, msat)
+        self.ticket_pay_by_offer(&hs.sid, &by, None, false, msat, None)
     }
 
     /// The seller's offer left for its invoice before the payment by offer was tried, and why:
