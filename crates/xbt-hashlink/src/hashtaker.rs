@@ -113,6 +113,8 @@ struct Guard {
     /// shares wait for a job checked at the new one.
     checked_pot: HashMap<u32, u32>,
     await_job: HashSet<u32>,
+    /// Shares sent again past what could have been on their way, waiting for their gateway's verdict, by this side's id.
+    resend_pending: HashMap<u64, (meter::Claim, meter::Hashed, Instant)>,
     /// The credit the seller holds and what's left of the budget, as the wallet last said (with the wallet's payer).
     credit_msat: u64,
     budget_left: Option<u64>,
@@ -505,6 +507,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             }
             if g.guard.retire_until.is_some_and(|t| Instant::now() > t) {
                 g.guard.retire_until = None;
+                g.guard.resend_pending.clear();
                 for (_, u) in g.guard.retired_up.drain() {
                     let _ = u.shutdown(std::net::Shutdown::Both);
                 }
@@ -705,10 +708,6 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                         continue;
                     }
                 };
-                if g.guard.resend_left == 0 {
-                    g.guard.resends_refused += 1;
-                    continue;
-                }
                 let out = sv1::with_user(&v, &cfg.user).unwrap_or_else(|| v.to_string());
                 let sent = g.guard.retired_up.get_mut(&chan).is_some_and(|u| u.write_all(format!("{out}\n").as_bytes()).is_ok());
                 if !sent {
@@ -716,9 +715,15 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                     g.guard.resends_refused += 1;
                     continue;
                 }
-                g.guard.resend_left -= 1;
                 g.guard.own_id(chan, theirs);
                 let at = g.guard.dropped_at.unwrap_or_else(Instant::now);
+                // past what could have been on its way, a share sent again counts only once its gateway takes it: that
+                // verdict is the proof it reached the gateway, and it's still aged as of the drop
+                if g.guard.resend_left == 0 {
+                    g.guard.resend_pending.insert(own, (c, h, at));
+                    continue;
+                }
+                g.guard.resend_left -= 1;
                 match g.meter.commit_at(&c, h, at) {
                     Ok(p) if p.old => g.end("shares arrive too old", &tx),
                     Ok(p) if p.old_job => g.end("shares on an old job", &tx),
@@ -928,6 +933,29 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender, check: Opti
         if sv1::method(&v) == Some("mining.set_extranonce") {
             g.end("the gateway changed the extranonce", &tx);
             break;
+        }
+        // a share sent again that waited for its verdict: counted once the gateway takes it, before the meter reads that
+        // verdict, so the verdict is counted with it
+        if let Some((c, h, at)) = v.get("id").and_then(Value::as_u64).and_then(|own| g.guard.resend_pending.remove(&own)) {
+            if !sv1::accepted(&v) {
+                g.guard.resends_refused += 1;
+            } else {
+                match g.meter.commit_at(&c, h, at) {
+                    Ok(p) if p.old => {
+                        g.end("shares arrive too old", &tx);
+                        break;
+                    }
+                    Ok(p) if p.old_job => {
+                        g.end("shares on an old job", &tx);
+                        break;
+                    }
+                    Ok(_) => {
+                        g.resent_counted += 1;
+                        g.last_work = Instant::now();
+                    }
+                    Err(_) => g.guard.resends_refused += 1,
+                }
+            }
         }
         if let Err(why) = g.meter.down(chan, &v) {
             g.events.push(json!({"ev": "a line that can't be checked", "why": why, "atMs": now_ms()}));

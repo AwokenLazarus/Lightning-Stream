@@ -676,6 +676,8 @@ fn a_renter_saying_paying_and_never_paying_ends_within_the_wait_with_the_miners_
     assert!(took <= hashmaker_wait() + Duration::from_millis(1500), "{} ms", took.as_millis());
     assert_eq!(r["stopped"]["unpaidWork"], "0", "{r}");
     assert!(after > before, "the miner hashed for the hashmaker's own pool during the wait");
+    // in the ramp, whose waits aren't counted against the hour's limit: the 10 s rule still ends it
+    assert!(r["servedMs"].as_u64().unwrap() < 30_000 && r["rampWaits"] == 1 && r["paymentWaits"] == 0, "{r}");
     a.h.shutdown();
     drop(miner);
 }
@@ -687,6 +689,26 @@ fn hashmaker_wait() -> Duration {
 /// A renter that says `paying` and pays each time, past the limit of waits an hour: the rental ends on it.
 #[test]
 fn a_renter_saying_paying_past_the_limit_ends() {
+    // in the ramp: its own limit
+    let r = say_paying_each_time(false);
+    assert_eq!(r["stopped"]["reason"], "too many waits for payment", "{r}");
+    assert_eq!(r["rampWaits"].as_u64().unwrap_or(0) as usize, xbt_hashlink::order::RAMP_WAITS_MOST, "{r}");
+    assert_eq!(r["paymentWaits"], 0, "{r}");
+    assert_eq!(r["stopped"]["unpaidWork"], "0", "{r}");
+}
+
+/// Past the ramp (the miners' first 30 s of work for the rental, paid as it goes), `paying` is held to the hour's limit.
+#[test]
+fn a_renter_saying_paying_past_the_limit_after_the_ramp_ends() {
+    let r = say_paying_each_time(true);
+    assert_eq!(r["stopped"]["reason"], "too many waits for payment", "{r}");
+    assert_eq!(r["paymentWaits"].as_u64().unwrap_or(0) as usize, xbt_hashlink::order::PAYING_WAITS_AN_HOUR, "{r}");
+    assert_eq!(r["stopped"]["unpaidWork"], "0", "{r}");
+}
+
+/// A renter that says `paying` at every share that waits, and pays one slice each time; with `ramp_first`, it pays
+/// as it goes, saying nothing, until its miners have worked 30 s for it.
+fn say_paying_each_time(ramp_first: bool) -> Value {
     let _s = serial();
     let sw = share_work(DIFF);
     let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
@@ -698,30 +720,31 @@ fn a_renter_saying_paying_past_the_limit_ends() {
     let stop: Arc<AtomicBool> = Arc::default();
     let (ma, st2) = (a.miners.clone(), stop.clone());
     let miner = thread::spawn(move || {
-        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 10.0, bad_every: 0, duration: Some(Duration::from_secs(120)), reconnect: true, extranonce_subscribe: false, bind: None });
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 10.0, bad_every: 0, duration: Some(Duration::from_secs(170)), reconnect: true, extranonce_subscribe: false, bind: None });
         st2.store(true, Ordering::SeqCst);
     });
     let (mut paid, mut said) = (1u64, 0usize);
     let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(110) && a.h.finished().is_empty() && !b.ended {
+    while t0.elapsed() < Duration::from_secs(160) && a.h.finished().is_empty() && !b.ended {
         let dues = b.dues;
         b.pump(u64::MAX, Duration::from_millis(50));
         if b.dues > dues && rental_where(&a.h, "on", |_| true)["waitingForPayment"] == false {
-            b.tx.send(&Msg::Paying).unwrap();
-            said += 1;
-            thread::sleep(Duration::from_millis(300));
+            let ramping = rental_where(&a.h, "on", |_| true)["servedMs"].as_u64().unwrap_or(0) < 31_000;
+            if !(ramp_first && ramping) {
+                b.tx.send(&Msg::Paying).unwrap();
+                said += 1;
+                thread::sleep(Duration::from_millis(300));
+            }
             paid += 1;
             b.pay(paid);
         }
     }
     let r = finished(&a.h, "lim", Duration::from_secs(5));
     stop.store(true, Ordering::SeqCst);
-    eprintln!("said paying {said} times, paid {paid}: stopped {}", r["stopped"]["reason"]);
-    assert_eq!(r["stopped"]["reason"], "too many waits for payment", "{r}");
-    assert_eq!(r["paymentWaits"].as_u64().unwrap_or(0) as usize, xbt_hashlink::order::PAYING_WAITS_AN_HOUR, "{r}");
-    assert_eq!(r["stopped"]["unpaidWork"], "0", "{r}");
+    eprintln!("said paying {said} times, paid {paid}: stopped {}, ramp waits {}, waits {}", r["stopped"]["reason"], r["rampWaits"], r["paymentWaits"]);
     a.h.shutdown();
     drop(miner);
+    r
 }
 
 /// A wallet whose ticket buys take `buy` each: it keeps the credit a ticket left, and pays each slice through the
@@ -1754,11 +1777,11 @@ fn link_reader(mut rx: link::Receiver) -> mpsc::Receiver<Msg> {
 
 /// The review's M1 probe, as a test: a hashmaker hashes the renter's job, sends none of the shares on, drops the link,
 /// and hands them all over as `resend` when the renter is back. Before, the renter counted all 40 and paid for them,
-/// and none reached its gateway. Now a share sent again goes on to its gateway session of before the drop, for its
-/// verdict, aged as of the drop, and only as many are taken as the miners' rate says could have been on their way:
-/// here, with nothing proven before the drop, the slack of 4 at most.
+/// and none reached its gateway. Now each share sent again goes on to its gateway session of before the drop, for its
+/// verdict, aged as of the drop; as many as the miners' rate says could have been on their way count at once (here,
+/// with nothing proven before the drop, the slack of 4), and the rest count only once the gateway takes them.
 #[test]
-fn held_back_shares_sent_again_after_a_drop_are_taken_only_as_far_as_could_have_been_in_flight_and_go_to_the_gateway() {
+fn held_back_shares_sent_again_after_a_drop_count_only_as_they_reach_the_gateway() {
     let _s = serial();
     let sw = share_work(DIFF);
     let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
@@ -1833,13 +1856,16 @@ fn held_back_shares_sent_again_after_a_drop_are_taken_only_as_far_as_could_have_
     }
     let _ = tx2.send(&Msg::Close { reason: "test over".into(), slices: None });
     let r = taker.join().unwrap();
-    let p = pool_report(&report);
+    // the pool writes its report twice a second: read it until it has caught up, for up to 5 s
+    let mut p = pool_report(&report);
+    let t0 = Instant::now();
+    while p["accepted"].as_u64() < r["resentCounted"].as_u64() && t0.elapsed() < Duration::from_secs(5) {
+        p = pool_report(&report);
+    }
     eprintln!("MEASURED resend after a drop: counted {} refused {}; meter {}; released {}; pool accepted {}", r["resentCounted"], r["resendsRefused"], r["meter"],
               r["released"], p["accepted"]);
     let counted = r["resentCounted"].as_u64().unwrap();
-    assert!(counted <= 4, "only what could have been on its way: {r}");
-    assert_eq!(r["resendsRefused"].as_u64().unwrap(), 40 - counted, "{r}");
-    assert_eq!(p["accepted"].as_u64().unwrap(), counted, "each one counted reached the renter's gateway: {p}");
+    assert_eq!(counted + r["resendsRefused"].as_u64().unwrap_or(0), 40, "{r}");
+    assert_eq!(p["accepted"].as_u64().unwrap(), counted, "each one counted reached the renter's gateway, which took it: {p}");
     assert_eq!(r["meter"]["accepted"].as_u64().unwrap(), counted, "and its verdict was read: {r}");
-    assert!(r["released"].as_u64().unwrap() <= 2, "{r}");
 }

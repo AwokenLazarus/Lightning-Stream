@@ -265,6 +265,8 @@ struct Rental {
     /// each such wait began, for the limit an hour.
     waiting_since: Option<Instant>,
     waits: VecDeque<Instant>,
+    /// Waits while the renter's step ramps up, counted apart ([`order::RAMP_WAITS_MOST`]).
+    ramp_waits: usize,
     /// The link dropped: until this deadline the rental waits for the hashtaker to come back
     /// ([`Msg::Resume`]), its miners on the fallback meanwhile; past it, the rental ends.
     suspended: Option<(Instant, String)>,
@@ -343,7 +345,7 @@ impl Rental {
             "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "miners": self.units.iter().collect::<Vec<_>>(), "want": self.want, "startedMs": self.started_ms,
             "ready": self.ready, "suspended": self.suspended.is_some(), "servedMs": self.served.as_millis() as u64,
-            "waitingForPayment": self.waiting_since.is_some(), "paymentWaits": self.waits.len(),
+            "waitingForPayment": self.waiting_since.is_some(), "paymentWaits": self.waits.len(), "rampWaits": self.ramp_waits,
             "unitWork": self.unit_work.iter().map(|(u, w)| (u.clone(), Value::from(w.to_string()))).collect::<serde_json::Map<_, _>>(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "paid": self.paid, "earnedMsat": self.paid * self.terms.price_msat,
@@ -832,7 +834,8 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             return;
         }
     };
-    if tx.send(&Msg::Welcome { rental: id.clone(), terms_hash: hex::encode(terms.hash()), proof: Some(PROOF.into()) }).is_err() {
+    let welcome = Msg::Welcome { rental: id.clone(), terms_hash: hex::encode(terms.hash()), proof: Some(PROOF.into()) };
+    if resumed && tx.send(&welcome).is_err() {
         return;
     }
     if resumed {
@@ -885,6 +888,7 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             held_since: None,
             waiting_since: None,
             waits: VecDeque::new(),
+            ramp_waits: 0,
             suspended: None,
             stopped: None,
             last_heard: Instant::now(),
@@ -895,8 +899,14 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             started_ms: now_ms(),
             rail,
         });
-        g.allocate();
     }
+    // the rental is known before its welcome goes, so a slice the hashtaker pays the moment it's welcomed (through the
+    // gateway, not this link) finds it. The welcome is sent with no lock held
+    if tx.send(&welcome).is_err() {
+        lock(&hub).rentals.remove(&id);
+        return;
+    }
+    lock(&hub).allocate();
     }
     loop {
         let m = match rx.recv() {
@@ -963,11 +973,18 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 while r.waits.front().is_some_and(|t| now - *t > Duration::from_secs(3600)) {
                     r.waits.pop_front();
                 }
-                if r.waits.len() >= order::PAYING_WAITS_AN_HOUR {
+                // while the renter's step ramps up (the miners' first 30 s of work here), its buys may outlast what it
+                // may pay ahead: those waits are counted apart, up to their own limit
+                let ramp = r.served < Duration::from_secs_f64(order::STEP_SECONDS);
+                if (ramp && r.ramp_waits >= order::RAMP_WAITS_MOST) || (!ramp && r.waits.len() >= order::PAYING_WAITS_AN_HOUR) {
                     g.stop_unpaid(&id, "too many waits for payment");
                     return;
                 }
-                r.waits.push_back(now);
+                if ramp {
+                    r.ramp_waits += 1;
+                } else {
+                    r.waits.push_back(now);
+                }
                 r.waiting_since = Some(now);
                 r.note(json!({"ev": "waiting for a payment on its way", "atMs": now_ms(), "held": r.held.len()}));
                 // the miners go to this side's own pool and their channels close, so a share held for payment can't go on

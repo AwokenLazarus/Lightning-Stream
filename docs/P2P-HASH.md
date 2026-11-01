@@ -223,6 +223,13 @@ is in `crates/xbt-hashlink/src/order.rs`.
 - No share is forwarded past what's paid. One that doesn't fit waits, the hashmaker says `due`, and if no payment
   comes within 2 s the rental stops and the miners go home (`unpaid`). Measured on the real-money regtest: stopped
   with 0 work past what was paid.
+- A renter whose payment is on its way says `paying`: the hashmaker waits up to 10 s, its miners on its own pool,
+  and ends the rental if the payment hasn't come (`unpaid`). It allows 6 such waits an hour. While the renter's step
+  ramps up, in the miners' first 30 s of work for the rental, a slow wallet's buys can outlast what it may pay ahead,
+  so those waits are counted apart, up to 12 (`too many waits for payment` past either limit). Measured: a wallet
+  whose ticket buys take 8 s keeps a 200 sat/s miner running
+  (`an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running`); a renter that never pays after `paying` in
+  the ramp ends at the 10 s rule.
 - A share nobody hashed, a repeat, or one too old goes no further; the miner gets a rejection from the hashmaker.
 - A renter that keeps the miners idle (no jobs, or jobs too fast to finish) uses up the paid time: four times what
   the paid slices should take at the miners' best measured speed (`paid time used up`).
@@ -275,11 +282,12 @@ share, one slice and one ticket (546 sat at least), whichever is more, plus any 
 
 **A dropped link.** At `resume` the hashmaker sends its recent shares again. The hashtaker passes over the ones it
 counted already. A new one goes on to its gateway session of before the drop, kept open 10 s after the hashmaker is
-back, for its verdict; it's aged as of the drop, by the same check of shares held back; and only as many are taken
-as could have been on their way: the miners' rate over the half minute before the link went quiet, over that
-silence and 2 s, and 4 more. So shares held back can't be turned into paid work by dropping the link
-(`held_back_shares_sent_again_after_a_drop_are_taken_only_as_far_as_could_have_been_in_flight_and_go_to_the_gateway`,
-the review's probe, which counted all 40 before). A link that drops more than 8 times in an hour ends the rental
+back, for its verdict, and it's aged as of the drop by the same check of shares held back. As many as could have been
+on their way count at once: the miners' rate over the half minute before the link went quiet, over that silence and
+2 s, and 4 more. The rest count only once the gateway takes them, since that verdict is the proof they reached it.
+So shares held back can't be turned into paid work that never reaches the renter's gateway by dropping the link
+(`held_back_shares_sent_again_after_a_drop_count_only_as_they_reach_the_gateway`, the review's probe, where before
+all 40 were counted and none reached the gateway). A link that drops more than 8 times in an hour ends the rental
 (`a_link_that_keeps_dropping_ends_the_rental`).
 
 **Follow-up, not built: refuse a key a block has revealed.** A found block publishes its key, so a hashmaker can

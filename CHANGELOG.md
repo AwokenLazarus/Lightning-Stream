@@ -191,9 +191,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   that turns every share down still owes for each one proven, and the hashmaker forwards none past what's paid.
   Before, a renter that accepted a few shares could underpay without limit. See docs/P2P-HASH.md.
 - A hashmaker can no longer turn shares it held back into paid work by dropping the link and sending them again:
-  a share sent again goes on to the renter's gateway for its verdict, aged as of the drop, and the renter takes
-  only as many as its miners' rate says could have been on their way. A link that drops more than 8 times in an
-  hour ends the rental.
+  a share sent again goes on to the renter's gateway for its verdict, aged as of the drop; as many as its miners'
+  rate says could have been on their way count at once, and the rest only once the gateway takes them. A link
+  that drops more than 8 times in an hour ends the rental.
 - Every share carries the renter's own id to its gateway, so its verdict is always read; a share with no id, or
   one still waiting for its verdict, is refused. A share whose time rolls back from its job's, or more than two
   hours forward, is refused. Before, shares with no id escaped the check of how many the gateway turned down.

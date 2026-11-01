@@ -21,6 +21,11 @@ pub const WAIT_FOR_PAYMENT: std::time::Duration = std::time::Duration::from_secs
 pub const WAIT_FOR_PAYING: std::time::Duration = std::time::Duration::from_secs(10);
 /// Such waits a rental may have in an hour.
 pub const PAYING_WAITS_AN_HOUR: usize = 6;
+/// While the renter's step ramps up to its cap ([`STEP_SECONDS`] of output), which is the miners' first that many
+/// seconds of work for the rental, a wallet slower than the step lasts can't keep a large miner fed, and each early
+/// ticket buy may be waited for. Those waits aren't counted against [`PAYING_WAITS_AN_HOUR`]; there may be this many.
+/// Each is still held to [`WAIT_FOR_PAYING`].
+pub const RAMP_WAITS_MOST: usize = 12;
 /// A share may be worth this many slices at most. Past it a renter would pay many slices ahead of one share.
 pub const LARGEST_SHARE_SLICES: u128 = 4;
 

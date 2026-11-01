@@ -705,6 +705,21 @@ def with_hrp(addr: str, hrp: str) -> str:
 
 
 def real_gateway(mode: str) -> None:
+    try:
+        real_gateway_run(mode)
+    finally:
+        # its reports and logs, beside the report (the lab copies only run/*.log and run/*.json back)
+        for src in sorted(glob.glob(f"{RUN}/{mode}-*")):
+            base = os.path.basename(src)
+            if base.endswith((".log", ".json")):
+                try:
+                    with open(src, "rb") as f, open(f"{OUT}/p2p_hash_{base}", "wb") as g:
+                        g.write(f.read())
+                except OSError:
+                    pass
+
+
+def real_gateway_run(mode: str) -> None:
     """A rental paid with real money through the wallet, of real work for a real gateway on a chain of its own."""
     keys = mode == "solo" or os.environ.get("P2P_HASH_PRIMED_KEYS") == "1"
     primed = os.environ.get("P2P_HASH_PRIMED", f"{HG}/primed-main")
