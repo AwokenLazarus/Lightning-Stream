@@ -8063,17 +8063,16 @@ fn a_resume_refused_at_the_sellers_cap_is_made_again_in_another_session() {
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     let n = 20 * MIB;
-    // 10 MiB of 20, which is what the call allows: the session's two held tickets are spent
-    let part = r.pay(&format!("/files/{n}"), 2_000);
-    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
-    assert_eq!((part["status"].as_u64(), part["complete"].as_bool()), (Some(200), Some(false)), "{part}");
-    assert!(got > 0, "{part}");
-    let sid = part["session"].as_str().unwrap().to_string();
-    // from here the seller refuses the session's locks at its cap, as it would after an outage; a new session's first
-    // lock names no session, and is taken
+    // the seller refuses the session's locks at its cap from its first refill on, as it would after an outage: the
+    // session's first lock names no session, and is taken (two tickets), and so is a new session's
     r.tap.set(Box::new(|seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
         .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
-    std::thread::sleep(Duration::from_millis(500));
+    // 10 MiB of 20, what the call allows: the session's two tickets are spent, and its refill was refused
+    let part = r.pay(&format!("/files/{n}"), 2_100);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 10 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    // the resume's first need is a lock, which the seller refuses: nothing of it goes out, and it is made again
     let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
                                          "if_range": part["etag"]}));
     r.tap.clear();
@@ -8138,8 +8137,9 @@ fn a_resume_whose_session_the_seller_forgot_is_made_again_in_another_session() {
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     let n = 10 * MIB;
-    let part = r.pay(&format!("/files/{n}"), 1_000);
-    let got = part["bytes"].as_u64().unwrap() as usize;
+    // one ticket's worth (a second, with its fee, is past the call's 2,000 sat)
+    let part = r.pay(&format!("/files/{n}"), 2_000);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
     assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
     let sid = part["session"].as_str().unwrap().to_string();
     wait_for("the pool to be filled again", || r.shop.held() == 2);
