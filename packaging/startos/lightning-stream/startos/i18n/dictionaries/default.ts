@@ -20,7 +20,7 @@ const dict = {
   Chain: 20,
   'The chain the node runs; the signer refuses to start on a different one': 21,
   'Node connection': 22,
-  'The XBT node the signer uses: host, RPC port, credentials and chain': 23,
+  'The XBT node the signer and the Stream Gateway use: host, RPC port, credentials and chain': 23,
   'The RPC user cannot contain a colon': 24,
   'Reset the web UI password': 25,
   'Forget the web interface password. The service restarts and the UI asks for a new setup code.': 26,
@@ -73,6 +73,11 @@ const dict = {
   'Share your File Browser files with the Files service (read-only), or use the folder in this app': 75,
   'VPN for your devices': 76,
   'Your devices connect here with the WireGuard config the VPN page makes for each one. Keep it on your LAN': 77,
+  'Stream Gateway (DATUM-compatible)': 78,
+  'Not set up yet: choose solo or Lazarus Pool on Services → Hashrate': 79,
+  'The gateway is starting': 80,
+  'Masking the jobs of rented hashrate': 81,
+  'Waiting for a block template from the XBT node: check the Node connection action': 82,
 } as const
 
 /**
