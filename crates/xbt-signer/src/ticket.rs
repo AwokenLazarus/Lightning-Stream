@@ -93,6 +93,9 @@ pub const TIP_UNKNOWN: &str = "ticket_chain";
 /// The rules of the wallet's checks of its Lightning node that the chain node's silence can cause
 /// ([`crate::ln::verify_backend`] asks it too).
 pub const CHAIN_RULES: [&str; 2] = ["ln_chain", "ln_backend"];
+/// The rules of a fill refused because a node or a channel is away for a moment: those, and a channel of the wallet's node
+/// that is down (a link that drops). Asked again inside a release's pause.
+pub const NODE_AWAY_RULES: [&str; 3] = ["ln_chain", "ln_backend", "ln_no_safe_channel"];
 /// The default of `tickets.http_idle_s`: a session the wallet pays over HTTP is stopped, and its
 /// unused tickets cancelled, after this long without a paid request. Below the gateway's own five
 /// minutes, so that the wallet cancels before the seller does.

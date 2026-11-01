@@ -2277,6 +2277,17 @@ impl Signer {
     /// its channels: seen of a Lightning Fork node that was killed as it sent the payment
     /// (`docs/LIMITS.md`). The seller will never show such a ticket locked. `false` whenever the
     /// node or its channel list cannot be read: nothing is concluded from a node that gave no answer.
+    /// Whether a ticket is on one of the wallet's channels with every channel up, by the node's word within a moment: the
+    /// seller has had the chance to see it. `false` where it is on none, a channel is down, or the node gives no answer.
+    pub(crate) fn ticket_on_a_way_up(&self, hash: &str) -> bool {
+        let Some(ln) = self.ln.clone() else { return false };
+        let h = hash.to_string();
+        within(Instant::now() + Duration::from_secs(2), move || {
+            ln.channels().is_ok_and(|cs| cs.iter().all(|c| c.get("active") == Some(&Value::Bool(true)))
+                                        && htlc_locks(&cs, &|_| true).list.iter().any(|x| str_or_empty(x.get("payment_hash")) == h))
+        }).unwrap_or(false)
+    }
+
     pub(crate) fn ticket_stranded(&self, hash: &str) -> bool {
         let Some(ln) = self.ln.clone() else { return false };
         let Ok(Some(p)) = ln.lookup(hash) else { return false };

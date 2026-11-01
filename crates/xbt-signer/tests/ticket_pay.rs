@@ -3880,6 +3880,22 @@ fn a_refill_asking_a_slow_node_after_its_sends_holds_up_no_release() {
     r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
 }
 
+/// A pool of 2, a refill due and nothing on its way, and the wallet's channel down for a few seconds (a link that drops): the
+/// refill is refused for want of an active channel, asked again inside the pause, and the file comes through.
+#[test]
+fn a_channel_down_with_a_refill_due_does_not_end_the_file() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        r.ln.st.lock().unwrap().channel["active"] = false.into();
+        std::thread::sleep(Duration::from_secs(3));
+        r.ln.st.lock().unwrap().channel["active"] = true.into();
+    });
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
 /// A seller slow with its 402: the ask gets what is left of the call's deadline.
 #[test]
 fn a_seller_slow_with_its_402_is_a_plain_answer_inside_the_calls_deadline() {
@@ -7066,9 +7082,9 @@ fn a_ticket_missing_from_a_channel_that_is_down_is_not_stranded() {
         s.stranded_off_channel = true;
         s.channel["active"] = false.into();
     }
-    // twice, past the gap each time (a third such pause in a row would end the session as a seller that never shows a
-    // ticket, `ticket_seller_stalled`, as docs/LIMITS.md says)
-    for _ in 0..2 {
+    // past the gap each time, and more times than the pauses that end a session whose seller never shows a ticket: those are
+    // not counted while the link is down, and the seller is not blamed for it
+    for _ in 0..4 {
         let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
         assert_ne!(v["rule"].as_str(), Some("ticket_session_ended"), "{v}");
         r.clock.fetch_add(21, Ordering::SeqCst);

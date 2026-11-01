@@ -3998,7 +3998,7 @@ impl Signer {
             // for any other reason is not one that asking again would change, and costs no wait
             let mut filled = self.ticket_fill_by(hs, pause_by, guard.clone());
             let mut poll = PAUSE_POLL_FIRST;
-            while Instant::now() < pause_by && filled.as_ref().err().is_some_and(|d| crate::ticket::CHAIN_RULES.contains(&d["rule"].as_str().unwrap_or_default()))
+            while Instant::now() < pause_by && filled.as_ref().err().is_some_and(|d| crate::ticket::NODE_AWAY_RULES.contains(&d["rule"].as_str().unwrap_or_default()))
                   && (due.answer.is_some() || !self.chain_answers() || self.ticket_refresh_coming(&hs.sid, &|| hs.ending.load(Ordering::SeqCst), pause_by)) {
                 if hs.ending.load(Ordering::SeqCst) {
                     return Err(stopping_refusal());
@@ -4224,6 +4224,12 @@ impl Signer {
     /// The seller has not shown a ticket, again. Past a few of those running with no byte between them, the session ends:
     /// a seller that never shows one holds the buyer up at no cost to itself, a pause at a time.
     fn ticket_stalled(&self, hs: &Arc<HttpSession>, not_ready: Value) -> Value {
+        // not the seller's doing where the ticket may not have reached it: a channel of the wallet's node down, the ticket on
+        // none of them (a link that dropped and is listing its HTLCs again), or a node that gives no answer. The link's own
+        // rules end such a session, by their own reasons ([`Signer::ticket_stranded`])
+        if !self.ticket_on_a_way_up(&str_or_empty(not_ready.get("hash"))) {
+            return not_ready;
+        }
         let n = hs.stalls.fetch_add(1, Ordering::SeqCst) + 1;
         if n < STALLS_MOST {
             return not_ready;
