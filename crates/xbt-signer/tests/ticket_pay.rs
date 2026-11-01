@@ -7622,7 +7622,15 @@ fn a_408_with_wins_unpaid_blames_no_seller() {
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
     // the wallet's router away for a whole file: its wins are booked, sent nowhere, and the answer is cut
     r.ln.st.lock().unwrap().router_down = true;
-    let a = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    // 128 pieces at one win in 32 draw none 1 time in 60: a file with no win is whole and owes nothing, and another is
+    // fetched (up to 5, each on the same session)
+    let mut a = Value::Null;
+    for _ in 0..5 {
+        a = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+        if a["wins"].as_u64() >= Some(1) {
+            break;
+        }
+    }
     r.ln.st.lock().unwrap().router_down = false;
     assert!(a["wins"].as_u64().unwrap() >= 1, "{a}");
     r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/pieces/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
@@ -13978,8 +13986,11 @@ fn the_wait_for_a_route_has_its_whole_8_s_after_a_slow_nodes_checks() {
         }
     };
     assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the window was met, in {tries} draws: {v}");
-    // the payment that met the moment waited it out: no refusal for want of a route, not even one tried again later
-    let refused: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ln_no_route").collect();
+    // the payment that met the moment waited it out: no refusal for want of a route, not even one tried again later.
+    // A win that came while it waited stood back ("another payment to the seller is waiting"), nothing sent, and was
+    // paid after: that is the wait, not one that ran out
+    let refused: Vec<Value> = r.audit("ticket_refused").into_iter()
+        .filter(|e| e["rule"] == "ln_no_route" && e["reason"].as_str().unwrap_or("").contains("has found no route")).collect();
     assert!(refused.is_empty(), "the wait had its 8 s after the checks, and none ran out: {refused:?}");
     assert!(!r.audit("ticket_route_waited").is_empty(), "the payment waited for the route: {v}");
     assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
