@@ -115,7 +115,7 @@ impl Standing {
 
     /// [`Standing::pay_next`], with `credit_msat` the renter's credit at the seller. Paid from credit, a slice changes
     /// nothing gone and unworked. One that has to buy a ticket adds the ticket: only paid ahead of need when the
-    /// smallest ticket keeps all that within the step.
+    /// smallest ticket keeps all that within [`Standing::most_unworked_msat`].
     pub fn pay_next_with(&self, credit_msat: u64) -> bool {
         if !self.pay_next() {
             return false;
@@ -125,7 +125,9 @@ impl Standing {
             return true;
         }
         let ahead = self.msat_of(covered.saturating_sub(self.proven));
-        ahead + credit_msat + self.smallest_ticket_msat() <= self.step_msat()
+        // a ticket bought ahead of need: within the most that may ever be gone and unworked, so it's bought while
+        // what's paid still runs, not when the next share waits for it
+        ahead + credit_msat + self.smallest_ticket_msat() <= self.most_unworked_msat()
     }
 
     /// The smallest ticket a payment can buy: the seller's smallest (546 sat), and never under the slice's price.

@@ -79,6 +79,8 @@ const IDS_KEPT: usize = 4096;
 pub const COMEBACKS_AN_HOUR: usize = 8;
 /// How long a share may have been on its way when the link dropped, past the link's own silence before it.
 const IN_FLIGHT: Duration = Duration::from_secs(2);
+/// A payment the measured buys say arrives this much before the hashmaker's short clock runs out needs no `paying`.
+const IN_TIME_MARGIN: f64 = 0.5;
 /// Shares sent again that are taken past what the miners' rate says could have been on their way.
 const RESEND_SLACK: u64 = 4;
 /// How long the dropped link's gateway sessions stay open after the hashmaker is back, for shares sent again.
@@ -115,6 +117,8 @@ struct Guard {
     await_job: HashSet<u32>,
     /// Shares sent again past what could have been on their way, waiting for their gateway's verdict, by this side's id.
     resend_pending: HashMap<u64, (meter::Claim, meter::Hashed, Instant)>,
+    /// When the payment in flight was queued.
+    in_flight_since: Option<Instant>,
     /// The credit the seller holds and what's left of the budget, as the wallet last said (with the wallet's payer).
     credit_msat: u64,
     budget_left: Option<u64>,
@@ -308,6 +312,7 @@ impl St {
                     return;
                 }
                 self.in_flight += 1;
+                self.guard.in_flight_since = Some(Instant::now());
                 self.receipts.push(receipt);
                 self.released = slice;
                 continue;
@@ -682,9 +687,14 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 g.dues += 1;
                 g.last_due = Some((work, paid));
                 g.settle_up(&tx);
-                // a payment on its way: the hashmaker waits for it, its miners on its own pool meanwhile
+                // a payment on its way that won't arrive within the hashmaker's short clock: it waits for it, its
+                // miners on its own pool meanwhile. One the measured buys say arrives in time needs no move
                 if g.in_flight > 0 {
-                    let _ = tx.send(&Msg::Paying);
+                    let measured = g.standing().buy_secs;
+                    let elapsed = g.guard.in_flight_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                    if measured <= 0.0 || measured.max(elapsed) + IN_TIME_MARGIN > order::WAIT_FOR_PAYMENT.as_secs_f64() {
+                        let _ = tx.send(&Msg::Paying);
+                    }
                 }
             }
             Msg::Resend { chan, line } => {
