@@ -264,6 +264,13 @@ def gateway_config(api, address, own=False):
             "datum": {"pool_host": "", "pooled_mining_only": False}}
 
 
+def offer_card(page):
+    """The first hashrate offer's card on the Rent page, which says why Rent waits (its price, start fee and
+    buttons), for a check's details; the page's tail when there is no card."""
+    m = re.search(r'<section class="card offer">.*?</section>', page, re.S)
+    return m.group(0) if m else page[-600:]
+
+
 def page_gateway(name, ui, payout):
     """The owner saves Your gateway on the Hashrate page (solo, their address); the UI writes run/datum/config.json.
     Checked as written, then given the test's share difficulty floor. Returns the config as the page wrote it."""
@@ -553,12 +560,16 @@ def main():
         check("H", "taker: the rules page shows the seller added, tied to its node from the signed listing, and the owner signs it",
               "applied" in applied.lower(), applied)
         page = taker.get("/hashrate")
-        check("H", "taker: then Rent is on", "<button>Rent</button>" in page, page[-600:])
+        card = offer_card(page)
+        check("H", "taker: then Rent is on", "<button>Rent</button>" in card, card)
         settled0 = len(lab.seller_settled())
         height0 = int(lab.cli("getblockcount"))
-        st, _, _ = taker.post("/hashrate", "/hashrate", {"action": "rent", "key": field(page, "key"), "miners": "1", "minutes": "8", "budget": "2000"})
+        # the budget the offer suggests (an hour of one machine and the start fee): the price of a piece scales with
+        # the piece, and the start fee is in whole pieces, so no fixed figure fits every offer
+        budget = field(card, "budget") or "2000"
+        st, _, _ = taker.post("/hashrate", "/hashrate", {"action": "rent", "key": field(page, "key"), "miners": "1", "minutes": "8", "budget": budget})
         flash = taker.flash("/hashrate")
-        check("H", "taker: Rent starts a rental", "Renting" in flash, flash)
+        check("H", "taker: Rent starts a rental", "Renting" in flash, [flash, {"budget": budget}, card])
         tdata = os.path.join(installs["taker"][0], "data")
 
         def rental():
