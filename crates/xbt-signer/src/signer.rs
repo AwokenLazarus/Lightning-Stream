@@ -237,6 +237,9 @@ pub struct Signer {
     /// Since when the node's channels have been out, and when that was last seen
     /// ([`Self::ln_channels_back`]).
     pub(crate) ln_channels_out: Mutex<Option<(std::time::Instant, std::time::Instant)>>,
+    /// When the wallet last saw every channel that could pay out (inactive), its peer's connection down: a ticket
+    /// that fails then failed for the outage, not for a full channel ([`crate::ln::OUTAGE_LATELY`]).
+    pub(crate) ln_last_out: Mutex<Option<std::time::Instant>>,
     /// The last tip the chain node gave, and when ([`Self::tip_known`]).
     tip_seen: Mutex<Option<(i64, f64)>>,
     /// A question about the tip is out ([`Self::height_asked`]).
@@ -357,7 +360,7 @@ impl Signer {
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
                                 ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
-                                ticket_pace: crate::ticket_rail::Pace::default(), ln_channels_out: Mutex::new(None), tip_seen: Mutex::new(None), tip_asking: std::sync::atomic::AtomicBool::new(false), ticket_refreshing: Mutex::new(HashSet::new()), ticket_off_channel: Mutex::new(HashMap::new()), ticket_queued: Mutex::new(Default::default()),
+                                ticket_pace: crate::ticket_rail::Pace::default(), ln_channels_out: Mutex::new(None), ln_last_out: Mutex::new(None), tip_seen: Mutex::new(None), tip_asking: std::sync::atomic::AtomicBool::new(false), ticket_refreshing: Mutex::new(HashSet::new()), ticket_off_channel: Mutex::new(HashMap::new()), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
                                 ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_late_tries: Mutex::new(HashMap::new()), ticket_start_stopped: Mutex::new(vec![]), ticket_unanswered: Mutex::new(HashMap::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),

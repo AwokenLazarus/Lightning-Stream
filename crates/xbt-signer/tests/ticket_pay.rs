@@ -787,6 +787,11 @@ struct PayState {
     peak: usize,
     /// The next sends fail as a full channel does, however many this says.
     fail_next: usize,
+    /// The next sends find the channel's peer gone: each takes the channel out for `drop_for` from then (inactive
+    /// in the listing, and a payment fails as the real node says it, with no balance), and it comes back by itself.
+    drop_at_send: usize,
+    drop_for: Duration,
+    out_until: Option<Instant>,
     /// The next payment fails each time it is sent, as to a hop that stays full; `failing` is its hash.
     fail_one: bool,
     failing: Option<String>,
@@ -1015,6 +1020,9 @@ impl LnBackend for PayLn {
         }
         let s = self.state();
         let mut c = s.channel.clone();
+        if s.out_until.is_some_and(|u| Instant::now() < u) {
+            c["active"] = false.into();
+        }
         let mut htlcs: Vec<Value> = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT" && !(s.stranded_off_channel && p["stranded"] == true)).map(|p| {
             json!({"incoming": false, "amount": (p["value_msat"].as_str().unwrap().parse::<u64>().unwrap() / 1000).to_string(), "hash_lock": p["payment_hash"],
                    "expiration_height": p["htlcs"][0]["route"]["total_time_lock"]})
@@ -1068,7 +1076,11 @@ impl LnBackend for PayLn {
             s.failing = Some(hash.clone());
         }
         // its own channel down: as the real node says it, no balance, and no attempt on its record
-        let down = s.channel["active"] != true;
+        if s.drop_at_send > 0 {
+            s.drop_at_send -= 1;
+            s.out_until = Some(Instant::now() + s.drop_for);
+        }
+        let down = s.channel["active"] != true || s.out_until.is_some_and(|u| Instant::now() < u);
         let failing = down || s.no_route || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
         s.fail_next = s.fail_next.saturating_sub(1);
         let late = !failing && s.late_fail > 0;
@@ -6505,6 +6517,41 @@ fn a_ticket_below_a_channels_dust_limit_is_never_held() {
     let v = r.pay(&format!("/files/{}", 6 * MIB), 5_000);
     assert_eq!((v["complete"].as_bool(), v["tickets_prepaid"].as_u64()), (Some(true), Some(1)), "from now on a prepaid one: {v}");
     assert_eq!(r.ln.state().payments.len(), sends + 1);
+}
+
+/// The channel's peer drops just as the session's first lock round is sent (a flap): both tickets fail, as the node
+/// says a payment fails on a channel that is out, with no balance. That is an outage, not a full channel: the session
+/// holds as many as before and waits for nothing, and a new session with the seller after it holds 2.
+///
+/// FAILS with every round that fails as a full channel does counted as one: the pool is halved and a wait set, and the
+/// next session with the seller inherits the smaller pool for ten minutes (seen on the lab after the flap checks, the
+/// slots checks' first session holding 1).
+#[test]
+fn a_lock_round_that_fails_in_an_outage_makes_the_wallet_hold_no_less() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.drop_at_send = 2;
+        s.drop_for = Duration::from_secs(3);
+    }
+    let v = r.pay("/page/1000", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "the page is paid all the same: {v}");
+    let failed = r.ln.by_status("FAILED");
+    assert_eq!(failed.len(), 2, "both tickets of the round failed in the outage: {v}");
+    assert!(failed.iter().all(|p| p["failure_reason"] == "FAILURE_REASON_INSUFFICIENT_BALANCE"), "{failed:?}");
+    let s = session_of(&r, &v);
+    assert_eq!((s["pool"].as_i64(), s["slot_fails"].as_i64()), (Some(2), Some(0)), "an outage is no full channel: {s}");
+    assert_ne!(s["hold_why"].as_str(), Some("ticket_slots"), "{s}");
+    assert!(r.audit("ticket_slot_failure").is_empty(), "{:?}", r.audit("ticket_slot_failure"));
+    // the channel back, a new session with the seller holds the 2 a channel of 30 allows
+    std::thread::sleep(Duration::from_secs(3));
+    r.call("ticket_stop", json!({"session": v["session"]}));
+    let next = r.pay("/page/1000", CALL);
+    assert_eq!(next["status"].as_u64(), Some(200), "{next}");
+    assert_ne!(next["session"], v["session"]);
+    assert_eq!(session_of(&r, &next)["pool"].as_i64(), Some(2), "{}", session_of(&r, &next));
+    r.assert_booked();
 }
 
 #[test]

@@ -1201,6 +1201,10 @@ impl Signer {
             Ok(p) => (Some(p), None),
             Err(e) => (ln.lookup(hash).ok().flatten(), Some(e)),
         }).collect();
+        // a round that failed while the wallet's channels were out (its peer's connection dropped) failed for the
+        // outage: no sign of a full channel, and the session holds no less for it. Asked of the node with no lock held
+        let any_failed = outcomes.iter().any(|(p, e)| e.is_some() || p.as_ref().is_some_and(|p| p.get("status").and_then(Value::as_str) == Some("FAILED")));
+        let outage = any_failed && self.ln_out_lately(Some(&*ln), lp.split(&self.chain));
         // what the node made of each
         let _g = self.lock();
         let mut tickets = vec![];
@@ -1218,7 +1222,7 @@ impl Signer {
                 if let Some(t) = st.book.tickets.get(hash) {
                     locked += usize::from(t.state == TState::Locked);
                     // a payment that failed as a full channel does: the node names no slot, only a balance or a route
-                    slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note));
+                    slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note) && !outage);
                     tickets.push(match &unsent {
                         Some(e) => node_said(with(t.public(), json!({"send_error": e.msg})), e),
                         None => node_failure(t.public(), pmt.as_ref().filter(|_| t.state == TState::Failed)),
@@ -1535,7 +1539,7 @@ impl Signer {
             // a ticket that was in flight and then failed as a full channel does met a hop without a slot: its
             // payment left the wallet's node before that hop refused it. It counts as a failed round, once per
             // wait (the tickets of one round fail together)
-            if was_locked && ticket::slot_failure(&t.note) {
+            if was_locked && ticket::slot_failure(&t.note) && !self.ln_out_lately(None, 0) {
                 if let Some(mut s) = st.book.sessions.get(&t.session).filter(|s| s.state == SState::Open && now >= s.hold_until).cloned() {
                     let had = s.pool;
                     if s.lock_round(0, 1, now) {

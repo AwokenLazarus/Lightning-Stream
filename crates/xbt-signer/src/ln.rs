@@ -843,6 +843,10 @@ pub(crate) const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
 pub(crate) const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
 /// Longer than the wait's polls, and than the moment between one refused payment and the next behind it.
 const CHANNEL_OUT_FORGOTTEN: Duration = Duration::from_secs(1);
+/// A ticket that fails this soon after the wallet saw its channels out failed for the outage: its round is no sign of a
+/// full channel, and the wallet holds no less for it. A minute covers a peer's reconnection and the payments failed
+/// back across it; a full channel after that is counted at the next round.
+pub const OUTAGE_LATELY: Duration = Duration::from_secs(60);
 
 /// Every channel with its verdict: `(usable ids, report)`.
 pub fn usable_channels(chans: &[Value], split_height: i64) -> (Vec<String>, Vec<Value>) {
@@ -1608,6 +1612,9 @@ impl Signer {
             let now = Instant::now();
             let up = !usable_channels(&chans, split).0.is_empty();
             let as_active: Vec<Value> = if up { vec![] } else { chans.iter().map(|c| with(c.clone(), json!({"active": true}))).collect() };
+            if !up && !usable_channels(&as_active, split).0.is_empty() {
+                *self.ln_last_out.lock().unwrap_or_else(|p| p.into_inner()) = Some(now);
+            }
             let mut out = self.ln_channels_out.lock().unwrap_or_else(|p| p.into_inner());
             if up || usable_channels(&as_active, split).0.is_empty() {
                 *out = None;
@@ -1623,6 +1630,19 @@ impl Signer {
             std::thread::sleep(CHANNEL_BACK_POLL.min(left));
             chans = ln.channels()?;
         }
+    }
+
+    /// Whether every channel that could pay is out now (read from the node), or was seen out within [`OUTAGE_LATELY`]:
+    /// a payment that failed meanwhile failed for an outage. A node that cannot be asked says nothing new.
+    pub(crate) fn ln_out_lately(&self, ln: Option<&dyn LnBackend>, split: i64) -> bool {
+        if let Some(chans) = ln.and_then(|ln| ln.channels().ok()) {
+            let up = !usable_channels(&chans, split).0.is_empty();
+            let as_active: Vec<Value> = chans.iter().map(|c| with(c.clone(), json!({"active": true}))).collect();
+            if !up && !usable_channels(&as_active, split).0.is_empty() {
+                *self.ln_last_out.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+            }
+        }
+        self.ln_last_out.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() <= OUTAGE_LATELY)
     }
 
     fn ln_routes_of(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool, chans: Vec<Value>) -> std::result::Result<LnRoutes, Value> {
