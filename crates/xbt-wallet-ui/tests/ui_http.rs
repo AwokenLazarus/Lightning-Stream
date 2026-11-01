@@ -4273,7 +4273,7 @@ fn another_gateways_api_is_set_on_the_page_and_an_installer_override_is_said() {
     let mut br = logged_in(&bx);
     let p = br.get("/hashrate");
     // the override, said, with the page's choice offered back
-    assert!(p.body.contains("The app&#39;s install settings changed since you chose <code>127.0.0.1:23339</code> on this page")
+    assert!(p.body.contains("The app's install settings changed since you chose <code>127.0.0.1:23339</code> on this page")
             && p.body.contains("<code>10.0.0.6:23334</code> now, as they say") && p.body.contains("Use 127.0.0.1:23339 again"), "{}", p.body);
     // the API field, filled with the API in use (not the one the address implies)
     assert!(p.body.contains("name=\"api\" value=\"10.0.0.6:7160\""), "{}", p.body);
