@@ -239,11 +239,13 @@ def main() -> int:
         check("compose: the gateway shares the renter's namespace and publishes nothing",
               dt.get("network_mode") == "service:renter" and not dt.get("ports"), {k: dt.get(k) for k in ("network_mode", "ports", "volumes")})
         cmd[cmd.index("--relays") + 1] = relay
+        # the renter pays on the lab signer's renter socket (the compose's run/rental/signer.sock is the app signer's)
+        cmd[cmd.index("--signer") + 1] = "/data/run/rental/" + os.path.basename(d.RENTER_SOCK)
         overlay = {
             "networks": {"default": {"name": NET, "external": True}},
             "services": {
                 "app_proxy": {"image": "debian:bookworm-slim", "profiles": ["umbrel-only"]},
-                "renter": {"image": IMAGES["renter"], "command": cmd, "volumes": [f"{RUN}:/data/run/signer:ro"]},
+                "renter": {"image": IMAGES["renter"], "command": cmd, "volumes": [f"{RUN}:/data/run/rental:ro"]},
                 "datum": {"image": IMAGES["datum"]},
                 **({"init": {"image": INIT_IMAGE}} if INIT_IMAGE else {}),
             },
@@ -253,6 +255,7 @@ def main() -> int:
         # the lab wallet's socket, for the renter's user (the image's, xbt-hashrate in the signer's group on a box)
         os.chmod(RUN, 0o711)
         os.chmod(d.SOCK, 0o666)
+        os.chmod(d.RENTER_SOCK, 0o666)
 
         # --- init: the compose's own, an xbt-init with the datum component (never laid out here: the test covers the
         # compose as shipped)
