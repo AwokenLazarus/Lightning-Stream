@@ -87,7 +87,7 @@ use crate::keystore::write_private;
 use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::signer::{deny, with, Signer};
-use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, PROGRESS_FLOOR_BYTES, ROUTE_FULL, TIP_UNKNOWN};
+use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, TState, Terms, TicketPolicy, HOLD_SHORT, PROGRESS_FLOOR_BYTES, ROUTE_FULL, TIP_UNKNOWN};
 use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, PriceCeiling, Receipt};
 use crate::{err, Result};
 
@@ -1603,6 +1603,9 @@ pub(crate) struct HttpSession {
     /// Hashes of this session's tickets the seller was asked to cancel because their payment had
     /// failed: each is asked for once.
     cancel_asked: Mutex<HashSet<String>>,
+    /// The seller refused a lock of this session `too_many_tickets`: when the call ends, the session's
+    /// unreleased tickets are cancelled and it is stopped ([`Signer::ticket_cap_full`]).
+    cap_full: AtomicBool,
 }
 
 impl HttpSession {
@@ -3053,7 +3056,7 @@ impl Signer {
                                                    paying: Mutex::new(()), order: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                                    money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), ending: AtomicBool::new(false), refilling: AtomicBool::new(false), stalls: AtomicUsize::new(0),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None), key_on_record: AtomicBool::new(false),
-                                                   cancel_asked: Mutex::new(HashSet::new()) });
+                                                   cancel_asked: Mutex::new(HashSet::new()), cap_full: AtomicBool::new(false) });
                     // a balance the wallet left with this seller in a session it stopped (a restart, or an idle stop) is
                     // used first, not left there while a new ticket is bought
                     // and where it could not be taken over because the seller has yet to follow a prepaid ticket of that session,
@@ -3123,14 +3126,49 @@ impl Signer {
                 return tried;
             }
         };
-        let out = {
+        let mut out = {
             // shared: other requests to this seller run beside this one
             let _call = hs.calls.read().unwrap_or_else(|p| p.into_inner());
             self.ticket_request(&hs, c, &terms)
         };
+        if hs.cap_full.load(Ordering::SeqCst) {
+            if let Some(stopped) = self.ticket_cap_full(&hs) {
+                if out.is_object() {
+                    out["session_stopped"] = stopped;
+                }
+                return Tried::Done(out);
+            }
+        }
         // the pool is filled again behind the call
         self.ticket_refill_later(&hs);
         Tried::Done(out)
+    }
+
+    /// The seller refused a lock of the session `too_many_tickets`, and the call has ended: the places it gives the
+    /// session are taken, and every later call to it would be refused the same until those tickets lapse (after a
+    /// channel's outage, by tickets whose payment is still on its way, or failed without the wallet hearing). The
+    /// session is stopped, its seller asked to cancel its tickets that were never released, and the next call (a
+    /// resume of the same file) opens another. `None`: left as it is (said in the audit).
+    ///
+    /// The seller is never left unpaid for what it served. A ticket whose secret has left (released), or may have
+    /// (retired), is never named for a cancel; and where the wallet's own count has the session drawing more than the
+    /// tickets released so far cover, nothing is cancelled and the session is kept: its next call releases what is owed
+    /// first, as any call does. Nor is a session stopped under an answer still being read beside this call.
+    fn ticket_cap_full(&self, hs: &Arc<HttpSession>) -> Option<Value> {
+        let owed = {
+            let m = lock_money(hs);
+            m.consumed.saturating_sub(m.absorbed_mark).saturating_add(m.reserved).saturating_sub(m.acct.balance())
+        };
+        let streaming = hs.streaming.load(Ordering::SeqCst);
+        if owed > 0 || streaming > 0 {
+            self.ticket_audit("ticket_cap_full_kept", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "owed_msat": owed.to_string(),
+                                                            "streaming": streaming}));
+            return None;
+        }
+        hs.cap_full.store(false, Ordering::SeqCst);
+        let why = "the seller holds as many tickets as it gives the session (too_many_tickets): those never released were cancelled, and the \
+                   next call opens another session";
+        Some(self.ticket_http_stop_with(hs, why, CANCEL_WAIT, false))
     }
 
     /// The first lock of a session, or a refill: ask the book which hashes the pool wants, the
@@ -3318,6 +3356,11 @@ impl Signer {
             // the seller's service is full: nothing was sold
             if let Some(d) = (status == 503).then(|| seller_busy(v)).flatten() {
                 return d;
+            }
+            // every place the seller gives the session is taken (after an outage, by tickets whose payment is still on
+            // its way or failed without the wallet hearing yet): dealt with once the call has ended
+            if status == 402 && code == "too_many_tickets" {
+                hs.cap_full.store(true, Ordering::SeqCst);
             }
             refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
         };
@@ -5722,6 +5765,12 @@ impl Signer {
     /// the seller is asked to cancel what is locked, and the wallet's own node is watched for up
     /// to `wait` until those tickets show failed. The wallet believes its node, not the answer.
     pub(crate) fn ticket_http_stop(&self, hs: &HttpSession, why: &str, wait: Duration) -> Value {
+        self.ticket_http_stop_with(hs, why, wait, true)
+    }
+
+    /// [`Signer::ticket_http_stop`]; `released_too: false` names for the cancel only tickets whose secret never left
+    /// (sent, locked, or offered and unpaid): never one released, or retired (that may have been), or settled.
+    fn ticket_http_stop_with(&self, hs: &HttpSession, why: &str, wait: Duration, released_too: bool) -> Value {
         // from here no ticket is released in the session, no new call takes it, and its open answers end: a stream
         // (a WebSocket, a VPN tunnel, a body read as it comes) stops reading and takes its last receipt as it closes.
         // The book is told first: it still shows the session open while the streams end, and books nothing more for it
@@ -5760,7 +5809,12 @@ impl Signer {
             }
             stopped
         };
-        let asked: Vec<String> = stopped.get("cancel").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.as_str().map(str::to_string)).collect();
+        let mut asked: Vec<String> = stopped.get("cancel").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.as_str().map(str::to_string)).collect();
+        if !released_too {
+            let never_released = |h: &String| self.ticket_store().ok().and_then(|g| g.as_ref().and_then(|st| st.book.tickets.get(h).map(|t| t.state)))
+                .is_some_and(|s| matches!(s, TState::Offered | TState::Sending | TState::Locked | TState::Failed));
+            asked.retain(never_released);
+        }
         let mut sent = false;
         if !asked.is_empty() && !lock_link(hs).seller_sid.is_empty() {
             // by their hashes, never "all" of the seller session: a new session of this wallet may have taken it over by the
