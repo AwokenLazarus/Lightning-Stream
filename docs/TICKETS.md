@@ -1126,7 +1126,7 @@ win waits for the lapse. The wallet asks the same where it held a win back for l
 invoice (below), which it never sent. Before any payment of the rail the wallet waits for an
 inactive channel, at most 8 s from when it first saw it out, and before a win or a prepaid ticket is
 sent it asks its node for a route to the seller (QueryRoutes, which needs `info:read`; nothing is
-sent) and waits for one within what is left of those 8 s. An invoice with route hints or blinded paths
+sent) and waits for one up to 8 s, counted from after its node's checks of the channel and the invoice. An invoice with route hints or blinded paths
 (the node's decode shows them) is not asked about: the query is not given them and finds no path to a
 seller behind a private channel, so such an invoice is sent at once. One payment to a seller waits at a
 time, in one window for all of them: the others are refused at once (`ln_no_route`, and not counted), and

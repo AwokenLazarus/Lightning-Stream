@@ -793,6 +793,8 @@ struct PayState {
     no_route_for: Duration,
     no_route_until: Option<Instant>,
     no_route_answers: usize,
+    /// How long the node takes to decode an invoice: a slow box under load, whose checks take seconds.
+    decode_takes: Duration,
     /// The seller sits behind a private channel: the node's decode of its invoices shows a route hint, its
     /// route query (which is not given the hint) finds no path, and a payment sent with the invoice arrives.
     private_seller: bool,
@@ -972,6 +974,8 @@ impl LnBackend for PayLn {
     }
 
     fn decode(&self, inv: &str) -> xbt402::Result<Value> {
+        let takes = self.st.lock().unwrap().decode_takes;
+        std::thread::sleep(takes);
         let d = xbt_signer::bolt11::decode(inv).map_err(|e| node_err(&e))?;
         let features: serde_json::Map<String, Value> = d.features.iter().map(|b| (b.to_string(), json!({"is_known": true}))).collect();
         let mut out = json!({"destination": d.payee_hex(), "payment_hash": d.payment_hash_hex(), "num_msat": d.amount_msat.unwrap_or(0).to_string(),
@@ -13932,6 +13936,32 @@ fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
     assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 2, "{v}");
     assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "no failed invoice sent again: {v}");
     assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+}
+
+/// On a slow box the node's checks before a payment take seconds (here its decode of the invoice, 5 s), and then the
+/// node finds no route to the seller for 5 s: the wallet's 8 s for a route are counted from after the checks, so it
+/// waits the 5 s out and pays, with nothing failed and the money right.
+///
+/// FAILS with the 8 s counted from before the checks: 3 s are left of them when the wait begins, the window outlasts
+/// them, and the call ends `ln_no_route`.
+#[test]
+fn the_wait_for_a_route_has_its_whole_8_s_after_a_slow_nodes_checks() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    {
+        let mut st = r.ln.st.lock().unwrap();
+        st.decode_takes = Duration::from_secs(5);
+        st.no_route_at_query = 1;
+        st.no_route_for = Duration::from_secs(5);
+    }
+    let size = 64 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    r.ln.st.lock().unwrap().decode_takes = Duration::ZERO;
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the window was met: {v}");
+    assert!(!v.to_string().contains("ln_no_route"), "the wait had its 8 s: {v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(200), Some(true), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
 }
 
 /// A link along the route is replaced, and for a while the node finds no route to the seller: a payment sent

@@ -1940,7 +1940,6 @@ impl Signer {
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
-        let checks_from = Instant::now();
         let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, &sid) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
@@ -1988,11 +1987,13 @@ impl Signer {
         };
         // a route to the seller, as the node would look for one when it pays: one moment after a link along the way
         // was replaced the node finds none for some seconds (up to 10 s seen on the lab), and a payment sent then fails
-        // at once. It is waited for, within what is left of the channel wait's 8 s. Only over the public graph: a
+        // at once. It is waited for up to 8 s, counted from after the node's checks. Only over the public graph: a
         // seller reached by its invoice's route hints or blinded paths (a private channel, an LSP) is one the node's
         // route query, which is not given them, never finds, and its invoice is sent as it always was
         if !hinted {
-            if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, checks_from) {
+            // the wait's 8 s are counted from here, after the node's checks of the channel and the invoice: on a slow box
+            // (a small computer under load) those took seconds, and were taken out of the wait
+            if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, Instant::now()) {
                 return with(refuse(&hash, "ln_no_route", why), json!({"route_ran_out": ran_out}));
             }
         }
