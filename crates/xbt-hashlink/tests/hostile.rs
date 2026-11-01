@@ -1283,7 +1283,16 @@ fn start_pool(job_every: Duration) -> (String, std::path::PathBuf) {
 
 fn pool_report(p: &std::path::Path) -> Value {
     thread::sleep(Duration::from_millis(700));
-    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+    // the stand-in pool writes its report twice a second, from its start: on a busy machine the first write can come
+    // later than that
+    let t0 = Instant::now();
+    loop {
+        match std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            Some(v) => return v,
+            None if t0.elapsed() < Duration::from_secs(10) => thread::sleep(Duration::from_millis(100)),
+            None => panic!("no pool report at {}", p.display()),
+        }
+    }
 }
 
 /// Shares nobody hashed: nothing is counted, nothing reaches the gateway, nothing more is paid, and the
