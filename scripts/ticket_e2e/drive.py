@@ -1134,6 +1134,8 @@ def flap() -> None:
     with open(path) as f:
         cfg = json.load(f)
     cfg["upstream"] = f"http://127.0.0.1:{range_port}"
+    # its own file, priced as big.bin is (the change of copy below rewrites it): a path the gateway has no route for is a 404
+    cfg["routes"].append({"path": "/flap.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}})
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
     start_gateway("gateway-flap", gw_port)
