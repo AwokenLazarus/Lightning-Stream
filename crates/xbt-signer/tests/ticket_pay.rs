@@ -3162,6 +3162,25 @@ fn seller_waits_as_shipped(extra: Value) -> Rig {
     seller_waits(15_000, extra)
 }
 
+/// The seller's terms as one before 0.2.0 gives them: every 402 with `refillWaitMs` taken out, from the first, so that
+/// the session's terms never have it.
+fn says_no_refill_wait(r: &Rig) {
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["extra"].as_object_mut().map(|x| x.remove("refillWaitMs"));
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+}
+
 /// A rig whose seller keeps a paused answer `ms` before it ends it.
 fn seller_waits(ms: u64, extra: Value) -> Rig {
     REFILL_WAIT_MS.store(ms, Ordering::SeqCst);
@@ -3434,21 +3453,7 @@ fn a_seller_that_keeps_a_paused_answer_less_than_the_wallets_pause_has_the_pause
 fn a_seller_whose_terms_do_not_say_its_wait_is_paused_for_by_the_wallets_own_limit() {
     let _g = env_lock();
     let r = seller_waits(6_000, json!({}));
-    // every 402 with `refillWaitMs` taken out, from the first: the session's terms never have it
-    r.tap.set(Box::new(|seen, real| {
-        if seen.paid {
-            return None;
-        }
-        let (status, mut headers, body) = whole(real().ok()?);
-        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
-            let mut pr = unb64json(v).unwrap();
-            for e in pr["accepts"].as_array_mut().unwrap() {
-                e["extra"].as_object_mut().map(|x| x.remove("refillWaitMs"));
-            }
-            *v = b64json(&pr);
-        }
-        Some(Ok(answer(status, headers, body)))
-    }));
+    says_no_refill_wait(&r);
     first_call_with_the_pool_shown(&r);
     r.shop.standin.hold_streams(true);
     late_ticket(&r);
@@ -3467,12 +3472,14 @@ fn a_seller_whose_terms_do_not_say_its_wait_is_paused_for_by_the_wallets_own_lim
     assert_money_agrees(&r);
 }
 
-/// A seller that closes a paused answer sooner than the wallet's pause (this one after 2 s), and then shows the ticket:
-/// its signed `status` lists the answer as ended, and nothing is released into it.
+/// A seller that closes a paused answer sooner than the wallet's pause (this one after 2 s) and does not say so in its
+/// terms (one before 0.2.0, `refillWaitMs` left out), and then shows the ticket: its signed `status` lists the answer as
+/// ended, and nothing is released into it. (A seller that says so has the pause end before its close, above.)
 #[test]
 fn a_close_by_the_seller_during_the_pause_is_noticed_and_nothing_is_released() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
+    says_no_refill_wait(&r);
     first_call_with_the_pool_shown(&r);
     r.shop.standin.hold_streams(true);
     let n = 60 * MIB;
