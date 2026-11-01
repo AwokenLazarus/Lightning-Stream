@@ -1031,10 +1031,18 @@ struct Seen {
     paid: bool,
     /// The call's limit the wallet sent the seller (`X-Xbt402-Max-Msat`), if any.
     cap_msat: Option<String>,
+    /// The `seq` its payment signature (`PAYMENT-SIGNATURE`) names, if it has one.
+    seq: Option<u64>,
 }
 
 fn cap_of(headers: &[(String, String)]) -> Option<String> {
     headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)).map(|(_, v)| v.clone())
+}
+
+fn seq_of(headers: &[(String, String)]) -> Option<u64> {
+    let (_, v) = headers.iter().find(|(k, _)| k == "PAYMENT-SIGNATURE")?;
+    let p: Value = serde_json::from_slice(&B64.decode(v).ok()?).ok()?;
+    p["payload"]["seq"].as_u64()
 }
 
 type Hook = Box<dyn FnMut(&Seen, &dyn Fn() -> xbt402::Result<WireAnswer>) -> Option<xbt402::Result<WireAnswer>> + Send>;
@@ -1058,7 +1066,7 @@ impl TicketWire for Tap {
     fn upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>) -> xbt402::Result<xbt_signer::ticket_pay::WireUpgrade> {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
         self.log.lock().unwrap().push(Seen { method: "GET".into(), path, body: String::new(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
-                                             cap_msat: cap_of(headers) });
+                                             cap_msat: cap_of(headers), seq: seq_of(headers) });
         self.inner.upgrade(url, headers, read_timeout, tls)
     }
 
@@ -1071,7 +1079,7 @@ impl TicketWire for Tap {
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> xbt402::Result<WireAnswer> {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
         let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
-                          cap_msat: cap_of(headers) };
+                          cap_msat: cap_of(headers), seq: seq_of(headers) };
         self.log.lock().unwrap().push(seen.clone());
         let kept: Vec<(String, String)> = headers.iter().filter(|(k, _)| !(self.drop_cap.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)))
             .filter(|(k, _)| !(self.drop_size.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_SIZE_HEADER)))
@@ -5740,6 +5748,34 @@ fn a_win_the_node_could_not_pay_for_a_moment_is_paid_by_the_next_call() {
     assert_wins(&r, paid);
 }
 
+/// A 408 comes before any handler of the seller's: the request's seq is not used up, and the wallet's second sending of a
+/// paid request answered 408 carries the same one, on either rail. FAILS on a wallet that takes a seq as used on a 408:
+/// on the draws rail the seller then refuses the next request `bad_seq`.
+#[test]
+fn a_paid_request_sent_again_after_a_408_carries_the_same_seq_on_either_rail() {
+    let _g = env_lock();
+    for (draws, path) in [(true, "/pieces/"), (false, "/page/")] {
+        let r = if draws { draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}})) } else { Rig::new(json!({})) };
+        let (size, max) = if draws { (16 * PIECE, 1_000) } else { (10, CALL) };
+        let first = r.pay(&format!("{path}{size}"), max);
+        assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        r.tap.set(Box::new(move |seen, _| {
+            (seen.paid && seen.path.starts_with(path) && m.fetch_add(1, Ordering::SeqCst) < 1).then(|| Ok(answer(408, vec![], b"{}".to_vec())))
+        }));
+        let before = r.tap.seen(path).len();
+        let v = r.pay(&format!("{path}{size}"), max);
+        r.tap.clear();
+        assert_eq!((v["status"].as_u64(), v["session"].as_str()), (Some(200), first["session"].as_str()), "{v}");
+        let sent: Vec<Option<u64>> = r.tap.seen(path).iter().skip(before).filter(|s| s.paid).map(|s| s.seq).collect();
+        assert!(sent.len() >= 2 && sent[0].is_some(), "{sent:?}");
+        assert_eq!(sent[1], sent[0], "the request after the 408 named another seq: {sent:?}");
+    }
+}
+
+/// The same on the ticket rail: a paid request answered 408 once is sent again and served; answered 408 every time, it is
+/// refused for that call; either way the session goes on and the credit is what it was.
 #[test]
 fn a_408_to_a_paid_request_stops_no_ticket_session() {
     let _g = env_lock();
