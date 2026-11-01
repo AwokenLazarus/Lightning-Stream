@@ -6,7 +6,8 @@
 # Images: the package's own commands, mounts and env (spec.ts, through test/spec-json.mjs), on stand-in images
 # where the published ones don't exist yet: xbt-hashlink, xbt-init and xbt-supervise from this tree (cargo, glibc,
 # on ubuntu:24.04), and the gateway from the lab binary P2P_HASH_GATEWAYS/datum_gateway-blind (CONVOY 971af86 +
-# gateway-blind-release.patch) unless DATUM_IMAGE names a built xbt-datum-gateway image. The node, the miner
+# gateway-blind-release.patch) unless DATUM_IMAGE names a built xbt-datum-gateway image, or DATUM_IMAGE_TAR an
+# archive of one (scripts/oci_build.sh's dist/oci/xbt-datum-gateway.tar), loaded here. The node, the miner
 # (stratum-grind) and the gateway binary come from P2P_HASH_GATEWAYS (default ~/xbt-rnd/hash-gateways).
 # Ports: 127.0.0.1:24190 (the seller's miners), 24191 (the node's RPC, on the test network's bridge address only).
 # Evidence: run/startos-datum/<stamp>/ (results.json, datum_regtest.log, the containers' logs).
@@ -25,7 +26,9 @@ nice -n 19 cargo build -q -j"${JOBS:-6}" --release --locked -p xbt-hashlink --bi
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 CTX=$(mktemp -d)
-trap 'rm -rf "$CTX"' EXIT
+LOADED=
+# the stand-in images go again at the end: no tag of this run is left on the lab
+trap 'rm -rf "$CTX"; docker rmi -f xbt-hashlink:standin-datum-test xbt-init:standin-datum-test xbt-test-probe:datum-test xbt-datum-gateway:standin-datum-test $LOADED >/dev/null 2>&1 || true' EXIT
 cp "$BIN/xbt-hashlink" "$BIN/xbt-init" "$BIN/xbt-supervise" "$HG/datum_gateway-blind" "$HG/lib/libmicrohttpd.so.12" "$CTX/"
 cat > "$CTX/Dockerfile.hashlink" <<'EOF'
 FROM ubuntu:24.04
@@ -57,12 +60,20 @@ echo "== stand-in images"
 docker build -q -t xbt-hashlink:standin-datum-test -f "$CTX/Dockerfile.hashlink" "$CTX" >/dev/null
 docker build -q -t xbt-init:standin-datum-test -f "$CTX/Dockerfile.init" "$CTX" >/dev/null
 docker build -q -t xbt-test-probe:datum-test -f "$CTX/Dockerfile.probe" "$CTX" >/dev/null
+if [ -n "${DATUM_IMAGE_TAR:-}" ]; then
+  out=$(docker load -i "$DATUM_IMAGE_TAR")
+  ref=$(printf '%s\n' "$out" | sed -n 's/^Loaded image: //p' | head -1)
+  [ -n "$ref" ] || { id=$(printf '%s\n' "$out" | sed -n 's/^Loaded image ID: //p' | head -1); ref=xbt-datum-gateway:loaded-datum-test; docker tag "$id" "$ref"; }
+  export DATUM_IMAGE=$ref
+  # what this run loaded goes again at the end
+  LOADED=$ref
+fi
 if [ -z "${DATUM_IMAGE:-}" ]; then
   docker build -q -t xbt-datum-gateway:standin-datum-test -f "$CTX/Dockerfile.datum" "$CTX" >/dev/null
   export DATUM_IMAGE=xbt-datum-gateway:standin-datum-test
 fi
 export HASHLINK_IMAGE=xbt-hashlink:standin-datum-test INIT_IMAGE=xbt-init:standin-datum-test PROBE_IMAGE=xbt-test-probe:datum-test HG
-echo "gateway binary $(sha256sum "$HG/datum_gateway-blind" | cut -c1-16), image $DATUM_IMAGE" | tee "$OUT/images.log"
+echo "lab gateway binary (the stand-in's) $(sha256sum "$HG/datum_gateway-blind" | cut -c1-16); image run: $DATUM_IMAGE ($(docker image inspect "$DATUM_IMAGE" --format '{{.Id}}' | cut -c1-19))${DATUM_IMAGE_TAR:+ from $DATUM_IMAGE_TAR}" | tee "$OUT/images.log"
 
 set +e
 nice -n 10 python3 packaging/startos/test/datum_regtest.py "$OUT"
