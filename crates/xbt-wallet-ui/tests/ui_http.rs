@@ -4005,7 +4005,14 @@ fn bundled_status(running: bool, node: Option<bool>, masking: bool, moved: Optio
 
 fn offers_one() -> Value {
     json!({"offers": [{"name": "Big miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
-                       "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": "https://miners.example/hashrate", "payNode": "02aa"}]})
+                       "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": "https://miners.example/hashrate", "payNode": MINERS_NODE}]})
+}
+
+const MINERS_NODE: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+/// Spending rules that let the app pay the stand-in hashmaker (its origin listed, with its node).
+fn miners_allowed() -> Value {
+    json!({"allowlist": [PROVIDER, ADDR, "https://miners.example"], "counterparties": {"https://miners.example": {"ln_node": MINERS_NODE}}})
 }
 
 /// "Your gateway": the bundled Stream Gateway's settings are written to its config for each mode, an address is checked
@@ -4023,7 +4030,7 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     std::fs::write(&rtok, "r".repeat(64)).unwrap();
     let gwdir = dir.path().join("run/datum");
     std::fs::create_dir_all(&gwdir).unwrap();
-    let bx = start(json!({}), false, |c| {
+    let bx = start(miners_allowed(), false, |c| {
         c.hash.renter = Some(renter.clone());
         c.hash.renter_token = Some(rtok.clone());
         c.hash.stream_gw.rpcurl = Some("http://xbt-knots_bitcoind_1:18443".into());
@@ -4099,7 +4106,7 @@ fn the_rent_page_shows_the_bundled_gateways_state() {
         std::fs::write(&rtok, "r".repeat(64)).unwrap();
         let gwdir = dir.path().join("run/datum");
         std::fs::create_dir_all(&gwdir).unwrap();
-        let bx = start(json!({}), false, |c| {
+        let bx = start(miners_allowed(), false, |c| {
             c.hash.renter = Some(renter.clone());
             c.hash.renter_token = Some(rtok.clone());
             c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
@@ -4135,7 +4142,7 @@ fn a_moved_install_is_told_and_can_switch_either_way() {
     let dir = tempfile::tempdir().unwrap();
     let rtok = dir.path().join("renter-token");
     std::fs::write(&rtok, "r".repeat(64)).unwrap();
-    let bx = start(json!({}), false, |c| {
+    let bx = start(miners_allowed(), false, |c| {
         c.hash.renter = Some(renter.clone());
         c.hash.renter_token = Some(rtok.clone());
         c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
@@ -4159,7 +4166,7 @@ fn a_moved_install_is_told_and_can_switch_either_way() {
         ("POST", "/datum") => json!({"ok": true, "datum": "127.0.0.1:23339", "reachable": true, "bundled": true}),
         _ => json!({}),
     });
-    let bx2 = start(json!({}), false, |c| {
+    let bx2 = start(miners_allowed(), false, |c| {
         c.hash.renter = Some(renter2.clone());
         c.hash.renter_token = Some(rtok.clone());
         c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
@@ -4186,7 +4193,7 @@ fn without_the_bundled_gateway_renting_says_it_isnt_masking() {
     let dir = tempfile::tempdir().unwrap();
     let rtok = dir.path().join("renter-token");
     std::fs::write(&rtok, "r".repeat(64)).unwrap();
-    let bx = start(json!({}), false, |c| {
+    let bx = start(miners_allowed(), false, |c| {
         c.hash.renter = Some(renter.clone());
         c.hash.renter_token = Some(rtok.clone());
     });
