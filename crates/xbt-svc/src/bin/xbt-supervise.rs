@@ -18,7 +18,8 @@
 //! `--peer`: a TCP address of the container whose network namespace this one shares (Docker's
 //! `network_mode: service:X`), looked at every `--every` seconds whether or not PROGRAM has started. When
 //! that container restarts it gets a new namespace, and this one is left in the old one, where nothing
-//! answers. So once the peer has answered, [`PEER_FAILS`] refused looks in a row stop PROGRAM and exit
+//! answers. So once the peer has answered, [`PEER_FAILS`] refused looks in a row stop PROGRAM (SIGKILL after
+//! [`PEER_GONE_GRACE`], not 15 s: nothing it serves can reach it any more) and exit
 //! [`PEER_GONE`]; a peer that never answers within [`PEER_GRACE`] does the same. The restart policy then
 //! starts this container again, in the peer's namespace as it is now.
 use std::net::{SocketAddr, TcpStream};
@@ -44,6 +45,12 @@ const PEER_GRACE: Duration = Duration::from_secs(90);
 const PEER_LOOK: Duration = Duration::from_secs(1);
 /// The exit code when the peer is gone (not PROGRAM's: the restart policy acts on any failure).
 const PEER_GONE: u8 = 3;
+/// How long PROGRAM has after SIGTERM before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(15);
+/// The same once the peer is gone: the namespace is dead (nothing PROGRAM serves or talks to is
+/// reachable from it), so there is nothing a graceful stop could still save, and every second it takes is
+/// a second the peer goes without it.
+const PEER_GONE_GRACE: Duration = Duration::from_secs(2);
 
 /// The peer whose network namespace this container shares, as last looked at.
 struct Peer {
@@ -126,8 +133,8 @@ fn say(msg: impl std::fmt::Display) {
     eprintln!("xbt-supervise: {msg}");
 }
 
-/// SIGTERM, then SIGKILL after 15 s.
-fn stop(child: &mut Child) {
+/// SIGTERM, then SIGKILL after `grace`.
+fn stop(child: &mut Child, grace: Duration) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: kill(2) on our own child's pid; no memory is shared
         unsafe {
@@ -135,7 +142,7 @@ fn stop(child: &mut Child) {
         }
     }
     let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(15) {
+    while t0.elapsed() < grace {
         if let Ok(Some(_)) = child.try_wait() {
             return;
         }
@@ -183,7 +190,7 @@ fn supervise(a: Args, signals: Signals) -> ExitCode {
             // a stop signal cuts the wait short; so does the child's own exit, at the next look
             signals.wait_timeout(a.every);
             if stopped() {
-                stop(&mut child);
+                stop(&mut child, STOP_GRACE);
                 return ExitCode::SUCCESS;
             }
             match child.try_wait() {
@@ -200,7 +207,7 @@ fn supervise(a: Args, signals: Signals) -> ExitCode {
             }
             if let Some(why) = peer_gone() {
                 say(format!("{why}: stopping {}", a.program[0]));
-                stop(&mut child);
+                stop(&mut child, PEER_GONE_GRACE);
                 return ExitCode::from(PEER_GONE);
             }
             let now = snapshot(&all);
@@ -208,7 +215,7 @@ fn supervise(a: Args, signals: Signals) -> ExitCode {
                 let changed: Vec<String> =
                     all.iter().zip(now.iter().zip(&seen)).filter(|(_, (n, s))| n != s).map(|(f, _)| f.display().to_string()).collect();
                 say(format!("{} changed: restarting {}", changed.join(", "), a.program[0]));
-                stop(&mut child);
+                stop(&mut child, STOP_GRACE);
                 break;
             }
         }
@@ -360,6 +367,23 @@ mod tests {
             assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(PEER_GONE)), "waiting={waiting}");
             assert_eq!(marker.exists(), !waiting, "the program ran only when nothing was waited for");
         }
+    }
+
+    /// A program that outlives SIGTERM is killed soon after the peer is gone, not after the usual 15 s.
+    #[test]
+    fn a_program_that_ignores_sigterm_is_killed_soon_once_the_peer_is_gone() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let args = s(&["--peer", &addr.to_string(), "--every", "0.1", "--", "/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"]);
+        let a = parse(&args).unwrap();
+        let signals = xbt_svc::shutdown::listen().unwrap();
+        let h = std::thread::spawn(move || supervise(a, signals));
+        std::thread::sleep(Duration::from_millis(500));
+        drop(l);
+        let t0 = Instant::now();
+        let code = h.join().unwrap();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(PEER_GONE)));
+        assert!(t0.elapsed() < PEER_GONE_GRACE + Duration::from_secs(3), "took {:?}", t0.elapsed());
     }
 
     /// A listener's accept that gives up at once (std has no accept with a deadline).
