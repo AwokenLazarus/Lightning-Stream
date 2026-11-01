@@ -323,8 +323,13 @@ its jobs. Renting opens when all three hold.
 
 **Upgrading from 0.1.x.** An install that had saved another gateway (a stock DATUM gateway app) is moved to the
 Stream Gateway once, at the first start: a stock gateway can't open its jobs, so every rental to it would be
-refused. The page says so and offers *Use … again*; a gateway chosen on the page after that is kept. *Use another
-gateway* takes a gateway of your own that opens its jobs the same way. A build of the app without the gateway
+refused. The page says so and offers *Use … again*. *Use another gateway* takes a gateway of your own that opens
+its jobs the same way, and its API address when that isn't the same host's port 7152.
+
+**The page or the installer.** A gateway chosen on the page is kept only while the installer's answer (the renter's
+`--upstream` and `--bundled-gateway`, on Linux the install script's gateway question) stays what it was when the choice
+was saved. Run the installer again with another answer and that answer wins; the page says which choice it replaced
+and offers it back. A build of the app without the gateway
 (armv7) says the gateway isn't masking and doesn't rent; selling hashrate works there as before.
 
 ## A stalled link
