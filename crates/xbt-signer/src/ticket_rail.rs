@@ -1923,6 +1923,7 @@ impl Signer {
 
     /// An ordinary payment of a session, booked before it is sent: a prepaid ticket (`win` None),
     /// or the win of a draw.
+    #[allow(clippy::too_many_arguments)]
     fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>,
                            due: Option<f64>) -> Value {
         if let Some(d) = self.ticket_shut() {
