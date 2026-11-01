@@ -250,9 +250,44 @@ pub fn write(setup: &StreamGwSetup, s: &Settings, chain: &str) -> Result<(), Str
     crate::setup::write_shared(&setup.dir, FILE, text.as_bytes()).map_err(|e| format!("The settings could not be saved: {e}"))
 }
 
+/// A written config whose node isn't the one this UI was given (`XBT_UI_DATUM_RPCURL`, from the platform: on StartOS
+/// the Node connection action, which restarts the app when it changes) is written again with it, from its own
+/// settings: the gateway follows the node without the owner saving the Hashrate page again. True when rewritten.
+pub fn follow_node(setup: &StreamGwSetup) -> Result<bool, String> {
+    let Some(url) = setup.rpcurl.as_deref() else { return Ok(false) };
+    let Ok(raw) = std::fs::read(setup.dir.join(FILE)) else { return Ok(false) };
+    let v: Value = serde_json::from_slice(&raw).map_err(|_| format!("{} is not JSON", FILE))?;
+    if v["bitcoind"]["rpcurl"].as_str() == Some(url) {
+        return Ok(false);
+    }
+    let Some(s) = read(&setup.dir) else { return Ok(false) };
+    let text = serde_json::to_string_pretty(&config_json(&s, setup)).unwrap_or_default() + "\n";
+    crate::setup::write_shared(&setup.dir, FILE, text.as_bytes()).map_err(|e| format!("{FILE} could not be rewritten: {e}"))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The node moves (StartOS: the Node connection action): the config written before follows it at the UI's start,
+    /// keeping the owner's settings; a config already on the node, or none, is left alone.
+    #[test]
+    fn a_written_config_follows_the_node_the_ui_is_given() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().to_path_buf();
+        let old = StreamGwSetup { rpcurl: Some("http://old-node:8332".into()), dir: dir.clone(), ..StreamGwSetup::default() };
+        assert_eq!(follow_node(&old), Ok(false), "no config yet");
+        let s = Settings::new(Mode::Solo, "bc1qt5praystcdle0nq04e3h02yjszha82uzhww85x6972lcy40k4eyqz9jfaq");
+        std::fs::write(dir.join(FILE), serde_json::to_string_pretty(&config_json(&s, &old)).unwrap()).unwrap();
+        assert_eq!(follow_node(&old), Ok(false), "already on that node");
+        let new = StreamGwSetup { rpcurl: Some("http://new-node:8332".into()), ..old.clone() };
+        assert_eq!(follow_node(&new), Ok(true));
+        let v: Value = serde_json::from_slice(&std::fs::read(dir.join(FILE)).unwrap()).unwrap();
+        assert_eq!(v["bitcoind"]["rpcurl"], "http://new-node:8332");
+        assert_eq!(v["mining"]["pool_address"], "bc1qt5praystcdle0nq04e3h02yjszha82uzhww85x6972lcy40k4eyqz9jfaq", "the owner's settings kept");
+        assert_eq!(follow_node(&new), Ok(false));
+    }
 
     fn setup(dir: &Path) -> StreamGwSetup {
         StreamGwSetup { rpcurl: Some("http://xbt-knots_bitcoind_1:8332".into()), dir: dir.to_path_buf(), ..StreamGwSetup::default() }
