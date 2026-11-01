@@ -35,8 +35,9 @@ Checks (OUT/umbrel_datum_regtest.json):
   rental      a masked solo rental through the compose, paid through the wallet: real blocks, each masked,
               each paying the regtest address, every job held to /xbt/job, payments = what the hashmaker earned,
               and the found blocks kept in datum/submitblocks
-  restart     after `docker restart` of the renter, is its gateway still on its loopback; and a restart of the
-              gateway's container puts it back
+  restart     after `docker restart` of the renter (a new namespace), the gateway leaves the old one by itself
+              (xbt-supervise --peer) and is restarted into the new one: masked jobs again within 30 s, and the
+              renter's page shows it within its look interval, with nobody touching anything
     datum_regtest.py
 """
 from __future__ import annotations
@@ -420,27 +421,37 @@ def main() -> int:
         kept = root("ls /d/datum/submitblocks | wc -l").strip()
         check("rental: the found blocks are kept in datum/submitblocks", int(kept or 0) >= len(blocks) >= 1, {"files": kept, "blocks": len(blocks)})
 
-        # --- restart: the renter's container restarted, its gateway still on its loopback?
+        # --- restart: `docker restart` of the renter gives it a new namespace; the gateway, by itself (xbt-supervise
+        # --peer), leaves the old one and its restart policy starts it in the new one
+        restarts0 = inspect(dn)["RestartCount"]
+        t_r = time.time()
         sh("docker", "restart", rn)
-        lab.wait("the renter's control page after its restart", 60, lambda: bool(status().get("role")), every=2)
-        time.sleep(5)
-        after = probe(f"container:{rn}", "connect", "127.0.0.1", str(STRATUM))
-        s2 = status()
-        REPORT["after_renter_restart"] = {"stratum": after, "datum": s2.get("datum"), "blinding": s2.get("blinding"), "gateway state": inspect(dn)["State"]["Status"]}
-        check("restart: after a restart of the renter, its gateway is still on its loopback", after.get("open") is True and s2["datum"]["reachable"] is True,
-              REPORT["after_renter_restart"])
-        # the gateway's container joins the renter's namespace as it is when it starts: a restart of it is the way back
-        sh("docker", "restart", dn)
-        lab.wait("the gateway after its own restart", 90, lambda: probe(f"container:{rn}", "connect", "127.0.0.1", str(STRATUM)).get("open") is True, every=3)
-        # the renter looks again once its last look is a minute old
-        until = time.time() + 150
-        s3 = status()
-        while time.time() < until and (s3.get("blinding") or {}).get("state") != "blinded":
-            time.sleep(10)
+        lab.wait("the renter's control page after its restart", 60, lambda: bool(status().get("role")), every=1)
+        back, j2 = None, {}
+        while time.time() - t_r < 120:
+            j2 = probe(f"container:{rn}", "job", "127.0.0.1", str(STRATUM), str(API))
+            o2 = j2.get("opened") if isinstance(j2.get("opened"), dict) else {}
+            if j2.get("code") == 200 and o2.get("mode") == "solo" and o2.get("null_key") is False:
+                back = round(time.time() - t_r, 1)
+                break
+            time.sleep(2)
+        d2 = inspect(dn)
+        said = [ln for ln in sh("docker", "logs", dn, check_rc=False).stderr.splitlines() if "stopped answering" in ln or "not answered" in ln]
+        REPORT["after_renter_restart"] = {"gateway masked again after s": back, "restart count": [restarts0, d2["RestartCount"]], "state": d2["State"]["Status"],
+                                          "supervise said": said[-2:], "job": j2}
+        check("restart: after `docker restart` of the renter, the gateway restarts by itself and serves masked jobs on the renter's new loopback within 30 s",
+              back is not None and back <= 30 and d2["RestartCount"] > restarts0 and said, REPORT["after_renter_restart"])
+        # and the renter's page says so by itself (it looks at its gateway again once its last look is a minute old)
+        seen, s3 = None, {}
+        while time.time() - t_r < 180:
             s3 = status()
-        REPORT["after_gateway_restart"] = {"datum": s3.get("datum"), "blinding": s3.get("blinding")}
-        check("restart: a restart of the gateway's container puts it back on the renter's loopback, its jobs masked",
-              s3["datum"]["reachable"] is True and (s3.get("blinding") or {}).get("state") == "blinded", REPORT["after_gateway_restart"])
+            if (s3.get("blinding") or {}).get("state") == "blinded" and s3["datum"]["reachable"] is True:
+                seen = round(time.time() - t_r, 1)
+                break
+            time.sleep(5)
+        REPORT["after_renter_restart"]["renter shows masked after s"] = seen
+        check("restart: the renter's page shows its gateway masked again by itself (within its look interval)", seen is not None and seen <= 120,
+              {"seconds": seen, "datum": s3.get("datum"), "blinding": s3.get("blinding")})
     except (lab.LabError, OSError, KeyError, IndexError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
         check("ran to its end", False, f"{type(e).__name__}: {e}")
     finally:
