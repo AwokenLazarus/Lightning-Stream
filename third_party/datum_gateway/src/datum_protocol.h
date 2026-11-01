@@ -1,0 +1,234 @@
+/*
+ *
+ * DATUM Gateway
+ * Decentralized Alternative Templates for Universal Mining
+ *
+ * This file is part of CONVOY's Bitcoin mining decentralization
+ * project, DATUM.
+ *
+ * https://convoy.xyz
+ *
+ * ---
+ *
+ * Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and individual contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+#ifndef _DATUM_PROTOCOL_H_
+#define _DATUM_PROTOCOL_H_
+
+#include <sodium.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "datum_stratum.h"
+
+// This is a protocol limit! server will truncate down to 8, unless a new spec is done that permits more.
+// Works out to over 5 minutes of jobs at 30-40 second work change intervals. No miner should be holding on to work this long.
+#define MAX_DATUM_PROTOCOL_JOBS 8
+
+// Pre-v1 draft discriminator. This is not a released DATUM protocol version.
+#define DATUM_ABW_DRAFT_REVISION 0
+#define DATUM_ABW_SHARE_TARGET_BASE_BITS 32
+#define DATUM_ABW_ASSIGNMENT_SLOTS 16
+#define DATUM_ABW_ASSIGNMENT_ACTIVE 0x01
+
+#define DATUM_PROTOCOL_VERSION "v0.4.1-beta" // this is sent to the server as a UA
+#define DATUM_PROTOCOL_CONNECT_TIMEOUT 30
+
+#define DATUM_PROTOCOL_MAX_CMD_DATA_SIZE 4194304 // 2^22 - protocol limit!
+#define DATUM_PROTOCOL_BUFFER_SIZE (DATUM_PROTOCOL_MAX_CMD_DATA_SIZE*3)
+#define DATUM_PROTOCOL_MAX_USERNAME_LEN 384
+
+// DRS version 1 HELLO flags. Unknown higher bits remain forward compatible;
+// an incompatible trailer layout requires a new DRS version.
+#define DATUM_DRS_RESUME_TOKEN_FLAG 0x01
+#define DATUM_DRS_FRAMING_V2_FLAG 0x02
+#define DATUM_DRS_GATEWAY_KEY_FLAG 0x80 // this gateway can hold the xor key on pool jobs
+
+// Protocol command 6 carries sequential DBF1 fragments. Only one small
+// fragment is admitted after the primary send queue drains.
+#define DATUM_BULK_FRAGMENT_HEADER_SIZE 16
+#define DATUM_BULK_FRAGMENT_DATA_SIZE (16 * 1024)
+
+#define MAX_DATUM_CLIENT_EVENTS 32
+
+// Header is only XOR'd with a rotating key.  This is NOT 100% secure, and makes the cmd# and length of the handshake message decipherable.
+// This is not an issue for security, however, as all following packets use a negotiated XOR key.
+// It's likely possible to brute force the XOR key to break packets down into individual commands, but the contents and nature of the
+// cmd is still obfuscated and unrecoverable without the session keys.
+
+typedef struct T_DATUM_PROTOCOL_HEADER {
+	uint32_t cmd_len:22; // max cmd size is 2^22 (~4MB), which is roughly the max block size for a raw submission or a raw template validation
+	bool is_signed;
+	bool is_encrypted_pubkey;
+	bool is_encrypted_channel;
+	uint8_t proto_cmd:5; // 32 protocol level commands
+} T_DATUM_PROTOCOL_HEADER;
+#define T_DATUM_PROTOCOL_HEADER_WIRE_BYTES 4
+
+typedef struct {
+	bool is_remote;
+	
+	// ed25519 key pair (signing)
+	unsigned char pk_ed25519[crypto_sign_PUBLICKEYBYTES];
+	unsigned char sk_ed25519[crypto_sign_SECRETKEYBYTES];
+	
+	// x25519 key pair (encyption)
+	unsigned char pk_x25519[crypto_box_PUBLICKEYBYTES];
+	unsigned char sk_x25519[crypto_box_SECRETKEYBYTES];
+} DATUM_ENC_KEYS;
+
+typedef struct {
+	DATUM_ENC_KEYS *local;
+	DATUM_ENC_KEYS *remote;
+	unsigned char precomp_remote[crypto_box_BEFORENMBYTES];
+} DATUM_ENC_PRECOMP;
+
+typedef struct T_DATUM_PROTOCOL_JOB {
+	unsigned char datum_job_id;
+	T_DATUM_STRATUM_JOB *sjob;
+	T_DATUM_STRATUM_JOB *server_sjob;
+	char server_job_id[sizeof(((T_DATUM_STRATUM_JOB *)0)->job_id)];
+	
+	bool server_has_merkle_branches;
+	
+	bool server_has_coinbase[8];
+	bool server_has_coinbase_empty;
+	bool server_has_short_txnlist;
+	
+	bool server_has_validated_block;
+} T_DATUM_PROTOCOL_JOB;
+
+typedef struct {
+	unsigned char datum_job_id;
+	unsigned char extranonce[12];
+	char username[384];
+	char stratum_job_id[24];
+	T_DATUM_STRATUM_JOB *sjob;
+	unsigned char coinbase_id;
+	bool subsidy_only;
+	bool is_block;
+	bool quickdiff;
+	bool blake2b_use_time_offset;
+	// Internal token is wire slot + 1 so zero remains an unset sentinel.
+	uint8_t abw_assignment_id;
+	// A job under this gateway's own key: section 0x06 on every share, and the
+	// key in section 0x07 on a block only.
+	bool pool_key;
+	uint8_t pool_key_clear_bits;
+	unsigned char pool_key_hash[32];
+	unsigned char pool_xor_key[16];
+	unsigned char raw_pow_hash[32];
+	unsigned char target_byte;
+	uint16_t target_byte_index;
+	uint64_t ntime;
+	uint64_t nonce;
+	uint32_t time_on_wire;
+	uint32_t version;
+} T_DATUM_PROTOCOL_POW;
+
+int datum_protocol_init(void);
+int datum_encrypt_generate_keys(DATUM_ENC_KEYS *keys);
+bool datum_protocol_is_active(void);
+bool datum_protocol_abw_required(void);
+bool datum_protocol_gateway_key_supported(void);
+void datum_increment_session_nonce(void *s);
+int datum_protocol_fetch_coinbaser(uint64_t value);
+int datum_protocol_coinbaser_fetch(void *s);
+int datum_protocol_migration_request(int len, const unsigned char *data);
+bool datum_protocol_take_connect_endpoint(
+	char *host,
+	size_t host_size,
+	int *port,
+	char *pubkey,
+	size_t pubkey_size
+);
+bool datum_protocol_migration_expired(uint64_t now_ms);
+int datum_protocol_pow_submit(
+	const T_DATUM_CLIENT_DATA *c,
+	const T_DATUM_STRATUM_JOB *job,
+	const char *username,
+	const bool was_block,
+	const bool subsidy_only,
+	const bool quickdiff,
+	const unsigned char *block_header,
+	const uint64_t target_diff,
+	const unsigned char *full_cb_tx,
+	const size_t full_cb_tx_size,
+	const unsigned char *raw_pow_hash,
+	const T_DATUM_STRATUM_COINBASE *cb,
+	unsigned char *extranonce,
+	unsigned char coinbase_index
+);
+
+bool datum_protocol_thread_is_active(void);
+void datum_protocol_start_connector(void);
+unsigned char datum_protocol_setup_new_job_idx(void *sx);
+int datum_protocol_pow_build_message(T_DATUM_PROTOCOL_POW *pow, unsigned char *msg, size_t msg_size);
+bool datum_protocol_abw_apply_active(T_DATUM_TEMPLATE_DATA *block_template);
+bool datum_protocol_abw_health_ok(void);
+
+extern uint64_t datum_accepted_share_count;
+extern uint64_t datum_accepted_share_diff;
+extern uint64_t datum_rejected_share_count;
+extern uint64_t datum_rejected_share_diff;
+
+#define DATUM_CONFIG_FLAG_ABW_DISABLED 0x01
+// Follows the configuration's end byte (after any DBF marker), and only counts
+// with ABW disabled: the pool takes gateway-held xor keys. pool-blind-spec.md.
+#define DATUM_CONFIG_MARKER_GATEWAY_KEY "DGK\x01"
+
+#define DATUM_REJECT_BAD_JOB_ID 10
+#define DATUM_REJECT_BAD_COINBASE_ID 11
+#define DATUM_REJECT_BAD_EXTRANONCE_SIZE 12
+#define DATUM_REJECT_BAD_TARGET 13
+#define DATUM_REJECT_BAD_USERNAME 14
+#define DATUM_REJECT_BAD_COINBASER_ID 15
+#define DATUM_REJECT_BAD_MERKLE_COUNT 16
+#define DATUM_REJECT_BAD_COINBASE_TOO_LARGE 17
+#define DATUM_REJECT_COINBASE_MISSING 18
+#define DATUM_REJECT_TARGET_MISMATCH 19
+#define DATUM_REJECT_H_NOT_ZERO 20
+#define DATUM_REJECT_HIGH_HASH 21
+#define DATUM_REJECT_COINBASE_ID_MISMATCH 22
+#define DATUM_REJECT_BAD_NTIME 23
+#define DATUM_REJECT_BAD_VERSION 24
+#define DATUM_REJECT_STALE_BLOCK 25
+#define DATUM_REJECT_BAD_COINBASE 26
+#define DATUM_REJECT_BAD_COINBASE_OUTPUTS 27
+#define DATUM_REJECT_MISSING_POOL_TAG 28
+#define DATUM_REJECT_DUPLICATE_WORK 29
+#define DATUM_REJECT_OTHER 30
+#define DATUM_REJECT_RECONSTRUCTION_MISMATCH 31
+#define DATUM_REJECT_BAD_BLAKE2B_SECTION 40
+#define DATUM_REJECT_HEADER_FIELD_MISMATCH 41
+#define DATUM_REJECT_HEADER_MERKLE_MISMATCH 42
+#define DATUM_REJECT_NO_SPLIT 43
+#define DATUM_REJECT_BAD_ABW_SLOT 44
+
+#define DATUM_POW_SHARE_RESPONSE_ACCEPTED 0x50
+#define DATUM_POW_SHARE_RESPONSE_ACCEPTED_TENTATIVELY 0x55
+#define DATUM_POW_SHARE_RESPONSE_REJECTED 0x66
+
+#endif

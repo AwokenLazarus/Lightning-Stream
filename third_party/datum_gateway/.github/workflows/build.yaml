@@ -1,0 +1,253 @@
+name: Build DATUM Gateway
+
+on:
+    schedule:
+        - cron: '0 0 1 * *'
+    push:
+    pull_request:
+
+env:
+  GLOBAL_CFLAGS: "-Wall -Werror"
+  ASAN_CFLAGS: "-fsanitize=address"
+  ASAN_OPTIONS: "abort_on_error=1:print_stacktrace=1"
+  UBSAN_CFLAGS: "-fsanitize=undefined -fno-sanitize-recover=all"
+  UBSAN_OPTIONS: "print_stacktrace=1"
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: brew install cmake pkgconf curl jansson libsodium libmicrohttpd argp-standalone epoll-shim
+
+      - name: Build and test
+        run: |
+          cmake -S . -B build -DCMAKE_C_FLAGS="${GLOBAL_CFLAGS}"
+          cmake --build build --parallel
+          ./build/datum_gateway --help
+          ./build/datum_gateway --test
+
+  build:
+    strategy:
+      matrix:
+        os:
+          - ubuntu:latest
+          - ubuntu:22.04
+          - debian:latest
+          - debian:stable
+          - debian:oldstable
+          - almalinux:latest
+          - amazonlinux:latest
+          - fedora:latest
+          - oraclelinux:9
+          - alpine:latest
+          - archlinux:latest
+          - gentoo/stage3:musl-hardened
+          - gentoo/stage3:hardened
+          - freebsd
+          - freebsd:14.4
+          - freebsd:14.4:aarch64
+        config:
+          - cmake_args: "-DENABLE_API=ON -DCMAKE_C_COMPILER=gcc"
+          - cmake_args: "-DENABLE_API=ON -DCMAKE_C_COMPILER=clang"
+          - cmake_args: "-DENABLE_API=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_C_FLAGS=-DDATUM_API_FOR_UMBREL=ON"
+            extra_cflags: "-DDATUM_API_FOR_UMBREL"
+          - cmake_args: "-DENABLE_API=OFF"
+        exclude:
+          # Clang configured for C11 rejects our C23 usage
+          - os: debian:oldstable
+            config:
+              cmake_args: "-DENABLE_API=ON -DCMAKE_C_COMPILER=clang"
+          # CMake can't find Threads support using GCC
+          - os: freebsd:14.4:aarch64
+            config:
+              cmake_args: "-DENABLE_API=ON -DCMAKE_C_COMPILER=gcc"
+          - os: freebsd:14.4:aarch64
+            config:
+              cmake_args: "-DENABLE_API=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_C_FLAGS=-DDATUM_API_FOR_UMBREL=ON"
+              extra_cflags: "-DDATUM_API_FOR_UMBREL"
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Restore package cache
+        if: startsWith(matrix.os, 'gentoo/')
+        uses: actions/cache/restore@v5
+        with:
+          path: pkg-cache
+          key: never-exists
+          restore-keys: |
+            ${{ matrix.os }}/pkg-cache/${{ matrix.config.cmake_args }}/
+            ${{ matrix.os }}/pkg-cache/
+
+      - name: Build inside Docker
+        if: "!startsWith(matrix.os, 'freebsd')"
+        id: docker-build
+        run: |
+          PKG_CACHE_DIR=/pkg-cache
+          PACKAGES_CLANG='clang'
+          PACKAGES_GCC='gcc'
+
+          # ASan detect_leaks is not supported on FreeBSD, so add it to options here
+          ASAN_OPTIONS="${ASAN_OPTIONS}:detect_leaks=1"
+
+          case "${{ matrix.os }}" in
+            debian:*|ubuntu:*)
+              INSTALL_CMD="apt update && apt install -y"
+              PACKAGES="git libc6-dev cmake libcurl4-openssl-dev libjansson-dev libsodium-dev pkgconf"
+              PACKAGES_API="libmicrohttpd-dev"
+              ;;
+            almalinux:*|amazonlinux:*|fedora:*|oraclelinux:*)
+              INSTALL_CMD="dnf install -y"
+              [[ "${{ matrix.os }}" =~ ^almalinux: ]] && INSTALL_CMD="dnf install -y dnf-plugins-core && dnf config-manager --set-enabled crb && $INSTALL_CMD"
+              [[ "${{ matrix.os }}" =~ ^oraclelinux: ]] && INSTALL_CMD="dnf install -y dnf-plugins-core && dnf config-manager --set-enabled ol9_codeready_builder && $INSTALL_CMD"
+              [[ "${{ matrix.os }}" =~ ^(alma|oracle)linux: ]] && INSTALL_CMD="dnf install -y epel-release && $INSTALL_CMD"
+              PACKAGES="git cmake libcurl-devel jansson-devel libsodium-devel pkgconf"
+              PACKAGES_API="libmicrohttpd-devel"
+              PACKAGES_GCC="$PACKAGES_GCC libasan libubsan"
+              [[ "${{ matrix.config.cmake_args }}" =~ clang|gcc ]] || PACKAGES="$PACKAGES $PACKAGES_GCC"
+              ;;
+            alpine:*)
+              INSTALL_CMD="apk add --no-cache"
+              PACKAGES="git build-base cmake argp-standalone curl-dev jansson-dev libsodium-dev compiler-rt"
+              PACKAGES_API="libmicrohttpd-dev"
+
+              # musl only supports ASan with clang
+              [[ "${{ matrix.config.cmake_args }}" =~ clang ]] || ASAN_CFLAGS=
+              ;;
+            archlinux:*)
+              INSTALL_CMD="pacman -Syu --noconfirm"
+              PACKAGES="git base-devel cmake curl jansson libsodium"
+              PACKAGES_API="libmicrohttpd"
+              ;;
+            gentoo/*)
+              PKG_CACHE_DIR='/var/cache/binpkgs'
+              INIT_CMD='
+                cat <<\EOF >>/etc/portage/make.conf
+          EMERGE_DEFAULT_OPTS="$EMERGE_DEFAULT_OPTS --quiet-build y --tree --autounmask-continue y --autounmask-keep-keywords y --autounmask-keep-masks y --autounmask-license n"
+          FETCHCOMMAND="$FETCHCOMMAND --progress=dot:giga"  # assumes wget default
+          EOF
+
+                if [ -e /var/cache/binpkgs/gentoo-repo.txz ]; then
+                  rm -rf /var/db/repos/gentoo
+                  tar -C /var/db/repos -xpf /var/cache/binpkgs/gentoo-repo.txz
+                  rm /var/cache/binpkgs/gentoo-repo.txz
+
+                  cache_cksum() {
+                    find /var/db/repos/gentoo /var/cache/binpkgs -type f -print0 | sort -z | xargs -0 sha256sum
+                  }
+                  cache_cksum > /tmp/initial-pkg-cache.cksum
+
+                  emerge --sync --quiet || true  # can fail if cache is recent enough
+                else
+                  emerge --sync --quiet
+                fi
+              '
+              INSTALL_CMD="emerge -1 sec-keys/openpgp-keys-gentoo-release && getuto && cat /etc/portage/make.conf && emerge -vuDkg1 @world && USE='-httpsrr -perl -extra -static-analyzer compiler-rt -openmp sanitize -adns -alt-svc -ftp -hsts -http2 -http3 -imap -pop3 -progress-meter -psl -quic -curl_quic_openssl -smtp -tftp -websockets' emerge -vuDkg1 --noreplace --jobs=\$(nproc) --buildpkg"
+              PACKAGES="dev-vcs/git dev-build/cmake net-misc/curl dev-libs/jansson dev-libs/libsodium virtual/pkgconfig app-portage/gentoolkit"
+              [[ "${{ matrix.os }}" =~ musl ]] && PACKAGES="$PACKAGES sys-libs/argp-standalone"
+              PACKAGES_API="net-libs/libmicrohttpd"
+              PACKAGES_CLANG="llvm-core/clang"
+
+              # musl only supports ASan with clang
+              [[ "${{ matrix.os }}" =~ musl && ! "${{ matrix.config.cmake_args }}" =~ clang ]] && ASAN_CFLAGS=
+
+              POSTINSTALL_CMD='
+                set +ex
+                source /etc/profile
+                set -ex
+              '
+              CLEANUP_CMD='
+                [ -e /tmp/initial-pkg-cache.cksum ] && cache_cksum >/tmp/final-pkg-cache.cksum
+                if ! diff -u /tmp/{initial,final}-pkg-cache.cksum; then
+                  ( cd /var/db/repos && tar --sort=name -cpJf /var/cache/binpkgs/gentoo-repo.txz gentoo )
+                  touch /output/SAVE_CACHE
+                  eclean -t 2w packages --changed-deps
+                fi
+              '
+              ;;
+          esac
+          PACKAGES="$PACKAGES ${{ matrix.config.extra_deps }}"
+          if [[ "${{ matrix.config.cmake_args }}" =~ ENABLE_API=ON ]]; then
+              PACKAGES="$PACKAGES $PACKAGES_API"
+          fi
+          if [[ "${{ matrix.config.cmake_args }}" =~ CMAKE_C_COMPILER=gcc ]]; then
+              PACKAGES="$PACKAGES $PACKAGES_GCC"
+          elif [[ "${{ matrix.config.cmake_args }}" =~ CMAKE_C_COMPILER=clang ]]; then
+              PACKAGES="$PACKAGES $PACKAGES_CLANG"
+          fi
+          CMD="set -ex
+            ${INIT_CMD}
+            ${INSTALL_CMD} ${PACKAGES}
+            ${POSTINSTALL_CMD}
+            git config --global --add safe.directory /workspace
+            mkdir -p build
+            cd build
+            CFLAGS='${{ env.GLOBAL_CFLAGS }}'
+            CFLAGS=\"\$CFLAGS\"' ${ASAN_CFLAGS} ${UBSAN_CFLAGS}'
+            CFLAGS=\"\$CFLAGS\"' ${{ matrix.config.extra_cflags }}'
+            cmake /workspace ${{ matrix.config.cmake_args }} -DCMAKE_C_FLAGS=\"\$CFLAGS\"
+            make -j\$(nproc)
+            export ASAN_OPTIONS='$ASAN_OPTIONS' UBSAN_OPTIONS='$UBSAN_OPTIONS'
+            ./datum_gateway --help
+            ./datum_gateway --test
+            ${CLEANUP_CMD}
+          "
+          docker run \
+            -v ./pkg-cache:"${PKG_CACHE_DIR}" \
+            -v ./output:"/output" \
+            -v "${{ github.workspace }}:/workspace":ro \
+            "${{ matrix.os }}" \
+            /bin/sh -c "${CMD}"
+
+          if [ -e output/SAVE_CACHE ]; then
+            echo 'save_cache=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'save_cache=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save package cache
+        if: steps.docker-build.outputs.save_cache == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: pkg-cache
+          key: ${{ matrix.os }}/pkg-cache/${{ matrix.config.cmake_args }}/${{ github.sha }}
+
+      - name: Build inside FreeBSD VM
+        if: startsWith(matrix.os, 'freebsd')
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ contains(matrix.os, ':14.4') && '14.4' || '' }}
+          arch: ${{ endsWith(matrix.os, ':aarch64') && 'aarch64' || '' }}
+          prepare: |
+            PACKAGES="git cmake pkgconf curl jansson libsodium libmicrohttpd argp-standalone libepoll-shim" 
+            if echo "${{ matrix.config.cmake_args }}" | grep -q "CMAKE_C_COMPILER=gcc"; then
+              PACKAGES="$PACKAGES gcc"
+            fi
+            pkg install -y $PACKAGES
+
+          run: |
+            ASAN_CFLAGS='${{ env.ASAN_CFLAGS }}' UBSAN_CFLAGS='${{ env.UBSAN_CFLAGS }}'
+
+            # GCC ASan doesn't work with FreeBSD
+            case "${{ matrix.config.cmake_args }}" in *gcc*) ASAN_CFLAGS= ;; esac
+
+            git config --global --add safe.directory ${{ github.workspace }}
+            mkdir -p build
+            cd build
+            CFLAGS='${{ env.GLOBAL_CFLAGS }}'
+            CFLAGS="$CFLAGS ${ASAN_CFLAGS} ${UBSAN_CFLAGS}"
+            CFLAGS="$CFLAGS"' ${{ matrix.config.extra_cflags }}'
+            echo "Using CFLAGS: $CFLAGS"
+            cmake ${{ github.workspace }} ${{ matrix.config.cmake_args }} -DCMAKE_C_FLAGS="${CFLAGS}"
+            make
+            export ASAN_OPTIONS='${{ env.ASAN_OPTIONS }}' UBSAN_OPTIONS='${{ env.UBSAN_OPTIONS }}'
+            ./datum_gateway --help
+            ./datum_gateway --test

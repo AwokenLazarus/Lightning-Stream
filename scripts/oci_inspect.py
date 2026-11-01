@@ -5,7 +5,8 @@ For every image and platform it reads the index, the manifest, the config and th
   * the platforms are linux/amd64, linux/arm64 and linux/arm/v7;
   * the image runs as a non-root user, has an ENTRYPOINT and a HEALTHCHECK, and sets XBT_DATA_DIR and XBT_MODE=production
     (xbt-init, the one-shot that fixes a bind mount's owners, is the exception: root, and no HEALTHCHECK);
-  * the binary layer holds exactly /usr/bin/<image> (and, for the signer and the gateway, /usr/bin/xbt-supervise),
+  * the binary layer holds exactly /usr/bin/<image> (and, for the signer, the gateway and the Stream Gateway
+    (xbt-datum-gateway), /usr/bin/xbt-supervise), plus any read-only data an image ships (DATA),
     each a static ELF (no PT_INTERP) for that architecture;
   * the base layer is the same blob in every image and on every platform (it is stored once).
 It prints a JSON report, writes a markdown table of sizes (--md), and exits 1 if any check fails.
@@ -21,9 +22,12 @@ import tarfile
 WANT = {("amd64", ""): 0x3E, ("arm64", ""): 0xB7, ("arm", "v7"): 0x28}
 ROOT_ONESHOTS = {"xbt-init"}
 # binaries an image carries beside its own, in the same layer
-COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"]}
+COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"], "xbt-datum-gateway": ["xbt-supervise"]}
 # data an image's binary layer carries beside its binaries, each read-only and not a program
-DATA = {"xbt-vpn": ["usr/share/xbt-vpn/ATTRIBUTION", "usr/share/xbt-vpn/dbip-country-lite.csv.gz"]}
+DATA = {"xbt-vpn": ["usr/share/xbt-vpn/ATTRIBUTION", "usr/share/xbt-vpn/dbip-country-lite.csv.gz"],
+        # the Stream Gateway's notice and the licences of what it links statically (two are LGPL)
+        "xbt-datum-gateway": [f"usr/share/xbt-datum-gateway/{n}" for n in ("NOTICE", "datum_gateway.LICENSE", "libsodium.LICENSE",
+                              "jansson.LICENSE", "curl.COPYING", "libmicrohttpd.COPYING", "argp-standalone.NOTICE")]}
 ELF_CLASS = {0x3E: 2, 0xB7: 2, 0x28: 1}
 
 
