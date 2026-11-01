@@ -183,14 +183,14 @@ impl Connector {
         let Some(status) = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s)) else {
             return Reply::Whole(json_response(502, &json!({"error": "the signer sent no head for the answer"})));
         };
-        if let Some(why) = head.get("error").and_then(Value::as_str) {
-            return Reply::Whole(json_response(502, &json!({"error": why})));
-        }
         // the seller sent the whole file for a part of it (its copy changed since the player's, or it serves no
         // ranges): the wallet read none of it, and nothing of another copy is spliced onto what the player has
         if head.get("range_ignored") == Some(&Value::Bool(true)) {
             return Reply::Whole(json_response(412, &json!({"error": "ticket_range_ignored: the seller answered the range with the whole file (its copy changed, \
                                                                      or it serves no ranges); none of it was read. Ask again from the start"})));
+        }
+        if let Some(why) = head.get("error").and_then(Value::as_str) {
+            return Reply::Whole(json_response(502, &json!({"error": why})));
         }
         let mut first = vec![0u8; 64];
         let n = src.read(&mut first).unwrap_or(0);

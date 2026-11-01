@@ -57,7 +57,8 @@ const OWED_POLL: Duration = Duration::from_millis(250);
 /// How many of a win's invoices, and of a session's, the wallet asks to have cancelled after failed payments.
 /// Past these it waits for them to lapse: a seller's node that fails every payment is not asked for ever.
 const CANCELS_PER_WIN: u32 = 4;
-/// How many times a win is refused for no route before the call gives up on that seller.
+/// How many times a win is refused for a seller that has been without a route for a whole window (not while
+/// another payment to it waits for one) before the call gives up on that seller.
 const NO_ROUTE_PER_WIN: u32 = 3;
 const CANCELS_PER_SESSION: u32 = 32;
 /// How many of a win's invoices, and of a session's, may run out in the wallet's queue before it stops asking.
@@ -745,7 +746,7 @@ impl Signer {
                 }
                 // a seller the wallet's node has no route to, win after win: the call ends with that reason, and the
                 // win stays owed for a later call
-                if rule == "ln_no_route" {
+                if rule == "ln_no_route" && out.get("route_ran_out") == Some(&Value::Bool(true)) {
                     let n = s.no_route.entry(win.draw()).or_default();
                     *n += 1;
                     if *n >= NO_ROUTE_PER_WIN {

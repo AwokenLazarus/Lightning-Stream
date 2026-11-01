@@ -2039,7 +2039,7 @@ fn plain_media_type(s: &str) -> Option<String> {
 /// The body of such an answer is not read, nor that of a 200 to a call that asked for a range from
 /// past the first byte: the seller sends the whole body, ignoring the range or (where the call named
 /// `if_range`) because its copy has changed, and reading it would buy again the bytes the caller
-/// already has. A 200 to a range from byte 0 is read, up to the range's last byte. (Until 0.1.20 a
+/// already has. A 200 to a range from byte 0 is a whole answer, read as any other. (Until 0.1.20 a
 /// 200 to any range was read, and metered, like any other.)
 ///
 /// A 206 that states no `Content-Length` is read to the end of its range and no further: `length`
@@ -2065,15 +2065,9 @@ fn answer_head(ans: &mut WireAnswer, asked: Option<ByteRange>) -> (Value, Option
     let cr = ans.header("Content-Range").map(str::to_string);
     let refuse = |v: Value, why: String| (v, Some(why));
     match ans.status {
-        // the whole body to a range from its first byte: what was asked for is its start, read up to the range's
-        // last byte (the app's player asks bytes=0-...)
-        200 if asked.is_some_and(|r| r.first == 0) => {
-            if let Some(last) = asked.and_then(|r| r.last) {
-                let n = ans.length.map_or(last + 1, |n| n.min(last + 1));
-                ans.length = Some(n);
-                v["content_length"] = n.into();
-            }
-        }
+        // the whole body to a range from its first byte (the app's player asks bytes=0-... first): a whole answer,
+        // paid as it is read and ended where the caller stops, its head and its receipt the whole body's
+        200 if asked.is_some_and(|r| r.first == 0) => {}
         // the whole body to a call that asked for part of it: the bytes before the range would be bought again
         200 if asked.is_some() => {
             v["range_ignored"] = true.into();
@@ -5667,7 +5661,7 @@ mod tests {
         assert!(refused.is_none() && v.get("range_ignored").is_none() && whole.length == Some(100), "from byte 0: the whole body is what was asked");
         let mut start = ans(200, "", Some(100));
         let (v, refused) = answer_head(&mut start, ByteRange::parse("bytes=0-9"));
-        assert_eq!((refused, start.length, v["content_length"].as_u64()), (None, Some(10), Some(10)), "from byte 0 to 9: read to byte 9");
+        assert_eq!((refused, start.length, v["content_length"].as_u64()), (None, Some(100), Some(100)), "from byte 0 to 9: the whole answer, as it states itself");
         assert_eq!(answer_head(&mut ans(416, "bytes */100", Some(0)), asked).0["content_range"], "bytes */100");
     }
 

@@ -158,14 +158,16 @@ impl Pace {
     /// Whether a payment to `payee`, which the node has just found no route to, may wait for one, and until when:
     /// one payment to a payee waits at a time, and all of them together no longer than `most` from when the
     /// node first found none (an outage nobody has looked at for a second is over). `None`: refuse it now.
-    fn route_wait_turn(&self, payee: &str, most: Duration) -> Option<Instant> {
+    /// `Err(true)`: the window is over, and the seller has been without a route for all of it; `Err(false)`: another
+    /// payment to it is waiting, and this one may be paid when that one's wait ends.
+    fn route_wait_turn(&self, payee: &str, most: Duration) -> std::result::Result<Instant, bool> {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         let (since, seen, waiting) = s.no_route.get(payee).copied().filter(|(_, seen, w)| *w || now.duration_since(*seen) <= Duration::from_secs(1))
             .unwrap_or((now, now, false));
         let until = since + most;
-        let turn = (!waiting && now < until).then_some(until);
-        s.no_route.insert(payee.to_string(), (since, now.max(seen), waiting || turn.is_some()));
+        let turn = if now >= until { Err(true) } else if waiting { Err(false) } else { Ok(until) };
+        s.no_route.insert(payee.to_string(), (since, now.max(seen), waiting || turn.is_ok()));
         turn
     }
 
@@ -1841,8 +1843,8 @@ impl Signer {
         // a route to the seller, as the node would look for one when it pays: one moment after a link along the way
         // was replaced the node finds none for some seconds (up to 10 s seen on the lab), and a payment sent then fails
         // at once. It is waited for, within what is left of the channel wait's 8 s
-        if let Err(why) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, checks_from) {
-            return refuse(&hash, "ln_no_route", why);
+        if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, checks_from) {
+            return with(refuse(&hash, "ln_no_route", why), json!({"route_ran_out": ran_out}));
         }
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
@@ -1868,7 +1870,9 @@ impl Signer {
     /// Read only: nothing is sent. A node that cannot answer the question is not asked again, and is
     /// no reason to refuse: the payment goes as it would have.
     #[allow(clippy::too_many_arguments)]
-    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), String> {
+    /// `Err((why, ran_out))`: `ran_out` where the seller has been without a route for the whole window, not
+    /// where this payment only stood back for another to the same seller.
+    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), (String, bool)> {
         let chan = (ids.len() == 1).then(|| ids[0].as_str());
         let ask = || {
             let asked = Instant::now();
@@ -1885,8 +1889,10 @@ impl Signer {
         // holds one place of the gate for 8 s, and the payments behind it are refused at once
         let refused = |since: f64| format!("the wallet's node has found no route to the seller for {since:.1} s: nothing was sent");
         let left = crate::ln::CHANNEL_BACK_WAIT.saturating_sub(from.elapsed());
-        let Some(until) = self.ticket_pace.route_wait_turn(payee, left.max(Duration::from_millis(1))) else {
-            return Err(refused(from.elapsed().as_secs_f64()));
+        let until = match self.ticket_pace.route_wait_turn(payee, left.max(Duration::from_millis(1))) {
+            Ok(u) => u,
+            Err(true) => return Err((refused(from.elapsed().as_secs_f64()), true)),
+            Err(false) => return Err(("another payment to the seller is waiting for a route: nothing was sent".into(), false)),
         };
         let no_route_from = self.engine.now();
         let record = |back: bool| {
@@ -1898,7 +1904,7 @@ impl Signer {
             if Instant::now() >= until || stopped {
                 self.ticket_pace.route_waited(payee, false);
                 record(false);
-                return Err(refused(from.elapsed().as_secs_f64()));
+                return Err((refused(from.elapsed().as_secs_f64()), true));
             }
             std::thread::sleep(crate::ln::CHANNEL_BACK_POLL.min(until.saturating_duration_since(Instant::now())));
             if ask() {

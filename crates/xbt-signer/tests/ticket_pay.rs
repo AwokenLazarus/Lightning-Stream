@@ -9664,11 +9664,58 @@ fn a_route_gone_for_good_ends_the_call_soon_with_its_reason() {
     r.ln.st.lock().unwrap().no_route = true;
     let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
     let took = t.elapsed();
-    assert!(took < Duration::from_secs(40), "the call took {took:?}: {v}");
+    assert!(took < Duration::from_secs(20), "the call took {took:?}: {v}");
     assert!(v.to_string().contains("ln_no_route"), "{v}");
     assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
     let waits = r.audit("ticket_route_waited");
     assert!(!waits.is_empty() && waits.len() <= 3, "one wait at a time: {waits:?}");
     assert_wins(&r, v["wins_paid"].as_u64().unwrap_or(0));
+}
+
+/// A whole body sent for a range from the first byte (the app's player's first part) is a whole answer: read
+/// and paid as any other, its head and receipt the whole body's, no fault of the seller's, the money one number.
+///
+/// FAILS with the answer cut at the range's last byte: the receipt, a hash of the whole body, does not match, and
+/// an honest seller is put at fault.
+#[test]
+fn a_whole_body_for_a_range_from_the_first_byte_is_a_whole_answer() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let n = 8 * MIB;
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                      "range": "bytes=0-4194303", "if_range": "\"v0\""}));
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64(), v["content_length"].as_u64()), (Some(200), Some(true), Some(n as u64), Some(n as u64)), "{v}");
+    assert!(v.get("seller_fault").is_none() && v["rule"] != "ticket_range_ignored", "{v}");
+    assert_eq!(v["receipt"]["body"], "as signed", "{v}");
+    let (paid, taken, book, _) = r.money();
+    assert_eq!((taken, book), (paid, paid), "{v}");
+    r.assert_booked();
+}
+
+/// A moment with no route to the seller, of 4 s and of 7 s, with many wins: the payments behind the one that
+/// waits stand back and go again, none of that counts toward giving up on the seller, and every win is paid, the
+/// file whole.
+///
+/// FAILS with the refusals of the payments standing back counted: three of them end the call within the moment.
+#[test]
+fn a_moment_with_no_route_and_many_wins_pays_every_win() {
+    let _g = env_lock();
+    for (at, secs) in [(2usize, 4u64), (5, 4), (2, 7)] {
+        let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+        {
+            let mut st = r.ln.st.lock().unwrap();
+            st.no_route_at_query = at;
+            st.no_route_for = Duration::from_secs(secs);
+        }
+        let size = 256 * PIECE;
+        let v = r.pay(&format!("/pieces/{size}"), 2_000);
+        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment: {v}");
+        assert_eq!(r.ln.by_status("FAILED").len(), 0, "({at}, {secs}): {v}");
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "({at}, {secs}): {v}");
+        let wins = v["wins"].as_u64().unwrap();
+        assert!(wins >= 4, "({at}, {secs}): {v}");
+        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "({at}, {secs}): {v}");
+        assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+    }
 }
 
