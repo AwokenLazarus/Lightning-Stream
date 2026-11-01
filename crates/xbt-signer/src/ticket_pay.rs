@@ -86,7 +86,7 @@ use crate::policy::normalize_dest;
 use crate::keystore::write_private;
 use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
-use crate::signer::{deny, with, Signer};
+use crate::signer::{deny, with, Caller, Signer};
 use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, PROGRESS_FLOOR_BYTES, ROUTE_FULL};
 use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, PriceCeiling, Receipt};
 use crate::{err, Result};
@@ -2383,7 +2383,8 @@ impl Signer {
     /// A caller that hands the answer on to a browser (a seller's own web page, docs/SELLER-APPS.md)
     /// sends the page's own request headers (`headers`, [`caller_headers`]) and, with
     /// `head_headers`, gets the seller's response headers in the head line ([`passed_headers`]).
-    pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
+    /// Only `caller` [`Caller::Renter`] pays under a task's rental terms, and only a rental's pieces of work ([`crate::renter`]).
+    pub(crate) fn xbt402_pay(&self, p: &Value, caller: Caller) -> Value {
         let origin = p.get("url").and_then(Value::as_str).and_then(|u| origin_of(u).ok()).map(|o| normalize_dest(&o));
         let forget = || {
             if let Some(o) = &origin {
@@ -2395,7 +2396,7 @@ impl Signer {
         // only a caller that asks for it (`known_terms`: a page of a web app, many small reads) is paid on terms it
         // was told before; any other call asks the seller's price first, and sees there what the seller says now
         let known = p.get("known_terms").and_then(Value::as_bool) == Some(true);
-        let first = self.xbt402_pay_as(p, known);
+        let first = self.xbt402_pay_as(p, known, caller);
         if stopped_on_new_terms(&first) {
             forget();
         }
@@ -2414,7 +2415,7 @@ impl Signer {
                 again["max_sats"] = (m - booked).max(0).into();
             }
         }
-        let mut v = self.xbt402_pay_as(&again, false);
+        let mut v = self.xbt402_pay_as(&again, false, caller);
         if stopped_on_new_terms(&v) {
             forget();
         }
@@ -2429,7 +2430,7 @@ impl Signer {
 
     /// [`Signer::xbt402_pay`]; `known_terms`: a request on a route whose terms the seller stated in this
     /// session may be paid without asking its price first ([`Signer::route_terms`]).
-    fn xbt402_pay_as(&self, p: &Value, known_terms: bool) -> Value {
+    fn xbt402_pay_as(&self, p: &Value, known_terms: bool, caller: Caller) -> Value {
         let tp = self.ticket_policy();
         let cfg = self.config();
         let max_sats = match p.get("max_sats").filter(|v| !v.is_null()) {
@@ -2462,6 +2463,11 @@ impl Signer {
             _ => vec![],
         };
         let task = Self::ticket_task_for(&tp, &str_or_empty(p.get("task")));
+        // a task's rental terms are the renter's alone, on its own socket, for a rental's pieces of work: decided
+        // on the task as it resolves, before anything is asked of the seller
+        if let Some(refused) = crate::renter::pay_gate(caller, &tp, task.as_deref().ok(), &method, &url) {
+            return refused;
+        }
         let stream_to = match stream_socket(p.get("stream_to")) {
             Ok(s) => s,
             Err(why) => return deny("stream_to", why),

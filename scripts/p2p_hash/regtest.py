@@ -250,7 +250,7 @@ def rental(name: str, stop_after: int | None, miner_secs: int, rate: float, orig
     extra = ["--stop-paying-after", str(stop_after)] if stop_after is not None else []
     hashtaker = spawn(f"{name}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
                                     "--found-out", f"{RUN}/{name}-found.json", "--upstream", f"127.0.0.1:{POOL}", "--user", "buyer.rented", "--allow-unblinded", "1",
-                                    "--signer", d.SOCK, "--task", "hashrate", *caps, "--rental", f"rt-{name}",
+                                    "--signer", d.RENTER_SOCK, "--task", "hashrate", *caps, "--rental", f"rt-{name}",
                                     "--idle-s", "15", "--report", f"{RUN}/{name}-buyer.json", *extra])
     time.sleep(2)
     miners = [spawn(f"{name}-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{MINERS}", "--user", f"hasher.m{i}", "--rate", str(rate),
@@ -543,7 +543,7 @@ def reprice_run() -> None:
         return spawn(f"rp-{name}", ["hashtaker", "--key", f"{RUN}/keys/{name}.key", "--hashmaker", f"127.0.0.1:{RP_LINK}", "--hashmaker-key", pub,
                                     "--price-msat", str(terms["priceMsat"]), "--slice-work", str(terms["sliceWork"]), "--grace-ms", str(terms["graceMs"]),
                                     "--start-slices", str(terms["startSlices"]), "--upstream", f"127.0.0.1:{RP_POOL}", "--user", "buyer.rented",
-                                    "--allow-unblinded", "1", "--signer", d.SOCK, "--task", "hashrate", "--pay-url", f"{RP_ORIGIN}/hashrate",
+                                    "--allow-unblinded", "1", "--signer", d.RENTER_SOCK, "--task", "hashrate", "--pay-url", f"{RP_ORIGIN}/hashrate",
                                     "--max-sats", "1500", "--miners", str(miners), "--rental", f"rt-{name}", "--idle-s", "15", "--duration-s", str(secs),
                                     "--report", f"{rp}/{name}-buyer.json"])
 
@@ -785,7 +785,7 @@ def real_gateway(mode: str) -> None:
         time.sleep(0.5)
         check_flags = ["--gateway-api", f"127.0.0.1:{api}"] if keys else ["--allow-unblinded", "1"]
         hashtaker = spawn(f"{mode}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER), "--found-out", f"{RUN}/{mode}-found.json",
-                                                 "--upstream", f"127.0.0.1:{st}", "--user", address, "--signer", d.SOCK, "--task", "hashrate", "--max-sats", "1500", "--rental", f"rt-{mode}",
+                                                 "--upstream", f"127.0.0.1:{st}", "--user", address, "--signer", d.RENTER_SOCK, "--task", "hashrate", "--max-sats", "1500", "--rental", f"rt-{mode}",
                                                  "--idle-s", str(REAL_SECS), "--duration-s", str(REAL_SECS), "--report", f"{RUN}/{mode}-buyer.json", *check_flags])
         time.sleep(2)
         log = open(f"{RUN}/{mode}-miner.log", "ab")
@@ -966,9 +966,9 @@ def main() -> int:
 
         # a rental smaller than the shop's ticket, from no credit at the second gateway
         inv0, pay0 = d.seller_invoices(), d.buyer_payments()
-        # the hashtaker's own call with the old caps (max_sats = the budget, no charge cap): no ticket fits
+        # the hashtaker's own call with the old caps (max_sats = the budget, no charge cap), on its socket: no ticket fits
         old = d.signer("xbt402_pay", {"url": f"{ORIGIN2}/hashrate/rt-old/1", "method": "POST", "body": "{}",
-                                      "max_sats": SMALL_BUDGET_SATS, "task": "hashrate"})
+                                      "max_sats": SMALL_BUDGET_SATS, "task": "hashrate"}, sock=d.RENTER_SOCK)
         old.pop("untrusted_provider_response", None)
         moved = {h: p["status"] for h, p in d.buyer_payments().items() if h not in pay0}
         check("small: with the old caps (max_sats = the 500-sat budget) a slice from no credit is refused, nothing paid",

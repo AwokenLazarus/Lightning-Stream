@@ -1227,6 +1227,11 @@ How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is
 - These figures assume firmware that hashes what Stratum gives it and honours `mining.set_difficulty`. No real
   firmware has been run against the check yet.
 - Writes to a miner and to the hashtaker's gateway have no time limit (from reading the code, not measured).
+- The rental terms of the starter rules' hashrate task (outside the wallet's limits for one payment, a day, a week
+  and one seller, up to the task's 200,000 sat) are paid only on the signer's socket for the renter
+  (`run/rental/`), which file permissions keep from every other service. That holds as far as the box's users and
+  groups hold: a process running as the renter's user, or as root, can use them. A setup without `xbt-init`'s
+  layout (a bare `B2_RENTAL_SOCK`) is only as closed as the dir its operator gives it.
 
 ### Signature hash and replay
 

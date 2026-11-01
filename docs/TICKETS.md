@@ -1626,6 +1626,17 @@ hashrate task: a budget of 200,000 sat, tickets of at most 10,000 sat, and 600 s
 miner at market price runs well inside them (its step is about 1,400 sat); a miner fast enough that its
 step would pass 10,000 sat pays in tickets of 10,000, about 414 an hour at 100 TH/s.
 
+A task's name is any caller's to give (`task` in `xbt402_pay`, a free string in the MCP tool), so the
+name grants nothing (`crates/xbt-signer/src/renter.rs`). A rental task's terms are paid only on the
+signer's socket for the hashrate renter (`B2_RENTAL_SOCK`, `run/rental/signer.sock`), whose dir the
+renter's group reaches and the MCP's does not, and only for a rental's pieces of work (`POST <pay
+url>/hashrate/<rental>/<slice>`). On the wallet's socket a call that names a rental task is refused
+(`ticket_rental_payer`) before anything is asked of the seller, as are `ticket_open`, `ticket_offer`,
+`ticket_lock` and `ticket_release` on such a task's session; the renter's socket answers only
+`xbt402_pay`, `ticket_stop` and `health`, and refuses any other route (`ticket_rental_route`). The
+socket grants nothing by itself: under a task without rental terms (an older wallet's) a rental's
+pieces of work are paid there under the wallet's own limits, as on the wallet's socket.
+
 The owner's limits are never raised by either one. The task's budget, the cap per seller and the
 caps on locked funds count what leaves the wallet, so a ticket bought for a small call counts in
 full.

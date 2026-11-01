@@ -94,6 +94,11 @@ pub const RUN_ENROLL: &str = "enroll";
 pub const HASHRATE: &str = "hashrate";
 /// Their settings, written by the UI's Hashrate page, and their control token.
 pub const RUN_HASHRATE: &str = "hashrate";
+/// The signer's socket for the hashrate renter alone (`signer.sock`): a task's rental terms
+/// (`tickets.tasks.<task>.rental`) are paid only through it. The signer owns the dir; its group is the
+/// hashrate services' (the renter, and the UI, which writes their settings), never the MCP's, so no
+/// other caller of the wallet reaches it.
+pub const RUN_RENTAL: &str = "rental";
 /// The shops without a web address the owner added (`shops.json`: their receipt keys and transport
 /// documents), written by the UI and read, by the signer's group, by the connector and the MCP, which
 /// hand them to the signer in each call to such a shop. The signer itself never mounts it.
@@ -152,6 +157,11 @@ impl DataDir {
     /// The signer's socket.
     pub fn signer_sock(&self) -> PathBuf {
         self.run(RUN_SIGNER).join("signer.sock")
+    }
+
+    /// The signer's socket for the hashrate renter ([`RUN_RENTAL`]).
+    pub fn rental_sock(&self) -> PathBuf {
+        self.run(RUN_RENTAL).join("signer.sock")
     }
 
     /// The signer's readiness file.

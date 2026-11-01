@@ -10920,7 +10920,7 @@ fn app_shop(price_msat: u64) -> Value {
     hash_shop(price_msat, json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000}), Some(100_000_000))
 }
 
-/// The hashtaker's payer on this rig's signer, over the signer's own socket, and the standing its
+/// The hashtaker's payer on this rig's signer, over the renter's socket ([`xbt_signer::renter`]), and the standing its
 /// meter would keep. Each step is what its payer thread does.
 struct Renter {
     payer: xbt_hashlink::rail::SignerPayer,
@@ -10932,7 +10932,7 @@ impl Renter {
     fn new(r: &Rig, task: &str, price_msat: u64, start_slices: u64, budget_sats: Option<u64>) -> Self {
         let sock = r.root.join("hashrate.sock");
         let _ = std::fs::remove_file(&sock);
-        let running = xbt_signer::server::spawn(r.s.clone(), &sock, false).unwrap();
+        let running = xbt_signer::server::spawn_renter(r.s.clone(), &sock).unwrap();
         let payer = xbt_hashlink::rail::SignerPayer::new(sock, r.shop.url("/hashrate"), task.into(), price_msat, budget_sats, None, Duration::from_secs(5));
         let standing = xbt_hashlink::order::Standing { proven: 0, largest_share: SLICE_WORK, paid: 0, start_slices, slice_work: SLICE_WORK, price_msat, msat_a_second: 0.0, buy_secs: 0.0 };
         Self { payer, standing, _running: running }
@@ -11309,7 +11309,7 @@ fn the_wallets_socket_pays_nothing_on_a_rentals_terms() {
     // the hashtaker's own payer, on the wallet's socket
     let mut payer = xbt_hashlink::rail::SignerPayer::new(sock.clone(), r.shop.url("/hashrate"), "hashrate".into(), MARKET_MSAT, Some(100_000), None, Duration::from_secs(5));
     let why = payer.pay("r1", 0, &json!({"slice": 0})).unwrap_err();
-    assert!(why.contains("ticket_rental_payer"), "{why}");
+    assert!(why.starts_with(xbt_hashlink::rail::WALLET_RULES) && why.contains("hashrate renter"), "{why}");
     assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
 }
 

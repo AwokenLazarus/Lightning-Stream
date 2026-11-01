@@ -19,6 +19,8 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
   /data/run/shops   0750 xbt-wallet-ui:xbt-signer, the shops without a web address the UI keeps (public data);
                     the connector (the signer's user) and the MCP (in its group) read it
   /data/run/hashrate 0750 xbt-wallet-ui:xbt-hashrate, their settings the UI's Hashrate page writes, and their control token
+  /data/run/rental  0750 xbt-signer:xbt-hashrate, the signer's socket for the hashrate renter alone, the one way to a
+                    task's rental terms; the group has the renter and the UI in it, never the MCP
   /data/stream-relay 0700, the built-in Stream relay's certificates and attempt log (xbt-stream-relay, 10016)
   /data/run/relay   0750 xbt-wallet-ui:xbt-stream-relay, the owner's relay settings the UI's Stream relays page writes
   /data/run/relay-status 0750 xbt-stream-relay:xbt-relay-status, the relay's status for the UI; the group
@@ -75,7 +77,7 @@ DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr
         ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/hashrate", 10010, 10010, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
         ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750), ("data/run/enroll", 10001, 10009, 0o750),
-        ("data/run/hashrate", 10005, 10010, 0o750),
+        ("data/run/hashrate", 10005, 10010, 0o750), ("data/run/rental", 10001, 10010, 0o750),
         ("data/run/shops", 10005, 10001, 0o750),
         ("data/stream-relay", 10016, 10016, 0o700), ("data/run/relay", 10005, 10016, 0o750), ("data/run/relay-status", 10016, 10017, 0o750), ("data/run/ai", 10005, 10014, 0o770),
         ("data/vpn", 10018, 10018, 0o700), ("data/run/vpn", 10005, 10018, 0o750), ("data/run/vpn-status", 10018, 10019, 0o750)]

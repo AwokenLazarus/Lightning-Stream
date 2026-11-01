@@ -125,6 +125,12 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that sells only its VPN exit is listed, so buyers can find it by its key.
 
 **Hashrate**
+- The hashrate task's own limits (its 200,000 sat budget, tickets up to 10,000 sat, 600 an hour, outside
+  the wallet's day, week and per-shop limits) now apply only to the app's renter paying a rented
+  miner's work. Before, any agent or MCP tool that named the task "hashrate" could pay any shop on
+  them, past your wallet's limits and with no approval. Such a call is now refused and nothing is
+  paid. The renter pays through its own connection to the wallet, which nothing else in the app can
+  reach.
 - Renting needs masked jobs, solo or through a pool, so a hashmaker can't keep back the shares that would be blocks.
   The app comes with a DATUM Gateway that masks its jobs and rents into it. The Rent page checks the gateway's jobs
   when it opens and before each rental; if they aren't masked (the gateway isn't running, or the app is set to

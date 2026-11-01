@@ -31,6 +31,7 @@ use crate::ln::{LnBackend, LnBook, LndRest};
 use crate::node::{self, KnotsRpc, Node};
 use crate::policy::{normalize_dest, AuditLog, Clock, Payment, PolicyConfig, PolicyEngine, PolicyStore};
 use crate::pyjson::{py_int, str_or_empty, truthy, ts_value};
+pub use crate::renter::Caller;
 use crate::sanitize::sanitize;
 use crate::sigaudit::{self, check_chain, SigAudit};
 use crate::{err, Result};
@@ -454,15 +455,27 @@ impl Signer {
         }
     }
 
-    /// Handle one request; every signature made meanwhile is logged under its method.
+    /// Handle one request from the wallet's socket; every signature made meanwhile is logged under its method.
     pub fn handle(&self, method: &str, params: &Value) -> Result<Value> {
+        self.handle_as(Caller::Wallet, method, params)
+    }
+
+    /// Handle one request from `caller`'s socket ([`crate::renter`]): the renter's answers only its own
+    /// methods, and only it pays under a task's rental terms.
+    pub fn handle_as(&self, caller: Caller, method: &str, params: &Value) -> Result<Value> {
         let _ctx = sigaudit::context(Some(method), Some(&format!("method:{method}")));
         let empty = json!({});
         let p = if params.is_object() { params } else { &empty };
-        self.dispatch(method, p)
+        if caller == Caller::Renter && !crate::renter::RENTER_METHODS.contains(&method) {
+            return Err(err("renter_socket", format!("{method} is not answered on the hashrate renter's socket, which pays a rental's pieces of work and nothing else")));
+        }
+        if let Some(refused) = self.renter_gate(caller, method, p) {
+            return Ok(sanitize(refused));
+        }
+        self.dispatch(caller, method, p)
     }
 
-    fn dispatch(&self, method: &str, p: &Value) -> Result<Value> {
+    fn dispatch(&self, caller: Caller, method: &str, p: &Value) -> Result<Value> {
         let s = |k: &str| str_or_empty(p.get(k));
         Ok(match method {
             "balance" => {
@@ -541,7 +554,7 @@ impl Signer {
                 sanitize(with(self.hot.status(), json!({"noticed": n})))
             }
             // takes the spend lock itself, and only for each lock and release, where an answer may be long (crate::ticket_pay)
-            "xbt402_pay" => sanitize(self.xbt402_pay(p)),
+            "xbt402_pay" => sanitize(self.xbt402_pay(p, caller)),
             // the sellers this wallet stays anonymous at (docs/BUYER-ACCOUNTS.md)
             // `damaged`: the choices file is there and cannot be read, and the wallet stays anonymous everywhere until it is mended
             // `here`: with `origin`, whether the owner's choice covers that shop, under this address or another of the same seller

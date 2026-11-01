@@ -94,6 +94,8 @@ LONG_LIMIT_S, LONG_READ_BPS = 2, 40_000_000
 TICKET_OVERRIDES: dict[str, Any] = {}
 REQUEST_MSAT = 2_500
 SOCK = f"{RUN}/signer.sock"
+# the signer's socket for the hashrate renter alone (B2_RENTAL_SOCK): a task's rental terms are paid only through it
+RENTER_SOCK = f"{RUN}/renter.sock"
 WALLET = f"{RUN}/wallet"
 PAGE = "a small page\n" * 20
 REPORT: dict[str, Any] = {"checks": [], "measured": {}}
@@ -143,12 +145,12 @@ def tick(blocks: int = 1) -> int:
 # --- the signer and the MCP server -----------------------------------------------------------------------
 
 
-def signer(method: str, params: dict[str, Any] | None = None, timeout: float = 180) -> dict[str, Any]:
-    """One call on the signer's socket: for looking at the wallet, never for paying."""
+def signer(method: str, params: dict[str, Any] | None = None, timeout: float = 180, sock: str = SOCK) -> dict[str, Any]:
+    """One call on the signer's socket (or `sock`, the renter's): for looking at the wallet, never for paying."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect(SOCK)
+        s.connect(sock)
         s.sendall((json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n").encode())
         buf = b""
         while not buf.endswith(b"\n"):
@@ -200,6 +202,7 @@ class Wallet:
         env = dict(
             os.environ,
             B2_SIGNER_SOCK=SOCK,
+            B2_RENTAL_SOCK=RENTER_SOCK,
             B2_RPCHOST="127.0.0.1",
             B2_RPCPORT=str(BASE),
             B2_RPCCOOKIE=f"{RUN}/rpc.cookie",

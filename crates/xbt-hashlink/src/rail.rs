@@ -132,8 +132,9 @@ fn moved_nothing(v: &serde_json::Value) -> bool {
 }
 
 /// The rules of the owner's that can refuse a slice's payment.
-const WALLET_RULE_NAMES: [&str; 11] = ["ticket_cap", "ticket_task_budget", "ticket_seller_cap", "ticket_rate_limit", "daily_budget", "weekly_budget", "per_counterparty",
-                                       "per_counterparty_daily", "max_per_tx", "human_threshold", "velocity"];
+/// (`ticket_rental_payer`, `ticket_rental_route`: the rental's terms asked for on a socket or a route that isn't the renter's.)
+const WALLET_RULE_NAMES: [&str; 13] = ["ticket_cap", "ticket_task_budget", "ticket_seller_cap", "ticket_rate_limit", "daily_budget", "weekly_budget", "per_counterparty",
+                                       "per_counterparty_daily", "max_per_tx", "human_threshold", "velocity", "ticket_rental_payer", "ticket_rental_route"];
 
 /// Room for a ticket's routing-fee limit, in sats, by the wallet's default limit (10 sat and 0.5%:
 /// `xbt_signer::ln::LnPolicy`). An owner who raised that limit is told so by the signer's refusal.

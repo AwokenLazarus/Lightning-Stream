@@ -272,6 +272,8 @@ export function services(cfg: Config): ServiceSpec[] {
       mounts: [
         vol('signer', '/data/signer'),
         vol('run/signer', '/data/run/signer'),
+        // the hashrate renter's own socket: the one way to the "hashrate" task's rental terms
+        vol('run/rental', '/data/run/rental'),
         vol('run/anchor', '/data/run/anchor', true),
         vol('run/ln', '/data/run/ln', true),
         vol('run/enroll', '/data/run/enroll'),
@@ -457,7 +459,8 @@ export function services(cfg: Config): ServiceSpec[] {
     },
     {
       // rents others' miners into the owner's own DATUM Gateway (Services → Hashrate), paying each piece of
-      // work through the signer as the "hashrate" task of the spending rules
+      // work through the signer as the "hashrate" task of the spending rules, on its own socket (run/rental), which
+      // no other service reaches and which the task's rental terms need
       id: 'hashtaker',
       image: 'hashlink',
       command: [
@@ -480,12 +483,12 @@ export function services(cfg: Config): ServiceSpec[] {
         '--relays',
         relays,
         '--signer',
-        '/data/run/signer/signer.sock',
+        '/data/run/rental/signer.sock',
         '--task',
         'hashrate',
       ],
       env: {},
-      mounts: [vol('hashrate', '/data/hashrate'), vol('run/hashrate', '/data/run/hashrate', true), vol('run/signer', '/data/run/signer', true)],
+      mounts: [vol('hashrate', '/data/hashrate'), vol('run/hashrate', '/data/run/hashrate', true), vol('run/rental', '/data/run/rental', true)],
       requires: ['signer'],
     },
     {
