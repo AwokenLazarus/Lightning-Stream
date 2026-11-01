@@ -82,6 +82,13 @@ fn eight(v: Option<&Value>, what: &str) -> Result<[u8; 8], String> {
     }
 }
 
+/// The first four bytes of an ntime field as a little-endian number: a header-v2 hasher's time offset, which the node
+/// adds to the job's wire time (the gateway's `datum_blake2b_share_ntime`). 8 hex digits are read as a number.
+pub fn ntime_offset(v: Option<&Value>) -> Result<u32, String> {
+    let b = eight(v, "ntime")?;
+    Ok(u32::from_le_bytes(b[..4].try_into().expect("4 bytes")))
+}
+
 /// The hash of a share, from its `mining.submit` line, on the job and session it names.
 pub fn share_hash(job: &Job, session: &Session, submit: &Value) -> Result<[u8; 32], String> {
     let p = submit.get("params").and_then(Value::as_array).ok_or("a submit with no params")?;

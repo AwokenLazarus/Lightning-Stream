@@ -157,7 +157,9 @@ pub fn caps_at(ticket_msat: u64, price_msat: u64, left_msat: Option<u64>, most_s
         return (fee_room_sats(0).min(most), None);
     }
     let left = left_msat.map_or(u64::MAX, |m| m / 1000);
-    let ticket = ticket_msat.div_ceil(1000).min(left).max(price);
+    // the budget is a hard cap: a ticket is never past what's left of it, even when that's under a slice (the signer
+    // then refuses the call, and nothing is paid). The renter ends at "budget reached" before it asks that
+    let ticket = ticket_msat.div_ceil(1000).max(price).min(left);
     (ticket.saturating_add(fee_room_sats(ticket)).min(most), Some(ticket.min(most)))
 }
 
@@ -204,7 +206,9 @@ impl SignerPayer {
     /// ([`crate::order::Standing::ticket_msat`]), the budget still the ceiling. Call it before each
     /// payment. Never called, a rental stays on tickets of the first step.
     pub fn caps_for(&mut self, ticket_msat: u64) {
-        (self.max_sats, self.max_charge_sats) = caps_at(ticket_msat, self.price_msat, self.left_msat(), self.most_sats);
+        // a slice the credit at the shop pays buys no ticket: the budget has nothing to say to it
+        let left = if self.credit_msat >= self.price_msat { None } else { self.left_msat() };
+        (self.max_sats, self.max_charge_sats) = caps_at(ticket_msat, self.price_msat, left, self.most_sats);
     }
 
     /// Pay one slice. `Ok` carries what the signer said (without the seller's body); `Err` why not.
@@ -284,6 +288,10 @@ pub trait Payer: Send {
     fn pay(&mut self, rental: &str, slice: u64, receipt: &serde_json::Value) -> Result<serde_json::Value, String>;
     /// End the wallet's session with the seller.
     fn stop(&mut self) -> Option<serde_json::Value>;
+    /// The credit the seller holds for this rental and what is left of its budget, both in msat, as the wallet last said.
+    fn held(&self) -> (u64, Option<u64>) {
+        (0, None)
+    }
 }
 
 impl Payer for SignerPayer {
@@ -297,6 +305,10 @@ impl Payer for SignerPayer {
 
     fn stop(&mut self) -> Option<serde_json::Value> {
         SignerPayer::stop(self)
+    }
+
+    fn held(&self) -> (u64, Option<u64>) {
+        (self.credit_msat, self.left_msat())
     }
 }
 
@@ -409,13 +421,14 @@ mod signer_wait_tests {
         assert_eq!(caps_at(1_000, P, None, None).1, Some(405));
         // the budget: the ticket is what is left of it
         assert_eq!(caps_at(1_377_000, P, Some(800_000), None), (800 + 14, Some(800)));
-        // every ticket inside what is left, once that holds a slice
-        for left in (P..3_000_000).step_by(7_001) {
+        // every ticket inside what is left
+        for left in (0..3_000_000).step_by(7_001) {
             for t in [546_000, 1_377_000, 34_440_000] {
-                assert!(caps_at(t, P, Some(left), None).1.unwrap() * 1000 <= left.max(405_000), "{t} of {left}");
+                assert!(caps_at(t, P, Some(left), None).1.unwrap() * 1000 <= left, "{t} of {left}");
             }
         }
-        assert_eq!(caps_at(546_000, P, Some(0), None).1, Some(405), "nothing left: the rental's own count stops it");
+        assert_eq!(caps_at(546_000, P, Some(0), None).1, Some(0), "nothing left: no ticket, and the signer refuses the call");
+        assert_eq!(caps_at(546_000, P, Some(300_000), None).1, Some(300), "under a slice left: never past the budget");
         // the most one payment may move holds whatever the step
         assert_eq!(caps_at(34_440_000, P, None, Some(2_000)), (2_000, Some(2_000)));
         // a price of nothing sets no charge cap, which the wallet would refuse as 0

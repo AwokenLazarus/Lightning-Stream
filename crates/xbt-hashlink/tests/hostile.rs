@@ -1502,3 +1502,337 @@ fn a_rental_with_no_way_to_check_blinding_does_not_start() {
     let e = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap_err();
     assert!(e.contains("blinding"), "{e}");
 }
+
+/// A gateway stand-in that keeps every line it's sent: it answers the subscribe and the authorize, gives one job, and
+/// answers shares as `verdict` says (none: it never answers them).
+fn recording_upstream(verdict: Option<bool>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let up = l.local_addr().unwrap().to_string();
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let kept = seen.clone();
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(c) = c else { continue };
+            let kept = kept.clone();
+            thread::spawn(move || {
+                let mut w = c.try_clone().unwrap();
+                let mut r = BufReader::new(c);
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 0) {
+                    let v: Value = serde_json::from_str(line.trim()).unwrap();
+                    kept.lock().unwrap().push(v.clone());
+                    let id = v["id"].clone();
+                    let out = match v["method"].as_str() {
+                        Some("mining.subscribe") => vec![json!({"id": id, "result": [[], "00000001", 8], "error": null})],
+                        Some("mining.authorize") => vec![
+                            json!({"id": id, "result": true, "error": null}),
+                            json!({"id": null, "method": "mining.set_difficulty", "params": [DIFF]}),
+                            job_line(1, true),
+                        ],
+                        Some("mining.submit") => match verdict {
+                            Some(true) => vec![json!({"id": id, "result": true, "error": null})],
+                            Some(false) => vec![json!({"id": id, "result": false, "error": [23, "low difficulty share", null]})],
+                            None => vec![],
+                        },
+                        _ => vec![json!({"id": id, "result": true, "error": null})],
+                    };
+                    for o in out {
+                        let _ = writeln!(w, "{o}");
+                    }
+                    line.clear();
+                }
+            });
+        }
+    });
+    (up, seen)
+}
+
+/// Shares with no id, or one still waiting for its verdict, could never be matched to a verdict, so a hashmaker could
+/// sell shares the gateway rejects without the renter seeing a rejection (review M2). They're refused before the
+/// gateway, and each share that does go on carries the renter's own id: what comes back is the gateway's word on it.
+#[test]
+fn shares_with_no_id_of_their_own_are_refused_and_never_reach_the_gateway() {
+    let _s = serial();
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
+    let (up, seen) = recording_upstream(None);
+    let (addr, hpub, got) = scripted_maker(Some(PROOF));
+    let cfg = taker_config(&addr, hpub, &terms, &up, "r", 30);
+    let taker = thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap());
+    let mut m = got.recv_timeout(Duration::from_secs(5)).unwrap();
+    m.open(7);
+    // one share with an id, then the same id again while it waits, then shares with none
+    m.tx.send(&Msg::Up { chan: 7, line: m.share(100) }).unwrap();
+    let mut again: Value = serde_json::from_str(&m.share(101)).unwrap();
+    again["id"] = json!(100);
+    m.tx.send(&Msg::Up { chan: 7, line: again.to_string() }).unwrap();
+    for i in 0..20 {
+        let mut v: Value = serde_json::from_str(&m.share(102 + i)).unwrap();
+        v["id"] = Value::Null;
+        if m.tx.send(&Msg::Up { chan: 7, line: v.to_string() }).is_err() {
+            break;
+        }
+    }
+    m.read(Duration::from_secs(4), |_| false);
+    let _ = m.tx.send(&Msg::Close { reason: "test over".into(), slices: None });
+    let r = taker.join().unwrap();
+    let submits: Vec<Value> = seen.lock().unwrap().iter().filter(|v| v["method"] == "mining.submit").cloned().collect();
+    eprintln!("MEASURED no ids: closed {}; meter {}; submits at the gateway {}", r["closed"], r["meter"], submits.len());
+    assert_eq!(submits.len(), 1, "only the share with an id of its own went on: {submits:?}");
+    assert!(submits[0]["id"].as_u64().is_some() && submits[0]["id"] != json!(100), "with the renter's own id: {submits:?}");
+    assert_eq!(r["meter"]["proven"], 1, "{r}");
+    assert_eq!(r["closed"], "shares that don't prove", "{r}");
+    assert!(r["released"].as_u64().unwrap() <= 2, "{r}");
+}
+
+/// A hashmaker asking the renter's gateway for an easier difficulty would get shares that show more of a block's hash
+/// than the job's mask allows (review LOW, raised to MEDIUM). Lines other than the session's own go no further than the
+/// renter, which answers them itself; `mining.configure` goes on without `minimum-difficulty`.
+#[test]
+fn a_hashmaker_cannot_ask_the_renters_gateway_for_another_difficulty() {
+    let _s = serial();
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
+    let (up, seen) = recording_upstream(Some(true));
+    let (addr, hpub, got) = scripted_maker(Some(PROOF));
+    let cfg = taker_config(&addr, hpub, &terms, &up, "r", 30);
+    let taker = thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap());
+    let mut m = got.recv_timeout(Duration::from_secs(5)).unwrap();
+    m.open(7);
+    for v in [
+        json!({"id": 50, "method": "mining.suggest_difficulty", "params": [0.000001]}),
+        json!({"id": 51, "method": "mining.suggest_target", "params": ["ff".repeat(32)]}),
+        json!({"id": 52, "method": "mining.configure", "params": [["version-rolling", "minimum-difficulty"], {"version-rolling.mask": "1fffe000", "minimum-difficulty.value": 0.000001}]}),
+    ] {
+        m.tx.send(&Msg::Up { chan: 7, line: v.to_string() }).unwrap();
+    }
+    let mut answers = Vec::new();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        if let Ok(Msg::Down { line, .. }) = m.rx.recv_timeout(Duration::from_millis(50)) {
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["id"].as_u64().is_some_and(|i| (50..=52).contains(&i)) {
+                answers.push(v);
+            }
+        }
+    }
+    let _ = m.tx.send(&Msg::Close { reason: "test over".into(), slices: None });
+    let _ = taker.join().unwrap();
+    let lines = seen.lock().unwrap().clone();
+    let methods: Vec<&str> = lines.iter().filter_map(|v| v["method"].as_str()).collect();
+    assert!(!methods.contains(&"mining.suggest_difficulty") && !methods.contains(&"mining.suggest_target"), "{methods:?}");
+    let conf = lines.iter().find(|v| v["method"] == "mining.configure").expect("configure went on");
+    assert_eq!(conf["params"][0], json!(["version-rolling"]), "{conf}");
+    assert!(conf["params"][1].get("minimum-difficulty.value").is_none(), "{conf}");
+    for id in [50, 51] {
+        let a = answers.iter().find(|a| a["id"] == id).unwrap_or_else(|| panic!("no answer to {id}: {answers:?}"));
+        assert!(a["error"].is_array(), "{a}");
+    }
+    assert!(answers.iter().any(|a| a["id"] == 52 && a["result"] == true), "the configure's answer, with its own id: {answers:?}");
+}
+
+/// A gateway API that answers every job as unmasked (null key).
+fn unmasked_api() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            let mut buf = [0u8; 2048];
+            let _ = std::io::Read::read(&mut c, &mut buf);
+            let body = json!({"mode": "pool-null", "null_key": true}).to_string();
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    addr
+}
+
+/// A renter pointed at a gateway whose jobs aren't masked pays nothing at all: not the start fee, not the first ticket
+/// (the gateway lane saw 5 payments before the first job's check refused it). The check is the gateway's own first
+/// job, before the hashmaker is dialled.
+#[test]
+fn a_renter_on_an_unmasked_gateway_pays_nothing() {
+    let _s = serial();
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 2 };
+    let (up, _seen) = recording_upstream(Some(true));
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let dialled = Arc::new(AtomicBool::new(false));
+    {
+        let d = dialled.clone();
+        thread::spawn(move || {
+            if l.accept().is_ok() {
+                d.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &noise::fresh_key());
+    let mut cfg = taker_config(&addr, hpub, &terms, &up, "r", 30);
+    cfg.allow_unblinded = false;
+    cfg.gateway_api = Some(unmasked_api());
+    let calls = Arc::new(AtomicU64::new(0));
+    cfg.payer = Some(Box::new(CountingPayer(calls.clone())));
+    let e = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap_err();
+    thread::sleep(Duration::from_millis(200));
+    assert!(e.contains("Nothing was paid"), "{e}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no payment asked for");
+    assert!(!dialled.load(Ordering::SeqCst), "the hashmaker isn't dialled");
+}
+
+struct CountingPayer(Arc<AtomicU64>);
+
+impl Payer for CountingPayer {
+    fn caps_for(&mut self, _ticket_msat: u64) {}
+    fn pay(&mut self, _rental: &str, _slice: u64, _receipt: &Value) -> Result<Value, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err("not in this test".into())
+    }
+    fn stop(&mut self) -> Option<Value> {
+        None
+    }
+}
+
+/// A link that drops and is made again, over and over: each return lets the hashmaker send shares again, so past
+/// [`hashtaker::COMEBACKS_AN_HOUR`] in an hour the renter ends the rental instead of dialling back.
+#[test]
+fn a_link_that_keeps_dropping_ends_the_rental() {
+    let _s = serial();
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
+    let (up, _seen) = recording_upstream(Some(true));
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let hk = noise::fresh_key();
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+    let resumes = Arc::new(AtomicU64::new(0));
+    {
+        let (t, resumes) = (terms.clone(), resumes.clone());
+        thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(c) = c else { continue };
+                let Ok(mut lk) = link::answer(c, hk) else { continue };
+                match lk.rx.recv() {
+                    Ok(Some(Msg::Hello { rental, .. })) | Ok(Some(Msg::Resume { rental })) => {
+                        let _ = lk.tx.send(&Msg::Welcome { rental, terms_hash: hex::encode(t.hash()), proof: Some(PROOF.into()) });
+                    }
+                    _ => continue,
+                }
+                resumes.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(300));
+                lk.tx.shutdown();
+            }
+        });
+    }
+    let cfg = taker_config(&addr, hpub, &terms, &up, "r", 60);
+    let r = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap();
+    eprintln!("MEASURED dropping link: closed {}; comebacks {}; welcomes {}", r["closed"], r["comebacks"], resumes.load(Ordering::SeqCst));
+    assert_eq!(r["closed"], "the link to this hashmaker drops too often", "{r}");
+    assert_eq!(r["comebacks"], hashtaker::COMEBACKS_AN_HOUR, "{r}");
+    assert_eq!(resumes.load(Ordering::SeqCst), 1 + hashtaker::COMEBACKS_AN_HOUR as u64);
+}
+
+/// A link's messages on a channel of their own.
+fn link_reader(mut rx: link::Receiver) -> mpsc::Receiver<Msg> {
+    let (s, r) = mpsc::channel();
+    thread::spawn(move || loop {
+        match rx.recv() {
+            Ok(Some(m)) => {
+                if s.send(m).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return,
+        }
+    });
+    r
+}
+
+/// The review's M1 probe, as a test: a hashmaker hashes the renter's job, sends none of the shares on, drops the link,
+/// and hands them all over as `resend` when the renter is back. Before, the renter counted all 40 and paid for them,
+/// and none reached its gateway. Now a share sent again goes on to its gateway session of before the drop, for its
+/// verdict, aged as of the drop, and only as many are taken as the miners' rate says could have been on their way:
+/// here, with nothing proven before the drop, the slack of 4 at most.
+#[test]
+fn held_back_shares_sent_again_after_a_drop_are_taken_only_as_far_as_could_have_been_in_flight_and_go_to_the_gateway() {
+    let _s = serial();
+    let sw = share_work(DIFF);
+    let terms = Terms { slice_work: 4 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
+    let (pool, report) = start_pool(Duration::from_secs(60));
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let hk = noise::fresh_key();
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+    let mut cfg = taker_config(&addr, hpub, &terms, &pool, "r", 60);
+    cfg.duration = Some(Duration::from_secs(40));
+    let taker = thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap());
+
+    // link 1: hello, welcome, the first slice, one channel and its job
+    let lk = link::answer(l.accept().unwrap().0, hk).unwrap();
+    let (tx, rx) = (lk.tx, link_reader(lk.rx));
+    let Ok(Msg::Hello { rental, terms: t, .. }) = rx.recv_timeout(Duration::from_secs(5)) else { panic!("no hello") };
+    tx.send(&Msg::Welcome { rental, terms_hash: hex::encode(t.hash()), proof: Some(PROOF.into()) }).unwrap();
+    let (mut job, mut session, mut diff, mut paid, mut opened) = (None::<Value>, None::<(String, usize)>, 1.0f64, 0, false);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(10) && (job.is_none() || session.is_none()) {
+        if !opened && paid > 0 {
+            opened = true;
+            tx.send(&Msg::Open { chan: 7, worker: "m0".into() }).unwrap();
+            tx.send(&Msg::Up { chan: 7, line: json!({"id": 1, "method": "mining.subscribe", "params": []}).to_string() }).unwrap();
+            tx.send(&Msg::Up { chan: 7, line: json!({"id": 2, "method": "mining.authorize", "params": ["m0", "x"]}).to_string() }).unwrap();
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Msg::Pay { .. }) => paid += 1,
+            Ok(Msg::Ping { n }) => {
+                let _ = tx.send(&Msg::Pong { n });
+            }
+            Ok(Msg::Down { line, .. }) => {
+                let v: Value = serde_json::from_str(&line).unwrap();
+                match v["method"].as_str() {
+                    Some("mining.set_difficulty") => diff = v["params"][0].as_f64().unwrap(),
+                    Some("mining.notify") => job = Some(v),
+                    _ if v["id"] == 1 => session = Some((v["result"][1].as_str().unwrap().to_string(), v["result"][2].as_u64().unwrap() as usize)),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let (job, (en1, size)) = (job.expect("no job"), session.expect("no session"));
+    // 40 real shares of the renter's job, held back
+    let lines: Vec<String> = (0..40u64)
+        .map(|i| {
+            let (e2, n) = standin::find_share(&job, &en1, size, diff, 1000 * i).unwrap();
+            json!({"id": 100 + i, "method": "mining.submit", "params": ["m0", job["params"][0], e2, job["params"][7], n]}).to_string()
+        })
+        .collect();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(12) {
+        if let Ok(Msg::Ping { n }) = rx.recv_timeout(Duration::from_millis(100)) {
+            let _ = tx.send(&Msg::Pong { n });
+        }
+    }
+    // the drop, the renter's return, and all 40 sent as if lost with the link
+    tx.shutdown();
+    let lk2 = link::answer(l.accept().unwrap().0, hk).unwrap();
+    let (tx2, rx2) = (lk2.tx, link_reader(lk2.rx));
+    let Ok(Msg::Resume { rental }) = rx2.recv_timeout(Duration::from_secs(10)) else { panic!("no resume") };
+    tx2.send(&Msg::Welcome { rental, terms_hash: hex::encode(terms.hash()), proof: Some(PROOF.into()) }).unwrap();
+    for line in &lines {
+        tx2.send(&Msg::Resend { chan: 7, line: line.clone() }).unwrap();
+    }
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(4) {
+        if let Ok(Msg::Ping { n }) = rx2.recv_timeout(Duration::from_millis(50)) {
+            let _ = tx2.send(&Msg::Pong { n });
+        }
+    }
+    let _ = tx2.send(&Msg::Close { reason: "test over".into(), slices: None });
+    let r = taker.join().unwrap();
+    let p = pool_report(&report);
+    eprintln!("MEASURED resend after a drop: counted {} refused {}; meter {}; released {}; pool accepted {}", r["resentCounted"], r["resendsRefused"], r["meter"],
+              r["released"], p["accepted"]);
+    let counted = r["resentCounted"].as_u64().unwrap();
+    assert!(counted <= 4, "only what could have been on its way: {r}");
+    assert_eq!(r["resendsRefused"].as_u64().unwrap(), 40 - counted, "{r}");
+    assert_eq!(p["accepted"].as_u64().unwrap(), counted, "each one counted reached the renter's gateway: {p}");
+    assert_eq!(r["meter"]["accepted"].as_u64().unwrap(), counted, "and its verdict was read: {r}");
+    assert!(r["released"].as_u64().unwrap() <= 2, "{r}");
+}
