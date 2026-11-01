@@ -1769,6 +1769,13 @@ impl Book {
         self.of_session(session).into_iter().find(|t| t.state == TState::Locked && usable_at(t, tip))
     }
 
+    /// The ticket `hash` of a session, where it is locked and the seller will still accept it at height
+    /// `tip`: what a release that names it takes. A ticket of the session locked since it was chosen is
+    /// no reason to refuse it, though that one may sort first (offered in the same second, or locked late).
+    pub fn usable_named(&self, session: &str, tip: i64, hash: &str) -> Option<&Ticket> {
+        self.tickets.get(hash).filter(|t| t.session == session && t.state == TState::Locked && usable_at(t, tip))
+    }
+
     /// Locked tickets of a session that are too close to their expiry to be released.
     pub fn stale(&self, session: &str, tip: i64) -> Vec<String> {
         self.of_session(session).into_iter().filter(|t| t.state == TState::Locked && !usable_at(t, tip)).map(|t| t.hash.clone()).collect()
@@ -2524,6 +2531,14 @@ mod tests {
         assert_eq!(b.usable("s1", 115), None);
         assert_eq!(b.usable("s1", 0), None, "our own tip unknown: nothing is released");
         assert_eq!(b.usable("s2", 99), None);
+        // named: that one, wherever it sorts, on the same terms
+        assert_eq!(b.usable_named("s1", 99, &new.hash).map(|t| t.hash.clone()), Some(new.hash.clone()), "an older one locked is no reason to refuse it");
+        assert_eq!(b.usable_named("s1", 100, &old.hash), None, "25 left");
+        assert_eq!(b.usable_named("s1", 99, &blind.hash), None);
+        assert_eq!(b.usable_named("s2", 99, &new.hash), None, "another session's");
+        assert_eq!(b.usable_named("s1", 99, "none"), None);
+        b.tickets.get_mut(&new.hash).unwrap().state = TState::Released;
+        assert_eq!(b.usable_named("s1", 99, &new.hash), None, "released once");
     }
 
     #[test]
