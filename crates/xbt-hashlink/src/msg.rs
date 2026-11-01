@@ -70,6 +70,10 @@ pub enum Msg {
     Due { work: u128, paid: u64 },
     /// A payment is on its way, after a `due`.
     Paying,
+    /// After a resume. From the hashmaker, once the shares it sent again are all sent: its count when it sent them.
+    /// From the hashtaker, once those are all settled: its count at the drop and the ones it counted from them. The
+    /// hashmaker's count comes down to the hashtaker's, by no more than what could have been on its way.
+    Resynced { work: u128, proven: u64 },
     Open { chan: u32, worker: String },
     Up { chan: u32, line: String },
     Down { chan: u32, line: String },
@@ -97,6 +101,7 @@ impl Msg {
             Msg::Resend { chan, line } => json!({"t": "resend", "chan": chan, "line": line}),
             Msg::Due { work, paid } => json!({"t": "due", "work": work.to_string(), "paid": paid}),
             Msg::Paying => json!({"t": "paying"}),
+            Msg::Resynced { work, proven } => json!({"t": "resynced", "work": work.to_string(), "proven": proven}),
             Msg::Open { chan, worker } => json!({"t": "open", "chan": chan, "worker": worker}),
             Msg::Up { chan, line } => json!({"t": "up", "chan": chan, "line": line}),
             Msg::Down { chan, line } => json!({"t": "down", "chan": chan, "line": line}),
@@ -132,6 +137,7 @@ impl Msg {
             "resend" => Msg::Resend { chan: chan()?, line: s("line")? },
             "due" => Msg::Due { work: s("work")?.parse().ok()?, paid: u("paid")? },
             "paying" => Msg::Paying,
+            "resynced" => Msg::Resynced { work: s("work")?.parse().ok()?, proven: u("proven")? },
             "open" => Msg::Open { chan: chan()?, worker: s("worker")? },
             "up" => Msg::Up { chan: chan()?, line: s("line")? },
             "down" => Msg::Down { chan: chan()?, line: s("line")? },
@@ -161,6 +167,7 @@ mod tests {
             Msg::Resend { chan: 3, line: "{\"id\":1}".into() },
             Msg::Due { work: 1 << 70, paid: 4 },
             Msg::Paying,
+            Msg::Resynced { work: 1 << 70, proven: 9 },
             Msg::Up { chan: 3, line: "{\"id\":1}".into() },
             Msg::Pay { slice: 2, preimage: "00".into(), receipt: json!({"a": 1}) },
             Msg::Rate { hs: 1.5e12, miners: 2 },

@@ -79,6 +79,8 @@ const IDS_KEPT: usize = 4096;
 pub const COMEBACKS_AN_HOUR: usize = 8;
 /// How long a share may have been on its way when the link dropped, past the link's own silence before it.
 const IN_FLIGHT: Duration = Duration::from_secs(2);
+/// How long after the hashmaker's resends this side waits for their verdicts before it says its count.
+const RESYNC_SETTLE: Duration = Duration::from_millis(1500);
 /// A payment the measured buys say arrives this much before the hashmaker's short clock runs out needs no `paying`.
 const IN_TIME_MARGIN: f64 = 0.5;
 /// Shares sent again that are taken past what the miners' rate says could have been on their way.
@@ -115,6 +117,12 @@ struct Guard {
     /// shares wait for a job checked at the new one.
     checked_pot: HashMap<u32, u32>,
     await_job: HashSet<u32>,
+    /// After a drop: this side's count at the drop, what it has counted since from shares sent again, when the
+    /// hashmaker said its resends were all sent, and whether this side has said its count.
+    resync_base: Option<(u128, u64)>,
+    resync_resent: (u128, u64),
+    resync_marker: Option<Instant>,
+    resync_said: bool,
     /// Shares sent again past what could have been on their way, waiting for their gateway's verdict, by this side's id.
     resend_pending: HashMap<u64, (meter::Claim, meter::Hashed, Instant)>,
     /// When the payment in flight was queued.
@@ -231,6 +239,9 @@ impl St {
         let measured = self.standing().buy_secs;
         let clock = order::WAIT_FOR_PAYMENT.as_secs_f64() - IN_TIME_MARGIN;
         let on_its_way = self.guard.in_flight_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        // the hashmaker's clock starts again with each payment that lands, so a wait is timed from the later of the
+        // due and the payment now on its way
+        let since = self.guard.in_flight_since.map_or(since, |f| f.max(since));
         // the ticker comes round every half second: said at a second, it's in before the clock's two
         if measured <= 0.0 || measured.max(on_its_way) > clock || since.elapsed().as_secs_f64() >= clock - IN_TIME_MARGIN {
             let _ = tx.send(&Msg::Paying);
@@ -242,6 +253,7 @@ impl St {
     /// dropped link's gateway sessions closed once their window for shares sent again is over.
     fn tick(&mut self, tx: &Sender) {
         self.say_paying_if_late(tx);
+        self.say_resynced(tx);
         if self.guard.retire_until.is_some_and(|t| Instant::now() > t) {
             self.guard.retire_until = None;
             self.guard.resend_pending.clear();
@@ -249,6 +261,27 @@ impl St {
                 let _ = u.shutdown(std::net::Shutdown::Both);
             }
         }
+    }
+
+    /// A share sent again, counted: part of what this side says its count is after the resume.
+    fn count_resent(&mut self, work: u128) {
+        self.resent_counted += 1;
+        if self.guard.resync_base.is_some() && !self.guard.resync_said {
+            self.guard.resync_resent.0 += work;
+            self.guard.resync_resent.1 += 1;
+        }
+    }
+
+    /// Once the hashmaker's resends are all here and settled (each counted, or refused, or past waiting for its
+    /// verdict), say this side's count: at the drop, and what it counted from them.
+    fn say_resynced(&mut self, tx: &Sender) {
+        let (Some((w, p)), Some(at)) = (self.guard.resync_base, self.guard.resync_marker) else { return };
+        if self.guard.resync_said || !(self.guard.resend_pending.is_empty() || at.elapsed() > RESYNC_SETTLE) {
+            return;
+        }
+        self.guard.resync_said = true;
+        let (rw, rp) = self.guard.resync_resent;
+        let _ = tx.send(&Msg::Resynced { work: w + rw, proven: p + rp });
     }
 
     fn lock_ahead(&mut self, tx: &Sender) {
@@ -777,13 +810,19 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 match g.meter.commit_at(&c, h, at) {
                     Ok(p) if p.old => g.end("shares arrive too old", &tx),
                     Ok(p) if p.old_job => g.end("shares on an old job", &tx),
-                    Ok(_) => {
-                        g.resent_counted += 1;
+                    Ok(p) => {
+                        g.count_resent(p.work);
                         g.last_work = Instant::now();
                         g.settle_up(&tx);
                     }
                     Err(_) => g.guard.resends_refused += 1,
                 }
+            }
+            Msg::Resynced { .. } => {
+                // the hashmaker's resends are all sent: this side says its count once they're settled
+                let mut g = lock(&st);
+                g.guard.resync_marker = Some(Instant::now());
+                g.say_resynced(&tx);
             }
             Msg::Shut { chan } => {
                 // the miner is gone: close its upstream session; the channel is let go (and the
@@ -875,6 +914,10 @@ fn come_back(cfg: &Redial, tx: &Sender, st: &Arc<Mutex<St>>, why: &str) -> Optio
         g.guard.retire_until = None;
         g.guard.dropped_at = Some(g.guard.last_heard.unwrap_or(now));
         g.guard.resend_left = g.guard.could_be_in_flight(now);
+        g.guard.resync_base = Some((g.meter.work, g.meter.proven));
+        g.guard.resync_resent = (0, 0);
+        g.guard.resync_marker = None;
+        g.guard.resync_said = false;
     }
     let mut pause = Duration::from_millis(250);
     while Instant::now() + pause < deadline {
@@ -999,13 +1042,14 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender, check: Opti
                         g.end("shares on an old job", &tx);
                         break;
                     }
-                    Ok(_) => {
-                        g.resent_counted += 1;
+                    Ok(p) => {
+                        g.count_resent(p.work);
                         g.last_work = Instant::now();
                     }
                     Err(_) => g.guard.resends_refused += 1,
                 }
             }
+            g.say_resynced(&tx);
         }
         if let Err(why) = g.meter.down(chan, &v) {
             g.events.push(json!({"ev": "a line that can't be checked", "why": why, "atMs": now_ms()}));
