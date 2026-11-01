@@ -225,6 +225,10 @@ impl Handler for Service {
             // at the price of /hot/ (a win in every fourth piece or so): 64 KiB every 100 ms
             return stream(n, None, body(n, 64 << 10, Duration::from_millis(100)));
         }
+        if let Some(n) = sized("/hotslow/") {
+            // at the price of /hot/, a piece every 2 s: a win comes no sooner than 2 s after the last
+            return stream(n, None, body(n, 64 << 10, Duration::from_secs(2)));
+        }
         if let Some(n) = sized("/stallpieces/") {
             // n bytes at the draws' price, then nothing for a minute
             return stream(n, None, Box::new(move |out| {
@@ -345,6 +349,7 @@ fn routes() -> Value {
         {"path": "/stallpieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
         {"path": "/rarewins/", "price": {"byte_msat": 10, "per_bytes": 65_536}},
         {"path": "/hottrickle/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
+        {"path": "/hotslow/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
         // 250 sat a KiB: a ticket of 1,000 sat pays for 4 KiB, well under the floor of a stream
         {"path": "/dearbytes/", "price": {"byte_msat": 250_000, "per_bytes": 1024}},
         {"path": "/keepalive/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
@@ -7446,9 +7451,11 @@ fn a_strict_seller_behind_twenty(stands_still: u64, hold: bool, sync_ms: u64) ->
 /// A seller that bears 2 unpaid wins (as shipped), beside 20 that wait for theirs as long as you like and whose wins
 /// are due first by their grace of 2 s: the payments wait while the first seller has 2 wins unpaid, at its count but
 /// not past it. Its wins go first all the same, before the next win stands its answer still: the first of them is
-/// paid among the first payments, not behind the 120 others waiting.
+/// paid among the first payments, not behind the 120 others waiting. Its pieces come 2 s apart, so its next win is
+/// 2 s away at the least: the gate (8 wide, each payment 1 s on the way) has let 8 of the others through by then.
 ///
-/// FAILS with only wins past the count hurried: the 2 wait behind the others' wins, due sooner.
+/// FAILS with only wins past the count hurried: the 2 wait behind the others' wins, due sooner, until the third
+/// comes, 2 s and 16 of the others' wins later at the least.
 #[test]
 fn wins_at_the_sellers_count_go_first_before_the_next_stands_it_still() {
     let _g = env_lock();
@@ -7465,13 +7472,15 @@ fn wins_at_the_sellers_count_go_first_before_the_next_stands_it_still() {
     }
     let size = 64 * PIECE;
     let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    // 28 pieces at one win in four: 2 wins or more but for 1 time in 300
+    let slow = 28 * PIECE;
     let strict_one = std::thread::scope(|sc| {
         let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
         wait_for_rig("120 wins waiting at the gate", || {
             let invoiced = r.shop.node.preimages.lock().unwrap().len();
             invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
         });
-        let strict_file = sc.spawn(|| buy(&r.shop));
+        let strict_file = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/hotslow/{slow}")), "max_sats": 2_000, "task": "film"})));
         // nothing is sent until the strict seller has 2 wins unpaid: its count, its answer still served
         wait_for_rig("the strict seller's second win", || {
             r.status()["paying"].as_array().into_iter().flatten().any(|p| p["origin"] == r.shop.origin.as_str() && p["wins"].as_u64() >= Some(2))
@@ -7487,7 +7496,8 @@ fn wins_at_the_sellers_count_go_first_before_the_next_stands_it_still() {
     let paid = r.audit("lottery_win_paid");
     let before = paid.iter().position(|a| a["session"] == strict_one["session"]).unwrap_or(usize::MAX);
     eprintln!("at the count: the strict seller's first win paid after {before} others");
-    assert!(before <= 16, "the strict seller's first win was paid after {before} of the others' wins, not first: {strict_one}");
+    // the 8 held at the gate are paid first; the strict seller's wins go in with the next 6 at the most
+    assert!(before <= 14, "the strict seller's first win was paid after {before} of the others' wins, not first: {strict_one}");
     assert_eq!((strict_one["complete"].as_bool(), strict_one["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(0)), "{strict_one}");
 }
 
