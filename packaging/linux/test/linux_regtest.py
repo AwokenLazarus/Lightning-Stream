@@ -316,6 +316,18 @@ def renter_status(name):
     return json.loads(sh("curl", "-s", "-m", "30", "-H", f"Authorization: Bearer {token}", f"http://127.0.0.1:{ctl}/status").stdout)
 
 
+def maker_status():
+    """The maker's hashmaker, as its control page says it (23342, loopback): why its miners are or aren't rentable."""
+    token = root_helper(os.path.join(OUT, "maker", "data"), "cat /d/run/hashrate/control-token").stdout.strip()
+    r = sh("curl", "-s", "-m", "30", "-H", f"Authorization: Bearer {token}", "http://127.0.0.1:23342/status", check_rc=False).stdout
+    try:
+        v = json.loads(r)
+    except ValueError:
+        return r[:400]
+    keep = ("paused", "renting", "open", "rentable", "capacity", "miners", "awaitSpeed", "holdNew", "priceSat", "sliceWork", "startSlices", "said", "why")
+    return {k: v[k] for k in v if any(w.lower() in k.lower() for w in keep)} if isinstance(v, dict) else v
+
+
 def renter_call(name, method, path, body):
     ctl = INSTALLS[name][6]
     token = root_helper(os.path.join(OUT, name, "data"), "cat /d/run/hashrate/control-token").stdout.strip()
@@ -561,7 +573,8 @@ def main():
               "applied" in applied.lower(), applied)
         page = taker.get("/hashrate")
         card = offer_card(page)
-        check("H", "taker: then Rent is on", "<button>Rent</button>" in card, card)
+        on = "<button>Rent</button>" in card
+        check("H", "taker: then Rent is on", on, card if on else [card, {"maker's hashmaker": maker_status()}])
         settled0 = len(lab.seller_settled())
         height0 = int(lab.cli("getblockcount"))
         # the budget the offer suggests (an hour of one machine and the start fee): the price of a piece scales with
