@@ -2043,7 +2043,12 @@ impl Signer {
         let left = crate::ln::CHANNEL_BACK_WAIT.saturating_sub(from.elapsed());
         let until = match self.ticket_pace.route_wait_turn(payee, left.max(Duration::from_millis(1))) {
             Ok(u) => u,
-            Err(true) => return Err((refused(from.elapsed().as_secs_f64()), true)),
+            // the window this payment would wait in ran out before it came, for another payment to the seller
+            Err(true) => {
+                let w = crate::ln::CHANNEL_BACK_WAIT.as_secs_f64();
+                return Err((format!("the wallet's node has found no route to the seller for the whole wait of {w:.0} s, which another payment to \
+                                     the seller waited out before this one came: nothing was sent"), true));
+            }
             Err(false) => return Err(("another payment to the seller is waiting for a route: nothing was sent".into(), false)),
         };
         let no_route_from = self.engine.now();
