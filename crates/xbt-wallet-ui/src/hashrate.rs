@@ -1061,7 +1061,12 @@ fn price_words(w: &Result<Want, String>, tip: Option<&Tip>, hs: Option<f64>, mar
 fn paused_words(why: &str) -> String {
     let w = match why {
         "no price yet" => "There is no price yet, so no rental starts.",
-        "no miner measured yet" => "Your miners are being measured, to size the pieces of work to them. Renting starts in a couple of minutes.",
+        "no miner measured yet" => {
+            "Waiting to measure your miners: a miner is measured from the shares its fallback pool accepts, and none has had one \
+             accepted there yet. A fast miner is measured within a minute, a slow one in a few. If your fallback pool doesn't take its \
+             shares (a pool of another chain, or a difficulty far above the miner), it is never measured and never offered: check \
+             the fallback pool, or fill in the work in each piece yourself, which needs no measuring."
+        }
         "a new price waits for the rentals going on to end" => {
             "Your new price starts once the rentals going on end and your shop has restarted with it. No new rental starts till then."
         }
@@ -1137,6 +1142,13 @@ fn th_hours(x: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A miner held back for measuring is explained, with what to check if it stays held.
+    #[test]
+    fn a_miner_waiting_to_be_measured_is_explained() {
+        let w = paused_words("no miner measured yet");
+        assert!(w.contains("its fallback pool accepts") && w.contains("never measured and never offered") && w.contains("work in each piece"), "{w}");
+    }
+
     #[test]
     fn a_rental_refused_for_a_shops_big_tickets_says_so_and_no_other_reason_is_shown_raw() {
         let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };

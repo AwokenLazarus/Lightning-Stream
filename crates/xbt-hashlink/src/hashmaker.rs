@@ -182,6 +182,9 @@ struct Unit {
     samples: VecDeque<(Instant, u128)>,
     /// The fastest it has been seen over [`SPEED_SPAN`] or more, from any of its work.
     fastest_hs: f64,
+    /// Its speed when last measured, kept while it stays connected: a slow miner whose window of accepted work goes
+    /// quiet for a while is still the miner it was (cleared when it disconnects).
+    last_hs: f64,
     earned_msat: u64,
     methods: BTreeMap<String, u64>,
     seen_ms: u64,
@@ -195,7 +198,21 @@ impl Unit {
         }
     }
 
+    /// Its speed now, or, while it's connected and its window has no accepted work, its speed when last measured.
+    fn speed(&self) -> f64 {
+        let now = self.hashrate();
+        if now > 0.0 || self.conn.is_none() {
+            now
+        } else {
+            self.last_hs
+        }
+    }
+
     fn note_speed(&mut self) {
+        let now = self.hashrate();
+        if now > 0.0 {
+            self.last_hs = now;
+        }
         if let (Some((t0, _)), Some((t1, _))) = (self.samples.front(), self.samples.back()) {
             if *t1 - *t0 >= SPEED_SPAN {
                 self.fastest_hs = self.fastest_hs.max(self.hashrate());
@@ -434,7 +451,7 @@ impl Hub {
         Capacity {
             miners: live.len() as u32,
             free_miners: free.len() as u32,
-            free_hs: free.iter().map(|u| u.hashrate() as u64).sum(),
+            free_hs: free.iter().map(|u| u.speed() as u64).sum(),
         }
     }
 
@@ -774,7 +791,7 @@ fn status(g: &Hub) -> Value {
         .iter()
         .map(|(name, u)| {
             json!({
-                "name": name, "peer": u.peer, "connected": u.conn.is_some(), "hashrateHs": u.hashrate(),
+                "name": name, "peer": u.peer, "connected": u.conn.is_some(), "hashrateHs": u.speed(),
                 "rentedTo": u.rental, "earnedMsat": u.earned_msat + live_earn.get(name).copied().unwrap_or(0),
                 "work": u.work.to_string(), "seenMs": u.seen_ms, "methods": u.methods,
             })
@@ -1537,6 +1554,7 @@ fn gone(g: &mut Hub, id: u64) {
         if let Some(unit) = g.units.get_mut(u) {
             if unit.conn == Some(id) {
                 unit.conn = None;
+                unit.last_hs = 0.0;
                 // a miner that never said its name leaves no record
                 if unit.provisional {
                     g.units.remove(u);
@@ -2183,6 +2201,26 @@ mod tests {
         assert_eq!(placement(&mut g, 2, Instant::now(), &mut sending), Some(Some("more".to_string())), "the other moves this round: {sending:?}");
         drop(g);
         h.shutdown();
+    }
+
+    /// A slow miner's speed, once measured, holds while it stays connected, though a window of its accepted work goes
+    /// quiet; it's measured again from nothing once it disconnects.
+    #[test]
+    fn a_measured_speed_holds_while_the_miner_stays_connected() {
+        let mut u = Unit { conn: Some(1), ..Unit::default() };
+        let t0 = Instant::now();
+        u.samples = VecDeque::from([(t0, 0), (t0 + Duration::from_secs(100), 1 << 32)]);
+        u.note_speed();
+        let measured = u.speed();
+        assert!(measured > 0.0);
+        // a quiet window: no accepted work in it
+        u.samples = VecDeque::from([(t0 + Duration::from_secs(400), 1 << 32), (t0 + Duration::from_secs(700), 1 << 32)]);
+        u.note_speed();
+        assert_eq!(u.hashrate(), 0.0);
+        assert_eq!(u.speed(), measured, "the speed it was measured at holds");
+        u.conn = None;
+        u.last_hs = 0.0;
+        assert_eq!(u.speed(), 0.0, "gone, it's measured again when it's back");
     }
 
     /// A miner waits for the answer to its subscribe before it says its name, so with no fallback it is
