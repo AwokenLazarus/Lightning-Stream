@@ -7126,9 +7126,14 @@ fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
     let _g = env_lock();
     // an invoice for another payee, and one for another amount: refused by the checks every invoice passes, nothing booked
     for (lie, rule) in [(Lie::OtherPayee, "ticket_payee"), (Lie::OtherAmount, "ticket_amount")] {
-        let r = quick_cut(|| draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}})));
-        *r.shop.node.lie.lock().unwrap() = lie;
-        let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+        // the seller cuts an answer soon (`quick_cut`): one cut before any piece won says nothing of the lie, and is
+        // drawn again in a new rig (up to 3)
+        let (r, v) = (0..3).map(|_| {
+            let r = quick_cut(|| draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}})));
+            *r.shop.node.lie.lock().unwrap() = lie;
+            let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+            (r, v)
+        }).find(|(_, v)| v["wins"].as_u64().unwrap_or(0) >= 1 || v["rail"] != "lottery").unwrap_or_else(|| panic!("three files drew no win"));
         assert_eq!(v["rail"], "lottery", "{v}");
         assert!(v["wins"].as_u64().unwrap() >= 1 && v["wins_paid"] == 0, "{v}");
         assert!(v["wins_unpaid"].as_array().unwrap().iter().all(|w| w["rule"] == rule), "{v}");
