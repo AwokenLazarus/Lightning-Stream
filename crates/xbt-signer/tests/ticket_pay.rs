@@ -9568,21 +9568,23 @@ fn a_moment_with_no_route_to_the_seller_is_waited_for_and_costs_no_failed_paymen
         let v = r.pay(&format!("/pieces/{size}"), 1_000);
         assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "{window:?}: no payment met the window: {v}");
         assert_eq!(r.ln.by_status("FAILED").len(), 0, "{window:?}: nothing was sent that could not be routed: {v}");
-        assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
-        let wins = v["wins"].as_u64().unwrap();
-        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{window:?}: {v}");
-        assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
         // the refusals of a seller without a route for a whole window (not of payments that stood back while one waited)
         let no_route: Vec<Value> = r.audit("ticket_refused").into_iter()
             .filter(|e| e["rule"] == "ln_no_route" && e["reason"].as_str().unwrap_or("").contains("has found no route")).collect();
         if window > Duration::from_secs(8) {
-            assert!(!no_route.is_empty(), "past 8 s the wait ends with its reason");
+            // past the 8 s the seller is given up on: the call ends with that reason, nothing failed, the money right
+            assert!(!no_route.is_empty() && v.to_string().contains("ln_no_route"), "past 8 s the wait ends with its reason: {v}");
             for e in &no_route {
                 let secs: f64 = e["reason"].as_str().unwrap().split("for ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
                 assert!(secs <= 8.6, "waited {secs} s: {e}");
             }
+            assert_wins(&r, v["wins_paid"].as_u64().unwrap());
         } else {
             assert!(no_route.is_empty(), "a window of 3 s is waited out: {no_route:?}");
+            assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+            let wins = v["wins"].as_u64().unwrap();
+            assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{window:?}: {v}");
+            assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
         }
     }
 }
