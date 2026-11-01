@@ -231,7 +231,7 @@ impl xbt_svc::http::Handler for Ui {
                 let ceiling = self.0.relay_ceiling(&req, &item);
                 // and its listed size: the most bytes, and so sats, one part may cost
                 let limit = self.0.relay_limit(&req, &item, range.as_deref().and_then(range_len));
-                relay(&url, range.as_deref(), ceiling.as_ref(), limit)
+                relay(&url, range.as_deref(), req.headers.get("if-range").map(String::as_str), ceiling.as_ref(), limit)
             }
         }
     }
@@ -298,11 +298,11 @@ fn larger_than_listed() -> xbt_svc::http::Reply {
 }
 
 /// The headers of a relayed answer that are passed on from the connector.
-const RELAYED: [&str; 3] = ["Content-Type", "Content-Range", "Accept-Ranges"];
+const RELAYED: [&str; 5] = ["Content-Type", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"];
 
 /// Stream the connector's answer for a seller URL to the reader, with the reader's `Range` (the
 /// connector takes one plain byte range and ignores any other).
-fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>, limit: Option<(u64, i64)>) -> xbt_svc::http::Reply {
+fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option<&serde_json::Value>, limit: Option<(u64, i64)>) -> xbt_svc::http::Reply {
     let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).redirects(0).build();
     let mut rq = agent.get(url);
     if let Some(c) = ceiling {
@@ -318,6 +318,10 @@ fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>, li
     }
     if let Some(r) = range.map(str::trim).filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
         rq = rq.set("Range", r);
+        // the reader's copy, as its validator names it: a changed file is not spliced onto what it has
+        if let Some(v) = if_range.map(str::trim).filter(|v| !v.is_empty() && v.len() <= 256 && v.bytes().all(|b| (0x20..0x7f).contains(&b))) {
+            rq = rq.set("If-Range", v);
+        }
     }
     let passed = |r: &ureq::Response| -> Vec<(String, String)> {
         RELAYED.iter().filter_map(|k| r.header(k).map(|v| (k.to_string(), v.to_string()))).collect()

@@ -186,6 +186,12 @@ impl Connector {
         if let Some(why) = head.get("error").and_then(Value::as_str) {
             return Reply::Whole(json_response(502, &json!({"error": why})));
         }
+        // the seller sent the whole file for a part of it (its copy changed since the player's, or it serves no
+        // ranges): the wallet read none of it, and nothing of another copy is spliced onto what the player has
+        if head.get("range_ignored") == Some(&Value::Bool(true)) {
+            return Reply::Whole(json_response(412, &json!({"error": "ticket_range_ignored: the seller answered the range with the whole file (its copy changed, \
+                                                                     or it serves no ranges); none of it was read. Ask again from the start"})));
+        }
         let mut first = vec![0u8; 64];
         let n = src.read(&mut first).unwrap_or(0);
         first.truncate(n);
@@ -196,6 +202,12 @@ impl Connector {
         headers.push(("Accept-Ranges".into(), if seller_ranges == Some("none") { "none" } else { "bytes" }.into()));
         if let Some(cr) = head.get("content_range").and_then(Value::as_str).filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
             headers.push(("Content-Range".into(), cr.into()));
+        }
+        // the copy's validators, which the player names in `If-Range` when it seeks
+        for (k, name) in [("etag", "ETag"), ("last_modified", "Last-Modified")] {
+            if let Some(x) = head.get(k).and_then(Value::as_str).filter(|x| x.len() <= 256 && x.bytes().all(|b| (0x20..0x7f).contains(&b))) {
+                headers.push((name.into(), x.into()));
+            }
         }
         let length = head.get("content_length").and_then(Value::as_u64);
         let head = first;

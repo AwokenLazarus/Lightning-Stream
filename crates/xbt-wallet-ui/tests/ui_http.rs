@@ -3675,3 +3675,59 @@ fn a_file_is_paid_no_further_than_its_listed_size() {
     assert_eq!(status, 200);
     assert_eq!((body.len(), clean), (1050, false), "one that sends more without saying so is cut at the listed size, and its reader sees a cut");
 }
+
+/// A player's seek through the wallet's relay: the seller's copy's validators come back, and the player's
+/// `If-Range` goes on with its range. A connector that says the copy changed (412) is answered as it said.
+#[test]
+fn the_relay_passes_if_range_and_the_copys_validators() {
+    use std::io::{Read, Write};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connector = format!("http://{}", l.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let log = seen.clone();
+    let body = film.clone();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut head = [0u8; 8192];
+            let n = s.read(&mut head).unwrap_or(0);
+            let asked = String::from_utf8_lossy(&head[..n]).to_string();
+            let if_range = asked.lines().find_map(|l| l.strip_prefix("If-Range: ").or_else(|| l.strip_prefix("if-range: "))).map(str::to_string);
+            log.lock().unwrap().push(if_range.clone());
+            if if_range.as_deref().is_some_and(|v| v != "\"v1\"") {
+                let msg = r#"{"error":"ticket_range_ignored: the copy changed"}"#;
+                let _ = write!(s, "HTTP/1.1 412 Precondition Failed\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}", msg.len());
+                continue;
+            }
+            let _ = write!(s, "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nContent-Range: bytes 1000-{}/{}\r\n\
+                               Content-Length: {}\r\nConnection: close\r\n\r\n", body.len() - 1, body.len(), body.len() - 1000);
+            let _ = s.write_all(&body[1000..]);
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}}]"#)).unwrap();
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+    });
+    let mut br = logged_in(&b);
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let url = format!("{}/s/~{st}/{FILM}", b.base);
+    let call = |if_range: &str| {
+        let rq = ureq::AgentBuilder::new().redirects(0).build().get(&url).set("Cookie", &br.cookie).set("Range", "bytes=1000-").set("If-Range", if_range);
+        match rq.call() {
+            Ok(r) => (r.status(), r.header("ETag").map(str::to_string)),
+            Err(ureq::Error::Status(c, r)) => (c, r.header("ETag").map(str::to_string)),
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(call("\"v1\""), (206, Some("\"v1\"".to_string())));
+    assert_eq!(call("\"v0\"").0, 412);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen, vec![Some("\"v1\"".to_string()), Some("\"v0\"".to_string())]);
+}
+
