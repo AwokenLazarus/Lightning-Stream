@@ -1085,13 +1085,16 @@ fn a_trial_slice_from_no_credit_is_paid_and_a_rental_after_it_pays_every_slice()
     let brief: Vec<_> = reports.iter().map(|r| (r["rental"].clone(), r["paid"].clone(), r["slicesDone"].as_array().map(Vec::len), r["stopped"].clone())).collect();
     assert_eq!((reports.len(), maker_paid), (2, slices), "{brief:?}");
     assert_eq!(b.bought_msat, b.charged_msat + b.credit_msat, "what left the wallet is what was charged and what the shop holds: {b:?}");
-    assert!(b.bought_msat <= (1 + 12) * terms().price_msat, "no ticket past the budgets, however far a whole one would have gone: {b:?}");
+    // a ticket is never below a slice (the signer refuses a charge cap under the price), so the last one may pass the
+    // budgets by what the shop held, less than a slice, which stays with it as credit
+    assert!(b.credit_msat < terms().price_msat, "less than a slice left at the shop: {b:?}");
+    assert!(b.bought_msat < (1 + 12) * terms().price_msat + terms().price_msat, "no ticket past the budgets by a slice or more: {b:?}");
 }
 
 /// A rental of twelve slices, 3,600 sat in all, from a buyer with no credit at the shop and no trial
 /// before it: its first ticket is the first step (546 sat), inside its budget, and every slice is paid,
-/// each charged its price, until the budget is spent, with nothing left at the shop. What leaves for
-/// tickets never passes the budget.
+/// each charged its price, until the budget is spent. What leaves for tickets passes the budget by less
+/// than a slice, held by the shop as credit.
 #[test]
 fn a_small_rental_from_no_credit_buys_one_ticket_and_pays_every_slice() {
     let _serial = serial();
@@ -1110,5 +1113,8 @@ fn a_small_rental_from_no_credit_buys_one_ticket_and_pays_every_slice() {
     assert_eq!((b.charged_msat, maker_paid), (budget_sats * 1000, Some(12)), "{b:?} {reports:?}");
     let first_step = order::FIRST_STEP_MSAT.max(price_msat).min(budget_sats * 1000);
     assert_eq!(b.first_msat, first_step, "the first step, inside what the budget has: {b:?}");
-    assert_eq!((b.bought_msat, b.credit_msat), (budget_sats * 1000, 0), "tickets came to the budget, and none past it: {b:?}");
+    // a ticket is never below a slice (the signer refuses a charge cap under the price): the last may pass the budget by
+    // what the shop held, less than a slice, which stays with it as credit
+    assert_eq!(b.bought_msat, b.charged_msat + b.credit_msat, "what left the wallet is what was charged and what the shop holds: {b:?}");
+    assert!(b.credit_msat < price_msat, "tickets came to the budget and less than a slice past it: {b:?}");
 }
