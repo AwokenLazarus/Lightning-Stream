@@ -36,7 +36,9 @@ ELF_CLASS = {0x3E: 2, 0xB7: 2, 0x28: 1}
 # datum_gateway MIT, libsodium ISC, jansson MIT, libcurl curl, libmicrohttpd LGPL-2.1-or-later (or eCos-2.0, its
 # dual licence), argp-standalone LGPL-2.0-or-later (GNU Library GPL 2 or later), musl MIT, and xbt-supervise ours
 OURS = "MIT OR Apache-2.0"
-LICENSES = {"xbt-datum-gateway": "MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)"}
+# xbt-vpn ships DB-IP's country table, under CC BY 4.0 (its ATTRIBUTION file is in the image, and the VPN page credits it)
+LICENSES = {"xbt-datum-gateway": "MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)",
+            "xbt-vpn": "(MIT OR Apache-2.0) AND CC-BY-4.0"}
 
 
 def license_of(image):
