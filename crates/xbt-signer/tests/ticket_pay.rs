@@ -13525,19 +13525,24 @@ fn a_route_gone_for_good_ends_the_call_soon_with_its_reason() {
 #[test]
 fn a_seller_behind_a_private_channel_is_paid_at_once_by_its_route_hints() {
     let _g = env_lock();
-    let r = Rig::new(json!({}));
+    // prepaid tickets: each one an ordinary payment of the seller's invoice, the path the route wait is on
+    let prepaid = json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
+    let r = Rig::shipped(json!({}), 30, prepaid);
     r.ln.st.lock().unwrap().private_seller = true;
     let t = Instant::now();
     let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+    assert!(r.ln.state().payments.iter().any(|p| p["status"] == "SUCCEEDED"), "a prepaid ticket was paid: {v}");
     assert!(t.elapsed() < Duration::from_secs(4), "the page took {:?}: {v}", t.elapsed());
+    // wins: 256 pieces, as many wins as the no-route tests see
     let d = patient_draws_rig(json!({}));
     d.ln.st.lock().unwrap().private_seller = true;
     let t = Instant::now();
-    let w = d.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+    let w = d.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(w["wins"].as_u64().unwrap_or(0) >= 1, "no win to pay: {w}");
     assert_eq!((w["status"].as_u64(), w["complete"].as_bool()), (Some(200), Some(true)), "{w}");
     assert_eq!((w["wins_paid"].as_u64(), w["wins_unpaid"].as_array().map(Vec::len)), (w["wins"].as_u64(), Some(0)), "{w}");
-    assert!(t.elapsed() < Duration::from_secs(20), "the file took {:?}: {w}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(30), "the file took {:?}: {w}", t.elapsed());
     for (rig, out) in [(&r, &v), (&d, &w)] {
         assert!(!out.to_string().contains("ln_no_route"), "{out}");
         assert!(rig.audit("ticket_route_waited").is_empty(), "no wait for a route the query cannot see");
