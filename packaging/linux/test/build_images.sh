@@ -21,10 +21,15 @@ echo "== this tree's xbt-init, xbt-wallet-ui and xbt-hashlink (x86_64 musl)"
 TGT=${CARGO_TARGET_DIR:-target}
 cargo build -q -j "${CARGO_BUILD_JOBS:-6}" --release --locked --target x86_64-unknown-linux-musl \
   -p xbt-wallet-ui -p xbt-hashlink -p xbt-svc --bin xbt-wallet-ui --bin xbt-hashlink --bin xbt-init
+# and this tree's users and groups (container/mkbase.py): the pinned images' /etc/group predates the Stream
+# Gateway's (xbt-datum, 10021, with the UI in it, so the UI can give run/datum/config.json the gateway's group)
+python3 container/mkbase.py "$T/base.tar"
+mkdir -p "$T/base" && tar -x -C "$T/base" -f "$T/base.tar" etc/passwd etc/group
 for img in xbt-init xbt-wallet-ui xbt-hashlink; do
   mkdir -p "$T/$img"
   cp "$TGT/x86_64-unknown-linux-musl/release/$img" "$T/$img/$img"
-  printf 'FROM %s\nCOPY --chmod=0555 %s /usr/bin/%s\n' "$(lock "$img")" "$img" "$img" > "$T/$img/Dockerfile"
+  cp "$T/base/etc/passwd" "$T/base/etc/group" "$T/$img/"
+  printf 'FROM %s\nCOPY --chmod=0555 %s /usr/bin/%s\nCOPY --chmod=0444 passwd group /etc/\n' "$(lock "$img")" "$img" "$img" > "$T/$img/Dockerfile"
   docker build -q -t "$img:linux-test" "$T/$img" >/dev/null
   echo "   $img:linux-test"
 done
