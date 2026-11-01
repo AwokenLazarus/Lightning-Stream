@@ -353,7 +353,9 @@ impl Signer {
             Tried::Done(with(refused("lottery_open", format!("no session of draws was opened with this seller: {why}")), json!({"stopped": stopped})))
         };
         // the seller's side: its name for the session, the session key and the anchor of its chain
-        let body = json!({"version": lottery::VERSION, "winMsat": win_msat.to_string()}).to_string().into_bytes();
+        // `canCancel`: this wallet asks the seller to cancel a failed win's invoice (`cancel`), so its next one comes at once and
+        // the seller may give invoices that outlive the grace. A seller before 0.2.0 ignores it
+        let body = json!({"version": lottery::VERSION, "winMsat": win_msat.to_string(), "canCancel": true}).to_string().into_bytes();
         let url = format!("{}/open", ds.base);
         let ans = match self.wire("POST", &url, &body, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy())) {
             Ok(a) => a,

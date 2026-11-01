@@ -350,7 +350,15 @@ involved no node.
   for the next one. Until 0.1.20 the grace, and so a win's invoice, was 30 s: a buyer whose
   payment took longer than that to reach the seller (a hop held one 8 to 22 s on a loaded lab
   node) had every win refused, and was served nothing more. A seller that shortens the grace
-  shortens its invoices with it.
+  shortens its invoices with it. From 0.2.0 a wallet says at the open that it asks for a failed
+  win's invoice to be cancelled, and a gateway from 0.2.0 gives it invoices of 180 s
+  (`lottery.invoice_secs_cancel`), the grace being unchanged: a wallet before 0.2.0, or a
+  gateway before it, keeps invoices as long as the grace. After a gateway restarts, a session's
+  invoices are the grace's again (what the buyer said is not journalled).
+- A win is judged against the wallet's send margin when its invoice comes and again just before
+  it is sent, after the waits for a route and for the spend lock: one whose invoice would end on
+  its way is held back unsent and paid on the next invoice. On a loaded lab, before the second
+  look, one win went with 1.1 s left and failed at the seller's node.
 - A wallet that starts again pays no win it found before the start: it cannot tell a start from
   a restore of older records, in which that win may be paid already; the seller has lost the
   wins that were unpaid at that moment (at most the 2 it bears). A gateway that starts again

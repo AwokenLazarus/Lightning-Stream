@@ -79,6 +79,11 @@ pub struct LotteryConfig {
     /// payment failed does not pay that invoice again, and waits for the next one, which must
     /// come before the grace ends.
     pub invoice_secs: u32,
+    /// A win's invoice lives this long for a session whose buyer said at the open that it asks for a failed win's
+    /// invoice to be cancelled (`canCancel`): its next invoice comes at once, not when the first lapses, so the
+    /// invoice may outlive the grace. From [`MIN_INVOICE_SECS`] to 3600; 180 s as shipped. A session whose buyer
+    /// said nothing (a wallet before 0.2.0) keeps [`LotteryConfig::invoice_secs`].
+    pub invoice_secs_cancel: u32,
 }
 
 impl LotteryConfig {
@@ -106,6 +111,7 @@ impl LotteryConfig {
                 "idle_secs",
                 "first_use_secs",
                 "invoice_secs",
+                "invoice_secs_cancel",
             ],
         )?;
         let c = Self::read(m, ticket_blocks)?;
@@ -139,6 +145,11 @@ impl LotteryConfig {
         if !(MIN_INVOICE_SECS..=3600).contains(&c.invoice_secs) {
             return Err(format!("lottery.invoice_secs is from {MIN_INVOICE_SECS} (a wallet refuses an invoice that expires within 5 s) to 3600"));
         }
+        if !(MIN_INVOICE_SECS..=3600).contains(&c.invoice_secs_cancel) {
+            return Err(format!("lottery.invoice_secs_cancel is from {MIN_INVOICE_SECS} to 3600"));
+        }
+        // a buyer that cannot ask for a cancel waits out a failed win's invoice: only such a buyer's invoices are bound by
+        // the grace (those of a buyer that can are `invoice_secs_cancel`)
         if c.invoice_secs > c.grace_seconds.max(MIN_INVOICE_SECS) {
             return Err(format!("lottery.invoice_secs {} is more than lottery.grace_seconds {}: a buyer whose payment of a win failed waits for that win's next invoice, which comes only when the first has lapsed, and the session would be refused win_unpaid in between", c.invoice_secs, c.grace_seconds));
         }
@@ -176,6 +187,10 @@ impl LotteryConfig {
             first_use_secs: num(m, "first_use_secs", 60)?,
             // the grace: an invoice that lapses unpaid is replaced by the time the grace ends
             invoice_secs: num32(m, "invoice_secs", grace_seconds.clamp(MIN_INVOICE_SECS, 3600))?,
+            // a buyer that asks for a failed win's invoice to be cancelled gets its next one at once: its invoices may
+            // outlive the grace, and do not lapse while the win waits its turn behind a hundred others (on the lab, wins
+            // reached the wallet's gate with 1 to 5 s of a 60 s invoice left, and were held back for it)
+            invoice_secs_cancel: num32(m, "invoice_secs_cancel", 180)?,
         })
     }
 
@@ -304,6 +319,9 @@ pub struct Session {
     /// When the buyer closed it, if it did while it owed: it serves nothing more and keeps its
     /// place in the caps until it has been quiet for `first_use_secs`.
     pub closed: Option<u64>,
+    /// The buyer said at the open that it asks for a failed win's invoice to be cancelled: its wins' invoices live
+    /// [`LotteryConfig::invoice_secs_cancel`]. Not journalled: after a restart its invoices are the grace's.
+    pub can_cancel: bool,
 }
 
 impl Session {
@@ -457,6 +475,7 @@ impl Book {
                 open_responses: 0,
                 finals: VecDeque::new(),
                 closed: None,
+                can_cancel: false,
             },
         );
         self.totals.opened += 1;
@@ -464,6 +483,22 @@ impl Book {
             self.log.push(Rec::Session(Box::new(Opened::of(&id, s))));
         }
         Ok(id)
+    }
+
+    /// The session's buyer asks for a failed win's invoice to be cancelled (it said so at the open).
+    pub fn can_cancel(&mut self, id: &str) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            s.can_cancel = true;
+        }
+    }
+
+    /// How long a win's invoice of the session lives: [`LotteryConfig::invoice_secs_cancel`] where its buyer can ask
+    /// for a cancel, else [`LotteryConfig::invoice_secs`] (never longer than the grace).
+    pub fn invoice_secs_of(&self, id: &str) -> u32 {
+        match self.sessions.get(id) {
+            Some(s) if s.can_cancel => self.cfg.invoice_secs.max(self.cfg.invoice_secs_cancel),
+            _ => self.cfg.invoice_secs,
+        }
     }
 
     pub fn anchor(&self, id: &str) -> Option<[u8; 32]> {
@@ -811,6 +846,7 @@ impl Book {
                     open_responses: 0,
                     finals: VecDeque::new(),
                     closed: o.closed,
+                    can_cancel: false,
                 },
             );
             return Ok(());
@@ -1112,6 +1148,22 @@ mod tests {
             }
             d += 1;
         }
+    }
+
+    #[test]
+    fn a_buyer_that_says_it_asks_for_cancels_gets_win_invoices_past_the_grace_and_one_that_does_not_never() {
+        let c = LotteryConfig::parse(&json!({}), 40).unwrap();
+        assert_eq!((c.invoice_secs, c.invoice_secs_cancel), (60, 180), "as shipped: the grace's 60 s, and 180 s for a buyer that can cancel");
+        assert!(LotteryConfig::parse(&json!({"invoice_secs_cancel": 14}), 40).is_err());
+        assert!(LotteryConfig::parse(&json!({"invoice_secs_cancel": 3601}), 40).is_err());
+        // the grace binds only the invoices of a buyer that cannot ask for a cancel
+        let long = LotteryConfig::parse(&json!({"grace_seconds": 30, "invoice_secs_cancel": 600}), 40).unwrap();
+        assert_eq!((long.invoice_secs, long.invoice_secs_cancel), (30, 600));
+        let mut b = Book::new(cfg());
+        let (old, new) = (open(&mut b, 1, "a").unwrap(), open(&mut b, 2, "a").unwrap());
+        b.can_cancel(&new);
+        assert_eq!((b.invoice_secs_of(&old), b.invoice_secs_of(&new)), (15, 180), "an old wallet: the grace (10 s, at least 15); a new one: 180 s");
+        assert_eq!(b.invoice_secs_of("no such session"), 15);
     }
 
     #[test]

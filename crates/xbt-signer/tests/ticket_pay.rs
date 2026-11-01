@@ -571,9 +571,19 @@ fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &
         }
         c.remove("strict");
     }
+    // a win's invoice lives as long as the grace for the wallets of these tests too, as it did before a wallet could say it
+    // asks for cancels (`canCancel`), unless a test names `invoice_secs_cancel`: what they test is timed on that
+    let mut lottery = conf["lottery"].clone();
+    if let Some(l) = lottery.as_object_mut() {
+        if !l.contains_key("invoice_secs_cancel") {
+            let grace = l.get("grace_seconds").and_then(Value::as_u64).unwrap_or(60);
+            let life = l.get("invoice_secs").and_then(Value::as_u64).unwrap_or(grace.clamp(15, 3600));
+            l.insert("invoice_secs_cancel".into(), life.into());
+        }
+    }
     json!({"listen": "127.0.0.1:0", "public_url": origin, "upstream": upstream, "state_dir": state, "chain": "regtest",
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
-           "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"], "offers": conf["offers"],
+           "tickets": conf["tickets"], "caps": caps, "lottery": lottery, "offers": conf["offers"],
            "times": {"refill_wait_ms": conf["refill_wait_ms"].as_u64().unwrap_or(REFILL_WAIT_MS.load(Ordering::SeqCst)), "upstream_wait_secs": UPSTREAM_WAIT_SECS.load(Ordering::SeqCst), "tick_ms": 50},
            "routes": routes_with(conf)})
 }
@@ -13294,6 +13304,29 @@ fn a_win_whose_invoice_runs_out_while_it_waits_for_a_route_is_not_sent() {
     let held: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ticket_expiry").collect();
     assert!(!held.is_empty(), "the win was held back when it was looked at again: {v}");
     assert_eq!((v["complete"].as_bool(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), v["wins"].as_u64(), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
+/// The wallet says at the open that it asks for a failed win's invoice to be cancelled, and a seller that gives such a
+/// buyer long invoices (`invoice_secs_cancel`) does: its wins are paid on invoices of 180 s, past the grace of 30.
+///
+/// FAILS without `canCancel` in the open: the seller gives the grace's 30 s.
+#[test]
+fn the_wallet_says_it_can_cancel_and_is_given_invoices_past_the_grace() {
+    let _g = env_lock();
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                                               "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "invoice_secs_cancel": 180,
+                                                           "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(v["wins_paid"].as_u64().unwrap_or(0) >= 1, "{v}");
+    let opens: Vec<Value> = r.tap.seen("/x402/lottery/open").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
+    assert!(!opens.is_empty() && opens.iter().all(|o| o["canCancel"] == true), "{opens:?}");
+    for p in r.ln.by_status("SUCCEEDED") {
+        let inv = xbt_signer::bolt11::decode(p["payment_request"].as_str().unwrap()).unwrap();
+        assert_eq!(inv.expiry_s, 180, "a win's invoice of 180 s, past the grace");
+    }
     assert_wins(&r, v["wins_paid"].as_u64().unwrap());
 }
 
