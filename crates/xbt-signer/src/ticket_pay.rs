@@ -3169,7 +3169,9 @@ impl Signer {
         // once, in the session the next call would open. A session ended for the seller's fault (a receipt that does not
         // hold, a charge above what arrived) or stranded is never made again: the call says why. Any other call refused
         // so is told why, and the next opens another, as before
-        let forgotten = out.get("rule").and_then(Value::as_str) == Some("ticket_session_ended") && hs.forgotten.load(Ordering::SeqCst);
+        // (the call that hears `session_unknown` is refused `ticket_session_ended`; one beside it, a refill say, may hear it
+        // first and stop the session, and this call is then refused as the session stops, `ticket_session`)
+        let forgotten = matches!(out.get("rule").and_then(Value::as_str), Some("ticket_session_ended" | "ticket_session")) && hs.forgotten.load(Ordering::SeqCst);
         let ended_under_it = !stopped.is_null() || forgotten;
         if ended_under_it && nothing && again && c.range.is_some() {
             self.ticket_audit("ticket_session_again", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee),
