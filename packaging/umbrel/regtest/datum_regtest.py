@@ -35,7 +35,8 @@ Checks (OUT/umbrel_datum_regtest.json):
   rental      a masked solo rental through the compose, paid through the wallet: real blocks, each masked,
               each paying the regtest address, every job held to /xbt/job, payments = what the hashmaker earned,
               and the found blocks kept in datum/submitblocks
-  restart     after `docker restart` of the renter, its gateway is still on its loopback (recorded)
+  restart     after `docker restart` of the renter, is its gateway still on its loopback; and a restart of the
+              gateway's container puts it back
     datum_regtest.py
 """
 from __future__ import annotations
@@ -428,6 +429,18 @@ def main() -> int:
         REPORT["after_renter_restart"] = {"stratum": after, "datum": s2.get("datum"), "blinding": s2.get("blinding"), "gateway state": inspect(dn)["State"]["Status"]}
         check("restart: after a restart of the renter, its gateway is still on its loopback", after.get("open") is True and s2["datum"]["reachable"] is True,
               REPORT["after_renter_restart"])
+        # the gateway's container joins the renter's namespace as it is when it starts: a restart of it is the way back
+        sh("docker", "restart", dn)
+        lab.wait("the gateway after its own restart", 90, lambda: probe(f"container:{rn}", "connect", "127.0.0.1", str(STRATUM)).get("open") is True, every=3)
+        # the renter looks again once its last look is a minute old
+        until = time.time() + 150
+        s3 = status()
+        while time.time() < until and (s3.get("blinding") or {}).get("state") != "blinded":
+            time.sleep(10)
+            s3 = status()
+        REPORT["after_gateway_restart"] = {"datum": s3.get("datum"), "blinding": s3.get("blinding")}
+        check("restart: a restart of the gateway's container puts it back on the renter's loopback, its jobs masked",
+              s3["datum"]["reachable"] is True and (s3.get("blinding") or {}).get("state") == "blinded", REPORT["after_gateway_restart"])
     except (lab.LabError, OSError, KeyError, IndexError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
         check("ran to its end", False, f"{type(e).__name__}: {e}")
     finally:
