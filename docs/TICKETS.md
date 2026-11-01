@@ -1147,7 +1147,7 @@ asks for a failed win's invoice to be cancelled (`canCancel: true`), and a gatew
 invoices of `invoice_secs_cancel` (180 s as shipped), longer than the grace: a win waiting its turn behind many others'
 does not see its invoice lapse, and a failed one's next invoice comes at once on the cancel. For a buyer that says
 nothing, a win's invoice lives as long as the seller's grace
-(`graceSeconds`, 60 s at the gateway, 30 s before 0.1.20; `invoice_secs`, which may not be longer, and is never
+(`graceSeconds`, 60 s at the gateway, 30 s before 0.2.0; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`
 carries it, the wallet pays it and asks again. (Until 2026-10-14 an invoice lived 60 s against a

@@ -2216,7 +2216,7 @@ fn plain_media_type(s: &str) -> Option<String> {
 /// The body of such an answer is not read, nor that of a 200 to a call that asked for a range from
 /// past the first byte: the seller sends the whole body, ignoring the range or (where the call named
 /// `if_range`) because its copy has changed, and reading it would buy again the bytes the caller
-/// already has. A 200 to a range from byte 0 is a whole answer, read as any other. (Until 0.1.20 a
+/// already has. A 200 to a range from byte 0 is a whole answer, read as any other. (Until 0.2.0 a
 /// 200 to any range was read, and metered, like any other.)
 ///
 /// A 206 that states no `Content-Length` is read to the end of its range and no further: `length`

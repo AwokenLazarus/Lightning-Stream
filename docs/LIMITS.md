@@ -347,7 +347,7 @@ involved no node.
   with the first request the gateway refuses `win_unpaid`, and the session goes on once it is
   paid. A slow payment pays less time: an invoice that is not paid within it (a win that waited
   its turn behind many others, section above, or a payment over a slow route) fails, and waits
-  for the next one. Until 0.1.20 the grace, and so a win's invoice, was 30 s: a buyer whose
+  for the next one. Until 0.2.0 the grace, and so a win's invoice, was 30 s: a buyer whose
   payment took longer than that to reach the seller (a hop held one 8 to 22 s on a loaded lab
   node) had every win refused, and was served nothing more. A seller that shortens the grace
   shortens its invoices with it. From 0.2.0 a wallet says at the open that it asks for a failed
@@ -1016,7 +1016,7 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   the range was ignored, before reading any of the body; what it still costs is bounded by the operating system's
   socket buffers on both ends and what was on its way, which the wallet does not set (a smaller receive buffer would
   also narrow every real download's window). Measured on Linux loopback: up to 822 KiB, 160 sat at the lab route's
-  200 sat a MiB. Before 0.1.20 that whole body was read and paid for, the start of the file bought again.
+  200 sat a MiB. Before 0.2.0 that whole body was read and paid for, the start of the file bought again.
 - A session of draws takes one answer at a time, and one streamed on may run for hours. Another call
   to that seller is told `ticket_busy` once that answer has been open 30 s, at once from then on, and
   otherwise after 50 s at most. A stop ends the open answer at once and gives no new value; wins
