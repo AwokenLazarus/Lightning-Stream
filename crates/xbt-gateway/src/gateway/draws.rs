@@ -430,7 +430,7 @@ impl Gateway {
         let (unpaid, win_msat, win_blocks, invoice_secs) = {
             let b = l.lock();
             match b.session(session) {
-                Some(s) if !s.unpaid.is_empty() => (s.unpaid.clone(), s.win_msat, b.cfg().win_blocks, b.cfg().invoice_secs),
+                Some(s) if !s.unpaid.is_empty() => (s.unpaid.clone(), s.win_msat, b.cfg().win_blocks, b.invoice_secs_of(session)),
                 _ => return,
             }
         };
@@ -672,6 +672,10 @@ impl Gateway {
         let opened = {
             let mut b = l.lock();
             b.open(&entropy, seed, chain, &addr, win_msat, self.now()).map(|id| {
+                // a buyer that says it asks for a failed win's invoice to be cancelled gets invoices that outlive the grace
+                if body.get("canCancel") == Some(&Value::Bool(true)) {
+                    b.can_cancel(&id);
+                }
                 let anchor = b.anchor(&id).unwrap_or([0; 32]);
                 (id, anchor)
             })

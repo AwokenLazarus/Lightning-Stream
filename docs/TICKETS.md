@@ -1142,7 +1142,11 @@ and at most half its life) is not sent, and one that ran out while the win waite
 not count against the seller, up to 4 for a win and 32 for a session; past that the session ends
 (`lottery_invoices_lapse`). One that came with less than 5 s left counts as a bad invoice. The
 win's next invoice goes before the wins no seller waits for, and a call waits for it where it is due
-within 10 s, or within what the wallet's margin holds back and 5 s more. A win's invoice lives as long as the seller's grace
+within 10 s, or within what the wallet's margin holds back and 5 s more. A wallet from 0.2.0 says at the open that it
+asks for a failed win's invoice to be cancelled (`canCancel: true`), and a gateway from 0.2.0 gives such a session
+invoices of `invoice_secs_cancel` (180 s as shipped), longer than the grace: a win waiting its turn behind many others'
+does not see its invoice lapse, and a failed one's next invoice comes at once on the cancel. For a buyer that says
+nothing, a win's invoice lives as long as the seller's grace
 (`graceSeconds`, 60 s at the gateway, 30 s before 0.1.20; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`

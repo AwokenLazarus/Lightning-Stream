@@ -76,7 +76,16 @@ impl Drawer {
     }
 
     fn open_sized(rig: &Rig, tag: u8, win_msat: Option<&str>) -> Self {
-        let got = Self::open_raw(rig, &json!({"version": "lottery/0", "winMsat": win_msat}));
+        Self::open_body(rig, tag, &json!({"version": "lottery/0", "winMsat": win_msat}))
+    }
+
+    /// A buyer that says it asks for a failed win's invoice to be cancelled (a wallet from 0.2.0).
+    fn open_cancelling(rig: &Rig, tag: u8) -> Self {
+        Self::open_body(rig, tag, &json!({"version": "lottery/0", "canCancel": true}))
+    }
+
+    fn open_body(rig: &Rig, tag: u8, body: &Value) -> Self {
+        let got = Self::open_raw(rig, body);
         assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
         let j = got.json();
         let session = j["session"].as_str().unwrap().to_string();
@@ -1154,7 +1163,10 @@ fn the_operators_view_answers_the_app_in_another_container_by_its_token_only() {
 
 /// A session with an unpaid win: the session, the answer that lists it, and its draw and invoice.
 fn with_a_win(rig: &Rig, tag: u8) -> (Drawer, u64, Hash) {
-    let mut b = Drawer::open(rig, tag);
+    win_in(Drawer::open(rig, tag))
+}
+
+fn win_in(mut b: Drawer) -> (Drawer, u64, Hash) {
     loop {
         let (seq, got) = b.get("/api");
         assert_eq!(got.status, 200);
@@ -1172,6 +1184,32 @@ fn ask_cancel(b: &mut Drawer, draw: u64, hash: &Hash) -> Value {
     let got = b.call("cancel", &json!({"draw": draw, "hash": hex::encode(hash)}));
     assert_eq!(got.status, 200, "{}", got.json());
     got.json()
+}
+
+/// A buyer that says at the open that it asks for cancels gets win invoices of `invoice_secs_cancel` (180 s as
+/// shipped), past the grace; one that says nothing (a wallet before 0.2.0) keeps the grace's. A failed win on a long
+/// invoice is cancelled and its next invoice comes at once, the grace unchanged.
+///
+/// FAILS with the long invoice for every buyer (an old wallet waits out a failed win's invoice past the grace, and is
+/// refused `win_unpaid` meanwhile), or for none (the queue lapses a new wallet's invoices).
+#[test]
+fn a_buyer_that_can_cancel_gets_long_win_invoices_and_one_that_cannot_keeps_the_graces() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["grace_seconds"] = json!(20);
+    });
+    let (_old, _, old_first) = with_a_win(&rig, 80);
+    assert_eq!(rig.node.expiry_of(&old_first), Some(20), "an old wallet's invoice lives as long as the grace");
+    let (mut b, draw, first) = win_in(Drawer::open_cancelling(&rig, 81));
+    assert_eq!(rig.node.expiry_of(&first), Some(180), "a wallet that can cancel: 180 s, past the grace of 20");
+    // its payment fails: it asks for the cancel, and the next invoice comes at once, as long
+    let j = ask_cancel(&mut b, draw, &first);
+    assert_eq!(j["cancelled"], true, "{j}");
+    let next = Drawer::hash_in(&j, draw);
+    assert!(next != first && rig.node.state_of(&next) == Some(InvoiceState::Open));
+    assert_eq!(rig.node.expiry_of(&next), Some(180));
+    assert!(rig.node.pay(&next));
+    assert_eq!(b.get("/api").1.status, 200);
 }
 
 /// The buyer's payment failed, and it asks for the invoice to be cancelled: the node's next invoice comes in
