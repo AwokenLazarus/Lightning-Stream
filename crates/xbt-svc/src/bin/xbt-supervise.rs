@@ -179,7 +179,9 @@ fn supervise(a: Args, signals: Signals) -> ExitCode {
             signals.wait_timeout(a.every);
         }
         let seen = snapshot(&all);
-        let mut child = match Command::new(&a.program[0]).args(&a.program[1..]).spawn() {
+        // the child gets SIGTERM and SIGINT back: listen() blocked them here, and a child inherits the
+        // mask, so a program with no handler of its own (the Stream Gateway) would outlive every stop
+        let mut child = match xbt_svc::shutdown::unblocked(Command::new(&a.program[0]).args(&a.program[1..])).spawn() {
             Ok(c) => c,
             Err(e) => {
                 say(format!("{}: {e}", a.program[0]));
@@ -324,6 +326,36 @@ mod tests {
             assert_eq!(p.note(false, t0 + Duration::from_secs(10)), None, "a slow start is not a gone namespace");
         }
         assert!(p.note(false, t0 + PEER_GRACE).is_some_and(|w| w.contains("has not answered")));
+    }
+
+    /// A supervised program with no SIGTERM handler of its own (sh running sleep, as the Stream Gateway
+    /// has none) stops at the stop, not at the SIGKILL 15 s later: with SIGTERM and SIGINT blocked in
+    /// this thread as listen() blocks them in the real supervisor.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_with_no_handler_stops_at_sigterm_not_at_the_kill() {
+        std::thread::spawn(|| {
+            // SAFETY: blocks SIGTERM and SIGINT in this thread only, as listen() does
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGTERM);
+                libc::sigaddset(&mut set, libc::SIGINT);
+                assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
+            }
+            let signals = Signals::none();
+            let s2 = signals.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(800));
+                s2.raise(libc::SIGTERM);
+            });
+            let a = parse(&s(&["--every", "0.1", "--", "/bin/sh", "-c", "sleep 60"])).unwrap();
+            let t0 = Instant::now();
+            let _ = supervise(a, signals);
+            assert!(t0.elapsed() < Duration::from_secs(5), "stopped after {:?}: the program never saw SIGTERM", t0.elapsed());
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

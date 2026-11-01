@@ -7,7 +7,11 @@
 //! ordinary code, with no handler and nothing that must be async-signal-safe. A service calls it
 //! before it starts any thread of its own: a thread started earlier keeps both signals unblocked,
 //! and one delivered to it is dropped (PID 1) or ends the process without a word (anyone else).
-//! A child started with `std::process::Command` gets an empty mask back (std resets it).
+//! A child inherits that mask: std's `Command` has passed the parent's signal mask on since Rust
+//! 1.66 (rust-lang/rust#101077). A child that relies on the default action of SIGTERM (a C program
+//! with no handler, such as the Stream Gateway) would then never see it and outlive every stop
+//! until a SIGKILL. So a service that has called [`listen`] starts its children through
+//! [`unblocked`], which takes the two signals out of the child's mask before it runs.
 //!
 //! What a service does when told: it takes no new work, gives the work in flight [`DRAIN`] to
 //! finish, flushes what it owns and exits 0. Work still running after that is abandoned as a kill
@@ -135,6 +139,31 @@ pub fn listen() -> io::Result<Signals> {
 }
 
 /// Elsewhere there is no SIGTERM: a `Signals` that never fires.
+/// `cmd` with SIGTERM and SIGINT taken out of the child's signal mask: what a service that has
+/// called [`listen`] (which blocks both, and a child inherits the mask) starts a child with, so the
+/// child stops on SIGTERM as it would started from a shell.
+#[cfg(unix)]
+pub fn unblocked(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let set = stop_set();
+    // SAFETY: the closure runs in the child between fork and exec, where only async-signal-safe calls
+    // are allowed: sigprocmask(2) is one, and it only reads `set`, the closure's own copy
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+}
+
+/// No signal mask to clear where there are no signals.
+#[cfg(not(unix))]
+pub fn unblocked(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
 #[cfg(not(unix))]
 pub fn listen() -> io::Result<Signals> {
     Ok(Signals::none())
@@ -209,6 +238,36 @@ pub fn say_stopped(service: &str, drained: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signals blocked in a child of this thread, as /proc reports them (SigBlk, a hex mask).
+    #[cfg(target_os = "linux")]
+    fn child_blocked(unblock: bool) -> u64 {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sed -n 's/^SigBlk:[[:space:]]*//p' /proc/self/status"]);
+        if unblock {
+            unblocked(&mut cmd);
+        }
+        let out = cmd.output().unwrap();
+        u64::from_str_radix(String::from_utf8_lossy(&out.stdout).trim(), 16).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_of_a_listening_service_gets_sigterm_and_sigint_back() {
+        let bits = (1u64 << (libc::SIGTERM - 1)) | (1u64 << (libc::SIGINT - 1));
+        // in a thread of its own, so the test harness's other threads keep their masks
+        std::thread::spawn(move || {
+            let set = stop_set();
+            // SAFETY: blocks the two signals in this thread only, as listen() does in a service
+            assert_eq!(unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) }, 0);
+            // std passes the mask on: a child started plainly has both blocked, and would ignore a stop
+            assert_eq!(child_blocked(false) & bits, bits, "std no longer passes the mask on: unblocked() may be unneeded");
+            // started through unblocked(), neither
+            assert_eq!(child_blocked(true) & bits, 0);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn a_drain_waits_for_its_requests_and_refuses_new_ones() {
