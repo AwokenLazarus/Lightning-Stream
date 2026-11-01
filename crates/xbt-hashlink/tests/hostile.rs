@@ -747,14 +747,15 @@ fn say_paying_each_time(ramp_first: bool) -> Value {
     r
 }
 
-/// A wallet whose ticket buys take `buy` each: it keeps the credit a ticket left, and pays each slice through the
-/// hashmaker's paid-slice endpoint as the gateway would pass it on.
+/// A wallet whose ticket buys take `buys[n]` each, the last for every one after: it keeps the credit a ticket left,
+/// and pays each slice through the hashmaker's paid-slice endpoint as the gateway would pass it on.
 struct SlowPayer {
     slices: String,
     price_msat: u64,
     ticket_msat: u64,
     credit_msat: u64,
-    buy: Duration,
+    buys: Vec<Duration>,
+    bought: usize,
 }
 
 impl Payer for SlowPayer {
@@ -765,7 +766,8 @@ impl Payer for SlowPayer {
     fn pay(&mut self, rental: &str, slice: u64, receipt: &Value) -> Result<Value, String> {
         let mut bought = 0;
         if self.credit_msat < self.price_msat {
-            thread::sleep(self.buy);
+            thread::sleep(self.buys[self.bought.min(self.buys.len() - 1)]);
+            self.bought += 1;
             bought = self.ticket_msat.max(self.price_msat);
             self.credit_msat += bought;
         }
@@ -836,7 +838,7 @@ fn slow_renter(with_fallback: bool) {
     let mut cfg = taker_config(&link, hpub, &terms, &pool, "slow", 60);
     cfg.duration = Some(Duration::from_secs(180));
     cfg.live = Some(live.clone());
-    cfg.payer = Some(Box::new(SlowPayer { slices, price_msat: terms.price_msat, ticket_msat: 0, credit_msat: 0, buy: Duration::from_secs(8) }));
+    cfg.payer = Some(Box::new(SlowPayer { slices, price_msat: terms.price_msat, ticket_msat: 0, credit_msat: 0, buys: vec![Duration::from_secs(8)], bought: 0 }));
     let taker = thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap());
     // what's paid ahead, sampled, against the step at that moment
     let mut worst = 0i64;
@@ -868,6 +870,48 @@ fn slow_renter(with_fallback: bool) {
         assert_eq!(left, 1, "taken once, never let go: {hz}");
         assert!(hz["rampWaits"].as_u64().unwrap() + hz["paymentWaits"].as_u64().unwrap() > 0, "it was waited for: {hz}");
     }
+    h.shutdown();
+    drop(miner);
+}
+
+/// A ticket buy far slower than those measured before it: the renter, which said nothing when the share was held (its
+/// buys had been quick), says `paying` from its own clock before the hashmaker's runs out, and the rental goes on.
+#[test]
+fn a_buy_slower_than_the_measured_ones_is_still_waited_for() {
+    let _s = serial();
+    let sw = share_work(DIFF);
+    // 300 sat a slice of 2 shares at 2 shares a second: a 546 sat ticket lasts under 2 s
+    let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 10_000, start_slices: 0 };
+    let (fb, _) = fallback_pool();
+    let [link, miners, slices] = ports::<3>();
+    let hk = noise::fresh_key();
+    let h = Hashmaker::start(
+        hashmaker::Config { miners: miners.clone(), link: link.clone(), key: hk, terms: terms.clone(), report: None, slices: Some(slices.clone()), fallback: Some(fb),
+                            rentable: None, min_slice_time: hashmaker::MIN_SLICE_TIME },
+        Box::new(|| Box::<LabSeller>::default()),
+    )
+    .unwrap();
+    wait_for(&link);
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+    let (pool, _) = start_pool(Duration::from_secs(5));
+    let stop: Arc<AtomicBool> = Arc::default();
+    let (ma, st2) = (miners.clone(), stop.clone());
+    let miner = thread::spawn(move || {
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 2.0, bad_every: 0, duration: Some(Duration::from_secs(60)), reconnect: true, extranonce_subscribe: false, bind: None });
+        st2.store(true, Ordering::SeqCst);
+    });
+    let mut cfg = taker_config(&link, hpub, &terms, &pool, "late", 60);
+    cfg.duration = Some(Duration::from_secs(40));
+    // two quick buys, then one of 3.5 s, then quick again
+    let buys = vec![Duration::from_millis(200), Duration::from_millis(200), Duration::from_millis(3500), Duration::from_millis(200)];
+    cfg.payer = Some(Box::new(SlowPayer { slices, price_msat: terms.price_msat, ticket_msat: 0, credit_msat: 0, buys, bought: 0 }));
+    let r = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap();
+    stop.store(true, Ordering::SeqCst);
+    let hz = h.wait_finished(1, Duration::from_secs(20)).into_iter().next().expect("the hashmaker's report");
+    eprintln!("measure: a late buy: closed {}, {} paid, waits {} + {} in the ramp: {}", r["closed"], r["paidSlices"], hz["paymentWaits"], hz["rampWaits"], hz["stopped"]);
+    assert_eq!(r["closed"], "rental time over", "{r}");
+    assert_eq!(hz["stopped"]["unpaidWork"], "0", "{hz}");
+    assert!(hz["paymentWaits"].as_u64().unwrap() + hz["rampWaits"].as_u64().unwrap() >= 1, "the late buy was waited for: {hz}");
     h.shutdown();
     drop(miner);
 }

@@ -119,6 +119,10 @@ struct Guard {
     resend_pending: HashMap<u64, (meter::Claim, meter::Hashed, Instant)>,
     /// When the payment in flight was queued.
     in_flight_since: Option<Instant>,
+    /// Since when the hashmaker has said a share waits for payment, while what's been paid (not what's on its way)
+    /// leaves the next share unpaid; and whether `paying` has been said for it.
+    due_open_since: Option<Instant>,
+    paying_said: bool,
     /// The credit the seller holds and what's left of the budget, as the wallet last said (with the wallet's payer).
     credit_msat: u64,
     budget_left: Option<u64>,
@@ -209,6 +213,31 @@ struct St {
 }
 
 impl St {
+    /// The hashmaker waits for a payment: say `paying` if one is on its way and won't arrive, by the measured buys or
+    /// by how long the clock has run, before the hashmaker's 2 s clock is out. Once for each wait; the wait is over
+    /// when what's been paid lets the next share go.
+    fn say_paying_if_late(&mut self, tx: &Sender) {
+        let Some(since) = self.guard.due_open_since else { return };
+        let mut paid = self.standing();
+        paid.paid = self.released.saturating_sub(self.in_flight);
+        if !paid.needed() {
+            self.guard.due_open_since = None;
+            self.guard.paying_said = false;
+            return;
+        }
+        if self.in_flight == 0 || self.guard.paying_said {
+            return;
+        }
+        let measured = self.standing().buy_secs;
+        let clock = order::WAIT_FOR_PAYMENT.as_secs_f64() - IN_TIME_MARGIN;
+        let on_its_way = self.guard.in_flight_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        // the ticker comes round every half second: said at a second, it's in before the clock's two
+        if measured <= 0.0 || measured.max(on_its_way) > clock || since.elapsed().as_secs_f64() >= clock - IN_TIME_MARGIN {
+            let _ = tx.send(&Msg::Paying);
+            self.guard.paying_said = true;
+        }
+    }
+
     fn lock_ahead(&mut self, tx: &Sender) {
         if self.queue.is_some() {
             return;
@@ -513,6 +542,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             if g.closed.is_some() {
                 return;
             }
+            g.say_paying_if_late(&tx);
             if g.guard.retire_until.is_some_and(|t| Instant::now() > t) {
                 g.guard.retire_until = None;
                 g.guard.resend_pending.clear();
@@ -691,14 +721,15 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 g.last_due = Some((work, paid));
                 g.settle_up(&tx);
                 // a payment on its way that won't arrive within the hashmaker's short clock: it waits for it, its
-                // miners on its own pool meanwhile. One the measured buys say arrives in time needs no move
-                if g.in_flight > 0 {
-                    let measured = g.standing().buy_secs;
-                    let elapsed = g.guard.in_flight_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
-                    if measured <= 0.0 || measured.max(elapsed) + IN_TIME_MARGIN > order::WAIT_FOR_PAYMENT.as_secs_f64() {
-                        let _ = tx.send(&Msg::Paying);
-                    }
+                // miners on its own pool meanwhile. One the measured buys say arrives in time needs no move; should it
+                // not, the ticker says paying before the clock runs out
+                // a share held after a wait already said for: a new wait of its own
+                if g.guard.paying_said {
+                    g.guard.paying_said = false;
+                    g.guard.due_open_since = None;
                 }
+                g.guard.due_open_since.get_or_insert_with(Instant::now);
+                g.say_paying_if_late(&tx);
             }
             Msg::Resend { chan, line } => {
                 // a share the hashmaker sent before the drop: one this side counted already is passed over. A new one
