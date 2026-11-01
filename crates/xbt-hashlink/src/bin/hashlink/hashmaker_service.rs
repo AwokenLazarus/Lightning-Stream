@@ -450,8 +450,11 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
             *shared.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
             asked_now = true;
         }
-        // what the gateway charges: a new price is taken by a restart, and no rental starts till then
-        if f.contains_key("gateway") && (asked_now || shop_asked.elapsed() >= SHOP_ASKED_EVERY) {
+        // what the gateway charges: a new price is taken by a restart, and no rental starts till then. While the shop is
+        // what holds rentals back it is asked at every look (a local call), so the pause ends with the restart and the
+        // listing published in this same look (which asks the gateway too) never offers 0 machines on a stale answer
+        let shop_holds = shop.is_some_and(|c| c != Some(settings.terms.price_msat));
+        if f.contains_key("gateway") && (asked_now || shop_holds || shop_asked.elapsed() >= SHOP_ASKED_EVERY) {
             shop = shop_charges(f);
             shop_asked = Instant::now();
             *shop_now.lock().unwrap_or_else(|p| p.into_inner()) = shop;
