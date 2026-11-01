@@ -1634,6 +1634,9 @@ url>/hashrate/<rental>/<slice>`). On the wallet's socket a call that names a ren
 (`ticket_rental_payer`) before anything is asked of the seller, as are `ticket_open`, `ticket_offer`,
 `ticket_lock` and `ticket_release` on such a task's session; the renter's socket answers only
 `xbt402_pay`, `ticket_stop` and `health`, and refuses any other route (`ticket_rental_route`). The
+route check is a shape check, not a payee check: it holds the renter to a rental's request shape, and
+which seller is paid, at what price, is still the seller's terms against the offer's price ceiling and
+the task's own limits. The
 socket grants nothing by itself: under a task without rental terms (an older wallet's) a rental's
 pieces of work are paid there under the wallet's own limits, as on the wallet's socket.
 

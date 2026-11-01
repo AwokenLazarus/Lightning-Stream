@@ -75,8 +75,16 @@ fn container_setup(data: &DataDir, mode: Mode) -> Result<(PathBuf, Option<Arc<Ke
     // the hashrate renter's socket, in the dir xbt-init made for it (its group keeps every other caller out): only
     // where that dir is there and closed to everyone else, never one made here (a bind mount's host folder that
     // no init made its own is root's, 0755)
-    if renter_dir_closed(&data.run(xbt_svc::RUN_RENTAL)) {
+    // (an operator's own B2_RENTAL_SOCK stands, and is said where it is bound)
+    let renter_dir = data.run(xbt_svc::RUN_RENTAL);
+    if env("B2_RENTAL_SOCK").is_some() || renter_dir_closed(&renter_dir) {
         set_default("B2_RENTAL_SOCK", data.rental_sock());
+    } else if renter_dir.exists() {
+        eprintln!("xbt-signer: no hashrate renter's socket: {} is not a directory closed to other users (xbt-init makes it 0750): \
+                   rentals are refused until it is", renter_dir.display());
+    } else {
+        eprintln!("xbt-signer: no hashrate renter's socket: {} is missing (xbt-init makes it where the hashrate services are installed): \
+                   rentals are refused", renter_dir.display());
     }
     let anchor_on = !matches!(env("XBT_ANCHOR").map(|v| v.to_ascii_lowercase()).as_deref(), Some("off" | "0" | "false" | "no"));
     if anchor_on {

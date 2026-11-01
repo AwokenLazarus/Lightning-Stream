@@ -7265,8 +7265,8 @@ fn credit_one_task_left_with_a_seller_is_not_taken_over_by_another_task() {
     wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
     r.tick();
     assert_eq!((ledger_of("film"), ledger_of("swarm")), (film_before, SETTLED), "swarm's spend is booked to swarm, film's is unchanged: {:?}", r.ledger());
-    // film's credit is still there for film, once swarm's session is stopped (while it is open, a call to the same
-    // address is served by it whatever its task: a path of its own, not a takeover)
+    // film's credit is still there for film, once swarm's session is stopped (while it is open, film's call is served by
+    // a session of film's own beside it: a_call_of_another_task_opens_its_own_session_beside_an_open_one)
     r.call("ticket_stop", json!({"session": b["session"]}));
     let again = r.pay("/page/10", 2_000);
     assert_eq!((again["status"].as_u64(), again["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "film pays from what it left: {again}");
@@ -11309,7 +11309,7 @@ fn the_wallets_socket_pays_nothing_on_a_rentals_terms() {
     // the hashtaker's own payer, on the wallet's socket
     let mut payer = xbt_hashlink::rail::SignerPayer::new(sock.clone(), r.shop.url("/hashrate"), "hashrate".into(), MARKET_MSAT, Some(100_000), None, Duration::from_secs(5));
     let why = payer.pay("r1", 0, &json!({"slice": 0})).unwrap_err();
-    assert!(why.starts_with(xbt_hashlink::rail::WALLET_RULES) && why.contains("hashrate renter"), "{why}");
+    assert!(why.starts_with(xbt_hashlink::rail::RENTER_SOCKET) && why.contains("hashrate renter") && !why.contains("rules page"), "{why}");
     assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
 }
 
@@ -11427,4 +11427,46 @@ fn a_call_of_another_task_is_not_held_back_by_a_pending_prepaid_ticket_it_cannot
     let other = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10").replace("127.0.0.1", "localhost"), "max_sats": CALL, "task": "swarm"}));
     assert_eq!((other["status"].as_u64(), other["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{other}");
     // (film's own call there is still held back for it: a_call_to_a_second_address_of_the_seller_buys_nothing_beside_a_pending_prepaid_ticket)
+}
+
+/// Every entry point of the wallet's socket that names a rental task, or one of its sessions, is refused: a
+/// session opened under it (`ticket_open`), and an offer, a lock or a release in a session the renter opened
+/// (adopted from the review's probe, probe/grants-review-gates). The renter's socket stops a session by its id
+/// only, never a seller's every session.
+#[test]
+fn the_wallets_socket_opens_offers_locks_and_releases_nothing_of_a_rental() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let o = r.call("ticket_open", json!({"task": "hashrate", "terms": {}}));
+    assert_eq!(o["rule"].as_str(), Some("ticket_rental_payer"), "{o}");
+    // a rental session the renter opened
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 2, Some(100_000));
+    for n in 1..=4 {
+        t.share(n as f64 * 9.0).unwrap();
+    }
+    let st = r.status();
+    let sid = st["sessions"].as_array().and_then(|a| a.iter().find(|s| s["task"] == "hashrate" && s["state"] == "open")).map(|s| s["session"].clone())
+        .or_else(|| st["paying"].as_array().and_then(|a| a.first()).map(|p| p["session"].clone())).unwrap_or(Value::Null);
+    assert!(sid.is_string(), "{st}");
+    let booked = r.ledger_sum();
+    for m in ["ticket_offer", "ticket_lock", "ticket_release"] {
+        let v = r.call(m, json!({"session": sid, "tickets": [], "count": 1}));
+        assert_eq!(v["rule"].as_str(), Some("ticket_rental_payer"), "{m}: {v}");
+    }
+    assert_eq!(r.ledger_sum(), booked, "nothing more booked");
+    let e = xbt_hashlink::rail::signer_call(&t.payer.sock, "ticket_stop", &json!({"seller": r.shop.url("/")})).unwrap();
+    assert_eq!(e["rule"].as_str(), Some("ticket_rental_route"), "{e}");
+}
+
+/// A call on the wallet's socket that names no task, where the rental task is the owner's only one (to which
+/// it resolves), is refused like one that names it (adopted from the review's probe).
+#[test]
+fn a_call_naming_no_task_that_resolves_to_the_rental_task_is_refused() {
+    let _g = env_lock();
+    let mut pol = mainnet_starter(starter_rental());
+    pol["tickets"]["tasks"].as_object_mut().unwrap().remove("default");
+    let r = Rig::shipped(pol, 30, app_shop(MARKET_MSAT));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/hashrate/r1/0"), "method": "POST", "body": "{}", "max_sats": 2_000}));
+    assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("ticket_rental_payer"), 0), "{v}");
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0));
 }

@@ -124,6 +124,10 @@ pub const BIG_TICKETS_ONLY: &str = "This hashmaker's smallest ticket is";
 pub const BUDGET_TOO_SHORT: &str = "What is left of this rental's budget";
 /// Where one of the owner's rules refused the payment.
 pub const WALLET_RULES: &str = "Your wallet's rules stopped this payment";
+/// Where the wallet refused the rental's terms to this connection (`ticket_rental_payer`, `ticket_rental_route`): a
+/// renter set up by hand on the wallet's own socket, or on a route that isn't a rental's piece of work. No limit
+/// of the owner's is at issue, so the words don't send the owner to the rules page.
+pub const RENTER_SOCKET: &str = "The wallet pays a rental only through the renter's own connection";
 
 /// Whether a refusal left everything where it was: nothing booked for the call and nothing released.
 fn moved_nothing(v: &serde_json::Value) -> bool {
@@ -132,9 +136,10 @@ fn moved_nothing(v: &serde_json::Value) -> bool {
 }
 
 /// The rules of the owner's that can refuse a slice's payment.
-/// (`ticket_rental_payer`, `ticket_rental_route`: the rental's terms asked for on a socket or a route that isn't the renter's.)
-const WALLET_RULE_NAMES: [&str; 13] = ["ticket_cap", "ticket_task_budget", "ticket_seller_cap", "ticket_rate_limit", "daily_budget", "weekly_budget", "per_counterparty",
-                                       "per_counterparty_daily", "max_per_tx", "human_threshold", "velocity", "ticket_rental_payer", "ticket_rental_route"];
+const WALLET_RULE_NAMES: [&str; 11] = ["ticket_cap", "ticket_task_budget", "ticket_seller_cap", "ticket_rate_limit", "daily_budget", "weekly_budget", "per_counterparty",
+                                       "per_counterparty_daily", "max_per_tx", "human_threshold", "velocity"];
+/// The wallet's refusals of the rental's terms to a connection or a route that isn't the renter's ([`RENTER_SOCKET`]).
+const RENTER_SOCKET_RULES: [&str; 2] = ["ticket_rental_payer", "ticket_rental_route"];
 
 /// Room for a ticket's routing-fee limit, in sats, by the wallet's default limit (10 sat and 0.5%:
 /// `xbt_signer::ln::LnPolicy`). An owner who raised that limit is told so by the signer's refusal.
@@ -265,6 +270,11 @@ impl SignerPayer {
             (rule, _) if WALLET_RULE_NAMES.contains(&rule) => {
                 let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or(rule);
                 Err(format!("{WALLET_RULES}: {why}. Nothing more was paid. Your limits are on the wallet's rules page."))
+            }
+            (rule, _) if RENTER_SOCKET_RULES.contains(&rule) => {
+                let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or(rule);
+                Err(format!("{RENTER_SOCKET}: {why}. The app's renter is set up that way; a renter set up by hand needs the wallet's renter socket \
+                             (run/rental/signer.sock, B2_RENTAL_SOCK), and an app whose parts are of different versions needs updating."))
             }
             _ => Err(r.to_string()),
         }

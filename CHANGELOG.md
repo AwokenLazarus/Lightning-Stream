@@ -136,6 +136,10 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   them, past your wallet's limits and with no approval. Such a call is now refused and nothing is
   paid. The renter pays through its own connection to the wallet, which nothing else in the app can
   reach.
+- If you run the renter by hand (`xbt-hashlink renter --signer …`), or your app's parts are of different
+  versions after an update, point `--signer` at the wallet's renter socket (`run/rental/signer.sock`), and
+  update every part of the app together: a renter on the wallet's ordinary socket now has every rental
+  payment refused, and the Hashrate page says so.
 - Renting needs masked jobs, solo or through a pool, so a hashmaker can't keep back the shares that would be blocks.
   The app comes with a DATUM Gateway that masks its jobs and rents into it. The Rent page checks the gateway's jobs
   when it opens and before each rental; if they aren't masked (the gateway isn't running, or the app is set to
