@@ -392,26 +392,66 @@ fn unpaid_by_the_wallet_stops_the_hash() {
     unpaid_stops(true);
 }
 
-/// Many slices (a rental of about 30 s at two slices a second): what the hashtaker paid and what the
-/// hashmaker earned are each its paid slices at the listed price, every slice's receipt agrees, and
-/// the paid slices are the work delivered at the slice size, within one slice either way (a slice
-/// is paid as it fills: the last one may be paid and not yet full when the miners stop, or full and
-/// not yet paid). With the wallet: one paid call per slice, each at the slice's price.
+/// The most a renter may have paid ahead of the work it has proven, in msat, just after paying a slice, by the
+/// payment rule as stated (`order::Standing::pay_next`), worked out here on its own so a change to the rule shows:
+/// a slice the next share needs (one share and one slice), or as far ahead as the step, which is the largest of the
+/// first step (546 sat), one share and what has been delivered (its 30 s cap only lowers it, and the renter's rate
+/// isn't in its receipts). The first slice is always paid, one slice ahead of nothing.
+fn most_paid_ahead_msat(proven: u128, share: u128, terms: &Terms) -> u128 {
+    let msat = |work: u128| work * terms.price_msat as u128 / terms.slice_work;
+    let step = (order::FIRST_STEP_MSAT as u128).max(msat(share)).max(msat(proven));
+    step.max(msat(share) + terms.price_msat as u128)
+}
+
+/// Many slices (a rental of about 30 s at two slices a second). The money is exact on both sides:
+/// - each side's sum is its paid slices at the listed price, and the two agree (and with the wallet, one paid call
+///   per slice, each at the slice's price);
+/// - every receipt is the same signed receipt on both sides, slice by slice, and both hash them the same;
+/// - the hashmaker is paid for no work it didn't prove: the work it counted is the work the hashtaker counted and
+///   the gateway took, each share proven, and no slice was paid further ahead of the proven work than the rule
+///   allows ([`most_paid_ahead_msat`], at each receipt's own count and at the end);
+/// - nothing is worked unpaid: the hashmaker forwards a share only when the slices paid cover it (`order::fits`), so
+///   its count never passes the paid work, and it ended with no unpaid work.
+///
+/// So the work delivered and the slices paid are within that paid-ahead bound one way and exactly nothing the other.
 fn many_slices(wallet: bool) {
     let r = rental(None, 30, wallet);
-    let (s, price) = (terms().slice_work, terms().price_msat);
+    let t = terms();
+    let (s, price, sw) = (t.slice_work, t.price_msat, share_work(DIFF));
     let paid = r.hashmaker["paid"].as_u64().unwrap();
     assert!(paid >= 30, "only {paid} slices: {}", r.hashmaker);
+    // the sums: each side its paid slices at the listed price
     assert_eq!(r.hashtaker["paidSlices"].as_u64().unwrap(), paid, "{}", r.hashtaker);
     assert_eq!(r.hashtaker["released"].as_u64().unwrap(), paid, "{}", r.hashtaker);
     assert_eq!(r.hashtaker["spentMsat"].as_u64().unwrap(), paid * price, "the hashtaker paid its slices at the listed price");
     assert_eq!(r.hashmaker["earnedMsat"].as_u64().unwrap(), paid * price, "the hashmaker earned its slices at the listed price");
-    assert_eq!((r.hashmaker["receiptsAgree"].as_u64().unwrap(), r.hashmaker["receiptsDisagree"].as_u64().unwrap()), (paid, 0));
-    assert_eq!(r.hashmaker["meter"], r.hashtaker["meter"], "both sides counted the same work");
+    // every receipt agrees: the same signed receipt on both sides, one for each slice in order, and the same hash
+    let (made, taken) = (r.hashtaker["receipts"].as_array().unwrap(), r.hashmaker["receipts"].as_array().unwrap());
+    assert_eq!(taken.len() as u64, paid, "{}", r.hashmaker);
+    assert_eq!(made, taken, "the hashmaker holds each receipt the hashtaker signed for its payments");
+    for (i, rc) in taken.iter().enumerate() {
+        assert_eq!((rc["rental"].as_str(), rc["slice"].as_u64()), (Some("rental-1"), Some(i as u64 + 1)), "{rc}");
+    }
+    assert_eq!(trust::receipts_hash(made, paid), trust::receipts_hash(taken, paid));
+    // no work unproven: both sides counted the same proven work, and the gateway took at least that
+    assert_eq!(r.hashmaker["meter"]["work"], r.hashtaker["meter"]["work"], "{} / {}", r.hashmaker, r.hashtaker);
+    assert_eq!(r.hashmaker["meter"]["proven"], r.hashtaker["meter"]["proven"]);
     let work = w(&r.hashmaker["meter"]["work"]);
-    let p = paid as u128;
-    assert!(work + s >= p * s && work < (p + 1) * s, "{paid} slices paid for {work} work at {s} a slice");
+    assert!(work > 0);
     assert!(w(&r.pool["work"]) >= work, "the pool saw at least the work both meters counted");
+    // paid ahead, slice by slice: each payment within the rule at the work its receipt says was proven then
+    let msat = |work: u128| work * price as u128 / s;
+    for rc in taken {
+        let (k, proven) = (rc["slice"].as_u64().unwrap() as u128, w(&rc["work"]));
+        let ahead = msat((k * s).saturating_sub(proven));
+        assert!(ahead <= most_paid_ahead_msat(proven, sw, &t), "slice {k} paid {ahead} msat ahead of {proven} proven: {rc}");
+    }
+    // and at the end
+    let covered = order::paid_work(paid, t.start_slices, s);
+    assert!(msat(covered.saturating_sub(work)) <= most_paid_ahead_msat(work, sw, &t), "{paid} slices paid for {work} work at {s} a slice");
+    // nothing unpaid: the work never passed what was paid
+    assert!(work <= covered, "{work} work, {paid} slices of {s} paid: {}", r.hashmaker);
+    assert_eq!(r.hashmaker["stopped"]["unpaidWork"], "0", "{}", r.hashmaker);
     if wallet {
         let pays: Vec<_> = r.wallet_calls.iter().filter(|c| c["method"] == "xbt402_pay").collect();
         assert_eq!(pays.len() as u64, paid, "one paid call per slice");
