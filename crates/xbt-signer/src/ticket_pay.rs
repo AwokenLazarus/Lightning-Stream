@@ -352,6 +352,9 @@ fn answer_closed_refusal(hs: &HttpSession) -> Value {
          json!({"session": hs.sid}))
 }
 
+/// Why a session the seller has forgotten was stopped ([`Signer::ticket_forgotten`]).
+const FORGOTTEN_WHY: &str = "the seller has forgotten the session";
+
 fn stopping_refusal() -> Value {
     refusal("ticket_session", "the session is being stopped: no ticket is released")
 }
@@ -3354,15 +3357,16 @@ impl Signer {
         if status != 402 || protocol_code(v.get("error")) != "session_unknown" {
             return None;
         }
-        let why = "the seller has forgotten the session";
+        let why = FORGOTTEN_WHY;
         let first = {
             let mut m = lock_money(hs);
             let first = m.fault.is_none();
             m.fault.get_or_insert_with(|| why.to_string());
             first
         };
-        // the session ends for this alone only if nothing was wrong with it before
-        if first {
+        // the session ends for this alone only if nothing was wrong with it before, and no stop of another (the caller's
+        // own, a budget's) had begun: a resume is never made again past a stop someone asked for
+        if first && !hs.ending.load(Ordering::SeqCst) {
             hs.forgotten.store(true, Ordering::SeqCst);
         }
         self.ticket_http_stop(hs, why, Duration::ZERO);
@@ -4644,6 +4648,9 @@ impl Signer {
     /// From the moment it begins nothing more is released; what it comes to is in the session's status if it takes longer.
     fn ticket_stop_inside(&self, hs: &Arc<HttpSession>, why: &str) -> Value {
         hs.ending.store(true, Ordering::SeqCst);
+        if why != FORGOTTEN_WHY {
+            hs.forgotten.store(false, Ordering::SeqCst);
+        }
         let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else { return self.ticket_http_stop(hs, why, Duration::ZERO) };
         let (h, w) = (hs.clone(), why.to_string());
         crate::ticket_rail::within(Instant::now() + STOP_INSIDE_WAIT, move || me.ticket_http_stop(&h, &w, Duration::ZERO))
@@ -5839,6 +5846,11 @@ impl Signer {
         // (a release, a lock, a prepaid ticket), however far a call had got (past every check of `ending`) when the stop came
         lock(&self.ticket_stopping).insert(hs.sid.clone());
         hs.ending.store(true, Ordering::SeqCst);
+        // a stop for any other reason than the seller's forgetting, even one that comes after it: a call refused by the
+        // session's end is not made again ([`HttpSession::forgotten`])
+        if why != FORGOTTEN_WHY {
+            hs.forgotten.store(false, Ordering::SeqCst);
+        }
         // a stop that may wait (the caller's own) waits for those last receipts, so that what the session leaves with
         // the seller below counts what the streams drew. Waited for here, holding nothing of the session or its slot
         // (the slot still names the session meanwhile, so that a new call to the seller is told to call again rather

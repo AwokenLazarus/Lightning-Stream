@@ -8144,6 +8144,60 @@ fn a_resume_whose_session_the_seller_forgot_is_made_again_in_another_session() {
     r.assert_booked();
 }
 
+/// The caller stops the session while its resume waits for the session's lock, and the seller then answers that lock
+/// `session_unknown`: the resume is refused, and not made again in another session. A stop someone asked for is never
+/// gone past by the second try.
+///
+/// FAILS with the forgotten session's flag set whatever stop had begun: the resume is made again, in a new session,
+/// after the caller stopped the old one.
+#[test]
+fn a_resume_whose_session_the_caller_stopped_is_not_made_again_when_the_seller_says_it_forgot_it() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"tickets": {"offers": false}}), 30, shipped_shop());
+    // the pool is never filled again (the seller busy): the session holds nothing once the first lock's tickets are used
+    let busy = Arc::new(AtomicBool::new(true));
+    let (arrived, stopped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (b, a, s) = (busy.clone(), arrived.clone(), stopped.clone());
+    r.tap.set(Box::new(move |seen, _real| {
+        if !(seen.path.ends_with("/lock") && seen.body.contains("\"session\"")) {
+            return None;
+        }
+        if b.load(Ordering::SeqCst) {
+            return Some(Ok(answer(503, vec![], json!({"error": "busy"}).to_string().into_bytes())));
+        }
+        // the resume's lock: held until the caller has stopped the session, then answered as by a seller that forgot it
+        a.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        while !s.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Some(Ok(answer(402, vec![], json!({"error": "session_unknown"}).to_string().into_bytes())))
+    }));
+    let n = 10 * MIB;
+    let part = r.pay(&format!("/files/{n}"), 2_000);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    let used = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((used["complete"].as_bool(), used["session"].as_str()), (Some(true), Some(sid.as_str())), "{used}");
+    assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "{}", r.status());
+    busy.store(false, Ordering::SeqCst);
+    let on = std::thread::scope(|sc| {
+        let call = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                                          "range": format!("bytes={got}-"), "if_range": part["etag"]})));
+        wait_for("the resume's lock to reach the seller", || arrived.load(Ordering::SeqCst));
+        let st = r.call("ticket_stop", json!({"session": sid}));
+        stopped.store(true, Ordering::SeqCst);
+        assert_eq!(st["verdict"].as_str(), Some("allow"), "{st}");
+        call.join().unwrap()
+    });
+    r.tap.clear();
+    assert!(r.audit("ticket_session_again").is_empty(), "made again past the caller's stop: {on}");
+    assert_ne!(on["status"].as_u64(), Some(206), "served in another session after the caller stopped this one: {on}");
+    assert!(on["session"].as_str().is_none_or(|s| s == sid), "{on}");
+    r.assert_booked();
+}
+
 /// A resume that meets a session ended for no lapse of the seller's memory (here a ticket of it stranded on none of the
 /// node's channels; as much for a receipt that does not hold or a charge above what arrived) is not made again in
 /// another session: the call is refused, and says why. The next call, the agent's own, opens another.
