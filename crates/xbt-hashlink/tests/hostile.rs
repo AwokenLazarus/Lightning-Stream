@@ -534,8 +534,9 @@ fn a_resume_loop_under_the_limit_ends_unpaid_with_the_bargain_kept() {
 fn a_resume_loop_past_the_limit_ends_on_it_with_the_bargain_kept() {
     let _s = serial();
     let sw = share_work(DIFF);
-    // ten slices of 2000 shares each: far more than the miner sends here
-    let terms = Terms { slice_work: 2000 * sw, price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
+    // ten slices of 2000 shares each: far more than the miner sends here. 50 sat each, so the ten paid up front are
+    // 500 sat, inside the renter's 546 sat step
+    let terms = Terms { slice_work: 2000 * sw, price_msat: 50_000, grace_ms: 5_000, start_slices: 0 };
     let a = app(&terms);
     let bk = noise::fresh_key();
     let (b, _) = connect(&a.link, bk, a.hpub, "limit", hello("limit", &terms));

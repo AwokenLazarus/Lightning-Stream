@@ -99,7 +99,9 @@ fn fake_wallet(dir: &std::path::Path, slices: String, calls: Arc<Mutex<Vec<Value
                     let mut out = String::new();
                     s.read_to_string(&mut out).unwrap();
                     let status: u64 = out.split_whitespace().nth(1).unwrap().parse().unwrap();
-                    json!({"verdict": "allow", "rail": "ticket", "status": status, "session": "s1", "charged_sats": if status == 200 { 5 } else { 0 }})
+                    json!({"verdict": "allow", "rail": "ticket", "status": status, "session": "s1",
+                           "charged_sats": if status == 200 { terms().price_msat / 1000 } else { 0 },
+                           "price_msat": if status == 200 { terms().price_msat } else { 0 }.to_string()})
                 }
                 _ => json!({"ok": true}),
             };
@@ -271,7 +273,9 @@ fn w(v: &Value) -> u128 {
 
 /// Is another slice due by the renter's rule, at this count, with shares of this size?
 fn due(terms: &Terms, proven: u128, largest_share: u128, paid: u64) -> bool {
-    order::Standing { proven, largest_share, paid, start_slices: terms.start_slices, slice_work: terms.slice_work, price_msat: terms.price_msat, msat_a_second: 0.0, buy_secs: 0.0 }.pay_next()
+    order::Standing { proven, largest_share, paid, start_slices: terms.start_slices, slice_work: terms.slice_work, price_msat: terms.price_msat,
+                      // the step without its 30 s cap: the renter's rate isn't in its receipts, and the cap only lowers it
+                      msat_a_second: f64::INFINITY, buy_secs: 0.0 }.pay_next()
 }
 
 /// Every payment was due by the hashtaker's rule when it was made: each receipt says its proven count
@@ -965,7 +969,9 @@ fn ticket_wallet(dir: &std::path::Path, slices: String, book: Arc<Mutex<Book>>) 
                         b.credit_msat -= price;
                         b.charged_msat += price;
                     }
-                    json!({"verdict": "allow", "rail": "ticket", "status": status, "session": "s1", "charged_sats": if status == 200 { price / 1000 } else { 0 }})
+                    let credit = book.lock().unwrap().credit_msat;
+                    json!({"verdict": "allow", "rail": "ticket", "status": status, "session": "s1", "charged_sats": if status == 200 { price / 1000 } else { 0 },
+                           "price_msat": if status == 200 { price } else { 0 }.to_string(), "balance_msat": credit.to_string()})
                 }
                 _ => json!({"ok": true}),
             };
@@ -1082,10 +1088,10 @@ fn a_trial_slice_from_no_credit_is_paid_and_a_rental_after_it_pays_every_slice()
     assert!(b.bought_msat <= (1 + 12) * terms().price_msat, "no ticket past the budgets, however far a whole one would have gone: {b:?}");
 }
 
-/// A rental of twelve slices, 60 sat in all, from a buyer with no credit at the shop and no trial
-/// before it: its first ticket is the first step inside its budget, far under the shop's own 900 sat,
-/// and every slice is paid, each charged its price, until the budget is spent, with nothing left at
-/// the shop. What leaves for tickets never passes the budget.
+/// A rental of twelve slices, 3,600 sat in all, from a buyer with no credit at the shop and no trial
+/// before it: its first ticket is the first step (546 sat), inside its budget, and every slice is paid,
+/// each charged its price, until the budget is spent, with nothing left at the shop. What leaves for
+/// tickets never passes the budget.
 #[test]
 fn a_small_rental_from_no_credit_buys_one_ticket_and_pays_every_slice() {
     let _serial = serial();
@@ -1102,6 +1108,7 @@ fn a_small_rental_from_no_credit_buys_one_ticket_and_pays_every_slice() {
     let maker_paid = reports.first().and_then(|r| r["paid"].as_u64());
     // what the wallet was charged = what the hashmaker counted paid = 12 × price = the budget
     assert_eq!((b.charged_msat, maker_paid), (budget_sats * 1000, Some(12)), "{b:?} {reports:?}");
-    assert_eq!(b.first_msat, budget_sats * 1000, "the first step, inside what the budget has: {b:?}");
+    let first_step = order::FIRST_STEP_MSAT.max(price_msat).min(budget_sats * 1000);
+    assert_eq!(b.first_msat, first_step, "the first step, inside what the budget has: {b:?}");
     assert_eq!((b.bought_msat, b.credit_msat), (budget_sats * 1000, 0), "tickets came to the budget, and none past it: {b:?}");
 }

@@ -292,7 +292,12 @@ mod tests {
     /// A buy slower than the step and the 10 s wait together: said in words.
     #[test]
     fn a_route_too_slow_for_the_miner_is_said_in_words() {
-        let (_, _, slow, _) = timeline(1_000_000, 20.0, 1, 120);
-        assert!(slow, "a 20 s buy against a 5.46 s step and a 10 s wait");
+        // 1,000 sat a slice, 100 sat a second, 200 sat delivered: the 546 sat step lasts 5.46 s. (On the timeline the first
+        // 20 s buy stalls the rental before any rate is measured, so the rule is checked on these numbers.)
+        let s = Standing { proven: 200, largest_share: 100, paid: 1, start_slices: 0, slice_work: 1000, price_msat: 1_000_000,
+                           msat_a_second: 100_000.0, buy_secs: 20.0 };
+        assert!(s.too_slow(), "a 20 s buy against a 5.46 s step and a 10 s wait");
+        assert!(!Standing { buy_secs: 15.0, ..s }.too_slow(), "a 15 s buy: the step and the wait cover it");
+        assert!(!Standing { msat_a_second: 0.0, ..s }.too_slow(), "no rate measured yet: nothing said");
     }
 }

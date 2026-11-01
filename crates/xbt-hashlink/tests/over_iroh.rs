@@ -229,7 +229,9 @@ fn check_counts_agree(r: &Value, b: &Value) {
 
 /// Is another slice due by the renter's rule, at this count, with shares of this size?
 fn due(terms: &Terms, proven: u128, largest_share: u128, paid: u64) -> bool {
-    order::Standing { proven, largest_share, paid, start_slices: terms.start_slices, slice_work: terms.slice_work, price_msat: terms.price_msat, msat_a_second: 0.0, buy_secs: 0.0 }.pay_next()
+    order::Standing { proven, largest_share, paid, start_slices: terms.start_slices, slice_work: terms.slice_work, price_msat: terms.price_msat,
+                      // the step without its 30 s cap: the renter's rate isn't in its receipts, and the cap only lowers it
+                      msat_a_second: f64::INFINITY, buy_secs: 0.0 }.pay_next()
 }
 
 /// Every slice paid once and when the rule said. The hashtaker's count is the hashmaker's but for shares on
