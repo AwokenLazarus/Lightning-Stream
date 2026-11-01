@@ -8052,6 +8052,42 @@ fn after_an_outage_that_fills_the_sellers_places_the_resume_goes_on_from_that_by
     assert_eq!(r.money(), (4 * TICKET, 4 * TICKET, 4 * TICKET, 4 * SETTLED));
 }
 
+/// The call that ended in the outage ended for another reason (a payment that failed), and it is the resume that the
+/// seller refuses `too_many_tickets`, before anything of it was sent or paid: the session is stopped, its unreleased
+/// tickets asked to be cancelled, and the resume is made again, once, in another session: a 206 of exactly the rest.
+///
+/// FAILS without the second try: the resume is refused, and only the call after it goes on.
+#[test]
+fn a_resume_refused_at_the_sellers_cap_is_made_again_in_another_session() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    let n = 10 * MIB;
+    // while the first part is read, and after it, every lock but the first is refused as the outage left them: the
+    // session's one ticket pays for the 5 MiB the call allows, and no other is held when the resume comes
+    let locks = Arc::new(AtomicUsize::new(0));
+    let seen_locks = locks.clone();
+    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/lock") && seen_locks.fetch_add(1, Ordering::SeqCst) >= 1)
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    let part = r.pay(&format!("/files/{n}"), 1_000);
+    let got = part["bytes"].as_u64().unwrap() as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    // the refills behind it were refused too; from here the seller refuses the session's next lock once more, then
+    // takes the locks of a new session
+    wait_for("the refill refused", || locks.load(Ordering::SeqCst) >= 2);
+    let refused_from = locks.load(Ordering::SeqCst);
+    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/lock") && locks.fetch_add(1, Ordering::SeqCst) == refused_from)
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                         "if_range": part["etag"]}));
+    r.tap.clear();
+    assert_eq!(r.audit("ticket_cap_full_again").len(), 1, "the resume was refused at the cap and made again: {on}");
+    assert_eq!(on["session_stopped"]["session"].as_str(), Some(sid.as_str()), "{on}");
+    assert_ne!(on["session"].as_str(), Some(sid.as_str()), "made again in another session: {on}");
+    assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
+    r.assert_booked();
+}
+
 /// A seller's gateway forgets a session that holds nothing and has been quiet for its `idle_secs`
 /// (300 s as shipped): a wallet whose node was away for that long comes back to a session only it
 /// remembers. The seller's `session_unknown` ends the session in the wallet too, and the next

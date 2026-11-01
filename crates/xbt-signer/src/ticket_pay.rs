@@ -2941,6 +2941,12 @@ impl Signer {
     /// Pay one request with tickets: read the entry, find or open the session with this seller,
     /// send the request.
     fn ticket_pay(&self, c: &Call, acc: &Value, prepaid_acc: Option<&Value>, lightning: &str) -> Tried {
+        self.ticket_pay_in(c, acc, prepaid_acc, lightning, true)
+    }
+
+    /// [`Signer::ticket_pay`]. `again`: a call refused at its lock because the seller's places for the session are
+    /// taken, with nothing sent or paid for it, is made once more in another session ([`Signer::ticket_cap_full`]).
+    fn ticket_pay_in(&self, c: &Call, acc: &Value, prepaid_acc: Option<&Value>, lightning: &str, again: bool) -> Tried {
         let terms = match PayTerms::parse(acc, lightning) {
             Ok(t) => t,
             Err((rule, why)) => return Tried::Next(format!("{rule}: {why}")),
@@ -3131,8 +3137,28 @@ impl Signer {
             let _call = hs.calls.read().unwrap_or_else(|p| p.into_inner());
             self.ticket_request(&hs, c, &terms)
         };
-        if hs.cap_full.load(Ordering::SeqCst) {
+        // only where the cap is what ended or refused this call: one that was served all the same (on credit taken over,
+        // say) goes on in its session, and the pool's next round asks again
+        let by_the_cap = ["ended", "reason"].iter().any(|k| out.get(*k).and_then(Value::as_str).is_some_and(|s| s.contains("too_many_tickets")));
+        if hs.cap_full.swap(false, Ordering::SeqCst) && by_the_cap {
+            hs.cap_full.store(true, Ordering::SeqCst);
             if let Some(stopped) = self.ticket_cap_full(&hs) {
+                // the call itself was refused before anything of it went to the seller or was paid (a resume, say, after the
+                // call that ended in the outage): it is made again, once, in the session the next call would open
+                let nothing = out.get("verdict").and_then(Value::as_str) != Some("allow") && out.get("status").is_none_or(Value::is_null)
+                    && py_int(out.get("charged_sats")).unwrap_or(0) == 0 && out.get("bytes").is_none_or(|b| b.is_null() || b.as_u64() == Some(0));
+                if again && nothing {
+                    self.ticket_audit("ticket_cap_full_again", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee)}));
+                    return match self.ticket_pay_in(c, acc, prepaid_acc, lightning, false) {
+                        Tried::Done(mut v) => {
+                            if v.is_object() {
+                                v["session_stopped"] = stopped;
+                            }
+                            Tried::Done(v)
+                        }
+                        next => next,
+                    };
+                }
                 if out.is_object() {
                     out["session_stopped"] = stopped;
                 }
