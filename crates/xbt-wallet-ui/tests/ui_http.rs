@@ -4070,7 +4070,7 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     // the page shows what was saved, and no longer asks to set it up
     let p = br.get("/hashrate");
     assert!(p.body.contains("name=\"mode\" value=\"pool-key\" checked") && p.body.contains(ADDR), "{}", p.body);
-    assert!(!p.body.contains("Set up your gateway") && p.body.contains("Your gateway isn&#39;t running"), "{}", p.body);
+    assert!(!p.body.contains("Set up your gateway") && p.body.contains("Your gateway isn't running"), "{}", p.body);
     // no secret of the box's in it: not the renter's token, not the UI's password
     let text = std::fs::read_to_string(&conf).unwrap();
     assert!(!text.contains(&"r".repeat(64)) && !text.contains("rpcpassword") && !text.contains("rpcuser"));
@@ -4084,7 +4084,7 @@ fn the_rent_page_shows_the_bundled_gateways_state() {
     type Answer = fn(&str, &str) -> Value;
     let cases: [(Answer, &str, bool, usize); 4] = [
         (|m, p| match (m, p) { ("GET", "/status") => bundled_status(false, None, false, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
-         "Your gateway isn&#39;t running", false, 0),
+         "Your gateway isn't running", false, 0),
         (|m, p| match (m, p) { ("GET", "/status") => bundled_status(true, Some(false), false, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
          "Your gateway is waiting for your node", false, 1),
         (|m, p| match (m, p) { ("GET", "/status") => bundled_status(true, Some(true), false, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
@@ -4167,7 +4167,7 @@ fn a_moved_install_is_told_and_can_switch_either_way() {
     });
     let mut br2 = logged_in(&bx2);
     let p = br2.get("/hashrate");
-    assert!(p.body.contains("Use the Stream Gateway (DATUM-compatible)") && p.body.contains("isn&#39;t masking its jobs"), "{}", p.body);
+    assert!(p.body.contains("Use the Stream Gateway (DATUM-compatible)") && p.body.contains("isn't masking its jobs"), "{}", p.body);
     let r = br2.act("/hashrate", "/hashrate", &[("action", "use-bundled")]);
     assert!(br2.flash_after(&r).contains("comes with this app"));
     assert!(seen2.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/datum" && b.contains("127.0.0.1:23339")));
@@ -4192,7 +4192,7 @@ fn without_the_bundled_gateway_renting_says_it_isnt_masking() {
     });
     let mut br = logged_in(&bx);
     let p = br.get("/hashrate");
-    assert!(p.body.contains("Your gateway isn&#39;t masking its jobs") && p.body.contains("doesn&#39;t include the Stream Gateway"), "{}", p.body);
+    assert!(p.body.contains("Your gateway isn't masking its jobs") && p.body.contains("doesn&#39;t include the Stream Gateway"), "{}", p.body);
     assert!(!p.body.contains("name=\"payout\""), "no settings for a gateway that isn't here");
     let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
     assert!(card[..card.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
