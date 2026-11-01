@@ -223,22 +223,9 @@ def main():
     run_service(init, IMG["init"])
     code = int(docker("wait", f"{P}-init").stdout.strip())
     rep = (docker("logs", f"{P}-init").stdout.strip().splitlines() or ["{}"])[-1]
-    emulated = False
-    if code != 0 and "unknown component datum" in rep:
-        # W5's xbt-init isn't in this tree yet: init without `datum`, and the component's work done here as the contract says
-        emulated = True
-        docker("rm", "-f", f"{P}-init", check_rc=False)
-        comps = ",".join(c for c in init["env"]["XBT_INIT_COMPONENTS"].split(",") if c != "datum")
-        run_service({**init, "env": {**init["env"], "XBT_INIT_COMPONENTS": comps}}, IMG["init"])
-        code = int(docker("wait", f"{P}-init").stdout.strip())
-        rep = (docker("logs", f"{P}-init").stdout.strip().splitlines() or ["{}"])[-1]
-        auth = init["env"]["XBT_INIT_NODE_RPC_AUTH"]
-        # the cookie goes in on stdin, never on a command line
-        docker("run", "--rm", "-i", "--network", "none", "--mount", f"type=volume,src={VOL},dst=/v,volume-nocopy=true", PROBE, "sh", "-c",
-               f"mkdir -p /v/datum/submitblocks /v/run/datum && chown -R {UID_DATUM}:{UID_DATUM} /v/datum && chmod 700 /v/datum /v/datum/submitblocks "
-               f"&& chown {UID_UI}:{UID_DATUM} /v/run/datum && chmod 750 /v/run/datum && umask 077 && cat > /v/run/datum/rpc.cookie "
-               f"&& chown {UID_DATUM}:{UID_DATUM} /v/run/datum/rpc.cookie && chmod 600 /v/run/datum/rpc.cookie", input=auth)
-    FACTS["init_datum_component"] = "emulated (W5's xbt-init not in this tree)" if emulated else "xbt-init"
+    # the package's own init makes the datum component's files: never emulated here, so the test covers the package as
+    # it ships (an init that doesn't know `datum` fails the check below)
+    FACTS["init_datum_component"] = "xbt-init"
     ls = vol("stat -c '%u:%g %a %n' /v/datum /v/datum/submitblocks /v/run/datum /v/run/datum/rpc.cookie; "
              "wc -c < /v/run/datum/rpc.cookie; tail -c1 /v/run/datum/rpc.cookie | od -An -c").stdout.split("\n")
     auth = init["env"]["XBT_INIT_NODE_RPC_AUTH"]

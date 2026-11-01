@@ -18,9 +18,9 @@ What the test changes in the app, and only that (the overlay this writes, OUT/ov
     is the compose's;
   * the renter's run/signer: the lab wallet's socket folder in place of the app's (the signer is the lab's);
   * the network: this run's, as umbrelOS's.
-Without UMB_INIT_IMAGE (an xbt-init that knows the `datum` component), the files init would make are laid
-out here, as W5's contract says (run/datum 0750 10005:10021, rpc.cookie 0600 10021, datum/ 0700 10021); with
-it, the compose's own init makes them and that is checked. The config the Hashrate page writes is written
+The compose's own init (UMB_INIT_IMAGE: this tree's xbt-init, which knows the `datum` component) makes the
+gateway's files, and that is checked; without it the test fails rather than lay them out itself, so it covers
+the compose as shipped. The config the Hashrate page writes is written
 here (solo, to a regtest address of the node's wallet).
 
 Checks (OUT/umbrel_datum_regtest.json):
@@ -254,19 +254,15 @@ def main() -> int:
         os.chmod(RUN, 0o711)
         os.chmod(d.SOCK, 0o666)
 
-        # --- init: the compose's own (an xbt-init with the datum component), or its files laid out here
+        # --- init: the compose's own, an xbt-init with the datum component (never laid out here: the test covers the
+        # compose as shipped)
         os.makedirs(f"{DATA}/data/run/hashrate", exist_ok=True)
-        if INIT_IMAGE:
-            compose(gw, "up", "--no-deps", "init")
-            st = layout(True)
-        else:
-            REPORT.setdefault("skipped", []).append({"check": "init: the datum component", "missing": "an xbt-init that knows `datum` (UMB_INIT_IMAGE)"})
-            print("SKIP  init's datum component: laid out here as W5's contract says", flush=True)
-            root(f"mkdir -p /d/datum/submitblocks /d/run/datum /d/hashrate && chown {DATUM_UID}:{DATUM_UID} /d/datum /d/datum/submitblocks && chmod 0700 /d/datum /d/datum/submitblocks"
-                 f" && chown {UI_UID}:{DATUM_UID} /d/run/datum && chmod 0750 /d/run/datum"
-                 f" && printf '%s' 'umbrel:{PASS}' > /d/run/datum/rpc.cookie && chown {DATUM_UID}:{DATUM_UID} /d/run/datum/rpc.cookie && chmod 0600 /d/run/datum/rpc.cookie"
-                 f" && chown {HASHRATE_UID}:{HASHRATE_UID} /d/hashrate && chmod 0700 /d/hashrate && chown {UI_UID}:{HASHRATE_UID} /d/run/hashrate && chmod 0750 /d/run/hashrate")
-            st = layout(True)
+        if not INIT_IMAGE:
+            check("init: the compose's own init (UMB_INIT_IMAGE, an xbt-init that knows `datum`) is given", False,
+                  "no UMB_INIT_IMAGE: packaging/umbrel/test-umbrel-datum.sh builds it from this tree")
+            raise lab.LabError("no init image")
+        compose(gw, "up", "--no-deps", "init")
+        st = layout(True)
         token = secrets.token_hex(32)
         root(f"printf '%s' '{token}' > /d/run/hashrate/control-token && chown {UI_UID}:{HASHRATE_UID} /d/run/hashrate/control-token && chmod 0640 /d/run/hashrate/control-token")
         want = {f"/d/datum {DATUM_UID} {DATUM_UID} 700", f"/d/datum/submitblocks {DATUM_UID} {DATUM_UID} 700", f"/d/run/datum {UI_UID} {DATUM_UID} 750",

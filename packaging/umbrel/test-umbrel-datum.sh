@@ -10,8 +10,8 @@
 #   xbt-hashlink        container/Dockerfile's stage, on the static musl binary
 #   xbt-datum-gateway   container/Dockerfile's stage, on scripts/datum_gateway_build.sh's static gateway (its
 #                       unit tests run too) staged as oci_build.sh stages it; or UMB_DATUM_IMAGE, already loaded
-#   xbt-init            when this tree's xbt-init knows the `datum` component: then the compose's own init
-#                       makes the gateway's files; until then the driver lays them out per W5's contract
+#   xbt-init            this tree's, which knows the `datum` component: the compose's own init
+#                       makes the gateway's files (the driver never lays them out itself)
 # Needs P2P_HASH_GATEWAYS (default ~/xbt-rnd/hash-gateways: bitcoind, bitcoin-cli, stratum-grind), the lab
 # (run/lightning-fork-lab), python:3-alpine and debian:bookworm-slim. Ports P2P_HASH_PORT_BASE (19961) to +30.
 # Report: run/umbrel_datum_regtest.json, run/umbrel_datum_regtest.log, run/umbrel_datum_<service>.log.
@@ -61,8 +61,7 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 # the app's images, amd64, from this tree
 T=x86_64-unknown-linux-musl
 MUSL=${CARGO_TARGET_DIR:-$ROOT/target}/$T/release
-INIT=0
-grep -q '"datum"' crates/xbt-svc/src/lib.rs crates/xbt-svc/src/layout.rs 2>/dev/null && INIT=1
+INIT=1
 nice -n 19 cargo build -q -j4 --release --locked --target $T -p xbt-hashlink --bin xbt-hashlink -p xbt-svc --bin xbt-supervise
 [ $INIT = 1 ] && nice -n 19 cargo build -q -j4 --release --locked --target $T -p xbt-svc --bin xbt-init
 CTX=$ROOT/run/umbrel-datum-ctx
