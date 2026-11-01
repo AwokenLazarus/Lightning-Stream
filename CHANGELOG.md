@@ -297,6 +297,22 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Sell, Hashrate says this beside "Rent out my miners", and the box starts unticked for an owner who has never
   saved the form; one who has keeps their choice. A rental card says in plain words why the hashmaker ended it for
   these two reasons.
+- Rent sent twice (a double click, or the browser sending the form again) starts one rental and pays one start
+  fee. Before, each send started a rental of its own, with its own start fee.
+- An offer's delivery records say what they are: how many, from how many keys, and that anyone can publish
+  them. No score is made of them and none is called confirmed. Before, the offer led with "TH-hours confirmed by
+  both sides", which one person with two keys could fill at no cost.
+- Records about other hashmakers no longer hide a hashmaker's own. Before, 500 records about anyone, free to
+  publish, pushed every other record out of view.
+- A hashmaker's published summary carries counts and totals only: rentals, slices and sats paid, and work. Before,
+  it listed each renter's app key and the hour each rental ended, without the renter's say. It now goes out at
+  most every six hours, dated to the hour; the rental-by-rental list stays on the hashmaker's box.
+- A rental's time runs from the first share your gateway accepts, so the seconds spent connecting and moving the
+  miners, or a gateway slow to answer, no longer come out of it.
+- Mining solo, each offer says one machine's chance of finding a block in an hour, from your own node's
+  difficulty, and how often a block comes at that speed on average. Through a pool it says nothing.
+- A hashmaker's listing more than two days old is no longer offered: it is from a hashmaker that has stopped
+  publishing. Listings now carry an expiry other Nostr clients read too.
 
 **The app**
 - A visit to a shop reached by its key is headed by the shop's name, and pages show such a shop by

@@ -203,6 +203,9 @@ struct St {
     /// Each job key hash seen, with the previous block its job was on.
     keys_seen: Vec<(String, String)>,
     first_proven: Option<Instant>,
+    /// When the gateway first accepted a share (and the time to report it): the rental's time runs from here,
+    /// so the seconds spent connecting and moving the miners are not taken from it.
+    first_accepted: Option<(Instant, u64)>,
     /// The hashmaker said a share waits for payment, how many times, and its last count when it did.
     dues: u64,
     last_due: Option<(u128, u64)>,
@@ -392,6 +395,7 @@ impl St {
             "lastRate": self.rate, "closed": self.closed, "payFailed": self.pay_failed, "events": self.events,
             "resentCounted": self.resent_counted, "resendsRefused": self.guard.resends_refused, "comebacks": self.guard.comebacks.len(), "jobsShownBlinded": self.jobs_shown_blinded, "blinding": self.blinding,
             "keysSeen": self.keys_seen.iter().map(|(k, p)| json!({"keyHash": k, "prevblock": p})).collect::<Vec<_>>(),
+            "firstAcceptedMs": self.first_accepted.map(|(_, ms)| ms),
             "dues": self.dues, "lastDue": self.last_due.map(|(w, p)| json!({"work": w.to_string(), "paid": p})),
             "paidSlices": self.paid_slices(), "spentMsat": self.paid_slices() * self.terms.price_msat,
             "miners": self.upstreams.len(), "budgetMsat": self.budget_msat,
@@ -474,6 +478,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
         blinding: None,
         keys_seen: Vec::new(),
         first_proven: None,
+        first_accepted: None,
         dues: 0,
         last_due: None,
         in_flight: 0,
@@ -545,7 +550,6 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
         let tx = tx.clone();
         let report = cfg.report.clone();
         let (idle, duration, cut, live) = (cfg.idle, cfg.duration, cfg.cut.clone(), cfg.live.clone());
-        let t0 = Instant::now();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(500));
             let mut g = lock(&st);
@@ -569,7 +573,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 Some("the first slice could not be paid")
             } else if g.last_work.elapsed() > idle {
                 Some("no proven work")
-            } else if duration.is_some_and(|d| t0.elapsed() > d) {
+            } else if time_over(g.first_accepted.map(|(t, _)| t), duration) {
                 Some("rental time over")
             } else {
                 None
@@ -933,6 +937,11 @@ fn drop_minimum_difficulty(v: &mut Value) {
     }
 }
 
+/// Is a rental's time up? It runs from the first share its gateway accepted: none yet, none of it used.
+fn time_over(first_accepted: Option<Instant>, duration: Option<Duration>) -> bool {
+    matches!((first_accepted, duration), (Some(t), Some(d)) if t.elapsed() > d)
+}
+
 fn lock(st: &Mutex<St>) -> std::sync::MutexGuard<'_, St> {
     st.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -1002,15 +1011,22 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender, check: Opti
                     Ok(_) => {
                         g.resent_counted += 1;
                         g.last_work = Instant::now();
+                        if g.first_accepted.is_none() {
+                            g.first_accepted = Some((Instant::now(), now_ms()));
+                        }
                     }
                     Err(_) => g.guard.resends_refused += 1,
                 }
             }
         }
-        if let Err(why) = g.meter.down(chan, &v) {
-            g.events.push(json!({"ev": "a line that can't be checked", "why": why, "atMs": now_ms()}));
-            g.end("a job this app can't check", &tx);
-            break;
+        match g.meter.down(chan, &v) {
+            Err(why) => {
+                g.events.push(json!({"ev": "a line that can't be checked", "why": why, "atMs": now_ms()}));
+                g.end("a job this app can't check", &tx);
+                break;
+            }
+            Ok(Some(crate::meter::Event::Accepted(_))) if g.first_accepted.is_none() => g.first_accepted = Some((Instant::now(), now_ms())),
+            Ok(_) => {}
         }
         // a new difficulty: the jobs were checked for shares of the old one's bits. Its shares wait for a job
         // checked at the new one, which a gateway sends with it
@@ -1051,6 +1067,16 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender, check: Opti
 #[cfg(test)]
 mod come_back_tests {
     use super::*;
+
+    #[test]
+    fn a_rentals_time_runs_from_its_first_accepted_share() {
+        let d = Some(Duration::from_secs(5));
+        assert!(!time_over(None, d), "no share accepted yet: none of its time used, however long it took to start");
+        assert!(!time_over(Some(Instant::now()), d));
+        assert!(!time_over(Instant::now().checked_sub(Duration::from_secs(4)), d));
+        assert!(time_over(Instant::now().checked_sub(Duration::from_secs(6)), d));
+        assert!(!time_over(Instant::now().checked_sub(Duration::from_secs(6)), None), "no time limit");
+    }
     use crate::rail::LabHashtaker;
     use std::net::TcpListener;
 
@@ -1087,6 +1113,7 @@ mod come_back_tests {
             blinding: None,
             keys_seen: Vec::new(),
             first_proven: None,
+            first_accepted: None,
             dues: 0,
             last_due: None,
             in_flight: 0,

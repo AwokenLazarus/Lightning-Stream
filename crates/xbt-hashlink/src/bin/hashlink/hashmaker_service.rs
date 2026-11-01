@@ -28,9 +28,9 @@
 //! Without `payNode`, the node is read from the hashmaker's gateway (`--gateway`, its `/services`).
 //!
 //! With relays and a Nostr key set, the hashmaker also publishes a signed summary of the rentals it
-//! served (by the same commitments the hashtakers' delivery records use, [`xbt_hashlink::trust`]),
-//! at most every ten minutes after a rental ends. It is kept in `hash-summary.json` beside the
-//! settings file, so it survives a restart.
+//! served: counts and totals only, no renter's key and no rental's time ([`xbt_hashlink::trust::Totals`]),
+//! at most every six hours, dated to the hour. The list behind it, rental by rental, stays on this box in
+//! `hash-summary.json` beside the settings file, so it survives a restart.
 //! A missing `--key` or `--nostr-key` file is made at the first start.
 
 use crate::http;
@@ -456,7 +456,8 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
 }
 
 /// The rentals this hashmaker served, kept in a file so its signed summary survives a restart, and
-/// published as that summary (at most every ten minutes, when a rental has ended since).
+/// published as that summary's totals (at most every six hours, when a rental has ended since: a summary
+/// published as each rental ends would date it).
 struct Served {
     file: Option<PathBuf>,
     rentals: std::collections::BTreeMap<String, trust::Served>,
@@ -465,7 +466,7 @@ struct Served {
 }
 
 impl Served {
-    const EVERY: Duration = Duration::from_secs(600);
+    const EVERY: Duration = Duration::from_secs(6 * 3600);
 
     fn load(file: Option<PathBuf>) -> Served {
         let rentals = file
@@ -489,6 +490,11 @@ impl Served {
                 }
             }
         }
+        self.publish(me, nostr_file, relays);
+    }
+
+    /// Publish the summary's totals, if a rental has ended since the last and it is time.
+    fn publish(&mut self, me: secp256k1::PublicKey, nostr_file: &str, relays: &str) {
         if !self.dirty || self.last.is_some_and(|t| t.elapsed() < Self::EVERY) {
             return;
         }
@@ -524,6 +530,14 @@ mod tests {
               link_public: None, iroh: None, pay_url: Some("https://box.example/hashrate".into()), pay_node: Some("02aa".into()), sized: true }
     }
     const S: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn a_listing_is_published_again_well_before_it_expires() {
+        // readers drop a listing two days old: one published every six hours at the least has eight chances
+        assert!(REPUBLISH_MAX * 8 <= Duration::from_secs(listing::MAX_AGE_S));
+        let same = said(1, 1, 4_000_000_000_000);
+        assert!(due(Some((&same, true)), &same, REPUBLISH_MAX), "nothing changed, and still published again");
+    }
 
     #[test]
     fn a_wobbling_hashrate_is_not_republished() {
@@ -674,4 +688,45 @@ mod tests {
         }
         assert_eq!(published, 1);
     }
+
+    /// What goes to the relays of the rentals served: counts and totals, with no renter's key, rental or time.
+    #[test]
+    fn the_published_summary_names_no_renter() {
+        let relay = xbt_nostr::standin::StandinRelay::start().unwrap();
+        let dir = std::env::temp_dir().join(format!("hashmaker-summary-{}", hex::encode(xbt_hashlink::noise::fresh_key().secret_bytes())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nostr = dir.join("nostr.key");
+        std::fs::write(&nostr, hex::encode(xbt_hashlink::noise::fresh_key().secret_bytes())).unwrap();
+        let me = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &xbt_hashlink::noise::fresh_key());
+        let renters: Vec<secp256k1::PublicKey> =
+            (0..3).map(|_| secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &xbt_hashlink::noise::fresh_key())).collect();
+        let mut served = Served::load(Some(dir.join("hash-summary.json")));
+        for (i, r) in renters.iter().enumerate() {
+            let s = trust::Served { commit: trust::commit(&format!("r{i}"), r, &me), hashtaker: *r, paid_slices: 2, paid_msat: 80_000, work: 2 << 47,
+                                    receipts_hash: format!("{i:064x}"), ended_at: 1_000_000 + i as u64 * 977 };
+            served.rentals.insert(s.commit.clone(), s);
+        }
+        served.dirty = true;
+        served.publish(me, nostr.to_str().unwrap(), &relay.url);
+        let evs = relay.events(trust::KIND);
+        assert_eq!(evs.len(), 1);
+        let all = serde_json::to_string(&evs[0].to_value()).unwrap();
+        for r in served.rentals.values() {
+            for leak in [hex::encode(r.hashtaker.serialize()), hex::encode(r.hashtaker.x_only_public_key().0.serialize()), r.commit.clone(), r.receipts_hash.clone(),
+                         r.ended_at.to_string()] {
+                assert!(!all.contains(&leak), "{leak} in {all}");
+            }
+        }
+        let content: Value = serde_json::from_str(&evs[0].content).unwrap();
+        assert_eq!((content["rentals"].as_u64(), content["paidSlices"].as_u64(), content["paidMsat"].as_u64()), (Some(3), Some(6), Some(240_000)), "{content}");
+        // not again before its time, whatever ends meanwhile
+        served.dirty = true;
+        served.publish(me, nostr.to_str().unwrap(), &relay.url);
+        assert_eq!(relay.events(trust::KIND).len(), 1);
+        // the box's own list keeps each rental
+        let kept = Served::load(Some(dir.join("hash-summary.json")));
+        assert_eq!(kept.rentals.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

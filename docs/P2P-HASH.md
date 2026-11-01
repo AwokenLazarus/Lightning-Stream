@@ -109,7 +109,9 @@ or `--config`, the service the app runs):
   - any other miner is sent `client.reconnect` to the app's own address and is placed by its
     worker name when it comes back.
 - **The listing says what is free** (`capacity`: miners, free miners, free hashrate) and is
-  published again when that changes.
+  published again when that changes, and every six hours at the least. A listing more than two days
+  old is not offered: its hashmaker has gone. The event says so to other clients too (NIP-40
+  `expiration`).
 - **The end of a rental.** Both sides let a channel's meter go at the same point: after the hashtaker's
   upstream session for it has ended and its last verdict was sent, the hashtaker says `shut`, and the
   hashmaker lets the channel go there too. This removed the case where the hashmaker counted one more
@@ -181,31 +183,31 @@ who saw that key on the link, can tell it is the hashtaker it served:
 
 It names no pool, payout address, user name, rental name or IP address.
 
-**A hashmaker's summary.** A hashmaker with relays and a Nostr key set publishes, at most every ten
-minutes after a rental ends, its own signed list of the rentals it served: kind 30078, `d` =
+**A hashmaker's summary.** A hashmaker with relays and a Nostr key set publishes, at most every six
+hours after a rental ends, its own signed totals of the rentals it served: kind 30078, `d` =
 `lightning-stream-hash-summary:<link key>`, `t` = `lightning-stream-hash-summary`, `p` = its link
-key (x-only), content at most 16 KiB with its newest 40 rentals (the commitment, the hashtaker's
-key, slices and millisatoshis paid, work, the receipts hash, the hour it ended). It is signed by the
-Nostr key the hashmaker's listing is bound to; a summary by any other key is ignored. The hashmaker
-keeps it in `hash-summary.json` beside its settings, so it survives a restart.
+key (x-only), content `{"v": 2, "hashmaker", "rentals", "paidSlices", "paidMsat", "work"}`, dated to the
+hour. It names no renter's key, no rental and no time a rental ran, so nobody can follow a renter from
+it. It is signed by the Nostr key the hashmaker's listing is bound to; a summary by any other key is
+ignored. The list behind it, rental by rental, stays on the hashmaker's box in `hash-summary.json` beside
+its settings, so it survives a restart.
 
-**What the offer shows.** Each offer on Services → Hashrate carries a delivery history built from
-the records and the summary on the app's relays: TH-hours confirmed by both sides, the records and
-how many the hashmaker confirmed, the speed delivered against the speed advertised (a weighted
-average), disputes, and the most recent rentals. A record is **confirmed** when the hashmaker's
-summary has the same commitment, hashtaker, slices paid and receipts hash; it is **disputed** when
-the summary has the rental but disagrees.
+**What the offer shows.** Each offer on Services → Hashrate carries the delivery records about its
+hashmaker on the app's relays: how many, and from how many keys, under the words "Anyone can publish
+these", and the newest, one for each key, each with its own speed delivered against advertised. It
+makes no score of them, and calls none confirmed. The app asks each relay for each hashmaker's records
+on their own (by the record's `p` tag), so records about other hashmakers, however many, can't push
+one hashmaker's out of a relay's answer.
 
-**What it does not prove.** Lightning payments are private, so nobody but the two sides can check
-that a payment happened. The history is made hard to fake rather than impossible to fake:
+**What it does not prove.** Nothing in a record is checked by the app. Lightning payments are private,
+so nobody but the two sides can check that a payment happened, and keys are free, so one person can
+write records under many keys and vouch for them as the hashmaker. What the app does:
 
 - a hashmaker's records about itself (its own link key, or its listing's Nostr key) are dropped;
-- a record the hashmaker did not confirm counts for 0.3 of one it did;
-- a record from a key with no record for any other hashmaker counts for half;
-- each key counts for at most its 3 most recent rentals with a hashmaker.
+- each key counts for at most its 3 most recent rentals with a hashmaker, and shows one line.
 
-A hashmaker can still make keys that rent from it and from others; the strongest evidence remains
-the hashtaker's own test slice.
+What a renter pays never depends on the records: steps are earned whatever they say. The evidence the
+app checks is the renter's own rentals, a test slice first.
 
 **Relays.** The relay at relay.lazarus-xbt.xyz accepts kind 30078 only in shapes it knows; these
 two shapes need its write policy updated (the change and its test are prepared with this work).

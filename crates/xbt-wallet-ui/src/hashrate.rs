@@ -789,6 +789,10 @@ impl App {
             b.push_str("</div>");
         }
 
+        // a solo renter's odds of a block come from its own node's difficulty, asked only when its jobs show solo
+        let solo = st["blinding"]["state"] == "blinded" && st["blinding"]["why"] == "solo";
+        let tip = if solo { self.mining_tip().ok() } else { None };
+
         // the offers: the main action
         b.push_str("<h2>Miners for rent</h2>");
         match call(&base, &token, "GET", "/offers", None) {
@@ -830,6 +834,7 @@ impl App {
                         ""
                     };
                     let history = history_panel(&x["history"]);
+                    let odds = solo_odds(&st["blinding"], tip.as_ref(), per_miner);
                     // what may leave the wallet for a trial's first ticket, as the hashtaker sets it (rail::caps_at),
                     // is said beside its price; a longer rental's tickets grow with its work, so it names no figure
                     let ticket = |k: &str| match x[k].as_u64() {
@@ -837,15 +842,15 @@ impl App {
                         None => "may buy a ticket from this shop".into(),
                     };
                     let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
-                        <input type=\"hidden\" name=\"key\" value=\"{}\"><p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
+                        <input type=\"hidden\" name=\"key\" value=\"{}\">{}<p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
                         about {}, and see what your own DATUM Gateway accepts before renting more. It is charged at most that, but your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
-                        esc(x["linkKey"].as_str().unwrap_or("")), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
+                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{old}{history}{allow}{trial}\
-                        <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
+                        <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
@@ -854,7 +859,7 @@ impl App {
                         <button{}>Rent</button></form></section>",
                         esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
-                        esc(x["linkKey"].as_str().unwrap_or("")), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
+                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
                         if can { "" } else { " disabled" }));
                 }
                 b.push_str("</div>");
@@ -895,21 +900,22 @@ impl App {
                 if n("budget") == 0 {
                     Err("Set the most this rental may cost.".into())
                 } else {
-                    call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1)})))
+                    call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1),
+                                                                     "once": g("once")})))
                         .and_then(|v| match v["rental"].as_str() {
                             Some(_) => Ok(format!("Renting. The miners start on your DATUM Gateway in a few seconds; you pay as their work is accepted.{}", may_buy(&v))),
                             None => Err(v["error"].as_str().map(|e| format!("Not rented: {e}.")).unwrap_or_else(|| "Not rented.".into())),
                         })
                 }
             }
-            "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true})))
+            "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true, "once": g("once")})))
                 .and_then(|v| match v["rental"].as_str() {
                     Some(_) => Ok(format!("Trying one slice, at most {}.{} When it is done, its result shows under Your rentals.", sats_n(num(&v["budgetSats"])), may_buy(&v))),
                     None => Err(v["error"].as_str().map(|e| format!("Not started: {e}.")).unwrap_or_else(|| "Not started.".into())),
                 }),
             "attest" => call(&base, &token, "POST", "/attest", Some(&json!({"rental": g("rental")})))
                 .and_then(|v| if v["ok"] == true {
-                    Ok("Published. Other hashtakers see this rental in the hashmaker's delivery history.".into())
+                    Ok("Published. Other hashtakers see this rental among the hashmaker's delivery records.".into())
                 } else {
                     Err(v["error"].as_str().map(|e| format!("Not published: {e}.")).unwrap_or_else(|| "Not published: no relay took it.".into()))
                 }),
@@ -998,6 +1004,30 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
              <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
+}
+
+/// The chance that `hs` hashes a second for `secs` find at least one block at `difficulty`: a block takes
+/// `difficulty × 2^32` hashes on average, and blocks come as a Poisson process.
+fn block_chance(hs: f64, secs: f64, difficulty: f64) -> f64 {
+    if hs <= 0.0 || secs <= 0.0 || difficulty <= 0.0 {
+        return 0.0;
+    }
+    -(-(hs * secs) / (difficulty * 4_294_967_296.0)).exp_m1()
+}
+
+/// A renter mining solo (its own gateway builds the blocks, as its jobs show) is told one machine's odds of a
+/// block in an hour, from its own node's difficulty. A pool shares its blocks out, so there it says nothing.
+fn solo_odds(blinding: &Value, tip: Option<&Tip>, hs: f64) -> String {
+    let (Some(tip), true) = (tip, blinding["state"] == "blinded" && blinding["why"] == "solo") else { return String::new() };
+    let p = block_chance(hs, 3600.0, tip.difficulty);
+    if p <= 0.0 {
+        return String::new();
+    }
+    let odds = if p >= 0.01 { format!("about {}", pct(p)) } else { format!("about 1 in {}", crate::html::group3((1.0 / p).round() as u64)) };
+    let days = tip.difficulty * 4_294_967_296.0 / hs / 86_400.0;
+    format!("<p class=\"small\">Mining solo, one machine's hour has {odds} chance of finding a block, by your node's difficulty now: at {} \
+             a block comes about every {} days on average, and most hours find none.</p>",
+            speed(hs), crate::html::group3(days.round() as u64))
 }
 
 /// A whole percentage.
@@ -1096,37 +1126,39 @@ fn result_box(r: &Value, trial: bool) -> String {
             speed(delivered), pct(r["staleShare"].as_f64().unwrap_or(0.0)), pct(r["rejectedShare"].as_f64().unwrap_or(0.0)))
 }
 
-/// A hashmaker's delivery history, as the offer shows it.
+/// A Rent form's mark: the renter's service starts one rental for it however many times the form is sent
+/// (a double click, the browser sending it again). Each form shown has a new one.
+fn once_input() -> String {
+    format!("<input type=\"hidden\" name=\"once\" value=\"{}\">", hex::encode(crate::random_bytes::<16>()))
+}
+
+/// A hashmaker's delivery records, as the offer shows them: counted, with the keys that signed them, and the
+/// newest one line per key, each saying its own figures. No score is made of them, since this app checks none
+/// of them: anyone can publish a record, under as many keys as they like, and a hashmaker can vouch for its own.
 fn history_panel(h: &Value) -> String {
     let records = h["records"].as_u64().unwrap_or(0);
     let says = &h["hashmakerSays"];
-    if records == 0 {
-        let own = if says.is_null() { String::new() } else {
-            format!(" The hashmaker says it served {} rental{} ({} TH-hours), but no hashtaker has published a record yet.",
-                    says["rentals"].as_u64().unwrap_or(0), if says["rentals"].as_u64() == Some(1) { "" } else { "s" }, th_hours(says["thHours"].as_f64().unwrap_or(0.0)))
-        };
-        return format!("<p class=\"small history\">No delivery history yet.{own} Try one slice first to see for yourself.</p>");
-    }
-    let confirmed = h["confirmed"].as_u64().unwrap_or(0);
-    let vs = h["deliveredVsAdvertised"].as_f64().map(|x| format!(" · delivered about {} of what it advertised", pct(x))).unwrap_or_default();
-    let disputed = match h["disputed"].as_u64().unwrap_or(0) {
-        0 => String::new(),
-        n => format!(" · <strong>{n} disputed</strong> (the hashtaker and the hashmaker disagree on what was paid)"),
+    let own = if says.is_null() { String::new() } else {
+        format!(" The hashmaker's own list says it served {} rental{} ({} TH-hours).",
+                says["rentals"].as_u64().unwrap_or(0), if says["rentals"].as_u64() == Some(1) { "" } else { "s" }, th_hours(says["thHours"].as_f64().unwrap_or(0.0)))
     };
+    if records == 0 {
+        return format!("<p class=\"small history\">No delivery records yet.{own} Try one slice first to see for yourself.</p>");
+    }
+    let keys = h["keys"].as_u64().unwrap_or(0);
     let recent: Vec<String> = h["recent"]
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|r| format!("{}{} ({}{})", speed(num(&r["deliveredHs"])), if r["trial"] == true { " test slice" } else { "" },
-                                 pct(r["ratio"].as_f64().unwrap_or(0.0)), if r["confirmed"] == true { ", confirmed" } else { "" }))
+                .map(|r| format!("{}{} ({})", speed(num(&r["deliveredHs"])), if r["trial"] == true { " test slice" } else { "" }, pct(r["ratio"].as_f64().unwrap_or(0.0))))
                 .collect()
         })
         .unwrap_or_default();
-    format!("<details class=\"history\"><summary>Delivery history: {} TH-hours confirmed by both sides · {records} record{} ({confirmed} confirmed){vs}{disputed}</summary>\
-             <p class=\"small\">Recent: {}.</p><p class=\"hint\">Records are signed by the hashtakers who rented, and confirmed when the hashmaker's \
-             own signed summary agrees. Lightning payments are private, so this is a signal, not proof: records the hashmaker did not confirm, \
-             and records from keys that never rented elsewhere, count for less.</p></details>",
-            th_hours(h["verifiedThHours"].as_f64().unwrap_or(0.0)), if records == 1 { "" } else { "s" }, esc(&recent.join("; ")))
+    format!("<details class=\"history\"><summary>Delivery records: {records} from {keys} key{}. Anyone can publish these.</summary>\
+             <p class=\"small\">Newest, one for each key, delivered against advertised: {}.{own}</p><p class=\"hint\">Each record is signed by whoever \
+             published it, and this app checks none of them: one person can write records under many keys, and a hashmaker can vouch for its own. \
+             What you pay never depends on them: you pay as the work arrives. A test slice is checked by your own DATUM Gateway.</p></details>",
+            if keys == 1 { "" } else { "s" }, esc(&recent.join("; ")))
 }
 
 fn th_hours(x: f64) -> String {
@@ -1168,19 +1200,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_solo_renter_is_told_its_odds_of_a_block_from_its_own_nodes_difficulty() {
+        // 4 TH/s at difficulty 6.33e9: a block every 78.7 days on average
+        let tip = Tip { difficulty: 6.33e9, subsidy_sats: 312_500_000, height: 1 };
+        let mean_days = tip.difficulty * 4_294_967_296.0 / 4e12 / 86_400.0;
+        assert!((mean_days - 78.7).abs() < 0.05, "{mean_days}");
+        let hour = block_chance(4e12, 3600.0, tip.difficulty);
+        assert!((hour - 5.296e-4).abs() < 1e-6, "{hour}");
+        assert!((block_chance(4e12, mean_days * 86_400.0, tip.difficulty) - (1.0 - (-1f64).exp())).abs() < 1e-9, "one mean's time: 63%");
+        assert_eq!(block_chance(0.0, 3600.0, tip.difficulty), 0.0);
+        let solo = json!({"state": "blinded", "why": "solo"});
+        let w = solo_odds(&solo, Some(&tip), 4e12);
+        assert!(w.contains("about 1 in 1,888 chance of finding a block") && w.contains("at 4.00 TH/s a block comes about every 79 days"), "{w}");
+        assert!(solo_odds(&solo, Some(&tip), 4e18).contains("about 100% chance"), "a huge machine");
+        // through a pool, or with jobs not shown solo, or with no difficulty from the node: nothing said
+        for b in [json!({"state": "blinded", "why": "pool-key"}), json!({"state": "blinded", "why": "abw"}), json!({"state": "not blinded", "why": "solo"}), Value::Null] {
+            assert_eq!(solo_odds(&b, Some(&tip), 4e12), "", "{b}");
+        }
+        assert_eq!(solo_odds(&solo, None, 4e12), "");
+    }
+
+    #[test]
     fn a_history_and_a_test_slice_read_plainly() {
-        assert!(history_panel(&json!({"records": 0})).contains("No delivery history yet"));
+        assert!(history_panel(&json!({"records": 0})).contains("No delivery records yet"));
         let says = history_panel(&json!({"records": 0, "hashmakerSays": {"rentals": 3, "thHours": 12.4}}));
-        assert!(says.contains("served 3 rentals (12 TH-hours)"), "{says}");
+        assert!(says.contains("own list says it served 3 rentals (12 TH-hours)"), "{says}");
         let h = history_panel(&json!({
-            "records": 4, "confirmed": 3, "disputed": 1, "verifiedThHours": 2.5, "deliveredVsAdvertised": 0.97,
-            "recent": [{"deliveredHs": "3900000000000", "ratio": 0.97, "confirmed": true, "trial": true}],
+            "records": 4, "keys": 2, "confirmed": 3, "disputed": 1, "verifiedThHours": 2.5, "deliveredVsAdvertised": 0.97,
+            "recent": [{"deliveredHs": "3900000000000", "ratio": 0.97, "trial": true}, {"deliveredHs": "2000000000000", "ratio": 0.5}],
         }));
-        assert!(h.contains("2.5 TH-hours confirmed by both sides"), "{h}");
-        assert!(h.contains("4 records (3 confirmed)"));
-        assert!(h.contains("delivered about 97% of what it advertised"));
-        assert!(h.contains("1 disputed"));
-        assert!(h.contains("3.90 TH/s test slice (97%, confirmed)"), "{h}");
+        let summary = &h[h.find("<summary>").unwrap()..h.find("</summary>").unwrap()];
+        assert_eq!(summary, "<summary>Delivery records: 4 from 2 keys. Anyone can publish these.", "the headline counts, and vouches for nothing");
+        // no score, and nothing says a record was checked or confirmed: each says its own figures
+        for claim in ["confirmed", "both sides", "verified", "trusted", "delivered about", "disputed"] {
+            assert!(!h.to_lowercase().contains(claim), "{claim}: {h}");
+        }
+        assert!(h.contains("3.90 TH/s test slice (97%); 2.00 TH/s (50%)"), "{h}");
+        assert!(h.contains("this app checks none of them") && h.contains("What you pay never depends on them"), "{h}");
         let r = result_box(&json!({"deliveredHs": 3_900_000_000_000u64, "advertisedHs": 4_000_000_000_000u64, "ratio": 0.975,
                                     "staleShare": 0.01, "rejectedShare": 0.02, "latencyMsP50": 110, "latencyMsP95": 300}), true);
         assert!(r.contains("What the test slice showed"), "{r}");
