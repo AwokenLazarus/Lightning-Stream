@@ -197,8 +197,9 @@ decoration only: it reads nothing and sends nothing. To stay out of the way:
 
 - it draws in a worker on an `OffscreenCanvas` where the browser has one, so the page's thread only
   forwards pointer positions; elsewhere it draws in the page with the same code;
-- 30 frames a second while the pointer moves, 6 at rest (sleeping between frames, not waking at
-  every display refresh), none while the tab is hidden or a video plays;
+- 30 frames a second while the pointer moves, 1.5 at rest (sleeping between frames, not waking at
+  every display refresh: a frame costs the compositor about 5 ms of CPU without a GPU, and at rest
+  the streams drift only a few pixels a second), none while the tab is hidden or a video plays;
 - half resolution (at most 0.75 backing pixels per CSS pixel; the glow hides it), the stream count
   scaled to the window, one still frame when the system asks for reduced motion;
 - no flash between pages: the streams' shape is a function of the clock, so every page shows the
@@ -220,6 +221,10 @@ river, averaged; 2026-10-26):
 | with the river (worker) | 3.25% (+1.68) | 7.23% (+4.28) |
 | with the river (in the page, the fallback) | 4.03% (+2.46) | 16.97% (+14.02) |
 | page thread busy, without / with (worker) | 0.04% / 0.04% | 0.45% / 0.66% |
+
+Those numbers are from 6 frames a second at rest. At 1.5 (2026-11-01, three runs of the look test
+on the labs) the river at rest adds 0.62, 1.35 and 0.81% of one core (with 0.85, 1.57 and 1.06%,
+without 0.23, 0.22 and 0.25%), down from 3.1-3.5% at 6.
 
 A frame of the river takes 0.14 ms on average and at most 0.9 ms, in the worker, never on the
 page's thread (the first frame of each page is drawn on the page's thread, once). A browser with a
