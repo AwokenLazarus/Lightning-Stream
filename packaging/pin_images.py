@@ -140,6 +140,18 @@ def _uses() -> list[tuple[str, str, str, set[str]]]:
     return out
 
 
+def _init_report(stdout: str) -> dict | None:
+    """xbt-init's report: the last line of its output, a JSON object with "ok"; None when there is none."""
+    import json
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        return v if isinstance(v, dict) and "ok" in v else None
+    return None
+
+
 def unknown_to_pins() -> list[str]:
     """Each pinned image against what its package asks of it: an init that doesn't know a component the package
     lists (xbt-init check says \"unknown component\"), a hashlink binary without a flag the package passes. Runs
@@ -153,17 +165,30 @@ def unknown_to_pins() -> list[str]:
         if kind == "init":
             r = _docker("run", "--rm", "--network", "none", "--tmpfs", "/x", ref, "check", "--data", "/x", "--components",
                         ",".join(sorted(wants)), check=False)
-            unknown = sorted(set(re.findall(r"unknown component ([a-z-]+)", r.stdout + r.stderr)))
+            # xbt-init check prints its report as JSON and exits 1 on any problem (an empty /x has many): the report
+            # is what's read. No report (a pull or run that failed) is a failure, never a pass
+            report = _init_report(r.stdout)
+            if report is None:
+                bad.append(f"{where}: {ref} could not be run to ask it (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+                continue
+            unknown = sorted({m for p in report.get("problems", []) for m in re.findall(r"unknown component ([a-z-]+)", str(p))})
             if unknown:
                 bad.append(f"{where}: {ref} doesn't know the component{'s' if len(unknown) > 1 else ''} {', '.join(unknown)}")
         else:
-            c = _docker("create", ref).stdout.strip()
+            made = _docker("create", ref, check=False)
+            c = made.stdout.strip()
+            if made.returncode != 0 or not c:
+                bad.append(f"{where}: {ref} could not be pulled or created (rc {made.returncode}): {made.stderr.strip()[-300:]}")
+                continue
             try:
                 with tempfile.TemporaryDirectory() as t:
-                    _docker("cp", f"{c}:/usr/bin/xbt-hashlink", f"{t}/xbt-hashlink")
-                    data = open(f"{t}/xbt-hashlink", "rb").read()
+                    got = _docker("cp", f"{c}:/usr/bin/xbt-hashlink", f"{t}/xbt-hashlink", check=False)
+                    data = open(f"{t}/xbt-hashlink", "rb").read() if got.returncode == 0 else b""
             finally:
                 _docker("rm", c, check=False)
+            if not data:
+                bad.append(f"{where}: {ref} has no /usr/bin/xbt-hashlink to read")
+                continue
             missing = sorted(f for f in wants if f.encode() not in data and f[2:].encode() not in data)
             if missing:
                 bad.append(f"{where}: {ref} doesn't take {', '.join(missing)}")
