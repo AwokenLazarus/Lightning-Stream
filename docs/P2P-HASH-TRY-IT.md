@@ -181,7 +181,9 @@ cookie file only the gateway reads; its config holds no secret), and listens on 
 [P2P-HASH.md](P2P-HASH.md#the-stream-gateway-that-comes-with-the-app).
 
 **Your own gateway instead.** *Use another gateway* takes a host:port. It has to open its jobs the way the
-Stream Gateway does (`GET /xbt/job` on its API); a stock DATUM gateway can't, and renting stays off with it.
+Stream Gateway does (`GET /xbt/job` on its API; give the API's host:port when it isn't the same host's port 7152);
+a stock DATUM gateway can't, and renting stays off with it. A choice made there holds until the installer is run again
+with another answer, which then wins (the page says so).
 Do not point rentals at a pool's public stratum port: you would be paying for work credited to whoever that
 port pays. On the command line: `--upstream host:port` and `--gateway-api host:port`.
 
