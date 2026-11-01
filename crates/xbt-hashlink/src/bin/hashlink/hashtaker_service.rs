@@ -73,6 +73,10 @@ struct R {
     upstream_flag: Option<String>,
     /// The gateway this install was moved from at the upgrade that brought the bundled one.
     moved_from: Option<String>,
+    /// The gateway chosen on the page that the installer's changed settings overrode.
+    installer_won: Option<String>,
+    /// The installer's answer this start was given (`--upstream`, `--bundled-gateway`), saved with a page's choice.
+    installer: Value,
     user: String,
     gateway_api: Option<String>,
     allow_unblinded: bool,
@@ -152,22 +156,74 @@ fn bundled_of(f: &HashMap<String, String>, candidates: &[String]) -> Option<Stri
     })
 }
 
-/// Which gateway to start with, from `renter.json` as saved and `--upstream`: `(datum, its API, moved from,
-/// renter.json to write)`. A gateway set before this app came with one (saved without `chosen`, or named by
-/// `--upstream` in an install's settings) is left for the bundled one, once: it can't open its jobs, and every
-/// rental to it would be refused. A gateway chosen on the page since then is kept.
-fn start_with(saved: Option<&Value>, upstream: &str, bundled: Option<&str>) -> (String, Option<String>, Option<String>, Option<Value>) {
+/// Where the renter starts: the gateway, its API, and what the page is told about how it got there.
+#[derive(Debug, Default, PartialEq)]
+struct Start {
+    datum: String,
+    api: Option<String>,
+    /// Moved to the bundled gateway from this one, at the upgrade that brought it.
+    moved_from: Option<String>,
+    /// The installer's settings changed since this gateway was chosen on the page, so theirs won.
+    installer_won: Option<String>,
+    /// `renter.json` to write, when it changes.
+    write: Option<Value>,
+}
+
+/// The installer's answer as this start was given it: `--upstream` and `--bundled-gateway`, as they were set.
+fn installer_of(f: &HashMap<String, String>) -> Value {
+    json!({"upstream": f.get("upstream").cloned().unwrap_or_default(), "bundledGateway": f.get("bundled-gateway").cloned().unwrap_or_default()})
+}
+
+/// Which gateway to start with, from `renter.json` as saved and the installer's answer (`--upstream`, the bundled gateway).
+///
+/// - A gateway chosen on the page (`chosen`) wins only while the installer's `--upstream` and `--bundled-gateway` are
+///   what they were when it was saved. If they changed, the installer's answer wins, and the page says so.
+/// - A gateway set before this app came with one (saved without `chosen`, or named by `--upstream`) is left for the
+///   bundled one, once: it can't open its jobs, and every rental to it would be refused. The page offers it back.
+fn start_with(saved: Option<&Value>, upstream: &str, bundled: Option<&str>, installer: &Value) -> Start {
     let s = |k: &str| saved.and_then(|v| v[k].as_str()).map(str::to_string).filter(|x| !x.is_empty());
-    let (datum, api, chosen, moved) = (s("datum"), s("api"), saved.is_some_and(|v| v["chosen"] == true), s("movedFrom"));
+    let chosen = saved.is_some_and(|v| v["chosen"] == true);
+    // a choice saved before the installer's answer was kept with it (none was released that way) counts as made under this one
+    let same_installer = saved.map(|v| &v["installer"]).filter(|i| !i.is_null()).is_none_or(|i| i == installer);
+    if chosen && same_installer {
+        return Start { datum: s("datum").unwrap_or_default(), api: s("api"), ..Start::default() };
+    }
+    let now = xbt_hashlink::now_ms();
+    if chosen {
+        // the installer's answer changed since: it wins over the page's choice, which is offered back
+        let was = s("datum").unwrap_or_default();
+        let mut st = start_with(None, upstream, bundled, installer);
+        st.installer_won = Some(was).filter(|w| !w.is_empty() && *w != st.datum);
+        let mut w = st.write.take().unwrap_or_else(|| json!({"datum": st.datum}));
+        w["installer"] = installer.clone();
+        if let Some(x) = &st.installer_won {
+            w["installerWon"] = json!(x);
+            w["installerWonAtMs"] = json!(now);
+        }
+        st.write = Some(w);
+        return st;
+    }
+    let (datum, api, moved, won) = (s("datum"), s("api"), s("movedFrom"), s("installerWon"));
     let set = datum.clone().or_else(|| Some(upstream.to_string()).filter(|u| !u.is_empty() && u != "auto"));
     match (set, bundled) {
-        (Some(d), Some(b)) if d != b && !chosen => {
-            let now = json!({"datum": b, "movedFrom": d, "movedAtMs": xbt_hashlink::now_ms()});
-            (b.to_string(), None, Some(d), Some(now))
-        }
-        _ if datum.is_some() => (datum.unwrap_or_default(), api, moved, None),
-        _ => (upstream.to_string(), None, None, None),
+        (Some(d), Some(b)) if d != b => Start {
+            datum: b.to_string(),
+            moved_from: Some(d.clone()),
+            write: Some(json!({"datum": b, "movedFrom": d, "movedAtMs": now, "installer": installer})),
+            ..Start::default()
+        },
+        _ if datum.is_some() => Start { datum: datum.unwrap_or_default(), api, moved_from: moved, installer_won: won, write: None },
+        _ => Start { datum: upstream.to_string(), ..Start::default() },
     }
+}
+
+/// `host:port`, the port a number from 1 to 65535, the host a name or an address (`[…]` for IPv6).
+fn host_port(s: &str) -> bool {
+    let Some((h, p)) = s.rsplit_once(':') else { return false };
+    let host_ok = !h.is_empty() && h.len() <= 253
+        && (h.bytes().all(|c| c.is_ascii_alphanumeric() || b".-_".contains(&c))
+            || (h.starts_with('[') && h.ends_with(']') && h[1..h.len() - 1].parse::<std::net::Ipv6Addr>().is_ok()));
+    host_ok && p.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
 /// Can a Stratum endpoint be reached (a TCP connection within a second)?
@@ -181,10 +237,16 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     let candidates = f.get("datum-candidates").map(|c| super::relays(c)).unwrap_or_default();
     let bundled = bundled_of(f, &candidates);
     let upstream_flag = f.get("upstream").cloned().filter(|u| !u.is_empty() && u != "auto");
-    let (mut datum, datum_api, moved_from, write) = start_with(saved.as_ref(), f.get("upstream").map(String::as_str).unwrap_or(""), bundled.as_deref());
+    let installer = installer_of(f);
+    let Start { datum: mut datum, api: datum_api, moved_from, installer_won, write } =
+        start_with(saved.as_ref(), f.get("upstream").map(String::as_str).unwrap_or(""), bundled.as_deref(), &installer);
     if let (Some(w), Some(d)) = (&write, &state) {
         let _ = std::fs::write(d.join("renter.json"), w.to_string());
-        eprintln!("hashtaker: rented work now goes to the Stream Gateway that comes with this app, at {datum}; the gateway saved before is kept, to go back to");
+        if let Some(was) = &installer_won {
+            eprintln!("hashtaker: the installer's settings changed since {was} was chosen on the page: rented work goes to {datum} now, as they say");
+        } else if moved_from.is_some() {
+            eprintln!("hashtaker: rented work now goes to the Stream Gateway that comes with this app, at {datum}; the gateway saved before is kept, to go back to");
+        }
     }
     if datum.is_empty() || datum == "auto" {
         // the gateway that comes with the app, else a DATUM-compatible gateway on this box that answers at a known address
@@ -200,6 +262,8 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         bundled,
         upstream_flag,
         moved_from,
+        installer_won,
+        installer,
         user: f.get("user").cloned().unwrap_or_else(|| "rented".into()),
         gateway_api: f.get("gateway-api").cloned(),
         allow_unblinded: f.contains_key("allow-unblinded"),
@@ -408,10 +472,10 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                 v
             });
             let datum_reachable = !datum.is_empty() && reachable(&datum);
-            let (bundled, moved_from, api) = {
+            let (bundled, moved_from, installer_won, api) = {
                 let g = lock(r);
                 let bundled_api = g.bundled.as_deref().and_then(|b| api_of(b, None, g.bundled.as_deref(), g.upstream_flag.as_deref(), g.gateway_api.as_deref()));
-                (g.bundled.clone().map(|b| (b, bundled_api)), g.moved_from.clone(), g.api())
+                (g.bundled.clone().map(|b| (b, bundled_api)), g.moved_from.clone(), g.installer_won.clone(), g.api())
             };
             let bundled = bundled.map(|(b, bapi)| {
                 let in_use = b == datum;
@@ -424,7 +488,8 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                 None => blinding,
             };
             (200, json!({
-                "role": "renter", "datum": {"addr": datum, "api": api, "reachable": datum_reachable, "found": found, "movedFrom": moved_from},
+                "role": "renter", "datum": {"addr": datum, "api": api, "reachable": datum_reachable, "found": found, "movedFrom": moved_from,
+                          "installerWon": installer_won},
                 "bundled": bundled, "blinding": blinding,
                 "relays": lock(r).relays.len(), "wallet": lock(r).signer.is_some(), "rentals": rentals,
             }))
@@ -448,23 +513,24 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
         ("POST", "/attest") => attest(r, &b),
         ("POST", "/datum") => {
             let a = b["addr"].as_str().unwrap_or("").trim().to_string();
-            if a.is_empty() || !a.contains(':') {
-                return (400, json!({"error": "the address is host:port"}));
+            if !host_port(&a) {
+                return (400, json!({"error": "the address is host:port, its port a number"}));
             }
             let api = b["api"].as_str().map(str::trim).filter(|x| !x.is_empty()).map(str::to_string);
-            if api.as_ref().is_some_and(|x| !x.contains(':')) {
-                return (400, json!({"error": "the gateway's API address is host:port"}));
+            if api.as_ref().is_some_and(|x| !host_port(x)) {
+                return (400, json!({"error": "the gateway's API address is host:port, its port a number"}));
             }
             let mut g = lock(r);
             g.datum = a.clone();
             g.datum_api = api.clone();
-            // chosen here: kept across restarts and upgrades
+            // chosen here: kept across restarts and upgrades, while the installer's answer stays what it is now
             g.moved_from = None;
+            g.installer_won = None;
             // a look at another gateway's jobs is not this one's
             g.shown = None;
             if let Some(d) = &g.state {
                 let _ = std::fs::create_dir_all(d);
-                let mut saved = json!({"datum": a, "chosen": true});
+                let mut saved = json!({"datum": a, "chosen": true, "installer": g.installer});
                 if let Some(x) = &api {
                     saved["api"] = json!(x);
                 }
@@ -703,35 +769,74 @@ mod tests {
 
     const B: Option<&str> = Some(BUNDLED_STRATUM);
 
+    /// The installer's answer as a start is given it.
+    fn inst(upstream: &str, bundled: &str) -> Value {
+        json!({"upstream": upstream, "bundledGateway": bundled})
+    }
+
     /// An install from before the app had its own gateway is moved to it once, at start, and keeps the address it
     /// had, to go back to; one chosen on the page since is kept; a box without the bundled gateway is left as it was.
     #[test]
     fn an_old_gateway_is_left_for_the_bundled_one_once_and_a_chosen_one_is_kept() {
+        let auto = inst("auto", "");
         // saved by 0.1.x: stock upstream, no `chosen`
         let old = json!({"datum": "datum_web_1:23334"});
-        let (d, api, moved, write) = start_with(Some(&old), "auto", B);
-        assert_eq!((d.as_str(), api, moved.as_deref()), (BUNDLED_STRATUM, None, Some("datum_web_1:23334")));
-        let w = write.expect("renter.json is rewritten");
-        assert_eq!(w["datum"], BUNDLED_STRATUM);
-        assert_eq!(w["movedFrom"], "datum_web_1:23334");
+        let st = start_with(Some(&old), "auto", B, &auto);
+        assert_eq!((st.datum.as_str(), st.api.as_deref(), st.moved_from.as_deref()), (BUNDLED_STRATUM, None, Some("datum_web_1:23334")));
+        let w = st.write.expect("renter.json is rewritten");
+        assert_eq!((&w["datum"], &w["movedFrom"], &w["installer"]), (&json!(BUNDLED_STRATUM), &json!("datum_web_1:23334"), &auto));
         assert!(w.get("chosen").is_none());
         // the next start keeps it there and still knows where it came from, with nothing to write
-        let (d, _, moved, write) = start_with(Some(&w), "auto", B);
-        assert_eq!((d.as_str(), moved.as_deref(), write), (BUNDLED_STRATUM, Some("datum_web_1:23334"), None));
-        // "use it again" on the page saves it as chosen: kept from then on
-        let chosen = json!({"datum": "datum_web_1:23334", "chosen": true, "api": "datum_web_1:7152"});
-        let (d, api, moved, write) = start_with(Some(&chosen), "auto", B);
-        assert_eq!((d.as_str(), api.as_deref(), moved, write), ("datum_web_1:23334", Some("datum_web_1:7152"), None, None));
-        // a Linux install whose settings name its own gateway (--upstream) moves the same way
-        let (d, _, moved, write) = start_with(None, "127.0.0.1:23334", B);
-        assert_eq!((d.as_str(), moved.as_deref()), (BUNDLED_STRATUM, Some("127.0.0.1:23334")));
-        assert!(write.is_some());
+        let st = start_with(Some(&w), "auto", B, &auto);
+        assert_eq!((st.datum.as_str(), st.moved_from.as_deref(), st.write), (BUNDLED_STRATUM, Some("datum_web_1:23334"), None));
+        // "use it again" on the page saves it as chosen, with the installer's answer: kept from then on
+        let chosen = json!({"datum": "datum_web_1:23334", "chosen": true, "api": "datum_web_1:7152", "installer": auto});
+        assert_eq!(start_with(Some(&chosen), "auto", B, &auto),
+                   Start { datum: "datum_web_1:23334".into(), api: Some("datum_web_1:7152".into()), ..Start::default() });
+        // a Linux install whose settings still name its own gateway from before (--upstream) moves the same way
+        let st = start_with(None, "127.0.0.1:23334", B, &inst("127.0.0.1:23334", ""));
+        assert_eq!((st.datum.as_str(), st.moved_from.as_deref()), (BUNDLED_STRATUM, Some("127.0.0.1:23334")));
+        assert!(st.write.is_some());
         // a fresh install: the bundled gateway (auto finds it first)
-        assert_eq!(start_with(None, "auto", B).0, "auto");
-        assert_eq!(start_with(None, BUNDLED_STRATUM, B), (BUNDLED_STRATUM.to_string(), None, None, None));
-        // no bundled gateway on this box: nothing moves
-        assert_eq!(start_with(Some(&old), "auto", None), ("datum_web_1:23334".to_string(), None, None, None));
-        assert_eq!(start_with(None, "10.0.0.5:23334", None).0, "10.0.0.5:23334");
+        assert_eq!(start_with(None, "auto", B, &auto).datum, "auto");
+        assert_eq!(start_with(None, BUNDLED_STRATUM, B, &inst(BUNDLED_STRATUM, "")), Start { datum: BUNDLED_STRATUM.into(), ..Start::default() });
+        // no bundled gateway on this box (or the installer said --bundled-gateway off): nothing moves
+        assert_eq!(start_with(Some(&old), "auto", None, &auto), Start { datum: "datum_web_1:23334".into(), ..Start::default() });
+        assert_eq!(start_with(None, "10.0.0.5:23334", None, &inst("10.0.0.5:23334", "off")).datum, "10.0.0.5:23334");
+    }
+
+    /// A page's choice wins only while the installer's `--upstream` and `--bundled-gateway` are what they were when it was
+    /// saved. When either changes, the installer's answer wins, the page is told which choice it overrode, and choosing it
+    /// again on the page keeps it under the new answer.
+    #[test]
+    fn a_changed_installer_answer_wins_over_an_older_page_choice() {
+        let own = inst("10.0.0.5:23334", "off");
+        let bundled_now = inst("127.0.0.1:23339", "127.0.0.1:23339");
+        // chosen on the page (the bundled gateway) while the installer said "my own, no bundled"
+        let page = json!({"datum": BUNDLED_STRATUM, "chosen": true, "installer": own});
+        // unchanged: the page's choice
+        assert_eq!(start_with(Some(&page), "10.0.0.5:23334", None, &own).datum, BUNDLED_STRATUM);
+        // the installer is run again and answers its own gateway at another address: the installer wins
+        let own2 = inst("10.0.0.6:23334", "off");
+        let st = start_with(Some(&page), "10.0.0.6:23334", None, &own2);
+        assert_eq!((st.datum.as_str(), st.installer_won.as_deref(), st.moved_from.as_deref()), ("10.0.0.6:23334", Some(BUNDLED_STRATUM), None));
+        let w = st.write.expect("renter.json is rewritten");
+        assert_eq!((&w["datum"], &w["installerWon"], &w["installer"]), (&json!("10.0.0.6:23334"), &json!(BUNDLED_STRATUM), &own2));
+        assert!(w.get("chosen").is_none(), "no longer a page choice");
+        // the next start keeps the installer's answer and still says which choice it overrode
+        let again = start_with(Some(&w), "10.0.0.6:23334", None, &own2);
+        assert_eq!((again.datum.as_str(), again.installer_won.as_deref(), again.write), ("10.0.0.6:23334", Some(BUNDLED_STRATUM), None));
+        // a page choice of the owner's gateway, then the installer switches to the bundled one (--bundled-gateway changes)
+        let mine = json!({"datum": "10.0.0.5:23334", "api": "10.0.0.5:7160", "chosen": true, "installer": own});
+        let st = start_with(Some(&mine), "127.0.0.1:23339", B, &bundled_now);
+        assert_eq!((st.datum.as_str(), st.api, st.installer_won.as_deref()), (BUNDLED_STRATUM, None, Some("10.0.0.5:23334")));
+        // only --bundled-gateway changed: still the installer's
+        let st = start_with(Some(&mine), "10.0.0.5:23334", B, &inst("10.0.0.5:23334", "127.0.0.1:23339"));
+        assert_eq!(st.installer_won.as_deref(), Some("10.0.0.5:23334"));
+        assert_eq!(st.datum, BUNDLED_STRATUM, "a gateway named by --upstream beside the bundled one is moved to it, as at an upgrade");
+        // the installer's answer is the same gateway the page chose: nothing to say
+        let st = start_with(Some(&json!({"datum": "10.0.0.6:23334", "chosen": true, "installer": own})), "10.0.0.6:23334", None, &own2);
+        assert_eq!((st.datum.as_str(), st.installer_won), ("10.0.0.6:23334", None));
     }
 
     #[test]
@@ -813,6 +918,8 @@ mod tests {
             bundled: Some(bundled.into()),
             upstream_flag: None,
             moved_from: None,
+            installer_won: None,
+            installer: inst("auto", ""),
             user: "rented".into(),
             gateway_api: api,
             allow_unblinded: false,
@@ -833,47 +940,45 @@ mod tests {
         }))
     }
 
-    /// The page's switch: choosing a gateway saves it as chosen (kept across upgrades) and forgets the move.
+    /// The page's switch: choosing a gateway saves it as chosen (kept across upgrades, under the same installer's answer),
+    /// with its API when one is given, and forgets the move.
     #[test]
-    fn choosing_a_gateway_on_the_page_keeps_it() {
+    fn choosing_a_gateway_on_the_page_keeps_it_with_its_api() {
         let dir = std::env::temp_dir().join(format!("hashtaker-choose-{}-{}", std::process::id(), xbt_hashlink::now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
-        let r = Arc::new(Mutex::new(R {
-            key: SecretKey::from_slice(&[7u8; 32]).unwrap(),
-            datum: BUNDLED_STRATUM.into(),
-            datum_api: None,
-            bundled: Some(BUNDLED_STRATUM.into()),
-            upstream_flag: None,
-            moved_from: Some("datum_web_1:23334".into()),
-            user: "rented".into(),
-            gateway_api: None,
-            allow_unblinded: false,
-            relays: vec![],
-            signer: None,
-            task: "hashrate".into(),
-            expect_node: None,
-            state: Some(dir.clone()),
-            offers: None,
-            authors: HashMap::new(),
-            history: None,
-            rentals: BTreeMap::new(),
-            iroh: None,
-            iroh_off: true,
-            iroh_relays: None,
-            failed_first: BTreeMap::new(),
-            shown: None,
-        }));
+        let r = test_r(BUNDLED_STRATUM, None);
+        {
+            let mut g = lock(&r);
+            g.state = Some(dir.clone());
+            g.moved_from = Some("datum_web_1:23334".into());
+            g.installer = inst("auto", "");
+        }
         let (code, v) = handle(&r, &[], "POST", "/datum", br#"{"addr": "datum_web_1:23334"}"#);
         assert_eq!((code, &v["bundled"]), (200, &json!(false)));
         let saved: Value = serde_json::from_slice(&std::fs::read(dir.join("renter.json")).unwrap()).unwrap();
-        assert_eq!(saved, json!({"datum": "datum_web_1:23334", "chosen": true}));
+        assert_eq!(saved, json!({"datum": "datum_web_1:23334", "chosen": true, "installer": inst("auto", "")}));
         assert!(lock(&r).moved_from.is_none());
-        assert_eq!(start_with(Some(&saved), "auto", B).0, "datum_web_1:23334", "kept at the next start");
-        // and back: the bundled gateway, chosen
+        assert_eq!(lock(&r).api().as_deref(), Some("datum_web_1:7152"), "no API given: its host's 7152");
+        assert_eq!(start_with(Some(&saved), "auto", B, &inst("auto", "")).datum, "datum_web_1:23334", "kept at the next start");
+        // a gateway whose API is elsewhere: saved with it, and the renter opens its jobs there
+        let (code, _) = handle(&r, &[], "POST", "/datum", br#"{"addr": "192.0.2.7:23334", "api": "192.0.2.8:7160"}"#);
+        assert_eq!(code, 200);
+        assert_eq!(lock(&r).api().as_deref(), Some("192.0.2.8:7160"));
+        let saved: Value = serde_json::from_slice(&std::fs::read(dir.join("renter.json")).unwrap()).unwrap();
+        assert_eq!(saved["api"], "192.0.2.8:7160");
+        let st = start_with(Some(&saved), "auto", B, &inst("auto", ""));
+        assert_eq!((st.datum.as_str(), st.api.as_deref()), ("192.0.2.7:23334", Some("192.0.2.8:7160")), "and after a restart");
+        // and back: the bundled gateway, chosen, on its own API
         let (code, v) = handle(&r, &[], "POST", "/datum", format!(r#"{{"addr": "{BUNDLED_STRATUM}"}}"#).as_bytes());
         assert_eq!((code, &v["bundled"]), (200, &json!(true)));
         assert_eq!(lock(&r).api().as_deref(), Some("127.0.0.1:7152"));
-        assert_eq!(handle(&r, &[], "POST", "/datum", br#"{"addr": "x:1", "api": "nocolon"}"#).0, 400);
+        // addresses that aren't host:port are refused, and change nothing
+        for bad in [r#"{"addr": "x:1", "api": "nocolon"}"#, r#"{"addr": "x:1", "api": "x:port"}"#, r#"{"addr": "x:1", "api": "x:0"}"#,
+                    r#"{"addr": "x:1", "api": "x:70000"}"#, r#"{"addr": "x:1", "api": "a b:7152"}"#, r#"{"addr": "nocolon"}"#, r#"{"addr": ":23334"}"#] {
+            assert_eq!(handle(&r, &[], "POST", "/datum", bad.as_bytes()).0, 400, "{bad}");
+        }
+        assert_eq!(lock(&r).datum, BUNDLED_STRATUM);
+        assert!(host_port("[::1]:7152") && host_port("datum-gateway_web_1:7152") && !host_port("[nope]:7152"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

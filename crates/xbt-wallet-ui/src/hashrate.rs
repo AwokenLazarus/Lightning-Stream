@@ -773,6 +773,16 @@ impl App {
                 <input type=\"hidden\" name=\"addr\" value=\"{}\"><button class=\"secondary\">Use {} again</button></form></section>",
                 crate::stream_gateway::NAME, esc(from), esc(from), esc(from)));
         }
+        // the installer's settings changed since a gateway was chosen here: theirs won, said with the way back
+        if let Some(was) = st["datum"]["installerWon"].as_str() {
+            let now = st["datum"]["addr"].as_str().unwrap_or("");
+            let now = if st["bundled"]["inUse"] == true { format!("the {}", crate::stream_gateway::NAME) } else { format!("<code>{}</code>", esc(now)) };
+            b.push_str(&format!("<section class=\"card\"><p>The app's install settings changed since you chose <code>{}</code> on this page, so rented \
+                work goes to {now} now, as they say.</p>\
+                <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"use-previous\">\
+                <input type=\"hidden\" name=\"addr\" value=\"{}\"><button class=\"secondary\">Use {} again</button></form></section>",
+                esc(was), esc(was), esc(was)));
+        }
 
         // the rentals going on and the last ones
         let rentals: Vec<Value> = st["rentals"].as_array().cloned().unwrap_or_default();
@@ -905,6 +915,12 @@ impl App {
             "datum" | "use-previous" | "use-bundled" => {
                 let mut body = json!({"addr": g("addr")});
                 if !g("api").is_empty() {
+                    // host:port, the port a number: refused here before the renter sees it
+                    let port_ok = g("api").rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && !h.contains(' ') && p.parse::<u16>().is_ok_and(|p| p > 0));
+                    if !port_ok {
+                        self.flash(ctx, false, "Not saved: the API address is host:port, like 192.168.1.20:7152.");
+                        return Resp::redirect(back);
+                    }
                     body["api"] = json!(g("api"));
                 }
                 if g("action") == "use-bundled" {
@@ -1063,12 +1079,18 @@ impl App {
         let other = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"datum\">\
             <label>Its address, with the port your miners use<input name=\"addr\" value=\"{}\" class=\"mono\" required placeholder=\"datum-gateway:23334\" \
             pattern=\"[A-Za-z0-9.\\-\\[\\]:_]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:23334\"></label>{}\
+            <label>Its API address, where the app opens its jobs (optional)<input name=\"api\" value=\"{}\" class=\"mono\" placeholder=\"the same host, port 7152\" \
+            pattern=\"[A-Za-z0-9.\\-\\[\\]:_]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:7152\"></label>\
+            <p class=\"hint\">Leave it empty when the API is on the same host at port 7152.</p>\
             <p class=\"hint\">It has to show its jobs masked, the way the {NAME} does; a stock DATUM-compatible gateway can't, and renting stays off with it. \
             The pool your rented work is paid through is chosen in that gateway, not here.</p>\
             <button class=\"secondary\">Save</button></form>\
             <p class=\"small\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">About gateways</a> (it suggests Lazarus Pool).</p>",
             esc(if b["inUse"] == true { "" } else { datum }),
             if found.is_empty() || found.iter().any(|f| f == datum) { String::new() } else { format!("<p class=\"hint\">Found on this box: <code>{}</code></p>", esc(&found.join(", "))) },
+            // its API as the renter uses it, when it isn't the one the address implies
+            esc(st["datum"]["api"].as_str().filter(|a| b["inUse"] != true && !datum.is_empty()
+                && datum.rsplit_once(':').is_none_or(|(h, _)| *a != format!("{h}:7152"))).unwrap_or("")),
             esc(&self.cfg.hash.datum_guide));
         if self.stream_gw_here() {
             o.push_str(&format!("<details><summary>Use another gateway</summary>{other}</details>"));
