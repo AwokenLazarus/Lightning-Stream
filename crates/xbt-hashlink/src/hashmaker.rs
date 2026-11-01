@@ -1140,6 +1140,14 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                 if want == have {
                     continue;
                 }
+                // no fallback, and its rental waits for a payment on its way: the miner stays where it is, connected,
+                // what it finds meanwhile going no further, and goes on with the rental when the payment lands (or is
+                // let go if the rental ends unpaid). It isn't on its way anywhere, so it holds up no other miner from its
+                // address
+                let waiting = g.units.get(&unit).and_then(|u| u.rental.as_ref()).and_then(|r| g.rentals.get(r)).is_some_and(|r| r.waiting_since.is_some() && r.stopped.is_none());
+                if want.is_none() && g.fallback.is_none() && waiting {
+                    continue;
+                }
                 // a miner that must connect again waits while others from its address are on their way elsewhere
                 let reconnects = !(conn.extranonce && conn.subscribe.is_some());
                 if reconnects {
@@ -1149,13 +1157,6 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                         continue;
                     }
                     sending.insert(conn.peer.clone(), want.clone());
-                }
-                // no fallback, and its rental waits for a payment on its way: the miner stays where it is, connected,
-                // what it finds meanwhile going no further, and goes on with the rental when the payment lands (or is
-                // let go if the rental ends unpaid)
-                let waiting = g.units.get(&unit).and_then(|u| u.rental.as_ref()).and_then(|r| g.rentals.get(r)).is_some_and(|r| r.waiting_since.is_some() && r.stopped.is_none());
-                if want.is_none() && g.fallback.is_none() && waiting {
-                    continue;
                 }
                 if want.is_some() || g.fallback.is_some() {
                     g.conns.get_mut(&c).unwrap().busy = true;

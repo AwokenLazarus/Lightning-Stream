@@ -916,6 +916,66 @@ fn a_buy_slower_than_the_measured_ones_is_still_waited_for() {
     drop(miner);
 }
 
+/// Two miners behind one address (one router), a hashmaker with no fallback. While one rental waits for a payment on
+/// its way, keeping its miner, another ends, and a third that waits for a miner gets that one at once: the waiting
+/// miner is on its way nowhere, so it holds up no other miner from its address.
+#[test]
+fn a_rental_waiting_for_a_payment_holds_up_no_other_miner_from_its_address() {
+    let _s = serial();
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
+    let a = app(&terms);
+    let stop: Arc<AtomicBool> = Arc::default();
+    let mut miners = Vec::new();
+    for name in ["m0", "m1"] {
+        let (ma, st2) = (a.miners.clone(), stop.clone());
+        miners.push(thread::spawn(move || {
+            let _ = standin::miner(standin::MinerConfig { pool: ma, user: name.into(), max_rate: 10.0, bad_every: 0, duration: Some(Duration::from_secs(60)), reconnect: true,
+                                                          extranonce_subscribe: false, bind: None });
+            st2.store(true, Ordering::SeqCst);
+        }));
+        thread::sleep(Duration::from_millis(400));
+    }
+    let start = |id: &str| {
+        let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, id, hello(id, &terms));
+        b.verdicts = Verdicts::AcceptAll;
+        b.pay(1);
+        b
+    };
+    let mut wait = start("wait");
+    wait.until_serving();
+    let mut ends = start("ends");
+    ends.until_serving();
+    let mut next = start("next");
+    next.pump(u64::MAX, Duration::from_millis(500));
+    assert!(next.chan.is_none(), "no miner free yet");
+    // the first rental's share waits for payment: it says one is on its way, and pays nothing
+    let t0 = Instant::now();
+    while wait.dues == 0 && t0.elapsed() < Duration::from_secs(20) {
+        wait.pump(u64::MAX, Duration::from_millis(50));
+        ends.pump(u64::MAX, Duration::from_millis(1));
+    }
+    wait.tx.send(&Msg::Paying).unwrap();
+    let t1 = Instant::now();
+    while !app_answers(&a.h)["rentals"].as_array().unwrap().iter().any(|r| r["rental"] == "wait" && r["waitingForPayment"] == true) {
+        assert!(t1.elapsed() < Duration::from_secs(5), "the first rental never waited: {}", app_answers(&a.h));
+        wait.pump(u64::MAX, Duration::from_millis(20));
+    }
+    // the second ends; the third should have its miner well inside the first's 10 s wait
+    let _ = ends.tx.send(&Msg::Close { reason: "done".into(), slices: None });
+    let closed = Instant::now();
+    while next.chan.is_none() && closed.elapsed() < Duration::from_secs(9) {
+        next.pump(u64::MAX, Duration::from_millis(50));
+        wait.pump(u64::MAX, Duration::from_millis(1));
+    }
+    let took = closed.elapsed();
+    eprintln!("measure: a miner freed while another at its address waits reached its next rental in {} ms", took.as_millis());
+    assert!(next.chan.is_some(), "the third rental got no miner while the first waited");
+    assert!(took < Duration::from_secs(4), "{} ms: held up by the waiting miner", took.as_millis());
+    stop.store(true, Ordering::SeqCst);
+    a.h.shutdown();
+    drop(miners);
+}
+
 /// A share nobody hashed goes no further, and the miner hears so from the app: the renter is not asked.
 #[test]
 fn a_share_nobody_hashed_is_not_sent_on_and_the_miner_gets_a_rejection() {
