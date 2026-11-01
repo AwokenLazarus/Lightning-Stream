@@ -55,7 +55,9 @@ STRATUM = 23339  # the Stream Gateway's stratum, the same on every install (the 
 DATUM_UID, UI_UID = 10021, 10005
 INIT_DATUM = os.environ.get("LS_TEST_INIT_DATUM", "1") == "1"  # the init in the images makes run/datum and the cookie
 DATUM_IMAGE = os.environ.get("LS_TEST_DATUM_IMAGE", "xbt-datum-gateway:0.1.0")
-LOCAL = {"init": "xbt-init:linux-test", "hashtaker": "xbt-hashlink:linux-test", "hashmaker": "xbt-hashlink:linux-test", "datum": DATUM_IMAGE}
+# this tree's seller gateway too: the published one refuses the config this UI writes (health_token)
+LOCAL = {"init": "xbt-init:linux-test", "hashtaker": "xbt-hashlink:linux-test", "hashmaker": "xbt-hashlink:linux-test", "datum": DATUM_IMAGE,
+         "gateway": "xbt-gateway:linux-test"}
 OWN_GW = "xbt-datum-gateway:linux-test-stock"
 HG = os.environ.get("P2P_HASH_GATEWAYS", os.path.expanduser("~/xbt-rnd/hash-gateways"))  # stratum-grind, a CPU miner of real shares
 RELAYS = f"ws://127.0.0.1:{P['relay']}"
@@ -111,7 +113,7 @@ def old_package():
 
 
 def override(d):
-    """The test's images (build_images.sh): this tree's init, UI and hashlink (the pinned init refuses the components
+    """The test's images (build_images.sh): this tree's init, UI, hashlink and seller gateway (the pinned init refuses the components
     this compose lists), the Stream Gateway's stand-in; and, while the init doesn't know the "datum" component, init
     without it (this test then makes run/datum, see datum_files)."""
     svc = dict(LOCAL)
