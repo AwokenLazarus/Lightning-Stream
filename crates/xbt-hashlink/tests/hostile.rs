@@ -969,8 +969,9 @@ fn a_rental_waiting_for_a_payment_holds_up_no_other_miner_from_its_address() {
     }
     let took = closed.elapsed();
     eprintln!("measure: a miner freed while another at its address waits reached its next rental in {} ms", took.as_millis());
-    assert!(next.chan.is_some(), "the third rental got no miner while the first waited");
-    assert!(took < Duration::from_secs(4), "{} ms: held up by the waiting miner", took.as_millis());
+    let st = app_answers(&a.h);
+    assert!(next.chan.is_some(), "the third rental got no miner while the first waited: {st}");
+    assert!(took < Duration::from_secs(4), "{} ms: held up by the waiting miner: {st}", took.as_millis());
     stop.store(true, Ordering::SeqCst);
     a.h.shutdown();
     drop(miners);
