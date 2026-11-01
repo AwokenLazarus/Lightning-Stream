@@ -1167,7 +1167,9 @@ def flap() -> None:
             price = int(again.get("price_msat") or 0)
             rest_msat = -(-rest * BYTE_MSAT // PER_BYTES)
             resumed = {"bytes": again.get("bytes"), "complete": again.get("complete"), "status": again.get("status"), "price_msat": price,
-                       "price_of_the_rest_msat": rest_msat, "ended": again.get("ended"), "etag": r.get("etag")}
+                       "price_of_the_rest_msat": rest_msat, "ended": again.get("ended"), "etag": r.get("etag"),
+                       "verdict": again.get("verdict"), "rule": again.get("rule"), "reason": str(again.get("reason") or again.get("error") or "")[:300],
+                       "session": again.get("session"), "first_session": r.get("session")}
             check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
                   bool(got) and clear and bool(r.get("etag")) and again.get("status") == 206 and again.get("complete") is True and again.get("bytes") == rest
                   and again.get("body_digest") == digest_of_range(got) and price <= rest_msat and not drops.errors,
