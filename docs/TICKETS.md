@@ -194,7 +194,7 @@ the lab), and cannot see `ACCEPTED` at all. A buyer that releases a ticket in th
 secret again. On the lab a buyer that paid as soon as its own node showed 8 tickets in flight was
 answered so and served on the retry. A buyer SHOULD wait for the seller's own word instead: the
 session's signed `status` (section 4) lists each ticket's state, and the wallet built here releases
-a ticket only after `status` has shown it `ACCEPTED`, for a bounded time (3 s by default), so that
+a ticket only after `status` has shown it `ACCEPTED`, for a bounded time (12 s by default), so that
 no secret leaves for a ticket the seller cannot yet use. Locked funds
 are not spent. They count against a cap on locked funds, not against a budget.
 
@@ -888,7 +888,7 @@ knows only tickets skips an entry it cannot read.
  "extra": {"version": "lottery/0", "layer": "lightning", "features": [512],
            "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40,
            "pay": "on-win", "release": "after-answer",
-           "window": 8, "graceSeconds": 30, "gracePieces": 64, "maxUnpaidWins": 2,
+           "window": 8, "graceSeconds": 60, "gracePieces": 64, "maxUnpaidWins": 2,
            "chainDraws": 65536, "pieceBytes": "262144",
            "receiptKey": "<33-byte public key>", "session": "/x402/lottery",
            "price": {"requestMsat": "0", "byteMsat": "100", "perBytes": "262144", "secondMsat": "0"}}}
@@ -1115,8 +1115,31 @@ when the node shows the first cancelled (it lapsed unpaid).
 
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed. A win's invoice lives as long as the seller's grace
-(`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer, and is never
+gateway does when the first has lapsed, or at once where the wallet asks it to cancel the first:
+`POST .../cancel` with `{"draw", "hash"}`, signed as every call of the session. The wallet asks only
+when its node shows the payment failed with nothing in flight, at most 4 times for a win and 32 for a
+session. The gateway cancels only the current invoice of that session's unpaid win, only where its own
+node shows it open (`cancelled` says whether it did), and at most `max_win_cancels` times a session, 32
+by default, past which it says `too_many_cancels`; the win's grace still runs from its draw, so a
+cancel buys the buyer no time, no draw and no money. A seller without the call answers 404, and the
+win waits for the lapse. The wallet asks the same where it held a win back for lack of time on its
+invoice (below), which it never sent. Before any payment of the rail the wallet waits for an
+inactive channel, at most 8 s from when it first saw it out, and before a win or a prepaid ticket is
+sent it asks its node for a route to the seller (QueryRoutes, which needs `info:read`; nothing is
+sent) and waits for one within what is left of those 8 s. An invoice with route hints or blinded paths
+(the node's decode shows them) is not asked about: the query is not given them and finds no path to a
+seller behind a private channel, so such an invoice is sent at once. One payment to a seller waits at a
+time, in one window for all of them: the others are refused at once (`ln_no_route`, and not counted), and
+a win whose wait ran the whole window three times ends the call with that reason, the win owed for a
+later call. A node that cannot answer the
+question is not waited for. A win whose invoice would end before
+the payment could arrive (by twice the longest of the latest payments' time on the way, at least 5 s
+and at most half its life) is not sent, and one that ran out while the win waited at the gate does
+not count against the seller, up to 4 for a win and 32 for a session; past that the session ends
+(`lottery_invoices_lapse`). One that came with less than 5 s left counts as a bad invoice. The
+win's next invoice goes before the wins no seller waits for, and a call waits for it where it is due
+within 10 s, or within what the wallet's margin holds back and 5 s more. A win's invoice lives as long as the seller's grace
+(`graceSeconds`, 60 s at the gateway, 30 s before 0.1.20; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`
 carries it, the wallet pays it and asks again. (Until 2026-10-14 an invoice lived 60 s against a
@@ -1158,8 +1181,8 @@ The seller goes first, and these are what bound it:
 - **The grace.** While a win is unpaid the seller serves on: for `graceSeconds`, for
   `gracePieces` pieces after that win, and with at most `maxUnpaidWins` wins unpaid. Beyond any
   of the three a request is refused `win_unpaid`, with the unpaid wins and their invoices, and
-  an answer that is being sent stands still for the payment (10 s at the gateway, and never
-  beyond the grace) and is then cut short. Service goes on when the seller's node shows the wins
+  an answer that is being sent stands still for the payment (15 s at the gateway as shipped: the larger of `refill_wait`, 15 s, and what is left of the
+  win's grace up to `pay_wait_secs`, 10 s; so past the grace when little of it is left) and is then cut short. Service goes on when the seller's node shows the wins
   paid. A file of 64 pieces at one win expected draws three or more wins 8 times in 100,
   and its answer then stands still at the third until the first is paid: what that takes is the
   buyer's to keep short (section 9.5).
@@ -1292,7 +1315,7 @@ this tree (the wallet's signer, its MCP server, the gateway), a stock file serve
 Lightning Fork nodes (buyer, one routing hop, seller) on one host over loopback, the buyer's
 channel and the seller's inbound channel opened with 30 slots. The lottery's own rules are the
 shipped ones on both sides (wins of 64 sat through a hop, odds of 1 in 4 at the most, 8 values
-ahead; a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid wins), with pieces of
+ahead; a window of 8 pieces, a grace of 60 s and 64 pieces, 2 unpaid wins), with pieces of
 64 KiB. Other settings of the lab are not the shipped ones. Its wallet policy has
 `velocity_max` 1,000 (shipped: 8), `max_sellers` 108 and `max_new_sellers_per_min` 400 for the
 100 sellers (15 and 30), `max_sends_per_hour` 100,000 (1,200), `max_answer_s` 120 (50) and a lab
@@ -1328,7 +1351,7 @@ wins differ from run to run. The report of the latest run is `reports/lottery_re
   item).
 - The gateway's grace of 10 s was sized for wins that are not paced. Paced 8 at a time, the last
   of 100 sellers' wins waited 13 s. The default is 30 s, and an answer that is being sent stands
-  still for a payment for 10 s at the most.
+  still for a payment for 15 s (`refill_wait`, the larger of it and `pay_wait_secs`, 10 s).
 - A wallet killed between the two writes that book a win kept a ledger row for a payment that
   was never sent. The book's row is now written first. The same was true of a prepaid ticket.
 - A wallet that stopped reading an answer left pieces open with the seller, and the session's
@@ -1755,6 +1778,9 @@ the session and blocks nothing.
 | The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its wait for a refill, 15 s by default), then releases. | Up to that wait. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
+| The wallet's chain node gives no tip, and none it gave in the last 5 minutes. | `ticket_chain` after up to `tickets.ready_wait_ms`, 12 s as shipped, all a release's waits together. | Nothing: no secret was released. |
+| The seller ended the answer a ticket is for while the ticket was awaited (its signed `status` lists it). | `ticket_answer_closed`. | Nothing: no secret was released. |
+| The seller shows no ticket three times running, with no byte delivered between them. | `ticket_seller_stalled`: the session is stopped. | Nothing more. |
 | The seller never shows a ticket `ACCEPTED`, and the wallet's own node calls its payment in flight and carries it on no channel (a node killed as it sent it). | The session is stopped (`ticket_session_ended`); the next call opens a new one, with a pool inside what the owner's cap for that seller has left. | Nothing: no secret was released. The ticket counts as locked until the node gives it up. |
 | Tickets failed on the wallet's node after their lock round was over. | The seller is asked to cancel their invoices before the next lock, once for each. | Nothing. Without it the seller refused the lock (`too_many_tickets`) until the invoices lapsed. |
 | The wallet's signer is killed. | On its next start every locked ticket is booked as if released and never released, and the sellers on record are asked to cancel. | The balance; and the pool's worst case held against the budgets until the node shows the tickets failed. |

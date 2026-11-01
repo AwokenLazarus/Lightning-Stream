@@ -11,6 +11,7 @@
 //! The same pass lines run against real nodes in `scripts/ticket_e2e_regtest.sh`.
 mod common;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpListener;
@@ -112,15 +113,17 @@ impl Handler for Service {
         };
         let stream = |n: usize, length: Option<u64>, b: xbt_svc::http::Body| {
             let _ = n;
-            Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
+            Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into()), ("ETag".into(), FILE_TAG.into())], length, body: b })
         };
         if let Some(n) = path.strip_prefix("/files/unsized/").or_else(|| path.strip_prefix("/pieces/unsized/")).and_then(|n| n.parse::<usize>().ok()) {
             // a file whose server states no size (sent as it is read): its length is known only at its end
             return stream(n, None, body(n, 64 << 10, Duration::ZERO));
         }
         if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")).or_else(|| sized("/uhd/")).or_else(|| sized("/hd20/")) {
-            // one byte range, as a file server answers it: 206 and that part of the same bytes
-            let range = req.header("Range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
+            // one byte range, as a file server answers it: 206 and that part of the same bytes; with an If-Range of
+            // another copy than this one, the whole body (RFC 9110 13.1.5), as a server whose file has changed
+            let other_copy = req.header("If-Range").is_some_and(|v| v != FILE_TAG);
+            let range = req.header("Range").filter(|_| !other_copy).and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
                 .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, if b.is_empty() { n.checked_sub(1)? } else { b.parse::<usize>().ok()?.min(n.checked_sub(1)?) })));
             if let Some((a, b)) = range.filter(|(a, b)| a <= b) {
                 let span = b - a + 1;
@@ -158,6 +161,19 @@ impl Handler for Service {
         }
         if let Some(n) = sized("/slow/") {
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::from_millis(15)));
+        }
+        if let Some(n) = sized("/latequiet/") {
+            // its bytes come a little late, and then nothing
+            return stream(n, Some(4 * n as u64), Box::new(move |out| {
+                std::thread::sleep(Duration::from_secs(4));
+                out.send(&(0..n).map(pattern).collect::<Vec<u8>>())?;
+                std::thread::sleep(QUIET_FOR);
+                Ok(())
+            }));
+        }
+        if let Some(n) = sized("/latehead/") {
+            std::thread::sleep(Duration::from_secs(25));
+            return stream(n, Some(n as u64), body(n, 64 << 10, Duration::from_millis(1)));
         }
         if let Some(n) = sized("/quiet/") {
             // a film whose seller sends n bytes of the 4n it states and then says nothing for [`QUIET_FOR`], as one at
@@ -333,6 +349,8 @@ fn routes() -> Value {
         {"path": "/dearbytes/", "price": {"byte_msat": 250_000, "per_bytes": 1024}},
         {"path": "/keepalive/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/stall/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
+        {"path": "/latehead/", "price": {"request_msat": 100_000}},
+        {"path": "/latequiet/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/timed/", "price": {"second_msat": 400_000}},
         {"path": "/quiet/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/quiettick/", "price": {"second_msat": 1000}},
@@ -383,6 +401,13 @@ struct SellerNode {
     inner: Arc<StandIn>,
     key: SecretKey,
     clock: Arc<AtomicU64>,
+    /// How far back its invoices are dated: an invoice that comes nearly dead.
+    backdate: AtomicU64,
+    /// The invoices made just after a cancel, in order: a win's next invoice, where the buyer asked.
+    reinvoiced: Mutex<Vec<String>>,
+    /// Every invoice it made, with when.
+    made: Mutex<Vec<(String, Instant)>>,
+    cancelled: AtomicBool,
     /// What the seller's node was given to settle: the buyer's node learns the preimage from it.
     preimages: Arc<Mutex<HashMap<String, String>>>,
     lie: Mutex<Lie>,
@@ -399,7 +424,7 @@ impl SellerNodeApi for SellerNode {
         let key = if lie == Lie::OtherPayee { SecretKey::from_slice(&[0x44; 32]).unwrap() } else { self.key };
         let msat = if lie == Lie::OtherAmount { msat + 1 } else { msat };
         // "p" is a tenth of a millisatoshi
-        Ok(invoice_cltv(&Spec { hrp: &format!("lnbcrt{}p", msat * 10), timestamp: self.clock.load(Ordering::SeqCst) - 1, payment_hash: *hash,
+        Ok(invoice_cltv(&Spec { hrp: &format!("lnbcrt{}p", msat * 10), timestamp: self.clock.load(Ordering::SeqCst) - 1 - self.backdate.load(Ordering::SeqCst), payment_hash: *hash,
                                 description: Some("ticket"), description_hash: None, expiry_s: Some(u64::from(expiry_s)), features: XBT, include_payee: false },
                         &key, Some(u64::from(cltv_blocks))))
     }
@@ -409,10 +434,14 @@ impl SellerNodeApi for SellerNode {
         self.inner.add_invoice(preimage, msat, cltv_blocks, expiry_s)?;
         let hash: Hash = Sha256::digest(preimage).into();
         self.preimages.lock().unwrap().insert(hex::encode(hash), hex::encode(preimage));
+        if self.cancelled.swap(false, Ordering::SeqCst) {
+            self.reinvoiced.lock().unwrap().push(hex::encode(hash));
+        }
+        self.made.lock().unwrap().push((hex::encode(hash), Instant::now()));
         let lie = *self.lie.lock().unwrap();
         let key = if lie == Lie::OtherPayee { SecretKey::from_slice(&[0x44; 32]).unwrap() } else { self.key };
         let msat = if lie == Lie::OtherAmount { msat + 1 } else { msat };
-        Ok(invoice_cltv(&Spec { hrp: &format!("lnbcrt{}p", msat * 10), timestamp: self.clock.load(Ordering::SeqCst) - 1, payment_hash: hash,
+        Ok(invoice_cltv(&Spec { hrp: &format!("lnbcrt{}p", msat * 10), timestamp: self.clock.load(Ordering::SeqCst) - 1 - self.backdate.load(Ordering::SeqCst), payment_hash: hash,
                                 description: Some("ticket"), description_hash: None, expiry_s: Some(u64::from(expiry_s)), features: XBT, include_payee: false },
                         &key, Some(u64::from(cltv_blocks))))
     }
@@ -430,7 +459,11 @@ impl SellerNodeApi for SellerNode {
     }
 
     fn cancel(&self, hash: &Hash) -> Result<(), NodeError> {
-        self.inner.cancel(hash)
+        let r = self.inner.cancel(hash);
+        if r.is_ok() {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+        r
     }
 
     fn lookup(&self, hash: &Hash) -> Result<Option<Invoice>, NodeError> {
@@ -547,7 +580,7 @@ fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &
     json!({"listen": "127.0.0.1:0", "public_url": origin, "upstream": upstream, "state_dir": state, "chain": "regtest",
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
            "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"], "offers": conf["offers"],
-           "times": {"refill_wait_ms": REFILL_WAIT_MS.load(Ordering::SeqCst), "upstream_wait_secs": UPSTREAM_WAIT_SECS.load(Ordering::SeqCst), "tick_ms": 50},
+           "times": {"refill_wait_ms": conf["refill_wait_ms"].as_u64().unwrap_or(REFILL_WAIT_MS.load(Ordering::SeqCst)), "upstream_wait_secs": UPSTREAM_WAIT_SECS.load(Ordering::SeqCst), "tick_ms": 50},
            "routes": routes_with(conf)})
 }
 
@@ -591,7 +624,7 @@ impl Shop {
         let key = SecretKey::from_slice(&[0x33; 32]).unwrap();
         let standin = Arc::new(StandIn::new(H0 as u32));
         standin.set_identity(&node_id(&key), &["regtest"]);
-        let node = Arc::new(SellerNode { inner: standin.clone(), key, clock: clock.clone(), preimages: Arc::new(Mutex::new(HashMap::new())), lie: Mutex::new(Lie::None) });
+        let node = Arc::new(SellerNode { inner: standin.clone(), key, clock: clock.clone(), backdate: AtomicU64::new(0), reinvoiced: Mutex::new(vec![]), made: Mutex::new(vec![]), cancelled: AtomicBool::new(false), preimages: Arc::new(Mutex::new(HashMap::new())), lie: Mutex::new(Lie::None) });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = tempfile::tempdir().unwrap();
@@ -731,6 +764,8 @@ impl Node for FundNode {
 #[derive(Default)]
 struct PayState {
     payments: Vec<Value>,
+    /// When each of `payments` was sent, in the same order.
+    sent_at: Vec<Instant>,
     next_index: u64,
     channel: Value,
     down: bool,
@@ -743,6 +778,24 @@ struct PayState {
     peak: usize,
     /// The next sends fail as a full channel does, however many this says.
     fail_next: usize,
+    /// The next payment fails each time it is sent, as to a hop that stays full; `failing` is its hash.
+    fail_one: bool,
+    failing: Option<String>,
+    /// Invoices whose payments fail as well (a win's next invoice, in the same drop).
+    fail_also: Vec<String>,
+    /// The node finds no route to the seller (a link along the way was replaced a moment ago): a payment
+    /// sent now fails at once, with no route and no attempt, and the node's route query says the same.
+    no_route: bool,
+    route_queries: usize,
+    /// From this route query on (counted from 1), no route for `no_route_for`: the window opens as a win is
+    /// about to be sent. `no_route_answers` counts the queries answered "no route".
+    no_route_at_query: usize,
+    no_route_for: Duration,
+    no_route_until: Option<Instant>,
+    no_route_answers: usize,
+    /// The seller sits behind a private channel: the node's decode of its invoices shows a route hint, its
+    /// route query (which is not given the hint) finds no path, and a payment sent with the invoice arrives.
+    private_seller: bool,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
     late_fail: usize,
@@ -752,8 +805,12 @@ struct PayState {
     /// the seller, the path enters elsewhere): its payments fail with this reason, nothing in flight.
     offer_unroutable: Option<&'static str>,
     router_down: bool,
+    /// The node says it is not synced to its chain, as one just started does.
+    unsynced: bool,
     /// How long a send takes to return: a payment's way through a hop.
     send_takes: Duration,
+    /// The sends wait here until this is false: the gate stays full, whatever the machine's speed.
+    hold_sends: bool,
     /// How long the node takes to list its channels: the checks the wallet makes of them before a
     /// payment (a busy node, a slow disk).
     checks_take: Duration,
@@ -771,6 +828,9 @@ struct PayState {
     held_back: bool,
     /// Slow payments stay on their way, whatever the clock says, for as long as this is set.
     hold_arrivals: bool,
+    /// How many times the node has listed its channels, and what happens as it does (a peer drops).
+    looks: usize,
+    on_look: Option<Arc<dyn Fn(usize) + Send + Sync>>,
     /// The next sends are in flight on this node and never reach the seller's (the node dies as it
     /// sends them); once `stranded_off_channel` is set, no channel of the node carries them and
     /// the node goes on calling them in flight.
@@ -787,6 +847,21 @@ struct PayState {
     /// How many times `down` turned away a question about the node itself (`GetInfo`, which the
     /// wallet asks before it begins a payment).
     turned_away: usize,
+    /// The next sends reach the seller, but the node answers before it lists the payment's HTLC (a
+    /// loaded node, or a payment stream that breaks): the send returns no record, and for
+    /// `unseen_for` the node's record of the payment shows no HTLC, though the seller holds it.
+    unseen_next: usize,
+    unseen_for: Duration,
+    unseen_until: HashMap<String, Instant>,
+    /// While a payment is unseen, it is shown with its HTLC but no expiry (a node that has not read it yet).
+    unseen_with_no_expiry: bool,
+    /// The next sends never reach the node: an error, and no record of them.
+    lost_next: usize,
+    /// How long the node takes to say what became of a payment, and how many times it was asked.
+    lookup_takes: Duration,
+    lookups: usize,
+    /// The hashes asked of the node, in the order answered.
+    lookup_log: Vec<String>,
 }
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
@@ -822,6 +897,7 @@ impl PayLn {
             if p["late_fail"] == true {
                 p["status"] = "FAILED".into();
                 p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
+                // the node keeps no failed attempts by default, so its record does not say that this one left it
                 p["htlcs"] = json!([]);
                 continue;
             }
@@ -888,7 +964,7 @@ impl LnBackend for PayLn {
         let h = self.chain.height();
         Ok(json!({"identity_pubkey": "02".to_string() + &"11".repeat(32), "alias": "buyer", "version": "0.21.3-beta-blake2b.17",
                   "chains": [{"chain": "bitcoin", "network": "regtest"}], "features": {"512": {"name": "option-blake2b", "is_required": true, "is_known": true}},
-                  "synced_to_chain": true, "block_height": h, "block_hash": FakeChain::bhash("regtest", h)}))
+                  "synced_to_chain": !self.st.lock().unwrap().unsynced, "block_height": h, "block_hash": FakeChain::bhash("regtest", h)}))
     }
 
     fn block_hash(&self, height: i64) -> xbt402::Result<String> {
@@ -898,13 +974,36 @@ impl LnBackend for PayLn {
     fn decode(&self, inv: &str) -> xbt402::Result<Value> {
         let d = xbt_signer::bolt11::decode(inv).map_err(|e| node_err(&e))?;
         let features: serde_json::Map<String, Value> = d.features.iter().map(|b| (b.to_string(), json!({"is_known": true}))).collect();
-        Ok(json!({"destination": d.payee_hex(), "payment_hash": d.payment_hash_hex(), "num_msat": d.amount_msat.unwrap_or(0).to_string(),
-                  "timestamp": d.timestamp.to_string(), "expiry": d.expiry_s.to_string(), "features": features}))
+        let mut out = json!({"destination": d.payee_hex(), "payment_hash": d.payment_hash_hex(), "num_msat": d.amount_msat.unwrap_or(0).to_string(),
+                             "timestamp": d.timestamp.to_string(), "expiry": d.expiry_s.to_string(), "features": features});
+        if self.st.lock().unwrap().private_seller {
+            out["route_hints"] = json!([{"hop_hints": [{"node_id": "02".repeat(33), "chan_id": "1099511693312", "fee_base_msat": 1000,
+                                                        "fee_proportional_millionths": 1, "cltv_expiry_delta": 40}]}]);
+        }
+        Ok(out)
+    }
+
+    fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64) -> xbt402::Result<bool> {
+        let mut s = self.st.lock().unwrap();
+        s.route_queries += 1;
+        if s.route_queries == s.no_route_at_query {
+            s.no_route_until = Some(Instant::now() + s.no_route_for);
+        }
+        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.private_seller;
+        s.no_route_answers += usize::from(none);
+        Ok(!none)
     }
 
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
-        let takes = self.st.lock().unwrap().checks_take;
+        let (takes, look, on_look) = {
+            let mut s = self.st.lock().unwrap();
+            s.looks += 1;
+            (s.checks_take, s.looks, s.on_look.clone())
+        };
         std::thread::sleep(takes);
+        if let Some(f) = on_look {
+            f(look);
+        }
         let s = self.state();
         let mut c = s.channel.clone();
         let mut htlcs: Vec<Value> = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT" && !(s.stranded_off_channel && p["stranded"] == true)).map(|p| {
@@ -930,6 +1029,7 @@ impl LnBackend for PayLn {
                        "fee_msat": "0", "payment_preimage": pre, "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                        "failure_reason": "FAILURE_REASON_NONE", "htlcs": []});
         s.payments.push(p.clone());
+        s.sent_at.push(Instant::now());
         Ok(p)
     }
 
@@ -938,17 +1038,29 @@ impl LnBackend for PayLn {
         let hash = d.payment_hash_hex();
         let raw: Hash = d.payment_hash.as_slice().try_into().map_err(|_| node_err("a hash of another length"))?;
         let h = self.chain.height();
+        while self.st.lock().unwrap().hold_sends {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let takes = self.st.lock().unwrap().send_takes;
         std::thread::sleep(takes);
         let mut s = self.st.lock().unwrap();
         if s.down || s.router_down {
             return Err(node_err("LN node unreachable"));
         }
+        if s.lost_next > 0 {
+            s.lost_next -= 1;
+            return Err(node_err("the connection broke as the payment was sent"));
+        }
         if s.payments.iter().any(|p| p["payment_hash"] == hash && p["status"] != "FAILED") {
             return Err(node_err("payment already exists"));
         }
         // a ticket of 40 blocks through one hop of 80 and the node's 3: no route inside a smaller limit
-        let failing = s.hop_full || s.fail_next > 0;
+        if std::mem::take(&mut s.fail_one) {
+            s.failing = Some(hash.clone());
+        }
+        // its own channel down: as the real node says it, no balance, and no attempt on its record
+        let down = s.channel["active"] != true;
+        let failing = down || s.no_route || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
         s.fail_next = s.fail_next.saturating_sub(1);
         let late = !failing && s.late_fail > 0;
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
@@ -969,19 +1081,44 @@ impl LnBackend for PayLn {
             {"pub_key": d.payee_hex(), "expiry": h + 43, "custom_records": {TAG_RECORD.to_string(): B64.encode(&r.tag)}}]});
         let p = json!({"payment_hash": hash, "payment_index": s.next_index.to_string(), "status": status, "value_msat": d.amount_msat.unwrap_or(0).to_string(),
                        "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
-                       "failure_reason": if arrives { "FAILURE_REASON_NONE" } else { "FAILURE_REASON_NO_ROUTE" },
+                       "failure_reason": if arrives { "FAILURE_REASON_NONE" } else if down { "FAILURE_REASON_INSUFFICIENT_BALANCE" } else { "FAILURE_REASON_NO_ROUTE" },
                        "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late, "stranded": stranded,
                        "arrives_at": arrives_at, "invoice_expires": d.timestamp + d.expiry_s, "amount_msat": d.amount_msat});
         s.payments.push(p.clone());
+        s.sent_at.push(Instant::now());
+        if arrives && !late && !stranded && s.unseen_next > 0 {
+            s.unseen_next -= 1;
+            let until = Instant::now() + s.unseen_for;
+            s.unseen_until.insert(hash, until);
+            return Err(node_err("the LN node's payment stream ended before the payment was locked"));
+        }
         Ok(p)
     }
 
     fn lookup(&self, hash: &str) -> xbt402::Result<Option<Value>> {
-        let s = self.state();
+        let takes = {
+            let mut s = self.st.lock().unwrap();
+            s.lookups += 1;
+            s.lookup_takes
+        };
+        std::thread::sleep(takes);
+        let mut s = self.state();
+        s.lookup_log.push(hash.to_string());
         if s.down || s.router_down {
             return Err(node_err("LN node unreachable"));
         }
-        Ok(s.payments.iter().rev().find(|p| p["payment_hash"] == hash).cloned())
+        let p = s.payments.iter().rev().find(|p| p["payment_hash"] == hash).cloned();
+        // a payment the node has not yet listed an HTLC for: in flight, nothing on its way to show
+        Ok(p.map(|mut p| {
+            if s.unseen_until.get(hash).is_some_and(|until| Instant::now() < *until) && p["status"] == "IN_FLIGHT" {
+                if s.unseen_with_no_expiry {
+                    p["htlcs"][0]["route"]["hops"][1]["expiry"] = json!(0);
+                } else {
+                    p["htlcs"] = json!([]);
+                }
+            }
+            p
+        }))
     }
 
     fn payments_after(&self, after: u64, max: u64) -> xbt402::Result<Vec<Value>> {
@@ -1041,6 +1178,7 @@ impl LnBackend for PayLn {
                            "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                            "failure_reason": reason, "htlcs": []});
             s.payments.push(p.clone());
+            s.sent_at.push(Instant::now());
             return Ok(p);
         }
         if !self.seller.pay_offer_invoice(&raw, d.amount_msat) {
@@ -1052,6 +1190,7 @@ impl LnBackend for PayLn {
                        "fee_msat": FEE_MSAT.to_string(), "payment_preimage": pre, "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                        "failure_reason": "FAILURE_REASON_NONE", "htlcs": []});
         s.payments.push(p.clone());
+        s.sent_at.push(Instant::now());
         Ok(p)
     }
 
@@ -1071,10 +1210,18 @@ struct Seen {
     paid: bool,
     /// The call's limit the wallet sent the seller (`X-Xbt402-Max-Msat`), if any.
     cap_msat: Option<String>,
+    /// The `seq` its payment signature (`PAYMENT-SIGNATURE`) names, if it has one.
+    seq: Option<u64>,
 }
 
 fn cap_of(headers: &[(String, String)]) -> Option<String> {
     headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)).map(|(_, v)| v.clone())
+}
+
+fn seq_of(headers: &[(String, String)]) -> Option<u64> {
+    let (_, v) = headers.iter().find(|(k, _)| k == "PAYMENT-SIGNATURE")?;
+    let p: Value = serde_json::from_slice(&B64.decode(v).ok()?).ok()?;
+    p["payload"]["seq"].as_u64()
 }
 
 type Hook = Box<dyn FnMut(&Seen, &dyn Fn() -> xbt402::Result<WireAnswer>) -> Option<xbt402::Result<WireAnswer>> + Send>;
@@ -1092,13 +1239,19 @@ struct Tap {
     drop_cap: AtomicBool,
     /// Leave out the size the buyer was shown (`X-Xbt402-Max-Size`): the seller then sends as one that ignores it.
     drop_size: AtomicBool,
+    /// The next `status`, and the next `cancel`, are this slow, held as a real one is to the read timeout it was sent with.
+    status_slow_ms: AtomicU64,
+    cancel_slow_ms: AtomicU64,
+    /// And the next unpaid ask of `/latehead/`.
+    ask_slow_ms: AtomicU64,
+    drop_none: AtomicU64,
 }
 
 impl TicketWire for Tap {
     fn upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>) -> xbt402::Result<xbt_signer::ticket_pay::WireUpgrade> {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
         self.log.lock().unwrap().push(Seen { method: "GET".into(), path, body: String::new(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
-                                             cap_msat: cap_of(headers) });
+                                             cap_msat: cap_of(headers), seq: seq_of(headers) });
         self.inner.upgrade(url, headers, read_timeout, tls)
     }
 
@@ -1111,8 +1264,16 @@ impl TicketWire for Tap {
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> xbt402::Result<WireAnswer> {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
         let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE"),
-                          cap_msat: cap_of(headers) };
+                          cap_msat: cap_of(headers), seq: seq_of(headers) };
         self.log.lock().unwrap().push(seen.clone());
+        let slow = if seen.path.starts_with("/x402/ticket/status") { &self.status_slow_ms } else if seen.path.starts_with("/x402/ticket/cancel") { &self.cancel_slow_ms }
+                   else if seen.path.starts_with("/latehead/") && !seen.paid { &self.ask_slow_ms } else { &self.drop_none };
+        let d = Duration::from_millis(slow.swap(0, Ordering::SeqCst));
+        if d > read_timeout {
+            std::thread::sleep(read_timeout);
+            return Err(xbt402::ChannelError::new("timeout", "the seller did not answer within the wallet's wait".to_string()));
+        }
+        std::thread::sleep(d);
         let kept: Vec<(String, String)> = headers.iter().filter(|(k, _)| !(self.drop_cap.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)))
             .filter(|(k, _)| !(self.drop_size.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_SIZE_HEADER)))
             .cloned().collect();
@@ -1352,6 +1513,16 @@ impl Rig {
         let settles = self.shop.standin.settles();
         let fresh = settles.iter().filter(|s| s.was_held).count();
         assert_eq!(fresh, self.shop.standin.count_held(InvoiceState::Settled), "a ticket settled twice: {settles:?}");
+    }
+}
+
+/// [`wait_for`] for what is built up by a whole rig, whose speed is the machine's: on a state, and
+/// a bound that only says the state will not come.
+fn wait_for_rig(what: &str, mut f: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !f() {
+        assert!(t.elapsed() < Duration::from_secs(300), "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -2422,6 +2593,112 @@ fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_
     r.assert_booked();
 }
 
+/// A caller that asks (`stream_paid`, the AI address) is told on its socket when its request is
+/// paid for, before the seller's head: `{"paid":true}` as the first line, the head after it, then
+/// the body. It times the seller from there, not from a payment that took long over a slow route.
+/// A caller that does not ask gets the head first, as before. The money is one ticket either way.
+#[test]
+fn a_call_that_asks_is_told_on_its_socket_when_it_is_paid_for_before_the_head() {
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    let read = |name: &'static str, lines: usize| {
+        let l = UnixListener::bind(dir.path().join(name)).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut b = BufReader::new(s);
+            let mut got = vec![];
+            for _ in 0..lines {
+                let mut line = String::new();
+                b.read_line(&mut line).unwrap();
+                got.push(serde_json::from_str::<Value>(&line).unwrap());
+            }
+            let mut rest = vec![];
+            b.read_to_end(&mut rest).unwrap();
+            (got, rest)
+        })
+    };
+    // the first call buys the session's prepaid ticket, then sends the request: told so in between
+    let sock = read("paid", 2);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "paid", "stream_head": true, "stream_paid": true}));
+    let (lines, body) = sock.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    assert_eq!(lines[0], json!({"paid": true}));
+    assert_eq!((lines[1]["status"].as_u64(), body.len() as u64), (Some(200), v["bytes"].as_u64().unwrap()), "{lines:?}");
+    // a call that does not ask: the head first, as before
+    let sock = read("plain", 1);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "plain", "stream_head": true}));
+    let (lines, _) = sock.join().unwrap();
+    assert_eq!((v["status"].as_u64(), lines[0]["status"].as_u64()), (Some(200), Some(200)), "{lines:?}");
+    std::env::remove_var("B2_STREAM_DIR");
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
+/// A caller that asked to be told (`stream_paid`, the AI address) and is gone by the time its
+/// request is paid for (its socket not there) is sent nothing: the request does not leave, the
+/// answer says so (`request_sent` false, no status), and the ticket bought for it stays with the
+/// seller as credit, which the next call spends without buying another.
+///
+/// FAILS before: the request left for the seller whatever became of the caller, so the AI address,
+/// which had gone on to another seller, had one answer paid to two.
+#[test]
+fn a_call_whose_caller_is_gone_once_it_is_paid_for_is_not_sent() {
+    use std::io::{BufReader, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    // no socket by that name: the caller is gone
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/11"), "max_sats": CALL, "task": "film", "stream_to": "gone", "stream_head": true,
+                                        "stream_paid": true}));
+    assert_eq!((v["rule"].as_str(), v["request_sent"].as_bool()), (Some("ticket_caller_gone"), Some(false)), "{v}");
+    assert!(v["status"].is_null(), "{v}");
+    assert_eq!(v["tickets_prepaid"].as_u64(), Some(1), "the ticket was bought before the request would have left: {v}");
+    assert!(r.tap.seen("/page/11").iter().all(|s| !s.paid), "the seller got no paid request");
+    // the next call, to a caller that is there, spends that credit: no second ticket
+    let l = UnixListener::bind(dir.path().join("here")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut all = String::new();
+        BufReader::new(s).read_to_string(&mut all).unwrap();
+        all
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/11"), "max_sats": CALL, "task": "film", "stream_to": "here", "stream_head": true,
+                                        "stream_paid": true}));
+    let got = reader.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(0), Some(true)), "{v}");
+    assert!(got.starts_with("{\"paid\":true}\n"), "{got}");
+    assert_eq!(r.tap.seen("/page/11").iter().filter(|s| s.paid).count(), 1, "one paid request reached the seller");
+    std::env::remove_var("B2_STREAM_DIR");
+    wait_for("no ticket on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
+/// A paid request a proxy in front of the seller answers with a 5xx and no receipt (a CDN's 524)
+/// has left: the answer says `request_sent`, so that a caller (the AI address) does not send it to
+/// a second seller while the first may still serve it.
+///
+/// FAILS before: the answer did not say, and the AI address read the 5xx as the seller's failure.
+#[test]
+fn a_paid_request_answered_5xx_without_a_receipt_says_it_was_sent() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/page/")).then(|| Ok(answer(524, vec![], b"a timeout occurred".to_vec())))));
+    let v = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((v["rule"].as_str(), v["status"].as_u64(), v["request_sent"].as_bool()), (Some("ticket_seller"), Some(524), Some(true)), "{v}");
+    // the session goes on: the next call is served, and says it was sent
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(true)), "{v}");
+}
+
 /// A seller's own web page, used inside the app (docs/SELLER-APPS.md): the caller's headers (its
 /// cookies, its login) reach the service, the seller's guest login wins over a forged one, the
 /// page the service serves only compressed comes back plain, and the seller's response headers come
@@ -2811,6 +3088,1202 @@ fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_t
     assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
     assert_eq!(r.status()["locked"]["tickets"], 0);
     r.assert_booked();
+}
+
+#[test]
+fn a_file_waits_for_a_ticket_the_node_has_not_yet_shown_locked_rather_than_ending() {
+    let _g = env_lock();
+    // the seller keeps a paused answer open as it ships
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::new(json!({}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    // a session, its pool of eight locked
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!((first["status"].as_u64(), first["complete"].as_bool()), (Some(200), Some(true)), "{first}");
+    // from now on the wallet's node answers each send before it lists the payment's HTLC, as a loaded node does
+    // (or a payment stream that breaks): the ticket reaches the seller, but for 3 s the node shows it on no way.
+    // The refills behind the file below are all such tickets, and the file needs more than the pool it starts with
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(3);
+    }
+    // 40 MiB at 200 sat a MiB: 8,000 sat, more than the seven tickets left and the 800 sat of balance
+    let n = 40 * MIB;
+    let v = r.pay(&format!("/files/{n}"), 12_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert!(v["ended"].is_null(), "the file is not ended for want of a ticket the node has yet to show locked: {v}");
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["body"].as_str()), (Some("8000000"), Some("as signed")), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n));
+    // what the buyer's node paid, what the seller's node took and what the book released are one number
+    wait_for("the node to show every ticket it sent", || r.ln.state().unseen_until.values().all(|u| Instant::now() >= *u));
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "the buyer's node, the seller's node and the book: {paid} {taken} {book}");
+    assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
+    assert!(paid >= 8 * TICKET, "{paid}");
+    r.assert_booked();
+}
+
+/// A ticket takes its time to reach the seller over a slow route, or a seller that is loaded takes its time to say
+/// so. The answer is paused meanwhile, and the seller keeps it open: the wallet waits as long.
+///
+/// FAILS with 3 s: `stopped by the wallet: ticket_not_ready`, on a lab at load 60 in the middle of a 100 MB file.
+#[test]
+fn a_file_waits_for_a_ticket_the_seller_is_slow_to_show_locked() {
+    let _g = env_lock();
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::new(json!({}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true), "{first}");
+    // the seller does not hear of a new ticket for 9 s, inside the 12 s a release pauses and past the 3 s it once did;
+    // the seven it holds from before, it has shown
+    r.shop.standin.hold_streams(true);
+    let n = 40 * MIB;
+    let v = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(9));
+            r.shop.standin.hold_streams(false);
+        });
+        r.pay(&format!("/files/{n}"), 12_000)
+    });
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert!(v["ended"].is_null(), "{v}");
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["body"].as_str()), (Some("8000000"), Some("as signed")), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n));
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "the buyer's node, the seller's node and the book: {paid} {taken} {book}");
+    assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
+    r.assert_booked();
+}
+
+/// A rig whose seller keeps a paused answer open as long as it does as shipped.
+fn seller_waits_as_shipped(extra: Value) -> Rig {
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::new(extra);
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    r
+}
+
+/// What the buyer's node paid, what the seller's node took, the book and the ledger are one number, and every secret that left is one of them.
+fn assert_money_agrees(r: &Rig) {
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "the buyer's node, the seller's node and the book: {paid} {taken} {book}");
+    assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED);
+    assert_eq!(paid, r.tap.secrets().len() as u64 * TICKET, "what was paid is what the secrets that left pay for");
+    r.assert_booked();
+}
+
+/// The answer under way, then `during` beside it, then what the call came to.
+fn under_way(r: &Rig, route: &str, max_sats: i64, during: impl FnOnce()) -> Value {
+    std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(route, max_sats));
+        wait_for("the answer to be under way", || r.tap.seen("/slow/").iter().any(|s| s.paid) && r.status()["paying"][0]["answer_open"] == true);
+        during();
+        t.join().unwrap()
+    })
+}
+
+/// The first call of a session, a small one, and the seller's word on the rest of the pool: from here a test may hold
+/// back what the seller hears of new tickets, and the seven it has are what the next answer has to go on.
+fn first_call_with_the_pool_shown(r: &Rig) -> Value {
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true), "{first}");
+    wait_for("the seller to have heard of all eight", || r.shop.standin.told_held() >= 8);
+    // tickets locked from here on are younger than these, and the book goes oldest first: the tests' clock stands still otherwise
+    r.clock.fetch_add(1, Ordering::SeqCst);
+    first
+}
+
+/// A wallet and a seller as they ship, a pool of 2: 5 MiB to a ticket, spent, and both of the next two locked and shown.
+fn shipped_with_pool_filled() -> Rig {
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((v["complete"].as_bool(), v["balance_msat"].as_str()), (Some(true), Some("0")), "{v}");
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    r
+}
+
+/// How many times the chain node has been asked its height.
+fn heights_asked(r: &Rig) -> usize {
+    r.node.chain.st.lock().unwrap().calls.iter().filter(|c| *c == "getblockcount").count()
+}
+
+/// Wait until the wallet has stopped releasing (`secrets` have left) and is asking the chain node again and again: a release is in its wait.
+fn wait_for_release_asking_the_chain(r: &Rig, secrets: usize) {
+    wait_for("the tickets at hand to be used up", || r.tap.secrets().len() == secrets);
+    let asked = heights_asked(r);
+    wait_for("the release to wait for the chain node", || heights_asked(r) >= asked + 3);
+    assert_eq!(r.tap.secrets().len(), secrets, "nothing is released on no tip");
+}
+
+fn stop_and_wait_for_tickets_back(r: &Rig, session: &Value) {
+    r.call("ticket_stop", json!({"session": session}));
+    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
+}
+
+fn assert_whole(v: &Value, n: usize) {
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
+    assert!(v["ended"].is_null(), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(n), "{v}");
+}
+
+/// A chain node that stops answering just where the file needs a refill: a busy node, or one restarting. Its height is
+/// not 0: the release waits for it, the refill goes when it is back, and the file comes through whole.
+#[test]
+fn a_file_comes_through_a_chain_node_that_stops_answering_for_a_while() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    // 15 MiB: three tickets, one more than the pool holds
+    let n = 15 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 5_000, || {
+        r.node.chain.st.lock().unwrap().down = true;
+        wait_for_release_asking_the_chain(&r, 3);
+        r.node.chain.st.lock().unwrap().down = false;
+    });
+    assert_whole(&v, n);
+    assert_eq!((v["price_msat"].as_str(), v["receipt"]["body"].as_str()), (Some("3000000"), Some("as signed")), "{v}");
+    assert_money_agrees(&r);
+}
+
+/// A chain node that fails now and then, as a loaded one does: each failure used to end the file, whichever call it
+/// hit, and one that hit the book's own question ended it with `ticket_none`.
+#[test]
+fn a_file_comes_through_a_chain_node_that_fails_every_other_question() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || r.node.chain.st.lock().unwrap().height_fails_every = 2);
+    r.node.chain.st.lock().unwrap().height_fails_every = 0;
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
+/// No tip is known at all, the last being too old to go by: the release waits for one, and goes on.
+///
+/// The clock is moved by hand: it is the one the wallet dates a tip by, and the node is down first, so no fresh tip can come between.
+#[test]
+fn a_file_waits_for_a_tip_nobody_knows() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    // four tickets of the seven left: no refill is needed
+    let n = 20 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || {
+        let before = r.tap.secrets().len();
+        r.node.chain.st.lock().unwrap().down = true;
+        r.clock.fetch_add(301, Ordering::SeqCst);
+        wait_for_release_asking_the_chain(&r, before);
+        r.node.chain.st.lock().unwrap().down = false;
+    });
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
+/// A tip that stays unknown ends the answer within the one pause, and says why: not `ticket_none`, and nothing is
+/// released. The pause is 12 s from the last byte, and a second try where the ticket is due has none of it left.
+#[test]
+fn a_tip_that_stays_unknown_ends_the_answer_and_says_why() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    let n = 40 * MIB;
+    let before = Cell::new(0);
+    let began = Cell::new(Instant::now());
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || {
+        began.set(Instant::now());
+        r.node.chain.st.lock().unwrap().down = true;
+        r.clock.fetch_add(301, Ordering::SeqCst);
+        before.set(r.tap.secrets().len());
+    });
+    assert!(began.get().elapsed() < Duration::from_secs(16), "{:?} {v}", began.get().elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_chain"), "{v}");
+    // at most the one on its way as the node went away
+    assert!(r.tap.secrets().len() <= before.get() + 1, "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(v["bytes"].as_u64().unwrap() as usize));
+    r.node.chain.st.lock().unwrap().down = false;
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// A tip lost while a release waits for the seller's word on a ticket: the ticket has not failed, whatever the book can
+/// say of it without a tip, and the wait goes on.
+#[test]
+fn a_tip_lost_while_the_seller_is_awaited_is_no_failed_ticket() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    let n = 40 * MIB;
+    let v = std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 20_000));
+        wait_for("the tickets at hand to be used up", || r.tap.secrets().len() == 8);
+        let polls = r.tap.seen("/x402/ticket/status").len();
+        wait_for("the release to ask the seller", || r.tap.seen("/x402/ticket/status").len() > polls + 1);
+        r.node.chain.st.lock().unwrap().down = true;
+        r.clock.fetch_add(301, Ordering::SeqCst);
+        let polls = r.tap.seen("/x402/ticket/status").len();
+        wait_for("the release to go on asking the seller", || r.tap.seen("/x402/ticket/status").len() > polls + 1);
+        r.node.chain.st.lock().unwrap().down = false;
+        r.shop.standin.hold_streams(false);
+        t.join().unwrap()
+    });
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
+/// The wait for the chain node is no wait for a stop.
+#[test]
+fn a_stop_ends_the_wait_for_a_tip_nobody_knows() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true));
+    let n = 40 * MIB;
+    let stopped_at = Cell::new(Instant::now());
+    let v = under_way(&r, &format!("/slow/{n}"), 20_000, || {
+        let before = r.tap.secrets().len();
+        r.node.chain.st.lock().unwrap().down = true;
+        r.clock.fetch_add(301, Ordering::SeqCst);
+        wait_for_release_asking_the_chain(&r, before);
+        stopped_at.set(Instant::now());
+        r.call("ticket_stop", json!({"session": first["session"]}));
+    });
+    assert!(stopped_at.get().elapsed() < Duration::from_secs(3), "the answer ended {:?} after the stop", stopped_at.get().elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_session"), "{v}");
+    r.node.chain.st.lock().unwrap().down = false;
+    stop_and_wait_for_tickets_back(&r, &first["session"]);
+    assert_money_agrees(&r);
+}
+
+/// A ticket the wallet's node is late with, and the seller later still: the shipped seller closes the paused answer
+/// after 15 s, and a secret that left after that would pay for nothing, with every book agreeing. One deadline for the
+/// whole pause, 12 s from the last byte: it ends the answer with no ninth secret, and what arrived is what eight paid for.
+#[test]
+fn no_ticket_is_released_after_the_seller_has_closed_the_answer() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(18);
+    }
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(16), "under the seller's wait: {took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert_eq!(v["bytes"].as_u64().unwrap() as usize, 39 * MIB, "what 7.8 tickets pay for: {v}");
+    assert_eq!(r.tap.secrets().len(), 8, "no secret after the pause: {v}");
+    r.shop.standin.hold_streams(false);
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+    assert_money_agrees(&r);
+}
+
+/// A seller that closes a paused answer sooner than the wallet's pause (this one after 2 s), and then shows the ticket:
+/// its signed `status` lists the answer as ended, and nothing is released into it.
+#[test]
+fn a_close_by_the_seller_during_the_pause_is_noticed_and_nothing_is_released() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    let n = 60 * MIB;
+    let v = std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 20_000));
+        wait_for("the tickets at hand to be used up", || r.tap.secrets().len() == 8);
+        std::thread::sleep(Duration::from_secs(4));
+        r.shop.standin.hold_streams(false);
+        t.join().unwrap()
+    });
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_answer_closed"), "{v}");
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// A seller that shows no new ticket at all holds a buyer up at no cost to itself: a pause a call. After three running,
+/// with no byte between them, the session ends, and says why; and the asking is not a poll every few milliseconds.
+#[test]
+fn a_seller_that_never_shows_a_ticket_is_left_after_a_few_pauses() {
+    let _g = env_lock();
+    // the pause as an owner may set it, so that a few of them are quick
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 3_000}}));
+    let first = first_call_with_the_pool_shown(&r);
+    let sid = first["session"].as_str().unwrap().to_string();
+    r.shop.standin.hold_streams(true);
+    let polls = r.tap.seen("/x402/ticket/status").len();
+    let t0 = Instant::now();
+    let file = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
+    assert!(t0.elapsed() < Duration::from_secs(6), "one pause: {:?} {file}", t0.elapsed());
+    assert!(file["ended"].as_str().unwrap().contains("ticket_not_ready"), "{file}");
+    let polled = r.tap.seen("/x402/ticket/status").len() - polls;
+    assert!(polled < 25, "{polled} questions in one pause");
+    // a seller slow to answer the cancel of a stop made inside a release does not keep the caller for it
+    r.tap.cancel_slow_ms.store(8_000, Ordering::SeqCst);
+    let mut calls = vec![];
+    loop {
+        let t = Instant::now();
+        let next = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+        assert!(t.elapsed() < Duration::from_millis(6_500), "{:?} {next}", t.elapsed());
+        let said = format!("{} {}", str_of(&next["rule"]), str_of(&next["ended"]));
+        calls.push(said.clone());
+        if said.contains("ticket_seller_stalled") {
+            break;
+        }
+        assert!(calls.len() < 4, "{calls:?}");
+    }
+    // one to a pause: the file's bytes after its early try cleared that one, and its second try, where the ticket was due,
+    // had none of its pause left and is not another. So three calls more
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_ne!(r.session(&sid)["sessions"][0]["state"], "open", "{calls:?}");
+    r.shop.standin.hold_streams(false);
+    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
+    assert_money_agrees(&r);
+}
+
+/// Calls side by side to a seller that shows nothing: each ends by its own deadline and not one behind the other.
+#[test]
+fn calls_side_by_side_do_not_wait_one_pause_after_another() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 2_000}}));
+    r.shop.standin.hold_streams(true);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..5u64).map(|i| {
+            let r = &r;
+            sc.spawn(move || {
+                std::thread::sleep(Duration::from_millis(300 * i));
+                let at = Instant::now();
+                let v = r.pay("/page/10", CALL);
+                (at.elapsed(), v)
+            })
+        }).collect();
+        for h in hs {
+            let (took, v) = h.join().unwrap();
+            assert!(took < Duration::from_secs(14), "{took:?} {v}");
+            assert_eq!(v["verdict"], "deny", "{v}");
+            assert!(!str_of(&v["rule"]).is_empty(), "a plain answer: {v}");
+        }
+    });
+    assert_eq!(r.tap.secrets().len(), 0);
+    assert_eq!(r.ledger_sum(), 0);
+    r.shop.standin.hold_streams(false);
+}
+
+fn str_of(v: &Value) -> String {
+    v.as_str().unwrap_or_default().to_string()
+}
+
+/// A ticket stuck in `sending`: the node calls it in flight and shows it on no way, for good. Each call waits a pause for
+/// it, until it is older than any send can be: then it is stranded, the session ends, and the next call opens another.
+#[test]
+fn a_ticket_stranded_in_sending_ends_its_session() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true));
+    let sid = first["session"].as_str().unwrap().to_string();
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(3_600);
+    }
+    let t = Instant::now();
+    let file = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
+    assert!(t.elapsed() < Duration::from_secs(16), "{:?} {file}", t.elapsed());
+    assert!(file["ended"].as_str().unwrap().contains("ticket_not_ready"), "{file}");
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "open", "younger than any send: not yet taken for stranded");
+    // older than any send can be
+    r.clock.fetch_add(91, Ordering::SeqCst);
+    r.ln.st.lock().unwrap().unseen_next = 0;
+    let t = Instant::now();
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert!(t.elapsed() < Duration::from_secs(3), "the first release to look finds it: {:?} {v}", t.elapsed());
+    let said = format!("{} {}", str_of(&v["rule"]), str_of(&v["ended"]));
+    assert!(said.contains("ticket_session_ended"), "{v}");
+    assert_ne!(r.session(&sid)["sessions"][0]["state"], "open", "{v}");
+    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty() && r.shop.held() == 0);
+    assert_money_agrees(&r);
+}
+
+/// A send the node has no record of (it never reached it): nothing is on its way, and nothing is waited for.
+#[test]
+fn a_send_the_node_has_no_record_of_is_not_waited_for() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    r.ln.st.lock().unwrap().lost_next = 1_000;
+    let t = Instant::now();
+    let v = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?} {v}", t.elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    r.ln.st.lock().unwrap().lost_next = 0;
+}
+
+/// A ticket whose HTLC the node shows with no expiry yet cannot be released, and is on its way: it is waited for.
+#[test]
+fn a_ticket_shown_with_no_expiry_yet_is_waited_for() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(3);
+        s.unseen_with_no_expiry = true;
+    }
+    let n = 40 * MIB;
+    let v = r.pay(&format!("/files/{n}"), 12_000);
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
+/// The wallet's node away for a moment while a ticket is on its way: no answer about it says nothing of it, and it is
+/// waited for inside the pause, whether the node is wholly away or its router only.
+#[test]
+fn the_nodes_silence_for_a_moment_does_not_end_the_wait_for_a_ticket() {
+    let _g = env_lock();
+    for router_only in [false, true] {
+        let r = seller_waits_as_shipped(json!({}));
+        first_call_with_the_pool_shown(&r);
+        {
+            let mut s = r.ln.st.lock().unwrap();
+            s.unseen_next = 1_000;
+            s.unseen_for = Duration::from_secs(60);
+        }
+        let n = 40 * MIB;
+        let v = std::thread::scope(|sc| {
+            let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 12_000));
+            wait_for_long("the pool to be used up", Duration::from_secs(20), || r.tap.secrets().len() == 8);
+            let asked = r.ln.state().lookups;
+            wait_for("the release to ask the node", || r.ln.state().lookups > asked);
+            {
+                let mut s = r.ln.st.lock().unwrap();
+                if router_only { s.router_down = true } else { s.down = true }
+            }
+            // away until the wallet has asked it something while it is, inside the pause: about a payment, or about itself
+            // where a refill asks before it sends
+            let questions = || {
+                let s = r.ln.st.lock().unwrap();
+                s.lookups + s.turned_away
+            };
+            let asked = questions();
+            wait_for_long("the wallet to ask the node that is away", Duration::from_secs(12), || questions() > asked);
+            {
+                // it is back, and shows the tickets locked
+                let mut s = r.ln.st.lock().unwrap();
+                s.router_down = false;
+                s.down = false;
+                s.unseen_next = 0;
+                s.unseen_until.clear();
+            }
+            t.join().unwrap()
+        });
+        assert_whole(&v, n);
+        assert_money_agrees(&r);
+    }
+}
+
+/// An answer priced by the second is charged for the time a ticket is late: the clock's price, said in `docs/LIMITS.md`.
+/// What it comes to is what this prints, and it is bounded by the seconds the answer was open.
+#[test]
+fn an_answer_by_the_second_pays_for_a_late_ticket_and_no_more() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    r.shop.standin.hold_streams(true);
+    // about 8.4 s of body at 400 sat a second: 3,360 sat, under four tickets, when nothing is late
+    let t0 = Instant::now();
+    let v = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(11));
+            r.shop.standin.hold_streams(false);
+        });
+        r.pay("/timed/85990", 20_000)
+    });
+    let open_s = t0.elapsed().as_secs() + 2;
+    let price = v["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+    eprintln!("a late ticket on an answer by the second: {price} msat, open {:?}, complete {}, ended {}", t0.elapsed(), v["complete"], v["ended"]);
+    assert!(price <= open_s * 400_000, "{price} msat in under {open_s} s: {v}");
+    assert!(v.get("seller_fault").is_none(), "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// The whole call has one deadline: a seller slow with the head of its answer gets what is left of it as its read
+/// timeout, so that the caller has a plain refusal in time and does not retry and pay again.
+#[test]
+fn a_seller_slow_with_its_head_is_a_plain_refusal_inside_the_calls_deadline() {
+    let _g = env_lock();
+    UPSTREAM_WAIT_SECS.store(40, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 6}}));
+    UPSTREAM_WAIT_SECS.store(UPSTREAM_WAIT_DEFAULT_SECS, Ordering::SeqCst);
+    let t = Instant::now();
+    let v = r.pay("/latehead/10", CALL);
+    assert!(t.elapsed() < Duration::from_secs(9), "{:?} {v}", t.elapsed());
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_seller")), "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// And a seller that goes quiet in the body ends at the deadline too, not a whole read timeout past it.
+#[test]
+fn a_seller_quiet_in_its_body_ends_at_the_calls_deadline() {
+    let _g = env_lock();
+    REFILL_WAIT_MS.store(40_000, Ordering::SeqCst);
+    UPSTREAM_WAIT_SECS.store(40, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 6}}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    UPSTREAM_WAIT_SECS.store(UPSTREAM_WAIT_DEFAULT_SECS, Ordering::SeqCst);
+    let t = Instant::now();
+    let v = r.pay(&format!("/latequiet/{}", 64 << 10), 5_000);
+    // the deadline and the 2 s its last receipt is waited for; by its read timeout alone it would be about 10 s and those
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?} {v}", t.elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("max_answer_s"), "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// A stop during each wait: it ends the answer there, nothing leaves after it began, and the first answer, this answer
+/// and what is left with the seller come to what was paid.
+#[test]
+fn a_stop_during_each_wait_ends_the_answer_with_the_books_agreeing() {
+    let _g = env_lock();
+    for kind in ["coming", "ready"] {
+        let r = seller_waits_as_shipped(json!({}));
+        let first = first_call_with_the_pool_shown(&r);
+        if kind == "coming" {
+            let mut s = r.ln.st.lock().unwrap();
+            s.unseen_next = 1_000;
+            s.unseen_for = Duration::from_secs(8);
+        } else {
+            r.shop.standin.hold_streams(true);
+        }
+        let n = 60 * MIB;
+        let (v, stop, before, took) = std::thread::scope(|sc| {
+            let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 20_000));
+            // the pool is used up, the next ticket is not going, and the wait is being spent asking
+            wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+            let lookups = r.ln.state().lookups;
+            let polls = r.tap.seen("/x402/ticket/status").len();
+            wait_for("the release to be in its wait", || if kind == "coming" { r.ln.state().lookups > lookups + 2 } else { r.tap.seen("/x402/ticket/status").len() > polls + 2 });
+            assert!(!t.is_finished(), "the release waits, and the answer with it");
+            let before = r.tap.secrets().len();
+            let began = Instant::now();
+            let stop = r.call("ticket_stop", json!({"session": first["session"]}));
+            let v = t.join().unwrap();
+            (v, stop, before, began.elapsed())
+        });
+        assert!(took < Duration::from_secs(3), "the answer ended {took:?} after the stop began: {v}");
+        assert_eq!(v["complete"], false, "{v}");
+        assert!(v["ended"].as_str().unwrap().contains("ticket_session"), "{v}");
+        r.shop.standin.hold_streams(false);
+        stop_and_wait_for_tickets_back(&r, &first["session"]);
+        assert_eq!(r.tap.secrets().len(), before, "nothing left after the stop began");
+        assert_money_agrees(&r);
+        let (paid, ..) = r.money();
+        let msat = |v: &Value| v.as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
+        assert_eq!(msat(&first["price_msat"]) + msat(&v["price_msat"]) + msat(&stop["http"]["left_with_seller_msat"]), paid, "{v} {stop}");
+    }
+}
+
+/// A node that takes 300 ms to answer each question: the wait asks it with no lock held, so that the wallet's other work
+/// is not held up, it does not ask it harder for being slow, and a stop is still prompt.
+#[test]
+fn a_wait_on_a_slow_node_holds_up_nothing_else_and_a_stop_is_prompt() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    let first = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!(first["complete"].as_bool(), Some(true));
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(60);
+    }
+    let n = 40 * MIB;
+    std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 12_000));
+        wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+        r.ln.st.lock().unwrap().lookup_takes = Duration::from_millis(300);
+        std::thread::sleep(Duration::from_secs(1));
+        // a call that takes the wallet's spend lock and nothing else: refused at once, the session being no session
+        let (t1, asked) = (Instant::now(), r.ln.st.lock().unwrap().lookups);
+        let mut waits = vec![];
+        while t1.elapsed() < Duration::from_secs(4) {
+            let w = Instant::now();
+            r.call("ticket_stop", json!({"session": "00"}));
+            waits.push(w.elapsed());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let rate = (r.ln.st.lock().unwrap().lookups - asked) as f64 / t1.elapsed().as_secs_f64();
+        let (avg, most) = (waits.iter().sum::<Duration>() / waits.len() as u32, *waits.iter().max().unwrap());
+        eprintln!("a node of 300 ms: spend lock waited {avg:?} on average, {most:?} at most, {rate:.1} questions a second");
+        assert!(avg < Duration::from_millis(150) && most < Duration::from_millis(700), "{avg:?} {most:?}");
+        let s0 = Instant::now();
+        let stopping = sc.spawn(|| r.call("ticket_stop", json!({"session": first["session"]})));
+        let v = t.join().unwrap();
+        let answer_took = s0.elapsed();
+        stopping.join().unwrap();
+        let stop_took = s0.elapsed();
+        eprintln!("a node of 300 ms: the answer ended after {answer_took:?}, the stop returned after {stop_took:?}");
+        assert!(answer_took < Duration::from_secs(2), "{answer_took:?} {v}");
+        assert!(stop_took < Duration::from_secs(4), "{stop_took:?} {v}");
+        assert_eq!(v["complete"], false, "{v}");
+    });
+    let mut s = r.ln.st.lock().unwrap();
+    s.lookup_takes = Duration::ZERO;
+    s.unseen_for = Duration::ZERO;
+    s.unseen_until.clear();
+}
+
+/// The waits of one release end together: the node late by 6 s, then the seller showing nothing. It is one pause of 12 s
+/// from the last byte, whichever is late, and not one wait after the other; the caller gets a plain answer with what
+/// arrived, and nothing is charged past that: the release that never happened moved no money.
+#[test]
+fn both_waits_of_one_release_are_one_pause_and_end_in_a_plain_answer() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(6);
+    }
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    assert!(took > Duration::from_secs(10), "it waited: {took:?} {v}");
+    assert!(took < Duration::from_secs(16), "one pause, inside the seller's wait: {took:?} {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(false)), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("the seller has not shown"), "it went on to the seller's word: {v}");
+    let got = v["bytes"].as_u64().unwrap();
+    assert_eq!(v["body_digest"], pattern_digest(got as usize));
+    let released = v["tickets_released"].as_u64().unwrap();
+    let price = v["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+    assert!(got * 200_000 / (1 << 20) <= (released + 1) * TICKET, "{got} bytes for {released} tickets: {v}");
+    assert!(price <= (got + (64 << 10)) * 200_000 / (1 << 20) + 1, "charged for what arrived: {price} for {got} bytes: {v}");
+    assert_eq!(r.tap.secrets().len() as u64, 1 + released, "one for the first call, and those of this one: {v}");
+    r.shop.standin.hold_streams(false);
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// A release that begins late in a call waits no longer than the call has left. Shown here with a deadline of 5 s, inside the 12 s of a pause.
+#[test]
+fn the_waits_of_a_release_end_at_the_calls_deadline() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 5}}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(9), "{took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].is_string(), "{v}");
+    assert_eq!(v["body_digest"], pattern_digest(v["bytes"].as_u64().unwrap() as usize));
+    r.shop.standin.hold_streams(false);
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+    // and a release for a head, with no answer open to tell it anything has ended
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 5}}));
+    r.shop.standin.hold_streams(true);
+    let t0 = Instant::now();
+    let v = r.pay("/page/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(9), "{:?} {v}", t0.elapsed());
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_not_ready")), "{v}");
+    assert_eq!(r.tap.secrets().len(), 0);
+    r.shop.standin.hold_streams(false);
+}
+
+/// [`shipped_with_pool_filled`], with the owner's `extra`.
+fn shipped_by(extra: Value) -> Rig {
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(extra, 30, shipped_shop());
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((v["complete"].as_bool(), v["balance_msat"].as_str()), (Some(true), Some("0")), "{v}");
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    r
+}
+
+/// Nothing more leaves once the call has answered, whatever it left going on behind.
+fn assert_nothing_leaves_after(r: &Rig, v: &Value) {
+    let secrets = r.tap.secrets().len();
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(r.tap.secrets().len(), secrets, "a secret left after the call answered: {v}");
+}
+
+/// The chain RPC hangs in the middle of a file (30 s and then an error, as its client's timeout gives): the last tip stands,
+/// the tickets at hand go, the refill goes on behind on its own thread, and the caller has a plain answer inside the pause.
+#[test]
+fn a_chain_node_that_hangs_during_a_file_costs_the_caller_one_pause() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let hung_at = Cell::new(Instant::now());
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        hung_at.set(Instant::now());
+        r.node.chain.st.lock().unwrap().hang_ms = 30_000;
+    });
+    assert!(hung_at.get().elapsed() < Duration::from_secs(20), "{:?} {v}", hung_at.get().elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].is_string(), "{v}");
+    assert_nothing_leaves_after(&r, &v);
+    r.node.chain.st.lock().unwrap().hang_ms = 0;
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// At the shipped deadline: the chain RPC hangs at 42 s of a long answer by the second, where a question of 30 s would run
+/// past the caller's 60 s, charged for all of it. It answers by the deadline and the wait for its last receipt.
+#[test]
+fn a_chain_node_that_hangs_late_in_a_long_answer_leaves_the_caller_its_answer() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let t0 = Instant::now();
+    let v = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(42).saturating_sub(t0.elapsed()));
+            r.node.chain.st.lock().unwrap().hang_ms = 30_000;
+        });
+        r.pay("/timed/1000000", 30_000)
+    });
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(57), "{took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].is_string(), "{v}");
+    let price = v["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+    assert!(price <= (took.as_secs() + 1) * 400_000, "{price} msat in {took:?}: {v}");
+    assert_nothing_leaves_after(&r, &v);
+    r.node.chain.st.lock().unwrap().hang_ms = 0;
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// The lookups of the wallet's node hang late in an answer: the same, at a short deadline.
+#[test]
+fn a_lightning_node_that_hangs_late_in_an_answer_leaves_the_caller_its_answer() {
+    let _g = env_lock();
+    let r = shipped_by(json!({"tickets": {"max_answer_s": 8}}));
+    let t0 = Instant::now();
+    let v = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(4));
+            let mut s = r.ln.st.lock().unwrap();
+            s.lookup_takes = Duration::from_secs(30);
+            s.down = true;
+        });
+        r.pay("/timed/1000000", 30_000)
+    });
+    assert!(t0.elapsed() < Duration::from_secs(15), "{:?} {v}", t0.elapsed());
+    assert!(v["ended"].is_string() || v["rule"].is_string(), "{v}");
+    assert_nothing_leaves_after(&r, &v);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.lookup_takes = Duration::ZERO;
+        s.down = false;
+    }
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// A seller slow to answer `status` (28 s, inside the read timeout), where a release asks it and where the last receipt
+/// is asked for: what is left of the deadline is all it gets. Shown with a deadline of 8 s.
+#[test]
+fn a_seller_slow_with_its_status_does_not_spend_the_callers_limit() {
+    let _g = env_lock();
+    for at_poll in [true, false] {
+        let r = shipped_by(json!({"tickets": {"max_answer_s": 8}}));
+        let t0 = Instant::now();
+        let v = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                if at_poll {
+                    std::thread::sleep(Duration::from_secs(2));
+                    r.shop.standin.hold_streams(true);
+                    std::thread::sleep(Duration::from_secs(1));
+                } else {
+                    std::thread::sleep(Duration::from_millis(7_800));
+                }
+                r.tap.status_slow_ms.store(28_000, Ordering::SeqCst);
+            });
+            r.pay("/timed/1000000", 30_000)
+        });
+        assert!(t0.elapsed() < Duration::from_secs(16), "at_poll {at_poll}: {:?} {v}", t0.elapsed());
+        assert!(v["ended"].is_string(), "{v}");
+        assert_nothing_leaves_after(&r, &v);
+        r.shop.standin.hold_streams(false);
+        stop_and_wait_for_tickets_back(&r, &v["session"]);
+        assert_money_agrees(&r);
+    }
+}
+
+/// A seller slow with its 402, up to the call's deadline: no secret is released for a call whose caller is about to give up.
+#[test]
+fn no_secret_leaves_past_the_calls_deadline() {
+    let _g = env_lock();
+    UPSTREAM_WAIT_SECS.store(40, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 3}}));
+    UPSTREAM_WAIT_SECS.store(UPSTREAM_WAIT_DEFAULT_SECS, Ordering::SeqCst);
+    first_call_with_the_pool_shown(&r);
+    // 800 sat left: spent, so that the next call needs a ticket
+    let spent = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+    assert_eq!(spent["complete"].as_bool(), Some(true), "{spent}");
+    let before = r.tap.secrets().len();
+    let mut once = true;
+    r.tap.set(Box::new(move |seen, _real| {
+        if !seen.paid && seen.path.starts_with("/latehead/") && std::mem::take(&mut once) {
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        None
+    }));
+    let t0 = Instant::now();
+    let v = r.pay("/latehead/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(7), "{:?} {v}", t0.elapsed());
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_call_deadline")), "{v}");
+    assert_eq!(r.tap.secrets().len(), before, "{v}");
+    assert_eq!(r.tap.seen("/latehead/").iter().filter(|s| s.paid).count(), 0, "{v}");
+    r.tap.clear();
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// The try on new terms keeps the first's deadline: a first ask of 5 s, of a deadline of 6 s, then a head of 25 s.
+#[test]
+fn the_try_on_new_terms_keeps_the_calls_deadline() {
+    let _g = env_lock();
+    UPSTREAM_WAIT_SECS.store(40, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 6}}));
+    UPSTREAM_WAIT_SECS.store(UPSTREAM_WAIT_DEFAULT_SECS, Ordering::SeqCst);
+    first_call_with_the_pool_shown(&r);
+    let mut once = true;
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || !seen.path.starts_with("/latehead/") || !std::mem::take(&mut once) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["amount"] = "998000".into();
+                e["extra"]["price"]["requestMsat"] = "998000".into();
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let t0 = Instant::now();
+    let v = r.pay("/latehead/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?} {v}", t0.elapsed());
+    r.tap.clear();
+}
+
+/// One slow stretch does not end a healthy session. Three small calls side by side at a seller late with its next tickets by
+/// more than one pause: each call's pause begins when its turn comes, one stall is counted, and the next call's ticket is shown.
+#[test]
+fn one_slow_stretch_with_calls_side_by_side_leaves_the_session_open() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 2_000}}));
+    let first = first_call_with_the_pool_shown(&r);
+    let sid = first["session"].as_str().unwrap().to_string();
+    r.shop.standin.hold_streams(true);
+    // the pool and the credit used up, whole
+    let drained = r.pay(&format!("/files/{}", 39 * MIB), 20_000);
+    assert_eq!(drained["complete"].as_bool(), Some(true), "{drained}");
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            std::thread::sleep(Duration::from_secs(3));
+            r.shop.standin.hold_streams(false);
+        });
+        let hs: Vec<_> = (0..3u64).map(|i| {
+            let r = &r;
+            sc.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100 * i));
+                r.pay("/page/10", CALL)
+            })
+        }).collect();
+        let answers: Vec<Value> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(answers.iter().all(|v| v["rule"] != "ticket_seller_stalled"), "{answers:?}");
+        assert!(answers.iter().any(|v| v["status"] == 200), "the ticket went once it was shown: {answers:?}");
+    });
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "open");
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["session"].as_str()), (Some(200), Some(sid.as_str())), "{next}");
+    assert_money_agrees_after_stop(&r, &next["session"]);
+}
+
+fn assert_money_agrees_after_stop(r: &Rig, session: &Value) {
+    stop_and_wait_for_tickets_back(r, session);
+    assert_money_agrees(r);
+}
+
+/// A call queued behind another that holds `paying` past this call's own deadline (the one ahead is asking a hung node
+/// whether its ticket is stranded, a little past its deadline): it answers at its deadline, and is not kept for a turn.
+#[test]
+fn a_call_queued_behind_another_answers_at_its_own_deadline() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 6, "ready_wait_ms": 20_000}}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    let drained = r.pay(&format!("/files/{}", 39 * MIB), 20_000);
+    assert_eq!(drained["complete"].as_bool(), Some(true), "{drained}");
+    r.ln.st.lock().unwrap().lookup_takes = Duration::from_secs(30);
+    std::thread::scope(|sc| {
+        let ahead = sc.spawn(|| r.pay("/page/10", CALL));
+        std::thread::sleep(Duration::from_millis(200));
+        let at = Instant::now();
+        let v = r.pay("/page/10", CALL);
+        assert!(at.elapsed() < Duration::from_secs(7), "{:?} {v}", at.elapsed());
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_busy")), "{v}");
+        ahead.join().unwrap();
+    });
+    assert_eq!(r.tap.secrets().len(), 8);
+    r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
+    r.shop.standin.hold_streams(false);
+}
+
+/// The lookups hang while a ticket is on its way: the round goes on behind, the caller has its answer at the end of the pause,
+/// and the release is not kept for 30 s a question.
+#[test]
+fn a_lookup_that_hangs_during_the_wait_is_given_up_on_at_the_end_of_the_pause() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 3_000}}));
+    first_call_with_the_pool_shown(&r);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(60);
+    }
+    let t0 = Cell::new(Instant::now());
+    let v = std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{}", 60 * MIB), 20_000));
+        // the refill behind the pool has been sent, and is on its way: the release waits for it, asking the node
+        wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+        wait_for("the refill to be sent", || !r.ln.state().unseen_until.is_empty());
+        let asked = r.ln.state().lookups;
+        wait_for("the release to ask the node", || r.ln.state().lookups > asked + 2);
+        // and now each question takes 30 s
+        r.ln.st.lock().unwrap().lookup_takes = Duration::from_secs(30);
+        t0.set(Instant::now());
+        t.join().unwrap()
+    });
+    assert!(t0.get().elapsed() < Duration::from_secs(5), "the rest of a pause of 3 s, not 30 s a question: {:?} {v}", t0.get().elapsed());
+    assert_eq!(v["complete"], false, "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("ticket_not_ready"), "{v}");
+    assert_nothing_leaves_after(&r, &v);
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+}
+
+/// The first fill of a new session, on a node that takes 20 s to send each ticket: it goes on behind on its own thread, and
+/// the call answers at its deadline; the tickets it locked are the session's when they come.
+#[test]
+fn a_first_fill_on_a_slow_node_is_given_up_on_at_the_calls_deadline() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 4}}));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_secs(20);
+    let t0 = Instant::now();
+    let v = r.pay("/page/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(8), "{:?} {v}", t0.elapsed());
+    assert_eq!(v["verdict"], "deny", "{v}");
+    assert_eq!(r.tap.secrets().len(), 0, "{v}");
+    r.ln.st.lock().unwrap().send_takes = Duration::ZERO;
+    wait_for_long("the sends to end", Duration::from_secs(45), || !r.ln.state().payments.is_empty() && r.status()["tickets"]["sending"].is_null());
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+fn wait_for_long(what: &str, most: Duration, mut f: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !f() {
+        assert!(t.elapsed() < most, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A refill whose sends come back with no word from the node, on a node whose every question then takes 30 s: the refill asks
+/// after them with no lock held, so the releases beside it go on, and the answer ends at its deadline with the pool released.
+#[test]
+fn a_refill_asking_a_slow_node_after_its_sends_holds_up_no_release() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({}));
+    first_call_with_the_pool_shown(&r);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(120);
+        s.lookup_takes = Duration::from_secs(30);
+    }
+    // the file's releases, then a pause of 12 s for the refill on its way: not the 30 s a question each of the refill's sends
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{}", 60 * MIB), 20_000);
+    assert!(t0.elapsed() < Duration::from_secs(30), "{:?} {v}", t0.elapsed());
+    assert_eq!(r.tap.secrets().len(), 8, "every ticket the pool held was released beside the refill: {v}");
+    assert_nothing_leaves_after(&r, &v);
+    r.ln.st.lock().unwrap().lookup_takes = Duration::ZERO;
+}
+
+/// A pool of 2, a refill due and nothing on its way, and the wallet's channel down for a few seconds (a link that drops): the
+/// refill is refused for want of an active channel, asked again inside the pause, and the file comes through.
+#[test]
+fn a_channel_down_with_a_refill_due_does_not_end_the_file() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        r.ln.st.lock().unwrap().channel["active"] = false.into();
+        std::thread::sleep(Duration::from_secs(3));
+        r.ln.st.lock().unwrap().channel["active"] = true.into();
+    });
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
+/// A seller slow with its 402: the ask gets what is left of the call's deadline.
+#[test]
+fn a_seller_slow_with_its_402_is_a_plain_answer_inside_the_calls_deadline() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 3}}));
+    r.tap.ask_slow_ms.store(28_000, Ordering::SeqCst);
+    let t0 = Instant::now();
+    let v = r.pay("/latehead/10", CALL);
+    assert!(t0.elapsed() < Duration::from_secs(6), "{:?} {v}", t0.elapsed());
+    assert_eq!(v["verdict"], "deny", "{v}");
+    assert_eq!(r.tap.secrets().len(), 0, "{v}");
+}
+
+/// An answer that came whole just inside the deadline and is never listed as closed: its last receipt is waited for a few
+/// seconds past the deadline, not the whole wait it would get with time to spare.
+#[test]
+fn a_last_receipt_never_listed_is_waited_for_only_a_little_past_the_deadline() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"max_answer_s": 3}}));
+    first_call_with_the_pool_shown(&r);
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.starts_with("/x402/ticket/status") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let mut v: Value = serde_json::from_slice(&body).ok()?;
+        v.as_object_mut()?.remove("responses");
+        let headers = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+        Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
+    }));
+    // a file that comes whole at once: its last receipt would be waited for 10 s, and the call has 3 s and 5 past them
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{}", MIB), 20_000);
+    assert_eq!(v["complete"].as_bool(), Some(true), "{v}");
+    assert!(t0.elapsed() < Duration::from_millis(9_500), "the deadline and 5 s, not 10 s from the end: {:?} {v}", t0.elapsed());
+    r.tap.clear();
+}
+
+/// A pool of 2, a refill due and nothing on its way, and the Lightning node away for a few seconds: the seller is waiting
+/// for this ticket, so the refill is asked again inside the pause, and the file comes through.
+#[test]
+fn a_lightning_node_away_with_a_refill_due_does_not_end_the_file() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        r.ln.st.lock().unwrap().down = true;
+        std::thread::sleep(Duration::from_secs(4));
+        r.ln.st.lock().unwrap().down = false;
+    });
+    assert_whole(&v, n);
+    assert_money_agrees(&r);
+}
+
+/// Its router alone away: the sends do not reach it, and hold their places in the pool until they are given up (the limit in
+/// `CHANGELOG.md`). The file ends in plain words, with no advice to cancel stale tickets there are none of.
+#[test]
+fn a_router_away_with_a_refill_due_ends_the_file_in_plain_words() {
+    let _g = env_lock();
+    let r = shipped_with_pool_filled();
+    let n = 25 * MIB;
+    let v = under_way(&r, &format!("/slow/{n}"), 8_000, || {
+        r.ln.st.lock().unwrap().router_down = true;
+        std::thread::sleep(Duration::from_secs(4));
+        r.ln.st.lock().unwrap().router_down = false;
+    });
+    assert_eq!(v["complete"], false, "{v}");
+    let ended = v["ended"].as_str().unwrap();
+    assert!(!ended.contains("stale"), "{v}");
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
+}
+
+/// The node's word on a ticket, old by the time it is applied: the book has moved on, and nothing is retired or booked for it.
+#[test]
+fn a_lookup_answered_before_the_node_failed_a_ticket_changes_nothing_after() {
+    let _g = env_lock();
+    let audit_count = |r: &Rig, what: &str| {
+        let mut n = 0;
+        let mut dirs = vec![r.root.clone(), r.root.join(".run")];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.path().is_file() {
+                    if let Ok(text) = std::fs::read(e.path()) {
+                        n += String::from_utf8_lossy(&text).matches(what).count();
+                    }
+                }
+            }
+        }
+        n
+    };
+    let r = seller_waits_as_shipped(json!({}));
+    assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.unseen_next = 1_000;
+        s.unseen_for = Duration::from_secs(120);
+    }
+    let n = 60 * MIB;
+    let v = std::thread::scope(|sc| {
+        let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 20_000));
+        wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+        // the sends behind it have ended, and asked the node their own questions
+        std::thread::sleep(Duration::from_secs(1));
+        {
+            let mut s = r.ln.st.lock().unwrap();
+            s.lookup_takes = Duration::from_secs(2);
+            s.lookup_log.clear();
+        }
+        // a round asks after each ticket in turn: the first of it has been answered, and the next question is out for 2 s
+        wait_for("a round to be under way", || r.ln.st.lock().unwrap().lookup_log.len() == 1);
+        let h = r.ln.st.lock().unwrap().lookup_log[0].clone();
+        {
+            let mut s = r.ln.st.lock().unwrap();
+            s.lookup_takes = Duration::ZERO;
+            let p = s.payments.iter_mut().rev().find(|p| p["payment_hash"] == h.as_str()).unwrap();
+            p["status"] = "FAILED".into();
+            p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
+            p["htlcs"] = json!([]);
+        }
+        // the watcher: the book brought to the node
+        r.status();
+        let (ledger, retired) = (r.ledger_sum(), audit_count(&r, "ticket_retired"));
+        // the round ends, with what it was told of that ticket before the node failed it
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!((r.ledger_sum(), audit_count(&r, "ticket_retired")), (ledger, retired), "the stale word on {h} was applied");
+        r.ln.st.lock().unwrap().unseen_until.clear();
+        t.join().unwrap()
+    });
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_money_agrees(&r);
 }
 
 #[test]
@@ -4803,6 +6276,8 @@ fn a_shop_that_fills_before_this_wallet_buys_sells_it_nothing() {
         }));
         let v = r.pay("/page/100", CALL);
         assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("seller_busy"), Some(0)), "{v}");
+        // refused unserved: a caller (the AI address) may take the request to another seller
+        assert_eq!(v["request_sent"].as_bool(), Some(false), "{v}");
         let lock = r.tap.seen("/x402/ticket/lock");
         assert_eq!(serde_json::from_str::<Value>(&lock[0].body).unwrap()["path"], "/page/100", "the first lock names the address");
         assert_eq!((r.ln.paid_msat(), r.shop.settled(), r.shop.held()), (0, 0, 0), "nothing sold");
@@ -5377,6 +6852,18 @@ fn draws_shop() -> Value {
     json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2}})
 }
 
+/// A seller that serves on while a win waits for its next invoice: what a test is about is the invoice,
+/// not the seller's answer standing still for its grace.
+fn patient_draws_rig(extra: Value) -> Rig {
+    // and that waits for the wallet's values as it does as shipped (15 s), not the tests' 2 s: a busy machine is not
+    // what these tests are about
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(extra, 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                                           "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    r
+}
+
 /// The wallet as it ships on a 30-slot channel, paying a seller that offers the lottery.
 fn draws_rig(extra: Value) -> Rig {
     Rig::shipped(extra, 30, draws_shop())
@@ -5385,6 +6872,14 @@ fn draws_rig(extra: Value) -> Rig {
 /// The wins of a call, by the book: the payments that pay a win, each with its state.
 fn win_tickets(r: &Rig, sid: &str) -> Vec<Value> {
     r.session(sid)["session_tickets"].as_array().cloned().unwrap_or_default().into_iter().filter(|t| t["win"].as_u64().unwrap_or(0) > 0).collect()
+}
+
+/// The validator of the test service's files (`ETag`): one copy, which never changes.
+const FILE_TAG: &str = "\"v1\"";
+
+/// A seller of an earlier version: it knows no `cancel`, and its route table answers 404.
+fn old_seller(r: &Rig) {
+    r.tap.set(Box::new(|seen, _| seen.path.ends_with("/lottery/cancel").then(|| Ok(answer(404, vec![], br#"{"error":"no_route"}"#.to_vec())))));
 }
 
 /// The node, the seller, the book and the ledger hold one number: `wins` wins of 64 sat, and nothing else.
@@ -5417,6 +6912,39 @@ fn a_seller_blocked_for_over_charging_is_paid_no_draw() {
     assert_eq!(unblock(&r, &id)["ok"], true);
     let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
     assert_eq!((v["rail"].as_str(), v["status"].as_u64()), (Some("lottery"), Some(200)), "unblocked, it is paid again: {v}");
+}
+
+/// A win paid over a slow route (its payment takes 40 s to reach the seller) to a seller whose
+/// lottery is as it ships: paid before its invoice lapses, and the node, the seller, the book and
+/// the ledger hold it.
+///
+/// FAILS before: a win's invoice lived as long as the grace, 30 s as shipped, so the seller's node
+/// refused the payment (incorrect payment details), and each next invoice lapsed on its way the
+/// same: a buyer on a slow route had every win refused and was served nothing more.
+#[test]
+fn a_win_paid_over_a_slow_route_reaches_a_seller_as_it_ships_before_its_invoice_lapses() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0}}));
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        (s.slow_next, s.arrives_after_s) = (1, 40);
+    }
+    // 64 pieces of 2 sat on wins of 64 sat: 2 wins expected a call; calls until one is won
+    let mut wins = 0;
+    for _ in 0..10 {
+        let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+        assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool()), (Some("lottery"), Some(200), Some(true)), "{v}");
+        let w = v["wins"].as_u64().unwrap();
+        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(w), Some(0)), "every win is paid: {v}");
+        wins += w;
+        if wins > 0 {
+            break;
+        }
+    }
+    assert!(wins > 0, "ten calls of 64 pieces and no win");
+    assert_eq!(r.ln.state().slow_next, 0, "the first win went the slow way");
+    assert!(r.ln.by_status("FAILED").is_empty(), "no win was refused at the seller: {:?}", r.ln.by_status("FAILED"));
+    assert_wins(&r, wins);
 }
 
 #[test]
@@ -5684,8 +7212,10 @@ fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
 fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_paid_twice() {
     let _g = env_lock();
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
-    // the first payment finds no route: nothing is spent, and the win stays owed
-    r.ln.st.lock().unwrap().fail_next = 1;
+    // on a seller of an earlier version, which is no worse off for being asked, and is asked once
+    old_seller(&r);
+    // the payment finds no route: nothing is spent, and the win stays owed
+    r.ln.st.lock().unwrap().fail_one = true;
     let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
     // (the seller serves on for its grace of 64 pieces and then stops this buyer: the file may be cut short)
     let wins = v["wins"].as_u64().unwrap();
@@ -5693,6 +7223,8 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     assert_eq!(v["wins_unpaid"][0]["rule"], "lottery_win_failed", "{v}");
     assert_eq!(v["wins_paid"].as_u64().unwrap(), wins - 1, "{v}");
     assert_wins(&r, wins - 1);
+    assert_eq!(r.ln.by_status("FAILED").len(), 1, "that invoice is not sent again");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 1, "a seller that knows no cancel is not asked again");
     let sid = v["session"].as_str().unwrap().to_string();
     let failed: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "failed").cloned().collect();
     assert_eq!((failed.len(), failed[0]["booked_sats"].as_i64()), (1, Some(0)), "the failed payment is booked back: {failed:?}");
@@ -5772,8 +7304,8 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
 /// was over and it cut the answer. Seen on the lab with 100 sellers: one file of 300.
 ///
 /// The seller's grace is the clock here: it cuts an answer whose win stays unpaid for longer, so
-/// an answer that arrives whole had its win paid while it waited. The grace is the 10 s an answer
-/// stands still at the gateway as shipped (`pay_wait_secs`). (With a grace of 2 s and the whole
+/// an answer that arrives whole had its win paid while it waited. The grace is `pay_wait_secs`' 10 s;
+/// the gateway as shipped waits longer still, its `refill_wait` of 15 s. (With a grace of 2 s and the whole
 /// call held to 1.8 s, the test failed under a full workspace run: the call of 16 MiB and 256
 /// draws took 2 to 8 s there, where alone it takes 0.8 s. The wallet asks again every 100 ms, so
 /// the 10 s are slack, and a wallet that never asks again is still cut.)
@@ -5838,39 +7370,79 @@ fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
     assert_wins(&r, wins);
 }
 
-#[test]
-fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for() {
-    let _g = env_lock();
-    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 8 s here,
-    // where the gateway ships 10: the test's clock does not move, so it stands still for its whole grace), and 20
-    // sellers beside it that serve on whatever is unpaid: their wins fill the wallet's gate, 8 at a time, and no
-    // answer waits for one of them
-    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 8}});
-    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+/// A seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third), and 20 sellers
+/// beside it that serve on whatever is unpaid: their wins fill the wallet's gate, 8 at a time, and no answer waits for
+/// one of them. `stands_still`: how long the strict seller's answer waits for a win, in ms (the larger of this and
+/// its grace, 8 s). `hold`: the node sends nothing until 120 wins wait and the strict seller has stopped. `sync_ms`: what each of the wallet's fsyncs
+/// takes on top, for the first 40 s of the strict seller's file (its answer stands still within its first pieces, and
+/// is cut, if at all, inside that: the whole queue on such a disk would take 6 minutes). The file from the strict
+/// seller, the sellers' answers to the others, and how many wins were paid before the strict seller's first.
+fn a_strict_seller_behind_twenty(stands_still: u64, hold: bool, sync_ms: u64) -> (Rig, Value, Vec<Value>, usize) {
+    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": stands_still, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 8}});
+    // patient by far: what this tests is the wait of the one that stands still
+    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000,
                          "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
     let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
                        "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
     let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
-    // a payment takes 1 s through the hop: the gate lets 8 through in a second, and the 120 wins that wait below take
-    // 15 s to pass, twice the strict seller's 8 s, so a gate in order of arrival fails. The hurried win's own path
-    // (the wallet sees the seller stand still, the win passes the gate, the payment goes) took 4.5 s on a lab VM
-    // starved of CPU, with 200 ms payments: a grace of 2 s failed there every time, and 8 s leaves room for it.
-    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(1_000);
+    {
+        // a payment takes 1 s through the hop: the gate lets 8 through in a second, and the 120 wins that wait below take 15 s
+        let mut s = r.ln.st.lock().unwrap();
+        s.send_takes = Duration::from_millis(1_000);
+        s.hold_sends = hold;
+    }
     let size = 64 * PIECE;
     let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    // whatever becomes of this test, the next one's disk is as it is
+    struct DiskBack;
+    impl Drop for DiskBack {
+        fn drop(&mut self) {
+            xbt_signer::fsx::probe::slow_syncs(0);
+        }
+    }
+    let _back = DiskBack;
+    xbt_signer::fsx::probe::slow_syncs(sync_ms);
+    let over = AtomicBool::new(false);
     let (strict_one, others) = std::thread::scope(|sc| {
-        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, forty seconds of the gate
+        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected
         let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
-        // once fifteen seconds' worth of them wait (the node has an invoice for each, and no payment yet), the file from
-        // the strict seller: its third unpaid win stops its answer, which is cut after eight seconds
-        // the two counts one after the other, never one lock inside the other ([`PayLn`] takes `preimages` under `st`)
-        wait_for("120 wins waiting at the gate", || {
+        // once 120 of them wait (the node has an invoice for each, and no payment yet), the file from the strict seller:
+        // its third unpaid win stops its answer. The two counts one after the other, never one lock inside the other
+        // ([`PayLn`] takes `preimages` under `st`)
+        wait_for_rig("120 wins waiting at the gate", || {
             let invoiced = r.shop.node.preimages.lock().unwrap().len();
             invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
         });
-        let v = buy(&r.shop);
+        let strict_file = sc.spawn(|| buy(&r.shop));
+        // the count is of the order alone: nothing is paid until the wallet has found the win its seller stops for
+        if hold {
+            wait_for_rig("the strict seller's third win", || {
+                r.status()["paying"].as_array().into_iter().flatten().any(|p| p["origin"] == r.shop.origin.as_str() && p["wins"].as_u64() >= Some(3))
+            });
+            r.ln.st.lock().unwrap().hold_sends = false;
+        }
+        // the rest need neither the slow disk nor the slow hop to show what they show
+        sc.spawn(|| {
+            let t = Instant::now();
+            while !over.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(40) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            xbt_signer::fsx::probe::slow_syncs(0);
+            r.ln.st.lock().unwrap().send_takes = Duration::ZERO;
+        });
+        let v = strict_file.join().unwrap();
+        over.store(true, Ordering::SeqCst);
         (v, others.into_iter().map(|t| t.join().unwrap()).collect::<Vec<Value>>())
     });
+    let paid = r.audit("lottery_win_paid");
+    let before = paid.iter().position(|a| a["session"] == strict_one["session"]).unwrap_or(usize::MAX);
+    (r, strict_one, others, before)
+}
+
+/// The strict seller's file is whole, every win is paid once, and one number is on the node, at the seller and in the
+/// ledger, with never more than 8 payments at once.
+fn assert_all_whole_and_paid_once(r: &Rig, strict_one: &Value, others: &[Value]) {
+    let size = 64 * PIECE;
     let whole = |v: &Value| {
         let wins = v["wins"].as_u64().unwrap_or(0);
         assert_eq!((v["verdict"].as_str(), v["rail"].as_str(), v["complete"].as_bool(), v["ended"].as_str()), (Some("allow"), Some("lottery"), Some(true), None), "{v}");
@@ -5878,15 +7450,318 @@ fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for
         assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
         wins
     };
-    // the strict seller's file is whole: every win its answer stood still for went through the gate before the hundred
-    // and more that waited there for nobody
-    let wins = whole(&strict_one);
+    let wins = whole(strict_one);
     assert!(wins >= 3, "a file of 64 pieces at one win in four that drew {wins} wins: its seller never stood still");
     let all: u64 = wins + others.iter().map(whole).sum::<u64>();
-    // one number on the node, at the seller and in the ledger, and never more than 8 payments at once
     r.tick();
     assert_eq!((r.ln.paid_msat(), r.shop.settled() as u64, r.ledger_sum()), (all * WIN, all, all as i64 * WIN_SETTLED));
     assert!(r.ln.state().peak <= 8, "{} payments at once", r.ln.state().peak);
+}
+
+/// The order, by count and not by the clock: the wins went in with at least 120 waiting at the gate, so in order of
+/// arrival the win the strict seller stood still for is paid after them. Its seller waits long enough here that its
+/// answer does not depend on how fast the machine is.
+#[test]
+fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for() {
+    let _g = env_lock();
+    let (r, strict_one, others, before) = a_strict_seller_behind_twenty(120_000, true, 0);
+    assert!(before < 60, "{before} wins were paid before the first one a seller stood still for, of the 120 and more that waited for nobody");
+    assert_all_whole_and_paid_once(&r, &strict_one, &others);
+}
+
+/// A wallet on a card or a USB disk: each of its fsyncs takes 100 ms on top, with its sellers on disks of their own, and
+/// its answer stands still for the 15 s the gateway ships (`refill_wait`). A win books about 6 fsyncs under the spend
+/// lock, one payment at a time.
+///
+/// FAILS before the wallet's look at a session left the spend lock and a hurried win went first at it: that win reached
+/// the gate only after the hundreds of payers before it had looked, was hurried there, and then waited for the lock
+/// behind the 7 others in the gate.
+#[test]
+fn a_win_the_seller_stands_still_for_is_in_time_on_a_wallet_with_a_slow_disk() {
+    let _g = env_lock();
+    let (r, strict_one, others, _) = a_strict_seller_behind_twenty(15_000, false, 100);
+    assert_all_whole_and_paid_once(&r, &strict_one, &others);
+}
+
+/// A payment's look at its session before the gate says nothing about what the session is when the payment books, seconds
+/// later: the booking asks again under the lock. Wins that had looked and waited at the gate when the session stopped (the
+/// seller's answer to a draw was at fault: a caller's stop waits for the call to end, this one does not) are neither booked
+/// nor paid, on the wallet's books, at the node or at the seller.
+#[test]
+fn a_win_that_waited_at_the_gate_while_its_session_stopped_is_neither_booked_nor_paid() {
+    let _g = env_lock();
+    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000,
+                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64, "meter": "draws"}}}});
+    let r = Rig::with_more(owner, true, true, 30, patient, &[]);
+    r.ln.st.lock().unwrap().hold_sends = true;
+    // the body stops after 128 of its pieces until told to go on, and a draw is then answered at fault
+    let (go, faulty) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (go2, faulty2) = (go.clone(), faulty.clone());
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path.starts_with("/x402/lottery/draw") && faulty2.load(Ordering::SeqCst) {
+            return Some(Ok(answer(400, vec![], b"{}".to_vec())));
+        }
+        if !(seen.paid && seen.path.starts_with("/hot/")) {
+            return None;
+        }
+        let ans = real().ok()?;
+        struct Pause(Box<dyn Read + Send>, usize, Arc<AtomicBool>);
+        impl Read for Pause {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                while self.1 == 0 && !self.2.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let want = if self.1 == 0 { buf.len() } else { buf.len().min(self.1) };
+                let n = self.0.read(&mut buf[..want])?;
+                self.1 = self.1.saturating_sub(n);
+                Ok(n)
+            }
+        }
+        Some(Ok(WireAnswer { status: ans.status, headers: ans.headers, length: ans.length, body: Box::new(Pause(ans.body, 128 * PIECE, go2.clone())), closer: ans.closer }))
+    }));
+    let size = 256 * PIECE;
+    let v = std::thread::scope(|sc| {
+        let buy = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/hot/{size}")), "max_sats": 100_000, "task": "film"})));
+        // 8 are in the gate, booked and held at the node; the wins beyond them wait, having looked at their session
+        wait_for_rig("wins beyond the 8 in the gate", || r.shop.node.preimages.lock().unwrap().len() >= 20 && r.ledger_sum() == 8 * 67);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(r.ledger_sum(), 8 * 67, "8 booked, each at a win and its fee limit, before the session stops");
+        faulty.store(true, Ordering::SeqCst);
+        go.store(true, Ordering::SeqCst);
+        wait_for_rig("the session to stop", || !r.audit("lottery_seller_fault").is_empty());
+        r.ln.st.lock().unwrap().hold_sends = false;
+        buy.join().unwrap()
+    });
+    r.tap.clear();
+    let wins = v["wins"].as_u64().unwrap_or(0);
+    assert!(wins >= 12, "{v}");
+    // the 8 that had gone through are paid, whatever the session; no other reached the node, the seller or the ledger
+    r.tick();
+    assert_eq!(r.ln.state().payments.len(), 8, "{v}");
+    assert_eq!((r.ln.paid_msat(), r.shop.settled() as u64), (8 * WIN, 8), "{v}");
+    assert_eq!(r.ledger_sum(), 8 * WIN_SETTLED, "{v}");
+    assert_eq!(r.audit("lottery_win_paid").len(), 8);
+    // the wins refused because the session had stopped are no invoices of the seller's that failed a check
+    assert!(!v["ended"].as_str().unwrap_or("").contains("invoices for wins fail"), "{v}");
+    assert!(r.audit("lottery_seller_fault").iter().all(|f| !f["reason"].as_str().unwrap_or("").contains("invoices")), "{:?}", r.audit("lottery_seller_fault"));
+}
+
+/// A 408 is the seller's HTTP layer giving up on a request of a wallet too slow to send it in time (a small
+/// machine short of memory or disk): no handler ran, nothing was served or charged, and the request's seq was not used up.
+/// FAILS before: the wallet stopped the session and recorded the seller at fault, and after a paid request's 408 its next
+/// request carried a seq past the seller's (`bad_seq`, which a paid route answers with no `nextSeq` the wallet reads), and
+/// that faulted the seller. Now the same request goes once more with its seq: served if it gets through, refused for
+/// that call alone if not; a draw's round goes once more and then as before. The session goes on, and what was paid is
+/// what the node paid.
+#[test]
+fn a_408_stops_no_session_and_blames_no_seller() {
+    let _g = env_lock();
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let late = |path: &'static str, times: usize| {
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        r.tap.set(Box::new(move |seen, _| {
+            (seen.path.starts_with(path) && (path != "/pieces/" || seen.paid) && m.fetch_add(1, Ordering::SeqCst) < times).then(|| Ok(answer(408, vec![], b"{}".to_vec())))
+        }));
+        n
+    };
+    // the rounds of a draw: two in a row late, then as the seller answers
+    let n = late("/x402/lottery/draw", 2);
+    let v = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    r.tap.clear();
+    assert_eq!((v["rail"].as_str(), v["complete"].as_bool(), v["ended"].as_str()), (Some("lottery"), Some(true), None), "{v}");
+    assert!(n.load(Ordering::SeqCst) >= 2, "{v}");
+    let mut wins = v["wins"].as_u64().unwrap();
+    assert_eq!(v["wins_paid"].as_u64(), Some(wins), "{v}");
+    assert_wins(&r, wins);
+    // a paid request late once: sent again with its seq, and served
+    late("/pieces/", 1);
+    let again = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+    r.tap.clear();
+    assert_eq!((again["complete"].as_bool(), again["session"].as_str()), (Some(true), v["session"].as_str()), "{again}");
+    wins += again["wins_paid"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    // late twice: refused, for this call
+    late("/pieces/", 2);
+    let refused = r.pay(&format!("/pieces/{}", 16 * PIECE), 1_000);
+    r.tap.clear();
+    assert_eq!((refused["verdict"].as_str(), refused["rule"].as_str(), refused["status"].as_u64()), (Some("deny"), Some("ticket_seller"), Some(408)), "{refused}");
+    assert_wins(&r, wins);
+    // the same session goes on, on the same chain, with no seq lost
+    let next = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    assert_eq!((next["complete"].as_bool(), next["session"].as_str()), (Some(true), v["session"].as_str()), "{next}");
+    wins += next["wins_paid"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    assert!(r.audit("lottery_seller_fault").is_empty(), "an honest seller was called at fault: {:?}", r.audit("lottery_seller_fault"));
+}
+
+/// The review's case: wins unpaid when an honest seller's HTTP layer answers 408, to a paid request and then to one round.
+/// FAILS before: the next request was refused `bad_seq` and the seller recorded at fault. Now no seller is blamed, and
+/// node, seller and ledger agree.
+#[test]
+fn a_408_with_wins_unpaid_blames_no_seller() {
+    let _g = env_lock();
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    // the wallet's router away for a whole file: its wins are booked, sent nowhere, and the answer is cut
+    r.ln.st.lock().unwrap().router_down = true;
+    let a = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    r.ln.st.lock().unwrap().router_down = false;
+    assert!(a["wins"].as_u64().unwrap() >= 1, "{a}");
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/pieces/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let b = r.pay(&format!("/pieces/{}", 16 * PIECE), 1_000);
+    r.tap.clear();
+    assert_eq!((b["rule"].as_str(), b["status"].as_u64()), (Some("ticket_seller"), Some(408)), "{b}");
+    let once = Arc::new(AtomicBool::new(true));
+    r.tap.set(Box::new(move |seen, _| (seen.path.starts_with("/x402/lottery/draw") && once.swap(false, Ordering::SeqCst)).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let c = r.pay(&format!("/pieces/{}", 16 * PIECE), 1_000);
+    r.tap.clear();
+    // the seller waits for the first file's wins, whose payments the wallet booked and its node can say nothing of: the
+    // session ends as such a session does (`lottery_win_in_doubt`), and no one is blamed
+    assert!(matches!(c["rule"].as_str(), Some("ok" | "lottery_win_in_doubt")), "{c}");
+    assert!(r.audit("lottery_seller_fault").is_empty(), "an honest seller was called at fault: {:?}", r.audit("lottery_seller_fault"));
+    // once the node can say the first file's payments never left, they are booked back; the next call is served, and
+    // node, seller and ledger agree
+    r.clock.fetch_add(300, Ordering::SeqCst);
+    r.tick();
+    let d = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+    assert_eq!((d["status"].as_u64(), d["complete"].as_bool()), (Some(200), Some(true)), "{d}");
+    r.tick();
+    assert_eq!((r.ln.paid_msat(), r.shop.settled() as u64 * WIN, r.ledger_sum()), (r.shop.settled() as u64 * WIN, r.ln.paid_msat(), r.shop.settled() as i64 * WIN_SETTLED),
+               "node, seller and ledger: {a} {b} {c} {d}");
+    assert!(r.audit("lottery_seller_fault").is_empty(), "{:?}", r.audit("lottery_seller_fault"));
+}
+
+/// A win the wallet's node could not pay for a moment (just started, not on its chain yet: `ln_chain`) is owed again, with
+/// its invoice. FAILS before: it was left with no payer, never paid, and the seller waited for it for good (on the lab,
+/// refusing every later call of the session `win_unpaid` for the 300 s it waited after a kill of the buyer's node). Now
+/// the session's next call pays it.
+///
+/// Files of 8 pieces, all of them served at once (the seller's window): the call that stops at the win has given its
+/// values. One that stops in the middle of an answer leaves the pieces on their way with none, and once those reach the
+/// seller's window the session ends instead, plainly, the seller told, and the next call opens another
+/// (`too_many_voids`): a path of its own, older than this, that leaves such a win unpaid.
+#[test]
+fn a_win_the_node_could_not_pay_for_a_moment_is_paid_by_the_next_call() {
+    let _g = env_lock();
+    let mut shop = draws_shop();
+    shop["lottery"]["max_voids"] = json!(100_000);
+    let r = Rig::shipped(json!({"tickets": {"lottery": {"max_odds_den": 4, "min_expected_wins": 0}}}), 30, shop);
+    let file = || r.pay(&format!("/hot/{}", 8 * PIECE), 1_000);
+    let first = file();
+    assert_eq!((first["rail"].as_str(), first["complete"].as_bool()), (Some("lottery"), Some(true)), "{first}");
+    let (mut found, mut paid) = (first["wins"].as_u64().unwrap(), first["wins_paid"].as_u64().unwrap());
+    // the node is not on its chain yet: calls until one of them finds a win
+    r.ln.st.lock().unwrap().unsynced = true;
+    let mut refused = None;
+    for _ in 0..12 {
+        let v = file();
+        found += v["wins"].as_u64().unwrap_or(0);
+        paid += v["wins_paid"].as_u64().unwrap_or(0);
+        if v["wins_unpaid"].as_array().is_some_and(|u| u.iter().any(|w| w["rule"] == "ln_chain")) {
+            refused = Some(v);
+            break;
+        }
+    }
+    r.ln.st.lock().unwrap().unsynced = false;
+    let refused = refused.expect("twelve files of 8 pieces at one win in four and no win");
+    assert_eq!(refused["session"], first["session"], "{refused}");
+    // the node is back: the session's next calls pay the win it could not, and are served
+    for _ in 0..2 {
+        let next = file();
+        assert_eq!((next["status"].as_u64(), next["complete"].as_bool(), next["session"].as_str()), (Some(200), Some(true), first["session"].as_str()), "{next}");
+        found += next["wins"].as_u64().unwrap();
+        paid += next["wins_paid"].as_u64().unwrap();
+    }
+    // every win found is paid, once: the one the node could not pay among them
+    assert_eq!(paid, found, "{refused}");
+    assert_wins(&r, paid);
+}
+
+/// A 408 comes before any handler of the seller's: the request's seq is not used up, and the wallet's second sending of a
+/// paid request answered 408 carries the same one, on either rail. FAILS on a wallet that takes a seq as used on a 408:
+/// on the draws rail the seller then refuses the next request `bad_seq`.
+#[test]
+fn a_paid_request_sent_again_after_a_408_carries_the_same_seq_on_either_rail() {
+    let _g = env_lock();
+    for (draws, path) in [(true, "/pieces/"), (false, "/page/")] {
+        let r = if draws { draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}})) } else { Rig::new(json!({})) };
+        let (size, max) = if draws { (16 * PIECE, 1_000) } else { (10, CALL) };
+        let first = r.pay(&format!("{path}{size}"), max);
+        assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        r.tap.set(Box::new(move |seen, _| {
+            (seen.paid && seen.path.starts_with(path) && m.fetch_add(1, Ordering::SeqCst) < 1).then(|| Ok(answer(408, vec![], b"{}".to_vec())))
+        }));
+        let before = r.tap.seen(path).len();
+        let v = r.pay(&format!("{path}{size}"), max);
+        r.tap.clear();
+        assert_eq!((v["status"].as_u64(), v["session"].as_str()), (Some(200), first["session"].as_str()), "{v}");
+        let sent: Vec<Option<u64>> = r.tap.seen(path).iter().skip(before).filter(|s| s.paid).map(|s| s.seq).collect();
+        assert!(sent.len() >= 2 && sent[0].is_some(), "{sent:?}");
+        assert_eq!(sent[1], sent[0], "the request after the 408 named another seq: {sent:?}");
+    }
+}
+
+/// The same on the ticket rail: a paid request answered 408 once is sent again and served; answered 408 every time, it is
+/// refused for that call; either way the session goes on and the credit is what it was.
+#[test]
+fn a_408_to_a_paid_request_stops_no_ticket_session() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    // late once: sent again with its seq, and served
+    let n = Arc::new(AtomicUsize::new(0));
+    let m = n.clone();
+    r.tap.set(Box::new(move |seen, _| (seen.paid && seen.path.starts_with("/page/") && m.fetch_add(1, Ordering::SeqCst) < 1).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let again = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((again["status"].as_u64(), again["session"].as_str(), n.load(Ordering::SeqCst)), (Some(200), first["session"].as_str(), 2), "{again}");
+    // late every time: refused, for this call
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/page/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let refused = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((refused["rule"].as_str(), refused["status"].as_u64()), (Some("ticket_seller"), Some(408)), "{refused}");
+    let next = r.pay("/page/10", CALL);
+    assert_eq!((next["status"].as_u64(), next["session"].as_str(), next["tickets_released"].as_u64()), (Some(200), first["session"].as_str(), Some(0)), "{next}");
+    assert!(r.audit("ticket_seller_fault").is_empty(), "an honest seller was called at fault");
+    r.assert_booked();
+}
+
+/// A 408 comes from the seller's HTTP layer before any handler runs: the reply says the request was not
+/// sent, the call is charged nothing, and the node, the seller, the book and the ledger do not move. On both rails.
+///
+/// FAILS with a 408 taken as a receipt-less 5xx: `request_sent` true, and whoever accounts for the call books its bound.
+#[test]
+fn a_408_says_the_request_was_not_sent_and_moves_no_money_on_either_side() {
+    let _g = env_lock();
+    // draws
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let v = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    let wins = v["wins_paid"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/pieces/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let late = r.pay(&format!("/pieces/{}", 16 * PIECE), 1_000);
+    r.tap.clear();
+    assert_eq!((late["status"].as_u64(), late["request_sent"].as_bool(), late["charged_sats"].as_i64()), (Some(408), Some(false), Some(0)), "{late}");
+    assert_wins(&r, wins);
+    // tickets
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    let before = r.money();
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/page/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
+    let late = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((late["status"].as_u64(), late["request_sent"].as_bool(), late["charged_sats"].as_i64()), (Some(408), Some(false), Some(0)), "{late}");
+    assert_eq!(r.money(), before, "{late}");
+    // a receipt-less 5xx may have been served behind a proxy: that one says it was sent
+    r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/page/")).then(|| Ok(answer(502, vec![], b"{}".to_vec())))));
+    let proxy = r.pay("/page/10", CALL);
+    r.tap.clear();
+    assert_eq!((proxy["status"].as_u64(), proxy["request_sent"].as_bool()), (Some(502), Some(true)), "{proxy}");
 }
 
 #[test]
@@ -6203,6 +8078,10 @@ fn a_ticket_that_is_on_none_of_the_nodes_channels_ends_its_session_and_the_next_
     r.ln.st.lock().unwrap().stranded_off_channel = true;
     let st = r.status();
     assert_eq!((st["locked"]["tickets"].as_i64(), st["node"]["in_book_not_on_node"].as_array().map(Vec::len), r.shop.held()), (Some(2), Some(2), 0), "{st}");
+    // seen so once: a link that dropped may still list it. Seen so for longer than such a gap lasts, every channel up
+    let first = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!(first["rule"].as_str(), Some("ticket_not_ready"), "{first}");
+    r.clock.fetch_add(21, Ordering::SeqCst);
     let ended = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
     assert_eq!((ended["verdict"].as_str(), ended["rule"].as_str(), ended["tickets_released"].as_u64()), (Some("deny"), Some("ticket_session_ended"), Some(0)), "{ended}");
     assert_ne!(r.session(&sid)["sessions"][0]["state"], "open");
@@ -6218,6 +8097,39 @@ fn a_ticket_that_is_on_none_of_the_nodes_channels_ends_its_session_and_the_next_
     let stranded: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "locked").cloned().collect();
     assert_eq!((stranded.len(), stranded.iter().map(|t| t["booked_sats"].as_i64().unwrap()).sum::<i64>()), (2, 0),
                "locked for as long as the node calls them in flight, and no secret of theirs left: {stranded:?}");
+}
+
+/// A channel that drops while a ticket is held on it (a link that flaps): the node calls the payment in flight and lists
+/// it on no channel while the link is down or listing its HTLCs again. That is no stranded ticket, however long it lasts
+/// with a channel down, and the session is not ended for it; the answer waits within its pause.
+#[test]
+fn a_ticket_missing_from_a_channel_that_is_down_is_not_stranded() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"tickets": {"ready_wait_ms": 300}}), 30, shipped_shop());
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!(v["complete"].as_bool(), Some(true), "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    r.ln.st.lock().unwrap().strand_next = 2;
+    let cut = r.pay(&format!("/files/{}", 15 * MIB), 5_000);
+    assert_eq!(cut["complete"].as_bool(), Some(false), "{cut}");
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.stranded_off_channel = true;
+        s.channel["active"] = false.into();
+    }
+    // past the gap each time, and more times than the pauses that end a session whose seller never shows a ticket: those are
+    // not counted while the link is down, and the seller is not blamed for it
+    for _ in 0..4 {
+        let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+        assert_ne!(v["rule"].as_str(), Some("ticket_session_ended"), "{v}");
+        r.clock.fetch_add(21, Ordering::SeqCst);
+    }
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "open", "a link that is down says nothing of the ticket");
+    // (once the link is up and the ticket still on no channel, it is stranded 20 s on: a_ticket_that_is_on_none_of_the_nodes_channels...)
+    r.ln.st.lock().unwrap().channel["active"] = true.into();
+    r.call("ticket_stop", json!({"session": sid}));
+    r.assert_booked();
 }
 
 // --- paying by the seller's BOLT 12 offer (docs/TICKETS.md, section 15) ---------------------------------
@@ -6369,6 +8281,9 @@ fn wins_are_paid_by_the_sellers_offer_and_each_once() {
     let _g = env_lock();
     let mut shop = draws_shop();
     shop["offers"] = json!({"enabled": true});
+    // the seller stands still as long as the gateway ships, 15 s. (The rig's 2 s cut this file on a loaded lab: three
+    // wins that come together are booked one after the other, 11 fsyncs each.) What this asks is how a win is paid
+    shop["refill_wait_ms"] = json!(15_000);
     let r = Rig::shipped(json!({}), 30, shop);
     let size = 256 * PIECE;
     let v = r.pay(&format!("/pieces/{size}"), 1_000);
@@ -9751,7 +11666,7 @@ fn a_call_to_a_seller_whose_session_is_being_stopped_is_told_to_call_again() {
         std::thread::sleep(Duration::from_millis(500));
         let during = r.pay("/page/12", CALL);
         assert_eq!(during["rule"].as_str(), Some("ticket_busy"), "a call while the session is being stopped: {during}");
-        assert_eq!(during["charged_sats"].as_i64(), Some(0), "{during}");
+        assert_eq!((during["charged_sats"].as_i64(), during["request_sent"].as_bool()), (Some(0), Some(false)), "{during}");
         let stop = stop.join().unwrap();
         let _ = tunnel.join().unwrap();
         slow.store(false, Ordering::SeqCst);
@@ -11392,3 +13307,855 @@ fn the_credit_left_behind_is_reached_in_ordinary_use() {
     assert_eq!(used.first(), Some(&old_id), "the credit of the first seller session is the first to be used: {used:?}");
     assert_eq!(r.ln.paid_msat(), 2 * TICKET, "no ticket beyond the two");
 }
+/// The node's channel goes inactive at its `after`-th look from now, and comes back `out` later, as
+/// a channel does when its peer's connection drops. What it returns says the moment came.
+fn flap(r: &Rig, after: usize, out: Duration) -> Arc<AtomicBool> {
+    let (ln, came, at) = (r.ln.clone(), Arc::new(AtomicBool::new(false)), r.ln.st.lock().unwrap().looks + after);
+    let told = came.clone();
+    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |look| {
+        if look == at {
+            told.store(true, Ordering::SeqCst);
+            ln.st.lock().unwrap().channel["active"] = false.into();
+            let ln = ln.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(out);
+                ln.st.lock().unwrap().channel["active"] = true.into();
+            });
+        }
+    }));
+    came
+}
+
+/// A 30 MiB file on the ticket rail, whose channel is out for 1.5 s partway through: the file is
+/// whole, and what the node paid, the seller took, the book and the ledger hold are one number.
+///
+/// FAILS before: the refill found no active channel and the answer ended with `ln_no_safe_channel`
+/// (seen at 68 MB of 100 on a lab).
+#[test]
+fn a_channel_out_for_a_moment_does_not_end_a_file_paid_by_tickets() {
+    let _g = env_lock();
+    // the seller waits for a ticket as long as it does as shipped (15 s), not the tests' 2 s, which the 1.5 s out can use up
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let came = flap(&r, 4, Duration::from_millis(1_500));
+    let size = 30 * MIB;
+    let v = r.pay(&format!("/files/{size}"), 20_000);
+    assert!(came.load(Ordering::SeqCst), "the channel never went out: {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(size as u64)), "{v}");
+    let (paid, taken, book, ledger) = r.money();
+    assert!(paid > 0, "{v}");
+    assert_eq!((taken, book, ledger), (paid, paid, (paid / TICKET) as i64 * SETTLED), "{v}");
+}
+
+/// The same on the draw rail: no win goes unpaid for a channel out for a moment.
+///
+/// FAILS before: the win was refused `ln_no_safe_channel` and owed until the seller's next list,
+/// long enough on a lab for its invoice to lapse and the answer to be cut.
+#[test]
+fn a_channel_out_for_a_moment_does_not_leave_a_win_unpaid() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    let came = flap(&r, 2, Duration::from_millis(1_500));
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert!(came.load(Ordering::SeqCst), "the channel never went out: {v}");
+    assert!(!r.call("history", json!({"limit": 5000})).to_string().contains("ln_no_safe_channel"), "a moment taken for an outage: {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_wins(&r, wins);
+}
+
+/// A channel that stays out still ends the answer with its reason, within the wait, and the calls
+/// behind it are told at once: they do not wait in turn.
+#[test]
+fn a_channel_that_stays_out_ends_the_answer_soon_and_the_next_call_at_once() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    r.ln.st.lock().unwrap().channel["active"] = false.into();
+    let t = Instant::now();
+    let v = r.pay(&format!("/files/{}", MIB), CALL);
+    let (first, t) = (t.elapsed(), Instant::now());
+    assert_eq!(r.ln.state().payments.len(), 0, "nothing left the node: {v}");
+    assert!(v.to_string().contains("ln_no_safe_channel"), "{v}");
+    assert!(first >= Duration::from_secs(8) && first < Duration::from_secs(20), "waited {first:?}");
+    let v = r.pay(&format!("/files/{}", MIB), CALL);
+    assert!(v.to_string().contains("ln_no_safe_channel"), "{v}");
+    assert!(t.elapsed() < Duration::from_secs(4), "the next call waited {:?}", t.elapsed());
+    assert_eq!(r.money(), (0, 0, 0, 0));
+}
+
+/// A payment that failed may have left the node and met anything on the way, and a real node's record
+/// does not say whether it did: it is the seller's next invoice that pays that win, never this one again.
+#[test]
+fn a_payment_that_failed_is_not_sent_again() {
+    let _g = env_lock();
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    old_seller(&r);
+    r.ln.st.lock().unwrap().late_fail = 1;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let failed = r.ln.by_status("FAILED");
+    assert_eq!(failed.len(), 1, "sent once: {v}");
+    assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| p["payment_hash"] == failed[0]["payment_hash"]), "{v}");
+    assert_eq!(v["wins_unpaid"][0]["rule"], "lottery_win_failed", "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!(v["wins_paid"].as_u64().unwrap(), wins - 1, "{v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins - 1);
+}
+
+/// At the node's next `times` looks at its channels with an invoice of the seller's open (the
+/// wallet is about to pay a win) the clock moves `secs`, and those invoices lapse with the seller:
+/// a win's invoice runs out while the win waits its turn at the wallet's gate.
+fn lapse_at_wins(r: &Rig, times: usize, secs: u64) {
+    lapse_at_wins_after(r, times, secs, Duration::ZERO);
+}
+
+/// [`lapse_at_wins`], with the seller's node showing them lapsed only `shown` later: until then the
+/// seller has no next invoice to give.
+fn lapse_at_wins_after(r: &Rig, times: usize, secs: u64, shown: Duration) {
+    let left = Mutex::new(times);
+    let (clock, node, standin) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone());
+    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
+        let take_one = |n: &mut usize| n.checked_sub(1).map(|less| *n = less).is_some();
+        if !open.is_empty() && take_one(&mut left.lock().unwrap()) {
+            clock.fetch_add(secs, Ordering::SeqCst);
+            let standin = standin.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(shown);
+                for h in &open {
+                    standin.expire_unpaid(h);
+                }
+            });
+        }
+    }));
+}
+
+/// The file is whole, every win of it is paid on one payment, and the wallet's checks refused at
+/// least `lapsed` invoices for having run out on the way.
+fn assert_paid_after_lapses(r: &Rig, v: &Value, size: usize, lapsed: usize) {
+    assert!(!v.to_string().contains("the owner's bounds") && !v.to_string().contains("lottery_seller_fault"), "{v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+    let refused = r.audit("ticket_refused");
+    let ran_out = refused.iter().filter(|e| e["rule"] == "ln_expired" || e["rule"] == "ticket_expiry").count();
+    assert!(ran_out >= lapsed, "{ran_out} invoices ran out, of {refused:?}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_each_win_paid_once(r, v["session"].as_str().unwrap(), wins);
+}
+
+/// The money, and by the book and the node each win on one payment: a win sent again is never paid twice.
+fn assert_each_win_paid_once(r: &Rig, sid: &str, wins: u64) {
+    assert_wins(r, wins);
+    let rows = win_tickets(r, sid);
+    let mut draws: Vec<u64> = rows.iter().filter(|t| t["state"] == "settled").map(|t| t["win"].as_u64().unwrap()).collect();
+    draws.sort_unstable();
+    draws.dedup();
+    assert_eq!(draws.len() as u64, wins, "every win paid, each once: {rows:?}");
+    let mut hashes: Vec<String> = r.ln.by_status("SUCCEEDED").iter().map(|p| p["payment_hash"].as_str().unwrap().to_string()).collect();
+    let paid = hashes.len();
+    hashes.sort_unstable();
+    hashes.dedup();
+    assert_eq!((paid as u64, hashes.len() as u64), (wins, wins), "one payment a win, each of its own invoice");
+}
+
+/// A win's invoice lapses in the wallet's queue: no bound of the owner's was met, and the win is
+/// paid on the seller's next invoice, once.
+///
+/// FAILS before: `ln_expired` ended the answer as "a win could not be paid inside the owner's bounds".
+#[test]
+fn a_win_whose_invoice_lapsed_in_the_wallets_queue_is_paid_by_the_sellers_next_invoice() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    lapse_at_wins(&r, 1, 31);
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_paid_after_lapses(&r, &v, size, 1);
+}
+
+/// Three invoices that ran out in the wallet's queue are not three bad invoices of the seller's.
+///
+/// FAILS before: the third ended the session, `lottery_seller_fault`.
+#[test]
+fn invoices_that_lapsed_in_the_wallets_queue_are_no_fault_of_the_sellers() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    // 2 s short of the end of this seller's invoice of 15 s: inside the 5 s a prepaid invoice must have left, `ticket_expiry`
+    lapse_at_wins(&r, 3, 13);
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_paid_after_lapses(&r, &v, size, 3);
+    assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry"), "{v}");
+}
+/// A tunnel whose refill finds the channel out for a moment: `active` false for 1.5 s while the
+/// wallet's pool is empty (the refill a release has to wait for), and again with a held ticket's
+/// HTLC pending on the channel, as a VPN tunnel saw. Nothing refuses, the tunnel carries all of it,
+/// and the node, the seller, the book and the seller's signed count agree.
+///
+/// FAILS before: the check refused `ln_no_safe_channel` in that moment, and on the socket path that
+/// ended the tunnel (about 5 of 28 VPN runs on a lab).
+#[test]
+fn a_channel_out_for_a_moment_ends_no_tunnel_whether_an_htlc_is_pending_or_the_pool_is_empty() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    for pending in [false, true] {
+        // the seller waits for a ticket as long as it does as shipped (15 s), not the tests' 2 s
+        REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+        let r = Rig::new(json!({}));
+        REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+        // with the pool empty: its first locks find no slot, and for the wait that follows the tunnel pays by prepaid
+        // tickets, each a refill its release waits for, with nothing held on the channel
+        r.ln.st.lock().unwrap().fail_next = if pending { 0 } else { 2 };
+        let (ln, came) = (r.ln.clone(), Arc::new(AtomicBool::new(false)));
+        let told = came.clone();
+        r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+            let (in_flight, paid) = (ln.by_status("IN_FLIGHT").len(), ln.by_status("SUCCEEDED").len());
+            if (in_flight > 0) == pending && (pending || paid > 0) && !told.swap(true, Ordering::SeqCst) {
+                ln.st.lock().unwrap().channel["active"] = false.into();
+                let ln = ln.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    ln.st.lock().unwrap().channel["active"] = true.into();
+                });
+            }
+        }));
+        let name = format!("tunnel{}", u8::from(pending));
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        // the caller: 3 MiB out and the same back, 64 KiB at a time, then it hangs up: six tickets' worth
+        let caller = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+            let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            let mut w = s;
+            let out: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+            let mut back = vec![0u8; out.len()];
+            let mut whole = 0;
+            for _ in 0..48 {
+                if w.write_all(&out).is_err() || rd.read_exact(&mut back).is_err() || back != out {
+                    break;
+                }
+                whole += 1;
+            }
+            w.shutdown(std::net::Shutdown::Both).unwrap();
+            whole
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/chat"), "max_sats": 20_000, "task": "film", "stream_to": name, "stream_head": true,
+                                           "head_headers": true, "upgrade": true, "headers": [["Sec-WebSocket-Key", "k1"], ["Sec-WebSocket-Version", "13"]]}));
+        assert_eq!(caller.join().unwrap(), 48, "pending {pending}: the tunnel carried all of it: {v}");
+        assert!(came.load(Ordering::SeqCst), "pending {pending}: the channel never went out: {v}");
+        let log = r.call("history", json!({"limit": 5000})).to_string();
+        assert!(!v.to_string().contains("ln_no_safe_channel") && !log.contains("ln_no_safe_channel"), "pending {pending}: a moment taken for an outage: {v}");
+        // 2,500 msat to open, and 6 MiB at 1,000 msat a KiB, by the wallet's count and the seller's signed one
+        let want = (2_500 + 6 * 1024 * 1_000).to_string();
+        assert_eq!((v["status"].as_u64(), v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str()), (Some(101), Some(want.as_str()), Some(want.as_str())), "{v}");
+        let (paid, taken, book, ledger) = r.money();
+        assert!(paid >= 6 * TICKET, "{v}");
+        assert_eq!((taken, book, ledger), (paid, paid, (paid / TICKET) as i64 * SETTLED), "{v}");
+    }
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// The seller's next invoice comes only when its node shows the first lapsed, which may be after the
+/// answer has ended: the call waits for it, and returns with every win paid.
+///
+/// FAILS before: the list was asked three times in 120 ms, and the call returned with the win owed
+/// (`wins_unpaid`: `ticket_expiry`), as 100 sellers at once did on a loaded lab.
+#[test]
+fn a_call_whose_answer_has_ended_waits_for_the_next_invoice_of_a_win_that_ran_out() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    lapse_at_wins_after(&r, 1, 28, Duration::from_millis(1_500));
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_paid_after_lapses(&r, &v, size, 1);
+}
+
+/// A request the seller refuses `win_unpaid` while its next invoice is not there yet: the call waits
+/// for it, pays it, and is served.
+///
+/// FAILS before: the request was refused twice within a moment, and the call ended `lottery_refused`.
+#[test]
+fn a_request_refused_for_a_win_waits_for_the_sellers_next_invoice_and_is_served() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    old_seller(&r);
+    r.ln.st.lock().unwrap().fail_one = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(v["wins"].as_u64().unwrap() >= 1, "{v}");
+    assert_eq!(v["wins_unpaid"][0]["rule"], "lottery_win_failed", "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    // the grace has gone by, and the seller's node shows the failed win's invoice lapsed only a moment later
+    r.clock.fetch_add(31, Ordering::SeqCst);
+    let failing: Hash = hex::decode(r.ln.st.lock().unwrap().failing.clone().unwrap()).unwrap().try_into().unwrap();
+    let standin = r.shop.standin.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1_500));
+        standin.expire_unpaid(&failing);
+    });
+    let again = r.pay("/tiny/10", 5);
+    assert_eq!((again["status"].as_u64(), again["session"].as_str()), (Some(200), Some(sid.as_str())), "{again}");
+    assert_each_win_paid_once(&r, &sid, v["wins"].as_u64().unwrap() + again["wins"].as_u64().unwrap());
+}
+
+/// Wins are taking 3 s on the way, and one's invoice has 5 s left when its turn comes: it would have ended
+/// on the way. It is not sent, and the seller's next invoice pays that win; no payment fails.
+///
+/// FAILS before: it was sent on the 5 s every prepaid invoice must have, and failed at the seller (5 of 314 on a lab).
+#[test]
+fn a_win_whose_invoice_would_end_on_the_way_is_not_sent_and_the_next_invoice_pays_it() {
+    let _g = env_lock();
+    // a seller that serves on while wins take their 3 s: this is about the invoice, not its answer standing still
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                                               "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
+    let size = 256 * PIECE;
+    // a file's wins teach the wallet how long they take on the way
+    let first = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((first["rail"].as_str(), first["complete"].as_bool()), (Some("lottery"), Some(true)), "{first}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{first}");
+    let (clock, node, standin, once) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
+    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open: Vec<Hash> = known.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).filter(|h| standin.state_of(h) == Some(InvoiceState::Open)).collect();
+        if !open.is_empty() && !once.swap(true, Ordering::SeqCst) {
+            // an invoice is dated a second back: 5 s left, which every prepaid invoice may have and these wins may not
+            clock.fetch_add(24, Ordering::SeqCst);
+            let standin = standin.clone();
+            // lapsed with the seller once the payments already on their way have arrived: they went in good time
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(4_500));
+                for h in &open {
+                    standin.expire_unpaid(h);
+                }
+            });
+        }
+    }));
+    // the next file's first win finds its invoice so
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "nothing was sent that could not arrive: {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["session"].as_str()), (Some(200), Some(true), first["session"].as_str()), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), first["wins"].as_u64().unwrap() + wins);
+    assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
+}
+
+/// A win whose first invoice came to nothing goes before the wins no seller waits for when its next
+/// invoice comes: behind a hundred others, that invoice runs out too.
+///
+/// FAILS before: the next invoice joined the end of the queue, and lapsed in it again (an 8 GB lab, 100 sellers).
+#[test]
+fn a_win_on_its_next_invoice_goes_before_the_wins_waiting() {
+    let _g = env_lock();
+    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
+    let r = Rig::with_more(owner, true, true, 30, patient.clone(), &vec![patient; 20]);
+    let mut st = r.ln.st.lock().unwrap();
+    st.send_takes = Duration::from_millis(1_000);
+    st.fail_one = true;
+    drop(st);
+    let size = 64 * PIECE;
+    let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    let all: Vec<Value> = std::thread::scope(|sc| {
+        let calls: Vec<_> = r.more.iter().chain(std::iter::once(&r.shop)).map(|shop| sc.spawn(move || buy(shop))).collect();
+        // the payment fails: the seller's node then shows its invoice lapsed
+        wait_for("the failing win's send", || !r.ln.by_status("FAILED").is_empty());
+        let failing: Hash = hex::decode(r.ln.st.lock().unwrap().failing.clone().unwrap()).unwrap().try_into().unwrap();
+        for shop in r.more.iter().chain(std::iter::once(&r.shop)) {
+            shop.standin.expire_unpaid(&failing);
+        }
+        calls.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let failing = r.ln.st.lock().unwrap().failing.clone().unwrap();
+    // the win that failed, by the book, and the invoice that paid it
+    let rows: Vec<Vec<Value>> = all.iter().filter_map(|v| v["session"].as_str()).map(|sid| win_tickets(&r, sid)).collect();
+    let (draw, row) = rows.iter().find_map(|rows| rows.iter().find(|t| t["hash"] == failing.as_str()).map(|t| (t["win"].as_u64().unwrap(), rows))).expect("the failed win's row");
+    let next = row.iter().find(|t| t["win"].as_u64() == Some(draw) && t["state"] == "settled").expect("the win was paid on its next invoice");
+    let payments: Vec<String> = r.ln.state().payments.iter().map(|p| p["payment_hash"].as_str().unwrap().to_string()).collect();
+    let at = |h: &str| payments.iter().rposition(|p| p == h).unwrap();
+    let (failed_at, paid_at) = (at(&failing), at(next["hash"].as_str().unwrap()));
+    assert!(payments.len() - paid_at > 40, "many waited behind it: paid at {paid_at} of {}", payments.len());
+    // counted from when the seller made the next invoice, not from the failure: how long the seller takes to
+    // make it (until the old one's time is up) is the seller's and the machine's, and no order of the
+    // wallet's. From then on, the payments sent before it are those already on their way and at most a
+    // gate's width more
+    let made = r.more.iter().chain(std::iter::once(&r.shop)).find_map(|shop| {
+        shop.node.made.lock().unwrap().iter().find(|(h, _)| h == next["hash"].as_str().unwrap()).map(|(_, at)| *at)
+    }).expect("the seller made the next invoice");
+    let made_at = r.ln.st.lock().unwrap().sent_at.iter().filter(|s| **s < made).count();
+    let behind = paid_at - made_at.min(paid_at);
+    eprintln!("priority: failed at {failed_at}, next invoice made at {made_at}, paid at {paid_at}, of {}: {behind} sent between", payments.len());
+    assert!(behind <= NEXT_INVOICE_BEHIND_MOST, "it waited behind the wins queued: {behind} payments were sent between the seller's next invoice \
+             (made when {made_at} had been sent) and its payment (at {paid_at}, of {}; it failed at {failed_at})", payments.len());
+}
+
+/// How many payments may go between a win's next invoice and its payment: the gate's 8, sent before the
+/// invoice came, and as many again whose turn was taken as it came.
+const NEXT_INVOICE_BEHIND_MOST: usize = 16;
+
+/// A stop ends the wait for a channel at once, on a prepaid ticket's path and a held one's.
+///
+/// FAILS without the stop's signal: the call went on waiting for the channel for up to 8 s.
+#[test]
+fn a_stop_ends_the_wait_for_a_channel_at_once() {
+    let _g = env_lock();
+    let prepaid = json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
+    for r in [Rig::shipped(json!({}), 30, prepaid), Rig::new(json!({}))] {
+        let first = r.pay("/page/10", CALL);
+        assert_eq!(first["status"], 200, "{first}");
+        let sid = first["session"].as_str().unwrap().to_string();
+        std::thread::scope(|sc| {
+            let call = sc.spawn(|| r.pay(&format!("/slow/{}", 200 * MIB), 100_000));
+            wait_for("the film under way", || r.tap.seen("/slow/").iter().any(|s| s.paid));
+            std::thread::sleep(Duration::from_millis(500));
+            let looks = r.ln.st.lock().unwrap().looks;
+            r.ln.st.lock().unwrap().channel["active"] = false.into();
+            // the wallet is in the wait once it has read the channels a few times with it out
+            wait_for("the wait", || r.ln.st.lock().unwrap().looks >= looks + 3);
+            let at = Instant::now();
+            let stop = sc.spawn(|| r.call("ticket_stop", json!({"session": sid})));
+            let out = call.join().unwrap();
+            let ended = at.elapsed();
+            stop.join().unwrap();
+            assert!(ended < Duration::from_secs(3), "the call ended {ended:?} after the stop: {}", out["ended"]);
+        });
+        r.tap.clear();
+    }
+}
+
+/// Out, refused, back for a while no payment looks at, and out again: the new outage has its own wait.
+///
+/// FAILS with the first outage's time counted against the second: refused at once.
+#[test]
+fn a_new_outage_has_its_own_wait() {
+    let _g = env_lock();
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    r.ln.st.lock().unwrap().channel["active"] = false.into();
+    let v = r.pay(&format!("/files/{MIB}"), CALL);
+    assert!(v.to_string().contains("ln_no_safe_channel"), "{v}");
+    r.ln.st.lock().unwrap().channel["active"] = true.into();
+    std::thread::sleep(Duration::from_secs(2));
+    r.ln.st.lock().unwrap().channel["active"] = false.into();
+    let back = r.ln.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1_500));
+        back.st.lock().unwrap().channel["active"] = true.into();
+    });
+    let v = r.pay(&format!("/files/{MIB}"), CALL);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
+}
+
+/// A seller whose every invoice for a win comes with 2 s left: no queue of the wallet's has a part in that.
+///
+/// FAILS with such an invoice taken as one that lapsed in the queue: never at fault, and asked again and again.
+#[test]
+fn a_seller_whose_invoices_come_nearly_dead_is_at_fault() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2}}));
+    // an invoice of 15 s, dated so that it has 2 s left when it is made, and cancelled before each list, so that the gateway makes the next
+    r.shop.node.backdate.store(13, Ordering::SeqCst);
+    let (node, standin) = (r.shop.node.clone(), r.shop.standin.clone());
+    r.tap.set(Box::new(move |seen, _| {
+        if seen.path.starts_with("/x402/lottery/draw") {
+            let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+            for h in known {
+                let h: Hash = hex::decode(h).unwrap().try_into().unwrap();
+                if standin.state_of(&h) == Some(InvoiceState::Open) {
+                    standin.expire_unpaid(&h);
+                }
+            }
+        }
+        None
+    }));
+    let t = Instant::now();
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    r.tap.clear();
+    assert!(v["ended"].as_str().unwrap_or("").contains("lottery_seller_fault"), "{v}");
+    assert!(t.elapsed() < Duration::from_secs(60), "{:?}", t.elapsed());
+    assert_eq!(r.ln.state().payments.len(), 0, "{v}");
+    assert_wins(&r, 0);
+}
+
+/// Invoices that keep running out in the wallet's queue end the session by name, with the money right.
+///
+/// FAILS with no cap on them: asked for ever.
+#[test]
+fn invoices_that_keep_lapsing_end_the_session_by_name() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    lapse_at_wins(&r, 1_000_000, 13);
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(v["ended"].as_str().unwrap_or("").contains("lottery_invoices_lapse"), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
+/// A channel that drops just after the checks: the send fails as the real node says it (no balance, no
+/// attempt on its record), nothing is spent, and the seller's next invoice pays the win, once.
+#[test]
+fn a_win_sent_as_the_channel_drops_is_paid_once_on_its_next_invoice() {
+    let _g = env_lock();
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let (ln, node, standin, once) = (r.ln.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
+    let mut st = r.ln.st.lock().unwrap();
+    st.send_takes = Duration::from_millis(200);
+    st.on_look = Some(Arc::new(move |_| {
+        // a look with an invoice open is a win's own check, which this passes: the channel goes as its payment is sent
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open = known.iter().any(|h| standin.state_of(&hex::decode(h).unwrap().try_into().unwrap()) == Some(InvoiceState::Open));
+        if open && !once.swap(true, Ordering::SeqCst) {
+            let ln = ln.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                ln.st.lock().unwrap().channel["active"] = false.into();
+                std::thread::sleep(Duration::from_millis(450));
+                ln.st.lock().unwrap().channel["active"] = true.into();
+            });
+        }
+    }));
+    drop(st);
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let failed = r.ln.by_status("FAILED");
+    assert!(!failed.is_empty(), "{v}");
+    assert!(failed.iter().all(|p| p["failure_reason"] == "FAILURE_REASON_INSUFFICIENT_BALANCE" && p["htlcs"] == json!([])), "{failed:?}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+    for p in &failed {
+        let h: Hash = hex::decode(p["payment_hash"].as_str().unwrap()).unwrap().try_into().unwrap();
+        r.shop.standin.expire_unpaid(&h);
+    }
+    let again = r.pay("/tiny/10", 5);
+    assert_eq!((again["status"].as_u64(), again["session"].as_str()), (Some(200), Some(sid.as_str())), "{again}");
+    assert_each_win_paid_once(&r, &sid, v["wins"].as_u64().unwrap() + again["wins"].as_u64().unwrap());
+}
+
+/// A win's payment fails, and its seller's answer will not wait for the invoice to lapse: the wallet asks
+/// the seller to cancel it and pays the next one at once. The file is whole, the invoice that failed is not sent
+/// again, and each win is paid once.
+///
+/// FAILS before: the win waited for the first invoice to lapse, and the seller cut the file meanwhile.
+#[test]
+fn a_win_whose_payment_failed_is_paid_at_once_on_the_sellers_next_invoice() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    r.ln.st.lock().unwrap().fail_one = true;
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 1, "{v}");
+    let failed = r.ln.by_status("FAILED");
+    assert_eq!(failed.len(), 1, "{v}");
+    assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| p["payment_hash"] == failed[0]["payment_hash"]), "not sent again: {v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+}
+
+/// A node that fails every payment: the seller is asked to cancel a bounded number of times, no invoice is
+/// sent twice, and nothing moves.
+///
+/// FAILS with no cap: a payment and a cancel and an invoice, for as long as the call lasts.
+#[test]
+fn a_node_that_fails_every_payment_is_not_asked_for_ever() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    r.ln.st.lock().unwrap().hop_full = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let asked = r.tap.seen("/x402/lottery/cancel").len() as u64;
+    let wins = v["wins"].as_u64().unwrap();
+    assert!(asked >= 1 && asked <= (wins * 4).min(32), "{asked} cancels for {wins} wins: {v}");
+    let failed = r.ln.by_status("FAILED");
+    let mut hashes: Vec<&str> = failed.iter().map(|p| p["payment_hash"].as_str().unwrap()).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    assert_eq!(hashes.len(), failed.len(), "each invoice sent once: {v}");
+    assert_wins(&r, 0);
+}
+
+/// A seller of an earlier version is asked to cancel once, whatever fails after: a 404 says it has no such call.
+///
+/// FAILS with the wallet asking again after a 404.
+#[test]
+fn a_seller_without_cancel_is_asked_once() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    old_seller(&r);
+    r.ln.st.lock().unwrap().hop_full = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(r.ln.by_status("FAILED").len() >= 2, "{v}");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 1, "{v}");
+    assert_wins(&r, 0);
+}
+
+/// A drop that fails a win's payment and then its next invoice's too, as one peer drop does to every
+/// payment on the wire: the call waits for the third invoice and returns with every win paid, the file whole,
+/// and no invoice sent twice.
+///
+/// FAILS with the call returning while the win is owed (on a loaded lab, 3 of 100 sessions so).
+#[test]
+fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    let (ln, node) = (r.ln.clone(), r.shop.node.clone());
+    let mut st = r.ln.st.lock().unwrap();
+    // payments take a second on the way: the wins are paid after the answer has ended
+    st.send_takes = Duration::from_millis(1_000);
+    st.fail_one = true;
+    // the win's next invoice, which the seller makes at the wallet's asking, fails in the same drop
+    st.on_look = Some(Arc::new(move |_| {
+        let next = node.reinvoiced.lock().unwrap().first().cloned();
+        if let Some(h) = next {
+            let mut s = ln.st.lock().unwrap();
+            if s.fail_also.is_empty() {
+                s.fail_also.push(h);
+            }
+        }
+    }));
+    drop(st);
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    let failed = r.ln.by_status("FAILED");
+    assert_eq!(failed.len(), 2, "the win's invoice and its next one: {v}");
+    assert_eq!(r.tap.seen("/x402/lottery/cancel").len(), 2, "{v}");
+    assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "no failed invoice sent again: {v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+}
+
+/// A link along the route is replaced, and for a while the node finds no route to the seller: a payment sent
+/// then fails at once. The wallet asks the node for a route first and waits for one, within 8 s: a window of
+/// 3 s costs no failed payment and no win; one of 10 s ends the wait at 8 s and the call with `ln_no_route`, the
+/// money still right.
+///
+/// FAILS with no route query: each win sent in the window fails, and its invoice has to be replaced.
+#[test]
+fn a_moment_with_no_route_to_the_seller_is_waited_for_and_costs_no_failed_payment() {
+    let _g = env_lock();
+    for window in [Duration::from_secs(3), Duration::from_secs(10)] {
+        let r = patient_draws_rig(json!({}));
+        {
+            // the window opens at the second win's route query: that win, and those behind it, meet it
+            let mut st = r.ln.st.lock().unwrap();
+            st.no_route_at_query = 2;
+            st.no_route_for = window;
+        }
+        let size = 256 * PIECE;
+        let v = r.pay(&format!("/pieces/{size}"), 1_000);
+        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "{window:?}: no payment met the window: {v}");
+        // a payment the node had found a route for just before the window opened is sent into it and fails, as it would
+        // on a real node: at most the gate's eight, and none is sent again
+        let failed = r.ln.by_status("FAILED");
+        assert!(failed.len() <= 8, "{window:?}: {} failed: {v}", failed.len());
+        assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "{window:?}: {v}");
+        // the refusals of a seller without a route for a whole window (not of payments that stood back while one waited)
+        let no_route: Vec<Value> = r.audit("ticket_refused").into_iter()
+            .filter(|e| e["rule"] == "ln_no_route" && e["reason"].as_str().unwrap_or("").contains("has found no route")).collect();
+        if window > Duration::from_secs(8) {
+            // past the 8 s the seller is given up on: the call ends with that reason, nothing failed, the money right
+            assert!(!no_route.is_empty() && v.to_string().contains("ln_no_route"), "past 8 s the wait ends with its reason: {v}");
+            // a wait that ran out says for how long; a payment after the window ran out, or the call's end after three such
+            // waits, says that instead
+            for e in &no_route {
+                let reason = e["reason"].as_str().unwrap();
+                match reason.split("for ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(secs) => assert!(secs <= 8.6, "waited {secs} s: {e}"),
+                    None => assert!(reason.contains("whole wait") || reason.contains("any of"), "a refusal for want of a route that says neither: {e}"),
+                }
+            }
+            assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+        } else {
+            assert!(no_route.is_empty(), "a window of 3 s is waited out: {no_route:?}");
+            assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "{v}");
+            let wins = v["wins"].as_u64().unwrap();
+            assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{window:?}: {v}");
+            assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+        }
+    }
+}
+
+/// A range that goes on from a copy the seller no longer has (`if_range` names another) is answered with the
+/// whole body: none of it is read, the call says so by its own rule and what it cost, and the money is the same
+/// on both sides. The copy it names goes on from the byte asked for, and the head says its validator.
+///
+/// FAILS before: the whole body was read and metered, the bytes the caller had bought again.
+#[test]
+fn a_range_answered_with_the_whole_body_is_not_read_and_one_of_the_same_copy_goes_on() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let n = 8 * MIB;
+    let first = r.pay(&format!("/files/{n}"), 5_000);
+    assert_eq!((first["status"].as_u64(), first["etag"].as_str()), (Some(200), Some(FILE_TAG)), "{first}");
+    let before = r.money();
+    let other = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                          "range": "bytes=1048576-", "if_range": "\"v0\""}));
+    assert_eq!((other["status"].as_u64(), other["rule"].as_str(), other["complete"].as_bool(), other["bytes"].as_u64()),
+               (Some(200), Some("ticket_range_ignored"), Some(false), Some(0)), "{other}");
+    let cost = other["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+    assert!(other["reason"].as_str().unwrap().contains(&format!("{cost} msat")), "{other}");
+    assert!(cost <= 50_000, "at most what the seller's socket took (256 KiB at 200 sat a MiB): {cost} msat");
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book), (paid, paid), "{other}");
+    assert!(paid - before.0 <= TICKET && ledger >= before.3, "no file bought again: {other}");
+    let same = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                         "range": "bytes=1048576-", "if_range": FILE_TAG}));
+    assert_eq!((same["status"].as_u64(), same["complete"].as_bool(), same["bytes"].as_u64()), (Some(206), Some(true), Some((n - MIB) as u64)), "{same}");
+    let bad = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": 5_000, "task": "film", "if_range": FILE_TAG}));
+    assert_eq!(bad["rule"], "if_range", "{bad}");
+    r.assert_booked();
+}
+
+/// A win's invoice the wallet held back for lack of time (it would have ended on the way) is cancelled at the
+/// wallet's asking, so the seller's next one comes at once rather than after the first has lapsed; the win is
+/// paid before the call returns, and nothing fails.
+///
+/// FAILS without asking: the next invoice waits for a lapse that, on this seller's 30 s invoice, comes after the
+/// call has stopped waiting, and the win is left owed.
+#[test]
+fn a_win_held_back_for_lack_of_time_gets_the_sellers_next_invoice_at_once() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
+    let size = 256 * PIECE;
+    // a file's wins teach the wallet how long they take on the way
+    let first = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((first["rail"].as_str(), first["complete"].as_bool()), (Some("lottery"), Some(true)), "{first}");
+    let (clock, node, standin, once) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
+    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open = known.iter().any(|h| standin.state_of(&hex::decode(h).unwrap().try_into().unwrap()) == Some(InvoiceState::Open));
+        if open && !once.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(300));
+            // the open invoices have 5 s left, which these wins may not be sent on; nothing lapses them here
+            clock.fetch_add(24, Ordering::SeqCst);
+        }
+    }));
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
+    assert!(!r.tap.seen("/x402/lottery/cancel").is_empty(), "the seller was asked to cancel it: {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), first["wins"].as_u64().unwrap() + wins);
+}
+
+/// The wallet's node has no route to the seller, for good: one payment waits for one at a time, all of them
+/// within one window of 8 s, the rest are refused at once, and the call ends with that reason well within the
+/// caller's minute. Nothing is sent, so nothing fails, and the money is what the node paid.
+///
+/// FAILS with a wait for each payment in turn: the call holds the gate for 8 s a win, past the minute.
+#[test]
+fn a_route_gone_for_good_ends_the_call_soon_with_its_reason() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    let t = Instant::now();
+    r.ln.st.lock().unwrap().no_route = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(20), "the call took {took:?}: {v}");
+    assert!(v.to_string().contains("ln_no_route"), "{v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    let waits = r.audit("ticket_route_waited");
+    assert!(!waits.is_empty() && waits.len() <= 3, "one wait at a time: {waits:?}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap_or(0));
+}
+
+/// A seller behind a private channel (or an LSP) is reached by its invoice's route hints, which the node's route
+/// query is not given: the query finds no path, ever. Its invoices are sent at once, as before the route wait,
+/// on the ticket rail and for wins, and nothing waits or is refused for want of a route.
+///
+/// FAILS with the route asked for every invoice: each waits out the 8 s and is refused `ln_no_route`, and the
+/// seller is never paid (the offers check of the lab, on real nodes, where the seller's one channel is private).
+#[test]
+fn a_seller_behind_a_private_channel_is_paid_at_once_by_its_route_hints() {
+    let _g = env_lock();
+    // prepaid tickets: each one an ordinary payment of the seller's invoice, the path the route wait is on
+    let prepaid = json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
+    let r = Rig::shipped(json!({}), 30, prepaid);
+    r.ln.st.lock().unwrap().private_seller = true;
+    let t = Instant::now();
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+    assert!(r.ln.state().payments.iter().any(|p| p["status"] == "SUCCEEDED"), "a prepaid ticket was paid: {v}");
+    assert!(t.elapsed() < Duration::from_secs(4), "the page took {:?}: {v}", t.elapsed());
+    // wins: 256 pieces, as many wins as the no-route tests see
+    let d = patient_draws_rig(json!({}));
+    d.ln.st.lock().unwrap().private_seller = true;
+    let t = Instant::now();
+    let w = d.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(w["wins"].as_u64().unwrap_or(0) >= 1, "no win to pay: {w}");
+    assert_eq!((w["status"].as_u64(), w["complete"].as_bool()), (Some(200), Some(true)), "{w}");
+    assert_eq!((w["wins_paid"].as_u64(), w["wins_unpaid"].as_array().map(Vec::len)), (w["wins"].as_u64(), Some(0)), "{w}");
+    assert!(t.elapsed() < Duration::from_secs(30), "the file took {:?}: {w}", t.elapsed());
+    for (rig, out) in [(&r, &v), (&d, &w)] {
+        assert!(!out.to_string().contains("ln_no_route"), "{out}");
+        assert!(rig.audit("ticket_route_waited").is_empty(), "no wait for a route the query cannot see");
+        assert_eq!(rig.ln.st.lock().unwrap().route_queries, 0, "no route query for an invoice with hints");
+        assert_eq!(rig.ln.by_status("FAILED").len(), 0);
+    }
+    assert_wins(&d, w["wins_paid"].as_u64().unwrap_or(0));
+}
+
+/// A whole body sent for a range from the first byte (the app's player's first part) is a whole answer: read
+/// and paid as any other, its head and receipt the whole body's, no fault of the seller's, the money one number.
+///
+/// FAILS with the answer cut at the range's last byte: the receipt, a hash of the whole body, does not match, and
+/// an honest seller is put at fault.
+#[test]
+fn a_whole_body_for_a_range_from_the_first_byte_is_a_whole_answer() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let n = 8 * MIB;
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                      "range": "bytes=0-4194303", "if_range": "\"v0\""}));
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64(), v["content_length"].as_u64()), (Some(200), Some(true), Some(n as u64), Some(n as u64)), "{v}");
+    assert!(v.get("seller_fault").is_none() && v["rule"] != "ticket_range_ignored", "{v}");
+    assert_eq!(v["receipt"]["body"], "as signed", "{v}");
+    let (paid, taken, book, _) = r.money();
+    assert_eq!((taken, book), (paid, paid), "{v}");
+    r.assert_booked();
+}
+
+/// A moment with no route to the seller, of 4 s and of 7 s, with many wins: the payments behind the one that
+/// waits stand back and go again, none of that counts toward giving up on the seller, and every win is paid, the
+/// file whole.
+///
+/// FAILS with the refusals of the payments standing back counted: three of them end the call within the moment.
+#[test]
+fn a_moment_with_no_route_and_many_wins_pays_every_win() {
+    let _g = env_lock();
+    for (at, secs) in [(2usize, 4u64), (5, 4), (2, 7)] {
+        let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+        {
+            let mut st = r.ln.st.lock().unwrap();
+            st.no_route_at_query = at;
+            st.no_route_for = Duration::from_secs(secs);
+        }
+        let size = 256 * PIECE;
+        let v = r.pay(&format!("/pieces/{size}"), 2_000);
+        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment: {v}");
+        // the payments the node had found a route for just before the moment came are sent into it and fail, as
+        // they would on a real node; at most the gate's eight, and none is sent again
+        let failed = r.ln.by_status("FAILED");
+        assert!(failed.len() <= 8, "({at}, {secs}): {} failed: {v}", failed.len());
+        assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "({at}, {secs}): {v}");
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "({at}, {secs}): {v}");
+        let wins = v["wins"].as_u64().unwrap();
+        assert!(wins >= 1, "({at}, {secs}): {v}");
+        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "({at}, {secs}): {v}");
+        assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
+    }
+}
+

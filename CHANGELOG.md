@@ -49,6 +49,55 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A slow wallet no longer blames a seller whose web server timed out waiting for the wallet's request
+  (HTTP 408). Nothing was served or charged: the wallet sends the same request once more, and if it
+  times out again, that call alone is refused and the session goes on.
+- A file no longer gets cut because the wallet's disk is slow while it pays many sellers. With 50 or
+  100 ms added to each of the wallet's disk writes and 20 other sellers' wins queued, the win a seller
+  was waiting for was paid after 19 to 30 others, and its file was cut in 9 of 12 runs. It is now paid
+  after 1 to 8 others, and the file arrives whole in 12 of 12.
+- After the wallet's Lightning node restarts in the middle of a download, a win it could not pay at
+  that moment is paid on the next call. The seller used to refuse that call and every later one for
+  as long as the session lasted.
+- A channel that drops for a moment no longer ends a paid file or answer: the wallet waits up to
+  8 s for it to come back, and as long for a route to the seller (after a link further along the way
+  was replaced, a node may find none for some seconds), rather than sending a payment that fails. A seller
+  the node has no route to for good ends the call with `ln_no_route` within those 8 s, and holds up no
+  other seller's payments. The route is asked for over the public graph only: a seller reached by its
+  invoice's route hints or blinded paths (a private channel, an LSP) is paid at once, as before, with no
+  wait. A channel that stays down still ends what is paid by tickets, with that
+  reason; a file paid by draws may still finish, with the wins it could not pay listed unpaid.
+- A win whose invoice ran out while it waited its turn is paid on the seller's next invoice, rather
+  than ending the file; a win that would arrive after its invoice ends is not sent.
+- Going on with a file from where it stopped (`range`) no longer buys the start of it again from a seller
+  whose server ignores ranges. Until now the wallet read and paid for a whole body sent in answer to a range,
+  "like any other"; now it reads none of it and says `ticket_range_ignored` (a range from the first byte,
+  which is what a player asks first, is a whole answer: read whole, up to the call's `max_sats`, not cut at the
+  range's last byte, so a caller of `bytes=0-1023` with a large `max_sats` can pay for the whole body), with what the call cost (on a route
+  priced by the byte, what the seller's socket took before the wallet closed it). A call that goes on from an
+  earlier answer can name that answer's `etag` (`if_range`): a seller whose file has changed since sends the whole
+  new file, which is not read either, rather than the rest of another file spliced onto the old start. The app's
+  player link and the wallet's own player pass the player's `If-Range` on and the seller's `ETag` and
+  `Last-Modified` back; a seek on a changed file is answered 412, with that reason.
+- A win whose payment failed no longer costs a file: the wallet asks the seller to cancel that invoice,
+  and pays the seller's next one at once rather than waiting for the first to lapse. It asks the same
+  for an invoice it held back because the win would have arrived after it ended. A seller on an
+  earlier version behaves as before.
+- A paid download or film no longer ends when a loaded node or a slow route is late with its next
+  ticket, or when the wallet's chain or Lightning node stops answering for a moment. The wallet waits
+  up to 12 s for each ticket while the seller keeps the answer open, and releases nothing for an answer
+  the seller has closed, or after the call's deadline. Where only the Lightning node's router was away,
+  tickets it never got hold their places for up to two minutes, and the file ends with `ticket_none`.
+- A whole paid call now has one deadline of 50 s, and answers plainly within about 55 s, before its
+  caller's 60 s, even if a node or the seller hangs: asking again then does not pay twice. Three things
+  can still run past that: paying a prepaid ticket, which waits as long as the Lightning node's own
+  timeout (60 s); the checks of the nodes that begin a call, each up to its own 30 s; and the wallet's
+  background check of its tickets while the Lightning node hangs, which holds the ticket book up.
+- An answer priced by the second is charged for that wait, by the clock, and each ticket can wait: at
+  400 sat a second, an answer of 3,600 sat came to 4,800 sat with the seller's word held back to 11 s,
+  and to 7,600 sat with its ticket 11 s past due.
+- A seller that keeps not showing the wallet's tickets, and a ticket stuck on its way for over 90 s,
+  now end the session, and the reply says which. A stop ends the answer at once.
 - A small payment works from no credit at a shop: the wallet buys a ticket sized to what the call may
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
@@ -76,6 +125,13 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   more than they could have delivered; an AI reply never past its quoted price.
 - A busy service refuses new buyers before they pay; buyers it is already serving stay served, and
   a refused buyer is sold nothing.
+- On a slow route the AI address no longer gives up on a seller while the wallet is still paying it,
+  and pays a second seller for the same answer: a seller's time to answer is counted from when its
+  call is paid for (up to 90 s for the payment, `LS_AI_PAY_WAIT_S`). A seller that has the request
+  and is then silent is no longer followed by another; whatever a failed call cost is booked to its
+  AI key.
+- A lottery win paid over a slow route reaches the seller before its invoice lapses: the seller's
+  grace, and with it a win's invoice, is 60 s by default instead of 30 s.
 - WebSockets (for example a web app's live updates) stay open for up to six hours, paid as their
   bytes pass, instead of ending with an ordinary answer's limit.
 - A paid WebSocket is charged no more than the limit the buyer set for it: the shop's gateway ends
@@ -105,6 +161,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A kill or a lost answer no longer buys a second ticket when the first was paid: the next call waits
   for the shop to take it, for two minutes at most. Long answers open for over ten minutes are no longer
   cut by a second call to the same shop.
+- An agent's paid download or payment that takes longer than a minute no longer fails at the MCP with
+  "Resource temporarily unavailable" while the wallet goes on paying for it. The MCP waits for a paying
+  call's answer as long as the wallet works on it; any other call still gives up after `B2_SIGNER_TIMEOUT`.
+  If a paying call's answer is lost (the wallet's signer stopped), the agent is told the call may have paid
+  (`signer_no_answer`, `request_sent: true`) rather than given an error that reads as if nothing happened.
 
 **VPN exits**
 - A priced exit's region check now runs for a buyer with no credit at that exit. Each check is

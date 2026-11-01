@@ -49,6 +49,21 @@ const QUEUE_WAIT: Duration = Duration::from_secs(50);
 const LONG_HOLD: Duration = Duration::from_secs(30);
 /// How long a stop waits for the answer open on its session of draws to end.
 const STOP_WAIT: Duration = Duration::from_secs(15);
+/// How long a call waits for the seller's next invoice of a win whose last one is about to lapse or has:
+/// the seller makes the next one only when its node shows the first cancelled, and the wallet refuses an
+/// invoice within 5 s of its end. An invoice with longer to live than this is not waited for.
+const OWED_WAIT: Duration = Duration::from_secs(10);
+const OWED_POLL: Duration = Duration::from_millis(250);
+/// How many of a win's invoices, and of a session's, the wallet asks to have cancelled after failed payments.
+/// Past these it waits for them to lapse: a seller's node that fails every payment is not asked for ever.
+const CANCELS_PER_WIN: u32 = 4;
+/// How many times a win is refused for a seller that has been without a route for a whole window (not while
+/// another payment to it waits for one) before the call gives up on that seller.
+const NO_ROUTE_PER_WIN: u32 = 3;
+const CANCELS_PER_SESSION: u32 = 32;
+/// How many of a win's invoices, and of a session's, may run out in the wallet's queue before it stops asking.
+const LAPSES_PER_WIN: u32 = 4;
+const LAPSES_PER_SESSION: u32 = 32;
 
 fn refused(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "lottery", "charged_sats": 0}))
@@ -122,6 +137,26 @@ struct State {
     paid_sats: i64,
     /// Invoices of this seller's that the wallet's checks refused (another payee, another amount, no bit 512).
     bad_invoices: u32,
+    /// Invoices that came with less time left than any prepaid invoice must have: no queue of the wallet's
+    /// had a part in that, and each counts against the seller.
+    dead_on_arrival: HashSet<[u8; 16]>,
+    /// How many of a win's invoices, and of the session's, ran out in the wallet's queue.
+    lapses: HashMap<u64, u32>,
+    lapsed: u32,
+    /// How many times a win was refused for no route to the seller.
+    no_route: HashMap<u64, u32>,
+    /// How many invoices the seller has been asked to cancel, by win and in all, and that it will not
+    /// (one of an earlier version, or at its own limit).
+    cancels: HashMap<u64, u32>,
+    cancels_asked: u32,
+    no_cancel: bool,
+    /// Wins whose invoice ran out or whose payment failed: their next invoice goes before the wins no seller
+    /// waits for. Behind them it can run out too: on an 8 GB lab, a win lapsed twice waiting behind wins of 100 sellers.
+    again: HashSet<u64>,
+    /// Invoices to ask the seller to cancel, before its list is next asked for.
+    to_cancel: Vec<(u64, String)>,
+    /// When the latest invoice of a win that is owed again ends: the seller's next one comes after that.
+    next_invoice_after: f64,
     /// Why this session draws no more.
     fault: Option<String>,
 }
@@ -368,8 +403,11 @@ impl Signer {
         let mut headers = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&ds.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth}))))];
         headers.extend(extra);
         let sent = self.wire(method, url, body, &headers, timeout);
-        // the seq is used up once the request has left, answered or not
-        link.next_seq = seq.saturating_add(1);
+        // the seq is used up once the request has left, answered or not; but not by a 408, which the seller's HTTP
+        // layer gives before any of its handlers sees the request ([`unsigned_and_no_fault`]): the next request takes it
+        // again (`link` is held, so no other has)
+        let late = sent.as_ref().is_ok_and(|a| a.status == 408);
+        link.next_seq = if late { seq } else { seq.saturating_add(1) };
         let ans = sent?;
         let receipt = DrawReceipt::read(ans.header("PAYMENT-RESPONSE"), &ds.terms.receipt_key, &link.seller_sid, seq, &digest, ans.status);
         Ok((seq, digest, ans, receipt))
@@ -379,10 +417,16 @@ impl Signer {
     fn draw_call(&self, ds: &DrawSession, what: &str, body: &Value) -> Result<(u16, Value, std::result::Result<DrawReceipt, String>)> {
         let url = format!("{}/{what}", ds.base);
         let raw = body.to_string().into_bytes();
-        for _ in 0..3 {
+        let mut late = 0;
+        for _ in 0..4 {
             let (_, _, ans, receipt) = self.draw_send(ds, "POST", &url, &raw, vec![("Content-Type".into(), "application/json".into())])?;
             let status = ans.status;
             let v: Value = serde_json::from_slice(&ans.read_small(SMALL_BODY)?).unwrap_or(Value::Null);
+            // the seller's HTTP layer gave up on it (408): nothing was served, and the same request goes once more
+            if receipt.is_err() && status == 408 && late == 0 {
+                late += 1;
+                continue;
+            }
             if receipt.is_err() && status == 402 && v.get("error").and_then(Value::as_str) == Some("bad_seq") {
                 // a seq only orders requests: the seller's is adopted, which costs nothing
                 if let Some(n) = v.get("nextSeq").and_then(Value::as_u64) {
@@ -451,6 +495,7 @@ impl Signer {
     /// reveal and work out every draw it covers. `Err`: the session is faulty (the refusal), and
     /// was stopped. This is the only place a [`Win`] comes from.
     fn draw_round(&self, ds: &DrawSession, pieces: &[Piece], voids: &[PieceId], ask: bool, counted: &Mutex<Counted>) -> std::result::Result<Round, Value> {
+        self.draw_cancel_failed(ds);
         let ahead = self.ticket_policy().lottery.ahead.max(1) as u64;
         let mut left: Vec<Piece> = vec![];
         let values: Vec<Value> = {
@@ -497,7 +542,7 @@ impl Signer {
         };
         if let Err(why) = &receipt {
             let code = protocol_code(v.get("error"));
-            if status >= 500 {
+            if unsigned_and_no_fault(status) {
                 return Ok(Round { wins: vec![], again: true, left });
             }
             if code == "session_unknown" {
@@ -579,6 +624,9 @@ impl Signer {
                 Some((d, inv)) => {
                     s.handed.insert(*d, (w.clone(), false));
                     s.tried.insert(invoice_mark(inv));
+                    if crate::bolt11::decode(inv).is_ok_and(|i| (i.expires_at() as f64) - self.engine.now() < crate::ticket::PREPAID_EXPIRY_MARGIN_S) {
+                        s.dead_on_arrival.insert(invoice_mark(inv));
+                    }
                     wins.push((w, Some(inv.clone())));
                 }
                 // no invoice yet: the win stays owed, and the seller's next answer may bring one
@@ -610,7 +658,11 @@ impl Signer {
             let _ = self.draw_fault(ds, "the seller is blocked for over-charging: no win is paid to it");
             return;
         }
-        lock(&ds.state).paying.insert(win.draw());
+        let first = {
+            let mut s = lock(&ds.state);
+            s.paying.insert(win.draw());
+            first || s.again.contains(&win.draw())
+        };
         // the seller's offer first, where its terms name one, with the note that names this session and draw; its
         // invoice where the offer cannot be fetched
         let (key, seller_session) = {
@@ -623,6 +675,15 @@ impl Signer {
         let out = self.lottery_pay_win(&ds.sid, win, invoice, first, by.as_ref());
         let charged = py_int(out.get("charged_sats")).unwrap_or(0).max(0);
         let rule = str_or_empty(out.get("rule"));
+        // the book holds this invoice's payment failed, with nothing of it in flight on the wallet's node
+        // its payment failed with nothing in flight, or the wallet held it back for lack of time and never sent it:
+        // either way the seller's next invoice is wanted at once
+        let unsent = rule == "ticket_expiry" && out.get("unsent") == Some(&Value::Bool(true));
+        let failed_hash = (rule == "lottery_win_failed" || unsent).then(|| crate::bolt11::decode(invoice).ok().map(|i| i.payment_hash_hex())).flatten()
+            .filter(|h| out.get("hash").and_then(Value::as_str) == Some(h.as_str()));
+        if let Some(hash) = failed_hash {
+            self.draw_cancel_later(ds, win, hash);
+        }
         let mut s = lock(&ds.state);
         s.paying.remove(&win.draw());
         let mut c = lock(counted);
@@ -662,20 +723,49 @@ impl Signer {
                 c.paid_sats = c.paid_sats.saturating_add(charged);
                 // not paid. An invoice the checks refused, or a payment that failed, leaves the win open for the seller's
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
-                let retry = rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
-                    | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
+                // an invoice that lapsed while its win waited its turn at the wallet's gate is no fault of the seller's, and
+                // no bound of the owner's: the seller's next invoice pays the same win. (One that came nearly dead
+                // is still the seller's doing, and an "invoice too long" is not one that ran out.)
+                let lapsed = !s.dead_on_arrival.contains(&invoice_mark(invoice)) && matches!(rule.as_str(), "ln_expired" | "ticket_expiry")
+                    && crate::bolt11::decode(invoice).is_ok_and(|i| {
+                        let (life, left) = (i.expires_at() as f64 - i.timestamp as f64, i.expires_at() as f64 - self.engine.now());
+                        left < self.ticket_pace.send_margin(life)
+                    });
+                if lapsed {
+                    s.lapsed += 1;
+                    let this_win = s.lapses.entry(win.draw()).or_default();
+                    *this_win += 1;
+                    if *this_win > LAPSES_PER_WIN || s.lapsed > LAPSES_PER_SESSION {
+                        let why = format!("{} of this seller's invoices ran out before their wins could be paid", s.lapsed);
+                        s.fault.get_or_insert(why);
+                        c.stop.get_or_insert("lottery_invoices_lapse: the seller's invoices for wins keep running out before they can be paid".into());
+                        c.halt = true;
+                    }
+                }
+                let retry = rule == "ln_expired" || rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
+                    | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled" | "ticket_session");
                 // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
                 // the same invoice is good the next time the seller lists it
-                let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_unavailable");
+                let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_no_route" | "ln_unavailable");
                 if c.unpaid.len() < UNPAID_LISTED {
                     c.unpaid.push(json!({"draw": win.draw(), "rule": rule}));
                 }
                 if not_now {
                     s.tried.remove(&invoice_mark(invoice));
                 }
+                // a seller the wallet's node has no route to, win after win: the call ends with that reason, and the
+                // win stays owed for a later call
+                if rule == "ln_no_route" && out.get("route_ran_out") == Some(&Value::Bool(true)) {
+                    let n = s.no_route.entry(win.draw()).or_default();
+                    *n += 1;
+                    if *n >= NO_ROUTE_PER_WIN {
+                        c.stop.get_or_insert(format!("ln_no_route: the wallet's node has found no route to the seller for any of {n} tries of a win"));
+                        c.halt = true;
+                    }
+                }
                 // an invoice the wallet's checks refused is the seller's doing. After three, the session is over: a
                 // seller that cannot make an invoice for its own node at its own win size is not asked again
-                if retry && rule != "lottery_win_failed" {
+                if retry && !lapsed && rule != "lottery_win_failed" {
                     s.bad_invoices += 1;
                     if s.bad_invoices >= BAD_INVOICES_MAX {
                         let why = format!("{} invoices of this seller failed the wallet's checks (the last: {rule})", s.bad_invoices);
@@ -689,12 +779,109 @@ impl Signer {
                     if let Some((w, _)) = s.handed.remove(&win.draw()) {
                         s.owed.push(w);
                     }
+                    if retry {
+                        s.again.insert(win.draw());
+                        let ends = crate::bolt11::decode(invoice).map_or(0.0, |i| i.expires_at() as f64);
+                        s.next_invoice_after = s.next_invoice_after.max(ends);
+                    }
                 } else {
-                    c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
+                    // the session stopped (its caller, a fault), or the owner's bounds, or the wallet's node (one just
+                    // started is not on its chain yet): this call asks for no more. Nothing was booked or sent, so the
+                    // win is owed again, with its invoice, for a later call of the session: a win left handed has no
+                    // payer, and its seller would refuse every later call for it (`win_unpaid`)
+                    if rule == "ticket_session" {
+                        c.stop.get_or_insert("ticket_session: the session was stopped".to_string());
+                    } else {
+                        c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
+                    }
                     c.halt = true;
+                    s.tried.remove(&invoice_mark(invoice));
+                    if let Some((w, _)) = s.handed.remove(&win.draw()) {
+                        s.owed.push(w);
+                    }
                 }
             }
         }
+    }
+
+    /// Remembers that the invoice `hash` of a win that is about to be owed again should be cancelled
+    /// by the seller, which [`Self::draw_round`] asks for before it asks for the seller's list.
+    fn draw_cancel_later(&self, ds: &DrawSession, win: &Win, hash: String) {
+        let mut s = lock(&ds.state);
+        let asked = s.cancels.get(&win.draw()).copied().unwrap_or(0);
+        if s.no_cancel || asked >= CANCELS_PER_WIN || s.cancels_asked >= CANCELS_PER_SESSION {
+            return;
+        }
+        s.cancels.insert(win.draw(), asked + 1);
+        s.cancels_asked += 1;
+        s.to_cancel.push((win.draw(), hash));
+    }
+
+    /// Asks the seller to cancel the invoices of wins whose payment failed, signed as every call of the
+    /// session is: its next invoice for each then comes at once, not when the first has lapsed, which on a
+    /// seller of 60 s is long after its answer has stopped waiting. No invoice is paid again. A seller
+    /// that cannot, or will not any more, is not asked again, and the win waits for the lapse as before.
+    fn draw_cancel_failed(&self, ds: &DrawSession) {
+        let asks = std::mem::take(&mut lock(&ds.state).to_cancel);
+        for (draw, hash) in asks {
+            let said = self.draw_call(ds, "cancel", &json!({"draw": draw, "hash": hash}));
+            let cancelled = said.as_ref().is_ok_and(|(status, v, _)| *status == 200 && v.get("cancelled") == Some(&Value::Bool(true)));
+            let mut s = lock(&ds.state);
+            if cancelled {
+                s.next_invoice_after = self.engine.now();
+            } else if said.as_ref().map_or(true, |(status, v, _)| *status != 200 || v.get("refused").is_some()) {
+                s.no_cancel = true;
+            }
+        }
+    }
+
+    /// Asks the seller's list and pays what it brings for the wins that are owed: a few times, and
+    /// for up to [`OWED_WAIT`] where the seller's next invoice is due by then. Without that wait, a win
+    /// whose invoice ran out at the gate stayed unpaid when its answer had already ended, for a next
+    /// call that may never come, and that call was refused `win_unpaid`.
+    fn draw_pay_owed(&self, ds: &DrawSession, first: bool, counted: &Mutex<Counted>) -> std::result::Result<(), Value> {
+        // up to the invoice's end where the measured time on the way kept it from being sent (`Pace::send_margin`)
+        let wait = OWED_WAIT.max(Duration::from_secs_f64(self.ticket_pace.send_margin(f64::MAX) + 5.0));
+        let until = Instant::now() + wait;
+        let unsettled = || !lock(&ds.state).owed.is_empty() && ds.fault().is_none() && !lock(counted).halt;
+        for tries in 1.. {
+            if !unsettled() {
+                break;
+            }
+            let r = self.draw_round(ds, &[], &[], true, counted)?;
+            for (w, inv) in &r.wins {
+                if let Some(inv) = inv {
+                    self.draw_pay(ds, w, inv, first, counted);
+                }
+            }
+            if !unsettled() {
+                break;
+            }
+            let due = lock(&ds.state).next_invoice_after - self.engine.now() < wait.as_secs_f64();
+            let waits = due && lock(&ds.state).next_invoice_after > 0.0 && Instant::now() < until;
+            if tries >= 3 && !waits {
+                break;
+            }
+            std::thread::sleep(if waits { OWED_POLL } else { ROUND_WAIT });
+        }
+        // kept while a win is owed: the session's next call is what its seller's next invoice is for
+        let mut s = lock(&ds.state);
+        if s.owed.is_empty() {
+            s.next_invoice_after = 0.0;
+        }
+        Ok(())
+    }
+
+    /// What a request refused for values or a win does: one round even with no win owed, since it
+    /// sends the values that are open, and then what [`Self::draw_pay_owed`] does.
+    fn draw_pay_owed_or_round(&self, ds: &DrawSession, counted: &Mutex<Counted>) -> std::result::Result<(), Value> {
+        let r = self.draw_round(ds, &[], &[], true, counted)?;
+        for (w, inv) in &r.wins {
+            if let Some(inv) = inv {
+                self.draw_pay(ds, w, inv, true, counted);
+            }
+        }
+        self.draw_pay_owed(ds, true, counted)
     }
 
     /// The wins of a round that was made after the answer had ended (the round that names void
@@ -723,8 +910,8 @@ impl Signer {
     /// The wins of this session that the seller's answer stands still for, by the wallet's own
     /// count against the seller's terms: they go through the gate before the wins no seller waits
     /// for. A seller serves on beside `maxUnpaidWins` unpaid wins, and beside a win for
-    /// `gracePieces` pieces after it; beyond either its answer stands still, for 10 s at the
-    /// gateway, and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
+    /// `gracePieces` pieces after it; beyond either its answer stands still, for 15 s at the
+    /// gateway as shipped (`refill_wait`), and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
     /// that are above that number go first; and a win goes first when the pieces the wallet has
     /// given values for since it are within the seller's `window` of `gracePieces` (the seller is
     /// that many pieces ahead of the wallet's values at the most). Called while an answer is being
@@ -779,11 +966,14 @@ impl Signer {
         self.lottery_touch(&ds.sid);
         let started = Instant::now();
         let mut tries = 0;
+        let mut late = false;
         let (seq, digest, ans, head) = loop {
             tries += 1;
             let (seq, digest, ans, receipt) = match self.draw_send(ds, c.method, c.url, c.body, c.headers()) {
                 Ok(x) => x,
-                Err(e) => return fail(ds, with(refused("ticket_seller", format!("the seller gave no answer to the request: {}", e.msg)), json!({"status": null}))),
+                // it may have reached the seller, and be served yet (`request_sent`, as on the ticket rail)
+                Err(e) => return fail(ds, with(refused("ticket_seller", format!("the seller gave no answer to the request: {}", e.msg)),
+                                               json!({"status": null, "request_sent": true}))),
             };
             let head = match receipt {
                 Ok(r) => r,
@@ -797,13 +987,20 @@ impl Signer {
                             continue;
                         }
                     }
-                    if status >= 500 {
-                        return fail(ds, with(refused("ticket_seller", format!("the seller answered HTTP {status} without a receipt")), json!({"status": status})));
+                    // the seller's HTTP layer gave up on it (408) before anything served it: once more, with its seq
+                    if status == 408 && !late {
+                        late = true;
+                        continue;
+                    }
+                    if unsigned_and_no_fault(status) {
+                        // a 408 comes before anything serves the request; behind a proxy's 5xx it may have been served
+                        return fail(ds, with(refused("ticket_seller", format!("the seller answered HTTP {status} without a receipt")),
+                                             json!({"status": status, "request_sent": status != 408})));
                     }
                     if status == 402 && code == "session_unknown" {
                         self.draw_stop(ds, "the seller has forgotten the session", false);
                         return fail(ds, with(refused("lottery_session_ended", "the seller has forgotten this session: it ended; nothing was served for this request"),
-                                             json!({"status": status})));
+                                             json!({"status": status, "request_sent": false})));
                     }
                     let d = self.draw_fault(ds, &format!("an answer to a request (HTTP {status} {code}) without a valid receipt: {why}"));
                     return fail(ds, with(d, json!({"status": status})));
@@ -816,19 +1013,12 @@ impl Signer {
                 // signed by the seller: it waits for values or for a win's payment. A round sends what is open and pays
                 // what its answer lists for wins the wallet found; then the request once more
                 if matches!(code, "win_unpaid" | "value_missing") && tries <= 2 {
-                    match self.draw_round(ds, &[], &[], true, &counted) {
-                        Ok(r) => {
-                            for (w, inv) in &r.wins {
-                                if let Some(inv) = inv {
-                                    // the seller serves this request when they are paid: they go first
-                                    self.draw_pay(ds, w, inv, true, &counted);
-                                }
-                            }
-                            if lock(&counted).stop.is_none() {
-                                continue;
-                            }
-                        }
-                        Err(d) => return fail(ds, d),
+                    // the seller serves this request when they are paid: they go first
+                    if let Err(d) = self.draw_pay_owed_or_round(ds, &counted) {
+                        return fail(ds, d);
+                    }
+                    if lock(&counted).stop.is_none() {
+                        continue;
                     }
                 }
                 // the seller takes no more voids in this session (pieces of answers this wallet stopped reading): the
@@ -836,7 +1026,7 @@ impl Signer {
                 if code == "too_many_voids" {
                     self.draw_stop(ds, "the seller takes no more voids in this session", true);
                     return fail(ds, with(refused("lottery_session_ended", "the seller ended this session: too many of its pieces were given no value; nothing was served \
-                                                                           for this request"), json!({"status": status, "seller_code": code})));
+                                                                           for this request"), json!({"status": status, "seller_code": code, "request_sent": false})));
                 }
                 // the seller waits for wins this wallet will not pay again: each has a payment in its book that has not
                 // failed (its node cannot say what became of it). Such a session cannot go on. It ends, and the next
@@ -851,11 +1041,12 @@ impl Signer {
                     if !listed.is_empty() && handed.len() == listed.len() && handed.iter().all(|d| self.lottery_win_live(&ds.sid, *d)) {
                         let stopped = self.draw_stop(ds, "a win's payment is not final on the wallet's node", true);
                         return fail(ds, with(refused("lottery_win_in_doubt", "the seller waits for a win whose payment this wallet has booked and its node has neither                                                                               completed nor failed: it is not paid a second time. The session was ended; call again"),
-                                             json!({"status": status, "seller_code": code, "stopped": stopped})));
+                                             json!({"status": status, "seller_code": code, "stopped": stopped, "request_sent": false})));
                     }
                 }
+                // refused unserved, and signed so (`request_sent` false: another seller may serve it)
                 return fail(ds, with(refused("lottery_refused", format!("the seller refused the request: HTTP {status} {code}; no piece was served for it")),
-                                     json!({"status": status, "seller_code": code})));
+                                     json!({"status": status, "seller_code": code, "request_sent": false})));
             }
             break (seq, digest, ans, head);
         };
@@ -886,6 +1077,7 @@ impl Signer {
         }
         let (_, stored, text) = sink.done();
         out = with(with(out, stored), about(ds, &counted));
+        super::range_ignored(&mut out, c);
         out["ms"] = json!((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0);
         out[UNTRUSTED_KEY] = untrusted(&text, head.raw);
         *lock(&ds.used) = self.engine.now();
@@ -1165,25 +1357,8 @@ impl Signer {
         *lock(&ds.answer_since) = None;
         // the connection is closed here: a seller that was still sending stops within its window
         drop(body);
-        // wins the seller had sent no invoice for: it is asked for its list, a few times, and what it lists is paid
-        for _ in 0..3 {
-            if lock(&ds.state).owed.is_empty() || ds.fault().is_some() || lock(counted).halt {
-                break;
-            }
-            match self.draw_round(ds, &[], &[], true, counted) {
-                Ok(r) => {
-                    for (w, inv) in &r.wins {
-                        if let Some(inv) = inv {
-                            self.draw_pay(ds, w, inv, false, counted);
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-            if !lock(&ds.state).owed.is_empty() {
-                std::thread::sleep(ROUND_WAIT);
-            }
-        }
+        // wins the seller had sent no invoice for, or whose last one ran out: it is asked for its list, and what it lists is paid
+        let _ = self.draw_pay_owed(ds, false, counted);
         let stop = lock(counted).stop.clone();
         let complete = stop.is_none() && mismatch.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);
         // an answer that did not arrive whole: the seller may hold pieces of it open that will get no value (it

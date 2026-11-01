@@ -122,7 +122,18 @@ xbt-compute's swarms, sells the same way: put a token-priced route in front of t
 | `LS_AI_SELLERS` | the sellers file the AI page writes |
 | `LS_AI_STATE` | the sellers' health, written by the endpoint |
 | `LS_AI_HOSTS` | host names it answers to, comma-separated (a DNS rebinding of the box's address is refused); unset: any |
-| `LS_AI_FIRST_BYTE_S` | how long a seller has for the first byte of its answer before the next is tried (default 20) |
+| `LS_AI_FIRST_BYTE_S` | how long a seller has for the first byte of its answer, from when its call is paid for (default 20) |
+| `LS_AI_PAY_WAIT_S` | how long a call waits for the wallet to pay for it, over a slow route (default 90, at least 30) |
+
+A seller is left for the next only while the request cannot have reached it: the wallet refused
+to pay, or it says the request never left, or the seller answered with a failure of its own (5xx,
+402, 408, 429). Once the wallet has said a request is paid for and leaving, a seller that is then
+silent, or slow to its first byte after a 2xx head, is not followed by another: it may still be
+serving the request, and one answer is never paid to two sellers. Whatever such a call cost is
+booked to the key when the wallet says it; where it never says, or the request may have left with
+no receipt, the most the request may cost. At most 8 calls wait on a payment at once. More wait up
+to 5 s for a place, 4 at most, then are answered 503, so the endpoint's other requests keep threads
+to answer on.
 
 The AI page's settings are `XBT_UI_AI_ENDPOINT` (the address it shows), `XBT_UI_AI_SELLERS`,
 `XBT_UI_CREDENTIALS` and `XBT_UI_AI_STATE` (docs in `crates/xbt-wallet-ui/src/config.rs`).

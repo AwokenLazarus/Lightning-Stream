@@ -289,3 +289,32 @@ fn an_answer_the_wallet_ended_early_is_cut_short_for_the_client_never_whole() {
     let all = raw_get(&addr, "/s/https://seller.example/files/big.iso");
     assert!(all.ends_with(b"0\r\n\r\n"), "a whole answer did not end with its last chunk");
 }
+
+/// (The head line is the signer's own for such an answer ([`head_to`] in the signer): `range_ignored` with the
+/// reason it was not read under `error`.)
+/// The seller's copy's validators reach the player, and the player's `If-Range` reaches the wallet with its
+/// range. A copy that changed since (the wallet reads none of its whole body, `range_ignored`) is told to the
+/// player as such, never as the rest of the file spliced onto what it has.
+#[test]
+fn a_seek_names_the_players_copy_and_a_changed_file_is_not_spliced_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let film = film();
+    let n = film.len();
+    let (sock, calls) = signer(dir.path(), film.clone(), None, Some(json!({"status": 200, "content_length": n, "etag": "\"v1\"", "last_modified": "Sat, 31 Oct 2026 12:00:00 GMT"})));
+    let addr = start(sock, dir.path());
+    let (status, head, _) = get(&addr, "/s/https://seller.example/v");
+    assert_eq!(status, 200, "{head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(lower.contains("etag: \"v1\"") && lower.contains("last-modified: sat, 31 oct 2026 12:00:00 gmt"), "{head}");
+    calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    let dir2 = tempfile::tempdir().unwrap();
+    let (sock, calls) = signer(dir2.path(), film.clone(), None, Some(json!({"status": 200, "content_length": n, "range_ignored": true,
+                                                                                                 "error": "the seller answered the range asked for (bytes=1000-) with the whole body"})));
+    let addr = start(sock, dir2.path());
+    let (status, head, body) = get_with(&addr, "/s/https://seller.example/v", "Range: bytes=1000-\r\nIf-Range: \"v0\"\r\n");
+    assert_eq!(status, 412, "{head}");
+    assert!(String::from_utf8_lossy(&body).contains("ticket_range_ignored"), "{}", String::from_utf8_lossy(&body));
+    let (params, _) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!((params["range"].as_str(), params["if_range"].as_str()), (Some("bytes=1000-"), Some("\"v0\"")), "{params}");
+}
+

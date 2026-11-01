@@ -151,11 +151,19 @@ pub fn signer_call(sock: &Path, timeout: Duration, method: &str, params: &Value)
 /// [`signer_call`], saying with an error whether the request may have reached the signer: `false`
 /// only where the socket could not be reached, so that nothing was sent.
 pub fn signer_call_sent(sock: &Path, timeout: Duration, method: &str, params: &Value) -> Result<Value, (bool, String)> {
-    let mut s = Stream::connect(sock).map_err(|e| (false, format!("signer socket {}: {e}", sock.display())))?;
-    signer_exchange(&mut s, sock, timeout, method, params).map_err(|e| (true, e))
+    signer_call_waiting(sock, timeout, Some(timeout), method, params)
 }
 
-fn signer_exchange(s: &mut Stream, sock: &Path, timeout: Duration, method: &str, params: &Value) -> Result<Value, String> {
+/// [`signer_call_sent`] with the wait for the answer apart from the rest: `answer_wait` `None` waits
+/// as long as the signer takes. Connecting and sending keep `timeout`.
+pub fn signer_call_waiting(sock: &Path, timeout: Duration, answer_wait: Option<Duration>, method: &str, params: &Value)
+                           -> Result<Value, (bool, String)> {
+    let mut s = Stream::connect(sock).map_err(|e| (false, format!("signer socket {}: {e}", sock.display())))?;
+    signer_exchange(&mut s, sock, timeout, answer_wait, method, params).map_err(|e| (true, e))
+}
+
+fn signer_exchange(s: &mut Stream, sock: &Path, timeout: Duration, answer_wait: Option<Duration>, method: &str, params: &Value)
+                   -> Result<Value, String> {
     let io = |e: std::io::Error| format!("signer socket {}: {e}", sock.display());
     s.set_timeouts(Some(timeout));
     let mut req = Map::new();
@@ -163,13 +171,25 @@ fn signer_exchange(s: &mut Stream, sock: &Path, timeout: Duration, method: &str,
     req.insert("method".into(), method.into());
     req.insert("params".into(), params.clone());
     s.write_all(format!("{}\n", dumps(&Value::Object(req))).as_bytes()).map_err(io)?;
+    s.set_read_timeout(answer_wait);
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).map_err(io)?;
+    if line.trim().is_empty() {
+        return Err(format!("signer socket {}: closed without an answer", sock.display()));
+    }
     let resp = parse_py(line.trim()).map_err(|e| format!("signer answer: {e}"))?;
     if let Some(e) = resp.get("error").filter(|e| !e.is_null()) {
         return Err(format!("signer error: {}", e.get("message").and_then(Value::as_str).unwrap_or("error")));
     }
     Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// The answer to a paying call whose own answer was lost after it was sent.
+fn no_answer(method: &str) -> Value {
+    let see = if method == "ln_pay" { "ln_status and the wallet's payments" } else { "ticket_status (or the wallet's history)" };
+    json!({"verdict": "unknown", "rule": "signer_no_answer", "request_sent": true,
+           "reason": format!("the wallet's signer took the call and its answer was lost (the signer stopped or its socket failed): \
+                              the call may have paid, in part or in full; {see} shows what it did. Do not repeat it before looking")})
 }
 
 /// Where B2 looks for the socket: `B2_SIGNER_SOCK`, else `$B2_ROOT/.run/signer.sock`.
@@ -222,6 +242,22 @@ impl Wallet {
         signer_call(&self.sock, self.timeout, method, params)
     }
 
+    /// A paying call: the signer answers when the payment, or the paid answer, is done, which can take
+    /// far longer than any other call, so its answer is waited for as long as the signer works
+    /// (the signer bounds the call itself: its stalls, deadlines and stops). An answer lost after the
+    /// call was sent (the signer stopped, the socket failed) is said as such, not as an error that
+    /// reads as if nothing happened: the call may have paid, in part or in full.
+    fn signer_pay(&self, method: &str, params: &Value) -> Result<Value, String> {
+        match signer_call_waiting(&self.sock, self.timeout, None, method, params) {
+            Ok(v) => Ok(v),
+            Err((true, e)) if !e.starts_with("signer error:") => {
+                eprintln!("xbt-wallet-mcp: {method}: the answer was lost after the call was sent: {e}");
+                Ok(no_answer(method))
+            }
+            Err((_, e)) => Err(e),
+        }
+    }
+
     /// The signer's `xbt402_pay` (or, AGP-048, `ln_pay`); an over-threshold call waits up to
     /// `approval_wait` for the human. Once the human approved in the UI the signer holds a one-time
     /// grant for exactly this call (url, method, max_sats; or the invoice), and the same call again
@@ -233,7 +269,7 @@ impl Wallet {
             with_transport(&mut params);
         }
         let args = Value::Object(params.clone());
-        let first = self.signer(method, &args)?;
+        let first = self.signer_pay(method, &args)?;
         if self.approval_wait.is_zero() || first.get("verdict").and_then(Value::as_str) != Some("needs_human") {
             return Ok(first);
         }
@@ -244,12 +280,12 @@ impl Wallet {
             std::thread::sleep(Duration::from_millis(500));
             state = self.signer("approval_status", &json!({"token": token}))?.get("state").and_then(Value::as_str).unwrap_or("unknown").to_string();
             if state == "approved" {
-                let mut paid = self.signer(method, &args)?;
+                let mut paid = self.signer_pay(method, &args)?;
                 // a payment the node has not settled yet answers "pending": the grant stays until
                 // it is used, so keep calling while the wait lasts
                 while paid.get("verdict").and_then(Value::as_str) == Some("pending") && std::time::Instant::now() < until {
                     std::thread::sleep(Duration::from_secs(1));
-                    paid = self.signer(method, &args)?;
+                    paid = self.signer_pay(method, &args)?;
                 }
                 if let Value::Object(m) = &mut paid {
                     m.insert("waited_for_human".into(), Value::Bool(true));
@@ -271,8 +307,10 @@ impl Wallet {
     /// stays in this process's log; the model gets B2's generic "Error executing tool" line.
     pub fn call_tool(&self, name: &str, mut params: Map<String, Value>) -> Result<String, String> {
         // no byte range asked for: the whole body, and the signer is not sent an empty one
-        if params.get("range").and_then(Value::as_str).is_some_and(|r| r.trim().is_empty()) {
-            params.remove("range");
+        for k in ["range", "if_range"] {
+            if params.get(k).and_then(Value::as_str).is_some_and(|r| r.trim().is_empty()) {
+                params.remove(k);
+            }
         }
         let result = match name {
             "xbt402_pay" | "ln_pay" => self.pay_waiting(name, &params)?,

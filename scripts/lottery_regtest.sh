@@ -8,7 +8,7 @@
 #
 # The file server is stock and unchanged; the signer, the MCP server and the gateways are the
 # release binaries of this tree, with the lottery's own rules as they ship on both sides (wins of
-# 64 sat, a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid wins). Not as shipped, in
+# 64 sat, a window of 8 pieces, a grace of 60 s and 64 pieces, 2 unpaid wins). Not as shipped, in
 # scripts/lottery/drive.py: the wallet's velocity_max, max_sellers, max_new_sellers_per_min,
 # max_sends_per_hour, max_answer_s and budgets; the gateways' cap on sessions from one address
 # (none: every buyer comes from 127.0.0.1), the age of a block height they accept (30 s) and the
@@ -49,7 +49,7 @@
 # Report: run/lottery_regtest.json and run/lottery_regtest.log.
 #
 #   scripts/lottery_regtest.sh              every check
-#   scripts/lottery_regtest.sh file swarm   only these
+#   scripts/lottery_regtest.sh file swarm   only these (always in the order above: kill last)
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$PWD

@@ -88,17 +88,28 @@ pub const ROUTE_FULL: &str = "ticket_route_full";
 /// Refusals of a held ticket that are no fault of the seller's terms or the owner's budgets, and
 /// leave prepaid tickets, or another rail, as the way to pay: no slot, dust, a full route.
 pub const HOLD_SHORT: [&str; 4] = ["ticket_slots", "ticket_dust", ROUTE_FULL, "ticket_slots_short"];
+/// The rule of a release refused because the chain node gave no tip to judge a ticket by.
+pub const TIP_UNKNOWN: &str = "ticket_chain";
+/// The rules of the wallet's checks of its Lightning node that the chain node's silence can cause
+/// ([`crate::ln::verify_backend`] asks it too).
+pub const CHAIN_RULES: [&str; 2] = ["ln_chain", "ln_backend"];
+/// The rules of a fill refused because a node or a channel is away for a moment: those, and a channel of the wallet's node
+/// that is down (a link that drops). Asked again inside a release's pause.
+pub const NODE_AWAY_RULES: [&str; 3] = ["ln_chain", "ln_backend", "ln_no_safe_channel"];
 /// The default of `tickets.http_idle_s`: a session the wallet pays over HTTP is stopped, and its
 /// unused tickets cancelled, after this long without a paid request. Below the gateway's own five
 /// minutes, so that the wallet cancels before the seller does.
 pub const HTTP_IDLE_S: i64 = 120;
-/// The default of `tickets.ready_wait_ms`: how long a release waits for the seller's own word that
-/// the ticket is locked on its node.
-pub const READY_WAIT_MS: i64 = 3_000;
-/// The default of `tickets.max_answer_s`: the longest the wallet keeps an answer that is paid for
-/// as it arrives open while the call reads it whole for its caller, or one priced by the second
-/// (its clock bills whether bytes come or not). Below the 60 seconds a caller of the signer's socket
-/// waits by default, so that a call ends, and says where it stopped, before its caller gives up.
+/// The default of `tickets.ready_wait_ms`: the most a release pauses for, all told, whatever it waits for: the
+/// seller's own word that the ticket is locked on its node, the wallet's node to show it locked, or a quiet chain node.
+/// Under the 15 s a seller as shipped keeps a paused answer open, by a margin for the way between them.
+pub const READY_WAIT_MS: i64 = 12_000;
+/// The default of `tickets.max_answer_s`: the deadline of a paid call, from when the wallet takes it, for an answer it
+/// reads whole for its caller or one priced by the second (its clock bills whether bytes come or not): every wait of its
+/// releases, the seller's head and the reading of its answer end by then, and its last receipt is waited for a few seconds
+/// past it ([`crate::ticket_pay`]). Below the 60 seconds a caller of the signer's socket waits by default, so that a call
+/// ends, and says where it stopped, before its caller gives up on it. An answer streamed on to its caller has
+/// `max_stream_s`, and a socket `max_socket_s`.
 pub const MAX_ANSWER_S: i64 = 50;
 /// The default of `tickets.max_stream_s`: the longest the wallet keeps open an answer it streams on
 /// to its caller as it arrives (a film, a download, an AI stream), paid for what arrives. As long as
@@ -1047,6 +1058,9 @@ pub fn slot_failure(reason: &str) -> bool {
     ["INSUFFICIENT_BALANCE", "NO_ROUTE", "FAILURE_REASON_ERROR"].iter().any(|k| r.contains(k)) || r == "ERROR"
 }
 
+/// A prepaid ticket's or a win's invoice is refused this close to its expiry: the payment needs the time to arrive.
+pub(crate) const PREPAID_EXPIRY_MARGIN_S: f64 = 5.0;
+
 /// How long nothing is locked after the `fails`-th failed round in a row: 30 s, doubling to 10 minutes.
 pub fn slot_wait_s(fails: u32) -> f64 {
     (SLOT_WAIT_S * f64::from(2u32.saturating_pow(fails.saturating_sub(1).min(16)))).min(SLOT_WAIT_MAX_S)
@@ -1735,7 +1749,7 @@ pub fn check_ticket_invoice(inv: &crate::bolt11::Invoice, s: &Session, pol: &Tic
         return refuse("ticket_expiry", format!("the invoice stays payable for {} s, above the owner's tickets.max_invoice_expiry_s {}", inv.expiry_s,
                                                pol.max_invoice_expiry_s));
     }
-    if (inv.expires_at() as f64) < now + 5.0 {
+    if (inv.expires_at() as f64) < now + PREPAID_EXPIRY_MARGIN_S {
         return refuse("ticket_expiry", "the invoice has expired, or does within 5 s");
     }
     if inv.payment_secret.is_none() {
@@ -1770,7 +1784,7 @@ pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, msat: u6
         return refuse("ticket_expiry", format!("the invoice stays payable for {} s, above the owner's tickets.max_invoice_expiry_s {}", inv.expiry_s,
                                                pol.max_invoice_expiry_s));
     }
-    if (inv.expires_at() as f64) < now + 5.0 {
+    if (inv.expires_at() as f64) < now + PREPAID_EXPIRY_MARGIN_S {
         return refuse("ticket_expiry", "the invoice has expired, or does within 5 s");
     }
     if inv.payment_secret.is_none() {

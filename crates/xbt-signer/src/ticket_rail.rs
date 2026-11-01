@@ -26,7 +26,7 @@
 //! | A win of the lottery is paid only for a draw the wallet worked out, once, as a prepaid ticket is paid. | [`Signer::lottery_pay_win`] takes a [`xbt402::lottery::Win`], which only the wallet's own check of a seller's reveal makes; [`Signer::ticket_book_prepay`] pays it only in the session it was drawn in, at that session's win size, and refuses a win that has a payment in the book that has not failed ([`crate::ticket::Book::win_payment`]). |
 //! | A prepaid ticket or a win paid by the seller's BOLT 12 offer is paid under every rule of one paid by invoice, and names the seller's session. | [`Signer::ticket_pay_by_offer`]: the offer and the fetched invoice are read and checked here (bit 512, the chain, the issuer, the exact amount, the wallet's own payer note repeated); every channel of the node must pass the guards, since `PayOffer` takes no set of outgoing channels; then the same book rows, ledger row and gate as [`Signer::ticket_pay_ordinary`]. Anything that fails before the booking leaves nothing booked and nothing sent, and the seller's invoice is paid instead; so does a payment the node found no route for (its blinded path entering where the node cannot reach), once the node says it failed for good with nothing in flight and the book holds it failed: that hash is never paid, and the invoice's is the one payment. |
 //! | An ordinary payment is on the channel until it settles, so it stays inside the gate until then. | [`Signer::ticket_pay_ordinary`] holds its place in [`Pace`] until the node shows the payment over. |
-//! | A win a seller's answer stands still for is not kept waiting behind wins no seller waits for. | [`Pace::hurry`], said by the session that found the win ([`crate::ticket_pay`]). It changes the order of payments the book allows anyway, and nothing else: which are paid, and how many at once, are as before. |
+//! | A win a seller's answer stands still for is not kept waiting behind wins no seller waits for. | [`Pace::hurry`], said by the session that found the win ([`crate::ticket_pay`]): first through the gate, and first to the book ([`Pace::spend_turn`]). It changes the order of payments the book allows anyway, and nothing else: which are paid, and how many at once, are as before. |
 //!
 //! Locks: the wallet's spend lock, then the book's. No lock is held while the node routes a
 //! ticket, so a release never waits for a lock round.
@@ -49,15 +49,33 @@ use crate::pyjson::{dumps_indent, py_int, str_or_empty, ts_value};
 use crate::sigaudit;
 use crate::signer::{deny, with, Signer};
 use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invoice, ledger_id, sats_ceil, sizing, Admit, Book, Limits, SState, Seed, Session,
-                    Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, MAX_TASK_WINDOW_S, OFFER_TTL_S, ROUTE_FULL, SESSION_IDLE_S,
+                    Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, MAX_TASK_WINDOW_S, OFFER_TTL_S, ROUTE_FULL, TIP_UNKNOWN, SESSION_IDLE_S,
                     TAG_RECORD};
 use crate::{err, Result};
 
 /// The longest the wallet waits for the seller's invoice for its offer, in seconds, before it
-/// pays the ticket or win by the seller's BOLT 11 invoice instead: a win's invoice lives 30 s by
-/// default (the gateway's `lottery.invoice_secs`), and a busy issuer can leave a request
+/// pays the ticket or win by the seller's BOLT 11 invoice instead: a win's invoice lives 60 s by
+/// default (the gateway's `lottery.invoice_secs`, its grace), and a busy issuer can leave a request
 /// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
 const OFFER_FETCH_S: i64 = 5;
+/// `f` on a thread of its own, its answer waited for until `by`: a node that hangs takes that thread, not the caller, and
+/// what it was asked for goes on there. `None`: no answer by then.
+pub(crate) fn within<T: Send + 'static>(by: Instant, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new().name("ticket-within".into()).spawn(move || {
+        let _ = tx.send(f());
+    }).ok()?;
+    rx.recv_timeout(by.saturating_duration_since(Instant::now())).ok()
+}
+
+/// How many times more a lock round asks for checks a chain node that fails now and then refused.
+const NODE_CHECK_TRIES: usize = 3;
+/// How far past the node's own timeout for a send (`ln.timeout_s`, 60 s as shipped) a ticket may be in `sending` before it
+/// is taken for stranded: well past any wait for it, so that it is no ticket a slow route is still carrying.
+const SENDING_STRANDED_PAST_TIMEOUT_S: f64 = 30.0;
+/// How long a ticket must be seen in flight on the node and on none of its channels, every channel up each time it is
+/// looked at, before it is taken for stranded: past the time a link that dropped takes to come back and list its HTLCs.
+const STRANDED_SEEN_S: f64 = 20.0;
 
 /// How long a call refused beside a session that stays open is told to wait: that session may be a
 /// long answer, so this is only how soon asking again is worth it.
@@ -86,6 +104,10 @@ const LIST_PAGES: usize = 50;
 /// 30 pending payments took 200 small payments sent 8 at a time without a failure, and failed 139
 /// of 200 sent 64 at a time (`docs/TICKETS.md` section 11).
 pub const SEND_PARALLEL: usize = 8;
+/// How many payments' times on the way [`Pace::send_margin`] goes by.
+const FLOWN_KEPT: usize = 32;
+/// How many route queries [`Pace::route_query_ms`] goes by.
+const QUERIES_KEPT: usize = 2_000;
 
 /// The gate every ticket payment passes on its way to the node's router: at most
 /// [`SEND_PARALLEL`] are inside at once. A held ticket leaves when its send returns (it is locked,
@@ -98,12 +120,21 @@ pub const SEND_PARALLEL: usize = 8;
 /// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
 /// that no seller's win waits behind a later one's until that seller's grace has run out. Before
 /// them all, in their own order of arrival, go the wins a seller's answer stands still for
-/// ([`Pace::hurry`]): a seller waits 30 s for a win it serves on beside, and 10 s for one it has
-/// stopped for, so the second cannot wait behind a hundred of the first.
+/// ([`Pace::hurry`]): a seller waits its grace (60 s as shipped) for a win it serves on beside, and 15 s (`refill_wait`)
+/// for one it has stopped for, so the second cannot wait behind a hundred of the first.
+///
+/// Each payment books under the wallet's spend lock, about six fsyncs, one payment at a time: on
+/// a disk of 50 ms an fsync the eight inside take turns of 0.3 s each, and on a card of 100 ms 0.6 s.
+/// So the payments of the gate take the lock by [`Pace::spend_turn`], which also lets a hurried win
+/// go first: past the gate it would otherwise wait behind every one of them. Hurried wins do not shut
+/// the others out for good ([`FIRST_IN_A_ROW`]).
 #[derive(Default)]
 pub struct Pace {
     state: Mutex<PaceState>,
     left: Condvar,
+    /// Apart from `left`: a turn is given up 2 times a win, and the hundreds in the gate's queue
+    /// have nothing to look at then.
+    turn_free: Condvar,
 }
 
 #[derive(Default)]
@@ -113,6 +144,24 @@ struct PaceState {
     next: u64,
     /// Who waits, in order of arrival.
     waiting: Vec<Waiter>,
+    /// The wins inside, each with whether it goes first.
+    inside_wins: Vec<((String, u64), bool)>,
+    /// Hurried wins let in one after another while others waited: at [`FIRST_IN_A_ROW`] one of those goes.
+    first_in_row: u32,
+    /// A payment has its turn at the spend lock.
+    turn_taken: bool,
+    /// Hurried wins, and other payments, that wait for a turn.
+    first_for_turn: usize,
+    plain_for_turn: usize,
+    /// Hurried wins given a turn one after another while others waited.
+    turns_in_row: u32,
+    /// How long the latest wins took on the way, in seconds ([`Pace::send_margin`]).
+    flown: std::collections::VecDeque<f64>,
+    /// How long the node's latest route queries took, in ms ([`Pace::route_query_ms`]).
+    queried: std::collections::VecDeque<f64>,
+    /// Payees the node has found no route to: since when, when that was last seen, and whether a payment is
+    /// waiting for one ([`Signer::ln_route_wait`]).
+    no_route: HashMap<String, (Instant, Instant, bool)>,
 }
 
 struct Waiter {
@@ -123,14 +172,36 @@ struct Waiter {
     first: bool,
 }
 
+/// How many hurried wins go one after another before a payment that is not hurried, through the gate
+/// and at the spend lock, before that payment goes all the same. A seller's hurried wins are few, but
+/// sellers can be many, and a prepaid ticket or a win no seller waits for has its own invoice's life to
+/// keep. This bounds what hurried wins take from the others, and nothing else: among payments that
+/// are not hurried, the gate goes in order of arrival, but turns at the spend lock go to whichever
+/// waiter wakes first, as before ([`Pace::spend_turn`]).
+const FIRST_IN_A_ROW: u32 = 8;
+
 impl PaceState {
-    /// Whose turn it is: the earliest of those that go first, or else the earliest.
+    /// Whose turn it is: the earliest of those that go first, or else the earliest. After
+    /// [`FIRST_IN_A_ROW`] of the first, the earliest of the others.
     fn turn(&self) -> Option<u64> {
-        self.waiting.iter().find(|w| w.first).or(self.waiting.first()).map(|w| w.n)
+        let first = self.waiting.iter().find(|w| w.first);
+        let plain = self.waiting.iter().find(|w| !w.first);
+        match (first, plain) {
+            (Some(_), Some(p)) if self.first_in_row >= FIRST_IN_A_ROW => Some(p.n),
+            (Some(f), _) => Some(f.n),
+            (None, p) => p.map(|w| w.n),
+        }
     }
 }
 
-pub struct PaceGuard<'a>(&'a Pace);
+pub struct PaceGuard<'a> {
+    pace: &'a Pace,
+    win: Option<(String, u64)>,
+}
+
+/// A payment's turn at the spend lock ([`Pace::spend_turn`]). Taken before the lock, and so given
+/// up after it.
+pub struct SpendTurn<'a>(&'a Pace);
 
 impl Pace {
     pub fn enter(&self) -> PaceGuard<'_> {
@@ -139,6 +210,72 @@ impl Pace {
 
     /// Enter to pay the win of `win` (the book's session and the draw), or a ticket (None).
     /// `first`: a seller stands still for this payment already.
+    /// A payment that arrived, and the time it took.
+    fn flew(&self, took: Duration) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.flown.len() == FLOWN_KEPT {
+            s.flown.pop_front();
+        }
+        s.flown.push_back(took.as_secs_f64());
+    }
+
+    /// Whether a payment to `payee`, which the node has just found no route to, may wait for one, and until when:
+    /// one payment to a payee waits at a time, and all of them together no longer than `most` from when the
+    /// node first found none (an outage nobody has looked at for a second is over). `None`: refuse it now.
+    /// `Err(true)`: the window is over, and the seller has been without a route for all of it; `Err(false)`: another
+    /// payment to it is waiting, and this one may be paid when that one's wait ends.
+    fn route_wait_turn(&self, payee: &str, most: Duration) -> std::result::Result<Instant, bool> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let (since, seen, waiting) = s.no_route.get(payee).copied().filter(|(_, seen, w)| *w || now.duration_since(*seen) <= Duration::from_secs(1))
+            .unwrap_or((now, now, false));
+        let until = since + most;
+        let turn = if now >= until { Err(true) } else if waiting { Err(false) } else { Ok(until) };
+        s.no_route.insert(payee.to_string(), (since, now.max(seen), waiting || turn.is_ok()));
+        turn
+    }
+
+    /// The payment that waited for a route to `payee` is done waiting; `found`: the node has one again.
+    fn route_waited(&self, payee: &str, found: bool) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if found {
+            s.no_route.remove(payee);
+        } else if let Some(e) = s.no_route.get_mut(payee) {
+            e.1 = Instant::now();
+            e.2 = false;
+        }
+    }
+
+    /// A route query of the node's, and the time it took.
+    pub fn queried(&self, took: Duration) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.queried.len() == QUERIES_KEPT {
+            s.queried.pop_front();
+        }
+        s.queried.push_back(took.as_secs_f64() * 1000.0);
+    }
+
+    /// What the latest route queries cost: their number, median and 99th percentile, in ms.
+    pub fn route_query_ms(&self) -> Value {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<f64> = s.queried.iter().copied().collect();
+        v.sort_by(f64::total_cmp);
+        let at = |q: f64| v.get(((v.len() as f64 - 1.0) * q).round() as usize).map(|x| (x * 10.0).round() / 10.0);
+        json!({"n": v.len(), "median": at(0.5), "p99": at(0.99)})
+    }
+
+    /// How much of its life an invoice of `life` seconds must have left for a win to be sent on it:
+    /// twice the longest of the latest payments on the way, and never less than the 5 s every prepaid
+    /// invoice must have, nor more than half its life. A win sent with less fails at the seller, whose
+    /// node has cancelled the invoice by the time it arrives; held back, it costs nobody anything, and the
+    /// seller's next invoice pays it. (Lab, 8 GB: 2.8 s on the way at the median, 8.5 s at the longest, 5
+    /// wins sent with 4 to 6 s left on an invoice of 60 s, all failed.)
+    pub fn send_margin(&self, life: f64) -> f64 {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let longest = s.flown.iter().copied().fold(0.0, f64::max);
+        (2.0 * longest).min(life / 2.0).max(ticket::PREPAID_EXPIRY_MARGIN_S)
+    }
+
     pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool) -> PaceGuard<'_> {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mine = s.next;
@@ -147,29 +284,77 @@ impl Pace {
         while s.inside >= SEND_PARALLEL || s.turn() != Some(mine) {
             s = self.left.wait(s).unwrap_or_else(|p| p.into_inner());
         }
-        s.waiting.retain(|w| w.n != mine);
+        let at = s.waiting.iter().position(|w| w.n == mine).unwrap_or(0);
+        let me = s.waiting.remove(at);
         s.inside += 1;
+        s.first_in_row = if me.first { s.first_in_row + 1 } else { 0 };
+        if let Some(win) = &me.win {
+            s.inside_wins.push((win.clone(), me.first));
+        }
         // the one behind may go in too, if there is room
         self.left.notify_all();
-        PaceGuard(self)
+        PaceGuard { pace: self, win: me.win }
     }
 
     /// The wins of `session` with these draws that wait here go first from now on: their seller
-    /// stands still for them. How many were moved. A win that is not waiting (it is inside, or
-    /// has not come yet) is not remembered: the caller says it again while it holds.
+    /// stands still for them, and so do those inside, at the spend lock. How many that wait were
+    /// moved. A win that has not come yet is not remembered: the caller says it again while it holds.
     pub fn hurry(&self, session: &str, draws: &[u64]) -> usize {
+        let named = |win: &(String, u64)| win.0 == session && draws.contains(&win.1);
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mut moved = 0;
         for w in s.waiting.iter_mut().filter(|w| !w.first) {
-            if w.win.as_ref().is_some_and(|(sid, d)| sid == session && draws.contains(d)) {
+            if w.win.as_ref().is_some_and(named) {
                 w.first = true;
                 moved += 1;
             }
         }
+        let mut inside = false;
+        for (_, first) in s.inside_wins.iter_mut().filter(|(win, first)| !*first && named(win)) {
+            *first = true;
+            inside = true;
+        }
         if moved > 0 {
             self.left.notify_all();
         }
+        if inside {
+            self.turn_free.notify_all();
+        }
         moved
+    }
+
+    /// A turn at the wallet's spend lock for a payment with no place in the gate any more: after
+    /// any hurried win, as [`PaceGuard::spend_turn`]. Taken with the lock not held, as that lock's
+    /// holders never ask for a turn. Other users of the lock do not take turns, and may come between.
+    pub fn spend_turn(&self) -> SpendTurn<'_> {
+        self.turn_for(None)
+    }
+
+    fn turn_for(&self, win: Option<&(String, u64)>) -> SpendTurn<'_> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.plain_for_turn += 1;
+        let mut first = false;
+        loop {
+            if !first && win.is_some_and(|w| s.inside_wins.iter().any(|(i, f)| *f && i == w)) {
+                first = true;
+                s.plain_for_turn -= 1;
+                s.first_for_turn += 1;
+            }
+            let row_full = s.turns_in_row >= FIRST_IN_A_ROW;
+            let mine = if first { !row_full || s.plain_for_turn == 0 } else { s.first_for_turn == 0 || row_full };
+            if mine && !s.turn_taken {
+                s.turn_taken = true;
+                if first {
+                    s.first_for_turn -= 1;
+                    s.turns_in_row += 1;
+                } else {
+                    s.plain_for_turn -= 1;
+                    s.turns_in_row = 0;
+                }
+                return SpendTurn(self);
+            }
+            s = self.turn_free.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
     }
 
     /// How many are inside now.
@@ -183,11 +368,30 @@ impl Pace {
     }
 }
 
+impl PaceGuard<'_> {
+    /// This payment's turn at the wallet's spend lock: before any payment that is not hurried, if
+    /// its seller stands still for it. To be held while the lock is ([`Pace::spend_turn`]).
+    pub fn spend_turn(&self) -> SpendTurn<'_> {
+        self.pace.turn_for(self.win.as_ref())
+    }
+}
+
 impl Drop for PaceGuard<'_> {
     fn drop(&mut self) {
-        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = self.pace.state.lock().unwrap_or_else(|p| p.into_inner());
         s.inside = s.inside.saturating_sub(1);
-        self.0.left.notify_all();
+        if let Some(win) = &self.win {
+            s.inside_wins.retain(|(w, _)| w != win);
+        }
+        self.pace.left.notify_all();
+    }
+}
+
+impl Drop for SpendTurn<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.turn_taken = false;
+        self.0.turn_free.notify_all();
     }
 }
 
@@ -879,10 +1083,10 @@ impl Signer {
         };
         let dest = format!("ln:{}", session.payee);
         // the rail's own checks of the node and of the channels a payment may leave through: no lock held
-        if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
+        if let Err(d) = self.ticket_node_checks(&*ln, &lp, &dest) {
             return with(d, json!({"rail": "ticket"}));
         }
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, &sid) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
         };
@@ -973,6 +1177,12 @@ impl Signer {
                 hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(err("ln_send", "the send did not return")))).collect::<Vec<_>>()
             }));
         }
+        // did those that failed reach the router? The node's own record says; with no answer one stays `sending`. Asked with
+        // no lock held: a node that hangs here would hold up the whole wallet, a release's book among it
+        let outcomes: Vec<(Option<Value>, Option<crate::Error>)> = sends.iter().zip(outcomes).map(|((hash, _), sent)| match sent {
+            Ok(p) => (Some(p), None),
+            Err(e) => (ln.lookup(hash).ok().flatten(), Some(e)),
+        }).collect();
         // what the node made of each
         let _g = self.lock();
         let mut tickets = vec![];
@@ -981,12 +1191,7 @@ impl Signer {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             let (mut locked, mut slot_failed) = (0usize, 0usize);
-            for ((hash, _), sent) in sends.iter().zip(outcomes) {
-                let (pmt, unsent) = match sent {
-                    Ok(p) => (Some(p), None),
-                    // did it reach the router? The node's own record says; with no answer it stays `sending`
-                    Err(e) => (ln.lookup(hash).ok().flatten(), Some(e)),
-                };
+            for ((hash, _), (pmt, unsent)) in sends.iter().zip(outcomes) {
                 // an error the node's record did not replace: it goes with the ticket's row
                 let unsent = unsent.filter(|_| pmt.is_none());
                 if let Some(pmt) = &pmt {
@@ -1178,7 +1383,7 @@ impl Signer {
         let sid = str_or_empty(p.get("session"));
         let cfg = self.config();
         let now = self.engine.now();
-        let tip = self.height_safe();
+        let tip = self.tip_known();
         let out = (|| -> Result<Value> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -1197,11 +1402,17 @@ impl Signer {
             }
             // `hash`: release this ticket and no other (the wallet's own payer names the one the seller has shown locked)
             let named = str_or_empty(p.get("hash"));
+            // no tip: nothing can be said of how long a ticket has left, so none is released, and none is called stale
+            let Some(tip) = tip else {
+                return Ok(with(refusal(TIP_UNKNOWN, "the wallet's chain node is not answering, so how long a ticket has left is not known: no secret was released; \
+                                                     call again"), json!({"session": sid})));
+            };
             let next = st.book.usable(&sid, tip).filter(|t| named.is_empty() || t.hash == named).cloned();
             let Some(mut t) = next else {
-                return Ok(with(refusal("ticket_none", "no locked ticket of this session can be released now: lock more (ticket_offer), and ask the \
-                                                       seller to cancel the stale ones"),
-                               json!({"session": sid, "stale": st.book.stale(&sid, tip), "want": st.book.want(&s, now)})));
+                let stale = st.book.stale(&sid, tip);
+                let advice = if stale.is_empty() { "lock more (ticket_offer)" } else { "lock more (ticket_offer), and ask the seller to cancel the stale ones" };
+                return Ok(with(refusal("ticket_none", format!("no locked ticket of this session can be released now: {advice}")),
+                               json!({"session": sid, "stale": stale, "want": st.book.want(&s, now)})));
             };
             let dest = format!("ln:{}", s.payee);
             let sats = booking_sats(t.msat, t.fee_limit_msat);
@@ -1628,7 +1839,7 @@ impl Signer {
             return passed("ln_node", "the wallet's Lightning node failed its checks".into());
         }
         // PayOffer takes no set of outgoing channels: every channel of the node must pass
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", true) {
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", true, sid) {
             Ok(r) => r,
             Err(d) => return passed(&str_or_empty(d.get("rule")), "a payment by offer may leave on any channel of the node, and not every one passes the guards".into()),
         };
@@ -1657,6 +1868,7 @@ impl Signer {
         }
         let hash = inv.payment_hash_hex();
         let booked = {
+            let _turn = inside.spend_turn();
             let _g = self.lock();
             self.ticket_book_prepay(sid, &hash, &lni, inv.payment_hash, inv.expires_at() as f64, &lp, &routes.ids, win, amount)
                 .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
@@ -1728,7 +1940,8 @@ impl Signer {
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
+        let checks_from = Instant::now();
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, &sid) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
         };
@@ -1757,16 +1970,35 @@ impl Signer {
         if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, msat, &tp_now, now) {
             return refuse(&hash, rule, why);
         }
-        match ln.decode(&invoice) {
+        if win.is_some() {
+            let (left, margin) = (inv.expires_at() as f64 - now, self.ticket_pace.send_margin(inv.expiry_s as f64));
+            if left < margin {
+                return with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it would have ended first (held to {margin:.0} s)")),
+                            json!({"hash": hash, "unsent": true}));
+            }
+        }
+        let hinted = match ln.decode(&invoice) {
             Ok(d) => {
                 if let Err(why) = cross_check(&inv, &d) {
                     return refuse(&hash, "ln_decode_mismatch", why);
                 }
+                inv.route_hints > 0 || has_hidden_way(&d)
             }
             Err(e) => return node_said(refuse(&hash, "ln_backend", e.msg.clone()), &e),
+        };
+        // a route to the seller, as the node would look for one when it pays: one moment after a link along the way
+        // was replaced the node finds none for some seconds (up to 10 s seen on the lab), and a payment sent then fails
+        // at once. It is waited for, within what is left of the channel wait's 8 s. Only over the public graph: a
+        // seller reached by its invoice's route hints or blinded paths (a private channel, an LSP) is one the node's
+        // route query, which is not given them, never finds, and its invoice is sent as it always was
+        if !hinted {
+            if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, checks_from) {
+                return with(refuse(&hash, "ln_no_route", why), json!({"route_ran_out": ran_out}));
+            }
         }
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
+            let _turn = inside.spend_turn();
             let _g = self.lock();
             self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win, msat)
                 .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
@@ -1783,6 +2015,61 @@ impl Signer {
     /// What the book holds booked for the ticket `hash` (0 where it holds none, or cannot be read).
     fn ticket_booked_sats(&self, hash: &str) -> i64 {
         self.ticket_store().ok().and_then(|g| g.as_ref().and_then(|st| st.book.tickets.get(hash).map(|t| t.booked_sats))).unwrap_or(0)
+    }
+
+    /// Waits until the node finds a route of `msat` to `payee` out through one of `ids`, or until
+    /// [`crate::ln::CHANNEL_BACK_WAIT`] has gone by since `from`, or the session `sid` is being stopped.
+    /// Read only: nothing is sent. A node that cannot answer the question is not asked again, and is
+    /// no reason to refuse: the payment goes as it would have.
+    #[allow(clippy::too_many_arguments)]
+    /// `Err((why, ran_out))`: `ran_out` where the seller has been without a route for the whole window, not
+    /// where this payment only stood back for another to the same seller.
+    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), (String, bool)> {
+        let chan = (ids.len() == 1).then(|| ids[0].as_str());
+        let ask = || {
+            let asked = Instant::now();
+            let found = ln.has_route(payee, msat, chan, final_cltv);
+            self.ticket_pace.queried(asked.elapsed());
+            // a node that cannot answer the question is no reason to hold the payment
+            !matches!(found, Ok(false))
+        };
+        if ask() {
+            self.ticket_pace.route_waited(payee, true);
+            return Ok(());
+        }
+        // one payment to this seller waits at a time, within one window for all of them: a seller gone for good
+        // holds one place of the gate for 8 s, and the payments behind it are refused at once
+        let refused = |since: f64| format!("the wallet's node has found no route to the seller for {since:.1} s: nothing was sent");
+        let left = crate::ln::CHANNEL_BACK_WAIT.saturating_sub(from.elapsed());
+        let until = match self.ticket_pace.route_wait_turn(payee, left.max(Duration::from_millis(1))) {
+            Ok(u) => u,
+            // the window this payment would wait in ran out before it came, for another payment to the seller
+            Err(true) => {
+                let w = crate::ln::CHANNEL_BACK_WAIT.as_secs_f64();
+                return Err((format!("the wallet's node has found no route to the seller for the whole wait of {w:.0} s, which another payment to \
+                                     the seller waited out before this one came: nothing was sent"), true));
+            }
+            Err(false) => return Err(("another payment to the seller is waiting for a route: nothing was sent".into(), false)),
+        };
+        let no_route_from = self.engine.now();
+        let record = |back: bool| {
+            self.ticket_audit("ticket_route_waited", json!({"session": sid, "dest": format!("ln:{payee}"), "no_route_from": no_route_from,
+                                                            "route_back_at": back.then(|| self.engine.now()), "waited_s": self.engine.now() - no_route_from}));
+        };
+        loop {
+            let stopped = self.ticket_is_stopping(sid) || self.ticket_session(sid).is_some_and(|s| s.state != SState::Open);
+            if Instant::now() >= until || stopped {
+                self.ticket_pace.route_waited(payee, false);
+                record(false);
+                return Err((refused(from.elapsed().as_secs_f64()), true));
+            }
+            std::thread::sleep(crate::ln::CHANNEL_BACK_POLL.min(until.saturating_duration_since(Instant::now())));
+            if ask() {
+                self.ticket_pace.route_waited(payee, true);
+                record(true);
+                return Ok(());
+            }
+        }
     }
 
     /// The end of an ordinary payment, booked (`booked_sats`): `send` hands it to the node, and
@@ -1807,6 +2094,7 @@ impl Signer {
         // over within `ORDINARY_PAY_S` and 5 s, and the call's caller has its answer before it stops waiting for one
         let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, i64::from(xbt402::ticket::ORDINARY_PAY_S)) as u64 + 5);
         let mut unsent: Option<crate::Error> = None;
+        let sent_at = Instant::now();
         let mut pmt = {
             let mut pmt = match send() {
                 Ok(p) => Some(p),
@@ -1823,6 +2111,9 @@ impl Signer {
             }
             pmt
         };
+        if pmt.as_ref().is_some_and(|p| str_or_empty(p.get("status")) == "SUCCEEDED") {
+            self.ticket_pace.flew(sent_at.elapsed());
+        }
         drop(inside);
         // once more outside the gate, for a payment whose end the node had not shown inside the wait
         if pmt.as_ref().is_none_or(|p| !payment_over(p)) {
@@ -1830,6 +2121,7 @@ impl Signer {
                 pmt = Some(p);
             }
         }
+        let _turn = self.ticket_pace.spend_turn();
         let _g = self.lock();
         let res = (|| -> Result<Option<Ticket>> {
             let mut g = self.ticket_store()?;
@@ -2104,16 +2396,34 @@ impl Signer {
     /// channel a payment may leave through. The payer asks this before it offers a hash to a
     /// seller: a hash that is offered and then cannot be paid keeps its place in the pool until it
     /// lapses, so none is offered while the wallet's own node could not pay it.
-    pub(crate) fn ticket_can_lock(&self, payee: &str) -> std::result::Result<(), Value> {
+    pub(crate) fn ticket_can_lock(&self, payee: &str, sid: &str) -> std::result::Result<(), Value> {
         let (ln, lp) = {
             let _g = self.lock();
             self.ticket_synced()?;
             self.ln_ready().map_err(|d| with(d, json!({"rail": "ticket", "charged_sats": 0})))?
         };
         let dest = format!("ln:{payee}");
-        self.ln_node_checks(&*ln, &lp, &dest, "").map_err(|d| with(d, json!({"rail": "ticket"})))?;
-        self.ln_route_checks(&*ln, &lp, &dest, "", false).map_err(|d| with(d, json!({"rail": "ticket"})))?;
+        self.ticket_node_checks(&*ln, &lp, &dest).map_err(|d| with(d, json!({"rail": "ticket"})))?;
+        self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, sid).map_err(|d| with(d, json!({"rail": "ticket"})))?;
         Ok(())
+    }
+
+    /// [`Signer::ln_node_checks`] for a lock round, asked again at once where a chain node that fails now and then
+    /// failed it: between the two checks of a round the seller issues its invoices, and a round given up there costs
+    /// them and their places with the seller. Not asked again of a node that took its time to fail (a timeout): that
+    /// one is not going to answer in a moment, and the caller is waiting.
+    fn ticket_node_checks(&self, ln: &dyn LnBackend, lp: &LnPolicy, dest: &str) -> std::result::Result<(), Value> {
+        for _ in 0..NODE_CHECK_TRIES {
+            let asked = Instant::now();
+            match self.ln_node_checks(ln, lp, dest, "") {
+                Ok(_) => return Ok(()),
+                Err(d) if ticket::CHAIN_RULES.contains(&d["rule"].as_str().unwrap_or_default()) && asked.elapsed() < Duration::from_secs(1) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(d) => return Err(d),
+            }
+        }
+        self.ln_node_checks(ln, lp, dest, "").map(|_| ())
     }
 
     /// A session of the book, as it is now.
@@ -2211,17 +2521,132 @@ impl Signer {
         }
     }
 
+    /// Ask the wallet's node about the tickets of this session not yet released, and bring the book to what it says. On a
+    /// thread of its own, one round at a time for a session, so that a node that hangs takes that thread and not the
+    /// caller: the round's answer is waited for until `by`, and `stop` ends the waiting. Returns whether a ticket is on its
+    /// way and not yet one a release can take ([`Signer::ticket_refresh_round`]); a node that has not answered in time
+    /// has said nothing of it, and it may be.
+    pub(crate) fn ticket_refresh_coming(&self, sid: &str, stop: &dyn Fn() -> bool, by: Instant) -> bool {
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else { return self.ticket_refresh_round(sid) };
+        if !self.ticket_refreshing.lock().unwrap_or_else(|p| p.into_inner()).insert(sid.to_string()) {
+            return true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let own = sid.to_string();
+        let spawned = std::thread::Builder::new().name("ticket-refresh".into()).spawn(move || {
+            let coming = me.ticket_refresh_round(&own);
+            me.ticket_refreshing.lock().unwrap_or_else(|p| p.into_inner()).remove(&own);
+            let _ = tx.send(coming);
+        });
+        if spawned.is_err() {
+            self.ticket_refreshing.lock().unwrap_or_else(|p| p.into_inner()).remove(sid);
+            return true;
+        }
+        loop {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(coming) => return coming,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if stop() => return false,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() >= by => return true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    /// One round: each ticket asked about with no lock held, so that a slow node holds up nobody else, until the session is
+    /// being stopped. Returns whether a ticket is one the node calls in flight and has not shown locked, locked with no
+    /// expiry the node has reported, or one the node gave no answer about. A send the node has no record of gives nothing
+    /// to wait for.
+    fn ticket_refresh_round(&self, sid: &str) -> bool {
+        let Some(ln) = self.ln.clone() else { return false };
+        let hashes: Vec<String> = {
+            let Ok(g) = self.ticket_store() else { return false };
+            let Some(st) = g.as_ref() else { return false };
+            st.book.of_session(sid).iter().filter(|t| t.state.unreleased()).map(|t| t.hash.clone()).collect()
+        };
+        let mut said = vec![];
+        for h in hashes {
+            if self.ticket_is_stopping(sid) {
+                return false;
+            }
+            let a = ln.lookup(&h);
+            said.push((h, a));
+        }
+        let _g = self.lock();
+        let Ok(mut g) = self.ticket_store() else { return false };
+        let Some(st) = g.as_mut() else { return false };
+        let mut coming = false;
+        for (h, a) in said {
+            // what the node said may be old by now: a ticket the book has moved on from is the reconcile's, which asks afresh
+            if let (Ok(Some(p)), true) = (&a, st.book.tickets.get(&h).is_some_and(|t| t.state.unreleased())) {
+                // unchecked: a row that cannot be written now is asked about again at the next round
+                let _ = self.ticket_apply(st, &h, p);
+            }
+            let Some(t) = st.book.tickets.get(&h) else { continue };
+            coming |= match (t.state, &a) {
+                (TState::Locked, _) => t.final_expiry == 0,
+                (TState::Sending, Err(_)) => true,
+                (TState::Sending, Ok(Some(p))) => str_or_empty(p.get("status")) == "IN_FLIGHT",
+                _ => false,
+            };
+        }
+        coming
+    }
+
+    /// A ticket of the session in `sending` for longer than a send can take, that the node calls in flight and shows on no
+    /// way, and that is not waiting its turn to be sent: it will never be locked, and the pool counts it. A node that gives
+    /// no answer by `by` says nothing.
+    pub(crate) fn ticket_sending_stranded(&self, sid: &str, by: Instant) -> Option<String> {
+        let (ln, me) = (self.ln.clone()?, self.me.get().and_then(std::sync::Weak::upgrade)?);
+        let now = self.engine.now();
+        let most = LnPolicy::from_map(&self.config().ln).timeout_s as f64 + SENDING_STRANDED_PAST_TIMEOUT_S;
+        let old: Vec<String> = {
+            let g = self.ticket_store().ok()?;
+            g.as_ref()?.book.of_session(sid).iter().filter(|t| t.state == TState::Sending && now - t.sent_ts > most).map(|t| t.hash.clone()).collect()
+        };
+        if old.is_empty() {
+            return None;
+        }
+        // and not while a channel is down: a link that dropped may yet carry it
+        within(by, move || {
+            let all_up = ln.channels().is_ok_and(|cs| cs.iter().all(|c| c.get("active") == Some(&Value::Bool(true))));
+            old.into_iter().find(|h| all_up && !me.ticket_is_queued(h)
+                                     && matches!(ln.lookup(h), Ok(Some(p)) if str_or_empty(p.get("status")) == "IN_FLIGHT" && !htlcs_in_flight(&p)))
+        }).flatten()
+    }
+
     /// Whether the wallet's own node calls a ticket's payment in flight and carries it on none of
     /// its channels: seen of a Lightning Fork node that was killed as it sent the payment
     /// (`docs/LIMITS.md`). The seller will never show such a ticket locked. `false` whenever the
     /// node or its channel list cannot be read: nothing is concluded from a node that gave no answer.
+    /// Whether a ticket is on one of the wallet's channels with every channel up, by the node's word within a moment: the
+    /// seller has had the chance to see it. `false` where it is on none, a channel is down, or the node gives no answer.
+    pub(crate) fn ticket_on_a_way_up(&self, hash: &str) -> bool {
+        let Some(ln) = self.ln.clone() else { return false };
+        let h = hash.to_string();
+        within(Instant::now() + Duration::from_secs(2), move || {
+            ln.channels().is_ok_and(|cs| cs.iter().all(|c| c.get("active") == Some(&Value::Bool(true)))
+                                        && htlc_locks(&cs, &|_| true).list.iter().any(|x| str_or_empty(x.get("payment_hash")) == h))
+        }).unwrap_or(false)
+    }
+
     pub(crate) fn ticket_stranded(&self, hash: &str) -> bool {
         let Some(ln) = self.ln.clone() else { return false };
         let Ok(Some(p)) = ln.lookup(hash) else { return false };
-        if str_or_empty(p.get("status")) != "IN_FLIGHT" {
+        let Ok(cs) = ln.channels() else { return false };
+        let on_a_way = htlc_locks(&cs, &|_| true).list.iter().any(|h| str_or_empty(h.get("payment_hash")) == hash);
+        // a channel down, or one that came back and has not listed its HTLCs again yet (a link that drops, a node
+        // resyncing): a ticket missing from it may still come. Only a ticket seen missing with every channel up, for as
+        // long as such a gap lasts, is taken for stranded
+        let all_up = cs.iter().all(|c| c.get("active") == Some(&Value::Bool(true)));
+        let now = self.engine.now();
+        let mut seen = self.ticket_off_channel.lock().unwrap_or_else(|p| p.into_inner());
+        if str_or_empty(p.get("status")) != "IN_FLIGHT" || on_a_way || !all_up {
+            seen.remove(hash);
             return false;
         }
-        ln.channels().is_ok_and(|cs| !htlc_locks(&cs, &|_| true).list.iter().any(|h| str_or_empty(h.get("payment_hash")) == hash))
+        let since = *seen.entry(hash.to_string()).or_insert(now);
+        now - since >= STRANDED_SEEN_S
     }
 
     /// Held tickets of a session whose invoice was sent to the node and whose payment failed: the
@@ -2503,7 +2928,8 @@ impl Signer {
     pub(crate) fn ticket_status_locked(&self, p: &Value) -> Value {
         let tp = self.ticket_policy();
         let mut out = json!({"rail": "ticket", "enabled": tp.enabled, "halted": self.ln_book.halted(),
-                             "book_error": self.ticket_error.lock().unwrap_or_else(|p| p.into_inner()).clone()});
+                             "book_error": self.ticket_error.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+                             "route_query_ms": self.ticket_pace.route_query_ms()});
         if !self.ticket_in_use() {
             return with(out, json!({"synced": false, "sessions": [], "tickets": {}, "locked": {"tickets": 0, "sats": 0}, "booked_sats": 0}));
         }
@@ -2865,11 +3291,25 @@ fn fitting_msat(lp: &LnPolicy, lo_msat: u64, hi_msat: u64, left: i64) -> Option<
     Some(lo * 1000)
 }
 
+/// Whether the node's decode of an invoice names ways to its payee the public graph does not have: route
+/// hints (a private channel) or blinded paths.
+fn has_hidden_way(decoded: &Value) -> bool {
+    ["route_hints", "blinded_paths"].iter().any(|k| decoded.get(*k).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn an_invoice_with_route_hints_or_blinded_paths_has_a_way_the_graph_does_not() {
+        assert!(!has_hidden_way(&json!({"destination": "02"})));
+        assert!(!has_hidden_way(&json!({"route_hints": [], "blinded_paths": []})));
+        assert!(has_hidden_way(&json!({"route_hints": [{"hop_hints": [{"chan_id": "1"}]}]})));
+        assert!(has_hidden_way(&json!({"blinded_paths": [{"blinded_path": {}}]})));
+    }
 
     #[test]
     fn at_most_eight_ticket_payments_are_with_the_router_at_once() {
@@ -2895,6 +3335,151 @@ mod tests {
             panic!("the send died");
         }).join());
         assert!(died.is_err() && pace.inside() == 0);
+    }
+
+    #[test]
+    fn a_hurried_win_inside_the_gate_has_the_next_turn_at_the_spend_lock() {
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        let holder = pace.enter_for(Some(("s0", 1)), false);
+        let inside: Vec<PaceGuard<'_>> = (1..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("s", i)), false)).collect();
+        std::thread::scope(|sc| {
+            // one has the turn; seven in the gate ask for one, and an eighth asks last
+            let held = holder.spend_turn();
+            let (pace, order) = (&pace, &order);
+            for (i, g) in inside.iter().enumerate() {
+                sc.spawn(move || {
+                    let _turn = g.spend_turn();
+                    order.lock().unwrap().push(i + 1);
+                });
+            }
+            // a payment that has left the gate takes its turn with them
+            sc.spawn(move || {
+                let _turn = pace.spend_turn();
+                order.lock().unwrap().push(0);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            // the last in the gate is the one its seller stands still for: it has the next turn all the same.
+            // (It was inside when its seller stopped: a win that is inside is not among those moved.)
+            assert_eq!(pace.hurry("s", &[7]), 0);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(order.lock().unwrap().is_empty(), "nobody has a turn while one is held");
+            drop(held);
+            while order.lock().unwrap().len() < SEND_PARALLEL {
+                std::thread::yield_now();
+            }
+            let first = order.lock().unwrap()[0];
+            assert_eq!(first, 7, "{:?}", order.lock().unwrap());
+        });
+        drop((holder, inside));
+        assert_eq!((pace.inside(), pace.waiting()), (0, 0));
+        // nothing is left behind: a turn is free
+        drop(pace.spend_turn());
+    }
+
+    #[test]
+    fn a_win_that_went_first_through_the_gate_goes_first_at_the_spend_lock() {
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            let holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            let (pace, order) = (&pace, &order);
+            let held = pace.spend_turn();
+            let (tx, rx) = std::sync::mpsc::channel();
+            sc.spawn(move || {
+                let g = pace.enter_for(Some(("hurried", 9)), false);
+                tx.send(()).unwrap();
+                let _turn = g.spend_turn();
+                order.lock().unwrap().push("hurried");
+            });
+            while pace.waiting() == 0 {
+                std::thread::yield_now();
+            }
+            assert_eq!(pace.hurry("hurried", &[9]), 1);
+            drop(holders);
+            rx.recv().unwrap();
+            // it is inside and asks for its turn, one that is not hurried asks too, and the turn is given up
+            sc.spawn(move || {
+                let _turn = pace.spend_turn();
+                order.lock().unwrap().push("other");
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        assert_eq!(order.into_inner().unwrap(), ["hurried", "other"]);
+    }
+
+    /// Wins that are hurried without end, through the gate and at the spend lock: one that is not
+    /// hurried still goes after [`FIRST_IN_A_ROW`] of them.
+    #[test]
+    fn hurried_wins_shut_no_other_payment_out_of_the_gate_or_the_spend_lock_for_good() {
+        let pace = Pace::default();
+        let (done, turns) = (std::sync::atomic::AtomicBool::new(false), AtomicUsize::new(0));
+        std::thread::scope(|sc| {
+            // the gate: full, a plain payment waits, and hurried wins keep coming
+            let holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            let (pace, done, turns) = (&pace, &done, &turns);
+            let plain = sc.spawn(move || {
+                let _inside = pace.enter();
+                let at = turns.load(Ordering::SeqCst);
+                done.store(true, Ordering::SeqCst);
+                at
+            });
+            while pace.waiting() == 0 {
+                std::thread::yield_now();
+            }
+            for t in 0..2 * SEND_PARALLEL as u64 {
+                sc.spawn(move || {
+                    let mut i = 0;
+                    while !done.load(Ordering::SeqCst) && i < 1_000 {
+                        let _inside = pace.enter_for(Some(("hurried", t * 10_000 + i)), true);
+                        turns.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        i += 1;
+                    }
+                });
+            }
+            while pace.waiting() < 2 * SEND_PARALLEL as u64 + 1 {
+                std::thread::yield_now();
+            }
+            drop(holders);
+            let at = plain.join().unwrap();
+            assert!(at <= FIRST_IN_A_ROW as usize + SEND_PARALLEL, "{at} hurried wins went first");
+        });
+        assert_eq!((pace.inside(), pace.waiting()), (0, 0));
+
+        // the spend lock: wins inside the gate, hurried, ask for turns without end; a payment past the gate waits
+        let (done, turns) = (std::sync::atomic::AtomicBool::new(false), AtomicUsize::new(0));
+        let inside: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("hurried", i)), true)).collect();
+        std::thread::scope(|sc| {
+            let (pace, done, turns) = (&pace, &done, &turns);
+            let held = pace.spend_turn();
+            for g in &inside {
+                sc.spawn(move || {
+                    let mut i = 0;
+                    while !done.load(Ordering::SeqCst) && i < 1_000 {
+                        let _turn = g.spend_turn();
+                        turns.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        i += 1;
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            let plain = sc.spawn(move || {
+                let _turn = pace.spend_turn();
+                let at = turns.load(Ordering::SeqCst);
+                done.store(true, Ordering::SeqCst);
+                at
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            drop(held);
+            let at = plain.join().unwrap();
+            assert!(at <= FIRST_IN_A_ROW as usize, "{at} hurried wins had a turn first");
+        });
+        drop(inside);
+        // nothing is left behind: a turn is free
+        drop(pace.spend_turn());
     }
 
     #[test]

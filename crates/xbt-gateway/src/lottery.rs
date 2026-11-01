@@ -64,6 +64,9 @@ pub struct LotteryConfig {
     /// in the window, so this is not what bounds the pieces a buyer gets for no value (`window`
     /// is): it is where a session whose window has narrowed is ended and another opened.
     pub max_voids: u32,
+    /// Invoices of unpaid wins one session may have cancelled (`cancel`), each of which the seller's
+    /// node then makes again. Past it they lapse as any invoice does.
+    pub max_win_cancels: u32,
     /// A route is drawn for only if its dearest piece wins at most 1 time in this many: the
     /// piece's price times this is at most `win_msat`. The wallet's owner has the same cap.
     pub max_odds_den: u32,
@@ -98,6 +101,7 @@ impl LotteryConfig {
                 "max_sessions",
                 "sessions_per_address",
                 "max_voids",
+                "max_win_cancels",
                 "max_odds_den",
                 "idle_secs",
                 "first_use_secs",
@@ -143,7 +147,10 @@ impl LotteryConfig {
 
     fn read(m: &Map<String, Value>, ticket_blocks: u32) -> Result<Self, String> {
         let win_msat = num(m, "win_msat", 64_000)?;
-        let grace_seconds = num32(m, "grace_seconds", 30)?;
+        // as long as a ticket's invoice lives (60 s): a win's invoice lives as long as the grace, and a buyer pays a win
+        // over a slow route in tens of seconds; one that lapsed on its way is refused at the seller with nothing paid,
+        // and the next lapses the same way. What a seller serves meanwhile is bounded by `grace_pieces` too
+        let grace_seconds = num32(m, "grace_seconds", xbt402::ticket::INVOICE_EXPIRY_S)?;
         Ok(Self {
             win_msat,
             min_win_msat: num(m, "min_win_msat", win_msat.min(16_000))?,
@@ -163,6 +170,7 @@ impl LotteryConfig {
             // way, one to a few and the window at the most, and each void narrows the window by one
             // for the rest of the session: past half of it the buyer is better served by a new session
             max_voids: num32(m, "max_voids", 4)?,
+            max_win_cancels: num32(m, "max_win_cancels", 32)?,
             max_odds_den: num32(m, "max_odds_den", 4)?,
             idle_secs: num(m, "idle_secs", 300)?,
             first_use_secs: num(m, "first_use_secs", 60)?,
@@ -209,6 +217,8 @@ pub enum Refusal {
     /// The window is full: pieces were served and no value or void has come for them.
     ValueMissing,
     TooManyVoids,
+    /// The session has had as many invoices cancelled as it may.
+    TooManyCancels,
     Draw(DrawError),
 }
 
@@ -223,6 +233,7 @@ impl Refusal {
             Self::WinUnpaid => "win_unpaid",
             Self::ValueMissing => "value_missing",
             Self::TooManyVoids => "too_many_voids",
+            Self::TooManyCancels => "too_many_cancels",
             Self::Draw(e) => e.code(),
         }
     }
@@ -284,6 +295,9 @@ pub struct Session {
     pub paid_wins: u64,
     pub unpaid: Vec<Win>,
     pub voids: u32,
+    /// Invoices of its wins it has had cancelled. Not kept across a restart: what it limits is the
+    /// node's work, which a restart costs anyway.
+    pub cancels: u32,
     /// Answers of this session that are still being sent.
     pub open_responses: u32,
     pub finals: VecDeque<Value>,
@@ -439,6 +453,7 @@ impl Book {
                 paid_wins: 0,
                 unpaid: vec![],
                 voids: 0,
+                cancels: 0,
                 open_responses: 0,
                 finals: VecDeque::new(),
                 closed: None,
@@ -502,7 +517,8 @@ impl Book {
 
     /// How long an answer that is being sent may stand still for the session's oldest unpaid win,
     /// in seconds: what is left of `grace_seconds` since it was drawn, and `pay_wait_secs` at the
-    /// most. 0: none is unpaid, or the time is up.
+    /// most. 0: none is unpaid, or the time is up. The gateway waits the larger of this and its
+    /// `refill_wait`, 15 s as shipped.
     pub fn grace_left(&self, session: &str, now: u64) -> u64 {
         let Some(s) = self.sessions.get(session) else { return 0 };
         let left = s.unpaid.iter().map(|w| w.drawn_at).min().map_or(0, |at| (at + u64::from(self.cfg.grace_seconds)).saturating_sub(now));
@@ -655,6 +671,22 @@ impl Book {
     /// forgotten at once. One that was served pieces it gave no value for, or has a win unpaid,
     /// keeps its place in the caps until [`Book::sweep`] takes it: closing must not be a way to
     /// take the window again and again from one address.
+    /// The buyer asks that the invoice `hash` of its unpaid win `draw` be cancelled, its payment having
+    /// failed: true where it is that win's current invoice, and counted. Any other asks for nothing: a
+    /// win of another session, one paid since, an invoice replaced since.
+    pub fn may_cancel(&mut self, session: &str, draw: u64, hash: &Hash) -> Result<bool, Refusal> {
+        let most = self.cfg.max_win_cancels;
+        let Some(s) = self.sessions.get_mut(session) else { return Err(Refusal::SessionUnknown) };
+        if !s.unpaid.iter().any(|w| w.draw == draw && !w.issuing && w.invoice.as_ref().is_some_and(|i| &i.hash == hash && i.text.is_some())) {
+            return Ok(false);
+        }
+        if s.cancels >= most {
+            return Err(Refusal::TooManyCancels);
+        }
+        s.cancels += 1;
+        Ok(true)
+    }
+
     pub fn close(&mut self, session: &str, now: u64) -> bool {
         let Some(s) = self.sessions.get_mut(session).filter(|s| s.closed.is_none()) else { return false };
         if s.unvalued() == 0 && s.unpaid.is_empty() {
@@ -775,6 +807,7 @@ impl Book {
                     paid_wins: o.paid_wins,
                     unpaid: vec![],
                     voids: o.voids,
+                    cancels: 0,
                     open_responses: 0,
                     finals: VecDeque::new(),
                     closed: o.closed,
@@ -1085,9 +1118,9 @@ mod tests {
     fn the_defaults_are_the_drafts_numbers_and_a_wrong_file_is_refused() {
         let c = LotteryConfig::parse(&json!({}), 40).unwrap();
         assert_eq!((c.win_msat, c.min_win_msat, c.win_blocks, c.window), (64_000, 16_000, 40, 8));
-        assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (30, 64, 2, 65_536));
+        assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (60, 64, 2, 65_536));
         assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids, c.max_odds_den), (262_144, 64, 4, 4, 4));
-        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 30, 10));
+        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 60, 10));
         // a win's invoice lives no longer than the grace, unless the grace is shorter than 5 s
         for (grace, invoice) in [(20, 20), (10, 15), (0, 15), (100, 100), (7200, 3600)] {
             assert_eq!(LotteryConfig::parse(&json!({"grace_seconds": grace}), 40).unwrap().invoice_secs, invoice, "{grace}");

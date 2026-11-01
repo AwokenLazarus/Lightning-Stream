@@ -125,7 +125,7 @@ impl Connector {
 
     /// One paid answer, handed on as it arrives: the seller's status and range from the head line,
     /// then the body.
-    fn stream(&self, url: &str, max_sats: i64, range: Option<&str>, ceiling: Option<Value>, max_size: Option<u64>) -> Reply {
+    fn stream(&self, url: &str, max_sats: i64, range: Option<&str>, if_range: Option<&str>, ceiling: Option<Value>, max_size: Option<u64>) -> Reply {
         let name = format!("ls-{}", random_hex());
         let path = self.cfg.stream_dir.join(&name);
         let listener = match listen_stream(&path) {
@@ -138,6 +138,10 @@ impl Connector {
         let mut params = json!({"url": url, "max_sats": max_sats, "task": self.cfg.task, "stream_to": name, "stream_head": true});
         if let Some(r) = range {
             params["range"] = r.into();
+            // the player's own validator of the copy it has: a changed file comes back whole, and is not spliced on
+            if let Some(v) = if_range {
+                params["if_range"] = v.into();
+            }
         }
         // the seller's listed prices, where the caller chose it from a listing: its terms past them are paid nothing
         if let Some(c) = ceiling {
@@ -187,6 +191,12 @@ impl Connector {
         let Some(status) = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s)) else {
             return Reply::Whole(json_response(502, &json!({"error": "the signer sent no head for the answer"})));
         };
+        // the seller sent the whole file for a part of it (its copy changed since the player's, or it serves no
+        // ranges): the wallet read none of it, and nothing of another copy is spliced onto what the player has
+        if head.get("range_ignored") == Some(&Value::Bool(true)) {
+            return Reply::Whole(json_response(412, &json!({"error": "ticket_range_ignored: the seller answered the range with the whole file (its copy changed, \
+                                                                     or it serves no ranges); none of it was read. Ask again from the start"})));
+        }
         if let Some(why) = head.get("error").and_then(Value::as_str) {
             return Reply::Whole(json_response(502, &json!({"error": why})));
         }
@@ -200,6 +210,12 @@ impl Connector {
         headers.push(("Accept-Ranges".into(), if seller_ranges == Some("none") { "none" } else { "bytes" }.into()));
         if let Some(cr) = head.get("content_range").and_then(Value::as_str).filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
             headers.push(("Content-Range".into(), cr.into()));
+        }
+        // the copy's validators, which the player names in `If-Range` when it seeks
+        for (k, name) in [("etag", "ETag"), ("last_modified", "Last-Modified")] {
+            if let Some(x) = head.get(k).and_then(Value::as_str).filter(|x| x.len() <= 256 && x.bytes().all(|b| (0x20..0x7f).contains(&b))) {
+                headers.push((name.into(), x.into()));
+            }
         }
         let length = head.get("content_length").and_then(Value::as_u64);
         let head = first;
@@ -273,11 +289,12 @@ impl Handler for Connector {
         }
         let max_sats = req.header("X-Max-Sats").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n >= 0).unwrap_or(self.cfg.max_sats).min(self.cfg.max_sats);
         let range = req.header("Range").map(str::trim).filter(|r| one_range(r));
+        let if_range = req.header("If-Range").map(str::trim).filter(|v| !v.is_empty() && v.len() <= 256);
         // `X-Price-Ceiling`: the listing's prices as the most this call pays. Only ever stricter than none
         let ceiling = req.header("X-Price-Ceiling").filter(|v| v.len() <= 1024).and_then(|v| serde_json::from_str::<Value>(v).ok()).filter(Value::is_object);
         // `X-Max-Size`: the most bytes the caller was shown the resource has (a listed file's size)
         let max_size = req.header("X-Max-Size").and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
-        self.stream(url, max_sats, range, ceiling, max_size)
+        self.stream(url, max_sats, range, if_range, ceiling, max_size)
     }
 }
 

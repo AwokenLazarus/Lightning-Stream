@@ -169,6 +169,12 @@ pub fn address_to_spk(addr: &str, hrp: &str) -> Result<Vec<u8>> {
     Ok(spk)
 }
 
+/// How long the last tip the chain node gave stands in for one it does not give: minutes, against a
+/// ticket's margin of [`crate::ticket::USABLE_MARGIN_BLOCKS`] blocks, so it decides nothing a fresh one would not.
+const TIP_KEPT_S: f64 = 300.0;
+/// How long a question about the tip is waited for: longer, and the last tip stands in for the answer.
+const TIP_ASK_MOST: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How to build a signer (tests inject a node, a clock).
 #[derive(Default)]
 pub struct SignerOptions {
@@ -228,6 +234,18 @@ pub struct Signer {
     pub(crate) ticket_synced: std::sync::atomic::AtomicBool,
     /// How many ticket payments are with the node's router at once ([`crate::ticket_rail::Pace`]).
     pub(crate) ticket_pace: crate::ticket_rail::Pace,
+    /// Since when the node's channels have been out, and when that was last seen
+    /// ([`Self::ln_channels_back`]).
+    pub(crate) ln_channels_out: Mutex<Option<(std::time::Instant, std::time::Instant)>>,
+    /// The last tip the chain node gave, and when ([`Self::tip_known`]).
+    tip_seen: Mutex<Option<(i64, f64)>>,
+    /// A question about the tip is out ([`Self::height_asked`]).
+    tip_asking: std::sync::atomic::AtomicBool,
+    /// The sessions a round of questions to the Lightning node is out for ([`Self::ticket_refresh_coming`]).
+    pub(crate) ticket_refreshing: Mutex<HashSet<String>>,
+    /// Tickets seen in flight on the node and on none of its channels, every channel up, and since when
+    /// ([`Self::ticket_stranded`]).
+    pub(crate) ticket_off_channel: Mutex<HashMap<String, f64>>,
     /// Held tickets booked `sending` whose send has not come back yet: waiting their turn in
     /// [`Self::ticket_pace`] or with the node. The node may have no record of one yet, and that
     /// is not a sign it never reached the node.
@@ -339,7 +357,7 @@ impl Signer {
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
                                 ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
-                                ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
+                                ticket_pace: crate::ticket_rail::Pace::default(), ln_channels_out: Mutex::new(None), tip_seen: Mutex::new(None), tip_asking: std::sync::atomic::AtomicBool::new(false), ticket_refreshing: Mutex::new(HashSet::new()), ticket_off_channel: Mutex::new(HashMap::new()), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
                                 ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_late_tries: Mutex::new(HashMap::new()), ticket_start_stopped: Mutex::new(vec![]), ticket_unanswered: Mutex::new(HashMap::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),
@@ -408,6 +426,18 @@ impl Signer {
         *self.human_pubkey.write().unwrap_or_else(|p| p.into_inner()) = k;
     }
 
+    /// [`Self::lock`], given up at `by`: whoever holds it may be waiting on a node that hangs.
+    pub(crate) fn lock_by(&self, by: std::time::Instant) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            match self.spend.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() >= by => return None,
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
     pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
         match self.spend.lock() {
             Ok(g) => g,
@@ -427,11 +457,42 @@ impl Signer {
     }
 
     fn height(&self) -> Result<i64> {
-        node::height(&*self.node).map(|h| h as i64)
+        let h = node::height(&*self.node).map(|h| h as i64)?;
+        *self.tip_seen.lock().unwrap_or_else(|p| p.into_inner()) = Some((h, self.now()));
+        Ok(h)
     }
 
+    /// The chain node's word on its height, waited for [`TIP_ASK_MOST`] at most: a node that hangs takes a thread, not
+    /// the caller. One question at a time: while one is out the node has given no answer, and `None` says so.
+    fn height_asked(&self) -> Option<i64> {
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else { return self.height().ok() };
+        if self.tip_asking.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        crate::ticket_rail::within(std::time::Instant::now() + TIP_ASK_MOST, move || {
+            let h = me.height().ok();
+            me.tip_asking.store(false, std::sync::atomic::Ordering::SeqCst);
+            h
+        }).flatten()
+    }
+
+    /// The chain's tip: the node's word, or, where the node gives none in time (busy, restarting, hung), the last it
+    /// gave within [`TIP_KEPT_S`]. `None`: not known, which says nothing about any height.
+    pub(crate) fn tip_known(&self) -> Option<i64> {
+        self.height_asked().or_else(|| {
+            let seen = *self.tip_seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.filter(|(_, at)| self.now() - at <= TIP_KEPT_S).map(|(h, _)| h)
+        })
+    }
+
+    /// Whether the chain node answers now.
+    pub(crate) fn chain_answers(&self) -> bool {
+        self.height_asked().is_some()
+    }
+
+    /// [`Self::tip_known`], with 0 for a tip not known: for a report, and for a bound that 0 leaves open.
     pub(crate) fn height_safe(&self) -> i64 {
-        self.height().unwrap_or(0)
+        self.tip_known().unwrap_or(0)
     }
 
     /// The chain's network id (`bip122:...`, P4), as a seller's 402 names it. A wrong mainnet anchor
