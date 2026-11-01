@@ -57,7 +57,7 @@ INIT_DATUM = os.environ.get("LS_TEST_INIT_DATUM", "1") == "1"  # the init in the
 DATUM_IMAGE = os.environ.get("LS_TEST_DATUM_IMAGE", "xbt-datum-gateway:0.1.0")
 # this tree's seller gateway too: the published one refuses the config this UI writes (health_token)
 LOCAL = {"init": "xbt-init:linux-test", "hashtaker": "xbt-hashlink:linux-test", "hashmaker": "xbt-hashlink:linux-test", "datum": DATUM_IMAGE,
-         "gateway": "xbt-gateway:linux-test"}
+         "gateway": "xbt-gateway:linux-test", "signer": "xbt-signer:linux-test"}
 OWN_GW = "xbt-datum-gateway:linux-test-stock"
 HG = os.environ.get("P2P_HASH_GATEWAYS", os.path.expanduser("~/xbt-rnd/hash-gateways"))  # stratum-grind, a CPU miner of real shares
 RELAYS = f"ws://127.0.0.1:{P['relay']}"

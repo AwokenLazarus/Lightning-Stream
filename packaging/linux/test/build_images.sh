@@ -22,8 +22,8 @@ lock() { awk -v n="$1" '$1 == n {print $2}' packaging/images.lock; }
 echo "== this tree's xbt-init, xbt-wallet-ui, xbt-hashlink and xbt-gateway (x86_64 musl)"
 TGT=${CARGO_TARGET_DIR:-target}
 cargo build -q -j "${CARGO_BUILD_JOBS:-6}" --release --locked --target x86_64-unknown-linux-musl \
-  -p xbt-wallet-ui -p xbt-hashlink -p xbt-svc -p xbt-gateway --bin xbt-wallet-ui --bin xbt-hashlink --bin xbt-init \
-  --bin xbt-gateway --bin xbt-supervise
+  -p xbt-wallet-ui -p xbt-hashlink -p xbt-svc -p xbt-gateway -p xbt-signer --bin xbt-wallet-ui --bin xbt-hashlink --bin xbt-init \
+  --bin xbt-gateway --bin xbt-signer --bin xbt-supervise
 # and this tree's users and groups (container/mkbase.py): the pinned images' /etc/group predates the Stream
 # Gateway's (xbt-datum, 10021, with the UI in it, so the UI can give run/datum/config.json the gateway's group)
 python3 container/mkbase.py "$T/base.tar"
@@ -36,14 +36,18 @@ for img in xbt-init xbt-wallet-ui xbt-hashlink; do
   docker build -q -t "$img:linux-test" "$T/$img" >/dev/null
   echo "   $img:linux-test"
 done
-# the seller gateway with xbt-supervise beside it, as its image ships them (oci_build.sh)
-mkdir -p "$T/xbt-gateway"
-cp "$TGT/x86_64-unknown-linux-musl/release/xbt-gateway" "$TGT/x86_64-unknown-linux-musl/release/xbt-supervise" \
-  "$T/base/etc/passwd" "$T/base/etc/group" "$T/xbt-gateway/"
-printf 'FROM %s\nCOPY --chmod=0555 xbt-gateway xbt-supervise /usr/bin/\nCOPY --chmod=0444 passwd group /etc/\n' "$(lock xbt-gateway)" \
-  > "$T/xbt-gateway/Dockerfile"
-docker build -q -t "xbt-gateway:linux-test" "$T/xbt-gateway" >/dev/null
-echo "   xbt-gateway:linux-test"
+# the seller gateway and the signer with xbt-supervise beside each, as their images ship them (oci_build.sh). The
+# signer is this tree's: the pinned one (12b8182c) serves no renter's socket (run/rental/signer.sock), which the
+# compose's hashtaker pays through
+for img in xbt-gateway xbt-signer; do
+  mkdir -p "$T/$img"
+  cp "$TGT/x86_64-unknown-linux-musl/release/$img" "$TGT/x86_64-unknown-linux-musl/release/xbt-supervise" \
+    "$T/base/etc/passwd" "$T/base/etc/group" "$T/$img/"
+  printf 'FROM %s\nCOPY --chmod=0555 %s xbt-supervise /usr/bin/\nCOPY --chmod=0444 passwd group /etc/\n' "$(lock "$img")" "$img" \
+    > "$T/$img/Dockerfile"
+  docker build -q -t "$img:linux-test" "$T/$img" >/dev/null
+  echo "   $img:linux-test"
+done
 
 echo "== a stock DATUM gateway ($(git rev-parse --short "$STOCK"))"
 mkdir -p "$T/gw-stock"
