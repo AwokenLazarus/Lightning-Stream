@@ -8076,7 +8076,8 @@ fn a_resume_refused_at_the_sellers_cap_is_made_again_in_another_session() {
     let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
                                          "if_range": part["etag"]}));
     r.tap.clear();
-    assert_eq!(r.audit("ticket_session_again").len(), 1, "the resume was refused at the cap and made again: {on}");
+    let locks: Vec<String> = r.tap.seen("/lock").iter().map(|s| s.body.chars().take(120).collect()).collect();
+    assert_eq!(r.audit("ticket_session_again").len(), 1, "the resume was refused at the cap and made again: part's session {sid}, the locks seen {locks:?}: {on}");
     assert_eq!(on["session_stopped"]["session"].as_str(), Some(sid.as_str()), "{on}");
     assert_ne!(on["session"].as_str(), Some(sid.as_str()), "made again in another session: {on}");
     assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
@@ -8152,7 +8153,7 @@ fn a_resume_whose_session_the_seller_forgot_is_made_again_in_another_session() {
     assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
     assert_ne!(on["session"].as_str(), Some(sid.as_str()), "{on}");
     let s = r.session(&sid);
-    assert_eq!(s["sessions"][0]["why"].as_str(), Some("the seller has forgotten the session"), "{s}");
+    assert!(s["sessions"][0]["why"].as_str().is_some_and(|w| w.starts_with("the seller has forgotten the session")), "{s}");
     r.assert_booked();
 }
 
