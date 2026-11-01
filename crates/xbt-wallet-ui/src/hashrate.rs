@@ -1124,8 +1124,9 @@ impl App {
         sg::write(&self.cfg.hash.stream_gw, &s, &self.signer_chain())?;
         Ok(match mode {
             Mode::Solo => format!("Saved. The {} starts with these settings in a few seconds; its blocks pay your address.", sg::NAME),
-            Mode::PoolKey => format!("Saved. The {} starts with these settings in a few seconds, mining through Lazarus Pool. \
-                Renting waits until the pool takes gateway keys; solo works now.", sg::NAME),
+            Mode::PoolKey => format!("Saved. The {} starts with these settings in a few seconds, mining through Lazarus Pool, which \
+                takes the gateway's key with a block. If the pool doesn't take it, renting stays off; solo always works. Pools \
+                that hold the key themselves (ABW) aren't supported yet.", sg::NAME),
         })
     }
 }

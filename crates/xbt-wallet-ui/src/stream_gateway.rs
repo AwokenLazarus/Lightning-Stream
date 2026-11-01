@@ -7,8 +7,11 @@
 //!
 //! * **solo** (the default): every block it finds pays the owner's own XBT address;
 //! * **pool-key**: it mines through Lazarus Pool, keeping the key itself and handing it to the pool with a
-//!   block. Its jobs are masked only once the pool takes gateway keys; until then they come back `pool-null`
+//!   block. Its jobs are masked only while the pool takes gateway keys; otherwise they come back `pool-null`
 //!   and the renter refuses them.
+//!
+//! Pools that hold the key themselves (CONVOY-style ABW, mode `abw`) are **not supported yet**: the renter can't
+//! check that such a pool changes its key after a block it found, so it refuses their jobs (xbt-hashlink blind.rs).
 //!
 //! The config holds no secret. The node's RPC credentials are in `rpc.cookie` beside it, which init writes
 //! (0600, the gateway's). The API's admin password is left empty: the gateway takes it only from this file, and
