@@ -3366,8 +3366,13 @@ impl Signer {
         };
         // the session ends for this alone only if nothing was wrong with it before, and no stop of another (the caller's
         // own, a budget's) had begun: a resume is never made again past a stop someone asked for
-        if first && !hs.ending.load(Ordering::SeqCst) {
+        // set, then look: a stop sets `ending` and then clears the flag, so whichever comes first the flag ends clear when
+        // a stop of another has begun (a look before the set could miss a stop that came between)
+        if first {
             hs.forgotten.store(true, Ordering::SeqCst);
+            if hs.ending.load(Ordering::SeqCst) {
+                hs.forgotten.store(false, Ordering::SeqCst);
+            }
         }
         self.ticket_http_stop(hs, why, Duration::ZERO);
         Some(format!("{why} (HTTP 402 session_unknown): the session was stopped, and the next call opens another"))
