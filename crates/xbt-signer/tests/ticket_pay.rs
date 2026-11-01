@@ -8720,6 +8720,50 @@ fn a_resume_refused_at_the_sellers_cap_before_it_left_is_made_again_in_another_s
     r.assert_booked();
 }
 
+/// As above, with a seller that sells no prepaid tickets, and a moment after a round with that seller failed in an
+/// outage (in a session of another task, which waits the outage's 30 s): the resume's second try, in a new session,
+/// locks at once and is served the rest, as a resume was before that wait. It is made once, so it sends one round at
+/// most; a call that opens a session otherwise still waits the 30 s out.
+///
+/// FAILS with the second try's session taking the outage's wait over: it locks nothing, and the resume is refused
+/// `ticket_outage`.
+#[test]
+fn a_resume_made_again_after_an_outage_locks_at_once_with_a_seller_that_sells_no_prepaid_tickets() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, held_only_shop());
+    r.tap.set(Box::new(|seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    let n = 10 * MIB;
+    let part = r.pay(&format!("/files/{n}"), 2_000);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    let used = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((used["complete"].as_bool(), used["session"].as_str()), (Some(true), Some(sid.as_str())), "{used}");
+    assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "{}", r.status());
+    // another task's first round with the seller fails in an outage: that session waits 30 s, and says why
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.drop_at_send = 2;
+        s.drop_for = Duration::from_secs(1);
+    }
+    let w = r.call("xbt402_pay", json!({"url": r.shop.url("/page/1000"), "max_sats": CALL, "task": "swarm"}));
+    assert_eq!(w["rule"].as_str(), Some("ticket_outage"), "{w}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 2, "{w}");
+    // the channel back, the resume: its session is refused at the seller's cap, and it is made again in another
+    std::thread::sleep(Duration::from_millis(1_500));
+    let before = r.audit("ticket_session_again").len();
+    assert_eq!(r.session(&sid)["sessions"][0]["state"].as_str(), Some("open"), "{}", r.session(&sid));
+    let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                         "if_range": part["etag"]}));
+    r.tap.clear();
+    assert_eq!(r.audit("ticket_session_again").len(), before + 1, "the resume was made again: {on}");
+    assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
+    assert_ne!(on["session"].as_str(), Some(sid.as_str()), "another session: {on}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 2, "no round failed after the outage's: {on}");
+    r.assert_booked();
+}
+
 /// A Lightning Fork node that is killed as it sends a ticket's payment can go on calling that
 /// payment in flight with nothing on its channel. Such a ticket is the oldest of its session and
 /// the seller never shows it locked: the session ends at the first release that waits for it, and

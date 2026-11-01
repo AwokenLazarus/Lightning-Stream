@@ -823,6 +823,13 @@ impl Signer {
     /// `ticket_open`: a session with one seller under one of the owner's tasks. `terms` is the
     /// `accepts` entry of the seller's 402 as the caller received it. Nothing is paid or locked.
     pub(crate) fn ticket_open_locked(&self, p: &Value) -> Value {
+        self.ticket_open_in(p, true)
+    }
+
+    /// [`Signer::ticket_open_locked`]. `outage_wait`: the session waits out what is left of an earlier session's wait
+    /// after a round that failed in an outage ([`ticket::OUTAGE_HOLD`]). Only the second try of a resume
+    /// ([`Signer::ticket_pay_in`]) opens without it: that try is made once, and locks at once.
+    pub(crate) fn ticket_open_in(&self, p: &Value, outage_wait: bool) -> Value {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
@@ -978,7 +985,7 @@ impl Signer {
                 }
             }
             // and what is left of a wait after a round that failed in an outage: the wait only, never a smaller pool
-            if let Some(until) = st.book.outage_hold(&terms.payee, now).filter(|u| size.pool > 0 && *u > hold_until) {
+            if let Some(until) = st.book.outage_hold(&terms.payee, now).filter(|u| outage_wait && size.pool > 0 && *u > hold_until) {
                 (hold_until, hold_why) = (until, ticket::OUTAGE_HOLD.to_string());
             }
             let lp = LnPolicy::from_map(&cfg.ln);

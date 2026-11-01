@@ -2992,7 +2992,9 @@ impl Signer {
 
     /// [`Signer::ticket_pay`]. `again`: a resume (a call with a `range`) whose session ended under it before anything
     /// of it went out (the seller's places full, [`Signer::ticket_cap_full`], or the session forgotten by the seller) is
-    /// made once more in another session.
+    /// made once more in another session. That session takes over no wait after an outage's round
+    /// ([`crate::ticket::OUTAGE_HOLD`]): it tries a lock at once, as a resume did before that wait, even with a seller
+    /// that sells no prepaid tickets.
     fn ticket_pay_in(&self, c: &Call, acc: &Value, prepaid_acc: Option<&Value>, lightning: &str, again: bool) -> Tried {
         let terms = match PayTerms::parse(acc, lightning) {
             Ok(t) => t,
@@ -3089,8 +3091,9 @@ impl Signer {
                     }
                     let o = {
                         let _g = self.lock();
-                        self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
-                                                                 "fit_sats": c.max_sats.max(0), "charge_sats": c.charge_sats.max(0)}))
+                        // the second try of a resume does not wait out an earlier session's outage: it is made once
+                        self.ticket_open_in(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
+                                                             "fit_sats": c.max_sats.max(0), "charge_sats": c.charge_sats.max(0)}), again)
                     };
                     if o["verdict"] != "allow" {
                         let rule = str_or_empty(o.get("rule"));
