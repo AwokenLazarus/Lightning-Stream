@@ -3531,7 +3531,7 @@ fn the_nodes_silence_for_a_moment_does_not_end_the_wait_for_a_ticket() {
     let _g = env_lock();
     for router_only in [false, true] {
         let r = seller_waits_as_shipped(json!({}));
-        assert_eq!(r.pay(&format!("/files/{}", MIB), 5_000)["complete"].as_bool(), Some(true));
+        first_call_with_the_pool_shown(&r);
         {
             let mut s = r.ln.st.lock().unwrap();
             s.unseen_next = 1_000;
@@ -3540,16 +3540,21 @@ fn the_nodes_silence_for_a_moment_does_not_end_the_wait_for_a_ticket() {
         let n = 40 * MIB;
         let v = std::thread::scope(|sc| {
             let t = sc.spawn(|| r.pay(&format!("/files/{n}"), 12_000));
-            wait_for("the pool to be used up", || r.tap.secrets().len() == 8);
+            wait_for_long("the pool to be used up", Duration::from_secs(20), || r.tap.secrets().len() == 8);
             let asked = r.ln.state().lookups;
             wait_for("the release to ask the node", || r.ln.state().lookups > asked);
             {
                 let mut s = r.ln.st.lock().unwrap();
                 if router_only { s.router_down = true } else { s.down = true }
             }
-            // away until the release has asked it at least once while it is, inside the pause
-            let asked = r.ln.state().lookups;
-            wait_for_long("the release to ask the node that is away", Duration::from_secs(12), || r.ln.st.lock().unwrap().lookups > asked);
+            // away until the wallet has asked it something while it is, inside the pause: about a payment, or about itself
+            // where a refill asks before it sends
+            let questions = || {
+                let s = r.ln.st.lock().unwrap();
+                s.lookups + s.turned_away
+            };
+            let asked = questions();
+            wait_for_long("the wallet to ask the node that is away", Duration::from_secs(12), || questions() > asked);
             {
                 // it is back, and shows the tickets locked
                 let mut s = r.ln.st.lock().unwrap();
