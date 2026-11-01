@@ -3148,11 +3148,7 @@ impl Signer {
             let _call = hs.calls.read().unwrap_or_else(|p| p.into_inner());
             self.ticket_request(&hs, c, &terms)
         };
-        // nothing of the call went to the seller or was paid: it was refused before its request left (a request that left
-        // may have been charged from the balance the session had, with nothing booked for this call)
-        let nothing = out.get("verdict").and_then(Value::as_str) != Some("allow") && out.get("status").is_none_or(Value::is_null)
-            && out.get("request_sent").and_then(Value::as_bool) != Some(true)
-            && py_int(out.get("charged_sats")).unwrap_or(0) == 0 && out.get("bytes").is_none_or(|b| b.is_null() || b.as_u64() == Some(0));
+        let nothing = refused_before_it_left(&out);
         // only where the cap is what ended or refused this call: one that was served all the same (on credit taken over,
         // say) goes on in its session, and the pool's next round asks again
         let by_the_cap = ["ended", "reason"].iter().any(|k| out.get(*k).and_then(Value::as_str).is_some_and(|s| s.contains("too_many_tickets")));
@@ -6371,6 +6367,14 @@ pub(crate) fn seller_busy(v: &Value) -> Option<Value> {
                                                     "busy": {"scope": scope, "inUse": in_use, "limit": limit, "retryAfter": retry}})))
 }
 
+/// Nothing of a call went to the seller or was paid: it was refused before its request left. A request that left may
+/// have been charged from the balance the session had, with nothing booked for this call: it is never sent again.
+fn refused_before_it_left(out: &Value) -> bool {
+    out.get("verdict").and_then(Value::as_str) != Some("allow") && out.get("status").is_none_or(Value::is_null)
+        && out.get("request_sent").and_then(Value::as_bool) != Some(true)
+        && py_int(out.get("charged_sats")).unwrap_or(0) == 0 && out.get("bytes").is_none_or(|b| b.is_null() || b.as_u64() == Some(0))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -6378,6 +6382,26 @@ mod tests {
         let hashes = vec![0u8; 8];
         assert_eq!(super::in_parts(&hashes, 3).map(<[u8]>::len).collect::<Vec<_>>(), vec![3, 3, 2]);
         assert_eq!(super::in_parts(&hashes, 0).len(), 8, "a cap of none still names one at a time");
+    }
+
+    /// Only a call refused before its request left is made again (a resume, in another session): one whose request left
+    /// may have been charged from the session's balance, with nothing booked for it, and is never sent twice.
+    ///
+    /// FAILS without `request_sent`: a refusal after the request left, charged nothing of its own, is taken for one
+    /// refused before.
+    #[test]
+    fn only_a_call_refused_before_its_request_left_counts_as_nothing_sent() {
+        let refused = json!({"verdict": "deny", "rule": "ticket_session_ended", "charged_sats": 0, "request_sent": false});
+        assert!(refused_before_it_left(&refused));
+        assert!(refused_before_it_left(&json!({"verdict": "deny", "rule": "ticket_session_ended"})), "said nothing of it: none left");
+        let mut left = refused.clone();
+        left["request_sent"] = json!(true);
+        assert!(!refused_before_it_left(&left), "its request left: {left}");
+        for (k, v) in [("verdict", json!("allow")), ("status", json!(200)), ("charged_sats", json!(1)), ("bytes", json!(10))] {
+            let mut o = refused.clone();
+            o[k] = v;
+            assert!(!refused_before_it_left(&o), "{o}");
+        }
     }
 
     #[test]
