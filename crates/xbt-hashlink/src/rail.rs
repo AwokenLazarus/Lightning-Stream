@@ -115,7 +115,14 @@ pub struct SignerPayer {
     /// How long a slice's payment waits for a signer whose socket is not there (a wallet that
     /// starts again): within the hashmaker's grace, so the slice is still paid in time.
     pub wait_for_signer: std::time::Duration,
+    /// How long a slice's payment waits for the signer's answer once sent ([`PAY_WAIT`]): the signer bounds the
+    /// call itself, and past this one that's stuck is taken as an answer lost.
+    pub pay_wait: std::time::Duration,
 }
+
+/// How long a slice's payment waits for the signer's answer: far past any payment the signer bounds itself, short of
+/// a rental hung for good on a signer that's stuck.
+pub const PAY_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The start of a refused payment's reason where a shop sells nothing small enough for what may leave
 /// the wallet now. The wallet's Hashrate page shows reasons that start with these as they stand.
@@ -167,18 +174,32 @@ pub fn signer_unreached(why: &str) -> bool {
     why.starts_with("signer socket ")
 }
 
+/// How long any signer call but a paying one waits for its answer.
+pub const SIGNER_WAIT: std::time::Duration = std::time::Duration::from_secs(200);
+
 /// One call on the signer's socket.
 pub fn signer_call(sock: &std::path::Path, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    signer_call_waiting(sock, method, params, Some(SIGNER_WAIT)).map_err(|(_, e)| e)
+}
+
+/// [`signer_call`], its answer waited for `answer_wait` (`None`: as long as the signer takes). The error says whether
+/// the call had been sent: an answer lost after that leaves the call's effect unknown.
+pub fn signer_call_waiting(sock: &std::path::Path, method: &str, params: &serde_json::Value, answer_wait: Option<std::time::Duration>)
+                           -> Result<serde_json::Value, (bool, String)> {
     use std::io::{BufRead, BufReader, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(sock).map_err(|e| format!("signer socket {}: {e}", sock.display()))?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(200))).map_err(|e| e.to_string())?;
+    let mut s = std::os::unix::net::UnixStream::connect(sock).map_err(|e| (false, format!("signer socket {}: {e}", sock.display())))?;
+    s.set_write_timeout(Some(SIGNER_WAIT)).map_err(|e| (false, e.to_string()))?;
     let req = serde_json::json!({"id": 1, "method": method, "params": params});
-    s.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
+    s.write_all(format!("{req}\n").as_bytes()).map_err(|e| (false, e.to_string()))?;
+    s.set_read_timeout(answer_wait).map_err(|e| (true, e.to_string()))?;
     let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).map_err(|e| format!("signer: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&line).map_err(|_| "signer: not JSON".to_string())?;
+    BufReader::new(s).read_line(&mut line).map_err(|e| (true, format!("signer: {e}")))?;
+    if line.trim().is_empty() {
+        return Err((true, "signer: closed without an answer".into()));
+    }
+    let v: serde_json::Value = serde_json::from_str(&line).map_err(|_| (true, "signer: not JSON".to_string()))?;
     match v.get("error").filter(|e| !e.is_null()) {
-        Some(e) => Err(format!("signer: {e}")),
+        Some(e) => Err((true, format!("signer error: {e}"))),
         None => Ok(v.get("result").cloned().unwrap_or_default()),
     }
 }
@@ -190,7 +211,7 @@ impl SignerPayer {
     pub fn new(sock: std::path::PathBuf, url: String, task: String, price_msat: u64, budget_sats: Option<u64>, most_sats: Option<u64>,
                wait_for_signer: std::time::Duration) -> Self {
         let mut p = Self { sock, url, task, price_msat, max_sats: 0, max_charge_sats: None, budget_sats, most_sats, charged_msat: 0, credit_msat: 0, session: None,
-                           ceiling: Some(slice_ceiling(price_msat)), wait_for_signer };
+                           ceiling: Some(slice_ceiling(price_msat)), wait_for_signer, pay_wait: PAY_WAIT };
         p.caps_for(crate::order::FIRST_STEP_MSAT);
         p
     }
@@ -225,7 +246,13 @@ impl SignerPayer {
         let mut pause = std::time::Duration::from_millis(250);
         let mut asked_again = false;
         let mut r = loop {
-            match signer_call(&self.sock, "xbt402_pay", &params) {
+            // the signer answers once the slice is paid, and bounds the call itself: its answer is waited for as long as
+            // it takes. One lost after the call was sent leaves the payment unknown: never paid again, never said unpaid
+            let called = match signer_call_waiting(&self.sock, "xbt402_pay", &params, Some(self.pay_wait)) {
+                Err((true, why)) if !why.starts_with("signer error:") => return Ok(self.lost_answer(&why)),
+                other => other.map_err(|(_, e)| e),
+            };
+            match called {
                 Err(why) if signer_unreached(&why) && start.elapsed() + pause < self.wait_for_signer => {
                     std::thread::sleep(pause);
                     pause = (pause * 2).min(std::time::Duration::from_secs(4));
@@ -269,6 +296,24 @@ impl SignerPayer {
         }
     }
 
+    /// A payment whose answer was lost after it was sent: it may have been paid, in part or in full. The wallet's
+    /// session is looked at for the credit it holds now; the slice is neither paid again nor called unpaid here (the
+    /// hashmaker knows whether it arrived, and ends the rental if it didn't).
+    fn lost_answer(&mut self, why: &str) -> serde_json::Value {
+        let status = self.session.clone().and_then(|s| signer_call(&self.sock, "ticket_status", &serde_json::json!({"session": s})).ok());
+        // the wallet's own count of what this session's seller holds: its entry in `paying`
+        let mine = status.as_ref().and_then(|v| v.get("paying")).and_then(serde_json::Value::as_array)
+            .and_then(|p| p.iter().find(|e| e.get("session").and_then(serde_json::Value::as_str) == self.session.as_deref()));
+        if let Some(b) = mine.and_then(|e| e.get("balance_msat")).and_then(serde_json::Value::as_str).and_then(|s| s.parse::<u64>().ok()) {
+            self.credit_msat = b;
+        }
+        // it may have been charged: counted as if it was, so what the budget has left is never overstated
+        self.charged_msat = self.charged_msat.saturating_add(self.price_msat);
+        serde_json::json!({"verdict": "unknown", "rule": "signer_no_answer", "request_sent": true, "charged_sats": 0,
+                           "reason": format!("the wallet's signer took the payment and its answer was lost ({why}): it may have paid"),
+                           "ticket_status": status})
+    }
+
     /// End the wallet's session with the hashmaker's gateway: its unused tickets are cancelled.
     pub fn stop(&mut self) -> Option<serde_json::Value> {
         let s = self.session.take()?;
@@ -284,6 +329,9 @@ pub trait Payer: Send {
     fn pay(&mut self, rental: &str, slice: u64, receipt: &serde_json::Value) -> Result<serde_json::Value, String>;
     /// End the wallet's session with the seller.
     fn stop(&mut self) -> Option<serde_json::Value>;
+    /// The credit the seller holds for this rental and what is left of its budget, both in msat, as the wallet last
+    /// said. The renter sizes each ticket, and pays ahead, by it: a payer that kept no credit says 0.
+    fn held(&self) -> (u64, Option<u64>);
 }
 
 impl Payer for SignerPayer {
@@ -297,6 +345,10 @@ impl Payer for SignerPayer {
 
     fn stop(&mut self) -> Option<serde_json::Value> {
         SignerPayer::stop(self)
+    }
+
+    fn held(&self) -> (u64, Option<u64>) {
+        (self.credit_msat, self.left_msat())
     }
 }
 
@@ -379,6 +431,102 @@ mod signer_wait_tests {
             }
         });
         (a, seen)
+    }
+
+    /// A fake signer that answers each call as `answer` says for its method, in order: `Some(v)` after `delay`, `None`
+    /// read and closed without an answer. The methods it was asked for are kept.
+    fn scripted(sock: &std::path::Path, delay: Duration, mut answers: Vec<(&'static str, Option<serde_json::Value>)>)
+                -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let l = UnixListener::bind(sock).unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let s2 = seen.clone();
+        answers.reverse();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(c) = c else { continue };
+                let mut line = String::new();
+                BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                s2.lock().unwrap().push(method.clone());
+                let Some((want, answer)) = answers.pop() else { continue };
+                assert_eq!(want, method);
+                std::thread::sleep(delay);
+                if let Some(a) = answer {
+                    let mut w = c;
+                    let _ = writeln!(w, "{}", serde_json::json!({"id": 1, "result": a}));
+                }
+            }
+        });
+        seen
+    }
+
+    /// A slice's payment waits for the signer as long as it works: past the time any other call waits.
+    #[test]
+    fn a_slice_payment_waits_for_a_slow_signer() {
+        let dir = scratch("slow");
+        let sock = dir.join("signer.sock");
+        let paid = serde_json::json!({"verdict": "allow", "status": 200, "price_msat": "404250", "balance_msat": "141750", "session": "s1"});
+        let seen = scripted(&sock, Duration::from_millis(1500), vec![("xbt402_pay", Some(paid.clone())), ("xbt402_pay", Some(paid))]);
+        // a call that waits a second for its answer gives up on this signer
+        let e = signer_call_waiting(&sock, "xbt402_pay", &serde_json::json!({}), Some(Duration::from_secs(1))).unwrap_err();
+        assert!(e.0, "it was sent: {e:?}");
+        // the payment waits for it
+        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 404_250, None, None, Duration::from_secs(2));
+        let v = p.pay("r1", 1, &serde_json::json!({})).unwrap();
+        assert_eq!(v["verdict"], "allow", "{v}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// A signer that takes the payment and never answers doesn't hang the rental: past the payment's wait it's taken
+    /// as an answer lost, and the session is looked at as for one.
+    #[test]
+    fn a_payment_to_a_stuck_signer_ends_as_unknown_after_its_wait() {
+        let dir = scratch("stuck");
+        let sock = dir.join("signer.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            for c in l.incoming() {
+                let Ok(c) = c else { continue };
+                let mut line = String::new();
+                BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+                // the payment is held open, unanswered; anything else is answered
+                if line.contains("xbt402_pay") {
+                    kept.push(c);
+                } else {
+                    let mut w = c;
+                    let _ = writeln!(w, "{}", serde_json::json!({"id": 1, "result": {"paying": []}}));
+                }
+            }
+        });
+        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 404_250, None, None, Duration::from_secs(2));
+        p.pay_wait = Duration::from_secs(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(p.pay("r1", 1, &serde_json::json!({})));
+        });
+        let v = rx.recv_timeout(Duration::from_secs(10)).expect("the payment gave up on the stuck signer").unwrap();
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("unknown"), Some("signer_no_answer")), "{v}");
+    }
+
+    /// A payment whose answer is lost after it was sent may have paid: it is said to be unknown, the wallet's session
+    /// is looked at for its credit, and it is never paid a second time here.
+    #[test]
+    fn a_payment_whose_answer_is_lost_is_unknown_and_never_paid_again() {
+        let dir = scratch("lost");
+        let sock = dir.join("signer.sock");
+        let paid = serde_json::json!({"verdict": "allow", "status": 200, "price_msat": "404250", "balance_msat": "141750", "session": "s1"});
+        // ticket_status as the signer answers it: each HTTP session's count under `paying`
+        let status = serde_json::json!({"paying": [{"session": "other", "balance_msat": "999000"}, {"session": "s1", "balance_msat": "123000", "spent_msat": "808500"}]});
+        let seen = scripted(&sock, Duration::ZERO, vec![("xbt402_pay", Some(paid)), ("xbt402_pay", None), ("ticket_status", Some(status))]);
+        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 404_250, Some(2_000), None, Duration::from_secs(2));
+        assert_eq!(p.pay("r1", 1, &serde_json::json!({})).unwrap()["verdict"], "allow");
+        let v = p.pay("r1", 2, &serde_json::json!({})).unwrap();
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["request_sent"].as_bool()), (Some("unknown"), Some("signer_no_answer"), Some(true)), "{v}");
+        assert_eq!(*seen.lock().unwrap(), vec!["xbt402_pay", "xbt402_pay", "ticket_status"], "looked at, not paid again");
+        // the credit this session's seller holds now, and the slice counted as charged: the budget left is never overstated
+        assert_eq!(Payer::held(&p), (123_000, Some(2_000_000 - 2 * 404_250 - 123_000)));
     }
 
     /// The offer's price per slice goes with each payment as the wallet's `price_ceiling`, so a

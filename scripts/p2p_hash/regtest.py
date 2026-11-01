@@ -709,6 +709,21 @@ def with_hrp(addr: str, hrp: str) -> str:
 
 
 def real_gateway(mode: str) -> None:
+    try:
+        real_gateway_run(mode)
+    finally:
+        # its reports and logs, beside the report (the lab copies only run/*.log and run/*.json back)
+        for src in sorted(glob.glob(f"{RUN}/{mode}-*")):
+            base = os.path.basename(src)
+            if base.endswith((".log", ".json")):
+                try:
+                    with open(src, "rb") as f, open(f"{OUT}/p2p_hash_{base}", "wb") as g:
+                        g.write(f.read())
+                except OSError:
+                    pass
+
+
+def real_gateway_run(mode: str) -> None:
     """A rental paid with real money through the wallet, of real work for a real gateway on a chain of its own."""
     keys = mode == "solo" or os.environ.get("P2P_HASH_PRIMED_KEYS") == "1"
     primed = os.environ.get("P2P_HASH_PRIMED", f"{HG}/primed-main")
@@ -871,10 +886,13 @@ def real_gateway(mode: str) -> None:
         REPORT[f"{mode}_share_to_block"] = matched
         check(f"{mode}: each block's share is one the hashmaker proved, matched by raw hash, nonce, ntime and extranonce", blocks and all(x["proven share"] and x["nonce matches"] and x["ntime matches"] and x["en2 in extranonce"] for x in matched), matched)
         same = (hz["meter"]["work"], hz["meter"]["proven"]) == (bz["meter"]["work"], bz["meter"]["proven"])
-        check(f"{mode}: both sides proved the same real shares, the gateway accepted them, none refused, none past what's paid",
-              same and hz["meter"]["proven"] >= 1 and bz["meter"]["accepted"] >= 1 and bz["meter"]["rejected"] == 0 and hz["meter"]["refused"] == 0 and bz["meter"]["refused"] == 0
+        # a share on its way when a found block moved the gateway to a new job is turned down as stale, by the gateway
+        # and in both counts alike: no more of those than blocks found, and no rejection of any other kind
+        stale_only = bz["meter"]["rejected"] == bz["meter"]["stale"] <= len(blocks) and hz["meter"]["rejected"] == bz["meter"]["rejected"]
+        check(f"{mode}: both sides proved the same real shares, the gateway accepted them (but shares a found block made stale), none refused, none past what's paid",
+              same and hz["meter"]["proven"] >= 1 and bz["meter"]["accepted"] >= 1 and stale_only and hz["meter"]["refused"] == 0 and bz["meter"]["refused"] == 0
               and int(hz["meter"]["work"]) <= hz["paid"] * slice_work,
-              {"hashmaker": hz["meter"], "hashtaker": bz["meter"], "paid": hz["paid"]})
+              {"hashmaker": hz["meter"], "hashtaker": bz["meter"], "paid": hz["paid"], "blocks found": len(blocks)})
         oks = [p for p in bz["pays"] if p.get("ok")]
         priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
         check(f"{mode}: the wallet's real payments = what the hashmaker earned", priced == hz["earnedMsat"] == hz["paid"] * PRICE_MSAT and hz["paid"] == len(oks) and not bz["payFailed"],

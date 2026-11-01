@@ -223,6 +223,13 @@ is in `crates/xbt-hashlink/src/order.rs`.
 - No share is forwarded past what's paid. One that doesn't fit waits, the hashmaker says `due`, and if no payment
   comes within 2 s the rental stops and the miners go home (`unpaid`). Measured on the real-money regtest: stopped
   with 0 work past what was paid.
+- A renter whose payment is on its way says `paying`: the hashmaker waits up to 10 s, its miners on its own pool,
+  and ends the rental if the payment hasn't come (`unpaid`). It allows 6 such waits an hour. While the renter's step
+  ramps up, in the miners' first 30 s of work for the rental, a slow wallet's buys can outlast what it may pay ahead,
+  so those waits are counted apart, up to 12 (`too many waits for payment` past either limit). Measured: a wallet
+  whose ticket buys take 8 s keeps a 200 sat/s miner running
+  (`an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running`); a renter that never pays after `paying` in
+  the ramp ends at the 10 s rule.
 - A share nobody hashed, a repeat, or one too old goes no further; the miner gets a rejection from the hashmaker.
 - A renter that keeps the miners idle (no jobs, or jobs too fast to finish) uses up the paid time: four times what
   the paid slices should take at the miners' best measured speed (`paid time used up`).
@@ -231,10 +238,29 @@ is in `crates/xbt-hashlink/src/order.rs`.
 - Walking away after the first step, with a new key each time, buys no work that wasn't paid for: each rental
   pays its start fee and first step, gets that much work, and stops.
 
-**The hashtaker.** It never has more paid for and not yet received than a minute of the miner's hashing or 546
-sat, whichever is more, plus any start fee shown on the offer.
-- Steps are earned: what's paid and unused never passes the largest of 546 sat, one share, or what has been
-  delivered, up to 30 s of the miner's output. Steps ignore reputation, so fake history pays nothing.
+**The hashtaker.** It never has more paid for and not yet received than a minute of the miner's hashing, or one
+share, one slice and one ticket (546 sat at least), whichever is more, plus any start fee shown on the offer.
+- What's paid and not yet received is the slices paid ahead of the work and the credit left with the seller. The
+  step is the largest of 546 sat, one share, or what has been delivered, up to 30 s of the miner's output. Steps
+  ignore reputation, so fake history pays nothing.
+- Each ticket is sized to keep both within the step and the start fee still to pay. A slice that must buy a ticket
+  is paid ahead of need while that ticket keeps both within the bound (the step, or one share, one slice and the
+  smallest ticket, 546 sat or a slice, whichever is more), so the next ticket is bought while what's paid still
+  runs. A slice the next share needs is paid whatever the step.
+- The renter says `paying` only when its measured ticket buys would not arrive within the hashmaker's 2 s clock.
+  A hashmaker with no fallback pool keeps its miners on the rental through the wait, connected, with what they
+  find meanwhile going no further (it would reach the renter as late as shares held back), and they go on when the
+  payment lands (`a_slow_honest_renter_keeps_its_miners_on_a_hashmaker_with_no_fallback`).
+- A slice's payment waits for the wallet's answer as long as the wallet works on it. An answer lost after the
+  payment was sent is unknown: the slice is never paid a second time, and the wallet's session is looked at for the
+  credit it holds.
+  `order::Standing::most_unworked_msat` is that bound; `what_is_gone_and_unworked_stays_within_the_stated_bound`
+  checks it at every ticket over prices from 20 to 3,000 sat a slice, shares up to 4 slices, four miner rates and
+  start fees of 0 to 3 slices.
+- A rental's last ticket can pass its budget by less than a slice, which stays with the seller as credit: a ticket
+  is never smaller than a slice, since the wallet refuses a charge cap under the price (a known limit of 0.2.0).
+- Nothing is paid, not the start fee or the first ticket, before the gateway's own first job is shown masked
+  (`a_renter_on_an_unmasked_gateway_pays_nothing`).
 - A hashmaker that takes a payment and vanishes keeps that step, and the app won't pay a seller a third time after
   two first steps that delivered little.
 - Shares that don't prove are not paid for, and many of them end the rental (`shares that don't prove`).
@@ -244,14 +270,32 @@ sat, whichever is more, plus any start fee shown on the offer.
   it is. No list of pools: a pool that adds a key passes by itself. Solo on a gateway that blinds, and a pool whose
   gateway holds the key, qualify. So would a pool-held key (ABW) through such a gateway, though no such pool has been
   run. A miner pointed straight at a pool, with no gateway of the renter's, can't be checked, so it's refused.
+- **Difficulty.** A job's `clear_bits` are right only for shares of the difficulty it was checked at. A hashmaker
+  can't ask the renter's gateway for another: `mining.suggest_difficulty`, `mining.suggest_target` and any other
+  line that isn't a miner's session go no further than the renter, which answers them itself, and
+  `mining.configure` goes on without `minimum-difficulty` (`a_hashmaker_cannot_ask_the_renters_gateway_for_another_difficulty`).
+  When the gateway sends a difficulty whose share bits aren't those the channel's last job was checked at, the
+  channel's shares are refused until a job checked masked at the new one comes, as a gateway sends with it
+  (`a_new_difficulty_holds_shares_till_a_job_is_checked_at_it`).
+- **Ids and times.** Every line a hashmaker's miner sends on carries the renter's own id to the gateway, and its
+  answer goes back with the miner's: a verdict is always read. A share with no id, or one whose id is still waiting
+  for its verdict, is refused (`shares_with_no_id_of_their_own_are_refused_and_never_reach_the_gateway`). A share
+  whose time rolls back from its job's, or more than two hours forward (the gateway's own limit past its template
+  time), is refused.
 - **Delay.** Blinding doesn't stop a hashmaker holding shares until a winner goes stale, or sitting on the job
   before a new block. The app ends a rental at the second share late on a superseded job, when a window of shares
   all arrive older than a quarter of a job's life, on 8 rejections in a row or under 75% accepted over 64, and
   when shares look harder than the difficulty said.
 
-**A dropped link.** At `resume` the hashmaker sends its recent shares again; the hashtaker checks each and counts
-it once, so the two counts come back level. Measured on the real-money regtest: 10 shares counted from the
-resend, both proven counts equal, every slice paid once.
+**A dropped link.** At `resume` the hashmaker sends its recent shares again. The hashtaker passes over the ones it
+counted already. A new one goes on to its gateway session of before the drop, kept open 10 s after the hashmaker is
+back, for its verdict, and it's aged as of the drop by the same check of shares held back. As many as could have been
+on their way count at once: the miners' rate over the half minute before the link went quiet, over that silence and
+2 s, and 4 more. The rest count only once the gateway takes them, since that verdict is the proof they reached it.
+So shares held back can't be turned into paid work that never reaches the renter's gateway by dropping the link
+(`held_back_shares_sent_again_after_a_drop_count_only_as_they_reach_the_gateway`, the review's probe, where before
+all 40 were counted and none reached the gateway). A link that drops more than 8 times in an hour ends the rental
+(`a_link_that_keeps_dropping_ends_the_rental`).
 
 **Follow-up, not built: refuse a key a block has revealed.** A found block publishes its key, so a hashmaker can
 work out that key's mask, and spot wins on any later job that commits to the same key. A gateway's own key changes
@@ -350,14 +394,16 @@ nothing it wasn't paid for, and the hashtaker at most its unused step.
   hashmaker's gateway through the wallet's signer, paid ahead of its work (`--signer`, a "hashrate" task budget);
   `scripts/p2p_hash_regtest.sh` runs it with Lightning Fork nodes. The stand-in rails remain for
   the lab.
-- **The meters at the end of a rental**: fixed (above). A rental cut mid-slice still leaves the
-  part of a slice done since the last payment unpaid: the hashmaker's exposure, by design, is under
-  one slice.
+- **The meters at the end of a rental**: fixed (above). The hashmaker forwards no share past what's
+  paid, so a rental cut mid-slice leaves no work of the hashmaker's unpaid; what the renter has paid
+  ahead and not received is its step (above).
 - **Which key signs the link**: today a key of the app's own. Open: the Lightning node key (a
   signing path to the node) or the app key bound to the node key by a signature in the listing.
 - **Listings** on public relays and directories (the signed `hashrate/0` listing on Nostr is
   built and used by `--find` and the hashtaker's service), reconnect with resume, the Tor transport.
 - **Miners behind one address with one worker name** count as one miner per live connection
   (`name #2`, …); give each miner its own worker name.
-- **Stale and reject thresholds**: rejected shares cost the hashmaker (no work counted); a rental with
-  none accepted ends (above), and a rule to end one on a high reject rate is not yet there.
+- **Stale and reject thresholds**: the renter's gateway's verdicts set nothing either side owes. The
+  renter ends a rental when its gateway turns down 8 shares in a row or accepts fewer than 48 of 64
+  (`the gateway accepted too few shares`). Every share carries the renter's own id, so each verdict
+  is read.

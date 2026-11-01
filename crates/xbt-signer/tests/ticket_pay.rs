@@ -10910,7 +10910,9 @@ impl Renter {
     }
 
     fn pay(&mut self) -> Result<Value, String> {
-        self.payer.caps_for(self.standing.ticket_msat());
+        // as the hashtaker sizes it: inside the step, with the credit the seller holds and the slice being paid
+        let credit = xbt_hashlink::rail::Payer::held(&self.payer).0;
+        self.payer.caps_for(self.standing.ticket_msat_with(credit));
         let n = self.standing.paid;
         self.payer.pay("r1", n, &json!({"slice": n}))
     }
@@ -11066,7 +11068,7 @@ fn a_big_miners_step_above_the_starter_cap_is_paid_in_tickets_of_the_cap() {
     t.standing.msat_a_second = slices_a_second * MARKET_MSAT as f64;
     t.standing.proven = 200 * SLICE_WORK;
     t.standing.paid = 200;
-    let step = t.standing.ticket_msat();
+    let step = t.standing.ticket_msat_with(0);
     assert!(step > 30_000_000, "the step a 100 TH/s miner has earned: {step} msat");
     for n in 201..=203 {
         t.standing.paid = n;

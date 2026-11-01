@@ -1215,7 +1215,7 @@ impl Signer {
             }
             // `hash`: release this ticket and no other (the wallet's own payer names the one the seller has shown locked)
             let named = str_or_empty(p.get("hash"));
-            let next = st.book.usable(&sid, tip).filter(|t| named.is_empty() || t.hash == named).cloned();
+            let next = if named.is_empty() { st.book.usable(&sid, tip) } else { st.book.usable_named(&sid, tip, &named) }.cloned();
             let Some(mut t) = next else {
                 return Ok(with(refusal("ticket_none", "no locked ticket of this session can be released now: lock more (ticket_offer), and ask the \
                                                        seller to cancel the stale ones"),

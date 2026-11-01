@@ -776,7 +776,7 @@ fn verdicts_arriving_after_the_drop_leave_both_sides_counting_the_same() {
 /// What the hashmaker sends is lost for a moment, so shares it counted never reach the hashtaker, and then
 /// the link drops. It sends them again on the new link, and the hashtaker checks them and counts each
 /// once: the two proven counts come back together, to the share (the miner stops before the rental does,
-/// so none is on its way at the end). None of those goes to the gateway, whose session ended with the old link.
+/// so none is on its way at the end). Each goes on to the gateway on its session of before the drop.
 #[test]
 fn shares_lost_with_the_link_are_sent_again_and_counted_once() {
     let _s = serial();
@@ -802,10 +802,11 @@ fn shares_lost_with_the_link_are_sent_again_and_counted_once() {
     // the same shares aren't counted twice, nor said against: a resend that was counted already is no repeat
     assert_eq!(b["meter"]["repeats"], 0, "{b}");
     assert_eq!(b["meter"]["refused"], 0, "{b}");
-    // the gateway never saw the shares sent again
+    // the shares sent again went on to the gateway, on their session of before the drop, for their verdicts: it took
+    // every share both sides counted
     let pool = d.pool.report();
     let proven = b["meter"]["proven"].as_u64().unwrap();
-    assert_eq!(pool["accepted"].as_u64().unwrap(), proven - resent, "pool {pool}\nhashtaker {b}");
+    assert_eq!(pool["accepted"].as_u64().unwrap(), proven, "pool {pool}\nhashtaker {b}");
     d.rig.hashmaker.shutdown();
 }
 

@@ -1213,8 +1213,9 @@ untrusted field.
 
 How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is protected".
 
-- A hashtaker can have paid for and not yet received up to a minute of the miner's hashing or 546 sat, whichever
-  is more, plus the start fee shown on the offer. That is what it loses to a hashmaker that takes a payment and
+- A hashtaker can have paid for and not yet received up to a minute of the miner's hashing, or one share, one
+  slice and one ticket (546 sat at least), whichever is more, plus the start fee shown on the offer: the slices
+  paid ahead and the credit left with the seller together. That is what it loses to a hashmaker that takes a payment and
   vanishes. Its app stops paying a seller after two first steps that delivered little.
 - A hashmaker forwards no share past what's paid. A renter that stops paying gets nothing more, and the miners go
   home 2 s after the first share that doesn't fit. A renter that walks away still cost the miners their move:
@@ -1227,6 +1228,14 @@ How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is
 - These figures assume firmware that hashes what Stratum gives it and honours `mining.set_difficulty`. No real
   firmware has been run against the check yet.
 - Writes to a miner and to the hashtaker's gateway have no time limit (from reading the code, not measured).
+- A rental's last ticket can pass its budget by less than a slice, which stays with the seller as credit for about
+  20 hours: a ticket is never smaller than a slice, since the wallet refuses a charge cap under the price.
+- A new price waits until the hashmaker's running rentals end: its gateway restarts to take a new route price, and a
+  restart would fail a running rental's payment. While any rental runs, no new rental starts at the new price.
+- A renter that keeps reading its link, slowly, can hold up the hashmaker's sends to it for up to 5 s each: the
+  write limit ends only a write that makes no progress (from reading the code, not measured).
+- Each side keeps the hashes of the shares a rental counted to refuse repeats, up to about 4 million, about 100 MB
+  at the most for a long rental at a high share rate (from the code's limits, not measured).
 
 ### Signature hash and replay
 

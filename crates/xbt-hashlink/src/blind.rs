@@ -23,7 +23,7 @@ const NOT_READY_WAIT: Duration = Duration::from_millis(200);
 const KEYS_KEPT: usize = 4096;
 const PROBE_WAIT: Duration = Duration::from_secs(10);
 
-fn tagged(tag: &str, msg: &[u8]) -> [u8; 32] {
+pub(crate) fn tagged(tag: &str, msg: &[u8]) -> [u8; 32] {
     let t: [u8; 32] = Sha256::digest(tag.as_bytes()).into();
     let mut h = Sha256::new();
     h.update(t);
@@ -60,7 +60,7 @@ fn num(v: &Value, what: &str) -> Result<u64, String> {
 }
 
 /// `h2` from the fields a gateway says it committed to, as the node computes it.
-fn h2_of(a: &Value, prev: &[u8; 32], clear_bits: u8) -> Result<[u8; 32], String> {
+pub(crate) fn h2_of(a: &Value, prev: &[u8; 32], clear_bits: u8) -> Result<[u8; 32], String> {
     let mut p = Vec::with_capacity(119);
     p.extend_from_slice(&(num(a, "version")? as u32).to_le_bytes());
     p.extend_from_slice(prev);
