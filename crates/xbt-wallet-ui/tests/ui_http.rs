@@ -3841,14 +3841,26 @@ fn the_relay_passes_if_range_and_the_copys_validators() {
 #[cfg(unix)]
 #[test]
 fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_on() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
     use xbt_wallet_ui::app::hashrate::Repriced;
     static RENTALS: AtomicUsize = AtomicUsize::new(0);
     static PAUSED: AtomicBool = AtomicBool::new(false);
+    // the hasher's terms: what its settings file says, as it reads it, or (`LAGS`) the price it hasn't moved from yet
+    static SETTINGS_AT: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+    static LAGS: AtomicBool = AtomicBool::new(false);
+    static STALE_MSAT: AtomicU64 = AtomicU64::new(0);
+    fn hasher_terms() -> Value {
+        if LAGS.load(SeqCst) {
+            return json!({"priceMsat": STALE_MSAT.load(SeqCst)});
+        }
+        let at = SETTINGS_AT.lock().unwrap().clone();
+        let s: Value = at.and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+        json!({"priceMsat": s["priceSat"].as_u64().unwrap_or(0) * 1000})
+    }
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
         ("GET", "/status") => json!({
-            "open": true, "settings": {}, "minersAddress": "umbrel.local:23340", "linkLan": "umbrel.local:23341",
+            "open": true, "settings": {}, "minersAddress": "umbrel.local:23340", "linkLan": "umbrel.local:23341", "terms": hasher_terms(),
             "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}],
             "rentals": (0..RENTALS.load(SeqCst)).map(|i| json!({"rental": format!("r{i}"), "buyer": "02aa", "miners": ["s11"], "paid": 1, "earnedMsat": 404000}))
                 .collect::<Vec<_>>(),
@@ -3860,6 +3872,7 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     let htok = dir.join("hasher-token");
     std::fs::write(&htok, "h".repeat(64)).unwrap();
     let settings = dir.join("hashrate-settings.json");
+    *SETTINGS_AT.lock().unwrap() = Some(settings.clone());
     let bx = start(json!({}), false, |c| {
         c.sell = true;
         c.gw.dir = dir.clone();
@@ -3903,8 +3916,17 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     assert_eq!(route(), Some(json!(404_000)));
     assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
 
-    // the difficulty rises while a rental goes on: the new price waits, no new rental starts, the route keeps its price
+    // the difficulty rises: within ten minutes of the last new price, the price in force stays (each restarts the shop)
     bx.rig.chain.st.lock().unwrap().difficulty = Some(7.0e9);
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+    assert_eq!((terms(&read()).0, read().get("pending"), route()), (Some(404), None, Some(json!(404_000))));
+    let aged = |s: &std::path::Path| {
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(s).unwrap()).unwrap();
+        v["appliedMs"] = json!(v["appliedMs"].as_u64().unwrap() - 600_000);
+        std::fs::write(s, v.to_string()).unwrap();
+    };
+    aged(&settings);
+    // past that, while a rental goes on: the new price waits, no new rental starts, the route keeps its price
     RENTALS.store(1, SeqCst);
     assert_eq!(bx._app.hash_reprice(false), Repriced::Held(1));
     let s = read();
@@ -3920,7 +3942,7 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     let s = read();
     assert_eq!(terms(&s).0, Some(366));
     assert!(s.get("pending").is_none(), "{s}");
-    assert_eq!(s["holdNew"], false, "no shop health address to wait on here: {s}");
+    assert_eq!(s["holdNew"], false, "nothing held with no rental going on: {s}");
     assert_eq!(route(), Some(json!(366_000)));
     PAUSED.store(false, SeqCst);
     assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
@@ -3968,6 +3990,24 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     // at or above it: no warning
     br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price_mode", "fixed"), ("price", "400"), ("enabled", "1")]);
     assert!(!br.get("/sell-hashrate").body.contains("Below mining value"));
+    assert_eq!(route(), Some(json!(400_000)));
+
+    // a renter's hello racing a new price: the hasher hasn't read the new terms yet when the price is saved, and takes a
+    // renter at the old ones. The shop keeps charging the old price till the hasher shows the new terms with no rental
+    // going on, so that renter pays the price it was taken at, and no renter is taken at the new terms meanwhile
+    // (the hasher takes none till its shop charges its terms)
+    STALE_MSAT.store(400_000, SeqCst);
+    LAGS.store(true, SeqCst);
+    br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price_mode", "fixed"), ("price", "300"), ("enabled", "1")]);
+    let s = read();
+    assert_eq!((terms(&s).0, s["routePriceSat"].as_u64(), route()), (Some(300), Some(400), Some(json!(400_000))), "{s}");
+    RENTALS.store(1, SeqCst);
+    LAGS.store(false, SeqCst);
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+    assert_eq!(route(), Some(json!(400_000)), "the renter taken at the old terms is still paying them");
+    RENTALS.store(0, SeqCst);
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+    assert_eq!((read()["routePriceSat"].as_u64(), route()), (Some(300), Some(json!(300_000))), "its rental ended: the shop charges the new price");
 }
 
 /// A renter whose DATUM Gateway doesn't mask its jobs (a stock gateway: nothing to open them, so they can't be checked) is

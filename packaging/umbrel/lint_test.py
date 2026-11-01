@@ -83,6 +83,12 @@ class NodeDataRule(unittest.TestCase):
                 self.fresh()
                 self.refused(lambda s: s[name].setdefault("volumes", []).append(dict(NODE_DIR)), f"{name} mounts the node's data folder", "a long-form mount is only the Lightning node's tls.cert")
 
+    def test_a_ui_selling_pieces_of_work_has_the_hashmaker_to_ask(self):
+        ui = [n for n, sv in yaml.safe_load(self.compose.read_text())["services"].items() if "XBT_UI_HASHER_SLICES" in (sv.get("environment") or {})]
+        self.assertEqual(len(ui), 1, ui)
+        self.refused(lambda s: s[ui[0]]["environment"].pop("XBT_UI_HASHER"), "the UI sells pieces of work with no hashmaker to ask",
+                     "XBT_UI_HASHER_SLICES without an http:// XBT_UI_HASHER")
+
     def test_the_exception_is_by_name(self):
         self.refused(lambda s: s.__setitem__("node-keys-bake2", s.pop(BAKE)), "the baker is renamed", "a long-form mount is only the Lightning node's tls.cert")
 
