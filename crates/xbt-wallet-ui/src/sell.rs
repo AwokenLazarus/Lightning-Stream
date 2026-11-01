@@ -627,6 +627,9 @@ pub struct Status {
 
 /// The ticket a new shop sells: 900 sat, so that with its fee limit it stays under 1,000 sat.
 const DEFAULT_TICKET_MSAT: u64 = 900_000;
+/// The largest prepaid ticket the hashrate route sells: 100,000 sat, well above 30 s of a 100 TH/s miner
+/// at market (about 34,000 sat). A renter's own step and rules decide what it asks for.
+const HASHRATE_TOP_TICKET_MSAT: u64 = 100_000_000;
 
 impl App {
     fn shop_path(&self) -> PathBuf {
@@ -818,6 +821,13 @@ impl App {
             let size = tickets.get("ticket_msat").and_then(Value::as_u64).unwrap_or(1_000_000);
             tickets["min_ticket_msat"] = json!(546_000u64.min(size));
         }
+        // renting out miners: a renter's first step is a ticket of 546 sat, so the shop sells one. Lowered from what
+        // is there, since this file is also where an earlier version wrote its own
+        if self.hash_route().is_some() && tickets.get("settle").and_then(Value::as_array).is_none_or(|a| a.iter().any(|w| w == "on-arrival")) {
+            let size = tickets.get("ticket_msat").and_then(Value::as_u64).unwrap_or(1_000_000);
+            let was = tickets.get("min_ticket_msat").and_then(Value::as_u64).unwrap_or(size);
+            tickets["min_ticket_msat"] = json!(was.min(546_000).min(size));
+        }
         c.insert("tickets".into(), tickets);
         if proxies.is_empty() && public_url.starts_with("https://") {
             // as for the sessions above: the proxy's connections are every buyer's, so the gateway's cap on
@@ -934,8 +944,13 @@ impl App {
             }
         }
         // pieces of work from this box's miners, when renting them out is on
-        if let Some(r) = self.hash_route() {
+        if let Some(mut r) = self.hash_route() {
             routes.retain(|x| x.get("path") != r.get("path"));
+            // a big miner's 30 s of output, paid by prepaid tickets; the held budget stays on the shop's own size
+            let t = c.get("tickets").cloned().unwrap_or(json!({}));
+            if t.get("settle").and_then(Value::as_array).is_none_or(|a| a.iter().any(|w| w == "on-arrival")) {
+                r["top_ticket_msat"] = json!(HASHRATE_TOP_TICKET_MSAT.max(t["ticket_msat"].as_u64().unwrap_or(0)));
+            }
             // listed beside the other services; its price is the route's
             let name = self.hash_settings()["name"].as_str().map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Hashrate").to_string();
             sections.push(json!({"name": name, "kind": "hashrate", "path": r["path"], "items": []}));

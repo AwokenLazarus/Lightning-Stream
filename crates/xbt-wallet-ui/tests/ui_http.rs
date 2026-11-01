@@ -165,6 +165,20 @@ fn sig(m: &[u8]) -> String {
 
 // --- auth, sessions, CSRF, headers -------------------------------------------------------------------
 
+/// The rules the signer's market test runs on (`crates/xbt-signer/tests/ticket_pay.rs`, `mainnet_starter`).
+#[test]
+fn the_starter_rules_on_mainnet_are_those_the_signer_is_tested_at_market_with() {
+    let p = xbt_wallet_ui::app::starter_policy("main");
+    assert_eq!(p["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}));
+    for (k, v) in [("max_per_tx_sats", 2_000), ("daily_budget_sats", 10_000), ("weekly_budget_sats", 30_000), ("per_counterparty_cap_sats", 10_000),
+                   ("per_counterparty_daily_sats", 5_000), ("velocity_max", 60), ("velocity_window_s", 3600), ("human_threshold_sats", 1_000), ("split_window_s", 600)] {
+        assert_eq!(p[k], json!(v), "{k}");
+    }
+    assert_eq!(p["tickets"]["tasks"]["default"]["budget_sats"], 10_000);
+    // off mainnet the task is as it was
+    assert_eq!(xbt_wallet_ui::app::starter_policy("regtest")["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 100_000}));
+}
+
 #[test]
 fn first_run_needs_the_setup_code_then_the_password_and_logins_are_throttled() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -861,8 +875,10 @@ fn the_starter_policy_turns_the_rail_and_tickets_on_and_is_low_on_mainnet() {
     assert_eq!(m["ln"]["split_height"], json!(xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT));
     assert!(m["max_per_tx_sats"].as_i64().unwrap() <= 2000 && m["daily_budget_sats"].as_i64().unwrap() <= 10000);
     assert!(m["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() <= 10000);
-    // renting miners pays under its own task: there from the start, low on mainnet, and only to listed sellers
-    assert!(m["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() <= 5000 && t["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() > 0);
+    // renting miners pays under its own task: there from the start, and only to listed sellers. On mainnet it's a rental
+    // task (Mike's decision for 0.2.0): a budget of 200,000 sat, tickets of at most 10,000 sat, 600 sends an hour
+    assert_eq!(m["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}));
+    assert!(t["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() > 0);
     assert!(m["tickets"]["tasks"]["hashrate"].get("admit").is_none());
     // the signer takes both
     for p in [t, m] {
@@ -1988,6 +2004,13 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let h = l.services.iter().find(|s| s.kind == "hashrate").expect("a hashrate service");
     assert_eq!((h.name.as_str(), h.path.as_str(), h.prices["request_msat"].as_str()), ("Basement miners", "/hashrate/", Some("40000")));
     assert_eq!(l.services.len(), 3, "the media server, its web app, and the hashrate");
+    // the shop sells a ticket of the first step, and the route larger prepaid ones; the shop's own size, which the
+    // held budget is figured on, stays
+    let conf = || -> Value { serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap() };
+    let tickets = || conf()["tickets"].clone();
+    assert_eq!((tickets()["min_ticket_msat"].clone(), tickets()["ticket_msat"].clone()), (json!(546_000), json!(900_000)), "{}", tickets());
+    let top = |c: &Value| c["routes"].as_array().unwrap().iter().find(|r| r["path"] == "/hashrate/").unwrap()["top_ticket_msat"].clone();
+    assert_eq!(top(&conf()), json!(100_000_000), "{}", conf());
     let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40")]);
     assert!(br.flash_after(&r).contains("Renting is off"));
     assert!(listing().services.iter().all(|s| s.kind != "hashrate"));
@@ -1996,8 +2019,14 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     st["enabled"] = json!(true);
     std::fs::write(dir.join("hashrate-settings.json"), st.to_string()).unwrap();
     assert!(listing().services.iter().all(|s| s.kind != "hashrate"));
+    // and the ticket follows it, from what a hand wrote above the first step: an update needs no Save to be rentable
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    c["tickets"]["min_ticket_msat"] = json!(800_000);
+    std::fs::write(dir.join("config.json"), c.to_string()).unwrap();
     assert_eq!(bx._app.refresh_shop_config(), Some("written"));
     assert!(listing().services.iter().any(|s| s.kind == "hashrate"));
+    assert_eq!(tickets()["min_ticket_msat"], json!(546_000), "{}", tickets());
+    assert_eq!(top(&conf()), json!(100_000_000), "the route's top ticket, written at start too: {}", conf());
     assert_eq!(bx._app.refresh_shop_config(), Some("unchanged"), "and only once");
     // a relay named by hand is kept after the app's, and publishing written off stays off
     let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
@@ -2357,6 +2386,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     let (renter, rseen) = control_standin(|m, p| match (m, p) {
         ("GET", "/status") => json!({
             "datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
+            "blinding": {"state": "blinded", "why": "solo", "words": "Blinded: a hashmaker can't tell which shares win, so it can't drop those."},
             "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
                          "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12},
                                   "walletMovedSats": 1002, "leftWithSellerMsat": 800000}}]}),
@@ -2401,6 +2431,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     // Sell → Hashrate: where to point the miners, each miner, the rental going on
     let p = br.get("/sell-hashrate");
     assert_eq!(p.status, 200);
+    assert!(p.body.contains("name=\"enabled\" value=\"1\" checked> Rent out my miners"), "an owner renting keeps the box ticked: {}", p.body);
     for s in ["Renting out: 1 of 2 miners rented", "stratum+tcp://umbrel.local:23334", "Your pool", "Rented out", "4.10 TH/s", "120 sats", "Stop this rental", "Listed"] {
         assert!(p.body.contains(s), "{s} missing from Sell hashrate");
     }
@@ -2467,6 +2498,62 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
 }
 
 /// Without an address renters outside can reach, the offer stays off public listings and the page
+/// An owner who has never saved the form finds "Rent out my miners" not ticked, with what a renter's word
+/// means beside it, and one who has saved keeps their choice, either way.
+#[test]
+fn renting_out_starts_unticked_says_what_a_renter_can_do_and_keeps_a_saved_choice() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        // as a hashmaker with a settings file not yet written says: not enabled, no fallback
+        ("GET", "/status") => json!({"open": false, "settings": {"enabled": false, "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000},
+                                      "minersAddress": "umbrel.local:23340", "miners": [], "rentals": []}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let htok = dir.path().join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.path().join("hashrate/settings.json");
+    let gw = dir.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gw.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    const OFF: &str = "name=\"enabled\" value=\"1\"> Rent out my miners";
+    const ON: &str = "name=\"enabled\" value=\"1\" checked> Rent out my miners";
+    const WARNING: &str = "A renter gets no work it hasn&#39;t paid for. If it stops paying, your miners go back to your own pool within seconds. A renter whose payment is slow to arrive can send them back to it for up to 10 seconds while it does. Your node checks every share&#39;s hash itself, so a renter&#39;s word doesn&#39;t set what the work is worth.";
+    assert!(!settings.exists(), "nothing saved yet");
+    let p = br.get("/sell-hashrate");
+    assert!(p.body.contains(OFF) && !p.body.contains(ON), "first view: not ticked: {}", p.body);
+    let warning = |body: &str| body.contains(WARNING) || body.contains(&WARNING.replace("&#39;", "'"));
+    assert!(warning(&p.body), "the warning, before anything is saved: {}", p.body);
+    assert!(p.body.find("Rent out my miners").unwrap() < p.body.find("A renter gets no work").unwrap(), "next to the choice");
+    assert!(p.body.find("A renter gets no work").unwrap() < p.body.find("<button>Save</button>").unwrap(), "before the save: {}", p.body);
+    // saved on, it stays on
+    let save = |on: bool| {
+        let mut f = vec![("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40")];
+        if on {
+            f.push(("enabled", "1"));
+        }
+        f
+    };
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &save(true));
+    assert!(br.flash_after(&r).starts_with("Saved. Renting is on."));
+    let p = br.get("/sell-hashrate");
+    assert!(p.body.contains(ON), "saved on: {}", p.body);
+    assert!(warning(&p.body), "the warning stays: {}", p.body);
+    // saved off, it stays off
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &save(false));
+    assert!(br.flash_after(&r).contains("Renting is off"));
+    let p = br.get("/sell-hashrate");
+    assert!(p.body.contains(OFF) && !p.body.contains(ON), "saved off: {}", p.body);
+}
+
 /// says why in plain words; the address is set, and cleared, on the page.
 #[test]
 fn hashrate_without_a_public_address_is_not_listed_and_says_why() {
@@ -3731,3 +3818,230 @@ fn the_relay_passes_if_range_and_the_copys_validators() {
     assert_eq!(seen, vec![Some("\"v1\"".to_string()), Some("\"v0\"".to_string())]);
 }
 
+/// The hashmaker's price follows the chain: by default what a piece of work is worth when mined, read through the
+/// signer from the XBT node, written for the hasher and into the shop's route alike. A new price waits for the
+/// rentals going on to end, no live price is no new rental, and a typed price is kept.
+#[cfg(unix)]
+#[test]
+fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_on() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use xbt_wallet_ui::app::hashrate::Repriced;
+    static RENTALS: AtomicUsize = AtomicUsize::new(0);
+    static PAUSED: AtomicBool = AtomicBool::new(false);
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({
+            "open": true, "settings": {}, "minersAddress": "umbrel.local:23340", "linkLan": "umbrel.local:23341",
+            "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}],
+            "rentals": (0..RENTALS.load(SeqCst)).map(|i| json!({"rental": format!("r{i}"), "buyer": "02aa", "miners": ["s11"], "paid": 1, "earnedMsat": 404000}))
+                .collect::<Vec<_>>(),
+            "paused": if PAUSED.load(SeqCst) { json!("a new price waits for the rentals going on to end") } else { Value::Null }}),
+        _ => json!({"error": "no"}),
+    });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let htok = dir.join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.join("hashrate-settings.json");
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    // a shop that sells: its node, its address, its chain
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "https://seller.example/")]);
+    let r = br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                                       ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    assert!(br.flash_after(&r).contains("Advanced settings saved"));
+    let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let route = || {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        c["routes"].as_array().unwrap().iter().find(|r| r["path"] == "/hashrate/").map(|r| r["price"]["request_msat"].clone())
+    };
+    let terms = |s: &Value| (s["priceSat"].as_u64(), s["sliceWork"].as_str().map(str::to_string), s["startSlices"].as_u64());
+
+    // the first view, nothing saved: the market price, for a piece sized to the miner here (4.1 TH/s: 2^45)
+    let p = br.get("/sell-hashrate");
+    assert!(p.body.contains("name=\"price_mode\" value=\"market\" checked"), "following the market is the default");
+    assert!(p.body.contains("It costs <strong>404 sats</strong>") && p.body.contains("worth about 404 sats"), "{}", p.body);
+    assert!(p.body.contains("start fee of <strong>404 sats</strong> (1 piece of work"), "{}", p.body);
+    assert!(!p.body.contains("Below mining value"));
+    assert!(p.body.contains("name=\"price\" value=\"\""), "no price typed, and the old 40 sat default is gone");
+
+    // saved at the market: the hasher's terms and the shop's route say the same price
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price_mode", "market"),
+                                                          ("price_pct", "100"), ("price", ""), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved. Renting is on."));
+    let s = read();
+    assert_eq!(terms(&s), (Some(404), Some((1u128 << 45).to_string()), Some(1)), "{s}");
+    assert_eq!((s["priceMode"].as_str(), s["holdNew"].as_bool(), s["priceSeenMs"].is_u64()), (Some("market"), Some(false), true), "{s}");
+    assert_eq!(route(), Some(json!(404_000)));
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+
+    // the difficulty rises while a rental goes on: the new price waits, no new rental starts, the route keeps its price
+    bx.rig.chain.st.lock().unwrap().difficulty = Some(7.0e9);
+    RENTALS.store(1, SeqCst);
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Held(1));
+    let s = read();
+    assert_eq!(terms(&s).0, Some(404), "the rental going on pays what it was made with");
+    assert_eq!((s["holdNew"].as_bool(), s["pending"]["priceSat"].as_u64()), (Some(true), Some(366)), "{s}");
+    assert_eq!(route(), Some(json!(404_000)));
+    // still going on: still waiting, whatever the hasher says
+    PAUSED.store(true, SeqCst);
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Held(1));
+    // it ends: the new price is in force, in the terms and the route alike
+    RENTALS.store(0, SeqCst);
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Applied);
+    let s = read();
+    assert_eq!(terms(&s).0, Some(366));
+    assert!(s.get("pending").is_none(), "{s}");
+    assert_eq!(s["holdNew"], false, "no shop health address to wait on here: {s}");
+    assert_eq!(route(), Some(json!(366_000)));
+    PAUSED.store(false, SeqCst);
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+
+    // the node stops answering: no live price, and nothing is made up; the price in force is not confirmed again
+    let seen_at = read()["priceSeenMs"].clone();
+    bx.rig.chain.st.lock().unwrap().down = true;
+    match bx._app.hash_reprice(false) {
+        Repriced::NoPrice(why) => assert!(why.contains("does not answer"), "{why}"),
+        o => panic!("{o:?}"),
+    }
+    assert_eq!((terms(&read()).0, read()["priceSeenMs"].clone()), (Some(366), seen_at));
+    let p = br.get("/sell-hashrate");
+    assert!(p.body.contains("No live price") && p.body.contains("no new rental starts until it can"), "{}", p.body);
+    // a pruned node, whose getblockstats fails: the block reward is the chain's schedule at the tip (regtest's
+    // halves every 150 blocks: 3.125 at 700), and the price is the one a full node gives
+    let height = {
+        let mut c = bx.rig.chain.st.lock().unwrap();
+        c.down = false;
+        c.subsidy = Some(None);
+        std::mem::replace(&mut c.height, 700)
+    };
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+    assert_eq!((terms(&read()).0, route()), (Some(366), Some(json!(366_000))));
+    let p = br.get("/sell-hashrate");
+    assert!(!p.body.contains("No live price") && p.body.contains("366 sats"), "{}", p.body);
+    // a node that can't say the block reward is no price either: no getblockstats, and a height whose schedule gives none
+    bx.rig.chain.st.lock().unwrap().height = height;
+    assert!(matches!(bx._app.hash_reprice(false), Repriced::NoPrice(w) if w.contains("block reward")));
+    bx.rig.chain.st.lock().unwrap().subsidy = None;
+
+    // a fixed price is kept, without the node, and is warned below mining value
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price_mode", "fixed"),
+                                                          ("price_pct", "100"), ("price", "100"), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved. Renting is on."));
+    let s = read();
+    assert_eq!((terms(&s).0, s["priceMode"].as_str(), s.get("priceSeenMs")), (Some(100), Some("fixed"), None), "{s}");
+    assert_eq!(route(), Some(json!(100_000)));
+    let p = br.get("/sell-hashrate");
+    assert!(p.body.contains("Below mining value") && p.body.contains("about 366 sats a piece"), "{}", p.body);
+    bx.rig.chain.st.lock().unwrap().down = true;
+    assert_eq!(bx._app.hash_reprice(false), Repriced::Same);
+    assert_eq!(terms(&read()).0, Some(100));
+    bx.rig.chain.st.lock().unwrap().down = false;
+    // at or above it: no warning
+    br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price_mode", "fixed"), ("price", "400"), ("enabled", "1")]);
+    assert!(!br.get("/sell-hashrate").body.contains("Below mining value"));
+}
+
+/// A renter whose DATUM Gateway doesn't mask its jobs (a stock gateway: nothing to open them, so they can't be checked) is
+/// told plainly before any click, every Rent is off, and a rent sent anyway is refused with nothing paid. One whose
+/// gateway does mask can rent.
+#[test]
+fn renting_waits_for_a_gateway_that_masks_its_jobs() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    fn offers() -> Value {
+        json!({"offers": [{"name": "Big miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+                           "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": format!("{PROVIDER}/hashrate"),
+                           "payNode": format!("03{}", "c".repeat(64))}]})
+    }
+    // the hashmaker is on the spending rules, with its node, so the gateway is the only thing Rent waits for
+    let rules = json!({"counterparties": {PROVIDER: {"ln_node": format!("03{}", "c".repeat(64))}}});
+    for masked in [false, true] {
+        let (renter, rseen) = if masked {
+            control_standin(|m, p| match (m, p) {
+                ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                             "blinding": {"state": "blinded", "why": "solo", "words": "Blinded: a hashmaker can't tell which shares win."}}),
+                ("GET", "/offers") => offers(),
+                ("POST", "/rent") => json!({"ok": true, "rental": "r1"}),
+                _ => json!({"error": "no"}),
+            })
+        } else {
+            control_standin(|m, p| match (m, p) {
+                ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                             "blinding": {"state": "can't be checked", "why": "the gateway's API: connection refused", "words": "This can't be checked."}}),
+                ("GET", "/offers") => offers(),
+                ("POST", "/rent") => json!({"ok": true, "rental": "r1"}),
+                _ => json!({"error": "no"}),
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let rtok = dir.path().join("renter-token");
+        std::fs::write(&rtok, "r".repeat(64)).unwrap();
+        let bx = start(rules.clone(), false, |c| {
+            c.hash.renter = Some(renter.clone());
+            c.hash.renter_token = Some(rtok.clone());
+        });
+        let mut br = logged_in(&bx);
+        let p = br.get("/hashrate");
+        let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
+        let card = &card[..card.find("</section>").unwrap()];
+        if masked {
+            assert!(p.body.contains("Ready to rent") && !p.body.contains("masking its jobs"), "{}", p.body);
+            assert!(card.contains("<button>Rent</button>"), "{card}");
+        } else {
+            assert!(p.body.contains("Your gateway isn&#39;t masking its jobs") || p.body.contains("Your gateway isn't masking its jobs"), "{}", p.body);
+            assert!(p.body.contains("the gateway that comes with this app is running") && p.body.contains("nothing is paid") && !p.body.contains("coming soon"), "{}", p.body);
+            assert!(card.contains("<button disabled>Rent</button>"), "{card}");
+            assert!(!p.body.contains("can't be checked") && !p.body.contains("refused"), "no scary words: {}", p.body);
+            let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("budget", "1000"), ("minutes", "60"), ("miners", "1")]);
+            assert!(br.flash_after(&r).contains("Nothing was paid"));
+            assert!(!rseen.lock().unwrap().iter().any(|(m, p, _, _)| m == "POST" && p == "/rent"), "no rent reached the renter's service");
+        }
+    }
+}
+
+/// The renter's offer card says the start fee, in sats and seconds, and a trial and a budget include it.
+#[test]
+fn an_offer_shows_its_start_fee() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
+        ("GET", "/offers") => json!({"offers": [
+            {"name": "Big miners", "linkKey": "02bb", "priceMsat": 3_235_000, "sliceWork": (1u128 << 48).to_string(), "startSlices": 2, "proves": true,
+             "miners": 1, "freeMiners": 1, "freeHs": "41000000000000", "payUrl": "https://miners.example/hashrate", "payNode": "02aa"},
+            {"name": "Old miners", "linkKey": "02cc", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": false,
+             "miners": 1, "freeMiners": 1, "freeHs": "4000000000000"}]}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    let card = |name: &str| {
+        let c = &p.body[p.body.find(&format!("<h3>{name}</h3>")).unwrap()..];
+        c[..c.find("</section>").unwrap()].to_string()
+    };
+    let big = card("Big miners");
+    assert!(big.contains("Start fee: <strong>6,470 sats</strong>, about 14 seconds of a machine") && big.contains("paid first"), "{big}");
+    assert!(big.contains("one piece of work and its start fee, about 9,705 sats"), "the trial pays the fee too: {big}");
+    assert!(big.contains("About an hour of one machine, with its start fee"), "{big}");
+    let old = card("Old miners");
+    assert!(old.contains("Needs updating") && old.contains("<button disabled>Rent</button>"), "{old}");
+    assert!(!old.contains("Start fee"), "{old}");
+}

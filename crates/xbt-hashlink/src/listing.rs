@@ -15,7 +15,7 @@
 //! wallet ties the seller's origin to a node it trusts), or that the hashrate is real (the meter
 //! pays only for accepted work).
 
-use crate::msg::Terms;
+use crate::msg::{Terms, PROOF};
 use secp256k1::ecdsa::Signature;
 use secp256k1::{Message, PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -52,6 +52,8 @@ pub struct Hashrate {
     pub pay_url: String,
     pub pay_node: String,
     pub terms: Terms,
+    /// How its shares are proven ([`PROOF`]). None: a listing from before shares were proven.
+    pub proof: Option<String>,
     /// Miners behind the hashmaker's app, and how many of them (with how much hashrate) are free to
     /// rent now. A rental takes whole miners. Zero miners: the listing does not say.
     pub capacity: Capacity,
@@ -106,6 +108,7 @@ impl Hashrate {
             },
             "pay": {"url": self.pay_url, "node": self.pay_node},
             "terms": self.terms.to_json(),
+            "proof": self.proof,
             "capacity": {"miners": self.capacity.miners, "freeMiners": self.capacity.free_miners, "freeHs": self.capacity.free_hs.to_string()},
         })
     }
@@ -127,6 +130,8 @@ impl Hashrate {
             pay_url: s("/pay/url")?,
             pay_node: s("/pay/node")?,
             terms: Terms::from_json(v.get("terms").ok_or("terms missing")?).ok_or("bad terms")?,
+            // optional: a listing from before it said nothing, and is told apart by [`Hashrate::proves`]
+            proof: v.get("proof").and_then(Value::as_str).map(str::to_string),
             // optional: a listing from before several hashtakers says nothing of its capacity
             capacity: v.get("capacity").map(|c| Capacity {
                 miners: c.get("miners").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
@@ -134,6 +139,12 @@ impl Hashrate {
                 free_hs: c.get("freeHs").and_then(Value::as_str).and_then(|h| h.parse().ok()).unwrap_or(0),
             }).unwrap_or_default(),
         })
+    }
+
+    /// Whether this hashmaker says it proves shares as this app checks them. A hashtaker that rents from one that
+    /// doesn't is refused at the handshake anyway.
+    pub fn proves(&self) -> bool {
+        self.proof.as_deref() == Some(PROOF)
     }
 
     /// The listing event, by the Nostr key `nostr`, bound to the link key `link`.
@@ -146,7 +157,7 @@ impl Hashrate {
         let tags = vec![
             tag("d", &hex::encode(self.link_key.serialize())),
             tag("title", &self.name),
-            tag("summary", &format!("{} hashrate, {} sat a slice, paid as accepted work arrives", self.algorithm, price_sat)),
+            tag("summary", &format!("{} hashrate, {} sat a slice, paid as it is used, seconds at a time", self.algorithm, price_sat)),
             tag("published_at", &created_at.to_string()),
             tag("t", TOPIC),
             tag("t", "hashrate"),
@@ -161,7 +172,7 @@ impl Hashrate {
             String::new()
         };
         let content = format!(
-            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM Gateway. Paid per slice of accepted work over Lightning Stream.{free}\n",
+            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM Gateway. Paid as it is used, seconds at a time, over Lightning Stream.{free}\n",
             self.name,
             self.algorithm,
             self.hashrate_hs as f64 / 1e12
@@ -238,7 +249,8 @@ mod tests {
             iroh: None,
             pay_url: "https://192.0.2.1:8443/hashrate".into(),
             pay_node: "02".to_string() + &"11".repeat(32),
-            terms: Terms { slice_work: 1 << 50, price_msat: 40_000, grace_ms: 30_000 },
+            terms: Terms { slice_work: 1 << 50, price_msat: 40_000, grace_ms: 30_000, start_slices: 0 },
+            proof: Some(PROOF.into()),
             capacity: Capacity { miners: 4, free_miners: 1, free_hs: 4_100_000_000_000 },
         }
     }
@@ -265,6 +277,26 @@ mod tests {
         assert!(Hashrate::read_event(&Event::sign(&nostr, 1000, KIND, tags, String::new()), 1000).is_err());
         assert!(Hashrate::read_event(&ev, 0).is_err(), "dated ahead");
         assert!(h.event(&link2, &nostr, 1).is_err());
+    }
+
+    #[test]
+    fn the_proof_is_carried_and_a_listing_without_one_reads_as_not_proving() {
+        let link = SecretKey::from_slice(&[5; 32]).unwrap();
+        let nostr = Keys::generate();
+        let h = listing(&link);
+        assert_eq!(h.to_json()["proof"], PROOF);
+        let back = Hashrate::read_event(&h.event(&link, &nostr, 1000).unwrap(), 1000).unwrap();
+        assert_eq!(back.proof.as_deref(), Some(PROOF));
+        assert!(back.proves());
+        // a listing from before the field: still read, and not one that proves
+        let mut v = h.to_json();
+        v.as_object_mut().unwrap().remove("proof");
+        let old = Hashrate::from_json(&v).unwrap();
+        assert_eq!(old.proof, None);
+        assert!(!old.proves());
+        // another proof is not this one
+        v["proof"] = json!("something-else/1");
+        assert!(!Hashrate::from_json(&v).unwrap().proves());
     }
 
     #[test]

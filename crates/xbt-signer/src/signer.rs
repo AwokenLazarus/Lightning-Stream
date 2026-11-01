@@ -557,6 +557,34 @@ impl Signer {
                 Ok(h) => json!({"reachable": true, "chain": self.chain, "height": h}),
                 Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
             },
+            // what a hashmaker's price follows (Sell → Hashrate): the tip's difficulty and subsidy as the node says them.
+            // What it does not say is left out, for the caller to refuse: nothing here is made up. A node that won't
+            // answer `getblockstats` for the tip (`subsidyError`) still says the height and its chain, and the subsidy is
+            // then the chain's own schedule at that height (`subsidyFrom`: "schedule"). A pruned Knots keeps the tip and
+            // answers it (Knots v29.4.2, -prune=550, regtest: only a pruned height gives "Block not available (pruned
+            // data)"); this is for one that refuses it all the same (an older node, an RPC whitelist)
+            "mining_tip" => match self.node.call("getblockchaininfo", json!([])) {
+                Ok(i) => {
+                    let height = i.get("blocks").and_then(Value::as_u64);
+                    let stats = height.map(|h| self.node.call("getblockstats", json!([h, ["subsidy"]])));
+                    let said = stats.as_ref().and_then(|r| r.as_ref().ok()).and_then(|s| s.get("subsidy").and_then(Value::as_u64));
+                    let chain = i.get("chain").and_then(Value::as_str).and_then(|c| xbt_primitives::network::Chain::from_name(c).ok());
+                    let (subsidy, from) = match (said, height, chain) {
+                        (Some(s), ..) => (Some(s), Value::from("getblockstats")),
+                        (None, Some(h), Some(c)) => (Some(c.block_subsidy(h)), Value::from("schedule")),
+                        _ => (None, Value::Null),
+                    };
+                    let why = match stats {
+                        Some(Err(e)) => Value::from(e.msg.chars().take(200).collect::<String>()),
+                        Some(Ok(_)) if said.is_none() => Value::from("getblockstats gave no subsidy"),
+                        _ => Value::Null,
+                    };
+                    json!({"reachable": true, "chain": self.chain, "height": height, "headers": i.get("headers"), "difficulty": i.get("difficulty"),
+                           "tipTime": i.get("time"), "syncing": i.get("initialblockdownload"), "subsidySats": subsidy, "subsidyFrom": from,
+                           "subsidyError": why})
+                }
+                Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
+            },
             "channels" => {
                 // `channels` lists what an earlier version's on-chain channel book holds; this version adds none
                 let mut out = json!({"channels": self.legacy_channels.public(), "legacy_channels": self.legacy_channels.notice(), "height": self.height_safe()});

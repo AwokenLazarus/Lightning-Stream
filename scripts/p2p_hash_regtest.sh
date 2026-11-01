@@ -6,10 +6,13 @@
 #
 # Lab: the ticket lab's (scripts/ticket_e2e/compose.yml on lightning-fork-lab, three Lightning Fork
 # nodes on one Knots BLAKE2b regtest), in its own compose project (p2phash) and on its own ports:
-# P2P_HASH_PORT_BASE (default 19961) to BASE+10 (BASE+10: a second gateway, a shop the wallet has no
-# credit with). P2P_HASH_LAB: a lightning-fork-lab checkout with its node binaries built (default
+# P2P_HASH_PORT_BASE (default 19961) to BASE+36 (BASE+10, +11: two more gateways, shops the wallet has no
+# credit with; BASE+13 to +28: the real gateways' own nodes, on chains of their own; BASE+29 to +36: the reprice
+# check's app, gateway and hashmaker). P2P_HASH_ONLY=reprice runs only the reprice check (a new price while a
+# rental goes on, with the hashmaker's real app and its gateway under xbt-supervise); P2P_HASH_ONLY=real only the
+# real gateways. P2P_HASH_LAB: a lightning-fork-lab checkout with its node binaries built (default
 # run/lightning-fork-lab, cloned and built when missing). The
-# lab's containers and volumes are removed on exit. About 10 minutes.
+# lab's containers and volumes are removed on exit. About 25 minutes, 10 without real gateways.
 # Report: run/p2p_hash_regtest.json and run/p2p_hash_regtest.log.
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -43,11 +46,14 @@ R=$(mktemp -d "${TMPDIR:-/tmp}/p2ph-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp \
   -p xbt-gateway --bin xbt-gateway -p xbt-hashlink --bin xbt-hashlink
+if [ "${P2P_HASH_ONLY:-}" = reprice ]; then
+  nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p xbt-svc --bin xbt-supervise
+fi
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
 # shellcheck disable=SC2046 # the port list is meant to split
-python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 10)))
+python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 36)))
 (cd "$LAB" && docker compose build -q lf1 && docker compose up -d fees knots-b2b)
 
 export LAB RUN=$R OUT=$ROOT/run BIN

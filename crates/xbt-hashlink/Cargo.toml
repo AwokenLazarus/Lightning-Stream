@@ -27,6 +27,10 @@ blake2.workspace = true
 # a stand-in miner connecting from an address of its own, as miners on a LAN do (lab only; already in the tree)
 socket2 = "0.6"
 
+[dev-dependencies]
+# the chain's own header code, to test the share check against
+xbt-primitives.workspace = true
+
 [[bin]]
 name = "xbt-hashlink"
 path = "src/bin/xbt-hashlink.rs"

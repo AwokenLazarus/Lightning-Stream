@@ -21,9 +21,10 @@ use xbt_hashlink::hashmaker::{self, Hashmaker};
 use xbt_hashlink::meter::share_work;
 use xbt_hashlink::msg::Terms;
 use xbt_hashlink::rail::{LabHashtaker, LabSeller};
-use xbt_hashlink::{hashtaker, noise, standin};
+use xbt_hashlink::{hashtaker, noise, order, standin};
 
-const DIFF: f64 = 0.25;
+/// About 4096 hashes a share: the chain's own format, at a difficulty a CPU reaches.
+const DIFF: f64 = 1.0 / (1u64 << 20) as f64;
 const JOB_MS: u64 = 2000;
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -63,7 +64,7 @@ fn tempdir() -> PathBuf {
 }
 
 fn terms() -> Terms {
-    Terms { slice_work: 6 * share_work(DIFF), price_msat: 5_000, grace_ms: 2500 }
+    Terms { slice_work: 6 * share_work(DIFF), price_msat: 300_000, grace_ms: 2500, start_slices: 0 }
 }
 
 struct Pool {
@@ -132,6 +133,7 @@ fn rig_from(n: usize, ext: &[bool], secs: u64, rate: f64, own: bool) -> Rig {
             slices: None,
             fallback: Some(fallback.addr.clone()),
             rentable: None,
+            min_slice_time: hashmaker::MIN_SLICE_TIME,
         },
         Box::new(|| Box::<LabSeller>::default()),
     )
@@ -174,7 +176,7 @@ fn hashtaker(rig: &Rig, name: &str, miners: u32, secs: u64, stop_paying_after: O
     hashtaker_idle(rig, name, miners, secs, stop_paying_after, Duration::from_secs(4))
 }
 
-/// [`hashtaker`], ending the rental after `idle` without accepted work.
+/// [`hashtaker`], ending the rental after `idle` without proven work.
 fn hashtaker_idle(rig: &Rig, name: &str, miners: u32, secs: u64, stop_paying_after: Option<u64>, idle: Duration) -> (Pool, thread::JoinHandle<Value>) {
     let pool = Pool::start(&rig.dir, name);
     let cfg = hashtaker::Config {
@@ -195,6 +197,8 @@ fn hashtaker_idle(rig: &Rig, name: &str, miners: u32, secs: u64, stop_paying_aft
         budget_msat: None,
         cut: None,
         live: None,
+        gateway_api: None,
+        allow_unblinded: true,
     };
     (pool, thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap()))
 }
@@ -216,13 +220,29 @@ fn rented_names(r: &Value) -> Vec<String> {
     r["miners"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect()
 }
 
+/// Is another slice due by the renter's rule, at this count, with shares of this size?
+fn due(terms: &Terms, proven: u128, largest_share: u128, paid: u64) -> bool {
+    order::Standing { proven, largest_share, paid, start_slices: terms.start_slices, slice_work: terms.slice_work, price_msat: terms.price_msat,
+                      // the step without its 30 s cap: the renter's rate isn't in its receipts, and the cap only lowers it
+                      msat_a_second: f64::INFINITY, buy_secs: 0.0 }.pay_next()
+}
+
+/// Every slice paid once and when the rule said. The hashtaker's count is the hashmaker's but for shares on
+/// their way when the hashtaker ended the rental, which it never read: a few at most, and the hashmaker is
+/// never the one behind.
 fn check_paid(r: &Value, b: &Value) {
+    let (s, sw) = (terms().slice_work, share_work(DIFF));
+    let work = |v: &Value| v["meter"]["work"].as_str().unwrap().parse::<u128>().unwrap();
     let paid = r["paid"].as_u64().unwrap();
     assert!(paid >= 1, "nothing paid: {r}");
-    assert_eq!(r["receiptsAgree"].as_u64().unwrap(), paid, "{r}");
-    assert_eq!(r["receiptsDisagree"].as_u64().unwrap(), 0);
     assert_eq!(b["released"].as_u64().unwrap(), paid, "hashtaker {b}\nhashmaker {r}");
-    assert_eq!(r["meter"], b["meter"], "both sides count the same work");
+    for rc in b["receipts"].as_array().unwrap() {
+        let (slice, at) = (rc["slice"].as_u64().unwrap(), rc["work"].as_str().unwrap().parse().unwrap());
+        assert!(due(&terms(), at, sw, slice - 1), "slice {slice} paid when it wasn't due: {rc}");
+    }
+    let (m, t) = (work(r), work(b));
+    assert!(m >= t && m - t <= s / 2, "the two proven counts, {m} and {t}, slice {s}\nhashtaker {b}\nhashmaker {r}");
+    assert!(m <= order::paid_work(paid, 0, s), "proven work stayed within what was paid: {r}");
 }
 
 #[test]
@@ -313,6 +333,10 @@ fn a_hashtaker_that_stops_paying_loses_only_its_own_miner() {
     assert!(b["closed"].as_str().unwrap().starts_with("hashmaker closed: unpaid"), "{b}");
     let stopped = finished(&rig.hashmaker, "stopper");
     assert_eq!(stopped["stopped"]["reason"], "unpaid");
+    let work = |v: &Value| v["meter"]["work"].as_str().unwrap().parse::<u128>().unwrap();
+    assert!(work(&stopped) <= order::paid_work(1, 0, terms().slice_work), "no share past what's paid: {stopped}");
+    assert!(!order::fits(work(&stopped), share_work(DIFF), 1, 0, terms().slice_work), "stopped once the next wouldn't fit: {stopped}");
+    assert_eq!(stopped["stopped"]["unpaidWork"], "0", "{stopped}");
     let lost = rented_names(&stopped)[0].clone();
     // the other rental goes on meanwhile, and the stopper's miner hashes at the fallback again
     let mid = rig.fallback.users();
@@ -494,7 +518,7 @@ fn cpu_secs() -> f64 {
 /// this machine's CPU, and a debug build of dozens of them measures the CPU, not the hashmaker.
 /// HASH_LOAD_TAKERS hashtakers (default 10) take HASH_LOAD_EACH miners each (default 3) from one
 /// hashmaker at once, for HASH_LOAD_SECS seconds (default 30), the miners at up to HASH_LOAD_RATE
-/// shares a second (default 6). Each rental is paid in full with receipts that agree, no miner is
+/// shares a second (default 6). Each rental is paid by the rule with counts that agree, no miner is
 /// rented twice, no rented miner's shares go to the fallback once its rental has run 5 s, and (in a
 /// release build) each rental gets at least 90% of the shares its miners make and no miner's shares
 /// stop for longer than a job. Prints one line of JSON: the rentals, the slices paid, the shares,

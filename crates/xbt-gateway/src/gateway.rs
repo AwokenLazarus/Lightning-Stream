@@ -959,6 +959,11 @@ impl Gateway {
                     if r.accounts.is_some() {
                         e["extra"]["identify"] = true.into();
                     }
+                    // the largest prepaid ticket of this route. A word of its own, not its `ticketMsat`: a buyer's session
+                    // goes on across routes on one ticket size
+                    if let Some(top) = r.top_ticket_msat.filter(|_| *settle == SETTLE_ON_ARRIVAL) {
+                        e["extra"]["topTicketMsat"] = top.to_string().into();
+                    }
                     // a prepaid ticket can be paid by the node's offer as well as by its invoice
                     if let Some(o) = self.offer_text().filter(|_| *settle == SETTLE_ON_ARRIVAL) {
                         e["extra"][xbt402::offer::EXTRA_OFFER] = o.into();
@@ -1226,6 +1231,12 @@ impl Gateway {
             .collect()
     }
 
+    /// The largest prepaid ticket any route sells: [`Route::top_ticket_msat`], else the gateway's own.
+    /// It holds nothing and is paid before it counts, so a lock names no route for it.
+    pub(crate) fn prepaid_top_msat(&self) -> u64 {
+        self.cfg.routes.iter().filter_map(|r| r.top_ticket_msat).fold(self.cfg.caps.ticket_msat, u64::max)
+    }
+
     fn lock_tickets(self: &Arc<Self>, req: &Request) -> Response {
         let pay = match self.pay_header(req) {
             Ok(p) => p,
@@ -1273,10 +1284,11 @@ impl Gateway {
                     Value::String(s) => s.parse::<u64>().ok(),
                     v => v.as_u64(),
                 };
-                match asked.filter(|n| (min..=self.cfg.caps.ticket_msat).contains(n)) {
+                let top = if prepaid { self.prepaid_top_msat() } else { self.cfg.caps.ticket_msat };
+                match asked.filter(|n| (min..=top).contains(n)) {
                     Some(n) => n,
                     None => {
-                        return error(400, "bad_request", &format!("ticketMsat is from {min} to {}", self.cfg.caps.ticket_msat))
+                        return error(400, "bad_request", &format!("ticketMsat is from {min} to {top}"))
                     }
                 }
             }

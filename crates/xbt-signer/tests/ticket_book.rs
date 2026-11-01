@@ -657,6 +657,27 @@ fn locked_rig(n: usize) -> (Rig, String, Vec<String>) {
     (r, sid, locked)
 }
 
+/// A release that names its ticket takes that one while it is locked, whichever of the session's
+/// locked tickets sorts first. The wallet's payer names the ticket it chose and waits for the seller
+/// to show it locked; a refill can lock another meanwhile that sorts before it (offered in the same
+/// second, the lower hash), and that was refused as `ticket_none`, which ends a rental.
+#[test]
+fn a_release_that_names_a_locked_ticket_takes_it_whatever_sorts_first() {
+    let _g = env_lock();
+    let (r, sid, locked) = locked_rig(2);
+    let mut sorted = locked;
+    sorted.sort();
+    // one lock round: the same second, so the lower hash is the one a release without a name takes
+    let (first, second) = (sorted[0].clone(), sorted[1].clone());
+    let v = r.call("ticket_release", json!({"session": sid, "hash": second}));
+    assert_eq!((v["verdict"].as_str(), v["hash"].as_str()), (Some("allow"), Some(second.as_str())), "{v}");
+    assert_eq!((r.state_of(&sid, &second), r.state_of(&sid, &first)), ("released".to_string(), "locked".to_string()));
+    // released once: named again, it is refused, and the other is still there for a release that names none
+    let again = r.call("ticket_release", json!({"session": sid, "hash": second}));
+    assert_eq!(again["rule"].as_str(), Some("ticket_none"), "{again}");
+    assert_eq!(r.release(&sid)["hash"].as_str(), Some(first.as_str()));
+}
+
 #[test]
 fn a_kill_at_every_write_point_of_a_release_never_undercounts_and_never_releases_twice() {
     let _g = env_lock();

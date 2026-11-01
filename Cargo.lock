@@ -5731,6 +5731,7 @@ dependencies = [
  "socket2",
  "xbt-iroh-link",
  "xbt-nostr",
+ "xbt-primitives",
 ]
 
 [[package]]
@@ -5820,6 +5821,7 @@ dependencies = [
  "url",
  "webpki-roots 0.26.11",
  "xbt-gateway",
+ "xbt-hashlink",
  "xbt-iroh-link",
  "xbt-primitives",
  "xbt-svc",

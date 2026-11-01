@@ -365,6 +365,27 @@ pub struct TaskPolicy {
     pub unlisted_max_locked_sats: i64,
     /// How this task's sellers are paid where their terms offer both tickets and the lottery.
     pub meter: crate::lottery::Meter,
+    /// The owner's standing word for a task that pays for work as it arrives ([`TaskRental`]).
+    pub rental: Option<TaskRental>,
+}
+
+/// policy.json `tickets.tasks.<task>.rental`: a task that pays for rented work seconds at a time, at a
+/// rate no other use of the wallet needs. It pays by prepaid tickets only, so it locks nothing. Its
+/// tickets are bounded by `max_ticket_sats`, its sends by `max_sends_per_hour`, and its spending by the
+/// task's own budget; the wallet's limits for one payment and for a day or a week, its cap for one
+/// seller and its velocity don't apply to it, and its payments don't count against them, so every
+/// other use of the wallet stands as it did. A wider grant than any other in `tickets`, so it is only
+/// what the owner signed: a task without it is paid as every other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRental {
+    pub max_ticket_sats: i64,
+    pub max_sends_per_hour: i64,
+}
+
+impl TaskRental {
+    pub fn max_ticket_msat(&self) -> u64 {
+        (self.max_ticket_sats.max(0) as u64).saturating_mul(1000)
+    }
 }
 
 /// policy.json `tickets`: the ticket rail's own settings. The allowlist, the daily and weekly
@@ -520,12 +541,18 @@ pub const TICKET_INT_KEYS: [&str; 23] = ["max_ticket_sats", "max_ticket_blocks",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
                                          "max_new_sellers_per_min", "max_sends_per_hour", "pool", "pool_many", "many_sellers", "floor_ticket_sats",
                                          "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "max_socket_s", "max_stream_s", "stream_floor_after_s", "feerate_cap_sat_per_kw"];
+pub const RENTAL_INT_KEYS: [&str; 2] = ["max_ticket_sats", "max_sends_per_hour"];
 pub const TASK_INT_KEYS: [&str; 8] = ["budget_sats", "window_s", "max_locked_sats", "max_locked_tickets", "max_sellers",
                                       "unlisted_max_spend_sats", "unlisted_max_tickets", "unlisted_max_locked_sats"];
 /// The longest window a task's budget can be read over: what the ledger keeps.
 pub const MAX_TASK_WINDOW_S: i64 = 7 * 86_400;
 
 impl TicketPolicy {
+    /// Whether `task` has a [`TaskRental`], so that its payments count only against itself.
+    pub fn is_rental(&self, task: &str) -> bool {
+        self.tasks.get(task).is_some_and(|t| t.rental.is_some())
+    }
+
     /// From policy.json `tickets`. A number that is missing takes the default; one that is not a
     /// non-negative integer is 0 here (it refuses, never widens) and an error in [`validate`].
     pub fn from_map(m: &Map<String, Value>) -> Self {
@@ -587,7 +614,10 @@ impl TicketPolicy {
                 max_sellers: i(t, "max_sellers", p.max_sellers),
                 admit: if t.get("admit").and_then(Value::as_str) == Some("any") { Admit::Any } else { Admit::Listed },
                 unlisted_max_spend_sats: i(t, "unlisted_max_spend_sats", two.saturating_mul(2)), unlisted_max_tickets: i(t, "unlisted_max_tickets", p.pool_many.min(1)),
-                unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two), meter: crate::lottery::Meter::parse(t.get("meter")) });
+                unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two), meter: crate::lottery::Meter::parse(t.get("meter")),
+                // anything but an object is no grant
+                rental: t.get("rental").and_then(Value::as_object).map(|r| TaskRental { max_ticket_sats: i(r, "max_ticket_sats", p.max_ticket_sats).min(i64::MAX / 1000),
+                                                                                        max_sends_per_hour: i(r, "max_sends_per_hour", p.max_sends_per_hour) }) });
         }
         p.max_ticket_sats = p.max_ticket_sats.min(i64::MAX / 1000);
         p
@@ -739,8 +769,19 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
                         errors.push(format!("policy.json {at}.meter: must be \"auto\" (the wallet's rule), \"tickets\" or \"draws\""));
                     }
                 }
+                match t.get("rental").filter(|v| !v.is_null()) {
+                    None => {}
+                    Some(Value::Object(r)) => {
+                        ints(r, &RENTAL_INT_KEYS, &format!("{at}.rental"), errors);
+                        for k in r.keys().filter(|k| !RENTAL_INT_KEYS.contains(&k.as_str())) {
+                            warnings.push(format!("policy.json {at}.rental.{k}: unknown key (the signer ignores it)"));
+                        }
+                        warnings.push(format!("policy.json {at}.rental: this task's payments are outside the wallet's limits for one payment, a day, a week and one seller; only its budget_sats bounds them"));
+                    }
+                    Some(_) => errors.push(format!("policy.json {at}.rental: must be an object")),
+                }
                 for k in t.keys() {
-                    if k != "admit" && k != "meter" && !TASK_INT_KEYS.contains(&k.as_str()) {
+                    if k != "admit" && k != "meter" && k != "rental" && !TASK_INT_KEYS.contains(&k.as_str()) {
                         warnings.push(format!("policy.json {at}.{k}: unknown key (the signer ignores it)"));
                     }
                 }
@@ -1027,6 +1068,27 @@ pub const PREPAY_PENDING_WHY: &str = "the payment of a prepaid ticket has no fin
 /// How long past a prepaid invoice's life the wallet waits for the seller to follow its payment: the
 /// gateway's 15 s after an invoice's life before its sweep, and a round of that sweep.
 pub const PREPAY_FOLLOW_GRACE_S: f64 = 15.0 + 10.0;
+
+/// [`prepaid_size`] for a task with a [`TaskRental`]: the largest ticket the seller sells on this
+/// route (`top_msat`, its `topTicketMsat`, beside its own size), clamped to what the owner allows the
+/// task where the seller lets the wallet ask for a smaller one, not refused. Refused only where the
+/// seller's smallest is above that.
+pub fn rental_prepaid_size(terms: &Terms, top_msat: Option<u64>, rental: &TaskRental, pol: &TicketPolicy) -> Result<u64, Refusal> {
+    if i64::from(terms.ticket_blocks) > pol.max_ticket_blocks {
+        return refuse("ticket_blocks", format!("ticketBlocks {} is above the owner's tickets.max_ticket_blocks {}", terms.ticket_blocks, pol.max_ticket_blocks));
+    }
+    let most = rental.max_ticket_msat();
+    let own = match terms.min_ticket_msat {
+        Some(m) if m <= most => terms.ticket_msat.max(top_msat.unwrap_or(0)).min(most),
+        Some(m) => return refuse("ticket_size", format!("this seller's smallest ticket of {m} msat is above the {most} msat the owner allows this task (its rental.max_ticket_sats)")),
+        None if terms.ticket_msat > most => return refuse("ticket_size", format!("this seller's ticket of {} msat is above the {most} msat the owner allows this task (its rental.max_ticket_sats)", terms.ticket_msat)),
+        None => terms.ticket_msat,
+    };
+    if own < 1000 {
+        return refuse("ticket_size", "a ticket below 1 sat: no node forwards it");
+    }
+    Ok(own)
+}
 
 /// Whether a prepaid ticket of `msat` may be bought in session `s`: its seller's size, or a
 /// smaller one inside what the seller's terms let the wallet ask for. A session that pays by
@@ -1610,7 +1672,12 @@ impl Book {
 
     /// Ticket payments handed to the router since `t`.
     pub fn sends_since(&self, t: f64) -> usize {
-        self.tickets.values().filter(|x| x.sent_ts > 0.0 && x.sent_ts >= t).count()
+        self.sends_since_where(t, |_| true)
+    }
+
+    /// [`Book::sends_since`], of the tasks `of` names.
+    pub fn sends_since_where(&self, t: f64, of: impl Fn(&str) -> bool) -> usize {
+        self.tickets.values().filter(|x| x.sent_ts > 0.0 && x.sent_ts >= t && of(&x.task)).count()
     }
 
     /// A session's tickets, oldest first.
@@ -1714,6 +1781,13 @@ impl Book {
     /// accept at height `tip` (its last hop's expiry more than [`USABLE_MARGIN_BLOCKS`] away).
     pub fn usable(&self, session: &str, tip: i64) -> Option<&Ticket> {
         self.of_session(session).into_iter().find(|t| t.state == TState::Locked && usable_at(t, tip))
+    }
+
+    /// The ticket `hash` of a session, where it is locked and the seller will still accept it at height
+    /// `tip`: what a release that names it takes. A ticket of the session locked since it was chosen is
+    /// no reason to refuse it, though that one may sort first (offered in the same second, or locked late).
+    pub fn usable_named(&self, session: &str, tip: i64, hash: &str) -> Option<&Ticket> {
+        self.tickets.get(hash).filter(|t| t.session == session && t.state == TState::Locked && usable_at(t, tip))
     }
 
     /// Locked tickets of a session that are too close to their expiry to be released.
@@ -2471,6 +2545,14 @@ mod tests {
         assert_eq!(b.usable("s1", 115), None);
         assert_eq!(b.usable("s1", 0), None, "our own tip unknown: nothing is released");
         assert_eq!(b.usable("s2", 99), None);
+        // named: that one, wherever it sorts, on the same terms
+        assert_eq!(b.usable_named("s1", 99, &new.hash).map(|t| t.hash.clone()), Some(new.hash.clone()), "an older one locked is no reason to refuse it");
+        assert_eq!(b.usable_named("s1", 100, &old.hash), None, "25 left");
+        assert_eq!(b.usable_named("s1", 99, &blind.hash), None);
+        assert_eq!(b.usable_named("s2", 99, &new.hash), None, "another session's");
+        assert_eq!(b.usable_named("s1", 99, "none"), None);
+        b.tickets.get_mut(&new.hash).unwrap().state = TState::Released;
+        assert_eq!(b.usable_named("s1", 99, &new.hash), None, "released once");
     }
 
     #[test]

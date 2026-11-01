@@ -316,6 +316,7 @@ impl Handler for Service {
         }
         Reply::Whole(match path.as_str() {
             "/api" => Response::text(200, "application/json", json!({"method": req.method, "body": String::from_utf8_lossy(&req.body)}).to_string()),
+            p if p.starts_with("/hashrate/") => Response::text(200, "application/json", "{\"counted\":true}"),
             "/broken" => Response::text(500, "text/plain", "the service failed"),
             _ => Response::text(404, "text/plain", "no such thing"),
         })
@@ -591,6 +592,14 @@ fn routes_with(conf: &Value) -> Value {
         if let Some(c) = conf["capacity"].get(route["path"].as_str().unwrap()) {
             route["capacity"] = c.clone();
         }
+    }
+    // a shop that rents out miners: a paid slice at this price, with a top ticket of its own ([`hash_shop`])
+    if let Some(price) = conf["slice_msat"].as_u64() {
+        let mut route = json!({"path": "/hashrate/", "methods": ["POST"], "price": {"request_msat": price}, "max_body": 4096});
+        if let Some(top) = conf["top_ticket_msat"].as_u64() {
+            route["top_ticket_msat"] = top.into();
+        }
+        r.as_array_mut().unwrap().push(route);
     }
     r
 }
@@ -11195,12 +11204,11 @@ fn a_call_may_buy_a_whole_ticket_and_be_charged_only_its_max_charge() {
     assert!(charged <= 30_000 && charged > 20_000, "charged {charged} msat for a cap of 30 sat: {film}");
 }
 
-/// A hashrate trial's payments, as `xbt-hashlink`'s `SignerPayer` makes them (`pay_caps`: `max_sats`
-/// 2,000 so the shop's whole ticket may be bought, `max_charge_sats` the trial's 40 sat), from no
-/// credit: the first slice buys one ticket, every slice after is paid from it, each is charged its
-/// own price, and the buyer's node, the seller's node, the receipts and the ledger agree on it.
-/// (The trial before the charge cap called with `max_sats` 40, which buys no ticket of 1,000 sat: it
-/// paid nothing at all. That call is still denied `max_sats`, as the first assertion here shows.)
+/// A call charged little that may buy the seller's one size of ticket (`max_sats` 2,000, `max_charge_sats`
+/// 40), from no credit: the first call buys one ticket, every call after is paid from it, each is
+/// charged its own price, and the buyer's node, the seller's node, the receipts and the ledger
+/// agree on it. (The same call with `max_sats` 40 buys no ticket of 1,000 sat, as the first assertion
+/// here shows. A hashrate rental no longer pays this way: [`a_starter_wallet_pays_a_4_th_miner_at_market_past_any_hourly_limit`].)
 #[test]
 fn a_trial_from_no_credit_buys_one_ticket_and_pays_every_slice_from_it() {
     let _g = env_lock();
@@ -14159,3 +14167,371 @@ fn a_moment_with_no_route_and_many_wins_pays_every_win() {
     }
 }
 
+// --- what a hashrate rental pays: market price, in steps it has earned ----------------------------------------
+
+/// Market price for the 2^45 hashes of a slice: about 1,617 sat for 2^47.
+const MARKET_MSAT: u64 = 404_250;
+const SLICE_WORK: u128 = 1 << 45;
+
+/// The wallet's starter rules on mainnet (`xbt_wallet_ui::app::starter_policy("main")`, which a test there
+/// holds to these) with the caps the signer takes on mainnet where the rules leave them out
+/// (`ticket::MAINNET_DEFAULTS`), on this rig's regtest chain. `hashrate`: that task's entry.
+fn mainnet_starter(hashrate: Value) -> Value {
+    json!({"max_per_tx_sats": 2_000, "daily_budget_sats": 10_000, "weekly_budget_sats": 30_000, "per_counterparty_cap_sats": 10_000, "per_counterparty_daily_sats": 5_000,
+           "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 1_000, "split_window_s": 600,
+           "ln": {"max_fee_base_sats": 10, "max_fee_ppm": 5_000},
+           "tickets": {"max_locked_tickets": 4, "max_locked_sats": 4_000, "max_sellers": 4, "max_new_sellers_per_min": 4, "max_sends_per_hour": 120,
+                       "tasks": {"default": {"budget_sats": 10_000}, "hashrate": hashrate}}})
+}
+
+fn starter_rental() -> Value {
+    json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}})
+}
+
+/// The task as the starter rules had it before: an older wallet's, whose owner has signed nothing since.
+fn older_hashrate_task() -> Value {
+    json!({"budget_sats": 5_000})
+}
+
+/// A hashmaker's gateway as it ships but for `tickets`, its route a paid slice at `price_msat`.
+fn hash_shop(price_msat: u64, tickets: Value, top: Option<u64>) -> Value {
+    json!({"tickets": tickets, "caps": {"sessions_per_address": 0, "strict": true}, "slice_msat": price_msat, "top_ticket_msat": top})
+}
+
+/// The gateway the app writes for a hashrate shop.
+fn app_shop(price_msat: u64) -> Value {
+    hash_shop(price_msat, json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000}), Some(100_000_000))
+}
+
+/// The hashtaker's payer on this rig's signer, over the signer's own socket, and the standing its
+/// meter would keep. Each step is what its payer thread does.
+struct Renter {
+    payer: xbt_hashlink::rail::SignerPayer,
+    standing: xbt_hashlink::order::Standing,
+    _running: xbt_signer::server::Running,
+}
+
+impl Renter {
+    fn new(r: &Rig, task: &str, price_msat: u64, start_slices: u64, budget_sats: Option<u64>) -> Self {
+        let sock = r.root.join("hashrate.sock");
+        let _ = std::fs::remove_file(&sock);
+        let running = xbt_signer::server::spawn(r.s.clone(), &sock, false).unwrap();
+        let payer = xbt_hashlink::rail::SignerPayer::new(sock, r.shop.url("/hashrate"), task.into(), price_msat, budget_sats, None, Duration::from_secs(5));
+        let standing = xbt_hashlink::order::Standing { proven: 0, largest_share: SLICE_WORK, paid: 0, start_slices, slice_work: SLICE_WORK, price_msat, msat_a_second: 0.0, buy_secs: 0.0 };
+        Self { payer, standing, _running: running }
+    }
+
+    /// A share's worth of proven work at `seconds` since the rental began, and every payment now due.
+    /// As in the hashtaker, a slice counts as paid from when it is queued.
+    fn share(&mut self, seconds: f64) -> Result<(), String> {
+        self.standing.proven += SLICE_WORK;
+        self.standing.msat_a_second = if seconds < 1.0 { 0.0 } else { (self.standing.proven / SLICE_WORK) as f64 * self.standing.price_msat as f64 / seconds };
+        while self.standing.pay_next() {
+            self.standing.paid += 1;
+            self.pay()?;
+        }
+        Ok(())
+    }
+
+    fn pay(&mut self) -> Result<Value, String> {
+        // as the hashtaker sizes it: inside the step, with the credit the seller holds and the slice being paid
+        let credit = xbt_hashlink::rail::Payer::held(&self.payer).0;
+        self.payer.caps_for(self.standing.ticket_msat_with(credit));
+        let n = self.standing.paid;
+        self.payer.pay("r1", n, &json!({"slice": n}))
+    }
+}
+
+fn paid_tickets(r: &Rig) -> Vec<u64> {
+    r.ln.by_status("SUCCEEDED").iter().map(|p| p["value_msat"].as_str().unwrap().parse::<u64>().unwrap() / 1000).collect()
+}
+
+/// The test the design rests on. A wallet on the starter rules, paying market price at a 4 TH/s miner's
+/// rate (about 165,000 sat an hour, a slice every 8.8 s) through a real gateway and signer, for
+/// longer than an hour on the wallet's clock: no limit stops it until the task's own budget, which
+/// is said plainly; every ticket is inside the step earned; nothing is ever locked; and the rest of
+/// the wallet stands, its budgets untouched by a sum far above them.
+#[test]
+fn a_starter_wallet_pays_a_4_th_miner_at_market_past_any_hourly_limit() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 2, Some(1_000_000));
+    let t0 = r.clock.load(Ordering::SeqCst);
+    let per_slice = (SLICE_WORK as f64) / 4e12;
+    let (mut seconds, mut shares, mut stopped) = (0.0f64, 0u64, None);
+    while seconds < 3.0 * 3600.0 {
+        seconds += per_slice;
+        shares += 1;
+        r.clock.store(t0 + seconds as u64, Ordering::SeqCst);
+        if let Err(why) = t.share(seconds) {
+            stopped = Some(why);
+            break;
+        }
+    }
+    let tickets = paid_tickets(&r);
+    let moved: u64 = tickets.iter().sum();
+    let slices = t.standing.paid - 1;
+    eprintln!("MEASURED {shares} shares in {seconds:.0} s: {slices} slices paid, {} tickets, {moved} sat, the largest {} sat, the last ten {:?}; ledger {}; ended: {stopped:?}",
+              tickets.len(), tickets.iter().max().unwrap(), &tickets[tickets.len() - 10..], r.ledger_sum());
+    assert!(seconds > 3600.0, "ended after {seconds} s: {stopped:?}");
+    let why = stopped.expect("the budget ends it");
+    assert!(why.starts_with(xbt_hashlink::rail::WALLET_RULES) && why.contains("budget_sats"), "{why}");
+    // the rate paid: market, within a slice or two of the work delivered, and no more tickets than the task's limit in any hour
+    assert!((180_000..=200_000).contains(&r.ledger_sum()), "{}", r.ledger_sum());
+    assert!(r.ln.by_status("IN_FLIGHT").is_empty() && r.ln.by_status("FAILED").is_empty(), "nothing locked, nothing failed");
+    assert!(tickets.len() as f64 / (seconds / 3600.0) < 600.0, "{} tickets", tickets.len());
+    // inside the step: 30 s of output, about 1,380 sat, whatever was delivered
+    assert!(*tickets.iter().max().unwrap() <= 1_400, "{tickets:?}");
+    assert!(tickets[0] <= 546 + 2 * 405, "{tickets:?}");
+    // the seller's signed count: every slice at its price
+    let stop = t.payer.stop().unwrap();
+    assert_eq!(stop["http"]["account"]["spent_msat"].as_str(), Some((slices * MARKET_MSAT).to_string().as_str()), "{stop}");
+    r.tick();
+    r.assert_booked();
+    // the wallet's other limits stand: the day's budget is far below what went, and another task pays as before
+    assert!(r.ledger_sum() > 10_000);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "default"}));
+    assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "{v}");
+}
+
+/// A wallet whose owner has signed nothing since: its task as the starter rules had it. A rental there
+/// locks a held pool after its first prepaid ticket, and ends at its 5,000 sat, about 109 s of a 4 TH/s
+/// miner at market, with a reason in words. So this wallet needs the owner's new rules to rent at market.
+#[test]
+fn an_older_wallet_stops_at_its_tasks_budget_and_says_so() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(older_hashrate_task()), 30, app_shop(MARKET_MSAT));
+    { let mut st = r.ln.st.lock().unwrap(); st.channel["remote_constraints"]["dust_limit_sat"] = "546".into(); st.channel["remote_pubkey"] = r.shop.id().into(); }
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 2, Some(1_000_000));
+    let t0 = r.clock.load(Ordering::SeqCst);
+    let (mut seconds, mut why) = (0.0f64, None);
+    let mut locked = false;
+    while seconds < 600.0 && why.is_none() {
+        seconds += SLICE_WORK as f64 / 4e12;
+        r.clock.store(t0 + seconds as u64, Ordering::SeqCst);
+        why = t.share(seconds).err();
+        std::thread::sleep(Duration::from_millis(20));
+        locked |= r.status()["sessions"].as_array().is_some_and(|a| a.iter().any(|s| s["pool"].as_u64().unwrap_or(0) > 0));
+    }
+    eprintln!("MEASURED an older wallet ended at {seconds:.0} s, {} sat booked: {why:?}", r.ledger_sum());
+    assert!(locked, "as it was: a held pool after the first prepaid ticket");
+    let why = why.expect("it ends");
+    assert!(why.starts_with(xbt_hashlink::rail::WALLET_RULES), "{why}");
+    assert!(r.ledger_sum() <= 5_000, "{}", r.ledger_sum());
+}
+
+/// A rental task holds nothing, whatever the seller offers; another task on the same wallet still holds
+/// after its first prepaid ticket. `ticket_seller_cap` refuses a held session outright (it isn't in
+/// `HOLD_SHORT`, so it doesn't fall back to prepaid tickets): a rental task doesn't reach it.
+#[test]
+fn a_rental_task_is_prepaid_only_where_another_task_holds() {
+    let _g = env_lock();
+    let extra = |seller_tickets: i64| { let mut p = mainnet_starter(starter_rental()); p["tickets"]["seller_max_tickets"] = seller_tickets.into(); p };
+    let pool = |r: &Rig, v: &Value| r.session(v["session"].as_str().unwrap())["sessions"][0]["pool"].as_u64();
+    let r = Rig::shipped(extra(2), 30, app_shop(MARKET_MSAT));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(10_000));
+    t.standing.paid = 1;
+    let v = t.pay().unwrap();
+    assert_eq!((pool(&r, &v), v["tickets_prepaid"].as_u64()), (Some(0), Some(1)), "{v}");
+    // a cap that allows no held ticket with this seller: another task is refused for it, with prepaid tickets on offer; a rental is not
+    let r = Rig::shipped(extra(0), 30, app_shop(MARKET_MSAT));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "default"}));
+    assert_eq!(v["rule"].as_str(), Some("ticket_seller_cap"), "{v}");
+    assert_eq!(r.ln.paid_msat(), 0);
+    let r = Rig::shipped(extra(0), 30, app_shop(MARKET_MSAT));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(10_000));
+    t.standing.paid = 1;
+    assert_eq!(t.pay().unwrap()["tickets_prepaid"].as_u64(), Some(1));
+    // a seller with held tickets only is refused for a rental task, in words, with nothing locked
+    let r = Rig::shipped(extra(2), 30, hash_shop(MARKET_MSAT, json!({"ticket_msat": 546_000, "settle": ["on-use"]}), None));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(10_000));
+    t.standing.paid = 1;
+    let why = t.pay().unwrap_err();
+    assert!(why.contains("ticket_prepaid_only"), "{why}");
+    assert!(r.ln.state().payments.is_empty());
+}
+
+/// `prepaid_size` clamps for a rental task: a route's top ticket above what the owner allows the task is
+/// bought at what it allows. For any other task the same seller's prepaid tickets are as they were:
+/// refused where the seller's one size is above `max_ticket_sats`.
+#[test]
+fn a_rental_tasks_ticket_is_clamped_where_anothers_is_refused() {
+    let _g = env_lock();
+    let task = json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 5_000, "max_sends_per_hour": 600}});
+    let shop = || hash_shop(MARKET_MSAT, json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000}), Some(100_000_000));
+    let r = Rig::shipped(mainnet_starter(task.clone()), 30, shop());
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(100_000));
+    t.standing.paid = 1;
+    t.payer.caps_for(30_000_000);
+    let v = t.payer.pay("r1", 1, &json!({})).unwrap();
+    assert_eq!((paid_tickets(&r), v["tickets_prepaid"].as_u64()), (vec![5_000], Some(1)), "what the task allows: {v}");
+    // the seller's smallest above what the task allows: refused, in words
+    let dear = hash_shop(MARKET_MSAT, json!({"ticket_msat": 6_000_000, "min_ticket_msat": 5_500_000}), None);
+    let r = Rig::shipped(mainnet_starter(task), 30, dear);
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(100_000));
+    t.standing.paid = 1;
+    assert!(t.pay().unwrap_err().contains("ticket_prepaid_only"));
+    // another task and a prepaid-only seller of one size above max_ticket_sats: as it was
+    let one = hash_shop(MARKET_MSAT, json!({"ticket_msat": 2_000_000, "settle": ["on-arrival"]}), None);
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, one);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 5_000, "task": "default"}));
+    assert!(v["reason"].as_str().unwrap().contains("max_ticket_sats") && r.ln.paid_msat() == 0, "{v}");
+}
+
+/// A miner whose earned step is above the starter rules' 10,000 sat a ticket: a 100 TH/s miner at market price earns
+/// a step of 30 s of its output, about 34,500 sat. Its tickets are clamped to the cap and paid, never refused or left
+/// waiting, and at that size it needs about 414 of them an hour, under the 600 its task allows.
+#[test]
+fn a_big_miners_step_above_the_starter_cap_is_paid_in_tickets_of_the_cap() {
+    let _g = env_lock();
+    let shop = hash_shop(MARKET_MSAT, json!({"ticket_msat": 546_000, "min_ticket_msat": 546_000}), Some(100_000_000));
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, shop);
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(200_000));
+    // 100 TH/s at market: 2^45 hashes a slice, about 2.84 slices a second, 1,149 sat a second
+    let slices_a_second = 100e12 / SLICE_WORK as f64;
+    t.standing.msat_a_second = slices_a_second * MARKET_MSAT as f64;
+    t.standing.proven = 200 * SLICE_WORK;
+    t.standing.paid = 200;
+    let step = t.standing.ticket_msat_with(0);
+    assert!(step > 30_000_000, "the step a 100 TH/s miner has earned: {step} msat");
+    for n in 201..=203 {
+        t.standing.paid = n;
+        let v = t.pay().unwrap_or_else(|e| panic!("slice {n}: {e}"));
+        assert_eq!(v["verdict"], "allow", "{v}");
+    }
+    let tickets = paid_tickets(&r);
+    assert!(!tickets.is_empty() && tickets.iter().all(|s| *s <= 10_000), "every ticket within the cap: {tickets:?}");
+    assert!(tickets.contains(&10_000), "clamped to the cap, not smaller: {tickets:?}");
+    let an_hour = 3600.0 * slices_a_second * MARKET_MSAT as f64 / 10_000_000.0;
+    assert!(an_hour < 600.0, "{an_hour:.0} tickets an hour at the cap");
+}
+
+/// The analysis' claim that, with the charge cap set per call, the ticket's size needs no wallet change.
+/// It holds for a task with no new settings only inside the seller's own size and the owner's "ask me
+/// first" line: the ticket is the charge cap from the seller's smallest up to those, and no further.
+/// So 546 sat and 900 sat: yes. The 1,380 sat of a 4 TH/s step on a starter wallet: no.
+#[test]
+fn a_charge_cap_sizes_the_ticket_only_inside_the_sellers_size_and_the_owners_threshold() {
+    let _g = env_lock();
+    let prepaid_only = || hash_shop(MARKET_MSAT, json!({"ticket_msat": 5_000_000, "min_ticket_msat": 546_000, "settle": ["on-arrival"]}), None);
+    let cases = [(546, 546), (700, 700), (900, 900), (1_380, 984)];
+    for (charge, bought) in cases {
+        let extra = {
+            let mut p = mainnet_starter(starter_rental());
+            p["tickets"]["max_ticket_sats"] = 5_000.into();
+            p
+        };
+        let r = Rig::shipped(extra, 30, prepaid_only());
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": charge + 200, "max_charge_sats": charge, "task": "default"}));
+        assert_eq!(v["status"].as_u64(), Some(200), "{charge}: {v}");
+        assert_eq!(paid_tickets(&r), vec![bought], "a charge cap of {charge}: {v}");
+    }
+    // a rental task: the same cap, the whole of it
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(100_000));
+    t.payer.caps_for(1_380_000);
+    t.payer.pay("r1", 1, &json!({})).unwrap();
+    assert_eq!(paid_tickets(&r), vec![1_380]);
+}
+
+/// The analysis' claim that the seller's 300 s idle drop isn't reached at these step times. A slice
+/// every 8.8 s, or a ticket every 30 s: no. A slow miner's slice can pass the wallet's own 120 s idle
+/// stop, which ends the session in order: the next slice opens another and spends what is left. And
+/// where the wallet's watcher was away too and the session had nothing in it, the seller has forgotten
+/// it: the signer ends the call with `ticket_session_ended`, and the payer asks once more.
+#[test]
+fn a_slow_miners_rental_goes_on_past_the_idle_limits() {
+    let _g = env_lock();
+    // one ticket's worth of slice, so nothing is left in the session between them
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, hash_shop(546_000, json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000}), Some(100_000_000)));
+    let mut t = Renter::new(&r, "hashrate", 546_000, 0, Some(100_000));
+    t.standing.paid = 1;
+    let first = t.pay().unwrap();
+    assert_eq!(first["balance_msat"].as_str(), Some("0"), "{first}");
+    // the watcher runs: the wallet stops the session at 120 s, and the next slice opens another
+    r.clock.fetch_add(130, Ordering::SeqCst);
+    r.tick();
+    t.standing.paid = 2;
+    let second = t.pay().unwrap();
+    assert_ne!(first["session"], second["session"], "{second}");
+    // the watcher away and the seller's idle limit passed: it forgets the session
+    r.clock.fetch_add(400, Ordering::SeqCst);
+    let sid = second["session"].as_str().unwrap().to_string();
+    wait_for("the seller to forget the session", || r.shop.gw.stats().sessions == 0);
+    t.standing.paid = 3;
+    let third = t.pay().unwrap();
+    assert_ne!(third["session"].as_str(), Some(sid.as_str()), "{third}");
+    assert_eq!(paid_tickets(&r), vec![546, 546, 546], "one ticket each, none twice");
+    assert_eq!(r.shop.settled(), 3);
+}
+
+/// What a shop-wide smallest of 546 sat does to a shop's other services, measured: the same calls on a
+/// shop with and without it. A call whose limit took the shop's own ticket pays the same tickets, in
+/// the same money. A call that couldn't before can now, and a call charged little moves less.
+#[test]
+fn a_shop_wide_smallest_of_546_changes_nothing_for_a_call_that_could_pay_before() {
+    let _g = env_lock();
+    let shop = |min: Option<u64>| {
+        let mut t = json!({"ticket_msat": 900_000});
+        if let Some(m) = min {
+            t["min_ticket_msat"] = m.into();
+        }
+        json!({"tickets": t, "caps": {"sessions_per_address": 0, "strict": true}})
+    };
+    let run = |min: Option<u64>, path: &str, max_sats: i64, charge: Option<i64>| {
+        let r = Rig::shipped(mainnet_starter(starter_rental()), 30, shop(min));
+        let mut p = json!({"url": r.shop.url(path), "max_sats": max_sats, "task": "default"});
+        if let Some(c) = charge {
+            p["max_charge_sats"] = c.into();
+        }
+        let v = r.call("xbt402_pay", p);
+        r.tick();
+        (v["status"].as_u64(), paid_tickets(&r), r.ledger_sum(), r.shop.settled())
+    };
+    for (path, max_sats) in [("/page/10", 2_000), ("/api", 2_000), (&format!("/files/{}", 3 * 1_048_576) as &str, 2_000), ("/tiny/1", 2_000)] {
+        let (before, after) = (run(None, path, max_sats, None), run(Some(546_000), path, max_sats, None));
+        eprintln!("MEASURED {path} at {max_sats}: without {before:?}, with {after:?}");
+        assert_eq!(before.0, after.0, "{path}");
+        assert_eq!(before.1, after.1, "{path}: the same tickets");
+    }
+    // what it does change: a call of a limit under the shop's own ticket pays where it was refused, and one charged little moves less
+    let (before, after) = (run(None, "/page/10", 700, None), run(Some(546_000), "/page/10", 700, None));
+    eprintln!("MEASURED /page/10 at 700: without {before:?}, with {after:?}");
+    assert_eq!((before.0, after.0), (None, Some(200)));
+    let (before, after) = (run(None, "/page/10", 2_000, Some(20)), run(Some(546_000), "/page/10", 2_000, Some(20)));
+    eprintln!("MEASURED /page/10 charged at most 20: without {before:?}, with {after:?}");
+    assert_eq!((before.1, after.1), (vec![900], vec![546]));
+}
+
+/// A rental's sends count against its own limit, and another task's only against the wallet's.
+#[test]
+fn a_rentals_sends_and_another_tasks_count_apart() {
+    let _g = env_lock();
+    let mut extra = mainnet_starter(json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 2}}));
+    extra["tickets"]["max_sends_per_hour"] = 1.into();
+    let r = Rig::shipped(extra, 30, hash_shop(MARKET_MSAT, json!({"ticket_msat": 546_000, "min_ticket_msat": 546_000, "settle": ["on-arrival"]}), None));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(100_000));
+    for n in 1..=2 {
+        t.standing.paid = n;
+        t.pay().unwrap();
+    }
+    assert_eq!(paid_tickets(&r).len(), 2);
+    // its third ticket: past its limit, in words
+    let mut last = Ok(json!({}));
+    for n in 3..=5 {
+        t.standing.paid = n;
+        last = t.pay();
+        if last.is_err() {
+            break;
+        }
+    }
+    let why = last.unwrap_err();
+    assert!(why.starts_with(xbt_hashlink::rail::WALLET_RULES) && why.contains("rental.max_sends_per_hour"), "{why}");
+    assert_eq!(paid_tickets(&r).len(), 2);
+    // the wallet's own limit of one an hour hasn't been touched by them: another task's first ticket goes
+    t.payer.stop();
+    // (3 MiB at 200 sat a MiB: more than the credit the rental left, so it buys a ticket)
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 3 * MIB)), "max_sats": 2_000, "task": "default"}));
+    assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "{v}");
+    assert!(paid_tickets(&r).len() >= 3, "{v}");
+}

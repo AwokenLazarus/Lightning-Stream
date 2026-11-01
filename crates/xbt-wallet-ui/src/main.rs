@@ -240,6 +240,14 @@ fn serve() -> i32 {
             }
         });
     }
+    if app.cfg.hash.hasher.is_some() {
+        let app = app.clone();
+        // the hashmaker's price follows the difficulty and its miners' speed (Sell → Hashrate)
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            app.hash_reprice(false);
+        });
+    }
     match xbt_wallet_ui::server::spawn(app.clone()) {
         Ok(r) => {
             eprintln!("xbt-wallet-ui listening on http://{}{} (signer {})", r.addr, app.cfg.base_path, app.cfg.signer_sock.display());

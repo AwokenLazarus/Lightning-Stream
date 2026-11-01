@@ -213,6 +213,7 @@ impl Gateway {
                 // the gateway's size, or a smaller one its terms let a buyer choose
                 let ticket = self.cfg.caps.ticket_msat;
                 let min = self.cfg.min_ticket_msat.unwrap_or(ticket);
+                let ticket = if self.cfg.min_ticket_msat.is_some() { self.prepaid_top_msat() } else { ticket };
                 let ok = self.cfg.prepaid
                     && (min..=ticket).contains(&note.amount_msat)
                     && inv.paid_msat >= note.amount_msat

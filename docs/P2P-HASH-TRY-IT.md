@@ -1,6 +1,8 @@
 # p2p-hash: try it
 
-Rent BLAKE2b hashrate from someone, or rent yours out, paid in sats as accepted work arrives.
+Rent BLAKE2b hashrate from someone, or rent yours out, paid in sats as you use it, seconds at a time.
+
+**In 0.2.0:** Renting hashrate needs masked jobs (jobs that hide which shares win), solo or through a pool, so a hashmaker can't keep back the shares that would be blocks. The app comes with a DATUM Gateway that masks its jobs, and rents into it. Before each rental, and when the Rent page opens, the app checks the jobs; if they aren't masked (the gateway isn't running, or the app is set to another gateway that doesn't mask), it says so and rents nothing.
 The hashtaker's own DATUM Gateway makes the jobs. Nobody holds anyone's money. How it works:
 [P2P-HASH.md](P2P-HASH.md).
 
@@ -74,16 +76,19 @@ target/release/xbt-hashlink keygen hashtaker.key      # the hashtaker's link key
        "macaroon": "invoices.macaroon",
        "info_macaroon": "info.macaroon"
      },
-     "tickets": { "ticket_msat": 546000, "max_tickets": 2, "ticket_blocks": 40, "settle": ["on-use", "on-arrival"] },
+     "tickets": { "ticket_msat": 546000, "min_ticket_msat": 546000, "max_tickets": 2, "ticket_blocks": 40, "settle": ["on-use", "on-arrival"] },
      "routes": [
        { "path": "/hashrate/", "upstream": "http://127.0.0.1:34943", "methods": ["POST"],
-         "max_body": 8192, "price": { "request_msat": 40000 } }
+         "max_body": 8192, "price": { "request_msat": 40000 }, "top_ticket_msat": 100000000 }
      ]
    }
    ```
 
-   `request_msat` is the price of one slice, and it must equal `--price-msat` below. Check the config
-   against the node, then run it:
+   `request_msat` is the price of one slice, and it must equal `--price-msat` below.
+   `min_ticket_msat` is the smallest ticket you sell, and a renter's first step: 546 sat. A gateway
+   whose smallest is more is refused by renters, with nothing paid. `top_ticket_msat` is the largest
+   prepaid ticket this route sells, for a big miner's tickets; it doesn't raise what is held.
+   Check the config against the node, then run it:
 
    ```
    target/release/xbt-gateway --check gateway.json
@@ -112,8 +117,8 @@ target/release/xbt-hashlink keygen hashtaker.key      # the hashtaker's link key
 
    - `--slice-work` is the work in a slice, in hashes. A share at difficulty `d` is `d × 2^32`
      hashes, so 140737488355328 is 8 shares at difficulty 4096: about 34 s of a 4.1 TH/s miner.
-   - `--slices` is where the gateway's paid requests arrive (the route's upstream above). The
-     hashmaker answers 200 only for a slice its own meter counted, so nothing else is charged.
+   - `--slices` is where the gateway's paid requests arrive (the route's upstream above). Each one
+     pays a slice ahead of its work, and the hashmaker sends no share on past what's paid.
    - `--relays` takes `wss://` relays. Plain `ws://` is accepted only on loopback.
 
 5. **Point the miners** at `stratum+tcp://HASHER_HOST:34930`. Keep the usual pool as the fallback
@@ -179,9 +184,9 @@ rented out at once. See [P2P-HASH.md](P2P-HASH.md#the-fallback-pool-and-several-
 
 - `buyer.json` and `hasher.json`: accepted and rejected shares, the work counted, each slice and
   its payment, and why the rental ended.
-- The hashmaker stops serving when a finished slice is not paid within `--grace-ms`, or as soon as
-  a second slice finishes unpaid. The hashtaker stops paying when no accepted work arrives (`--idle-s`)
-  or at `--duration-s`.
+- The hashmaker sends no share on past what's paid: one that doesn't fit waits 2 s for payment, and
+  without it the rental stops and the miners go home. The hashtaker stops paying when no proven work
+  arrives (`--idle-s`) or at `--duration-s`.
 
 ## Known limits
 

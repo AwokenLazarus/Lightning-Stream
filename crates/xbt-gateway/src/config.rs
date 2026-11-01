@@ -100,6 +100,10 @@ pub struct Route {
     pub accounts: Option<Accounts>,
     /// How many buyers and streams the service takes at once (`capacity`, docs/CAPACITY.md).
     pub capacity: Capacity,
+    /// The largest prepaid ticket a buyer may ask for on this route (`top_ticket_msat`), above
+    /// `tickets.ticket_msat`: work paid for at a rate a shop's own ticket can't keep up with. Prepaid
+    /// only, so what it raises isn't held: the held budget and every other route's terms stand.
+    pub top_ticket_msat: Option<u64>,
     /// The service the route is part of (`service`, else its upstream; "" for the config's): the
     /// routes of one service count a buyer once over all of them (`capacity.max_buyers`).
     pub service: String,
@@ -869,6 +873,11 @@ impl Config {
             if r.path == lottery_path || r.path.starts_with(&format!("{lottery_path}/")) {
                 return Err(format!("route {}: that path is the gateway's own", r.path));
             }
+            if let Some(top) = r.top_ticket_msat {
+                if !prepaid || min_ticket_msat.is_none() || !(ticket_msat..=100_000_000_000).contains(&top) {
+                    return Err(format!("route {}: top_ticket_msat is from tickets.ticket_msat ({ticket_msat}) to 100000000000, and needs prepaid tickets and tickets.min_ticket_msat", r.path));
+                }
+            }
             if r.release == Release::AfterVerify && r.price.request_msat > ticket_msat {
                 return Err(format!(
                     "route {}: a piece served before its secret costs at most one ticket",
@@ -984,6 +993,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "websocket",
             "accounts",
             "capacity",
+            "top_ticket_msat",
             "service",
         ],
     )?;
@@ -1222,6 +1232,7 @@ fn route(v: &Value) -> Result<Route, String> {
         websocket,
         accounts,
         capacity,
+        top_ticket_msat: r.get("top_ticket_msat").map(|_| num(r, "top_ticket_msat", 0)).transpose()?,
         service,
     })
 }
@@ -1815,6 +1826,27 @@ mod tests {
             (
                 "tickets.settle",
                 Box::new(|v| v["tickets"] = json!({"settle": []})),
+            ),
+            (
+                "top_ticket_msat",
+                Box::new(|v| {
+                    v["tickets"] = json!({"ticket_msat": 546_000});
+                    v["routes"][0]["top_ticket_msat"] = json!(1_000_000);
+                }),
+            ),
+            (
+                "top_ticket_msat",
+                Box::new(|v| {
+                    v["tickets"] = json!({"ticket_msat": 546_000, "min_ticket_msat": 546_000, "settle": ["on-use"]});
+                    v["routes"][0]["top_ticket_msat"] = json!(1_000_000);
+                }),
+            ),
+            (
+                "top_ticket_msat",
+                Box::new(|v| {
+                    v["tickets"] = json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000});
+                    v["routes"][0]["top_ticket_msat"] = json!(899_999);
+                }),
             ),
             (
                 "tickets.settle",

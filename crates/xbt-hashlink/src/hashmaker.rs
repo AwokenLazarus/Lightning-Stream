@@ -15,16 +15,18 @@
 //! * any other miner is asked to connect again (`client.reconnect` to the app's own address) and
 //!   placed by its worker name when it does.
 //!
-//! Within a rental the hashmaker meters the hashtaker's verdicts itself, takes a locked ticket before
-//! serving a slice (the lab's rail over the link), and ends the rental when a finished slice is
-//! not paid within the grace time, or as soon as a second slice finishes unpaid. When the hashtaker
-//! ends it, the hashtaker says how many slices it counted, and only slices both sides counted are
-//! billed.
+//! Within a rental the hashmaker proves every share itself ([`crate::meter`]): one its hash doesn't prove
+//! is neither counted nor sent on, and the miner gets a rejection from here. A renter's verdicts set
+//! nothing. No share is forwarded past what's paid ([`crate::order`]): one that doesn't fit waits on a short clock
+//! for payment, and without it the rental stops and its miners go home. It also stops on what a renter
+//! could do to keep miners without work to show: no first payment in time, paid time used up, more jobs or
+//! shares a second than a rental needs, or jobs it can't check.
 
 use crate::link::{self, Sender};
 use crate::listing::Capacity;
-use crate::meter::{Event, Meter, Receipt};
-use crate::msg::{Msg, Terms};
+use crate::meter::{share_work, Claim, Meter, Proven, Receipt, Refused, Verdicts};
+use crate::msg::{Msg, Terms, PROOF};
+use crate::order;
 use crate::rail::{sha256, Hash, SellerRail};
 use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
@@ -55,17 +57,45 @@ pub struct Config {
     pub fallback: Option<String>,
     /// At most this many miners rented out at once (`None`: all of them).
     pub rentable: Option<u32>,
+    /// The least time a slice is reckoned to take, when reckoning a rental's paid time; a miner of unknown
+    /// speed is reckoned at this. [`MIN_SLICE_TIME`] but for the lab.
+    pub min_slice_time: Duration,
 }
 
 /// A rental's miners make tickets for one seller's rail each: one per rental.
 pub type Rails = Box<dyn FnMut() -> Box<dyn SellerRail> + Send>;
 
 const PING_EVERY: Duration = Duration::from_secs(15);
-const QUIET_LIMIT: Duration = Duration::from_secs(60);
+/// A rental whose hashtaker has been silent this long ends, however its link stalled.
+pub const QUIET_LIMIT: Duration = Duration::from_secs(60);
+/// A rental's paid time: its miners go idle or nearly so if a renter sends no jobs, or jobs too fast to work
+/// on, and proven work then never reaches what's paid. So a rental ends once its miners have served for this many
+/// times what the slices paid should take them.
+const PAID_TIME_FACTOR: u32 = 4;
+/// See [`Config::min_slice_time`]. A miner's speed needs this long to be measured at all.
+pub const MIN_SLICE_TIME: Duration = Duration::from_secs(60);
+/// How long a miner's accepted work is watched before its speed is believed.
+const SPEED_SPAN: Duration = Duration::from_secs(60);
+/// More than this many shares proven in a second, for [`OVER_LIMIT`], ends a rental. A rental's cost to this
+/// app is about one line relayed and two hashes for each.
+const SHARES_A_SECOND: u32 = 500;
+/// More than this many notifies in a second, for [`OVER_LIMIT`], ends a rental.
+const JOBS_A_SECOND: u32 = 20;
+const OVER_LIMIT: Duration = Duration::from_secs(10);
+/// A rental's resumes, past one for each slice paid. Each one moves its miners to the fallback and back.
+const RESUMES_LEEWAY: u64 = 8;
+/// How long a share stays ready to be sent again at a `resume`: a link can stall this long unnoticed.
+const RECENT_KEPT: Duration = Duration::from_secs(120);
+const RECENT_MOST: usize = 8192;
+/// Proven shares kept for the report.
+const PROVEN_KEPT: usize = 256;
+/// Shares waiting for payment, at the most.
+const HELD_MOST: usize = 2048;
 // Five minutes: a miner's accepted shares come a fraction of a second apart or more (one 4 TH/s
 // miner sent about 0.2 a second), so a one-minute window held a dozen or so and could read a third
 // high or low; five minutes holds five times as many.
 const RATE_WINDOW: Duration = Duration::from_secs(300);
+/// With no fallback (the lab), how long a miner waits for a rental before it's let go.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How long a miner asked to connect again is expected back from its address.
 const RETURN_WAIT: Duration = Duration::from_secs(20);
@@ -112,7 +142,7 @@ struct Conn {
     /// The miner asked for `mining.set_extranonce`.
     extranonce: bool,
     /// Verdicts of the fallback (the miner's hashrate while it is not rented).
-    fb_meter: Meter,
+    fb_meter: Verdicts,
     /// Asked to connect again: closed at this time if still open.
     close_at: Option<Instant>,
     /// A placement or switch is under way for this connection.
@@ -133,6 +163,8 @@ struct Unit {
     /// Accepted work, fallback and rentals together (for the hashrate).
     work: u128,
     samples: VecDeque<(Instant, u128)>,
+    /// The fastest it has been seen over [`SPEED_SPAN`] or more, from any of its work.
+    fastest_hs: f64,
     earned_msat: u64,
     methods: BTreeMap<String, u64>,
     seen_ms: u64,
@@ -145,6 +177,53 @@ impl Unit {
             _ => 0.0,
         }
     }
+
+    fn note_speed(&mut self) {
+        if let (Some((t0, _)), Some((t1, _))) = (self.samples.front(), self.samples.back()) {
+            if *t1 - *t0 >= SPEED_SPAN {
+                self.fastest_hs = self.fastest_hs.max(self.hashrate());
+            }
+        }
+    }
+}
+
+/// Over a rate for [`OVER_LIMIT`] without a break.
+struct RateLimit {
+    most: u32,
+    count: u32,
+    second: Instant,
+    over_since: Option<Instant>,
+}
+
+impl RateLimit {
+    fn new(most: u32) -> RateLimit {
+        RateLimit { most, count: 0, second: Instant::now(), over_since: None }
+    }
+
+    /// One more, and whether that's over the limit for long enough.
+    fn hit(&mut self) -> bool {
+        self.count += 1;
+        let now = Instant::now();
+        if now - self.second >= Duration::from_secs(1) {
+            if self.count > self.most {
+                self.over_since.get_or_insert(self.second);
+            } else {
+                self.over_since = None;
+            }
+            self.count = 0;
+            self.second = now;
+        }
+        self.over_since.is_some_and(|t| now - t > OVER_LIMIT)
+    }
+}
+
+/// A proven share waiting for payment.
+struct Held {
+    conn: u64,
+    claim: Claim,
+    hash: Result<[u8; 32], String>,
+    v: Value,
+    line: String,
 }
 
 struct Rental {
@@ -163,18 +242,31 @@ struct Rental {
     unit_work: BTreeMap<String, u128>,
     locks: BTreeMap<u64, Hash>,
     paid: u64,
-    /// Own meter's work and time when each slice finished (index = slice - 1).
+    /// Own meter's work and time when each slice's worth was reached (index = slice - 1).
     done: Vec<(u128, u64)>,
     receipts: Vec<Value>,
-    agree: u64,
-    disagree: u64,
-    due_since: Option<Instant>,
-    lock_missing_since: Option<Instant>,
-    /// Miners are served (with the lab's rail, once the first ticket is locked).
+    /// Miners are served ([`order::ready_to_serve`]).
     ready: bool,
-    /// The hashtaker ended it: billed are the slices both sides counted; payments for them may still
-    /// arrive until the deadline.
-    closing: Option<(Instant, u64, String)>,
+    /// When this rental was asked for: its first payment has until the grace time after this.
+    asked_at: Instant,
+    /// How long miners have served it.
+    served: Duration,
+    shares: RateLimit,
+    jobs: RateLimit,
+    /// Shares sent on lately, with their channels, to send again at a `resume`.
+    recent: VecDeque<(u32, String, Instant)>,
+    resumes: u64,
+    /// The last proven shares, for the report: what each was, and its raw hash.
+    proven_shares: VecDeque<Value>,
+    /// Proven shares that don't fit in what's paid, in the order they came, and since when.
+    held: VecDeque<Held>,
+    held_since: Option<Instant>,
+    /// Waiting for a payment the renter said is on its way, its miners on the hashmaker's own pool meanwhile; and when
+    /// each such wait began, for the limit an hour.
+    waiting_since: Option<Instant>,
+    waits: VecDeque<Instant>,
+    /// Waits while the renter's step ramps up, counted apart ([`order::RAMP_WAITS_MOST`]).
+    ramp_waits: usize,
     /// The link dropped: until this deadline the rental waits for the hashtaker to come back
     /// ([`Msg::Resume`]), its miners on the fallback meanwhile; past it, the rental ends.
     suspended: Option<(Instant, String)>,
@@ -195,8 +287,34 @@ impl Rental {
         }
     }
 
-    fn completed(&self) -> u64 {
-        (self.meter.work / self.terms.slice_work) as u64
+    /// A share counted: its credit, and whether it's a reason to stop.
+    fn counted(&mut self, chan: u32, line: &str, p: &Proven) -> Option<String> {
+        if let Some(u) = self.chan_unit.get(&chan) {
+            *self.unit_work.entry(u.clone()).or_default() += p.work;
+        }
+        let s = self.terms.slice_work;
+        while self.meter.work >= (self.done.len() as u128 + 1) * s {
+            let w = self.meter.work;
+            self.done.push((w, now_ms()));
+        }
+        let now = Instant::now();
+        if self.proven_shares.len() == PROVEN_KEPT {
+            self.proven_shares.pop_front();
+        }
+        let params = sv1::parse(line).and_then(|v| sv1::params(&v).cloned()).unwrap_or_default();
+        self.proven_shares.push_back(json!({"chan": chan, "job": params.get(1), "en2": params.get(2), "ntime": params.get(3), "nonce": params.get(4),
+            "hash": hex::encode(p.hash), "work": p.work.to_string(), "atMs": now_ms()}));
+        self.recent.push_back((chan, line.to_string(), now));
+        while self.recent.len() > RECENT_MOST || self.recent.front().is_some_and(|(_, _, t)| now - *t > RECENT_KEPT) {
+            self.recent.pop_front();
+        }
+        if p.harder {
+            return Some("shares harder than the difficulty said".into());
+        }
+        if self.shares.hit() {
+            return Some("too many shares".into());
+        }
+        None
     }
 
     fn hashrate(&mut self) -> f64 {
@@ -226,12 +344,12 @@ impl Rental {
             "role": "hasher", "rental": self.id, "buyer": hex::encode(self.hashtaker.serialize()),
             "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "miners": self.units.iter().collect::<Vec<_>>(), "want": self.want, "startedMs": self.started_ms,
-            "ready": self.ready, "suspended": self.suspended.is_some(),
+            "ready": self.ready, "suspended": self.suspended.is_some(), "servedMs": self.served.as_millis() as u64,
+            "waitingForPayment": self.waiting_since.is_some(), "paymentWaits": self.waits.len(), "rampWaits": self.ramp_waits,
             "unitWork": self.unit_work.iter().map(|(u, w)| (u.clone(), Value::from(w.to_string()))).collect::<serde_json::Map<_, _>>(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "paid": self.paid, "earnedMsat": self.paid * self.terms.price_msat,
-            "receiptsAgree": self.agree, "receiptsDisagree": self.disagree,
-            "receipts": self.receipts, "stopped": self.stopped, "closing": self.closing.as_ref().map(|c| c.2.clone()),
+            "receipts": self.receipts, "stopped": self.stopped, "provenShares": self.proven_shares,
             "events": self.events,
         })
     }
@@ -241,9 +359,9 @@ struct Hub {
     terms: Terms,
     fallback: Option<String>,
     rentable: Option<u32>,
+    min_slice_time: Duration,
     /// Rentals are taken (off: miners all hash for the fallback, new hashtakers are told so).
     open: bool,
-    over_link: bool,
     units: BTreeMap<String, Unit>,
     conns: HashMap<u64, Conn>,
     rentals: BTreeMap<String, Rental>,
@@ -301,7 +419,7 @@ impl Hub {
     /// Where a unit's miner should hash now: a ready rental, or the fallback (`None`).
     fn target(&self, unit: &str) -> Option<String> {
         let r = self.units.get(unit)?.rental.as_ref()?;
-        self.rentals.get(r).filter(|r| r.ready && r.closing.is_none() && r.suspended.is_none() && r.stopped.is_none()).map(|r| r.id.clone())
+        self.rentals.get(r).filter(|r| r.ready && r.suspended.is_none() && r.stopped.is_none() && r.waiting_since.is_none()).map(|r| r.id.clone())
     }
 
     fn slot_rental(&self, conn: u64, slot: u64) -> Option<String> {
@@ -319,7 +437,7 @@ impl Hub {
         let mut changed = false;
         let cap = self.rentable.unwrap_or(u32::MAX);
         let ids: Vec<String> =
-            self.rentals.iter().filter(|(_, r)| r.closing.is_none() && r.suspended.is_none() && r.stopped.is_none()).map(|(k, _)| k.clone()).collect();
+            self.rentals.iter().filter(|(_, r)| r.ready && r.suspended.is_none() && r.stopped.is_none()).map(|(k, _)| k.clone()).collect();
         let mut order: Vec<(u64, String)> = ids.into_iter().map(|k| (self.rentals[&k].started_ms, k)).collect();
         order.sort();
         for (_, id) in order {
@@ -358,14 +476,19 @@ impl Hub {
     fn finish(&mut self, id: &str, reason: &str, tell: bool) {
         let Some(mut r) = self.rentals.remove(id) else { return };
         let s = r.terms.slice_work;
-        let billable = r.closing.as_ref().map(|c| c.1).unwrap_or(r.done.len() as u64);
-        let unpaid = (billable.saturating_sub(r.paid)) as f64;
-        let unbilled = (r.done.len() as u64).saturating_sub(billable);
+        let paid_work = order::paid_work(r.paid, r.terms.start_slices, s);
+        // shares still waiting for payment go no further, and their miners hear so
+        for h in std::mem::take(&mut r.held) {
+            let answer = Refused::Bad("unpaid".into()).rejection(h.v.get("id").unwrap_or(&Value::Null));
+            if let Some(c) = self.conns.get_mut(&h.conn) {
+                let _ = send_line(&mut c.w, &answer.to_string());
+            }
+        }
         r.stopped = Some(json!({
             "reason": reason, "atMs": now_ms(), "work": r.meter.work.to_string(), "paid": r.paid,
-            "unpaidWork": r.meter.work.saturating_sub(r.paid as u128 * s).to_string(),
-            "unpaidSlices": r.meter.work.saturating_sub(r.paid as u128 * s) as f64 / s as f64,
-            "billedSlices": billable, "unpaidBilledSlices": unpaid, "unbilledSlices": unbilled,
+            "unpaidWork": r.meter.work.saturating_sub(paid_work).to_string(),
+            "unpaidSlices": r.meter.work.saturating_sub(paid_work) as f64 / s as f64,
+            "paidAheadWork": paid_work.saturating_sub(r.meter.work).to_string(),
         }));
         if tell {
             let _ = r.tx.send(&Msg::Close { reason: reason.to_string(), slices: None });
@@ -402,14 +525,23 @@ impl Hub {
         let Some(r) = self.rentals.get_mut(id) else { return };
         let grace = Duration::from_millis(r.terms.grace_ms);
         r.suspended = Some((Instant::now() + grace, why.to_string()));
-        r.due_since = None;
-        r.lock_missing_since = None;
         r.note(json!({"ev": "link lost, waiting for the hashtaker", "why": why, "graceMs": r.terms.grace_ms, "atMs": now_ms()}));
         let chans: Vec<(u32, (u64, u64))> = r.chans.drain().collect();
+        r.chan_unit.clear();
+        // what's forwarded is kept in `recent`; this side checks no more shares on these channels
         for (chan, _) in &chans {
             r.meter.close(*chan);
         }
-        r.chan_unit.clear();
+        // shares waiting for payment are lost with their channels
+        r.held_since = None;
+        let held = std::mem::take(&mut r.held);
+        for h in held {
+            let answer = Refused::UnknownJob.rejection(h.v.get("id").unwrap_or(&Value::Null));
+            if let Some(c) = self.conns.get_mut(&h.conn) {
+                let _ = send_line(&mut c.w, &answer.to_string());
+            }
+        }
+        let Some(r) = self.rentals.get_mut(id) else { return };
         let units: Vec<String> = std::mem::take(&mut r.units).into_iter().collect();
         for (_, (conn, slot)) in chans {
             drop_slot(self, conn, slot);
@@ -451,8 +583,8 @@ impl Hashmaker {
             terms: cfg.terms.clone(),
             fallback: cfg.fallback.clone(),
             rentable: cfg.rentable,
+            min_slice_time: cfg.min_slice_time,
             open: true,
-            over_link: cfg.slices.is_none(),
             units: BTreeMap::new(),
             conns: HashMap::new(),
             rentals: BTreeMap::new(),
@@ -639,13 +771,33 @@ fn status(g: &Hub) -> Value {
 
 fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
     let Ok(link::Link { tx, mut rx, remote }) = link::answer(s, key) else { return };
-    let (id, want, terms, resumed) = match rx.recv() {
+    let (id, want, terms, resumed) = match rx.recv_within(link::HANDSHAKE_TIMEOUT) {
         Ok(Some(Msg::Resume { rental })) => {
             // the same hashtaker, back on a new link within the grace time: the rental carries on
-            let g = lock(&hub);
-            let back = g.rentals.get(&rental).filter(|r| r.suspended.is_some() && r.closing.is_none() && r.stopped.is_none() && r.hashtaker == remote);
-            match back {
-                Some(r) => (rental, r.want, r.terms.clone(), true),
+            let mut g = lock(&hub);
+            let back = g.rentals.get(&rental).filter(|r| r.stopped.is_none() && r.hashtaker == remote);
+            match back.map(|r| (r.want, r.terms.clone(), r.suspended.is_some(), r.tx.clone(), r.resumes + 1 > RESUMES_LEEWAY + r.paid)) {
+                Some((.., true)) => {
+                    // refused before any welcome: a resume past the limit is never told it's back
+                    drop(g);
+                    let _ = tx.send(&Msg::Close { reason: "too many resumes".into(), slices: None });
+                    tx.shutdown();
+                    let mut g = lock(&hub);
+                    if let Some(r) = g.rentals.get_mut(&rental) {
+                        r.tx.shutdown();
+                    }
+                    g.finish(&rental, "too many resumes", false);
+                    return;
+                }
+                Some((want, terms, waiting, old, false)) => {
+                    // back before this side noticed the drop (its key says it is the same hashtaker): the
+                    // old link is gone for it, so it is let go here too, as if the drop had been heard
+                    if !waiting {
+                        old.shutdown();
+                        g.suspend(&rental, "the hashtaker came back on a new link");
+                    }
+                    (rental, want, terms, true)
+                }
                 None => {
                     drop(g);
                     let _ = tx.send(&Msg::Close { reason: "no rental of yours waits to be resumed".into(), slices: None });
@@ -654,9 +806,12 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 }
             }
         }
-        Ok(Some(Msg::Hello { rental, terms, miners, .. })) => {
+        Ok(Some(Msg::Hello { rental, terms, miners, proof, .. })) => {
             let g = lock(&hub);
-            let why = if !g.open {
+            let why = if proof.as_deref() != Some(PROOF) {
+                // a renter that doesn't prove shares would pay by the verdicts: update, or no rental
+                Some(format!("this hashmaker proves shares ({PROOF}): this hashtaker needs updating"))
+            } else if !g.open {
                 Some("this hashmaker is not renting out miners now".to_string())
             } else if terms != g.terms {
                 Some("terms differ from the listing".to_string())
@@ -679,19 +834,24 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             return;
         }
     };
-    if tx.send(&Msg::Welcome { rental: id.clone(), terms_hash: hex::encode(terms.hash()) }).is_err() {
+    let welcome = Msg::Welcome { rental: id.clone(), terms_hash: hex::encode(terms.hash()), proof: Some(PROOF.into()) };
+    if resumed && tx.send(&welcome).is_err() {
         return;
     }
     if resumed {
         let mut g = lock(&hub);
         let Some(r) = g.rentals.get_mut(&id) else { return };
+        r.resumes += 1;
         r.tx = tx.clone();
         r.suspended = None;
         r.last_heard = Instant::now();
         r.last_ping = Instant::now();
-        r.due_since = (r.completed() > r.paid).then(Instant::now);
-        // the hashtaker sends its locks again on the new link; the clock for a missing one starts afresh
-        r.lock_missing_since = None;
+        // shares the old link may have lost, before anything else on this one: the hashtaker checks each
+        // and counts each once, so its count comes back up to this side's
+        let again: Vec<Msg> = r.recent.iter().map(|(chan, line, _)| Msg::Resend { chan: *chan, line: line.clone() }).collect();
+        for m in &again {
+            let _ = r.tx.send(m);
+        }
         let r = g.rentals.get_mut(&id).unwrap();
         r.note(json!({"ev": "hashtaker back, rental resumed", "atMs": now_ms()}));
         eprintln!("hashmaker: rental {id} resumed by hashtaker {}", hex::encode(remote.serialize()));
@@ -701,7 +861,6 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
     {
         let mut g = lock(&hub);
         let rail = (g.rails)();
-        let ready = !g.over_link;
         g.rentals.insert(id.clone(), Rental {
             terms,
             id: id.clone(),
@@ -717,12 +876,19 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             paid: 0,
             done: Vec::new(),
             receipts: Vec::new(),
-            agree: 0,
-            disagree: 0,
-            due_since: None,
-            lock_missing_since: None,
-            ready,
-            closing: None,
+            ready: false,
+            asked_at: Instant::now(),
+            served: Duration::ZERO,
+            shares: RateLimit::new(SHARES_A_SECOND),
+            jobs: RateLimit::new(JOBS_A_SECOND),
+            recent: VecDeque::new(),
+            resumes: 0,
+            proven_shares: VecDeque::new(),
+            held: VecDeque::new(),
+            held_since: None,
+            waiting_since: None,
+            waits: VecDeque::new(),
+            ramp_waits: 0,
             suspended: None,
             stopped: None,
             last_heard: Instant::now(),
@@ -733,8 +899,14 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             started_ms: now_ms(),
             rail,
         });
-        g.allocate();
     }
+    // the rental is known before its welcome goes, so a slice the hashtaker pays the moment it's welcomed (through the
+    // gateway, not this link) finds it. The welcome is sent with no lock held
+    if tx.send(&welcome).is_err() {
+        lock(&hub).rentals.remove(&id);
+        return;
+    }
+    lock(&hub).allocate();
     }
     loop {
         let m = match rx.recv() {
@@ -743,7 +915,7 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             Err(e) => {
                 let mut g = lock(&hub);
                 // a link that dropped on its own (not one a resume replaced) puts the rental on hold
-                if g.rentals.get(&id).is_some_and(|r| r.closing.is_none() && r.suspended.is_none() && r.tx.same(&tx)) {
+                if g.rentals.get(&id).is_some_and(|r| r.suspended.is_none() && r.tx.same(&tx)) {
                     g.suspend(&id, &format!("link lost: {e}"));
                 }
                 return;
@@ -755,32 +927,25 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
         match m {
             Msg::Down { chan, line } => {
                 let Some(v) = sv1::parse(&line) else { continue };
-                let ev = r.meter.down(chan, &v);
-                if let Some(Event::Accepted(w)) = ev {
-                    let u = r.chan_unit.get(&chan).cloned();
-                    if let Some(u) = &u {
-                        *r.unit_work.entry(u.clone()).or_default() += w;
-                    }
-                    if let Some(unit) = u.and_then(|u| g.units.get_mut(&u)) {
-                        unit.work += w;
-                    }
-                    let r = g.rentals.get_mut(&id).unwrap();
-                    let s = r.terms.slice_work;
-                    while r.meter.work >= (r.done.len() as u128 + 1) * s {
-                        let w = r.meter.work;
-                        r.done.push((w, now_ms()));
-                    }
-                    if r.closing.is_none() {
-                        if r.completed() > r.paid && r.due_since.is_none() {
-                            r.due_since = Some(Instant::now());
-                        }
-                        if r.completed() >= r.paid + 2 {
-                            g.stop_unpaid(&id, "unpaid");
-                            return;
-                        }
-                    }
+                // the difficulty is the hashtaker's to say, and whether a share can be covered by what's paid
+                // is the order's: refused here, before a miner hashes for it
+                if sv1::set_difficulty(&v).is_some_and(|d| order::share_too_big(share_work(d), r.terms.slice_work)) {
+                    g.stop_unpaid(&id, "a difficulty too high for the slice");
+                    return;
                 }
-                let r = g.rentals.get_mut(&id).unwrap();
+                if sv1::method(&v) == Some("mining.set_extranonce") {
+                    g.stop_unpaid(&id, "the hashtaker changed the extranonce");
+                    return;
+                }
+                if let Err(why) = r.meter.down(chan, &v) {
+                    r.note(json!({"ev": "a line that can't be checked", "why": why, "atMs": now_ms()}));
+                    g.stop_unpaid(&id, "a job this app can't check");
+                    return;
+                }
+                if sv1::notify_job(&v).is_some() && r.jobs.hit() {
+                    g.stop_unpaid(&id, "too many jobs");
+                    return;
+                }
                 if let Some(&(conn, slot)) = r.chans.get(&chan) {
                     down_line(&mut g, conn, slot, &v, &line);
                 }
@@ -790,16 +955,46 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 let price = r.terms.price_msat;
                 if slice > r.paid && r.rail.held(slice, &h, price) {
                     r.locks.insert(slice, h);
-                    if r.locks.contains_key(&(r.paid + 1)) {
-                        r.lock_missing_since = None;
-                        r.ready = true;
-                    }
                     r.note(json!({"ev": "locked", "slice": slice, "atMs": now_ms()}));
                 }
             }
             Msg::Pay { slice, preimage, receipt } => {
                 let ok = pay(r, slice, &preimage, &receipt);
                 r.note(json!({"ev": "pay", "slice": slice, "ok": ok.is_ok(), "why": ok.as_ref().err(), "atMs": now_ms()}));
+                flush_held(&mut g, &id);
+            }
+            Msg::Paying => {
+                // a payment on its way: wait for it, the miners on this side's own pool meanwhile. Only when something waits,
+                // once at a time, and a few times an hour
+                if r.held.is_empty() || r.waiting_since.is_some() {
+                    continue;
+                }
+                let now = Instant::now();
+                while r.waits.front().is_some_and(|t| now - *t > Duration::from_secs(3600)) {
+                    r.waits.pop_front();
+                }
+                // while the renter's step ramps up (the miners' first 30 s of work here), its buys may outlast what it
+                // may pay ahead: those waits are counted apart, up to their own limit
+                let ramp = r.served < Duration::from_secs_f64(order::STEP_SECONDS);
+                if (ramp && r.ramp_waits >= order::RAMP_WAITS_MOST) || (!ramp && r.waits.len() >= order::PAYING_WAITS_AN_HOUR) {
+                    g.stop_unpaid(&id, "too many waits for payment");
+                    return;
+                }
+                if ramp {
+                    r.ramp_waits += 1;
+                } else {
+                    r.waits.push_back(now);
+                }
+                r.waiting_since = Some(now);
+                r.note(json!({"ev": "waiting for a payment on its way", "atMs": now_ms(), "held": r.held.len()}));
+                // the miners go to this side's own pool and their channels close, or with no fallback stay on the rental
+                // with nothing they find going further: either way a share held for payment would reach the renter too
+                // late to be told from one held back. Its miner is told, and it is neither counted nor paid
+                r.held_since = None;
+                let held = std::mem::take(&mut r.held);
+                for h in held {
+                    answer_share(&mut g, h.conn, &Refused::TooOld, &h.v);
+                }
             }
             Msg::Shut { chan } => {
                 // the hashtaker's last verdict for this channel has been read: both meters let it go here
@@ -813,20 +1008,8 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 let _ = r.tx.send(&Msg::Pong { n });
             }
             Msg::Close { reason, slices } => {
-                // only slices both sides counted are billed; payments for them may still be on the way
-                let billable = slices.map(|n| n.min(r.done.len() as u64)).unwrap_or(r.paid);
-                r.note(json!({"ev": "hashtaker closed", "reason": reason, "hashtakerSlices": slices, "billable": billable, "atMs": now_ms()}));
-                let grace = Duration::from_millis(r.terms.grace_ms);
-                r.closing = Some((Instant::now() + grace, billable, format!("hashtaker closed: {reason}")));
-                r.due_since = None;
-                let units: Vec<String> = r.units.iter().cloned().collect();
-                for u in units {
-                    if let Some(unit) = g.units.get_mut(&u) {
-                        if unit.rental.as_deref() == Some(id.as_str()) {
-                            unit.rental = None;
-                        }
-                    }
-                }
+                r.note(json!({"ev": "hashtaker closed", "reason": reason, "hashtakerSlices": slices, "atMs": now_ms()}));
+                g.finish(&id, &format!("hashtaker closed: {reason}"), false);
                 return;
             }
             _ => {}
@@ -847,7 +1030,6 @@ fn pay(r: &mut Rental, slice: u64, preimage: &str, receipt: &Value) -> Result<()
     r.rail.settle(slice, &p)?;
     r.locks.remove(&slice);
     credit(r, slice, receipt);
-    r.lock_missing_since = (!r.locks.contains_key(&(r.paid + 1))).then(Instant::now);
     Ok(())
 }
 
@@ -859,27 +1041,13 @@ fn check_receipt(r: &Rental, slice: u64, receipt: &Value) -> Result<(), String> 
     if rc.rental != r.id || rc.slice != slice {
         return Err("receipt for another rental or slice".into());
     }
-    if r.done.len() < slice as usize {
-        return Err(format!("slice {slice} is not done by this side's count"));
-    }
-    if let Some((_, billable, _)) = &r.closing {
-        if slice > *billable {
-            return Err(format!("slice {slice} is past the {billable} the hashtaker counted"));
-        }
-    }
     Ok(())
 }
 
 fn credit(r: &mut Rental, slice: u64, receipt: &Value) {
-    let own = r.done.get(slice as usize - 1).map(|(w, _)| *w);
-    if own.map(|w| w.to_string()).as_deref() == receipt.get("work").and_then(Value::as_str) {
-        r.agree += 1;
-    } else {
-        r.disagree += 1;
-    }
     r.receipts.push(receipt.clone());
     r.paid = slice;
-    r.due_since = (r.closing.is_none() && r.completed() > r.paid).then(Instant::now);
+    r.ready = order::ready_to_serve(r.paid, r.terms.start_slices);
 }
 
 // --- the ticker --------------------------------------------------------------------------------
@@ -887,8 +1055,11 @@ fn credit(r: &mut Rental, slice: u64, receipt: &Value) {
 fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
     let mut last_rate = Instant::now();
     let mut last_report = Instant::now();
+    let mut last_tick = Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(200));
+        let tick = last_tick.elapsed();
+        last_tick = Instant::now();
         if down.load(Ordering::Relaxed) {
             return;
         }
@@ -905,17 +1076,28 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                     }
                     continue;
                 }
-                if let Some((deadline, billable, why)) = r.closing.clone() {
-                    if r.paid >= billable || Instant::now() > deadline {
-                        g.finish(&id, &why, false);
-                    }
-                    continue;
-                }
                 let grace = Duration::from_millis(r.terms.grace_ms);
-                let why = if r.due_since.is_some_and(|t| t.elapsed() > grace) {
+                // served: time its miners work for it, not time they wait on it for a payment on its way (with no
+                // fallback they stay on its channels through the wait)
+                if !r.chans.is_empty() && r.waiting_since.is_none() {
+                    r.served += tick;
+                }
+                let r = &g.rentals[&id];
+                // a slice's reckoned time: by the fastest these miners have been seen, on any work, so a renter
+                // that keeps them slow doesn't make its own paid time longer
+                let fastest: f64 = r.units.iter().filter_map(|u| g.units.get(u)).map(|u| u.fastest_hs).sum();
+                let by_speed = if fastest > 0.0 { Duration::from_secs_f64((r.terms.slice_work as f64 / fastest).min(1e9)) } else { Duration::ZERO };
+                let slice_time = by_speed.max(g.min_slice_time);
+                let why = if !r.ready && r.asked_at.elapsed() > grace {
+                    Some("no first payment")
+                } else if match r.waiting_since {
+                    // a payment said to be on its way is waited for longer; any other, for the short clock
+                    Some(t) => t.elapsed() > order::WAIT_FOR_PAYING,
+                    None => r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT),
+                } {
                     Some("unpaid")
-                } else if r.lock_missing_since.is_some_and(|t| t.elapsed() > grace) {
-                    Some("no ticket locked")
+                } else if r.served > slice_time.saturating_mul((r.paid.min(1 << 20) as u32) * PAID_TIME_FACTOR) {
+                    Some("paid time used up")
                 } else if r.last_heard.elapsed() > QUIET_LIMIT {
                     Some("link quiet")
                 } else {
@@ -939,42 +1121,8 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
             let mut sending: HashMap<String, Option<String>> = HashMap::new();
             let conn_ids: Vec<u64> = g.conns.keys().copied().collect();
             for c in conn_ids {
-                let conn = g.conns.get(&c).unwrap();
-                if conn.close_at.is_some_and(|t| now > t) {
-                    let _ = conn.w.shutdown(std::net::Shutdown::Both);
-                    continue;
-                }
-                if conn.busy || conn.close_at.is_some() {
-                    continue;
-                }
-                let Some(unit) = conn.unit.clone() else { continue };
-                let Some(active) = conn.active else { continue };
-                // a connection not yet named is left where it was placed until it says who it is
-                if conn.authorize.is_none() {
-                    continue;
-                }
-                let want = g.target(&unit);
-                let have = g.slot_rental(c, active);
-                if want == have {
-                    continue;
-                }
-                // a miner that must connect again waits while others from its address are on their way elsewhere
-                let reconnects = !(conn.extranonce && conn.subscribe.is_some());
-                if reconnects {
-                    let elsewhere = g.returning.get(&conn.peer).is_some_and(|(t, n, at)| *n > 0 && at.elapsed() < RETURN_WAIT && *t != want)
-                        || sending.get(&conn.peer).is_some_and(|t| *t != want);
-                    if elsewhere {
-                        continue;
-                    }
-                    sending.insert(conn.peer.clone(), want.clone());
-                }
-                if want.is_some() || g.fallback.is_some() {
-                    g.conns.get_mut(&c).unwrap().busy = true;
+                if let Some(want) = placement(&mut g, c, now, &mut sending) {
                     switches.push((c, want));
-                } else {
-                    // no fallback (the lab): a miner whose rental ended is let go
-                    let conn = g.conns.get(&c).unwrap();
-                    let _ = conn.w.shutdown(std::net::Shutdown::Both);
                 }
             }
             // old upstream sessions let go after their drain
@@ -994,6 +1142,7 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                     while u.samples.front().is_some_and(|(t, _)| now - *t > RATE_WINDOW) {
                         u.samples.pop_front();
                     }
+                    u.note_speed();
                 }
                 let ids: Vec<String> = g.rentals.keys().cloned().collect();
                 for id in ids {
@@ -1041,7 +1190,7 @@ fn serve_miner(conn: TcpStream, hub: Shared) {
             authorize: None,
             configure: None,
             extranonce: false,
-            fb_meter: Meter::default(),
+            fb_meter: Verdicts::default(),
             close_at: None,
             busy: true,
             hinted: false,
@@ -1061,8 +1210,14 @@ fn serve_miner(conn: TcpStream, hub: Shared) {
             Ok(_) => {}
         }
         let Some(v) = sv1::parse(&line) else { continue };
+        // a share for a rental is read under the lock and hashed outside it
+        let claim = claim_share(&mut lock(&hub), id, &v);
+        let hashed = claim.map(|c| c.map(|c| {
+            let h = c.hash();
+            (c, h)
+        }));
         let mut g = lock(&hub);
-        if !up_line(&mut g, id, &v, line.trim_end()) {
+        if !up_line(&mut g, id, &v, line.trim_end(), hashed) {
             break;
         }
     }
@@ -1070,9 +1225,27 @@ fn serve_miner(conn: TcpStream, hub: Shared) {
     gone(&mut g, id);
 }
 
+/// A share read and hashed outside the lock, or why it was refused before that.
+type Hashed = Result<(Claim, Result<[u8; 32], String>), Refused>;
+
+/// The upstream a share goes to: the one whose job it names, or the active one.
+fn share_slot(c: &Conn, v: &Value) -> Option<u64> {
+    let job = sv1::submit_job(v)?;
+    c.slots.iter().find(|(_, s)| s.jobs.contains(&job)).map(|(k, _)| *k).or(c.active)
+}
+
+/// Read a share headed for a rental's channel; `None` for anything else.
+fn claim_share(g: &mut Hub, id: u64, v: &Value) -> Option<Result<Claim, Refused>> {
+    let c = g.conns.get(&id)?;
+    let SlotKind::Rental { rental, chan } = &c.slots.get(&share_slot(c, v)?)?.kind else { return None };
+    let chan = *chan;
+    let r = g.rentals.get_mut(rental)?;
+    Some(r.meter.claim(chan, v))
+}
+
 /// A line from a miner: remembered (subscribe, authorize, configure), then sent to the upstream
 /// whose job it names, or the active one, or held until one is there.
-fn up_line(g: &mut Hub, id: u64, v: &Value, line: &str) -> bool {
+fn up_line(g: &mut Hub, id: u64, v: &Value, line: &str, hashed: Option<Hashed>) -> bool {
     let Some(c) = g.conns.get_mut(&id) else { return false };
     match sv1::method(v) {
         Some("mining.subscribe") => c.subscribe = Some(v.clone()),
@@ -1097,20 +1270,17 @@ fn up_line(g: &mut Hub, id: u64, v: &Value, line: &str) -> bool {
         }
     }
     let c = g.conns.get_mut(&id).unwrap();
-    let slot = match sv1::submit_job(v) {
-        Some(job) => c.slots.iter().find(|(_, s)| s.jobs.contains(&job)).map(|(k, _)| *k).or(c.active),
-        None => c.active,
-    };
+    let slot = if sv1::submit_job(v).is_some() { share_slot(c, v) } else { c.active };
     let Some(slot) = slot else {
         if c.held.len() < 64 {
             c.held.push(line.to_string());
         }
         return true;
     };
-    to_slot(g, id, slot, v, line)
+    to_slot(g, id, slot, v, line, hashed)
 }
 
-fn to_slot(g: &mut Hub, id: u64, slot: u64, v: &Value, line: &str) -> bool {
+fn to_slot(g: &mut Hub, id: u64, slot: u64, v: &Value, line: &str, hashed: Option<Hashed>) -> bool {
     let Some(c) = g.conns.get_mut(&id) else { return false };
     let Some(s) = c.slots.get_mut(&slot) else { return true };
     match &mut s.kind {
@@ -1127,11 +1297,118 @@ fn to_slot(g: &mut Hub, id: u64, slot: u64, v: &Value, line: &str) -> bool {
         }
         SlotKind::Rental { rental, chan } => {
             let (rental, chan) = (rental.clone(), *chan);
-            if let Some(r) = g.rentals.get_mut(&rental) {
-                r.meter.up(chan, v);
+            let Some(r) = g.rentals.get_mut(&rental) else { return true };
+            if sv1::submit_job(v).is_none() {
+                r.meter.note_up(chan, v);
                 let _ = r.tx.send(&Msg::Up { chan, line: line.to_string() });
+                return true;
             }
+            // a share: it goes on only if its hash proves it and what's paid covers it
+            let (claim, hash) = match hashed {
+                Some(Ok(x)) => x,
+                Some(Err(why)) => {
+                    answer_share(g, id, &why, v);
+                    return true;
+                }
+                None => match r.meter.claim(chan, v) {
+                    Ok(c) => {
+                        let h = c.hash();
+                        (c, h)
+                    }
+                    Err(why) => {
+                        answer_share(g, id, &why, v);
+                        return true;
+                    }
+                },
+            };
+            let worth = match r.meter.worth(&claim, &hash) {
+                Ok(w) => w,
+                Err(why) => {
+                    answer_share(g, id, &why, v);
+                    return true;
+                }
+            };
+            let t = &r.terms;
+            if r.held.is_empty() && order::fits(r.meter.work, worth, r.paid, t.start_slices, t.slice_work) {
+                forward_share(g, &rental, id, &claim, hash, v, line);
+                return true;
+            }
+            if r.held.len() >= HELD_MOST {
+                answer_share(g, id, &Refused::Bad("too many waiting".into()), v);
+                return true;
+            }
+            // a miner kept on its rental through a wait for a payment on its way (no fallback): what it finds meanwhile
+            // goes no further, as with a fallback it would have gone to this side's own pool. Held and sent on when the
+            // payment lands it would reach the renter as late as shares held back, and be taken for them
+            if r.waiting_since.is_some() {
+                answer_share(g, id, &Refused::TooOld, v);
+                return true;
+            }
+            r.held.push_back(Held { conn: id, claim, hash, v: v.clone(), line: line.to_string() });
+            r.held_since.get_or_insert_with(Instant::now);
+            let due = Msg::Due { work: r.meter.work, paid: r.paid };
+            let _ = r.tx.send(&due);
             true
+        }
+    }
+}
+
+/// A share that goes no further: the miner's answer comes from here.
+fn answer_share(g: &mut Hub, id: u64, why: &Refused, v: &Value) {
+    let answer = why.rejection(v.get("id").unwrap_or(&Value::Null));
+    if let Some(c) = g.conns.get_mut(&id) {
+        let _ = send_line(&mut c.w, &answer.to_string());
+    }
+}
+
+/// Count a proven share that what's paid covers, and send it on.
+fn forward_share(g: &mut Hub, rental: &str, id: u64, claim: &Claim, hash: Result<[u8; 32], String>, v: &Value, line: &str) {
+    let Some(r) = g.rentals.get_mut(rental) else { return };
+    let chan = claim.chan();
+    let p = match r.meter.commit(claim, hash) {
+        Ok(p) => p,
+        Err(why) => {
+            answer_share(g, id, &why, v);
+            return;
+        }
+    };
+    let _ = r.tx.send(&Msg::Up { chan, line: line.to_string() });
+    let stop = r.counted(chan, line, &p);
+    let unit = r.chan_unit.get(&chan).cloned();
+    if let Some(unit) = unit.and_then(|u| g.units.get_mut(&u)) {
+        unit.work += p.work;
+    }
+    if let Some(why) = stop {
+        g.stop_unpaid(rental, &why);
+    }
+}
+
+/// A payment came: the shares waiting for it that it covers go on, in order.
+fn flush_held(g: &mut Hub, rental: &str) {
+    loop {
+        let Some(r) = g.rentals.get_mut(rental) else { return };
+        let t = &r.terms;
+        // a payment came: whatever wait there was ends, and the miners come back
+        r.waiting_since = None;
+        let fits = match r.held.front() {
+            None => {
+                r.held_since = None;
+                return;
+            }
+            Some(h) => r.meter.worth(&h.claim, &h.hash).map(|w| order::fits(r.meter.work, w, r.paid, t.start_slices, t.slice_work)),
+        };
+        match fits {
+            Ok(false) => return,
+            Ok(true) => {
+                let h = r.held.pop_front().expect("there's one");
+                // a payment is a fresh start for the clock of whatever still waits
+                r.held_since = Some(Instant::now());
+                forward_share(g, rental, h.conn, &h.claim, h.hash, &h.v, &h.line);
+            }
+            Err(why) => {
+                let h = r.held.pop_front().expect("there's one");
+                answer_share(g, h.conn, &why, &h.v);
+            }
         }
     }
 }
@@ -1292,11 +1569,12 @@ fn name_unit(g: &mut Hub, id: u64, worker: &str) {
         n += 1;
         name = format!("{worker} #{n}");
     }
-    let (mut carried, mut methods, peer) = (0u128, BTreeMap::new(), g.conns[&id].peer.clone());
+    let (mut carried, mut methods, mut placed, peer) = (0u128, BTreeMap::new(), None, g.conns[&id].peer.clone());
     if provisional {
         if let Some(u) = g.units.remove(&cur) {
             carried = u.work;
             methods = u.methods;
+            placed = u.rental;
         }
         for r in g.rentals.values_mut() {
             r.units.remove(&cur);
@@ -1317,6 +1595,15 @@ fn name_unit(g: &mut Hub, id: u64, worker: &str) {
     }
     if u.rental.as_ref().is_some_and(|r| !g.rentals.contains_key(r)) {
         u.rental = None;
+    }
+    // the rental that took it before it said its name keeps it (its miner is hashing for it now), unless
+    // its own record is still in a rental. Let go, it was offered again only at the next round, after any
+    // miner freed meanwhile that sorts before it: the rental took that one, and this miner was let go
+    if u.rental.is_none() {
+        if let Some(r) = placed.and_then(|r| g.rentals.get_mut(&r)) {
+            r.units.insert(name.clone());
+            g.units.get_mut(&name).unwrap().rental = Some(r.id.clone());
+        }
     }
     // the channels this connection uses credit their work to the miner's own name
     let chans: Vec<(String, u32)> = g.conns[&id].slots.values().filter_map(|s| match &s.kind {
@@ -1377,7 +1664,7 @@ fn place(hub: &Shared, id: u64) {
             let g = lock(hub);
             let Some(c) = g.conns.get(&id) else { return };
             // the hint, while the rental it names still takes miners
-            let hinted = hint.clone().flatten().filter(|r| g.rentals.get(r).is_some_and(|r| r.ready && r.closing.is_none() && r.suspended.is_none() && r.stopped.is_none()));
+            let hinted = hint.clone().flatten().filter(|r| g.rentals.get(r).is_some_and(|r| r.ready && r.suspended.is_none() && r.stopped.is_none()));
             let own = g.target(c.unit.as_deref().unwrap_or(""));
             (if c.authorize.is_some() { own } else { hinted.or(own) }, g.fallback.clone())
         };
@@ -1411,6 +1698,56 @@ fn place(hub: &Shared, id: u64) {
     }
     if let Some(c) = lock(hub).conns.get_mut(&id) {
         c.busy = false;
+    }
+}
+
+/// Where connection `c` should hash this round: `Some(target)` for a switch (it's marked busy), `None` for none. A
+/// miner whose rental ended is let go here when there's no fallback. `sending` keeps, for each address, where the
+/// miners that must connect again are sent this round.
+fn placement(g: &mut Hub, c: u64, now: Instant, sending: &mut HashMap<String, Option<String>>) -> Option<Option<String>> {
+    let conn = g.conns.get(&c).unwrap();
+    if conn.close_at.is_some_and(|t| now > t) {
+        let _ = conn.w.shutdown(std::net::Shutdown::Both);
+        return None;
+    }
+    if conn.busy || conn.close_at.is_some() {
+        return None;
+    }
+    let unit = conn.unit.clone()?;
+    let active = conn.active?;
+    // a connection not yet named is left where it was placed until it says who it is
+    conn.authorize.as_ref()?;
+    let want = g.target(&unit);
+    let have = g.slot_rental(c, active);
+    if want == have {
+        return None;
+    }
+    // no fallback, and its rental waits for a payment on its way: the miner stays where it is, connected,
+    // what it finds meanwhile going no further, and goes on with the rental when the payment lands (or is
+    // let go if the rental ends unpaid). It isn't on its way anywhere, so it holds up no other miner from its
+    // address
+    let waiting = g.units.get(&unit).and_then(|u| u.rental.as_ref()).and_then(|r| g.rentals.get(r)).is_some_and(|r| r.waiting_since.is_some() && r.stopped.is_none());
+    if want.is_none() && g.fallback.is_none() && waiting {
+        return None;
+    }
+    // a miner that must connect again waits while others from its address are on their way elsewhere
+    let reconnects = !(conn.extranonce && conn.subscribe.is_some());
+    if reconnects {
+        let elsewhere = g.returning.get(&conn.peer).is_some_and(|(t, n, at)| *n > 0 && at.elapsed() < RETURN_WAIT && *t != want)
+            || sending.get(&conn.peer).is_some_and(|t| *t != want);
+        if elsewhere {
+            return None;
+        }
+        sending.insert(conn.peer.clone(), want.clone());
+    }
+    if want.is_some() || g.fallback.is_some() {
+        g.conns.get_mut(&c).unwrap().busy = true;
+        Some(want)
+    } else {
+        // no fallback (the lab): a miner whose rental ended is let go
+        let conn = g.conns.get(&c).unwrap();
+        let _ = conn.w.shutdown(std::net::Shutdown::Both);
+        None
     }
 }
 
@@ -1495,7 +1832,7 @@ fn attach(hub: &Shared, id: u64, rental: Option<String>, replay: bool) -> bool {
     }
     for l in lines {
         if let Some(v) = sv1::parse(&l) {
-            to_slot(&mut g, id, slot_id, &v, &l);
+            to_slot(&mut g, id, slot_id, &v, &l, None);
         }
     }
     true
@@ -1538,7 +1875,7 @@ fn fallback_reader(s: TcpStream, hub: Shared, id: u64, slot: u64) {
         if !c.slots.contains_key(&slot) {
             return;
         }
-        if let Some(Event::Accepted(w)) = c.fb_meter.down(slot as u32, &v) {
+        if let Some(w) = c.fb_meter.down(slot as u32, &v) {
             if let Some(u) = c.unit.clone() {
                 if let Some(unit) = g.units.get_mut(&u) {
                     unit.work += w;
@@ -1566,7 +1903,7 @@ fn serve_slices(l: TcpListener, hub: Shared, down: Arc<AtomicBool>) {
         std::thread::spawn(move || {
             let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
             let Some((method, path, body)) = read_request(&mut conn) else { return };
-            let (code, out) = slice_request(&hub, &method, &path, &body);
+            let (code, out) = slice_request(&hub, &method, &path, &body, &|| peer_gone(&conn));
             let body = out.to_string();
             let _ = conn.write_all(
                 format!("HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", if code == 200 { "OK" } else { "Conflict" }, body.len())
@@ -1576,7 +1913,20 @@ fn serve_slices(l: TcpListener, hub: Shared, down: Arc<AtomicBool>) {
     }
 }
 
-fn slice_request(hub: &Mutex<Hub>, method: &str, path: &str, body: &[u8]) -> (u16, Value) {
+/// Whether the other end has closed this connection. Nothing is read from it.
+fn peer_gone(conn: &TcpStream) -> bool {
+    if conn.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let seen = conn.peek(&mut [0u8; 1]);
+    let _ = conn.set_nonblocking(false);
+    match seen {
+        Ok(n) => n == 0,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+    }
+}
+
+fn slice_request(hub: &Mutex<Hub>, method: &str, path: &str, body: &[u8], gateway_gone: &dyn Fn() -> bool) -> (u16, Value) {
     let parts: Vec<&str> = path.split('?').next().unwrap_or("").trim_matches('/').split('/').collect();
     let (rental, slice) = match parts.as_slice() {
         [.., r, s] => (r.to_string(), s.parse::<u64>().ok()),
@@ -1588,27 +1938,34 @@ fn slice_request(hub: &Mutex<Hub>, method: &str, path: &str, body: &[u8]) -> (u1
     let Ok(receipt) = serde_json::from_slice::<Value>(body) else {
         return (409, json!({"error": "the body is not a receipt"}));
     };
-    // the link may bring the verdict that finished the slice a moment after the payment
-    let t0 = Instant::now();
-    loop {
-        let mut g = lock(hub);
-        let Some(r) = g.rentals.get_mut(&rental) else {
-            return (409, json!({"error": "no such rental going on"}));
-        };
-        match check_receipt(r, slice, &receipt) {
-            Err(why) if why.contains("not done") && t0.elapsed() < Duration::from_secs(3) => {}
-            Err(why) => {
-                r.note(json!({"ev": "paid slice refused", "slice": slice, "why": why, "atMs": now_ms()}));
-                return (409, json!({"error": why}));
-            }
-            Ok(()) => {
-                credit(r, slice, &receipt);
-                r.note(json!({"ev": "paid slice", "slice": slice, "atMs": now_ms()}));
-                return (200, json!({"ok": true, "rental": rental, "slice": slice}));
-            }
+    let mut g = lock(hub);
+    // a first slice with no miner to give it: refused here, so its charge goes back
+    let c = g.capacity();
+    let no_miners = c.miners > 0 && c.free_miners == 0;
+    let Some(r) = g.rentals.get_mut(&rental) else {
+        return (409, json!({"error": "no such rental going on"}));
+    };
+    // the gateway stopped waiting and gave the charge back: a credit now would be a slice for nothing. Read
+    // here, with the lock, right before any credit, so a wait for the lock is covered too
+    if gateway_gone() {
+        r.note(json!({"ev": "paid slice given up by the gateway", "slice": slice, "atMs": now_ms()}));
+        return (409, json!({"error": "the gateway stopped waiting"}));
+    }
+    if slice == 1 && no_miners {
+        r.note(json!({"ev": "paid slice refused", "slice": slice, "why": "no miners free now", "atMs": now_ms()}));
+        return (409, json!({"error": "no miners free now"}));
+    }
+    match check_receipt(r, slice, &receipt) {
+        Err(why) => {
+            r.note(json!({"ev": "paid slice refused", "slice": slice, "why": why, "atMs": now_ms()}));
+            (409, json!({"error": why}))
         }
-        drop(g);
-        std::thread::sleep(Duration::from_millis(50));
+        Ok(()) => {
+            credit(r, slice, &receipt);
+            r.note(json!({"ev": "paid slice", "slice": slice, "atMs": now_ms()}));
+            flush_held(&mut g, &rental);
+            (200, json!({"ok": true, "rental": rental, "slice": slice}))
+        }
     }
 }
 
@@ -1663,4 +2020,159 @@ pub fn read_request_auth(conn: &mut TcpStream) -> Option<(String, String, Vec<u8
         return None;
     }
     Some((method, path, body, auth))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rail::LabSeller;
+
+    fn start(terms: &Terms, slices: &str) -> (Hashmaker, String, PublicKey) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let link = l.local_addr().unwrap().to_string();
+        drop(l);
+        let m = TcpListener::bind("127.0.0.1:0").unwrap();
+        let miners = m.local_addr().unwrap().to_string();
+        drop(m);
+        let hk = crate::noise::fresh_key();
+        let h = Hashmaker::start(
+            Config { miners, link: link.clone(), key: hk, terms: terms.clone(), report: None, slices: Some(slices.into()), fallback: None, rentable: None, min_slice_time: MIN_SLICE_TIME },
+            Box::new(|| Box::<LabSeller>::default()),
+        )
+        .unwrap();
+        (h, link, PublicKey::from_secret_key(secp256k1::SECP256K1, &hk))
+    }
+
+    /// The gateway gave the charge back before the credit: no slice for nothing. With it still there, the
+    /// slice is credited and the rental is ready, ahead of any work.
+    #[test]
+    fn a_slice_is_credited_only_while_the_gateway_is_waiting() {
+        let terms = Terms { slice_work: 1 << 20, price_msat: 5_000, grace_ms: 30_000, start_slices: 0 };
+        let s = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slices = s.local_addr().unwrap().to_string();
+        drop(s);
+        let (h, addr, hpub) = start(&terms, &slices);
+        let bk = crate::noise::fresh_key();
+        let lk = link::dial(&addr, bk, hpub).unwrap();
+        lk.tx.send(&Msg::Hello { rental: "r".into(), listing: "l".into(), terms: terms.clone(), miners: 1, proof: Some(PROOF.into()) }).unwrap();
+        let mut rx = lk.rx;
+        assert!(matches!(rx.recv_within(Duration::from_secs(5)), Ok(Some(Msg::Welcome { .. }))));
+        let receipt = Receipt { rental: "r".into(), slice: 1, work: 0, accepted: 0, rejected: 0, at_ms: 1 }.sign(&bk).to_string();
+        let (code, out) = slice_request(&h.hub, "POST", "/hashrate/r/1", receipt.as_bytes(), &|| true);
+        assert_eq!((code, out["error"].as_str()), (409, Some("the gateway stopped waiting")));
+        let r = &h.status()["rentals"][0];
+        assert_eq!((r["paid"].as_u64(), r["ready"].as_bool()), (Some(0), Some(false)), "{r}");
+        assert!(r["events"].as_array().unwrap().iter().any(|e| e["ev"] == "paid slice given up by the gateway"), "{r}");
+        let (code, _) = slice_request(&h.hub, "POST", "/hashrate/r/1", receipt.as_bytes(), &|| false);
+        assert_eq!(code, 200);
+        let r = &h.status()["rentals"][0];
+        assert_eq!((r["paid"].as_u64(), r["ready"].as_bool()), (Some(1), Some(true)), "{r}");
+        h.shutdown();
+    }
+
+    /// Miners behind one address, no fallback: one whose rental waits for a payment on its way stays where it is, and
+    /// is no miner on its way anywhere, so another from its address that's to move to its new rental moves this round.
+    #[test]
+    fn a_miner_kept_through_a_wait_holds_up_no_other_miner_from_its_address() {
+        let terms = Terms { slice_work: 1 << 20, price_msat: 5_000, grace_ms: 30_000, start_slices: 0 };
+        let s = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slices = s.local_addr().unwrap().to_string();
+        drop(s);
+        let (h, addr, hpub) = start(&terms, &slices);
+        let mut links = Vec::new();
+        for id in ["wait", "more"] {
+            let lk = link::dial(&addr, crate::noise::fresh_key(), hpub).unwrap();
+            lk.tx.send(&Msg::Hello { rental: id.into(), listing: "l".into(), terms: terms.clone(), miners: 2, proof: Some(PROOF.into()) }).unwrap();
+            let mut rx = lk.rx;
+            assert!(matches!(rx.recv_within(Duration::from_secs(5)), Ok(Some(Msg::Welcome { .. }))));
+            links.push((lk.tx, rx));
+        }
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slot = |rental: &str, chan: u32| Slot {
+            kind: SlotKind::Rental { rental: rental.into(), chan }, jobs: VecDeque::new(), draining_until: None, swallow: Vec::new(), sub_id: None, fresh: false,
+        };
+        let conn = |unit: &str, at: u64, rental: &str| Conn {
+            unit: Some(unit.into()), peer: "10.0.0.5".into(), w: TcpStream::connect(l.local_addr().unwrap()).unwrap(), local: String::new(),
+            slots: BTreeMap::from([(at, slot(rental, at as u32))]), active: Some(at), held: Vec::new(), subscribe: None,
+            authorize: Some(serde_json::json!({"id": 2, "method": "mining.authorize", "params": [unit, "x"]})), configure: None, extranonce: false,
+            fb_meter: Verdicts::default(), close_at: None, busy: false, hinted: false,
+        };
+        let mut g = lock(&h.hub);
+        for id in ["wait", "more"] {
+            g.rentals.get_mut(id).unwrap().ready = true;
+        }
+        g.rentals.get_mut("wait").unwrap().waiting_since = Some(Instant::now());
+        // the first: on its rental, which waits; the second: on a rental that ended, taken by "more"
+        g.conns.insert(1, conn("a", 10, "wait"));
+        g.units.insert("a".into(), Unit { conn: Some(1), rental: Some("wait".into()), ..Unit::default() });
+        g.rentals.get_mut("wait").unwrap().units.insert("a".into());
+        g.conns.insert(2, conn("b", 20, "ended"));
+        g.units.insert("b".into(), Unit { conn: Some(2), rental: Some("more".into()), ..Unit::default() });
+        g.rentals.get_mut("more").unwrap().units.insert("b".into());
+        let mut sending = HashMap::new();
+        assert_eq!(placement(&mut g, 1, Instant::now(), &mut sending), None, "kept where it is, through the wait");
+        assert_eq!(placement(&mut g, 2, Instant::now(), &mut sending), Some(Some("more".to_string())), "the other moves this round: {sending:?}");
+        drop(g);
+        h.shutdown();
+    }
+
+    /// A miner waits for the answer to its subscribe before it says its name, so with no fallback it is
+    /// taken by a rental before it is named. Named, it stays with that rental: the rental is not left one
+    /// short for the next round to fill, which takes a free miner whose name sorts first (one whose own
+    /// rental just ended) and lets this one go (`a_huge_difficulty_ends_that_rental_and_the_app_and_other_rentals_go_on`).
+    #[test]
+    fn a_miner_taken_before_it_says_its_name_stays_with_that_rental() {
+        let terms = Terms { slice_work: 1 << 20, price_msat: 5_000, grace_ms: 30_000, start_slices: 0 };
+        let s = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slices = s.local_addr().unwrap().to_string();
+        drop(s);
+        let (h, addr, hpub) = start(&terms, &slices);
+        let lk = link::dial(&addr, crate::noise::fresh_key(), hpub).unwrap();
+        lk.tx.send(&Msg::Hello { rental: "r".into(), listing: "l".into(), terms: terms.clone(), miners: 1, proof: Some(PROOF.into()) }).unwrap();
+        let mut rx = lk.rx;
+        assert!(matches!(rx.recv_within(Duration::from_secs(5)), Ok(Some(Msg::Welcome { .. }))));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = |unit: &str| Conn {
+            unit: Some(unit.into()), peer: "127.0.0.1".into(), w: TcpStream::connect(l.local_addr().unwrap()).unwrap(), local: String::new(), slots: BTreeMap::new(),
+            active: None, held: Vec::new(), subscribe: None, authorize: None, configure: None, extranonce: false, fb_meter: Verdicts::default(), close_at: None,
+            // the app's own rounds leave these two alone
+            busy: true, hinted: false,
+        };
+        let mut g = lock(&h.hub);
+        g.rentals.get_mut("r").unwrap().ready = true;
+        // placed by its address and taken by the rental
+        let placed = "127.0.0.1 #900".to_string();
+        g.conns.insert(900, conn(&placed));
+        g.units.insert(placed.clone(), Unit { provisional: true, conn: Some(900), rental: Some("r".into()), ..Unit::default() });
+        g.rentals.get_mut("r").unwrap().units.insert(placed.clone());
+        // a named miner, free, its name before the other's
+        g.conns.insert(901, conn("m0"));
+        g.units.insert("m0".into(), Unit { conn: Some(901), ..Unit::default() });
+        name_unit(&mut g, 900, "other");
+        assert_eq!(g.units["other"].rental.as_deref(), Some("r"), "named, it keeps its rental");
+        assert!(!g.units.contains_key(&placed));
+        assert!(!g.allocate(), "the rental has the miner it asked for");
+        assert_eq!(g.rentals["r"].units.iter().collect::<Vec<_>>(), ["other"]);
+        assert!(g.units["m0"].rental.is_none());
+        drop(g);
+        h.shutdown();
+    }
+
+    #[test]
+    fn a_limit_over_a_rate_trips_only_after_staying_over() {
+        let mut l = RateLimit::new(2);
+        l.second = Instant::now() - Duration::from_secs(1);
+        l.count = 5;
+        assert!(!l.hit(), "just over, not for long");
+        // over since 11 s ago, and still
+        l.over_since = Some(Instant::now() - Duration::from_secs(11));
+        l.second = Instant::now() - Duration::from_secs(1);
+        l.count = 5;
+        assert!(l.hit());
+        // a quiet second clears it
+        l.second = Instant::now() - Duration::from_secs(1);
+        l.count = 0;
+        assert!(!l.hit());
+        assert!(l.over_since.is_none());
+    }
 }

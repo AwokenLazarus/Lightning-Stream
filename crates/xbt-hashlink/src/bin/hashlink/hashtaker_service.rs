@@ -60,6 +60,8 @@ struct R {
     key: SecretKey,
     datum: String,
     user: String,
+    gateway_api: Option<String>,
+    allow_unblinded: bool,
     relays: Vec<String>,
     signer: Option<PathBuf>,
     task: String,
@@ -76,6 +78,41 @@ struct R {
     iroh: Option<Option<Arc<Dialer>>>,
     iroh_off: bool,
     iroh_relays: Option<String>,
+    /// Failed first steps in a row, by seller's link key: kept across restarts.
+    failed_first: BTreeMap<String, u32>,
+    /// What the upstream's jobs show, as last looked at, and for which upstream.
+    shown: Option<(String, xbt_hashlink::blind::Shown, u64)>,
+}
+
+/// A gateway's API port when nothing says otherwise.
+const GATEWAY_API_PORT: u16 = 7152;
+/// How often an upstream's jobs are looked at again.
+const LOOK_EVERY: Duration = Duration::from_secs(60);
+
+impl R {
+    /// Where this upstream's jobs are opened: as configured, or the gateway's API on the same host.
+    fn api(&self) -> Option<String> {
+        self.gateway_api.clone().or_else(|| {
+            let host = self.datum.rsplit_once(':').map(|(h, _)| h)?;
+            Some(format!("{host}:{GATEWAY_API_PORT}"))
+        })
+    }
+
+    /// A rental ended: a failed first step counts against its seller, and anything else clears the count.
+    fn note_rental_end(&mut self, seller: &str, report: &Value) {
+        if xbt_hashlink::order::failed_first_step(report) {
+            *self.failed_first.entry(seller.to_string()).or_default() += 1;
+        } else {
+            self.failed_first.remove(seller);
+        }
+        if let Some(d) = &self.state {
+            let _ = std::fs::write(d.join("failed-first-steps.json"), serde_json::to_vec(&self.failed_first).unwrap_or_default());
+        }
+    }
+
+    fn refused_seller(&self, seller: &str) -> bool {
+        self.failed_first.get(seller).is_some_and(|n| *n >= xbt_hashlink::order::FAILED_FIRST_STEPS)
+    }
 }
 
 /// Can a Stratum endpoint be reached (a TCP connection within a second)?
@@ -91,10 +128,15 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         // a DATUM Gateway on this box, if one answers at a known address
         datum = f.get("datum-candidates").map(|c| super::relays(c)).unwrap_or_default().into_iter().find(|a| reachable(a)).unwrap_or_default();
     }
+    let failed_first = state.as_ref().and_then(|d| std::fs::read(d.join("failed-first-steps.json")).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let r = Arc::new(Mutex::new(R {
+        shown: None,
+        failed_first,
         key: crate::hashmaker_service::key_file(super::need(f, "key")?)?,
         datum,
         user: f.get("user").cloned().unwrap_or_else(|| "rented".into()),
+        gateway_api: f.get("gateway-api").cloned(),
+        allow_unblinded: f.contains_key("allow-unblinded"),
         relays: f.get("relays").map(|r| super::relays(r)).unwrap_or_default(),
         signer: f.get("signer").map(PathBuf::from),
         task: f.get("task").cloned().unwrap_or_else(|| "hashrate".into()),
@@ -111,6 +153,15 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     let candidates = f.get("datum-candidates").map(|c| super::relays(c)).unwrap_or_default();
     let addr = super::need(f, "control")?.to_string();
     let token = f.get("control-token-file").map(|p| http::token(p)).transpose()?;
+    {
+        // what the upstream's jobs show, kept current for the renter's page: a pool that adds a key shows here by
+        // itself, and no list says so
+        let r = r.clone();
+        std::thread::spawn(move || loop {
+            look_at_upstream(&r);
+            std::thread::sleep(LOOK_EVERY);
+        });
+    }
     http::serve(&addr, token, Arc::new(move |method, path, body| handle(&r, &candidates, method, path, body)))?;
     eprintln!("hashtaker: control page on {addr}");
     loop {
@@ -122,16 +173,22 @@ fn lock(r: &Mutex<R>) -> std::sync::MutexGuard<'_, R> {
     r.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// What must be paid before the miners move: the start fee and a slice.
+fn first_payment_msat(t: &xbt_hashlink::msg::Terms) -> u64 {
+    t.price_msat.saturating_mul(t.start_slices.saturating_add(1))
+}
+
 fn offer_json(h: &Hashrate, event: &str) -> Value {
     json!({
         "name": h.name, "algorithm": h.algorithm, "linkKey": hex::encode(h.link_key.serialize()), "linkAddr": h.link_addr,
         "directLink": h.iroh.is_some(),
         "priceMsat": h.terms.price_msat, "sliceWork": h.terms.slice_work.to_string(), "graceMs": h.terms.grace_ms,
+        "startSlices": h.terms.start_slices, "proves": h.proves(),
         "hashrateHs": h.hashrate_hs.to_string(), "payUrl": h.pay_url, "payNode": h.pay_node,
         "miners": h.capacity.miners, "freeMiners": h.capacity.free_miners, "freeHs": h.capacity.free_hs.to_string(), "event": event,
-        // what a trial (one slice's budget) may leave the wallet for: the shop's whole ticket
-        "trialMayBuyTicketUpToSats": xbt_hashlink::rail::pay_caps(h.terms.price_msat.div_ceil(1000)).0,
-        "mayBuyTicketUpToSats": xbt_hashlink::rail::TICKET_ROOM_SATS,
+        // what a trial may leave the wallet for: a ticket of the first step and its fee limit.
+        // A longer rental's tickets grow as they are earned, so no figure stands for them
+        "trialMayBuyTicketUpToSats": xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(h.terms.price_msat.saturating_mul(h.terms.start_slices + 1)), None).0,
     })
 }
 
@@ -197,6 +254,21 @@ fn trial_minutes(slice_work: u128, hs: u64) -> u64 {
     ((secs / 60.0).ceil() as u64).clamp(TRIAL_MIN_MINUTES, TRIAL_MAX_MINUTES)
 }
 
+/// Look at what the upstream's jobs show, with no lock held for it.
+fn look_at_upstream(r: &Mutex<R>) -> Option<xbt_hashlink::blind::Shown> {
+    let (datum, api, user) = {
+        let g = lock(r);
+        (g.datum.clone(), g.api(), g.user.clone())
+    };
+    if datum.is_empty() {
+        lock(r).shown = None;
+        return None;
+    }
+    let shown = xbt_hashlink::blind::probe(&datum, api.as_deref(), &user);
+    lock(r).shown = Some((datum, shown.clone(), xbt_hashlink::now_ms()));
+    Some(shown)
+}
+
 fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, body: &[u8]) -> (u16, Value) {
     let b: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     match (method, path.split('?').next().unwrap_or("")) {
@@ -219,8 +291,18 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                 .collect();
             drop(g);
             let found: Vec<&String> = candidates.iter().filter(|a| reachable(a)).collect();
+            // looked at again when the renter's page asks and the last look is old or of another gateway
+            let stale = lock(r).shown.as_ref().is_none_or(|(d, _, at)| *d != datum || xbt_hashlink::now_ms().saturating_sub(*at) > LOOK_EVERY.as_millis() as u64);
+            if stale && !datum.is_empty() && reachable(&datum) {
+                look_at_upstream(r);
+            }
+            let blinding = lock(r).shown.as_ref().filter(|(for_datum, ..)| *for_datum == datum).map(|(_, shown, at)| {
+                let mut v = shown.to_json();
+                v["checkedMs"] = json!(at);
+                v
+            });
             (200, json!({
-                "role": "renter", "datum": {"addr": datum, "reachable": !datum.is_empty() && reachable(&datum), "found": found},
+                "role": "renter", "datum": {"addr": datum, "reachable": !datum.is_empty() && reachable(&datum), "found": found}, "blinding": blinding,
                 "relays": lock(r).relays.len(), "wallet": lock(r).signer.is_some(), "rentals": rentals,
             }))
         }
@@ -272,6 +354,9 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
 fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     let key_hex = b["linkKey"].as_str().unwrap_or("");
     let trial = b["trial"] == true;
+    if lock(r).refused_seller(key_hex) {
+        return (409, json!({"error": "this hashmaker took your first payment twice and delivered little: this app won't pay it again"}));
+    }
     let mut miners = b["miners"].as_u64().unwrap_or(1).clamp(1, 1000) as u32;
     let mut budget_sats = b["budgetSats"].as_u64().unwrap_or(0);
     let mut minutes = b["minutes"].as_u64().unwrap_or(60).clamp(1, 7 * 24 * 60);
@@ -285,19 +370,30 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     if !reachable(&datum) {
         return (400, json!({"error": format!("your DATUM Gateway at {datum} does not answer")}));
     }
+    // looked at again now: this is the money's last chance to stay home
+    let allow_unblinded = lock(r).allow_unblinded;
+    if !allow_unblinded {
+        match look_at_upstream(r) {
+            Some(shown) if !shown.may_rent() => return (409, json!({"error": shown.words(), "blinding": shown.to_json()})),
+            _ => {}
+        }
+    }
     let pick = |o: Vec<(Hashrate, String)>| o.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key_hex);
     let Some((h, event)) = pick(offers(r, false)).or_else(|| pick(offers(r, true))) else {
         return (404, json!({"error": "that hashmaker's listing is no longer on the relays"}));
     };
+    if !h.proves() {
+        return (400, json!({"error": "this hashmaker's app doesn't prove the work it sells: it needs updating"}));
+    }
     if trial {
-        // one machine, one slice: the budget is one slice's price, and the time a few slices' worth
+        // one machine, one slice: the budget is one slice's price with the start fee, and the time a few slices' worth
         miners = 1;
-        budget_sats = h.terms.price_msat.div_ceil(1000);
+        budget_sats = first_payment_msat(&h.terms).div_ceil(1000);
         minutes = trial_minutes(h.terms.slice_work, per_miner_hs(&h));
     }
     let advertised_hs = per_miner_hs(&h).saturating_mul(miners as u64);
-    if h.terms.price_msat > budget_sats * 1000 {
-        return (400, json!({"error": "the budget is less than one slice"}));
+    if first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
+        return (400, json!({"error": if h.terms.start_slices > 0 { "the budget is less than the start fee and one slice" } else { "the budget is less than one slice" }}));
     }
     // over iroh when the listing offers it (no port forward needed on the hashmaker's side), else over
     // TCP to the address it names
@@ -316,17 +412,14 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     let live = Arc::new(Mutex::new(json!({"closed": null})));
     let cut = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let (key, user, signer, task) = {
+    let (key, user, signer, task, gateway_api, allow_unblinded) = {
         let g = lock(r);
-        (g.key, g.user.clone(), g.signer.clone(), g.task.clone())
+        (g.key, g.user.clone(), g.signer.clone(), g.task.clone(), g.api(), g.allow_unblinded)
     };
-    // the offer's price per slice is the most the wallet pays the shop for one ([`SignerPayer::ceiling`])
-    let ceiling = Some(xbt_hashlink::rail::slice_ceiling(h.terms.price_msat));
-    // a budget under the shop's ticket may still buy one: the slices are charged within the budget,
-    // and the ticket's rest stays with that shop as credit
-    let (max_sats, max_charge_sats) = xbt_hashlink::rail::pay_caps(budget_sats);
-    let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats, max_charge_sats, session: None, ceiling,
-                                                       wait_for_signer: std::time::Duration::from_millis(h.terms.grace_ms / 2) });
+    // the first ticket, the first step's: later ones grow as they are earned, inside the budget
+    let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
+    let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(budget_sats), None,
+                                                   std::time::Duration::from_millis(h.terms.grace_ms / 2)));
     let cfg = hashtaker::Config {
         hashmaker: addr,
         hashmaker_key: h.link_key,
@@ -340,11 +433,13 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         idle: Duration::from_secs(180),
         duration: Some(Duration::from_secs(minutes * 60)),
         report: None,
-        payer,
+        payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
         miners,
         budget_msat: Some(budget_sats * 1000),
         cut: Some(cut.clone()),
         live: Some(live.clone()),
+        gateway_api: gateway_api.clone(),
+        allow_unblinded,
     };
     {
         let mut g = lock(r);
@@ -369,16 +464,18 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         });
     }
     let hashmaker_key: PublicKey = h.link_key;
+    let service = r.clone();
     std::thread::spawn(move || {
         let res = hashtaker::run(cfg, Box::<LabHashtaker>::default());
-        if let Err(e) = res {
-            *live.lock().unwrap_or_else(|p| p.into_inner()) = json!({"closed": format!("could not start: {e}")});
+        match res {
+            Err(e) => *live.lock().unwrap_or_else(|p| p.into_inner()) = json!({"closed": format!("could not start: {e}")}),
+            Ok(report) => lock(&service).note_rental_end(&hex::encode(hashmaker_key.serialize()), &report),
         }
         done.store(true, Ordering::Relaxed);
         eprintln!("hashtaker: rental with {} ended", hex::encode(hashmaker_key.serialize()));
     });
     // the rental may buy the shop's ticket: what of it the slices do not use stays with that shop as credit
-    (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes, "mayBuyTicketUpToSats": max_sats}))
+    (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes, "mayBuyTicketUpToSats": first_ticket}))
 }
 
 /// Publish the signed delivery record of a rental that ended (the hashtaker's choice, per rental).

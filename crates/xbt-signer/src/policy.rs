@@ -740,7 +740,7 @@ impl PolicyEngine {
     /// threshold, approvals); `booked_sats` is the most the ledger gains from it (the sums).
     /// They differ on a channel, where the signed increase is known only from its state.
     pub fn evaluate_booking(&self, payment: &Payment, booked_sats: i64, human: bool) -> Result<Decision> {
-        self.decide(payment, booked_sats, human, false)
+        self.decide(payment, booked_sats, human, false, false)
     }
 
     /// Stream tickets: [`Self::evaluate_booking`] for a seller the caller has already admitted
@@ -748,15 +748,25 @@ impl PolicyEngine {
     /// any seller under its own budget and per-seller cap). The allowlist is the one rule not
     /// applied; every other rule is, and no human approval is asked for.
     pub fn evaluate_admitted(&self, payment: &Payment, booked_sats: i64) -> Result<Decision> {
-        self.decide(payment, booked_sats, false, true)
+        self.decide(payment, booked_sats, false, true, false)
     }
 
-    fn decide(&self, payment: &Payment, booked_sats: i64, human: bool, admitted: bool) -> Result<Decision> {
+    /// A payment of a task the owner gave a [`crate::ticket::TaskRental`]: admitted, and outside the
+    /// rules of this engine. The caller holds it to the task's own limits.
+    pub fn evaluate_rental(&self, payment: &Payment, booked_sats: i64) -> Result<Decision> {
+        self.decide(payment, booked_sats, false, true, true)
+    }
+
+    fn decide(&self, payment: &Payment, booked_sats: i64, human: bool, admitted: bool, rental: bool) -> Result<Decision> {
         let now = self.now();
         let p = payment.normalized(now);
         let cfg = &self.config();
         let allowlist = self.allowlist();
-        let ledger = self.store.payments()?;
+        // a rental task's payments count only against that task, so the rest of the wallet stands as it did. By the
+        // ledger's own id, as velocity reads them: a memo alone is the caller's word
+        let tickets = crate::ticket::TicketPolicy::from_map(&cfg.tickets);
+        let ledger: Vec<LedgerEntry> = self.store.payments()?.into_iter()
+            .filter(|p| !crate::ticket::is_ledger_id(&p.txid) || !crate::ticket::memo_task(&p.memo).is_some_and(|t| tickets.is_rental(t))).collect();
         let daily = Self::spent(&ledger, DAY_S, now, None)?;
         let weekly = Self::spent(&ledger, WEEK_S, now, None)?;
         let cpty = Self::spent(&ledger, WEEK_S, now, Some(&p.dest))?;
@@ -780,6 +790,9 @@ impl PolicyEngine {
         }
         if !admitted && !allowlist.contains(&p.dest) {
             return Ok(decide(Deny, "allowlist", format!("destination not on allowlist: {}", p.dest), None, None));
+        }
+        if rental {
+            return Ok(decide(Allow, "ok", "inside the task's own limits (tickets.tasks.*.rental)".into(), None, None));
         }
         if p.amount_sats > cfg.max_per_tx_sats {
             return Ok(decide(Deny, "max_per_tx", format!("{} sats exceeds max_per_tx {}", p.amount_sats, cfg.max_per_tx_sats), None, None));

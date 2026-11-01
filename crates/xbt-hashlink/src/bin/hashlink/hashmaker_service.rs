@@ -4,9 +4,19 @@
 //! reads the state from the control page.
 //!
 //! Settings file (JSON; every key optional, a flag gives the default):
-//! `{"enabled": true, "fallback": "host:port", "priceSat": 40, "sliceWork": "140737488355328",
+//! `{"enabled": true, "fallback": "host:port", "priceSat": 404, "sliceWork": "35184372088832", "startSlices": 2,
 //!   "graceMs": 45000, "rentable": 3, "name": "My miners", "linkPublic": "host:port",
-//!   "payUrl": "https://shop.example/hashrate", "payNode": "02…", "minersPublic": "host:port"}`
+//!   "payUrl": "https://shop.example/hashrate", "payNode": "02…", "minersPublic": "host:port",
+//!   "priceSeenMs": 1790000000000, "holdNew": false, "awaitSpeed": false}`
+//!
+//! **The price is the app's.** It alone can read the difficulty (through the signer, which this service,
+//! open to the internet, has no way to reach), so it works out `priceSat`, `sliceWork` and `startSlices`
+//! and writes the same price into the gateway's route. Here they are only read, and:
+//! * a rental keeps the terms it was made with ([`Hashmaker::set_terms`]);
+//! * no price yet, a live price the app stopped confirming (`priceSeenMs`, [`PRICE_MAX_AGE_MS`]), or
+//!   `holdNew` (a new price waiting for the rentals going on to end) takes no new rental, and leaves the
+//!   ones going on alone;
+//! * a listing goes out only when the gateway charges what its terms say ([`route_price_msat`]).
 //!
 //! Hashtakers reach the link over iroh by default (`--iroh off` turns it off; `--iroh-relays` names
 //! relays, `none` for direct only): the listing names the link's iroh key and relay, and no port
@@ -47,6 +57,14 @@ const HASHRATE_MOVE: f64 = 0.20;
 /// And at least this often, so relays keep it (as the gateway's listing).
 const REPUBLISH_MAX: Duration = Duration::from_secs(6 * 3600);
 
+/// A slice's work when neither the flag nor the app says: about one share of an S11 (4 TH/s).
+const DEFAULT_SLICE_WORK: u128 = 1 << 45;
+/// A live price the app has not confirmed for this long takes no new rental. The difficulty moves only
+/// every 2016 blocks, so this rides out a node or a signer restarting.
+const PRICE_MAX_AGE_MS: u64 = 3_600_000;
+/// The gateway's route for paid slices (the app writes it, `hash_route`).
+const HASH_ROUTE: &str = "/hashrate/";
+
 /// What a published listing said, to compare the next one against.
 #[derive(Clone, Debug, PartialEq)]
 struct Said {
@@ -61,6 +79,8 @@ struct Said {
     iroh: Option<IrohLink>,
     pay_url: Option<String>,
     pay_node: Option<String>,
+    /// The app has sized the slice to a measured miner: until then there is no listing.
+    sized: bool,
 }
 
 /// Whether to publish now, `since` after the last attempt (`ok`: whether it was taken).
@@ -80,7 +100,8 @@ fn due(last: Option<(&Said, bool)>, now: &Said, since: Duration) -> bool {
         || l.link_public != now.link_public
         || l.iroh != now.iroh
         || l.pay_url != now.pay_url
-        || l.pay_node != now.pay_node;
+        || l.pay_node != now.pay_node
+        || l.sized != now.sized;
     if what {
         return since >= REPUBLISH_CAPACITY;
     }
@@ -101,6 +122,36 @@ struct Settings {
     pay_node: Option<String>,
     /// The address the hashmaker's miners use (shown by the app).
     miners_public: Option<String>,
+    /// A new price waits for the rentals going on to end: no new rental till then.
+    hold_new: bool,
+    /// The app has not measured a miner to size the slice to yet.
+    await_speed: bool,
+    /// When the app last confirmed a live price against the chain. None: a price the owner typed.
+    price_seen_ms: Option<u64>,
+}
+
+/// Why no new rental is taken now, if so. The rentals going on are not touched by any of these.
+fn paused(s: &Settings, now_ms: u64) -> Option<&'static str> {
+    if s.terms.price_msat == 0 {
+        Some("no price yet")
+    } else if s.await_speed {
+        Some("no miner measured yet")
+    } else if s.hold_new {
+        Some("a new price waits for the rentals going on to end")
+    } else if s.price_seen_ms.is_some_and(|t| now_ms.saturating_sub(t) > PRICE_MAX_AGE_MS) {
+        Some("the live price has not been confirmed for over an hour")
+    } else {
+        None
+    }
+}
+
+/// The miners rentals may take now: none while [`paused`]. ([`Hashmaker::set_open`] would end the rentals going on.)
+fn rentable_now(s: &Settings, now_ms: u64) -> Option<u32> {
+    if paused(s, now_ms).is_some() {
+        Some(0)
+    } else {
+        s.rentable
+    }
 }
 
 fn defaults(f: &HashMap<String, String>) -> Result<Settings, String> {
@@ -108,9 +159,11 @@ fn defaults(f: &HashMap<String, String>) -> Result<Settings, String> {
         enabled: !f.contains_key("config"),
         fallback: f.get("fallback").cloned().filter(|a| !a.is_empty()),
         terms: Terms {
-            slice_work: super::num(f, "slice-work", Some(1u128 << 47))?,
-            price_msat: super::num(f, "price-msat", Some(40_000))?,
+            slice_work: super::num(f, "slice-work", Some(DEFAULT_SLICE_WORK))?,
+            // with a settings file the app says the price (0: none yet, and no rental); without one, the flag must
+            price_msat: super::num(f, "price-msat", f.contains_key("config").then_some(0))?,
             grace_ms: super::num(f, "grace-ms", Some(45_000))?,
+            start_slices: super::num(f, "start-slices", Some(0))?,
         },
         rentable: f.get("rentable").map(|v| v.parse()).transpose().map_err(|_| "--rentable")?,
         name: f.get("name").cloned().unwrap_or_else(|| "Hashrate".into()),
@@ -118,6 +171,9 @@ fn defaults(f: &HashMap<String, String>) -> Result<Settings, String> {
         pay_url: f.get("pay-url").cloned(),
         pay_node: f.get("pay-node").cloned(),
         miners_public: f.get("miners-public").cloned(),
+        hold_new: false,
+        await_speed: false,
+        price_seen_ms: None,
     })
 }
 
@@ -133,8 +189,14 @@ fn read_settings(path: &Option<PathBuf>, base: &Settings) -> Settings {
         s.fallback = Some(f.trim().to_string()).filter(|f| !f.is_empty());
     }
     if let Some(p) = v.get("priceSat").and_then(Value::as_u64) {
-        s.terms.price_msat = p * 1000;
+        s.terms.price_msat = p.saturating_mul(1000);
     }
+    if let Some(n) = v.get("startSlices").and_then(Value::as_u64) {
+        s.terms.start_slices = n;
+    }
+    s.hold_new = v.get("holdNew").and_then(Value::as_bool).unwrap_or(false);
+    s.await_speed = v.get("awaitSpeed").and_then(Value::as_bool).unwrap_or(false);
+    s.price_seen_ms = v.get("priceSeenMs").and_then(Value::as_u64);
     if let Some(w) = v.get("sliceWork").and_then(Value::as_str).and_then(|w| w.parse().ok()).filter(|w: &u128| *w > 0) {
         s.terms.slice_work = w;
     }
@@ -157,8 +219,8 @@ fn read_settings(path: &Option<PathBuf>, base: &Settings) -> Settings {
     s
 }
 
-/// The node a gateway's tickets pay (`payTo` of its `/services`).
-fn gateway_node(base: &str) -> Option<String> {
+/// A gateway's `/services`.
+fn gateway_services(base: &str) -> Option<Value> {
     let rest = base.trim_end_matches('/').strip_prefix("http://")?;
     let (host, path) = (rest, "/services");
     let mut s = std::net::TcpStream::connect(host).ok()?;
@@ -169,7 +231,35 @@ fn gateway_node(base: &str) -> Option<String> {
     s.take(256 * 1024).read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
     let body = text.split_once("\r\n\r\n")?.1;
-    serde_json::from_str::<Value>(body).ok()?.get("payTo")?.as_str().map(str::to_string)
+    serde_json::from_str::<Value>(body).ok()
+}
+
+/// The node a gateway's tickets pay (`payTo` of its `/services`).
+fn gateway_node(base: &str) -> Option<String> {
+    gateway_services(base)?.get("payTo")?.as_str().map(str::to_string)
+}
+
+/// What a gateway charges for a paid slice now, from its `/services`.
+fn route_price_msat(services: &Value) -> Option<u64> {
+    services.get("routes")?.as_array()?.iter().find(|r| r.get("path").and_then(Value::as_str) == Some(HASH_ROUTE))?.pointer("/price/requestMsat")?.as_str()?.parse().ok()
+}
+
+/// What a listing still lacks, and why, in the owner's words.
+fn missing(s: &Settings, reach: &Option<String>) -> Option<(&'static str, &'static str)> {
+    if s.terms.price_msat == 0 {
+        return Some(("price", "There is no price yet: the app has not been able to read today's difficulty from your XBT node."));
+    }
+    if s.await_speed {
+        return Some(("speed", "Your offer is published once a miner has hashed for a couple of minutes: its pieces of work are sized to its speed."));
+    }
+    [
+        ("link", reach, "Your miners cannot be reached from outside yet: the direct link has not found our relay. Check this box's internet connection; your offer is published once it has."),
+        ("pay-url", &s.pay_url, "Set your shop's public address on the Sell page first."),
+        ("pay-node", &s.pay_node, "Your shop's Lightning node is not known yet."),
+    ]
+    .into_iter()
+    .find(|(_, v, _)| v.is_none())
+    .map(|(k, _, why)| (k, why))
 }
 
 /// A key file: read, or made (mode 0600) when it is not there yet.
@@ -201,7 +291,8 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
             report: f.get("report").map(PathBuf::from),
             slices: f.get("slices").cloned(),
             fallback: settings.fallback.clone(),
-            rentable: settings.rentable,
+            rentable: rentable_now(&settings, xbt_hashlink::now_ms()),
+            min_slice_time: hashmaker::MIN_SLICE_TIME,
         },
         Box::new(|| Box::<LabSeller>::default()),
     )?);
@@ -237,7 +328,9 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
                         "enabled": s.enabled, "fallback": s.fallback, "priceSat": s.terms.price_msat / 1000,
                         "sliceWork": s.terms.slice_work.to_string(), "graceMs": s.terms.grace_ms, "rentable": s.rentable, "name": s.name,
                         "linkPublic": s.link_public, "payUrl": s.pay_url, "payNode": s.pay_node,
+                        "startSlices": s.terms.start_slices, "holdNew": s.hold_new,
                     });
+                    v["paused"] = json!(paused(&s, xbt_hashlink::now_ms()));
                     v["minersAddress"] = json!(s.miners_public.clone().unwrap_or_else(|| miners_default.clone()));
                     v["linkLan"] = json!(link_lan);
                     v["iroh"] = match &iroh {
@@ -261,6 +354,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
     }
     eprintln!("hashmaker: serving; renting {}", if settings.enabled && settings.fallback.is_some() { "on" } else { "off" });
     let mut seen = mtime(&path);
+    let mut rentable = rentable_now(&settings, xbt_hashlink::now_ms());
     let mut last: Option<(Said, bool)> = None;
     let mut last_pub = Instant::now();
     let mut served = Served::load(path.as_ref().map(|p| p.with_file_name("hash-summary.json")));
@@ -274,14 +368,26 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
             seen = m;
             let next = read_settings(&path, &base);
             if next != settings {
-                eprintln!("hashmaker: new settings: renting {}, fallback {}", if next.enabled { "on" } else { "off" }, next.fallback.as_deref().unwrap_or("none"));
+                // a price confirmed again is no news
+                if (&next.terms, next.enabled, &next.fallback) != (&settings.terms, settings.enabled, &settings.fallback) {
+                    eprintln!("hashmaker: new settings: renting {}, fallback {}, {} msat a slice of {}", if next.enabled { "on" } else { "off" },
+                              next.fallback.as_deref().unwrap_or("none"), next.terms.price_msat, next.terms.slice_work);
+                }
                 h.set_terms(next.terms.clone());
                 h.set_fallback(next.fallback.clone());
-                h.set_rentable(next.rentable);
                 h.set_open(next.enabled && next.fallback.is_some());
                 settings = next;
                 *shared.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
             }
+        }
+        // as time goes too: a live price that nothing confirms stops taking rentals
+        let want = rentable_now(&settings, xbt_hashlink::now_ms());
+        if want != rentable {
+            if let Some(why) = paused(&settings, xbt_hashlink::now_ms()) {
+                eprintln!("hashmaker: no new rentals: {why}");
+            }
+            h.set_rentable(want);
+            rentable = want;
         }
         let Some(r) = f.get("relays") else { continue };
         let renting = settings.enabled && settings.fallback.is_some();
@@ -297,21 +403,15 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         // not offered: a listing naming no way to reach it would send hashtakers nowhere)
         let iroh_now = iroh.as_ref().map(|l| over_iroh::advertise(l, Duration::from_secs(10))).filter(|i| !i.relays.is_empty() || !i.direct.is_empty());
         let now = Said { cap, renting, terms: settings.terms.clone(), name: settings.name.clone(),
-                         link_public: settings.link_public.clone(), iroh: iroh_now.clone(), pay_url: settings.pay_url.clone(), pay_node: settings.pay_node.clone() };
+                         link_public: settings.link_public.clone(), iroh: iroh_now.clone(), pay_url: settings.pay_url.clone(), pay_node: settings.pay_node.clone(),
+                         sized: !settings.await_speed };
         if !due(last.as_ref().map(|(s, ok)| (s, *ok)), &now, last_pub.elapsed()) {
             continue;
         }
         // no public address hashtakers can reach: no listing on public relays (one naming an address
         // only the LAN can reach would send hashtakers nowhere)
         let reach = iroh_now.as_ref().map(|i| i.id.clone()).or_else(|| settings.link_public.clone());
-        let missing = [
-            ("link", &reach, "Your miners cannot be reached from outside yet: the direct link has not found our relay. Check this box's internet connection; your offer is published once it has."),
-            ("pay-url", &settings.pay_url, "Set your shop's public address on the Sell page first."),
-            ("pay-node", &settings.pay_node, "Your shop's Lightning node is not known yet."),
-        ]
-        .into_iter()
-        .find(|(_, v, _)| v.is_none());
-        if let Some((k, _, why)) = missing {
+        if let Some((k, why)) = missing(&settings, &reach) {
             let was = published.lock().unwrap_or_else(|p| p.into_inner()).clone();
             if was.get("missing").and_then(Value::as_str) != Some(k) {
                 eprintln!("hashmaker: listing not published: {k} is not set");
@@ -321,6 +421,18 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
             last = Some((now, true));
             last_pub = Instant::now();
             continue;
+        }
+        // the listing says what a slice costs, and the gateway charges it: a gateway that has not taken a new price
+        // yet (it restarts for it) charges another, so the listing waits, and is tried again in a minute
+        if let Some(g) = f.get("gateway") {
+            let charged = gateway_services(g).as_ref().and_then(route_price_msat);
+            if charged != Some(settings.terms.price_msat) {
+                eprintln!("hashmaker: listing not published: the gateway charges {charged:?} msat a slice, the terms say {}", settings.terms.price_msat);
+                *published.lock().unwrap_or_else(|p| p.into_inner()) = json!({"ok": false, "missing": "route-price", "why": "Your shop is starting with its new price. Your offer is published once it charges that price.", "atMs": xbt_hashlink::now_ms()});
+                last = Some((now, false));
+                last_pub = Instant::now();
+                continue;
+            }
         }
         let mut fl = f.clone();
         fl.insert("name".into(), settings.name.clone());
@@ -408,8 +520,8 @@ mod tests {
     use super::*;
 
     fn said(miners: u32, free: u32, hs: u64) -> Said {
-        Said { cap: Capacity { miners, free_miners: free, free_hs: hs }, renting: true, terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000 }, name: "m".into(),
-              link_public: None, iroh: None, pay_url: Some("https://box.example/hashrate".into()), pay_node: Some("02aa".into()) }
+        Said { cap: Capacity { miners, free_miners: free, free_hs: hs }, renting: true, terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000, start_slices: 0 }, name: "m".into(),
+              link_public: None, iroh: None, pay_url: Some("https://box.example/hashrate".into()), pay_node: Some("02aa".into()), sized: true }
     }
     const S: fn(u64) -> Duration = Duration::from_secs;
 
@@ -471,6 +583,77 @@ mod tests {
         assert!(!due(Some((&last, false)), &last, S(30)));
         assert!(due(Some((&last, false)), &last, S(60)));
         assert!(!due(Some((&last, true)), &last, S(3600)));
+    }
+
+    fn settings(file: Value) -> Settings {
+        let d = std::env::temp_dir().join(format!("hashmaker-service-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("settings.json");
+        std::fs::write(&p, file.to_string()).unwrap();
+        let flags = HashMap::from([("config".to_string(), p.display().to_string())]);
+        read_settings(&Some(p), &defaults(&flags).unwrap())
+    }
+
+    #[test]
+    fn with_no_price_from_the_app_nothing_is_for_rent_and_no_40_sat_default_is_left() {
+        let s = settings(json!({"enabled": true, "fallback": "pool:3333"}));
+        assert_eq!((s.terms.price_msat, s.terms.slice_work), (0, 1 << 45));
+        assert_eq!(paused(&s, 1), Some("no price yet"));
+        assert_eq!(rentable_now(&s, 1), Some(0));
+        assert_eq!(missing(&s, &Some("x".into())).map(|m| m.0), Some("price"));
+        // by hand, without a settings file, the flag must say it
+        assert!(defaults(&HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn the_terms_are_what_the_app_wrote() {
+        let s = settings(json!({"enabled": true, "fallback": "pool:3333", "priceSat": 404, "sliceWork": "35184372088832", "startSlices": 2}));
+        assert_eq!(s.terms, Terms { slice_work: 1 << 45, price_msat: 404_000, grace_ms: 45_000, start_slices: 2 });
+        assert_eq!(paused(&s, u64::MAX), None, "a typed price has nothing to go stale");
+    }
+
+    #[test]
+    fn a_live_price_nobody_confirms_stops_new_rentals_and_says_why() {
+        let s = settings(json!({"enabled": true, "fallback": "pool:3333", "priceSat": 404, "priceSeenMs": 1_000, "rentable": 3}));
+        assert_eq!(rentable_now(&s, 1_000 + PRICE_MAX_AGE_MS), Some(3));
+        assert_eq!(rentable_now(&s, 1_001 + PRICE_MAX_AGE_MS), Some(0));
+        assert!(paused(&s, 1_001 + PRICE_MAX_AGE_MS).unwrap().contains("not been confirmed"));
+    }
+
+    #[test]
+    fn a_new_price_waiting_takes_no_new_rental_and_a_slice_not_sized_yet_is_not_listed() {
+        let held = settings(json!({"priceSat": 404, "holdNew": true, "rentable": 3}));
+        assert_eq!(rentable_now(&held, 1), Some(0));
+        assert_eq!(missing(&held, &Some("x".into())).map(|m| m.0), Some("pay-url"), "listed, as nothing free");
+        let new = settings(json!({"priceSat": 404, "awaitSpeed": true}));
+        assert_eq!(rentable_now(&new, 1), Some(0));
+        assert_eq!(missing(&new, &Some("x".into())).map(|m| m.0), Some("speed"));
+        // once it is sized, that is news at once, whatever the terms
+        let (mut a, mut b) = (said(1, 1, 1), said(1, 1, 1));
+        a.sized = false;
+        b.sized = true;
+        assert!(due(Some((&a, true)), &b, S(60)));
+    }
+
+    #[test]
+    fn the_price_a_gateway_charges_is_read_from_its_services() {
+        // as the gateway writes it (Price::terms)
+        let v = json!({"payTo": "02aa", "routes": [{"path": "/films/", "price": {"requestMsat": "5"}},
+                                                    {"path": "/hashrate/", "methods": ["POST"], "price": {"requestMsat": "404000", "byteMsat": "0", "perBytes": "1", "secondMsat": "0"}}]});
+        assert_eq!(route_price_msat(&v), Some(404_000));
+        assert_eq!(route_price_msat(&json!({"routes": [{"path": "/films/", "price": {"requestMsat": "5"}}]})), None, "no route: no price");
+        assert_eq!(route_price_msat(&json!({})), None);
+    }
+
+    #[test]
+    fn a_speed_that_wobbles_does_not_change_the_terms_or_publish_more() {
+        let terms = said(1, 1, 1).terms;
+        let last = said(1, 1, 4_000_000_000_000);
+        for hs in [2_900_000_000_000, 4_400_000_000_000, 3_300_000_000_000] {
+            let now = said(1, 1, hs);
+            assert_eq!(now.terms, terms);
+            assert!(!due(Some((&last, true)), &now, S(120)), "{hs}");
+        }
     }
 
     #[test]

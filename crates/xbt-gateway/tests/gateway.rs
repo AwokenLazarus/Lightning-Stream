@@ -2105,6 +2105,49 @@ fn a_buyer_may_ask_for_a_smaller_ticket_down_to_the_smallest_the_terms_name() {
     assert_eq!(b.balance(), 1_350_000);
 }
 
+/// A route's own top ticket: its prepaid entry says so, a prepaid ticket up to it is sold and credited
+/// at its size, and nothing else moves: not the held entry, not another route's terms, not the largest
+/// held ticket, not the held budget.
+#[test]
+fn a_routes_top_ticket_is_for_prepaid_tickets_and_moves_nothing_else() {
+    let plain = {
+        let (rig, _d) = start(&|v| {
+            v["tickets"] = json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000});
+            v["caps"] = json!({"sessions_per_address": 0, "held_after_paid": false});
+        });
+        (rig.gw.stats().max_held, http(&rig.addr, "GET", "/api", &[], b"", None).json())
+    };
+    let (rig, _d) = start(&|v| {
+        v["tickets"] = json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000});
+        v["caps"] = json!({"sessions_per_address": 0, "held_after_paid": false});
+        let mut r = v["routes"].as_array().unwrap().clone();
+        r.push(json!({"path": "/hashrate/", "methods": ["POST"], "price": {"request_msat": 404_250}, "top_ticket_msat": 100_000_000}));
+        v["routes"] = json!(r);
+    });
+    let entry = |pr: &Value, settle: &str| pr["accepts"].as_array().unwrap().iter().find(|a| a["extra"]["settle"] == settle).unwrap()["extra"].clone();
+    let hash = http(&rig.addr, "POST", "/hashrate/r/1", &[], b"", None).json();
+    assert_eq!(entry(&hash, "on-arrival")["topTicketMsat"], "100000000", "{hash}");
+    assert_eq!((entry(&hash, "on-arrival")["ticketMsat"].clone(), entry(&hash, "on-use")["ticketMsat"].clone()), (json!("900000"), json!("900000")));
+    assert!(entry(&hash, "on-use").get("topTicketMsat").is_none(), "{hash}");
+    let other = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert!(entry(&other, "on-arrival").get("topTicketMsat").is_none(), "{other}");
+    for settle in ["on-use", "on-arrival"] {
+        assert_eq!(entry(&other, settle)["ticketMsat"], entry(&plain.1, settle)["ticketMsat"]);
+        assert_eq!(entry(&other, settle)["minTicketMsat"], entry(&plain.1, settle)["minTicketMsat"]);
+    }
+    assert_eq!(rig.gw.stats().max_held, plain.0, "the held budget");
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_with(&s, &json!({"ticketMsat": "900001"})).status, 400, "no held ticket past the shop's own");
+    assert_eq!(b.lock_prepaid_with(1, &json!({"ticketMsat": "100000001"})).status, 400, "past the top");
+    assert_eq!(b.lock_prepaid_with(1, &json!({"ticketMsat": "545999"})).status, 400, "below the first step");
+    let j = b.lock_prepaid_with(1, &json!({"ticketMsat": "34440000"})).json();
+    let hash = xbt402::ticket::hex32(j["tickets"][0]["hash"].as_str().unwrap()).unwrap();
+    assert!(rig.node.pay(&hash));
+    b.release(&[rig.node.paid_preimage(&hash).unwrap()]);
+    assert_eq!(b.balance(), 34_440_000);
+}
+
 #[test]
 fn a_gateway_whose_terms_name_no_smallest_size_ignores_a_size_asked_for() {
     let (rig, _d) = start(&|v| v["caps"] = json!({"sessions_per_address": 0, "held_after_paid": false}));

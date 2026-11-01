@@ -3511,7 +3511,8 @@ impl Signer {
         // is asked of the seller where none fits
         let size = self.ticket_prepaid_size(&hs.sid, spent.left(), spent.charge_sats);
         spent.room(size.map(|(_, face, booked)| (face, booked)), true)?;
-        let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m));
+        // a rental task's sizes aren't its seller's own (`topTicketMsat`): each is asked for by name
+        let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m || self.ticket_policy().is_rental(&s.task)));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
         self.ticket_can_lock(&hs.terms.terms.payee, &hs.sid)?;
         if let Some(d) = at_fault() {
