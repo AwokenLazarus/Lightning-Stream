@@ -1713,12 +1713,10 @@ fn placement(g: &mut Hub, c: u64, now: Instant, sending: &mut HashMap<String, Op
     if conn.busy || conn.close_at.is_some() {
         return None;
     }
-    let Some(unit) = conn.unit.clone() else { return None };
-    let Some(active) = conn.active else { return None };
+    let unit = conn.unit.clone()?;
+    let active = conn.active?;
     // a connection not yet named is left where it was placed until it says who it is
-    if conn.authorize.is_none() {
-        return None;
-    }
+    conn.authorize.as_ref()?;
     let want = g.target(&unit);
     let have = g.slot_rental(c, active);
     if want == have {
