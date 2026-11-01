@@ -49,6 +49,19 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A download cut short by a channel outage now picks up from the byte it stopped at. If the seller
+  has forgotten the session or has no room for more tickets, the wallet opens a fresh session once
+  and carries on. It never retries a session the seller faulted or one you stopped, and never pays
+  twice for the same bytes. If a seller ignores a byte range and sends the whole file, the wallet
+  closes at once; the unread part costs at most what was already on its way.
+- On a busy wallet, lottery wins are now paid nearest-deadline first. A seller's unpaid wins are
+  hurried as soon as it reaches its limit. Every invoice is checked again just before it is sent, so
+  none goes out about to expire. A 0.2.0 wallet tells a 0.2.0 seller it can cancel, and gets win
+  invoices of up to 180 s, so a busy wallet no longer misses wins. Older wallets and sellers keep
+  today's behaviour.
+- A seller can now say how long it waits for the next ticket, and the wallet ends its own pause a
+  little before that (a tenth of the wait, between 1 s and 3 s), so no ticket is ever paid into an
+  answer the seller has already closed. A seller that doesn't say keeps today's behaviour.
 - A slow wallet no longer blames a seller whose web server timed out waiting for the wallet's request
   (HTTP 408). Nothing was served or charged: the wallet sends the same request once more, and if it
   times out again, that call alone is refused and the session goes on.
@@ -62,10 +75,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A channel that drops for a moment no longer ends a paid file or answer: the wallet waits up to
   8 s for it to come back, and as long for a route to the seller (after a link further along the way
   was replaced, a node may find none for some seconds), rather than sending a payment that fails. A seller
-  the node has no route to for good ends the call with `ln_no_route` within those 8 s, and holds up no
-  other seller's payments. The route is asked for over the public graph only: a seller reached by its
-  invoice's route hints or blinded paths (a private channel, an LSP) is paid at once, as before, with no
-  wait. A channel that stays down still ends what is paid by tickets, with that
+  the node has no route to for good ends the call with `ln_no_route` within 8 s counted from after the
+  node's checks, and holds up no
+  other seller's payments. The route is asked for with the invoice's route hints, so a seller reached through a
+  private channel (an LSP's, say) is found as its payment finds it, and waited for the same way; an invoice with
+  blinded paths, which the route query does not take, is paid at once, as before. A channel that stays down still ends what is paid by tickets, with that
   reason; a file paid by draws may still finish, with the wins it could not pay listed unpaid.
 - A win whose invoice ran out while it waited its turn is paid on the seller's next invoice, rather
   than ending the file; a win that would arrive after its invoice ends is not sent.
@@ -158,6 +172,14 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that will not say what an earlier session left with it no longer has a new ticket bought
   beside that credit: the call is refused with a time to retry. After two minutes a new session starts,
   your wallet's history names what may be left, and the next session uses that credit first, oldest first.
+- Credit one task leaves with a shop is no longer spent by another task's calls, which could take
+  that task past its own budget. The credit now waits for a call of its own task, for up to about
+  20 hours, and another task's call to that shop buys its own ticket.
+- A call of one task is no longer paid from a session another task has open with the same shop, which
+  spent that task's credit and booked the tickets it bought to that task, past the calling task's
+  own budget. Each task now has its own session with a shop: a second task's call opens one beside
+  it and buys its own ticket. A call at another address of the same shop no longer stops another
+  task's session, and is no longer held back by another task's prepaid ticket still on its way.
 - A kill or a lost answer no longer buys a second ticket when the first was paid: the next call waits
   for the shop to take it, for two minutes at most. Long answers open for over ten minutes are no longer
   cut by a second call to the same shop.
@@ -166,6 +188,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   call's answer as long as the wallet works on it; any other call still gives up after `B2_SIGNER_TIMEOUT`.
   If a paying call's answer is lost (the wallet's signer stopped), the agent is told the call may have paid
   (`signer_no_answer`, `request_sent: true`) rather than given an error that reads as if nothing happened.
+  A paying call still has a ceiling, 24 h 5 min as shipped (`XBT_MCP_PAY_CEILING_S`, past the longest the wallet keeps any answer open), and at most 14 are in
+  progress at once, so a stuck signer cannot take every worker of the MCP: a `ticket_stop` is always served.
 
 **VPN exits**
 - A priced exit's region check now runs for a buyer with no credit at that exit. Each check is
@@ -191,10 +215,32 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that sells only its VPN exit is listed, so buyers can find it by its key.
 
 **Hashrate**
+- The hashrate task's own limits (its 200,000 sat budget, tickets up to 10,000 sat, 600 an hour, outside
+  the wallet's day, week and per-shop limits) now apply only to the app's renter paying a rented
+  miner's work. Before, any agent or MCP tool that named the task "hashrate" could pay any shop on
+  them, past your wallet's limits and with no approval. Such a call is now refused and nothing is
+  paid. The renter pays through its own connection to the wallet, which nothing else in the app can
+  reach.
+- If you run the renter by hand (`xbt-hashlink renter --signer …`), or your app's parts are of different
+  versions after an update, point `--signer` at the wallet's renter socket (`run/rental/signer.sock`), and
+  update every part of the app together: a renter on the wallet's ordinary socket now has every rental
+  payment refused, and the Hashrate page says so.
 - Renting needs masked jobs, solo or through a pool, so a hashmaker can't keep back the shares that would be blocks.
-  The app comes with a DATUM Gateway that masks its jobs and rents into it. The Rent page checks the gateway's jobs
-  when it opens and before each rental; if they aren't masked (the gateway isn't running, or the app is set to
-  another gateway), it says so and rents nothing.
+  The app comes with its own gateway, the Stream Gateway (DATUM-compatible), which masks its jobs, and rents into it.
+  The Rent page checks the gateway's jobs when it opens and before each rental; if they aren't masked (the gateway
+  isn't set up or running, or the app is set to another gateway), it says so and rents nothing.
+- *Your gateway* on the Hashrate page sets the Stream Gateway up: solo to your own XBT address (the default), or
+  through Lazarus Pool. The address is checked for your node's network first (bc1q, bc1p or a legacy address on
+  mainnet). The page shows the gateway running, connected to your node, and masking its jobs.
+- Lazarus Pool mode masks its jobs once Lazarus Pool takes gateway-held keys; until then renting stays off in that
+  mode, and solo works. In that mode your gateway holds the key, so it could hide a block it finds from the pool,
+  the same as any DATUM miner can today. Pools that hold the key themselves (CONVOY-style) come later.
+- The gateway's config holds no secret: the node's RPC credentials go to a cookie file only the gateway reads, its
+  API has no admin password (every admin page is off), and it listens on 127.0.0.1 only. A block it finds is kept
+  on disk even if the node's submitblock fails.
+- An app set to another gateway before this version is moved to the Stream Gateway once, and the Hashrate page
+  offers the old one back. On armv7 the app has no Stream Gateway: the Rent page says the gateway isn't masking,
+  and selling hashrate works as before.
 - Both apps check every share's hash themselves, from the Stratum lines alone. A share counts only
   if it proves its work; neither side takes the other's word, and a renter's verdicts set nothing.
 - Renters: paid as you use it, seconds at a time. You never have more paid for and not yet received
@@ -263,6 +309,16 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   a share sent again goes on to the renter's gateway for its verdict, aged as of the drop; as many as its miners'
   rate says could have been on their way count at once, and the rest only once the gateway takes them. A link
   that drops more than 8 times in an hour ends the rental.
+- After a dropped link both sides say their count once the shares sent again are settled, and the hashmaker's comes
+  down to the renter's by no more than what it forwarded in the 2 s before the renter was last heard from, never
+  more than 4 s before the drop. Before, a share sent again that the renter couldn't send on left the hashmaker's count ahead, and the rental could end unpaid.
+- A price saved with no rental going on holds no miner back: the hashmaker takes no new rental only until its shop
+  charges that price, and the Sell page says so. While rentals go on, a new price waits for them, and the hashmaker
+  takes it for new rentals the moment the last one ends. The shop starts charging a new price only once the
+  hashmaker shows it has the new terms with no rental going on, so a renter taken at the old terms in that moment
+  pays them to its end. A market price moving with the chain changes at most once every ten minutes. Before, a price saved on a
+  fresh install held every miner back, under "a new price waits for the rentals going on to end", until the app's
+  next minute check found the shop charging it.
 - Every share carries the renter's own id to its gateway, so its verdict is always read; a share with no id, or
   one still waiting for its verdict, is refused. A share whose time rolls back from its job's, or more than two
   hours forward, is refused. Before, shares with no id escaped the check of how many the gateway turned down.
@@ -279,6 +335,22 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Sell, Hashrate says this beside "Rent out my miners", and the box starts unticked for an owner who has never
   saved the form; one who has keeps their choice. A rental card says in plain words why the hashmaker ended it for
   these two reasons.
+- Rent sent twice (a double click, or the browser sending the form again) starts one rental and pays one start
+  fee. Before, each send started a rental of its own, with its own start fee.
+- An offer's delivery records say what they are: how many, from how many keys, and that anyone can publish
+  them. No score is made of them and none is called confirmed. Before, the offer led with "TH-hours confirmed by
+  both sides", which one person with two keys could fill at no cost.
+- Records about other hashmakers no longer hide a hashmaker's own. Before, 500 records about anyone, free to
+  publish, pushed every other record out of view.
+- A hashmaker's published summary carries counts and totals only: rentals, slices and sats paid, and work. Before,
+  it listed each renter's app key and the hour each rental ended, without the renter's say. It now goes out at
+  most every six hours, dated to the hour; the rental-by-rental list stays on the hashmaker's box.
+- A rental's time runs from the first share your gateway accepts, so the seconds spent connecting and moving the
+  miners, or a gateway slow to answer, no longer come out of it.
+- Mining solo, each offer says one machine's chance of finding a block in an hour, from your own node's
+  difficulty, and how often a block comes at that speed on average. Through a pool it says nothing.
+- A hashmaker's listing more than two days old is no longer offered: it is from a hashmaker that has stopped
+  publishing. Listings now carry an expiry other Nostr clients read too.
 
 **The app**
 - A visit to a shop reached by its key is headed by the shop's name, and pages show such a shop by

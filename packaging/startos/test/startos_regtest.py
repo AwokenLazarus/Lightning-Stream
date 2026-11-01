@@ -148,26 +148,37 @@ def main():
                "node-keys only, never its chain data or admin macaroon; node-keys watches for the grant and writes only run/ln; the MCP sees "
                "neither it nor run/ln; the hashrate services see the signer only read-only; the VPN service reads the VPN settings and nothing of the wallet",
           by["init"].get("user") == "root" and by["node-keys"].get("user") == "root"
-          and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker"))
+          and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker", "datum"))
           and own("mcp") == [("mcp", False), ("run/signer", True), ("run/ui", True)] and lf("mcp") == []
           and own("ui") == [("ui", False), ("run/signer", True), ("run/ui", False), ("run/ln", False), ("run/gateway", False), ("run/hashrate", False),
-                            ("run/shops", False), ("run/ai", False), ("run/vpn", False), ("run/vpn-status", True), ("run/enroll", True)] and lf("ui") == ["public"]
+                            ("run/datum", False), ("run/shops", False), ("run/ai", False), ("run/vpn", False), ("run/vpn-status", True), ("run/enroll", True)] and lf("ui") == ["public"]
           and own("vpn") == [("vpn", False), ("run/vpn", True), ("run/vpn-status", False)] and lf("vpn") == [] and not by["vpn"].get("user")
-          and own("signer") == [("signer", False), ("run/signer", False), ("run/anchor", True), ("run/ln", True), ("run/enroll", False)]
+          and own("signer") == [("signer", False), ("run/signer", False), ("run/rental", False), ("run/anchor", True), ("run/ln", True), ("run/enroll", False)]
           and lf("signer") == ["public"]
           and own("gateway") == [("gateway", False), ("run/gateway", True)] and lf("gateway") == ["public"]
-          and own("hashtaker") == [("hashrate", False), ("run/hashrate", True), ("run/signer", True)] and lf("hashtaker") == []
+          and own("hashtaker") == [("hashrate", False), ("run/hashrate", True), ("run/rental", True)] and lf("hashtaker") == []
           and own("hashmaker") == [("hashrate", False), ("run/hashrate", True)] and lf("hashmaker") == []
+          and own("datum") == [("datum", False), ("run/datum", True)] and lf("datum") == []
           and sorted(lf("node-keys")) == ["apps", "public"] and own("node-keys") == [("run/ln", False)]
           and by["node-keys"]["env"].get("XBT_KEYS_GRANT_DIR") == "/mnt/lightning-fork-apps/lightning-stream" and "XBT_KEYS_ADMIN" not in by["node-keys"]["env"]
           and "XBT_KEYS_GW_DIR" not in by["node-keys"]["env"] and by["ui"]["env"].get("XBT_UI_LN_GRANT") == "1"
           and [m["subpath"] for m in by["witness"]["mounts"]] == ["witness", "run/anchor"], sp["services"])
     check("I", "one package for the whole app: the wallet, the connector, the shop, hashrate and the VPN, on 127.0.0.1 inside it; the shop's and the "
                "hashrate pages' addresses on the UI",
-          {s["id"] for s in sp["services"]} == {"init", "node-keys", "witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker", "vpn"}
+          {s["id"] for s in sp["services"]} == {"init", "node-keys", "witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker", "vpn", "datum"}
           and by["ui"]["env"].get("XBT_UI_SELL") == "1" and by["ui"]["env"].get("XBT_UI_HASHRENT") == "http://127.0.0.1:23343"
           and by["ui"]["env"].get("XBT_UI_GW_HEALTH_URL") == "http://127.0.0.1:8402/x402/ticket/health" and "XBT_UI_ROLE" not in by["ui"]["env"],
           {s["id"]: s["env"] for s in sp["services"] if s["id"] == "ui"})
+    ht = by["hashtaker"]["command"]
+    check("I", "the Stream Gateway (masking): a daemon on the package's loopback, started by the config the UI writes, the node "
+               "from the Node connection action through init's cookie; the hashtaker tries it first, holds every job to its "
+               "/xbt/job, and never runs unmasked",
+          by["datum"]["command"][:6] == ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--"]
+          and "datum" in by["init"]["env"]["XBT_INIT_COMPONENTS"].split(",") and by["init"]["env"]["XBT_INIT_NODE_RPC_AUTH"] == "lab:lab"
+          and by["ui"]["env"].get("XBT_UI_DATUM_RPCURL") == "http://knots-b2b:18443" and by["ui"]["env"].get("XBT_UI_DATUM_DIR") == "/data/run/datum"
+          and ht[ht.index("--datum-candidates") + 1].split(",")[0] == "127.0.0.1:23339" and ht[ht.index("--gateway-api") + 1] == "127.0.0.1:7152"
+          and not any("--allow-unblinded" in s["command"] for s in sp["services"]),
+          {"datum": by["datum"]["command"], "hashtaker": ht})
 
     # --- the Lightning lab: the XBT node (the Node connection action's values) and Lightning Fork's two nodes ----
     log("== the Lightning lab: a Knots BLAKE2b regtest, lf1 (the wallet's server) and lf2 (the gateway's), one channel")

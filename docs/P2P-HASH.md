@@ -1,12 +1,12 @@
 # p2p-hash: rented hashrate over Lightning Stream (phase 1)
 
-**In 0.2.0:** Renting hashrate needs masked jobs (jobs that hide which shares win), solo or through a pool, so a hashmaker can't keep back the shares that would be blocks. The app comes with a DATUM Gateway that masks its jobs, and rents into it. Before each rental, and when the Rent page opens, the app checks the jobs; if they aren't masked (the gateway isn't running, or the app is set to another gateway that doesn't mask), it says so and rents nothing.
+**In 0.2.0:** Renting hashrate needs masked jobs (jobs that hide which shares win), solo or through a pool, so a hashmaker can't keep back the shares that would be blocks. The app comes with its own gateway, the **Stream Gateway (DATUM-compatible)**, which masks its jobs, and rents into it. You set it up on the Hashrate page under *Your gateway*: solo to your own XBT address (the default), or through Lazarus Pool. Before each rental, and when the Rent page opens, the app checks the jobs; if they aren't masked (the gateway isn't set up or running, or the app is set to another gateway that doesn't mask), it says so and rents nothing.
 
-Anyone rents hashrate from anyone, paid as it is used, seconds at a time, pointed at the hashtaker's own DATUM
-Gateway. The hashtaker makes the jobs; the hashmaker runs no gateway. Nobody holds anyone's money.
+Anyone rents hashrate from anyone, paid as it is used, seconds at a time, pointed at the hashtaker's own
+gateway. The hashtaker makes the jobs; the hashmaker runs no gateway. Nobody holds anyone's money.
 
 ```
-miners ──SV1 (LAN)──> hashmaker's app ══ link (BOLT 8 Noise_XK) ══> hashtaker's app ──SV1──> hashtaker's DATUM Gateway ──> pool
+miners ──SV1 (LAN)──> hashmaker's app ══ link (BOLT 8 Noise_XK) ══> hashtaker's app ──SV1──> hashtaker's gateway ──> pool or solo
                            jobs and verdicts ◄──────────────── shares ────────►
                            meter                                  meter, tickets, receipts
 ```
@@ -14,7 +14,7 @@ miners ──SV1 (LAN)──> hashmaker's app ══ link (BOLT 8 Noise_XK) ═�
 **The two roles** are named after the direction of the hash, not after who publishes:
 
 - the **hashmaker** produces the hash: it brings the miners and publishes the signed listing;
-- the **hashtaker** receives it: it takes a listing and points the work at its own DATUM Gateway.
+- the **hashtaker** receives it: it takes a listing and points the work at its own gateway.
 
 Earlier versions called them the hasher and the buyer (or renter). Those names stay where changing
 them would break something already running: the Umbrel app's `hasher` and `renter` services, their
@@ -109,7 +109,9 @@ or `--config`, the service the app runs):
   - any other miner is sent `client.reconnect` to the app's own address and is placed by its
     worker name when it comes back.
 - **The listing says what is free** (`capacity`: miners, free miners, free hashrate) and is
-  published again when that changes.
+  published again when that changes, and every six hours at the least. A listing more than two days
+  old is not offered: its hashmaker has gone. The event says so to other clients too (NIP-40
+  `expiration`).
 - **The end of a rental.** Both sides let a channel's meter go at the same point: after the hashtaker's
   upstream session for it has ended and its last verdict was sent, the hashtaker says `shut`, and the
   hashmaker lets the channel go there too. This removed the case where the hashmaker counted one more
@@ -127,7 +129,7 @@ or `--config`, the service the app runs):
 - **A link that goes silent**, with no close and no end of stream, ends the rental on both sides: see
   "What a stalled link can cost" below.
 - **The hashtaker's service** (`xbt-hashlink hashtaker`) finds offers on Nostr and runs several rentals
-  at once into the hashtaker's own DATUM Gateway, each with a budget and a cut switch, paying through
+  at once into the hashtaker's own gateway, each with a budget and a cut switch, paying through
   the wallet's signer.
 - **Control pages** for the app (`GET /status`, `POST /stop/RENTAL`; `GET /offers`, `POST /rent`,
   `POST /cut`, `POST /datum`) answer only with the control token (`--control-token-file`).
@@ -148,7 +150,7 @@ authorizes; the stand-in miner now does the same.
 
 The app (Umbrel) has a page for each side: Sell → Hashrate (the fallback, the price, how many
 miners to rent out, each miner and each rental, a Stop button) and Services → Hashrate (the offers,
-a budget and a duration, each rental with a Cut button, the hashtaker's DATUM Gateway). Rentals also
+a budget and a duration, each rental with a Cut button, and *Your gateway*). Rentals also
 show on Live connections.
 
 ## Trust before renting: a test slice and a delivery history
@@ -159,7 +161,7 @@ A hashtaker has two ways to judge a hashmaker before committing a budget
 **A test slice.** Services → Hashrate → *Try one slice first* rents one machine for one slice:
 its budget is one slice's price, and its time limit is three slices' worth at the advertised speed,
 between 5 and 60 minutes. It is an ordinary rental, paid the ordinary way, and the hashtaker's own
-DATUM Gateway checks every share. When it ends, the rental shows what it delivered: the speed
+gateway checks every share. When it ends, the rental shows what it delivered: the speed
 (accepted work over the time from the start to the finished slice, so it includes the first seconds
 of connecting) against the speed the listing advertised, the share of stale shares (Stratum V1
 error 21, or an error that says stale) and of rejected shares, and the share round trip (submit to
@@ -181,31 +183,31 @@ who saw that key on the link, can tell it is the hashtaker it served:
 
 It names no pool, payout address, user name, rental name or IP address.
 
-**A hashmaker's summary.** A hashmaker with relays and a Nostr key set publishes, at most every ten
-minutes after a rental ends, its own signed list of the rentals it served: kind 30078, `d` =
+**A hashmaker's summary.** A hashmaker with relays and a Nostr key set publishes, at most every six
+hours after a rental ends, its own signed totals of the rentals it served: kind 30078, `d` =
 `lightning-stream-hash-summary:<link key>`, `t` = `lightning-stream-hash-summary`, `p` = its link
-key (x-only), content at most 16 KiB with its newest 40 rentals (the commitment, the hashtaker's
-key, slices and millisatoshis paid, work, the receipts hash, the hour it ended). It is signed by the
-Nostr key the hashmaker's listing is bound to; a summary by any other key is ignored. The hashmaker
-keeps it in `hash-summary.json` beside its settings, so it survives a restart.
+key (x-only), content `{"v": 2, "hashmaker", "rentals", "paidSlices", "paidMsat", "work"}`, dated to the
+hour. It names no renter's key, no rental and no time a rental ran, so nobody can follow a renter from
+it. It is signed by the Nostr key the hashmaker's listing is bound to; a summary by any other key is
+ignored. The list behind it, rental by rental, stays on the hashmaker's box in `hash-summary.json` beside
+its settings, so it survives a restart.
 
-**What the offer shows.** Each offer on Services → Hashrate carries a delivery history built from
-the records and the summary on the app's relays: TH-hours confirmed by both sides, the records and
-how many the hashmaker confirmed, the speed delivered against the speed advertised (a weighted
-average), disputes, and the most recent rentals. A record is **confirmed** when the hashmaker's
-summary has the same commitment, hashtaker, slices paid and receipts hash; it is **disputed** when
-the summary has the rental but disagrees.
+**What the offer shows.** Each offer on Services → Hashrate carries the delivery records about its
+hashmaker on the app's relays: how many, and from how many keys, under the words "Anyone can publish
+these", and the newest, one for each key, each with its own speed delivered against advertised. It
+makes no score of them, and calls none confirmed. The app asks each relay for each hashmaker's records
+on their own (by the record's `p` tag), so records about other hashmakers, however many, can't push
+one hashmaker's out of a relay's answer.
 
-**What it does not prove.** Lightning payments are private, so nobody but the two sides can check
-that a payment happened. The history is made hard to fake rather than impossible to fake:
+**What it does not prove.** Nothing in a record is checked by the app. Lightning payments are private,
+so nobody but the two sides can check that a payment happened, and keys are free, so one person can
+write records under many keys and vouch for them as the hashmaker. What the app does:
 
 - a hashmaker's records about itself (its own link key, or its listing's Nostr key) are dropped;
-- a record the hashmaker did not confirm counts for 0.3 of one it did;
-- a record from a key with no record for any other hashmaker counts for half;
-- each key counts for at most its 3 most recent rentals with a hashmaker.
+- each key counts for at most its 3 most recent rentals with a hashmaker, and shows one line.
 
-A hashmaker can still make keys that rent from it and from others; the strongest evidence remains
-the hashtaker's own test slice.
+What a renter pays never depends on the records: steps are earned whatever they say. The evidence the
+app checks is the renter's own rentals, a test slice first.
 
 **Relays.** The relay at relay.lazarus-xbt.xyz accepts kind 30078 only in shapes it knows; these
 two shapes need its write policy updated (the change and its test are prepared with this work).
@@ -297,6 +299,15 @@ So shares held back can't be turned into paid work that never reaches the renter
 all 40 were counted and none reached the gateway). A link that drops more than 8 times in an hour ends the rental
 (`a_link_that_keeps_dropping_ends_the_rental`).
 
+Once the shares sent again are settled, each side says its count (`resynced`): the hashmaker its count when it sent
+them, the hashtaker its count at the drop and what it counted of them. The hashmaker's count comes down to the
+hashtaker's, by no more than the work it forwarded in the 2 s before it last heard from the hashtaker (and never more
+than in the 4 s before the drop, however quiet the hashtaker kept), so the two
+books agree and the loss of shares the hashtaker's gateway never took is the hashmaker's
+(`shares_the_hashtaker_could_not_send_on_after_a_drop_come_off_the_hashmakers_count`). A hashtaker that says a lower
+count than it has gets no more than that each time, and past 8 such resumes in an hour the rental ends
+(`a_renter_saying_a_low_count_after_each_resume_costs_the_hashmaker_no_more_than_was_in_flight`).
+
 **Follow-up, not built: refuse a key a block has revealed.** A found block publishes its key, so a hashmaker can
 work out that key's mask, and spot wins on any later job that commits to the same key. A gateway's own key changes
 with every template, and the app refuses a gateway key seen on two previous blocks. A key the pool holds (ABW) can
@@ -305,6 +316,76 @@ it finds, and says so on the renter's page. The check that would end the relianc
 the blocks the renter's node follows, read from each new header, and refuse any job, in any mode, that commits to
 one. The renter's app reads no block headers today (its gateway's API gives a job's previous block by hash only),
 so it waits for that plumbing.
+
+## The Stream Gateway that comes with the app
+
+The app runs its own gateway beside the renter: the **Stream Gateway (DATUM-compatible)**. It is CONVOY's
+`datum_gateway` (MIT, commit 971af86) with a patch that masks every job with a key of the gateway's own, a new
+key for each block template, and opens each job to the renter on `GET /xbt/job` (never the key). It runs as
+`xbt-datum-gateway` in its own container: on Umbrel a `datum` service in the renter's network namespace, on
+StartOS a `datum` daemon in the package, on Linux a `datum` compose service. Its license and notice ship in
+the image (`/usr/share/xbt-datum-gateway/LICENSE`). "DATUM" names the protocol it speaks; the gateway is not
+OCEAN's or CONVOY's product.
+
+**Your gateway** (Hashrate page) sets where its blocks pay:
+
+| Mode | Blocks pay | Masked |
+|---|---|---|
+| **Solo** (default) | your own XBT address, the whole block | from the first job: the key is the gateway's |
+| **Lazarus Pool** (`pool-key`) | the pool, which pays you for your share of its work at the address you give | once Lazarus Pool takes gateway-held keys. Until then its jobs show `pool-null` and renting stays off in this mode; solo works |
+
+In Lazarus Pool mode your gateway holds the key that masks its jobs and hands it to the pool with a block, so it
+could hide a block it finds from the pool, the same as any DATUM miner can today. Pools whose own server holds
+the key (CONVOY-style ABW) are a follow-up: the renter can't yet check that such a pool changes its key.
+
+The payout address is checked for the node's chain before anything is saved: on mainnet `bc1q…` (P2WPKH or
+P2WSH), `bc1p…` (taproot) or a legacy `1…` / `3…` address with a good checksum.
+
+**What it writes.** The page writes `run/datum/config.json` (0640, the gateway's group), in the keys CONVOY's
+gateway reads:
+
+```json
+{"bitcoind": {"rpccookiefile": "/data/run/datum/rpc.cookie", "rpcurl": "http://NODE:PORT", "work_update_seconds": 40, "notify_fallback": true},
+ "stratum":  {"listen_addr": "127.0.0.1", "listen_port": 23339},
+ "mining":   {"pool_address": "<your address>", "coinbase_tag_primary": "Lightning Stream", "coinbase_tag_secondary": "Stream Gateway",
+              "coinbase_unique_id": 1234, "save_submitblocks_dir": "/data/datum/submitblocks"},
+ "api":      {"listen_addr": "127.0.0.1", "listen_port": 7152, "admin_password": "", "xbt_job_allow": "", "modify_conf": false},
+ "logger":   {"log_to_console": true, "log_to_file": false, "log_level_console": 2},
+ "datum":    {"pool_host": "", "pooled_mining_only": false},
+ "xbt":      {"mode": "solo", "pool": null}}
+```
+
+In Lazarus Pool mode `datum` is `{"pool_host": "datum.lazarus-xbt.xyz", "pool_port": 28915, "pool_pubkey": "<the pool's
+key>", "pool_pass_workers": true, "pool_pass_full_users": false, "pooled_mining_only": true}`, from
+`https://pool.lazarus-xbt.xyz/api/pool` (editable on the page). The gateway ignores `xbt`; the page reads it back.
+
+- **No secret in it.** The node's RPC user and password go to `run/datum/rpc.cookie` (`user:password`, no newline,
+  0600, the gateway's own), which the one-shot init writes from the credentials the signer already gets: Umbrel's
+  node exports, StartOS's *Node connection* action, Linux's `LS_NODE_RPC_*`. A changed password is rewritten at
+  the next start and the gateway restarts with it.
+- **No admin password.** CONVOY's gateway reads its API password only from this file, so it is left empty: every
+  admin page and action (`/clients`, `/threads`, `/config`, `/cmd`) is then off. What stays is `/xbt/job` and the
+  read-only dashboard.
+- **Loopback only.** Stratum on `127.0.0.1:23339`, the API on `127.0.0.1:7152` (7153 on Linux, where your own
+  gateway may hold 7152), and `xbt_job_allow` empty: `/xbt/job` answers loopback alone. On Umbrel only the renter
+  shares that loopback; a hashmaker never reaches it.
+- **New blocks are polled for** (`notify_fallback`): the app can't add `blocknotify` to your node.
+- **A block it found stays on disk** in `datum/submitblocks/` even if the node's `submitblock` fails.
+- **Keys live in memory**, one per template. A restart makes new templates and new keys: nothing to back up.
+
+**The rent page** shows the gateway's state: running, connected to your node (it has handed out a job), and masking
+its jobs. Renting opens when all three hold.
+
+**Upgrading from 0.1.x.** An install that had saved another gateway (a stock DATUM gateway app) is moved to the
+Stream Gateway once, at the first start: a stock gateway can't open its jobs, so every rental to it would be
+refused. The page says so and offers *Use … again*. *Use another gateway* takes a gateway of your own that opens
+its jobs the same way, and its API address when that isn't the same host's port 7152.
+
+**The page or the installer.** A gateway chosen on the page is kept only while the installer's answer (the renter's
+`--upstream` and `--bundled-gateway`, on Linux the install script's gateway question) stays what it was when the choice
+was saved. Run the installer again with another answer and that answer wins; the page says which choice it replaced
+and offers it back. A build of the app without the gateway
+(armv7) says the gateway isn't masking and doesn't rent; selling hashrate works there as before.
 
 ## A stalled link
 

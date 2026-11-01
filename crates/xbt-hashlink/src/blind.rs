@@ -22,6 +22,10 @@ const NOT_READY_TRIES: u32 = 5;
 const NOT_READY_WAIT: Duration = Duration::from_millis(200);
 const KEYS_KEPT: usize = 4096;
 const PROBE_WAIT: Duration = Duration::from_secs(10);
+/// The modes whose key this app can check: the renter's own gateway holds it, fresh for each template.
+pub const KNOWN_MODES: [&str; 2] = ["solo", "pool-key"];
+/// How a job in any other mode is refused (and told apart from a gateway that doesn't answer).
+const UNSUPPORTED: &str = "not supported yet";
 
 pub(crate) fn tagged(tag: &str, msg: &[u8]) -> [u8; 32] {
     let t: [u8; 32] = Sha256::digest(tag.as_bytes()).into();
@@ -104,19 +108,27 @@ impl Check {
         let a = self.ask(id, pot)?;
         verify(&a, &coinb1, &hidden, pot)?;
         let mode = a.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
-        // a gateway's own key is for one template. A pool's may last until it's used: a pool holds that one, and
-        // rotates it on its own terms
-        if matches!(mode.as_str(), "solo" | "pool-key") {
-            let (key, prev) = (hex32(&a, "xor_key_hash")?, hex32(&a, "prevblock")?);
-            let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-            if keys.get(&key).is_some_and(|was| *was != prev) {
-                return Err("the gateway used one key on two templates".into());
-            }
-            if keys.len() >= KEYS_KEPT {
-                keys.clear();
-            }
-            keys.insert(key, prev);
+        // Mike's rule: what can't be checked is refused. Only a key the renter's own gateway holds can be checked to
+        // change with every template: "solo" and "pool-key". A key the pool holds ("abw") may outlast a block it
+        // found, and nothing here can see whether it does; any other word is a mode this app doesn't know
+        if !KNOWN_MODES.contains(&mode.as_str()) {
+            return Err(if mode == "abw" {
+                format!("{UNSUPPORTED}: its pool holds the key (ABW), and this app can't check that the pool changes it after a block")
+            } else {
+                format!("{UNSUPPORTED}: the gateway names a mode this app doesn't know ({mode:?})")
+            });
         }
+        // one key for one template: a key seen on another previous block could be one a found block has shown
+        let (key, prev) = (hex32(&a, "xor_key_hash")?, hex32(&a, "prevblock")?);
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.get(&key).is_some_and(|was| *was != prev) {
+            return Err("the gateway used one key on two templates".into());
+        }
+        if keys.len() >= KEYS_KEPT {
+            keys.clear();
+        }
+        keys.insert(key, prev);
+        drop(keys);
         Ok(JobSeen { mode, key_hash: hex::encode(hex32(&a, "xor_key_hash")?), prevblock: hex::encode(hex32(&a, "prevblock")?) })
     }
 
@@ -183,7 +195,6 @@ impl Shown {
                 let whose = match mode.as_str() {
                     "solo" => "Your gateway holds the key, on a block of your own.",
                     "pool-key" => "Your gateway holds the key, and your pool takes it when a block is found.",
-                    "abw" => "Your pool holds the key, and this relies on your pool changing it after a block it finds: this app can't yet check that.",
                     _ => "",
                 };
                 format!("Blinded: a hashmaker can't tell which shares win, so it can't drop those. {whose}").trim_end().to_string()
@@ -234,7 +245,9 @@ pub fn probe(upstream: &str, api: Option<&str>, user: &str) -> Shown {
             return match Check::new(api.to_string()).job(&v, d) {
                 Ok(mode) => Shown::Blinded(mode),
                 // no answer about the job is no answer; an answer that fails is one
-                Err(why) if why.contains("API") || why.contains("doesn't know") || why.contains("no such address") => Shown::Unverifiable(why),
+                Err(why) if why.contains("API") || why.contains("doesn't know") || why.contains("no such address") || why.contains(UNSUPPORTED) => {
+                    Shown::Unverifiable(why)
+                }
                 Err(why) => Shown::NotBlinded(why),
             };
         }
@@ -406,18 +419,45 @@ mod tests {
         assert!(check.job(&notify(&a), 1.0).unwrap_err().contains("two templates"));
     }
 
-    /// A pool's key may outlast a template: the pool rotates it. A key is judged by what's committed, under any word.
+    /// Mike's rule: what can't be checked is refused. A pool-held key (ABW) can outlast a block the pool found and
+    /// nothing here sees whether it does; a mode never seen can't be judged at all. Both are refused even with a
+    /// commitment that checks out, and the page says why without calling them unmasked.
     #[test]
-    fn a_pools_key_may_outlast_a_template_and_a_mode_never_seen_passes_on_its_commitment() {
-        for mode in ["abw", "some-pool-next-year"] {
+    fn a_pool_held_key_and_a_mode_never_seen_are_refused_as_unverifiable() {
+        for mode in ["abw", "some-pool-next-year", ""] {
+            let mut a = real();
+            a["mode"] = json!(mode);
+            let body = a.to_string();
+            let check = Check::new(api(move |_| (200, body.clone())));
+            let why = check.job(&notify(&a), 1.0).unwrap_err();
+            assert!(why.contains(UNSUPPORTED), "{mode}: {why}");
+            if mode == "abw" {
+                assert!(why.contains("ABW"), "{why}");
+            }
+            let up = stratum(notify(&a));
+            let body = a.to_string();
+            let shown = probe(&up, Some(&api(move |_| (200, body.clone()))), "u");
+            assert!(matches!(shown, Shown::Unverifiable(_)) && !shown.may_rent(), "{mode}: {shown:?}");
+        }
+    }
+
+    /// Every mode that isn't refused keeps one key to one template: a key seen on another previous block is refused,
+    /// in pool-key as in solo.
+    #[test]
+    fn one_key_on_two_templates_is_refused_in_every_mode_that_rents() {
+        for mode in KNOWN_MODES {
             let mut a = real();
             a["mode"] = json!(mode);
             let body = a.to_string();
             let check = Check::new(api(move |_| (200, body.clone())));
             assert_eq!(check.job(&notify(&a), 1.0), Ok(mode.to_string()));
             check.keys.lock().unwrap().insert(hex32(&a, "xor_key_hash").unwrap(), [9u8; 32]);
-            assert_eq!(check.job(&notify(&a), 1.0), Ok(mode.to_string()), "no template rule for a key the gateway doesn't hold");
+            assert!(check.job(&notify(&a), 1.0).unwrap_err().contains("two templates"), "{mode}");
         }
+    }
+
+    #[test]
+    fn a_pool_with_no_key_is_refused_whatever_its_word() {
         // a pool with no key at all is still refused, whatever word it uses
         let mut a = real();
         a["mode"] = json!("pool-null");

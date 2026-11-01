@@ -94,6 +94,11 @@ pub const RUN_ENROLL: &str = "enroll";
 pub const HASHRATE: &str = "hashrate";
 /// Their settings, written by the UI's Hashrate page, and their control token.
 pub const RUN_HASHRATE: &str = "hashrate";
+/// The signer's socket for the hashrate renter alone (`signer.sock`): a task's rental terms
+/// (`tickets.tasks.<task>.rental`) are paid only through it. The signer owns the dir; its group is the
+/// hashrate services' (the renter, and the UI, which writes their settings), never the MCP's, so no
+/// other caller of the wallet reaches it.
+pub const RUN_RENTAL: &str = "rental";
 /// The shops without a web address the owner added (`shops.json`: their receipt keys and transport
 /// documents), written by the UI and read, by the signer's group, by the connector and the MCP, which
 /// hand them to the signer in each call to such a shop. The signer itself never mounts it.
@@ -113,6 +118,14 @@ pub const RUN_VPN_STATUS: &str = "vpn-status";
 /// The AI endpoint's files, which the UI and the connector (as the signer's user) both write: the
 /// credential store, the AI sellers the UI writes, and the sellers' health the endpoint writes.
 pub const RUN_AI: &str = "ai";
+/// The Stream Gateway (DATUM-compatible) that masks the renter's jobs: its blocks kept for a resubmit
+/// (`submitblocks/`).
+pub const DATUM: &str = "datum";
+/// Its config (`config.json`), written by the UI's Hashrate page, and the node's RPC cookie
+/// (`rpc.cookie`), written by init; the gateway reads both.
+pub const RUN_DATUM: &str = "datum";
+/// The node RPC cookie's name in `run/datum/`: `user:password`, no newline.
+pub const DATUM_RPC_COOKIE: &str = "rpc.cookie";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 
@@ -152,6 +165,11 @@ impl DataDir {
     /// The signer's socket.
     pub fn signer_sock(&self) -> PathBuf {
         self.run(RUN_SIGNER).join("signer.sock")
+    }
+
+    /// The signer's socket for the hashrate renter ([`RUN_RENTAL`]).
+    pub fn rental_sock(&self) -> PathBuf {
+        self.run(RUN_RENTAL).join("signer.sock")
     }
 
     /// The signer's readiness file.

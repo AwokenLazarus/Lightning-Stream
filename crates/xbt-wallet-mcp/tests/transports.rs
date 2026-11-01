@@ -7,10 +7,12 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use xbt_wallet_mcp::mcp::{FORBIDDEN, TOOL_NAMES};
+
+mod common;
+use common::spawn_on_own_port;
 
 const BIN: &str = env!("CARGO_BIN_EXE_xbt-wallet-mcp");
 const WIF: &str = "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn";
@@ -128,19 +130,14 @@ impl Drop for Http {
     }
 }
 
-fn http(sock: &Path, port: u16, token: Option<&str>) -> Http {
+/// The binary over HTTP on loopback, on a port the OS picks.
+fn http(sock: &Path, token: Option<&str>) -> Http {
     let mut cmd = Command::new(BIN);
-    cmd.env_clear().env("B2_SIGNER_SOCK", sock).args(["--http", &format!("127.0.0.1:{port}")]).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.env_clear().env("B2_SIGNER_SOCK", sock).args(["--http", "127.0.0.1:0"]);
     if let Some(t) = token {
         cmd.env("XBT_MCP_HTTP_TOKEN", t);
     }
-    let child = cmd.spawn().unwrap();
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let (child, port, _) = spawn_on_own_port(cmd);
     Http { child, base: format!("http://127.0.0.1:{port}/mcp") }
 }
 
@@ -165,12 +162,11 @@ fn req(method: &str, url: &str, body: Option<&Value>, headers: &[(&str, &str)]) 
     (st, sid, s)
 }
 
-// ports: AGP-030's range 33500-33599
 #[test]
 fn streamable_http_sessions_and_guards() {
     let dir = tempfile::tempdir().unwrap();
     let (sock, _) = mock_signer(dir.path());
-    let h = http(&sock, 33591, None);
+    let h = http(&sock, None);
     // AGP-063 X1: no token configured: one is generated next to the signer socket, and required
     let tok = std::fs::read_to_string(dir.path().join("mcp-http-token")).unwrap().trim().to_string();
     let auth = format!("Bearer {tok}");
@@ -200,42 +196,35 @@ fn streamable_http_sessions_and_guards() {
     assert_eq!(req("DELETE", &h.base, None, &[a, ("Mcp-Session-Id", &sid)]).0, 200);
     assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid)]).0, 404);
 
-    let t = http(&sock, 33592, Some("s3cret"));
+    let t = http(&sock, Some("s3cret"));
     assert_eq!(req("POST", &t.base, Some(&init_msg(1)), &[]).0, 401);
     assert_eq!(req("POST", &t.base, Some(&init_msg(1)), &[("Authorization", "Bearer wrong!")]).0, 401);
     assert_eq!(req("POST", &t.base, Some(&init_msg(1)), &[("Authorization", "Bearer s3cret")]).0, 200);
 }
 
-// ports: AGP-063's range 29060-29069 (outside the ephemeral range)
 #[test]
 fn x1_the_generated_token_is_private_and_origin_is_checked_with_allow_remote() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let (sock, _) = mock_signer(dir.path());
-    let h = http(&sock, 29060, None);
+    let h = http(&sock, None);
     let p = dir.path().join("mcp-http-token");
     assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
     let tok = std::fs::read_to_string(&p).unwrap().trim().to_string();
     assert_eq!(tok.len(), 64);
     assert_eq!(req("POST", &h.base, Some(&init_msg(1)), &[]).0, 401, "loopback is no authentication");
     drop(h);
-    let h = http(&sock, 29061, None);
+    let h = http(&sock, None);
     let auth = format!("Bearer {tok}");
     assert_eq!(req("POST", &h.base, Some(&init_msg(1)), &[("Authorization", &auth)]).0, 200, "the same token after a restart");
     // a remote listener still refuses a browser page from elsewhere (a DNS rebinding: Origin = Host)
     let mut cmd = Command::new(BIN);
-    cmd.env_clear().env("B2_SIGNER_SOCK", &sock).env("XBT_MCP_HTTP_TOKEN", "s3cret").args(["--http", "127.0.0.1:29062", "--http-allow-remote"])
-        .stdout(Stdio::null()).stderr(Stdio::null());
-    let r = Http { child: cmd.spawn().unwrap(), base: "http://127.0.0.1:29062/mcp".into() };
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", 29062)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    cmd.env_clear().env("B2_SIGNER_SOCK", &sock).env("XBT_MCP_HTTP_TOKEN", "s3cret").args(["--http", "127.0.0.1:0", "--http-allow-remote"]);
+    let (child, port, _) = spawn_on_own_port(cmd);
+    let r = Http { child, base: format!("http://127.0.0.1:{port}/mcp") };
     let b = ("Authorization", "Bearer s3cret");
-    assert_eq!(req("POST", &r.base, Some(&init_msg(1)), &[b, ("Origin", "http://rebind.example:29062")]).0, 403);
-    assert_eq!(req("POST", &r.base, Some(&init_msg(1)), &[b, ("Origin", "http://127.0.0.1:29062")]).0, 200);
+    assert_eq!(req("POST", &r.base, Some(&init_msg(1)), &[b, ("Origin", &format!("http://rebind.example:{port}"))]).0, 403);
+    assert_eq!(req("POST", &r.base, Some(&init_msg(1)), &[b, ("Origin", &format!("http://127.0.0.1:{port}"))]).0, 200);
 }
 
 /// The in-process payer paid the on-chain channel, which was removed: a start that still asks for
@@ -249,10 +238,10 @@ fn a_start_that_asks_for_the_removed_local_payer_is_refused() {
 
 #[test]
 fn http_refuses_non_loopback_without_token() {
-    let out = Command::new(BIN).env_clear().args(["--http", "0.0.0.0:33593"]).output().unwrap();
+    let out = Command::new(BIN).env_clear().args(["--http", "0.0.0.0:0"]).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a loopback address"));
-    let out = Command::new(BIN).env_clear().args(["--http", "0.0.0.0:33593", "--http-allow-remote"]).output().unwrap();
+    let out = Command::new(BIN).env_clear().args(["--http", "0.0.0.0:0", "--http-allow-remote"]).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("needs XBT_MCP_HTTP_TOKEN"));
 }
 
@@ -281,22 +270,17 @@ fn stdio_call_before_initialize_is_refused() {
 }
 
 /// AGP-038 container mode: XBT_DATA_DIR, a non-loopback listener with a generated token, a base path,
-/// /healthz and /readyz following the signer's readiness file. Port 33740 (AGP-038's 33700-33799).
+/// /healthz and /readyz following the signer's readiness file.
 #[test]
 fn data_dir_mode_health_token_and_base_path() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let (sock, _) = mock_signer(dir.path());
     let data = dir.path().join("data");
-    let child = Command::new(BIN).env_clear().env("XBT_DATA_DIR", &data).env("B2_SIGNER_SOCK", &sock).env("XBT_BASE_PATH", "/w/")
-        .env("XBT_MCP_HTTP", "0.0.0.0:33740").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let h = Http { child, base: "http://127.0.0.1:33740".into() };
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", 33740)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear().env("XBT_DATA_DIR", &data).env("B2_SIGNER_SOCK", &sock).env("XBT_BASE_PATH", "/w/").env("XBT_MCP_HTTP", "0.0.0.0:0");
+    let (child, port, _) = spawn_on_own_port(cmd);
+    let h = Http { child, base: format!("http://127.0.0.1:{port}") };
     let tok_path = data.join("mcp/secrets/mcp-http-token");
     let token = std::fs::read_to_string(&tok_path).unwrap();
     assert_eq!(token.len(), 64);
@@ -325,7 +309,7 @@ fn data_dir_mode_health_token_and_base_path() {
     assert_eq!(req("POST", &format!("{}/mcp", h.base), Some(&init_msg(1)), &[("Authorization", &auth)]).0, 200);
     // production mode (a data dir) refuses the token as a plain env value
     let out = Command::new(BIN).env_clear().env("XBT_DATA_DIR", &data).env("XBT_MCP_HTTP_TOKEN", "x")
-        .env("XBT_MCP_HTTP", "127.0.0.1:33741").env("B2_SIGNER_SOCK", &sock).output().unwrap();
+        .env("XBT_MCP_HTTP", "127.0.0.1:0").env("B2_SIGNER_SOCK", &sock).output().unwrap();
     assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("refused in production mode"));
 }
 
@@ -354,7 +338,7 @@ fn req_all(method: &str, url: &str, body: Option<&Value>, headers: &[(&str, &str
 /// AGP-042: on a box the UI owns the token (run/ui/mcp-http-token, 0640) and the MCP only reads it, on
 /// every request. The owner's rotation (the UI replacing the file, xbt_svc::replace_secret_file, as the
 /// Agents page does) cuts the old token off at once. The MCP has no rotation endpoint for a bearer token
-/// to call, and the new token never appears in any MCP response. Ports: AGP-042's 34200-34299.
+/// to call, and the new token never appears in any MCP response.
 #[test]
 fn ui_owned_token_rotation_cannot_be_done_or_seen_by_an_agent() {
     use std::os::unix::fs::PermissionsExt;
@@ -366,15 +350,10 @@ fn ui_owned_token_rotation_cannot_be_done_or_seen_by_an_agent() {
     let old = "0a".repeat(32);
     xbt_svc::replace_secret_file(&tok_path, format!("{old}\n").as_bytes(), 0o640).unwrap();
     // no XBT_MCP_HTTP_TOKEN_FILE: the data dir's run/ui/mcp-http-token is found on its own
-    let child = Command::new(BIN).env_clear().env("XBT_DATA_DIR", &data).env("B2_SIGNER_SOCK", &sock)
-        .env("XBT_MCP_HTTP", "0.0.0.0:34201").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let h = Http { child, base: "http://127.0.0.1:34201".into() };
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", 34201)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear().env("XBT_DATA_DIR", &data).env("B2_SIGNER_SOCK", &sock).env("XBT_MCP_HTTP", "0.0.0.0:0");
+    let (child, port, _) = spawn_on_own_port(cmd);
+    let h = Http { child, base: format!("http://127.0.0.1:{port}") };
     assert!(!data.join("mcp/secrets/mcp-http-token").exists(), "no second token of the MCP's own");
     let mcp = format!("{}/mcp", h.base);
     let old_auth = format!("Bearer {old}");

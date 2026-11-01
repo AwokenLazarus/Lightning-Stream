@@ -2,12 +2,12 @@
 
 Rent BLAKE2b hashrate from someone, or rent yours out, paid in sats as you use it, seconds at a time.
 
-**In 0.2.0:** Renting hashrate needs masked jobs (jobs that hide which shares win), solo or through a pool, so a hashmaker can't keep back the shares that would be blocks. The app comes with a DATUM Gateway that masks its jobs, and rents into it. Before each rental, and when the Rent page opens, the app checks the jobs; if they aren't masked (the gateway isn't running, or the app is set to another gateway that doesn't mask), it says so and rents nothing.
-The hashtaker's own DATUM Gateway makes the jobs. Nobody holds anyone's money. How it works:
+**In 0.2.0:** Renting hashrate needs masked jobs (jobs that hide which shares win), solo or through a pool, so a hashmaker can't keep back the shares that would be blocks. The app comes with its own gateway, the **Stream Gateway (DATUM-compatible)**, which masks its jobs, and rents into it. You set it up on the Hashrate page under *Your gateway*: solo to your own XBT address (the default), or through Lazarus Pool. Before each rental, and when the Rent page opens, the app checks the jobs; if they aren't masked (the gateway isn't set up or running, or the app is set to another gateway that doesn't mask), it says so and rents nothing.
+The hashtaker's own gateway makes the jobs. Nobody holds anyone's money. How it works:
 [P2P-HASH.md](P2P-HASH.md).
 
 ```
-miners ──SV1──> hashmaker: xbt-hashlink hashmaker ══ encrypted link ══> hashtaker: xbt-hashlink hashtaker ──SV1──> hashtaker's DATUM Gateway
+miners ──SV1──> hashmaker: xbt-hashlink hashmaker ══ encrypted link ══> hashtaker: xbt-hashlink hashtaker ──SV1──> hashtaker's gateway
                 hashmaker: xbt-gateway (sells slices)  <── one paid request per slice ──  hashtaker's wallet signer
 discovery: the hashmaker's signed listing on Nostr relays
 ```
@@ -19,7 +19,7 @@ own nodes with one script: [LINUX.md](LINUX.md).
 
 ## What happened when we ran it
 
-A BLAKE2b ASIC on stock firmware rented into a real DATUM Gateway, with the hashmaker and the hashtaker on
+A BLAKE2b ASIC on stock firmware rented into a real DATUM-protocol gateway, with the hashmaker and the hashtaker on
 two machines and the payments over the public XBT Lightning network:
 - 129 shares accepted, 0 rejected;
 - 14 slices paid, and all 14 signed work receipts matched the hashmaker's own count;
@@ -32,7 +32,7 @@ two machines and the payments over the public XBT Lightning network:
 | | Hashmaker | Hashtaker |
 |---|---|---|
 | Lightning | a Lightning Fork (lnd-family) node with inbound capacity | a Lightning Fork node with a route to the hashmaker's |
-| Mining | a BLAKE2b miner that can point at a Stratum V1 address | a DATUM Gateway (or any SV1 pool endpoint) and a user name on it |
+| Mining | a BLAKE2b miner that can point at a Stratum V1 address | a gateway that masks its jobs: the app's own Stream Gateway (DATUM-compatible), or one of yours that opens its jobs on `/xbt/job` |
 | Software | `xbt-hashlink`, `xbt-gateway`, a TLS front | `xbt-hashlink`, the wallet signer (`xbt-signer`) |
 | Network | one port for miners (LAN), one for the link and one https port, both reachable by the hashtaker | reaches the hashmaker's link and https ports |
 
@@ -155,23 +155,40 @@ target/release/xbt-hashlink keygen hashtaker.key      # the hashtaker's link key
    - `--find` reads signed hashrate listings from the relays and keeps one only if its
      signatures and its binding to the hashmaker's link key hold. `--expect-node` and
      `--max-price-msat` narrow the choice.
-   - `--upstream` and `--user` are the hashtaker's DATUM Gateway and the user it credits.
+   - `--upstream` and `--user` are the hashtaker's gateway and the user it credits.
    - Payment: each finished slice is one paid request to the hashmaker's gateway, through the
      wallet signer, under the task's budget and the policy's caps.
    - `--stop-paying-after N` stops paying after N slices, to see the hashmaker stop.
 
-## Your DATUM Gateway
+## Your gateway
 
-Rented hashrate goes to the hashtaker's own DATUM Gateway: it builds the block templates, and the pool
-that pays you is chosen in its own settings, not in Lightning Stream. If you do not run one yet,
-set one up first: a DATUM Gateway built for this chain's BLAKE2b work, pointed at a pool that takes
-DATUM work. For example Lazarus Pool: its site, lazarus-xbt.xyz, says which gateway to run and the
-pool address to put in its settings. Do not point rentals at a
-pool's public stratum port in place of a DATUM Gateway: you would be paying for work credited to
-whoever that port pays.
+Rented hashrate goes to the hashtaker's own gateway: it builds the block templates and masks every job, so a
+hashmaker can't tell which shares win. The app comes with one, the **Stream Gateway (DATUM-compatible)**. On
+the app's Hashrate page, under *Your gateway*:
 
-Then give the hashtaker side its address: `--upstream host:port` on the command line, or the "Your
-DATUM Gateway" box on the app's Hashrate page.
+1. **Choose where its blocks pay.** *Solo* (the default): every block it finds pays your address, whole.
+   *Lazarus Pool*: blocks are shared through the pool, which pays you for your share of its work. Lazarus Pool
+   masks these jobs once it takes gateway-held keys; until then renting stays off in that mode, and solo works.
+   In that mode your gateway holds the key and hands it to the pool with a block, so it could hide a block it
+   finds from the pool, the same as any DATUM miner can today.
+2. **Enter your XBT address.** On mainnet it starts `bc1q`, `bc1p`, `1` or `3`; the page checks it for your
+   node's network before saving.
+3. **Save.** The gateway starts a few seconds later. The page then shows it running, connected to your node,
+   and masking its jobs; renting opens when all three hold.
+
+It reaches your XBT node by RPC with the credentials the app already has (the one-shot init writes them to a
+cookie file only the gateway reads; its config holds no secret), and listens on 127.0.0.1 only. Details:
+[P2P-HASH.md](P2P-HASH.md#the-stream-gateway-that-comes-with-the-app).
+
+**Your own gateway instead.** *Use another gateway* takes a host:port. It has to open its jobs the way the
+Stream Gateway does (`GET /xbt/job` on its API; give the API's host:port when it isn't the same host's port 7152);
+a stock DATUM gateway can't, and renting stays off with it. A choice made there holds until the installer is run again
+with another answer, which then wins (the page says so).
+Do not point rentals at a pool's public stratum port: you would be paying for work credited to whoever that
+port pays. On the command line: `--upstream host:port` and `--gateway-api host:port`.
+
+**Upgrading from 0.1.x.** An app that was set to a stock gateway app is moved to the Stream Gateway once, and
+the page offers the old one back. Pools whose server holds the key (CONVOY-style ABW) are a follow-up.
 
 ## Renting out several miners, with a fallback
 
@@ -211,7 +228,7 @@ rented out at once. See [P2P-HASH.md](P2P-HASH.md#the-fallback-pool-and-several-
     `SLICES_PORT`;
   - discovery: `RELAY_LISTEN` (a stand-in relay on the hashtaker's loopback, reached by the hashmaker
     through an ssh tunnel), `LISTING_NAME`, `HASHRATE_HS`;
-  - hashtaker: `GATEWAY` and `GW_USER` (the DATUM Gateway and its user), `SIGNER_SOCK`, `TASK`,
+  - hashtaker: `GATEWAY` and `GW_USER` (the gateway and its user), `SIGNER_SOCK`, `TASK`,
     `MAX_SATS`, `BUYER_KEY`, `PAY_NODE` (the hashmaker's node id);
   - terms: `SLICE_WORK`, `PRICE_MSAT`, `GRACE_MS`, `STOP_PAYING_AFTER`, `MINUTES`;
   - evidence: `BUYER_LNCLI` and `SELLER_LNCLI` (lncli commands for each node).

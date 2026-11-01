@@ -225,6 +225,10 @@ impl Handler for Service {
             // at the price of /hot/ (a win in every fourth piece or so): 64 KiB every 100 ms
             return stream(n, None, body(n, 64 << 10, Duration::from_millis(100)));
         }
+        if let Some(n) = sized("/hotslow/") {
+            // at the price of /hot/, a piece every 2 s: a win comes no sooner than 2 s after the last
+            return stream(n, None, body(n, 64 << 10, Duration::from_secs(2)));
+        }
         if let Some(n) = sized("/stallpieces/") {
             // n bytes at the draws' price, then nothing for a minute
             return stream(n, None, Box::new(move |out| {
@@ -346,6 +350,7 @@ fn routes() -> Value {
         {"path": "/stallpieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
         {"path": "/rarewins/", "price": {"byte_msat": 10, "per_bytes": 65_536}},
         {"path": "/hottrickle/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
+        {"path": "/hotslow/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
         // 250 sat a KiB: a ticket of 1,000 sat pays for 4 KiB, well under the floor of a stream
         {"path": "/dearbytes/", "price": {"byte_msat": 250_000, "per_bytes": 1024}},
         {"path": "/keepalive/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
@@ -578,9 +583,19 @@ fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &
         }
         c.remove("strict");
     }
+    // a win's invoice lives as long as the grace for the wallets of these tests too, as it did before a wallet could say it
+    // asks for cancels (`canCancel`), unless a test names `invoice_secs_cancel`: what they test is timed on that
+    let mut lottery = conf["lottery"].clone();
+    if let Some(l) = lottery.as_object_mut() {
+        if !l.contains_key("invoice_secs_cancel") {
+            let grace = l.get("grace_seconds").and_then(Value::as_u64).unwrap_or(60);
+            let life = l.get("invoice_secs").and_then(Value::as_u64).unwrap_or(grace.clamp(15, 3600));
+            l.insert("invoice_secs_cancel".into(), life.into());
+        }
+    }
     json!({"listen": "127.0.0.1:0", "public_url": origin, "upstream": upstream, "state_dir": state, "chain": "regtest",
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
-           "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"], "offers": conf["offers"],
+           "tickets": conf["tickets"], "caps": caps, "lottery": lottery, "offers": conf["offers"],
            "times": {"refill_wait_ms": conf["refill_wait_ms"].as_u64().unwrap_or(REFILL_WAIT_MS.load(Ordering::SeqCst)), "upstream_wait_secs": UPSTREAM_WAIT_SECS.load(Ordering::SeqCst), "tick_ms": 50},
            "routes": routes_with(conf)})
 }
@@ -809,8 +824,10 @@ struct PayState {
     no_route_for: Duration,
     no_route_until: Option<Instant>,
     no_route_answers: usize,
+    /// How long the node takes to decode an invoice: a slow box under load, whose checks take seconds.
+    decode_takes: Duration,
     /// The seller sits behind a private channel: the node's decode of its invoices shows a route hint, its
-    /// route query (which is not given the hint) finds no path, and a payment sent with the invoice arrives.
+    /// route query finds a path only when it is given that hint, and a payment sent with the invoice arrives.
     private_seller: bool,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
@@ -988,6 +1005,8 @@ impl LnBackend for PayLn {
     }
 
     fn decode(&self, inv: &str) -> xbt402::Result<Value> {
+        let takes = self.st.lock().unwrap().decode_takes;
+        std::thread::sleep(takes);
         let d = xbt_signer::bolt11::decode(inv).map_err(|e| node_err(&e))?;
         let features: serde_json::Map<String, Value> = d.features.iter().map(|b| (b.to_string(), json!({"is_known": true}))).collect();
         let mut out = json!({"destination": d.payee_hex(), "payment_hash": d.payment_hash_hex(), "num_msat": d.amount_msat.unwrap_or(0).to_string(),
@@ -999,13 +1018,14 @@ impl LnBackend for PayLn {
         Ok(out)
     }
 
-    fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64) -> xbt402::Result<bool> {
+    fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64, hints: &[Value]) -> xbt402::Result<bool> {
         let mut s = self.st.lock().unwrap();
         s.route_queries += 1;
         if s.route_queries == s.no_route_at_query {
             s.no_route_until = Some(Instant::now() + s.no_route_for);
         }
-        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.private_seller;
+        // a seller behind a private channel is found only through the invoice's hints, as the real node finds it
+        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u) || (s.private_seller && hints.is_empty());
         s.no_route_answers += usize::from(none);
         Ok(!none)
     }
@@ -2029,8 +2049,14 @@ fn a_streamed_download_paid_by_draws_is_not_cut_at_max_answer_s() {
 fn streamed_call(r: &Rig, dir: &std::path::Path, name: &str, url: String, max_sats: u64, reader_stalls: Option<Duration>) -> (Value, usize, Duration) {
     use std::io::Read as _;
     let l = std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap();
+    // set before the harness's own connection that lets a waiting reader go: the reader says whose it took
+    let woken = Arc::new(AtomicBool::new(false));
+    let by_harness = woken.clone();
     let reader = std::thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
+        if by_harness.load(Ordering::SeqCst) {
+            return (0, true);
+        }
         let mut buf = vec![0u8; 64 << 10];
         let mut got = s.read(&mut buf).unwrap_or(0);
         if let Some(stall) = reader_stalls {
@@ -2039,11 +2065,26 @@ fn streamed_call(r: &Rig, dir: &std::path::Path, name: &str, url: String, max_sa
         let mut rest = vec![];
         let _ = s.read_to_end(&mut rest);
         got += rest.len();
-        got
+        (got, false)
     });
     let started = Instant::now();
     let v = r.call("xbt402_pay", json!({"url": url, "max_sats": max_sats, "task": "film", "stream_to": name}));
-    let got = reader.join().unwrap();
+    // a call that ended without opening the reader's socket (refused, or failed before its answer) leaves the reader in
+    // its accept: it is let go, with nothing read, so that the test fails on the call's answer rather than hang
+    let t = Instant::now();
+    while !reader.is_finished() && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !reader.is_finished() {
+        woken.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(dir.join(name));
+    }
+    let (got, harness) = reader.join().unwrap();
+    if harness {
+        eprintln!("streamed_call {name}: the signer never connected to the reader (the harness let it go); the call answered {v}");
+    } else if got == 0 {
+        eprintln!("streamed_call {name}: the signer connected and sent nothing; the call answered {v}");
+    }
     (v, got, started.elapsed())
 }
 
@@ -3186,10 +3227,41 @@ fn a_file_waits_for_a_ticket_the_seller_is_slow_to_show_locked() {
 
 /// A rig whose seller keeps a paused answer open as long as it does as shipped.
 fn seller_waits_as_shipped(extra: Value) -> Rig {
-    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    seller_waits(15_000, extra)
+}
+
+/// The seller's terms as one before 0.2.0 gives them: every 402 with `refillWaitMs` taken out, from the first, so that
+/// the session's terms never have it.
+fn says_no_refill_wait(r: &Rig) {
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["extra"].as_object_mut().map(|x| x.remove("refillWaitMs"));
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+}
+
+/// A rig whose seller keeps a paused answer `ms` before it ends it.
+fn seller_waits(ms: u64, extra: Value) -> Rig {
+    REFILL_WAIT_MS.store(ms, Ordering::SeqCst);
     let r = Rig::new(extra);
     REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
     r
+}
+
+/// The wallet's node shows none of the next tickets locked for 18 s: a release waits for it to the end of its pause.
+fn late_ticket(r: &Rig) {
+    let mut s = r.ln.st.lock().unwrap();
+    s.unseen_next = 1_000;
+    s.unseen_for = Duration::from_secs(18);
 }
 
 /// What the buyer's node paid, what the seller's node took, the book and the ledger are one number, and every secret that left is one of them.
@@ -3415,12 +3487,67 @@ fn no_ticket_is_released_after_the_seller_has_closed_the_answer() {
     assert_money_agrees(&r);
 }
 
-/// A seller that closes a paused answer sooner than the wallet's pause (this one after 2 s), and then shows the ticket:
-/// its signed `status` lists the answer as ended, and nothing is released into it.
+/// A seller that keeps a paused answer 6 s, less than the wallet's 12 s pause, and says so in its terms
+/// (`refillWaitMs`), with the wallet's node late with the ticket: the pause ends a margin before the seller would
+/// close the answer (5 s from the last byte), not 6 s after it is closed. Nothing more is released, and what arrived
+/// is what eight paid for.
+///
+/// FAILS with the pause held to `ready_wait_ms` alone: it runs its 12 s, past the seller's close.
+#[test]
+fn a_seller_that_keeps_a_paused_answer_less_than_the_wallets_pause_has_the_pause_end_before_its_close() {
+    let _g = env_lock();
+    let r = seller_waits(6_000, json!({}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    late_ticket(&r);
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    // the body's 39 MiB and the 5 s pause, with room for a loaded machine; the 12 s pause takes 12 s and more
+    assert!(took < Duration::from_secs(10), "the pause ended before the seller's 6 s: {took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert_eq!(v["bytes"].as_u64().unwrap() as usize, 39 * MIB, "what 7.8 tickets pay for: {v}");
+    assert_eq!(r.tap.secrets().len(), 8, "no secret after the pause: {v}");
+    r.shop.standin.hold_streams(false);
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+    assert_money_agrees(&r);
+}
+
+/// The same seller as one before 0.2.0, whose terms do not say how long it keeps a paused answer: the wallet pauses by
+/// its own limit, 12 s, as it always has, and still releases nothing after the seller's close.
+#[test]
+fn a_seller_whose_terms_do_not_say_its_wait_is_paused_for_by_the_wallets_own_limit() {
+    let _g = env_lock();
+    let r = seller_waits(6_000, json!({}));
+    says_no_refill_wait(&r);
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    late_ticket(&r);
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    assert!(took >= Duration::from_secs(11), "the wallet's own 12 s: {took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert_eq!(v["bytes"].as_u64().unwrap() as usize, 39 * MIB, "{v}");
+    assert_eq!(r.tap.secrets().len(), 8, "no secret after the pause: {v}");
+    r.shop.standin.hold_streams(false);
+    r.tap.clear();
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+    assert_money_agrees(&r);
+}
+
+/// A seller that closes a paused answer sooner than the wallet's pause (this one after 2 s) and does not say so in its
+/// terms (one before 0.2.0, `refillWaitMs` left out), and then shows the ticket: its signed `status` lists the answer as
+/// ended, and nothing is released into it. (A seller that says so has the pause end before its close, above.)
 #[test]
 fn a_close_by_the_seller_during_the_pause_is_noticed_and_nothing_is_released() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
+    says_no_refill_wait(&r);
     first_call_with_the_pool_shown(&r);
     r.shop.standin.hold_streams(true);
     let n = 60 * MIB;
@@ -7618,6 +7745,126 @@ fn a_strict_seller_behind_twenty(stands_still: u64, hold: bool, sync_ms: u64) ->
     (r, strict_one, others, before)
 }
 
+/// A seller that bears 2 unpaid wins (as shipped), beside 20 that wait for theirs as long as you like and whose wins
+/// are due first by their grace of 2 s: the payments wait while the first seller has 2 wins unpaid, at its count but
+/// not past it. Its wins go first all the same, before the next win stands its answer still: the first of them is
+/// paid among the first payments, not behind the 120 others waiting. Its pieces come 2 s apart, so its next win is
+/// 2 s away at the least: the gate (8 wide, each payment 1 s on the way) has let 8 of the others through by then.
+///
+/// FAILS with only wins past the count hurried: the 2 wait behind the others' wins, due sooner, until the third
+/// comes, 2 s and 16 of the others' wins later at the least.
+#[test]
+fn wins_at_the_sellers_count_go_first_before_the_next_stands_it_still() {
+    let _g = env_lock();
+    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30}});
+    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000,
+                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}},
+                                   // the strict seller's 28 pieces 2 s apart take 56 s, past the 50 s a call read whole is given
+                                   "max_answer_s": 120}});
+    let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.send_takes = Duration::from_millis(1_000);
+        s.hold_sends = true;
+    }
+    let size = 64 * PIECE;
+    let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    // 28 pieces at one win in four: 2 wins or more but for 1 time in 300
+    let slow = 28 * PIECE;
+    let strict_one = std::thread::scope(|sc| {
+        let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
+        wait_for_rig("120 wins waiting at the gate", || {
+            let invoiced = r.shop.node.preimages.lock().unwrap().len();
+            invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
+        });
+        let strict_file = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/hotslow/{slow}")), "max_sats": 2_000, "task": "film"})));
+        // nothing is sent until the strict seller has 2 wins unpaid: its count, its answer still served
+        wait_for_rig("the strict seller's second win", || {
+            r.status()["paying"].as_array().into_iter().flatten().any(|p| p["origin"] == r.shop.origin.as_str() && p["wins"].as_u64() >= Some(2))
+        });
+        r.ln.st.lock().unwrap().hold_sends = false;
+        let v = strict_file.join().unwrap();
+        r.ln.st.lock().unwrap().send_takes = Duration::ZERO;
+        for t in others {
+            t.join().unwrap();
+        }
+        v
+    });
+    let paid = r.audit("lottery_win_paid");
+    let before = paid.iter().position(|a| a["session"] == strict_one["session"]).unwrap_or(usize::MAX);
+    eprintln!("at the count: the strict seller's first win paid after {before} others");
+    // the 8 held at the gate are paid first; the strict seller's wins go in with the next 6 at the most
+    assert!(before <= 14, "the strict seller's first win was paid after {before} of the others' wins, not first: {strict_one}");
+    assert_eq!((strict_one["complete"].as_bool(), strict_one["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(0)), "{strict_one}");
+}
+
+/// A seller whose grace is short (10 s, and 1 s more once its answer stands still) and who bears any number of
+/// unpaid wins, beside 20 that give 600 s: its wins are paid before the 120 of theirs that wait at the gate when it
+/// starts, by when each seller's grace ends, and its file is whole. The wallet's own count never hurries such a
+/// seller's wins: it stands still for none of its pieces or wins, only for time.
+///
+/// FAILS with the gate in order of arrival: its wins wait behind the 120 (15 s at 8 a second; on a clock that ran, past
+/// its grace, and its answer cut `win_unpaid`).
+#[test]
+fn a_seller_with_a_short_grace_is_paid_before_twenty_that_can_wait() {
+    let _g = env_lock();
+    let short = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 1_000,
+                       "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 10, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let long = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000,
+                      "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 600, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
+    let r = Rig::with_more(owner, true, true, 30, short, &vec![long; 20]);
+    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(1_000);
+    let size = 64 * PIECE;
+    let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    let (short_one, others) = std::thread::scope(|sc| {
+        let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
+        wait_for_rig("120 wins waiting at the gate", || {
+            // the sellers share one node: its invoices, then the buyer node's payments, never one lock inside the other
+            let invoiced = r.shop.node.preimages.lock().unwrap().len();
+            invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
+        });
+        // a file of 64 pieces at one win in four draws none 1 time in 10^8: one that does is drawn again, in its session
+        let mut short_one = Value::Null;
+        for _ in 0..3 {
+            short_one = sc.spawn(|| buy(&r.shop)).join().unwrap();
+            if short_one["wins"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+        }
+        (short_one, others.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>())
+    });
+    let wins = short_one["wins"].as_u64().unwrap_or(0);
+    assert!(wins >= 1, "three files of 64 pieces that drew no win: {short_one}");
+    // the test's clock stands still, so no seller's grace runs out here: what is measured is the order. Each of the short
+    // seller's wins is paid within a few gate widths of the seller making its invoice (the wins the wallet already had in
+    // hand when it came go too), not behind the 120 waiting
+    let payments: Vec<String> = r.ln.state().payments.iter().map(|p| p["payment_hash"].as_str().unwrap().to_string()).collect();
+    let sent_at = r.ln.st.lock().unwrap().sent_at.clone();
+    let made = r.shop.node.made.lock().unwrap().clone();
+    let sid = short_one["session"].as_str().unwrap();
+    let paid: Vec<String> = win_tickets(&r, sid).iter().filter(|t| t["state"] == "settled").map(|t| t["hash"].as_str().unwrap().to_string()).collect();
+    assert_eq!(paid.len() as u64, wins, "{short_one}");
+    for h in &paid {
+        let at = payments.iter().rposition(|p| p == h).expect("the win's payment");
+        let made_at = made.iter().find(|(m, _)| m == h).map(|(_, i)| *i).expect("the seller made its invoice");
+        let before = sent_at.iter().filter(|s| **s < made_at).count();
+        let behind = at - before.min(at);
+        eprintln!("short grace: invoice made when {before} had been sent, paid at {at}: {behind} between");
+        // measured: 17 to 23 with the gate by due, 295 to 311 in order of arrival (the 120 waiting and those after them)
+        assert!(behind <= 48, "a win of the short seller waited behind {behind} payments of sellers that could wait (paid at {at} of {})", payments.len());
+    }
+    assert_eq!((short_one["complete"].as_bool(), short_one["ended"].as_str()), (Some(true), None), "its answer was cut: {short_one}");
+    assert_eq!((short_one["wins_paid"].as_u64(), short_one["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{short_one}");
+    for v in &others {
+        assert_eq!((v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(0)), "{v}");
+    }
+    assert!(r.ln.state().peak <= 8, "{} payments at once", r.ln.state().peak);
+}
+
 /// The strict seller's file is whole, every win is paid once, and one number is on the node, at the seller and in the
 /// ledger, with never more than 8 payments at once.
 fn assert_all_whole_and_paid_once(r: &Rig, strict_one: &Value, others: &[Value]) {
@@ -7785,7 +8032,15 @@ fn a_408_with_wins_unpaid_blames_no_seller() {
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
     // the wallet's router away for a whole file: its wins are booked, sent nowhere, and the answer is cut
     r.ln.st.lock().unwrap().router_down = true;
-    let a = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    // 128 pieces at one win in 32 draw none 1 time in 60: a file with no win is whole and owes nothing, and another is
+    // fetched (up to 5, each on the same session)
+    let mut a = Value::Null;
+    for _ in 0..5 {
+        a = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+        if a["wins"].as_u64() >= Some(1) {
+            break;
+        }
+    }
     r.ln.st.lock().unwrap().router_down = false;
     assert!(a["wins"].as_u64().unwrap() >= 1, "{a}");
     r.tap.set(Box::new(|seen, _| (seen.paid && seen.path.starts_with("/pieces/")).then(|| Ok(answer(408, vec![], b"{}".to_vec())))));
@@ -8188,6 +8443,62 @@ fn tickets_whose_payment_failed_after_their_lock_round_give_their_places_with_th
     assert_eq!(r.money(), (4 * TICKET, 4 * TICKET, 4 * TICKET, 4 * SETTLED));
 }
 
+/// A channel's outage leaves the seller holding every place it gives the session (the pool's next tickets are with it
+/// as invoices, their payments still on their way), and the call ends refused `too_many_tickets`. The session is
+/// stopped as the call ends, its seller asked to cancel the tickets that were never released, and the resume of the
+/// file opens another session: a 206 of exactly the rest, priced as the rest. The tickets released for what was
+/// served are never named for the cancel, and they are paid: the money is one number on the node, at the seller, in
+/// the book and the ledger.
+///
+/// FAILS without the cancel: the resume is refused `too_many_tickets` too, until the seller's own 75 s for an unpaid
+/// invoice are over (seen on the lab, through a drop of the channel every second).
+#[test]
+fn after_an_outage_that_fills_the_sellers_places_the_resume_goes_on_from_that_byte() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    let n = 15 * MIB;
+    let first = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((first["status"].as_u64(), first["complete"].as_bool()), (Some(200), Some(true)), "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    // the outage has left the seller's places for the session taken: it refuses the session's next lock, as it does
+    // until those tickets lapse. A new session's first lock names no session, and is taken
+    let full = |seen: &Seen, _real: &dyn Fn() -> xbt402::Result<WireAnswer>| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())));
+    r.tap.set(Box::new(full));
+    // the two tickets held pay for 10 MiB, and the lock for the rest is refused at the cap: the call ends there
+    let cut = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film"}));
+    let got = cut["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((cut["status"].as_u64(), cut["complete"].as_bool(), got), (Some(200), Some(false), 10 * MIB), "{cut}");
+    assert!(cut["ended"].as_str().is_some_and(|e| e.contains("too_many_tickets")), "the outage ends on the seller's cap: {cut}");
+    assert_eq!(cut["session_stopped"]["session"].as_str(), Some(sid.as_str()), "the session was stopped as the call ended: {cut}");
+    // what was asked to be cancelled: never a ticket that was released
+    let released: Vec<String> = r.session(&sid)["session_tickets"].as_array().unwrap().iter()
+        .filter(|t| matches!(t["state"].as_str(), Some("released" | "settled" | "retired"))).map(|t| t["hash"].as_str().unwrap().to_string()).collect();
+    assert!(released.len() >= 3, "the tickets that paid for the first file and the 10 MiB: {}", r.session(&sid));
+    let asked: Vec<String> = r.tap.seen("/x402/ticket/cancel").iter().flat_map(|s| {
+        serde_json::from_str::<Value>(&s.body).unwrap()["hashes"].as_array().cloned().unwrap_or_default()
+    }).filter_map(|h| h.as_str().map(str::to_string)).collect();
+    assert!(asked.iter().all(|h| !released.contains(h)), "a released ticket was named for the cancel: {asked:?} {released:?}");
+    // and every one never released was: the refills the cap refused, which the seller may hold as invoices
+    let unreleased: std::collections::BTreeSet<String> = r.session(&sid)["session_tickets"].as_array().unwrap().iter()
+        .filter(|t| !matches!(t["state"].as_str(), Some("released" | "settled" | "retired"))).map(|t| t["hash"].as_str().unwrap().to_string()).collect();
+    let asked_set: std::collections::BTreeSet<String> = asked.iter().cloned().collect();
+    assert!(!asked_set.is_empty() && asked_set == unreleased, "the cancel names each ticket never released, and only those: {asked_set:?} {unreleased:?}");
+    assert_eq!(cut["session_stopped"]["cancel_asked"].as_u64(), Some(asked_set.len() as u64), "{cut}");
+    // the resume, from that byte, of the same copy, in another session
+    let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                         "if_range": cut["etag"]}));
+    r.tap.clear();
+    assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
+    assert_eq!(on["price_msat"].as_str(), Some("1000000"), "priced as the rest, 5 MiB at 200 sat a MiB: {on}");
+    assert_ne!(on["session"].as_str(), Some(sid.as_str()), "another session: {on}");
+    r.assert_booked();
+    // 1 ticket for the first file, 2 for the 10 MiB, 1 for the rest; the tickets the stopped session held come back
+    wait_for("the last ticket to settle", || r.money().0 == 4 * TICKET);
+    assert_eq!(r.money(), (4 * TICKET, 4 * TICKET, 4 * TICKET, 4 * SETTLED));
+}
+
 /// A seller's gateway forgets a session that holds nothing and has been quiet for its `idle_secs`
 /// (300 s as shipped): a wallet whose node was away for that long comes back to a session only it
 /// remembers. The seller's `session_unknown` ends the session in the wallet too, and the next
@@ -8229,6 +8540,184 @@ fn a_session_the_seller_has_forgotten_is_ended_and_the_next_call_opens_another()
         r.ln.by_status("IN_FLIGHT").len() <= 2
     });
     assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
+}
+
+/// The seller forgot the session while the wallet's node was away (a channel's outage long enough), and the call that
+/// meets that is a resume, with nothing of it sent yet: the session is ended as before, and the resume is made again,
+/// once, in another session: a 206 of exactly the rest. (A call that is not a resume is still refused, as the test
+/// above says.)
+///
+/// FAILS without the second try: the resume is refused `ticket_session_ended`.
+#[test]
+fn a_resume_whose_session_the_seller_forgot_is_made_again_in_another_session() {
+    let _g = env_lock();
+    // prepaid tickets by `lock`, not by the seller's offer, so that every ticket the resume would buy asks the seller
+    let r = Rig::shipped(json!({"tickets": {"offers": false}}), 30, shipped_shop());
+    // the session's pool is never filled again (the seller busy): it holds nothing when the seller forgets it, and the
+    // resume's first step is a lock, which the seller answers `session_unknown`. (A resume that released a ticket the
+    // wallet still took for held would have charged it, and is rightly not made again: something of it went out.)
+    r.tap.set(Box::new(|seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
+        .then(|| Ok(answer(503, vec![], json!({"error": "busy"}).to_string().into_bytes())))));
+    let n = 10 * MIB;
+    // one ticket's worth (a second, with its fee, is past the call's 2,000 sat)
+    let part = r.pay(&format!("/files/{n}"), 2_000);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    // what the session's first lock held beside the ticket used is used up by another file: it holds nothing now
+    let used = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((used["complete"].as_bool(), used["session"].as_str()), (Some(true), Some(sid.as_str())), "{used}");
+    assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "{}", r.status());
+    // nothing is heard of the wallet for longer than the seller keeps a quiet session: it forgets it. (The wallet's
+    // watcher did not run meanwhile: its node was away)
+    assert_eq!(r.shop.gw.stats().sessions, 1, "the seller has the one session");
+    r.clock.fetch_add(350, Ordering::SeqCst);
+    wait_for("the seller to forget the session", || r.shop.gw.stats().sessions == 0);
+    r.tap.clear();
+    let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                         "if_range": part["etag"]}));
+    assert_eq!(r.audit("ticket_session_again").len(), 1, "{on}");
+    assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
+    assert_ne!(on["session"].as_str(), Some(sid.as_str()), "{on}");
+    let s = r.session(&sid);
+    assert!(s["sessions"][0]["why"].as_str().is_some_and(|w| w.starts_with("the seller has forgotten the session")), "{s}");
+    r.assert_booked();
+}
+
+/// The caller stops the session while its resume waits for the session's lock, and the seller then answers that lock
+/// `session_unknown`: the resume is refused, and not made again in another session. A stop someone asked for is never
+/// gone past by the second try.
+///
+/// FAILS with the forgotten session's flag set whatever stop had begun: the resume is made again, in a new session,
+/// after the caller stopped the old one.
+#[test]
+fn a_resume_whose_session_the_caller_stopped_is_not_made_again_when_the_seller_says_it_forgot_it() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"tickets": {"offers": false}}), 30, shipped_shop());
+    // the pool is never filled again (the seller busy): the session holds nothing once the first lock's tickets are used
+    let busy = Arc::new(AtomicBool::new(true));
+    let (arrived, stopped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (b, a, s) = (busy.clone(), arrived.clone(), stopped.clone());
+    r.tap.set(Box::new(move |seen, _real| {
+        if !(seen.path.ends_with("/lock") && seen.body.contains("\"session\"")) {
+            return None;
+        }
+        if b.load(Ordering::SeqCst) {
+            return Some(Ok(answer(503, vec![], json!({"error": "busy"}).to_string().into_bytes())));
+        }
+        // the resume's lock: held until the caller has stopped the session, then answered as by a seller that forgot it
+        a.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        while !s.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Some(Ok(answer(402, vec![], json!({"error": "session_unknown"}).to_string().into_bytes())))
+    }));
+    let n = 10 * MIB;
+    let part = r.pay(&format!("/files/{n}"), 2_000);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    let used = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((used["complete"].as_bool(), used["session"].as_str()), (Some(true), Some(sid.as_str())), "{used}");
+    assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "{}", r.status());
+    busy.store(false, Ordering::SeqCst);
+    let on = std::thread::scope(|sc| {
+        let call = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film",
+                                                          "range": format!("bytes={got}-"), "if_range": part["etag"]})));
+        wait_for("the resume's lock to reach the seller", || arrived.load(Ordering::SeqCst));
+        let st = r.call("ticket_stop", json!({"session": sid}));
+        stopped.store(true, Ordering::SeqCst);
+        assert_eq!(st["verdict"].as_str(), Some("allow"), "{st}");
+        call.join().unwrap()
+    });
+    r.tap.clear();
+    assert!(r.audit("ticket_session_again").is_empty(), "made again past the caller's stop: {on}");
+    assert_ne!(on["status"].as_u64(), Some(206), "served in another session after the caller stopped this one: {on}");
+    assert!(on["session"].as_str().is_none_or(|s| s == sid), "{on}");
+    r.assert_booked();
+}
+
+/// A resume that meets a session ended for no lapse of the seller's memory (here a ticket of it stranded on none of the
+/// node's channels; as much for a receipt that does not hold or a charge above what arrived) is not made again in
+/// another session: the call is refused, and says why. The next call, the agent's own, opens another.
+///
+/// FAILS with every `ticket_session_ended` taken for a forgotten session: the resume is made again at once, and buys
+/// from the seller in a new session with nothing said of why the last one ended.
+#[test]
+fn a_resume_whose_session_ended_for_a_stranded_ticket_is_not_made_again() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"tickets": {"ready_wait_ms": 300}}), 30, shipped_shop());
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    r.ln.st.lock().unwrap().strand_next = 2;
+    let n = 15 * MIB;
+    let cut = r.pay(&format!("/files/{n}"), 5_000);
+    let got = cut["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((cut["complete"].as_bool(), got), (Some(false), 10 * MIB), "{cut}");
+    r.ln.st.lock().unwrap().stranded_off_channel = true;
+    let first = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!(first["rule"].as_str(), Some("ticket_not_ready"), "{first}");
+    r.clock.fetch_add(21, Ordering::SeqCst);
+    // the resume of the cut file meets the stranded ticket: the session is ended under it, with nothing of it sent
+    let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                         "if_range": cut["etag"]}));
+    assert_eq!((on["verdict"].as_str(), on["rule"].as_str(), on["session"].as_str()), (Some("deny"), Some("ticket_session_ended"), Some(sid.as_str())), "{on}");
+    assert!(on["reason"].as_str().is_some_and(|w| w.contains("on none of the channels")), "the agent is told why: {on}");
+    assert!(r.audit("ticket_session_again").is_empty(), "made again after the seller's session ended for a stranded ticket: {on}");
+    assert_ne!(r.session(&sid)["sessions"][0]["state"], "open");
+    // the agent's next call opens another session and pays
+    let next = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                           "if_range": cut["etag"]}));
+    assert_eq!((next["status"].as_u64(), next["complete"].as_bool(), next["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{next}");
+    assert_ne!(next["session"].as_str(), Some(sid.as_str()));
+    r.assert_booked();
+}
+
+/// A resume (a call that goes on from a byte) whose session the seller refuses at its cap (`too_many_tickets`) on the
+/// call's first lock, before anything of it went out, with nothing in the session's balance and no ticket held (the
+/// first lock's tickets used up, every lock after it refused): the
+/// session is stopped, and the resume is made again, once, in another session, a 206 of exactly the rest. Every lock of
+/// the old session is refused from before the resume, so the refusal is the resume's own.
+///
+/// FAILS without the second try: the resume is refused `too_many_tickets`.
+#[test]
+fn a_resume_refused_at_the_sellers_cap_before_it_left_is_made_again_in_another_session() {
+    let _g = env_lock();
+    // prepaid tickets by `lock`, not by the seller's offer: every ticket the session would buy meets the cap
+    let r = Rig::shipped(json!({"tickets": {"offers": false}}), 30, shipped_shop());
+    // every lock of a session already open is refused at the cap from the start: the first lock of a session (which
+    // names none) is taken, and the session's pool is never filled again
+    r.tap.set(Box::new(|seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    let n = 10 * MIB;
+    // one ticket's 5 MiB, used up to the last msat (a second, with its fee, is past the call's 2,000 sat): the call
+    // ends on its own limit
+    let part = r.pay(&format!("/files/{n}"), 2_000);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    // what the session's first lock held beside it is used up by another file; the pool, refused at the cap, is never
+    // filled again, and the session holds nothing
+    let used = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((used["complete"].as_bool(), used["session"].as_str()), (Some(true), Some(sid.as_str())), "{used}");
+    assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "{}", r.status());
+    let before = r.audit("ticket_session_again").len();
+    let on = if r.session(&sid)["sessions"][0]["state"] == "open" {
+        let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                             "if_range": part["etag"]}));
+        assert_eq!(r.audit("ticket_session_again").len(), before + 1, "the resume was made again: {on}");
+        on
+    } else {
+        panic!("the session was stopped before the resume, by the first call: {}", r.session(&sid));
+    };
+    r.tap.clear();
+    assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
+    assert_ne!(on["session"].as_str(), Some(sid.as_str()), "another session: {on}");
+    assert_eq!(on["session_stopped"]["session"].as_str(), Some(sid.as_str()), "{on}");
+    r.assert_booked();
 }
 
 /// A Lightning Fork node that is killed as it sends a ticket's payment can go on calling that
@@ -9182,13 +9671,31 @@ fn a_paid_tunnel_pays_at_most_one_and_a_half_tickets_ahead() {
             let most = most.join().unwrap();
             holds.join().unwrap();
             eprintln!("credit ahead, {}: at most {:.3} tickets, {through} bytes each way", if delays { "a slow seller" } else { "flat out" }, most as f64 / TICKET as f64);
-            assert_eq!(through, each);
+            // a tunnel that carried less has ended: the wallet's answer says why (a busy machine once ended one here, unexplained)
+            let mut ws = Some(ws);
+            if through != each {
+                let w = ws.take().unwrap().join().unwrap();
+                // and the session's tickets as the book and the node have them, for what ended it
+                let sid = w["session"].as_str().unwrap_or_default().to_string();
+                let node: Vec<String> = ["IN_FLIGHT", "SUCCEEDED", "FAILED"].iter().map(|st| format!("{st} {}", r.ln.by_status(st).len())).collect();
+                // the tip the wallet reads now, and each locked ticket's blocks left (one is released only while more than 25 are left)
+                let tip = r.call("node_status", json!({}));
+                let session = r.session(&sid);
+                let left: Vec<String> = session["session_tickets"].as_array().into_iter().flatten().filter(|t| t["state"] == "locked")
+                    .map(|t| format!("{}", t["final_expiry"].as_i64().unwrap_or(0) - tip["height"].as_i64().unwrap_or(0))).collect();
+                panic!("{}: the tunnel ended at {through} of {each} bytes each way; the wallet: ended {:?}, rule {:?}, reason {:?}, {} released, {:?} sat charged; \
+                        seller charged {} msat; the node: {node:?}; the chain: {tip}, chain node height {}; blocks left on the locked: {left:?}; the session: {}",
+                       if delays { "a slow seller" } else { "flat out" }, w["ended"], w["rule"], w["reason"], w["tickets_released"], w["charged_sats"],
+                       r.shop.gw.stats().charged_msat, r.node.chain.height(), session.to_string().chars().take(3000).collect::<String>());
+            }
             assert!(most < 16 * TICKET / 10, "{} the wallet paid {most} msat ahead of what the seller charged", if delays { "a seller slow to show tickets:" } else { "flat out:" });
             let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
             let stop = r.call("ticket_stop", json!({"session": sid}));
             let (paid, taken, book, _) = r.money();
             assert_eq!((taken, book), (paid, paid), "{stop}");
-            ws.join().unwrap();
+            if let Some(ws) = ws {
+                ws.join().unwrap();
+            }
         });
         caller.join().unwrap();
         REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
@@ -9867,6 +10374,47 @@ fn credit_given_up_after_a_takeover_is_not_taken_over_through_the_earlier_sessio
     wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
     let (node, seller, book, _) = r.money();
     assert_eq!((node, seller, book), (2 * TICKET, 2 * TICKET, 2 * TICKET));
+}
+
+/// Credit one task leaves with a seller stays with that task. A task's budget is booked when a ticket
+/// is bought, to the task that bought it: a call of another task that took that credit over would
+/// spend it against neither budget, and so past its own. `film` buys a prepaid ticket, uses part of
+/// it and stops; `swarm` then calls the same shop. It takes nothing of `film`'s over, buys a ticket
+/// of its own, and that ticket is booked to `swarm`.
+#[test]
+fn credit_one_task_left_with_a_seller_is_not_taken_over_by_another_task() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let ledger_of = |task: &str| -> i64 {
+        r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some(task)).map(|row| row["amount_sats"].as_i64().unwrap()).sum()
+    };
+    let a = r.pay("/page/10", 2_000);
+    assert_eq!((a["status"].as_u64(), a["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{a}");
+    let a_seller = r.status()["paying"][0]["seller_session"].as_str().unwrap().to_string();
+    assert!(!a_seller.is_empty());
+    let stop = r.call("ticket_stop", json!({"session": a["session"]}));
+    let left: u64 = stop["http"]["left_with_seller_msat"].as_str().unwrap_or("0").parse().unwrap();
+    assert!(left > 0, "film left credit with the seller: {stop}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    let film_before = ledger_of("film");
+    assert_eq!((film_before, ledger_of("swarm")), (SETTLED, 0), "{:?}", r.ledger());
+    let b = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!(b["status"].as_u64(), Some(200), "{b}");
+    assert_ne!(b["session"], a["session"]);
+    let taken: Vec<Value> = r.audit("ticket_resumed").into_iter().filter(|e| e["seller_session"].as_str() == Some(a_seller.as_str())).collect();
+    assert!(taken.is_empty(), "swarm took over the credit film left with the seller: {taken:?}");
+    assert_eq!(b["tickets_prepaid"].as_u64(), Some(1), "swarm bought a ticket of its own: {b}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    assert_eq!((ledger_of("film"), ledger_of("swarm")), (film_before, SETTLED), "swarm's spend is booked to swarm, film's is unchanged: {:?}", r.ledger());
+    // film's credit is still there for film, once swarm's session is stopped (while it is open, film's call is served by
+    // a session of film's own beside it: a_call_of_another_task_opens_its_own_session_beside_an_open_one)
+    r.call("ticket_stop", json!({"session": b["session"]}));
+    let again = r.pay("/page/10", 2_000);
+    assert_eq!((again["status"].as_u64(), again["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "film pays from what it left: {again}");
+    assert_ne!(again["session"], b["session"]);
+    assert_eq!(r.audit("ticket_resumed").iter().filter(|e| e["seller_session"].as_str() == Some(a_seller.as_str())).count(), 1, "taken over by its own task");
 }
 
 /// A choices file that cannot be read holds an identified seller session back, and burns nothing:
@@ -13934,6 +14482,114 @@ fn a_new_outage_has_its_own_wait() {
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
 }
 
+/// A win's invoice has 8 s left when the wallet looks at it, and then the win waits for a route, in which the clock
+/// moves on past the invoice's end: it is looked at again just before it is booked and sent, held back unsent, and
+/// paid on the seller's next invoice. No payment is sent on an invoice that has run out, and none fails.
+///
+/// FAILS without the second look: the win is sent on its lapsed invoice, and the payment fails at the seller's node
+/// (`FAILURE_REASON_INCORRECT_PAYMENT_DETAILS` on a real node; seen on the lab with 1.1 s left at the send).
+#[test]
+fn a_win_whose_invoice_runs_out_while_it_waits_for_a_route_is_not_sent() {
+    let _g = env_lock();
+    let size = 256 * PIECE;
+    // a file that draws no win never meets the moment, and is drawn again (1 time in 3,000 at one win in 32)
+    let mut tries = 0;
+    let (r, v) = loop {
+        tries += 1;
+        let r = patient_draws_rig(json!({}));
+        // the seller's invoices of 30 s are dated so that each has 8 s left when it is made
+        r.shop.node.backdate.store(22, Ordering::SeqCst);
+        {
+            // the first win's route query opens a moment with no route, of 2 s
+            let mut st = r.ln.st.lock().unwrap();
+            st.no_route_at_query = 1;
+            st.no_route_for = Duration::from_secs(2);
+        }
+        let met = std::sync::atomic::AtomicBool::new(false);
+        let v = std::thread::scope(|sc| {
+            let call = sc.spawn(|| r.pay(&format!("/pieces/{size}"), 1_000));
+            wait_for_rig("the first win's wait for a route, or the call's end", || r.ln.st.lock().unwrap().no_route_answers > 0 || call.is_finished());
+            if r.ln.st.lock().unwrap().no_route_answers > 0 {
+                met.store(true, Ordering::SeqCst);
+                // while the first win waits for its route, 4 s pass: its invoice has 4 s left, under the 5 s a win must have,
+                // and is held back. The seller's later invoices live their 30 s: what is tested is the one that ran out, not
+                // how a loaded box keeps up with invoices of 8 s
+                r.shop.node.backdate.store(0, Ordering::SeqCst);
+                r.clock.fetch_add(4, Ordering::SeqCst);
+            }
+            call.join().unwrap()
+        });
+        if met.load(Ordering::SeqCst) || tries == 3 {
+            break (r, v);
+        }
+    };
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the moment was met, in {tries} files: {v}");
+    assert!(v["wins"].as_u64().unwrap_or(0) >= 1, "{v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "no payment on a lapsed invoice: {v}");
+    let held: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ticket_expiry").collect();
+    assert!(!held.is_empty(), "the win was held back when it was looked at again: {v}");
+    assert_eq!((v["complete"].as_bool(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), v["wins"].as_u64(), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
+/// A prepaid ticket's invoice with 7 s left when the seller makes it (more than the 5 s every prepaid invoice must have),
+/// and the node finds no route to the seller for a moment, in which 9 s pass: asked again after the wait, the invoice
+/// has under 5 s left and is not sent. The next invoice is paid, nothing failed, and the money is one number.
+///
+/// FAILS with only wins asked again after the waits: the prepaid ticket is sent on an invoice that has run out.
+#[test]
+fn a_prepaid_ticket_whose_invoice_runs_out_while_it_waits_for_a_route_is_not_sent() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    // no slot for a held ticket (half the channel's 30 carry the node's own routing): the wallet buys prepaid ones
+    r.ln.st.lock().unwrap().foreign = 15;
+    // the seller's invoices of 60 s are dated so that each has 7 s left when it is made
+    r.shop.node.backdate.store(52, Ordering::SeqCst);
+    {
+        let mut st = r.ln.st.lock().unwrap();
+        st.no_route_at_query = 1;
+        st.no_route_for = Duration::from_secs(2);
+    }
+    let v = std::thread::scope(|sc| {
+        let call = sc.spawn(|| r.pay("/page/1000", CALL));
+        wait_for("the prepaid ticket's wait for a route", || r.ln.st.lock().unwrap().no_route_answers > 0);
+        r.clock.fetch_add(9, Ordering::SeqCst);
+        call.join().unwrap()
+    });
+    let held: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ticket_expiry").collect();
+    assert!(!held.is_empty(), "the prepaid ticket was held back when it was looked at again: {v}");
+    assert!(held.iter().all(|e| e["win"].is_null() && e["prepaid"] == true), "{held:?}");
+    let sent: Vec<String> = ["SUCCEEDED", "IN_FLIGHT", "FAILED"].iter().flat_map(|s| r.ln.by_status(s)).filter_map(|p| p["payment_hash"].as_str().map(str::to_string)).collect();
+    for e in &held {
+        assert!(!sent.iter().any(|h| Some(h.as_str()) == e["payment_hash"].as_str()), "an invoice held back reached the node: {e}");
+    }
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    r.assert_booked();
+}
+
+/// The wallet says at the open that it asks for a failed win's invoice to be cancelled, and a seller that gives such a
+/// buyer long invoices (`invoice_secs_cancel`) does: its wins are paid on invoices of 180 s, past the grace of 30.
+///
+/// FAILS without `canCancel` in the open: the seller gives the grace's 30 s.
+#[test]
+fn the_wallet_says_it_can_cancel_and_is_given_invoices_past_the_grace() {
+    let _g = env_lock();
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                                               "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30, "invoice_secs_cancel": 180,
+                                                           "max_unpaid_wins": 100_000, "grace_pieces": 100_000}}));
+    REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(v["wins_paid"].as_u64().unwrap_or(0) >= 1, "{v}");
+    let opens: Vec<Value> = r.tap.seen("/x402/lottery/open").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
+    assert!(!opens.is_empty() && opens.iter().all(|o| o["canCancel"] == true), "{opens:?}");
+    for p in r.ln.by_status("SUCCEEDED") {
+        let inv = xbt_signer::bolt11::decode(p["payment_request"].as_str().unwrap()).unwrap();
+        assert_eq!(inv.expiry_s, 180, "a win's invoice of 180 s, past the grace");
+    }
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
 /// A seller whose every invoice for a win comes with 2 s left: no queue of the wallet's has a part in that.
 ///
 /// FAILS with such an invoice taken as one that lapsed in the queue: never at fault, and asked again and again.
@@ -14112,6 +14768,46 @@ fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
     assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
 }
 
+/// On a slow box the node's checks before a payment take seconds (here its decode of the invoice, 5 s), and then the
+/// node finds no route to the seller for 5 s: the wallet's 8 s for a route are counted from after the checks, so it
+/// waits the 5 s out and pays, with nothing failed and the money right.
+///
+/// FAILS with the 8 s counted from before the checks: 3 s are left of them when the wait begins, the window outlasts
+/// them, and the call ends `ln_no_route`.
+#[test]
+fn the_wait_for_a_route_has_its_whole_8_s_after_a_slow_nodes_checks() {
+    let _g = env_lock();
+    let size = 256 * PIECE;
+    // the moment opens at the first win's route query: a draw with no win never meets it, and is drawn again
+    let mut tries = 0;
+    let (r, v) = loop {
+        tries += 1;
+        let r = patient_draws_rig(json!({}));
+        {
+            let mut st = r.ln.st.lock().unwrap();
+            st.decode_takes = Duration::from_secs(5);
+            st.no_route_at_query = 1;
+            st.no_route_for = Duration::from_secs(5);
+        }
+        let v = r.pay(&format!("/pieces/{size}"), 1_000);
+        r.ln.st.lock().unwrap().decode_takes = Duration::ZERO;
+        if r.ln.st.lock().unwrap().route_queries > 0 || tries == 5 {
+            break (r, v);
+        }
+    };
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the window was met, in {tries} draws: {v}");
+    // the payment that met the moment waited it out: no refusal for want of a route, not even one tried again later.
+    // A win that came while it waited stood back ("another payment to the seller is waiting"), nothing sent, and was
+    // paid after: that is the wait, not one that ran out
+    let refused: Vec<Value> = r.audit("ticket_refused").into_iter()
+        .filter(|e| e["rule"] == "ln_no_route" && e["reason"].as_str().unwrap_or("").contains("has found no route")).collect();
+    assert!(refused.is_empty(), "the wait had its 8 s after the checks, and none ran out: {refused:?}");
+    assert!(!r.audit("ticket_route_waited").is_empty(), "the payment waited for the route: {v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(200), Some(true), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
 /// A link along the route is replaced, and for a while the node finds no route to the seller: a payment sent
 /// then fails at once. The wallet asks the node for a route first and waits for one, within 8 s: a window of
 /// 3 s costs no failed payment and no win; one of 10 s ends the wait at 8 s and the call with `ln_no_route`, the
@@ -14182,7 +14878,9 @@ fn a_range_answered_with_the_whole_body_is_not_read_and_one_of_the_same_copy_goe
                (Some(200), Some("ticket_range_ignored"), Some(false), Some(0)), "{other}");
     let cost = other["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
     assert!(other["reason"].as_str().unwrap().contains(&format!("{cost} msat")), "{other}");
-    assert!(cost <= 50_000, "at most what the seller's socket took (256 KiB at 200 sat a MiB): {cost} msat");
+    // what the seller's socket took before the wallet closed it: the buffers of both ends and what was on its way,
+    // which LIMITS bounds by its measure on Linux loopback (822 KiB); 1 MiB at 200 sat a MiB, a small part of the file
+    assert!(cost <= 200_000, "at most what the seller's socket took (1 MiB at 200 sat a MiB): {cost} msat");
     let (paid, taken, book, ledger) = r.money();
     assert_eq!((taken, book), (paid, paid), "{other}");
     assert!(paid - before.0 <= TICKET && ledger >= before.3, "no file bought again: {other}");
@@ -14250,25 +14948,22 @@ fn a_route_gone_for_good_ends_the_call_soon_with_its_reason() {
     assert_wins(&r, v["wins_paid"].as_u64().unwrap_or(0));
 }
 
-/// A seller behind a private channel (or an LSP) is reached by its invoice's route hints, which the node's route
-/// query is not given: the query finds no path, ever. Its invoices are sent at once, as before the route wait,
-/// on the ticket rail and for wins, and nothing waits or is refused for want of a route.
+/// A seller behind a private channel (or an LSP) is reached by its invoice's route hints: the wallet gives its node's
+/// route query the hints, which then finds the route the payment takes, and the invoice is paid at once, on the ticket
+/// rail and for wins, with no wait and no failure.
 ///
-/// FAILS with the route asked for every invoice: each waits out the 8 s and is refused `ln_no_route`, and the
-/// seller is never paid (the offers check of the lab, on real nodes, where the seller's one channel is private).
+/// FAILS with the query not given the hints: each invoice waits out the 8 s and is refused `ln_no_route`, and the seller
+/// is never paid (the offers check of the lab, on real nodes, where the seller's one channel is private).
 #[test]
 fn a_seller_behind_a_private_channel_is_paid_at_once_by_its_route_hints() {
     let _g = env_lock();
-    // prepaid tickets: each one an ordinary payment of the seller's invoice, the path the route wait is on
     let prepaid = json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
     let r = Rig::shipped(json!({}), 30, prepaid);
     r.ln.st.lock().unwrap().private_seller = true;
     let t = Instant::now();
     let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
-    assert!(r.ln.state().payments.iter().any(|p| p["status"] == "SUCCEEDED"), "a prepaid ticket was paid: {v}");
     assert!(t.elapsed() < Duration::from_secs(4), "the page took {:?}: {v}", t.elapsed());
-    // wins: 256 pieces, as many wins as the no-route tests see
     let d = patient_draws_rig(json!({}));
     d.ln.st.lock().unwrap().private_seller = true;
     let t = Instant::now();
@@ -14279,11 +14974,36 @@ fn a_seller_behind_a_private_channel_is_paid_at_once_by_its_route_hints() {
     assert!(t.elapsed() < Duration::from_secs(30), "the file took {:?}: {w}", t.elapsed());
     for (rig, out) in [(&r, &v), (&d, &w)] {
         assert!(!out.to_string().contains("ln_no_route"), "{out}");
-        assert!(rig.audit("ticket_route_waited").is_empty(), "no wait for a route the query cannot see");
-        assert_eq!(rig.ln.st.lock().unwrap().route_queries, 0, "no route query for an invoice with hints");
+        assert!(rig.audit("ticket_route_waited").is_empty(), "no wait: the route is found through the hint");
+        let st = rig.ln.st.lock().unwrap();
+        assert!(st.route_queries > 0 && st.no_route_answers == 0, "the route was asked for, with the hints, and found: {} asked, {} not found", st.route_queries, st.no_route_answers);
+        drop(st);
         assert_eq!(rig.ln.by_status("FAILED").len(), 0);
     }
     assert_wins(&d, w["wins_paid"].as_u64().unwrap_or(0));
+}
+
+/// A seller behind a private channel whose hinted route is gone for a moment (the link to it replaced): the wallet
+/// waits for it, as for any seller's, and pays when it is back; nothing fails.
+///
+/// FAILS with hinted invoices sent without the wait: the payment sent in the moment fails.
+#[test]
+fn a_seller_behind_a_private_channel_whose_route_is_gone_for_a_moment_is_waited_for() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    {
+        let mut st = r.ln.st.lock().unwrap();
+        st.private_seller = true;
+        st.no_route_at_query = 2;
+        st.no_route_for = Duration::from_secs(3);
+    }
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "a payment met the moment: {v}");
+    assert!(!r.audit("ticket_route_waited").is_empty(), "and waited for the route: {v}");
+    assert!(r.ln.by_status("FAILED").len() <= 8, "only the gate's eight checked just before the moment may fail: {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(200), Some(true), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
 }
 
 /// A whole body sent for a range from the first byte (the app's player's first part) is a whole answer: read
@@ -14315,15 +15035,25 @@ fn a_whole_body_for_a_range_from_the_first_byte_is_a_whole_answer() {
 fn a_moment_with_no_route_and_many_wins_pays_every_win() {
     let _g = env_lock();
     for (at, secs) in [(2usize, 4u64), (5, 4), (2, 7)] {
-        let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
-        {
-            let mut st = r.ln.st.lock().unwrap();
-            st.no_route_at_query = at;
-            st.no_route_for = Duration::from_secs(secs);
-        }
         let size = 256 * PIECE;
-        let v = r.pay(&format!("/pieces/{size}"), 2_000);
-        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment: {v}");
+        // the moment opens at a win's route query: a draw with fewer wins than that never meets it, and is drawn again
+        // (a new rig: the luck of the draw, not the wallet's doing), a few times at most
+        let mut tries = 0;
+        let (r, v) = loop {
+            tries += 1;
+            let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+            {
+                let mut st = r.ln.st.lock().unwrap();
+                st.no_route_at_query = at;
+                st.no_route_for = Duration::from_secs(secs);
+            }
+            let v = r.pay(&format!("/pieces/{size}"), 2_000);
+            let (met, asked) = { let st = r.ln.st.lock().unwrap(); (st.no_route_answers > 0, st.route_queries) };
+            if met || asked >= at || tries == 5 {
+                break (r, v);
+            }
+        };
+        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment in {tries} draws: {v}");
         // the payments the node had found a route for just before the moment came are sent into it and fail, as
         // they would on a real node; at most the gate's eight, and none is sent again
         let failed = r.ln.by_status("FAILED");
@@ -14373,7 +15103,7 @@ fn app_shop(price_msat: u64) -> Value {
     hash_shop(price_msat, json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000}), Some(100_000_000))
 }
 
-/// The hashtaker's payer on this rig's signer, over the signer's own socket, and the standing its
+/// The hashtaker's payer on this rig's signer, over the renter's socket ([`xbt_signer::renter`]), and the standing its
 /// meter would keep. Each step is what its payer thread does.
 struct Renter {
     payer: xbt_hashlink::rail::SignerPayer,
@@ -14385,7 +15115,7 @@ impl Renter {
     fn new(r: &Rig, task: &str, price_msat: u64, start_slices: u64, budget_sats: Option<u64>) -> Self {
         let sock = r.root.join("hashrate.sock");
         let _ = std::fs::remove_file(&sock);
-        let running = xbt_signer::server::spawn(r.s.clone(), &sock, false).unwrap();
+        let running = xbt_signer::server::spawn_renter(r.s.clone(), &sock).unwrap();
         let payer = xbt_hashlink::rail::SignerPayer::new(sock, r.shop.url("/hashrate"), task.into(), price_msat, budget_sats, None, Duration::from_secs(5));
         let standing = xbt_hashlink::order::Standing { proven: 0, largest_share: SLICE_WORK, paid: 0, start_slices, slice_work: SLICE_WORK, price_msat, msat_a_second: 0.0, buy_secs: 0.0 };
         Self { payer, standing, _running: running }
@@ -14704,4 +15434,227 @@ fn a_rentals_sends_and_another_tasks_count_apart() {
     let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 3 * MIB)), "max_sats": 2_000, "task": "default"}));
     assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "{v}");
     assert!(paid_tickets(&r).len() >= 3, "{v}");
+}
+
+// --- a rental's terms are the renter's alone ---------------------------------------------------------------------
+
+/// A call naming `task`, in the words the MCP's `xbt402_pay` sends to the signer (its `task` is a free string).
+fn as_the_mcp_asks(r: &Rig, path: &str, max_sats: i64, task: &str) -> Value {
+    json!({"url": r.shop.url(path), "method": "POST", "body": "{}", "max_sats": max_sats, "task": task, "range": ""})
+}
+
+/// The rental grant goes with the renter's socket, not with the task's name. On the mainnet starter rules a
+/// caller on the wallet's own socket that said `task: "hashrate"` was paid outside max_per_tx (2,000), the
+/// approval threshold (1,000), the day's (10,000) and week's (30,000) budgets and the per-seller cap (10,000),
+/// up to the task's 200,000 sat, on any route (21 calls of 9,000 sat in a row, and a page). Such
+/// a call is refused before anything is asked of the seller, and nothing is paid.
+#[test]
+fn a_caller_naming_the_hashrate_task_gets_none_of_the_rentals_terms() {
+    let _g = env_lock();
+    // a named seller whose paid route costs 9,000 sat a call, with tickets of 10,000
+    let shop = || hash_shop(9_000_000, json!({"ticket_msat": 10_000_000, "min_ticket_msat": 546_000}), None);
+    // control: the same call under the wallet's own rules is not paid
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, shop());
+    let v = r.call("xbt402_pay", as_the_mcp_asks(&r, "/hashrate/not-a-rental-0", 10_100, "default"));
+    assert_ne!(v["verdict"], "allow", "{v}");
+    // the same caller saying "hashrate"
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, shop());
+    let mut allowed = 0;
+    let mut last = Value::Null;
+    for i in 0..30 {
+        last = r.call("xbt402_pay", as_the_mcp_asks(&r, &format!("/hashrate/not-a-rental-{i}"), 10_100, "hashrate"));
+        if last["verdict"] == "allow" {
+            allowed += 1;
+        }
+    }
+    // and a plain page of the same seller, under the same name
+    let page = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "hashrate"}));
+    eprintln!("hashrate named on the wallet's socket: {allowed} calls of 9,000 sat allowed, ledger {} sat; the last {last}; a /page/ call: {page}", r.ledger_sum());
+    assert_eq!(allowed, 0, "{last}");
+    for v in [&last, &page] {
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("deny"), Some("ticket_rental_payer"), 0), "{v}");
+    }
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
+    assert!(r.tap.seen("/").is_empty(), "nothing asked of the seller: {:?}", r.tap.seen("/").iter().map(|s| s.path.clone()).collect::<Vec<_>>());
+}
+
+/// What the MCP tool sends reaches the signer on the wallet's socket: there, a call that names the rental
+/// task is refused whatever it asks for, and so is a renter pointed at that socket (an app whose renter
+/// was not moved to its own socket), in words the Hashrate page shows.
+#[test]
+fn the_wallets_socket_pays_nothing_on_a_rentals_terms() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let sock = r.root.join("wallet.sock");
+    let _ = std::fs::remove_file(&sock);
+    let _running = xbt_signer::server::spawn(r.s.clone(), &sock, false).unwrap();
+    // the MCP's call, a rental's piece of work and all
+    let v = xbt_hashlink::rail::signer_call(&sock, "xbt402_pay", &as_the_mcp_asks(&r, "/hashrate/r1/0", 2_000, "hashrate")).unwrap();
+    assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("ticket_rental_payer"), 0), "{v}");
+    // the hashtaker's own payer, on the wallet's socket
+    let mut payer = xbt_hashlink::rail::SignerPayer::new(sock.clone(), r.shop.url("/hashrate"), "hashrate".into(), MARKET_MSAT, Some(100_000), None, Duration::from_secs(5));
+    let why = payer.pay("r1", 0, &json!({"slice": 0})).unwrap_err();
+    assert!(why.starts_with(xbt_hashlink::rail::RENTER_SOCKET) && why.contains("hashrate renter") && !why.contains("rules page"), "{why}");
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
+}
+
+/// The renter's socket pays a rental's pieces of work and nothing else: not a page of the same seller, posted
+/// or not, nor a piece of work asked for by GET. And it grants nothing by itself: a piece of work under a task
+/// without rental terms (an older wallet's hashrate task) is paid there as on the wallet's socket, under the
+/// wallet's own limits.
+#[test]
+fn the_renters_socket_pays_a_rentals_pieces_of_work_only() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(100_000));
+    let ask = |p: Value| xbt_hashlink::rail::signer_call(&t.payer.sock, "xbt402_pay", &p).unwrap();
+    let page = ask(json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "hashrate"}));
+    let posted = ask(as_the_mcp_asks(&r, "/page/10", 2_000, "hashrate"));
+    let got = ask(json!({"url": r.shop.url("/hashrate/r1/0"), "max_sats": 2_000, "task": "hashrate"}));
+    for (what, v) in [("a page", &page), ("a page, posted", &posted), ("a GET", &got)] {
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("deny"), Some("ticket_rental_route"), 0), "{what}: {v}");
+    }
+    // the renter's own words for it: nothing about the wallet's socket or its rules
+    let mut astray = xbt_hashlink::rail::SignerPayer::new(t.payer.sock.clone(), r.shop.url("/page"), "hashrate".into(), MARKET_MSAT, Some(100_000), None, Duration::from_secs(5));
+    let why = astray.pay("r1", 0, &json!({"slice": 0})).unwrap_err();
+    assert!(why.starts_with(xbt_hashlink::rail::RENTER_ROUTE) && !why.contains("socket") && !why.contains("rules page"), "{why}");
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
+    // a piece of work under the wallet's own task: its rules, and nothing of the rental's
+    let other = ask(as_the_mcp_asks(&r, "/hashrate/r1/0", 2_000, "default"));
+    let booked = |task: &str| -> i64 {
+        r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some(task)).map(|row| row["amount_sats"].as_i64().unwrap()).sum()
+    };
+    eprintln!("a piece of work under \"default\" on the renter's socket: {other}");
+    assert!(!other["rule"].as_str().unwrap_or("").starts_with("ticket_rental"), "{other}");
+    assert_eq!(booked("hashrate"), 0);
+    assert!(r.ledger_sum() == booked("default") && r.ledger_sum() <= 2_000, "within the wallet's max_per_tx: {}", r.ledger_sum());
+    // the wallet's other methods are not on it
+    let e = xbt_hashlink::rail::signer_call(&t.payer.sock, "pay", &json!({"to": "x", "amount_sats": 1})).unwrap_err();
+    assert!(e.contains("rental"), "{e}");
+}
+
+/// A rental through the renter's socket pays as before: its pieces of work, on its own terms, booked to its task.
+#[test]
+fn a_rental_through_the_renters_socket_pays_on_its_own_terms() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 2, Some(100_000));
+    for n in 1..=40 {
+        t.share(n as f64 * 9.0).unwrap();
+    }
+    let booked: i64 = r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some("hashrate")).map(|row| row["amount_sats"].as_i64().unwrap()).sum();
+    eprintln!("MEASURED 40 shares: {} slices paid, tickets {:?}, booked {booked}", t.standing.paid, paid_tickets(&r));
+    // past the wallet's own limits for one payment and one seller's day, which a rental is not held to
+    assert!(booked > 10_000 && booked == r.ledger_sum(), "{booked} of {}", r.ledger_sum());
+}
+
+// --- a session is its task's alone ------------------------------------------------------------------------------
+
+/// What the ledger holds under `task`'s memo.
+fn ledger_of(r: &Rig, task: &str) -> i64 {
+    r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some(task)).map(|row| row["amount_sats"].as_i64().unwrap()).sum()
+}
+
+/// A call of one task is never served by another task's session. A task's budget is booked when its ticket
+/// is bought, so a `swarm` call paid from the session `film` has open at the same address spends film's
+/// credit, and the refills it buys there are booked to film: past swarm's own budget. With film's session
+/// open, swarm's call opens a session of its own beside it, buys its own ticket, and books it to swarm; film's
+/// next call is still served by film's session.
+#[test]
+fn a_call_of_another_task_opens_its_own_session_beside_an_open_one() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let a = r.pay("/page/10", 2_000);
+    assert_eq!((a["status"].as_u64(), a["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{a}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    let film_before = ledger_of(&r, "film");
+    let b = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!(b["status"].as_u64(), Some(200), "{b}");
+    assert_ne!(b["session"], a["session"], "swarm's call is served by a session of its own: {b}");
+    assert_eq!(b["tickets_prepaid"].as_u64(), Some(1), "swarm bought its own ticket: {b}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    assert_eq!((ledger_of(&r, "film"), ledger_of(&r, "swarm")), (film_before, SETTLED), "{:?}", r.ledger());
+    // both are open, and each task's call goes to its own
+    let c = r.pay("/page/10", 2_000);
+    let d = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!((c["status"].as_u64(), &c["session"], c["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), &a["session"], 0), "{c}");
+    assert_eq!((d["status"].as_u64(), &d["session"], d["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), &b["session"], 0), "{d}");
+    assert_eq!(r.money().0, 2 * TICKET, "two tickets, one each");
+}
+
+/// A call of one task at another address of the same seller does not stop the session another task has open
+/// there (as it does its own task's, to take over its balance): film's session goes on, and its next call
+/// is served by it, with nothing taken over.
+#[test]
+fn a_call_of_another_task_at_another_address_leaves_the_open_session_alone() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"ticket_msat": 1_000_000, "settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}, "alias": true}));
+    let a = r.pay("/page/10", 2_000);
+    assert_eq!(a["status"].as_u64(), Some(200), "{a}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    let b = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10").replace("127.0.0.1", "localhost"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!(b["status"].as_u64(), Some(200), "{b}");
+    assert_ne!(b["session"], a["session"]);
+    assert!(b.get("stopped").is_none(), "{b}");
+    let c = r.pay("/page/10", 2_000);
+    assert_eq!((c["status"].as_u64(), &c["session"]), (Some(200), &a["session"]), "film's session is still open: {c}");
+    assert!(r.audit("ticket_resumed").is_empty(), "nothing taken over: {:?}", r.audit("ticket_resumed"));
+}
+
+/// The guard against buying a ticket beside a prepaid one still pending holds that ticket's credit for its own
+/// task: another task can never take it over, so its call is not held back waiting for it, and buys its own.
+#[test]
+fn a_call_of_another_task_is_not_held_back_by_a_pending_prepaid_ticket_it_cannot_take() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true}, "alias": true}));
+    r.ln.st.lock().unwrap().held_back = true;
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    r.ln.st.lock().unwrap().held_back = false;
+    let other = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10").replace("127.0.0.1", "localhost"), "max_sats": CALL, "task": "swarm"}));
+    assert_eq!((other["status"].as_u64(), other["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{other}");
+    // (film's own call there is still held back for it: a_call_to_a_second_address_of_the_seller_buys_nothing_beside_a_pending_prepaid_ticket)
+}
+
+/// Every entry point of the wallet's socket that names a rental task, or one of its sessions, is refused: a
+/// session opened under it (`ticket_open`), and an offer, a lock or a release in a session the renter opened.
+/// The renter's socket stops a session by its id only, never a seller's every session.
+#[test]
+fn the_wallets_socket_opens_offers_locks_and_releases_nothing_of_a_rental() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let o = r.call("ticket_open", json!({"task": "hashrate", "terms": {}}));
+    assert_eq!(o["rule"].as_str(), Some("ticket_rental_payer"), "{o}");
+    // a rental session the renter opened
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 2, Some(100_000));
+    for n in 1..=4 {
+        t.share(n as f64 * 9.0).unwrap();
+    }
+    let st = r.status();
+    let sid = st["sessions"].as_array().and_then(|a| a.iter().find(|s| s["task"] == "hashrate" && s["state"] == "open")).map(|s| s["session"].clone())
+        .or_else(|| st["paying"].as_array().and_then(|a| a.first()).map(|p| p["session"].clone())).unwrap_or(Value::Null);
+    assert!(sid.is_string(), "{st}");
+    let booked = r.ledger_sum();
+    for m in ["ticket_offer", "ticket_lock", "ticket_release"] {
+        let v = r.call(m, json!({"session": sid, "tickets": [], "count": 1}));
+        assert_eq!(v["rule"].as_str(), Some("ticket_rental_payer"), "{m}: {v}");
+    }
+    assert_eq!(r.ledger_sum(), booked, "nothing more booked");
+    let e = xbt_hashlink::rail::signer_call(&t.payer.sock, "ticket_stop", &json!({"seller": r.shop.url("/")})).unwrap();
+    assert_eq!(e["rule"].as_str(), Some("ticket_rental_route"), "{e}");
+}
+
+/// A call on the wallet's socket that names no task, where the rental task is the owner's only one (to which
+/// it resolves), is refused like one that names it.
+#[test]
+fn a_call_naming_no_task_that_resolves_to_the_rental_task_is_refused() {
+    let _g = env_lock();
+    let mut pol = mainnet_starter(starter_rental());
+    pol["tickets"]["tasks"].as_object_mut().unwrap().remove("default");
+    let r = Rig::shipped(pol, 30, app_shop(MARKET_MSAT));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/hashrate/r1/0"), "method": "POST", "body": "{}", "max_sats": 2_000}));
+    assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("ticket_rental_payer"), 0), "{v}");
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0));
 }

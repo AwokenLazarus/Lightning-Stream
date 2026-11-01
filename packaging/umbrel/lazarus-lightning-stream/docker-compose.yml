@@ -25,6 +25,16 @@
 # pages (23342, 23343) are reached by the UI only, with the token init makes in run/hashrate/. The
 # image has no published digest yet: it is the local tag scripts/oci_build.sh --load gives.
 #
+# Stream Gateway (DATUM-compatible): the renter's own gateway, the `datum` service, in the renter's
+# network namespace. Every rented job is masked with this gateway's key, and the renter checks each job on
+# the gateway's /xbt/job before a miner gets it. Stratum 127.0.0.1:23339 and the API 127.0.0.1:7152 are
+# on the renter's loopback only: no other container and nothing on the LAN reaches them, and no host port
+# is published. It talks to the node over RPC alone (no ZMQ: new blocks come from polling), with the
+# cookie init writes in run/datum from the node's RPC user and password. It stays idle until the UI's
+# Hashrate page ("Your gateway") writes run/datum/config.json (solo to the owner's address, or Lazarus),
+# which holds no secret. Found blocks are also kept in datum/submitblocks. The image has no published
+# digest yet: it is the local tag oci_build.sh --load gives (xbt-datum-gateway:0.1.0).
+#
 # Stream sockets live in run/signer/streams (B2_STREAM_DIR for the signer and the connector). The
 # connector runs as the signer's user, because the published signer image cannot gain a group until
 # it is rebuilt. It mounts that directory read-write and the rest of run/signer read-only, and it
@@ -91,7 +101,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,vpn
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,vpn,datum
       XBT_INIT_NODE_RPC_USER: ${APP_BITCOIN_RPC_USER:-${APP_XBT_KNOTS_RPC_USER}}
       XBT_INIT_NODE_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-${APP_XBT_KNOTS_RPC_PASS}}
       XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
@@ -133,6 +143,8 @@ services:
       - ${APP_DATA_DIR}/data/signer:/data/signer
       - ${APP_DATA_DIR}/data/run/shops:/data/run/shops:ro
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer
+      # the hashrate renter's own socket: the one way to the "hashrate" task's rental terms
+      - ${APP_DATA_DIR}/data/run/rental:/data/run/rental
       - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor:ro
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro
       - ${APP_DATA_DIR}/data/run/enroll:/data/run/enroll
@@ -205,6 +217,9 @@ services:
       XBT_UI_HASHER_TOKEN_FILE: /data/run/hashrate/control-token
       XBT_UI_HASHRENT: http://lazarus-lightning-stream_renter_1:23343
       XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
+      # Hashrate → Your gateway: the node the Stream Gateway reaches, written into run/datum/config.json
+      # (the same node the signer uses; its RPC cookie is init's, never in the config)
+      XBT_UI_DATUM_RPCURL: http://${APP_BITCOIN_NODE_IP:-${APP_XBT_KNOTS_NODE_HOST}}:${APP_BITCOIN_RPC_PORT:-${APP_XBT_KNOTS_RPC_PORT}}
       # no XBT_UI_PLATFORM_LOGIN: umbrelOS 2.0 runs no app-proxy container (umbreld proxies the port
       # itself, after its own login), so that name is free for any other app to take on this network.
       # The app password is Umbrel's deterministic one, shown on the app's page in the dashboard
@@ -252,6 +267,8 @@ services:
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
       # the Hashrate page writes the hasher's settings here; the control token is here too
       - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate
+      # the Hashrate page writes the Stream Gateway's config here
+      - ${APP_DATA_DIR}/data/run/datum:/data/run/datum
       - ${APP_DATA_DIR}/data/run/shops:/data/run/shops
       - ${APP_DATA_DIR}/data/run/enroll:/data/run/enroll:ro
       - *lightning-cert
@@ -398,14 +415,46 @@ services:
         condition: service_started
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "0.0.0.0:23343",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
-              "--upstream", "auto", "--datum-candidates", "datum_web_1:23334,datum-gateway_web_1:23334",
+              "--upstream", "auto", "--datum-candidates", "127.0.0.1:23339,datum_web_1:23334,datum-gateway_web_1:23334",
               "--user", "rented", "--relays", "wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
-              "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
+              "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:
       - ${APP_DATA_DIR}/data/hashrate:/data/hashrate
       - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate:ro
-      # the signer's socket, read-only: the renter pays each piece of work through it
-      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the signer's socket for the renter alone, read-only: the renter pays each piece of work through it,
+      # and no other service reaches it (the "hashrate" task's rental terms are paid on it only)
+      - ${APP_DATA_DIR}/data/run/rental:/data/run/rental:ro
+
+  # The Stream Gateway (DATUM-compatible), first of the renter's candidates. It shares the renter's network
+  # namespace, so its stratum (127.0.0.1:23339) and its API (127.0.0.1:7152: /xbt/job opens each job for
+  # the renter's check) are the renter's loopback. Never --allow-unblinded: a job it can't show masked is
+  # refused. It starts once the Hashrate page writes run/datum/config.json, and again when that or the
+  # cookie changes; until then it waits, and that is healthy. --peer: a restarted renter gets a new
+  # namespace and would leave this one in the old one, so xbt-supervise looks at the renter's control port
+  # on loopback and exits when it stops answering; restart: on-failure then starts it in the renter's new one.
+  datum:
+    <<: *service
+    image: xbt-datum-gateway:0.1.0
+    network_mode: "service:renter"
+    stop_grace_period: 20s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      renter:
+        condition: service_started
+    entrypoint: ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie",
+                 "--peer", "127.0.0.1:23343", "--", "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
+    healthcheck:
+      test: ["CMD", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:7152/", "--waiting-for", "/data/run/datum/config.json"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    volumes:
+      # its found blocks (submitblocks) and anything else it keeps
+      - ${APP_DATA_DIR}/data/datum:/data/datum
+      # its config (the UI's) and the node's RPC cookie (init's), read-only
+      - ${APP_DATA_DIR}/data/run/datum:/data/run/datum:ro
 
   # The VPN service: the WireGuard endpoint the owner's devices pair with on the LAN (UDP 51830; 51820
   # is left to WireGuard apps), and this box's exit if the owner offers one on the VPN page. Userspace

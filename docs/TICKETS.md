@@ -57,6 +57,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
            "ticketMsat": "1000000", "maxTickets": 2, "ticketBlocks": 40,
            "release": "with-request", "settle": "on-use",
            "receiptKey": "<33-byte public key>", "session": "/x402/ticket", "seqWindow": 64,
+           "refillWaitMs": 15000,
            "price": {"requestMsat": "2500", "byteMsat": "0", "perBytes": "1", "secondMsat": "0"}}}
 ```
 
@@ -75,6 +76,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 | `settle` | `on-use`: tickets are held until used. `on-arrival`: section 5. | Whether a ticket can be had back. |
 | `receiptKey` | The key that signs the seller's receipts. | With tickets the payment preimage proves nothing: the buyer always knew it. The signed receipt is the proof of what was paid for. |
 | `session` | Path of the session endpoints on the seller's origin. | |
+| `refillWaitMs` | Optional (from 0.2.0). How long, in milliseconds, the seller keeps an answer paused for a release before it ends it (the gateway's `times.refill_wait_ms`, 15000 as shipped). A whole number, or one as a decimal string as the msat fields are. Absent: not stated, as by a seller before 0.2.0; a buyer takes any other value as not stated. | A secret released after the seller has ended the answer pays for nothing. A buyer ends its pause for such an answer a margin before then (this wallet: a tenth of it for the way, at least 1 s and at most 3 s), or at its own limit if that comes first; without the field it pauses by its own limit alone. The field can only shorten a buyer's pause, never lengthen it: a seller that states too little gives up its own sales, and a relay that strips it leaves the buyer as before. Like every other term it is as sure as the TLS the 402 came over: nothing signs the terms, and a relay that could rewrite this could rewrite `payTo`. |
 | `heldAfterPaid` | Optional, on an `on-use` entry: `true` when the seller issues held tickets only to a session that has paid a prepaid ticket (section 2, `prepaid_first`). Absent: no such rule is stated. | A buyer that knows the rule buys its prepaid ticket first, instead of offering hashes the seller would refuse. A buyer that does not read it is still told `prepaid_first` and recovers. |
 | `offer` | Optional, on an `on-arrival` entry: a BOLT 12 offer of the seller's node, with no amount, by which its prepaid tickets can be paid (section 15). Never on an `on-use` entry. | A buyer that pays by offer asks for no invoice over HTTP. One that does not read the field buys its prepaid tickets with `lock` as before. |
 
@@ -1128,9 +1130,9 @@ win waits for the lapse. The wallet asks the same where it held a win back for l
 invoice (below), which it never sent. Before any payment of the rail the wallet waits for an
 inactive channel, at most 8 s from when it first saw it out, and before a win or a prepaid ticket is
 sent it asks its node for a route to the seller (QueryRoutes, which needs `info:read`; nothing is
-sent) and waits for one within what is left of those 8 s. An invoice with route hints or blinded paths
-(the node's decode shows them) is not asked about: the query is not given them and finds no path to a
-seller behind a private channel, so such an invoice is sent at once. One payment to a seller waits at a
+sent) and waits for one up to 8 s, counted from after its node's checks of the channel and the invoice. The query
+is given the invoice's route hints (as the node's decode shows them), so a seller behind a private channel is found
+as the payment finds it; an invoice with blinded paths, which the query is not given, is not asked about and is sent at once. One payment to a seller waits at a
 time, in one window for all of them: the others are refused at once (`ln_no_route`, and not counted), and
 a win whose wait ran the whole window three times ends the call with that reason, the win owed for a
 later call. A node that cannot answer the
@@ -1140,7 +1142,11 @@ and at most half its life) is not sent, and one that ran out while the win waite
 not count against the seller, up to 4 for a win and 32 for a session; past that the session ends
 (`lottery_invoices_lapse`). One that came with less than 5 s left counts as a bad invoice. The
 win's next invoice goes before the wins no seller waits for, and a call waits for it where it is due
-within 10 s, or within what the wallet's margin holds back and 5 s more. A win's invoice lives as long as the seller's grace
+within 10 s, or within what the wallet's margin holds back and 5 s more. A wallet from 0.2.0 says at the open that it
+asks for a failed win's invoice to be cancelled (`canCancel: true`), and a gateway from 0.2.0 gives such a session
+invoices of `invoice_secs_cancel` (180 s as shipped), longer than the grace: a win waiting its turn behind many others'
+does not see its invoice lapse, and a failed one's next invoice comes at once on the cancel. For a buyer that says
+nothing, a win's invoice lives as long as the seller's grace
 (`graceSeconds`, 60 s at the gateway, 30 s before 0.1.20; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`
@@ -1648,6 +1654,20 @@ whose rules don't say so pays a rental like any other task. On mainnet the start
 hashrate task: a budget of 200,000 sat, tickets of at most 10,000 sat, and 600 sends an hour. A 4 TH/s
 miner at market price runs well inside them (its step is about 1,400 sat); a miner fast enough that its
 step would pass 10,000 sat pays in tickets of 10,000, about 414 an hour at 100 TH/s.
+
+A task's name is any caller's to give (`task` in `xbt402_pay`, a free string in the MCP tool), so the
+name grants nothing (`crates/xbt-signer/src/renter.rs`). A rental task's terms are paid only on the
+signer's socket for the hashrate renter (`B2_RENTAL_SOCK`, `run/rental/signer.sock`), whose dir the
+renter's group reaches and the MCP's does not, and only for a rental's pieces of work (`POST <pay
+url>/hashrate/<rental>/<slice>`). On the wallet's socket a call that names a rental task is refused
+(`ticket_rental_payer`) before anything is asked of the seller, as are `ticket_open`, `ticket_offer`,
+`ticket_lock` and `ticket_release` on such a task's session; the renter's socket answers only
+`xbt402_pay`, `ticket_stop` and `health`, and refuses any other route (`ticket_rental_route`). The
+route check is a shape check, not a payee check: it holds the renter to a rental's request shape, and
+which seller is paid, at what price, is still the seller's terms against the offer's price ceiling and
+the task's own limits. The
+socket grants nothing by itself: under a task without rental terms (an older wallet's) a rental's
+pieces of work are paid there under the wallet's own limits, as on the wallet's socket.
 
 The owner's limits are never raised by either one. The task's budget, the cap per seller and the
 caps on locked funds count what leaves the wallet, so a ticket bought for a small call counts in

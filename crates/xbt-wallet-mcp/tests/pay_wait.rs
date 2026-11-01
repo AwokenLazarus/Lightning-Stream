@@ -16,6 +16,9 @@ enum Answer {
     After(Duration),
     /// the request is read, then the connection is closed with no answer
     Never,
+    /// a paying call is read and held, its connection open, for good (a signer stuck, or stopped); any other call is
+    /// answered at once
+    Stuck,
 }
 
 /// A signer that answers every call as `answer` says.
@@ -36,6 +39,13 @@ fn signer(dir: &Path, answer: Answer) -> PathBuf {
                         let _ = c.write_all(format!("{}\n", json!({"id": 1, "result": result})).as_bytes());
                     }
                     Answer::Never => drop(c),
+                    Answer::Stuck if matches!(req["method"].as_str(), Some("xbt402_pay" | "ln_pay")) => loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    },
+                    Answer::Stuck => {
+                        let result = json!({"verdict": "allow", "method": req["method"]});
+                        let _ = c.write_all(format!("{}\n", json!({"id": 1, "result": result})).as_bytes());
+                    }
                 }
             });
         }
@@ -102,4 +112,45 @@ fn a_paying_call_that_never_reached_the_signer_is_an_error_and_nothing_else() {
     let w = wallet(dir.path().join("no-signer.sock"));
     let e = w.call_tool("xbt402_pay", pay_args()).unwrap_err();
     assert!(e.starts_with("signer socket "), "{e}");
+}
+
+#[test]
+fn a_paying_call_on_a_signer_that_never_answers_ends_at_the_ceiling_as_an_answer_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = wallet(signer(dir.path(), Answer::Stuck));
+    w.pay_ceiling = Duration::from_secs(2);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(w.call_tool("xbt402_pay", pay_args()));
+    });
+    // with no ceiling it would wait for good: here it is given 10 s
+    let v: Value = serde_json::from_str(&rx.recv_timeout(Duration::from_secs(10)).expect("the call ended at its ceiling").unwrap()).unwrap();
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["request_sent"].as_bool()), (Some("unknown"), Some("signer_no_answer"), Some(true)), "{v}");
+}
+
+#[test]
+fn with_every_paying_call_held_by_a_stuck_signer_a_ticket_stop_is_still_served() {
+    use xbt_wallet_mcp::mcp::{Server, PAYING_MOST};
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = wallet(signer(dir.path(), Answer::Stuck));
+    w.ticket_tools = true;
+    let server = std::sync::Arc::new(Server::new(std::sync::Arc::new(w)));
+    // as many paying calls as the HTTP transport has workers: the most are held, the rest refused at once
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..xbt_wallet_mcp::transport::HTTP_WORKERS {
+        let (server, tx) = (server.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(server.call_tool("xbt402_pay", &pay_args()));
+        });
+    }
+    let refused: Vec<Value> = (0..xbt_wallet_mcp::transport::HTTP_WORKERS - PAYING_MOST).map(|_| rx.recv_timeout(Duration::from_secs(10)).expect("refused at once")).collect();
+    assert!(refused.iter().all(|v| v["isError"] == true && v.to_string().contains("paying calls are in progress")), "{refused:?}");
+    // the places left are a stop's
+    let mut stop = Map::new();
+    stop.insert("session".into(), "s1".into());
+    let t0 = std::time::Instant::now();
+    let v = server.call_tool("ticket_stop", &stop);
+    assert_eq!(v["isError"], false, "{v}");
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    assert!(rx.try_recv().is_err(), "the paying calls are still held");
 }

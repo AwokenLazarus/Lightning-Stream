@@ -117,8 +117,11 @@ const QUERIES_KEPT: usize = 2_000;
 /// the owner's `tickets.max_sellers` and each seller's unpaid wins bound the number; each leaves
 /// within what the Lightning rail's `timeout_s` bounds.
 ///
-/// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
-/// that no seller's win waits behind a later one's until that seller's grace has run out. Before
+/// In order of when they are due: with a hundred sellers' wins waiting, the one whose seller's grace ends
+/// first goes first (a prepaid ticket by its invoice's end, a lock round of held tickets as if its seller
+/// gave it 60 s, [`UNTIMED_DUE_S`]), so that no seller's win waits behind one whose seller can wait longer,
+/// and a win whose first invoice came to nothing goes by when it was first won, not by when its next invoice
+/// came. Of two due at once, the one that came first. Before
 /// them all, in their own order of arrival, go the wins a seller's answer stands still for
 /// ([`Pace::hurry`]): a seller waits its grace (60 s as shipped) for a win it serves on beside, and 15 s (`refill_wait`)
 /// for one it has stopped for, so the second cannot wait behind a hundred of the first.
@@ -170,7 +173,13 @@ struct Waiter {
     win: Option<(String, u64)>,
     /// It goes before every waiter that is not `first`.
     first: bool,
+    /// By when it must be paid, in Unix seconds: the earliest goes first among its kind ([`Pace::enter_for`]).
+    due: f64,
 }
+
+/// The time a payment no seller's clock is on (a lock round of held tickets) is taken to have, from when it
+/// comes to the gate: a seller's grace as shipped. It orders that payment among those whose sellers' clocks run.
+const UNTIMED_DUE_S: f64 = 60.0;
 
 /// How many hurried wins go one after another before a payment that is not hurried, through the gate
 /// and at the spend lock, before that payment goes all the same. A seller's hurried wins are few, but
@@ -184,8 +193,8 @@ impl PaceState {
     /// Whose turn it is: the earliest of those that go first, or else the earliest. After
     /// [`FIRST_IN_A_ROW`] of the first, the earliest of the others.
     fn turn(&self) -> Option<u64> {
-        let first = self.waiting.iter().find(|w| w.first);
-        let plain = self.waiting.iter().find(|w| !w.first);
+        let soonest = |first: bool| self.waiting.iter().filter(|w| w.first == first).min_by(|a, b| a.due.total_cmp(&b.due).then(a.n.cmp(&b.n)));
+        let (first, plain) = (soonest(true), soonest(false));
         match (first, plain) {
             (Some(_), Some(p)) if self.first_in_row >= FIRST_IN_A_ROW => Some(p.n),
             (Some(f), _) => Some(f.n),
@@ -205,7 +214,7 @@ pub struct SpendTurn<'a>(&'a Pace);
 
 impl Pace {
     pub fn enter(&self) -> PaceGuard<'_> {
-        self.enter_for(None, false)
+        self.enter_for(None, false, None)
     }
 
     /// Enter to pay the win of `win` (the book's session and the draw), or a ticket (None).
@@ -276,11 +285,16 @@ impl Pace {
         (2.0 * longest).min(life / 2.0).max(ticket::PREPAID_EXPIRY_MARGIN_S)
     }
 
-    pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool) -> PaceGuard<'_> {
+    /// `due`: by when, on the wallet's clock, it must be paid (the seller's: the end of a win's grace, the end of an
+    /// invoice's life; a payment no seller's clock is on is given [`UNTIMED_DUE_S`] from when it comes). Among those
+    /// that go first, and among the others, the earliest due goes first, and of two due at once the one that came
+    /// first. None: after every one with a due, in order of arrival.
+    pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool, due: Option<f64>) -> PaceGuard<'_> {
+        let due = due.filter(|d| d.is_finite()).unwrap_or(f64::INFINITY);
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mine = s.next;
         s.next += 1;
-        s.waiting.push(Waiter { n: mine, win: win.map(|(session, draw)| (session.to_string(), draw)), first });
+        s.waiting.push(Waiter { n: mine, win: win.map(|(session, draw)| (session.to_string(), draw)), first, due });
         while s.inside >= SEND_PARALLEL || s.turn() != Some(mine) {
             s = self.left.wait(s).unwrap_or_else(|p| p.into_inner());
         }
@@ -896,7 +910,7 @@ impl Signer {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             self.ticket_seed(&st.book)?;
-            if let Some(s) = st.book.open_with(&terms.payee) {
+            if let Some(s) = st.book.open_with(&terms.payee, &task_name) {
                 return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first, or call again when it ends"), json!({"session": s.id, "retry_after_s": SESSION_EXISTS_RETRY_S})));
             }
             if st.book.open_sessions(None) as i64 >= tp.max_sellers {
@@ -1189,10 +1203,11 @@ impl Signer {
         let mut outcomes: Vec<Result<Value>> = vec![];
         for chunk in sends.chunks(SEND_PARALLEL) {
             outcomes.extend(std::thread::scope(|sc| {
+                let due = self.engine.now() + UNTIMED_DUE_S;
                 let hs: Vec<_> = chunk.iter().map(|(_, r)| {
                     let (ln, pace) = (&ln, &self.ticket_pace);
                     sc.spawn(move || {
-                        let _inside = pace.enter();
+                        let _inside = pace.enter_for(None, false, Some(due));
                         ln.send_held(r)
                     })
                 }).collect();
@@ -1789,7 +1804,7 @@ impl Signer {
     /// `ticket_msat`, where given: the size asked of the seller for this ticket ([`Signer::ticket_prepaid_size`]).
     pub(crate) fn ticket_prepay(&self, p: &Value) -> Value {
         let msat = crate::ticket::outside_u64(p.get("ticket_msat"));
-        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None, false, msat)
+        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None, false, msat, None)
     }
 
     /// Pay one win of a session that pays by draws: the seller's invoice for it, checked, booked
@@ -1802,11 +1817,13 @@ impl Signer {
     /// the wins no seller waits for ([`Pace`]).
     /// `by`: the seller's offer, where its terms name one; the win is paid by it first, and by
     /// `invoice` where the offer cannot be fetched ([`Signer::ticket_pay_by_offer`]).
-    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool, by: Option<&OfferWay<'_>>) -> Value {
-        if let Some(v) = by.and_then(|b| self.ticket_pay_by_offer(sid, b, Some(win), first, None)) {
+    /// `due`: when the seller's grace for the win ends, on the wallet's clock: the gate pays the win before those
+    /// due later ([`Pace::enter_for`]).
+    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool, by: Option<&OfferWay<'_>>, due: Option<f64>) -> Value {
+        if let Some(v) = by.and_then(|b| self.ticket_pay_by_offer(sid, b, Some(win), first, None, due)) {
             return v;
         }
-        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first, None)
+        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first, None, due)
     }
 
     /// Pay a prepaid ticket (`win` None) or a win by the seller's BOLT 12 offer
@@ -1825,7 +1842,8 @@ impl Signer {
     /// gives it, with `by_offer`; a refusal by the book's rules is final, since the invoice would
     /// meet the same rules.
     /// `msat`: the size of a prepaid ticket asked for, where it is not the seller's own.
-    pub(crate) fn ticket_pay_by_offer(&self, sid: &str, by: &OfferWay<'_>, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>) -> Option<Value> {
+    pub(crate) fn ticket_pay_by_offer(&self, sid: &str, by: &OfferWay<'_>, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>,
+                                      due: Option<f64>) -> Option<Value> {
         if self.ticket_shut().is_some() {
             return None;
         }
@@ -1868,7 +1886,8 @@ impl Signer {
         let purpose = win.map_or(xbt402::offer::Purpose::Ticket, |w| xbt402::offer::Purpose::Win(w.draw()));
         let note = xbt402::offer::note(by.key, by.seller_session, purpose, amount, &random_bytes::<16>());
         // through the gate, as every ordinary payment of the rail, from its checks to its end
-        let inside = self.ticket_pace.enter_for(win.map(|w| (sid, w.draw())), first);
+        let due = due.unwrap_or_else(|| self.engine.now() + UNTIMED_DUE_S);
+        let inside = self.ticket_pace.enter_for(win.map(|w| (sid, w.draw())), first, Some(due));
         if self.ln_node_checks(&*ln, &lp, &dest, "").is_err() {
             return passed("ln_node", "the wallet's Lightning node failed its checks".into());
         }
@@ -1938,7 +1957,9 @@ impl Signer {
 
     /// An ordinary payment of a session, booked before it is sent: a prepaid ticket (`win` None),
     /// or the win of a draw.
-    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>) -> Value {
+    #[allow(clippy::too_many_arguments)]
+    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>,
+                           due: Option<f64>) -> Value {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
@@ -1970,11 +1991,13 @@ impl Signer {
         // no answer from the chain node for 3 of 309 (seen on the lab). And such a payment is pending on the wallet's
         // channel until it has settled, so the gate is also what keeps at most 8 of them there. (Leaving when the
         // send returned, as a held ticket does, let 24 wins be pending on a 30-slot channel, and 47 of 313 failed.)
-        let inside = self.ticket_pace.enter_for(win.map(|w| (sid.as_str(), w.draw())), first);
+        // in the gate's order by when the seller needs it: the end of the win's grace, or of the invoice's life
+        let expires = crate::bolt11::decode(&invoice).ok().map(|i| i.expires_at() as f64);
+        let due = [due, expires].into_iter().flatten().reduce(f64::min).unwrap_or_else(|| self.engine.now() + UNTIMED_DUE_S);
+        let inside = self.ticket_pace.enter_for(win.map(|w| (sid.as_str(), w.draw())), first, Some(due));
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
-        let checks_from = Instant::now();
         let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, &sid) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
@@ -2004,29 +2027,42 @@ impl Signer {
         if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, msat, &tp_now, now) {
             return refuse(&hash, rule, why);
         }
-        if win.is_some() {
-            let (left, margin) = (inv.expires_at() as f64 - now, self.ticket_pace.send_margin(inv.expiry_s as f64));
-            if left < margin {
-                return with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it would have ended first (held to {margin:.0} s)")),
-                            json!({"hash": hash, "unsent": true}));
+        // a win whose invoice would end before its payment could arrive is held back, never sent: asked here, and again
+        // just before it is booked and sent, after every wait between (the route's, the spend lock's), in which an
+        // invoice near its end can pass its margin
+        // a prepaid ticket (no win) is held to the 5 s every prepaid invoice must have left, asked again after the waits too
+        let too_late = |now: f64| -> Option<Value> {
+            let left = inv.expires_at() as f64 - now;
+            if win.is_none() {
+                return (left < ticket::PREPAID_EXPIRY_MARGIN_S).then(|| with(refuse(&hash, "ticket_expiry", "the invoice has expired, or does within 5 s".into()),
+                                                                             json!({"hash": hash, "unsent": true})));
             }
+            let margin = self.ticket_pace.send_margin(inv.expiry_s as f64);
+            (left < margin).then(|| with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it \
+                                                                                 would have ended first (held to {margin:.0} s)")),
+                                         json!({"hash": hash, "unsent": true})))
+        };
+        if let Some(d) = too_late(now) {
+            return d;
         }
-        let hinted = match ln.decode(&invoice) {
+        let (hints, blinded) = match ln.decode(&invoice) {
             Ok(d) => {
                 if let Err(why) = cross_check(&inv, &d) {
                     return refuse(&hash, "ln_decode_mismatch", why);
                 }
-                inv.route_hints > 0 || has_hidden_way(&d)
+                (d.get("route_hints").and_then(Value::as_array).cloned().unwrap_or_default(), has_blinded_paths(&d))
             }
             Err(e) => return node_said(refuse(&hash, "ln_backend", e.msg.clone()), &e),
         };
         // a route to the seller, as the node would look for one when it pays: one moment after a link along the way
         // was replaced the node finds none for some seconds (up to 10 s seen on the lab), and a payment sent then fails
-        // at once. It is waited for, within what is left of the channel wait's 8 s. Only over the public graph: a
-        // seller reached by its invoice's route hints or blinded paths (a private channel, an LSP) is one the node's
-        // route query, which is not given them, never finds, and its invoice is sent as it always was
-        if !hinted {
-            if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, checks_from) {
+        // at once. It is waited for up to 8 s, counted from after the node's checks. The query is given the invoice's
+        // route hints, so a seller reached through a private channel (an LSP's, say) is found as the payment finds it.
+        // Not for blinded paths, which the query is not given: such an invoice is sent as it always was
+        if !blinded {
+            // the wait's 8 s are counted from here, after the node's checks of the channel and the invoice: on a slow box
+            // (a small computer under load) those took seconds, and were taken out of the wait
+            if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &hints, &sid, Instant::now()) {
                 return with(refuse(&hash, "ln_no_route", why), json!({"route_ran_out": ran_out}));
             }
         }
@@ -2034,6 +2070,9 @@ impl Signer {
         let booked = {
             let _turn = inside.spend_turn();
             let _g = self.lock();
+            if let Some(d) = too_late(self.engine.now()) {
+                return d;
+            }
             self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win, msat)
                 .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
         };
@@ -2058,11 +2097,12 @@ impl Signer {
     #[allow(clippy::too_many_arguments)]
     /// `Err((why, ran_out))`: `ran_out` where the seller has been without a route for the whole window, not
     /// where this payment only stood back for another to the same seller.
-    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), (String, bool)> {
+    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, hints: &[Value], sid: &str, from: Instant)
+                     -> std::result::Result<(), (String, bool)> {
         let chan = (ids.len() == 1).then(|| ids[0].as_str());
         let ask = || {
             let asked = Instant::now();
-            let found = ln.has_route(payee, msat, chan, final_cltv);
+            let found = ln.has_route(payee, msat, chan, final_cltv, hints);
             self.ticket_pace.queried(asked.elapsed());
             // a node that cannot answer the question is no reason to hold the payment
             !matches!(found, Ok(false))
@@ -2734,7 +2774,9 @@ impl Signer {
     /// One whose receipt key on record is another's is another shop on the same node, and is passed over.
     /// One with no key on record (killed before its first signed receipt, or from before 0.1.20) has
     /// nothing to know its seller by but where it was opened: only a call to that `origin` may take it.
-    pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, origin: &str, sid: &str) -> Vec<Resumable> {
+    /// And one any session of another `task` used is passed over: its credit was bought under that
+    /// task's budget, and stays with that task (it waits for a session of it, or lapses).
+    pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, origin: &str, task: &str, sid: &str) -> Vec<Resumable> {
         let now = self.engine.now();
         let Ok(g) = self.ticket_store() else { return vec![] };
         let Some(st) = g.as_ref() else { return vec![] };
@@ -2751,11 +2793,13 @@ impl Signer {
             }
             let group: Vec<&Session> = st.book.sessions.values().filter(|o| o.http.as_ref().is_some_and(|h| h.id == http.id)).collect();
             let on_record = group.iter().filter_map(|o| o.http.as_ref()).map(|h| h.receipt_key.as_str()).find(|k| !k.is_empty()).unwrap_or("").to_string();
-            // another shop on the same node; one a session still has open; and one given up, or stopped for what the seller
+            // another shop on the same node; credit another task bought (booked to that task's budget, so not this one's
+            // to spend); one a session still has open; and one given up, or stopped for what the seller
             // did (a fault, terms that changed under it): nothing more is released to a seller in such a session, and its
             // balance is not spent either
             if (!on_record.is_empty() && on_record != receipt_key)
                 || (on_record.is_empty() && !group.iter().any(|o| o.origin == origin))
+                || group.iter().any(|o| o.task != task)
                 || group.iter().any(|o| o.state == SState::Open || o.why.contains(CREDIT_GIVEN_UP) || o.why.starts_with("seller fault") || o.why.contains("terms changed")) {
                 continue;
             }
@@ -3056,14 +3100,14 @@ impl Signer {
         self.ticket_store().map_or(true, |g| g.as_ref().is_none_or(|st| st.book.win_payment(sid, draw).is_some()))
     }
 
-    /// Whether the open session with this seller at `origin`, if there is one, pays by draws.
-    pub(crate) fn ticket_open_kind(&self, payee: &str, origin: &str) -> Option<bool> {
+    /// Whether the open session with this seller at `origin` under `task`, if there is one, pays by draws.
+    pub(crate) fn ticket_open_kind(&self, payee: &str, origin: &str, task: &str) -> Option<bool> {
         let g = self.ticket_store().ok()?;
         let book = &g.as_ref()?.book;
-        if book.draws_open_with(payee, origin).is_some() {
+        if book.draws_open_with(payee, origin, task).is_some() {
             return Some(true);
         }
-        book.open_with(payee).map(|_| false)
+        book.open_with(payee, task).map(|_| false)
     }
 
     /// Whether the wallet's node has an active channel of its own to `payee`: a win paid over it
@@ -3122,7 +3166,7 @@ impl Signer {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             self.ticket_seed(&st.book)?;
-            if let Some(s) = st.book.draws_open_with(&terms.payee, &origin) {
+            if let Some(s) = st.book.draws_open_with(&terms.payee, &origin, &task_name) {
                 return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first, or call again when it ends"), json!({"session": s.id, "retry_after_s": SESSION_EXISTS_RETRY_S})));
             }
             if st.book.open_sessions(None) as i64 >= tp.max_sellers {
@@ -3332,10 +3376,9 @@ fn fitting_msat(lp: &LnPolicy, lo_msat: u64, hi_msat: u64, left: i64) -> Option<
     Some(lo * 1000)
 }
 
-/// Whether the node's decode of an invoice names ways to its payee the public graph does not have: route
-/// hints (a private channel) or blinded paths.
-fn has_hidden_way(decoded: &Value) -> bool {
-    ["route_hints", "blinded_paths"].iter().any(|k| decoded.get(*k).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+/// Whether the node's decode of an invoice names blinded paths to its payee, which the node's route query is not given.
+fn has_blinded_paths(decoded: &Value) -> bool {
+    decoded.get("blinded_paths").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
 }
 
 #[cfg(test)]
@@ -3345,11 +3388,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_invoice_with_route_hints_or_blinded_paths_has_a_way_the_graph_does_not() {
-        assert!(!has_hidden_way(&json!({"destination": "02"})));
-        assert!(!has_hidden_way(&json!({"route_hints": [], "blinded_paths": []})));
-        assert!(has_hidden_way(&json!({"route_hints": [{"hop_hints": [{"chan_id": "1"}]}]})));
-        assert!(has_hidden_way(&json!({"blinded_paths": [{"blinded_path": {}}]})));
+    fn an_invoice_with_blinded_paths_is_told_from_one_with_route_hints() {
+        assert!(!has_blinded_paths(&json!({"destination": "02"})));
+        assert!(!has_blinded_paths(&json!({"route_hints": [], "blinded_paths": []})));
+        assert!(!has_blinded_paths(&json!({"route_hints": [{"hop_hints": [{"chan_id": "1"}]}]})));
+        assert!(has_blinded_paths(&json!({"blinded_paths": [{"blinded_path": {}}]})));
     }
 
     #[test]
@@ -3382,8 +3425,8 @@ mod tests {
     fn a_hurried_win_inside_the_gate_has_the_next_turn_at_the_spend_lock() {
         let pace = Pace::default();
         let order = Mutex::new(vec![]);
-        let holder = pace.enter_for(Some(("s0", 1)), false);
-        let inside: Vec<PaceGuard<'_>> = (1..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("s", i)), false)).collect();
+        let holder = pace.enter_for(Some(("s0", 1)), false, None);
+        let inside: Vec<PaceGuard<'_>> = (1..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("s", i)), false, None)).collect();
         std::thread::scope(|sc| {
             // one has the turn; seven in the gate ask for one, and an eighth asks last
             let held = holder.spend_turn();
@@ -3419,6 +3462,35 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_lets_in_the_payment_due_soonest_and_of_two_due_at_once_the_first_that_came() {
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            let mut holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            let (pace, order) = (&pace, &order);
+            // they come in this order, due at these times; the hurried one goes before them all
+            let come = [("late", 300.0, false), ("soon", 100.0, false), ("soon too", 100.0, false), ("between", 200.0, false), ("hurried", 900.0, true)];
+            for (k, (name, due, first)) in come.into_iter().enumerate() {
+                sc.spawn(move || {
+                    let _inside = pace.enter_for(Some((name, 1)), first, Some(due));
+                    order.lock().unwrap().push(name);
+                });
+                while pace.waiting() < k as u64 + 1 {
+                    std::thread::yield_now();
+                }
+            }
+            // one place at a time
+            for left in (0..come.len()).rev() {
+                drop(holders.pop());
+                while pace.waiting() > left as u64 {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        assert_eq!(*order.lock().unwrap(), ["hurried", "soon", "soon too", "between", "late"]);
+    }
+
+    #[test]
     fn a_win_that_went_first_through_the_gate_goes_first_at_the_spend_lock() {
         let pace = Pace::default();
         let order = Mutex::new(vec![]);
@@ -3428,7 +3500,7 @@ mod tests {
             let held = pace.spend_turn();
             let (tx, rx) = std::sync::mpsc::channel();
             sc.spawn(move || {
-                let g = pace.enter_for(Some(("hurried", 9)), false);
+                let g = pace.enter_for(Some(("hurried", 9)), false, None);
                 tx.send(()).unwrap();
                 let _turn = g.spend_turn();
                 order.lock().unwrap().push("hurried");
@@ -3473,7 +3545,7 @@ mod tests {
                 sc.spawn(move || {
                     let mut i = 0;
                     while !done.load(Ordering::SeqCst) && i < 1_000 {
-                        let _inside = pace.enter_for(Some(("hurried", t * 10_000 + i)), true);
+                        let _inside = pace.enter_for(Some(("hurried", t * 10_000 + i)), true, None);
                         turns.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(1));
                         i += 1;
@@ -3491,7 +3563,7 @@ mod tests {
 
         // the spend lock: wins inside the gate, hurried, ask for turns without end; a payment past the gate waits
         let (done, turns) = (std::sync::atomic::AtomicBool::new(false), AtomicUsize::new(0));
-        let inside: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("hurried", i)), true)).collect();
+        let inside: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("hurried", i)), true, None)).collect();
         std::thread::scope(|sc| {
             let (pace, done, turns) = (&pace, &done, &turns);
             let held = pace.spend_turn();
@@ -3561,7 +3633,7 @@ mod tests {
             for i in 0..40u64 {
                 let (pace, order) = (&pace, &order);
                 sc.spawn(move || {
-                    let _inside = pace.enter_for(Some((&format!("s{i}"), 7)), false);
+                    let _inside = pace.enter_for(Some((&format!("s{i}"), 7)), false, None);
                     order.lock().unwrap().push(i);
                     std::thread::sleep(Duration::from_millis(2));
                 });
@@ -3576,7 +3648,7 @@ mod tests {
             // one that comes with its seller standing still already goes with them, behind those that came before it
             let (pace_, order_) = (&pace, &order);
             sc.spawn(move || {
-                let _inside = pace_.enter_for(Some(("late", 1)), true);
+                let _inside = pace_.enter_for(Some(("late", 1)), true, None);
                 order_.lock().unwrap().push(99);
             });
             while pace.waiting() < 41 {

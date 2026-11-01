@@ -12,7 +12,8 @@ ${APP_PASSWORD} is used.
 Compose: app_proxy's APP_HOST is `<app-id>_<service>_1` of a real service; every volume is under
 ${APP_DATA_DIR}; every agentpay image is a published one, ghcr.io/awokenlazarus/<image>:<version>-<commit>@sha256:<digest>,
 the very reference packaging/images.lock pins (the stand-in node's image is the one local image, amd64-only;
-lightning-stream:0.1.0 is the connector, which has no digest until it is published); every ${VAR} is provided by umbrelOS,
+lightning-stream:0.1.0 is the connector, and xbt-hashlink, xbt-vpn and xbt-datum-gateway likewise have no digest until
+they are published); every ${VAR} is provided by umbrelOS,
 this app's exports or a dependency's exports; a slot's variable (APP_BITCOIN_*, set by whichever node app the
 owner selects) is only used as `${APP_BITCOIN_X:-${FALLBACK}}` with a fallback this store's implementing app
 exports; `docker compose config` accepts the file with those values, and with the slot's values alone.
@@ -27,7 +28,7 @@ Shape: the compose file is read strictly (a key written twice is refused) and it
 (no extends, include, build, secrets, configs, env_file, hooks, ...); an entrypoint only where one is pinned; no
 `..` in a mount; ${NAME}, ${NAME:-} and a slot's ${SLOT:-${FALLBACK}} the only substitutions (no default); a name
 is a string; xbt-init is one service, init, mounting the data dir alone; a network namespace is joined only where
-pinned; the node-keys one-shots run no healthcheck, and the baker's environment is exactly its own. Every rule on what
+pinned (the Stream Gateway always in the renter's, with no port); the node-keys one-shots run no healthcheck, and the baker's environment is exactly its own. Every rule on what
 a container reaches is checked again on the model `docker compose config` resolves (no .env read), with the host's
 folders marked, in each environment lint resolves (this store's apps, and a slot's node alone), so that nothing
 written can hide a mount from it. Package: an app's folder holds its manifest, compose file, exports.sh, the icon and
@@ -68,9 +69,10 @@ REGISTRY = "ghcr.io/awokenlazarus"
 # the one image of this store that is not published: the stand-in XBT node (lazarus-xbt-knots), amd64-only, which
 # a box with Paul's Knots BLAKE2b Companion never installs
 LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
-# the connector, xbt-hashlink and xbt-vpn have no line in images.lock yet. oci_build.sh --load tags them
-# <image>:0.1.0. A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
-UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink|xbt-vpn):0\.1\.0$")
+# the connector, xbt-hashlink, xbt-vpn and the Stream Gateway have no line in images.lock yet. oci_build.sh
+# --load tags them <image>:0.1.0. A digest is not invented here. Anything else (a registry name, a made-up
+# digest) still fails.
+UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink|xbt-vpn|xbt-datum-gateway):0\.1\.0$")
 # Umbrel's shared Downloads (the Files app's Downloads), read-only, for the wallet's Files service only.
 # umbrelOS 1.x rewrites this compatibility path to ${UMBREL_ROOT}/home/Downloads; the app must declare
 # the STORAGE_DOWNLOADS permission (umbrel-apps .agents/skills/umbrel-package-app/SKILL.md).
@@ -90,26 +92,30 @@ AGENTPAY = {
     # run/enroll: the copy of the one-time enrolment code the signer writes for the setup page. run/shops,
     # read-only: the shops reached by key, for callers that hand it no transport document (the AI
     # address, agents)
-    "xbt-signer": ("signer", {"signer", "enroll"}, {"anchor", "ln", "shops"}),
+    # run/rental: the hashrate renter's own socket, which the signer serves
+    "xbt-signer": ("signer", {"signer", "enroll", "rental"}, {"anchor", "ln", "shops"}),
     "xbt-anchor-witness": ("witness", {"anchor"}, set()),
     # run/ui holds the UI-owned MCP token; the MCP may only read it. run/shops: the shops without a
     # web address the UI keeps, read by the connector and the MCP to hand to the signer
     "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui", "shops"}),
     # the setup pages write run/ln (the rail macaroon), run/gateway (the gateway's config and macaroons)
     # and run/hashrate (the hasher's settings); the AI page writes run/ai (keys, sellers)
-    # and run/vpn (the devices and exit the VPN pages set), reading the VPN service's status
-    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "shops", "ai", "vpn"}, {"signer", "enroll", "vpn-status"}),
+    # and run/vpn (the devices and exit the VPN pages set), reading the VPN service's status; and
+    # run/datum (the Stream Gateway's config, from the Hashrate page)
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "shops", "ai", "vpn", "datum"}, {"signer", "enroll", "vpn-status"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
     # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT. The AI
     # endpoint books the keys' spend and the sellers' health in run/ai, shared by group with the UI
     "lightning-stream": (None, {"ai"}, {"signer", "shops"}),
     # the hasher and the renter: their keys and state; the settings and token read-only; the renter
-    # also the signer's socket, read-only
-    "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),
+    # also its own socket of the signer's (run/rental), read-only, and not the wallet's
+    "xbt-hashlink": ("hashrate", set(), {"hashrate", "rental"}),
     # the VPN service: its keys and lists; the settings read-only; its status for the UI. Priced exits
     # are paid through the owner's wallet: the signer's socket and the shops read-only, and the stream
     # sockets are STREAM_MOUNT (each paid tunnel's socket is made there)
     "xbt-vpn": ("vpn", {"vpn-status"}, {"vpn", "signer", "shops"}),
+    # the Stream Gateway (DATUM-compatible): its found blocks; its config and the node's RPC cookie read-only
+    "xbt-datum-gateway": ("datum", set(), {"datum"}),
 }
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
@@ -155,14 +161,19 @@ RESOLVED_APP_PROXY_KEYS = {"image", "environment", "networks"}
 # an entrypoint replaces what the image runs: only these, exactly
 SIGNER_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--",
                      "/usr/bin/xbt-signer"]
+# the Stream Gateway: started once its config is written, again when that or the node's cookie changes, and
+# gone (to be restarted in the renter's namespace as it is then) when the renter's control port stops answering
+DATUM_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie",
+                    "--peer", "127.0.0.1:23343", "--", "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
 ENTRYPOINTS = {("lazarus-lightning-stream", "signer"): SIGNER_ENTRYPOINT, ("lazarus-xbt-agent-wallet", "signer"): SIGNER_ENTRYPOINT,
-               ("lazarus-xbt-knots", "node"): ["bitcoind"]}
+               ("lazarus-xbt-knots", "node"): ["bitcoind"], ("lazarus-lightning-stream", "datum"): DATUM_ENTRYPOINT}
 # the baker's whole environment, as written (nothing more reaches it: no env_file)
 NODE_KEYS_BAKE_ENV = {"XBT_KEYS_NODE_REST": "https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}",
                       "XBT_KEYS_TLS_CERT": "/node/tls.cert", "XBT_KEYS_ADMIN": "/node/data/chain", "XBT_KEYS_RAIL_DIR": "/data/run/ln",
                       "XBT_KEYS_GW_DIR": "/data/run/gateway", "XBT_KEYS_BAKE_TO": "/data/run/node-keys", "XBT_KEYS_RETRY_MAX_S": "30"}
-# the one network namespace a service may join: the connector shares the UI's (loopback only)
-NETNS = {("lazarus-lightning-stream", "connector"): "service:ui"}
+# the network namespaces a service may join: the connector shares the UI's, and the Stream Gateway the
+# renter's (loopback only: its stratum and its /xbt/job are the renter's alone)
+NETNS = {("lazarus-lightning-stream", "connector"): "service:ui", ("lazarus-lightning-stream", "datum"): "service:renter"}
 # xbt-init (root, CHOWN/FOWNER/DAC_OVERRIDE): one service, `init`, its own command, the data dir alone
 INIT_VOLUMES = ["${APP_DATA_DIR}/data:/data"]
 # a one-shot node-keys runs nothing else in its container: no healthcheck command
@@ -586,6 +597,12 @@ def main() -> int:
                 bad(f"{folder}/{name}: image {img!r} is not the one packaging/images.lock pins ({pins.get(pin['name'])!r})")
             node_keys = s.get("command") == ["node-keys"]
             base = pin["name"] if pin else img.split(":")[0]
+            # a UI that writes the shop's route for paid pieces of work (XBT_UI_HASHER_SLICES) asks the hashmaker
+            # (XBT_UI_HASHER) before it moves that route to a new price: with no hashmaker address the route would
+            # never follow, and a hashmaker whose gateway charges another price takes no rental
+            ui_env = env_of(s)
+            if str(ui_env.get("XBT_UI_HASHER_SLICES") or "").startswith("http://") and not str(ui_env.get("XBT_UI_HASHER") or "").startswith("http://"):
+                bad(f"{folder}/{name}: XBT_UI_HASHER_SLICES without an http:// XBT_UI_HASHER: the shop's route would never follow a new price")
             # the name alone is not the exception: the baker's checks below decide, before any other
             baker = name == NODE_KEYS_BAKE
             if s.get("cap_add") and (baker or base != "xbt-init"):
@@ -652,6 +669,11 @@ def main() -> int:
                     bad(f"{folder}/{name}: must wait for init (service_completed_successfully)")
                 if base == "lightning-stream" and s.get("ports"):
                     bad(f"{folder}/{name}: the connector is not published on the LAN")
+                if base == "xbt-datum-gateway":
+                    # its API opens every job (/xbt/job) and serves it to loopback only: on the app's network it
+                    # would be any container's to read, and on a host port the LAN's
+                    if s.get("ports") or s.get("network_mode") != "service:renter":
+                        bad(f"{folder}/{name}: the Stream Gateway publishes no port and runs in the renter's network namespace (service:renter)")
                 allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"} if comp else set()
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{r}:/data/run/{r}" for r in own_runs}
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{p}:/data/run/{p}:ro" for p in peers}

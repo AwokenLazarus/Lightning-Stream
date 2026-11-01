@@ -350,7 +350,15 @@ involved no node.
   for the next one. Until 0.1.20 the grace, and so a win's invoice, was 30 s: a buyer whose
   payment took longer than that to reach the seller (a hop held one 8 to 22 s on a loaded lab
   node) had every win refused, and was served nothing more. A seller that shortens the grace
-  shortens its invoices with it.
+  shortens its invoices with it. From 0.2.0 a wallet says at the open that it asks for a failed
+  win's invoice to be cancelled, and a gateway from 0.2.0 gives it invoices of 180 s
+  (`lottery.invoice_secs_cancel`), the grace being unchanged: a wallet before 0.2.0, or a
+  gateway before it, keeps invoices as long as the grace. After a gateway restarts, a session's
+  invoices are the grace's again (what the buyer said is not journalled).
+- A win is judged against the wallet's send margin when its invoice comes and again just before
+  it is sent, after the waits for a route and for the spend lock: one whose invoice would end on
+  its way is held back unsent and paid on the next invoice. On a loaded lab, before the second
+  look, one win went with 1.1 s left and failed at the seller's node.
 - A wallet that starts again pays no win it found before the start: it cannot tell a start from
   a restore of older records, in which that win may be paid already; the seller has lost the
   wins that were unpaid at that moment (at most the 2 it bears). A gateway that starts again
@@ -942,7 +950,10 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A release pauses for 12 s at most, all told, whatever it waits for (`tickets.ready_wait_ms`):
   under the 15 s a seller as shipped keeps a paused answer open, so that no secret leaves for an
   answer already over; just before the book the seller's signed `status` is asked whether it is.
-  A seller that closes a paused answer sooner than that is caught there, not before. For an answer
+  A seller that says in its terms how long it keeps a paused answer (`refillWaitMs`, from 0.2.0) has
+  the pause end a margin before then, a tenth of it but at least 1 s and at most 3 s (a seller that
+  waits 2 s: a pause of 1 s; one that waits 1 s or less: no pause), if that comes sooner. One that
+  closes a paused answer sooner and does not say so is caught there, not before. For an answer
   by the byte the 12 s run from its last byte, for a request from when its turn comes, and for an
   answer by the second from each release, since each second's ticket can wait in its turn.
 - **An answer priced by the second is charged for the pauses.** It is the clock's price: the
@@ -985,11 +996,12 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   and at more or fewer as its seller's format takes fewer or more. An owner who runs such models raises
   `tickets.stream_floor_after_s`. An answer the wallet ends early, for any reason, reaches the client cut short
   (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
-- The wallet's wait for a route to the seller (up to 8 s, after a link along the way was replaced) covers
-  public routes only. The node's route query (QueryRoutes) is not given an invoice's route hints or blinded
-  paths, so for a seller reached by those (a private channel, an LSP) it never finds one: such an invoice is
-  sent at once, with no route query, and a moment with no route to that seller fails the payment as it did
-  before 0.2.0 (the win is owed again, or the ticket call ends with the node's reason).
+- The wallet's wait for a route to the seller (up to 8 s, after a link along the way was replaced) gives the
+  node's route query (QueryRoutes, by its `POST` form) the invoice's route hints, so a seller reached through
+  a private channel is found and waited for like any other. It does not cover blinded paths, which that query
+  is not given: an invoice with them is sent at once, with no route query, and a moment with no route to that
+  seller fails the payment as it did before 0.2.0 (the win is owed again, or the ticket call ends with the
+  node's reason). A gateway marks its invoices private, so most carry hints.
 - A client that takes nothing for 60 to 90 s, such as a player paused with its buffer full, loses its
   connection, and the wallet stops paying for that answer. (Each write has 30 s, `stream_write`; a
   stalled socket may still take a little at the first ones, so it is the second or third that fails:
@@ -1000,8 +1012,11 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   `max_sats`, not cut at the range's last byte, so a caller asking `bytes=0-1023` with a large `max_sats` can be
   charged for the whole body. A seller whose server ignores ranges, or whose file
   has changed since, answers with the whole body: the wallet reads none of it (`ticket_range_ignored`), and the
-  call costs what the seller's socket took before it was closed, which on a route priced by the byte is up to a
-  few hundred KiB. Before 0.1.20 that whole body was read and paid for, the start of the file bought again.
+  call costs what the seller's socket took before it was closed. The wallet ends the connection the moment it sees
+  the range was ignored, before reading any of the body; what it still costs is bounded by the operating system's
+  socket buffers on both ends and what was on its way, which the wallet does not set (a smaller receive buffer would
+  also narrow every real download's window). Measured on Linux loopback: up to 822 KiB, 160 sat at the lab route's
+  200 sat a MiB. Before 0.1.20 that whole body was read and paid for, the start of the file bought again.
 - A session of draws takes one answer at a time, and one streamed on may run for hours. Another call
   to that seller is told `ticket_busy` once that answer has been open 30 s, at once from then on, and
   otherwise after 50 s at most. A stop ends the open answer at once and gives no new value; wins
@@ -1279,14 +1294,31 @@ How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is
 - These figures assume firmware that hashes what Stratum gives it and honours `mining.set_difficulty`. No real
   firmware has been run against the check yet.
 - Writes to a miner and to the hashtaker's gateway have no time limit (from reading the code, not measured).
+- After a dropped link, the hashmaker can lose at most the work it forwarded in the 2 s before it last heard from the
+  renter, and never more than in the 4 s before the drop, that the renter's gateway never took (shares sent again
+  the renter couldn't send on or count), at most 8 times an hour; past that the rental ends. After each resume both sides say their count, and the hashmaker's comes
+  down to the renter's by no more than that.
+- A share sent again after a drop whose verdict takes more than 10 s to come from the renter's gateway is counted by
+  neither side: the renter stops waiting for it, and the hashmaker's count comes down to the renter's.
+- A link that stalls without either side noticing for more than 4 s can still end the rental as unpaid: shares
+  forwarded before the last 4 s are not taken as lost when the count comes down, so the hashmaker stays ahead and
+  holds a share the renter thinks is paid.
 - A rental's last ticket can pass its budget by less than a slice, which stays with the seller as credit for about
   20 hours: a ticket is never smaller than a slice, since the wallet refuses a charge cap under the price.
 - A new price waits until the hashmaker's running rentals end: its gateway restarts to take a new route price, and a
   restart would fail a running rental's payment. While any rental runs, no new rental starts at the new price.
+  With none running, no new rental starts until the gateway charges the new price (about the time it takes to
+  restart). A market price moving with the chain is put in force at most once every ten minutes; a price the owner
+  saves is taken at once.
 - A renter that keeps reading its link, slowly, can hold up the hashmaker's sends to it for up to 5 s each: the
   write limit ends only a write that makes no progress (from reading the code, not measured).
 - Each side keeps the hashes of the shares a rental counted to refuse repeats, up to about 4 million, about 100 MB
   at the most for a long rental at a high share rate (from the code's limits, not measured).
+- The rental terms of the starter rules' hashrate task (outside the wallet's limits for one payment, a day, a week
+  and one seller, up to the task's 200,000 sat) are paid only on the signer's socket for the renter
+  (`run/rental/`), which file permissions keep from every other service. That holds as far as the box's users and
+  groups hold: a process running as the renter's user, or as root, can use them. A setup without `xbt-init`'s
+  layout (a bare `B2_RENTAL_SOCK`) is only as closed as the dir its operator gives it.
 
 ### Signature hash and replay
 

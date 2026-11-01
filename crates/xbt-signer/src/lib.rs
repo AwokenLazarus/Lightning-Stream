@@ -43,6 +43,7 @@ pub mod macaroon;
 pub mod node;
 pub mod policy;
 pub mod pyjson;
+pub mod renter;
 pub mod sanitize;
 pub mod seller_block;
 pub mod server;

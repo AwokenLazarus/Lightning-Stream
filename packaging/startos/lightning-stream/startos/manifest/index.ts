@@ -9,7 +9,9 @@ import { IMAGES } from '../spec'
 export const manifest = setupManifest({
   id: 'lightning-stream',
   title: 'Lightning Stream',
-  license: 'MIT OR Apache-2.0',
+  // ours, the Stream Gateway's image, which links C libraries of other licences (two LGPL; its
+  // /usr/share/xbt-datum-gateway has their texts and the NOTICE), and the VPN image's DB-IP table (CC BY 4.0)
+  license: '(MIT OR Apache-2.0) AND MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND CC-BY-4.0',
   packageRepo: 'https://github.com/AwokenLazarus/Lightning-Stream',
   upstreamRepo: 'https://github.com/AwokenLazarus/Lightning-Stream',
   marketingUrl: 'https://github.com/AwokenLazarus/Lightning-Stream',
@@ -26,6 +28,7 @@ export const manifest = setupManifest({
     connector: { source: { dockerTag: IMAGES.connector }, arch: ['x86_64', 'aarch64'] },
     hashlink: { source: { dockerTag: IMAGES.hashlink }, arch: ['x86_64', 'aarch64'] },
     vpn: { source: { dockerTag: IMAGES.vpn }, arch: ['x86_64', 'aarch64'] },
+    datum: { source: { dockerTag: IMAGES.datum }, arch: ['x86_64', 'aarch64'] },
   },
   hardwareRequirements: {
     ram: 512 * 1024 ** 2, // 512 MiB: every service is a small static binary

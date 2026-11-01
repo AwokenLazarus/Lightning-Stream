@@ -1648,17 +1648,18 @@ impl Book {
         l
     }
 
-    /// The open ticket session with this seller, if there is one. A session that pays by draws
-    /// holds nothing with the seller's node and is found by [`Self::draws_open_with`].
-    pub fn open_with(&self, payee: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.draws.is_none())
+    /// The open ticket session with this seller under `task`, if there is one. A session is its task's
+    /// alone, so each task has its own with a seller. A session that pays by draws holds nothing with
+    /// the seller's node and is found by [`Self::draws_open_with`].
+    pub fn open_with(&self, payee: &str, task: &str) -> Option<&Session> {
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.task == task && s.draws.is_none())
     }
 
     /// The open session that pays this seller's node by draws at `origin`, if there is one. One
     /// node may sell at several origins (a node that runs several services), and each is a
-    /// session of its own.
-    pub fn draws_open_with(&self, payee: &str, origin: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.origin == origin && s.draws.is_some())
+    /// session of its own, and so is each task's.
+    pub fn draws_open_with(&self, payee: &str, origin: &str, task: &str) -> Option<&Session> {
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.origin == origin && s.task == task && s.draws.is_some())
     }
 
     /// The payment of a win of a session that is in the book and has not failed: a win with one is
@@ -1740,10 +1741,16 @@ impl Book {
     /// sweep. Until then a ticket bought in another session would be a second one, and the first's
     /// credit left behind. Bounded by the invoice's life and [`PREPAY_FOLLOW_GRACE_S`], so that a
     /// payment stuck at a hop does not hold the buyer back for longer. Not one of the seller session
-    /// `own`: taken over, its credit is this session's.
+    /// `own`: taken over, its credit is this session's. Nor one of another task's session (where
+    /// `session` is in the book): its credit is that task's, which this session never takes over, so
+    /// there is nothing to wait for.
     pub fn prepaid_unfollowed(&self, payee: &str, session: &str, own: Option<&str>, now: f64) -> Option<(&Ticket, f64)> {
+        let task = self.sessions.get(session).map(|s| s.task.as_str());
         self.tickets.values().filter(|t| t.prepaid && t.win == 0 && t.payee == payee && t.session != session && t.invoice_expires > 0.0).filter_map(|t| {
             let s = self.sessions.get(&t.session)?;
+            if task.is_some_and(|task| s.task != task) {
+                return None;
+            }
             let waits = match t.state {
                 TState::Released | TState::Sending | TState::Locked => true,
                 // (a session's reason is kept cut short)

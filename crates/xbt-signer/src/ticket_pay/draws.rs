@@ -153,6 +153,9 @@ struct State {
     /// Wins whose invoice ran out or whose payment failed: their next invoice goes before the wins no seller
     /// waits for. Behind them it can run out too: on an 8 GB lab, a win lapsed twice waiting behind wins of 100 sellers.
     again: HashSet<u64>,
+    /// When the wallet first had each win to pay, on its clock: the seller's grace for it runs from about then,
+    /// and the gate pays the win in that order ([`crate::ticket_rail::Pace::enter_for`]).
+    seen_at: HashMap<u64, f64>,
     /// Invoices to ask the seller to cancel, before its list is next asked for.
     to_cancel: Vec<(u64, String)>,
     /// When the latest invoice of a win that is owed again ends: the seller's next one comes after that.
@@ -237,6 +240,18 @@ struct Round {
 }
 
 /// What one call counted: for its reply.
+impl State {
+    /// What a payment of a win came to, for when the win was first seen: once it is paid (`allow`) its place in the
+    /// gate's order is no longer needed, and a long session keeps no entry per win. Only then: a win the book says has a
+    /// payment already (`lottery_win_paid`) may have it still in flight, and should that fail the win is owed again
+    /// with the deadline it had; one booked and waiting on the node's word (`pending`) the same.
+    fn pay_outcome_seen(&mut self, draw: u64, verdict: Option<&str>) {
+        if verdict == Some("allow") {
+            self.seen_at.remove(&draw);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Counted {
     price_msat: u64,
@@ -283,8 +298,13 @@ impl Signer {
             return Tried::Next("draws are paid over https, or over http to this machine only (127.0.0.1, ::1, localhost): on a plain connection a \
                                 listener learns the session key".into());
         }
+        // a session of draws is its task's alone, as a session of tickets is (`super::SlotKey`)
+        let key = match &c.task {
+            Ok(t) => super::slot_key(c.origin, t),
+            Err(why) => return Tried::Next(why.clone()),
+        };
         for attempt in 0..2 {
-            let existing = lock(&self.draw_http).get(c.origin).cloned();
+            let existing = lock(&self.draw_http).get(&key).cloned();
             // a session the book no longer holds open (stopped by the agent, idle, a fault) is gone
             let existing = match existing {
                 Some(d) if d.fault().is_some() || !self.ticket_session(&d.sid).is_some_and(|s| s.state == SState::Open) => {
@@ -350,7 +370,9 @@ impl Signer {
             Tried::Done(with(refused("lottery_open", format!("no session of draws was opened with this seller: {why}")), json!({"stopped": stopped})))
         };
         // the seller's side: its name for the session, the session key and the anchor of its chain
-        let body = json!({"version": lottery::VERSION, "winMsat": win_msat.to_string()}).to_string().into_bytes();
+        // `canCancel`: this wallet asks the seller to cancel a failed win's invoice (`cancel`), so its next one comes at once and
+        // the seller may give invoices that outlive the grace. A seller before 0.2.0 ignores it
+        let body = json!({"version": lottery::VERSION, "winMsat": win_msat.to_string(), "canCancel": true}).to_string().into_bytes();
         let url = format!("{}/open", ds.base);
         let ans = match self.wire("POST", &url, &body, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy())) {
             Ok(a) => a,
@@ -380,11 +402,12 @@ impl Signer {
         *lock(&ds.link) = Link::new(seller_sid, key, 0);
         lock(&ds.state).buyer = Some(buyer);
         let mut map = lock(&self.draw_http);
-        if map.contains_key(c.origin) {
+        let key = super::slot_key(c.origin, &ds.task);
+        if map.contains_key(&key) {
             drop(map);
             return Err(give_up("another call opened a session with this seller meanwhile: call again".into()));
         }
-        map.insert(c.origin.to_string(), ds.clone());
+        map.insert(key, ds.clone());
         Ok(ds)
     }
 
@@ -453,8 +476,9 @@ impl Signer {
     pub(crate) fn draw_stop(&self, ds: &DrawSession, why: &str, tell: bool) -> Value {
         {
             let mut map = lock(&self.draw_http);
-            if map.get(&ds.origin).is_some_and(|d| d.sid == ds.sid) {
-                map.remove(&ds.origin);
+            let key = super::slot_key(&ds.origin, &ds.task);
+            if map.get(&key).is_some_and(|d| d.sid == ds.sid) {
+                map.remove(&key);
             }
         }
         let told = tell && !lock(&ds.link).seller_sid.is_empty() && matches!(self.draw_call(ds, "close", &json!({})), Ok((200, _, _)));
@@ -658,10 +682,12 @@ impl Signer {
             let _ = self.draw_fault(ds, "the seller is blocked for over-charging: no win is paid to it");
             return;
         }
-        let first = {
+        let (first, due) = {
             let mut s = lock(&ds.state);
             s.paying.insert(win.draw());
-            first || s.again.contains(&win.draw())
+            let now = self.engine.now();
+            let seen = *s.seen_at.entry(win.draw()).or_insert(now);
+            (first || s.again.contains(&win.draw()), seen + f64::from(ds.terms.grace_seconds))
         };
         // the seller's offer first, where its terms name one, with the note that names this session and draw; its
         // invoice where the offer cannot be fetched
@@ -672,7 +698,7 @@ impl Signer {
         let by = xbt402::offer::entry_offer(&ds.terms.accepted)
             .filter(|_| !seller_session.is_empty())
             .map(|offer| crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session });
-        let out = self.lottery_pay_win(&ds.sid, win, invoice, first, by.as_ref());
+        let out = self.lottery_pay_win(&ds.sid, win, invoice, first, by.as_ref(), Some(due));
         let charged = py_int(out.get("charged_sats")).unwrap_or(0).max(0);
         let rule = str_or_empty(out.get("rule"));
         // the book holds this invoice's payment failed, with nothing of it in flight on the wallet's node
@@ -686,6 +712,7 @@ impl Signer {
         }
         let mut s = lock(&ds.state);
         s.paying.remove(&win.draw());
+        s.pay_outcome_seen(win.draw(), out.get("verdict").and_then(Value::as_str));
         let mut c = lock(counted);
         match out.get("verdict").and_then(Value::as_str) {
             Some("allow") => {
@@ -911,8 +938,10 @@ impl Signer {
     /// count against the seller's terms: they go through the gate before the wins no seller waits
     /// for. A seller serves on beside `maxUnpaidWins` unpaid wins, and beside a win for
     /// `gracePieces` pieces after it; beyond either its answer stands still, for 15 s at the
-    /// gateway as shipped (`refill_wait`), and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
-    /// that are above that number go first; and a win goes first when the pieces the wallet has
+    /// gateway as shipped (`refill_wait`), and is then cut short. So from `maxUnpaidWins` unpaid on, the oldest go first, as
+    /// many as bring the count below it: the next win would stop the seller, and a win waiting behind a hundred others' would
+    /// not be paid within those 15 s (seen on a loaded lab: two wins at the count, a third found, and the answer cut); and a
+    /// win goes first when the pieces the wallet has
     /// given values for since it are within the seller's `window` of `gracePieces` (the seller is
     /// that many pieces ahead of the wallet's values at the most). Called while an answer is being
     /// read: of an answer that is over, no piece waits for a payment.
@@ -924,7 +953,8 @@ impl Signer {
             }
             let mut unpaid: Vec<u64> = s.owed.iter().map(Win::draw).chain(s.paying.iter().copied()).collect();
             unpaid.sort_unstable();
-            let above = unpaid.len().saturating_sub(ds.terms.max_unpaid_wins as usize);
+            // at the seller's count already, not only past it: the next win would stand it still
+            let above = (unpaid.len() + 1).saturating_sub(ds.terms.max_unpaid_wins as usize);
             let issued = s.buyer.as_ref().map_or(0, Buyer::issued);
             let far = u64::from(ds.terms.grace_pieces).saturating_sub(u64::from(ds.terms.window));
             unpaid.iter().enumerate().filter(|(i, d)| *i < above || issued.saturating_sub(**d) >= far).map(|(_, d)| *d).filter(|d| s.paying.contains(d)).collect()
@@ -1412,5 +1442,29 @@ impl Signer {
             m["receipt"] = json!({"signed": true, "body": if complete { "sent as it arrived" } else { "cut short" }});
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A win keeps when it was first seen until it is paid: an answer that the book has a payment for it already
+    /// (`lottery_win_paid`, that payment perhaps still in flight) leaves it, so that a win owed again after that payment
+    /// fails goes in the gate's order by its first deadline.
+    #[test]
+    fn a_win_keeps_its_first_seen_time_until_it_is_paid() {
+        let mut s = State::default();
+        for d in [5, 6, 7] {
+            s.seen_at.insert(d, 100.0 + d as f64);
+        }
+        // the book has a payment for win 5 already, perhaps still in flight: `lottery_win_paid` is a refusal
+        s.pay_outcome_seen(5, Some("deny"));
+        // win 6 booked and waiting on the node's word
+        s.pay_outcome_seen(6, Some("pending"));
+        assert_eq!((s.seen_at.get(&5), s.seen_at.get(&6)), (Some(&105.0), Some(&106.0)), "a win not yet paid keeps its first-seen time");
+        // win 7 paid: it leaves
+        s.pay_outcome_seen(7, Some("allow"));
+        assert_eq!(s.seen_at.get(&7), None);
     }
 }

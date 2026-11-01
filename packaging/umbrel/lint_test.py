@@ -83,6 +83,12 @@ class NodeDataRule(unittest.TestCase):
                 self.fresh()
                 self.refused(lambda s: s[name].setdefault("volumes", []).append(dict(NODE_DIR)), f"{name} mounts the node's data folder", "a long-form mount is only the Lightning node's tls.cert")
 
+    def test_a_ui_selling_pieces_of_work_has_the_hashmaker_to_ask(self):
+        ui = [n for n, sv in yaml.safe_load(self.compose.read_text())["services"].items() if "XBT_UI_HASHER_SLICES" in (sv.get("environment") or {})]
+        self.assertEqual(len(ui), 1, ui)
+        self.refused(lambda s: s[ui[0]]["environment"].pop("XBT_UI_HASHER"), "the UI sells pieces of work with no hashmaker to ask",
+                     "XBT_UI_HASHER_SLICES without an http:// XBT_UI_HASHER")
+
     def test_the_exception_is_by_name(self):
         self.refused(lambda s: s.__setitem__("node-keys-bake2", s.pop(BAKE)), "the baker is renamed", "a long-form mount is only the Lightning node's tls.cert")
 
@@ -126,6 +132,30 @@ class NodeDataRule(unittest.TestCase):
             "a second xbt-init": (lambda s: s.__setitem__("init2", dict(s["init"])), "xbt-init runs as one service, named init"),
             "init mounts the hand-over too": (lambda s: s["init"]["volumes"].append("${APP_DATA_DIR}/data/run/node-keys:/h"), "and mounts ['${APP_DATA_DIR}/data:/data'] alone"),
             "init runs another command": (lambda s: s["init"].__setitem__("command", ["check", "--data", "/h"]), "xbt-init runs its own command"),
+        }
+        for why, (change, says) in cases.items():
+            with self.subTest(why=why):
+                self.fresh()
+                self.refused(change, why, says)
+
+    def test_the_stream_gateway_stays_on_the_renters_loopback(self):
+        """The Stream Gateway's API opens every job (/xbt/job) to loopback: it stays in the renter's network
+        namespace, publishes nothing, mounts its own dirs alone and runs what is pinned for it."""
+        ns = "publishes no port and runs in the renter's network namespace"
+        cases = {
+            "it publishes its API": (lambda s: s["datum"].__setitem__("ports", ["7152:7152"]), ns),
+            "it is on the app's network": (lambda s: s["datum"].pop("network_mode"), ns),
+            "it joins the UI's namespace": (lambda s: s["datum"].__setitem__("network_mode", "service:ui"), "the namespace pinned for it"),
+            "it runs on the host's network": (lambda s: s["datum"].__setitem__("network_mode", "host"), "the namespace pinned for it"),
+            "another service joins it": (lambda s: s["witness"].__setitem__("network_mode", "service:datum"), "the namespace pinned for it"),
+            "it writes its config": (lambda s: s["datum"]["volumes"].__setitem__(1, "${APP_DATA_DIR}/data/run/datum:/data/run/datum"),
+                                     "is outside its own sub-dir and socket dirs"),
+            "it mounts the signer's dir": (lambda s: s["datum"]["volumes"].append("${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro"),
+                                           "is outside its own sub-dir and socket dirs"),
+            "it runs as the box user": (lambda s: s["datum"].__setitem__("user", "1000:1000"), "must run as its image's own user"),
+            "it runs something else": (lambda s: s["datum"].__setitem__("entrypoint", ["/usr/bin/xbt-datum-gateway", "-c", "/tmp/x.json"]),
+                                       "is not the one pinned for it"),
+            "its image is another": (lambda s: s["datum"].__setitem__("image", "ghcr.io/retropex/datum:v1.13"), "is not ghcr.io/awokenlazarus/"),
         }
         for why, (change, says) in cases.items():
             with self.subTest(why=why):

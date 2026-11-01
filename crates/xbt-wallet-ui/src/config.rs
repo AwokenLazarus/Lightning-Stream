@@ -61,7 +61,12 @@
 //! | `XBT_UI_FILES_ROOT` | unset | a folder the box shares with the app (Umbrel's Downloads, read-only): the owner chooses the shared folder under it on the Sell page, instead of `XBT_UI_FILES_DIR` |
 //! | `XBT_UI_FILES_BIND` | `127.0.0.1:8486` | where the UI serves that folder; on a platform whose gateway runs in another container, the app's private network |
 //! | `XBT_UI_FILES_UPSTREAM` | `http://<XBT_UI_FILES_BIND>` | how the gateway reaches the folder, as its container sees the UI |
-//! | `XBT_UI_DATUM_GUIDE` | the project's guide | where a renter without a DATUM Gateway is sent to set one up |
+//! | `XBT_UI_DATUM_GUIDE` | the project's guide | where a renter without a gateway is sent to set one up |
+//! | `XBT_UI_DATUM_RPCURL` | | the XBT node's RPC address (`http://host:port`) as the bundled Stream Gateway reaches it. Set: the Hashrate page has the gateway's settings ("Your gateway") and writes its config. Unset: this install has no bundled gateway |
+//! | `XBT_UI_DATUM_DIR` | `$XBT_DATA_DIR/run/datum` | where the Hashrate page writes the Stream Gateway's `config.json` (no secret in it) |
+//! | `XBT_UI_DATUM_API_PORT` | `7152` | the Stream Gateway's API port, on 127.0.0.1 only (Linux: `7153`) |
+//! | `XBT_UI_DATUM_GATEWAY_RUN_DIR` | `/data/run/datum` | that folder as the gateway's container sees it: its config names `rpc.cookie` there, which init writes |
+//! | `XBT_UI_DATUM_GATEWAY_STATE_DIR` | `/data/datum` | the gateway's own folder as its container sees it: the blocks it submits are kept in `submitblocks/` |
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -249,10 +254,33 @@ pub struct HashSetup {
     pub renter: Option<String>,
     pub renter_token: Option<PathBuf>,
     pub datum_guide: String,
+    /// The Stream Gateway (DATUM-compatible) that comes with the app, when this install has it.
+    pub stream_gw: StreamGwSetup,
 }
 
-/// The guide a renter without a DATUM Gateway is sent to.
-pub const DATUM_GUIDE: &str = "https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/P2P-HASH-TRY-IT.md#your-datum-gateway";
+/// The bundled Stream Gateway's settings: where its config goes, and what goes in it besides the owner's choices.
+#[derive(Debug, Clone)]
+pub struct StreamGwSetup {
+    /// The node's RPC URL as the gateway reaches it; `None`: no bundled gateway in this install.
+    pub rpcurl: Option<String>,
+    /// Where the UI writes `config.json`.
+    pub dir: PathBuf,
+    pub api_port: u16,
+    pub stratum_port: u16,
+    /// `dir` and the gateway's own folder, as the gateway's container sees them.
+    pub gateway_run_dir: String,
+    pub gateway_state_dir: String,
+}
+
+impl Default for StreamGwSetup {
+    fn default() -> Self {
+        Self { rpcurl: None, dir: PathBuf::from("/nonexistent/run/datum"), api_port: 7152, stratum_port: 23339,
+               gateway_run_dir: "/data/run/datum".into(), gateway_state_dir: "/data/datum".into() }
+    }
+}
+
+/// The guide a renter is sent to about gateways.
+pub const DATUM_GUIDE: &str = "https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/P2P-HASH-TRY-IT.md#your-gateway";
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
@@ -314,6 +342,7 @@ impl Config {
             Some(o) => return Err(format!("XBT_UI_ROLE {o}: wallet or gateway")),
         };
         let run_dir = |name: &str| env("XBT_DATA_DIR").map(|d| PathBuf::from(d).join("run").join(name)).unwrap_or_else(|| data_dir.join(name));
+        let datum_dir = env("XBT_UI_DATUM_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("datum"));
         let ln = LnSetup {
             dir: env("XBT_UI_LN_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("ln")),
             rest: env("XBT_UI_LN_REST"),
@@ -418,6 +447,21 @@ impl Config {
                 renter: env("XBT_UI_HASHRENT").filter(|u| u.starts_with("http://")),
                 renter_token: env("XBT_UI_HASHRENT_TOKEN_FILE").map(PathBuf::from),
                 datum_guide: env("XBT_UI_DATUM_GUIDE").filter(|u| u.starts_with("https://")).unwrap_or_else(|| DATUM_GUIDE.into()),
+                stream_gw: StreamGwSetup {
+                    rpcurl: match env("XBT_UI_DATUM_RPCURL") {
+                        Some(u) if u.starts_with("http://") && u.len() > 7 => Some(u.trim_end_matches('/').to_string()),
+                        Some(_) => return Err("XBT_UI_DATUM_RPCURL: the node's RPC address, http://host:port".into()),
+                        None => None,
+                    },
+                    dir: datum_dir,
+                    api_port: match env("XBT_UI_DATUM_API_PORT") {
+                        Some(p) => p.parse().ok().filter(|p| *p > 0).ok_or("XBT_UI_DATUM_API_PORT: a port")?,
+                        None => 7152,
+                    },
+                    stratum_port: 23339,
+                    gateway_run_dir: env("XBT_UI_DATUM_GATEWAY_RUN_DIR").unwrap_or_else(|| "/data/run/datum".into()),
+                    gateway_state_dir: env("XBT_UI_DATUM_GATEWAY_STATE_DIR").unwrap_or_else(|| "/data/datum".into()),
+                },
             },
         })
     }

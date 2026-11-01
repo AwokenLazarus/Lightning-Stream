@@ -394,13 +394,30 @@ fn unpaid_by_the_wallet_stops_the_hash() {
 
 /// The most a renter may have paid ahead of the work it has proven, in msat, just after paying a slice, by the
 /// payment rule as stated (`order::Standing::pay_next`), worked out here on its own so a change to the rule shows:
-/// a slice the next share needs (one share and one slice), or as far ahead as the step, which is the largest of the
-/// first step (546 sat), one share and what has been delivered (its 30 s cap only lowers it, and the renter's rate
-/// isn't in its receipts). The first slice is always paid, one slice ahead of nothing.
-fn most_paid_ahead_msat(proven: u128, share: u128, terms: &Terms) -> u128 {
+/// a slice the next share needs (one share and one slice), or as far ahead as the step: what has been delivered, up to
+/// 30 s of the output ([`order::STEP_SECONDS`]), and never under the first step (546 sat) or one share. The first slice
+/// is always paid, one slice ahead of nothing.
+///
+/// `most_msat_a_second` is the most the renter can have measured its output at, in msat a second: it measures what it
+/// proved since its first proof, which came before any receipt with work in it, so the time since that receipt is
+/// shorter and gives a rate no lower ([`rate_most`]). `None`: no such receipt yet, and no cap is taken.
+fn most_paid_ahead_msat(proven: u128, share: u128, terms: &Terms, most_msat_a_second: Option<f64>) -> u128 {
     let msat = |work: u128| work * terms.price_msat as u128 / terms.slice_work;
-    let step = (order::FIRST_STEP_MSAT as u128).max(msat(share)).max(msat(proven));
+    let delivered = match most_msat_a_second {
+        Some(rate) => msat(proven).min((rate * order::STEP_SECONDS).ceil() as u128),
+        None => msat(proven),
+    };
+    let step = (order::FIRST_STEP_MSAT as u128).max(msat(share)).max(delivered);
     step.max(msat(share) + terms.price_msat as u128)
+}
+
+/// The most output, in msat a second, a renter can have measured when it signed `rc`: its proven work over the time
+/// since `first`, the first receipt with work in it (its first proof was before that). None within a second of it,
+/// where the renter may not have measured at all (no cap then).
+fn rate_most(rc: &Value, first: Option<&Value>, terms: &Terms) -> Option<f64> {
+    let first = first?;
+    let secs = rc["atMs"].as_u64()?.saturating_sub(first["atMs"].as_u64()?) as f64 / 1000.0;
+    (secs >= 1.0).then(|| (w(&rc["work"]) * terms.price_msat as u128 / terms.slice_work) as f64 / secs)
 }
 
 /// Many slices (a rental of about 30 s at two slices a second). The money is exact on both sides:
@@ -436,19 +453,25 @@ fn many_slices(wallet: bool) {
     // no work unproven: both sides counted the same proven work, and the gateway took at least that
     assert_eq!(r.hashmaker["meter"]["work"], r.hashtaker["meter"]["work"], "{} / {}", r.hashmaker, r.hashtaker);
     assert_eq!(r.hashmaker["meter"]["proven"], r.hashtaker["meter"]["proven"]);
+    // and the gateway's verdicts, as each side heard them (only what each refused may differ)
+    assert_eq!((&r.hashmaker["meter"]["accepted"], &r.hashmaker["meter"]["rejected"]), (&r.hashtaker["meter"]["accepted"], &r.hashtaker["meter"]["rejected"]),
+               "{} / {}", r.hashmaker["meter"], r.hashtaker["meter"]);
     let work = w(&r.hashmaker["meter"]["work"]);
     assert!(work > 0);
     assert!(w(&r.pool["work"]) >= work, "the pool saw at least the work both meters counted");
     // paid ahead, slice by slice: each payment within the rule at the work its receipt says was proven then
     let msat = |work: u128| work * price as u128 / s;
+    let first = taken.iter().find(|rc| w(&rc["work"]) > 0);
+    let mut last_most = 0;
     for rc in taken {
         let (k, proven) = (rc["slice"].as_u64().unwrap() as u128, w(&rc["work"]));
         let ahead = msat((k * s).saturating_sub(proven));
-        assert!(ahead <= most_paid_ahead_msat(proven, sw, &t), "slice {k} paid {ahead} msat ahead of {proven} proven: {rc}");
+        last_most = most_paid_ahead_msat(proven, sw, &t, rate_most(rc, first, &t));
+        assert!(ahead <= last_most, "slice {k} paid {ahead} msat ahead of {proven} proven, at most {last_most}: {rc}");
     }
-    // and at the end
+    // and at the end, by the last payment's bound: the work only grew since
     let covered = order::paid_work(paid, t.start_slices, s);
-    assert!(msat(covered.saturating_sub(work)) <= most_paid_ahead_msat(work, sw, &t), "{paid} slices paid for {work} work at {s} a slice");
+    assert!(msat(covered.saturating_sub(work)) <= last_most, "{paid} slices paid for {work} work at {s} a slice, at most {last_most} msat ahead");
     // nothing unpaid: the work never passed what was paid
     assert!(work <= covered, "{work} work, {paid} slices of {s} paid: {}", r.hashmaker);
     assert_eq!(r.hashmaker["stopped"]["unpaidWork"], "0", "{}", r.hashmaker);

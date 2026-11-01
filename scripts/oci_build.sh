@@ -6,6 +6,8 @@
 #   xbt-hashlink (p2p-hash: the hasher's and the renter's services; likewise)
 #   xbt-stream-relay (the built-in Stream relay, off until the owner switches it on; likewise)
 #   xbt-vpn (the VPN service: the owner's devices' WireGuard endpoint, and an exit if offered)
+#   xbt-datum-gateway (the Stream Gateway, DATUM-compatible: the renter's masking gateway; C, built by
+#     scripts/datum_gateway_build.sh, or taken from XBT_DATUM_PREBUILT)
 #   (xbt-supervise is not an image: it is copied into the signer and gateway images)
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
@@ -46,7 +48,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay xbt-gateway lightning-stream xbt-hashlink xbt-stream-relay xbt-vpn)
+IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay xbt-gateway lightning-stream xbt-hashlink xbt-stream-relay xbt-vpn xbt-datum-gateway)
 [ -n "$ONLY" ] && IMAGES=(${ONLY//,/ })
 TGT=${CARGO_TARGET_DIR:-target}
 want() { [[ " ${IMAGES[*]} " == *" $1 "* ]]; }
@@ -84,7 +86,7 @@ if [ $CARGO = 1 ]; then
       "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
     fi
     if want xbt-gateway; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-gateway --bin xbt-gateway; fi
-    if want xbt-signer || want xbt-gateway; then
+    if want xbt-signer || want xbt-gateway || want xbt-datum-gateway; then
       "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-svc --bin xbt-supervise
     fi
     if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-wallet-mcp; fi
@@ -100,8 +102,9 @@ if [ $CARGO = 1 ]; then
 fi
 for t in "${!ARCH[@]}"; do
   mkdir -p "$CTX/bin/${ARCH[$t]}"
-  bins=("${IMAGES[@]}")
-  if want xbt-signer || want xbt-gateway; then bins+=(xbt-supervise); fi
+  bins=()
+  for b in "${IMAGES[@]}"; do [ "$b" = xbt-datum-gateway ] || bins+=("$b"); done
+  if want xbt-signer || want xbt-gateway || want xbt-datum-gateway; then bins+=(xbt-supervise); fi
   for b in "${bins[@]}"; do
     f=$TGT/$t/release/$b
     [ -x "$f" ] || { echo "oci_build: $f missing (run without --skip-cargo)" >&2; exit 1; }
@@ -119,6 +122,35 @@ for t in "${!ARCH[@]}"; do
     fi
   done
 done
+# The Stream Gateway (xbt-datum-gateway) is C, not cargo: scripts/datum_gateway_build.sh makes its static
+# binaries and the licences it ships (dist/datum; XBT_DATUM_PREBUILT names a directory that already holds
+# them, as --skip-cargo does for the Rust ones). One layer, a root staged here with its modes: the binary and
+# xbt-supervise 0555, the notice and licences 0444 in a 0555 folder (the base layer makes the folder too).
+if want xbt-datum-gateway; then
+  declare -A ZIG=([x86_64-unknown-linux-musl]=x86_64-linux-musl [aarch64-unknown-linux-musl]=aarch64-linux-musl
+                  [armv7-unknown-linux-musleabihf]=arm-linux-musleabihf)
+  DG=${XBT_DATUM_PREBUILT:-}
+  if [ -z "$DG" ]; then
+    DG=$OUT/datum
+    zt=(); for t in "${!ARCH[@]}"; do zt+=("${ZIG[$t]}"); done
+    # a pushed image is a release: its gateway build refuses a dirty tree (its NOTICE names the commit)
+    XBT_DATUM_RELEASE=${PUSH:+1} "${SOAK[@]}" scripts/datum_gateway_build.sh --out "$DG" --targets "$(IFS=,; echo "${zt[*]}")" --test
+  fi
+  for t in "${!ARCH[@]}"; do
+    d=$CTX/bin/${ARCH[$t]}
+    f=$DG/${ZIG[$t]}/xbt-datum-gateway
+    [ -x "$f" ] || { echo "oci_build: $f missing (scripts/datum_gateway_build.sh)" >&2; exit 1; }
+    file -b "$f" | grep -q "statically linked" || { echo "oci_build: $f is not static: $(file -b "$f")" >&2; exit 1; }
+    if grep -q -a -F -e "$ROOT/" "$f"; then echo "oci_build: $f names a build host path" >&2; exit 1; fi
+    r=$d/xbt-datum-gateway.root
+    if [ -d "$r" ]; then chmod -R u+w "$r"; fi
+    rm -rf "$r" && mkdir -p "$r/usr/bin" "$r/usr/share/xbt-datum-gateway"
+    cp "$f" "$r/usr/bin/xbt-datum-gateway" && cp "$d/xbt-supervise" "$r/usr/bin/xbt-supervise"
+    chmod 0555 "$r/usr/bin/"*
+    cp "$DG"/licenses/* "$r/usr/share/xbt-datum-gateway/" && chmod 0444 "$r/usr/share/xbt-datum-gateway/"*
+    chmod 0755 "$r/usr" "$r/usr/bin" "$r/usr/share" && chmod 0555 "$r/usr/share/xbt-datum-gateway"
+  done
+fi
 # --binaries-only: the checked static binaries in dist/oci/ctx/bin/<arch>/ are the result (the binary
 # release workflow packs them); no image is built
 if [ $BIN_ONLY = 1 ]; then
@@ -161,15 +193,20 @@ fi
 
 SRC=https://github.com/AwokenLazarus/Lightning-Stream
 LABELS=(--label "org.opencontainers.image.source=$SRC" --label "org.opencontainers.image.revision=$REV$DIRTY"
-        --label "org.opencontainers.image.version=$VERSION" --label "org.opencontainers.image.licenses=MIT OR Apache-2.0")
+        --label "org.opencontainers.image.version=$VERSION")
 # the same on the multi-platform index (a registry's package page reads the index's annotations), and no
 # provenance or SBOM attestation (they would add manifests of their own to the index)
 INDEX=(--annotation "index:org.opencontainers.image.source=$SRC" --annotation "index:org.opencontainers.image.revision=$REV$DIRTY"
-       --annotation "index:org.opencontainers.image.version=$VERSION" --annotation "index:org.opencontainers.image.licenses=MIT OR Apache-2.0"
+       --annotation "index:org.opencontainers.image.version=$VERSION"
        --provenance=false --sbom=false)
 for img in "${IMAGES[@]}"; do
   echo "== buildx $img ($PLATFORMS)"
-  ARCHIVE=(--platform "$PLATFORMS" --target "$img" "${LABELS[@]}" --label "org.opencontainers.image.title=$img" "${INDEX[@]}"
+  # each image's own licence (SPDX; scripts/oci_inspect.py's table, which also checks it): ours, or, for the Stream
+  # Gateway, with the C libraries it links (two LGPL)
+  lic=$(python3 scripts/oci_inspect.py --license "$img")
+  LIC=(--label "org.opencontainers.image.licenses=$lic")
+  ARCHIVE=(--platform "$PLATFORMS" --target "$img" "${LABELS[@]}" "${LIC[@]}" --label "org.opencontainers.image.title=$img" "${INDEX[@]}"
+           --annotation "index:org.opencontainers.image.licenses=$lic"
            --annotation "index:org.opencontainers.image.title=$img"
            --annotation "index:org.opencontainers.image.description=Lightning Stream: $img, a static binary FROM scratch (docs/CONTAINER.md)"
            --build-arg SOURCE_DATE_EPOCH="$EPOCH")
@@ -181,10 +218,10 @@ for img in "${IMAGES[@]}"; do
       --output "type=image,name=$PUSH/$img:$VERSION-$REV,push=true,unpack=false,oci-mediatypes=true,rewrite-timestamp=true" "$CTX" >/dev/null
   fi
   if [ $LOAD = 1 ]; then
-    docker buildx build -q --platform linux/amd64 --target "$img" "${LABELS[@]}" --label "org.opencontainers.image.title=$img" \
+    docker buildx build -q --platform linux/amd64 --target "$img" "${LABELS[@]}" "${LIC[@]}" --label "org.opencontainers.image.title=$img" \
       --build-arg SOURCE_DATE_EPOCH="$EPOCH" -t "$img:agp038" --load "$CTX" >/dev/null
     # every platform under the version tag (Docker's containerd image store keeps a multi-platform index)
-    docker buildx build -q --platform "$PLATFORMS" --target "$img" "${LABELS[@]}" --label "org.opencontainers.image.title=$img" \
+    docker buildx build -q --platform "$PLATFORMS" --target "$img" "${LABELS[@]}" "${LIC[@]}" --label "org.opencontainers.image.title=$img" \
       --build-arg SOURCE_DATE_EPOCH="$EPOCH" -t "$img:$VERSION" --load "$CTX" >/dev/null
   fi
 done

@@ -1,7 +1,8 @@
 import { i18n } from './i18n'
 import { sdk } from './sdk'
 import { storeJson } from './fileModels/store.json'
-import { LIGHTNING, PORTS, services, ServiceSpec } from './spec'
+import { DATUM, LIGHTNING, PORTS, services, ServiceSpec } from './spec'
+import { access } from 'node:fs/promises'
 
 export const main = sdk.setupMain(async ({ effects }) => {
   const store = await storeJson.read().const(effects)
@@ -84,12 +85,19 @@ export const main = sdk.setupMain(async ({ effects }) => {
     gracePeriod,
   })
 
-  const [init, witness, signer, mcp, ui, connector, gateway, hashmaker, hashtaker, vpn] = (
-    ['init', 'witness', 'signer', 'mcp', 'ui', 'connector', 'gateway', 'hashmaker', 'hashtaker', 'vpn'] as const
+  const [init, witness, signer, mcp, ui, connector, gateway, hashmaker, hashtaker, vpn, datum] = (
+    ['init', 'witness', 'signer', 'mcp', 'ui', 'connector', 'gateway', 'hashmaker', 'hashtaker', 'vpn', 'datum'] as const
   ).map(spec)
   const witnessSub = sub(witness)
   const signerSub = sub(signer)
   const hashmakerSub = sub(hashmaker)
+  const datumSub = sub(datum)
+  // the masking gateway's config, as Services → Hashrate writes it (DATUM.config inside the daemon)
+  const datumConfigured = () =>
+    access(sdk.volumes.main.subpath(DATUM.config.replace(/^\/data\//, ''))).then(
+      () => true,
+      () => false,
+    )
 
   // init first (xbt-init: owners and modes on the root-owned volume, the node credentials, the MCP token,
   // the hashrate control token), then the witness, the signer, and the services on the signer's socket
@@ -144,7 +152,37 @@ export const main = sdk.setupMain(async ({ effects }) => {
         ready: scriptReady(hashmaker, hashmakerSub, 30_000),
         requires: ['init'],
       })
-      .addDaemon('hashtaker', { subcontainer: sub(hashtaker), exec: exec(hashtaker), ready: { display: null, fn: () => ({ result: 'success', message: null }) }, requires: ['signer'] })
+      // the masking gateway: idle (and healthy) until Services → Hashrate writes its config; then ready once its
+      // API answers and its Stratum listens, which it does only after the node gave it a block template
+      .addDaemon('datum', {
+        subcontainer: datumSub,
+        exec: exec(datum),
+        ready: {
+          display: i18n('Stream Gateway (DATUM-compatible)'),
+          fn: async () => {
+            if (!(await datumConfigured())) {
+              return { result: 'success', message: i18n('Not set up yet: choose solo or Lazarus Pool on Services → Hashrate') }
+            }
+            const api = await sdk.healthCheck.runHealthScript(datum.readyCommand as [string, ...string[]], datumSub, {
+              errorMessage: i18n('The gateway is starting'),
+            })
+            if (api.result !== 'success') return { result: 'starting', message: i18n('The gateway is starting') }
+            const stratum = await sdk.healthCheck.checkPortListening(effects, PORTS.datumStratum, {
+              successMessage: i18n('Masking the jobs of rented hashrate'),
+              errorMessage: i18n('Waiting for a block template from the XBT node: check the Node connection action'),
+            })
+            return stratum.result === 'success' ? stratum : { ...stratum, result: 'loading' }
+          },
+          gracePeriod: 60_000,
+        },
+        requires: ['init'],
+      })
+      .addDaemon('hashtaker', {
+        subcontainer: sub(hashtaker),
+        exec: exec(hashtaker),
+        ready: { display: null, fn: () => ({ result: 'success', message: null }) },
+        requires: ['signer'],
+      })
       .addDaemon('vpn', { subcontainer: sub(vpn), exec: exec(vpn), ready: { display: null, fn: () => ({ result: 'success', message: null }) }, requires: ['init'] })
       // Readiness as the wallet sees it: the MCP's /readyz (the signer is up, the node is reachable and synced,
       // the keys are unlocked, the witness answers). A 503 while the node syncs is "loading", with the reason.

@@ -47,8 +47,11 @@ jobs:
           python3 -m venv "$HOME/.local/share/ziglang-venv"
           "$HOME/.local/share/ziglang-venv/bin/pip" install --quiet "ziglang==$ZIGLANG_VERSION"
           "$HOME/.local/share/ziglang-venv/bin/python" -m ziglang version
+      # file: the build's checks; cmake, make and pkg-config: the Stream Gateway (xbt-datum-gateway), a C
+      # program that scripts/oci_build.sh builds through scripts/datum_gateway_build.sh for all three
+      # platforms with zig (named here, not left to the runner image)
       - name: Install the tools the build checks with
-        run: sudo apt-get update -q && sudo apt-get install -y -q file
+        run: sudo apt-get update -q && sudo apt-get install -y -q file cmake make pkg-config
       # buildx keeps a multi-platform index only with the containerd image store or a container builder
       - name: Set up a buildx builder
         run: |
@@ -72,4 +75,16 @@ jobs:
           path: |
             packaging/images.lock
             dist/oci/IMAGES.md
+          if-no-files-found: error
+      # The Stream Gateway image links libmicrohttpd and argp-standalone (GNU LGPL) statically: keep the exact
+      # source tarballs the build used, checked against the build script's pins, for the release to attach.
+      - name: Collect the gateway's LGPL sources
+        if: hashFiles('scripts/datum_gateway_build.sh') != ''
+        run: scripts/datum_gateway_sources.sh dist/datum-sources
+      - name: Keep the gateway's LGPL sources
+        if: hashFiles('scripts/datum_gateway_build.sh') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: datum-gateway-sources
+          path: dist/datum-sources/
           if-no-files-found: error

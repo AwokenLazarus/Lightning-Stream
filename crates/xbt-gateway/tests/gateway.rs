@@ -3,6 +3,10 @@
 //! shipped binary to the same rules on Lightning Fork nodes.
 mod common;
 
+/// The refill wait for tests that stream a paid body and are not about that wait running out: a slow box (old cores,
+/// a cold cache) took longer than the rig's 300 ms for a buyer's lock and release, and cut the body. Shipped: 15 s.
+const SLOW_BOX_REFILL_MS: u64 = 5_000;
+
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -77,6 +81,8 @@ fn an_unpaid_request_gets_the_terms_and_reaches_nothing() {
         json!({"requestMsat": "0", "byteMsat": "1000", "perBytes": "1048576", "secondMsat": "0"})
     );
     assert_eq!(x["receiptKey"], KEY(&rig));
+    // how long it keeps an answer paused for a release (`times.refill_wait_ms`, 300 in this rig)
+    assert_eq!(x["refillWaitMs"].as_u64(), Some(300));
     assert_eq!(pr["resource"]["url"], "http://gateway.test:8402/files/1000");
     assert_eq!(
         http(&rig.addr, "GET", "/verify/10", &[], b"", None).json()["accepts"][0]["extra"]
@@ -300,11 +306,13 @@ fn no_ticket_is_settled_inside_24_blocks_of_its_expiry() {
 fn no_ticket_is_settled_without_a_fresh_block_height() {
     // the janitor asks once at the start and then not again within this test
     let (rig, _d) = start(
-        &|v| v["times"] = json!({"height_max_age_secs": 1, "tick_ms": 5000, "upstream_wait_secs": 2, "refill_wait_ms": 300}),
+        // a height 3 s old is stale (shipped: 10 s). 1 s was shorter than one request on a slow box: the fresh height of
+        // a tick had gone stale again by the time the request after it was served
+        &|v| v["times"] = json!({"height_max_age_secs": 3, "tick_ms": 5000, "upstream_wait_secs": 2, "refill_wait_ms": 300}),
     );
     let mut b = Buyer::new(&rig, 1);
     let s = b.lock(&rig, 1);
-    std::thread::sleep(Duration::from_millis(1200));
+    std::thread::sleep(Duration::from_millis(3200));
     assert_eq!(
         rig.gw.stats().height,
         None,
@@ -328,7 +336,7 @@ fn no_ticket_is_settled_without_a_fresh_block_height() {
     // a node that is not there gives no height either
     let t = b.lock(&rig, 1);
     rig.node.set_down(true);
-    std::thread::sleep(Duration::from_millis(1200));
+    std::thread::sleep(Duration::from_millis(3200));
     rig.gw.tick();
     assert_eq!(rig.gw.stats().height, None);
     assert_eq!(b.get("/api", Some(&t[0])).error(), "node_unavailable");
@@ -745,6 +753,9 @@ fn a_body_priced_per_byte_is_paid_as_it_arrives() {
     let (rig, _d) = start(&|v| {
         v["routes"][0]["price"] = json!({"byte_msat": 200_000, "per_bytes": 1_048_576});
         v["tickets"] = json!({"ticket_msat": 2_000_000, "max_tickets": 8});
+        // this test is about paying as the body streams, not about the wait for a refill: the buyer's lock and
+        // release (several node calls) took over the rig's 300 ms on a slow box (shipped: 15 s)
+        v["times"]["refill_wait_ms"] = json!(SLOW_BOX_REFILL_MS);
     });
     let mut b = Buyer::new(&rig, 1);
     let size = 100_000_000usize;

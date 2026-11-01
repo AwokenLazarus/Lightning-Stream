@@ -45,11 +45,17 @@ mkdir -p "$ROOT/run"
 R=$(mktemp -d "${TMPDIR:-/tmp}/p2ph-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp \
-  -p xbt-gateway --bin xbt-gateway -p xbt-hashlink --bin xbt-hashlink
+  -p xbt-gateway --bin xbt-gateway -p xbt-hashlink --bin xbt-hashlink --features xbt-hashlink/test-unblinded
 if [ "${P2P_HASH_ONLY:-}" = reprice ]; then
   nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p xbt-svc --bin xbt-supervise
 fi
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
+# the real gateways' rentals run the Stream Gateway the image ships (static, x86_64), built here once if missing
+# (its pinned sources are cached); P2P_HASH_DATUM_GATEWAY names another binary
+if [ -z "${P2P_HASH_DATUM_GATEWAY:-}" ] && [ ! -x "$ROOT/dist/datum/x86_64-linux-musl/xbt-datum-gateway" ]; then
+  nice -n 19 "$ROOT/scripts/datum_gateway_build.sh" --targets x86_64-linux-musl >"$ROOT/run/datum_gateway_build.log" 2>&1 \
+    || { tail -20 "$ROOT/run/datum_gateway_build.log" >&2; echo "p2p_hash_regtest: the Stream Gateway did not build" >&2; exit 1; }
+fi
 
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
 # shellcheck disable=SC2046 # the port list is meant to split

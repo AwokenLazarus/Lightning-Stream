@@ -1,8 +1,9 @@
 # Lightning Stream on a plain Linux machine: the same images as the Umbrel app, for an owner who runs
-# their own XBT node, Lightning node (lnd-family) and DATUM Gateway on this machine.
+# their own XBT node and Lightning node (lnd-family) on this machine. A masking gateway comes with it,
+# the Stream Gateway (DATUM-compatible, service "datum"); an owner may use their own DATUM Gateway instead.
 #
 # install.sh writes .env beside this file and starts it; docs/LINUX.md is the guide. Every service
-# uses the host's network, so the app reaches the owner's node, Lightning node and DATUM Gateway on
+# uses the host's network, so the app reaches the owner's node, Lightning node and own DATUM Gateway on
 # 127.0.0.1, where they listen by default, and every port of the app is on 127.0.0.1 too, except:
 #   * the gateway (selling port 8402): it listens beyond loopback only once the owner saves a shop
 #     with an https:// address on the Sell page (the owner's reverse proxy or tunnel leads there);
@@ -58,10 +59,12 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay,vpn
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay,vpn,datum
       XBT_INIT_NODE_RPC_USER: ${LS_NODE_RPC_USER:?set LS_NODE_RPC_USER in .env, the XBT node's RPC user}
       XBT_INIT_NODE_RPC_PASS: ${LS_NODE_RPC_PASS:?set LS_NODE_RPC_PASS in .env, the XBT node's RPC password}
       XBT_INIT_UI_PASSWORD: ${LS_UI_PASSWORD:?set LS_UI_PASSWORD in .env, the app's login password}
+      # the Stream Gateway's node login: init writes it as run/datum/rpc.cookie (user:password, 0600, its
+      # user's) from the two RPC settings above, and makes run/datum/ (the UI writes, the gateway reads)
     volumes:
       - ${LS_DATA_DIR:?LS_DATA_DIR}:/data
 
@@ -97,6 +100,8 @@ services:
       - ${LS_DATA_DIR}/signer:/data/signer
       - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
       - ${LS_DATA_DIR}/run/signer:/data/run/signer
+      # the hashrate renter's own socket: the one way to the "hashrate" task's rental terms
+      - ${LS_DATA_DIR}/run/rental:/data/run/rental
       - ${LS_DATA_DIR}/run/anchor:/data/run/anchor:ro
       - ${LS_DATA_DIR}/run/ln:/data/run/ln:ro
       - ${LS_DATA_DIR}/run/enroll:/data/run/enroll
@@ -167,6 +172,11 @@ services:
       XBT_UI_AI_SELLERS: /data/run/ai/sellers.json
       XBT_UI_CREDENTIALS: /data/run/ai/credentials.json
       XBT_UI_AI_STATE: /data/run/ai/state.json
+      # the Stream Gateway (Services → Hashrate → Your gateway): the UI writes its config.json (no secret in
+      # it) into this dir, for this node, with the API on this port (stratum is 127.0.0.1:23339)
+      XBT_UI_DATUM_DIR: /data/run/datum
+      XBT_UI_DATUM_RPCURL: http://${LS_NODE_RPC_HOST:-127.0.0.1}:${LS_NODE_RPC_PORT}
+      XBT_UI_DATUM_API_PORT: ${LS_DATUM_API_PORT:-7153}
     volumes:
       - ${LS_DATA_DIR}/ui:/data/ui
       - ${LS_DATA_DIR}/run/ai:/data/run/ai
@@ -181,6 +191,7 @@ services:
       - ${LS_DATA_DIR}/run/relay-status:/data/run/relay-status:ro
       - ${LS_DATA_DIR}/run/vpn:/data/run/vpn
       - ${LS_DATA_DIR}/run/vpn-status:/data/run/vpn-status:ro
+      - ${LS_DATA_DIR}/run/datum:/data/run/datum
       - *lightning-cert
 
   # One-shot, run by install.sh (`docker compose --profile setup run --rm -T node-keys < admin.macaroon`): has the
@@ -269,8 +280,40 @@ services:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
 
-  # The hashtaker: rents other people's miners into the owner's own DATUM Gateway (Services → Hashrate)
-  # and pays each piece of work through the signer, as the "hashrate" task of the spending rules.
+  # The Stream Gateway (DATUM-compatible), the masking gateway that comes with the app: rented miners work
+  # on its jobs, solo on the owner's XBT node or for Lazarus Pool, as set on Services → Hashrate. Each job
+  # is masked with a key of the gateway's own, so a hashmaker can't tell which shares would be blocks and
+  # keep those back; the hashtaker opens every job on the API's /xbt/job before a miner gets it. Both
+  # ports are on loopback (stratum 23339; API LS_DATUM_API_PORT, 7153, not 7152, which an owner's own
+  # gateway may hold), and /xbt/job and the dashboard answer loopback only (no admin password: every
+  # admin endpoint refuses). The node is reached over RPC with the login init writes
+  # (run/datum/rpc.cookie); no ZMQ: new blocks are found by polling the node. Idle until the UI writes
+  # run/datum/config.json; a found block is also saved under LS_DATA_DIR/datum/submitblocks.
+  datum:
+    <<: *service
+    image: xbt-datum-gateway:0.1.0
+    stop_grace_period: 30s
+    entrypoint: ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--",
+                 "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
+    # probed at the port this install gives the API, not the image's default 7152
+    healthcheck:
+      test: ["CMD", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:${LS_DATUM_API_PORT:-7153}/",
+             "--waiting-for", "/data/run/datum/config.json"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    volumes:
+      - ${LS_DATA_DIR}/datum:/data/datum
+      - ${LS_DATA_DIR}/run/datum:/data/run/datum:ro
+
+  # The hashtaker: rents other people's miners into a DATUM-protocol gateway (the one above unless the
+  # owner chose their own: LS_DATUM_GATEWAY) and pays each piece of work through the signer, as the
+  # "hashrate" task of the spending rules, on the renter's own socket (run/rental), which no other service
+  # reaches and which the task's rental terms need. Every job is opened on LS_GATEWAY_API (or the API saved with a
+  # gateway chosen on the page) and checked to be masked before a miner gets it; a rental to a gateway whose
+  # jobs aren't is refused. LS_BUNDLED_GATEWAY is "off" when the owner chose their own gateway at install,
+  # so the hashtaker keeps it rather than moving to the Stream Gateway.
   hashtaker:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd
@@ -282,13 +325,15 @@ services:
         condition: service_started
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
-              "--upstream", "${LS_DATUM:-127.0.0.1:23334}", "--user", "${LS_DATUM_USER:-rented}",
+              "--upstream", "${LS_DATUM:-127.0.0.1:23339}", "--gateway-api", "${LS_GATEWAY_API:-127.0.0.1:7153}",
+              "--datum-candidates", "127.0.0.1:23339", "--bundled-gateway", "${LS_BUNDLED_GATEWAY:-127.0.0.1:23339}",
+              "--user", "${LS_DATUM_USER:-rented}",
               "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
-              "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
+              "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
-      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/rental:/data/run/rental:ro
 
   # The built-in Stream relay (docs/RUN-A-RELAY.md): carries direct links between other people's apps
   # when their routers block a direct connection. Profile "relay": started only with LS_RELAY=1,
@@ -297,7 +342,7 @@ services:
   # Settings → Stream relays and its checks pass.
   stream-relay:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-stream-relay:local
+    image: xbt-stream-relay:0.1.0
     profiles: ["relay"]
     network_mode: bridge
     ports:
@@ -322,7 +367,7 @@ services:
   # (LS_VPN_REGION, two letters).
   vpn:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-vpn:local
+    image: xbt-vpn:0.1.0
     profiles: ["vpn"]
     network_mode: bridge
     ports:

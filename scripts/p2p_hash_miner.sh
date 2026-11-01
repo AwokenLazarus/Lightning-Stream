@@ -34,7 +34,7 @@ SLICE_WORK=$((SHARES_PER_SLICE * SHARE_DIFF * 4294967296))
 if [ -n "${GATEWAY_API:-}" ]; then BLIND=(--gateway-api "$GATEWAY_API"); else BLIND=(--allow-unblinded 1); fi
 D=run/p2p-hash/miner/$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$D"
-cargo build -q --release -p xbt-hashlink
+cargo build -q --release -p xbt-hashlink --features test-unblinded
 BIN=target/release/xbt-hashlink
 DM="python3 -I scripts/p2p_hash/dragonmint.py $MINER"
 

@@ -33,6 +33,10 @@ pub const VERSION: &str = "hashrate/0";
 const BIND: &str = "xbt-hashlink/nostr-bind/0";
 /// An event dated further ahead than this is refused.
 const MAX_AHEAD_S: u64 = 600;
+/// A listing older than this is refused: its hashmaker publishes again well within it while it is there
+/// (every few hours at the least), so one this old is from a hashmaker that has gone. Its event also says so to
+/// other clients (NIP-40 `expiration`).
+pub const MAX_AGE_S: u64 = 48 * 3600;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hashrate {
@@ -165,6 +169,7 @@ impl Hashrate {
             vec!["price".into(), price_sat, "SAT".into(), "slice".into()],
             tag(DOC_TAG, &self.to_json().to_string()),
             tag(BIND_TAG, &hex::encode(bind.serialize_compact())),
+            tag("expiration", &(created_at + MAX_AGE_S).to_string()),
         ];
         let free = if self.capacity.miners > 0 {
             format!(" {} of {} miners free now, about {:.2} TH/s.", self.capacity.free_miners, self.capacity.miners, self.capacity.free_hs as f64 / 1e12)
@@ -172,7 +177,7 @@ impl Hashrate {
             String::new()
         };
         let content = format!(
-            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM Gateway. Paid as it is used, seconds at a time, over Lightning Stream.{free}\n",
+            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM-compatible gateway. Paid as it is used, seconds at a time, over Lightning Stream.{free}\n",
             self.name,
             self.algorithm,
             self.hashrate_hs as f64 / 1e12
@@ -187,6 +192,12 @@ impl Hashrate {
         }
         if ev.created_at > now + MAX_AHEAD_S {
             return Err("dated in the future".into());
+        }
+        if ev.created_at.saturating_add(MAX_AGE_S) <= now {
+            return Err("more than two days old: its hashmaker has stopped publishing it".into());
+        }
+        if ev.tag("expiration").and_then(|e| e.parse::<u64>().ok()).is_some_and(|e| e <= now) {
+            return Err("expired".into());
         }
         if !ev.tags.iter().any(|t| t.len() >= 2 && t[0] == "t" && t[1] == TOPIC) {
             return Err("not a hashrate listing".into());
@@ -205,8 +216,9 @@ impl Hashrate {
     }
 }
 
-pub fn filter(limit: usize) -> Value {
-    json!({"kinds": [KIND], "#t": [TOPIC], "limit": limit})
+/// The listings published since `since`, newest first.
+pub fn filter(limit: usize, since: u64) -> Value {
+    json!({"kinds": [KIND], "#t": [TOPIC], "since": since, "limit": limit})
 }
 
 /// Publish a listing to each relay: what each said.
@@ -219,7 +231,7 @@ pub fn publish(relays: &[String], ev: &Event) -> Vec<Value> {
 
 /// Every good listing on the relays, newest per link key; and how many events were refused.
 pub fn find(relays: &[String], now: u64) -> (Vec<(Hashrate, Event)>, usize) {
-    let (events, _) = xbt_nostr::oneshot::query(relays, &filter(100), Duration::from_secs(10));
+    let (events, _) = xbt_nostr::oneshot::query(relays, &filter(100, now.saturating_sub(MAX_AGE_S)), Duration::from_secs(10));
     let mut best: Vec<(Hashrate, Event)> = Vec::new();
     let mut refused = 0;
     for ev in events {
@@ -277,6 +289,42 @@ mod tests {
         assert!(Hashrate::read_event(&Event::sign(&nostr, 1000, KIND, tags, String::new()), 1000).is_err());
         assert!(Hashrate::read_event(&ev, 0).is_err(), "dated ahead");
         assert!(h.event(&link2, &nostr, 1).is_err());
+    }
+
+    #[test]
+    fn a_listing_expires_after_two_days() {
+        let link = SecretKey::from_slice(&[5; 32]).unwrap();
+        let nostr = Keys::generate();
+        let h = listing(&link);
+        let ev = h.event(&link, &nostr, 1000).unwrap();
+        assert_eq!(ev.tag("expiration"), Some((1000 + MAX_AGE_S).to_string().as_str()), "other clients are told too (NIP-40)");
+        assert!(Hashrate::read_event(&ev, 1000 + MAX_AGE_S - 1).is_ok());
+        assert!(Hashrate::read_event(&ev, 1000 + MAX_AGE_S).unwrap_err().contains("two days old"));
+        // a listing that says it expires sooner is taken at its word
+        let mut tags = ev.tags.clone();
+        tags.last_mut().unwrap()[1] = "2000".into();
+        let soon = Event::sign(&nostr, 1000, KIND, tags, String::new());
+        assert!(Hashrate::read_event(&soon, 1999).is_ok());
+        assert!(Hashrate::read_event(&soon, 2000).is_err());
+        // one without the tag (an older app's) still ages out by its date
+        let tags: Vec<Vec<String>> = ev.tags.iter().filter(|t| t[0] != "expiration").cloned().collect();
+        let old = Event::sign(&nostr, 1000, KIND, tags, String::new());
+        assert!(Hashrate::read_event(&old, 1000 + MAX_AGE_S - 1).is_ok());
+        assert!(Hashrate::read_event(&old, 1000 + MAX_AGE_S).is_err());
+    }
+
+    /// On a relay: a hashmaker that stopped publishing three days ago is not offered; one that publishes is.
+    #[test]
+    fn a_hashmaker_gone_for_days_is_not_found() {
+        let relay = xbt_nostr::standin::StandinRelay::start().unwrap();
+        let relays = vec![relay.url.clone()];
+        let now = xbt_nostr::now();
+        let (gone, here) = (SecretKey::from_slice(&[7; 32]).unwrap(), SecretKey::from_slice(&[8; 32]).unwrap());
+        publish(&relays, &listing(&gone).event(&gone, &Keys::generate(), now - 3 * 86_400).unwrap());
+        publish(&relays, &listing(&here).event(&here, &Keys::generate(), now - 6 * 3600).unwrap());
+        let (found, _) = find(&relays, now);
+        let keys: Vec<PublicKey> = found.iter().map(|(h, _)| h.link_key).collect();
+        assert_eq!(keys, [PublicKey::from_secret_key(secp256k1::SECP256K1, &here)]);
     }
 
     #[test]

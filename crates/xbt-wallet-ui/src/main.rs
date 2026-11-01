@@ -216,6 +216,12 @@ fn serve() -> i32 {
         Ok(false) => {}
         Err(e) => eprintln!("xbt-wallet-ui: the gateway's config was left as it was: {e}"),
     }
+    // the Stream Gateway's config follows the node this UI is given (StartOS: the Node connection action), too
+    match xbt_wallet_ui::stream_gateway::follow_node(&cfg.hash.stream_gw) {
+        Ok(true) => eprintln!("xbt-wallet-ui: the Stream Gateway's config now names the node at {}", cfg.hash.stream_gw.rpcurl.as_deref().unwrap_or("")),
+        Ok(false) => {}
+        Err(e) => eprintln!("xbt-wallet-ui: the Stream Gateway's config: {e}"),
+    }
     let app = match xbt_wallet_ui::app::App::new(cfg) {
         Ok(a) => a,
         Err(e) => {

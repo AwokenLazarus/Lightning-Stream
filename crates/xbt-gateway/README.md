@@ -239,6 +239,13 @@ be paid is your price: a piece of a tenth of a sat wins a 64-sat payment one tim
 you are actually paid comes near that only over many wins: within 20% takes about 68 wins
 (4,350 sat at this win size), nine times in ten.
 
+A win's invoice lives `invoice_secs` (as long as `grace_seconds`, and never longer) for a buyer
+that says nothing more. A buyer that says at the open that it asks for a failed win's invoice to
+be cancelled (`canCancel`, every wallet from 0.2.0) gets invoices of `invoice_secs_cancel`, 180 s
+as shipped: its next invoice comes at once when a payment fails, so a long invoice holds it up
+for nothing, and a win that waits its turn behind many others' does not see its invoice lapse.
+The grace is the same for both: a win unpaid past it stops the answer either way.
+
 A route is offered this way only if its dearest piece (its request, one second, or `piece_bytes`
 of its body) costs a quarter of `win_msat` or less (`max_odds_den`, 4: no piece wins more often
 than one time in four, which is also the most a wallet's owner allows by default). You serve

@@ -222,7 +222,10 @@ fn jellyfin_login(base: &str, name: &str, password: &str, buyer: &str) -> Result
 
 /// A hook's account: the seller's program, given the buyer's handle, prints `{"headers": {…}}`.
 fn hook_make(command: &Path, buyer: &str) -> Result<Account, String> {
-    let out = std::process::Command::new(command).arg(handle(buyer)).output().map_err(|e| format!("the accounts hook: {e}"))?;
+    // the hook gets SIGTERM and SIGINT back, which this service blocks for its own stop (xbt_svc::shutdown::unblocked)
+    let out = xbt_svc::shutdown::unblocked(std::process::Command::new(command).arg(handle(buyer)))
+        .output()
+        .map_err(|e| format!("the accounts hook: {e}"))?;
     if !out.status.success() {
         return Err(format!("the accounts hook failed ({})", out.status));
     }
