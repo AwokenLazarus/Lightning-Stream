@@ -41,8 +41,6 @@ DEPS=(
   "curl-8.11.1.tar.xz https://curl.se/download/curl-8.11.1.tar.xz c7ca7db48b0909743eaef34250da02c19bc61d4f1dcedd6603f109409536ab56"
   "libmicrohttpd-1.0.1.tar.gz https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz|https://ftpmirror.gnu.org/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94"
   "argp-standalone-1.5.0.tar.gz https://github.com/argp-standalone/argp-standalone/archive/refs/tags/1.5.0.tar.gz c29eae929dfebd575c38174f2c8c315766092cec99a8f987569d0cad3c6d64f6"
-  # argp-standalone's licence (its sources say GNU Library GPL version 2 or later; its tarball carries no text)
-  "lgpl-2.0.txt https://www.gnu.org/licenses/old-licenses/lgpl-2.0.txt cc535c21133c895b56b374c8a1dc1eb948d99003ed2b47372069456b62f42b24"
 )
 for d in "${DEPS[@]}"; do
   read -r name url sum <<<"$d"
@@ -196,9 +194,13 @@ tar xOf "$CACHE/jansson-2.14.tar.gz" jansson-2.14/LICENSE > "$L/jansson.LICENSE"
 tar xOf "$CACHE/curl-8.11.1.tar.xz" curl-8.11.1/COPYING > "$L/curl.COPYING"
 tar xOf "$CACHE/libmicrohttpd-1.0.1.tar.gz" libmicrohttpd-1.0.1/COPYING > "$L/libmicrohttpd.COPYING"
 # argp-standalone ships no licence file: its sources' own notice (GNU Library GPL, version 2 or later) and that
-# licence's text, from the FSF (pinned above)
+# licence's text
 tar xOf "$CACHE/argp-standalone-1.5.0.tar.gz" argp-standalone-1.5.0/argp-parse.c | sed -n '1,/\*\//p' > "$L/argp-standalone.NOTICE"
-cp "$CACHE/lgpl-2.0.txt" "$L/argp-standalone.COPYING"
+# (the FSF's lgpl-2.0.txt, kept in third_party/licenses: a licence text needs no fetch at build time)
+LGPL2=$ROOT/third_party/licenses/lgpl-2.0.txt
+[ "$(sha256sum "$LGPL2" | cut -d' ' -f1)" = cc535c21133c895b56b374c8a1dc1eb948d99003ed2b47372069456b62f42b24 ] \
+  || { echo "datum_gateway_build: $LGPL2 is not the FSF's text" >&2; exit 1; }
+cp "$LGPL2" "$L/argp-standalone.COPYING"
 # musl, which zig links in as the C library: its MIT copyright notice, from the copy zig builds it from
 cp "$(dirname "$ZIG_EXE")/lib/libc/musl/COPYRIGHT" "$L/musl.COPYRIGHT"
 for f in "$L"/*; do [ -s "$f" ] || { echo "datum_gateway_build: $f is empty" >&2; exit 1; }; done
