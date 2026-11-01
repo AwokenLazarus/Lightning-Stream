@@ -66,7 +66,15 @@ ZIG_PY=${XBT_ZIG_PY:-$HOME/.local/share/ziglang-venv/bin/python}
 ZIG_EXE=$("$ZIG_PY" -m ziglang env | sed -n 's/^ *\.zig_exe = "\(.*\)",$/\1/p')
 [ -n "$ZIG_EXE" ] || { echo "datum_gateway_build: zig env names no zig_exe" >&2; exit 1; }
 ZIG_DIRS=("$(dirname "$ZIG_EXE")/" "${ZIG_GLOBAL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig}/")
-REV=$(git rev-parse --short=12 HEAD)$(git status --porcelain --untracked-files=no | grep -q . && echo "-dirty" || true)
+COMMIT=$(git rev-parse --short=12 HEAD)
+DIRTY=$(git status --porcelain --untracked-files=no | grep -q . && echo 1 || true)
+# a release build (oci_build.sh --push sets XBT_DATUM_RELEASE=1) is of a committed tree only: the NOTICE names
+# that commit as the source. A local build from changes not committed says so, and its NOTICE too
+if [ -n "$DIRTY" ] && [ "${XBT_DATUM_RELEASE:-}" = 1 ]; then
+  echo "datum_gateway_build: a release build needs a clean tree (its NOTICE names the commit as its source)" >&2; exit 1
+fi
+[ -n "$DIRTY" ] && echo "datum_gateway_build: warning: the tree has changes not committed; the NOTICE says so (not for release)" >&2
+REV=$COMMIT${DIRTY:+-dirty}
 # what the gateway tells a pool it is (the hello's second user-agent field): upstream's commit, then ours
 export XBT_DATUM_BUILD_NAME="971af86b93de+xbt-mask.$REV"
 
@@ -186,8 +194,9 @@ done
 L=$OUT/licenses
 rm -rf "$L" && mkdir -p "$L"
 # the NOTICE names the commit this binary was built from, so the source it points to is that exact tree
-sed -e "s/@BUILD@/$XBT_DATUM_BUILD_NAME/g" -e "s/@COMMIT@/$REV/g" "$ROOT/container/datum-gateway-NOTICE" > "$L/NOTICE"
-grep -q '@BUILD@\|@COMMIT@' "$L/NOTICE" && { echo "datum_gateway_build: NOTICE not filled in" >&2; exit 1; }
+LOCAL=${DIRTY:+, with changes not committed (a local build, not for release)}
+sed -e "s/@BUILD@/$XBT_DATUM_BUILD_NAME/g" -e "s/@COMMIT@/$COMMIT/g" -e "s/@LOCAL@/$LOCAL/g" "$ROOT/container/datum-gateway-NOTICE" > "$L/NOTICE"
+grep -q '@BUILD@\|@COMMIT@\|@LOCAL@' "$L/NOTICE" && { echo "datum_gateway_build: NOTICE not filled in" >&2; exit 1; }
 cp "$ROOT/third_party/datum_gateway/LICENSE" "$L/datum_gateway.LICENSE"
 tar xOf "$CACHE/libsodium-1.0.20.tar.gz" libsodium-1.0.20/LICENSE > "$L/libsodium.LICENSE"
 tar xOf "$CACHE/jansson-2.14.tar.gz" jansson-2.14/LICENSE > "$L/jansson.LICENSE"

@@ -133,7 +133,8 @@ if want xbt-datum-gateway; then
   if [ -z "$DG" ]; then
     DG=$OUT/datum
     zt=(); for t in "${!ARCH[@]}"; do zt+=("${ZIG[$t]}"); done
-    "${SOAK[@]}" scripts/datum_gateway_build.sh --out "$DG" --targets "$(IFS=,; echo "${zt[*]}")" --test
+    # a pushed image is a release: its gateway build refuses a dirty tree (its NOTICE names the commit)
+    XBT_DATUM_RELEASE=${PUSH:+1} "${SOAK[@]}" scripts/datum_gateway_build.sh --out "$DG" --targets "$(IFS=,; echo "${zt[*]}")" --test
   fi
   for t in "${!ARCH[@]}"; do
     d=$CTX/bin/${ARCH[$t]}

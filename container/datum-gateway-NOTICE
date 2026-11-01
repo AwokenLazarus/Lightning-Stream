@@ -1,5 +1,5 @@
 Stream Gateway (DATUM-compatible), as shipped in Lightning Stream's xbt-datum-gateway image.
-This binary: @BUILD@, built from Lightning Stream commit @COMMIT@
+This binary: @BUILD@, built from Lightning Stream commit @COMMIT@@LOCAL@
 (https://github.com/AwokenLazarus/Lightning-Stream/tree/@COMMIT@).
 
 It is CONVOY's datum_gateway (https://github.com/CONVOYMining/datum_gateway, commit
