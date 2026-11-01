@@ -86,7 +86,7 @@ use crate::policy::normalize_dest;
 use crate::keystore::write_private;
 use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
-use crate::signer::{deny, with, Signer};
+use crate::signer::{deny, with, Caller, Signer};
 use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, PROGRESS_FLOOR_BYTES, ROUTE_FULL, TIP_UNKNOWN};
 use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, PriceCeiling, Receipt};
 use crate::{err, Result};
@@ -1646,6 +1646,15 @@ pub(crate) struct Slot {
     open: Mutex<Option<Arc<HttpSession>>>,
 }
 
+/// Where a session is kept: a seller's address and the task it pays under. A session is its task's alone: a
+/// task's budget is booked when its tickets are bought, so a call of another task served by it would spend
+/// that task's credit and book its refills to that task. A call of another task opens a session of its own.
+pub(crate) type SlotKey = (String, String);
+
+pub(crate) fn slot_key(origin: &str, task: &str) -> SlotKey {
+    (origin.to_string(), task.to_string())
+}
+
 /// What trying one rail came to.
 enum Tried {
     Done(Value),
@@ -2476,8 +2485,8 @@ impl Signer {
     /// Whether terms kept for a route of `origin` are those of the session open with it: the same node,
     /// receipt key, ticket and endpoints. Terms kept from before the session was opened again on others
     /// would stop it as a seller whose terms changed; the price is asked instead.
-    fn route_terms_fit(&self, origin: &str, pr: &Value, lightning: &str) -> bool {
-        let Some(slot) = lock(&self.ticket_http).get(origin).cloned() else { return false };
+    fn route_terms_fit(&self, origin: &str, task: &str, pr: &Value, lightning: &str) -> bool {
+        let Some(slot) = lock(&self.ticket_http).get(&slot_key(origin, task)).cloned() else { return false };
         let Ok(open) = slot.open.try_lock() else { return false };
         let Some(h) = open.as_ref() else { return false };
         offers(pr, lightning).into_iter().any(|o| match o {
@@ -2529,7 +2538,8 @@ impl Signer {
     /// A caller that hands the answer on to a browser (a seller's own web page, docs/SELLER-APPS.md)
     /// sends the page's own request headers (`headers`, [`caller_headers`]) and, with
     /// `head_headers`, gets the seller's response headers in the head line ([`passed_headers`]).
-    pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
+    /// Only `caller` [`Caller::Renter`] pays under a task's rental terms, and only a rental's pieces of work ([`crate::renter`]).
+    pub(crate) fn xbt402_pay(&self, p: &Value, caller: Caller) -> Value {
         let origin = p.get("url").and_then(Value::as_str).and_then(|u| origin_of(u).ok()).map(|o| normalize_dest(&o));
         let forget = || {
             if let Some(o) = &origin {
@@ -2543,7 +2553,7 @@ impl Signer {
         let known = p.get("known_terms").and_then(Value::as_bool) == Some(true);
         // the whole call has one deadline, the try on new terms below included
         let call_by = Instant::now() + Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64);
-        let first = self.xbt402_pay_as(p, known, call_by);
+        let first = self.xbt402_pay_as(p, known, call_by, caller);
         if stopped_on_new_terms(&first) {
             forget();
         }
@@ -2562,7 +2572,7 @@ impl Signer {
                 again["max_sats"] = (m - booked).max(0).into();
             }
         }
-        let mut v = self.xbt402_pay_as(&again, false, call_by);
+        let mut v = self.xbt402_pay_as(&again, false, call_by, caller);
         if stopped_on_new_terms(&v) {
             forget();
         }
@@ -2577,7 +2587,7 @@ impl Signer {
 
     /// [`Signer::xbt402_pay`]; `known_terms`: a request on a route whose terms the seller stated in this
     /// session may be paid without asking its price first ([`Signer::route_terms`]).
-    fn xbt402_pay_as(&self, p: &Value, known_terms: bool, call_by: Instant) -> Value {
+    fn xbt402_pay_as(&self, p: &Value, known_terms: bool, call_by: Instant, caller: Caller) -> Value {
         let tp = self.ticket_policy();
         let cfg = self.config();
         let max_sats = match p.get("max_sats").filter(|v| !v.is_null()) {
@@ -2610,6 +2620,11 @@ impl Signer {
             _ => vec![],
         };
         let task = Self::ticket_task_for(&tp, &str_or_empty(p.get("task")));
+        // a task's rental terms are the renter's alone, on its own socket, for a rental's pieces of work: decided
+        // on the task as it resolves, before anything is asked of the seller
+        if let Some(refused) = crate::renter::pay_gate(caller, &tp, task.as_deref().ok(), &method, &url) {
+            return refused;
+        }
         let stream_to = match stream_socket(p.get("stream_to")) {
             Ok(s) => s,
             Err(why) => return deny("stream_to", why),
@@ -2713,11 +2728,12 @@ impl Signer {
         };
         // the session open with this seller, named in the ask of the price: a seller whose route is full
         // goes on serving a buyer it serves there (docs/CAPACITY.md)
-        let named0 = self.ticket_seller_sid(&origin, false);
+        let call_task = task.as_deref().unwrap_or("");
+        let named0 = task.as_deref().ok().and_then(|t| self.ticket_seller_sid(&origin, t, false));
         // a plain read on a route whose terms this seller stated, with a session open: paid without asking
         let known = (known_terms && named0.is_some() && matches!(method.as_str(), "GET" | "HEAD") && raw.is_empty() && !upgrade)
             .then(|| self.route_terms_for(&origin, &url)).flatten()
-            .filter(|pr| self.route_terms_fit(&origin, pr, &lightning));
+            .filter(|pr| self.route_terms_fit(&origin, call_task, pr, &lightning));
         let pr = match known {
             Some(pr) => pr,
             None => {
@@ -2744,7 +2760,7 @@ impl Signer {
                     // busy while another call was opening the session with this seller (a page's first parts at
                     // once): asked again as that session's buyer, once it is open
                     if probe.status == 503 && named.is_none() {
-                        named = self.ticket_seller_sid(&origin, true);
+                        named = task.as_deref().ok().and_then(|t| self.ticket_seller_sid(&origin, t, true));
                         if named.is_some() {
                             continue;
                         }
@@ -2888,7 +2904,7 @@ impl Signer {
             ticket_entry: ticket.is_some(), lottery_entry: true, lottery_on: tp.lottery.enabled,
             meter: tp.tasks.get(task).map_or(crate::lottery::Meter::Auto, |t| t.meter),
             // a session this process pays this origin by draws is the one that is open; else what the book holds open with the seller's node
-            open: if lock(&self.draw_http).contains_key(c.origin) { Some(true) } else { self.ticket_open_kind(&payee, c.origin) },
+            open: if lock(&self.draw_http).contains_key(&slot_key(c.origin, task)) { Some(true) } else { self.ticket_open_kind(&payee, c.origin, task) },
             dearest_msat: draw.dearest_piece().unwrap_or(u64::MAX), ticket_msat: ticket.as_ref().map_or(u64::MAX, |t| t.ticket_msat),
             expect_msat, held_fits: ticket.is_some() && self.ticket_held_fits(task),
             stay_tickets: tp.lottery.stay_tickets.max(1) as u64, prepaid_entry, win_msat, min_wins: tp.lottery.min_expected_wins.max(0) as u64 })
@@ -2977,14 +2993,20 @@ impl Signer {
             return Tried::Next("tickets are paid over https, or over http to this machine only (127.0.0.1, ::1, localhost): on a plain connection a \
                                 listener learns the session key".into());
         }
-        let slot = lock(&self.ticket_http).entry(c.origin.to_string()).or_default().clone();
+        // a call of no task the owner named has no session to be served by
+        let task = match &c.task {
+            Ok(t) => t.clone(),
+            Err(why) => return Tried::Next(why.clone()),
+        };
+        let key = slot_key(c.origin, &task);
+        let slot = lock(&self.ticket_http).entry(key.clone()).or_default().clone();
         // the session with this seller, or why there is none
         let found: std::result::Result<Arc<HttpSession>, Tried> = 'open: {
             let mut open = lock(&slot.open);
             // a seller that gave no word about its earlier session a moment ago: a call that queued behind that wait, or came
             // straight after it, is told the same at once, and is not made to wait as long again, each behind the last
             if open.is_none() {
-                let said = lock(&self.ticket_unanswered).get(c.origin).filter(|(at, _)| self.engine.now() - at < RESUME_RETRY_AFTER_S as f64).map(|(_, d)| d.clone());
+                let said = lock(&self.ticket_unanswered).get(&key).filter(|(at, _)| self.engine.now() - at < RESUME_RETRY_AFTER_S as f64).map(|(_, d)| d.clone());
                 if let Some(d) = said {
                     break 'open Err(Tried::Done(d));
                 }
@@ -2993,11 +3015,11 @@ impl Signer {
             // unless another call has made a new one meanwhile
             {
                 let mut map = lock(&self.ticket_http);
-                match map.get(c.origin) {
+                match map.get(&key) {
                     Some(s) if Arc::ptr_eq(s, &slot) => {}
                     Some(_) => break 'open Err(Tried::Done(refusal("ticket_busy", "another call is opening a session with this seller: call again"))),
                     None => {
-                        map.insert(c.origin.to_string(), slot.clone());
+                        map.insert(key.clone(), slot.clone());
                     }
                 }
             }
@@ -3030,13 +3052,9 @@ impl Signer {
                 None => {
                     // the same seller (its node and receipt key) open under another address, an alias of this shop or
                     // the one it moved from: that session is stopped, and the new one takes over its balance
-                    if let Err(busy) = self.ticket_http_move(c.origin, &terms) {
+                    if let Err(busy) = self.ticket_http_move(c.origin, &task, &terms) {
                         break 'open Err(Tried::Done(busy));
                     }
-                    let task = match &c.task {
-                        Ok(t) => t.clone(),
-                        Err(why) => break 'open Err(Tried::Next(why.clone())),
-                    };
                     let o = {
                         let _g = self.lock();
                         self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
@@ -3071,7 +3089,7 @@ impl Signer {
                         Resumed::Taken => true,
                         Resumed::Fresh => false,
                         Resumed::Wait(d) => {
-                            lock(&self.ticket_unanswered).insert(c.origin.to_string(), (self.engine.now(), d.clone()));
+                            lock(&self.ticket_unanswered).insert(key.clone(), (self.engine.now(), d.clone()));
                             let stopped = self.ticket_http_stop(&h, crate::ticket::RESUME_WAIT_WHY, Duration::ZERO);
                             break 'open Err(Tried::Done(with(d, json!({"stopped": stopped}))));
                         }
@@ -3125,8 +3143,8 @@ impl Signer {
         let hs = match found {
             Ok(hs) => hs,
             Err(tried) => {
-                if lock(&self.ticket_http).get(c.origin).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
-                    self.ticket_slot_drop(c.origin);
+                if lock(&self.ticket_http).get(&key).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
+                    self.ticket_slot_drop(&key);
                 }
                 return tried;
             }
@@ -3289,8 +3307,8 @@ impl Signer {
     /// session locks nothing until its `retryAfter` has passed, and the refusal says so.
     /// The seller's id of the session open with `origin`, if one is. While a call is opening one: none,
     /// or with `wait`, the one it opened.
-    fn ticket_seller_sid(&self, origin: &str, wait: bool) -> Option<String> {
-        let slot = lock(&self.ticket_http).get(origin).cloned()?;
+    fn ticket_seller_sid(&self, origin: &str, task: &str, wait: bool) -> Option<String> {
+        let slot = lock(&self.ticket_http).get(&slot_key(origin, task)).cloned()?;
         let open = if wait { lock(&slot.open) } else { slot.open.try_lock().ok()? };
         let sid = lock_link(open.as_ref()?).seller_sid.clone();
         (!sid.is_empty()).then_some(sid)
@@ -3781,11 +3799,12 @@ impl Signer {
         }
     }
 
-    /// Stop a session this process holds open with the seller of `terms` under an origin other than
-    /// `origin`, so that a session opened at `origin` takes over its balance ([`Signer::ticket_resume`]).
+    /// Stop a session this process holds open under `task` with the seller of `terms` under an origin other
+    /// than `origin`, so that a session opened at `origin` takes over its balance ([`Signer::ticket_resume`]).
+    /// Another task's session there is left alone: its balance is not this task's to take over.
     /// `Err`: that session is in use by another call right now, which is told to come back.
-    fn ticket_http_move(&self, origin: &str, terms: &PayTerms) -> std::result::Result<(), Value> {
-        let others: Vec<Arc<Slot>> = lock(&self.ticket_http).iter().filter(|(o, _)| o.as_str() != origin).map(|(_, s)| s.clone()).collect();
+    fn ticket_http_move(&self, origin: &str, task: &str, terms: &PayTerms) -> std::result::Result<(), Value> {
+        let others: Vec<Arc<Slot>> = lock(&self.ticket_http).iter().filter(|((o, t), _)| o.as_str() != origin && t.as_str() == task).map(|(_, s)| s.clone()).collect();
         for slot in others {
             // never waited for: a call through the other name may be waiting for this one's place
             let Ok(mut open) = slot.open.try_lock() else {
@@ -3810,7 +3829,7 @@ impl Signer {
     /// `true`: taken over.
     fn ticket_resume(&self, hs: &HttpSession) -> Resumed {
         let receipt_key = hex::encode(&hs.terms.receipt_key);
-        let candidates = self.ticket_resumable_all(&hs.terms.terms.payee, &receipt_key, &hs.origin, &hs.sid);
+        let candidates = self.ticket_resumable_all(&hs.terms.terms.payee, &receipt_key, &hs.origin, &hs.task, &hs.sid);
         let waiting = format!("resume:{}:{receipt_key}", hs.terms.terms.payee);
         let empty = |found: &crate::ticket_rail::Resumable| format!("empty:{}:{}", found.http.id, found.sent);
         // a seller session this process still holds for a session of its own, whatever the book says of that session (an
@@ -5744,11 +5763,11 @@ impl Signer {
 
     /// Forget a seller's place when it holds no session, so that the places kept are those of
     /// open sessions (which the owner's `tickets.max_sellers` bounds) and of calls in progress.
-    fn ticket_slot_drop(&self, origin: &str) {
+    fn ticket_slot_drop(&self, key: &SlotKey) {
         let mut map = lock(&self.ticket_http);
-        let empty = map.get(origin).is_some_and(|slot| slot.open.try_lock().is_ok_and(|open| open.is_none()));
+        let empty = map.get(key).is_some_and(|slot| slot.open.try_lock().is_ok_and(|open| open.is_none()));
         if empty {
-            map.remove(origin);
+            map.remove(key);
         }
     }
 
@@ -5774,7 +5793,8 @@ impl Signer {
             }
         }
         {
-            let slot = lock(&self.ticket_http).get(&hs.origin).cloned();
+            let key = slot_key(&hs.origin, &hs.task);
+            let slot = lock(&self.ticket_http).get(&key).cloned();
             if let Some(slot) = slot {
                 if let Ok(mut open) = slot.open.try_lock() {
                     if open.as_ref().is_some_and(|h| h.sid == hs.sid) {
@@ -5782,7 +5802,7 @@ impl Signer {
                     }
                 }
             }
-            self.ticket_slot_drop(&hs.origin);
+            self.ticket_slot_drop(&key);
         }
         let still_streaming = hs.streaming.load(Ordering::SeqCst) > 0;
         let stopped = {

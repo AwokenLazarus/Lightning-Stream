@@ -158,6 +158,14 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that will not say what an earlier session left with it no longer has a new ticket bought
   beside that credit: the call is refused with a time to retry. After two minutes a new session starts,
   your wallet's history names what may be left, and the next session uses that credit first, oldest first.
+- Credit one task leaves with a shop is no longer spent by another task's calls, which could take
+  that task past its own budget. The credit now waits for a call of its own task, for up to about
+  20 hours, and another task's call to that shop buys its own ticket.
+- A call of one task is no longer paid from a session another task has open with the same shop, which
+  spent that task's credit and booked the tickets it bought to that task, past the calling task's
+  own budget. Each task now has its own session with a shop: a second task's call opens one beside
+  it and buys its own ticket. A call at another address of the same shop no longer stops another
+  task's session, and is no longer held back by another task's prepaid ticket still on its way.
 - A kill or a lost answer no longer buys a second ticket when the first was paid: the next call waits
   for the shop to take it, for two minutes at most. Long answers open for over ten minutes are no longer
   cut by a second call to the same shop.
@@ -191,6 +199,16 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - A shop that sells only its VPN exit is listed, so buyers can find it by its key.
 
 **Hashrate**
+- The hashrate task's own limits (its 200,000 sat budget, tickets up to 10,000 sat, 600 an hour, outside
+  the wallet's day, week and per-shop limits) now apply only to the app's renter paying a rented
+  miner's work. Before, any agent or MCP tool that named the task "hashrate" could pay any shop on
+  them, past your wallet's limits and with no approval. Such a call is now refused and nothing is
+  paid. The renter pays through its own connection to the wallet, which nothing else in the app can
+  reach.
+- If you run the renter by hand (`xbt-hashlink renter --signer …`), or your app's parts are of different
+  versions after an update, point `--signer` at the wallet's renter socket (`run/rental/signer.sock`), and
+  update every part of the app together: a renter on the wallet's ordinary socket now has every rental
+  payment refused, and the Hashrate page says so.
 - Renting needs masked jobs, solo or through a pool, so a hashmaker can't keep back the shares that would be blocks.
   The app comes with a DATUM Gateway that masks its jobs and rents into it. The Rent page checks the gateway's jobs
   when it opens and before each rental; if they aren't masked (the gateway isn't running, or the app is set to

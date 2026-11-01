@@ -959,7 +959,9 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
     // a payment the wallet refused: the hashmaker will only say a piece went unpaid, and the reason is this wallet's,
     // in words where it has them (xbt_hashlink::rail::BIG_TICKETS_ONLY and those beside it)
-    const WORDS: [&str; 3] = ["This hashmaker's smallest ticket is", "What is left of this rental's budget", "Your wallet's rules stopped this payment"];
+    const WORDS: [&str; 5] = ["This hashmaker's smallest ticket is", "What is left of this rental's budget", "Your wallet's rules stopped this payment",
+                              "The wallet pays a rental only through the renter's own connection",
+                              "The renter asked to pay something that isn't a piece of work of its rental"];
     let refused = live["pays"].as_array().into_iter().flatten().rev().find_map(|p| p["why"].as_str().filter(|w| WORDS.iter().any(|s| w.starts_with(s))))
         .map(|w| format!("<p class=\"hint\">{}</p>", esc(w))).unwrap_or_default();
     let cut = if ended {

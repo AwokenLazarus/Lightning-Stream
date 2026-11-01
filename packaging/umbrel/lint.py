@@ -90,7 +90,8 @@ AGENTPAY = {
     # run/enroll: the copy of the one-time enrolment code the signer writes for the setup page. run/shops,
     # read-only: the shops reached by key, for callers that hand it no transport document (the AI
     # address, agents)
-    "xbt-signer": ("signer", {"signer", "enroll"}, {"anchor", "ln", "shops"}),
+    # run/rental: the hashrate renter's own socket, which the signer serves
+    "xbt-signer": ("signer", {"signer", "enroll", "rental"}, {"anchor", "ln", "shops"}),
     "xbt-anchor-witness": ("witness", {"anchor"}, set()),
     # run/ui holds the UI-owned MCP token; the MCP may only read it. run/shops: the shops without a
     # web address the UI keeps, read by the connector and the MCP to hand to the signer
@@ -104,8 +105,8 @@ AGENTPAY = {
     # endpoint books the keys' spend and the sellers' health in run/ai, shared by group with the UI
     "lightning-stream": (None, {"ai"}, {"signer", "shops"}),
     # the hasher and the renter: their keys and state; the settings and token read-only; the renter
-    # also the signer's socket, read-only
-    "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),
+    # also its own socket of the signer's (run/rental), read-only, and not the wallet's
+    "xbt-hashlink": ("hashrate", set(), {"hashrate", "rental"}),
     # the VPN service: its keys and lists; the settings read-only; its status for the UI. Priced exits
     # are paid through the owner's wallet: the signer's socket and the shops read-only, and the stream
     # sockets are STREAM_MOUNT (each paid tunnel's socket is made there)

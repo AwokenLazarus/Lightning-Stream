@@ -7,7 +7,8 @@
 //! Environment as B2's signer: `B2_ROOT` (policy.json, `.run/`), `B2_DATADIR`, `B2_RPCPORT`, `B2_RPCHOST`,
 //! `B2_RPCCOOKIE`, `B2_WALLET`, `B2_CHAIN`, `B2_SIGNER_SOCK` (a path, or `tcp://127.0.0.1:PORT`),
 //! `B2_SIGNER_SOCK_MODE`, `B2_HOT_KEYFILE` / `B2_HOT_PASSPHRASE`, `B2_ANCHOR_SOCK`, `B2_WATCH_INTERVAL`,
-//! `B2_HOT_SCAN`.
+//! `B2_HOT_SCAN`, and `B2_RENTAL_SOCK`: the hashrate renter's own socket, the only one that pays under a
+//! task's rental terms (`xbt_signer::renter`; unset: no caller does).
 //!
 //! Container mode (AGP-038, `docs/CONTAINER.md`): with `XBT_DATA_DIR` set and neither `--root` nor
 //! `B2_ROOT`, the root is `$XBT_DATA_DIR/signer`; the socket is `run/signer/signer.sock` (mode 660), the
@@ -16,7 +17,8 @@
 //! default that pays nobody; the node is `XBT_NODE_RPC_HOST`/`XBT_NODE_RPC_PORT`/`XBT_CHAIN` with
 //! the secret `node-rpc-auth`; the wrapping key is the secret `signer-passphrase`, else
 //! `signer-wrap-key` (32 bytes, generated 0600 on first run). The signer writes its readiness to
-//! `run/signer/ready.json` every `XBT_READY_INTERVAL` seconds (default 5).
+//! `run/signer/ready.json` every `XBT_READY_INTERVAL` seconds (default 5). Where `xbt-init` made
+//! `run/rental/` (the hashrate services are installed), the renter's socket is `run/rental/signer.sock`.
 //!
 //! SIGTERM or SIGINT stops it: no new request, the ones running and the watcher's tick get 5 s to
 //! finish, the socket is removed, exit 0.
@@ -70,6 +72,20 @@ fn container_setup(data: &DataDir, mode: Mode) -> Result<(PathBuf, Option<Arc<Ke
     xbt_svc::ensure_dir(&run, 0o750).map_err(|e| format!("{}: {e}", run.display()))?;
     set_default("B2_SIGNER_SOCK", data.signer_sock());
     set_default("B2_SIGNER_SOCK_MODE", "660");
+    // the hashrate renter's socket, in the dir xbt-init made for it (its group keeps every other caller out): only
+    // where that dir is there and closed to everyone else, never one made here (a bind mount's host folder that
+    // no init made its own is root's, 0755)
+    // (an operator's own B2_RENTAL_SOCK stands, and is said where it is bound)
+    let renter_dir = data.run(xbt_svc::RUN_RENTAL);
+    if env("B2_RENTAL_SOCK").is_some() || renter_dir_closed(&renter_dir) {
+        set_default("B2_RENTAL_SOCK", data.rental_sock());
+    } else if renter_dir.exists() {
+        eprintln!("xbt-signer: no hashrate renter's socket: {} is not a directory closed to other users (xbt-init makes it 0750): \
+                   rentals are refused until it is", renter_dir.display());
+    } else {
+        eprintln!("xbt-signer: no hashrate renter's socket: {} is missing (xbt-init makes it where the hashrate services are installed): \
+                   rentals are refused", renter_dir.display());
+    }
     let anchor_on = !matches!(env("XBT_ANCHOR").map(|v| v.to_ascii_lowercase()).as_deref(), Some("off" | "0" | "false" | "no"));
     if anchor_on {
         set_default("B2_ANCHOR_SOCK", data.anchor_sock());
@@ -110,6 +126,20 @@ fn container_setup(data: &DataDir, mode: Mode) -> Result<(PathBuf, Option<Arc<Ke
         }
     }
     keystore(&secrets).map(|k| (root, k))
+}
+
+/// Whether `dir` is a directory the world can't enter: the renter's socket dir as xbt-init leaves it (0750).
+fn renter_dir_closed(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o007 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        false
+    }
 }
 
 /// The wrapping key: `B2_HOT_KEYFILE` (a path) as before; else the secret `signer-passphrase`; else

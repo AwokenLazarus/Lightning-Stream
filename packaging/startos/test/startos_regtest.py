@@ -153,10 +153,10 @@ def main():
           and own("ui") == [("ui", False), ("run/signer", True), ("run/ui", False), ("run/ln", False), ("run/gateway", False), ("run/hashrate", False),
                             ("run/shops", False), ("run/ai", False), ("run/vpn", False), ("run/vpn-status", True), ("run/enroll", True)] and lf("ui") == ["public"]
           and own("vpn") == [("vpn", False), ("run/vpn", True), ("run/vpn-status", False)] and lf("vpn") == [] and not by["vpn"].get("user")
-          and own("signer") == [("signer", False), ("run/signer", False), ("run/anchor", True), ("run/ln", True), ("run/enroll", False)]
+          and own("signer") == [("signer", False), ("run/signer", False), ("run/rental", False), ("run/anchor", True), ("run/ln", True), ("run/enroll", False)]
           and lf("signer") == ["public"]
           and own("gateway") == [("gateway", False), ("run/gateway", True)] and lf("gateway") == ["public"]
-          and own("hashtaker") == [("hashrate", False), ("run/hashrate", True), ("run/signer", True)] and lf("hashtaker") == []
+          and own("hashtaker") == [("hashrate", False), ("run/hashrate", True), ("run/rental", True)] and lf("hashtaker") == []
           and own("hashmaker") == [("hashrate", False), ("run/hashrate", True)] and lf("hashmaker") == []
           and sorted(lf("node-keys")) == ["apps", "public"] and own("node-keys") == [("run/ln", False)]
           and by["node-keys"]["env"].get("XBT_KEYS_GRANT_DIR") == "/mnt/lightning-fork-apps/lightning-stream" and "XBT_KEYS_ADMIN" not in by["node-keys"]["env"]

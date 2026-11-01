@@ -133,6 +133,8 @@ services:
       - ${APP_DATA_DIR}/data/signer:/data/signer
       - ${APP_DATA_DIR}/data/run/shops:/data/run/shops:ro
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer
+      # the hashrate renter's own socket: the one way to the "hashrate" task's rental terms
+      - ${APP_DATA_DIR}/data/run/rental:/data/run/rental
       - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor:ro
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro
       - ${APP_DATA_DIR}/data/run/enroll:/data/run/enroll
@@ -400,12 +402,13 @@ services:
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
               "--upstream", "auto", "--datum-candidates", "datum_web_1:23334,datum-gateway_web_1:23334",
               "--user", "rented", "--relays", "wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
-              "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
+              "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:
       - ${APP_DATA_DIR}/data/hashrate:/data/hashrate
       - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate:ro
-      # the signer's socket, read-only: the renter pays each piece of work through it
-      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the signer's socket for the renter alone, read-only: the renter pays each piece of work through it,
+      # and no other service reaches it (the "hashrate" task's rental terms are paid on it only)
+      - ${APP_DATA_DIR}/data/run/rental:/data/run/rental:ro
 
   # The VPN service: the WireGuard endpoint the owner's devices pair with on the LAN (UDP 51830; 51820
   # is left to WireGuard apps), and this box's exit if the owner offers one on the VPN page. Userspace

@@ -74,6 +74,9 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     SharedDir { dir: crate::RUN_GATEWAY, writer: crate::UI, reader: crate::GATEWAY, gid: 10007, mode: 0o750 },
     SharedDir { dir: crate::RUN_ENROLL, writer: crate::SIGNER, reader: crate::UI, gid: ENROLL_GID, mode: 0o750 },
     SharedDir { dir: crate::RUN_HASHRATE, writer: crate::UI, reader: crate::HASHRATE, gid: HASHRATE_GID, mode: 0o750 },
+    // the signer's socket for the hashrate renter alone: the one way to a task's rental terms. The hashrate
+    // services' group (the renter, and the UI) reaches it; the MCP, in the signer's group, does not
+    SharedDir { dir: crate::RUN_RENTAL, writer: crate::SIGNER, reader: crate::HASHRATE, gid: HASHRATE_GID, mode: 0o750 },
     // public data only (receipt keys, signed transport documents): read by the signer's group
     SharedDir { dir: crate::RUN_SHOPS, writer: crate::UI, reader: crate::SIGNER, gid: SHOPS_GID, mode: 0o750 },
     // the built-in Stream relay: the owner's settings in, its status out
@@ -712,6 +715,10 @@ mod tests {
         init_as(&root3, &names, &Provision::default(), uid).unwrap();
         assert_eq!(std::fs::read(&tok).unwrap(), first, "the token survives a restart");
         assert!(!root.join("run/hashrate").exists(), "no hashrate dir without the hashrate component");
+        // the renter's socket dir: the signer's, reached by the hashrate group alone (here, every component is this uid)
+        let md = std::fs::metadata(root3.join("run/rental")).unwrap();
+        assert_eq!((md.uid(), md.mode() & 0o7777), (uid, 0o750));
+        assert!(!root.join("run/rental").exists() && !root2.join("run/rental").exists(), "no renter's socket without the hashrate component");
     }
 
     #[test]

@@ -97,6 +97,8 @@ services:
       - ${LS_DATA_DIR}/signer:/data/signer
       - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
       - ${LS_DATA_DIR}/run/signer:/data/run/signer
+      # the hashrate renter's own socket: the one way to the "hashrate" task's rental terms
+      - ${LS_DATA_DIR}/run/rental:/data/run/rental
       - ${LS_DATA_DIR}/run/anchor:/data/run/anchor:ro
       - ${LS_DATA_DIR}/run/ln:/data/run/ln:ro
       - ${LS_DATA_DIR}/run/enroll:/data/run/enroll
@@ -270,7 +272,8 @@ services:
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
 
   # The hashtaker: rents other people's miners into the owner's own DATUM Gateway (Services → Hashrate)
-  # and pays each piece of work through the signer, as the "hashrate" task of the spending rules.
+  # and pays each piece of work through the signer, as the "hashrate" task of the spending rules: on the
+  # renter's own socket (run/rental), which no other service reaches and which the task's rental terms need.
   hashtaker:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd
@@ -284,11 +287,11 @@ services:
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
               "--upstream", "${LS_DATUM:-127.0.0.1:23334}", "--user", "${LS_DATUM_USER:-rented}",
               "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
-              "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
+              "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
-      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/rental:/data/run/rental:ro
 
   # The built-in Stream relay (docs/RUN-A-RELAY.md): carries direct links between other people's apps
   # when their routers block a direct connection. Profile "relay": started only with LS_RELAY=1,

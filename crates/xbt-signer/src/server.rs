@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::anchor::serve_conn;
 use crate::ipc::{Listener, Stream};
-use crate::signer::Signer;
+use crate::signer::{Caller, Signer};
 use crate::{err, Result};
 
 /// A running signer socket; stops accepting when dropped.
@@ -42,9 +42,9 @@ impl Drop for Running {
     }
 }
 
-fn handle(signer: &Signer, req: &Value) -> Result<Value> {
+fn handle(signer: &Signer, caller: Caller, req: &Value) -> Result<Value> {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-    signer.handle(method, req.get("params").unwrap_or(&json!({})))
+    signer.handle_as(caller, method, req.get("params").unwrap_or(&json!({})))
 }
 
 /// The socket's mode: `B2_SIGNER_SOCK_MODE` (octal, default 600). 660 lets the signer's group (the
@@ -61,8 +61,18 @@ pub fn sock_mode() -> Result<u32> {
     }
 }
 
-/// Bind `sock` and serve it on background threads, with the watcher when `watch` is set.
+/// Bind `sock` (the wallet's socket) and serve it on background threads, with the watcher when `watch` is set.
 pub fn spawn(signer: Arc<Signer>, sock: &Path, watch: bool) -> Result<Running> {
+    spawn_as(signer, sock, watch, Caller::Wallet)
+}
+
+/// Bind `sock` as the hashrate renter's socket ([`crate::renter`]): the one way to a task's rental terms.
+/// Its dir is what keeps every other caller out, so it is made by `xbt-init`, not here.
+pub fn spawn_renter(signer: Arc<Signer>, sock: &Path) -> Result<Running> {
+    spawn_as(signer, sock, false, Caller::Renter)
+}
+
+fn spawn_as(signer: Arc<Signer>, sock: &Path, watch: bool, caller: Caller) -> Result<Running> {
     let listener = Listener::bind(sock, sock_mode()?).map_err(|e| err("io", format!("{}: {e}", sock.display())))?;
     let stop = Arc::new(AtomicBool::new(false));
     let drain = Arc::new(xbt_svc::shutdown::Drain::default());
@@ -79,7 +89,7 @@ pub fn spawn(signer: Arc<Signer>, sock: &Path, watch: bool) -> Result<Running> {
         if let Ok(conn) = conn {
             let (s, d) = (signer.clone(), d.clone());
             std::thread::spawn(move || serve_conn(conn, |req| match d.enter() {
-                Some(_busy) => handle(&s, req),
+                Some(_busy) => handle(&s, caller, req),
                 None => Err(err("stopping", "the signer is stopping")),
             }));
         }
@@ -89,13 +99,30 @@ pub fn spawn(signer: Arc<Signer>, sock: &Path, watch: bool) -> Result<Running> {
 
 /// Serve until a stop signal (the binary), then stop as [`Running::finish`] says. `signals` was
 /// made before the process started any thread ([`xbt_svc::shutdown::listen`]).
+/// With `B2_RENTAL_SOCK` set, the hashrate renter's socket is served beside the wallet's.
 pub fn serve(signer: Arc<Signer>, signals: xbt_svc::shutdown::Signals) -> Result<()> {
     let sock = signer.sock_path.clone();
+    let renter = match std::env::var("B2_RENTAL_SOCK").ok().filter(|s| !s.trim().is_empty()).map(std::path::PathBuf::from) {
+        // a renter's socket that can't be bound costs the wallet nothing else: rentals are refused until it can
+        Some(rs) => match spawn_renter(signer.clone(), &rs) {
+            Ok(r) => {
+                println!("signer listening for the hashrate renter on {}", rs.display());
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("xbt-signer: the hashrate renter's socket {}: {}: no rental is paid until it is bound", rs.display(), e.msg);
+                None
+            }
+        },
+        None => None,
+    };
     let r = spawn(signer, &sock, true)?;
     println!("signer listening on {}", sock.display());
     let sig = signals.wait();
     xbt_svc::shutdown::say_stopping("xbt-signer", sig);
-    let drained = r.finish(xbt_svc::shutdown::DRAIN);
+    // the renter's socket first: it takes no new request while the wallet's drains
+    let renter_drained = renter.as_ref().is_none_or(|rr| rr.finish(xbt_svc::shutdown::DRAIN));
+    let drained = r.finish(xbt_svc::shutdown::DRAIN) && renter_drained;
     xbt_svc::shutdown::say_stopped("xbt-signer", drained);
     Ok(())
 }

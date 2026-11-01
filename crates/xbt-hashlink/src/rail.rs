@@ -131,6 +131,13 @@ pub const BIG_TICKETS_ONLY: &str = "This hashmaker's smallest ticket is";
 pub const BUDGET_TOO_SHORT: &str = "What is left of this rental's budget";
 /// Where one of the owner's rules refused the payment.
 pub const WALLET_RULES: &str = "Your wallet's rules stopped this payment";
+/// Where the wallet refused the rental's terms to this connection (`ticket_rental_payer`): a renter set up by hand
+/// on the wallet's own socket, or an app whose parts are of different versions. No limit of the owner's is at
+/// issue, so the words don't send the owner to the rules page.
+pub const RENTER_SOCKET: &str = "The wallet pays a rental only through the renter's own connection";
+/// Where the renter's own socket refused what the renter asked of it (`ticket_rental_route`): a payment that isn't
+/// a piece of work of its rental (`POST <pay url>/hashrate/<rental>/<slice>`), or a stop without a session.
+pub const RENTER_ROUTE: &str = "The renter asked to pay something that isn't a piece of work of its rental";
 
 /// Whether a refusal left everything where it was: nothing booked for the call and nothing released.
 fn moved_nothing(v: &serde_json::Value) -> bool {
@@ -291,6 +298,13 @@ impl SignerPayer {
             (rule, _) if WALLET_RULE_NAMES.contains(&rule) => {
                 let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or(rule);
                 Err(format!("{WALLET_RULES}: {why}. Nothing more was paid. Your limits are on the wallet's rules page."))
+            }
+            // (a stop without a session is refused the same way, but a stop's answer is never read as a payment's)
+            ("ticket_rental_route", _) => Err(format!("{RENTER_ROUTE} (POST <pay url>/hashrate/<rental>/<slice>): nothing was paid.")),
+            ("ticket_rental_payer", _) => {
+                let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or("ticket_rental_payer");
+                Err(format!("{RENTER_SOCKET}: {why}. The app's own renter pays that way; a renter set up by hand needs the wallet's renter socket \
+                             (run/rental/signer.sock, B2_RENTAL_SOCK), and an app whose parts are of different versions needs updating."))
             }
             _ => Err(r.to_string()),
         }

@@ -31,6 +31,7 @@ use crate::ln::{LnBackend, LnBook, LndRest};
 use crate::node::{self, KnotsRpc, Node};
 use crate::policy::{normalize_dest, AuditLog, Clock, Payment, PolicyConfig, PolicyEngine, PolicyStore};
 use crate::pyjson::{py_int, str_or_empty, truthy, ts_value};
+pub use crate::renter::Caller;
 use crate::sanitize::sanitize;
 use crate::sigaudit::{self, check_chain, SigAudit};
 use crate::{err, Result};
@@ -254,9 +255,9 @@ pub struct Signer {
     /// for its session, the sessions of an earlier run whose cancel was asked for, and this signer
     /// itself (for the thread that refills a pool behind a call).
     pub(crate) ticket_wire: Arc<dyn crate::ticket_pay::TicketWire>,
-    pub(crate) ticket_http: Mutex<HashMap<String, Arc<crate::ticket_pay::Slot>>>,
-    /// The sessions this process pays by draws, by the seller's origin (`docs/TICKETS.md`, section 9).
-    pub(crate) draw_http: Mutex<HashMap<String, Arc<crate::ticket_pay::DrawSession>>>,
+    pub(crate) ticket_http: Mutex<HashMap<crate::ticket_pay::SlotKey, Arc<crate::ticket_pay::Slot>>>,
+    /// The sessions this process pays by draws, by the seller's origin and the task (`docs/TICKETS.md`, section 9).
+    pub(crate) draw_http: Mutex<HashMap<crate::ticket_pay::SlotKey, Arc<crate::ticket_pay::DrawSession>>>,
     /// The terms a seller last stated for each of its routes, by origin then route path, where its
     /// gateway refuses a paid request that repeats another route's terms (`termsChecked`): a request
     /// on a known route is then paid without asking its price first, a round trip saved.
@@ -269,9 +270,9 @@ pub struct Signer {
     pub(crate) ticket_late_tries: Mutex<HashMap<String, (u32, f64)>>,
     /// Sessions this start stopped: the watcher asks their sellers, once, what credit they left.
     pub(crate) ticket_start_stopped: Mutex<Vec<String>>,
-    /// The last refusal of a call by address, for the wait for a seller's word
+    /// The last refusal of a call by address and task, for the wait for a seller's word
     /// (`ticket_seller_unanswered`): when, and the answer. Calls that queued behind it have it at once.
-    pub(crate) ticket_unanswered: Mutex<HashMap<String, (f64, Value)>>,
+    pub(crate) ticket_unanswered: Mutex<HashMap<crate::ticket_pay::SlotKey, (f64, Value)>>,
     /// Sessions whose stop has begun and that the book still shows open, while their streams end
     /// ([`crate::ticket_pay`]'s `ticket_http_stop`): the book books nothing more for them, a release,
     /// a lock or a prepaid ticket, however far a call had got when the stop came.
@@ -515,15 +516,27 @@ impl Signer {
         }
     }
 
-    /// Handle one request; every signature made meanwhile is logged under its method.
+    /// Handle one request from the wallet's socket; every signature made meanwhile is logged under its method.
     pub fn handle(&self, method: &str, params: &Value) -> Result<Value> {
+        self.handle_as(Caller::Wallet, method, params)
+    }
+
+    /// Handle one request from `caller`'s socket ([`crate::renter`]): the renter's answers only its own
+    /// methods, and only it pays under a task's rental terms.
+    pub fn handle_as(&self, caller: Caller, method: &str, params: &Value) -> Result<Value> {
         let _ctx = sigaudit::context(Some(method), Some(&format!("method:{method}")));
         let empty = json!({});
         let p = if params.is_object() { params } else { &empty };
-        self.dispatch(method, p)
+        if caller == Caller::Renter && !crate::renter::RENTER_METHODS.contains(&method) {
+            return Err(err("renter_socket", format!("{method} is not answered on the hashrate renter's socket, which pays a rental's pieces of work and nothing else")));
+        }
+        if let Some(refused) = self.renter_gate(caller, method, p) {
+            return Ok(sanitize(refused));
+        }
+        self.dispatch(caller, method, p)
     }
 
-    fn dispatch(&self, method: &str, p: &Value) -> Result<Value> {
+    fn dispatch(&self, caller: Caller, method: &str, p: &Value) -> Result<Value> {
         let s = |k: &str| str_or_empty(p.get(k));
         Ok(match method {
             "balance" => {
@@ -602,7 +615,7 @@ impl Signer {
                 sanitize(with(self.hot.status(), json!({"noticed": n})))
             }
             // takes the spend lock itself, and only for each lock and release, where an answer may be long (crate::ticket_pay)
-            "xbt402_pay" => sanitize(self.xbt402_pay(p)),
+            "xbt402_pay" => sanitize(self.xbt402_pay(p, caller)),
             // the sellers this wallet stays anonymous at (docs/BUYER-ACCOUNTS.md)
             // `damaged`: the choices file is there and cannot be read, and the wallet stays anonymous everywhere until it is mended
             // `here`: with `origin`, whether the owner's choice covers that shop, under this address or another of the same seller
