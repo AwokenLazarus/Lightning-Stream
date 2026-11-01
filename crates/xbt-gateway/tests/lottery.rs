@@ -316,7 +316,12 @@ fn a_page_is_paid_by_draws_and_a_win_is_paid_when_the_node_says_so() {
 
 #[test]
 fn a_body_priced_per_byte_is_cut_into_pieces_that_are_each_a_draw() {
-    let (rig, _d) = start(&lottery);
+    // about drawing piece by piece, not about the wait for a draw running out: a slow box's draw took longer than the
+    // rig's 300 ms and the body was cut (shipped: 15 s)
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["times"]["refill_wait_ms"] = json!(5_000);
+    });
     let mut b = Drawer::open(&rig, 2);
     // 10 pieces and 100 bytes: 10 full pieces of 1,000 msat and a last one of 2 msat
     let size = 10 * PIECE as usize + 100;
