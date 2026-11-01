@@ -15,8 +15,8 @@ A public test release. What is new since 0.1.19, in short; the sections below gi
   with a key the gateway holds, so a rented miner can't tell which share is a block and can't
   withhold one. The renter checks each job before its miners get it: a rental whose job can't be
   shown masked ends, and nothing is paid before the first job has been checked. It mines solo, paid
-  to your own address, or on Lazarus Pool once the pool takes gateway-held keys (until then pool mode
-  is refused and solo works).
+  to your own address, or on Lazarus Pool, which takes jobs masked with your gateway's own key; a pool
+  that doesn't is refused.
 - **Hashrate payments.** Both sides prove every share, and a renter pays as the work arrives: you
   never have more paid for and not yet received than a minute of the miner's hashing, or one share,
   one slice and one ticket (546 sat at least), whichever is more, plus any start fee shown on the
@@ -47,7 +47,9 @@ A public test release. What is new since 0.1.19, in short; the sections below gi
   `/usr/share/xbt-datum-gateway/`. You may rebuild the gateway, or relink it against modified
   versions of those two libraries: this repository holds its complete source, the pinned library
   versions with their sha256 sums, and the script that builds and links it
-  (`scripts/datum_gateway_build.sh`), at the commit the image's tag names.
+  (`scripts/datum_gateway_build.sh`), at the commit the image's tag names. The GitHub release `v0.2.0`
+  carries the exact source tarballs of both libraries that the image was built from, with their
+  checksums (`SHA256SUMS-datum-gateway-lgpl`).
 
 **Shops without a web address**
 - A shop can be reached by its key alone, over an encrypted direct link, with no hostname,
