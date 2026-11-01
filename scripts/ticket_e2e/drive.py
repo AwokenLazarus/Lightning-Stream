@@ -1058,6 +1058,7 @@ class ChannelDrops:
         self.reconnected = 0
         self.errors: list[str] = []
         self.back_s: list[float | None] = []
+        self.last_connect: float | None = None
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def run(self) -> None:
@@ -1069,6 +1070,7 @@ class ChannelDrops:
                 lab.lncli(BUYER, "disconnect", pk)
                 self.drops += 1
                 lab.lncli(BUYER, "connect", f"{pk}@{HOP}:9735")
+                self.last_connect = time.monotonic()
             except LabError as e:
                 said = str(e).split("rpc error:")[-1]
                 # the nodes reconnect to a channel's peer by themselves: between this disconnect and connect, or before
@@ -1108,12 +1110,16 @@ class ChannelDrops:
         self.done.set()
         self.thread.join()
         ChannelDrops.uses += 1
-        measured(f"flap_channel_back_every_{self.every:g}s_{ChannelDrops.uses}", self.back_summary())
+        summary = self.back_summary()
         pk = lab.pubkey(HOP)
         try:
             lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
         except LabError as e:
+            measured(f"flap_channel_back_every_{self.every:g}s_{ChannelDrops.uses}", {**summary, "last_connect_to_active_s": None})
             raise LabError(f"{e} (what both nodes said then: {self.diagnose()})") from e
+        # the last reconnect, with no drop after it to cut the wait short: how long until the channel was active again
+        summary["last_connect_to_active_s"] = round(time.monotonic() - self.last_connect, 2) if self.last_connect is not None else None
+        measured(f"flap_channel_back_every_{self.every:g}s_{ChannelDrops.uses}", summary)
 
     def diagnose(self) -> str:
         """What the buyer and its peer say of each other when the channel does not come back: their peers, their
