@@ -985,13 +985,20 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   and at more or fewer as its seller's format takes fewer or more. An owner who runs such models raises
   `tickets.stream_floor_after_s`. An answer the wallet ends early, for any reason, reaches the client cut short
   (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
+- The wallet's wait for a route to the seller (up to 8 s, after a link along the way was replaced) covers
+  public routes only. The node's route query (QueryRoutes) is not given an invoice's route hints or blinded
+  paths, so for a seller reached by those (a private channel, an LSP) it never finds one: such an invoice is
+  sent at once, with no route query, and a moment with no route to that seller fails the payment as it did
+  before 0.2.0 (the win is owed again, or the ticket call ends with the node's reason).
 - A client that takes nothing for 60 to 90 s, such as a player paused with its buffer full, loses its
   connection, and the wallet stops paying for that answer. (Each write has 30 s, `stream_write`; a
   stalled socket may still take a little at the first ones, so it is the second or third that fails:
   measured on Linux loopback, 61 s through the app, and 9 s for a bare socket with a 3 s limit.) What was on its way when it stopped is paid for. A
   player that can seek resumes by asking again from where it was (`Range`), naming the copy it has
   (`If-Range`, the `etag` of the answer it goes on from; the app and the wallet's player pass both on).
-  A whole body sent for a range from the first byte is read, up to the range's last byte. A seller whose server ignores ranges, or whose file
+  A whole body sent for a range from the first byte is a whole answer: it is read whole, up to the call's
+  `max_sats`, not cut at the range's last byte, so a caller asking `bytes=0-1023` with a large `max_sats` can be
+  charged for the whole body. A seller whose server ignores ranges, or whose file
   has changed since, answers with the whole body: the wallet reads none of it (`ticket_range_ignored`), and the
   call costs what the seller's socket took before it was closed, which on a route priced by the byte is up to a
   few hundred KiB. Before 0.1.20 that whole body was read and paid for, the start of the file bought again.

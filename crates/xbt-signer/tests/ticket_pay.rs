@@ -782,6 +782,9 @@ struct PayState {
     no_route_for: Duration,
     no_route_until: Option<Instant>,
     no_route_answers: usize,
+    /// The seller sits behind a private channel: the node's decode of its invoices shows a route hint, its
+    /// route query (which is not given the hint) finds no path, and a payment sent with the invoice arrives.
+    private_seller: bool,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
     late_fail: usize,
@@ -960,8 +963,13 @@ impl LnBackend for PayLn {
     fn decode(&self, inv: &str) -> xbt402::Result<Value> {
         let d = xbt_signer::bolt11::decode(inv).map_err(|e| node_err(&e))?;
         let features: serde_json::Map<String, Value> = d.features.iter().map(|b| (b.to_string(), json!({"is_known": true}))).collect();
-        Ok(json!({"destination": d.payee_hex(), "payment_hash": d.payment_hash_hex(), "num_msat": d.amount_msat.unwrap_or(0).to_string(),
-                  "timestamp": d.timestamp.to_string(), "expiry": d.expiry_s.to_string(), "features": features}))
+        let mut out = json!({"destination": d.payee_hex(), "payment_hash": d.payment_hash_hex(), "num_msat": d.amount_msat.unwrap_or(0).to_string(),
+                             "timestamp": d.timestamp.to_string(), "expiry": d.expiry_s.to_string(), "features": features});
+        if self.st.lock().unwrap().private_seller {
+            out["route_hints"] = json!([{"hop_hints": [{"node_id": "02".repeat(33), "chan_id": "1099511693312", "fee_base_msat": 1000,
+                                                        "fee_proportional_millionths": 1, "cltv_expiry_delta": 40}]}]);
+        }
+        Ok(out)
     }
 
     fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64) -> xbt402::Result<bool> {
@@ -970,7 +978,7 @@ impl LnBackend for PayLn {
         if s.route_queries == s.no_route_at_query {
             s.no_route_until = Some(Instant::now() + s.no_route_for);
         }
-        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u);
+        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.private_seller;
         s.no_route_answers += usize::from(none);
         Ok(!none)
     }
@@ -13353,8 +13361,8 @@ fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
 
 /// A link along the route is replaced, and for a while the node finds no route to the seller: a payment sent
 /// then fails at once. The wallet asks the node for a route first and waits for one, within 8 s: a window of
-/// 3 s costs no failed payment and no win; one of 10 s ends the wait at 8 s with its reason, and still no payment
-/// fails, and the win is paid on its own invoice once the route is back.
+/// 3 s costs no failed payment and no win; one of 10 s ends the wait at 8 s and the call with `ln_no_route`, the
+/// money still right.
 ///
 /// FAILS with no route query: each win sent in the window fails, and its invoice has to be replaced.
 #[test]
@@ -13482,6 +13490,37 @@ fn a_route_gone_for_good_ends_the_call_soon_with_its_reason() {
     let waits = r.audit("ticket_route_waited");
     assert!(!waits.is_empty() && waits.len() <= 3, "one wait at a time: {waits:?}");
     assert_wins(&r, v["wins_paid"].as_u64().unwrap_or(0));
+}
+
+/// A seller behind a private channel (or an LSP) is reached by its invoice's route hints, which the node's route
+/// query is not given: the query finds no path, ever. Its invoices are sent at once, as before the route wait,
+/// on the ticket rail and for wins, and nothing waits or is refused for want of a route.
+///
+/// FAILS with the route asked for every invoice: each waits out the 8 s and is refused `ln_no_route`, and the
+/// seller is never paid (the offers check of the lab, on real nodes, where the seller's one channel is private).
+#[test]
+fn a_seller_behind_a_private_channel_is_paid_at_once_by_its_route_hints() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    r.ln.st.lock().unwrap().private_seller = true;
+    let t = Instant::now();
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+    assert!(t.elapsed() < Duration::from_secs(4), "the page took {:?}: {v}", t.elapsed());
+    let d = patient_draws_rig(json!({}));
+    d.ln.st.lock().unwrap().private_seller = true;
+    let t = Instant::now();
+    let w = d.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+    assert_eq!((w["status"].as_u64(), w["complete"].as_bool()), (Some(200), Some(true)), "{w}");
+    assert_eq!((w["wins_paid"].as_u64(), w["wins_unpaid"].as_array().map(Vec::len)), (w["wins"].as_u64(), Some(0)), "{w}");
+    assert!(t.elapsed() < Duration::from_secs(20), "the file took {:?}: {w}", t.elapsed());
+    for (rig, out) in [(&r, &v), (&d, &w)] {
+        assert!(!out.to_string().contains("ln_no_route"), "{out}");
+        assert!(rig.audit("ticket_route_waited").is_empty(), "no wait for a route the query cannot see");
+        assert_eq!(rig.ln.st.lock().unwrap().route_queries, 0, "no route query for an invoice with hints");
+        assert_eq!(rig.ln.by_status("FAILED").len(), 0);
+    }
+    assert_wins(&d, w["wins_paid"].as_u64().unwrap_or(0));
 }
 
 /// A whole body sent for a range from the first byte (the app's player's first part) is a whole answer: read
