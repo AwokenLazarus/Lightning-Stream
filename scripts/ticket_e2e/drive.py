@@ -893,7 +893,7 @@ def page() -> None:
     r = pay(f"{ORIGIN}/small.txt")
     first = time.monotonic() - t0
     ok = (r.get("verdict") == "allow" and r.get("rail") == "ticket" and r.get("status") == 200 and body_of(r) == PAGE and r.get("tickets_released") == 1
-          and r.get("price_msat") == str(REQUEST_MSAT) and r.get("balance_msat") == str(TICKET_MSAT - REQUEST_MSAT) and r["receipt"] == {"signed": True, "body": "as signed"})
+          and r.get("price_msat") == str(REQUEST_MSAT) and r.get("balance_msat") == str(TICKET_MSAT - REQUEST_MSAT) and r.get("receipt") == {"signed": True, "body": "as signed"})
     check("page: one xbt402_pay call fetched a priced page behind the gateway, through the hop: one ticket of the pool released, 2,500 msat used, the seller's receipt signs the body",
           ok, brief(r))
     # the node reports a payment settled a moment before it takes the HTLC off its channel: the book and the channel are
@@ -978,12 +978,12 @@ def stream() -> None:
     r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
     took = time.monotonic() - t0
     ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
-          and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
+          and r.get("tickets_released") == 20 and (r.get("receipt") or {}).get("body") == "as signed" and (r.get("receipt") or {}).get("last", {}).get("charged") == str(price_msat))
     stored = r.get("saved_to", "")
     same_file = bool(stored) and os.path.getsize(stored) == BIG and hashlib.sha256(open(stored, "rb").read()).hexdigest() == r.get("body_digest")
     measured("file_100mb_s", round(took, 2))
     check("stream: a 100 MB file priced per byte came through the wallet whole: 20 tickets released one at a time as it arrived, the stored file is the seller's file, and the last receipt signs its hash and its price",
-          ok and same_file, {**brief(r), "receipt": {"body": r["receipt"].get("body")}, "seconds": round(took, 2), "stored_is_the_file": same_file})
+          ok and same_file, {**brief(r), "receipt": {"body": (r.get("receipt") or {}).get("body")}, "seconds": round(took, 2), "stored_is_the_file": same_file})
     if stored:
         os.remove(stored)
     # half way: the call allows half the price
@@ -997,7 +997,7 @@ def stream() -> None:
           and half * 1000 - 1_015_000 <= by_count <= half * 1000 + (64 << 10) * BYTE_MSAT // PER_BYTES + 1 and got < BIG * 0.52
           and int(r.get("charged_sats") or 0) <= half)
     check("stream: the same file under a call that allows half its price stops near half way, at the byte the tickets that fit the call's max_sats pay for by the wallet's own count",
-          ok, {**brief(r), "receipt": {"body": r["receipt"].get("body")}, "bytes": got, "max_sats": half, "price_of_bytes_msat": by_count})
+          ok, {**brief(r), "receipt": {"body": (r.get("receipt") or {}).get("body")}, "bytes": got, "max_sats": half, "price_of_bytes_msat": by_count})
     if r.get("saved_to"):
         os.remove(r["saved_to"])
     # stopped by the agent while it arrives
@@ -2095,7 +2095,7 @@ def link_check_end(relay: bool, mode: str, m0: dict[str, Any], paid0: set[str], 
     measured(f"link_{mode}_100mb_s", round(took, 2))
     measured(f"link_{mode}_mbit_s", mbit)
     ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
-          and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
+          and r.get("tickets_released") == 20 and (r.get("receipt") or {}).get("body") == "as signed" and (r.get("receipt") or {}).get("last", {}).get("charged") == str(price_msat))
     check(f"link ({mode}): a shop with no web address, reached over its iroh link{' through a relay only' if relay else ''}: the 100 MB file came whole, paid as it arrived with 20 tickets released one at a time, the last receipt signs its hash and its exact price, every ticket the seller took is booked once and the money agrees",
           ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False) and len(doc.get("transport") or []) == LINK_KEYS,
           {**brief(r), "rails_passed_over": r.get("rails_passed_over"), "origin": origin, "link_keys": len(doc.get("transport") or []), "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
