@@ -49,6 +49,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A download cut short by a channel outage now picks up from the byte it stopped at. If the seller
+  has forgotten the session or has no room for more tickets, the wallet opens a fresh session once
+  and carries on. It never retries a session the seller faulted or one you stopped, and never pays
+  twice for the same bytes. If a seller ignores a byte range and sends the whole file, the wallet
+  closes at once; the unread part costs at most what was already on its way.
 - On a busy wallet, lottery wins are now paid nearest-deadline first. A seller's unpaid wins are
   hurried as soon as it reaches its limit. Every invoice is checked again just before it is sent, so
   none goes out about to expire. A 0.2.0 wallet tells a 0.2.0 seller it can cancel, and gets win
