@@ -81,6 +81,8 @@ pub const COMEBACKS_AN_HOUR: usize = 8;
 const IN_FLIGHT: Duration = Duration::from_secs(2);
 /// How far into a wait for a payment on its way, by this side's clock, it says `paying` if the payment is still on its way.
 const PAYING_AFTER: Duration = Duration::from_millis(500);
+/// A payment the measured buys say lands by this far into the wait needs no `paying`.
+const LANDS_BY: Duration = Duration::from_millis(1200);
 /// How long after the hashmaker's resends this side waits for their verdicts before it says its count.
 const RESYNC_SETTLE: Duration = Duration::from_millis(1500);
 /// A payment the measured buys say arrives this much before the hashmaker's short clock runs out needs no `paying`.
@@ -245,8 +247,14 @@ impl St {
         // due and the payment now on its way
         let since = self.guard.in_flight_since.map_or(since, |f| f.max(since));
         // the hashmaker's clock starts when a payment is credited, a little before this side hears so, and the ticker
-        // comes round every half second: said half a second into the wait, it's in well before the clock's two
-        if measured <= 0.0 || measured.max(on_its_way) > clock || since.elapsed() >= PAYING_AFTER {
+        // comes round every half second: said half a second into the wait, it's in well before the clock's two. But a
+        // payment the measured buys say lands by 1.2 s into the wait needs no wait said, which would use one of the
+        // hour's few: a wallet on a slow box at about a second a payment, often caught short, would run out of them.
+        // One past its measured time is late, and said at once
+        let elapsed = since.elapsed().as_secs_f64();
+        let left = measured - on_its_way;
+        let lands_in_time = measured > 0.0 && left >= 0.0 && elapsed + left <= LANDS_BY.as_secs_f64();
+        if measured <= 0.0 || measured.max(on_its_way) > clock || (since.elapsed() >= PAYING_AFTER && !lands_in_time) {
             let _ = tx.send(&Msg::Paying);
             self.guard.paying_said = true;
         }
@@ -1228,9 +1236,32 @@ mod come_back_tests {
         }
     }
 
+    /// A wallet at about 0.9 s a payment, on its way 0.6 s of it: the measured buys say it lands by 1.2 s into the wait,
+    /// so no wait is said, and none of the hour's few is used.
+    #[test]
+    fn a_payment_the_measured_buys_say_lands_in_time_says_no_paying() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, _peer) = a_link(key, hk);
+        let st = state();
+        let mut g = lock(&st);
+        g.released = 1;
+        g.in_flight = 1;
+        g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(600));
+        g.buys = VecDeque::from([0.9, 0.9, 0.9]);
+        g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(600));
+        g.tick(&tx);
+        assert!(!g.guard.paying_said, "lands in 0.3 s more: no wait said");
+        // the same payment past its measured time: late, said
+        g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(1000));
+        g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(1000));
+        g.tick(&tx);
+        assert!(g.guard.paying_said, "past its measured time: said");
+    }
+
     /// The hashmaker's clock for a held share starts at the credit of the payment before, a little before this side
-    /// hears the wallet's answer; with the link's latency and the ticker's half second on top, `paying` is said half a
-    /// second into this side's wait, in good time before the hashmaker's two.
+    /// hears the wallet's answer; with the link's latency and the ticker's half second on top, `paying` for a payment
+    /// late past its measured buys (0.2 s, on its way 0.6 s) is said half a second into this side's wait, in good time
+    /// before the hashmaker's two.
     #[test]
     fn paying_is_said_half_a_second_into_a_wait() {
         let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());

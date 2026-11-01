@@ -1127,6 +1127,49 @@ fn a_held_share_waits_for_the_count_after_a_resume_then_no_longer() {
     drop(miner);
 }
 
+/// A wallet on a slow box, about 0.9 s a payment, whose shares are often held for the next: each payment lands well
+/// inside the hashmaker's 2 s clock, so no wait is said for it, and the rental runs its time without using up the
+/// hour's waits.
+#[test]
+fn a_wallet_at_a_second_a_payment_often_caught_short_runs_its_rental() {
+    let _s = serial();
+    let sw = share_work(DIFF);
+    // 300 sat a slice of 2 shares, 2 shares a second: a 546 sat ticket lasts under 2 s, so payments are often needed
+    let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 10_000, start_slices: 0 };
+    let (fb, _) = fallback_pool();
+    let [link, miners, slices] = ports::<3>();
+    let hk = noise::fresh_key();
+    let h = Hashmaker::start(
+        hashmaker::Config { miners: miners.clone(), link: link.clone(), key: hk, terms: terms.clone(), report: None, slices: Some(slices.clone()), fallback: Some(fb),
+                            rentable: None, min_slice_time: hashmaker::MIN_SLICE_TIME },
+        Box::new(|| Box::<LabSeller>::default()),
+    )
+    .unwrap();
+    wait_for(&link);
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+    let (pool, _) = start_pool(Duration::from_secs(5));
+    let stop: Arc<AtomicBool> = Arc::default();
+    let (ma, st2) = (miners.clone(), stop.clone());
+    let miner = thread::spawn(move || {
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 2.0, bad_every: 0, duration: Some(Duration::from_secs(120)), reconnect: true, extranonce_subscribe: false, bind: None });
+        st2.store(true, Ordering::SeqCst);
+    });
+    let mut cfg = taker_config(&link, hpub, &terms, &pool, "pi", 60);
+    cfg.duration = Some(Duration::from_secs(90));
+    cfg.payer = Some(Box::new(SlowPayer { slices, price_msat: terms.price_msat, ticket_msat: 0, credit_msat: 0, buys: vec![Duration::from_millis(900)], bought: 0 }));
+    let r = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap();
+    stop.store(true, Ordering::SeqCst);
+    let hz = h.wait_finished(1, Duration::from_secs(20)).into_iter().next().expect("the hashmaker's report");
+    eprintln!("measure: 0.9 s payments: closed {}, {} paid, dues {}, waits {} + {} in the ramp: {}", r["closed"], r["paidSlices"], r["dues"], hz["paymentWaits"],
+              hz["rampWaits"], hz["stopped"]);
+    assert_eq!(r["closed"], "rental time over", "{r}");
+    assert!(r["dues"].as_u64().unwrap() >= 5, "shares were often held for the next payment: {r}");
+    assert!(hz["paymentWaits"].as_u64().unwrap() as usize <= xbt_hashlink::order::PAYING_WAITS_AN_HOUR, "{hz}");
+    assert_eq!(hz["stopped"]["unpaidWork"], "0", "{hz}");
+    h.shutdown();
+    drop(miner);
+}
+
 /// A share nobody hashed goes no further, and the miner hears so from the app: the renter is not asked.
 #[test]
 fn a_share_nobody_hashed_is_not_sent_on_and_the_miner_gets_a_rejection() {
