@@ -49,6 +49,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- On a busy wallet, lottery wins are now paid nearest-deadline first. A seller's unpaid wins are
+  hurried as soon as it reaches its limit. Every invoice is checked again just before it is sent, so
+  none goes out about to expire. A 0.2.0 wallet tells a 0.2.0 seller it can cancel, and gets win
+  invoices of up to 180 s, so a busy wallet no longer misses wins. Older wallets and sellers keep
+  today's behaviour.
 - A seller can now say how long it waits for the next ticket, and the wallet ends its own pause a
   little before that (a tenth of the wait, between 1 s and 3 s), so no ticket is ever paid into an
   answer the seller has already closed. A seller that doesn't say keeps today's behaviour.
