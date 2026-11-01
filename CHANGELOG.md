@@ -22,7 +22,9 @@ A public test release. What is new since 0.1.19, in short; the sections below gi
   one slice and one ticket (546 sat at least), whichever is more, plus any start fee shown on the
   offer. Shares sent again after a link drop still get their verdict, and a hashmaker's difficulty
   requests go no further than the renter.
-- **Rentals.** A Rent sent twice starts one rental and pays one start fee. Delivery records are shown
+- **Rentals.** A start fee asks for 30 pieces of work at most, so a rental with a small piece starts
+  before its first payment is due. A seller's listing never offers 0 miners just after a start or a new
+  price. A Rent sent twice starts one rental and pays one start fee. Delivery records are shown
   as claims anyone can publish, and a flood of them no longer hides a hashmaker's own. A hashmaker's
   public summary names no renter.
 - **Wallet limits.** The hashrate rental's own limits apply only to the app's renter paying a rented
