@@ -88,6 +88,13 @@ pub const ROUTE_FULL: &str = "ticket_route_full";
 /// Refusals of a held ticket that are no fault of the seller's terms or the owner's budgets, and
 /// leave prepaid tickets, or another rail, as the way to pay: no slot, dust, a full route.
 pub const HOLD_SHORT: [&str; 4] = ["ticket_slots", "ticket_dust", ROUTE_FULL, "ticket_slots_short"];
+/// Why a session waits after a lock round that failed while the wallet's channels were out (or just after): the
+/// session buys prepaid tickets meanwhile, holds as many as before once the wait is over, and a session after it
+/// takes nothing over from it (not one of [`HOLD_SHORT`]).
+pub const OUTAGE_HOLD: &str = "ticket_outage";
+/// How long that wait is: no lock is tried again sooner, so an outage, or a full channel the wallet cannot tell from
+/// one, costs a round of failed payments at most every 30 s.
+pub const OUTAGE_HOLD_S: f64 = 30.0;
 /// The rule of a release refused because the chain node gave no tip to judge a ticket by.
 pub const TIP_UNKNOWN: &str = "ticket_chain";
 /// The rules of the wallet's checks of its Lightning node that the chain node's silence can cause
@@ -1445,6 +1452,17 @@ impl Session {
     /// locked before a prepaid one is paid ([`Session::paid_first`]).
     pub fn prepaid_now(&self, now: f64) -> bool {
         self.prepaid_msat > 0 && (self.pool == 0 || now < self.hold_until || self.paid_first)
+    }
+
+    /// A lock round that locked nothing and failed in an outage ([`OUTAGE_HOLD`]): a wait, with the pool and the run
+    /// of failed rounds as they were. Returns whether anything changed.
+    pub fn outage_round(&mut self, now: f64) -> bool {
+        if now < self.hold_until {
+            return false;
+        }
+        self.hold_until = now + OUTAGE_HOLD_S;
+        self.hold_why = OUTAGE_HOLD.into();
+        true
     }
 
     /// What a lock round came to: `locked` tickets the node holds, `slot_failed` that failed as a

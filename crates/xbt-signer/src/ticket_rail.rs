@@ -1212,7 +1212,7 @@ impl Signer {
         let res = (|| -> Result<()> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
-            let (mut locked, mut slot_failed) = (0usize, 0usize);
+            let (mut locked, mut slot_failed, mut outage_failed) = (0usize, 0usize, 0usize);
             for ((hash, _), (pmt, unsent)) in sends.iter().zip(outcomes) {
                 // an error the node's record did not replace: it goes with the ticket's row
                 let unsent = unsent.filter(|_| pmt.is_none());
@@ -1222,7 +1222,9 @@ impl Signer {
                 if let Some(t) = st.book.tickets.get(hash) {
                     locked += usize::from(t.state == TState::Locked);
                     // a payment that failed as a full channel does: the node names no slot, only a balance or a route
-                    slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note) && !outage);
+                    let full = t.state == TState::Failed && ticket::slot_failure(&t.note);
+                    slot_failed += usize::from(full && !outage);
+                    outage_failed += usize::from(full && outage);
                     tickets.push(match &unsent {
                         Some(e) => node_said(with(t.public(), json!({"send_error": e.msg})), e),
                         None => node_failure(t.public(), pmt.as_ref().filter(|_| t.state == TState::Failed)),
@@ -1239,6 +1241,11 @@ impl Signer {
                                            "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why});
                         self.ticket_audit("ticket_slot_failure", with(json!({"session": sid, "dest": dest, "locked": locked}), held_less.clone()));
                     }
+                } else if locked == 0 && outage_failed > 0 && s.outage_round(self.engine.now()) {
+                    // nothing locked, for an outage: a short wait (prepaid tickets meanwhile), the pool as it was
+                    st.commit(&[s.row()])?;
+                    self.ticket_audit("ticket_outage_round", json!({"session": sid, "dest": dest, "failed": outage_failed, "pool": s.pool,
+                                                                    "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why}));
                 }
             }
             Ok(())

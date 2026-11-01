@@ -6521,7 +6521,8 @@ fn a_ticket_below_a_channels_dust_limit_is_never_held() {
 
 /// The channel's peer drops just as the session's first lock round is sent (a flap): both tickets fail, as the node
 /// says a payment fails on a channel that is out, with no balance. That is an outage, not a full channel: the session
-/// holds as many as before and waits for nothing, and a new session with the seller after it holds 2.
+/// holds as many as before, waits a short while (`ticket_outage`, 30 s) and pays the page with a prepaid ticket
+/// meanwhile, and a new session with the seller after it holds 2.
 ///
 /// FAILS with every round that fails as a full channel does counted as one: the pool is halved and a wait set, and the
 /// next session with the seller inherits the smaller pool for ten minutes (seen on the lab after the flap checks, the
@@ -6542,7 +6543,8 @@ fn a_lock_round_that_fails_in_an_outage_makes_the_wallet_hold_no_less() {
     assert!(failed.iter().all(|p| p["failure_reason"] == "FAILURE_REASON_INSUFFICIENT_BALANCE"), "{failed:?}");
     let s = session_of(&r, &v);
     assert_eq!((s["pool"].as_i64(), s["slot_fails"].as_i64()), (Some(2), Some(0)), "an outage is no full channel: {s}");
-    assert_ne!(s["hold_why"].as_str(), Some("ticket_slots"), "{s}");
+    assert_eq!(s["hold_why"].as_str(), Some("ticket_outage"), "{s}");
+    assert_eq!((v["tickets_prepaid"].as_u64(), r.audit("ticket_outage_round").len()), (Some(1), 1), "{v}");
     assert!(r.audit("ticket_slot_failure").is_empty(), "{:?}", r.audit("ticket_slot_failure"));
     // the channel back, a new session with the seller holds the 2 a channel of 30 allows
     std::thread::sleep(Duration::from_secs(3));
@@ -6555,9 +6557,10 @@ fn a_lock_round_that_fails_in_an_outage_makes_the_wallet_hold_no_less() {
 }
 
 /// A channel that is full with its peer up, within the minute after an outage: the wallet cannot tell it from the
-/// outage, and holds no less for it. Each lock round's tickets fail (nothing is paid for a failed ticket) and the page
-/// is paid all the same; once the minute is over a full channel is counted again: the pool halves and a wait is set.
-/// What it costs meanwhile is a lock round a session, of 2 failed payments, bounded by the minute.
+/// outage, and holds no less for it. The round's tickets fail (nothing is paid for a failed ticket), the session waits
+/// 30 s before it locks again (prepaid tickets meanwhile) and the page is paid all the same; once the minute is over a
+/// full channel is counted again: the pool halves and the longer wait is set. What it costs meanwhile is a round of
+/// 2 failed payments at most every 30 s a session, for that minute.
 #[test]
 fn a_full_channel_soon_after_an_outage_is_counted_once_the_minute_is_over() {
     let _g = env_lock();
