@@ -306,7 +306,10 @@ def drop_run() -> None:
         return sum(p.get("ok") is True for p in report("buyer")["pays"])
 
     def during() -> None:
-        lab.wait("three slices paid before the drop", 120, lambda: paid_slices() >= 3, every=0.2)
+        # the renter pays its whole step ahead (5 slices at 100 sat) before any miner is on: work proven, not slices
+        # paid, says the rental is under way. A loss from the start leaves the hashtaker never hearing of its miners
+        lab.wait("two slices' worth proven before the drop", 120,
+                 lambda: paid_slices() >= 3 and int(report("buyer")["meter"]["work"]) >= 2 * SLICE_WORK, every=0.2)
         # what the hashmaker sends is lost for a stretch: shares its side counted and the hashtaker's never read. The
         # link is cut only once the hashmaker has sent a share into the loss, so the drop always lands with one in flight
         road.lose = True
