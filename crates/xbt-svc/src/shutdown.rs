@@ -7,11 +7,13 @@
 //! ordinary code, with no handler and nothing that must be async-signal-safe. A service calls it
 //! before it starts any thread of its own: a thread started earlier keeps both signals unblocked,
 //! and one delivered to it is dropped (PID 1) or ends the process without a word (anyone else).
-//! A child inherits that mask: std's `Command` has passed the parent's signal mask on since Rust
-//! 1.66 (rust-lang/rust#101077). A child that relies on the default action of SIGTERM (a C program
-//! with no handler, such as the Stream Gateway) would then never see it and outlive every stop
-//! until a SIGKILL. So a service that has called [`listen`] starts its children through
-//! [`unblocked`], which takes the two signals out of the child's mask before it runs.
+//! A child may inherit that mask: whether std's `Command` clears it depends on how it spawns on
+//! the target. The images' static musl build passes it on (the Stream Gateway, started by
+//! xbt-supervise, had SIGINT and SIGTERM blocked: SigBlk 0x4002), while a glibc build may not. A
+//! child that relies on the default action of SIGTERM (a C program with no handler, such as the
+//! Stream Gateway) then never sees it and outlives every stop until a SIGKILL. So a service that has
+//! called [`listen`] starts its children through [`unblocked`], which takes the two signals out of
+//! the child's mask before it runs, whatever the target.
 //!
 //! What a service does when told: it takes no new work, gives the work in flight [`DRAIN`] to
 //! finish, flushes what it owns and exits 0. Work still running after that is abandoned as a kill
@@ -260,9 +262,10 @@ mod tests {
             let set = stop_set();
             // SAFETY: blocks the two signals in this thread only, as listen() does in a service
             assert_eq!(unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) }, 0);
-            // std passes the mask on: a child started plainly has both blocked, and would ignore a stop
-            assert_eq!(child_blocked(false) & bits, bits, "std no longer passes the mask on: unblocked() may be unneeded");
-            // started through unblocked(), neither
+            // started plainly, a child may have both blocked or not, by target (module docs): either way,
+            // through unblocked() it has neither
+            let plain = child_blocked(false) & bits;
+            assert!(plain == bits || plain == 0, "a plain child's mask is the parent's or empty: {plain:#x}");
             assert_eq!(child_blocked(true) & bits, 0);
         })
         .join()
