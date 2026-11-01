@@ -796,6 +796,18 @@ impl Payer for SlowPayer {
 /// the step, and no more waits than the hour allows.
 #[test]
 fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
+    slow_renter(true);
+}
+
+/// The same, on a hashmaker with no fallback pool, as many at home are: during each wait its miner stays connected
+/// on the rental, its shares held for the payment on its way, and goes on when it lands. A miner that doesn't come
+/// back when let go (as the stand-in here, which ignores `client.reconnect`) keeps hashing for the rental throughout.
+#[test]
+fn a_slow_honest_renter_keeps_its_miners_on_a_hashmaker_with_no_fallback() {
+    slow_renter(false);
+}
+
+fn slow_renter(with_fallback: bool) {
     let _s = serial();
     let sw = share_work(DIFF);
     // 20 sat a slice of 2 shares, the miner at 20 shares a second: 200 sat a second, the 546 sat step 2.7 s
@@ -804,7 +816,8 @@ fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
     let [link, miners, slices] = ports::<3>();
     let hk = noise::fresh_key();
     let h = Hashmaker::start(
-        hashmaker::Config { miners: miners.clone(), link: link.clone(), key: hk, terms: terms.clone(), report: None, slices: Some(slices.clone()), fallback: Some(fb),
+        hashmaker::Config { miners: miners.clone(), link: link.clone(), key: hk, terms: terms.clone(), report: None, slices: Some(slices.clone()),
+                            fallback: with_fallback.then_some(fb),
                             rentable: None, min_slice_time: hashmaker::MIN_SLICE_TIME },
         Box::new(|| Box::<LabSeller>::default()),
     )
@@ -815,7 +828,8 @@ fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
     let stop: Arc<AtomicBool> = Arc::default();
     let (ma, st2) = (miners.clone(), stop.clone());
     let miner = thread::spawn(move || {
-        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 20.0, bad_every: 0, duration: Some(Duration::from_secs(200)), reconnect: true, extranonce_subscribe: false, bind: None });
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 20.0, bad_every: 0, duration: Some(Duration::from_secs(200)), reconnect: with_fallback,
+                                                      extranonce_subscribe: false, bind: None });
         st2.store(true, Ordering::SeqCst);
     });
     let live: Arc<Mutex<Value>> = Arc::default();
@@ -845,8 +859,14 @@ fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
     assert!(hz["paymentWaits"].as_u64().unwrap() as usize <= xbt_hashlink::order::PAYING_WAITS_AN_HOUR, "{hz}");
     assert!(worst <= 0, "never more paid ahead than the step: {worst} msat over");
     assert!(r["paidSlices"].as_u64().unwrap() > 100, "it kept running: {r}");
-    if hz["paymentWaits"].as_u64().unwrap() > 0 {
+    if with_fallback && hz["paymentWaits"].as_u64().unwrap() + hz["rampWaits"].as_u64().unwrap() > 0 {
         assert!(fb_took > 0, "the miner hashed for the hashmaker's own pool during the waits");
+    }
+    if !with_fallback {
+        // the one miner stayed on the rental, connected, from its start to its end
+        let left = hz["events"].as_array().unwrap().iter().filter(|e| e["ev"] == "miner taken").count();
+        assert_eq!(left, 1, "taken once, never let go: {hz}");
+        assert!(hz["rampWaits"].as_u64().unwrap() + hz["paymentWaits"].as_u64().unwrap() > 0, "it was waited for: {hz}");
     }
     h.shutdown();
     drop(miner);

@@ -987,12 +987,16 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 }
                 r.waiting_since = Some(now);
                 r.note(json!({"ev": "waiting for a payment on its way", "atMs": now_ms(), "held": r.held.len()}));
-                // the miners go to this side's own pool and their channels close, so a share held for payment can't go on
-                // later: its miner is told, and it is neither counted nor paid
-                r.held_since = None;
-                let held = std::mem::take(&mut r.held);
-                for h in held {
-                    answer_share(&mut g, h.conn, &Refused::TooOld, &h.v);
+                // with a fallback the miners go to this side's own pool and their channels close, so a share held for
+                // payment can't go on later: its miner is told, and it is neither counted nor paid. With none they
+                // stay, and what they hold goes on when the payment lands
+                if g.fallback.is_some() {
+                    let r = g.rentals.get_mut(&id).unwrap();
+                    r.held_since = None;
+                    let held = std::mem::take(&mut r.held);
+                    for h in held {
+                        answer_share(&mut g, h.conn, &Refused::TooOld, &h.v);
+                    }
                 }
             }
             Msg::Shut { chan } => {
@@ -1146,6 +1150,13 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                         continue;
                     }
                     sending.insert(conn.peer.clone(), want.clone());
+                }
+                // no fallback, and its rental waits for a payment on its way: the miner stays where it is, connected,
+                // its shares held for that payment, and goes on with the rental when it lands (or is let go if the
+                // rental ends unpaid)
+                let waiting = g.units.get(&unit).and_then(|u| u.rental.as_ref()).and_then(|r| g.rentals.get(r)).is_some_and(|r| r.waiting_since.is_some() && r.stopped.is_none());
+                if want.is_none() && g.fallback.is_none() && waiting {
+                    continue;
                 }
                 if want.is_some() || g.fallback.is_some() {
                     g.conns.get_mut(&c).unwrap().busy = true;
