@@ -664,6 +664,11 @@ def one() -> None:
         raise LabError(f"the first lock round locked {len(b.hashes)} of {HELD}: {json.dumps(out)[:600]}")
     first = list(b.hashes)
     st = agree(HELD)
+    # the lock answers once lf1 has the HTLCs out; the seller's node shows them ACCEPTED only once they have crossed the hop
+    try:
+        lab.wait("the seller's node to show the tickets ACCEPTED", 30, lambda: shop.states(first) == {"ACCEPTED": HELD}, every=0.1)
+    except LabError:
+        pass
     check(f"one: {HELD} tickets locked through the hop: ACCEPTED on the seller's node, in flight on the buyer's, nothing spent",
           shop.states(first) == {"ACCEPTED": HELD} and buyer_in_flight() == set(first) and st["locked"] == {"tickets": HELD, "sats": HELD * 1000} and WALLET_PROC.spent() == spent0,
           {"seller": shop.states(first), "buyer_htlcs": len(buyer_in_flight()), "book": st["locked"], "agree": st["node"], "ledger": WALLET_PROC.spent() - spent0})
@@ -689,6 +694,14 @@ def one() -> None:
     check("one: after each release one ticket is left and the pool asks for one more, which locks before the next request",
           wants == [1] * 5 and len(hashes) == HELD + 5, {"want_after_each_release": wants, "tickets_locked_in_all": len(hashes), "refill_s": refills})
     REPORT["measured"]["one_refill_1_s"] = sorted(refills)[len(refills) // 2]
+    released, unreleased = hashes[:5], hashes[5:]
+    # the stop names every ticket the book may still have held, and that includes a released one whose settle the book has
+    # not yet read from lf1 (by design: its secret may never have reached the seller, whose node refuses to cancel a settled
+    # ticket). The book reads lf1 at ticket_status and at the watcher's tick, so it is brought to the five settled first
+    try:
+        lab.wait("the book to show the five settled", 30, lambda: b.tickets() == {"settled": 5, "locked": HELD}, every=0.2)
+    except LabError:
+        pass
     cancel = b.stop().get("cancel", [])
     lab.wait("the session to close", 60, lambda: status(b.session)["sessions"][0]["state"] == "closed", every=0.5)
     st = agree(0)
@@ -697,9 +710,11 @@ def one() -> None:
     cost = sum(cost_sats(p) for p in ours if p["status"] == "SUCCEEDED")
     fees = sum(int(p["fee_msat"]) for p in ours if p["status"] == "SUCCEEDED")
     check(f"one: stop: 5 settled and {HELD} cancelled on both nodes, the book and the buyer's node agree, no HTLC left",
-          len(cancel) == HELD and b.tickets() == {"failed": HELD, "settled": 5} and shop.states(hashes) == {"CANCELED": HELD, "SETTLED": 5}
+          sorted(cancel) == sorted(unreleased) and b.tickets() == {"failed": HELD, "settled": 5} and shop.states(hashes) == {"CANCELED": HELD, "SETTLED": 5}
           and lab.tally_states(p["status"] for p in ours) == {"FAILED": HELD, "SUCCEEDED": 5} and st["node"]["agree"] and not buyer_in_flight(),
-          {"book": b.tickets(), "seller": shop.states(hashes), "buyer": lab.tally_states(p["status"] for p in ours), "node": st["node"]})
+          {"book": b.tickets(), "seller": shop.states(hashes), "buyer": lab.tally_states(p["status"] for p in ours), "node": st["node"],
+           "cancel": {"named": len(cancel), "unreleased_named": sum(h in cancel for h in unreleased), "released_named": sum(h in cancel for h in released),
+                      "others_named": sum(h not in hashes for h in cancel)}, "buyer_in_flight": len(buyer_in_flight())})
     check(f"one: the ledger holds what lf1 paid for the five, routing fees included, and nothing for the {HELD} that came back",
           WALLET_PROC.spent() - spent0 == cost and fees > 0, {"ledger_sats": WALLET_PROC.spent() - spent0, "node_cost_sats": cost, "fees_msat": fees})
     REPORT["paid_invoices"] = [p["payment_request"] for p in ours if p["status"] == "SUCCEEDED"]
