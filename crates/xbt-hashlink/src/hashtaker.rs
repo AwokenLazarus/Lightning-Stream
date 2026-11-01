@@ -480,6 +480,9 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                     g.buys.push_back(ms as f64 / 1000.0);
                 }
                 match r {
+                    // its answer lost after it was sent: it may have paid. Not paid again; the hashmaker, which knows
+                    // whether it arrived, ends the rental if it didn't
+                    Ok(v) if v["verdict"] == "unknown" => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": null, "unknown": true, "wallet": v})),
                     Ok(v) => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": true, "ticketMsat": ticket, "wallet": v})),
                     Err(why) => {
                         g.pay_failed = true;
