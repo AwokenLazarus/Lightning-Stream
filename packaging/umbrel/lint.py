@@ -160,9 +160,10 @@ RESOLVED_APP_PROXY_KEYS = {"image", "environment", "networks"}
 # an entrypoint replaces what the image runs: only these, exactly
 SIGNER_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--",
                      "/usr/bin/xbt-signer"]
-# the Stream Gateway: started once its config is written, again when that or the node's cookie changes
-DATUM_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--",
-                    "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
+# the Stream Gateway: started once its config is written, again when that or the node's cookie changes, and
+# gone (to be restarted in the renter's namespace as it is then) when the renter's control port stops answering
+DATUM_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie",
+                    "--peer", "127.0.0.1:23343", "--", "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
 ENTRYPOINTS = {("lazarus-lightning-stream", "signer"): SIGNER_ENTRYPOINT, ("lazarus-xbt-agent-wallet", "signer"): SIGNER_ENTRYPOINT,
                ("lazarus-xbt-knots", "node"): ["bitcoind"], ("lazarus-lightning-stream", "datum"): DATUM_ENTRYPOINT}
 # the baker's whole environment, as written (nothing more reaches it: no env_file)

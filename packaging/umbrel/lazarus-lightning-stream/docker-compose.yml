@@ -426,7 +426,9 @@ services:
   # namespace, so its stratum (127.0.0.1:23339) and its API (127.0.0.1:7152: /xbt/job opens each job for
   # the renter's check) are the renter's loopback. Never --allow-unblinded: a job it can't show masked is
   # refused. It starts once the Hashrate page writes run/datum/config.json, and again when that or the
-  # cookie changes; until then it waits, and that is healthy.
+  # cookie changes; until then it waits, and that is healthy. --peer: a restarted renter gets a new
+  # namespace and would leave this one in the old one, so xbt-supervise looks at the renter's control port
+  # on loopback and exits when it stops answering; restart: on-failure then starts it in the renter's new one.
   datum:
     <<: *service
     image: xbt-datum-gateway:0.1.0
@@ -437,8 +439,8 @@ services:
         condition: service_completed_successfully
       renter:
         condition: service_started
-    entrypoint: ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--",
-                 "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
+    entrypoint: ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie",
+                 "--peer", "127.0.0.1:23343", "--", "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
     healthcheck:
       test: ["CMD", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:7152/", "--waiting-for", "/data/run/datum/config.json"]
       interval: 30s
