@@ -302,7 +302,7 @@ fn ended_words(why: &str) -> String {
     let w = ["hashmaker closed: ", "hashtaker closed: ", "hasher closed: ", "buyer closed: "].iter().fold(why, |w, p| w.trim_start_matches(p));
     match w {
         "cut by the hashtaker" | "cut by the buyer" => "You cut it.".into(),
-        "budget used up" => "Its budget is used up.".into(),
+        "budget used up" | "budget reached" => "Its budget is used up.".into(),
         "rental time over" => "Its time is up.".into(),
         "no proven work" | "no accepted work" => "The miners stopped sending work.".into(),
         "unpaid" => "A piece of work was not paid in time.".into(),
@@ -748,7 +748,7 @@ impl App {
         let st = call(&base, &token, "GET", "/status", None);
         let csrf = App::csrf_input(ctx);
         let mut b = String::from("<p class=\"lead\">Rent miners from other people, by the piece of work they do, into your own DATUM Gateway. \
-            You pay only for work both sides have checked. Paid as you use it, seconds at a time: you never have more paid for and not yet received than a minute of the miner's hashing or 546 sat, whichever is more, plus any start fee shown on the offer. You can cut a rental at any moment.</p>\
+            Paid as you use it, seconds at a time: you never have more paid for and not yet received than a minute of the miner's hashing, or one share, one slice and one ticket (546 sat at least), whichever is more, plus any start fee shown on the offer. You can cut a rental at any moment.</p>\
             <p class=\"hint\">Renting, you are the <strong>hashtaker</strong>: the hash comes to you. The people whose miners you rent are <strong>hashmakers</strong>.</p>");
         let st = match st {
             Ok(s) => s,

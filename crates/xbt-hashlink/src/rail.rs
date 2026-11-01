@@ -284,6 +284,9 @@ pub trait Payer: Send {
     fn pay(&mut self, rental: &str, slice: u64, receipt: &serde_json::Value) -> Result<serde_json::Value, String>;
     /// End the wallet's session with the seller.
     fn stop(&mut self) -> Option<serde_json::Value>;
+    /// The credit the seller holds for this rental and what is left of its budget, both in msat, as the wallet last
+    /// said. The renter sizes each ticket, and pays ahead, by it: a payer that kept no credit says 0.
+    fn held(&self) -> (u64, Option<u64>);
 }
 
 impl Payer for SignerPayer {
@@ -297,6 +300,10 @@ impl Payer for SignerPayer {
 
     fn stop(&mut self) -> Option<serde_json::Value> {
         SignerPayer::stop(self)
+    }
+
+    fn held(&self) -> (u64, Option<u64>) {
+        (self.credit_msat, self.left_msat())
     }
 }
 

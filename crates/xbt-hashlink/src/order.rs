@@ -102,6 +102,50 @@ impl Standing {
         true
     }
 
+    /// A payment that has to be made now: the start fee and the first slice, or one the next share needs.
+    pub fn needed(&self) -> bool {
+        let share = self.largest_share.min(LARGEST_SHARE_SLICES * self.slice_work);
+        !ready_to_serve(self.paid, self.start_slices) || self.proven + share > paid_work(self.paid, self.start_slices, self.slice_work)
+    }
+
+    /// [`Standing::pay_next`], with `credit_msat` the renter's credit at the seller. Paid from credit, a slice changes
+    /// nothing gone and unworked. One that has to buy a ticket adds the ticket: only paid ahead of need when the
+    /// smallest ticket keeps all that within the step.
+    pub fn pay_next_with(&self, credit_msat: u64) -> bool {
+        if !self.pay_next() {
+            return false;
+        }
+        let covered = paid_work(self.paid, self.start_slices, self.slice_work);
+        if self.needed() || credit_msat >= self.price_msat {
+            return true;
+        }
+        let ahead = self.msat_of(covered.saturating_sub(self.proven));
+        ahead + credit_msat + self.smallest_ticket_msat() <= self.step_msat()
+    }
+
+    /// The smallest ticket a payment can buy: the seller's smallest (546 sat), and never under the slice's price.
+    pub fn smallest_ticket_msat(&self) -> u64 {
+        FIRST_STEP_MSAT.max(self.price_msat)
+    }
+
+    /// The ticket to buy for slice `self.paid` (counted in `paid`), when the credit at the seller doesn't cover it:
+    /// what keeps the money gone and not yet worked, slices paid ahead and credit left at the seller, within the step
+    /// and the start fee still to pay, and never under the smallest ticket.
+    pub fn ticket_msat_with(&self, credit_msat: u64) -> u64 {
+        let ahead = self.msat_of(paid_work(self.paid, self.start_slices, self.slice_work).saturating_sub(self.proven));
+        let fee_left = self.start_slices.saturating_sub(self.paid).saturating_mul(self.price_msat);
+        let room = (self.step_msat() + fee_left + self.price_msat).saturating_sub(ahead + credit_msat);
+        room.max(self.smallest_ticket_msat())
+    }
+
+    /// The most that is ever gone and not yet worked (slices paid ahead and credit at the seller), the start fee aside:
+    /// the step, or, when a share must be paid for and a ticket bought for it, one share, one slice and the smallest
+    /// ticket, whichever is more.
+    pub fn most_unworked_msat(&self) -> u64 {
+        let share = self.largest_share.min(LARGEST_SHARE_SLICES * self.slice_work);
+        self.step_msat().max(self.msat_of(share) + self.price_msat + self.smallest_ticket_msat())
+    }
+
     /// How long what's paid and not yet worked lasts at the measured output.
     pub fn secs_left(&self) -> f64 {
         let covered = paid_work(self.paid, self.start_slices, self.slice_work);
@@ -119,15 +163,6 @@ impl Standing {
             && (self.step_msat() as f64 / self.msat_a_second) + WAIT_FOR_PAYING.as_secs_f64() < self.buy_secs
     }
 
-    /// The largest ticket worth buying for the payment that's due. With the start fee on the first, whose share
-    /// isn't known yet.
-    pub fn ticket_msat(&self) -> u64 {
-        let step = self.step_msat();
-        if self.paid == 0 {
-            return step.max(self.price_msat).saturating_add(self.start_slices.saturating_mul(self.price_msat));
-        }
-        step.max(self.price_msat)
-    }
 }
 
 /// Was this ended rental a failed first step? Money went and little work came back, and the renter didn't end it
@@ -228,11 +263,15 @@ mod tests {
 
     #[test]
     fn the_first_ticket_holds_the_fee_and_the_first_step() {
-        assert_eq!(at(0, 0, 0).ticket_msat(), 546_000 + 800_000);
-        // a slice above the first step: that, then
-        let s = Standing { price_msat: 1_000_000, start_slices: 1, ..at(0, 0, 0) };
-        assert_eq!(s.ticket_msat(), 2_000_000);
-        assert_eq!(at(0, 0, 3).ticket_msat(), 546_000);
+        // the first payment (slice 1, a fee slice): it, the other fee slice and the first step
+        assert_eq!(at(0, 0, 1).ticket_msat_with(0), 546_000 + 800_000);
+        // a slice above the first step: the fee slice and the step, then the smallest ticket, a slice
+        let s = Standing { price_msat: 1_000_000, start_slices: 1, ..at(0, 0, 1) };
+        assert_eq!(s.ticket_msat_with(0), 1_546_000);
+        assert_eq!(Standing { paid: 2, ..s }.ticket_msat_with(546_000), 1_000_000);
+        // past the fee: the step, less what's paid ahead (a slice) and the credit, with this slice
+        assert_eq!(at(0, 0, 3).ticket_msat_with(0), 546_000);
+        assert_eq!(at(0, 0, 3).ticket_msat_with(100_000), 546_000, "never under the smallest ticket");
     }
 
     /// A rental on a timeline: a share every second, each payment that buys a ticket taking `buy` seconds to arrive
@@ -287,6 +326,52 @@ mod tests {
         let (most, stalled, slow, waits) = timeline(1_000_000, 8.0, 1, 3600);
         assert!(!stalled && !slow, "large: most ahead {most}, waits {waits}");
         assert!(waits <= PAYING_WAITS_AN_HOUR, "large: {waits} waits in the hour");
+    }
+
+    /// What's gone and not yet worked (slices paid ahead and the credit at the seller) never passes
+    /// [`Standing::most_unworked_msat`] and the start fee still to pay, at the moment each ticket is bought, over prices,
+    /// share sizes, miner rates and start fees; and the renter's own count never leaves a share waiting.
+    #[test]
+    fn what_is_gone_and_unworked_stays_within_the_stated_bound() {
+        let mut worst = 0.0f64;
+        for price in [20_000u64, 100_000, 400_000, 546_000, 1_000_000, 3_000_000] {
+            for share in [1u128, 10, 100, 400, 1000, 3000, 4000] {
+                for per_sec in [0.2f64, 1.0, 5.0, 40.0] {
+                    for start in [0u64, 1, 3] {
+                        let slice = 1000u128;
+                        let mut s = Standing { proven: 0, largest_share: share, paid: 0, start_slices: start, slice_work: slice, price_msat: price, msat_a_second: 0.0, buy_secs: 0.0 };
+                        let mut credit = 0u64;
+                        let mut owed = 0.0f64;
+                        for tick in 0..3000u64 {
+                            let now = tick as f64 / 10.0;
+                            while s.pay_next_with(credit) {
+                                s.paid += 1;
+                                if credit < price {
+                                    credit += s.ticket_msat_with(credit);
+                                    let fee_left = start.saturating_sub(s.paid) * price;
+                                    let ahead = s.msat_of(paid_work(s.paid, start, slice).saturating_sub(s.proven));
+                                    let gone = ahead + credit - price;
+                                    let bound = s.most_unworked_msat() + fee_left;
+                                    assert!(gone <= bound, "price {price} share {share} rate {per_sec} start {start} t {now}: {gone} over {bound}");
+                                    worst = worst.max(gone as f64 / s.step_msat() as f64);
+                                }
+                                credit -= price;
+                            }
+                            owed += per_sec / 10.0;
+                            while owed >= 1.0 && fits(s.proven, share, s.paid, start, slice) {
+                                owed -= 1.0;
+                                s.proven += share;
+                            }
+                            assert!(owed < 2.0 + per_sec, "a share waited: price {price} share {share} rate {per_sec} start {start} t {now}");
+                            if now >= 1.0 {
+                                s.msat_a_second = s.msat_of(s.proven) as f64 / now;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("MEASURED the most gone and unworked, over the step: {worst:.2}");
     }
 
     /// A buy slower than the step and the 10 s wait together: said in words.

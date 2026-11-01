@@ -49,6 +49,8 @@ const SUPERSEDED_IN_FLIGHT: Duration = Duration::from_secs(2);
 /// The late shares of a superseded job a channel stands: one could be firmware finishing up, a second is
 /// a miner left on the old job, whose work is useless and credited.
 const SUPERSEDED_SHARES: u32 = 2;
+/// How far a share's time may roll forward from its job's: a gateway takes up to two hours past its template's time.
+pub const NTIME_ROLL_MOST: u32 = 7200;
 
 /// The work of one share at difficulty `d`.
 pub fn share_work(d: f64) -> u128 {
@@ -70,6 +72,8 @@ pub enum Refused {
     Low,
     /// This hash was counted already.
     Repeat,
+    /// Its time rolls back from its job's, or further forward than a gateway takes.
+    Time,
     /// A line this check can't read.
     Bad(String),
 }
@@ -81,6 +85,7 @@ impl Refused {
             Refused::UnknownJob => (21, "job not found"),
             Refused::TooOld => (21, "stale job"),
             Refused::Low => (23, "low difficulty share"),
+            Refused::Time => (20, "ntime out of range"),
             Refused::Repeat => (22, "duplicate share"),
             Refused::Bad(_) => (20, "share can't be checked"),
         };
@@ -161,6 +166,8 @@ struct JobRec {
     d: f64,
     gen: u64,
     at: Instant,
+    /// The time offset its notify gave, which a miner's own may roll forward from.
+    ntime: Option<u32>,
 }
 
 struct Chan {
@@ -205,6 +212,9 @@ fn stale(v: &Value) -> bool {
         _ => false,
     }
 }
+
+/// A share's hash, or why it couldn't be had.
+pub type Hashed = Result<[u8; 32], String>;
 
 #[derive(Default)]
 pub struct Meter {
@@ -263,6 +273,14 @@ impl Meter {
         if j.gen + 1 < c.gen {
             return Err(Refused::TooOld);
         }
+        // the time the node would read: the job's, rolled forward at most as far as a gateway takes (its template
+        // time and two hours). A share whose block would be refused for its time is no work to sell
+        if let Some(jt) = j.ntime {
+            let t = proof::ntime_offset(sv1::params(v).and_then(|p| p.get(3))).map_err(Refused::Bad)?;
+            if t.wrapping_sub(jt) > NTIME_ROLL_MOST {
+                return Err(Refused::Time);
+            }
+        }
         let session = c.session.clone().ok_or_else(|| Refused::Bad("a share before the subscribe's answer".into()))?;
         let newest = at + 1 == c.jobs.len();
         let first = c.jobs.front().map(|f| f.at).unwrap_or(j.at);
@@ -283,6 +301,12 @@ impl Meter {
         })
     }
 
+    /// A share refused before it reached the meter (its id, or a job not yet checked at its difficulty): counted
+    /// as any refusal is.
+    pub fn refuse(&mut self, e: &Refused) {
+        self.note_refused(e);
+    }
+
     fn note_refused(&mut self, e: &Refused) {
         self.refused += 1;
         match e {
@@ -298,7 +322,13 @@ impl Meter {
     ///   youngest share is older than a quarter of that life (at least 10 s) has odds of about 1e-4; shares
     ///   held back, or mined on an old job on purpose, look like this.
     pub fn commit(&mut self, c: &Claim, hash: Result<[u8; 32], String>) -> Result<Proven, Refused> {
-        let r = self.commit_inner(c, hash);
+        self.commit_at(c, hash, Instant::now())
+    }
+
+    /// [`Meter::commit`] for a share that arrived at `at`: a share sent again after a drop is aged at the drop, when
+    /// it was on its way, not when it came again.
+    pub fn commit_at(&mut self, c: &Claim, hash: Result<[u8; 32], String>, at: Instant) -> Result<Proven, Refused> {
+        let r = self.commit_inner(c, hash, at);
         if let Err(e) = &r {
             self.note_refused(e);
         }
@@ -344,10 +374,10 @@ impl Meter {
         Ok((h, d))
     }
 
-    fn commit_inner(&mut self, c: &Claim, hash: Result<[u8; 32], String>) -> Result<Proven, Refused> {
+    fn commit_inner(&mut self, c: &Claim, hash: Result<[u8; 32], String>, at: Instant) -> Result<Proven, Refused> {
         let (h, d) = self.credit(c, hash)?;
         let work = share_work(d);
-        let (limit, age) = (AGE_FLOOR.max(c.job_life / 4), c.job_at.elapsed());
+        let (limit, age) = (AGE_FLOOR.max(c.job_life / 4), at.saturating_duration_since(c.job_at));
         let old = self.age_test.add(if age > limit { 1.0 } else { 0.0 }, |all| all >= 1.0);
         let (mut harder, mut old_job) = (false, false);
         if let Some(ch) = self.chans.get_mut(&c.chan) {
@@ -366,13 +396,15 @@ impl Meter {
         Ok(Proven { work, harder, old, old_job, hash: h })
     }
 
-    /// A share sent again after a drop, for the count alone: it's checked like any other and counted
-    /// once, nothing is said against it if it was counted already, and no verdict will come for it.
-    pub fn resent(&mut self, chan: u32, v: &Value) -> Option<u128> {
-        let c = self.claim_inner(chan, v).ok()?;
+    /// Was this share, sent again after a drop, counted already? Its claim, to commit, if not. A share the
+    /// hashtaker counted before the drop is passed over without a word; one that fails its checks is `Err`.
+    pub fn resent_claim(&mut self, chan: u32, v: &Value) -> Result<Option<(Claim, Hashed)>, Refused> {
+        let c = self.claim(chan, v)?;
         let h = c.hash();
-        let (_, d) = self.credit(&c, h).ok()?;
-        Some(share_work(d))
+        match self.earned(&c, &h) {
+            Err(Refused::Repeat) => Ok(None),
+            _ => Ok(Some((c, h))),
+        }
     }
 
     /// A share read, hashed and counted at once.
@@ -414,7 +446,8 @@ impl Meter {
             if c.jobs.len() == JOBS_KEPT {
                 c.jobs.pop_front();
             }
-            c.jobs.push_back(JobRec { id, job: Arc::new(job), d: c.diff, gen: c.gen, at: Instant::now() });
+            let ntime = proof::ntime_offset(sv1::params(v).and_then(|p| p.get(7))).ok();
+            c.jobs.push_back(JobRec { id, job: Arc::new(job), d: c.diff, gen: c.gen, at: Instant::now(), ntime });
             return Ok(None);
         }
         if !sv1::is_response(v) {
@@ -645,6 +678,30 @@ mod tests {
         assert_eq!(m.down(1, &p(r#"{"id":5,"result":true,"error":null}"#)).unwrap(), None);
         assert_eq!(m.work, before);
         assert_eq!(m.accepted, 1);
+    }
+
+    /// A share's time may roll forward from its job's as far as a gateway takes (two hours), and never back.
+    #[test]
+    fn a_share_whose_time_leaves_its_jobs_range_is_refused() {
+        let mut m = Meter::default();
+        open(&mut m, 1);
+        m.down(1, &json!({"id": null, "method": "mining.set_difficulty", "params": [D]})).unwrap();
+        m.down(1, &job(1, false)).unwrap();
+        let s = share(1, D, 1, 5);
+        let at = |t: u32| {
+            let mut v = s.clone();
+            v["params"][3] = json!(format!("{t:08x}"));
+            v
+        };
+        assert_eq!(m.claim(1, &at(1_700_000_000 - 1)).err(), Some(Refused::Time), "rolled back");
+        assert_eq!(m.claim(1, &at(1_700_000_000 + NTIME_ROLL_MOST + 1)).err(), Some(Refused::Time), "past two hours");
+        assert!(m.claim(1, &at(1_700_000_000 + NTIME_ROLL_MOST)).is_ok());
+        assert!(m.claim(1, &at(1_700_000_000)).is_ok());
+        // the 16-digit form: its first four bytes are the time, little-endian
+        let mut long = s.clone();
+        long["params"][3] = json!(format!("{}{}", hex::encode((1_700_000_000u32 - 5).to_le_bytes()), "00000000"));
+        assert_eq!(m.claim(1, &long).err(), Some(Refused::Time));
+        assert_eq!(m.refused, 3);
     }
 
     #[test]
