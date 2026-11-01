@@ -1112,8 +1112,9 @@ class ChannelDrops:
 
 
 # What an answer the wallet does not read may still cost on a route priced by the byte: what the seller's socket took
-# before the wallet closed it (its buffers, a few hundred KiB at most); the check reports the amount.
-UNREAD_MOST_MSAT = -(-(256 << 10) * BYTE_MSAT // PER_BYTES)
+# before the wallet closed it (its buffers, a few hundred KiB at most, docs/LIMITS.md); the check reports the amount.
+# More than 512 KiB is a finding, not load.
+UNREAD_MOST_MSAT = -(-(512 << 10) * BYTE_MSAT // PER_BYTES)
 
 
 def digest_of_range(start: int) -> str:
