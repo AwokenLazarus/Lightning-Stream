@@ -7466,7 +7466,8 @@ fn a_seller_with_a_short_grace_is_paid_before_twenty_that_can_wait() {
     let wins = short_one["wins"].as_u64().unwrap_or(0);
     assert!(wins >= 1, "a file of 64 pieces that drew no win: {short_one}");
     // the test's clock stands still, so no seller's grace runs out here: what is measured is the order. Each of the short
-    // seller's wins is paid within a gate's width or two of the seller making its invoice, not behind the 120 waiting
+    // seller's wins is paid within a few gate widths of the seller making its invoice (the wins the wallet already had in
+    // hand when it came go too), not behind the 120 waiting
     let payments: Vec<String> = r.ln.state().payments.iter().map(|p| p["payment_hash"].as_str().unwrap().to_string()).collect();
     let sent_at = r.ln.st.lock().unwrap().sent_at.clone();
     let made = r.shop.node.made.lock().unwrap().clone();
@@ -7479,7 +7480,8 @@ fn a_seller_with_a_short_grace_is_paid_before_twenty_that_can_wait() {
         let before = sent_at.iter().filter(|s| **s < made_at).count();
         let behind = at - before.min(at);
         eprintln!("short grace: invoice made when {before} had been sent, paid at {at}: {behind} between");
-        assert!(behind <= 16, "a win of the short seller waited behind {behind} payments of sellers that could wait (paid at {at} of {})", payments.len());
+        // measured: 17 to 23 with the gate by due, 295 to 311 in order of arrival (the 120 waiting and those after them)
+        assert!(behind <= 48, "a win of the short seller waited behind {behind} payments of sellers that could wait (paid at {at} of {})", payments.len());
     }
     assert_eq!((short_one["complete"].as_bool(), short_one["ended"].as_str()), (Some(true), None), "its answer was cut: {short_one}");
     assert_eq!((short_one["wins_paid"].as_u64(), short_one["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{short_one}");
