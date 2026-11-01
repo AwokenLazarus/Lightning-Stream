@@ -880,7 +880,8 @@ fn slow_renter(with_fallback: bool) {
 fn a_buy_slower_than_the_measured_ones_is_still_waited_for() {
     let _s = serial();
     let sw = share_work(DIFF);
-    // 300 sat a slice of 2 shares at 2 shares a second: a 546 sat ticket lasts under 2 s
+    // 300 sat a slice of 2 shares, a share every 2.5 s: one share waits for the late buy, and no second comes within
+    // the hashmaker's 2 s clock to remind the renter
     let terms = Terms { slice_work: 2 * sw, price_msat: 300_000, grace_ms: 10_000, start_slices: 0 };
     let (fb, _) = fallback_pool();
     let [link, miners, slices] = ports::<3>();
@@ -897,11 +898,11 @@ fn a_buy_slower_than_the_measured_ones_is_still_waited_for() {
     let stop: Arc<AtomicBool> = Arc::default();
     let (ma, st2) = (miners.clone(), stop.clone());
     let miner = thread::spawn(move || {
-        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 2.0, bad_every: 0, duration: Some(Duration::from_secs(60)), reconnect: true, extranonce_subscribe: false, bind: None });
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 0.4, bad_every: 0, duration: Some(Duration::from_secs(80)), reconnect: true, extranonce_subscribe: false, bind: None });
         st2.store(true, Ordering::SeqCst);
     });
     let mut cfg = taker_config(&link, hpub, &terms, &pool, "late", 60);
-    cfg.duration = Some(Duration::from_secs(40));
+    cfg.duration = Some(Duration::from_secs(60));
     // two quick buys, then one of 6 s, far past what's paid ahead and the hashmaker's 2 s clock, then quick again
     let buys = vec![Duration::from_millis(200), Duration::from_millis(200), Duration::from_millis(6000), Duration::from_millis(200)];
     cfg.payer = Some(Box::new(SlowPayer { slices, price_msat: terms.price_msat, ticket_msat: 0, credit_msat: 0, buys, bought: 0 }));
