@@ -9046,13 +9046,31 @@ fn a_paid_tunnel_pays_at_most_one_and_a_half_tickets_ahead() {
             let most = most.join().unwrap();
             holds.join().unwrap();
             eprintln!("credit ahead, {}: at most {:.3} tickets, {through} bytes each way", if delays { "a slow seller" } else { "flat out" }, most as f64 / TICKET as f64);
-            assert_eq!(through, each);
+            // a tunnel that carried less has ended: the wallet's answer says why (a busy machine once ended one here, unexplained)
+            let mut ws = Some(ws);
+            if through != each {
+                let w = ws.take().unwrap().join().unwrap();
+                // and the session's tickets as the book and the node have them, for what ended it
+                let sid = w["session"].as_str().unwrap_or_default().to_string();
+                let node: Vec<String> = ["IN_FLIGHT", "SUCCEEDED", "FAILED"].iter().map(|st| format!("{st} {}", r.ln.by_status(st).len())).collect();
+                // the tip the wallet reads now, and each locked ticket's blocks left (one is released only while more than 25 are left)
+                let tip = r.call("node_status", json!({}));
+                let session = r.session(&sid);
+                let left: Vec<String> = session["session_tickets"].as_array().into_iter().flatten().filter(|t| t["state"] == "locked")
+                    .map(|t| format!("{}", t["final_expiry"].as_i64().unwrap_or(0) - tip["height"].as_i64().unwrap_or(0))).collect();
+                panic!("{}: the tunnel ended at {through} of {each} bytes each way; the wallet: ended {:?}, rule {:?}, reason {:?}, {} released, {:?} sat charged; \
+                        seller charged {} msat; the node: {node:?}; the chain: {tip}, chain node height {}; blocks left on the locked: {left:?}; the session: {}",
+                       if delays { "a slow seller" } else { "flat out" }, w["ended"], w["rule"], w["reason"], w["tickets_released"], w["charged_sats"],
+                       r.shop.gw.stats().charged_msat, r.node.chain.height(), session.to_string().chars().take(3000).collect::<String>());
+            }
             assert!(most < 16 * TICKET / 10, "{} the wallet paid {most} msat ahead of what the seller charged", if delays { "a seller slow to show tickets:" } else { "flat out:" });
             let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
             let stop = r.call("ticket_stop", json!({"session": sid}));
             let (paid, taken, book, _) = r.money();
             assert_eq!((taken, book), (paid, paid), "{stop}");
-            ws.join().unwrap();
+            if let Some(ws) = ws {
+                ws.join().unwrap();
+            }
         });
         caller.join().unwrap();
         REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
