@@ -8130,8 +8130,9 @@ fn a_resume_whose_session_the_seller_forgot_is_made_again_in_another_session() {
     assert_eq!(r.status()["locked"]["tickets"].as_i64(), Some(0), "{}", r.status());
     // nothing is heard of the wallet for longer than the seller keeps a quiet session: it forgets it. (The wallet's
     // watcher did not run meanwhile: its node was away)
+    assert_eq!(r.shop.gw.stats().sessions, 1, "the seller has the one session");
     r.clock.fetch_add(350, Ordering::SeqCst);
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for("the seller to forget the session", || r.shop.gw.stats().sessions == 0);
     r.tap.clear();
     let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
                                          "if_range": part["etag"]}));
