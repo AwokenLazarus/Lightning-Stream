@@ -362,8 +362,9 @@ impl Rental {
         while self.rate.front().is_some_and(|(t, _)| now - *t > Duration::from_secs(30)) {
             self.rate.pop_front();
         }
+        // a count that came down after a resume reads as no work in this window, not less than none
         match (self.rate.front(), self.rate.back()) {
-            (Some((t0, w0)), Some((t1, w1))) if t1 > t0 => (w1 - w0) as f64 / (*t1 - *t0).as_secs_f64(),
+            (Some((t0, w0)), Some((t1, w1))) if t1 > t0 => w1.saturating_sub(*w0) as f64 / (*t1 - *t0).as_secs_f64(),
             _ => 0.0,
         }
     }

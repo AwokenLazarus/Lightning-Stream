@@ -1183,10 +1183,10 @@ mod come_back_tests {
         let st = state();
         {
             let mut g = lock(&st);
-            // slice 1 on its way for 0.3 s, the buys before it quick, the share waiting 1.2 s
+            // slice 1 on its way for 1.3 s, the buys before it quick, the share waiting 1.2 s
             g.released = 1;
             g.in_flight = 1;
-            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(300));
+            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(1300));
             g.buys = VecDeque::from([0.2, 0.2]);
             g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(1200));
             g.tick(&tx);
@@ -1198,6 +1198,31 @@ mod come_back_tests {
         }
         assert!(said, "paying said by the ticker");
         assert!(lock(&st).guard.paying_said);
+    }
+
+    /// A payment that landed restarts the hashmaker's clock for a share still short: the next one, queued as it
+    /// landed, is timed from then, not from the first due (review 22d, finding 2), so no wait is said for it early.
+    #[test]
+    fn a_wait_is_timed_from_the_payment_on_its_way_not_the_first_due() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, peer) = a_link(key, hk);
+        let st = state();
+        {
+            let mut g = lock(&st);
+            // the share has waited 1.2 s since its due; a payment landed 0.2 s ago and the next was queued then
+            g.released = 1;
+            g.in_flight = 1;
+            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(200));
+            g.buys = VecDeque::from([0.2, 0.2]);
+            g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(1200));
+            g.tick(&tx);
+            assert!(!g.guard.paying_said, "not said 0.2 s into this payment");
+        }
+        drop(tx);
+        let mut lk = peer.join().unwrap();
+        while let Ok(Some(m)) = lk.rx.recv_within(Duration::from_millis(300)) {
+            assert!(!matches!(m, Msg::Paying), "said early");
+        }
     }
 
     /// A gateway's API that answers each job id with what it was given: enough for [`blind::Check`].
