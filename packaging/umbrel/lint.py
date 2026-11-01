@@ -586,6 +586,12 @@ def main() -> int:
                 bad(f"{folder}/{name}: image {img!r} is not the one packaging/images.lock pins ({pins.get(pin['name'])!r})")
             node_keys = s.get("command") == ["node-keys"]
             base = pin["name"] if pin else img.split(":")[0]
+            # a UI that writes the shop's route for paid pieces of work (XBT_UI_HASHER_SLICES) asks the hashmaker
+            # (XBT_UI_HASHER) before it moves that route to a new price: with no hashmaker address the route would
+            # never follow, and a hashmaker whose gateway charges another price takes no rental
+            ui_env = env_of(s)
+            if str(ui_env.get("XBT_UI_HASHER_SLICES") or "").startswith("http://") and not str(ui_env.get("XBT_UI_HASHER") or "").startswith("http://"):
+                bad(f"{folder}/{name}: XBT_UI_HASHER_SLICES without an http:// XBT_UI_HASHER: the shop's route would never follow a new price")
             # the name alone is not the exception: the baker's checks below decide, before any other
             baker = name == NODE_KEYS_BAKE
             if s.get("cap_add") and (baker or base != "xbt-init"):

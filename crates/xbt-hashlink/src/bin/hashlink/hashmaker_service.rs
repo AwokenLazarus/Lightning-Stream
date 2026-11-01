@@ -661,6 +661,114 @@ mod tests {
         assert!(!due(Some((&last, true)), &last, S(3600)));
     }
 
+    /// A free port on loopback.
+    fn port() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    fn get(addr: &str, path: &str) -> Option<Value> {
+        use std::io::{Read, Write};
+        let mut c = std::net::TcpStream::connect(addr).ok()?;
+        c.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        c.write_all(format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes()).ok()?;
+        let mut b = String::new();
+        c.read_to_string(&mut b).ok()?;
+        serde_json::from_str(b.split_once("\r\n\r\n")?.1).ok()
+    }
+
+    /// A gateway stand-in that charges `charged` msat a slice, and notes, each time it is asked, what the hashmaker
+    /// at `control` takes then (its `rentable`, with the price of its terms).
+    fn gateway(charged: Arc<std::sync::atomic::AtomicU64>, control: String) -> (String, Arc<Mutex<Vec<(Value, Value)>>>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let asked: Arc<Mutex<Vec<(Value, Value)>>> = Arc::default();
+        let noted = asked.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = c.read(&mut buf);
+                // the hashmaker as it is while it waits for this answer
+                if let Some(st) = get(&control, "/status") {
+                    noted.lock().unwrap().push((st["rentable"].clone(), st["terms"]["priceMsat"].clone()));
+                }
+                let p = charged.load(std::sync::atomic::Ordering::SeqCst);
+                let body = json!({"routes": [{"path": HASH_ROUTE, "price": {"requestMsat": p.to_string()}}]}).to_string();
+                let _ = c.write_all(format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// While the hashmaker asks its gateway whether it charges new terms, it takes no new rental: after a new price in
+    /// its settings, and when a hold for a new price ends with the last rental going on. Otherwise a renter's hello in
+    /// that moment would start at terms the gateway doesn't charge yet.
+    #[test]
+    fn no_rental_is_taken_while_the_gateway_is_asked_about_new_terms() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let d = std::env::temp_dir().join(format!("hashmaker-ask-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let file = d.join("settings.json");
+        let work = (1u128 << 40).to_string();
+        let write = |v: Value| {
+            // a new mtime each time, whatever the clock's grain
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::write(&file, v.to_string()).unwrap();
+        };
+        let base = json!({"enabled": true, "fallback": "127.0.0.1:9", "priceSat": 404, "sliceWork": work, "startSlices": 1, "graceMs": 8000, "rentable": 3});
+        write(base.clone());
+        let with = |extra: Value| {
+            let mut v = base.clone();
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            v
+        };
+        let charged = Arc::new(AtomicU64::new(404_000));
+        let (control, link) = (port(), port());
+        let (gw, asked) = gateway(charged.clone(), control.clone());
+        let key = xbt_hashlink::noise::fresh_key();
+        let f: HashMap<String, String> = [("config", file.display().to_string()), ("gateway", gw), ("control", control.clone()), ("miners", port()),
+                                          ("link", link.clone()), ("iroh", "off".into())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        std::thread::spawn(move || run(&f, key));
+        let status = || get(&control, "/status").unwrap_or(Value::Null);
+        let until = |what: &str, ok: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !ok() {
+                assert!(t.elapsed() < Duration::from_secs(30), "{what}: {}", status());
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        until("serving, taking rentals", &|| status()["rentable"] == 3);
+
+        // a new price the gateway doesn't charge yet: asked about it with no rental taken
+        asked.lock().unwrap().clear();
+        write(with(json!({"priceSat": 366})));
+        until("the gateway asked about the new price", &|| asked.lock().unwrap().iter().any(|(_, p)| *p == 366_000));
+        let first = asked.lock().unwrap().iter().find(|(_, p)| *p == 366_000).cloned().unwrap();
+        assert_eq!(first.0, json!(0), "a rental could be taken at terms the gateway doesn't charge: {:?}", asked.lock().unwrap());
+        assert_eq!(status()["paused"], "your shop does not charge this price yet");
+        charged.store(366_000, SeqCst);
+        until("taking rentals once the gateway charges it", &|| status()["rentable"] == 3);
+
+        // a rental going on, and a new price waiting for it (`holdNew`); it ends (no first payment), the hold with it
+        let hk = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &key);
+        let lk = xbt_hashlink::link::dial(&link, xbt_hashlink::noise::fresh_key(), hk).unwrap();
+        let terms = Terms::from_json(&status()["terms"]).unwrap();
+        lk.tx.send(&xbt_hashlink::msg::Msg::Hello { rental: "r1".into(), listing: "l".into(), terms, miners: 1, proof: Some(xbt_hashlink::msg::PROOF.into()) }).unwrap();
+        until("the rental going on", &|| status()["rentals"].as_array().is_some_and(|r| r.len() == 1));
+        asked.lock().unwrap().clear();
+        write(with(json!({"priceSat": 366, "holdNew": true, "pending": {"priceSat": 300, "sliceWork": work, "startSlices": 1}})));
+        until("held for the rental", &|| status()["paused"] == "a new price waits for the rentals going on to end");
+        until("the gateway asked about the pending terms", &|| asked.lock().unwrap().iter().any(|(_, p)| *p == 300_000));
+        let first = asked.lock().unwrap().iter().find(|(_, p)| *p == 300_000).cloned().unwrap();
+        assert_eq!(first.0, json!(0), "a rental could be taken at the pending terms before the gateway charges them: {:?}", asked.lock().unwrap());
+        assert_eq!(status()["paused"], "your shop does not charge this price yet");
+        drop(lk);
+    }
+
     fn settings(file: Value) -> Settings {
         let d = std::env::temp_dir().join(format!("hashmaker-service-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&d).unwrap();
