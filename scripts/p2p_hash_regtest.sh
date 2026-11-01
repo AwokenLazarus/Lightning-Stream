@@ -45,7 +45,7 @@ mkdir -p "$ROOT/run"
 R=$(mktemp -d "${TMPDIR:-/tmp}/p2ph-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp \
-  -p xbt-gateway --bin xbt-gateway -p xbt-hashlink --bin xbt-hashlink
+  -p xbt-gateway --bin xbt-gateway -p xbt-hashlink --bin xbt-hashlink --features xbt-hashlink/test-unblinded
 if [ "${P2P_HASH_ONLY:-}" = reprice ]; then
   nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p xbt-svc --bin xbt-supervise
 fi

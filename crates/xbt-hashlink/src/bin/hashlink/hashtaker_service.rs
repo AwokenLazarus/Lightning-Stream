@@ -283,7 +283,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         installer,
         user: f.get("user").cloned().unwrap_or_else(|| "rented".into()),
         gateway_api: f.get("gateway-api").cloned(),
-        allow_unblinded: f.contains_key("allow-unblinded"),
+        allow_unblinded: super::allow_unblinded(f)?,
         relays: f.get("relays").map(|r| super::relays(r)).unwrap_or_default(),
         signer: f.get("signer").map(PathBuf::from),
         task: f.get("task").cloned().unwrap_or_else(|| "hashrate".into()),
