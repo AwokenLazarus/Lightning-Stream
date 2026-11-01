@@ -115,7 +115,14 @@ pub struct SignerPayer {
     /// How long a slice's payment waits for a signer whose socket is not there (a wallet that
     /// starts again): within the hashmaker's grace, so the slice is still paid in time.
     pub wait_for_signer: std::time::Duration,
+    /// How long a slice's payment waits for the signer's answer once sent ([`PAY_WAIT`]): the signer bounds the
+    /// call itself, and past this one that's stuck is taken as an answer lost.
+    pub pay_wait: std::time::Duration,
 }
+
+/// How long a slice's payment waits for the signer's answer: far past any payment the signer bounds itself, short of
+/// a rental hung for good on a signer that's stuck.
+pub const PAY_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The start of a refused payment's reason where a shop sells nothing small enough for what may leave
 /// the wallet now. The wallet's Hashrate page shows reasons that start with these as they stand.
@@ -204,7 +211,7 @@ impl SignerPayer {
     pub fn new(sock: std::path::PathBuf, url: String, task: String, price_msat: u64, budget_sats: Option<u64>, most_sats: Option<u64>,
                wait_for_signer: std::time::Duration) -> Self {
         let mut p = Self { sock, url, task, price_msat, max_sats: 0, max_charge_sats: None, budget_sats, most_sats, charged_msat: 0, credit_msat: 0, session: None,
-                           ceiling: Some(slice_ceiling(price_msat)), wait_for_signer };
+                           ceiling: Some(slice_ceiling(price_msat)), wait_for_signer, pay_wait: PAY_WAIT };
         p.caps_for(crate::order::FIRST_STEP_MSAT);
         p
     }
@@ -241,7 +248,7 @@ impl SignerPayer {
         let mut r = loop {
             // the signer answers once the slice is paid, and bounds the call itself: its answer is waited for as long as
             // it takes. One lost after the call was sent leaves the payment unknown: never paid again, never said unpaid
-            let called = match signer_call_waiting(&self.sock, "xbt402_pay", &params, None) {
+            let called = match signer_call_waiting(&self.sock, "xbt402_pay", &params, Some(self.pay_wait)) {
                 Err((true, why)) if !why.starts_with("signer error:") => return Ok(self.lost_answer(&why)),
                 other => other.map_err(|(_, e)| e),
             };
@@ -469,6 +476,38 @@ mod signer_wait_tests {
         let v = p.pay("r1", 1, &serde_json::json!({})).unwrap();
         assert_eq!(v["verdict"], "allow", "{v}");
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// A signer that takes the payment and never answers doesn't hang the rental: past the payment's wait it's taken
+    /// as an answer lost, and the session is looked at as for one.
+    #[test]
+    fn a_payment_to_a_stuck_signer_ends_as_unknown_after_its_wait() {
+        let dir = scratch("stuck");
+        let sock = dir.join("signer.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            for c in l.incoming() {
+                let Ok(c) = c else { continue };
+                let mut line = String::new();
+                BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+                // the payment is held open, unanswered; anything else is answered
+                if line.contains("xbt402_pay") {
+                    kept.push(c);
+                } else {
+                    let mut w = c;
+                    let _ = writeln!(w, "{}", serde_json::json!({"id": 1, "result": {"paying": []}}));
+                }
+            }
+        });
+        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 404_250, None, None, Duration::from_secs(2));
+        p.pay_wait = Duration::from_secs(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(p.pay("r1", 1, &serde_json::json!({})));
+        });
+        let v = rx.recv_timeout(Duration::from_secs(10)).expect("the payment gave up on the stuck signer").unwrap();
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("unknown"), Some("signer_no_answer")), "{v}");
     }
 
     /// A payment whose answer is lost after it was sent may have paid: it is said to be unknown, the wallet's session
