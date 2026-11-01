@@ -9007,8 +9007,13 @@ fn a_paid_tunnel_pays_at_most_one_and_a_half_tickets_ahead() {
             let mut ws = Some(ws);
             if through != each {
                 let w = ws.take().unwrap().join().unwrap();
-                panic!("{}: the tunnel ended at {through} of {each} bytes each way; the wallet: ended {:?}, rule {:?}, reason {:?}, {} released, {:?} sat charged; seller charged {} msat",
-                       if delays { "a slow seller" } else { "flat out" }, w["ended"], w["rule"], w["reason"], w["tickets_released"], w["charged_sats"], r.shop.gw.stats().charged_msat);
+                // and the session's tickets as the book and the node have them, for what ended it
+                let sid = w["session"].as_str().unwrap_or_default().to_string();
+                let node: Vec<String> = ["IN_FLIGHT", "SUCCEEDED", "FAILED"].iter().map(|st| format!("{st} {}", r.ln.by_status(st).len())).collect();
+                panic!("{}: the tunnel ended at {through} of {each} bytes each way; the wallet: ended {:?}, rule {:?}, reason {:?}, {} released, {:?} sat charged; \
+                        seller charged {} msat; the node: {node:?}; the session: {}",
+                       if delays { "a slow seller" } else { "flat out" }, w["ended"], w["rule"], w["reason"], w["tickets_released"], w["charged_sats"],
+                       r.shop.gw.stats().charged_msat, r.session(&sid).to_string().chars().take(3000).collect::<String>());
             }
             assert!(most < 16 * TICKET / 10, "{} the wallet paid {most} msat ahead of what the seller charged", if delays { "a seller slow to show tickets:" } else { "flat out:" });
             let sid = r.status()["sessions"][0]["session"].as_str().unwrap().to_string();
