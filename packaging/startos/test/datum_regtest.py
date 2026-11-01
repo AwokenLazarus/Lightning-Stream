@@ -170,7 +170,7 @@ def node_up(gw, subnet):
 
 
 def cleanup():
-    for c in ("hashtaker", "datum", "hashmaker", "relay", "ns", "seller", "init"):
+    for c in ("hashtaker", "datum", "hashmaker", "fwd-ns", "fwd-seller", "relay", "ns", "seller", "init"):
         r = docker("logs", f"{P}-{c}", check_rc=False)
         if r.returncode == 0:
             with open(os.path.join(OUT, f"{c}.log"), "w") as f:
@@ -301,13 +301,18 @@ def main():
            "relay", "--listen", "0.0.0.0:7777")
     docker("run", "-d", "--name", f"{P}-seller", "--network", NET, "--network-alias", "seller", "-p", f"127.0.0.1:{MINERS}:23340",
            "debian:bookworm-slim", "sleep", "infinity")
+    # a Nostr client takes plain ws:// only to its own machine: each namespace reaches the stand-in relay through a
+    # loopback forwarder (test-only; on a box the relays are wss://)
+    for ns in ("seller", "ns"):
+        docker("run", "-d", "--name", f"{P}-fwd-{ns}", "--network", f"container:{P}-{ns}", PROBE,
+               "socat", "TCP-LISTEN:7777,bind=127.0.0.1,fork,reuseaddr", "TCP:relay:7777")
     for k in ("hasher", "nostr"):
         docker("run", "--rm", "--user", "0:0", "-v", f"{SVOL}:/d", "--entrypoint", "/usr/bin/xbt-hashlink", IMG["hashlink"], "keygen", f"/d/{k}.key")
     docker("run", "-d", "--name", f"{P}-hashmaker", "--network", f"container:{P}-seller", "--user", "0:0", "-v", f"{SVOL}:/d",
            "--entrypoint", "/usr/bin/xbt-hashlink", IMG["hashlink"],
            "hashmaker", "--key", "/d/hasher.key", "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "127.0.0.1:23344",
            "--slice-work", str(2**33), "--price-msat", "100000", "--grace-ms", "900000", "--min-slice-s", "1800", "--report", "/d/hasher.json",
-           "--relays", "ws://relay:7777", "--nostr-key", "/d/nostr.key", "--name", "regtest hashmaker", "--link-public", "seller:23341",
+           "--relays", "ws://127.0.0.1:7777", "--nostr-key", "/d/nostr.key", "--name", "regtest hashmaker", "--link-public", "seller:23341",
            "--pay-url", "http://seller:9/hashrate", "--pay-node", "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
            "--hashrate-hs", "60000000", "--listing-out", "/d/listing.json")
     wait_until(lambda: docker("run", "--rm", "-v", f"{SVOL}:/d", PROBE, "test", "-s", "/d/listing.json", check_rc=False).returncode == 0, 60,
@@ -315,7 +320,7 @@ def main():
 
     log("== the renter: the spec's hashtaker (the stand-in relay; no wallet: no --signer)")
     cmd = list(ht)
-    cmd[cmd.index("--relays") + 1] = "ws://relay:7777"
+    cmd[cmd.index("--relays") + 1] = "ws://127.0.0.1:7777"
     i = cmd.index("--signer")
     del cmd[i:i + 2]
     FACTS["hashtaker_command"] = cmd

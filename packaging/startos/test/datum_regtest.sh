@@ -51,7 +51,7 @@ USER xbt-datum
 EOF
 cat > "$CTX/Dockerfile.probe" <<'EOF'
 FROM ubuntu:24.04
-RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends curl >/dev/null && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends curl socat >/dev/null && rm -rf /var/lib/apt/lists/*
 EOF
 echo "== stand-in images"
 docker build -q -t xbt-hashlink:standin-datum-test -f "$CTX/Dockerfile.hashlink" "$CTX" >/dev/null
