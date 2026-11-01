@@ -902,8 +902,8 @@ fn a_buy_slower_than_the_measured_ones_is_still_waited_for() {
     });
     let mut cfg = taker_config(&link, hpub, &terms, &pool, "late", 60);
     cfg.duration = Some(Duration::from_secs(40));
-    // two quick buys, then one of 3.5 s, then quick again
-    let buys = vec![Duration::from_millis(200), Duration::from_millis(200), Duration::from_millis(3500), Duration::from_millis(200)];
+    // two quick buys, then one of 6 s, far past what's paid ahead and the hashmaker's 2 s clock, then quick again
+    let buys = vec![Duration::from_millis(200), Duration::from_millis(200), Duration::from_millis(6000), Duration::from_millis(200)];
     cfg.payer = Some(Box::new(SlowPayer { slices, price_msat: terms.price_msat, ticket_msat: 0, credit_msat: 0, buys, bought: 0 }));
     let r = hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap();
     stop.store(true, Ordering::SeqCst);
