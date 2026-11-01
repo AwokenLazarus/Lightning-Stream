@@ -3421,7 +3421,7 @@ fn no_ticket_is_released_after_the_seller_has_closed_the_answer() {
 
 /// A seller that keeps a paused answer 6 s, less than the wallet's 12 s pause, and says so in its terms
 /// (`refillWaitMs`), with the wallet's node late with the ticket: the pause ends a margin before the seller would
-/// close the answer (5.4 s from the last byte), not 6 s after it is closed. Nothing more is released, and what arrived
+/// close the answer (5 s from the last byte), not 6 s after it is closed. Nothing more is released, and what arrived
 /// is what eight paid for.
 ///
 /// FAILS with the pause held to `ready_wait_ms` alone: it runs its 12 s, past the seller's close.
@@ -3436,7 +3436,7 @@ fn a_seller_that_keeps_a_paused_answer_less_than_the_wallets_pause_has_the_pause
     let t0 = Instant::now();
     let v = r.pay(&format!("/files/{n}"), 20_000);
     let took = t0.elapsed();
-    // the body's 39 MiB and the 5.4 s pause, with room for a loaded machine; the 12 s pause takes 12 s and more
+    // the body's 39 MiB and the 5 s pause, with room for a loaded machine; the 12 s pause takes 12 s and more
     assert!(took < Duration::from_secs(10), "the pause ended before the seller's 6 s: {took:?} {v}");
     assert_eq!(v["complete"], false, "{v}");
     assert_eq!(v["bytes"].as_u64().unwrap() as usize, 39 * MIB, "what 7.8 tickets pay for: {v}");
