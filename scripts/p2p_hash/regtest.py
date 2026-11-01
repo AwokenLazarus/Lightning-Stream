@@ -866,11 +866,16 @@ def real_gateway_run(mode: str) -> None:
         log = open(f"{RUN}/{mode}-miner.log", "ab")
         grind = subprocess.Popen(["nice", "-n", "15", f"{HG}/stratum-grind", "--host", "127.0.0.1", "--port", str(MINERS), "--user", "hasher.m1"], stdout=log, stderr=log, env=env)
         PROCS.append(grind)
-        hashtaker.wait(REAL_SECS + 120)
-        hashmaker.wait(60)
+        # the rental's time counts from its first accepted share, which can come minutes in on a loaded box
+        hashtaker.wait(REAL_SECS + 300)
+        if not keys:
+            # the renter refuses the pool's first job and pays nothing, so the hashmaker never opens a rental and
+            # never ends one by itself: stop it here rather than wait for an exit that doesn't come
+            hashmaker.terminate()
+            hashmaker.wait(30)
+        else:
+            hashmaker.wait(60)
         grind.terminate()
-        with open(f"{RUN}/{mode}-hasher.json") as f:
-            hz = json.load(f)
         with open(f"{RUN}/{mode}-buyer.json") as f:
             bz = json.load(f)
         height1 = int(cli("getblockcount"))
@@ -882,6 +887,8 @@ def real_gateway_run(mode: str) -> None:
                   {"closed": bz.get("closed"), "refused": refused[:1], "jobs shown blinded": bz.get("jobsShownBlinded"), "meter": bz.get("meter"),
                    "paid before the first job (start fee)": len([p for p in bz.get("pays", []) if p.get("ok")])})
             return
+        with open(f"{RUN}/{mode}-hasher.json") as f:
+            hz = json.load(f)
         blocks = []
         for h in range(height0 + 1, height1 + 1):
             block_id = cli("getblockhash", str(h))
