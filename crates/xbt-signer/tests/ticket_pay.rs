@@ -9572,7 +9572,9 @@ fn a_moment_with_no_route_to_the_seller_is_waited_for_and_costs_no_failed_paymen
         let wins = v["wins"].as_u64().unwrap();
         assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{window:?}: {v}");
         assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), wins);
-        let no_route: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ln_no_route").collect();
+        // the refusals of a seller without a route for a whole window (not of payments that stood back while one waited)
+        let no_route: Vec<Value> = r.audit("ticket_refused").into_iter()
+            .filter(|e| e["rule"] == "ln_no_route" && e["reason"].as_str().unwrap_or("").contains("has found no route")).collect();
         if window > Duration::from_secs(8) {
             assert!(!no_route.is_empty(), "past 8 s the wait ends with its reason");
             for e in &no_route {
@@ -9710,7 +9712,11 @@ fn a_moment_with_no_route_and_many_wins_pays_every_win() {
         let size = 256 * PIECE;
         let v = r.pay(&format!("/pieces/{size}"), 2_000);
         assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment: {v}");
-        assert_eq!(r.ln.by_status("FAILED").len(), 0, "({at}, {secs}): {v}");
+        // the payments the node had found a route for just before the moment came are sent into it and fail, as
+        // they would on a real node; at most the gate's eight, and none is sent again
+        let failed = r.ln.by_status("FAILED");
+        assert!(failed.len() <= 8, "({at}, {secs}): {} failed: {v}", failed.len());
+        assert!(!r.ln.by_status("SUCCEEDED").iter().any(|p| failed.iter().any(|f| f["payment_hash"] == p["payment_hash"])), "({at}, {secs}): {v}");
         assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["body_digest"].as_str()), (Some(200), Some(true), Some(pattern_digest(size).as_str())), "({at}, {secs}): {v}");
         let wins = v["wins"].as_u64().unwrap();
         assert!(wins >= 4, "({at}, {secs}): {v}");
