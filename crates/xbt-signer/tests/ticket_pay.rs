@@ -2020,7 +2020,19 @@ fn streamed_call(r: &Rig, dir: &std::path::Path, name: &str, url: String, max_sa
     });
     let started = Instant::now();
     let v = r.call("xbt402_pay", json!({"url": url, "max_sats": max_sats, "task": "film", "stream_to": name}));
+    // a call that ended without opening the reader's socket (refused, or failed before its answer) leaves the reader in
+    // its accept: it is let go, with nothing read, so that the test fails on the call's answer rather than hang
+    let t = Instant::now();
+    while !reader.is_finished() && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !reader.is_finished() {
+        let _ = std::os::unix::net::UnixStream::connect(dir.join(name));
+    }
     let got = reader.join().unwrap();
+    if got == 0 {
+        eprintln!("streamed_call {name}: nothing reached the reader; the call answered {v}");
+    }
     (v, got, started.elapsed())
 }
 
