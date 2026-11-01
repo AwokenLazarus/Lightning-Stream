@@ -2266,7 +2266,7 @@ impl Signer {
     /// still hold there (sending, locked, or retired at a start), by session, for the cancel before
     /// the takeover.
     /// One whose receipt key on record is another's is another shop on the same node, and is passed over.
-    /// One with no key on record (killed before its first signed receipt, or from before 0.1.20) has
+    /// One with no key on record (killed before its first signed receipt, or from before 0.2.0) has
     /// nothing to know its seller by but where it was opened: only a call to that `origin` may take it.
     pub(crate) fn ticket_resumable_all(&self, payee: &str, receipt_key: &str, origin: &str, sid: &str) -> Vec<Resumable> {
         let now = self.engine.now();

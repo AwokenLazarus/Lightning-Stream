@@ -1312,7 +1312,7 @@ pub struct SellerSession {
     /// chosen to stay anonymous at is not taken over by a later one.
     pub identified: bool,
     /// The receipt key of the seller's terms, hex: who this seller is, whatever its address. Empty
-    /// in a row from before 0.1.20.
+    /// in a row from before 0.2.0.
     pub receipt_key: String,
 }
 

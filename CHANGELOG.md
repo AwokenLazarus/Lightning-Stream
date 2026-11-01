@@ -5,7 +5,49 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
-## 0.1.20 (2026-10-31)
+## 0.2.0 (2026-11-01)
+
+A public test release. What is new since 0.1.19, in short; the sections below give the details.
+
+**In 0.2.0**
+- **Hashrate rental with masked jobs.** The Stream Gateway (DATUM-compatible) now comes with the app
+  on Umbrel, StartOS and Linux, and a renter's rented hashrate goes through it. Every job is masked
+  with a key the gateway holds, so a rented miner can't tell which share is a block and can't
+  withhold one. The renter checks each job before its miners get it: a rental whose job can't be
+  shown masked ends, and nothing is paid before the first job has been checked. It mines solo, paid
+  to your own address, or on Lazarus Pool once the pool takes gateway-held keys (until then pool mode
+  is refused and solo works).
+- **Hashrate payments.** Both sides prove every share, and a renter pays as the work arrives: you
+  never have more paid for and not yet received than a minute of the miner's hashing, or one share,
+  one slice and one ticket (546 sat at least), whichever is more, plus any start fee shown on the
+  offer. Shares sent again after a link drop still get their verdict, and a hashmaker's difficulty
+  requests go no further than the renter.
+- **Rentals.** A Rent sent twice starts one rental and pays one start fee. Delivery records are shown
+  as claims anyone can publish, and a flood of them no longer hides a hashmaker's own. A hashmaker's
+  public summary names no renter.
+- **Wallet limits.** The hashrate rental's own limits apply only to the app's renter paying a rented
+  miner's work; any other call that names the task "hashrate" is refused (`ticket_rental_payer`) and
+  pays nothing. One task's credit is never spent by another: ticket sessions are per task, so a shop
+  may see two sessions from one wallet.
+- **Paying.** Slow routes, channel drops of up to 8 s, a seller's 408, resumes from a byte (with
+  `If-Range`), and stream tickets under load no longer end paid calls or pay twice. An agent's long
+  paid call waits for the wallet instead of failing at the MCP. A seller behind a private channel is
+  paid through its route hints. A file resumes after a channel outage. Wins are paid in the order
+  their sellers' grace ends.
+- **VPN exits.** A tunnel pays about one and a half tickets ahead at most, asks again for a ticket
+  refused for a moment, and shows what it has used as it runs.
+- The lab checks now require usage times the listed price, to the msat, on both sides for files,
+  web apps and VPN tunnels.
+
+**Licences**
+- The Stream Gateway image (`xbt-datum-gateway`) is CONVOY's datum_gateway (MIT) with Lightning
+  Stream's changes. It is linked statically with libsodium (ISC), jansson (MIT), libcurl (curl
+  licence), musl (MIT), and two LGPL libraries: libmicrohttpd 1.0.1 (GNU LGPL 2.1 or later) and
+  argp-standalone 1.5.0 (GNU Library GPL 2 or later). The image carries each licence and a NOTICE in
+  `/usr/share/xbt-datum-gateway/`. You may rebuild the gateway, or relink it against modified
+  versions of those two libraries: this repository holds its complete source, the pinned library
+  versions with their sha256 sums, and the script that builds and links it
+  (`scripts/datum_gateway_build.sh`), at the commit the image's tag names.
 
 **Shops without a web address**
 - A shop can be reached by its key alone, over an encrypted direct link, with no hostname,
@@ -53,7 +95,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   be charged, while the call itself stays capped at that charge.
 - Stopping a call ends it at once: nothing more is booked or paid for that session once the stop
   begins, and a prepaid ticket or win paid without its proof now counts in what the call charged.
-- A file is never read past the size its listing shows. From a 0.1.20 shop, a file that grew after
+- A file is never read past the size its listing shows. From a 0.2.0 shop, a file that grew after
   it was listed is refused before any of it is sent, costing nothing on a route priced by size, such
   as Files, and only the request's price on a route with one; one whose server states no size is
   stopped at the listed size. From an older shop, the wallet stops at the listed size and
