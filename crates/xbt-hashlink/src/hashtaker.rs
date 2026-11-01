@@ -79,6 +79,12 @@ const IDS_KEPT: usize = 4096;
 pub const COMEBACKS_AN_HOUR: usize = 8;
 /// How long a share may have been on its way when the link dropped, past the link's own silence before it.
 const IN_FLIGHT: Duration = Duration::from_secs(2);
+/// How far into a wait for a payment on its way, by this side's clock, it says `paying` if the payment is still on its way.
+const PAYING_AFTER: Duration = Duration::from_millis(500);
+/// A payment the measured buys say lands by this far into the wait needs no `paying`.
+const LANDS_BY: Duration = Duration::from_millis(1200);
+/// How long after the hashmaker's resends this side waits for their verdicts before it says its count.
+const RESYNC_SETTLE: Duration = Duration::from_millis(1500);
 /// A payment the measured buys say arrives this much before the hashmaker's short clock runs out needs no `paying`.
 const IN_TIME_MARGIN: f64 = 0.5;
 /// Shares sent again that are taken past what the miners' rate says could have been on their way.
@@ -115,6 +121,12 @@ struct Guard {
     /// shares wait for a job checked at the new one.
     checked_pot: HashMap<u32, u32>,
     await_job: HashSet<u32>,
+    /// After a drop: this side's count at the drop, what it has counted since from shares sent again, when the
+    /// hashmaker said its resends were all sent, and whether this side has said its count.
+    resync_base: Option<(u128, u64)>,
+    resync_resent: (u128, u64),
+    resync_marker: Option<Instant>,
+    resync_said: bool,
     /// Shares sent again past what could have been on their way, waiting for their gateway's verdict, by this side's id.
     resend_pending: HashMap<u64, (meter::Claim, meter::Hashed, Instant)>,
     /// When the payment in flight was queued.
@@ -234,8 +246,18 @@ impl St {
         let measured = self.standing().buy_secs;
         let clock = order::WAIT_FOR_PAYMENT.as_secs_f64() - IN_TIME_MARGIN;
         let on_its_way = self.guard.in_flight_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
-        // the ticker comes round every half second: said at a second, it's in before the clock's two
-        if measured <= 0.0 || measured.max(on_its_way) > clock || since.elapsed().as_secs_f64() >= clock - IN_TIME_MARGIN {
+        // the hashmaker's clock starts again with each payment that lands, so a wait is timed from the later of the
+        // due and the payment now on its way
+        let since = self.guard.in_flight_since.map_or(since, |f| f.max(since));
+        // the hashmaker's clock starts when a payment is credited, a little before this side hears so, and the ticker
+        // comes round every half second: said half a second into the wait, it's in well before the clock's two. But a
+        // payment the measured buys say lands by 1.2 s into the wait needs no wait said, which would use one of the
+        // hour's few: a wallet on a slow box at about a second a payment, often caught short, would run out of them.
+        // One past its measured time is late, and said at once
+        let elapsed = since.elapsed().as_secs_f64();
+        let left = measured - on_its_way;
+        let lands_in_time = measured > 0.0 && left >= 0.0 && elapsed + left <= LANDS_BY.as_secs_f64();
+        if measured <= 0.0 || measured.max(on_its_way) > clock || (since.elapsed() >= PAYING_AFTER && !lands_in_time) {
             let _ = tx.send(&Msg::Paying);
             self.guard.paying_said = true;
         }
@@ -245,6 +267,7 @@ impl St {
     /// dropped link's gateway sessions closed once their window for shares sent again is over.
     fn tick(&mut self, tx: &Sender) {
         self.say_paying_if_late(tx);
+        self.say_resynced(tx);
         if self.guard.retire_until.is_some_and(|t| Instant::now() > t) {
             self.guard.retire_until = None;
             self.guard.resend_pending.clear();
@@ -252,6 +275,27 @@ impl St {
                 let _ = u.shutdown(std::net::Shutdown::Both);
             }
         }
+    }
+
+    /// A share sent again, counted: part of what this side says its count is after the resume.
+    fn count_resent(&mut self, work: u128) {
+        self.resent_counted += 1;
+        if self.guard.resync_base.is_some() && !self.guard.resync_said {
+            self.guard.resync_resent.0 += work;
+            self.guard.resync_resent.1 += 1;
+        }
+    }
+
+    /// Once the hashmaker's resends are all here and settled (each counted, or refused, or past waiting for its
+    /// verdict), say this side's count: at the drop, and what it counted from them.
+    fn say_resynced(&mut self, tx: &Sender) {
+        let (Some((w, p)), Some(at)) = (self.guard.resync_base, self.guard.resync_marker) else { return };
+        if self.guard.resync_said || !(self.guard.resend_pending.is_empty() || at.elapsed() > RESYNC_SETTLE) {
+            return;
+        }
+        self.guard.resync_said = true;
+        let (rw, rp) = self.guard.resync_resent;
+        let _ = tx.send(&Msg::Resynced { work: w + rw, proven: p + rp });
     }
 
     fn lock_ahead(&mut self, tx: &Sender) {
@@ -781,13 +825,19 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 match g.meter.commit_at(&c, h, at) {
                     Ok(p) if p.old => g.end("shares arrive too old", &tx),
                     Ok(p) if p.old_job => g.end("shares on an old job", &tx),
-                    Ok(_) => {
-                        g.resent_counted += 1;
+                    Ok(p) => {
+                        g.count_resent(p.work);
                         g.last_work = Instant::now();
                         g.settle_up(&tx);
                     }
                     Err(_) => g.guard.resends_refused += 1,
                 }
+            }
+            Msg::Resynced { .. } => {
+                // the hashmaker's resends are all sent: this side says its count once they're settled
+                let mut g = lock(&st);
+                g.guard.resync_marker = Some(Instant::now());
+                g.say_resynced(&tx);
             }
             Msg::Shut { chan } => {
                 // the miner is gone: close its upstream session; the channel is let go (and the
@@ -879,6 +929,10 @@ fn come_back(cfg: &Redial, tx: &Sender, st: &Arc<Mutex<St>>, why: &str) -> Optio
         g.guard.retire_until = None;
         g.guard.dropped_at = Some(g.guard.last_heard.unwrap_or(now));
         g.guard.resend_left = g.guard.could_be_in_flight(now);
+        g.guard.resync_base = Some((g.meter.work, g.meter.proven));
+        g.guard.resync_resent = (0, 0);
+        g.guard.resync_marker = None;
+        g.guard.resync_said = false;
     }
     let mut pause = Duration::from_millis(250);
     while Instant::now() + pause < deadline {
@@ -1008,8 +1062,8 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender, check: Opti
                         g.end("shares on an old job", &tx);
                         break;
                     }
-                    Ok(_) => {
-                        g.resent_counted += 1;
+                    Ok(p) => {
+                        g.count_resent(p.work);
                         g.last_work = Instant::now();
                         if g.first_accepted.is_none() {
                             g.first_accepted = Some((Instant::now(), now_ms()));
@@ -1018,6 +1072,7 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender, check: Opti
                     Err(_) => g.guard.resends_refused += 1,
                 }
             }
+            g.say_resynced(&tx);
         }
         match g.meter.down(chan, &v) {
             Err(why) => {
@@ -1166,10 +1221,10 @@ mod come_back_tests {
         let st = state();
         {
             let mut g = lock(&st);
-            // slice 1 on its way for 0.3 s, the buys before it quick, the share waiting 1.2 s
+            // slice 1 on its way for 1.3 s, the buys before it quick, the share waiting 1.2 s
             g.released = 1;
             g.in_flight = 1;
-            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(300));
+            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(1300));
             g.buys = VecDeque::from([0.2, 0.2]);
             g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(1200));
             g.tick(&tx);
@@ -1181,6 +1236,80 @@ mod come_back_tests {
         }
         assert!(said, "paying said by the ticker");
         assert!(lock(&st).guard.paying_said);
+    }
+
+    /// A payment that landed restarts the hashmaker's clock for a share still short: the next one, queued as it
+    /// landed, is timed from then, not from the first due (review 22d, finding 2), so no wait is said for it early.
+    #[test]
+    fn a_wait_is_timed_from_the_payment_on_its_way_not_the_first_due() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, peer) = a_link(key, hk);
+        let st = state();
+        {
+            let mut g = lock(&st);
+            // the share has waited 1.2 s since its due; a payment landed 0.2 s ago and the next was queued then
+            g.released = 1;
+            g.in_flight = 1;
+            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(200));
+            g.buys = VecDeque::from([0.2, 0.2]);
+            g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(1200));
+            g.tick(&tx);
+            assert!(!g.guard.paying_said, "not said 0.2 s into this payment");
+        }
+        drop(tx);
+        let mut lk = peer.join().unwrap();
+        while let Ok(Some(m)) = lk.rx.recv_within(Duration::from_millis(300)) {
+            assert!(!matches!(m, Msg::Paying), "said early");
+        }
+    }
+
+    /// A wallet at about 0.9 s a payment, on its way 0.6 s of it: the measured buys say it lands by 1.2 s into the wait,
+    /// so no wait is said, and none of the hour's few is used.
+    #[test]
+    fn a_payment_the_measured_buys_say_lands_in_time_says_no_paying() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, _peer) = a_link(key, hk);
+        let st = state();
+        let mut g = lock(&st);
+        g.released = 1;
+        g.in_flight = 1;
+        g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(600));
+        g.buys = VecDeque::from([0.9, 0.9, 0.9]);
+        g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(600));
+        g.tick(&tx);
+        assert!(!g.guard.paying_said, "lands in 0.3 s more: no wait said");
+        // the same payment past its measured time: late, said
+        g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(1000));
+        g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(1000));
+        g.tick(&tx);
+        assert!(g.guard.paying_said, "past its measured time: said");
+    }
+
+    /// The hashmaker's clock for a held share starts at the credit of the payment before, a little before this side
+    /// hears the wallet's answer; with the link's latency and the ticker's half second on top, `paying` for a payment
+    /// late past its measured buys (0.2 s, on its way 0.6 s) is said half a second into this side's wait, in good time
+    /// before the hashmaker's two.
+    #[test]
+    fn paying_is_said_half_a_second_into_a_wait() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, peer) = a_link(key, hk);
+        let st = state();
+        {
+            let mut g = lock(&st);
+            g.released = 1;
+            g.in_flight = 1;
+            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(600));
+            g.buys = VecDeque::from([0.2, 0.2]);
+            g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(600));
+            g.tick(&tx);
+            assert!(g.guard.paying_said, "said 0.6 s into the wait");
+        }
+        let mut lk = peer.join().unwrap();
+        let mut said = false;
+        while let Ok(Some(m)) = lk.rx.recv_within(Duration::from_millis(300)) {
+            said |= matches!(m, Msg::Paying);
+        }
+        assert!(said);
     }
 
     /// A gateway's API that answers each job id with what it was given: enough for [`blind::Check`].

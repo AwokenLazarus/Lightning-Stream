@@ -84,6 +84,26 @@ const JOBS_A_SECOND: u32 = 20;
 const OVER_LIMIT: Duration = Duration::from_secs(10);
 /// A rental's resumes, past one for each slice paid. Each one moves its miners to the fallback and back.
 const RESUMES_LEEWAY: u64 = 8;
+/// Resumes in an hour whose count may come down to the hashtaker's: past these the rental ends.
+pub const RESYNCS_AN_HOUR: usize = 8;
+/// Shares forwarded this long before the link was last heard from may have been on their way when it dropped.
+pub const IN_FLIGHT_BEFORE: Duration = Duration::from_secs(2);
+/// However long the hashtaker kept quiet before a drop, shares forwarded longer than this before it aren't taken as on
+/// their way.
+pub const IN_FLIGHT_MOST: Duration = Duration::from_secs(4);
+/// How long a held share's clock waits, after a resume, for the hashtaker to say its count.
+const RESYNC_WAIT: Duration = Duration::from_secs(3);
+
+/// What a resumed rental's count may come down to.
+#[derive(Clone, Copy, Debug)]
+struct Resync {
+    at: Instant,
+    work: u128,
+    proven: u64,
+    /// The work and shares forwarded since shortly before the link was last heard from.
+    cap_work: u128,
+    cap_shares: u64,
+}
 /// How long a share stays ready to be sent again at a `resume`: a link can stall this long unnoticed.
 const RECENT_KEPT: Duration = Duration::from_secs(120);
 const RECENT_MOST: usize = 8192;
@@ -165,6 +185,9 @@ struct Unit {
     samples: VecDeque<(Instant, u128)>,
     /// The fastest it has been seen over [`SPEED_SPAN`] or more, from any of its work.
     fastest_hs: f64,
+    /// Its speed when last measured, kept while it stays connected: a slow miner whose window of accepted work goes
+    /// quiet for a while is still the miner it was (cleared when it disconnects).
+    last_hs: f64,
     earned_msat: u64,
     methods: BTreeMap<String, u64>,
     seen_ms: u64,
@@ -178,7 +201,21 @@ impl Unit {
         }
     }
 
+    /// Its speed now, or, while it's connected and its window has no accepted work, its speed when last measured.
+    fn speed(&self) -> f64 {
+        let now = self.hashrate();
+        if now > 0.0 || self.conn.is_none() {
+            now
+        } else {
+            self.last_hs
+        }
+    }
+
     fn note_speed(&mut self) {
+        let now = self.hashrate();
+        if now > 0.0 {
+            self.last_hs = now;
+        }
         if let (Some((t0, _)), Some((t1, _))) = (self.samples.front(), self.samples.back()) {
             if *t1 - *t0 >= SPEED_SPAN {
                 self.fastest_hs = self.fastest_hs.max(self.hashrate());
@@ -254,7 +291,12 @@ struct Rental {
     shares: RateLimit,
     jobs: RateLimit,
     /// Shares sent on lately, with their channels, to send again at a `resume`.
-    recent: VecDeque<(u32, String, Instant)>,
+    recent: VecDeque<(u32, String, Instant, u128)>,
+    /// After a resume, till the hashtaker says its count: the hashmaker's count then, and the most it may come down.
+    resync: Option<Resync>,
+    /// Resumes whose count came down, in the last hour, and all the work it came down by.
+    resyncs: VecDeque<Instant>,
+    lowered_work: u128,
     resumes: u64,
     /// The last proven shares, for the report: what each was, and its raw hash.
     proven_shares: VecDeque<Value>,
@@ -304,8 +346,8 @@ impl Rental {
         let params = sv1::parse(line).and_then(|v| sv1::params(&v).cloned()).unwrap_or_default();
         self.proven_shares.push_back(json!({"chan": chan, "job": params.get(1), "en2": params.get(2), "ntime": params.get(3), "nonce": params.get(4),
             "hash": hex::encode(p.hash), "work": p.work.to_string(), "atMs": now_ms()}));
-        self.recent.push_back((chan, line.to_string(), now));
-        while self.recent.len() > RECENT_MOST || self.recent.front().is_some_and(|(_, _, t)| now - *t > RECENT_KEPT) {
+        self.recent.push_back((chan, line.to_string(), now, p.work));
+        while self.recent.len() > RECENT_MOST || self.recent.front().is_some_and(|(_, _, t, _)| now - *t > RECENT_KEPT) {
             self.recent.pop_front();
         }
         if p.harder {
@@ -323,8 +365,9 @@ impl Rental {
         while self.rate.front().is_some_and(|(t, _)| now - *t > Duration::from_secs(30)) {
             self.rate.pop_front();
         }
+        // a count that came down after a resume reads as no work in this window, not less than none
         match (self.rate.front(), self.rate.back()) {
-            (Some((t0, w0)), Some((t1, w1))) if t1 > t0 => (w1 - w0) as f64 / (*t1 - *t0).as_secs_f64(),
+            (Some((t0, w0)), Some((t1, w1))) if t1 > t0 => w1.saturating_sub(*w0) as f64 / (*t1 - *t0).as_secs_f64(),
             _ => 0.0,
         }
     }
@@ -345,7 +388,7 @@ impl Rental {
             "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "miners": self.units.iter().collect::<Vec<_>>(), "want": self.want, "startedMs": self.started_ms,
             "ready": self.ready, "suspended": self.suspended.is_some(), "servedMs": self.served.as_millis() as u64,
-            "waitingForPayment": self.waiting_since.is_some(), "paymentWaits": self.waits.len(), "rampWaits": self.ramp_waits,
+            "waitingForPayment": self.waiting_since.is_some(), "paymentWaits": self.waits.len(), "rampWaits": self.ramp_waits, "loweredAfterResumes": self.lowered_work.to_string(),
             "unitWork": self.unit_work.iter().map(|(u, w)| (u.clone(), Value::from(w.to_string()))).collect::<serde_json::Map<_, _>>(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "paid": self.paid, "earnedMsat": self.paid * self.terms.price_msat,
@@ -412,7 +455,7 @@ impl Hub {
         Capacity {
             miners: live.len() as u32,
             free_miners: free.len() as u32,
-            free_hs: free.iter().map(|u| u.hashrate() as u64).sum(),
+            free_hs: free.iter().map(|u| u.speed() as u64).sum(),
         }
     }
 
@@ -752,7 +795,7 @@ fn status(g: &Hub) -> Value {
         .iter()
         .map(|(name, u)| {
             json!({
-                "name": name, "peer": u.peer, "connected": u.conn.is_some(), "hashrateHs": u.hashrate(),
+                "name": name, "peer": u.peer, "connected": u.conn.is_some(), "hashrateHs": u.speed(),
                 "rentedTo": u.rental, "earnedMsat": u.earned_msat + live_earn.get(name).copied().unwrap_or(0),
                 "work": u.work.to_string(), "seenMs": u.seen_ms, "methods": u.methods,
             })
@@ -843,15 +886,25 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
         let Some(r) = g.rentals.get_mut(&id) else { return };
         r.resumes += 1;
         r.tx = tx.clone();
+        // when the link dropped: when this side noticed, or now if it hadn't
+        let dropped_at = r.suspended.as_ref().map_or_else(Instant::now, |(until, _)| *until - Duration::from_millis(r.terms.grace_ms));
         r.suspended = None;
+        let heard = r.last_heard;
         r.last_heard = Instant::now();
         r.last_ping = Instant::now();
         // shares the old link may have lost, before anything else on this one: the hashtaker checks each
         // and counts each once, so its count comes back up to this side's
-        let again: Vec<Msg> = r.recent.iter().map(|(chan, line, _)| Msg::Resend { chan: *chan, line: line.clone() }).collect();
+        let again: Vec<Msg> = r.recent.iter().map(|(chan, line, _, _)| Msg::Resend { chan: *chan, line: line.clone() }).collect();
         for m in &again {
             let _ = r.tx.send(m);
         }
+        // then this side's count, and what of it may have been on its way: shares forwarded since shortly before the
+        // link was last heard from. The hashtaker answers with its own, and this side's comes down to it, by no more
+        // a hashtaker that keeps quiet can't stretch that: never more than the last few seconds before the drop
+        let since = heard.checked_sub(IN_FLIGHT_BEFORE).unwrap_or(heard).max(dropped_at.checked_sub(IN_FLIGHT_MOST).unwrap_or(dropped_at));
+        let (cap_work, cap_shares) = r.recent.iter().filter(|(_, _, t, _)| *t >= since).fold((0u128, 0u64), |(w, n), (_, _, _, sw)| (w + sw, n + 1));
+        r.resync = Some(Resync { at: Instant::now(), work: r.meter.work, proven: r.meter.proven, cap_work, cap_shares });
+        let _ = r.tx.send(&Msg::Resynced { work: r.meter.work, proven: r.meter.proven });
         let r = g.rentals.get_mut(&id).unwrap();
         r.note(json!({"ev": "hashtaker back, rental resumed", "atMs": now_ms()}));
         eprintln!("hashmaker: rental {id} resumed by hashtaker {}", hex::encode(remote.serialize()));
@@ -882,6 +935,9 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             shares: RateLimit::new(SHARES_A_SECOND),
             jobs: RateLimit::new(JOBS_A_SECOND),
             recent: VecDeque::new(),
+            resync: None,
+            resyncs: VecDeque::new(),
+            lowered_work: 0,
             resumes: 0,
             proven_shares: VecDeque::new(),
             held: VecDeque::new(),
@@ -961,6 +1017,40 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             Msg::Pay { slice, preimage, receipt } => {
                 let ok = pay(r, slice, &preimage, &receipt);
                 r.note(json!({"ev": "pay", "slice": slice, "ok": ok.is_ok(), "why": ok.as_ref().err(), "atMs": now_ms()}));
+                // only a payment credited moves what waits on, or starts its clock again: a payment refused is nothing
+                if ok.is_ok() {
+                    flush_held(&mut g, &id);
+                }
+            }
+            Msg::Resynced { work, proven } => {
+                // the hashtaker's count after a resume: this side's comes down to it, by no more than what could have
+                // been on its way. Shares it forwarded that the hashtaker's gateway never took are this side's loss
+                let Some(rs) = r.resync.take() else { continue };
+                let work_to = work.max(rs.work.saturating_sub(rs.cap_work)).min(rs.work);
+                let proven_to = proven.max(rs.proven.saturating_sub(rs.cap_shares)).min(rs.proven);
+                let (by_work, by_shares) = (rs.work - work_to, rs.proven - proven_to);
+                let said = |r: &mut Rental, lowered: u128| {
+                    r.note(json!({"ev": "count after the resume", "hashtaker": work.to_string(), "was": rs.work.to_string(), "lowered": lowered.to_string(),
+                                  "most": rs.cap_work.to_string(), "atMs": now_ms()}));
+                };
+                if by_work == 0 && by_shares == 0 {
+                    said(r, 0);
+                    continue;
+                }
+                let now = Instant::now();
+                while r.resyncs.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(3600)) {
+                    r.resyncs.pop_front();
+                }
+                if r.resyncs.len() >= RESYNCS_AN_HOUR {
+                    said(r, 0);
+                    g.stop_unpaid(&id, "its count fell short after too many resumes");
+                    return;
+                }
+                said(r, by_work);
+                r.resyncs.push_back(now);
+                r.meter.work -= by_work;
+                r.meter.proven -= by_shares;
+                r.lowered_work += by_work;
                 flush_held(&mut g, &id);
             }
             Msg::Paying => {
@@ -1090,11 +1180,7 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                 let slice_time = by_speed.max(g.min_slice_time);
                 let why = if !r.ready && r.asked_at.elapsed() > grace {
                     Some("no first payment")
-                } else if match r.waiting_since {
-                    // a payment said to be on its way is waited for longer; any other, for the short clock
-                    Some(t) => t.elapsed() > order::WAIT_FOR_PAYING,
-                    None => r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT),
-                } {
+                } else if out_of_time_for_payment(r) {
                     Some("unpaid")
                 } else if r.served > slice_time.saturating_mul((r.paid.min(1 << 20) as u32) * PAID_TIME_FACTOR) {
                     Some("paid time used up")
@@ -1398,7 +1484,12 @@ fn flush_held(g: &mut Hub, rental: &str) {
             Some(h) => r.meter.worth(&h.claim, &h.hash).map(|w| order::fits(r.meter.work, w, r.paid, t.start_slices, t.slice_work)),
         };
         match fits {
-            Ok(false) => return,
+            // still short, after a payment or the count coming down: a fresh start for its clock too, as the hashtaker
+            // times its own wait from the payment it has on its way
+            Ok(false) => {
+                r.held_since = Some(Instant::now());
+                return;
+            }
             Ok(true) => {
                 let h = r.held.pop_front().expect("there's one");
                 // a payment is a fresh start for the clock of whatever still waits
@@ -1461,6 +1552,15 @@ fn down_line(g: &mut Hub, id: u64, slot: u64, v: &Value, line: &str) {
     let _ = send_line(&mut c.w, line);
 }
 
+/// Has a share waited too long for payment? A payment said to be on its way is waited for longer; any other, for the
+/// short clock, and not while a resumed rental's count is still to come down to the hashtaker's.
+fn out_of_time_for_payment(r: &Rental) -> bool {
+    match r.waiting_since {
+        Some(t) => t.elapsed() > order::WAIT_FOR_PAYING,
+        None => r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT) && !r.resync.is_some_and(|s| s.at.elapsed() < RESYNC_WAIT),
+    }
+}
+
 /// A miner's connection ended.
 fn gone(g: &mut Hub, id: u64) {
     let Some(c) = g.conns.remove(&id) else { return };
@@ -1468,6 +1568,7 @@ fn gone(g: &mut Hub, id: u64) {
         if let Some(unit) = g.units.get_mut(u) {
             if unit.conn == Some(id) {
                 unit.conn = None;
+                unit.last_hs = 0.0;
                 // a miner that never said its name leaves no record
                 if unit.provisional {
                     g.units.remove(u);
@@ -2112,6 +2213,52 @@ mod tests {
         let mut sending = HashMap::new();
         assert_eq!(placement(&mut g, 1, Instant::now(), &mut sending), None, "kept where it is, through the wait");
         assert_eq!(placement(&mut g, 2, Instant::now(), &mut sending), Some(Some("more".to_string())), "the other moves this round: {sending:?}");
+        drop(g);
+        h.shutdown();
+    }
+
+    /// A slow miner's speed, once measured, holds while it stays connected, though a window of its accepted work goes
+    /// quiet; it's measured again from nothing once it disconnects.
+    #[test]
+    fn a_measured_speed_holds_while_the_miner_stays_connected() {
+        let mut u = Unit { conn: Some(1), ..Unit::default() };
+        let t0 = Instant::now();
+        u.samples = VecDeque::from([(t0, 0), (t0 + Duration::from_secs(100), 1 << 32)]);
+        u.note_speed();
+        let measured = u.speed();
+        assert!(measured > 0.0);
+        // a quiet window: no accepted work in it
+        u.samples = VecDeque::from([(t0 + Duration::from_secs(400), 1 << 32), (t0 + Duration::from_secs(700), 1 << 32)]);
+        u.note_speed();
+        assert_eq!(u.hashrate(), 0.0);
+        assert_eq!(u.speed(), measured, "the speed it was measured at holds");
+        u.conn = None;
+        u.last_hs = 0.0;
+        assert_eq!(u.speed(), 0.0, "gone, it's measured again when it's back");
+    }
+
+    /// After a resume, a held share's short clock waits up to 3 s for the hashtaker to say its count, and no longer.
+    #[test]
+    fn a_held_share_waits_for_the_count_after_a_resume_then_no_longer() {
+        let terms = Terms { slice_work: 1 << 20, price_msat: 5_000, grace_ms: 30_000, start_slices: 0 };
+        let s = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slices = s.local_addr().unwrap().to_string();
+        drop(s);
+        let (h, addr, hpub) = start(&terms, &slices);
+        let lk = link::dial(&addr, crate::noise::fresh_key(), hpub).unwrap();
+        lk.tx.send(&Msg::Hello { rental: "r".into(), listing: "l".into(), terms: terms.clone(), miners: 1, proof: Some(PROOF.into()) }).unwrap();
+        let mut rx = lk.rx;
+        assert!(matches!(rx.recv_within(Duration::from_secs(5)), Ok(Some(Msg::Welcome { .. }))));
+        let mut g = lock(&h.hub);
+        let r = g.rentals.get_mut("r").unwrap();
+        let resync = |ago: u64| Some(Resync { at: Instant::now() - Duration::from_millis(ago), work: 0, proven: 0, cap_work: 0, cap_shares: 0 });
+        // a share held 2.5 s: past the short clock
+        r.held_since = Some(Instant::now() - Duration::from_millis(2500));
+        assert!(out_of_time_for_payment(r), "no resume: out of time");
+        r.resync = resync(1000);
+        assert!(!out_of_time_for_payment(r), "resumed 1 s ago, its count not said: it waits");
+        r.resync = resync(3500);
+        assert!(out_of_time_for_payment(r), "resumed 3.5 s ago: no longer");
         drop(g);
         h.shutdown();
     }
