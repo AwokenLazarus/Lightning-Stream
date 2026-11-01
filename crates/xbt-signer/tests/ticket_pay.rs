@@ -7438,8 +7438,8 @@ fn a_strict_seller_behind_twenty(stands_still: u64, hold: bool, sync_ms: u64) ->
 /// starts, by when each seller's grace ends, and its file is whole. The wallet's own count never hurries such a
 /// seller's wins: it stands still for none of its pieces or wins, only for time.
 ///
-/// FAILS with the gate in order of arrival: its wins wait behind the 120 (15 s at 8 a second), past its grace, and
-/// its answer is cut `win_unpaid`.
+/// FAILS with the gate in order of arrival: its wins wait behind the 120 (15 s at 8 a second; on a clock that ran, past
+/// its grace, and its answer cut `win_unpaid`).
 #[test]
 fn a_seller_with_a_short_grace_is_paid_before_twenty_that_can_wait() {
     let _g = env_lock();
@@ -7465,6 +7465,22 @@ fn a_seller_with_a_short_grace_is_paid_before_twenty_that_can_wait() {
     });
     let wins = short_one["wins"].as_u64().unwrap_or(0);
     assert!(wins >= 1, "a file of 64 pieces that drew no win: {short_one}");
+    // the test's clock stands still, so no seller's grace runs out here: what is measured is the order. Each of the short
+    // seller's wins is paid within a gate's width or two of the seller making its invoice, not behind the 120 waiting
+    let payments: Vec<String> = r.ln.state().payments.iter().map(|p| p["payment_hash"].as_str().unwrap().to_string()).collect();
+    let sent_at = r.ln.st.lock().unwrap().sent_at.clone();
+    let made = r.shop.node.made.lock().unwrap().clone();
+    let sid = short_one["session"].as_str().unwrap();
+    let paid: Vec<String> = win_tickets(&r, sid).iter().filter(|t| t["state"] == "settled").map(|t| t["hash"].as_str().unwrap().to_string()).collect();
+    assert_eq!(paid.len() as u64, wins, "{short_one}");
+    for h in &paid {
+        let at = payments.iter().rposition(|p| p == h).expect("the win's payment");
+        let made_at = made.iter().find(|(m, _)| m == h).map(|(_, i)| *i).expect("the seller made its invoice");
+        let before = sent_at.iter().filter(|s| **s < made_at).count();
+        let behind = at - before.min(at);
+        eprintln!("short grace: invoice made when {before} had been sent, paid at {at}: {behind} between");
+        assert!(behind <= 16, "a win of the short seller waited behind {behind} payments of sellers that could wait (paid at {at} of {})", payments.len());
+    }
     assert_eq!((short_one["complete"].as_bool(), short_one["ended"].as_str()), (Some(true), None), "its answer was cut: {short_one}");
     assert_eq!((short_one["wins_paid"].as_u64(), short_one["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{short_one}");
     for v in &others {
