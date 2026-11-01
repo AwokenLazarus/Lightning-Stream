@@ -1017,7 +1017,10 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             Msg::Pay { slice, preimage, receipt } => {
                 let ok = pay(r, slice, &preimage, &receipt);
                 r.note(json!({"ev": "pay", "slice": slice, "ok": ok.is_ok(), "why": ok.as_ref().err(), "atMs": now_ms()}));
-                flush_held(&mut g, &id);
+                // only a payment credited moves what waits on, or starts its clock again: a payment refused is nothing
+                if ok.is_ok() {
+                    flush_held(&mut g, &id);
+                }
             }
             Msg::Resynced { work, proven } => {
                 // the hashtaker's count after a resume: this side's comes down to it, by no more than what could have

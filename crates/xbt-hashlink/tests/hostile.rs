@@ -1035,12 +1035,94 @@ fn a_renter_saying_a_low_count_after_each_resume_costs_the_hashmaker_no_more_tha
               lowered as f64 / terms.slice_work as f64, r["stopped"]["reason"]);
     assert_eq!(r["stopped"]["reason"], "its count fell short after too many resumes", "{r}");
     assert!(counts.iter().all(|(l, m)| l <= m), "never past what was in flight: {counts:?}");
-    // at 20 shares a second, the last 4 s before the drop and some slack: never the 6 s of work before each drop
-    let most_a_resume = 100 * sw;
+    // at 20 shares a second, the last 4 s before the drop (and two shares for the clocks' grain): never the 6 s of work
+    // before each drop
+    let most_a_resume = 82 * sw;
     assert!(counts.iter().all(|(_, m)| *m <= most_a_resume), "what may come down is the last few seconds' work: {counts:?}");
     assert_eq!(counts.iter().filter(|(l, _)| *l > 0).count(), xbt_hashlink::hashmaker::RESYNCS_AN_HOUR, "{counts:?}");
     assert_eq!(lowered, counts.iter().map(|(l, _)| l).sum::<u128>());
     assert!(lowered <= allowed, "{lowered} past {allowed}");
+    a.h.shutdown();
+    drop(miner);
+}
+
+/// A renter that sends payments the hashmaker refuses (a slice already paid, or none at all) while a share waits for
+/// payment: a refused payment is no payment, and doesn't start the share's clock again, so the rental ends unpaid on
+/// time (review of #16: `Pay { slice: 0 }` every 1.5 s held the miners for hours).
+#[test]
+fn payments_the_hashmaker_refuses_do_not_hold_off_the_unpaid_clock() {
+    let _s = serial();
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 5_000, start_slices: 0 };
+    let a = app(&terms);
+    let (mut b, _) = connect(&a.link, noise::fresh_key(), a.hpub, "nopay", hello("nopay", &terms));
+    b.verdicts = Verdicts::AcceptAll;
+    b.pay(1);
+    let stop: Arc<AtomicBool> = Arc::default();
+    let (ma, st2) = (a.miners.clone(), stop.clone());
+    let miner = thread::spawn(move || {
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 10.0, bad_every: 0, duration: Some(Duration::from_secs(60)), reconnect: true,
+                                                      extranonce_subscribe: false, bind: None });
+        st2.store(true, Ordering::SeqCst);
+    });
+    let t0 = Instant::now();
+    while b.dues == 0 && t0.elapsed() < Duration::from_secs(20) {
+        b.pump(u64::MAX, Duration::from_millis(50));
+    }
+    assert!(b.dues > 0, "a share waited for payment");
+    let held = Instant::now();
+    let mut sent = 0;
+    while a.h.finished().is_empty() && held.elapsed() < Duration::from_secs(12) {
+        let _ = b.tx.send(&Msg::Pay { slice: 0, preimage: "00".repeat(32), receipt: json!({}) });
+        sent += 1;
+        b.pump(u64::MAX, Duration::from_millis(700));
+    }
+    let r = finished(&a.h, "nopay", Duration::from_secs(5));
+    let took = held.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    eprintln!("measure: {sent} refused payments, stopped {} {} ms after the share waited", r["stopped"]["reason"], took.as_millis());
+    assert_eq!(r["stopped"]["reason"], "unpaid", "{r}");
+    assert!(took < xbt_hashlink::order::WAIT_FOR_PAYMENT + Duration::from_millis(1500), "{} ms", took.as_millis());
+    a.h.shutdown();
+    drop(miner);
+}
+
+/// A resumed rental whose renter hasn't said its count yet: a share held then waits up to 3 s past the resume for it,
+/// then the short clock rules again and the rental ends unpaid.
+#[test]
+fn a_held_share_waits_for_the_count_after_a_resume_then_no_longer() {
+    let _s = serial();
+    let terms = Terms { slice_work: 4 * share_work(DIFF), price_msat: 300_000, grace_ms: 10_000, start_slices: 0 };
+    let a = app(&terms);
+    let bk = noise::fresh_key();
+    let (mut b, _) = connect(&a.link, bk, a.hpub, "pause", hello("pause", &terms));
+    b.verdicts = Verdicts::AcceptAll;
+    b.pay(1);
+    let stop: Arc<AtomicBool> = Arc::default();
+    let (ma, st2) = (a.miners.clone(), stop.clone());
+    let miner = thread::spawn(move || {
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 10.0, bad_every: 0, duration: Some(Duration::from_secs(60)), reconnect: true,
+                                                      extranonce_subscribe: false, bind: None });
+        st2.store(true, Ordering::SeqCst);
+    });
+    let t0 = Instant::now();
+    while b.dues == 0 && t0.elapsed() < Duration::from_secs(20) {
+        b.pump(u64::MAX, Duration::from_millis(20));
+    }
+    assert!(b.dues > 0, "a share waited for payment");
+    // back at once, and never says its count
+    let (mut nb, w) = connect(&a.link, bk, a.hpub, "pause", Msg::Resume { rental: "pause".into() });
+    assert!(matches!(w, Msg::Welcome { .. }), "{w:?}");
+    let resumed = Instant::now();
+    while a.h.finished().is_empty() && resumed.elapsed() < Duration::from_secs(10) {
+        nb.pump(u64::MAX, Duration::from_millis(50));
+    }
+    let r = finished(&a.h, "pause", Duration::from_secs(5));
+    let took = resumed.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    eprintln!("measure: a held share after a resume with no count said: stopped {} {} ms after the resume", r["stopped"]["reason"], took.as_millis());
+    assert_eq!(r["stopped"]["reason"], "unpaid", "{r}");
+    assert!(took >= Duration::from_millis(2800), "waited for the count: {} ms", took.as_millis());
+    assert!(took < Duration::from_millis(5000), "and no longer: {} ms", took.as_millis());
     a.h.shutdown();
     drop(miner);
 }

@@ -79,6 +79,8 @@ const IDS_KEPT: usize = 4096;
 pub const COMEBACKS_AN_HOUR: usize = 8;
 /// How long a share may have been on its way when the link dropped, past the link's own silence before it.
 const IN_FLIGHT: Duration = Duration::from_secs(2);
+/// How far into a wait for a payment on its way, by this side's clock, it says `paying` if the payment is still on its way.
+const PAYING_AFTER: Duration = Duration::from_millis(500);
 /// How long after the hashmaker's resends this side waits for their verdicts before it says its count.
 const RESYNC_SETTLE: Duration = Duration::from_millis(1500);
 /// A payment the measured buys say arrives this much before the hashmaker's short clock runs out needs no `paying`.
@@ -242,8 +244,9 @@ impl St {
         // the hashmaker's clock starts again with each payment that lands, so a wait is timed from the later of the
         // due and the payment now on its way
         let since = self.guard.in_flight_since.map_or(since, |f| f.max(since));
-        // the ticker comes round every half second: said at a second, it's in before the clock's two
-        if measured <= 0.0 || measured.max(on_its_way) > clock || since.elapsed().as_secs_f64() >= clock - IN_TIME_MARGIN {
+        // the hashmaker's clock starts when a payment is credited, a little before this side hears so, and the ticker
+        // comes round every half second: said half a second into the wait, it's in well before the clock's two
+        if measured <= 0.0 || measured.max(on_its_way) > clock || since.elapsed() >= PAYING_AFTER {
             let _ = tx.send(&Msg::Paying);
             self.guard.paying_said = true;
         }
@@ -1223,6 +1226,32 @@ mod come_back_tests {
         while let Ok(Some(m)) = lk.rx.recv_within(Duration::from_millis(300)) {
             assert!(!matches!(m, Msg::Paying), "said early");
         }
+    }
+
+    /// The hashmaker's clock for a held share starts at the credit of the payment before, a little before this side
+    /// hears the wallet's answer; with the link's latency and the ticker's half second on top, `paying` is said half a
+    /// second into this side's wait, in good time before the hashmaker's two.
+    #[test]
+    fn paying_is_said_half_a_second_into_a_wait() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, peer) = a_link(key, hk);
+        let st = state();
+        {
+            let mut g = lock(&st);
+            g.released = 1;
+            g.in_flight = 1;
+            g.guard.in_flight_since = Some(Instant::now() - Duration::from_millis(600));
+            g.buys = VecDeque::from([0.2, 0.2]);
+            g.guard.due_open_since = Some(Instant::now() - Duration::from_millis(600));
+            g.tick(&tx);
+            assert!(g.guard.paying_said, "said 0.6 s into the wait");
+        }
+        let mut lk = peer.join().unwrap();
+        let mut said = false;
+        while let Ok(Some(m)) = lk.rx.recv_within(Duration::from_millis(300)) {
+            said |= matches!(m, Msg::Paying);
+        }
+        assert!(said);
     }
 
     /// A gateway's API that answers each job id with what it was given: enough for [`blind::Check`].
