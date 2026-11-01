@@ -297,7 +297,7 @@ services:
   # Settings → Stream relays and its checks pass.
   stream-relay:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-stream-relay:local
+    image: xbt-stream-relay:0.1.0
     profiles: ["relay"]
     network_mode: bridge
     ports:
@@ -322,7 +322,7 @@ services:
   # (LS_VPN_REGION, two letters).
   vpn:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-vpn:local
+    image: xbt-vpn:0.1.0
     profiles: ["vpn"]
     network_mode: bridge
     ports:
