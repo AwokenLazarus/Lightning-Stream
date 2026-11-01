@@ -1009,8 +1009,8 @@ fn a_renter_saying_a_low_count_after_each_resume_costs_the_hashmaker_no_more_tha
     });
     let mut resumes = 0;
     while a.h.finished().is_empty() && resumes < 20 {
-        // shares come right up to the drop, so some were forwarded within its last 2 s
-        b.pump(b.shares + 20, Duration::from_secs(15));
+        // shares come for 4 s right up to the drop: some forwarded within its last 2 s, more before
+        b.pump(b.shares + 80, Duration::from_secs(15));
         let (mut nb, w) = connect(&a.link, bk, a.hpub, "lie", Msg::Resume { rental: "lie".into() });
         if !matches!(w, Msg::Welcome { .. }) {
             break;
