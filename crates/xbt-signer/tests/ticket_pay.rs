@@ -3319,8 +3319,9 @@ fn the_nodes_silence_for_a_moment_does_not_end_the_wait_for_a_ticket() {
                 let mut s = r.ln.st.lock().unwrap();
                 if router_only { s.router_down = true } else { s.down = true }
             }
-            // away for 2 s, inside the pause
-            std::thread::sleep(Duration::from_secs(2));
+            // away until the release has asked it at least once while it is, inside the pause
+            let asked = r.ln.state().lookups;
+            wait_for_long("the release to ask the node that is away", Duration::from_secs(12), || r.ln.st.lock().unwrap().lookups > asked);
             {
                 // it is back, and shows the tickets locked
                 let mut s = r.ln.st.lock().unwrap();
