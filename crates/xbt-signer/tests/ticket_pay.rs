@@ -11250,3 +11250,111 @@ fn a_rentals_sends_and_another_tasks_count_apart() {
     assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "{v}");
     assert!(paid_tickets(&r).len() >= 3, "{v}");
 }
+
+// --- a rental's terms are the renter's alone (review probe/hashlink-review-f711) ----------------------------------
+
+/// A call naming `task`, in the words the MCP's `xbt402_pay` sends to the signer (its `task` is a free string).
+fn as_the_mcp_asks(r: &Rig, path: &str, max_sats: i64, task: &str) -> Value {
+    json!({"url": r.shop.url(path), "method": "POST", "body": "{}", "max_sats": max_sats, "task": task, "range": ""})
+}
+
+/// The rental grant goes with the renter's socket, not with the task's name. On the mainnet starter rules a
+/// caller on the wallet's own socket that said `task: "hashrate"` was paid outside max_per_tx (2,000), the
+/// approval threshold (1,000), the day's (10,000) and week's (30,000) budgets and the per-seller cap (10,000),
+/// up to the task's 200,000 sat, on any route (the review's probe: 21 calls of 9,000 sat, and a page). Such
+/// a call is refused before anything is asked of the seller, and nothing is paid.
+#[test]
+fn a_caller_naming_the_hashrate_task_gets_none_of_the_rentals_terms() {
+    let _g = env_lock();
+    // a named seller whose paid route costs 9,000 sat a call, with tickets of 10,000
+    let shop = || hash_shop(9_000_000, json!({"ticket_msat": 10_000_000, "min_ticket_msat": 546_000}), None);
+    // control: the same call under the wallet's own rules is not paid
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, shop());
+    let v = r.call("xbt402_pay", as_the_mcp_asks(&r, "/hashrate/not-a-rental-0", 10_100, "default"));
+    assert_ne!(v["verdict"], "allow", "{v}");
+    // the same caller saying "hashrate"
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, shop());
+    let mut allowed = 0;
+    let mut last = Value::Null;
+    for i in 0..30 {
+        last = r.call("xbt402_pay", as_the_mcp_asks(&r, &format!("/hashrate/not-a-rental-{i}"), 10_100, "hashrate"));
+        if last["verdict"] == "allow" {
+            allowed += 1;
+        }
+    }
+    // and a plain page of the same seller, under the same name
+    let page = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "hashrate"}));
+    eprintln!("hashrate named on the wallet's socket: {allowed} calls of 9,000 sat allowed, ledger {} sat; the last {last}; a /page/ call: {page}", r.ledger_sum());
+    assert_eq!(allowed, 0, "{last}");
+    for v in [&last, &page] {
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("deny"), Some("ticket_rental_payer"), 0), "{v}");
+    }
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
+    assert!(r.tap.seen("/").is_empty(), "nothing asked of the seller: {:?}", r.tap.seen("/").iter().map(|s| s.path.clone()).collect::<Vec<_>>());
+}
+
+/// What the MCP tool sends reaches the signer on the wallet's socket: there, a call that names the rental
+/// task is refused whatever it asks for, and so is a renter pointed at that socket (an app whose renter
+/// was not moved to its own socket), in words the Hashrate page shows.
+#[test]
+fn the_wallets_socket_pays_nothing_on_a_rentals_terms() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let sock = r.root.join("wallet.sock");
+    let _ = std::fs::remove_file(&sock);
+    let _running = xbt_signer::server::spawn(r.s.clone(), &sock, false).unwrap();
+    // the MCP's call, a rental's piece of work and all
+    let v = xbt_hashlink::rail::signer_call(&sock, "xbt402_pay", &as_the_mcp_asks(&r, "/hashrate/r1/0", 2_000, "hashrate")).unwrap();
+    assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("ticket_rental_payer"), 0), "{v}");
+    // the hashtaker's own payer, on the wallet's socket
+    let mut payer = xbt_hashlink::rail::SignerPayer::new(sock.clone(), r.shop.url("/hashrate"), "hashrate".into(), MARKET_MSAT, Some(100_000), None, Duration::from_secs(5));
+    let why = payer.pay("r1", 0, &json!({"slice": 0})).unwrap_err();
+    assert!(why.contains("ticket_rental_payer"), "{why}");
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
+}
+
+/// The renter's socket pays a rental's pieces of work and nothing else: not a page of the same seller, posted
+/// or not, nor a piece of work asked for by GET. And it grants nothing by itself: a piece of work under a task
+/// without rental terms (an older wallet's hashrate task) is paid there as on the wallet's socket, under the
+/// wallet's own limits.
+#[test]
+fn the_renters_socket_pays_a_rentals_pieces_of_work_only() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let t = Renter::new(&r, "hashrate", MARKET_MSAT, 0, Some(100_000));
+    let ask = |p: Value| xbt_hashlink::rail::signer_call(&t.payer.sock, "xbt402_pay", &p).unwrap();
+    let page = ask(json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "hashrate"}));
+    let posted = ask(as_the_mcp_asks(&r, "/page/10", 2_000, "hashrate"));
+    let got = ask(json!({"url": r.shop.url("/hashrate/r1/0"), "max_sats": 2_000, "task": "hashrate"}));
+    for (what, v) in [("a page", &page), ("a page, posted", &posted), ("a GET", &got)] {
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("deny"), Some("ticket_rental_route"), 0), "{what}: {v}");
+    }
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
+    // a piece of work under the wallet's own task: its rules, and nothing of the rental's
+    let other = ask(as_the_mcp_asks(&r, "/hashrate/r1/0", 2_000, "default"));
+    let booked = |task: &str| -> i64 {
+        r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some(task)).map(|row| row["amount_sats"].as_i64().unwrap()).sum()
+    };
+    eprintln!("a piece of work under \"default\" on the renter's socket: {other}");
+    assert!(!other["rule"].as_str().unwrap_or("").starts_with("ticket_rental"), "{other}");
+    assert_eq!(booked("hashrate"), 0);
+    assert!(r.ledger_sum() == booked("default") && r.ledger_sum() <= 2_000, "within the wallet's max_per_tx: {}", r.ledger_sum());
+    // the wallet's other methods are not on it
+    let e = xbt_hashlink::rail::signer_call(&t.payer.sock, "pay", &json!({"to": "x", "amount_sats": 1})).unwrap_err();
+    assert!(e.contains("rental"), "{e}");
+}
+
+/// A rental through the renter's socket pays as before: its pieces of work, on its own terms, booked to its task.
+#[test]
+fn a_rental_through_the_renters_socket_pays_on_its_own_terms() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let mut t = Renter::new(&r, "hashrate", MARKET_MSAT, 2, Some(100_000));
+    for n in 1..=40 {
+        t.share(n as f64 * 9.0).unwrap();
+    }
+    let booked: i64 = r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some("hashrate")).map(|row| row["amount_sats"].as_i64().unwrap()).sum();
+    eprintln!("MEASURED 40 shares: {} slices paid, tickets {:?}, booked {booked}", t.standing.paid, paid_tickets(&r));
+    // past the wallet's own limits for one payment and one seller's day, which a rental is not held to
+    assert!(booked > 10_000 && booked == r.ledger_sum(), "{booked} of {}", r.ledger_sum());
+}
