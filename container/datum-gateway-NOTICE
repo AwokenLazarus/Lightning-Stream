@@ -1,0 +1,20 @@
+Stream Gateway (DATUM-compatible), as shipped in Lightning Stream's xbt-datum-gateway image.
+
+It is CONVOY's datum_gateway (https://github.com/CONVOYMining/datum_gateway, commit
+971af86b93de088e217a9e74d1ac70188565dbb7), MIT licensed (datum_gateway.LICENSE), with Lightning Stream's
+changes: every job is masked with a fresh key the gateway holds, so a hasher cannot tell which share is a
+block, and each job can be opened (without its key) on the gateway's loopback API at /xbt/job for the
+renter's check. The licence grants no right to the DATUM name or other marks of their owners: "DATUM" is
+used here only to say which protocol it speaks.
+
+It is linked statically with:
+  libsodium 1.0.20          ISC licence                     libsodium.LICENSE
+  jansson 2.14              MIT licence                     jansson.LICENSE
+  libcurl 8.11.1            curl licence (MIT-style)        curl.COPYING
+  libmicrohttpd 1.0.1       GNU LGPL 2.1 or later           libmicrohttpd.COPYING
+  argp-standalone 1.5.0     GNU Library GPL 2 or later      argp-standalone.NOTICE
+and with musl libc through zig (MIT).
+
+The complete source of this program, including the two LGPL libraries' pinned versions and the script that
+builds and links it (scripts/datum_gateway_build.sh), is at https://github.com/AwokenLazarus/Lightning-Stream,
+so you can rebuild it, or relink it against modified versions of those libraries.

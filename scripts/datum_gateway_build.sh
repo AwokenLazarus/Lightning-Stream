@@ -39,7 +39,7 @@ DEPS=(
   "libsodium-1.0.20.tar.gz https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19"
   "jansson-2.14.tar.gz https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz 5798d010e41cf8d76b66236cfb2f2543c8d082181d16bc3085ab49538d4b9929"
   "curl-8.11.1.tar.xz https://curl.se/download/curl-8.11.1.tar.xz c7ca7db48b0909743eaef34250da02c19bc61d4f1dcedd6603f109409536ab56"
-  "libmicrohttpd-1.0.1.tar.gz https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94"
+  "libmicrohttpd-1.0.1.tar.gz https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz|https://ftpmirror.gnu.org/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94"
   "argp-standalone-1.5.0.tar.gz https://github.com/argp-standalone/argp-standalone/archive/refs/tags/1.5.0.tar.gz c29eae929dfebd575c38174f2c8c315766092cec99a8f987569d0cad3c6d64f6"
 )
 for d in "${DEPS[@]}"; do
@@ -47,7 +47,13 @@ for d in "${DEPS[@]}"; do
   f=$CACHE/$name
   if [ ! -f "$f" ] || [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sum" ]; then
     echo "== fetch $name"
-    curl -fsSL --max-time 300 -o "$f.part" "$url"
+    # the url may list mirrors, |-separated: the first that serves it wins
+    got=0
+    IFS='|' read -r -a urls <<<"$url"
+    for u in "${urls[@]}"; do
+      if curl -fsSL --retry 3 --retry-delay 5 --max-time 300 -o "$f.part" "$u"; then got=1; break; fi
+    done
+    [ $got = 1 ] || { echo "datum_gateway_build: $name could not be fetched" >&2; exit 1; }
     mv "$f.part" "$f"
   fi
   got=$(sha256sum "$f" | cut -d' ' -f1)
@@ -129,6 +135,10 @@ for T in "${TS[@]}"; do
 #define HAVE_STRCASECMP 1
 #define HAVE_DECL_PROGRAM_INVOCATION_NAME 1
 #define HAVE_DECL_PROGRAM_INVOCATION_SHORT_NAME 1
+#define HAVE_GCC_ATTRIBUTE 1
+#define NORETURN __attribute__ ((__noreturn__))
+#define PRINTF_STYLE(f, a) __attribute__ ((__format__ (__printf__, f, a)))
+#define UNUSED __attribute__ ((__unused__))
 EOF
   (cd "$W/argp" && for c in argp-ba argp-eexst argp-fmtstream argp-help argp-parse argp-pv argp-pvh; do
       "$CC" $CFLAGS -D_GNU_SOURCE -DHAVE_CONFIG_H=1 -I. -c "$c.c" -o "$c.o" || exit 1
@@ -143,7 +153,7 @@ EOF
       -DCMAKE_FIND_ROOT_PATH="$P" -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
       -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
       -DARGP_INCLUDE_DIR="$P/include" -DARGP_LIBRARY="$P/lib/libargp.a" \
-      -DCMAKE_C_FLAGS="$CFLAGS -ffile-prefix-map=$B=/build" -DCMAKE_EXE_LINKER_FLAGS="-static" >>"$log" 2>&1 \
+      -DCMAKE_C_FLAGS="$CFLAGS -ffile-prefix-map=$B=/build" -DCMAKE_EXE_LINKER_FLAGS="-static -s" >>"$log" 2>&1 \
     && cmake --build "$B" -j"$J" >>"$log" 2>&1) \
     || { tail -40 "$log" >&2; echo "datum_gateway_build: the gateway failed for $T ($log)" >&2; exit 1; }
 
@@ -161,4 +171,18 @@ EOF
     tail -3 "$W/test.log"
   fi
 done
+# what the image ships beside the binary (usr/share/xbt-datum-gateway): our notice, the gateway's licence and
+# each statically linked library's (libmicrohttpd and argp-standalone are LGPL: the notice says where the
+# source and this script are, so the binary can be rebuilt and relinked)
+L=$OUT/licenses
+rm -rf "$L" && mkdir -p "$L"
+cp "$ROOT/container/datum-gateway-NOTICE" "$L/NOTICE"
+cp "$ROOT/third_party/datum_gateway/LICENSE" "$L/datum_gateway.LICENSE"
+tar xOf "$CACHE/libsodium-1.0.20.tar.gz" libsodium-1.0.20/LICENSE > "$L/libsodium.LICENSE"
+tar xOf "$CACHE/jansson-2.14.tar.gz" jansson-2.14/LICENSE > "$L/jansson.LICENSE"
+tar xOf "$CACHE/curl-8.11.1.tar.xz" curl-8.11.1/COPYING > "$L/curl.COPYING"
+tar xOf "$CACHE/libmicrohttpd-1.0.1.tar.gz" libmicrohttpd-1.0.1/COPYING > "$L/libmicrohttpd.COPYING"
+# argp-standalone ships no licence file: its sources' own notice (GNU Library GPL, version 2 or later)
+tar xOf "$CACHE/argp-standalone-1.5.0.tar.gz" argp-standalone-1.5.0/argp-parse.c | sed -n '1,/\*\//p' > "$L/argp-standalone.NOTICE"
+for f in "$L"/*; do [ -s "$f" ] || { echo "datum_gateway_build: $f is empty" >&2; exit 1; }; done
 echo "datum_gateway_build: OK ($XBT_DATUM_BUILD_NAME)"
