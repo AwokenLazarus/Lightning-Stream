@@ -8121,7 +8121,13 @@ fn a_resume_whose_session_the_seller_forgot_is_made_again_in_another_session() {
     wait_for("the pool to be filled again", || r.shop.held() == 2);
     r.clock.fetch_add(350, Ordering::SeqCst);
     wait_for("the seller to cancel what the session held", || r.shop.held() == 0);
-    std::thread::sleep(Duration::from_millis(300));
+    // and the wallet's node to show them cancelled: the resume then holds none to release, and its first step is a lock,
+    // which the seller answers `session_unknown`. (A resume that released one first, before the node showed it cancelled,
+    // has charged that ticket and is not made again: something of it went out.)
+    wait_for("the wallet to see the session's tickets cancelled", || {
+        r.tick();
+        r.status()["locked"]["tickets"].as_i64() == Some(0)
+    });
     let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
                                          "if_range": part["etag"]}));
     assert_eq!(r.audit("ticket_session_again").len(), 1, "{on}");
@@ -8179,7 +8185,8 @@ fn a_resume_whose_session_ended_for_a_stranded_ticket_is_not_made_again() {
 #[test]
 fn a_resume_refused_at_the_sellers_cap_before_it_left_is_made_again_in_another_session() {
     let _g = env_lock();
-    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    // prepaid tickets by `lock`, not by the seller's offer: every ticket the session would buy meets the cap
+    let r = Rig::shipped(json!({"tickets": {"offers": false}}), 30, shipped_shop());
     // every lock of a session already open is refused at the cap from the start: the first lock of a session (which
     // names none) is taken, and the session's pool is never filled again
     r.tap.set(Box::new(|seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
