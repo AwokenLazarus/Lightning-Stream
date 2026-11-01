@@ -14,7 +14,9 @@
 //!                         from F as they change; without --fallback and --config: one rental, then exit
 //! xbt-hashlink hashtaker --key F --control ADDR [--control-token-file F] --upstream ADDR|auto --user U --relays URL,URL
 //!                     [--signer SOCK --task T] [--expect-node HEX] [--datum-candidates ADDR,ADDR] [--state DIR]
-//!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum
+//!                     [--gateway-api ADDR] [--bundled-gateway ADDR|off]
+//!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum.
+//!                         The app's own Stream Gateway is 127.0.0.1:23339 when the candidates list it
 //! xbt-hashlink hashtaker  --key F --upstream ADDR --user U [--idle-s S] [--duration-s S] [--stop-paying-after N]
 //!                     [--rental ID] [--report F] [--miners N] [--budget-sats N]
 //!                     ( --hashmaker ADDR --hashmaker-key HEX --slice-work W --price-msat P [--grace-ms G]

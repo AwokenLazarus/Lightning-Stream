@@ -70,9 +70,10 @@ tmpfs `/tmp`.
                    VPN pages, read by the VPN service
   run/vpn-status/  uid 10018, gid 10019 (xbt-vpn-status), 0750: endpoint.json, status.json, exit-status.json
                    (0640), written by the VPN service, read by the UI; the group has the service and the UI in it
-  run/datum/       uid 10005, gid 10021 (xbt-datum), 0750: config.json (0640), the Stream Gateway's own config, written
-                   by the UI's Hashrate page ("Your gateway"), no secret in it; rpc.cookie (0600, uid 10021), the node's
-                   RPC user:password, written by init. The gateway's API and Stratum listen on loopback only
+  run/datum/       uid 10005, gid 10021 (xbt-datum), 0750: config.json (0640), the Stream Gateway's config, written by
+                   the UI's Hashrate page (no secret in it); rpc.cookie (0600, uid 10021), the node's RPC user:password
+                   with no newline, written by init from the credentials the signer gets, read by the gateway only.
+                   The gateway's API and Stratum listen on loopback only
   run/ai/          uid 10005, gid 10014 (xbt-ai), 0770: the AI endpoint's files (docs/INFERENCE.md):
                    credentials.json (0660), the store of AI keys and local links, edited by the UI's AI page and
                    booked by the connector; sellers.json (0640), written by the AI page; state.json (0640), the
@@ -136,7 +137,7 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10017 | (group xbt-relay-status only) | |
 | 10018 | xbt-vpn | xbt-vpn (the VPN service: the owner's devices' WireGuard endpoint, and an exit if offered) |
 | 10019 | (group xbt-vpn-status only) | |
-| 10021 | xbt-datum | xbt-datum-gateway (the Stream Gateway, DATUM-compatible: the renter's own masking gateway; the UI is in its group) |
+| 10021 | xbt-datum | xbt-datum-gateway (the Stream Gateway, DATUM-compatible: the renter's own masking gateway; the UI is in its group, for run/datum) |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |

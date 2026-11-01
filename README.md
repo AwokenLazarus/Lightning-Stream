@@ -56,9 +56,10 @@ money**, and allow a seller. Our demo shop, **Lightning Stream Genesis**, has th
   and in private mode buyers never learn your box's address. A relay is built in (off by default,
   free); paid relays come in an update.
 - **Rent hashrate.** A *hashmaker* lists its miners and a *hashtaker* rents them into its own
-  DATUM Gateway, paid as it uses them, seconds at a time. Both apps check every share's hash
-  themselves, and the renter's gateway hides which shares win. The app comes with a DATUM
-  Gateway that masks its jobs, and won't rent into one that doesn't.
+  gateway, paid as it uses them, seconds at a time. Both apps check every share's hash
+  themselves, and the renter's gateway hides which shares win. The app comes with its own, the
+  Stream Gateway (DATUM-compatible), set on the Hashrate page to mine solo to your address or
+  through Lazarus Pool, and won't rent into a gateway that doesn't mask its jobs.
   ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
 - **Agents.** An AI agent pays through the same wallet over MCP and never holds a key.
 - **A local AI address.** The app gives the box an OpenAI-compatible address on the owner's network.
@@ -119,7 +120,8 @@ by Luke Dashjr, who wrote the BLAKE2b proof of work; the signature hash that kee
 being replayed on the SHA-256 chain is Kyle Santiago's. Lightning on XBT is Paul Lamb's Lightning
 Fork, a fork of Lightning Labs' lnd, and PrivKey's Core Lightning fork. Paul also packages
 Knots-BLAKE2b and Lightning Fork for Umbrel and StartOS, and built the access grant the StartOS
-package uses. Hashrate rental is built around OCEAN's DATUM.
+package uses. Hashrate rental is built around OCEAN's DATUM, and the Stream Gateway is CONVOY's
+datum_gateway (MIT) with a masking patch.
 
 Chris Guida's two reviews are why Lightning Stream is built on Lightning, and they narrowed what it
 claims. Kyle Santiago pointed out the slot and dust limits the ticket defaults are built around.

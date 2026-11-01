@@ -18,6 +18,10 @@
 //!   once and removed. Without the UI, the token stays `mcp/secrets/mcp-http-token`. A secret is
 //!   rewritten only when its value changes; a generated one never is.
 //!
+//! * with the Stream Gateway (`datum`) and the UI: writes the node's RPC credentials to
+//!   `run/datum/rpc.cookie` (`user:password`, no newline, 0600, the gateway's), which its config names as
+//!   `bitcoind.rpccookiefile`, and makes `datum/submitblocks/`. The config the UI writes beside it holds no secret.
+//!
 //! It reports what it did as JSON (names, owners and modes; never a secret's value).
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -43,6 +47,7 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::HASHRATE, user: "xbt-hashrate", uid: 10010 },
     Component { name: crate::STREAM_RELAY, user: "xbt-stream-relay", uid: STREAM_RELAY_UID },
     Component { name: crate::VPN, user: "xbt-vpn", uid: VPN_UID },
+    Component { name: crate::DATUM, user: "xbt-datum", uid: DATUM_UID },
 ];
 
 /// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
@@ -87,6 +92,9 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     // the stream sockets: the VPN service makes the socket each paid tunnel is streamed to here, and the
     // signer (whose dir it is) connects to it. Only where the VPN is installed; else the signer's alone (0750)
     SharedDir { dir: crate::RUN_STREAMS, writer: crate::SIGNER, reader: crate::VPN, gid: STREAMS_GID, mode: 0o770 },
+    // the Stream Gateway: its config the UI's Hashrate page writes (no secret in it), and the node's RPC
+    // cookie init writes there (the gateway's own, 0600)
+    SharedDir { dir: crate::RUN_DATUM, writer: crate::UI, reader: crate::DATUM, gid: DATUM_UID, mode: 0o750 },
 ];
 
 /// A group only: the signer and the VPN service, for the stream sockets' dir (`run/signer/streams`).
@@ -107,6 +115,10 @@ pub const RELAY_STATUS_GID: u32 = 10017;
 pub const VPN_UID: u32 = 10018;
 /// A group only: the VPN service and the UI, for the service's status files.
 pub const VPN_STATUS_GID: u32 = 10019;
+/// The Stream Gateway's user and group (10020 is reserved for cmp's knots-xbt).
+pub const DATUM_UID: u32 = 10021;
+/// The node RPC cookie's mode: the gateway's alone.
+pub const DATUM_COOKIE_MODE: u32 = 0o600;
 
 /// The group `run/shops/` is read by: the signer's own, whose user the connector runs as and whose
 /// group the MCP is in.
@@ -453,6 +465,17 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
         let r = put_secret_gid(&path, &token, ui, gid, MCP_TOKEN_MODE)?;
         secrets.push(json!({"component": crate::UI, "name": format!("run/{}/{HASHRATE_TOKEN}", crate::RUN_HASHRATE), "result": r}));
     }
+    if let Some(d) = comps.iter().find(|c| c.name == crate::DATUM) {
+        // the blocks it submits, kept on the volume for a resubmit if the node's submitblock fails
+        dirs.push(own_dir(&root.join(crate::DATUM).join("submitblocks"), uid_of(d), 0o700, true)?);
+        // the node's RPC credentials as a cookie file (`bitcoind.rpccookiefile`): the gateway's config, which the
+        // UI writes, never holds them. No newline: the gateway takes the file's first line as it is, newline and all
+        if let (Some(a), true) = (&prov.node_rpc_auth, has(crate::UI)) {
+            let path = root.join("run").join(crate::RUN_DATUM).join(crate::DATUM_RPC_COOKIE);
+            let r = put_secret(&path, a.as_bytes(), uid_of(d), DATUM_COOKIE_MODE)?;
+            secrets.push(json!({"component": crate::DATUM, "name": format!("run/{}/{}", crate::RUN_DATUM, crate::DATUM_RPC_COOKIE), "result": r}));
+        }
+    }
     Ok(json!({"ok": true, "root": root.display().to_string(), "dirs": dirs, "secrets": secrets}))
 }
 
@@ -499,6 +522,13 @@ pub fn check(root: &Path, names: &[String]) -> Value {
         if c.name == crate::UI && names.iter().any(|n| n == crate::MCP) {
             want(root.join("run").join(crate::RUN_UI).join(crate::MCP_TOKEN), c.uid, MCP_TOKEN_MODE);
         }
+        if c.name == crate::DATUM {
+            want(d.join("submitblocks"), c.uid, 0o700);
+            let cookie = root.join("run").join(crate::RUN_DATUM).join(crate::DATUM_RPC_COOKIE);
+            if std::fs::symlink_metadata(&cookie).is_ok() {
+                want(cookie, c.uid, DATUM_COOKIE_MODE);
+            }
+        }
     }
     json!({"ok": problems.is_empty(), "problems": problems, "paths": rows})
 }
@@ -515,7 +545,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016), ("vpn", 10018)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016), ("vpn", 10018), ("datum", 10021)]);
     }
 
     #[test]
@@ -712,6 +742,48 @@ mod tests {
         init_as(&root3, &names, &Provision::default(), uid).unwrap();
         assert_eq!(std::fs::read(&tok).unwrap(), first, "the token survives a restart");
         assert!(!root.join("run/hashrate").exists(), "no hashrate dir without the hashrate component");
+    }
+
+    /// The Stream Gateway: its config dir is the UI's (it writes config.json) and the gateway's by group; the node's
+    /// RPC credentials go to its cookie file alone, 0600, without a newline (the gateway would send the newline as
+    /// part of the password), and only with both the gateway and the UI installed.
+    #[test]
+    fn the_stream_gateways_cookie_is_its_own_and_its_config_dir_is_shared() {
+        let uid = me();
+        if uid == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("data");
+        let names: Vec<String> = ["signer", "ui", "hashrate", "datum"].iter().map(|s| s.to_string()).collect();
+        let prov = Provision { node_rpc_auth: Some("xbt:pw-secret".into()), ..Provision::default() };
+        let r = init_as(&root, &names, &prov, uid).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(!r.to_string().contains("pw-secret"), "the report never holds a secret");
+        let cookie = root.join("run/datum/rpc.cookie");
+        assert_eq!(std::fs::read(&cookie).unwrap(), b"xbt:pw-secret", "user:password, no newline");
+        assert_eq!(std::fs::metadata(&cookie).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::metadata(root.join("run/datum")).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(std::fs::metadata(root.join("datum")).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(std::fs::metadata(root.join("datum/submitblocks")).unwrap().mode() & 0o7777, 0o700);
+        // the node's password changed (StartOS: the node-connection action): rewritten, and so the gateway restarts
+        let prov2 = Provision { node_rpc_auth: Some("xbt:new".into()), ..Provision::default() };
+        let r2 = init_as(&root, &names, &prov2, uid).unwrap();
+        assert!(r2["secrets"].as_array().unwrap().iter().any(|s| s["name"] == "run/datum/rpc.cookie" && s["result"] == "written"), "{r2}");
+        assert_eq!(std::fs::read(&cookie).unwrap(), b"xbt:new");
+        // a cookie whose mode drifted is put back
+        std::fs::set_permissions(&cookie, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        init_as(&root, &names, &prov2, uid).unwrap();
+        assert_eq!(std::fs::metadata(&cookie).unwrap().mode() & 0o7777, 0o600);
+        // no UI, no gateway config dir and no cookie
+        let root2 = t.path().join("no-ui");
+        let names2: Vec<String> = ["signer", "datum"].iter().map(|s| s.to_string()).collect();
+        init_as(&root2, &names2, &prov, uid).unwrap();
+        assert!(!root2.join("run/datum").exists());
+        // no gateway, no cookie
+        let root3 = t.path().join("no-datum");
+        init_as(&root3, &["signer".to_string(), "ui".to_string()], &prov, uid).unwrap();
+        assert!(!root3.join("run/datum").exists());
     }
 
     #[test]
