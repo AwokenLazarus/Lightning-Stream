@@ -49,6 +49,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   it (File Browser keeps those readable by its own group only; Stream reads them through that group).
 
 **Paying**
+- A seller can now say how long it waits for the next ticket, and the wallet ends its own pause a
+  little before that (a tenth of the wait, between 1 s and 3 s), so no ticket is ever paid into an
+  answer the seller has already closed. A seller that doesn't say keeps today's behaviour.
 - A slow wallet no longer blames a seller whose web server timed out waiting for the wallet's request
   (HTTP 408). Nothing was served or charged: the wallet sends the same request once more, and if it
   times out again, that call alone is refused and the session goes on.
