@@ -13528,9 +13528,14 @@ fn a_moment_with_no_route_to_the_seller_is_waited_for_and_costs_no_failed_paymen
         if window > Duration::from_secs(8) {
             // past the 8 s the seller is given up on: the call ends with that reason, nothing failed, the money right
             assert!(!no_route.is_empty() && v.to_string().contains("ln_no_route"), "past 8 s the wait ends with its reason: {v}");
+            // a wait that ran out says for how long; a payment after the window ran out, or the call's end after three such
+            // waits, says that instead
             for e in &no_route {
-                let secs: f64 = e["reason"].as_str().unwrap().split("for ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
-                assert!(secs <= 8.6, "waited {secs} s: {e}");
+                let reason = e["reason"].as_str().unwrap();
+                match reason.split("for ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(secs) => assert!(secs <= 8.6, "waited {secs} s: {e}"),
+                    None => assert!(reason.contains("whole wait") || reason.contains("any of"), "a refusal for want of a route that says neither: {e}"),
+                }
             }
             assert_wins(&r, v["wins_paid"].as_u64().unwrap());
         } else {
