@@ -1115,7 +1115,27 @@ when the node shows the first cancelled (it lapsed unpaid).
 
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed. A win's invoice lives as long as the seller's grace
+gateway does when the first has lapsed, or at once where the wallet asks it to cancel the first:
+`POST .../cancel` with `{"draw", "hash"}`, signed as every call of the session. The wallet asks only
+when its node shows the payment failed with nothing in flight, at most 4 times for a win and 32 for a
+session. The gateway cancels only the current invoice of that session's unpaid win, only where its own
+node shows it open (`cancelled` says whether it did), and at most `max_win_cancels` times a session, 32
+by default, past which it says `too_many_cancels`; the win's grace still runs from its draw, so a
+cancel buys the buyer no time, no draw and no money. A seller without the call answers 404, and the
+win waits for the lapse. The wallet asks the same where it held a win back for lack of time on its
+invoice (below), which it never sent. Before any payment of the rail the wallet waits for an
+inactive channel, at most 8 s from when it first saw it out, and before a win or a prepaid ticket is
+sent it asks its node for a route to the seller (QueryRoutes, which needs `info:read`; nothing is
+sent) and waits for one within what is left of those 8 s. One payment to a seller waits at a time, in
+one window for all of them: the others are refused at once (`ln_no_route`), and a win refused so three
+times ends the call with that reason, the win owed for a later call. A node that cannot answer the
+question is not waited for. A win whose invoice would end before
+the payment could arrive (by twice the longest of the latest payments' time on the way, at least 5 s
+and at most half its life) is not sent, and one that ran out while the win waited at the gate does
+not count against the seller, up to 4 for a win and 32 for a session; past that the session ends
+(`lottery_invoices_lapse`). One that came with less than 5 s left counts as a bad invoice. The
+win's next invoice goes before the wins no seller waits for, and a call waits for it where it is due
+within 10 s, or within what the wallet's margin holds back and 5 s more. A win's invoice lives as long as the seller's grace
 (`graceSeconds`, 60 s at the gateway, 30 s before 0.1.20; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`

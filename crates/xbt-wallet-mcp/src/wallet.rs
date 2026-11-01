@@ -271,8 +271,10 @@ impl Wallet {
     /// stays in this process's log; the model gets B2's generic "Error executing tool" line.
     pub fn call_tool(&self, name: &str, mut params: Map<String, Value>) -> Result<String, String> {
         // no byte range asked for: the whole body, and the signer is not sent an empty one
-        if params.get("range").and_then(Value::as_str).is_some_and(|r| r.trim().is_empty()) {
-            params.remove("range");
+        for k in ["range", "if_range"] {
+            if params.get(k).and_then(Value::as_str).is_some_and(|r| r.trim().is_empty()) {
+                params.remove(k);
+            }
         }
         let result = match name {
             "xbt402_pay" | "ln_pay" => self.pay_waiting(name, &params)?,

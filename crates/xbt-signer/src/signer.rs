@@ -228,6 +228,9 @@ pub struct Signer {
     pub(crate) ticket_synced: std::sync::atomic::AtomicBool,
     /// How many ticket payments are with the node's router at once ([`crate::ticket_rail::Pace`]).
     pub(crate) ticket_pace: crate::ticket_rail::Pace,
+    /// Since when the node's channels have been out, and when that was last seen
+    /// ([`Self::ln_channels_back`]).
+    pub(crate) ln_channels_out: Mutex<Option<(std::time::Instant, std::time::Instant)>>,
     /// Held tickets booked `sending` whose send has not come back yet: waiting their turn in
     /// [`Self::ticket_pace`] or with the node. The node may have no record of one yet, and that
     /// is not a sign it never reached the node.
@@ -339,7 +342,7 @@ impl Signer {
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
                                 ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
-                                ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
+                                ticket_pace: crate::ticket_rail::Pace::default(), ln_channels_out: Mutex::new(None), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
                                 ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_late_tries: Mutex::new(HashMap::new()), ticket_start_stopped: Mutex::new(vec![]), ticket_unanswered: Mutex::new(HashMap::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),

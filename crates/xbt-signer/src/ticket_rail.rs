@@ -86,6 +86,10 @@ const LIST_PAGES: usize = 50;
 /// 30 pending payments took 200 small payments sent 8 at a time without a failure, and failed 139
 /// of 200 sent 64 at a time (`docs/TICKETS.md` section 11).
 pub const SEND_PARALLEL: usize = 8;
+/// How many payments' times on the way [`Pace::send_margin`] goes by.
+const FLOWN_KEPT: usize = 32;
+/// How many route queries [`Pace::route_query_ms`] goes by.
+const QUERIES_KEPT: usize = 2_000;
 
 /// The gate every ticket payment passes on its way to the node's router: at most
 /// [`SEND_PARALLEL`] are inside at once. A held ticket leaves when its send returns (it is locked,
@@ -133,6 +137,13 @@ struct PaceState {
     plain_for_turn: usize,
     /// Hurried wins given a turn one after another while others waited.
     turns_in_row: u32,
+    /// How long the latest wins took on the way, in seconds ([`Pace::send_margin`]).
+    flown: std::collections::VecDeque<f64>,
+    /// How long the node's latest route queries took, in ms ([`Pace::route_query_ms`]).
+    queried: std::collections::VecDeque<f64>,
+    /// Payees the node has found no route to: since when, when that was last seen, and whether a payment is
+    /// waiting for one ([`Signer::ln_route_wait`]).
+    no_route: HashMap<String, (Instant, Instant, bool)>,
 }
 
 struct Waiter {
@@ -181,6 +192,72 @@ impl Pace {
 
     /// Enter to pay the win of `win` (the book's session and the draw), or a ticket (None).
     /// `first`: a seller stands still for this payment already.
+    /// A payment that arrived, and the time it took.
+    fn flew(&self, took: Duration) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.flown.len() == FLOWN_KEPT {
+            s.flown.pop_front();
+        }
+        s.flown.push_back(took.as_secs_f64());
+    }
+
+    /// Whether a payment to `payee`, which the node has just found no route to, may wait for one, and until when:
+    /// one payment to a payee waits at a time, and all of them together no longer than `most` from when the
+    /// node first found none (an outage nobody has looked at for a second is over). `None`: refuse it now.
+    /// `Err(true)`: the window is over, and the seller has been without a route for all of it; `Err(false)`: another
+    /// payment to it is waiting, and this one may be paid when that one's wait ends.
+    fn route_wait_turn(&self, payee: &str, most: Duration) -> std::result::Result<Instant, bool> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let (since, seen, waiting) = s.no_route.get(payee).copied().filter(|(_, seen, w)| *w || now.duration_since(*seen) <= Duration::from_secs(1))
+            .unwrap_or((now, now, false));
+        let until = since + most;
+        let turn = if now >= until { Err(true) } else if waiting { Err(false) } else { Ok(until) };
+        s.no_route.insert(payee.to_string(), (since, now.max(seen), waiting || turn.is_ok()));
+        turn
+    }
+
+    /// The payment that waited for a route to `payee` is done waiting; `found`: the node has one again.
+    fn route_waited(&self, payee: &str, found: bool) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if found {
+            s.no_route.remove(payee);
+        } else if let Some(e) = s.no_route.get_mut(payee) {
+            e.1 = Instant::now();
+            e.2 = false;
+        }
+    }
+
+    /// A route query of the node's, and the time it took.
+    pub fn queried(&self, took: Duration) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.queried.len() == QUERIES_KEPT {
+            s.queried.pop_front();
+        }
+        s.queried.push_back(took.as_secs_f64() * 1000.0);
+    }
+
+    /// What the latest route queries cost: their number, median and 99th percentile, in ms.
+    pub fn route_query_ms(&self) -> Value {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<f64> = s.queried.iter().copied().collect();
+        v.sort_by(f64::total_cmp);
+        let at = |q: f64| v.get(((v.len() as f64 - 1.0) * q).round() as usize).map(|x| (x * 10.0).round() / 10.0);
+        json!({"n": v.len(), "median": at(0.5), "p99": at(0.99)})
+    }
+
+    /// How much of its life an invoice of `life` seconds must have left for a win to be sent on it:
+    /// twice the longest of the latest payments on the way, and never less than the 5 s every prepaid
+    /// invoice must have, nor more than half its life. A win sent with less fails at the seller, whose
+    /// node has cancelled the invoice by the time it arrives; held back, it costs nobody anything, and the
+    /// seller's next invoice pays it. (Lab, 8 GB: 2.8 s on the way at the median, 8.5 s at the longest, 5
+    /// wins sent with 4 to 6 s left on an invoice of 60 s, all failed.)
+    pub fn send_margin(&self, life: f64) -> f64 {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let longest = s.flown.iter().copied().fold(0.0, f64::max);
+        (2.0 * longest).min(life / 2.0).max(ticket::PREPAID_EXPIRY_MARGIN_S)
+    }
+
     pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool) -> PaceGuard<'_> {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mine = s.next;
@@ -991,7 +1068,7 @@ impl Signer {
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, &sid) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
         };
@@ -1737,7 +1814,7 @@ impl Signer {
             return passed("ln_node", "the wallet's Lightning node failed its checks".into());
         }
         // PayOffer takes no set of outgoing channels: every channel of the node must pass
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", true) {
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", true, sid) {
             Ok(r) => r,
             Err(d) => return passed(&str_or_empty(d.get("rule")), "a payment by offer may leave on any channel of the node, and not every one passes the guards".into()),
         };
@@ -1838,7 +1915,8 @@ impl Signer {
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
-        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
+        let checks_from = Instant::now();
+        let routes = match self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, &sid) {
             Ok(r) => r,
             Err(d) => return with(d, json!({"rail": "ticket"})),
         };
@@ -1867,6 +1945,13 @@ impl Signer {
         if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, msat, &tp_now, now) {
             return refuse(&hash, rule, why);
         }
+        if win.is_some() {
+            let (left, margin) = (inv.expires_at() as f64 - now, self.ticket_pace.send_margin(inv.expiry_s as f64));
+            if left < margin {
+                return with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it would have ended first (held to {margin:.0} s)")),
+                            json!({"hash": hash, "unsent": true}));
+            }
+        }
         match ln.decode(&invoice) {
             Ok(d) => {
                 if let Err(why) = cross_check(&inv, &d) {
@@ -1874,6 +1959,12 @@ impl Signer {
                 }
             }
             Err(e) => return node_said(refuse(&hash, "ln_backend", e.msg.clone()), &e),
+        }
+        // a route to the seller, as the node would look for one when it pays: one moment after a link along the way
+        // was replaced the node finds none for some seconds (up to 10 s seen on the lab), and a payment sent then fails
+        // at once. It is waited for, within what is left of the channel wait's 8 s
+        if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, checks_from) {
+            return with(refuse(&hash, "ln_no_route", why), json!({"route_ran_out": ran_out}));
         }
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
@@ -1894,6 +1985,56 @@ impl Signer {
     /// What the book holds booked for the ticket `hash` (0 where it holds none, or cannot be read).
     fn ticket_booked_sats(&self, hash: &str) -> i64 {
         self.ticket_store().ok().and_then(|g| g.as_ref().and_then(|st| st.book.tickets.get(hash).map(|t| t.booked_sats))).unwrap_or(0)
+    }
+
+    /// Waits until the node finds a route of `msat` to `payee` out through one of `ids`, or until
+    /// [`crate::ln::CHANNEL_BACK_WAIT`] has gone by since `from`, or the session `sid` is being stopped.
+    /// Read only: nothing is sent. A node that cannot answer the question is not asked again, and is
+    /// no reason to refuse: the payment goes as it would have.
+    #[allow(clippy::too_many_arguments)]
+    /// `Err((why, ran_out))`: `ran_out` where the seller has been without a route for the whole window, not
+    /// where this payment only stood back for another to the same seller.
+    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), (String, bool)> {
+        let chan = (ids.len() == 1).then(|| ids[0].as_str());
+        let ask = || {
+            let asked = Instant::now();
+            let found = ln.has_route(payee, msat, chan, final_cltv);
+            self.ticket_pace.queried(asked.elapsed());
+            // a node that cannot answer the question is no reason to hold the payment
+            !matches!(found, Ok(false))
+        };
+        if ask() {
+            self.ticket_pace.route_waited(payee, true);
+            return Ok(());
+        }
+        // one payment to this seller waits at a time, within one window for all of them: a seller gone for good
+        // holds one place of the gate for 8 s, and the payments behind it are refused at once
+        let refused = |since: f64| format!("the wallet's node has found no route to the seller for {since:.1} s: nothing was sent");
+        let left = crate::ln::CHANNEL_BACK_WAIT.saturating_sub(from.elapsed());
+        let until = match self.ticket_pace.route_wait_turn(payee, left.max(Duration::from_millis(1))) {
+            Ok(u) => u,
+            Err(true) => return Err((refused(from.elapsed().as_secs_f64()), true)),
+            Err(false) => return Err(("another payment to the seller is waiting for a route: nothing was sent".into(), false)),
+        };
+        let no_route_from = self.engine.now();
+        let record = |back: bool| {
+            self.ticket_audit("ticket_route_waited", json!({"session": sid, "dest": format!("ln:{payee}"), "no_route_from": no_route_from,
+                                                            "route_back_at": back.then(|| self.engine.now()), "waited_s": self.engine.now() - no_route_from}));
+        };
+        loop {
+            let stopped = self.ticket_is_stopping(sid) || self.ticket_session(sid).is_some_and(|s| s.state != SState::Open);
+            if Instant::now() >= until || stopped {
+                self.ticket_pace.route_waited(payee, false);
+                record(false);
+                return Err((refused(from.elapsed().as_secs_f64()), true));
+            }
+            std::thread::sleep(crate::ln::CHANNEL_BACK_POLL.min(until.saturating_duration_since(Instant::now())));
+            if ask() {
+                self.ticket_pace.route_waited(payee, true);
+                record(true);
+                return Ok(());
+            }
+        }
     }
 
     /// The end of an ordinary payment, booked (`booked_sats`): `send` hands it to the node, and
@@ -1918,6 +2059,7 @@ impl Signer {
         // over within `ORDINARY_PAY_S` and 5 s, and the call's caller has its answer before it stops waiting for one
         let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, i64::from(xbt402::ticket::ORDINARY_PAY_S)) as u64 + 5);
         let mut unsent: Option<crate::Error> = None;
+        let sent_at = Instant::now();
         let mut pmt = {
             let mut pmt = match send() {
                 Ok(p) => Some(p),
@@ -1934,6 +2076,9 @@ impl Signer {
             }
             pmt
         };
+        if pmt.as_ref().is_some_and(|p| str_or_empty(p.get("status")) == "SUCCEEDED") {
+            self.ticket_pace.flew(sent_at.elapsed());
+        }
         drop(inside);
         // once more outside the gate, for a payment whose end the node had not shown inside the wait
         if pmt.as_ref().is_none_or(|p| !payment_over(p)) {
@@ -2216,7 +2361,7 @@ impl Signer {
     /// channel a payment may leave through. The payer asks this before it offers a hash to a
     /// seller: a hash that is offered and then cannot be paid keeps its place in the pool until it
     /// lapses, so none is offered while the wallet's own node could not pay it.
-    pub(crate) fn ticket_can_lock(&self, payee: &str) -> std::result::Result<(), Value> {
+    pub(crate) fn ticket_can_lock(&self, payee: &str, sid: &str) -> std::result::Result<(), Value> {
         let (ln, lp) = {
             let _g = self.lock();
             self.ticket_synced()?;
@@ -2224,7 +2369,7 @@ impl Signer {
         };
         let dest = format!("ln:{payee}");
         self.ln_node_checks(&*ln, &lp, &dest, "").map_err(|d| with(d, json!({"rail": "ticket"})))?;
-        self.ln_route_checks(&*ln, &lp, &dest, "", false).map_err(|d| with(d, json!({"rail": "ticket"})))?;
+        self.ln_route_checks_waiting(&*ln, &lp, &dest, "", false, sid).map_err(|d| with(d, json!({"rail": "ticket"})))?;
         Ok(())
     }
 
@@ -2615,7 +2760,8 @@ impl Signer {
     pub(crate) fn ticket_status_locked(&self, p: &Value) -> Value {
         let tp = self.ticket_policy();
         let mut out = json!({"rail": "ticket", "enabled": tp.enabled, "halted": self.ln_book.halted(),
-                             "book_error": self.ticket_error.lock().unwrap_or_else(|p| p.into_inner()).clone()});
+                             "book_error": self.ticket_error.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+                             "route_query_ms": self.ticket_pace.route_query_ms()});
         if !self.ticket_in_use() {
             return with(out, json!({"synced": false, "sessions": [], "tickets": {}, "locked": {"tickets": 0, "sats": 0}, "booked_sats": 0}));
         }

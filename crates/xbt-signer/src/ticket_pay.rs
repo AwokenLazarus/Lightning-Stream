@@ -1618,6 +1618,10 @@ struct Call<'a> {
     stream_paid: bool,
     /// The byte range asked for (`range`), sent as the `Range` header of every request for the URL.
     range: Option<ByteRange>,
+    /// The validator of the copy the range continues (`if_range`: the `ETag` or `Last-Modified` of the
+    /// answer it follows), sent as `If-Range` with it: a seller whose copy has changed since sends the whole
+    /// body, which the wallet does not read, rather than the rest of another file.
+    if_range: Option<String>,
     /// The caller's own request headers (`headers`, [`caller_headers`]), sent on every request of
     /// the call for its URL: a seller's web app asks with its cookies, its login and its formats.
     extra: Vec<(String, String)>,
@@ -1644,6 +1648,7 @@ impl Call<'_> {
     /// The headers every request of the call for its URL carries beside the payment's.
     fn headers(&self) -> Vec<(String, String)> {
         let mut h: Vec<(String, String)> = self.range.iter().map(|r| ("Range".to_string(), r.header())).collect();
+        h.extend(self.range.and(self.if_range.clone()).map(|v| ("If-Range".to_string(), v)));
         h.extend(self.extra.iter().cloned());
         h.extend(self.max_size.map(|n| (xbt402::ticket::MAX_SIZE_HEADER.to_string(), n.to_string())));
         h
@@ -2115,8 +2120,11 @@ fn plain_media_type(s: &str) -> Option<String> {
 ///
 /// `Err` (with the head as far as it was read): an answer of 206 whose `Content-Range` is not the
 /// range the call asked for, or that cannot be read, or whose `Content-Length` disagrees with it.
-/// The body of such an answer is not read. A 200 to a call that asked for a range is a seller that
-/// sends the whole body; it is read, and metered, like any other.
+/// The body of such an answer is not read, nor that of a 200 to a call that asked for a range from
+/// past the first byte: the seller sends the whole body, ignoring the range or (where the call named
+/// `if_range`) because its copy has changed, and reading it would buy again the bytes the caller
+/// already has. A 200 to a range from byte 0 is a whole answer, read as any other. (Until 0.1.20 a
+/// 200 to any range was read, and metered, like any other.)
 ///
 /// A 206 that states no `Content-Length` is read to the end of its range and no further: `length`
 /// is set from its `Content-Range`.
@@ -2132,9 +2140,23 @@ fn answer_head(ans: &mut WireAnswer, asked: Option<ByteRange>) -> (Value, Option
     if let Some(t) = ans.header("Content-Type").and_then(plain_media_type) {
         v["content_type"] = t.into();
     }
+    // what a caller that goes on later from where this answer ended names in `if_range`
+    for (k, name) in [("etag", "ETag"), ("last_modified", "Last-Modified")] {
+        if let Some(x) = ans.header(name).map(str::trim).filter(|x| !x.is_empty() && x.len() <= 256 && x.bytes().all(|b| (0x20..0x7f).contains(&b))) {
+            v[k] = x.into();
+        }
+    }
     let cr = ans.header("Content-Range").map(str::to_string);
     let refuse = |v: Value, why: String| (v, Some(why));
     match ans.status {
+        // the whole body to a range from its first byte (the app's player asks bytes=0-... first): a whole answer,
+        // paid as it is read and ended where the caller stops, its head and its receipt the whole body's
+        200 if asked.is_some_and(|r| r.first == 0) => {}
+        // the whole body to a call that asked for part of it: the bytes before the range would be bought again
+        200 if asked.is_some() => {
+            v["range_ignored"] = true.into();
+            return refuse(v, format!("the seller answered the range asked for ({}) with the whole body", asked.map(|r| r.header()).unwrap_or_default()));
+        }
         206 => {
             let Some((a, b, total)) = cr.as_deref().and_then(content_range) else {
                 return refuse(v, "the seller's 206 has no Content-Range the wallet can read".into());
@@ -2163,6 +2185,19 @@ fn answer_head(ans: &mut WireAnswer, asked: Option<ByteRange>) -> (Value, Option
         _ => {}
     }
     (v, None)
+}
+
+/// A call whose range the seller answered with the whole body ([`answer_head`]): said by its own rule,
+/// with what it cost, which is what the route charges for an answer it does not read.
+fn range_ignored(out: &mut Value, c: &Call<'_>) {
+    if out.get("range_ignored") != Some(&Value::Bool(true)) {
+        return;
+    }
+    let msat = out.get("price_msat").and_then(|v| crate::ticket::outside_u64(Some(v))).unwrap_or(0);
+    out["rule"] = "ticket_range_ignored".into();
+    out["complete"] = false.into();
+    out["reason"] = format!("the seller ignored the range asked for ({}) and sent the whole body: none of it was read, so the bytes the caller already \
+                             has were not bought again; this call cost {msat} msat", c.range.map(|r| r.header()).unwrap_or_default()).into();
 }
 
 /// The x402 scheme name of the on-chain channel this wallet once paid: recognised in a 402 only to
@@ -2523,6 +2558,14 @@ impl Signer {
         if range.is_some() && method != "GET" {
             return deny("range", "range is for a GET");
         }
+        let if_range = match p.get("if_range").filter(|v| !v.is_null()) {
+            None => None,
+            Some(v) => match v.as_str().filter(|s| !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| (0x20..0x7f).contains(&b))) {
+                Some(s) if range.is_some() => Some(s.to_string()),
+                Some(_) => return deny("if_range", "if_range goes with a range"),
+                None => return deny("if_range", "if_range is the ETag or Last-Modified of the answer the range continues, in visible characters"),
+            },
+        };
         // the caller's piece hashes are of the whole body, from its first byte: a part of it would be judged against the wrong pieces
         if range.is_some() && !piece_hashes.is_empty() {
             return deny("range", "range and piece_sha256 do not go together: the pieces are counted from the body's first byte");
@@ -2680,8 +2723,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, extra, head_headers, upgrade,
-                          credit_only, charge_sats, max_size };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, if_range, extra, head_headers, upgrade, credit_only, charge_sats, max_size };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // a route that gives each buyer an account is paid with tickets only: draws serve no buyer as its account
@@ -3045,7 +3087,7 @@ impl Signer {
 
     fn ticket_fill_once(&self, hs: &HttpSession) -> std::result::Result<usize, Value> {
         // the wallet's own node first: no hash goes to a seller that the node could not then pay for
-        self.ticket_can_lock(&hs.terms.terms.payee)?;
+        self.ticket_can_lock(&hs.terms.terms.payee, &hs.sid)?;
         self.ticket_cancel_dead(hs);
         let offer = {
             let _g = self.lock();
@@ -3405,7 +3447,7 @@ impl Signer {
         spent.room(size.map(|(_, face, booked)| (face, booked)), true)?;
         let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
-        self.ticket_can_lock(&hs.terms.terms.payee)?;
+        self.ticket_can_lock(&hs.terms.terms.payee, &hs.sid)?;
         if let Some(d) = at_fault() {
             return Err(d);
         }
@@ -4695,6 +4737,7 @@ impl Signer {
         out["price_msat"] = price_msat.to_string().into();
         out["receipt"] = receipt_note;
         out["released"] = json!(spent.hashes);
+        range_ignored(&mut out, c);
         out["ms"] = json!((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0);
         out[UNTRUSTED_KEY] = untrusted(&text, head.raw);
         if !seller_last.is_null() {
@@ -6171,7 +6214,14 @@ mod tests {
         assert!(answer_head(&mut ans(206, "bytes 10-19/100", Some(11)), asked).1.is_some(), "a length that is not the span");
         assert!(answer_head(&mut ans(206, "bytes 10-30/100", Some(21)), ByteRange::parse("bytes=10-20")).1.is_some(), "past the end asked for");
         assert!(answer_head(&mut ans(206, "", Some(5)), None).1.is_some(), "a 206 with no range");
-        assert!(answer_head(&mut ans(200, "", Some(100)), asked).1.is_none(), "a whole body, the range ignored");
+        let (v, refused) = answer_head(&mut ans(200, "", Some(100)), asked);
+        assert!(refused.is_some() && v["range_ignored"] == true, "a whole body to a range from byte 10 is not read");
+        let mut whole = ans(200, "", Some(100));
+        let (v, refused) = answer_head(&mut whole, ByteRange::parse("bytes=0-"));
+        assert!(refused.is_none() && v.get("range_ignored").is_none() && whole.length == Some(100), "from byte 0: the whole body is what was asked");
+        let mut start = ans(200, "", Some(100));
+        let (v, refused) = answer_head(&mut start, ByteRange::parse("bytes=0-9"));
+        assert_eq!((refused, start.length, v["content_length"].as_u64()), (None, Some(100), Some(100)), "from byte 0 to 9: the whole answer, as it states itself");
         assert_eq!(answer_head(&mut ans(416, "bytes */100", Some(0)), asked).0["content_range"], "bytes */100");
     }
 

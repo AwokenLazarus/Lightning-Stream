@@ -92,6 +92,12 @@
      "description": "Optional: one byte range of a GET, bytes=N- or bytes=N-M, to buy part of a file or a film. Billed per MiB for the bytes sent, as a player is. Empty: the whole body.",
      "title": "Range",
      "type": "string"
+    },
+    "if_range": {
+     "default": "",
+     "description": "Optional, with a range that goes on from an earlier answer: that answer's etag (or last_modified). A file that changed since comes back whole and is not read, rather than its rest spliced onto the old bytes. A seller that ignores ranges is answered the same way: rule ticket_range_ignored, with what the call cost.",
+     "title": "If-Range",
+     "type": "string"
     }
    },
    "required": [
