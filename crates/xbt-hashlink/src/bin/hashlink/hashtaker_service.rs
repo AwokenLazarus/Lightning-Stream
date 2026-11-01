@@ -108,6 +108,23 @@ const GATEWAY_API_PORT: u16 = 7152;
 pub const BUNDLED_STRATUM: &str = "127.0.0.1:23339";
 /// How often an upstream's jobs are looked at again.
 const LOOK_EVERY: Duration = Duration::from_secs(60);
+/// How often while the last look didn't show its jobs masked: a gateway that comes back (or gets its node's work)
+/// shows on the renter's page within seconds, not at the next minute.
+const LOOK_SOON: Duration = Duration::from_secs(5);
+
+/// When to look at the upstream again after this look: soon while it isn't showing masked jobs, else every minute.
+fn look_interval(last: Option<&xbt_hashlink::blind::Shown>) -> Duration {
+    if last.is_some_and(|s| s.may_rent()) {
+        LOOK_EVERY
+    } else {
+        LOOK_SOON
+    }
+}
+
+/// Whether the last look is too old to show for `datum` at `now_ms` (or was of another gateway, or there was none).
+fn look_stale(last: Option<&(String, xbt_hashlink::blind::Shown, u64)>, datum: &str, now_ms: u64) -> bool {
+    last.is_none_or(|(d, shown, at)| d != datum || now_ms.saturating_sub(*at) >= look_interval(Some(shown)).as_millis() as u64)
+}
 
 impl R {
     /// Where this upstream's jobs are opened: as configured, or the gateway's API on the same host.
@@ -287,8 +304,8 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         // itself, and no list says so
         let r = r.clone();
         std::thread::spawn(move || loop {
-            look_at_upstream(&r);
-            std::thread::sleep(LOOK_EVERY);
+            let shown = look_at_upstream(&r);
+            std::thread::sleep(look_interval(shown.as_ref()));
         });
     }
     http::serve(&addr, token, Arc::new(move |method, path, body| handle(&r, &candidates, method, path, body)))?;
@@ -462,7 +479,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             drop(g);
             let found: Vec<&String> = candidates.iter().filter(|a| reachable(a)).collect();
             // looked at again when the renter's page asks and the last look is old or of another gateway
-            let stale = lock(r).shown.as_ref().is_none_or(|(d, _, at)| *d != datum || xbt_hashlink::now_ms().saturating_sub(*at) > LOOK_EVERY.as_millis() as u64);
+            let stale = look_stale(lock(r).shown.as_ref(), &datum, xbt_hashlink::now_ms());
             if stale && !datum.is_empty() && reachable(&datum) {
                 look_at_upstream(r);
             }
@@ -878,6 +895,35 @@ mod tests {
         assert_eq!((unmasked["state"].as_str(), &unmasked["node"]), (Some("not masking"), &json!(true)));
         let other = bundled_status("127.0.0.1:1", Some("127.0.0.1:1"), false, None, None);
         assert_eq!((other["state"].as_str(), &other["inUse"]), (Some("not running"), &json!(false)));
+    }
+
+    /// A gateway whose jobs weren't shown masked is looked at again within 5 s, so its coming back shows on the page at
+    /// once; one that shows them masked, every minute.
+    #[test]
+    fn a_gateway_not_yet_masked_is_looked_at_again_within_seconds() {
+        use xbt_hashlink::blind::Shown;
+        let blinded = Shown::Blinded("solo".into());
+        let unchecked = Shown::Unverifiable("127.0.0.1:23339 doesn't answer".into());
+        let unmasked = Shown::NotBlinded("its key is null".into());
+        assert_eq!(look_interval(Some(&blinded)), Duration::from_secs(60));
+        for s in [&unchecked, &unmasked] {
+            assert_eq!(look_interval(Some(s)), Duration::from_secs(5));
+        }
+        assert_eq!(look_interval(None), Duration::from_secs(5), "no gateway, or no look yet");
+        let d = BUNDLED_STRATUM;
+        let at = 1_000_000u64;
+        // "can't be checked" 6 s ago: looked at again when the page asks
+        let last = (d.to_string(), unchecked.clone(), at);
+        assert!(!look_stale(Some(&last), d, at + 4_999));
+        assert!(look_stale(Some(&last), d, at + 5_000));
+        // masked 6 s ago: kept for the minute
+        let last = (d.to_string(), blinded.clone(), at);
+        assert!(!look_stale(Some(&last), d, at + 6_000));
+        assert!(!look_stale(Some(&last), d, at + 59_999));
+        assert!(look_stale(Some(&last), d, at + 60_000));
+        // another gateway's look, or none: stale
+        assert!(look_stale(Some(&last), "192.0.2.7:23334", at + 1));
+        assert!(look_stale(None, d, at));
     }
 
     /// The bundled gateway up (its API answers) with no Stratum yet, its old look saying "doesn't answer": the status says
