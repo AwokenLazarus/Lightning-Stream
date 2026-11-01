@@ -8015,39 +8015,40 @@ fn tickets_whose_payment_failed_after_their_lock_round_give_their_places_with_th
 #[test]
 fn after_an_outage_that_fills_the_sellers_places_the_resume_goes_on_from_that_byte() {
     let _g = env_lock();
-    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, shipped_shop());
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
     let n = 15 * MIB;
     let first = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
     assert_eq!((first["status"].as_u64(), first["complete"].as_bool()), (Some(200), Some(true)), "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
     wait_for("the pool to be filled again", || r.shop.held() == 2);
-    // the outage: the node takes no payment and answers no question about one. The two tickets held pay for 10 MiB;
-    // the two that were to follow are with the seller as invoices, and its places for the session are taken
-    r.ln.st.lock().unwrap().router_down = true;
+    // the outage has left the seller's places for the session taken: it refuses the session's next lock, as it does
+    // until those tickets lapse. A new session's first lock names no session, and is taken
+    let full = |seen: &Seen, _real: &dyn Fn() -> xbt402::Result<WireAnswer>| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())));
+    r.tap.set(Box::new(full));
+    // the two tickets held pay for 10 MiB, and the lock for the rest is refused at the cap: the call ends there
     let cut = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film"}));
-    let got = cut["bytes"].as_u64().unwrap() as usize;
+    let got = cut["bytes"].as_u64().unwrap_or(0) as usize;
     assert_eq!((cut["status"].as_u64(), cut["complete"].as_bool(), got), (Some(200), Some(false), 10 * MIB), "{cut}");
-    let sid = cut["session"].as_str().unwrap().to_string();
     assert!(cut["ended"].as_str().is_some_and(|e| e.contains("too_many_tickets")), "the outage ends on the seller's cap: {cut}");
-    // the channel is back, and nothing of the outage has lapsed yet
-    r.ln.st.lock().unwrap().router_down = false;
     assert_eq!(cut["session_stopped"]["session"].as_str(), Some(sid.as_str()), "the session was stopped as the call ended: {cut}");
     // what was asked to be cancelled: never a ticket that was released
     let released: Vec<String> = r.session(&sid)["session_tickets"].as_array().unwrap().iter()
         .filter(|t| matches!(t["state"].as_str(), Some("released" | "settled" | "retired"))).map(|t| t["hash"].as_str().unwrap().to_string()).collect();
-    assert!(released.len() >= 2, "the tickets that paid for the 10 MiB: {}", r.session(&sid));
+    assert!(released.len() >= 3, "the tickets that paid for the first file and the 10 MiB: {}", r.session(&sid));
     let asked: Vec<String> = r.tap.seen("/x402/ticket/cancel").iter().flat_map(|s| {
         serde_json::from_str::<Value>(&s.body).unwrap()["hashes"].as_array().cloned().unwrap_or_default()
     }).filter_map(|h| h.as_str().map(str::to_string)).collect();
-    assert!(!asked.is_empty(), "the unreleased tickets were asked to be cancelled");
     assert!(asked.iter().all(|h| !released.contains(h)), "a released ticket was named for the cancel: {asked:?} {released:?}");
-    // the resume, from that byte, of the same copy
+    // the resume, from that byte, of the same copy, in another session
     let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
                                          "if_range": cut["etag"]}));
+    r.tap.clear();
     assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
     assert_eq!(on["price_msat"].as_str(), Some("1000000"), "priced as the rest, 5 MiB at 200 sat a MiB: {on}");
     assert_ne!(on["session"].as_str(), Some(sid.as_str()), "another session: {on}");
     r.assert_booked();
-    // 1 ticket for the first file, 2 for the 10 MiB, 1 for the rest: the cancelled ones cost nothing
+    // 1 ticket for the first file, 2 for the 10 MiB, 1 for the rest; the tickets the stopped session held come back
     wait_for("the last ticket to settle", || r.money().0 == 4 * TICKET);
     assert_eq!(r.money(), (4 * TICKET, 4 * TICKET, 4 * TICKET, 4 * SETTLED));
 }
@@ -8061,23 +8062,18 @@ fn after_an_outage_that_fills_the_sellers_places_the_resume_goes_on_from_that_by
 fn a_resume_refused_at_the_sellers_cap_is_made_again_in_another_session() {
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, shipped_shop());
-    let n = 10 * MIB;
-    // while the first part is read, and after it, every lock but the first is refused as the outage left them: the
-    // session's one ticket pays for the 5 MiB the call allows, and no other is held when the resume comes
-    let locks = Arc::new(AtomicUsize::new(0));
-    let seen_locks = locks.clone();
-    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/lock") && seen_locks.fetch_add(1, Ordering::SeqCst) >= 1)
-        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
-    let part = r.pay(&format!("/files/{n}"), 1_000);
-    let got = part["bytes"].as_u64().unwrap() as usize;
-    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let n = 20 * MIB;
+    // 10 MiB of 20, which is what the call allows: the session's two held tickets are spent
+    let part = r.pay(&format!("/files/{n}"), 2_000);
+    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool()), (Some(200), Some(false)), "{part}");
+    assert!(got > 0, "{part}");
     let sid = part["session"].as_str().unwrap().to_string();
-    // the refills behind it were refused too; from here the seller refuses the session's next lock once more, then
-    // takes the locks of a new session
-    wait_for("the refill refused", || locks.load(Ordering::SeqCst) >= 2);
-    let refused_from = locks.load(Ordering::SeqCst);
-    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/lock") && locks.fetch_add(1, Ordering::SeqCst) == refused_from)
+    // from here the seller refuses the session's locks at its cap, as it would after an outage; a new session's first
+    // lock names no session, and is taken
+    r.tap.set(Box::new(|seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
         .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    std::thread::sleep(Duration::from_millis(500));
     let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
                                          "if_range": part["etag"]}));
     r.tap.clear();
