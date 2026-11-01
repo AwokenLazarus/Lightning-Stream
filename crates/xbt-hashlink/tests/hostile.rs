@@ -1009,8 +1009,9 @@ fn a_renter_saying_a_low_count_after_each_resume_costs_the_hashmaker_no_more_tha
     });
     let mut resumes = 0;
     while a.h.finished().is_empty() && resumes < 20 {
-        // shares come for 4 s right up to the drop: some forwarded within its last 2 s, more before
-        b.pump(b.shares + 80, Duration::from_secs(15));
+        // shares come for 6 s right up to the drop, the renter quiet but for pongs: more than the last 4 s of them,
+        // what a quiet renter can be taken to have had on their way at the most
+        b.pump(b.shares + 120, Duration::from_secs(20));
         let (mut nb, w) = connect(&a.link, bk, a.hpub, "lie", Msg::Resume { rental: "lie".into() });
         if !matches!(w, Msg::Welcome { .. }) {
             break;
@@ -1034,6 +1035,9 @@ fn a_renter_saying_a_low_count_after_each_resume_costs_the_hashmaker_no_more_tha
               lowered as f64 / terms.slice_work as f64, r["stopped"]["reason"]);
     assert_eq!(r["stopped"]["reason"], "its count fell short after too many resumes", "{r}");
     assert!(counts.iter().all(|(l, m)| l <= m), "never past what was in flight: {counts:?}");
+    // at 20 shares a second, the last 4 s before the drop and some slack: never the 6 s of work before each drop
+    let most_a_resume = 100 * sw;
+    assert!(counts.iter().all(|(_, m)| *m <= most_a_resume), "what may come down is the last few seconds' work: {counts:?}");
     assert_eq!(counts.iter().filter(|(l, _)| *l > 0).count(), xbt_hashlink::hashmaker::RESYNCS_AN_HOUR, "{counts:?}");
     assert_eq!(lowered, counts.iter().map(|(l, _)| l).sum::<u128>());
     assert!(lowered <= allowed, "{lowered} past {allowed}");

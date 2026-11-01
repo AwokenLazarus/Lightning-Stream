@@ -88,6 +88,9 @@ const RESUMES_LEEWAY: u64 = 8;
 pub const RESYNCS_AN_HOUR: usize = 8;
 /// Shares forwarded this long before the link was last heard from may have been on their way when it dropped.
 pub const IN_FLIGHT_BEFORE: Duration = Duration::from_secs(2);
+/// However long the hashtaker kept quiet before a drop, shares forwarded longer than this before it aren't taken as on
+/// their way.
+pub const IN_FLIGHT_MOST: Duration = Duration::from_secs(4);
 /// How long a held share's clock waits, after a resume, for the hashtaker to say its count.
 const RESYNC_WAIT: Duration = Duration::from_secs(3);
 
@@ -883,6 +886,8 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
         let Some(r) = g.rentals.get_mut(&id) else { return };
         r.resumes += 1;
         r.tx = tx.clone();
+        // when the link dropped: when this side noticed, or now if it hadn't
+        let dropped_at = r.suspended.as_ref().map_or_else(Instant::now, |(until, _)| *until - Duration::from_millis(r.terms.grace_ms));
         r.suspended = None;
         let heard = r.last_heard;
         r.last_heard = Instant::now();
@@ -895,7 +900,8 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
         }
         // then this side's count, and what of it may have been on its way: shares forwarded since shortly before the
         // link was last heard from. The hashtaker answers with its own, and this side's comes down to it, by no more
-        let since = heard.checked_sub(IN_FLIGHT_BEFORE).unwrap_or(heard);
+        // a hashtaker that keeps quiet can't stretch that: never more than the last few seconds before the drop
+        let since = heard.checked_sub(IN_FLIGHT_BEFORE).unwrap_or(heard).max(dropped_at.checked_sub(IN_FLIGHT_MOST).unwrap_or(dropped_at));
         let (cap_work, cap_shares) = r.recent.iter().filter(|(_, _, t, _)| *t >= since).fold((0u128, 0u64), |(w, n), (_, _, _, sw)| (w + sw, n + 1));
         r.resync = Some(Resync { at: Instant::now(), work: r.meter.work, proven: r.meter.proven, cap_work, cap_shares });
         let _ = r.tx.send(&Msg::Resynced { work: r.meter.work, proven: r.meter.proven });
