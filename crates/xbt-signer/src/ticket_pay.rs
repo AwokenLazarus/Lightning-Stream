@@ -351,8 +351,12 @@ fn refusal(rule: &str, reason: impl Into<String>) -> Value {
 /// channel out for a moment. Any other (a stopped session, a blocked seller, the owner's limits) stands.
 fn passing_refusal(why: &str) -> bool {
     let rule = why.split(':').next().unwrap_or_default();
-    ["ticket_not_ready", "ticket_busy", "ticket_answer_open", "ticket_seller", "ln_no_safe_channel", "ln_backend"].contains(&rule) || HOLD_SHORT.contains(&rule)
+    ["ticket_not_ready", "ticket_busy", "ticket_answer_open", "ticket_seller", "ln_no_safe_channel", "ln_backend", crate::ticket::OUTAGE_HOLD].contains(&rule)
+        || HOLD_SHORT.contains(&rule)
 }
+
+/// Why no ticket is locked meanwhile, after a round that failed in an outage ([`crate::ticket::OUTAGE_HOLD`]).
+const OUTAGE_WORDS: &str = "the channel to the seller was out a moment ago, and the wallet waits for it to come back before it locks again";
 
 fn answer_closed_refusal(hs: &HttpSession) -> Value {
     with(refusal("ticket_answer_closed", "the seller has ended the answer this ticket was for: no secret was released"),
@@ -3105,8 +3109,9 @@ impl Signer {
                             let stopped = self.ticket_http_stop(&h, "no ticket could be locked", Duration::ZERO);
                             if let Some(s) = wait {
                                 let why = if s.hold_why.is_empty() { "ticket_slots".to_string() } else { s.hold_why.clone() };
-                                break 'open Err(Tried::Done(with(refusal(&why, format!("no ticket is locked with this seller for another {:.0} s: a lock found no free slot \
-                                                                                        on the way to it, and its terms offer no prepaid tickets", (s.hold_until - now).max(0.0))),
+                                let what = if why == crate::ticket::OUTAGE_HOLD { OUTAGE_WORDS } else { "a lock found no free slot on the way to it" };
+                                break 'open Err(Tried::Done(with(refusal(&why, format!("no ticket is locked with this seller for another {:.0} s: {what}, and its terms offer \
+                                                                                        no prepaid tickets", (s.hold_until - now).max(0.0))),
                                                                  json!({"stopped": stopped, "retry_after_s": (s.hold_until - now).max(0.0).ceil(), "slot_fails": s.slot_fails}))));
                             }
                             break 'open Err(Tried::Done(with(refusal("ticket_lock", "no ticket was locked with this seller: its invoices did not pass the wallet's checks, or the \
@@ -4333,9 +4338,10 @@ impl Signer {
                     }
                     if now < s.hold_until {
                         filled?;
+                        let what = if s.hold_why == crate::ticket::OUTAGE_HOLD { OUTAGE_WORDS } else { "the last lock found no free slot on the way" };
                         return Err(with(refusal(if s.hold_why.is_empty() { "ticket_slots" } else { s.hold_why.as_str() },
-                                                format!("no ticket is locked with this seller for another {:.0} s: the last lock found no free slot on the way, and \
-                                                         the seller's terms offer no prepaid tickets", s.hold_until - now)),
+                                                format!("no ticket is locked with this seller for another {:.0} s: {what}, and the seller's terms offer no prepaid \
+                                                         tickets", s.hold_until - now)),
                                         json!({"session": hs.sid, "retry_after_s": (s.hold_until - now).ceil()})));
                     }
                 }
@@ -6294,6 +6300,15 @@ mod tests {
         let hashes = vec![0u8; 8];
         assert_eq!(super::in_parts(&hashes, 3).map(<[u8]>::len).collect::<Vec<_>>(), vec![3, 3, 2]);
         assert_eq!(super::in_parts(&hashes, 0).len(), 8, "a cap of none still names one at a time");
+    }
+
+    /// A wait after a round that failed in an outage passes by itself, as one for a full channel does: a socket or a
+    /// tunnel to a seller with no prepaid tickets rides it out rather than ending.
+    #[test]
+    fn a_wait_after_an_outage_passes_by_itself() {
+        assert!(passing_refusal(&format!("{}: no ticket is locked with this seller for another 20 s", crate::ticket::OUTAGE_HOLD)));
+        assert!(passing_refusal("ticket_slots: no ticket is locked"));
+        assert!(!passing_refusal("ticket_session: the session was stopped"));
     }
 
     #[test]

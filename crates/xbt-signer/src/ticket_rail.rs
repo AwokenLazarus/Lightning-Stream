@@ -963,6 +963,10 @@ impl Signer {
                     (hold_until, hold_why) = (b.hold_until, b.hold_why.clone());
                 }
             }
+            // and what is left of a wait after a round that failed in an outage: the wait only, never a smaller pool
+            if let Some(until) = st.book.outage_hold(&terms.payee, now).filter(|u| size.pool > 0 && *u > hold_until) {
+                (hold_until, hold_why) = (until, ticket::OUTAGE_HOLD.to_string());
+            }
             let lp = LnPolicy::from_map(&cfg.ln);
             // a prepaid ticket is sized per purchase: where the seller lets the wallet ask for a smaller one,
             // the one that counts here is the largest that fits under the ceiling
@@ -1241,8 +1245,9 @@ impl Signer {
                                            "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why});
                         self.ticket_audit("ticket_slot_failure", with(json!({"session": sid, "dest": dest, "locked": locked}), held_less.clone()));
                     }
-                } else if locked == 0 && outage_failed > 0 && s.outage_round(self.engine.now()) {
-                    // nothing locked, for an outage: a short wait (prepaid tickets meanwhile), the pool as it was
+                } else if outage_failed > 0 && s.outage_round(self.engine.now()) {
+                    // tickets that failed for an outage, whether or not others locked: a short wait before the missing
+                    // ones are tried again (prepaid tickets meanwhile, where the seller sells them), the pool as it was
                     st.commit(&[s.row()])?;
                     self.ticket_audit("ticket_outage_round", json!({"session": sid, "dest": dest, "failed": outage_failed, "pool": s.pool,
                                                                     "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why}));

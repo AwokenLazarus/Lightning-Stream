@@ -1721,6 +1721,13 @@ impl Book {
     /// session with the seller starts with its smaller pool, its count of failed rounds and what
     /// is left of its wait, so that stopping a session and opening another does not try at once
     /// what just failed.
+    /// The latest wait of an earlier session with this payee after a round that failed in an outage ([`OUTAGE_HOLD`]),
+    /// if it is not over: a new session waits it out too (the wait only; its pool is its own), so that stopping one
+    /// session and opening another does not send a failing round each call.
+    pub fn outage_hold(&self, payee: &str, now: f64) -> Option<f64> {
+        self.sessions.values().filter(|s| s.payee == payee && s.hold_why == OUTAGE_HOLD && s.hold_until > now).map(|s| s.hold_until).reduce(f64::max)
+    }
+
     pub fn held_less(&self, payee: &str, now: f64) -> Option<&Session> {
         self.sessions.values().filter(|s| s.payee == payee && HOLD_SHORT.contains(&s.hold_why.as_str()) && s.hold_why != "ticket_dust")
             .filter(|s| s.hold_until > now - SLOT_WAIT_MAX_S).max_by(|a, b| a.hold_until.total_cmp(&b.hold_until).then_with(|| a.opened_ts.total_cmp(&b.opened_ts)))

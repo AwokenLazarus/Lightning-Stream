@@ -790,6 +790,8 @@ struct PayState {
     /// The next sends find the channel's peer gone: each takes the channel out for `drop_for` from then (inactive
     /// in the listing, and a payment fails as the real node says it, with no balance), and it comes back by itself.
     drop_at_send: usize,
+    /// Sends let through before `drop_at_send` takes the channel out (a round of which some lock and some do not).
+    drop_skip: usize,
     drop_for: Duration,
     out_until: Option<Instant>,
     /// The next payment fails each time it is sent, as to a hop that stays full; `failing` is its hash.
@@ -1077,8 +1079,12 @@ impl LnBackend for PayLn {
         }
         // its own channel down: as the real node says it, no balance, and no attempt on its record
         if s.drop_at_send > 0 {
-            s.drop_at_send -= 1;
-            s.out_until = Some(Instant::now() + s.drop_for);
+            if s.drop_skip > 0 {
+                s.drop_skip -= 1;
+            } else {
+                s.drop_at_send -= 1;
+                s.out_until = Some(Instant::now() + s.drop_for);
+            }
         }
         let down = s.channel["active"] != true || s.out_until.is_some_and(|u| Instant::now() < u);
         let failing = down || s.no_route || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.hop_full || s.fail_next > 0 || s.failing.as_deref() == Some(hash.as_str()) || s.fail_also.contains(&hash);
@@ -6597,6 +6603,77 @@ fn a_full_channel_soon_after_an_outage_is_counted_once_the_minute_is_over() {
     assert_eq!((s["pool"].as_i64(), s["slot_fails"].as_i64(), s["hold_why"].as_str()), (Some(1), Some(1), Some("ticket_slots")), "past the minute: {s}");
     assert_eq!(r.audit("ticket_slot_failure").len(), 1);
     // nothing was paid for a failed ticket, and the money is one number
+    r.assert_booked();
+}
+
+/// A seller with no prepaid tickets, and the channel out as the first round is sent: the call is refused for the
+/// outage, said as such. Within the minute after it the seller's route is full too (its peer up): calls that open new
+/// sessions wait out the 30 s after the outage's round rather than each sending a round that fails, and once the 30 s
+/// are over one round is tried, fails, and the wait starts again. At most one failed round each 30 s, across calls.
+///
+/// FAILS with the wait kept on the session alone: each new call's session sends a round of 2 failed payments.
+#[test]
+fn a_seller_without_prepaid_tickets_is_tried_once_each_30_s_after_an_outage_across_calls() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, held_only_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.drop_at_send = 2;
+        s.drop_for = Duration::from_secs(2);
+    }
+    let first = r.pay("/page/1000", CALL);
+    assert_eq!(first["rule"].as_str(), Some("ticket_outage"), "{first}");
+    assert!(first["reason"].as_str().unwrap_or("").contains("the channel to the seller was out a moment ago"), "said as an outage: {first}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 2);
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(2));
+    // the route full meanwhile, the peer up: any round sent now fails
+    r.ln.st.lock().unwrap().fail_next = 100;
+    for _ in 0..4 {
+        let v = r.pay("/page/1000", CALL);
+        assert_eq!(v["rule"].as_str(), Some("ticket_outage"), "{v}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(r.ln.by_status("FAILED").len(), 2, "no round sent within the 30 s, whatever the calls");
+    // past the 30 s (and inside the minute): one round is tried, fails, and the wait starts again
+    std::thread::sleep(Duration::from_secs(31).saturating_sub(started.elapsed()));
+    for _ in 0..4 {
+        let v = r.pay("/page/1000", CALL);
+        assert_eq!(v["verdict"].as_str(), Some("deny"), "{v}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert_eq!(r.ln.by_status("FAILED").len(), 4, "one round of 2 in the second 30 s, not one a call");
+    r.ln.st.lock().unwrap().fail_next = 0;
+    r.assert_booked();
+}
+
+/// The channel's peer drops in the middle of a round: one ticket locks and the other fails for the outage. The
+/// session holds as many as before and waits 30 s before it tries the missing one again, rather than at every refill.
+///
+/// FAILS with a wait only after a round that locked nothing: the refill tries the missing ticket at once, and again.
+#[test]
+fn a_round_partly_locked_in_an_outage_waits_before_it_tries_the_missing_ticket_again() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.drop_skip = 1;
+        s.drop_at_send = 1;
+        s.drop_for = Duration::from_secs(2);
+    }
+    let v = r.pay("/page/1000", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 1, "one of the round's two failed in the outage: {v}");
+    let s = session_of(&r, &v);
+    assert_eq!((s["pool"].as_i64(), s["slot_fails"].as_i64(), s["hold_why"].as_str()), (Some(2), Some(0), Some("ticket_outage")), "{s}");
+    let sent = r.ln.state().payments.len();
+    // calls from the balance meanwhile, and the watcher: the missing ticket is not tried again during the wait
+    for _ in 0..5 {
+        assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+        r.tick();
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    assert_eq!(r.ln.state().payments.len(), sent, "no send during the wait");
     r.assert_booked();
 }
 
