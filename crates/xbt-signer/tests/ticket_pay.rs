@@ -13947,18 +13947,29 @@ fn a_win_that_fails_twice_in_one_drop_is_paid_before_the_call_returns() {
 #[test]
 fn the_wait_for_a_route_has_its_whole_8_s_after_a_slow_nodes_checks() {
     let _g = env_lock();
-    let r = patient_draws_rig(json!({}));
-    {
-        let mut st = r.ln.st.lock().unwrap();
-        st.decode_takes = Duration::from_secs(5);
-        st.no_route_at_query = 1;
-        st.no_route_for = Duration::from_secs(5);
-    }
-    let size = 64 * PIECE;
-    let v = r.pay(&format!("/pieces/{size}"), 1_000);
-    r.ln.st.lock().unwrap().decode_takes = Duration::ZERO;
-    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the window was met: {v}");
-    assert!(!v.to_string().contains("ln_no_route"), "the wait had its 8 s: {v}");
+    let size = 256 * PIECE;
+    // the moment opens at the first win's route query: a draw with no win never meets it, and is drawn again
+    let mut tries = 0;
+    let (r, v) = loop {
+        tries += 1;
+        let r = patient_draws_rig(json!({}));
+        {
+            let mut st = r.ln.st.lock().unwrap();
+            st.decode_takes = Duration::from_secs(5);
+            st.no_route_at_query = 1;
+            st.no_route_for = Duration::from_secs(5);
+        }
+        let v = r.pay(&format!("/pieces/{size}"), 1_000);
+        r.ln.st.lock().unwrap().decode_takes = Duration::ZERO;
+        if r.ln.st.lock().unwrap().route_queries > 0 || tries == 5 {
+            break (r, v);
+        }
+    };
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "the window was met, in {tries} draws: {v}");
+    // the payment that met the moment waited it out: no refusal for want of a route, not even one tried again later
+    let refused: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ln_no_route").collect();
+    assert!(refused.is_empty(), "the wait had its 8 s after the checks, and none ran out: {refused:?}");
+    assert!(!r.audit("ticket_route_waited").is_empty(), "the payment waited for the route: {v}");
     assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(200), Some(true), Some(0)), "{v}");
     assert_wins(&r, v["wins_paid"].as_u64().unwrap());
