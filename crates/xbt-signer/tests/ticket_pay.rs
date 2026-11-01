@@ -399,6 +399,8 @@ struct SellerNode {
     backdate: AtomicU64,
     /// The invoices made just after a cancel, in order: a win's next invoice, where the buyer asked.
     reinvoiced: Mutex<Vec<String>>,
+    /// Every invoice it made, with when.
+    made: Mutex<Vec<(String, Instant)>>,
     cancelled: AtomicBool,
     /// What the seller's node was given to settle: the buyer's node learns the preimage from it.
     preimages: Arc<Mutex<HashMap<String, String>>>,
@@ -429,6 +431,7 @@ impl SellerNodeApi for SellerNode {
         if self.cancelled.swap(false, Ordering::SeqCst) {
             self.reinvoiced.lock().unwrap().push(hex::encode(hash));
         }
+        self.made.lock().unwrap().push((hex::encode(hash), Instant::now()));
         let lie = *self.lie.lock().unwrap();
         let key = if lie == Lie::OtherPayee { SecretKey::from_slice(&[0x44; 32]).unwrap() } else { self.key };
         let msat = if lie == Lie::OtherAmount { msat + 1 } else { msat };
@@ -615,7 +618,7 @@ impl Shop {
         let key = SecretKey::from_slice(&[0x33; 32]).unwrap();
         let standin = Arc::new(StandIn::new(H0 as u32));
         standin.set_identity(&node_id(&key), &["regtest"]);
-        let node = Arc::new(SellerNode { inner: standin.clone(), key, clock: clock.clone(), backdate: AtomicU64::new(0), reinvoiced: Mutex::new(vec![]), cancelled: AtomicBool::new(false), preimages: Arc::new(Mutex::new(HashMap::new())), lie: Mutex::new(Lie::None) });
+        let node = Arc::new(SellerNode { inner: standin.clone(), key, clock: clock.clone(), backdate: AtomicU64::new(0), reinvoiced: Mutex::new(vec![]), made: Mutex::new(vec![]), cancelled: AtomicBool::new(false), preimages: Arc::new(Mutex::new(HashMap::new())), lie: Mutex::new(Lie::None) });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = tempfile::tempdir().unwrap();
@@ -755,6 +758,8 @@ impl Node for FundNode {
 #[derive(Default)]
 struct PayState {
     payments: Vec<Value>,
+    /// When each of `payments` was sent, in the same order.
+    sent_at: Vec<Instant>,
     next_index: u64,
     channel: Value,
     down: bool,
@@ -1018,6 +1023,7 @@ impl LnBackend for PayLn {
                        "fee_msat": "0", "payment_preimage": pre, "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                        "failure_reason": "FAILURE_REASON_NONE", "htlcs": []});
         s.payments.push(p.clone());
+        s.sent_at.push(Instant::now());
         Ok(p)
     }
 
@@ -1073,6 +1079,7 @@ impl LnBackend for PayLn {
                        "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late, "stranded": stranded,
                        "arrives_at": arrives_at, "invoice_expires": d.timestamp + d.expiry_s, "amount_msat": d.amount_msat});
         s.payments.push(p.clone());
+        s.sent_at.push(Instant::now());
         if arrives && !late && !stranded && s.unseen_next > 0 {
             s.unseen_next -= 1;
             let until = Instant::now() + s.unseen_for;
@@ -1165,6 +1172,7 @@ impl LnBackend for PayLn {
                            "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                            "failure_reason": reason, "htlcs": []});
             s.payments.push(p.clone());
+            s.sent_at.push(Instant::now());
             return Ok(p);
         }
         if !self.seller.pay_offer_invoice(&raw, d.amount_msat) {
@@ -1176,6 +1184,7 @@ impl LnBackend for PayLn {
                        "fee_msat": FEE_MSAT.to_string(), "payment_preimage": pre, "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                        "failure_reason": "FAILURE_REASON_NONE", "htlcs": []});
         s.payments.push(p.clone());
+        s.sent_at.push(Instant::now());
         Ok(p)
     }
 
@@ -13124,8 +13133,23 @@ fn a_win_on_its_next_invoice_goes_before_the_wins_waiting() {
     let at = |h: &str| payments.iter().rposition(|p| p == h).unwrap();
     let (failed_at, paid_at) = (at(&failing), at(next["hash"].as_str().unwrap()));
     assert!(payments.len() - paid_at > 40, "many waited behind it: paid at {paid_at} of {}", payments.len());
-    assert!(paid_at - failed_at < payments.len() / 2, "it did not wait behind them: failed at {failed_at}, paid at {paid_at}, of {}", payments.len());
+    // counted from when the seller made the next invoice, not from the failure: how long the seller takes to
+    // make it (until the old one's time is up) is the seller's and the machine's, and no order of the
+    // wallet's. From then on, the payments sent before it are those already on their way and at most a
+    // gate's width more
+    let made = r.more.iter().chain(std::iter::once(&r.shop)).find_map(|shop| {
+        shop.node.made.lock().unwrap().iter().find(|(h, _)| h == next["hash"].as_str().unwrap()).map(|(_, at)| *at)
+    }).expect("the seller made the next invoice");
+    let made_at = r.ln.st.lock().unwrap().sent_at.iter().filter(|s| **s < made).count();
+    let behind = paid_at - made_at.min(paid_at);
+    eprintln!("priority: failed at {failed_at}, next invoice made at {made_at}, paid at {paid_at}, of {}: {behind} sent between", payments.len());
+    assert!(behind <= NEXT_INVOICE_BEHIND_MOST, "it waited behind the wins queued: {behind} payments were sent between the seller's next invoice \
+             (made when {made_at} had been sent) and its payment (at {paid_at}, of {}; it failed at {failed_at})", payments.len());
 }
+
+/// How many payments may go between a win's next invoice and its payment: the gate's 8, sent before the
+/// invoice came, and as many again whose turn was taken as it came.
+const NEXT_INVOICE_BEHIND_MOST: usize = 16;
 
 /// A stop ends the wait for a channel at once, on a prepaid ticket's path and a held one's.
 ///
