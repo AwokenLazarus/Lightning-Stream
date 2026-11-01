@@ -1997,9 +1997,14 @@ impl Signer {
         // a win whose invoice would end before its payment could arrive is held back, never sent: asked here, and again
         // just before it is booked and sent, after every wait between (the route's, the spend lock's), in which an
         // invoice near its end can pass its margin
+        // a prepaid ticket (no win) is held to the 5 s every prepaid invoice must have left, asked again after the waits too
         let too_late = |now: f64| -> Option<Value> {
-            win?;
-            let (left, margin) = (inv.expires_at() as f64 - now, self.ticket_pace.send_margin(inv.expiry_s as f64));
+            let left = inv.expires_at() as f64 - now;
+            if win.is_none() {
+                return (left < ticket::PREPAID_EXPIRY_MARGIN_S).then(|| with(refuse(&hash, "ticket_expiry", "the invoice has expired, or does within 5 s".into()),
+                                                                             json!({"hash": hash, "unsent": true})));
+            }
+            let margin = self.ticket_pace.send_margin(inv.expiry_s as f64);
             (left < margin).then(|| with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it \
                                                                                  would have ended first (held to {margin:.0} s)")),
                                          json!({"hash": hash, "unsent": true})))

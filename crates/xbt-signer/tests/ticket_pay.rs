@@ -7530,11 +7530,18 @@ fn a_seller_with_a_short_grace_is_paid_before_twenty_that_can_wait() {
             let invoiced = r.shop.node.preimages.lock().unwrap().len();
             invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
         });
-        let short_one = sc.spawn(|| buy(&r.shop)).join().unwrap();
+        // a file of 64 pieces at one win in four draws none 1 time in 10^8: one that does is drawn again, in its session
+        let mut short_one = Value::Null;
+        for _ in 0..3 {
+            short_one = sc.spawn(|| buy(&r.shop)).join().unwrap();
+            if short_one["wins"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+        }
         (short_one, others.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>())
     });
     let wins = short_one["wins"].as_u64().unwrap_or(0);
-    assert!(wins >= 1, "a file of 64 pieces that drew no win: {short_one}");
+    assert!(wins >= 1, "three files of 64 pieces that drew no win: {short_one}");
     // the test's clock stands still, so no seller's grace runs out here: what is measured is the order. Each of the short
     // seller's wins is paid within a few gate widths of the seller making its invoice (the wins the wallet already had in
     // hand when it came go too), not behind the 120 waiting
@@ -13365,6 +13372,41 @@ fn a_win_whose_invoice_runs_out_while_it_waits_for_a_route_is_not_sent() {
     assert!(!held.is_empty(), "the win was held back when it was looked at again: {v}");
     assert_eq!((v["complete"].as_bool(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), v["wins"].as_u64(), Some(0)), "{v}");
     assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
+/// A prepaid ticket's invoice with 7 s left when the seller makes it (more than the 5 s every prepaid invoice must have),
+/// and the node finds no route to the seller for a moment, in which 9 s pass: asked again after the wait, the invoice
+/// has under 5 s left and is not sent. The next invoice is paid, nothing failed, and the money is one number.
+///
+/// FAILS with only wins asked again after the waits: the prepaid ticket is sent on an invoice that has run out.
+#[test]
+fn a_prepaid_ticket_whose_invoice_runs_out_while_it_waits_for_a_route_is_not_sent() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    // no slot for a held ticket (half the channel's 30 carry the node's own routing): the wallet buys prepaid ones
+    r.ln.st.lock().unwrap().foreign = 15;
+    // the seller's invoices of 60 s are dated so that each has 7 s left when it is made
+    r.shop.node.backdate.store(52, Ordering::SeqCst);
+    {
+        let mut st = r.ln.st.lock().unwrap();
+        st.no_route_at_query = 1;
+        st.no_route_for = Duration::from_secs(2);
+    }
+    let v = std::thread::scope(|sc| {
+        let call = sc.spawn(|| r.pay("/page/1000", CALL));
+        wait_for("the prepaid ticket's wait for a route", || r.ln.st.lock().unwrap().no_route_answers > 0);
+        r.clock.fetch_add(9, Ordering::SeqCst);
+        call.join().unwrap()
+    });
+    let held: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ticket_expiry").collect();
+    assert!(!held.is_empty(), "the prepaid ticket was held back when it was looked at again: {v}");
+    assert!(held.iter().all(|e| e["win"].is_null() && e["prepaid"] == true), "{held:?}");
+    let sent: Vec<String> = ["SUCCEEDED", "IN_FLIGHT", "FAILED"].iter().flat_map(|s| r.ln.by_status(s)).filter_map(|p| p["payment_hash"].as_str().map(str::to_string)).collect();
+    for e in &held {
+        assert!(!sent.iter().any(|h| Some(h.as_str()) == e["payment_hash"].as_str()), "an invoice held back reached the node: {e}");
+    }
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    r.assert_booked();
 }
 
 /// The wallet says at the open that it asks for a failed win's invoice to be cancelled, and a seller that gives such a

@@ -696,6 +696,8 @@ impl Signer {
         let mut c = lock(counted);
         match out.get("verdict").and_then(Value::as_str) {
             Some("allow") => {
+                // paid: its place in the gate's order is no longer needed, and a long session keeps no entry per win
+                s.seen_at.remove(&win.draw());
                 s.wins_paid += 1;
                 s.paid_sats = s.paid_sats.saturating_add(charged);
                 c.wins_paid += 1;
@@ -722,7 +724,9 @@ impl Signer {
                 }
             }
             // the book has a payment for this win already: it is paid, or being paid, and this invoice is not
-            _ if rule == "lottery_win_paid" => {}
+            _ if rule == "lottery_win_paid" => {
+                s.seen_at.remove(&win.draw());
+            }
             _ => {
                 // whatever such an answer booked left all the same (an answer that books says pending; this one is for
                 // any that did not)
