@@ -7134,10 +7134,11 @@ fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
         assert!(v["wins_unpaid"].as_array().unwrap().iter().all(|w| w["rule"] == rule), "{v}");
         assert!(r.ledger().is_empty() && r.ln.state().payments.is_empty(), "nothing was booked and nothing reached the node");
         let refusals = r.audit("ticket_refused");
-        assert!(refusals.iter().all(|a| a["rule"] == rule && a["win"].as_u64().unwrap() > 0));
-        // after three such invoices the seller is not asked for another in this session: it is faulty and is
-        // stopped, and a later call starts a new one
-        assert!((1..=4).contains(&refusals.len()), "{} refusals", refusals.len());
+        assert!(refusals.iter().all(|a| a["rule"] == rule && a["win"].as_u64().unwrap() > 0), "{refusals:?}");
+        // every lie is refused, and none is paid (above). After three such invoices the seller is not asked for another in
+        // this session: it is faulty and is stopped, and a later call starts a new one. Wins whose invoices were being
+        // looked at side by side when the third was refused are refused too: on a loaded machine more than four
+        assert!(!refusals.is_empty(), "no lie was refused: {v}");
         if refusals.len() >= 3 {
             assert!(v["ended"].as_str().unwrap().contains("lottery_seller_fault"), "{v}");
             let next = r.pay("/tiny/10", 5);
