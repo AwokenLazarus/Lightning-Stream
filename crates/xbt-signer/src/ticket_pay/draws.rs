@@ -918,8 +918,10 @@ impl Signer {
     /// count against the seller's terms: they go through the gate before the wins no seller waits
     /// for. A seller serves on beside `maxUnpaidWins` unpaid wins, and beside a win for
     /// `gracePieces` pieces after it; beyond either its answer stands still, for 15 s at the
-    /// gateway as shipped (`refill_wait`), and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
-    /// that are above that number go first; and a win goes first when the pieces the wallet has
+    /// gateway as shipped (`refill_wait`), and is then cut short. So from `maxUnpaidWins` unpaid on, the oldest go first, as
+    /// many as bring the count below it: the next win would stop the seller, and a win waiting behind a hundred others' would
+    /// not be paid within those 15 s (seen on a loaded lab: two wins at the count, a third found, and the answer cut); and a
+    /// win goes first when the pieces the wallet has
     /// given values for since it are within the seller's `window` of `gracePieces` (the seller is
     /// that many pieces ahead of the wallet's values at the most). Called while an answer is being
     /// read: of an answer that is over, no piece waits for a payment.
@@ -931,7 +933,8 @@ impl Signer {
             }
             let mut unpaid: Vec<u64> = s.owed.iter().map(Win::draw).chain(s.paying.iter().copied()).collect();
             unpaid.sort_unstable();
-            let above = unpaid.len().saturating_sub(ds.terms.max_unpaid_wins as usize);
+            // at the seller's count already, not only past it: the next win would stand it still
+            let above = (unpaid.len() + 1).saturating_sub(ds.terms.max_unpaid_wins as usize);
             let issued = s.buyer.as_ref().map_or(0, Buyer::issued);
             let far = u64::from(ds.terms.grace_pieces).saturating_sub(u64::from(ds.terms.window));
             unpaid.iter().enumerate().filter(|(i, d)| *i < above || issued.saturating_sub(**d) >= far).map(|(_, d)| *d).filter(|d| s.paying.contains(d)).collect()

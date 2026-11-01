@@ -7443,6 +7443,54 @@ fn a_strict_seller_behind_twenty(stands_still: u64, hold: bool, sync_ms: u64) ->
     (r, strict_one, others, before)
 }
 
+/// A seller that bears 2 unpaid wins (as shipped), beside 20 that wait for theirs as long as you like and whose wins
+/// are due first by their grace of 2 s: the payments wait while the first seller has 2 wins unpaid, at its count but
+/// not past it. Its wins go first all the same, before the next win stands its answer still: the first of them is
+/// paid among the first payments, not behind the 120 others waiting.
+///
+/// FAILS with only wins past the count hurried: the 2 wait behind the others' wins, due sooner.
+#[test]
+fn wins_at_the_sellers_count_go_first_before_the_next_stands_it_still() {
+    let _g = env_lock();
+    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 30}});
+    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000,
+                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
+    let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.send_takes = Duration::from_millis(1_000);
+        s.hold_sends = true;
+    }
+    let size = 64 * PIECE;
+    let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    let strict_one = std::thread::scope(|sc| {
+        let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
+        wait_for_rig("120 wins waiting at the gate", || {
+            let invoiced = r.shop.node.preimages.lock().unwrap().len();
+            invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
+        });
+        let strict_file = sc.spawn(|| buy(&r.shop));
+        // nothing is sent until the strict seller has 2 wins unpaid: its count, its answer still served
+        wait_for_rig("the strict seller's second win", || {
+            r.status()["paying"].as_array().into_iter().flatten().any(|p| p["origin"] == r.shop.origin.as_str() && p["wins"].as_u64() >= Some(2))
+        });
+        r.ln.st.lock().unwrap().hold_sends = false;
+        let v = strict_file.join().unwrap();
+        r.ln.st.lock().unwrap().send_takes = Duration::ZERO;
+        for t in others {
+            t.join().unwrap();
+        }
+        v
+    });
+    let paid = r.audit("lottery_win_paid");
+    let before = paid.iter().position(|a| a["session"] == strict_one["session"]).unwrap_or(usize::MAX);
+    eprintln!("at the count: the strict seller's first win paid after {before} others");
+    assert!(before <= 16, "the strict seller's first win was paid after {before} of the others' wins, not first: {strict_one}");
+    assert_eq!((strict_one["complete"].as_bool(), strict_one["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(0)), "{strict_one}");
+}
+
 /// A seller whose grace is short (10 s, and 1 s more once its answer stands still) and who bears any number of
 /// unpaid wins, beside 20 that give 600 s: its wins are paid before the 120 of theirs that wait at the gate when it
 /// starts, by when each seller's grace ends, and its file is whole. The wallet's own count never hurries such a
