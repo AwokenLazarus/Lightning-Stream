@@ -98,6 +98,10 @@ A public test release. What is new since 0.1.19, in short; the sections below gi
   and carries on. It never retries a session the seller faulted or one you stopped, and never pays
   twice for the same bytes. If a seller ignores a byte range and sends the whole file, the wallet
   closes at once; the unread part costs at most what was already on its way.
+- A channel outage is no longer taken for a full route. Before, the payments that failed while your
+  channels were down halved the tickets your wallet holds with that seller, for this session and the
+  next, for up to ten minutes. Now the wallet waits 30 s and pays from prepaid tickets meanwhile, then
+  holds as many as before. A route that really is full is still counted as before.
 - On a busy wallet, lottery wins are now paid nearest-deadline first. A seller's unpaid wins are
   hurried as soon as it reaches its limit. Every invoice is checked again just before it is sent, so
   none goes out about to expire. A 0.2.0 wallet tells a 0.2.0 seller it can cancel, and gets win
