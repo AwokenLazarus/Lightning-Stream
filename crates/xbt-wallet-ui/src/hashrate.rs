@@ -961,12 +961,15 @@ fn rent_status(st: &Value, here: bool, set_up: bool) -> (&'static str, &'static 
                 format!("Rented work goes to the {NAME} that comes with this app. It masks its jobs, so a hashmaker can't keep back the shares that \
                     would be blocks. Choose below where its blocks pay: solo, to an address of yours, or through Lazarus Pool. Renting starts once it runs."));
     }
-    if on_bundled && b["running"] != true {
+    // the bundled gateway's own state first: its jobs' generic words ("can't be checked: … doesn't answer") are never
+    // shown for it while it isn't up or has no work from the node
+    let bstate = b["state"].as_str().unwrap_or("");
+    if on_bundled && (b["running"] != true || bstate == "not running") {
         return ("bad", "Your gateway isn't running",
                 format!("The {NAME} starts a few seconds after its settings are saved. If it doesn't, restart Lightning Stream. Renting stays off \
                     until then, and nothing is paid."));
     }
-    if on_bundled && b["node"] != true {
+    if on_bundled && (b["node"] != true || bstate == "waiting for the node") {
         return ("warn", "Your gateway is waiting for your node",
                 format!("The {NAME} runs, but it has no work from your XBT node yet. Check that the node is running and synced. Renting stays off \
                     until then, and nothing is paid."));

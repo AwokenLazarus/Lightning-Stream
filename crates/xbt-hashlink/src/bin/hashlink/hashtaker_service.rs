@@ -349,6 +349,17 @@ fn bundled_status(addr: &str, api: Option<&str>, in_use: bool, stratum: Option<b
            "mode": blinding.filter(|_| masking).and_then(|b| b["why"].as_str())})
 }
 
+/// What the renter's page says for the bundled gateway in a state that has nothing to do with its jobs' masking.
+fn bundled_words(state: &str) -> Option<&'static str> {
+    match state {
+        "not running" => Some("The Stream Gateway (DATUM-compatible) isn't running yet: it starts a few seconds after its settings are \
+                               saved on the Hashrate page. Rentals wait for it, and nothing is paid"),
+        "waiting for the node" => Some("The Stream Gateway (DATUM-compatible) is waiting for your node: it has no work from it yet. Check \
+                                        that your XBT node is running and synced. Rentals wait for it, and nothing is paid"),
+        _ => None,
+    }
+}
+
 /// Look at what the upstream's jobs show, with no lock held for it.
 fn look_at_upstream(r: &Mutex<R>) -> Option<xbt_hashlink::blind::Shown> {
     let (datum, api, user) = {
@@ -406,6 +417,12 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                 let in_use = b == datum;
                 bundled_status(&b, bapi.as_deref(), in_use, if in_use { Some(datum_reachable) } else { None }, if in_use { blinding.as_ref() } else { None })
             });
+            // the bundled gateway not up yet, or up with no work from the node: said as that, not as a job that
+            // can't be checked at an address that doesn't answer
+            let blinding = match bundled.as_ref().filter(|b| b["inUse"] == true).and_then(|b| bundled_words(b["state"].as_str().unwrap_or(""))) {
+                Some(w) => Some(json!({"state": "can't be checked", "why": w, "words": w, "bundled": true})),
+                None => blinding,
+            };
             (200, json!({
                 "role": "renter", "datum": {"addr": datum, "api": api, "reachable": datum_reachable, "found": found, "movedFrom": moved_from},
                 "bundled": bundled, "blinding": blinding,
@@ -486,14 +503,29 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     if datum.is_empty() {
         return (400, json!({"error": "no gateway set: rented hashrate goes to your own gateway"}));
     }
+    // the bundled gateway's own words when it isn't up, or has no work from the node yet
+    let bundled_said = |shown: Option<&Value>| -> Option<&'static str> {
+        let g = lock(r);
+        if g.bundled.as_deref() != Some(datum.as_str()) {
+            return None;
+        }
+        let api = g.api();
+        drop(g);
+        bundled_words(bundled_status(&datum, api.as_deref(), true, None, shown)["state"].as_str().unwrap_or(""))
+    };
     if !reachable(&datum) {
-        return (400, json!({"error": format!("your gateway at {datum} does not answer")}));
+        let e = bundled_said(None).map(str::to_string).unwrap_or_else(|| format!("your gateway at {datum} does not answer"));
+        return (400, json!({"error": e}));
     }
     // looked at again now: this is the money's last chance to stay home
     let allow_unblinded = lock(r).allow_unblinded;
     if !allow_unblinded {
         match look_at_upstream(r) {
-            Some(shown) if !shown.may_rent() => return (409, json!({"error": shown.words(), "blinding": shown.to_json()})),
+            Some(shown) if !shown.may_rent() => {
+                let j = shown.to_json();
+                let e = bundled_said(Some(&j)).map(str::to_string).unwrap_or_else(|| shown.words());
+                return (409, json!({"error": e, "blinding": j}));
+            }
             _ => {}
         }
     }
@@ -741,6 +773,64 @@ mod tests {
         assert_eq!((unmasked["state"].as_str(), &unmasked["node"]), (Some("not masking"), &json!(true)));
         let other = bundled_status("127.0.0.1:1", Some("127.0.0.1:1"), false, None, None);
         assert_eq!((other["state"].as_str(), &other["inUse"]), (Some("not running"), &json!(false)));
+    }
+
+    /// The bundled gateway up (its API answers) with no Stratum yet, its old look saying "doesn't answer": the status says
+    /// it waits for the node, in the gateway's words; with nothing up at all, that it isn't running.
+    #[test]
+    fn a_bundled_gateway_waiting_for_its_node_is_said_as_that() {
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_addr = api.local_addr().unwrap().to_string();
+        // a Stratum port nothing listens on
+        let stratum = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+        let r = test_r(&stratum, Some(api_addr.clone()));
+        lock(&r).shown = Some((stratum.clone(), xbt_hashlink::blind::Shown::Unverifiable(format!("{stratum} doesn't answer")), xbt_hashlink::now_ms()));
+        let (_, st) = handle(&r, &[], "GET", "/status", b"");
+        assert_eq!(st["bundled"]["state"], "waiting for the node", "{st}");
+        let words = st["blinding"]["words"].as_str().unwrap();
+        assert!(words.contains("is waiting for your node") && !words.contains("doesn't answer") && !words.contains("can't be checked"), "{words}");
+        assert_eq!(st["blinding"]["state"], "can't be checked", "renting still waits");
+        // a rent asked for anyway is refused in the same words
+        let (code, v) = handle(&r, &[], "POST", "/rent", br#"{"linkKey": "02bb", "budgetSats": 100}"#);
+        assert_eq!(code, 400);
+        assert!(v["error"].as_str().unwrap().contains("waiting for your node"), "{v}");
+        // nothing up: not running
+        drop(api);
+        let (_, st) = handle(&r, &[], "GET", "/status", b"");
+        assert_eq!(st["bundled"]["state"], "not running");
+        assert!(st["blinding"]["words"].as_str().unwrap().contains("isn't running yet"));
+        // another gateway in use: its own look's words, untouched
+        lock(&r).datum = "127.0.0.1:1".into();
+        let (_, st) = handle(&r, &[], "GET", "/status", b"");
+        assert!(st["blinding"].is_null() || st["blinding"]["bundled"].is_null(), "{st}");
+    }
+
+    fn test_r(bundled: &str, api: Option<String>) -> Arc<Mutex<R>> {
+        Arc::new(Mutex::new(R {
+            key: SecretKey::from_slice(&[7u8; 32]).unwrap(),
+            datum: bundled.into(),
+            datum_api: None,
+            bundled: Some(bundled.into()),
+            upstream_flag: None,
+            moved_from: None,
+            user: "rented".into(),
+            gateway_api: api,
+            allow_unblinded: false,
+            relays: vec![],
+            signer: None,
+            task: "hashrate".into(),
+            expect_node: None,
+            state: None,
+            offers: None,
+            authors: HashMap::new(),
+            history: None,
+            rentals: BTreeMap::new(),
+            iroh: None,
+            iroh_off: true,
+            iroh_relays: None,
+            failed_first: BTreeMap::new(),
+            shown: None,
+        }))
     }
 
     /// The page's switch: choosing a gateway saves it as chosen (kept across upgrades) and forgets the move.

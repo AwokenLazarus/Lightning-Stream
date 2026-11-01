@@ -4204,3 +4204,45 @@ fn without_the_bundled_gateway_renting_says_it_isnt_masking() {
     let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
     assert!(card[..card.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
 }
+
+/// StartOS (W7): the bundled gateway up, with no Stratum yet while it waits for the node. The rent page says it waits for
+/// the node, never the generic "can't be checked: ... doesn't answer", and a rent sent anyway comes back in the gateway's words.
+#[test]
+fn a_bundled_gateway_waiting_for_its_node_reads_as_that_not_as_an_address_that_doesnt_answer() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        // as an older renter (or a stale look) words it: the generic words; the bundled state is the truth
+        ("GET", "/status") => json!({"datum": {"addr": "127.0.0.1:23339", "reachable": false, "found": []},
+            "bundled": {"addr": "127.0.0.1:23339", "inUse": true, "running": true, "node": false, "masking": false, "state": "waiting for the node"},
+            "blinding": {"state": "can't be checked", "why": "127.0.0.1:23339 doesn't answer",
+                         "words": "This can't be checked: 127.0.0.1:23339 doesn't answer. Without a look inside its jobs nobody can say a hashmaker can't drop the shares that win, so rentals to this upstream are refused."},
+            "rentals": []}),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+    });
+    let st = xbt_wallet_ui::config::StreamGwSetup { rpcurl: Some("http://node:18443".into()), dir: gwdir.clone(), ..Default::default() };
+    xbt_wallet_ui::stream_gateway::write(&st, &xbt_wallet_ui::stream_gateway::Settings::new(xbt_wallet_ui::stream_gateway::Mode::Solo,
+                                         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"), "regtest").unwrap();
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Your gateway is waiting for your node") && p.body.contains("has no work from your XBT node yet"), "{}", p.body);
+    for generic in ["doesn&#39;t answer", "doesn't answer", "can&#39;t be checked", "can't be checked", "Can&#39;t reach", "Can't reach", "isn&#39;t running", "isn't running"] {
+        assert!(!p.body.contains(generic), "{generic}: {}", p.body);
+    }
+    let rows = &p.body[p.body.find("<ul class=\"plain\">").unwrap()..];
+    let rows = &rows[..rows.find("</ul>").unwrap()];
+    assert_eq!(rows.matches("pill good").count(), 1, "running, and not yet connected to the node: {rows}");
+    let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
+    assert!(card[..card.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
+}
