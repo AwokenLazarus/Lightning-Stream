@@ -2949,8 +2949,9 @@ impl Signer {
         self.ticket_pay_in(c, acc, prepaid_acc, lightning, true)
     }
 
-    /// [`Signer::ticket_pay`]. `again`: a call refused at its lock because the seller's places for the session are
-    /// taken, with nothing sent or paid for it, is made once more in another session ([`Signer::ticket_cap_full`]).
+    /// [`Signer::ticket_pay`]. `again`: a resume (a call with a `range`) whose session ended under it before anything
+    /// of it went out (the seller's places full, [`Signer::ticket_cap_full`], or the session forgotten by the seller) is
+    /// made once more in another session.
     fn ticket_pay_in(&self, c: &Call, acc: &Value, prepaid_acc: Option<&Value>, lightning: &str, again: bool) -> Tried {
         let terms = match PayTerms::parse(acc, lightning) {
             Ok(t) => t,
@@ -3142,33 +3143,46 @@ impl Signer {
             let _call = hs.calls.read().unwrap_or_else(|p| p.into_inner());
             self.ticket_request(&hs, c, &terms)
         };
+        // nothing of the call went to the seller or was paid: it was refused before its request left
+        let nothing = out.get("verdict").and_then(Value::as_str) != Some("allow") && out.get("status").is_none_or(Value::is_null)
+            && py_int(out.get("charged_sats")).unwrap_or(0) == 0 && out.get("bytes").is_none_or(|b| b.is_null() || b.as_u64() == Some(0));
         // only where the cap is what ended or refused this call: one that was served all the same (on credit taken over,
         // say) goes on in its session, and the pool's next round asks again
         let by_the_cap = ["ended", "reason"].iter().any(|k| out.get(*k).and_then(Value::as_str).is_some_and(|s| s.contains("too_many_tickets")));
+        let mut stopped = Value::Null;
         if hs.cap_full.swap(false, Ordering::SeqCst) && by_the_cap {
             hs.cap_full.store(true, Ordering::SeqCst);
-            if let Some(stopped) = self.ticket_cap_full(&hs) {
-                // the call itself was refused before anything of it went to the seller or was paid (a resume, say, after the
-                // call that ended in the outage): it is made again, once, in the session the next call would open
-                let nothing = out.get("verdict").and_then(Value::as_str) != Some("allow") && out.get("status").is_none_or(Value::is_null)
-                    && py_int(out.get("charged_sats")).unwrap_or(0) == 0 && out.get("bytes").is_none_or(|b| b.is_null() || b.as_u64() == Some(0));
-                if again && nothing {
-                    self.ticket_audit("ticket_cap_full_again", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee)}));
-                    return match self.ticket_pay_in(c, acc, prepaid_acc, lightning, false) {
-                        Tried::Done(mut v) => {
-                            if v.is_object() {
-                                v["session_stopped"] = stopped;
-                            }
-                            Tried::Done(v)
-                        }
-                        next => next,
-                    };
+            match self.ticket_cap_full(&hs) {
+                Some(s) => stopped = s,
+                None => {
+                    self.ticket_refill_later(&hs);
+                    return Tried::Done(out);
                 }
-                if out.is_object() {
-                    out["session_stopped"] = stopped;
-                }
-                return Tried::Done(out);
             }
+        }
+        // the session ended under a resume (a call that goes on from a byte, `range`), before anything of it went out: the
+        // seller's places for it were full (stopped just above), or the seller had forgotten it (`ticket_session_ended`,
+        // stopped as it was told). A resume after a channel's outage meets either. It is made again, once, in the session
+        // the next call would open. Any other call refused so is told why, and the next opens another, as before
+        let ended_under_it = !stopped.is_null() || out.get("rule").and_then(Value::as_str) == Some("ticket_session_ended");
+        if ended_under_it && nothing && again && c.range.is_some() {
+            self.ticket_audit("ticket_session_again", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee),
+                                                             "why": str_or_empty(out.get("rule"))}));
+            return match self.ticket_pay_in(c, acc, prepaid_acc, lightning, false) {
+                Tried::Done(mut v) => {
+                    if v.is_object() && !stopped.is_null() {
+                        v["session_stopped"] = stopped;
+                    }
+                    Tried::Done(v)
+                }
+                next => next,
+            };
+        }
+        if !stopped.is_null() {
+            if out.is_object() {
+                out["session_stopped"] = stopped;
+            }
+            return Tried::Done(out);
         }
         // the pool is filled again behind the call
         self.ticket_refill_later(&hs);

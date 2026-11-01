@@ -8081,7 +8081,7 @@ fn a_resume_refused_at_the_sellers_cap_is_made_again_in_another_session() {
     let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
                                          "if_range": part["etag"]}));
     r.tap.clear();
-    assert_eq!(r.audit("ticket_cap_full_again").len(), 1, "the resume was refused at the cap and made again: {on}");
+    assert_eq!(r.audit("ticket_session_again").len(), 1, "the resume was refused at the cap and made again: {on}");
     assert_eq!(on["session_stopped"]["session"].as_str(), Some(sid.as_str()), "{on}");
     assert_ne!(on["session"].as_str(), Some(sid.as_str()), "made again in another session: {on}");
     assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
@@ -8129,6 +8129,35 @@ fn a_session_the_seller_has_forgotten_is_ended_and_the_next_call_opens_another()
         r.ln.by_status("IN_FLIGHT").len() <= 2
     });
     assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
+}
+
+/// The seller forgot the session while the wallet's node was away (a channel's outage long enough), and the call that
+/// meets that is a resume, with nothing of it sent yet: the session is ended as before, and the resume is made again,
+/// once, in another session: a 206 of exactly the rest. (A call that is not a resume is still refused, as the test
+/// above says.)
+///
+/// FAILS without the second try: the resume is refused `ticket_session_ended`.
+#[test]
+fn a_resume_whose_session_the_seller_forgot_is_made_again_in_another_session() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    let n = 10 * MIB;
+    let part = r.pay(&format!("/files/{n}"), 1_000);
+    let got = part["bytes"].as_u64().unwrap() as usize;
+    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 5 * MIB), "{part}");
+    let sid = part["session"].as_str().unwrap().to_string();
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    r.clock.fetch_add(350, Ordering::SeqCst);
+    wait_for("the seller to cancel what the session held", || r.shop.held() == 0);
+    std::thread::sleep(Duration::from_millis(300));
+    let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
+                                         "if_range": part["etag"]}));
+    assert_eq!(r.audit("ticket_session_again").len(), 1, "{on}");
+    assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
+    assert_ne!(on["session"].as_str(), Some(sid.as_str()), "{on}");
+    let s = r.session(&sid);
+    assert_eq!(s["sessions"][0]["why"].as_str(), Some("the seller has forgotten the session"), "{s}");
+    r.assert_booked();
 }
 
 /// A Lightning Fork node that is killed as it sends a ticket's payment can go on calling that
