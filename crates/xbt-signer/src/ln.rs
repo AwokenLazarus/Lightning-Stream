@@ -291,9 +291,11 @@ pub trait LnBackend: Send + Sync {
     fn utxos(&self) -> Result<Vec<Value>>;
     /// `GET /v1/graph/routes/{payee}/{amt}` (QueryRoutes, `info:read`): whether the node finds a route of
     /// `amt_msat` to `payee` out through `outgoing_chan_id`, as its own payment would look for one
-    /// (mission control included). Nothing is sent. `Ok(false)` only for the node's own "no path";
-    /// any other failure to answer is an error.
-    fn has_route(&self, _payee: &str, _amt_msat: u64, _outgoing_chan_id: Option<&str>, _final_cltv: u64) -> Result<bool> {
+    /// (mission control included). With `route_hints` (the invoice's, as the node's decode gives them), the same
+    /// query by `POST` with them, so that a seller reached through a private channel is found as the payment
+    /// would find it. Nothing is sent. `Ok(false)` only for the node's own "no path"; any other failure to answer
+    /// is an error.
+    fn has_route(&self, _payee: &str, _amt_msat: u64, _outgoing_chan_id: Option<&str>, _final_cltv: u64, _route_hints: &[Value]) -> Result<bool> {
         Err(err("ln_backend", "this backend does not look for routes"))
     }
     /// Stream tickets, `POST /v2/router/send` for a hold invoice: the `Payment` as soon as it is
@@ -584,15 +586,26 @@ impl LnBackend for LndRest {
         Ok(self.get("/v1/channels")?.get("channels").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
-    fn has_route(&self, payee: &str, amt_msat: u64, outgoing_chan_id: Option<&str>, final_cltv: u64) -> Result<bool> {
+    fn has_route(&self, payee: &str, amt_msat: u64, outgoing_chan_id: Option<&str>, final_cltv: u64, route_hints: &[Value]) -> Result<bool> {
         if payee.len() != 66 || !payee.bytes().all(|c| c.is_ascii_hexdigit()) {
             return Err(err("ln_backend", "a route is looked for to a node key only"));
         }
-        let mut path = format!("/v1/graph/routes/{payee}/0?amt_msat={amt_msat}&final_cltv_delta={final_cltv}&use_mission_control=true");
-        if let Some(c) = outgoing_chan_id.filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())) {
-            path.push_str(&format!("&outgoing_chan_id={c}"));
-        }
-        match self.get(&path) {
+        let chan = outgoing_chan_id.filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()));
+        let asked = if route_hints.is_empty() {
+            let mut path = format!("/v1/graph/routes/{payee}/0?amt_msat={amt_msat}&final_cltv_delta={final_cltv}&use_mission_control=true");
+            if let Some(c) = chan {
+                path.push_str(&format!("&outgoing_chan_id={c}"));
+            }
+            self.get(&path)
+        } else {
+            // the query string cannot carry the hints: the node's POST form of the same query takes them in its body
+            let mut body = json!({"amt_msat": amt_msat.to_string(), "final_cltv_delta": final_cltv, "use_mission_control": true, "route_hints": route_hints});
+            if let Some(c) = chan {
+                body["outgoing_chan_id"] = c.into();
+            }
+            self.post(&format!("/v1/graph/routes/{payee}/0"), &body, 30)
+        };
+        match asked {
             Ok(v) => Ok(v.get("routes").and_then(Value::as_array).is_some_and(|r| !r.is_empty())),
             // the node's own word that it has no path: no route, and no error
             Err(e) if e.msg.contains("LN node HTTP") && e.seller.as_deref().is_some_and(|m| m.contains("unable to find a path")) => Ok(false),
@@ -2183,12 +2196,56 @@ mod tests {
         std::fs::write(&mac, [1u8, 2, 3]).unwrap();
         let ln = LndRest::new(&url, &mac, None).unwrap();
         let payee = format!("02{}", "ab".repeat(32));
-        assert!(ln.has_route(&payee, 64_000, Some("123"), 40).unwrap());
-        assert!(!ln.has_route(&payee, 64_000, None, 40).unwrap());
-        assert!(ln.has_route(&payee, 64_000, None, 40).is_err(), "a node that cannot answer is no 'no route'");
-        assert!(ln.has_route("not/a/key", 1, None, 40).is_err());
+        assert!(ln.has_route(&payee, 64_000, Some("123"), 40, &[]).unwrap());
+        assert!(!ln.has_route(&payee, 64_000, None, 40, &[]).unwrap());
+        assert!(ln.has_route(&payee, 64_000, None, 40, &[]).is_err(), "a node that cannot answer is no 'no route'");
+        assert!(ln.has_route("not/a/key", 1, None, 40, &[]).is_err());
         let asked = asked.lock().unwrap().clone();
         assert_eq!(asked[0], format!("/v1/graph/routes/{payee}/0?amt_msat=64000&final_cltv_delta=40&use_mission_control=true&outgoing_chan_id=123"));
         assert_eq!(asked.len(), 3);
+    }
+
+    #[test]
+    fn a_route_query_with_the_invoices_hints_goes_by_post_with_them() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, Value)>));
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            let mut len = 0;
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if h.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            *s2.lock().unwrap() = Some((line.split_whitespace().take(2).collect::<Vec<_>>().join(" "), serde_json::from_slice(&body).unwrap()));
+            let ok = r#"{"routes":[{"total_time_lock":150,"hops":[]}]}"#;
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok}", ok.len()).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mac = dir.path().join("m");
+        std::fs::write(&mac, [1u8, 2, 3]).unwrap();
+        let ln = LndRest::new(&url, &mac, None).unwrap();
+        let payee = format!("02{}", "ab".repeat(32));
+        let hints = vec![json!({"hop_hints": [{"node_id": format!("03{}", "cd".repeat(32)), "chan_id": "1099511693312", "fee_base_msat": 1000,
+                                               "fee_proportional_millionths": 1, "cltv_expiry_delta": 40}]})];
+        assert!(ln.has_route(&payee, 64_000, Some("123"), 40, &hints).unwrap());
+        let (line, body) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(line, format!("POST /v1/graph/routes/{payee}/0"));
+        assert_eq!((body["amt_msat"].as_str(), body["final_cltv_delta"].as_u64(), body["use_mission_control"].as_bool(), body["outgoing_chan_id"].as_str()),
+                   (Some("64000"), Some(40), Some(true), Some("123")));
+        assert_eq!(body["route_hints"], json!(hints));
     }
 }

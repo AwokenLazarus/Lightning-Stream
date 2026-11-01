@@ -788,7 +788,7 @@ struct PayState {
     no_route_until: Option<Instant>,
     no_route_answers: usize,
     /// The seller sits behind a private channel: the node's decode of its invoices shows a route hint, its
-    /// route query (which is not given the hint) finds no path, and a payment sent with the invoice arrives.
+    /// route query finds a path only when it is given that hint, and a payment sent with the invoice arrives.
     private_seller: bool,
     /// The next sends leave the node and are refused at a later hop: in flight at first, failed
     /// with no route when the node is asked again.
@@ -977,13 +977,14 @@ impl LnBackend for PayLn {
         Ok(out)
     }
 
-    fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64) -> xbt402::Result<bool> {
+    fn has_route(&self, _payee: &str, _amt_msat: u64, _chan: Option<&str>, _final_cltv: u64, hints: &[Value]) -> xbt402::Result<bool> {
         let mut s = self.st.lock().unwrap();
         s.route_queries += 1;
         if s.route_queries == s.no_route_at_query {
             s.no_route_until = Some(Instant::now() + s.no_route_for);
         }
-        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u) || s.private_seller;
+        // a seller behind a private channel is found only through the invoice's hints, as the real node finds it
+        let none = s.no_route || s.down || s.no_route_until.is_some_and(|u| Instant::now() < u) || (s.private_seller && hints.is_empty());
         s.no_route_answers += usize::from(none);
         Ok(!none)
     }
@@ -13521,25 +13522,22 @@ fn a_route_gone_for_good_ends_the_call_soon_with_its_reason() {
     assert_wins(&r, v["wins_paid"].as_u64().unwrap_or(0));
 }
 
-/// A seller behind a private channel (or an LSP) is reached by its invoice's route hints, which the node's route
-/// query is not given: the query finds no path, ever. Its invoices are sent at once, as before the route wait,
-/// on the ticket rail and for wins, and nothing waits or is refused for want of a route.
+/// A seller behind a private channel (or an LSP) is reached by its invoice's route hints: the wallet gives its node's
+/// route query the hints, which then finds the route the payment takes, and the invoice is paid at once, on the ticket
+/// rail and for wins, with no wait and no failure.
 ///
-/// FAILS with the route asked for every invoice: each waits out the 8 s and is refused `ln_no_route`, and the
-/// seller is never paid (the offers check of the lab, on real nodes, where the seller's one channel is private).
+/// FAILS with the query not given the hints: each invoice waits out the 8 s and is refused `ln_no_route`, and the seller
+/// is never paid (the offers check of the lab, on real nodes, where the seller's one channel is private).
 #[test]
 fn a_seller_behind_a_private_channel_is_paid_at_once_by_its_route_hints() {
     let _g = env_lock();
-    // prepaid tickets: each one an ordinary payment of the seller's invoice, the path the route wait is on
     let prepaid = json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
     let r = Rig::shipped(json!({}), 30, prepaid);
     r.ln.st.lock().unwrap().private_seller = true;
     let t = Instant::now();
     let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
-    assert!(r.ln.state().payments.iter().any(|p| p["status"] == "SUCCEEDED"), "a prepaid ticket was paid: {v}");
     assert!(t.elapsed() < Duration::from_secs(4), "the page took {:?}: {v}", t.elapsed());
-    // wins: 256 pieces, as many wins as the no-route tests see
     let d = patient_draws_rig(json!({}));
     d.ln.st.lock().unwrap().private_seller = true;
     let t = Instant::now();
@@ -13550,11 +13548,36 @@ fn a_seller_behind_a_private_channel_is_paid_at_once_by_its_route_hints() {
     assert!(t.elapsed() < Duration::from_secs(30), "the file took {:?}: {w}", t.elapsed());
     for (rig, out) in [(&r, &v), (&d, &w)] {
         assert!(!out.to_string().contains("ln_no_route"), "{out}");
-        assert!(rig.audit("ticket_route_waited").is_empty(), "no wait for a route the query cannot see");
-        assert_eq!(rig.ln.st.lock().unwrap().route_queries, 0, "no route query for an invoice with hints");
+        assert!(rig.audit("ticket_route_waited").is_empty(), "no wait: the route is found through the hint");
+        let st = rig.ln.st.lock().unwrap();
+        assert!(st.route_queries > 0 && st.no_route_answers == 0, "the route was asked for, with the hints, and found: {} asked, {} not found", st.route_queries, st.no_route_answers);
+        drop(st);
         assert_eq!(rig.ln.by_status("FAILED").len(), 0);
     }
     assert_wins(&d, w["wins_paid"].as_u64().unwrap_or(0));
+}
+
+/// A seller behind a private channel whose hinted route is gone for a moment (the link to it replaced): the wallet
+/// waits for it, as for any seller's, and pays when it is back; nothing fails.
+///
+/// FAILS with hinted invoices sent without the wait: the payment sent in the moment fails.
+#[test]
+fn a_seller_behind_a_private_channel_whose_route_is_gone_for_a_moment_is_waited_for() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    {
+        let mut st = r.ln.st.lock().unwrap();
+        st.private_seller = true;
+        st.no_route_at_query = 2;
+        st.no_route_for = Duration::from_secs(3);
+    }
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "a payment met the moment: {v}");
+    assert!(!r.audit("ticket_route_waited").is_empty(), "and waited for the route: {v}");
+    assert!(r.ln.by_status("FAILED").len() <= 8, "only the gate's eight checked just before the moment may fail: {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(200), Some(true), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
 }
 
 /// A whole body sent for a range from the first byte (the app's player's first part) is a whole answer: read

@@ -985,11 +985,12 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   and at more or fewer as its seller's format takes fewer or more. An owner who runs such models raises
   `tickets.stream_floor_after_s`. An answer the wallet ends early, for any reason, reaches the client cut short
   (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
-- The wallet's wait for a route to the seller (up to 8 s, after a link along the way was replaced) covers
-  public routes only. The node's route query (QueryRoutes) is not given an invoice's route hints or blinded
-  paths, so for a seller reached by those (a private channel, an LSP) it never finds one: such an invoice is
-  sent at once, with no route query, and a moment with no route to that seller fails the payment as it did
-  before 0.2.0 (the win is owed again, or the ticket call ends with the node's reason).
+- The wallet's wait for a route to the seller (up to 8 s, after a link along the way was replaced) gives the
+  node's route query (QueryRoutes, by its `POST` form) the invoice's route hints, so a seller reached through
+  a private channel is found and waited for like any other. It does not cover blinded paths, which that query
+  is not given: an invoice with them is sent at once, with no route query, and a moment with no route to that
+  seller fails the payment as it did before 0.2.0 (the win is owed again, or the ticket call ends with the
+  node's reason). A gateway marks its invoices private, so most carry hints.
 - A client that takes nothing for 60 to 90 s, such as a player paused with its buffer full, loses its
   connection, and the wallet stops paying for that answer. (Each write has 30 s, `stream_write`; a
   stalled socket may still take a little at the first ones, so it is the second or third that fails:

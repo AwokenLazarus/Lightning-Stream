@@ -1977,22 +1977,22 @@ impl Signer {
                             json!({"hash": hash, "unsent": true}));
             }
         }
-        let hinted = match ln.decode(&invoice) {
+        let (hints, blinded) = match ln.decode(&invoice) {
             Ok(d) => {
                 if let Err(why) = cross_check(&inv, &d) {
                     return refuse(&hash, "ln_decode_mismatch", why);
                 }
-                inv.route_hints > 0 || has_hidden_way(&d)
+                (d.get("route_hints").and_then(Value::as_array).cloned().unwrap_or_default(), has_blinded_paths(&d))
             }
             Err(e) => return node_said(refuse(&hash, "ln_backend", e.msg.clone()), &e),
         };
         // a route to the seller, as the node would look for one when it pays: one moment after a link along the way
         // was replaced the node finds none for some seconds (up to 10 s seen on the lab), and a payment sent then fails
-        // at once. It is waited for, within what is left of the channel wait's 8 s. Only over the public graph: a
-        // seller reached by its invoice's route hints or blinded paths (a private channel, an LSP) is one the node's
-        // route query, which is not given them, never finds, and its invoice is sent as it always was
-        if !hinted {
-            if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &sid, checks_from) {
+        // at once. It is waited for, within what is left of the channel wait's 8 s. The query is given the invoice's
+        // route hints, so a seller reached through a private channel (an LSP's, say) is found as the payment finds it.
+        // Not for blinded paths, which the query is not given: such an invoice is sent as it always was
+        if !blinded {
+            if let Err((why, ran_out)) = self.ln_route_wait(&*ln, &session.payee, msat, &routes.ids, inv.min_final_cltv, &hints, &sid, checks_from) {
                 return with(refuse(&hash, "ln_no_route", why), json!({"route_ran_out": ran_out}));
             }
         }
@@ -2024,11 +2024,12 @@ impl Signer {
     #[allow(clippy::too_many_arguments)]
     /// `Err((why, ran_out))`: `ran_out` where the seller has been without a route for the whole window, not
     /// where this payment only stood back for another to the same seller.
-    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), (String, bool)> {
+    fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, hints: &[Value], sid: &str, from: Instant)
+                     -> std::result::Result<(), (String, bool)> {
         let chan = (ids.len() == 1).then(|| ids[0].as_str());
         let ask = || {
             let asked = Instant::now();
-            let found = ln.has_route(payee, msat, chan, final_cltv);
+            let found = ln.has_route(payee, msat, chan, final_cltv, hints);
             self.ticket_pace.queried(asked.elapsed());
             // a node that cannot answer the question is no reason to hold the payment
             !matches!(found, Ok(false))
@@ -3291,10 +3292,9 @@ fn fitting_msat(lp: &LnPolicy, lo_msat: u64, hi_msat: u64, left: i64) -> Option<
     Some(lo * 1000)
 }
 
-/// Whether the node's decode of an invoice names ways to its payee the public graph does not have: route
-/// hints (a private channel) or blinded paths.
-fn has_hidden_way(decoded: &Value) -> bool {
-    ["route_hints", "blinded_paths"].iter().any(|k| decoded.get(*k).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+/// Whether the node's decode of an invoice names blinded paths to its payee, which the node's route query is not given.
+fn has_blinded_paths(decoded: &Value) -> bool {
+    decoded.get("blinded_paths").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
 }
 
 #[cfg(test)]
@@ -3304,11 +3304,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_invoice_with_route_hints_or_blinded_paths_has_a_way_the_graph_does_not() {
-        assert!(!has_hidden_way(&json!({"destination": "02"})));
-        assert!(!has_hidden_way(&json!({"route_hints": [], "blinded_paths": []})));
-        assert!(has_hidden_way(&json!({"route_hints": [{"hop_hints": [{"chan_id": "1"}]}]})));
-        assert!(has_hidden_way(&json!({"blinded_paths": [{"blinded_path": {}}]})));
+    fn an_invoice_with_blinded_paths_is_told_from_one_with_route_hints() {
+        assert!(!has_blinded_paths(&json!({"destination": "02"})));
+        assert!(!has_blinded_paths(&json!({"route_hints": [], "blinded_paths": []})));
+        assert!(!has_blinded_paths(&json!({"route_hints": [{"hop_hints": [{"chan_id": "1"}]}]})));
+        assert!(has_blinded_paths(&json!({"blinded_paths": [{"blinded_path": {}}]})));
     }
 
     #[test]
