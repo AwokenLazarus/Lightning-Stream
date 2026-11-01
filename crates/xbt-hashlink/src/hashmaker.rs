@@ -1180,12 +1180,7 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                 let slice_time = by_speed.max(g.min_slice_time);
                 let why = if !r.ready && r.asked_at.elapsed() > grace {
                     Some("no first payment")
-                } else if match r.waiting_since {
-                    // a payment said to be on its way is waited for longer; any other, for the short clock, and not while
-                    // a resumed rental's count is still to come down to the hashtaker's
-                    Some(t) => t.elapsed() > order::WAIT_FOR_PAYING,
-                    None => r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT) && !r.resync.is_some_and(|s| s.at.elapsed() < RESYNC_WAIT),
-                } {
+                } else if out_of_time_for_payment(r) {
                     Some("unpaid")
                 } else if r.served > slice_time.saturating_mul((r.paid.min(1 << 20) as u32) * PAID_TIME_FACTOR) {
                     Some("paid time used up")
@@ -1555,6 +1550,15 @@ fn down_line(g: &mut Hub, id: u64, slot: u64, v: &Value, line: &str) {
         return;
     }
     let _ = send_line(&mut c.w, line);
+}
+
+/// Has a share waited too long for payment? A payment said to be on its way is waited for longer; any other, for the
+/// short clock, and not while a resumed rental's count is still to come down to the hashtaker's.
+fn out_of_time_for_payment(r: &Rental) -> bool {
+    match r.waiting_since {
+        Some(t) => t.elapsed() > order::WAIT_FOR_PAYING,
+        None => r.held_since.is_some_and(|t| t.elapsed() > order::WAIT_FOR_PAYMENT) && !r.resync.is_some_and(|s| s.at.elapsed() < RESYNC_WAIT),
+    }
 }
 
 /// A miner's connection ended.
@@ -2231,6 +2235,32 @@ mod tests {
         u.conn = None;
         u.last_hs = 0.0;
         assert_eq!(u.speed(), 0.0, "gone, it's measured again when it's back");
+    }
+
+    /// After a resume, a held share's short clock waits up to 3 s for the hashtaker to say its count, and no longer.
+    #[test]
+    fn a_held_share_waits_for_the_count_after_a_resume_then_no_longer() {
+        let terms = Terms { slice_work: 1 << 20, price_msat: 5_000, grace_ms: 30_000, start_slices: 0 };
+        let s = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slices = s.local_addr().unwrap().to_string();
+        drop(s);
+        let (h, addr, hpub) = start(&terms, &slices);
+        let lk = link::dial(&addr, crate::noise::fresh_key(), hpub).unwrap();
+        lk.tx.send(&Msg::Hello { rental: "r".into(), listing: "l".into(), terms: terms.clone(), miners: 1, proof: Some(PROOF.into()) }).unwrap();
+        let mut rx = lk.rx;
+        assert!(matches!(rx.recv_within(Duration::from_secs(5)), Ok(Some(Msg::Welcome { .. }))));
+        let mut g = lock(&h.hub);
+        let r = g.rentals.get_mut("r").unwrap();
+        let resync = |ago: u64| Some(Resync { at: Instant::now() - Duration::from_millis(ago), work: 0, proven: 0, cap_work: 0, cap_shares: 0 });
+        // a share held 2.5 s: past the short clock
+        r.held_since = Some(Instant::now() - Duration::from_millis(2500));
+        assert!(out_of_time_for_payment(r), "no resume: out of time");
+        r.resync = resync(1000);
+        assert!(!out_of_time_for_payment(r), "resumed 1 s ago, its count not said: it waits");
+        r.resync = resync(3500);
+        assert!(out_of_time_for_payment(r), "resumed 3.5 s ago: no longer");
+        drop(g);
+        h.shutdown();
     }
 
     /// A miner waits for the answer to its subscribe before it says its name, so with no fallback it is
