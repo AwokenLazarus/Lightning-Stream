@@ -1616,17 +1616,18 @@ impl Book {
         l
     }
 
-    /// The open ticket session with this seller, if there is one. A session that pays by draws
-    /// holds nothing with the seller's node and is found by [`Self::draws_open_with`].
-    pub fn open_with(&self, payee: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.draws.is_none())
+    /// The open ticket session with this seller under `task`, if there is one. A session is its task's
+    /// alone, so each task has its own with a seller. A session that pays by draws holds nothing with
+    /// the seller's node and is found by [`Self::draws_open_with`].
+    pub fn open_with(&self, payee: &str, task: &str) -> Option<&Session> {
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.task == task && s.draws.is_none())
     }
 
     /// The open session that pays this seller's node by draws at `origin`, if there is one. One
     /// node may sell at several origins (a node that runs several services), and each is a
-    /// session of its own.
-    pub fn draws_open_with(&self, payee: &str, origin: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.origin == origin && s.draws.is_some())
+    /// session of its own, and so is each task's.
+    pub fn draws_open_with(&self, payee: &str, origin: &str, task: &str) -> Option<&Session> {
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.origin == origin && s.task == task && s.draws.is_some())
     }
 
     /// The payment of a win of a session that is in the book and has not failed: a win with one is

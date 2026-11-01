@@ -248,8 +248,13 @@ impl Signer {
             return Tried::Next("draws are paid over https, or over http to this machine only (127.0.0.1, ::1, localhost): on a plain connection a \
                                 listener learns the session key".into());
         }
+        // a session of draws is its task's alone, as a session of tickets is (`super::SlotKey`)
+        let key = match &c.task {
+            Ok(t) => super::slot_key(c.origin, t),
+            Err(why) => return Tried::Next(why.clone()),
+        };
         for attempt in 0..2 {
-            let existing = lock(&self.draw_http).get(c.origin).cloned();
+            let existing = lock(&self.draw_http).get(&key).cloned();
             // a session the book no longer holds open (stopped by the agent, idle, a fault) is gone
             let existing = match existing {
                 Some(d) if d.fault().is_some() || !self.ticket_session(&d.sid).is_some_and(|s| s.state == SState::Open) => {
@@ -345,11 +350,12 @@ impl Signer {
         *lock(&ds.link) = Link::new(seller_sid, key, 0);
         lock(&ds.state).buyer = Some(buyer);
         let mut map = lock(&self.draw_http);
-        if map.contains_key(c.origin) {
+        let key = super::slot_key(c.origin, &ds.task);
+        if map.contains_key(&key) {
             drop(map);
             return Err(give_up("another call opened a session with this seller meanwhile: call again".into()));
         }
-        map.insert(c.origin.to_string(), ds.clone());
+        map.insert(key, ds.clone());
         Ok(ds)
     }
 
@@ -409,8 +415,9 @@ impl Signer {
     pub(crate) fn draw_stop(&self, ds: &DrawSession, why: &str, tell: bool) -> Value {
         {
             let mut map = lock(&self.draw_http);
-            if map.get(&ds.origin).is_some_and(|d| d.sid == ds.sid) {
-                map.remove(&ds.origin);
+            let key = super::slot_key(&ds.origin, &ds.task);
+            if map.get(&key).is_some_and(|d| d.sid == ds.sid) {
+                map.remove(&key);
             }
         }
         let told = tell && !lock(&ds.link).seller_sid.is_empty() && matches!(self.draw_call(ds, "close", &json!({})), Ok((200, _, _)));

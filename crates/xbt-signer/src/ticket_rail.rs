@@ -692,7 +692,7 @@ impl Signer {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             self.ticket_seed(&st.book)?;
-            if let Some(s) = st.book.open_with(&terms.payee) {
+            if let Some(s) = st.book.open_with(&terms.payee, &task_name) {
                 return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first, or call again when it ends"), json!({"session": s.id, "retry_after_s": SESSION_EXISTS_RETRY_S})));
             }
             if st.book.open_sessions(None) as i64 >= tp.max_sellers {
@@ -2618,14 +2618,14 @@ impl Signer {
         self.ticket_store().map_or(true, |g| g.as_ref().is_none_or(|st| st.book.win_payment(sid, draw).is_some()))
     }
 
-    /// Whether the open session with this seller at `origin`, if there is one, pays by draws.
-    pub(crate) fn ticket_open_kind(&self, payee: &str, origin: &str) -> Option<bool> {
+    /// Whether the open session with this seller at `origin` under `task`, if there is one, pays by draws.
+    pub(crate) fn ticket_open_kind(&self, payee: &str, origin: &str, task: &str) -> Option<bool> {
         let g = self.ticket_store().ok()?;
         let book = &g.as_ref()?.book;
-        if book.draws_open_with(payee, origin).is_some() {
+        if book.draws_open_with(payee, origin, task).is_some() {
             return Some(true);
         }
-        book.open_with(payee).map(|_| false)
+        book.open_with(payee, task).map(|_| false)
     }
 
     /// Whether the wallet's node has an active channel of its own to `payee`: a win paid over it
@@ -2684,7 +2684,7 @@ impl Signer {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             self.ticket_seed(&st.book)?;
-            if let Some(s) = st.book.draws_open_with(&terms.payee, &origin) {
+            if let Some(s) = st.book.draws_open_with(&terms.payee, &origin, &task_name) {
                 return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first, or call again when it ends"), json!({"session": s.id, "retry_after_s": SESSION_EXISTS_RETRY_S})));
             }
             if st.book.open_sessions(None) as i64 >= tp.max_sellers {

@@ -237,9 +237,9 @@ pub struct Signer {
     /// for its session, the sessions of an earlier run whose cancel was asked for, and this signer
     /// itself (for the thread that refills a pool behind a call).
     pub(crate) ticket_wire: Arc<dyn crate::ticket_pay::TicketWire>,
-    pub(crate) ticket_http: Mutex<HashMap<String, Arc<crate::ticket_pay::Slot>>>,
-    /// The sessions this process pays by draws, by the seller's origin (`docs/TICKETS.md`, section 9).
-    pub(crate) draw_http: Mutex<HashMap<String, Arc<crate::ticket_pay::DrawSession>>>,
+    pub(crate) ticket_http: Mutex<HashMap<crate::ticket_pay::SlotKey, Arc<crate::ticket_pay::Slot>>>,
+    /// The sessions this process pays by draws, by the seller's origin and the task (`docs/TICKETS.md`, section 9).
+    pub(crate) draw_http: Mutex<HashMap<crate::ticket_pay::SlotKey, Arc<crate::ticket_pay::DrawSession>>>,
     /// The terms a seller last stated for each of its routes, by origin then route path, where its
     /// gateway refuses a paid request that repeats another route's terms (`termsChecked`): a request
     /// on a known route is then paid without asking its price first, a round trip saved.
@@ -252,9 +252,9 @@ pub struct Signer {
     pub(crate) ticket_late_tries: Mutex<HashMap<String, (u32, f64)>>,
     /// Sessions this start stopped: the watcher asks their sellers, once, what credit they left.
     pub(crate) ticket_start_stopped: Mutex<Vec<String>>,
-    /// The last refusal of a call by address, for the wait for a seller's word
+    /// The last refusal of a call by address and task, for the wait for a seller's word
     /// (`ticket_seller_unanswered`): when, and the answer. Calls that queued behind it have it at once.
-    pub(crate) ticket_unanswered: Mutex<HashMap<String, (f64, Value)>>,
+    pub(crate) ticket_unanswered: Mutex<HashMap<crate::ticket_pay::SlotKey, (f64, Value)>>,
     /// Sessions whose stop has begun and that the book still shows open, while their streams end
     /// ([`crate::ticket_pay`]'s `ticket_http_stop`): the book books nothing more for them, a release,
     /// a lock or a prepaid ticket, however far a call had got when the stop came.
