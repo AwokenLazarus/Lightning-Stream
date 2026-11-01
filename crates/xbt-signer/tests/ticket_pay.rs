@@ -11251,7 +11251,7 @@ fn a_rentals_sends_and_another_tasks_count_apart() {
     assert!(paid_tickets(&r).len() >= 3, "{v}");
 }
 
-// --- a rental's terms are the renter's alone (review probe/hashlink-review-f711) ----------------------------------
+// --- a rental's terms are the renter's alone ---------------------------------------------------------------------
 
 /// A call naming `task`, in the words the MCP's `xbt402_pay` sends to the signer (its `task` is a free string).
 fn as_the_mcp_asks(r: &Rig, path: &str, max_sats: i64, task: &str) -> Value {
@@ -11261,7 +11261,7 @@ fn as_the_mcp_asks(r: &Rig, path: &str, max_sats: i64, task: &str) -> Value {
 /// The rental grant goes with the renter's socket, not with the task's name. On the mainnet starter rules a
 /// caller on the wallet's own socket that said `task: "hashrate"` was paid outside max_per_tx (2,000), the
 /// approval threshold (1,000), the day's (10,000) and week's (30,000) budgets and the per-seller cap (10,000),
-/// up to the task's 200,000 sat, on any route (the review's probe: 21 calls of 9,000 sat, and a page). Such
+/// up to the task's 200,000 sat, on any route (21 calls of 9,000 sat in a row, and a page). Such
 /// a call is refused before anything is asked of the seller, and nothing is paid.
 #[test]
 fn a_caller_naming_the_hashrate_task_gets_none_of_the_rentals_terms() {
@@ -11329,6 +11329,10 @@ fn the_renters_socket_pays_a_rentals_pieces_of_work_only() {
     for (what, v) in [("a page", &page), ("a page, posted", &posted), ("a GET", &got)] {
         assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("deny"), Some("ticket_rental_route"), 0), "{what}: {v}");
     }
+    // the renter's own words for it: nothing about the wallet's socket or its rules
+    let mut astray = xbt_hashlink::rail::SignerPayer::new(t.payer.sock.clone(), r.shop.url("/page"), "hashrate".into(), MARKET_MSAT, Some(100_000), None, Duration::from_secs(5));
+    let why = astray.pay("r1", 0, &json!({"slice": 0})).unwrap_err();
+    assert!(why.starts_with(xbt_hashlink::rail::RENTER_ROUTE) && !why.contains("socket") && !why.contains("rules page"), "{why}");
     assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0), "nothing paid");
     // a piece of work under the wallet's own task: its rules, and nothing of the rental's
     let other = ask(as_the_mcp_asks(&r, "/hashrate/r1/0", 2_000, "default"));
@@ -11430,9 +11434,8 @@ fn a_call_of_another_task_is_not_held_back_by_a_pending_prepaid_ticket_it_cannot
 }
 
 /// Every entry point of the wallet's socket that names a rental task, or one of its sessions, is refused: a
-/// session opened under it (`ticket_open`), and an offer, a lock or a release in a session the renter opened
-/// (adopted from the review's probe, probe/grants-review-gates). The renter's socket stops a session by its id
-/// only, never a seller's every session.
+/// session opened under it (`ticket_open`), and an offer, a lock or a release in a session the renter opened.
+/// The renter's socket stops a session by its id only, never a seller's every session.
 #[test]
 fn the_wallets_socket_opens_offers_locks_and_releases_nothing_of_a_rental() {
     let _g = env_lock();
@@ -11459,7 +11462,7 @@ fn the_wallets_socket_opens_offers_locks_and_releases_nothing_of_a_rental() {
 }
 
 /// A call on the wallet's socket that names no task, where the rental task is the owner's only one (to which
-/// it resolves), is refused like one that names it (adopted from the review's probe).
+/// it resolves), is refused like one that names it.
 #[test]
 fn a_call_naming_no_task_that_resolves_to_the_rental_task_is_refused() {
     let _g = env_lock();

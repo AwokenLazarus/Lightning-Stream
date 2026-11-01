@@ -124,10 +124,13 @@ pub const BIG_TICKETS_ONLY: &str = "This hashmaker's smallest ticket is";
 pub const BUDGET_TOO_SHORT: &str = "What is left of this rental's budget";
 /// Where one of the owner's rules refused the payment.
 pub const WALLET_RULES: &str = "Your wallet's rules stopped this payment";
-/// Where the wallet refused the rental's terms to this connection (`ticket_rental_payer`, `ticket_rental_route`): a
-/// renter set up by hand on the wallet's own socket, or on a route that isn't a rental's piece of work. No limit
-/// of the owner's is at issue, so the words don't send the owner to the rules page.
+/// Where the wallet refused the rental's terms to this connection (`ticket_rental_payer`): a renter set up by hand
+/// on the wallet's own socket, or an app whose parts are of different versions. No limit of the owner's is at
+/// issue, so the words don't send the owner to the rules page.
 pub const RENTER_SOCKET: &str = "The wallet pays a rental only through the renter's own connection";
+/// Where the renter's own socket refused what the renter asked of it (`ticket_rental_route`): a payment that isn't
+/// a piece of work of its rental (`POST <pay url>/hashrate/<rental>/<slice>`), or a stop without a session.
+pub const RENTER_ROUTE: &str = "The renter asked to pay something that isn't a piece of work of its rental";
 
 /// Whether a refusal left everything where it was: nothing booked for the call and nothing released.
 fn moved_nothing(v: &serde_json::Value) -> bool {
@@ -138,8 +141,6 @@ fn moved_nothing(v: &serde_json::Value) -> bool {
 /// The rules of the owner's that can refuse a slice's payment.
 const WALLET_RULE_NAMES: [&str; 11] = ["ticket_cap", "ticket_task_budget", "ticket_seller_cap", "ticket_rate_limit", "daily_budget", "weekly_budget", "per_counterparty",
                                        "per_counterparty_daily", "max_per_tx", "human_threshold", "velocity"];
-/// The wallet's refusals of the rental's terms to a connection or a route that isn't the renter's ([`RENTER_SOCKET`]).
-const RENTER_SOCKET_RULES: [&str; 2] = ["ticket_rental_payer", "ticket_rental_route"];
 
 /// Room for a ticket's routing-fee limit, in sats, by the wallet's default limit (10 sat and 0.5%:
 /// `xbt_signer::ln::LnPolicy`). An owner who raised that limit is told so by the signer's refusal.
@@ -271,9 +272,11 @@ impl SignerPayer {
                 let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or(rule);
                 Err(format!("{WALLET_RULES}: {why}. Nothing more was paid. Your limits are on the wallet's rules page."))
             }
-            (rule, _) if RENTER_SOCKET_RULES.contains(&rule) => {
-                let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or(rule);
-                Err(format!("{RENTER_SOCKET}: {why}. The app's renter is set up that way; a renter set up by hand needs the wallet's renter socket \
+            // (a stop without a session is refused the same way, but a stop's answer is never read as a payment's)
+            ("ticket_rental_route", _) => Err(format!("{RENTER_ROUTE} (POST <pay url>/hashrate/<rental>/<slice>): nothing was paid.")),
+            ("ticket_rental_payer", _) => {
+                let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or("ticket_rental_payer");
+                Err(format!("{RENTER_SOCKET}: {why}. The app's own renter pays that way; a renter set up by hand needs the wallet's renter socket \
                              (run/rental/signer.sock, B2_RENTAL_SOCK), and an app whose parts are of different versions needs updating."))
             }
             _ => Err(r.to_string()),
