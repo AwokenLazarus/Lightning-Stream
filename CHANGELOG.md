@@ -105,6 +105,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Credit one task leaves with a shop is no longer spent by another task's calls, which could take
   that task past its own budget. The credit now waits for a call of its own task, for up to about
   20 hours, and another task's call to that shop buys its own ticket.
+- A call of one task is no longer paid from a session another task has open with the same shop, which
+  spent that task's credit and booked the tickets it bought to that task, past the calling task's
+  own budget. Each task now has its own session with a shop: a second task's call opens one beside
+  it and buys its own ticket. A call at another address of the same shop no longer stops another
+  task's session, and is no longer held back by another task's prepaid ticket still on its way.
 - A kill or a lost answer no longer buys a second ticket when the first was paid: the next call waits
   for the shop to take it, for two minutes at most. Long answers open for over ten minutes are no longer
   cut by a second call to the same shop.
