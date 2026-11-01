@@ -876,17 +876,24 @@ def real_gateway_run(mode: str) -> None:
         else:
             hashmaker.wait(60)
         grind.terminate()
-        with open(f"{RUN}/{mode}-buyer.json") as f:
-            bz = json.load(f)
         height1 = int(cli("getblockcount"))
         if not keys:
-            # a pool on the null key: the gateway opens its jobs as pool-null, and the renter stops before any work
-            refused = [e for e in bz.get("events", []) if e.get("ev") == "a job not shown to be blinded"]
-            check(f"{mode}: a pool without gateway keys is refused: the renter stops at its first job and no share reaches the gateway",
-                  bool(refused) and "null" in refused[0].get("why", "") and bz.get("jobsShownBlinded", 0) == 0 and bz["meter"]["accepted"] == 0,
-                  {"closed": bz.get("closed"), "refused": refused[:1], "jobs shown blinded": bz.get("jobsShownBlinded"), "meter": bz.get("meter"),
-                   "paid before the first job (start fee)": len([p for p in bz.get("pays", []) if p.get("ok")])})
+            # a pool on the null key: the gateway opens its jobs as pool-null, and the renter refuses at its first job,
+            # before any rental: it exits with the reason and writes no rental report, and the hashmaker is paid nothing
+            with open(f"{RUN}/{mode}-hashtaker.log", errors="replace") as f:
+                said = [ln.strip() for ln in f if "Not blinded" in ln]
+            bz = {}
+            if os.path.exists(f"{RUN}/{mode}-buyer.json"):
+                with open(f"{RUN}/{mode}-buyer.json") as f:
+                    bz = json.load(f)
+            paid = len([p for p in bz.get("pays", []) if p.get("ok")])
+            check(f"{mode}: a pool without gateway keys is refused: the renter stops at its first job, pays nothing, and no share reaches the gateway",
+                  bool(said) and "null" in said[0] and "Nothing was paid" in said[0] and hashtaker.returncode not in (0, None) and paid == 0
+                  and bz.get("jobsShownBlinded", 0) == 0 and (bz.get("meter") or {}).get("accepted", 0) == 0,
+                  {"said": said[:1], "exit": hashtaker.returncode, "paid": paid, "report": {k: bz.get(k) for k in ("closed", "jobsShownBlinded", "meter")} if bz else None})
             return
+        with open(f"{RUN}/{mode}-buyer.json") as f:
+            bz = json.load(f)
         with open(f"{RUN}/{mode}-hasher.json") as f:
             hz = json.load(f)
         blocks = []
