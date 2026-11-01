@@ -307,8 +307,10 @@ services:
 
   # The hashtaker: rents other people's miners into a DATUM-protocol gateway (the one above unless the
   # owner chose their own: LS_DATUM_GATEWAY) and pays each piece of work through the signer, as the
-  # "hashrate" task of the spending rules. Every job is opened on LS_GATEWAY_API and checked to be masked
-  # before a miner gets it; a rental to a gateway whose jobs aren't is refused.
+  # "hashrate" task of the spending rules. Every job is opened on LS_GATEWAY_API (or the API saved with a
+  # gateway chosen on the page) and checked to be masked before a miner gets it; a rental to a gateway whose
+  # jobs aren't is refused. LS_BUNDLED_GATEWAY is "off" when the owner chose their own gateway at install,
+  # so the hashtaker keeps it rather than moving to the Stream Gateway.
   hashtaker:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd
@@ -321,7 +323,7 @@ services:
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
               "--upstream", "${LS_DATUM:-127.0.0.1:23339}", "--gateway-api", "${LS_GATEWAY_API:-127.0.0.1:7153}",
-              "--datum-candidates", "127.0.0.1:23339",
+              "--datum-candidates", "127.0.0.1:23339", "--bundled-gateway", "${LS_BUNDLED_GATEWAY:-127.0.0.1:23339}",
               "--user", "${LS_DATUM_USER:-rented}",
               "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
               "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]

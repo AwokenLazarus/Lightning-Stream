@@ -5,9 +5,10 @@
 # real work on masked solo jobs between them, the owner's own stock DATUM gateway refused, and
 # uninstall.sh (packaging/linux/test/linux_regtest.py). Prints RESULT PASS|FAIL.
 # Needs the lab (run/lightning-fork-lab, cloned and built when missing), the pinned images (pulled), the
-# test's images (packaging/linux/test/build_images.sh: this tree's wallet-ui and hashlink, the Stream
-# Gateway's stand-in and a stock gateway; LS_TEST_BUILD=0 uses the ones already built), and stratum-grind
-# in P2P_HASH_GATEWAYS (~/xbt-rnd/hash-gateways, as the p2p_hash regtest's real gateway mode).
+# test's images (packaging/linux/test/build_images.sh: this tree's init, wallet-ui and hashlink, and a
+# stock gateway; LS_TEST_BUILD=0 uses the ones already built), the Stream Gateway's image
+# (LS_TEST_DATUM_IMAGE, default xbt-datum-gateway:0.1.0 from scripts/oci_build.sh --load), and
+# stratum-grind in P2P_HASH_GATEWAYS (~/xbt-rnd/hash-gateways, as the p2p_hash regtest's real gateway mode).
 # Ports: 127.0.0.1 LS_TEST_PORT_BASE (24600) + 10..57, the Stream Gateway's 23339, and the hashmaker's
 # 23340-23344. Evidence: run/linux-test/<stamp>/.
 set -euo pipefail

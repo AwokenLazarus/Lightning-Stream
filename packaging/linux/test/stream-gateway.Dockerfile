@@ -1,8 +1,6 @@
-# The Linux package test's stand-in for the Stream Gateway image (xbt-datum-gateway), until the gateway lane
-# publishes one: the gateway built from a copy of third_party/datum_gateway (context: that folder), dynamic on
-# Debian, with the published image's xbt-supervise, user (xbt-datum, 10021) and paths. The test builds it
-# twice: from HEAD (CONVOY + the masking patch) and from the vendor commit unmodified (an owner's own stock
-# DATUM gateway). packaging/linux/test/build_images.sh runs it; never published.
+# The Linux package test's owner's own stock DATUM gateway: third_party/datum_gateway at the vendor commit
+# (CONVOY, unmodified; context: that folder), dynamic on Debian, with the published image's xbt-supervise,
+# the Stream Gateway's user (10021) and paths. packaging/linux/test/build_images.sh runs it; never published.
 ARG SUPERVISE_FROM
 FROM debian:bookworm-slim AS build
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential cmake pkg-config \

@@ -79,7 +79,7 @@ ok "--yes: settings in the environment win over .env, are written, and are used 
 # the hashtaker's gateway: the Stream Gateway by default, masked jobs checked on its API, never unmasked
 e=$T/none/app/.env
 grep -qx LS_DATUM_GATEWAY=bundled "$e" && grep -qx LS_DATUM=127.0.0.1:23339 "$e" && grep -qx LS_GATEWAY_API=127.0.0.1:7153 "$e" \
-  && grep -qx LS_DATUM_API_PORT=7153 "$e" && ! grep -q "Until now" "$T/none.out"
+  && grep -qx LS_DATUM_API_PORT=7153 "$e" && grep -qx LS_BUNDLED_GATEWAY=127.0.0.1:23339 "$e" && ! grep -q "Until now" "$T/none.out"
 ok "a first install: the Stream Gateway (stratum 127.0.0.1:23339, API 127.0.0.1:7153), nothing said of a move" $? "$e"
 c=$PKG/docker-compose.yml
 grep -q '"--upstream", "${LS_DATUM:-127.0.0.1:23339}", "--gateway-api", "${LS_GATEWAY_API:-127.0.0.1:7153}"' "$c" \
@@ -105,14 +105,15 @@ ok "run again: stays on the Stream Gateway, nothing said again" $? "$T/from01.ou
 run own LS_DATUM_GATEWAY=own LS_DATUM=192.168.1.5:23334
 e=$T/own/app/.env
 grep -qx 0 "$T/own.rc" && grep -qx LS_DATUM_GATEWAY=own "$e" && grep -qx LS_DATUM=192.168.1.5:23334 "$e" \
-  && grep -qx LS_GATEWAY_API=192.168.1.5:7152 "$e" && grep -q "Rentals need masked jobs" "$T/own.out" \
+  && grep -qx LS_GATEWAY_API=192.168.1.5:7152 "$e" && grep -qx LS_BUNDLED_GATEWAY=off "$e" && grep -q "Rentals need masked jobs" "$T/own.out" \
   && grep -q "A stock DATUM Gateway doesn't mask its jobs" "$T/own.out" && grep -q "every rental is refused" "$T/own.out"
-ok "your own gateway: kept with its API (host:7152), and said plainly that rentals need masked jobs" $? "$T/own.out"
+ok "your own gateway: kept with its API (host:7152), the hashtaker told not to move it, and said plainly that rentals need masked jobs" $? "$T/own.out"
 cp "$e" "$T/own.env"
 mkdir -p "$T/back/app" && cp "$T/own.env" "$T/back/app/.env"
 run back LS_DATUM_GATEWAY=bundled
 e=$T/back/app/.env
-grep -qx 0 "$T/back.rc" && grep -qx LS_DATUM=127.0.0.1:23339 "$e" && grep -qx LS_GATEWAY_API=127.0.0.1:7153 "$e" && grep -qx LS_DATUM_OWN=192.168.1.5:23334 "$e"
+grep -qx 0 "$T/back.rc" && grep -qx LS_DATUM=127.0.0.1:23339 "$e" && grep -qx LS_GATEWAY_API=127.0.0.1:7153 "$e" && grep -qx LS_DATUM_OWN=192.168.1.5:23334 "$e" \
+  && grep -qx LS_BUNDLED_GATEWAY=127.0.0.1:23339 "$e"
 ok "and back to the Stream Gateway: its addresses, yours kept" $? "$e"
 mkdir -p "$T/again/app" && cp "$e" "$T/again/app/.env"
 run again LS_DATUM_GATEWAY=own

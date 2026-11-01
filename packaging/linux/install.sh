@@ -131,7 +131,7 @@ case $LS_DATUM_GATEWAY in
   *) die "answer 1 (the Stream Gateway that comes with the app) or 2 (your own DATUM Gateway), not \"$LS_DATUM_GATEWAY\"" ;;
 esac
 if [ "$LS_DATUM_GATEWAY" = bundled ]; then
-  LS_DATUM=$BUNDLED_DATUM LS_GATEWAY_API=$BUNDLED_API
+  LS_DATUM=$BUNDLED_DATUM LS_GATEWAY_API=$BUNDLED_API LS_BUNDLED_GATEWAY=$BUNDLED_DATUM
   echo "   The Stream Gateway: once the app is running, choose solo (paid to your own XBT address) or Lazarus"
   echo "   Pool on Services → Hashrate, under Your gateway. It uses your XBT node above."
   if [ "$MOVED" = 1 ]; then say "rented hashrate now goes to the Stream Gateway (yours was $LS_DATUM_OWN)"; fi
@@ -149,6 +149,8 @@ else
   ask LS_GATEWAY_API "Its API address, where the app opens its jobs (/xbt/job)" "${LS_DATUM%:*}:7152"
   [[ $LS_GATEWAY_API == *:* ]] || die "the API address is host:port, not \"$LS_GATEWAY_API\""
   LS_DATUM_OWN=$LS_DATUM
+  # the hashtaker would otherwise move a gateway it wasn't given on its page to the Stream Gateway
+  LS_BUNDLED_GATEWAY=off
 fi
 ask LS_DATUM_USER "The user name rented miners use on it" "rented"
 
@@ -227,7 +229,7 @@ mkdir -p "$LS_DATA_DIR"
       if plain "$v"; then printf "%s=%s\n" "$1" "$v"; else printf "%s='%s'\n" "$1" "$v"; fi
     }
     asked=" COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT
-            LS_NODE_RPC_USER LS_NODE_RPC_PASS LS_DATUM_GATEWAY LS_DATUM LS_GATEWAY_API LS_DATUM_OWN LS_DATUM_API_PORT
+            LS_NODE_RPC_USER LS_NODE_RPC_PASS LS_DATUM_GATEWAY LS_DATUM LS_GATEWAY_API LS_DATUM_OWN LS_DATUM_API_PORT LS_BUNDLED_GATEWAY
             LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_VPN LS_VPN_PORT LS_VPN_ENDPOINT LS_VPN_REGION
             LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_APP_PORTS
             LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS LS_FILES_PORT "

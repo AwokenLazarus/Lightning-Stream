@@ -3,10 +3,10 @@
 #   xbt-init:linux-test, xbt-wallet-ui:linux-test, xbt-hashlink:linux-test   the published images with this
 #       tree's binaries in them (static musl, as oci_build.sh builds them): the init that knows the compose's
 #       components, the renter's masking check, the Hashrate page;
-#   xbt-datum-gateway:linux-test        the Stream Gateway from third_party/datum_gateway at HEAD
-#       (stream-gateway.Dockerfile: a stand-in for the gateway lane's image);
-#   xbt-datum-gateway:linux-test-stock  the same from the vendor commit, unmodified: an owner's own stock
-#       DATUM gateway, which doesn't mask its jobs.
+#   xbt-datum-gateway:linux-test-stock  third_party/datum_gateway at the vendor commit, unmodified, built on
+#       Debian (stream-gateway.Dockerfile): an owner's own stock DATUM gateway, which doesn't mask its jobs.
+# The Stream Gateway itself is the real image (scripts/oci_build.sh --load: xbt-datum-gateway:0.1.0, or
+# LS_TEST_DATUM_IMAGE), not built here.
 # Run by packaging/linux/test-linux.sh unless LS_TEST_BUILD=0.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
@@ -29,13 +29,9 @@ for img in xbt-init xbt-wallet-ui xbt-hashlink; do
   echo "   $img:linux-test"
 done
 
-echo "== the Stream Gateway (HEAD) and a stock DATUM gateway ($(git rev-parse --short "$STOCK"))"
-for v in head stock; do
-  ref=HEAD; tag=linux-test
-  [ "$v" = stock ] && { ref=$STOCK; tag=linux-test-stock; }
-  mkdir -p "$T/gw-$v"
-  git archive "$ref" third_party/datum_gateway | tar -x -C "$T/gw-$v"
-  docker build -q --build-arg SUPERVISE_FROM="$(lock xbt-gateway)" -f "$ROOT/packaging/linux/test/stream-gateway.Dockerfile" \
-    -t "xbt-datum-gateway:$tag" "$T/gw-$v/third_party/datum_gateway" >/dev/null
-  echo "   xbt-datum-gateway:$tag"
-done
+echo "== a stock DATUM gateway ($(git rev-parse --short "$STOCK"))"
+mkdir -p "$T/gw-stock"
+git archive "$STOCK" third_party/datum_gateway | tar -x -C "$T/gw-stock"
+docker build -q --build-arg SUPERVISE_FROM="$(lock xbt-gateway)" -f "$ROOT/packaging/linux/test/stream-gateway.Dockerfile" \
+  -t xbt-datum-gateway:linux-test-stock "$T/gw-stock/third_party/datum_gateway" >/dev/null
+echo "   xbt-datum-gateway:linux-test-stock"

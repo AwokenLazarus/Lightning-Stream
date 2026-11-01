@@ -15,11 +15,13 @@ A Services -> Hashrate, one rental of real work on masked solo jobs, paid slice 
 the solo address; then A switched to its owner's own stock DATUM gateway, where renting is refused in
 words; then uninstall.sh, which must leave nothing behind.
 
-Until the init and UI of the Stream Gateway lane (W5) are in the images, this plays their part from
-docs/run-handoff's contract: run/datum/ (0750 10005:10021), rpc.cookie (0600 10021, "user:password" with
-no newline), config.json (0640 10005:10021, no secret) and datum/submitblocks/ (0700 10021). With
-LS_TEST_INIT_DATUM=1 (an init that knows the "datum" component) init makes the cookie and the dirs, and
-that is checked instead. The gateway's image is build_images.sh's stand-in until a digest is pinned.
+The Stream Gateway is set up as the owner does it: init makes run/datum/ (0750 10005:10021), the node
+login rpc.cookie (0600 10021, "user:password", no newline) and datum/submitblocks/ (0700 10021), and the
+Hashrate page's "Your gateway" (solo) writes config.json (0640 10005:10021, no secret), all checked. The
+one change the test makes is the gateway's share difficulty floor (vardiff_min 1, as the p2p_hash regtest's
+real gateway), so a CPU miner finds shares. LS_TEST_INIT_DATUM=0 plays init's part, for an init without
+the "datum" component. The gateway's image is LS_TEST_DATUM_IMAGE (default the compose file's own,
+xbt-datum-gateway:0.1.0, as oci_build.sh --load tags it); its id is in the results.
 
     linux_regtest.py OUT      (run by packaging/linux/test-linux.sh)
 Checks (results.json): I install, G the update from 0.1, K the node's keys, L loopback-only ports, U the
@@ -51,9 +53,9 @@ INSTALLS = {
 }
 STRATUM = 23339  # the Stream Gateway's stratum, the same on every install (the UI writes it); one gateway at a time has a config here
 DATUM_UID, UI_UID = 10021, 10005
-INIT_DATUM = os.environ.get("LS_TEST_INIT_DATUM") == "1"  # the init in the images makes run/datum and the cookie
-LOCAL = {"init": "xbt-init:linux-test", "hashtaker": "xbt-hashlink:linux-test", "hashmaker": "xbt-hashlink:linux-test",
-         "datum": "xbt-datum-gateway:linux-test"}
+INIT_DATUM = os.environ.get("LS_TEST_INIT_DATUM", "1") == "1"  # the init in the images makes run/datum and the cookie
+DATUM_IMAGE = os.environ.get("LS_TEST_DATUM_IMAGE", "xbt-datum-gateway:0.1.0")
+LOCAL = {"init": "xbt-init:linux-test", "hashtaker": "xbt-hashlink:linux-test", "hashmaker": "xbt-hashlink:linux-test", "datum": DATUM_IMAGE}
 OWN_GW = "xbt-datum-gateway:linux-test-stock"
 HG = os.environ.get("P2P_HASH_GATEWAYS", os.path.expanduser("~/xbt-rnd/hash-gateways"))  # stratum-grind, a CPU miner of real shares
 RELAYS = f"ws://127.0.0.1:{P['relay']}"
@@ -170,6 +172,9 @@ def update(name, d, old_env):
     """The owner updates a 0.1 install: `git pull`, then install.sh again, with the answers in .env (the test's ports
     for the Stream Gateway's API given, as two installs share this machine)."""
     before = env_file(d)
+    # what a 0.1 owner's page saved when they set their own gateway there (no "chosen": 0.1 had no such word)
+    root_helper(os.path.join(d, "data"), f"printf '%s' '{json.dumps({'datum': before.get('LS_DATUM')})}' > /d/hashrate/renter.json "
+                                         "&& chown 10010:10010 /d/hashrate/renter.json && chmod 600 /d/hashrate/renter.json", ro=False)
     override(d)
     base = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "LN_TICKET_", "PKG_LAB_", "LAB", "RUN", "ACTIVATION_", "LS_"))}
     # settings this version adds, given as an owner gives them to an unattended update: the test's ports
@@ -194,6 +199,9 @@ def update(name, d, old_env):
           cmd[cmd.index("--upstream") + 1] == f"127.0.0.1:{STRATUM}" and cmd[cmd.index("--gateway-api") + 1] == f"127.0.0.1:{INSTALLS[name][8]}"
           and "--allow-unblinded" not in cmd, cmd)
     env = dict(old_env, **{k: v for k, v in after.items()})
+    st = waited(lambda: renter_status(name), 60, f"{name}'s hashtaker answering") or {}
+    check("G", f"{name}: the hashtaker moved the gateway its 0.1 page saved to the Stream Gateway, and keeps the old one to go back to",
+          (st.get("datum") or {}).get("addr") == f"127.0.0.1:{STRATUM}" and (st.get("datum") or {}).get("movedFrom") == own, st.get("datum"))
     datum_files(name, d)
     check("G", f"{name}: the Stream Gateway service is added and healthy (idle: no gateway set yet)",
           waited(lambda: health(d, "datum") == "healthy", 120, "the Stream Gateway's health") is not None, health(d, "datum"))
@@ -209,8 +217,13 @@ def env_file(d):
     return out
 
 
+def dc_env():
+    """The environment for `docker compose` in an install's folder: its own files and .env, not the lab's COMPOSE_*."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "LS_"))}
+
+
 def container(d, svc):
-    return sh("docker", "compose", "ps", "-a", "-q", svc, cwd=d).stdout.strip()
+    return sh("docker", "compose", "ps", "-a", "-q", svc, cwd=d, env=dc_env()).stdout.strip()
 
 
 def health(d, svc):
@@ -247,6 +260,35 @@ def gateway_config(api, address, own=False):
                        "save_submitblocks_dir": "/data/datum/submitblocks"},
             "api": api_cfg, "logger": {"log_to_console": True, "log_to_file": False, "log_level_console": 2},
             "datum": {"pool_host": "", "pooled_mining_only": False}}
+
+
+def page_gateway(name, ui, payout):
+    """The owner saves Your gateway on the Hashrate page (solo, their address); the UI writes run/datum/config.json.
+    Checked as written, then given the test's share difficulty floor. Returns the config as the page wrote it."""
+    d = os.path.join(OUT, name)
+    data = os.path.join(d, "data")
+    st, _, _ = ui.post("/hashrate", "/hashrate", {"action": "gateway", "mode": "solo", "payout": payout})
+    flash = ui.flash("/hashrate")
+    check("M", f"{name}: Your gateway (solo, a regtest address) saves on the Hashrate page", st == 303 and "Saved" in flash, flash)
+    meta = root_helper(data, "stat -c '%u:%g %a' /d/run/datum/config.json; cat /d/run/datum/config.json", ro=True).stdout
+    head, _, body = meta.partition("\n")
+    try:
+        cfg = json.loads(body)
+    except ValueError:
+        cfg = {}
+    api = INSTALLS[name][8]
+    ok = (head.strip() == f"{UI_UID}:{DATUM_UID} 640" and cfg.get("stratum", {}).get("listen_addr") == "127.0.0.1"
+          and cfg["stratum"].get("listen_port") == STRATUM and cfg.get("api", {}).get("listen_addr") == "127.0.0.1"
+          and cfg["api"].get("listen_port") == api and cfg["api"].get("xbt_job_allow", "") == "" and cfg["api"].get("admin_password") == ""
+          and cfg.get("bitcoind", {}).get("rpccookiefile") == "/data/run/datum/rpc.cookie"
+          and cfg["bitcoind"].get("rpcurl") == f"http://127.0.0.1:{P['rpc']}" and cfg.get("mining", {}).get("pool_address") == payout
+          and cfg.get("datum", {}).get("pool_host") == "" and "lab:lab" not in body and '"lab"' not in body)
+    check("M", f"{name}: the page wrote config.json (0640 10005:10021): loopback stratum {STRATUM} and API {api}, /xbt/job loopback only, "
+               "no admin password, the node by cookie file, solo to the address, no secret", ok, [head, cfg])
+    if cfg:
+        cfg["stratum"]["vardiff_min"] = 1
+        root_helper(data, f"cat > /d/run/datum/config.json <<'EOF'\n{json.dumps(cfg)}\nEOF", ro=False)
+    return cfg
 
 
 def set_gateway(d, cfg):
@@ -436,21 +478,25 @@ def main():
             _, f1, f2 = owner_setup(ui, SIGN_BIN, key, pol, code)
             check("U", f"{name}: the owner enrols an approval key and signs the rules", "enrolled" in f1.lower() and "applied" in f2.lower(), [f1, f2])
             if "restarts" in f2:
-                sh("docker", "compose", "restart", "signer", cwd=d)
+                sh("docker", "compose", "restart", "signer", cwd=d, env=dc_env())
             page = ui.get("/lightning")
             check("U", f"{name}: the Lightning page says the node is connected by itself (no paste)", "connected" in page.lower(), page[-400:])
             uis[name] = (ui, key)
 
         # --- M: each install's Stream Gateway, set to solo, shown masked to its own hashtaker -------------------------
         lan = sh("hostname", "-I").stdout.split()[0]
+        log(f"   the Stream Gateway's image: {DATUM_IMAGE} {docker('image', 'inspect', '-f', '{{.Id}}', DATUM_IMAGE, check_rc=False).stdout.strip()}")
         for name in ("maker", "taker"):
             d = installs[name][0]
             api = INSTALLS[name][8]
-            set_gateway(d, gateway_config(api, solo))
+            if INIT_DATUM:
+                page_gateway(name, uis[name][0], solo)
+            else:
+                set_gateway(d, gateway_config(api, solo))
             up = waited(lambda: sh("bash", "-c", f"exec 3<>/dev/tcp/127.0.0.1/{STRATUM}", check_rc=False).returncode == 0, 120, f"{name}'s Stream Gateway stratum")
             check("M", f"{name}: Your gateway saved (solo), the Stream Gateway starts by itself and is healthy",
                   up is not None and waited(lambda: health(d, "datum") == "healthy", 120, f"{name}'s datum health") is not None,
-                  {"health": health(d, "datum"), "log": sh("docker", "compose", "logs", "--tail", "15", "datum", cwd=d, check_rc=False).stdout[-1200:]})
+                  {"health": health(d, "datum"), "log": sh("docker", "compose", "logs", "--tail", "15", "datum", cwd=d, env=dc_env(), check_rc=False).stdout[-1200:]})
             b = masked_shown(name)
             check("M", f"{name}{' (updated from 0.1)' if name == 'maker' else ''}: its hashtaker shows the Stream Gateway masking its jobs (solo: the gateway holds the key)",
                   (b or {}).get("state") == "blinded" and b.get("why") == "solo" and "Your gateway holds the key" in b.get("words", ""), b)
@@ -549,6 +595,10 @@ def main():
             b = renter_status("taker").get("blinding") or {}
             return b if b.get("state") and b.get("state") != "blinded" else None
         b = waited(refused, 180, "the taker's hashtaker looking at the own gateway", every=5) or renter_status("taker").get("blinding")
+        st = renter_status("taker")
+        check("O", "taker: the hashtaker keeps the owner's own gateway, with its API (not moved to the Stream Gateway)",
+              (st.get("datum") or {}).get("addr") == f"127.0.0.1:{P['own']}" and (st.get("datum") or {}).get("api") == f"127.0.0.1:{P['own_api']}",
+              st.get("datum"))
         check("O", "taker: its hashtaker says in words that the own gateway's jobs can't be shown masked, and rentals to it are refused",
               (b or {}).get("state") in ("can't be checked", "not blinded") and "rentals to this upstream are refused" in (b or {}).get("words", ""), b)
         page = taker.get("/hashrate")
