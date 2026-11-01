@@ -14167,15 +14167,25 @@ fn a_whole_body_for_a_range_from_the_first_byte_is_a_whole_answer() {
 fn a_moment_with_no_route_and_many_wins_pays_every_win() {
     let _g = env_lock();
     for (at, secs) in [(2usize, 4u64), (5, 4), (2, 7)] {
-        let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
-        {
-            let mut st = r.ln.st.lock().unwrap();
-            st.no_route_at_query = at;
-            st.no_route_for = Duration::from_secs(secs);
-        }
         let size = 256 * PIECE;
-        let v = r.pay(&format!("/pieces/{size}"), 2_000);
-        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment: {v}");
+        // the moment opens at a win's route query: a draw with fewer wins than that never meets it, and is drawn again
+        // (a new rig: the luck of the draw, not the wallet's doing), a few times at most
+        let mut tries = 0;
+        let (r, v) = loop {
+            tries += 1;
+            let r = patient_draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+            {
+                let mut st = r.ln.st.lock().unwrap();
+                st.no_route_at_query = at;
+                st.no_route_for = Duration::from_secs(secs);
+            }
+            let v = r.pay(&format!("/pieces/{size}"), 2_000);
+            let (met, asked) = { let st = r.ln.st.lock().unwrap(); (st.no_route_answers > 0, st.route_queries) };
+            if met || asked >= at || tries == 5 {
+                break (r, v);
+            }
+        };
+        assert!(r.ln.st.lock().unwrap().no_route_answers > 0, "({at}, {secs}): no payment met the moment in {tries} draws: {v}");
         // the payments the node had found a route for just before the moment came are sent into it and fail, as
         // they would on a real node; at most the gate's eight, and none is sent again
         let failed = r.ln.by_status("FAILED");
