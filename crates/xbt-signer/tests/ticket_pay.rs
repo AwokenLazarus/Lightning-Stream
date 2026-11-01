@@ -6708,6 +6708,9 @@ fn a_full_channel_soon_after_an_outage_is_counted_once_the_minute_is_over() {
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
     std::thread::sleep(Duration::from_secs(2));
     r.call("ticket_stop", json!({"session": v["session"]}));
+    // the outage's 30 s wait over on the wallet's clock (which stands still in these tests unless moved), and the minute
+    // after the outage (counted on the real clock) not: a new session is not held by that wait, and sends a round
+    r.clock.fetch_add(31, Ordering::SeqCst);
     // the channel back and full (its peer up), inside the minute: the new session's round fails and is not counted
     r.ln.st.lock().unwrap().fail_next = 2;
     let soon = r.pay("/page/1000", CALL);
@@ -6723,6 +6726,8 @@ fn a_full_channel_soon_after_an_outage_is_counted_once_the_minute_is_over() {
     // full channel is counted again
     let left = Duration::from_secs(65).saturating_sub(out_at.elapsed());
     std::thread::sleep(left);
+    // and the 30 s wait after that session's round over too
+    r.clock.fetch_add(31, Ordering::SeqCst);
     r.ln.st.lock().unwrap().fail_next = 2;
     let later = r.pay("/page/1000", CALL);
     assert_eq!(later["status"].as_u64(), Some(200), "{later}");
@@ -6752,7 +6757,6 @@ fn a_seller_without_prepaid_tickets_is_tried_once_each_30_s_after_an_outage_acro
     assert_eq!(first["rule"].as_str(), Some("ticket_outage"), "{first}");
     assert!(first["reason"].as_str().unwrap_or("").contains("the channel to the seller was out a moment ago"), "said as an outage: {first}");
     assert_eq!(r.ln.by_status("FAILED").len(), 2);
-    let started = Instant::now();
     std::thread::sleep(Duration::from_secs(2));
     // the route full meanwhile, the peer up: any round sent now fails
     r.ln.st.lock().unwrap().fail_next = 100;
@@ -6762,8 +6766,9 @@ fn a_seller_without_prepaid_tickets_is_tried_once_each_30_s_after_an_outage_acro
         std::thread::sleep(Duration::from_millis(500));
     }
     assert_eq!(r.ln.by_status("FAILED").len(), 2, "no round sent within the 30 s, whatever the calls");
-    // past the 30 s (and inside the minute): one round is tried, fails, and the wait starts again
-    std::thread::sleep(Duration::from_secs(31).saturating_sub(started.elapsed()));
+    // past the 30 s on the wallet's clock (which stands still in these tests unless moved), and inside the minute after
+    // the outage (counted on the real clock): one round is tried, fails, and the wait starts again
+    r.clock.fetch_add(31, Ordering::SeqCst);
     for _ in 0..4 {
         let v = r.pay("/page/1000", CALL);
         assert_eq!(v["verdict"].as_str(), Some("deny"), "{v}");
