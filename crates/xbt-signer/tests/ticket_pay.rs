@@ -2268,7 +2268,11 @@ fn an_answer_paid_at_its_head_has_the_limits_of_any_other() {
     drip(&r);
     let (v, _, _) = streamed_call(&r, dir.path(), "flat-cap", r.shop.url(&format!("/page/{page}")), CALL as u64, None);
     assert!(v["ended"].as_str().unwrap_or("").contains("max_stream_s: the answer has been open"), "{v}");
-    let r = Rig::new(json!({"tickets": {"max_answer_s": 2}}));
+    // (the call's deadline runs from when the wallet takes it: the session's first lock is made by a call before, and
+    // the deadline leaves room for a release on a busy box, so that what ends the call is the answer held open, never the
+    // lock. The page drips for 30,000 s)
+    let r = Rig::new(json!({"tickets": {"max_answer_s": 6}}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200), "the session is open, its tickets locked");
     drip(&r);
     let v = r.pay(&format!("/page/{page}"), CALL);
     assert!(v["ended"].as_str().unwrap_or("").contains("max_answer_s: the answer has been open"), "{v}");
