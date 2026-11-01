@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::pyjson::str_or_empty;
 use crate::ticket::{outside_u64, Refusal, Terms};
+use std::time::Duration;
 use xbt402::tokens::TokenRule;
 
 fn refuse<T>(rule: &'static str, msg: impl Into<String>) -> Result<T, Refusal> {
@@ -200,6 +201,17 @@ pub struct PayTerms {
     /// [`SEQ_WINDOW_MAX`] here): that many of the session's requests may be on their way at once.
     /// 1, a seller that does not state it: one at a time, each sent once the one before is answered.
     pub seq_window: u64,
+    /// How long the seller keeps an answer paused for a release before it ends it (`refillWaitMs`): the wallet's pause
+    /// for such an answer ends a margin before then ([`seller_pause`]). `None`, a seller that does not state it (one
+    /// before 0.2.0): `tickets.ready_wait_ms` alone.
+    pub refill_wait: Option<Duration>,
+}
+
+/// The most the wallet pauses an answer for a seller that keeps one paused `refill_wait` before it ends it: that less
+/// the way a release takes to reach it, a tenth of it and at most 3 s (15 s, the gateway as shipped: 13.5 s). A
+/// release that arrives after the seller has ended the answer pays for nothing.
+pub fn seller_pause(refill_wait: Duration) -> Duration {
+    refill_wait.saturating_sub((refill_wait / 10).min(Duration::from_secs(3)))
 }
 
 /// The widest seq window the wallet uses, whatever a seller states.
@@ -220,7 +232,13 @@ impl PayTerms {
             None => 1,
             Some(v) => v.as_u64().filter(|&w| w >= 1).ok_or(("ticket_terms", "seqWindow is not a whole number of 1 or more".to_string()))?.min(SEQ_WINDOW_MAX),
         };
-        Ok(Self { terms, receipt_key, session_path, price: Price::parse(acc)?, release: str_or_empty(x.get("release")), accepted: acc.clone(), seq_window })
+        // a seller says how long it keeps a paused answer, or leaves it to the wallet's own limit. A seller can only
+        // shorten the wallet's pause by it (a release then gives up sooner, and nothing is released), never lengthen it
+        let refill_wait = match x.get("refillWaitMs").filter(|v| !v.is_null()) {
+            None => None,
+            Some(v) => Some(Duration::from_millis(v.as_u64().ok_or(("ticket_terms", "refillWaitMs is not a whole number of milliseconds".to_string()))?)),
+        };
+        Ok(Self { terms, receipt_key, session_path, price: Price::parse(acc)?, release: str_or_empty(x.get("release")), accepted: acc.clone(), seq_window, refill_wait })
     }
 
     /// Whether `other` (the terms of a later 402 from the same origin) is the same seller on the
@@ -505,6 +523,28 @@ mod tests {
         for bad in [json!(0), json!(-1), json!("64"), json!(1.5)] {
             assert_eq!(a(bad.clone()), Err("ticket_terms"), "{bad}");
         }
+    }
+
+    #[test]
+    fn terms_say_how_long_the_seller_keeps_a_paused_answer_and_the_pause_ends_before() {
+        let a = |w: Value| {
+            let mut a = accepts(json!({"requestMsat": "2500"}));
+            a["extra"]["refillWaitMs"] = w;
+            PayTerms::parse(&a, NET).map(|t| t.refill_wait).map_err(|e| e.0)
+        };
+        // not stated (a seller before 0.2.0): the wallet's own limit alone
+        assert_eq!(PayTerms::parse(&accepts(json!({"requestMsat": "2500"})), NET).unwrap().refill_wait, None);
+        assert_eq!(a(Value::Null), Ok(None));
+        assert_eq!(a(json!(15_000)), Ok(Some(Duration::from_secs(15))));
+        assert_eq!(a(json!(0)), Ok(Some(Duration::ZERO)));
+        for bad in [json!(-1), json!("15000"), json!(1.5)] {
+            assert_eq!(a(bad.clone()), Err("ticket_terms"), "{bad}");
+        }
+        // a tenth of the seller's wait for the way, at most 3 s
+        assert_eq!(seller_pause(Duration::from_secs(15)), Duration::from_millis(13_500));
+        assert_eq!(seller_pause(Duration::from_secs(2)), Duration::from_millis(1_800));
+        assert_eq!(seller_pause(Duration::from_secs(60)), Duration::from_secs(57));
+        assert_eq!(seller_pause(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]
