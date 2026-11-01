@@ -172,8 +172,7 @@ impl Hashrate {
             String::new()
         };
         let content = format!(
-            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM-compatible gateway. Paid as it is used, seconds at a time, over Lightning Stream.{free}
-",
+            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM-compatible gateway. Paid as it is used, seconds at a time, over Lightning Stream.{free}\n",
             self.name,
             self.algorithm,
             self.hashrate_hs as f64 / 1e12
