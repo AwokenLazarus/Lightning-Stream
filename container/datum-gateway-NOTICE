@@ -1,4 +1,6 @@
 Stream Gateway (DATUM-compatible), as shipped in Lightning Stream's xbt-datum-gateway image.
+This binary: @BUILD@, built from Lightning Stream commit @COMMIT@
+(https://github.com/AwokenLazarus/Lightning-Stream/tree/@COMMIT@).
 
 It is CONVOY's datum_gateway (https://github.com/CONVOYMining/datum_gateway, commit
 971af86b93de088e217a9e74d1ac70188565dbb7), MIT licensed (datum_gateway.LICENSE), with Lightning Stream's
@@ -15,9 +17,11 @@ It is linked statically with:
   jansson 2.14              MIT licence                     jansson.LICENSE
   libcurl 8.11.1            curl licence (MIT-style)        curl.COPYING
   libmicrohttpd 1.0.1       GNU LGPL 2.1 or later (or eCos) libmicrohttpd.COPYING
-  argp-standalone 1.5.0     GNU Library GPL 2 or later      argp-standalone.NOTICE
-and with musl libc through zig (MIT).
+  argp-standalone 1.5.0     GNU Library GPL 2 or later      argp-standalone.NOTICE, argp-standalone.COPYING
+  musl (through zig 0.16)   MIT                             musl.COPYRIGHT
 
 The complete source of this program, including the two LGPL libraries' pinned versions and the script that
-builds and links it (scripts/datum_gateway_build.sh), is at https://github.com/AwokenLazarus/Lightning-Stream,
-so you can rebuild it, or relink it against modified versions of those libraries.
+builds and links it (scripts/datum_gateway_build.sh), is at that commit, so you can rebuild it, or relink it
+against modified versions of those libraries. The Lightning Stream release that ships this image also attaches
+the exact source tarballs of libmicrohttpd and argp-standalone it was built from, with their SHA256SUMS
+(scripts/datum_gateway_sources.sh), so their source is at hand from us as well as from upstream.

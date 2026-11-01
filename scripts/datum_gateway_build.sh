@@ -41,6 +41,8 @@ DEPS=(
   "curl-8.11.1.tar.xz https://curl.se/download/curl-8.11.1.tar.xz c7ca7db48b0909743eaef34250da02c19bc61d4f1dcedd6603f109409536ab56"
   "libmicrohttpd-1.0.1.tar.gz https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz|https://ftpmirror.gnu.org/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94"
   "argp-standalone-1.5.0.tar.gz https://github.com/argp-standalone/argp-standalone/archive/refs/tags/1.5.0.tar.gz c29eae929dfebd575c38174f2c8c315766092cec99a8f987569d0cad3c6d64f6"
+  # argp-standalone's licence (its sources say GNU Library GPL version 2 or later; its tarball carries no text)
+  "lgpl-2.0.txt https://www.gnu.org/licenses/old-licenses/lgpl-2.0.txt cc535c21133c895b56b374c8a1dc1eb948d99003ed2b47372069456b62f42b24"
 )
 for d in "${DEPS[@]}"; do
   read -r name url sum <<<"$d"
@@ -185,13 +187,19 @@ done
 # source and this script are, so the binary can be rebuilt and relinked)
 L=$OUT/licenses
 rm -rf "$L" && mkdir -p "$L"
-cp "$ROOT/container/datum-gateway-NOTICE" "$L/NOTICE"
+# the NOTICE names the commit this binary was built from, so the source it points to is that exact tree
+sed -e "s/@BUILD@/$XBT_DATUM_BUILD_NAME/g" -e "s/@COMMIT@/$REV/g" "$ROOT/container/datum-gateway-NOTICE" > "$L/NOTICE"
+grep -q '@BUILD@\|@COMMIT@' "$L/NOTICE" && { echo "datum_gateway_build: NOTICE not filled in" >&2; exit 1; }
 cp "$ROOT/third_party/datum_gateway/LICENSE" "$L/datum_gateway.LICENSE"
 tar xOf "$CACHE/libsodium-1.0.20.tar.gz" libsodium-1.0.20/LICENSE > "$L/libsodium.LICENSE"
 tar xOf "$CACHE/jansson-2.14.tar.gz" jansson-2.14/LICENSE > "$L/jansson.LICENSE"
 tar xOf "$CACHE/curl-8.11.1.tar.xz" curl-8.11.1/COPYING > "$L/curl.COPYING"
 tar xOf "$CACHE/libmicrohttpd-1.0.1.tar.gz" libmicrohttpd-1.0.1/COPYING > "$L/libmicrohttpd.COPYING"
-# argp-standalone ships no licence file: its sources' own notice (GNU Library GPL, version 2 or later)
+# argp-standalone ships no licence file: its sources' own notice (GNU Library GPL, version 2 or later) and that
+# licence's text, from the FSF (pinned above)
 tar xOf "$CACHE/argp-standalone-1.5.0.tar.gz" argp-standalone-1.5.0/argp-parse.c | sed -n '1,/\*\//p' > "$L/argp-standalone.NOTICE"
+cp "$CACHE/lgpl-2.0.txt" "$L/argp-standalone.COPYING"
+# musl, which zig links in as the C library: its MIT copyright notice, from the copy zig builds it from
+cp "$(dirname "$ZIG_EXE")/lib/libc/musl/COPYRIGHT" "$L/musl.COPYRIGHT"
 for f in "$L"/*; do [ -s "$f" ] || { echo "datum_gateway_build: $f is empty" >&2; exit 1; }; done
 echo "datum_gateway_build: OK ($XBT_DATUM_BUILD_NAME)"

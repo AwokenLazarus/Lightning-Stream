@@ -29,7 +29,8 @@ COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"],
 DATA = {"xbt-vpn": ["usr/share/xbt-vpn/ATTRIBUTION", "usr/share/xbt-vpn/dbip-country-lite.csv.gz"],
         # the Stream Gateway's notice and the licences of what it links statically (two are LGPL)
         "xbt-datum-gateway": [f"usr/share/xbt-datum-gateway/{n}" for n in ("NOTICE", "datum_gateway.LICENSE", "libsodium.LICENSE",
-                              "jansson.LICENSE", "curl.COPYING", "libmicrohttpd.COPYING", "argp-standalone.NOTICE")]}
+                              "jansson.LICENSE", "curl.COPYING", "libmicrohttpd.COPYING", "argp-standalone.NOTICE",
+                              "argp-standalone.COPYING", "musl.COPYRIGHT")]}
 ELF_CLASS = {0x3E: 2, 0xB7: 2, 0x28: 1}
 # each image's licence (SPDX), as its OCI label and index annotation state it (oci_build.sh reads this with
 # --license IMAGE). Ours is MIT OR Apache-2.0 (Cargo.toml). The Stream Gateway links C code of other licences:
