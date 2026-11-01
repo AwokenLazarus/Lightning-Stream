@@ -6554,6 +6554,48 @@ fn a_lock_round_that_fails_in_an_outage_makes_the_wallet_hold_no_less() {
     r.assert_booked();
 }
 
+/// A channel that is full with its peer up, within the minute after an outage: the wallet cannot tell it from the
+/// outage, and holds no less for it. Each lock round's tickets fail (nothing is paid for a failed ticket) and the page
+/// is paid all the same; once the minute is over a full channel is counted again: the pool halves and a wait is set.
+/// What it costs meanwhile is a lock round a session, of 2 failed payments, bounded by the minute.
+#[test]
+fn a_full_channel_soon_after_an_outage_is_counted_once_the_minute_is_over() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    {
+        let mut s = r.ln.st.lock().unwrap();
+        s.drop_at_send = 2;
+        s.drop_for = Duration::from_secs(2);
+    }
+    let out_at = Instant::now();
+    let v = r.pay("/page/1000", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    std::thread::sleep(Duration::from_secs(2));
+    r.call("ticket_stop", json!({"session": v["session"]}));
+    // the channel back and full (its peer up), inside the minute: the new session's round fails and is not counted
+    r.ln.st.lock().unwrap().fail_next = 2;
+    let soon = r.pay("/page/1000", CALL);
+    assert!(out_at.elapsed() < Duration::from_secs(50), "the test's own timing: {:?}", out_at.elapsed());
+    assert_eq!(soon["status"].as_u64(), Some(200), "the page is paid all the same: {soon}");
+    let s = session_of(&r, &soon);
+    assert_eq!((s["pool"].as_i64(), s["slot_fails"].as_i64()), (Some(2), Some(0)), "inside the minute: {s}");
+    assert!(r.audit("ticket_slot_failure").is_empty());
+    let failed_soon = r.ln.by_status("FAILED").len();
+    assert!((4..=6).contains(&failed_soon), "the outage's round and this one, 2 failed payments each (and a refill's at most): {failed_soon}");
+    r.call("ticket_stop", json!({"session": soon["session"]}));
+    // a minute and more after the outage, a full channel is counted again
+    let left = Duration::from_secs(61).saturating_sub(out_at.elapsed());
+    std::thread::sleep(left);
+    r.ln.st.lock().unwrap().fail_next = 2;
+    let later = r.pay("/page/1000", CALL);
+    assert_eq!(later["status"].as_u64(), Some(200), "{later}");
+    let s = session_of(&r, &later);
+    assert_eq!((s["pool"].as_i64(), s["slot_fails"].as_i64(), s["hold_why"].as_str()), (Some(1), Some(1), Some("ticket_slots")), "past the minute: {s}");
+    assert_eq!(r.audit("ticket_slot_failure").len(), 1);
+    // nothing was paid for a failed ticket, and the money is one number
+    r.assert_booked();
+}
+
 #[test]
 fn a_lock_that_finds_no_slot_makes_the_wallet_hold_less_wait_and_then_pay_another_way() {
     let _g = env_lock();
