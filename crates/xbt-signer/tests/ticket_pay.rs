@@ -13533,7 +13533,9 @@ fn a_range_answered_with_the_whole_body_is_not_read_and_one_of_the_same_copy_goe
                (Some(200), Some("ticket_range_ignored"), Some(false), Some(0)), "{other}");
     let cost = other["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
     assert!(other["reason"].as_str().unwrap().contains(&format!("{cost} msat")), "{other}");
-    assert!(cost <= 50_000, "at most what the seller's socket took (256 KiB at 200 sat a MiB): {cost} msat");
+    // what the seller's socket took before the wallet closed it: the buffers of both ends and what was on its way,
+    // which LIMITS bounds by its measure on Linux loopback (822 KiB); 1 MiB at 200 sat a MiB, a small part of the file
+    assert!(cost <= 200_000, "at most what the seller's socket took (1 MiB at 200 sat a MiB): {cost} msat");
     let (paid, taken, book, ledger) = r.money();
     assert_eq!((taken, book), (paid, paid), "{other}");
     assert!(paid - before.0 <= TICKET && ledger >= before.3, "no file bought again: {other}");
