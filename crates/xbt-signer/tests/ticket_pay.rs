@@ -13263,6 +13263,40 @@ fn a_new_outage_has_its_own_wait() {
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
 }
 
+/// A win's invoice has 8 s left when the wallet looks at it, and then the win waits for a route, in which the clock
+/// moves on past the invoice's end: it is looked at again just before it is booked and sent, held back unsent, and
+/// paid on the seller's next invoice. No payment is sent on an invoice that has run out, and none fails.
+///
+/// FAILS without the second look: the win is sent on its lapsed invoice, and the payment fails at the seller's node
+/// (`FAILURE_REASON_INCORRECT_PAYMENT_DETAILS` on a real node; seen on the lab with 1.1 s left at the send).
+#[test]
+fn a_win_whose_invoice_runs_out_while_it_waits_for_a_route_is_not_sent() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    // the seller's invoices of 30 s are dated so that each has 8 s left when it is made
+    r.shop.node.backdate.store(22, Ordering::SeqCst);
+    {
+        // the first win's route query opens a moment with no route, of 2 s
+        let mut st = r.ln.st.lock().unwrap();
+        st.no_route_at_query = 1;
+        st.no_route_for = Duration::from_secs(2);
+    }
+    let size = 256 * PIECE;
+    let v = std::thread::scope(|sc| {
+        let call = sc.spawn(|| r.pay(&format!("/pieces/{size}"), 1_000));
+        // while the first win waits for its route, 9 s pass: its invoice has run out
+        wait_for("the first win's wait for a route", || r.ln.st.lock().unwrap().no_route_answers > 0);
+        r.clock.fetch_add(9, Ordering::SeqCst);
+        call.join().unwrap()
+    });
+    assert!(v["wins"].as_u64().unwrap_or(0) >= 1, "{v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "no payment on a lapsed invoice: {v}");
+    let held: Vec<Value> = r.audit("ticket_refused").into_iter().filter(|e| e["rule"] == "ticket_expiry").collect();
+    assert!(!held.is_empty(), "the win was held back when it was looked at again: {v}");
+    assert_eq!((v["complete"].as_bool(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), v["wins"].as_u64(), Some(0)), "{v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
 /// A seller whose every invoice for a win comes with 2 s left: no queue of the wallet's has a part in that.
 ///
 /// FAILS with such an invoice taken as one that lapsed in the queue: never at fault, and asked again and again.

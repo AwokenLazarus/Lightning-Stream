@@ -1994,12 +1994,18 @@ impl Signer {
         if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, msat, &tp_now, now) {
             return refuse(&hash, rule, why);
         }
-        if win.is_some() {
+        // a win whose invoice would end before its payment could arrive is held back, never sent: asked here, and again
+        // just before it is booked and sent, after every wait between (the route's, the spend lock's), in which an
+        // invoice near its end can pass its margin
+        let too_late = |now: f64| -> Option<Value> {
+            win?;
             let (left, margin) = (inv.expires_at() as f64 - now, self.ticket_pace.send_margin(inv.expiry_s as f64));
-            if left < margin {
-                return with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it would have ended first (held to {margin:.0} s)")),
-                            json!({"hash": hash, "unsent": true}));
-            }
+            (left < margin).then(|| with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it \
+                                                                                 would have ended first (held to {margin:.0} s)")),
+                                         json!({"hash": hash, "unsent": true})))
+        };
+        if let Some(d) = too_late(now) {
+            return d;
         }
         let hinted = match ln.decode(&invoice) {
             Ok(d) => {
@@ -2024,6 +2030,9 @@ impl Signer {
         let booked = {
             let _turn = inside.spend_turn();
             let _g = self.lock();
+            if let Some(d) = too_late(self.engine.now()) {
+                return d;
+            }
             self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win, msat)
                 .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
         };
