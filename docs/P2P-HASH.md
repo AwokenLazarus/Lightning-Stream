@@ -332,7 +332,7 @@ OCEAN's or CONVOY's product.
 | Mode | Blocks pay | Masked |
 |---|---|---|
 | **Solo** (default) | your own XBT address, the whole block | from the first job: the key is the gateway's |
-| **Lazarus Pool** (`pool-key`) | the pool, which pays you for your share of its work at the address you give | once Lazarus Pool takes gateway-held keys. Until then its jobs show `pool-null` and renting stays off in this mode; solo works |
+| **Lazarus Pool** (`pool-key`) | the pool, which pays you for your share of its work at the address you give | from the first job: Lazarus Pool takes gateway-held keys. A pool whose jobs show `pool-null` is refused for renting; solo works |
 
 In Lazarus Pool mode your gateway holds the key that masks its jobs and hands it to the pool with a block, so it
 could hide a block it finds from the pool, the same as any DATUM miner can today. Pools whose own server holds
