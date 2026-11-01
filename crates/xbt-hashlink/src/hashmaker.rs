@@ -1077,7 +1077,9 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
                     continue;
                 }
                 let grace = Duration::from_millis(r.terms.grace_ms);
-                if !r.chans.is_empty() {
+                // served: time its miners work for it, not time they wait on it for a payment on its way (with no
+                // fallback they stay on its channels through the wait)
+                if !r.chans.is_empty() && r.waiting_since.is_none() {
                     r.served += tick;
                 }
                 let r = &g.rentals[&id];
