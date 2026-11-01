@@ -6586,8 +6586,9 @@ fn a_full_channel_soon_after_an_outage_is_counted_once_the_minute_is_over() {
     let failed_soon = r.ln.by_status("FAILED").len();
     assert!((4..=6).contains(&failed_soon), "the outage's round and this one, 2 failed payments each (and a refill's at most): {failed_soon}");
     r.call("ticket_stop", json!({"session": soon["session"]}));
-    // a minute and more after the outage, a full channel is counted again
-    let left = Duration::from_secs(61).saturating_sub(out_at.elapsed());
+    // a minute and more after the outage was last seen (the channel out for its 2 s, read as out until it came back), a
+    // full channel is counted again
+    let left = Duration::from_secs(65).saturating_sub(out_at.elapsed());
     std::thread::sleep(left);
     r.ln.st.lock().unwrap().fail_next = 2;
     let later = r.pay("/page/1000", CALL);
