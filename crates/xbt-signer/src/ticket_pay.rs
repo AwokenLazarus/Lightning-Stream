@@ -944,6 +944,30 @@ impl Sink {
         }
     }
 
+    /// The reader at the socket is still there: reached, and not closed since. For a caller that
+    /// never writes on its socket (`stream_paid`): whatever it might have written is read and lost.
+    fn reader_there(&mut self) -> bool {
+        use std::io::Read;
+        if self.gone {
+            return false;
+        }
+        let Some(out) = self.out.as_mut() else { return true };
+        if out.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let there = match out.read(&mut [0u8; 1]) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+        };
+        let _ = out.set_nonblocking(false);
+        if !there {
+            self.out = None;
+            self.gone = true;
+        }
+        there
+    }
+
     fn put(&mut self, chunk: &[u8]) {
         use std::io::Write;
         // past the size the buyer was shown: what fits is taken, and the call reads no further
@@ -1582,6 +1606,16 @@ struct Call<'a> {
     stream_to: Option<PathBuf>,
     /// The head of the answer goes to that socket first, as one line of JSON (`stream_head`).
     stream_head: bool,
+    /// With `stream_head`, on the ticket rail: the socket is opened, and `{"paid":true}` written as
+    /// its first line, once the request's tickets are paid and before the request leaves for the
+    /// seller (`stream_paid`), so that a caller that times the seller counts from there and not
+    /// from a payment that took long over a slow route. The head line follows it. Where the wallet
+    /// pays again after that line (the seller's balance ran short), `{"paying":true}` comes first and
+    /// `{"paid":true}` again before the request is sent again. A caller gone by then (its socket
+    /// closed, or never reached) is sent nothing more: the request does not leave, and the answer
+    /// says `ticket_caller_gone` with `request_sent` false, so that it may go to another seller
+    /// without being paid twice.
+    stream_paid: bool,
     /// The byte range asked for (`range`), sent as the `Range` header of every request for the URL.
     range: Option<ByteRange>,
     /// The caller's own request headers (`headers`, [`caller_headers`]), sent on every request of
@@ -1738,6 +1772,9 @@ struct Spent {
     /// What the tickets released for the call come to, in msat: the credit its own answer may have
     /// drawn past what the session had when it started ([`Stream::cut_bound`]).
     released_msat: u64,
+    /// A request the seller may serve, or charge, has left for it (`request_sent` in the answer):
+    /// not one the seller refused unserved and signed so (a 402, 503 or `identify_first`).
+    sent: bool,
 }
 
 impl Spent {
@@ -2485,6 +2522,7 @@ impl Signer {
             Err(why) => return deny("headers", why),
         };
         let head_headers = stream_head && p.get("head_headers").and_then(Value::as_bool) == Some(true);
+        let stream_paid = stream_head && p.get("stream_paid").and_then(Value::as_bool) == Some(true);
         // the price the buyer was shown where it chose this seller: terms above it are paid nothing
         let ceiling = match PriceCeiling::parse(p.get("price_ceiling")) {
             Ok(c) => c,
@@ -2597,10 +2635,12 @@ impl Signer {
                 // a seller whose service is full turns a new visit away before it is sold anything
                 if probe.status == 503 {
                     let v: Value = probe.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                    // refused unserved: another seller may serve the request (`request_sent` false)
                     if let Some(d) = seller_busy(&v) {
                         return d;
                     }
-                    return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"), json!({"status": 503, "charged_sats": 0}));
+                    return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"),
+                                json!({"status": 503, "charged_sats": 0, "request_sent": false}));
                 }
                 if probe.status != 402 {
                     let status = probe.status;
@@ -2630,7 +2670,8 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only, charge_sats, max_size };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, extra, head_headers, upgrade,
+                          credit_only, charge_sats, max_size };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // a route that gives each buyer an account is paid with tickets only: draws serve no buyer as its account
@@ -4307,7 +4348,7 @@ impl Signer {
         let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), charge_sats: Some(c.charge_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
         let about = |hs: &HttpSession, spent: &Spent| {
             json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
-                   "tickets_prepaid": spent.prepaid,
+                   "tickets_prepaid": spent.prepaid, "request_sent": spent.sent,
                    "balance_msat": hs.balance().to_string(), "credited_msat": hs.credited().to_string(), "tickets": self.ticket_session_counts(&hs.sid)})
         };
         let fail = |hs: &HttpSession, spent: &Spent, d: Value| with(d, about(hs, spent));
@@ -4336,6 +4377,14 @@ impl Signer {
         // the most a ticket of this seller adds to the balance: how many rounds of releases a head's reserve takes
         let ticket_msat = hs.terms.terms.ticket_msat.max(1);
         let most_rounds = reserve.div_ceil(ticket_msat).saturating_add(2).min(64);
+        // the caller's socket, opened once the request is paid for where it asked to be told (`stream_paid`)
+        let mut early: Option<Sink> = None;
+        // that caller was told the wallet pays again since it was told the request is paid for
+        let mut paying_told = false;
+        // a caller that asked to be told and is gone (its socket closed, or never reached) gets no answer: the
+        // request does not leave, so that one answer is never paid to two sellers
+        let caller_gone = || refusal("ticket_caller_gone", "the caller stopped waiting before the request was sent: it was not sent, and what was \
+                                                            paid for it stays with the seller as credit");
         let (rid, seq, digest, ans, head, mark, streaming) = loop {
             // whole tickets until the seller's balance covers what it wants before it serves. The balance
             // by the wallet's count: answers open beside this one draw on it as they go
@@ -4351,6 +4400,12 @@ impl Signer {
                     let why = if reserve > ticket_msat.saturating_mul(62) { "the route's price needs more than 64 tickets before it is served" }
                               else { "the answers open beside this request drew the tickets released for it before it could be sent: call again" };
                     return fail(hs, &spent, refusal(if reserve > ticket_msat.saturating_mul(62) { "ticket_terms" } else { "ticket_contended" }, why));
+                }
+                // the caller was told the request is paid for, and the wallet pays again (the seller's balance ran short):
+                // said, so that it does not count this payment as the seller's time
+                if let Some(s) = early.as_mut().filter(|_| !paying_told) {
+                    s.head(&json!({"paying": true}));
+                    paying_told = true;
                 }
                 if let Err(d) = self.ticket_release_one(hs, &mut spent, started, &short_now) {
                     return fail(hs, &spent, d);
@@ -4389,6 +4444,27 @@ impl Signer {
                 // the price the wallet counts this request at: a seller that checks it refuses another unpaid
                 headers.push((xbt402::ticket::PRICE_HEADER.into(),
                               xbt402::ticket::price_line(price.request_msat, price.byte_msat, price.per_bytes, price.second_msat, &price.tokens)));
+                // paid for, and its turn to leave: from here the seller's time is the seller's, whatever the payment (or
+                // the turn) took. Said again after any payment since the caller was told; and before every send, a caller
+                // gone (a request sent again for `bad_seq` may find it gone meanwhile) is sent nothing
+                if c.stream_paid {
+                    match early.as_mut() {
+                        None => {
+                            let mut s = Sink::for_call(c);
+                            s.head(&json!({"paid": true}));
+                            early = Some(s);
+                        }
+                        Some(s) if paying_told => s.head(&json!({"paid": true})),
+                        Some(_) => {}
+                    }
+                    paying_told = false;
+                    if !c.upgrade && early.as_mut().is_some_and(|s| !s.reader_there()) {
+                        self.seq_done(hs, seq);
+                        lock_money(hs).close(rid, 0, 0);
+                        return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
+                    }
+                }
+                spent.sent = true;
                 sent_epoch = lock_money(hs).epoch;
                 let sent = if c.upgrade {
                     self.wire_upgrade(c.url, &headers, Self::ticket_read_timeout(&tp)).map(|u| {
@@ -4430,6 +4506,8 @@ impl Signer {
                                 Some(s) => seq = s,
                                 None => std::thread::sleep(Duration::from_millis(10)),
                             }
+                            // refused unserved, and signed so: it is sent again below, or not at all
+                            spent.sent = false;
                             continue;
                         }
                     }
@@ -4521,6 +4599,8 @@ impl Signer {
                                                      json!({"status": 403})));
                     }
                     identified_again = true;
+                    // refused unserved, and signed so
+                    spent.sent = false;
                     if self.ticket_identify(hs).is_ok() {
                         continue;
                     }
@@ -4533,6 +4613,8 @@ impl Signer {
                 let status = ans.status;
                 let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
                 let code = protocol_code(v.get("error"));
+                // refused unserved, and signed so: nothing of it is served or charged
+                spent.sent = false;
                 // signed by the seller: its balance is what it says, and the loop releases one ticket more if that is short
                 if code == "balance_short" && short < 4 && hs.balance() < reserve {
                     short += 1;
@@ -4550,7 +4632,7 @@ impl Signer {
         let mut ans = ans;
         let status = ans.status;
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
-        let mut sink = Sink::for_call(c);
+        let mut sink = early.take().unwrap_or_else(|| Sink::for_call(c));
         // a 206 for another range than was asked is not read: what it has cost is what its head charged
         let (head_fields, not_read) = c.head(&mut ans, &mut sink);
         out = with(out, head_fields);
@@ -5830,7 +5912,8 @@ pub(crate) fn seller_busy(v: &Value) -> Option<Value> {
         "bandwidth" => format!("This shop is busy{}. Try again in a moment.", counts("Mbit/s carried")),
         _ => "This shop is busy. Try again in a moment.".to_string(),
     };
-    Some(with(deny("seller_busy", words), json!({"status": 503, "charged_sats": 0, "seller_code": "busy",
+    // turned away unserved, before anything was paid for it: another seller may serve the request (`request_sent` false)
+    Some(with(deny("seller_busy", words), json!({"status": 503, "charged_sats": 0, "seller_code": "busy", "request_sent": false,
                                                     "busy": {"scope": scope, "inUse": in_use, "limit": limit, "retryAfter": retry}})))
 }
 

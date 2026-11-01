@@ -888,7 +888,7 @@ knows only tickets skips an entry it cannot read.
  "extra": {"version": "lottery/0", "layer": "lightning", "features": [512],
            "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40,
            "pay": "on-win", "release": "after-answer",
-           "window": 8, "graceSeconds": 30, "gracePieces": 64, "maxUnpaidWins": 2,
+           "window": 8, "graceSeconds": 60, "gracePieces": 64, "maxUnpaidWins": 2,
            "chainDraws": 65536, "pieceBytes": "262144",
            "receiptKey": "<33-byte public key>", "session": "/x402/lottery",
            "price": {"requestMsat": "0", "byteMsat": "100", "perBytes": "262144", "secondMsat": "0"}}}
@@ -1116,7 +1116,7 @@ when the node shows the first cancelled (it lapsed unpaid).
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
 gateway does when the first has lapsed. A win's invoice lives as long as the seller's grace
-(`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer, and is never
+(`graceSeconds`, 60 s at the gateway, 30 s before 0.1.20; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`
 carries it, the wallet pays it and asks again. (Until 2026-10-14 an invoice lived 60 s against a
@@ -1292,7 +1292,7 @@ this tree (the wallet's signer, its MCP server, the gateway), a stock file serve
 Lightning Fork nodes (buyer, one routing hop, seller) on one host over loopback, the buyer's
 channel and the seller's inbound channel opened with 30 slots. The lottery's own rules are the
 shipped ones on both sides (wins of 64 sat through a hop, odds of 1 in 4 at the most, 8 values
-ahead; a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid wins), with pieces of
+ahead; a window of 8 pieces, a grace of 60 s and 64 pieces, 2 unpaid wins), with pieces of
 64 KiB. Other settings of the lab are not the shipped ones. Its wallet policy has
 `velocity_max` 1,000 (shipped: 8), `max_sellers` 108 and `max_new_sellers_per_min` 400 for the
 100 sellers (15 and 30), `max_sends_per_hour` 100,000 (1,200), `max_answer_s` 120 (50) and a lab

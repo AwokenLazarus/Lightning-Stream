@@ -389,10 +389,10 @@ def terms() -> None:
     schemes = [a["scheme"] for a in pr["accepts"]]
     entry = pr["accepts"][-1]
     x = entry.get("extra", {})
-    check("terms: the 402 lists held tickets, prepaid tickets and, last, the lottery: a win of 64 sat (16 at the least), paid after it by an invoice, the window of 8, the grace of 30 s and 64 pieces, and the piece size",
+    check("terms: the 402 lists held tickets, prepaid tickets and, last, the lottery: a win of 64 sat (16 at the least), paid after it by an invoice, the window of 8, the grace of 60 s and 64 pieces, and the piece size",
           status_code == 402 and schemes == ["ticket", "ticket", "lottery"] and entry["payTo"] == lab.pubkey(SELLER)
           and (x.get("winMsat"), x.get("minWinMsat"), x.get("pay"), x.get("window"), x.get("graceSeconds"), x.get("gracePieces"), x.get("maxUnpaidWins"), x.get("pieceBytes"))
-          == ("64000", "16000", "on-win", 8, 30, 64, 2, str(PIECE)),
+          == ("64000", "16000", "on-win", 8, 60, 64, 2, str(PIECE)),
           {"schemes": schemes, "lottery": {k: x.get(k) for k in ("winMsat", "minWinMsat", "pay", "release", "window", "graceSeconds", "gracePieces", "maxUnpaidWins", "chainDraws", "pieceBytes")}})
     tools = {t["name"]: t for t in agent().tools()}
     desc = tools["xbt402_pay"]["description"]
