@@ -197,6 +197,55 @@ def spawn(name: str, args: list[str]) -> subprocess.Popen[bytes]:
     return p
 
 
+class LatePool:
+    """Between the gateway and primed: holds what the pool sends for LATE seconds after each new block, so the
+    gateway's coinbaser (5 s timeout) is late and its first full jobs go out on coinbase[0]; the late coinbaser then
+    rewrites the job's coinbases in place (P2P_HASH_LATE_COINBASER=1)."""
+
+    LATE = 7.0
+
+    def __init__(self, listen: int, to: int, height: Any) -> None:
+        self.to, self.height, self.changed, self.held = to, height, 0.0, 0
+        self.server = socket.create_server(("127.0.0.1", listen))
+        threading.Thread(target=self.watch, daemon=True).start()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def watch(self) -> None:
+        last = None
+        while True:
+            try:
+                h = self.height()
+            except Exception:  # noqa: BLE001  (the node stopping at the end)
+                return
+            if last is not None and h != last:
+                self.changed = time.time()
+            last = h
+            time.sleep(0.3)
+
+    def serve(self) -> None:
+        while True:
+            a, _ = self.server.accept()
+            b = socket.create_connection(("127.0.0.1", self.to))
+            threading.Thread(target=self.pump, args=(a, b, False), daemon=True).start()
+            threading.Thread(target=self.pump, args=(b, a, True), daemon=True).start()
+
+    def pump(self, x: socket.socket, y: socket.socket, from_pool: bool) -> None:
+        try:
+            while data := x.recv(65536):
+                wait = self.changed + self.LATE - time.time()
+                if from_pool and wait > 0:
+                    self.held += 1
+                    time.sleep(wait)
+                y.sendall(data)
+        except OSError:
+            pass
+        for z in (x, y):
+            try:
+                z.close()
+            except OSError:
+                pass
+
+
 class Road:
     """A TCP relay on the hashtaker's way to the link: it can lose what the hashmaker sends, close what
     it carries, and refuse what comes next."""
@@ -782,7 +831,10 @@ def real_gateway_run(mode: str) -> None:
             log = open(f"{RUN}/{mode}-primed.log", "ab")
             PROCS.append(subprocess.Popen([primed, "-c", f"{home}/prime/prime.toml", "run"], stdout=log, stderr=log))
             lab.wait("primed", 30, lambda: socket.create_connection(("127.0.0.1", prime), 1).close() or True, every=0.5)
-            datum = {"pool_host": "127.0.0.1", "pool_port": prime, "pool_pubkey": pub, "pool_pass_workers": True, "pool_pass_full_users": True,
+            late = None
+            if os.environ.get("P2P_HASH_LATE_COINBASER") == "1":
+                late = LatePool(base + 6, prime, lambda: int(cli("getblockcount")))
+            datum = {"pool_host": "127.0.0.1", "pool_port": base + 6 if late else prime, "pool_pubkey": pub, "pool_pass_workers": True, "pool_pass_full_users": True,
                      "pooled_mining_only": True, "protocol_global_timeout": 60}
             pool_address = "bc1qt5praystcdle0nq04e3h02yjszha82uzhww85x6972lcy40k4eyqz9jfaq"
         with open(f"{home}/gw.json", "w") as f:
@@ -869,6 +921,16 @@ def real_gateway_run(mode: str) -> None:
                   {"height": [height0, height1], "blocks": blocks})
             check(f"{mode}: the hashtaker held every job to what the gateway opened on its API", bz["jobsShownBlinded"] >= 1 and bz["closed"] == "rental time over",
                   {"jobs shown blinded": bz["jobsShownBlinded"], "closed": bz["closed"]})
+            # a rental keeps its miners across block changes: every new block's first (empty) job, and the jobs sent
+            # while a coinbaser is late, are opened on the API, so no block change ends it
+            prevs = {k["prevblock"] for k in bz.get("keysSeen", [])}
+            how = " with a late coinbaser" if mode == "pool" and os.environ.get("P2P_HASH_LATE_COINBASER") == "1" else ""
+            check(f"{mode}: the rental kept its miners across {len(blocks)} block changes{how}, to the end of its time",
+                  len(blocks) >= 2 and len(prevs) >= len(blocks) and bz["closed"] == "rental time over"
+                  and not [e for e in bz.get("events", []) if e.get("ev") == "a job not shown to be blinded"],
+                  {"blocks": len(blocks), "previous blocks its jobs were on": len(prevs), "closed": bz["closed"],
+                   "refused": [e for e in bz.get("events", []) if e.get("ev") == "a job not shown to be blinded"][:2],
+                   **({"pool replies held": late.held} if mode == "pool" and late else {})})
         else:
             REPORT.setdefault("skipped", []).append({"check": f"{mode}: masked blocks", "missing": "a primed that takes gateway-held keys"})
             print(f"SKIP  {mode}: masked blocks: no primed that takes gateway-held keys; this run's blocks are unblinded", flush=True)
