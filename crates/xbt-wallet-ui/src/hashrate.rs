@@ -35,6 +35,10 @@ const WAIT: Duration = Duration::from_secs(6);
 /// What a rental pays before the miners move, in seconds of their work: it pays for moving them. The S11
 /// run sets the real value.
 pub const START_FEE_SECONDS: f64 = 12.0;
+/// The most pieces a start fee asks for. The renter pays the fee a piece at a time, each a paid request, within the
+/// first payment's grace: a fee of thousands of small pieces (an owner's small fixed piece, before any miner of theirs
+/// has hashed here and the speed is an S11's) could never be paid in time, and every rental would end unstarted.
+pub const MAX_START_SLICES: u64 = 30;
 /// A piece of work is about one share: a gateway's vardiff aims at 8 shares a minute.
 const SHARE_SECONDS: f64 = 7.5;
 /// The miner speed estimates are given for, and pieces are sized to until a miner has hashed here: an S11.
@@ -108,9 +112,9 @@ pub fn slice_for(hs: f64, now: Option<u128>) -> u128 {
 pub fn start_slices_for(hs: f64, slice_work: u128, now: Option<u64>) -> u64 {
     let secs = |n: u64| n as f64 * slice_work.max(1) as f64 / hs.max(1.0);
     if let Some(n) = now.filter(|n| *n >= 1 && (START_FEE_SECONDS * 0.5..=START_FEE_SECONDS * 1.5).contains(&secs(*n))) {
-        return n;
+        return n.min(MAX_START_SLICES);
     }
-    ((START_FEE_SECONDS * hs.max(1.0) / slice_work.max(1) as f64).round() as u64).max(1)
+    ((START_FEE_SECONDS * hs.max(1.0) / slice_work.max(1) as f64).round() as u64).clamp(1, MAX_START_SLICES)
 }
 
 /// How a hashmaker prices: a percent of what the work is worth when mined, or sats for a piece of `per` hashes.
@@ -1669,6 +1673,11 @@ mod tests {
         // the fee alone, far off its seconds: set again
         assert_eq!(start_slices_for(4e12, 1 << 45, Some(5)), 1);
         assert_eq!(start_slices_for(5e12, 1 << 45, None), 2, "with nothing in force, the nearest");
+        // a small piece at an S11's speed: 12 s would be 5,588 pieces, never paid within the grace; capped
+        assert_eq!(start_slices_for(4e12, 1 << 33, None), MAX_START_SLICES);
+        assert_eq!(start_slices_for(4e12, 1 << 33, Some(5588)), MAX_START_SLICES, "a fee in force above the cap is capped too");
+        let fixed = json!({"priceMode": "fixed", "fixedPriceSat": 1, "fixedSliceWork": "8589934592", "sliceFixed": true, "sliceWork": "8589934592"});
+        assert_eq!(want(&fixed, Err("no tip"), None).unwrap().start_slices, MAX_START_SLICES, "an owner's small fixed piece, no miner measured");
     }
 
     #[test]
