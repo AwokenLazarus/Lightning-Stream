@@ -1049,17 +1049,22 @@ class ChannelDrops:
     """The buyer's connection to its one peer dropped and made again every second, on the real nodes: its channel
     goes inactive, as it does when a peer's connection drops, under whatever the wallet is paying then."""
 
+    uses = 0
+
     def __init__(self, every: float = 0.0) -> None:
         self.every = every or float(os.environ.get("FLAP_EVERY", "5"))
         self.done = threading.Event()
         self.drops = 0
         self.reconnected = 0
         self.errors: list[str] = []
+        self.back_s: list[float | None] = []
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def run(self) -> None:
         pk = lab.pubkey(HOP)
-        while not self.done.wait(self.every):
+        next_drop = time.monotonic() + self.every
+        while not self.done.wait(max(0.0, next_drop - time.monotonic())):
+            next_drop += self.every
             try:
                 lab.lncli(BUYER, "disconnect", pk)
                 self.drops += 1
@@ -1072,6 +1077,28 @@ class ChannelDrops:
                     self.reconnected += 1
                 else:
                     self.errors.append(said[:160])
+            # how long from the connect until the buyer's node shows the channel active again, within this cycle (the
+            # next drop keeps its time): None, still out when the next drop came
+            t0 = time.monotonic()
+            back = None
+            while time.monotonic() < next_drop and not self.done.is_set():
+                try:
+                    if any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]):
+                        back = time.monotonic() - t0
+                        break
+                except LabError:
+                    pass
+                time.sleep(0.1)
+            self.back_s.append(back)
+
+    def back_summary(self) -> dict[str, Any]:
+        """Connect to channel active, per cycle: how many, the median, 90th percentile and longest of those that came
+        back within their cycle, how many did not, and how many took over the wallet's 8 s wait."""
+        came = sorted(b for b in self.back_s if b is not None)
+        at = lambda q: round(came[min(len(came) - 1, int(q * (len(came) - 1) + 0.5))], 2) if came else None  # noqa: E731
+        return {"cycles": len(self.back_s), "back_in_cycle": len(came), "not_back_in_cycle": len(self.back_s) - len(came),
+                "median_s": at(0.5), "p90_s": at(0.9), "longest_s": round(came[-1], 2) if came else None,
+                "over_8s": sum(1 for b in came if b > 8.0), "every_s": self.every}
 
     def __enter__(self) -> "ChannelDrops":
         self.thread.start()
@@ -1080,6 +1107,8 @@ class ChannelDrops:
     def __exit__(self, *_: Any) -> None:
         self.done.set()
         self.thread.join()
+        ChannelDrops.uses += 1
+        measured(f"flap_channel_back_every_{self.every:g}s_{ChannelDrops.uses}", self.back_summary())
         pk = lab.pubkey(HOP)
         try:
             lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
@@ -1112,9 +1141,10 @@ class ChannelDrops:
 
 
 # What an answer the wallet does not read may still cost on a route priced by the byte: what the seller's socket took
-# before the wallet closed it (its buffers, a few hundred KiB at most, docs/LIMITS.md); the check reports the amount.
-# More than 512 KiB is a finding, not load.
-UNREAD_MOST_MSAT = -(-(512 << 10) * BYTE_MSAT // PER_BYTES)
+# before the wallet closed it, at once on seeing the range ignored. That is bounded by the OS's socket buffers on both
+# ends and what was on its way (docs/LIMITS.md: up to 822 KiB measured on loopback), not by the wallet; the check
+# reports the amount. More than 2 MiB is a finding.
+UNREAD_MOST_MSAT = -(-(2 << 20) * BYTE_MSAT // PER_BYTES)
 
 
 def digest_of_range(start: int) -> str:

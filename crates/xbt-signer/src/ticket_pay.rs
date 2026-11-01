@@ -2214,6 +2214,11 @@ fn answer_head(ans: &mut WireAnswer, asked: Option<ByteRange>) -> (Value, Option
         // the whole body to a call that asked for part of it: the bytes before the range would be bought again
         200 if asked.is_some() => {
             v["range_ignored"] = true.into();
+            // the connection ends here, before a byte of the body is read: what the seller's socket can still take is all
+            // it costs (the OS's buffers and what is on its way, docs/LIMITS.md)
+            if let Some(close) = &ans.closer {
+                close();
+            }
             return refuse(v, format!("the seller answered the range asked for ({}) with the whole body", asked.map(|r| r.header()).unwrap_or_default()));
         }
         206 => {
@@ -6571,8 +6576,13 @@ mod tests {
         assert!(answer_head(&mut ans(206, "bytes 10-19/100", Some(11)), asked).1.is_some(), "a length that is not the span");
         assert!(answer_head(&mut ans(206, "bytes 10-30/100", Some(21)), ByteRange::parse("bytes=10-20")).1.is_some(), "past the end asked for");
         assert!(answer_head(&mut ans(206, "", Some(5)), None).1.is_some(), "a 206 with no range");
-        let (v, refused) = answer_head(&mut ans(200, "", Some(100)), asked);
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut whole_to_a_range = ans(200, "", Some(100));
+        let c = closed.clone();
+        whole_to_a_range.closer = Some(Arc::new(move || c.store(true, Ordering::SeqCst)));
+        let (v, refused) = answer_head(&mut whole_to_a_range, asked);
         assert!(refused.is_some() && v["range_ignored"] == true, "a whole body to a range from byte 10 is not read");
+        assert!(closed.load(Ordering::SeqCst), "and its connection is ended at once, before any of it is read");
         let mut whole = ans(200, "", Some(100));
         let (v, refused) = answer_head(&mut whole, ByteRange::parse("bytes=0-"));
         assert!(refused.is_none() && v.get("range_ignored").is_none() && whole.length == Some(100), "from byte 0: the whole body is what was asked");
