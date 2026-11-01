@@ -279,7 +279,7 @@ pub trait LnBackend: Send + Sync {
     fn lookup(&self, payment_hash: &str) -> Result<Option<Value>>;
     /// `GET /v1/utxos`: the node's on-chain coins.
     fn utxos(&self) -> Result<Vec<Value>>;
-    /// `GET /v1/graph/routes/{payee}/{amt}` (`offchain:read`): whether the node finds a route of
+    /// `GET /v1/graph/routes/{payee}/{amt}` (QueryRoutes, `info:read`): whether the node finds a route of
     /// `amt_msat` to `payee` out through `outgoing_chan_id`, as its own payment would look for one
     /// (mission control included). Nothing is sent. `Ok(false)` only for the node's own "no path";
     /// any other failure to answer is an error.
@@ -825,8 +825,9 @@ pub fn channel_refusal(c: &Value, split_height: i64) -> Option<String> {
     None
 }
 
-/// How long the ticket rail's checks wait for an inactive channel ([`Signer::ln_channels_back`]): less
-/// than the 10 s a seller's answer stands still for a win, with room left to pay it.
+/// How long the ticket rail's checks wait for an inactive channel ([`Signer::ln_channels_back`]), and a
+/// payment for a route to its seller: less than the 15 s a seller's answer stands still for a payment as
+/// shipped (`refill_wait`), with room left to pay it.
 pub(crate) const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
 pub(crate) const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
 /// Longer than the wait's polls, and than the moment between one refused payment and the next behind it.

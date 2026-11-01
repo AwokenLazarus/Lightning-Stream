@@ -57,6 +57,8 @@ const OWED_POLL: Duration = Duration::from_millis(250);
 /// How many of a win's invoices, and of a session's, the wallet asks to have cancelled after failed payments.
 /// Past these it waits for them to lapse: a seller's node that fails every payment is not asked for ever.
 const CANCELS_PER_WIN: u32 = 4;
+/// How many times a win is refused for no route before the call gives up on that seller.
+const NO_ROUTE_PER_WIN: u32 = 3;
 const CANCELS_PER_SESSION: u32 = 32;
 /// How many of a win's invoices, and of a session's, may run out in the wallet's queue before it stops asking.
 const LAPSES_PER_WIN: u32 = 4;
@@ -140,6 +142,8 @@ struct State {
     /// How many of a win's invoices, and of the session's, ran out in the wallet's queue.
     lapses: HashMap<u64, u32>,
     lapsed: u32,
+    /// How many times a win was refused for no route to the seller.
+    no_route: HashMap<u64, u32>,
     /// How many invoices the seller has been asked to cancel, by win and in all, and that it will not
     /// (one of an earlier version, or at its own limit).
     cancels: HashMap<u64, u32>,
@@ -662,7 +666,10 @@ impl Signer {
         let charged = py_int(out.get("charged_sats")).unwrap_or(0).max(0);
         let rule = str_or_empty(out.get("rule"));
         // the book holds this invoice's payment failed, with nothing of it in flight on the wallet's node
-        let failed_hash = (rule == "lottery_win_failed").then(|| crate::bolt11::decode(invoice).ok().map(|i| i.payment_hash_hex())).flatten()
+        // its payment failed with nothing in flight, or the wallet held it back for lack of time and never sent it:
+        // either way the seller's next invoice is wanted at once
+        let unsent = rule == "ticket_expiry" && out.get("unsent") == Some(&Value::Bool(true));
+        let failed_hash = (rule == "lottery_win_failed" || unsent).then(|| crate::bolt11::decode(invoice).ok().map(|i| i.payment_hash_hex())).flatten()
             .filter(|h| out.get("hash").and_then(Value::as_str) == Some(h.as_str()));
         if let Some(hash) = failed_hash {
             self.draw_cancel_later(ds, win, hash);
@@ -735,6 +742,16 @@ impl Signer {
                 }
                 if not_now {
                     s.tried.remove(&invoice_mark(invoice));
+                }
+                // a seller the wallet's node has no route to, win after win: the call ends with that reason, and the
+                // win stays owed for a later call
+                if rule == "ln_no_route" {
+                    let n = s.no_route.entry(win.draw()).or_default();
+                    *n += 1;
+                    if *n >= NO_ROUTE_PER_WIN {
+                        c.stop.get_or_insert(format!("ln_no_route: the wallet's node has found no route to the seller for any of {n} tries of a win"));
+                        c.halt = true;
+                    }
                 }
                 // an invoice the wallet's checks refused is the seller's doing. After three, the session is over: a
                 // seller that cannot make an invoice for its own node at its own win size is not asked again

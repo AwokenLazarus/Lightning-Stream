@@ -9616,3 +9616,59 @@ fn a_range_answered_with_the_whole_body_is_not_read_and_one_of_the_same_copy_goe
     r.assert_booked();
 }
 
+/// A win's invoice the wallet held back for lack of time (it would have ended on the way) is cancelled at the
+/// wallet's asking, so the seller's next one comes at once rather than after the first has lapsed; the win is
+/// paid before the call returns, and nothing fails.
+///
+/// FAILS without asking: the next invoice waits for a lapse that, on this seller's 30 s invoice, comes after the
+/// call has stopped waiting, and the win is left owed.
+#[test]
+fn a_win_held_back_for_lack_of_time_gets_the_sellers_next_invoice_at_once() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    r.ln.st.lock().unwrap().send_takes = Duration::from_secs(3);
+    let size = 256 * PIECE;
+    // a file's wins teach the wallet how long they take on the way
+    let first = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((first["rail"].as_str(), first["complete"].as_bool()), (Some("lottery"), Some(true)), "{first}");
+    let (clock, node, standin, once) = (r.clock.clone(), r.shop.node.clone(), r.shop.standin.clone(), AtomicBool::new(false));
+    r.ln.st.lock().unwrap().on_look = Some(Arc::new(move |_| {
+        let known: Vec<String> = node.preimages.lock().unwrap().keys().cloned().collect();
+        let open = known.iter().any(|h| standin.state_of(&hex::decode(h).unwrap().try_into().unwrap()) == Some(InvoiceState::Open));
+        if open && !once.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(300));
+            // the open invoices have 5 s left, which these wins may not be sent on; nothing lapses them here
+            clock.fetch_add(24, Ordering::SeqCst);
+        }
+    }));
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    assert!(r.audit("ticket_refused").iter().any(|e| e["rule"] == "ticket_expiry" && e["reason"].as_str().unwrap_or("").contains("on the way")), "{v}");
+    assert!(!r.tap.seen("/x402/lottery/cancel").is_empty(), "the seller was asked to cancel it: {v}");
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+    assert_each_win_paid_once(&r, v["session"].as_str().unwrap(), first["wins"].as_u64().unwrap() + wins);
+}
+
+/// The wallet's node has no route to the seller, for good: one payment waits for one at a time, all of them
+/// within one window of 8 s, the rest are refused at once, and the call ends with that reason well within the
+/// caller's minute. Nothing is sent, so nothing fails, and the money is what the node paid.
+///
+/// FAILS with a wait for each payment in turn: the call holds the gate for 8 s a win, past the minute.
+#[test]
+fn a_route_gone_for_good_ends_the_call_soon_with_its_reason() {
+    let _g = env_lock();
+    let r = patient_draws_rig(json!({}));
+    let t = Instant::now();
+    r.ln.st.lock().unwrap().no_route = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(40), "the call took {took:?}: {v}");
+    assert!(v.to_string().contains("ln_no_route"), "{v}");
+    assert_eq!(r.ln.by_status("FAILED").len(), 0, "{v}");
+    let waits = r.audit("ticket_route_waited");
+    assert!(!waits.is_empty() && waits.len() <= 3, "one wait at a time: {waits:?}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap_or(0));
+}
+

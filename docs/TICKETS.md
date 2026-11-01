@@ -1118,8 +1118,14 @@ session. The gateway cancels only the current invoice of that session's unpaid w
 node shows it open (`cancelled` says whether it did), and at most `max_win_cancels` times a session, 32
 by default, past which it says `too_many_cancels`; the win's grace still runs from its draw, so a
 cancel buys the buyer no time, no draw and no money. A seller without the call answers 404, and the
-win waits for the lapse. Before any payment of the rail the wallet waits for an
-inactive channel, at most 8 s from when it first saw it out. A win whose invoice would end before
+win waits for the lapse. The wallet asks the same where it held a win back for lack of time on its
+invoice (below), which it never sent. Before any payment of the rail the wallet waits for an
+inactive channel, at most 8 s from when it first saw it out, and before a win or a prepaid ticket is
+sent it asks its node for a route to the seller (QueryRoutes, which needs `info:read`; nothing is
+sent) and waits for one within what is left of those 8 s. One payment to a seller waits at a time, in
+one window for all of them: the others are refused at once (`ln_no_route`), and a win refused so three
+times ends the call with that reason, the win owed for a later call. A node that cannot answer the
+question is not waited for. A win whose invoice would end before
 the payment could arrive (by twice the longest of the latest payments' time on the way, at least 5 s
 and at most half its life) is not sent, and one that ran out while the win waited at the gate does
 not count against the seller, up to 4 for a win and 32 for a session; past that the session ends

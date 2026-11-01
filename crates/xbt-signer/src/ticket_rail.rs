@@ -117,6 +117,9 @@ struct PaceState {
     flown: std::collections::VecDeque<f64>,
     /// How long the node's latest route queries took, in ms ([`Pace::route_query_ms`]).
     queried: std::collections::VecDeque<f64>,
+    /// Payees the node has found no route to: since when, when that was last seen, and whether a payment is
+    /// waiting for one ([`Signer::ln_route_wait`]).
+    no_route: HashMap<String, (Instant, Instant, bool)>,
 }
 
 struct Waiter {
@@ -150,6 +153,31 @@ impl Pace {
             s.flown.pop_front();
         }
         s.flown.push_back(took.as_secs_f64());
+    }
+
+    /// Whether a payment to `payee`, which the node has just found no route to, may wait for one, and until when:
+    /// one payment to a payee waits at a time, and all of them together no longer than `most` from when the
+    /// node first found none (an outage nobody has looked at for a second is over). `None`: refuse it now.
+    fn route_wait_turn(&self, payee: &str, most: Duration) -> Option<Instant> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let (since, seen, waiting) = s.no_route.get(payee).copied().filter(|(_, seen, w)| *w || now.duration_since(*seen) <= Duration::from_secs(1))
+            .unwrap_or((now, now, false));
+        let until = since + most;
+        let turn = (!waiting && now < until).then_some(until);
+        s.no_route.insert(payee.to_string(), (since, now.max(seen), waiting || turn.is_some()));
+        turn
+    }
+
+    /// The payment that waited for a route to `payee` is done waiting; `found`: the node has one again.
+    fn route_waited(&self, payee: &str, found: bool) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if found {
+            s.no_route.remove(payee);
+        } else if let Some(e) = s.no_route.get_mut(payee) {
+            e.1 = Instant::now();
+            e.2 = false;
+        }
     }
 
     /// A route query of the node's, and the time it took.
@@ -1798,7 +1826,8 @@ impl Signer {
         if win.is_some() {
             let (left, margin) = (inv.expires_at() as f64 - now, self.ticket_pace.send_margin(inv.expiry_s as f64));
             if left < margin {
-                return refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it would have ended first (held to {margin:.0} s)"));
+                return with(refuse(&hash, "ticket_expiry", format!("the invoice ends in {left:.0} s, and wins are taking long enough on the way that it would have ended first (held to {margin:.0} s)")),
+                            json!({"hash": hash, "unsent": true}));
             }
         }
         match ln.decode(&invoice) {
@@ -1840,35 +1869,43 @@ impl Signer {
     /// no reason to refuse: the payment goes as it would have.
     #[allow(clippy::too_many_arguments)]
     fn ln_route_wait(&self, ln: &dyn LnBackend, payee: &str, msat: u64, ids: &[String], final_cltv: u64, sid: &str, from: Instant) -> std::result::Result<(), String> {
-        let until = from + crate::ln::CHANNEL_BACK_WAIT;
         let chan = (ids.len() == 1).then(|| ids[0].as_str());
-        // when this payment first found no route, on the wallet's clock, for the record of the wait
-        let mut none_since: Option<f64> = None;
-        let waited = |none_since: Option<f64>, back: bool| {
-            if let Some(at) = none_since {
-                self.ticket_audit("ticket_route_waited", json!({"session": sid, "dest": format!("ln:{payee}"), "no_route_from": at,
-                                                                "route_back_at": back.then(|| self.engine.now()), "waited_s": self.engine.now() - at}));
-            }
-        };
-        loop {
+        let ask = || {
             let asked = Instant::now();
             let found = ln.has_route(payee, msat, chan, final_cltv);
             self.ticket_pace.queried(asked.elapsed());
-            match found {
-                Ok(true) | Err(_) => {
-                    waited(none_since, true);
-                    return Ok(());
-                }
-                Ok(false) => {
-                    none_since.get_or_insert_with(|| self.engine.now());
-                }
-            }
+            // a node that cannot answer the question is no reason to hold the payment
+            !matches!(found, Ok(false))
+        };
+        if ask() {
+            self.ticket_pace.route_waited(payee, true);
+            return Ok(());
+        }
+        // one payment to this seller waits at a time, within one window for all of them: a seller gone for good
+        // holds one place of the gate for 8 s, and the payments behind it are refused at once
+        let refused = |since: f64| format!("the wallet's node has found no route to the seller for {since:.1} s: nothing was sent");
+        let left = crate::ln::CHANNEL_BACK_WAIT.saturating_sub(from.elapsed());
+        let Some(until) = self.ticket_pace.route_wait_turn(payee, left.max(Duration::from_millis(1))) else {
+            return Err(refused(from.elapsed().as_secs_f64()));
+        };
+        let no_route_from = self.engine.now();
+        let record = |back: bool| {
+            self.ticket_audit("ticket_route_waited", json!({"session": sid, "dest": format!("ln:{payee}"), "no_route_from": no_route_from,
+                                                            "route_back_at": back.then(|| self.engine.now()), "waited_s": self.engine.now() - no_route_from}));
+        };
+        loop {
             let stopped = self.ticket_is_stopping(sid) || self.ticket_session(sid).is_some_and(|s| s.state != SState::Open);
             if Instant::now() >= until || stopped {
-                waited(none_since, false);
-                return Err(format!("the wallet's node found no route to the seller for {:.1} s: nothing was sent", from.elapsed().as_secs_f64()));
+                self.ticket_pace.route_waited(payee, false);
+                record(false);
+                return Err(refused(from.elapsed().as_secs_f64()));
             }
             std::thread::sleep(crate::ln::CHANNEL_BACK_POLL.min(until.saturating_duration_since(Instant::now())));
+            if ask() {
+                self.ticket_pace.route_waited(payee, true);
+                record(true);
+                return Ok(());
+            }
         }
     }
 

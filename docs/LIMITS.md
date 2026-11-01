@@ -943,7 +943,8 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   stalled socket may still take a little at the first ones, so it is the second or third that fails:
   measured on Linux loopback, 61 s through the app, and 9 s for a bare socket with a 3 s limit.) What was on its way when it stopped is paid for. A
   player that can seek resumes by asking again from where it was (`Range`), naming the copy it has
-  (`If-Range`, the `etag` of the answer it goes on from). A seller whose server ignores ranges, or whose file
+  (`If-Range`, the `etag` of the answer it goes on from; the app and the wallet's player pass both on).
+  A whole body sent for a range from the first byte is read, up to the range's last byte. A seller whose server ignores ranges, or whose file
   has changed since, answers with the whole body: the wallet reads none of it (`ticket_range_ignored`), and the
   call costs what the seller's socket took before it was closed, which on a route priced by the byte is up to a
   few hundred KiB. Before 0.1.20 that whole body was read and paid for, the start of the file bought again.
