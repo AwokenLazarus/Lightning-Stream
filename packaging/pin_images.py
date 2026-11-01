@@ -26,9 +26,10 @@ HERE = Path(__file__).resolve().parent
 LOCK = HERE / "images.lock"
 REF = re.compile(r"^(?P<repo>[a-z0-9.-]+(?::\d+)?(?:/[a-z0-9._-]+)+)/(?P<name>xbt-[a-z0-9-]+|lightning-stream):(?P<tag>[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12})"
                  r"@(?P<digest>sha256:[0-9a-f]{64})$")
-# an image reference of an agentpay service, local tag or pinned. lightning-stream and xbt-hashlink are
-# included so that once images.lock has their lines, this rewrites their local tags to those digests.
-ANY = r"(?:[a-z0-9.:/-]+/)?(xbt-(?:init|signer|anchor-witness|wallet-mcp|wallet-ui|gateway|work-relay|hashlink|stream-relay|vpn)|lightning-stream)(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?"
+# an image reference of an agentpay service, local tag or pinned. lightning-stream, xbt-hashlink and
+# xbt-datum-gateway are included so that once images.lock has their lines, this rewrites their local tags to
+# those digests.
+ANY = r"(?:[a-z0-9.:/-]+/)?(xbt-(?:init|signer|anchor-witness|wallet-mcp|wallet-ui|gateway|work-relay|hashlink|stream-relay|vpn|datum-gateway)|lightning-stream)(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?"
 
 
 def load_lock(path: Path = LOCK) -> dict[str, str]:

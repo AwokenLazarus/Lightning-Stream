@@ -62,6 +62,10 @@ done
 
 ZIG_PY=${XBT_ZIG_PY:-$HOME/.local/share/ziglang-venv/bin/python}
 "$ZIG_PY" -m ziglang version >/dev/null || { echo "datum_gateway_build: zig is missing ($ZIG_PY -m ziglang)" >&2; exit 1; }
+# zig's install directory (its lib/ is beside the binary) and its global cache, for the host-path check
+ZIG_EXE=$("$ZIG_PY" -m ziglang env | sed -n 's/^ *\.zig_exe = "\(.*\)",$/\1/p')
+[ -n "$ZIG_EXE" ] || { echo "datum_gateway_build: zig env names no zig_exe" >&2; exit 1; }
+ZIG_DIRS=("$(dirname "$ZIG_EXE")/" "${ZIG_GLOBAL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig}/")
 REV=$(git rev-parse --short=12 HEAD)$(git status --porcelain --untracked-files=no | grep -q . && echo "-dirty" || true)
 # what the gateway tells a pool it is (the hello's second user-agent field): upstream's commit, then ours
 export XBT_DATUM_BUILD_NAME="971af86b93de+xbt-mask.$REV"
@@ -136,6 +140,7 @@ for T in "${TS[@]}"; do
 #define HAVE_DECL_PROGRAM_INVOCATION_NAME 1
 #define HAVE_DECL_PROGRAM_INVOCATION_SHORT_NAME 1
 #define HAVE_GCC_ATTRIBUTE 1
+/* what argp's own configure adds (meson_config.h.in): its sources use these */
 #define NORETURN __attribute__ ((__noreturn__))
 #define PRINTF_STYLE(f, a) __attribute__ ((__format__ (__printf__, f, a)))
 #define UNUSED __attribute__ ((__unused__))
@@ -145,7 +150,9 @@ EOF
     done && "$AR" rcs "$P/lib/libargp.a" argp-*.o && cp argp.h "$P/include/") >>"$log" 2>&1 \
     || { tail -30 "$log" >&2; echo "datum_gateway_build: argp failed for $T ($log)" >&2; exit 1; }
 
-  # the gateway, against those alone (CMAKE_FIND_ROOT_PATH: no host library is found)
+  # the gateway, against those alone (CMAKE_FIND_ROOT_PATH: no host library is found). Linked stripped (-s,
+  # no symbols and no debug info): zig builds its musl libc once into its own cache, with that build's working directory and zig's own
+  # install path in the DWARF (no -ffile-prefix-map reaches it), and those are host paths
   B=$W/gw
   (cmake -S "$ROOT/third_party/datum_gateway" -B "$B" -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR="$PROC" \
@@ -161,9 +168,11 @@ EOF
   cp "$B/datum_gateway" "$OUT/$T/xbt-datum-gateway"
   f=$OUT/$T/xbt-datum-gateway
   file -b "$f" | grep -q "statically linked" || { echo "datum_gateway_build: $f is not static: $(file -b "$f")" >&2; exit 1; }
-  if grep -q -a -F -e "$ROOT/" -e "$OUT/" "$f"; then
-    echo "datum_gateway_build: $f names a build host path" >&2; exit 1
-  fi
+  # no build host path: the checkout, the build tree, this user's home (the zig venv, the source cache) and
+  # zig's own install and cache directories, wherever they are
+  for h in "$ROOT/" "$OUT/" "$HOME/" "${ZIG_DIRS[@]}"; do
+    if grep -q -a -F -e "$h" "$f"; then echo "datum_gateway_build: $f names a build host path ($h)" >&2; exit 1; fi
+  done
   echo "== $T: $(file -b "$f" | cut -d, -f1-2), $(stat -c %s "$f") bytes, sha256 $(sha256sum "$f" | cut -c1-16)"
   if [ $TEST = 1 ] && [ "$T" = x86_64-linux-musl ] && [ "$(uname -m)" = x86_64 ]; then
     echo "== $T: the gateway's unit tests"

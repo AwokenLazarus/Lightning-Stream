@@ -132,6 +132,30 @@ class NodeDataRule(unittest.TestCase):
                 self.fresh()
                 self.refused(change, why, says)
 
+    def test_the_stream_gateway_stays_on_the_renters_loopback(self):
+        """The Stream Gateway's API opens every job (/xbt/job) to loopback: it stays in the renter's network
+        namespace, publishes nothing, mounts its own dirs alone and runs what is pinned for it."""
+        ns = "publishes no port and runs in the renter's network namespace"
+        cases = {
+            "it publishes its API": (lambda s: s["datum"].__setitem__("ports", ["7152:7152"]), ns),
+            "it is on the app's network": (lambda s: s["datum"].pop("network_mode"), ns),
+            "it joins the UI's namespace": (lambda s: s["datum"].__setitem__("network_mode", "service:ui"), "the namespace pinned for it"),
+            "it runs on the host's network": (lambda s: s["datum"].__setitem__("network_mode", "host"), "the namespace pinned for it"),
+            "another service joins it": (lambda s: s["witness"].__setitem__("network_mode", "service:datum"), "the namespace pinned for it"),
+            "it writes its config": (lambda s: s["datum"]["volumes"].__setitem__(1, "${APP_DATA_DIR}/data/run/datum:/data/run/datum"),
+                                     "is outside its own sub-dir and socket dirs"),
+            "it mounts the signer's dir": (lambda s: s["datum"]["volumes"].append("${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro"),
+                                           "is outside its own sub-dir and socket dirs"),
+            "it runs as the box user": (lambda s: s["datum"].__setitem__("user", "1000:1000"), "must run as its image's own user"),
+            "it runs something else": (lambda s: s["datum"].__setitem__("entrypoint", ["/usr/bin/xbt-datum-gateway", "-c", "/tmp/x.json"]),
+                                       "is not the one pinned for it"),
+            "its image is another": (lambda s: s["datum"].__setitem__("image", "ghcr.io/retropex/datum:v1.13"), "is not ghcr.io/awokenlazarus/"),
+        }
+        for why, (change, says) in cases.items():
+            with self.subTest(why=why):
+                self.fresh()
+                self.refused(change, why, says)
+
     def test_every_container_keeps_to_itself(self):
         """No container reaches into another's processes, files or privileges, umbrelOS's app_proxy included."""
         cases = {
