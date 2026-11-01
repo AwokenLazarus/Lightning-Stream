@@ -213,6 +213,9 @@ fn stale(v: &Value) -> bool {
     }
 }
 
+/// A share's hash, or why it couldn't be had.
+pub type Hashed = Result<[u8; 32], String>;
+
 #[derive(Default)]
 pub struct Meter {
     chans: HashMap<u32, Chan>,
@@ -395,7 +398,7 @@ impl Meter {
 
     /// Was this share, sent again after a drop, counted already? Its claim, to commit, if not. A share the
     /// hashtaker counted before the drop is passed over without a word; one that fails its checks is `Err`.
-    pub fn resent_claim(&mut self, chan: u32, v: &Value) -> Result<Option<(Claim, Result<[u8; 32], String>)>, Refused> {
+    pub fn resent_claim(&mut self, chan: u32, v: &Value) -> Result<Option<(Claim, Hashed)>, Refused> {
         let c = self.claim(chan, v)?;
         let h = c.hash();
         match self.earned(&c, &h) {
