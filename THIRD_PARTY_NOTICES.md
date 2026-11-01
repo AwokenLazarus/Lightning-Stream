@@ -113,8 +113,10 @@ statically, in the `xbt-datum-gateway` image only, with libsodium 1.0.20 (ISC), 
 8.11.1 (curl licence), libmicrohttpd 1.0.1 (GNU LGPL 2.1 or later, or eCos) and argp-standalone 1.5.0 (GNU
 Library GPL 2 or later), each from a pinned source checked by its hash, and with musl (MIT) through zig. The
 image carries each licence text (argp-standalone's as the FSF publishes it, and musl's copyright notice) and a
-NOTICE naming the commit it was built from in `/usr/share/xbt-datum-gateway/`; the release attaches the two LGPL
-libraries' exact source tarballs (`scripts/datum_gateway_sources.sh`); its OCI licence label is
+NOTICE naming the commit it was built from in `/usr/share/xbt-datum-gateway/`; the workflow that publishes the images keeps the two LGPL
+libraries' exact source tarballs (`scripts/datum_gateway_sources.sh`, checked against the build script's pins),
+and the GitHub release of the version that ships the image (`v0.2.0` for 0.2.0) attaches them with
+`SHA256SUMS-datum-gateway-lgpl`; its OCI licence label is
 `MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)`. The
 LGPL libraries' source is pinned in that script, which with this repository's source lets anyone rebuild the
 gateway or relink it against modified versions of them.

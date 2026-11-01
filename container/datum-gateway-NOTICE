@@ -22,6 +22,8 @@ It is linked statically with:
 
 The complete source of this program, including the two LGPL libraries' pinned versions and the script that
 builds and links it (scripts/datum_gateway_build.sh), is at that commit, so you can rebuild it, or relink it
-against modified versions of those libraries. The Lightning Stream release that ships this image also attaches
-the exact source tarballs of libmicrohttpd and argp-standalone it was built from, with their SHA256SUMS
-(scripts/datum_gateway_sources.sh), so their source is at hand from us as well as from upstream.
+against modified versions of those libraries. The exact source tarballs of libmicrohttpd and argp-standalone this
+image was built from are also at hand from us, not only from upstream: the workflow that publishes the images
+keeps them (scripts/datum_gateway_sources.sh, each checked against the pin in scripts/datum_gateway_build.sh),
+and the GitHub release of the Lightning Stream version that ships this image (for 0.2.0: release v0.2.0)
+attaches them with SHA256SUMS-datum-gateway-lgpl.
