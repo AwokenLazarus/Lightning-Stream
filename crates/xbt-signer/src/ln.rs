@@ -603,7 +603,8 @@ impl LnBackend for LndRest {
             if let Some(c) = chan {
                 body["outgoing_chan_id"] = c.into();
             }
-            self.post(&format!("/v1/graph/routes/{payee}/0"), &body, 30)
+            // about the GET's 30 s: the request's whole time, as a stalled node's other queries wait
+            self.post(&format!("/v1/graph/routes/{payee}/0"), &body, 1)
         };
         match asked {
             Ok(v) => Ok(v.get("routes").and_then(Value::as_array).is_some_and(|r| !r.is_empty())),

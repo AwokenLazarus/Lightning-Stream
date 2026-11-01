@@ -218,13 +218,14 @@ pub struct Wallet {
     pub ticket_tools: bool,
     /// The longest a paying call waits for the signer's answer (`XBT_MCP_PAY_CEILING_S`): past it the answer counts as
     /// lost (`signer_no_answer`), so that a signer that never answers (stuck, or stopped with its socket open) holds no
-    /// worker for ever. As shipped, the longest the signer keeps any answer open (`tickets.max_socket_s`, 6 h) and 5
-    /// minutes more: no call the signer works on is cut by it.
+    /// worker for ever. As shipped, the longest the signer keeps any answer open whatever its owner sets (each open
+    /// limit, `tickets.max_socket_s` among them, is held to 24 h) and 5 minutes more: no call the signer works on is
+    /// cut by it, not even with `max_socket_s` raised past its 6 h.
     pub pay_ceiling: Duration,
 }
 
 /// [`Wallet::pay_ceiling`] as shipped, in seconds.
-pub const PAY_CEILING_S: u64 = xbt_signer::ticket::MAX_SOCKET_S as u64 + 300;
+pub const PAY_CEILING_S: u64 = 86_400 + 300;
 
 impl Wallet {
     pub fn new(sock: PathBuf) -> Self {

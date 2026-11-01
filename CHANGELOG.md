@@ -166,7 +166,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   call's answer as long as the wallet works on it; any other call still gives up after `B2_SIGNER_TIMEOUT`.
   If a paying call's answer is lost (the wallet's signer stopped), the agent is told the call may have paid
   (`signer_no_answer`, `request_sent: true`) rather than given an error that reads as if nothing happened.
-  A paying call still has a ceiling, 6 h 5 min as shipped (`XBT_MCP_PAY_CEILING_S`), and at most 14 are in
+  A paying call still has a ceiling, 24 h 5 min as shipped (`XBT_MCP_PAY_CEILING_S`, past the longest the wallet keeps any answer open), and at most 14 are in
   progress at once, so a stuck signer cannot take every worker of the MCP: a `ticket_stop` is always served.
 
 **VPN exits**
