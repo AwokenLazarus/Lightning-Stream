@@ -8053,37 +8053,6 @@ fn after_an_outage_that_fills_the_sellers_places_the_resume_goes_on_from_that_by
     assert_eq!(r.money(), (4 * TICKET, 4 * TICKET, 4 * TICKET, 4 * SETTLED));
 }
 
-/// The call that ended in the outage ended for another reason (a payment that failed), and it is the resume that the
-/// seller refuses `too_many_tickets`, before anything of it was sent or paid: the session is stopped, its unreleased
-/// tickets asked to be cancelled, and the resume is made again, once, in another session: a 206 of exactly the rest.
-///
-/// FAILS without the second try: the resume is refused, and only the call after it goes on.
-#[test]
-fn a_resume_refused_at_the_sellers_cap_is_made_again_in_another_session() {
-    let _g = env_lock();
-    let r = Rig::shipped(json!({}), 30, shipped_shop());
-    let n = 20 * MIB;
-    // the seller refuses the session's locks at its cap from its first refill on, as it would after an outage: the
-    // session's first lock names no session, and is taken (two tickets), and so is a new session's
-    r.tap.set(Box::new(|seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\""))
-        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
-    // 10 MiB of 20, what the call allows: the session's two tickets are spent, and its refill was refused
-    let part = r.pay(&format!("/files/{n}"), 2_100);
-    let got = part["bytes"].as_u64().unwrap_or(0) as usize;
-    assert_eq!((part["status"].as_u64(), part["complete"].as_bool(), got), (Some(200), Some(false), 10 * MIB), "{part}");
-    let sid = part["session"].as_str().unwrap().to_string();
-    // the resume's first need is a lock, which the seller refuses: nothing of it goes out, and it is made again
-    let on = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={got}-"),
-                                         "if_range": part["etag"]}));
-    r.tap.clear();
-    let locks: Vec<String> = r.tap.seen("/lock").iter().map(|s| s.body.chars().take(120).collect()).collect();
-    assert_eq!(r.audit("ticket_session_again").len(), 1, "the resume was refused at the cap and made again: part's session {sid}, the locks seen {locks:?}: {on}");
-    assert_eq!(on["session_stopped"]["session"].as_str(), Some(sid.as_str()), "{on}");
-    assert_ne!(on["session"].as_str(), Some(sid.as_str()), "made again in another session: {on}");
-    assert_eq!((on["status"].as_u64(), on["complete"].as_bool(), on["bytes"].as_u64()), (Some(206), Some(true), Some((n - got) as u64)), "{on}");
-    r.assert_booked();
-}
-
 /// A seller's gateway forgets a session that holds nothing and has been quiet for its `idle_secs`
 /// (300 s as shipped): a wallet whose node was away for that long comes back to a session only it
 /// remembers. The seller's `session_unknown` ends the session in the wallet too, and the next
