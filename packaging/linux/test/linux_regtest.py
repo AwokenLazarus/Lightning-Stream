@@ -585,7 +585,25 @@ def main():
         check("H", "taker: Rent starts a rental", "Renting" in flash, [flash, {"budget": budget}, card])
         tdata = os.path.join(installs["taker"][0], "data")
 
+        regrinds = []
+
         def rental():
+            nonlocal grind
+            # the hashmaker moves an already connected miner into the rental with client.reconnect and then closes its
+            # connection; a real miner connects again, stratum-grind neither follows client.reconnect nor reconnects
+            # (it hangs): so when the maker's hashmaker shows its miner gone, the test's miner is started again
+            st = maker_status()
+            ms = st.get("miners") if isinstance(st, dict) else None
+            if isinstance(ms, list) and not any(m.get("connected") for m in ms) and len(regrinds) < 5:
+                grind.terminate()
+                try:
+                    grind.wait(10)
+                except subprocess.TimeoutExpired:
+                    grind.kill()
+                grind = subprocess.Popen(["nice", "-n", "15", os.path.join(HG, "stratum-grind"), "--host", "127.0.0.1", "--port", "23340", "--user", "maker.m1"],
+                                         stdout=glog, stderr=glog, env={**os.environ, "LD_LIBRARY_PATH": os.path.join(HG, "lib")})
+                regrinds.append(time.strftime("%H:%M:%S"))
+                log(f"   the maker's hashmaker let the test's miner go (client.reconnect): stratum-grind started again ({regrinds[-1]})")
             x = (renter_status("taker").get("rentals") or [{}])[0]
             live = x.get("live") or {}
             paid = int(live.get("paid") or live.get("released") or 0)
