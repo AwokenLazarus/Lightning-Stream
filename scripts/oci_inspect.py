@@ -22,7 +22,7 @@ import tarfile
 WANT = {("amd64", ""): 0x3E, ("arm64", ""): 0xB7, ("arm", "v7"): 0x28}
 ROOT_ONESHOTS = {"xbt-init"}
 # binaries an image carries beside its own, in the same layer
-COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"], "xbt-datum-gateway": ["xbt-supervise"]}
+COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"], "xbt-datum-gateway": ["xbt-supervise"], "lightning-stream": ["xbt-supervise"]}
 # data an image's binary layer carries beside its binaries, each read-only and not a program
 DATA = {"xbt-vpn": ["usr/share/xbt-vpn/ATTRIBUTION", "usr/share/xbt-vpn/dbip-country-lite.csv.gz"],
         # the Stream Gateway's notice and the licences of what it links statically (two are LGPL)

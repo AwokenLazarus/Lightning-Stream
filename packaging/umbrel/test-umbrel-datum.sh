@@ -12,6 +12,8 @@
 #                       unit tests run too) staged as oci_build.sh stages it; or UMB_DATUM_IMAGE, already loaded
 #   xbt-init            when this tree's xbt-init knows the `datum` component: then the compose's own init
 #                       makes the gateway's files; until then the driver lays them out per W5's contract
+#   xbt-wallet-ui,      with that init too (it lays out the UI's files): the UI and the connector in its
+#   lightning-stream    namespace, for the check that a restart of the UI doesn't strand the connector
 # Needs P2P_HASH_GATEWAYS (default ~/xbt-rnd/hash-gateways: bitcoind, bitcoin-cli, stratum-grind), the lab
 # (run/lightning-fork-lab), python:3-alpine and debian:bookworm-slim. Ports P2P_HASH_PORT_BASE (19961) to +30.
 # Report: run/umbrel_datum_regtest.json, run/umbrel_datum_regtest.log, run/umbrel_datum_<service>.log.
@@ -40,7 +42,7 @@ R=
 cleanup() {
   if [ -n "$R" ]; then pkill -f "$R/" 2>/dev/null || true; fi
   (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
-  docker image rm -f "xbt-hashlink:$TAG" "xbt-datum-gateway:$TAG" "xbt-init:$TAG" >/dev/null 2>&1 || true
+  docker image rm -f "xbt-hashlink:$TAG" "xbt-datum-gateway:$TAG" "xbt-init:$TAG" "xbt-wallet-ui:$TAG" "lightning-stream:$TAG" >/dev/null 2>&1 || true
   if [ -n "$R" ]; then
     mkdir -p "$ROOT/run/umbrel_datum_regtest"
     cp "$R"/*.log "$R"/*.json "$ROOT/run/umbrel_datum_regtest/" 2>/dev/null || true
@@ -64,7 +66,8 @@ MUSL=${CARGO_TARGET_DIR:-$ROOT/target}/$T/release
 INIT=0
 grep -q '"datum"' crates/xbt-svc/src/lib.rs crates/xbt-svc/src/layout.rs 2>/dev/null && INIT=1
 nice -n 19 cargo build -q -j4 --release --locked --target $T -p xbt-hashlink --bin xbt-hashlink -p xbt-svc --bin xbt-supervise
-[ $INIT = 1 ] && nice -n 19 cargo build -q -j4 --release --locked --target $T -p xbt-svc --bin xbt-init
+[ $INIT = 1 ] && nice -n 19 cargo build -q -j4 --release --locked --target $T -p xbt-svc --bin xbt-init \
+  -p xbt-wallet-ui --bin xbt-wallet-ui -p lightning-stream --bin lightning-stream
 CTX=$ROOT/run/umbrel-datum-ctx
 if [ -d "$CTX" ]; then chmod -R u+w "$CTX"; fi
 rm -rf "$CTX" && mkdir -p "$CTX/bin/amd64"
@@ -77,6 +80,11 @@ if [ $INIT = 1 ]; then
   cp "$MUSL/xbt-init" "$CTX/bin/amd64/"
   docker buildx build -q --platform linux/amd64 --target xbt-init --load -t "xbt-init:$TAG" "$CTX" >/dev/null
   export UMB_INIT_IMAGE=xbt-init:$TAG
+  cp "$MUSL/xbt-wallet-ui" "$CTX/bin/amd64/"
+  mkdir -p "$CTX/bin/amd64/lightning-stream.d" && cp "$MUSL/lightning-stream" "$MUSL/xbt-supervise" "$CTX/bin/amd64/lightning-stream.d/"
+  docker buildx build -q --platform linux/amd64 --target xbt-wallet-ui --load -t "xbt-wallet-ui:$TAG" "$CTX" >/dev/null
+  docker buildx build -q --platform linux/amd64 --target lightning-stream --load -t "lightning-stream:$TAG" "$CTX" >/dev/null
+  export UMB_UI_IMAGE=xbt-wallet-ui:$TAG UMB_CONNECTOR_IMAGE=lightning-stream:$TAG
 fi
 if [ -n "${UMB_DATUM_IMAGE:-}" ]; then
   docker image inspect "$UMB_DATUM_IMAGE" >/dev/null || { echo "test-umbrel-datum: $UMB_DATUM_IMAGE is not loaded" >&2; exit 2; }

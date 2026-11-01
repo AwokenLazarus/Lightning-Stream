@@ -336,10 +336,14 @@ services:
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
       - ${APP_DATA_DIR}/data/run/node-keys:/data/run/node-keys
 
+  # --peer: a restart of the UI gives it a new network namespace and would leave the connector in the old
+  # one (8484 and the AI endpoint gone), so xbt-supervise looks at the UI's port on loopback and exits when
+  # it stops answering; restart: on-failure then starts the connector in the UI's new namespace.
   connector:
     <<: *service
     image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-12b8182c0bf6@sha256:b67c0c1e8649192283618b5fd7ced80022d85af5da035a1b2085cfdb7202bc24
     network_mode: "service:ui"
+    entrypoint: ["/usr/bin/xbt-supervise", "--peer", "127.0.0.1:8482", "--", "/usr/bin/lightning-stream"]
     stop_grace_period: 15s
     depends_on:
       init:

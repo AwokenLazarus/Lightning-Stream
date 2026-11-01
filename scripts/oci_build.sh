@@ -8,7 +8,7 @@
 #   xbt-vpn (the VPN service: the owner's devices' WireGuard endpoint, and an exit if offered)
 #   xbt-datum-gateway (the Stream Gateway, DATUM-compatible: the renter's masking gateway; C, built by
 #     scripts/datum_gateway_build.sh, or taken from XBT_DATUM_PREBUILT)
-#   (xbt-supervise is not an image: it is copied into the signer and gateway images)
+#   (xbt-supervise is not an image: it is copied into the signer, gateway, Stream Gateway and connector images)
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
 # Steps: build the static musl binaries for the three targets (release profile, --locked so that the
@@ -86,7 +86,7 @@ if [ $CARGO = 1 ]; then
       "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
     fi
     if want xbt-gateway; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-gateway --bin xbt-gateway; fi
-    if want xbt-signer || want xbt-gateway || want xbt-datum-gateway; then
+    if want xbt-signer || want xbt-gateway || want xbt-datum-gateway || want lightning-stream; then
       "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-svc --bin xbt-supervise
     fi
     if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-wallet-mcp; fi
@@ -104,7 +104,7 @@ for t in "${!ARCH[@]}"; do
   mkdir -p "$CTX/bin/${ARCH[$t]}"
   bins=()
   for b in "${IMAGES[@]}"; do [ "$b" = xbt-datum-gateway ] || bins+=("$b"); done
-  if want xbt-signer || want xbt-gateway || want xbt-datum-gateway; then bins+=(xbt-supervise); fi
+  if want xbt-signer || want xbt-gateway || want xbt-datum-gateway || want lightning-stream; then bins+=(xbt-supervise); fi
   for b in "${bins[@]}"; do
     f=$TGT/$t/release/$b
     [ -x "$f" ] || { echo "oci_build: $f missing (run without --skip-cargo)" >&2; exit 1; }
@@ -115,7 +115,7 @@ for t in "${!ARCH[@]}"; do
     cp "$f" "$CTX/bin/${ARCH[$t]}/$b"
   done
   # the images whose layer holds xbt-supervise beside their own binary
-  for b in xbt-signer xbt-gateway; do
+  for b in xbt-signer xbt-gateway lightning-stream; do
     if want "$b"; then
       mkdir -p "$CTX/bin/${ARCH[$t]}/$b.d"
       cp "$CTX/bin/${ARCH[$t]}/$b" "$CTX/bin/${ARCH[$t]}/xbt-supervise" "$CTX/bin/${ARCH[$t]}/$b.d/"

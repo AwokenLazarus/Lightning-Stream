@@ -164,8 +164,11 @@ SIGNER_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.mac
 # gone (to be restarted in the renter's namespace as it is then) when the renter's control port stops answering
 DATUM_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie",
                     "--peer", "127.0.0.1:23343", "--", "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
+# the connector: the UI's namespace, left (to be restarted in the UI's new one) when the UI's port stops answering
+CONNECTOR_ENTRYPOINT = ["/usr/bin/xbt-supervise", "--peer", "127.0.0.1:8482", "--", "/usr/bin/lightning-stream"]
 ENTRYPOINTS = {("lazarus-lightning-stream", "signer"): SIGNER_ENTRYPOINT, ("lazarus-xbt-agent-wallet", "signer"): SIGNER_ENTRYPOINT,
-               ("lazarus-xbt-knots", "node"): ["bitcoind"], ("lazarus-lightning-stream", "datum"): DATUM_ENTRYPOINT}
+               ("lazarus-xbt-knots", "node"): ["bitcoind"], ("lazarus-lightning-stream", "datum"): DATUM_ENTRYPOINT,
+               ("lazarus-lightning-stream", "connector"): CONNECTOR_ENTRYPOINT}
 # the baker's whole environment, as written (nothing more reaches it: no env_file)
 NODE_KEYS_BAKE_ENV = {"XBT_KEYS_NODE_REST": "https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}",
                       "XBT_KEYS_TLS_CERT": "/node/tls.cert", "XBT_KEYS_ADMIN": "/node/data/chain", "XBT_KEYS_RAIL_DIR": "/data/run/ln",
@@ -318,6 +321,10 @@ def raw_shape(folder: str, c: dict, svcs: dict) -> None:
         nm = sv.get("network_mode")
         if nm not in (None, "none") and nm != NETNS.get((folder, name)):
             bad(f"{folder}/{name}: network_mode {nm!r}: none, or the namespace pinned for it ({NETNS.get((folder, name))})")
+        # a service in another's namespace is left in the old one when that one restarts: it runs under
+        # xbt-supervise --peer (its pinned entrypoint), which exits so that it is restarted into the new one
+        if nm and nm == NETNS.get((folder, name)) and sv.get("entrypoint") != ENTRYPOINTS.get((folder, name)):
+            bad(f"{folder}/{name}: in {nm}'s namespace it must run its pinned entrypoint (xbt-supervise --peer), so a restart of {nm[8:]} does not strand it")
         if sv.get("command") == ["node-keys"] and sv.get("healthcheck") != ONESHOT_HEALTH:
             bad(f"{folder}/{name}: a node-keys one-shot's healthcheck is exactly {ONESHOT_HEALTH}")
         allowed = APP_PROXY_KEYS if name == "app_proxy" else SERVICE_KEYS

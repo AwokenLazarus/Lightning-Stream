@@ -35,6 +35,9 @@ Checks (OUT/umbrel_datum_regtest.json):
   rental      a masked solo rental through the compose, paid through the wallet: real blocks, each masked,
               each paying the regtest address, every job held to /xbt/job, payments = what the hashmaker earned,
               and the found blocks kept in datum/submitblocks
+  connector   (with an init that lays out the UI) the connector answers on the UI's loopback (8484) and the AI
+              endpoint (33540); after `docker restart` of the UI it leaves the old namespace by itself and answers
+              again within 30 s, with nobody touching anything
   restart     after `docker restart` of the renter (a new namespace), the gateway leaves the old one by itself
               (xbt-supervise --peer) and is restarted into the new one: masked jobs again within 30 s, and the
               renter's page shows it within its look interval, with nobody touching anything
@@ -71,6 +74,7 @@ DATUM_UID = int(os.environ.get("UMB_DATUM_UID", "10021"))
 UI_UID, HASHRATE_UID = 10005, 10010
 IMAGES = {"renter": os.environ["UMB_HASHLINK_IMAGE"], "datum": os.environ["UMB_DATUM_IMAGE"]}
 INIT_IMAGE = os.environ.get("UMB_INIT_IMAGE", "")
+UI_IMAGE, CONNECTOR_IMAGE = os.environ.get("UMB_UI_IMAGE", ""), os.environ.get("UMB_CONNECTOR_IMAGE", "")
 PROBE_IMAGE = "python:3-alpine"
 RENT_MINUTES = int(os.environ.get("UMB_DATUM_RENT_MINUTES", "6"))
 NET = f"umbdatum-{os.getpid()}"
@@ -200,6 +204,41 @@ def layout(cookie_owner_ok: bool) -> dict[str, Any]:
     return {"stat": out.strip().splitlines(), "cookie_owner_ok": cookie_owner_ok}
 
 
+def connector_check() -> None:
+    """The connector shares the UI's network namespace: 8484 (the UI's player calls) and the AI endpoint on
+    33540 are the UI's container's. A restart of the UI makes a new namespace; the connector, under
+    xbt-supervise --peer 127.0.0.1:8482, leaves the old one and is restarted into the new one by itself."""
+    gw = inspect(NET)["IPAM"]["Config"][0]["Gateway"]
+    compose(gw, "up", "-d", "--no-deps", "ui", "connector")
+    un, cn = cname("ui"), cname("connector")
+
+    def answers() -> dict[str, Any]:
+        return {port: probe(f"container:{un}", "connect", "127.0.0.1", str(port)).get("open") for port in (8484, 33540)}
+
+    lab.wait("the connector on the UI's loopback", 120, lambda: all(answers().values()), every=3)
+    ui, ci = inspect(un), inspect(cn)
+    ep = ci["Config"]["Entrypoint"] or []
+    check("connector: it answers in the UI's namespace (8484, the AI endpoint 33540), under xbt-supervise --peer 127.0.0.1:8482",
+          ci["HostConfig"]["NetworkMode"] == f"container:{ui['Id']}" and ep[:3] == ["/usr/bin/xbt-supervise", "--peer", "127.0.0.1:8482"] and all(answers().values()),
+          {"network": ci["HostConfig"]["NetworkMode"], "ui": ui["Id"][:12], "entrypoint": ep, "answers": answers()})
+    restarts0 = ci["RestartCount"]
+    t0 = time.time()
+    sh("docker", "restart", un)
+    back, seen = None, {}
+    while time.time() - t0 < 120:
+        seen = answers()
+        if all(seen.values()):
+            back = round(time.time() - t0, 1)
+            break
+        time.sleep(2)
+    c2 = inspect(cn)
+    said = [ln for ln in sh("docker", "logs", cn, check_rc=False).stderr.splitlines() if "stopped answering" in ln or "not answered" in ln]
+    REPORT["after_ui_restart"] = {"connector answers again after s": back, "restart count": [restarts0, c2["RestartCount"]], "state": c2["State"]["Status"],
+                                  "supervise said": said[-2:], "answers": seen}
+    check("connector: after `docker restart` of the ui, the connector restarts by itself and answers on 8484 and 33540 within 30 s",
+          back is not None and back <= 30 and c2["RestartCount"] > restarts0 and bool(said), REPORT["after_ui_restart"])
+
+
 def main() -> int:
     t0 = time.time()
     gw = ""
@@ -246,10 +285,13 @@ def main() -> int:
                 "renter": {"image": IMAGES["renter"], "command": cmd, "volumes": [f"{RUN}:/data/run/signer:ro"]},
                 "datum": {"image": IMAGES["datum"]},
                 **({"init": {"image": INIT_IMAGE}} if INIT_IMAGE else {}),
+                # the UI's host ports are the box's: none on a lab (reset below)
+                **({"ui": {"image": UI_IMAGE, "ports": "__RESET__"}, "connector": {"image": CONNECTOR_IMAGE}} if UI_IMAGE else {}),
             },
         }
         with open(f"{WORK}/overlay.yml", "w") as f:
-            yaml.safe_dump(overlay, f, sort_keys=False)
+            f.write(yaml.safe_dump(overlay, sort_keys=False).replace("ports: __RESET__", "ports: !reset []"))
+        os.makedirs(f"{WORK}/umbrel-root/data/storage/downloads", exist_ok=True)
         # the lab wallet's socket, for the renter's user (the image's, xbt-hashrate in the signer's group on a box)
         os.chmod(RUN, 0o711)
         os.chmod(d.SOCK, 0o666)
@@ -421,6 +463,13 @@ def main() -> int:
         kept = root("ls /d/datum/submitblocks | wc -l").strip()
         check("rental: the found blocks are kept in datum/submitblocks", int(kept or 0) >= len(blocks) >= 1, {"files": kept, "blocks": len(blocks)})
 
+        # --- the connector in the UI's namespace: a restart of the UI must not strand it
+        if UI_IMAGE and INIT_IMAGE:
+            connector_check()
+        else:
+            REPORT.setdefault("skipped", []).append({"check": "connector", "missing": "an xbt-init that lays out the UI (UMB_INIT_IMAGE) and the UI's images"})
+            print("SKIP  connector: no init with the datum component, so the UI isn't laid out", flush=True)
+
         # --- restart: `docker restart` of the renter gives it a new namespace; the gateway, by itself (xbt-supervise
         # --peer), leaves the old one and its restart policy starts it in the new one
         restarts0 = inspect(dn)["RestartCount"]
@@ -460,7 +509,7 @@ def main() -> int:
                 x.terminate()
         if gw:
             sh("docker", "rm", "-f", FWD, check_rc=False)
-            for svc in ("renter", "datum", "init"):
+            for svc in ("renter", "datum", "init", "ui", "connector"):
                 r = sh("docker", "logs", "--timestamps", cname(svc), check_rc=False)
                 with open(f"{OUT}/umbrel_datum_{svc}.log", "w") as f:
                     f.write(r.stdout + r.stderr)

@@ -89,10 +89,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/u
 # The connector. A local player asks it for a seller's URL; the signer pays and streams the body.
 # It holds no keys. USER is the signer's user: the sockets it binds have to be ones that user can
 # connect to, and the published signer image cannot gain a group until it is rebuilt. Loopback only.
+# xbt-supervise rides along: on Umbrel the connector shares the UI's network namespace, and runs under
+# `xbt-supervise --peer` so that a restart of the UI (a new namespace) restarts it into the new one.
 FROM base AS lightning-stream
 ARG TARGETARCH
 ARG TARGETVARIANT
-COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/lightning-stream /usr/bin/lightning-stream
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/lightning-stream.d/ /usr/bin/
 USER xbt-signer
 ENV LS_LISTEN=127.0.0.1:8484
 ENTRYPOINT ["/usr/bin/lightning-stream"]

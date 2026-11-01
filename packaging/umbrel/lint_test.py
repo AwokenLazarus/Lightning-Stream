@@ -150,6 +150,11 @@ class NodeDataRule(unittest.TestCase):
             "it runs something else": (lambda s: s["datum"].__setitem__("entrypoint", ["/usr/bin/xbt-datum-gateway", "-c", "/tmp/x.json"]),
                                        "is not the one pinned for it"),
             "its image is another": (lambda s: s["datum"].__setitem__("image", "ghcr.io/retropex/datum:v1.13"), "is not ghcr.io/awokenlazarus/"),
+            # a restart of the renter must not leave it in the old namespace: xbt-supervise --peer, pinned
+            "it runs without the peer watch": (lambda s: s["datum"].pop("entrypoint"), "must run its pinned entrypoint (xbt-supervise --peer)"),
+            "the connector runs without the peer watch": (lambda s: s["connector"].pop("entrypoint"), "must run its pinned entrypoint (xbt-supervise --peer)"),
+            "the connector watches another port": (lambda s: s["connector"].__setitem__("entrypoint", ["/usr/bin/xbt-supervise", "--peer", "127.0.0.1:9", "--",
+                                                                                                "/usr/bin/lightning-stream"]), "is not the one pinned for it"),
         }
         for why, (change, says) in cases.items():
             with self.subTest(why=why):
