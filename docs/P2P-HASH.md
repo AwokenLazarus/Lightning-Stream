@@ -243,10 +243,11 @@ share, one slice and one ticket (546 sat at least), whichever is more, plus any 
 - What's paid and not yet received is the slices paid ahead of the work and the credit left with the seller. The
   step is the largest of 546 sat, one share, or what has been delivered, up to 30 s of the miner's output. Steps
   ignore reputation, so fake history pays nothing.
-- A slice is paid ahead only while that, with the smallest ticket if one must be bought, stays within the step.
-  Each ticket is sized to keep both within the step and the start fee still to pay. A slice the next share needs
-  is paid whatever the step, which is where one share, one slice and the smallest ticket (546 sat or a slice,
-  whichever is more) come from: credit under a slice, the slice, and a ticket bought for it.
+- Each ticket is sized to keep both within the step and the start fee still to pay. A slice that must buy a ticket
+  is paid ahead of need while that ticket keeps both within the bound (the step, or one share, one slice and the
+  smallest ticket, 546 sat or a slice, whichever is more), so the next ticket is bought while what's paid still
+  runs. A slice the next share needs is paid whatever the step.
+- The renter says `paying` only when its measured ticket buys would not arrive within the hashmaker's 2 s clock.
   `order::Standing::most_unworked_msat` is that bound; `what_is_gone_and_unworked_stays_within_the_stated_bound`
   checks it at every ticket over prices from 20 to 3,000 sat a slice, shares up to 4 slices, four miner rates and
   start fees of 0 to 3 slices.
