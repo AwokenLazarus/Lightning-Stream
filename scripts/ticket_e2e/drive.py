@@ -1081,7 +1081,34 @@ class ChannelDrops:
         self.done.set()
         self.thread.join()
         pk = lab.pubkey(HOP)
-        lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
+        try:
+            lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
+        except LabError as e:
+            raise LabError(f"{e} (what both nodes said then: {self.diagnose()})") from e
+
+    def diagnose(self) -> str:
+        """What the buyer and its peer say of each other when the channel does not come back: their peers, their
+        inactive channels, and the last 50 lines of each node's log about the other. Kept in run/flap-channel-diag.log."""
+        out: dict[str, Any] = {"drops": self.drops, "reconnected_by_themselves": self.reconnected, "errors": self.errors}
+        for node, other in ((BUYER, HOP), (HOP, BUYER)):
+            opk = lab.pubkey(other)
+            seen: dict[str, Any] = {}
+            try:
+                seen["peers"] = [{k: p.get(k) for k in ("pub_key", "address", "inbound", "flap_count", "last_flap_ns", "errors")}
+                                 for p in lab.lncli(node, "listpeers").get("peers", []) if p.get("pub_key") == opk]
+            except LabError as e:
+                seen["peers"] = str(e)[:300]
+            try:
+                seen["inactive"] = [{k: c.get(k) for k in ("chan_id", "remote_pubkey", "active", "lifetime", "uptime", "chan_status_flags")}
+                                    for c in lab.lncli(node, "listchannels", "--inactive_only").get("channels", [])]
+            except LabError as e:
+                seen["inactive"] = str(e)[:300]
+            logs = lab.dc("logs", "--no-color", "--tail", "4000", node, check=False).splitlines()
+            seen["log"] = [ln[-400:] for ln in logs if opk[:16] in ln or opk[:10] in ln][-50:]
+            out[node] = seen
+        with open(f"{RUN}/flap-channel-diag.log", "w") as f:
+            json.dump(out, f, indent=1)
+        return json.dumps({n: {"peers": out[n]["peers"], "inactive": out[n]["inactive"]} for n in (BUYER, HOP)})[:1500]
 
 
 # What an answer the wallet does not read may still cost on a route priced by the byte: what the seller's socket took
