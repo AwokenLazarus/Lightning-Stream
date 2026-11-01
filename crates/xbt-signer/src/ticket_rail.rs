@@ -26,7 +26,7 @@
 //! | A win of the lottery is paid only for a draw the wallet worked out, once, as a prepaid ticket is paid. | [`Signer::lottery_pay_win`] takes a [`xbt402::lottery::Win`], which only the wallet's own check of a seller's reveal makes; [`Signer::ticket_book_prepay`] pays it only in the session it was drawn in, at that session's win size, and refuses a win that has a payment in the book that has not failed ([`crate::ticket::Book::win_payment`]). |
 //! | A prepaid ticket or a win paid by the seller's BOLT 12 offer is paid under every rule of one paid by invoice, and names the seller's session. | [`Signer::ticket_pay_by_offer`]: the offer and the fetched invoice are read and checked here (bit 512, the chain, the issuer, the exact amount, the wallet's own payer note repeated); every channel of the node must pass the guards, since `PayOffer` takes no set of outgoing channels; then the same book rows, ledger row and gate as [`Signer::ticket_pay_ordinary`]. Anything that fails before the booking leaves nothing booked and nothing sent, and the seller's invoice is paid instead; so does a payment the node found no route for (its blinded path entering where the node cannot reach), once the node says it failed for good with nothing in flight and the book holds it failed: that hash is never paid, and the invoice's is the one payment. |
 //! | An ordinary payment is on the channel until it settles, so it stays inside the gate until then. | [`Signer::ticket_pay_ordinary`] holds its place in [`Pace`] until the node shows the payment over. |
-//! | A win a seller's answer stands still for is not kept waiting behind wins no seller waits for. | [`Pace::hurry`], said by the session that found the win ([`crate::ticket_pay`]). It changes the order of payments the book allows anyway, and nothing else: which are paid, and how many at once, are as before. |
+//! | A win a seller's answer stands still for is not kept waiting behind wins no seller waits for. | [`Pace::hurry`], said by the session that found the win ([`crate::ticket_pay`]): first through the gate, and first to the book ([`Pace::spend_turn`]). It changes the order of payments the book allows anyway, and nothing else: which are paid, and how many at once, are as before. |
 //!
 //! Locks: the wallet's spend lock, then the book's. No lock is held while the node routes a
 //! ticket, so a release never waits for a lock round.
@@ -98,12 +98,21 @@ pub const SEND_PARALLEL: usize = 8;
 /// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
 /// that no seller's win waits behind a later one's until that seller's grace has run out. Before
 /// them all, in their own order of arrival, go the wins a seller's answer stands still for
-/// ([`Pace::hurry`]): a seller waits its grace (60 s as shipped) for a win it serves on beside, and 10 s for one it has
-/// stopped for, so the second cannot wait behind a hundred of the first.
+/// ([`Pace::hurry`]): a seller waits its grace (60 s as shipped) for a win it serves on beside, and 15 s (`refill_wait`)
+/// for one it has stopped for, so the second cannot wait behind a hundred of the first.
+///
+/// Each payment books under the wallet's spend lock, about six fsyncs, one payment at a time: on
+/// a disk of 50 ms an fsync the eight inside take turns of 0.3 s each, and on a card of 100 ms 0.6 s.
+/// So the payments of the gate take the lock by [`Pace::spend_turn`], which also lets a hurried win
+/// go first: past the gate it would otherwise wait behind every one of them. Hurried wins do not shut
+/// the others out for good ([`FIRST_IN_A_ROW`]).
 #[derive(Default)]
 pub struct Pace {
     state: Mutex<PaceState>,
     left: Condvar,
+    /// Apart from `left`: a turn is given up 2 times a win, and the hundreds in the gate's queue
+    /// have nothing to look at then.
+    turn_free: Condvar,
 }
 
 #[derive(Default)]
@@ -113,6 +122,17 @@ struct PaceState {
     next: u64,
     /// Who waits, in order of arrival.
     waiting: Vec<Waiter>,
+    /// The wins inside, each with whether it goes first.
+    inside_wins: Vec<((String, u64), bool)>,
+    /// Hurried wins let in one after another while others waited: at [`FIRST_IN_A_ROW`] one of those goes.
+    first_in_row: u32,
+    /// A payment has its turn at the spend lock.
+    turn_taken: bool,
+    /// Hurried wins, and other payments, that wait for a turn.
+    first_for_turn: usize,
+    plain_for_turn: usize,
+    /// Hurried wins given a turn one after another while others waited.
+    turns_in_row: u32,
 }
 
 struct Waiter {
@@ -123,14 +143,36 @@ struct Waiter {
     first: bool,
 }
 
+/// How many hurried wins go one after another before a payment that is not hurried, through the gate
+/// and at the spend lock, before that payment goes all the same. A seller's hurried wins are few, but
+/// sellers can be many, and a prepaid ticket or a win no seller waits for has its own invoice's life to
+/// keep. This bounds what hurried wins take from the others, and nothing else: among payments that
+/// are not hurried, the gate goes in order of arrival, but turns at the spend lock go to whichever
+/// waiter wakes first, as before ([`Pace::spend_turn`]).
+const FIRST_IN_A_ROW: u32 = 8;
+
 impl PaceState {
-    /// Whose turn it is: the earliest of those that go first, or else the earliest.
+    /// Whose turn it is: the earliest of those that go first, or else the earliest. After
+    /// [`FIRST_IN_A_ROW`] of the first, the earliest of the others.
     fn turn(&self) -> Option<u64> {
-        self.waiting.iter().find(|w| w.first).or(self.waiting.first()).map(|w| w.n)
+        let first = self.waiting.iter().find(|w| w.first);
+        let plain = self.waiting.iter().find(|w| !w.first);
+        match (first, plain) {
+            (Some(_), Some(p)) if self.first_in_row >= FIRST_IN_A_ROW => Some(p.n),
+            (Some(f), _) => Some(f.n),
+            (None, p) => p.map(|w| w.n),
+        }
     }
 }
 
-pub struct PaceGuard<'a>(&'a Pace);
+pub struct PaceGuard<'a> {
+    pace: &'a Pace,
+    win: Option<(String, u64)>,
+}
+
+/// A payment's turn at the spend lock ([`Pace::spend_turn`]). Taken before the lock, and so given
+/// up after it.
+pub struct SpendTurn<'a>(&'a Pace);
 
 impl Pace {
     pub fn enter(&self) -> PaceGuard<'_> {
@@ -147,29 +189,77 @@ impl Pace {
         while s.inside >= SEND_PARALLEL || s.turn() != Some(mine) {
             s = self.left.wait(s).unwrap_or_else(|p| p.into_inner());
         }
-        s.waiting.retain(|w| w.n != mine);
+        let at = s.waiting.iter().position(|w| w.n == mine).unwrap_or(0);
+        let me = s.waiting.remove(at);
         s.inside += 1;
+        s.first_in_row = if me.first { s.first_in_row + 1 } else { 0 };
+        if let Some(win) = &me.win {
+            s.inside_wins.push((win.clone(), me.first));
+        }
         // the one behind may go in too, if there is room
         self.left.notify_all();
-        PaceGuard(self)
+        PaceGuard { pace: self, win: me.win }
     }
 
     /// The wins of `session` with these draws that wait here go first from now on: their seller
-    /// stands still for them. How many were moved. A win that is not waiting (it is inside, or
-    /// has not come yet) is not remembered: the caller says it again while it holds.
+    /// stands still for them, and so do those inside, at the spend lock. How many that wait were
+    /// moved. A win that has not come yet is not remembered: the caller says it again while it holds.
     pub fn hurry(&self, session: &str, draws: &[u64]) -> usize {
+        let named = |win: &(String, u64)| win.0 == session && draws.contains(&win.1);
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mut moved = 0;
         for w in s.waiting.iter_mut().filter(|w| !w.first) {
-            if w.win.as_ref().is_some_and(|(sid, d)| sid == session && draws.contains(d)) {
+            if w.win.as_ref().is_some_and(named) {
                 w.first = true;
                 moved += 1;
             }
         }
+        let mut inside = false;
+        for (_, first) in s.inside_wins.iter_mut().filter(|(win, first)| !*first && named(win)) {
+            *first = true;
+            inside = true;
+        }
         if moved > 0 {
             self.left.notify_all();
         }
+        if inside {
+            self.turn_free.notify_all();
+        }
         moved
+    }
+
+    /// A turn at the wallet's spend lock for a payment with no place in the gate any more: after
+    /// any hurried win, as [`PaceGuard::spend_turn`]. Taken with the lock not held, as that lock's
+    /// holders never ask for a turn. Other users of the lock do not take turns, and may come between.
+    pub fn spend_turn(&self) -> SpendTurn<'_> {
+        self.turn_for(None)
+    }
+
+    fn turn_for(&self, win: Option<&(String, u64)>) -> SpendTurn<'_> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.plain_for_turn += 1;
+        let mut first = false;
+        loop {
+            if !first && win.is_some_and(|w| s.inside_wins.iter().any(|(i, f)| *f && i == w)) {
+                first = true;
+                s.plain_for_turn -= 1;
+                s.first_for_turn += 1;
+            }
+            let row_full = s.turns_in_row >= FIRST_IN_A_ROW;
+            let mine = if first { !row_full || s.plain_for_turn == 0 } else { s.first_for_turn == 0 || row_full };
+            if mine && !s.turn_taken {
+                s.turn_taken = true;
+                if first {
+                    s.first_for_turn -= 1;
+                    s.turns_in_row += 1;
+                } else {
+                    s.plain_for_turn -= 1;
+                    s.turns_in_row = 0;
+                }
+                return SpendTurn(self);
+            }
+            s = self.turn_free.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
     }
 
     /// How many are inside now.
@@ -183,11 +273,30 @@ impl Pace {
     }
 }
 
+impl PaceGuard<'_> {
+    /// This payment's turn at the wallet's spend lock: before any payment that is not hurried, if
+    /// its seller stands still for it. To be held while the lock is ([`Pace::spend_turn`]).
+    pub fn spend_turn(&self) -> SpendTurn<'_> {
+        self.pace.turn_for(self.win.as_ref())
+    }
+}
+
 impl Drop for PaceGuard<'_> {
     fn drop(&mut self) {
-        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = self.pace.state.lock().unwrap_or_else(|p| p.into_inner());
         s.inside = s.inside.saturating_sub(1);
-        self.0.left.notify_all();
+        if let Some(win) = &self.win {
+            s.inside_wins.retain(|(w, _)| w != win);
+        }
+        self.pace.left.notify_all();
+    }
+}
+
+impl Drop for SpendTurn<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.turn_taken = false;
+        self.0.turn_free.notify_all();
     }
 }
 
@@ -1657,6 +1766,7 @@ impl Signer {
         }
         let hash = inv.payment_hash_hex();
         let booked = {
+            let _turn = inside.spend_turn();
             let _g = self.lock();
             self.ticket_book_prepay(sid, &hash, &lni, inv.payment_hash, inv.expires_at() as f64, &lp, &routes.ids, win, amount)
                 .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
@@ -1767,6 +1877,7 @@ impl Signer {
         }
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
+            let _turn = inside.spend_turn();
             let _g = self.lock();
             self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win, msat)
                 .map(|r| r.map(|s| (s, self.ticket_booked_sats(&hash))))
@@ -1830,6 +1941,7 @@ impl Signer {
                 pmt = Some(p);
             }
         }
+        let _turn = self.ticket_pace.spend_turn();
         let _g = self.lock();
         let res = (|| -> Result<Option<Ticket>> {
             let mut g = self.ticket_store()?;
@@ -2895,6 +3007,151 @@ mod tests {
             panic!("the send died");
         }).join());
         assert!(died.is_err() && pace.inside() == 0);
+    }
+
+    #[test]
+    fn a_hurried_win_inside_the_gate_has_the_next_turn_at_the_spend_lock() {
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        let holder = pace.enter_for(Some(("s0", 1)), false);
+        let inside: Vec<PaceGuard<'_>> = (1..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("s", i)), false)).collect();
+        std::thread::scope(|sc| {
+            // one has the turn; seven in the gate ask for one, and an eighth asks last
+            let held = holder.spend_turn();
+            let (pace, order) = (&pace, &order);
+            for (i, g) in inside.iter().enumerate() {
+                sc.spawn(move || {
+                    let _turn = g.spend_turn();
+                    order.lock().unwrap().push(i + 1);
+                });
+            }
+            // a payment that has left the gate takes its turn with them
+            sc.spawn(move || {
+                let _turn = pace.spend_turn();
+                order.lock().unwrap().push(0);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            // the last in the gate is the one its seller stands still for: it has the next turn all the same.
+            // (It was inside when its seller stopped: a win that is inside is not among those moved.)
+            assert_eq!(pace.hurry("s", &[7]), 0);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(order.lock().unwrap().is_empty(), "nobody has a turn while one is held");
+            drop(held);
+            while order.lock().unwrap().len() < SEND_PARALLEL {
+                std::thread::yield_now();
+            }
+            let first = order.lock().unwrap()[0];
+            assert_eq!(first, 7, "{:?}", order.lock().unwrap());
+        });
+        drop((holder, inside));
+        assert_eq!((pace.inside(), pace.waiting()), (0, 0));
+        // nothing is left behind: a turn is free
+        drop(pace.spend_turn());
+    }
+
+    #[test]
+    fn a_win_that_went_first_through_the_gate_goes_first_at_the_spend_lock() {
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            let holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            let (pace, order) = (&pace, &order);
+            let held = pace.spend_turn();
+            let (tx, rx) = std::sync::mpsc::channel();
+            sc.spawn(move || {
+                let g = pace.enter_for(Some(("hurried", 9)), false);
+                tx.send(()).unwrap();
+                let _turn = g.spend_turn();
+                order.lock().unwrap().push("hurried");
+            });
+            while pace.waiting() == 0 {
+                std::thread::yield_now();
+            }
+            assert_eq!(pace.hurry("hurried", &[9]), 1);
+            drop(holders);
+            rx.recv().unwrap();
+            // it is inside and asks for its turn, one that is not hurried asks too, and the turn is given up
+            sc.spawn(move || {
+                let _turn = pace.spend_turn();
+                order.lock().unwrap().push("other");
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        assert_eq!(order.into_inner().unwrap(), ["hurried", "other"]);
+    }
+
+    /// Wins that are hurried without end, through the gate and at the spend lock: one that is not
+    /// hurried still goes after [`FIRST_IN_A_ROW`] of them.
+    #[test]
+    fn hurried_wins_shut_no_other_payment_out_of_the_gate_or_the_spend_lock_for_good() {
+        let pace = Pace::default();
+        let (done, turns) = (std::sync::atomic::AtomicBool::new(false), AtomicUsize::new(0));
+        std::thread::scope(|sc| {
+            // the gate: full, a plain payment waits, and hurried wins keep coming
+            let holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            let (pace, done, turns) = (&pace, &done, &turns);
+            let plain = sc.spawn(move || {
+                let _inside = pace.enter();
+                let at = turns.load(Ordering::SeqCst);
+                done.store(true, Ordering::SeqCst);
+                at
+            });
+            while pace.waiting() == 0 {
+                std::thread::yield_now();
+            }
+            for t in 0..2 * SEND_PARALLEL as u64 {
+                sc.spawn(move || {
+                    let mut i = 0;
+                    while !done.load(Ordering::SeqCst) && i < 1_000 {
+                        let _inside = pace.enter_for(Some(("hurried", t * 10_000 + i)), true);
+                        turns.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        i += 1;
+                    }
+                });
+            }
+            while pace.waiting() < 2 * SEND_PARALLEL as u64 + 1 {
+                std::thread::yield_now();
+            }
+            drop(holders);
+            let at = plain.join().unwrap();
+            assert!(at <= FIRST_IN_A_ROW as usize + SEND_PARALLEL, "{at} hurried wins went first");
+        });
+        assert_eq!((pace.inside(), pace.waiting()), (0, 0));
+
+        // the spend lock: wins inside the gate, hurried, ask for turns without end; a payment past the gate waits
+        let (done, turns) = (std::sync::atomic::AtomicBool::new(false), AtomicUsize::new(0));
+        let inside: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL as u64).map(|i| pace.enter_for(Some(("hurried", i)), true)).collect();
+        std::thread::scope(|sc| {
+            let (pace, done, turns) = (&pace, &done, &turns);
+            let held = pace.spend_turn();
+            for g in &inside {
+                sc.spawn(move || {
+                    let mut i = 0;
+                    while !done.load(Ordering::SeqCst) && i < 1_000 {
+                        let _turn = g.spend_turn();
+                        turns.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        i += 1;
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            let plain = sc.spawn(move || {
+                let _turn = pace.spend_turn();
+                let at = turns.load(Ordering::SeqCst);
+                done.store(true, Ordering::SeqCst);
+                at
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            drop(held);
+            let at = plain.join().unwrap();
+            assert!(at <= FIRST_IN_A_ROW as usize, "{at} hurried wins had a turn first");
+        });
+        drop(inside);
+        // nothing is left behind: a turn is free
+        drop(pace.spend_turn());
     }
 
     #[test]

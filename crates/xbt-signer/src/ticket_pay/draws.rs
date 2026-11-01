@@ -368,8 +368,11 @@ impl Signer {
         let mut headers = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&ds.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth}))))];
         headers.extend(extra);
         let sent = self.wire(method, url, body, &headers, timeout);
-        // the seq is used up once the request has left, answered or not
-        link.next_seq = seq.saturating_add(1);
+        // the seq is used up once the request has left, answered or not; but not by a 408, which the seller's HTTP
+        // layer gives before any of its handlers sees the request ([`unsigned_and_no_fault`]): the next request takes it
+        // again (`link` is held, so no other has)
+        let late = sent.as_ref().is_ok_and(|a| a.status == 408);
+        link.next_seq = if late { seq } else { seq.saturating_add(1) };
         let ans = sent?;
         let receipt = DrawReceipt::read(ans.header("PAYMENT-RESPONSE"), &ds.terms.receipt_key, &link.seller_sid, seq, &digest, ans.status);
         Ok((seq, digest, ans, receipt))
@@ -379,10 +382,16 @@ impl Signer {
     fn draw_call(&self, ds: &DrawSession, what: &str, body: &Value) -> Result<(u16, Value, std::result::Result<DrawReceipt, String>)> {
         let url = format!("{}/{what}", ds.base);
         let raw = body.to_string().into_bytes();
-        for _ in 0..3 {
+        let mut late = 0;
+        for _ in 0..4 {
             let (_, _, ans, receipt) = self.draw_send(ds, "POST", &url, &raw, vec![("Content-Type".into(), "application/json".into())])?;
             let status = ans.status;
             let v: Value = serde_json::from_slice(&ans.read_small(SMALL_BODY)?).unwrap_or(Value::Null);
+            // the seller's HTTP layer gave up on it (408): nothing was served, and the same request goes once more
+            if receipt.is_err() && status == 408 && late == 0 {
+                late += 1;
+                continue;
+            }
             if receipt.is_err() && status == 402 && v.get("error").and_then(Value::as_str) == Some("bad_seq") {
                 // a seq only orders requests: the seller's is adopted, which costs nothing
                 if let Some(n) = v.get("nextSeq").and_then(Value::as_u64) {
@@ -497,7 +506,7 @@ impl Signer {
         };
         if let Err(why) = &receipt {
             let code = protocol_code(v.get("error"));
-            if status >= 500 {
+            if unsigned_and_no_fault(status) {
                 return Ok(Round { wins: vec![], again: true, left });
             }
             if code == "session_unknown" {
@@ -663,7 +672,7 @@ impl Signer {
                 // not paid. An invoice the checks refused, or a payment that failed, leaves the win open for the seller's
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
                 let retry = rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
-                    | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
+                    | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled" | "ticket_session");
                 // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
                 // the same invoice is good the next time the seller lists it
                 let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_unavailable");
@@ -690,8 +699,20 @@ impl Signer {
                         s.owed.push(w);
                     }
                 } else {
-                    c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
+                    // the session stopped (its caller, a fault), or the owner's bounds, or the wallet's node (one just
+                    // started is not on its chain yet): this call asks for no more. Nothing was booked or sent, so the
+                    // win is owed again, with its invoice, for a later call of the session: a win left handed has no
+                    // payer, and its seller would refuse every later call for it (`win_unpaid`)
+                    if rule == "ticket_session" {
+                        c.stop.get_or_insert("ticket_session: the session was stopped".to_string());
+                    } else {
+                        c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
+                    }
                     c.halt = true;
+                    s.tried.remove(&invoice_mark(invoice));
+                    if let Some((w, _)) = s.handed.remove(&win.draw()) {
+                        s.owed.push(w);
+                    }
                 }
             }
         }
@@ -723,8 +744,8 @@ impl Signer {
     /// The wins of this session that the seller's answer stands still for, by the wallet's own
     /// count against the seller's terms: they go through the gate before the wins no seller waits
     /// for. A seller serves on beside `maxUnpaidWins` unpaid wins, and beside a win for
-    /// `gracePieces` pieces after it; beyond either its answer stands still, for 10 s at the
-    /// gateway, and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
+    /// `gracePieces` pieces after it; beyond either its answer stands still, for 15 s at the
+    /// gateway as shipped (`refill_wait`), and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
     /// that are above that number go first; and a win goes first when the pieces the wallet has
     /// given values for since it are within the seller's `window` of `gracePieces` (the seller is
     /// that many pieces ahead of the wallet's values at the most). Called while an answer is being
@@ -779,6 +800,7 @@ impl Signer {
         self.lottery_touch(&ds.sid);
         let started = Instant::now();
         let mut tries = 0;
+        let mut late = false;
         let (seq, digest, ans, head) = loop {
             tries += 1;
             let (seq, digest, ans, receipt) = match self.draw_send(ds, c.method, c.url, c.body, c.headers()) {
@@ -799,10 +821,15 @@ impl Signer {
                             continue;
                         }
                     }
-                    if status >= 500 {
-                        // a proxy's, it may be: the request may be served behind it
+                    // the seller's HTTP layer gave up on it (408) before anything served it: once more, with its seq
+                    if status == 408 && !late {
+                        late = true;
+                        continue;
+                    }
+                    if unsigned_and_no_fault(status) {
+                        // a 408 comes before anything serves the request; behind a proxy's 5xx it may have been served
                         return fail(ds, with(refused("ticket_seller", format!("the seller answered HTTP {status} without a receipt")),
-                                             json!({"status": status, "request_sent": true})));
+                                             json!({"status": status, "request_sent": status != 408})));
                     }
                     if status == 402 && code == "session_unknown" {
                         self.draw_stop(ds, "the seller has forgotten the session", false);

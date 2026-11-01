@@ -313,7 +313,7 @@ involved no node.
   for goes first. On one 30-slot channel that paid the wins of 100
   sellers of one buyer at 14 wins a second, with no payment failed; a buyer whose wins come
   faster than that keeps its sellers waiting: a seller serves on for its grace of 60 s, and an
-  answer it is sending stands still for a payment for 10 s at the most before it is cut. Before the wallet kept a win inside that limit until it had settled, 24 payments were
+  answer it is sending stands still for a payment for 15 s before it is cut (`refill_wait`, the larger of it and `pay_wait_secs`, 10 s). Before the wallet kept a win inside that limit until it had settled, 24 payments were
   pending on the channel at once and 47 of 313 failed: found on the lab, and what the limit is
   for.
 - What those two waits bound, reasoned from the lab's rate and not run beyond 100 sellers. A
@@ -322,8 +322,8 @@ involved no node.
   past that the seller serves that buyer nothing more until the win is paid. A win an answer
   stands still for (the third unpaid win of a session, or one that 64 pieces were served after)
   goes before those, so its wait is the next of the 8 places to come free, its own payment
-  (0.44 s at the median on the lab), and the other wins of that kind ahead of it: some 140 of
-  them at once would take the 10 s. Before the wallet did this, such a win took its turn with
+  (0.44 s at the median on the lab), and the other wins of that kind ahead of it: some 210 of
+  them at once would take the 15 s. Before the wallet did this, such a win took its turn with
   the rest, and on a busy host the turn passed 10 s: with 16 busy loops beside the lab a file
   was cut short in 12 of 15 runs of the 100-seller check, each time with every win paid
   afterwards, and in none of 5 with the wins in this order (`docs/TICKETS.md`, section 9.12).
@@ -984,6 +984,15 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   one open while its page is.
 - A free answer has no cap, floor or stop of its own: a seller can hold one open for as long as
   its caller waits. Only the caller's time and a thread are at stake, nothing paid or locked. To be fixed.
+- The wallet's disk sets how fast it pays wins. Measured with only the wallet's fsyncs slowed: a
+  win is about 11.5 fsyncs, all under the wallet's spend lock, one win at a time, whatever the
+  gate lets through: 0.60 s of that lock a win at 50 ms an fsync, 1.15 s at 100 ms, so at most about
+  1.7 and 0.87 wins a second. A file of 16 MiB on a route where 1 piece in 4 wins, streamed on to its
+  caller, came in whole in 64 to 73 s at 100 ms and 117 to 148 s at 200 ms. Read whole by the call, it
+  is held to the 50 s above: whole at 50 ms an fsync (39 s), stopped in 5 of 7 runs at 100 ms and 4 of 4
+  at 200 ms. The call says why it stopped, and what it paid is what its node paid. A longer limit
+  would not help, since its caller waits 60 s. Writing a win's rows under fewer fsyncs would, and is
+  not done yet.
 - An answer priced by the second is paid up to a fifth of a second early, and the wallet counts
   its seconds from before it sent the request, so it can pay for one second the seller did not
   charge.
