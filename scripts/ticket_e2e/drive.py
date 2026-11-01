@@ -2425,7 +2425,7 @@ def long_download(relay: bool) -> None:
     default 50 s): the 320 MB file through the connector, which streams it on as it is paid for. It
     comes whole, its sha256 the file's, and the money agrees, the seller paid for every byte and no
     more than a ticket past them. `relay`: from a shop with no web address, relay-only, as a Private
-    shop is reached. Before 0.1.20 such a download was cut at max_answer_s and the client kept a
+    shop is reached. Before 0.2.0 such a download was cut at max_answer_s and the client kept a
     short file that looked whole."""
     mode = "relay" if relay else "direct"
     want = huge_file()

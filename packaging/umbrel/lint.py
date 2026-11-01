@@ -129,9 +129,9 @@ CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls
 # What the folder exposes beyond the admin macaroon: wallet.db, macaroons.db and tls.key (and the SHA256
 # bridge node's wallet and its password file). A compromised baker image could take the wallet's seed
 # when the wallet password is known, and Lightning Fork's dashboard uses a fixed default one. Accepted
-# for 0.1.20 because the admin macaroon the baker needs anyway already allows draining the node; the
+# for 0.2.0 because the admin macaroon the baker needs anyway already allows draining the node; the
 # way out is for Lightning Fork to hand narrow macaroons to apps itself (asked of its author for
-# 0.1.21). Every other container: tls.cert only.
+# 0.2.1). Every other container: tls.cert only.
 NODE_KEYS_BAKE = "node-keys-bake"
 NODE_DIR_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}", "target": "/node", "read_only": True,
                   "bind": {"create_host_path": False}}

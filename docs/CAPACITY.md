@@ -83,6 +83,6 @@ nothing was charged; loading it again tries again.
 
 - The counts are in the gateway's memory. A restarted gateway counts no one until its buyers come
   back.
-- Transcode caps, a queue, and an app that retries by itself come later (0.1.21).
+- Transcode caps, a queue, and an app that retries by itself come later (0.2.x).
 - A buyer that bought tickets with the shop's terms from `/services` (not from a 402) and is then
   turned away keeps those tickets as credit with the shop or as held tickets that expire unused.

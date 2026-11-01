@@ -6,7 +6,7 @@ VPNs don't allow that. Then a **relay** passes the traffic between the two apps.
 
 Anyone can run a relay. Each one adds capacity for everyone whose network blocks direct
 connections, and apps prefer a relay near them. Running one is volunteer work for now; paid relays
-are planned for version 0.1.21 (below).
+are planned for a later version (below).
 
 ## What a relay sees, and what it doesn't
 
@@ -366,11 +366,11 @@ the newest per author and `d` replaces the older).
 refuses an announcement whose signature fails, whose `d` doesn't match its `relay`, that is dated
 more than 10 minutes ahead, or that has lapsed.
 
-## Paid relays (planned for version 0.1.21)
+## Paid relays (planned for a later version)
 
 A relay costs its operator bandwidth. Paid relays let an operator charge for what the relay
-carries, through Stream itself, like any other service. The built-in relay in 0.1.20 is free; the
-design below is what 0.1.21 adds.
+carries, through Stream itself, like any other service. The built-in relay in 0.2.0 is free; the
+design below is what that version adds.
 
 - **What is charged:** bytes the relay carries between two apps, per GB. The operator sets the
   price; the suggested default is **2 sats per GB**. Helping two apps find each other and punch
@@ -386,7 +386,7 @@ design below is what 0.1.21 adds.
 - **Cost on the page:** the relay page shows an estimate from the operator's own bandwidth price
   (what a GB costs them) against the price charged.
 
-What 0.1.20 leaves ready for it: the built-in relay decides who may connect through a metering hook
+What 0.2.0 leaves ready for it: the built-in relay decides who may connect through a metering hook
 (`xbt_stream_relay::meter::Meter`, behind iroh-relay's per-client access control, which sees each
 client's iroh key on connect and on disconnect), free for everyone today. Metering by bytes needs a
 per-client byte count, which iroh-relay 1.4.1 doesn't expose: a small change to iroh-relay, planned

@@ -1527,7 +1527,7 @@ fn shipped(v: &mut Value) {
 
 /// As shipped: a lock for held tickets that nobody authenticated, or of a session that has paid
 /// nothing, is refused `prepaid_first` and asks the node for nothing; a session's first lock is
-/// for a prepaid ticket, whose invoice lapses in 60 s as any does (20 s before 0.1.20, which shut
+/// for a prepaid ticket, whose invoice lapses in 60 s as any does (20 s before 0.2.0, which shut
 /// out buyers on slow routes); once that ticket is paid and presented the
 /// session is issued hold invoices; and one address has at most 2 unpaid invoices.
 ///

@@ -747,7 +747,7 @@ too, and holds after it.
 | Held tickets on one channel, all sessions together | Half of the channel's slots: 15 of 30 | The other half is for ordinary payments, for settles on their way and for everyone else (section 11). |
 | Ticket life (`ticketBlocks`) | 40 blocks | The node takes no less than 24. The seller's node cancels at 18 before expiry, the seller stops accepting at 24 before, and the payer's node adds 3: so 19 usable blocks, and at most 25 blocks locked behind a silent seller. |
 | Seller's margin | 24 blocks before expiry | 18, when its node cancels the ticket itself, and 6 more for a settle that has to go on chain (the node starts that 16 blocks before expiry). The 18 is the node's `invoices.holdexpirydelta`, a setting of the node's runner: 18 on the Lightning Fork node at its default, 12 on upstream lnd. The node does not tell it, so the gateway takes it from its config (`node.hold_expiry_delta`, 18 unless the runner says otherwise) and refuses to start when it is above 18: the margin is one number for both sides (a buyer stops releasing a ticket at 25 blocks), so it is not moved to fit a node. |
-| Invoice time expiry | 60 s, a first lock's included | Long enough to pay through a few hops on a slow route (a hop held a payment 8 to 22 s on a loaded lab node, and a first lock's 20 s, before 0.1.20, refused such buyers every time), short enough that unpaid invoices do not pile up. What bounds a stranger's unpaid places is the caps by address. |
+| Invoice time expiry | 60 s, a first lock's included | Long enough to pay through a few hops on a slow route (a hop held a payment 8 to 22 s on a loaded lab node, and a first lock's 20 s, before 0.2.0, refused such buyers every time), short enough that unpaid invoices do not pile up. What bounds a stranger's unpaid places is the caps by address. |
 | Tickets in flight per channel | 30 on a Core Lightning channel, 483 at most | 483 is the protocol's limit and Lightning Fork's default; 30 is Core Lightning's default, each way, set when the channel opens. Between Lightning Fork nodes, of 520 offered at once 483 locked in 8 s and 37 failed on the buyer's node (`INSUFFICIENT_BALANCE`) with nothing held; to a Core Lightning node, of 40 offered 30 locked and 10 failed the same way. 483 tickets take a commitment transaction from 1,116 to 84,200 weight units. |
 | Macaroons | Buyer: `info:read`, `offchain:read`, `offchain:write`, `onchain:read`. Seller: one with `invoices:read`, `invoices:write`, and one with `info:read`. | The buyer's was enough for its side. The seller's invoice macaroon makes, follows, settles and cancels tickets and cannot read the block height; the second one reads it. Neither could send coins, pay, open a channel, read the wallet or bake another. |
 | Seller's caps (the gateway's defaults in this tree) | 15 held tickets for all sessions together, 2 a session, 30 sessions, 2 from one address, 2 unpaid invoices from one address; hold invoices only to a session that has paid a ticket | What buyers can hold of the seller's inbound capacity at no cost to them: 15,000 sat and half of one 30-slot channel. A runner whose inbound channels all carry more says so (`caps.inbound_slots`), and one with several channels may raise the cap past half of one (`caps.held_over_half`). Until 2026-10-13 the defaults were 8 a session and 240 in all. |
@@ -1616,7 +1616,7 @@ node reports, and nothing else.
 | | `max_sats` | `max_charge_sats` (default: `max_sats`; never above it) |
 |---|---|---|
 | Bounds | What may leave the wallet for the call on the ticket rail: the tickets it releases or buys, whole, with their routing fees. Not a call paid by draws: its wins are bounded by the charge cap's luck cap and the task's budget (section 9.8) | What the call's answer may be charged by the seller |
-| Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the gateway ends the answer there, a body or a paid WebSocket (gateways before 0.1.20 did not stop a WebSocket at it: bytes in flight past it were charged, and the wallet takes such a receipt as the seller's fault) |
+| Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the gateway ends the answer there, a body or a paid WebSocket (gateways before 0.2.0 did not stop a WebSocket at it: bytes in flight past it were charged, and the wallet takes such a receipt as the seller's fault) |
 | Checked by the wallet | Before a ticket is released or bought: it must fit what is left of `max_sats` | A quoted price above it is refused before anything is paid (`max_sats`); a metered answer is cut there; a receipt that charges more is a seller fault (`ticket_over_cap`) |
 | Where the difference goes | — | It stays as credit with that seller. A later session with it takes it over within 20 hours of the stop (the newest stopped sessions first, and only where the seller's signed count agrees); after that it is lost |
 
@@ -1689,7 +1689,7 @@ the balance it held before (under one ticket), and nothing after.
 the resource has (`max_size`; the app passes a listed file's size). It goes to the seller as
 `X-Xbt402-Max-Size`; a caller's own `x-xbt402-*` headers are refused. The seller, the wallet and the
 app judge an answer by one rule: a `206` by the total in its `Content-Range`, any other `2xx` by its
-`Content-Length`. A 0.1.20 seller judges a GET or HEAD of a route not priced by the token by it,
+`Content-Length`. A 0.2.0 seller judges a GET or HEAD of a route not priced by the token by it,
 taking the smallest size named, and refuses an answer that states more before any of its body is
 sent: `412` `larger_than_shown`. It charges the request's price, as for an answer with no body: on a
 route priced only by the byte or the second (a file) that is nothing; on one priced by the request
@@ -1703,9 +1703,9 @@ draw owed, nothing charged). A route priced by the request is not judged by the 
 its request is a piece of its own: the answer is served, the wallet reads none of a body larger than
 the size, and it draws for the request's piece all the same, as the ticket rail charges its price.
 
-An answer that states no size is cut at the size named as it is sent: the 0.1.20 seller ends it
+An answer that states no size is cut at the size named as it is sent: the 0.2.0 seller ends it
 there cut short (on the ticket rail; the lottery rail does not yet), and the wallet reads no more
-than that on either rail. A seller that ignores the header (gateways before 0.1.20) sends as before;
+than that on either rail. A seller that ignores the header (gateways before 0.2.0) sends as before;
 the wallet reads none of a body whose head states more, or no more than the size of one that
 states none, and stops the call. That seller then charges only what it had pushed into the buffers
 between the wallet and itself before the stop (a socket's, a proxy's, a relay's: up to a few MiB),
@@ -2104,7 +2104,7 @@ session starts fresh. The seller's word moves no money: it only lets the wallet 
 counts as paid. Only a seller with the same receipt key is taken over: another shop on the same node
 is another seller, even though its payments reach the same node. A key is public, so naming it proves nothing:
 a session's key goes on record at its first signed receipt, and one with another key on record is not asked about at all.
-One with no key on record (killed before its first signed receipt, or from before 0.1.20) is taken over only at the address it was opened at.
+One with no key on record (killed before its first signed receipt, or from before 0.2.0) is taken over only at the address it was opened at.
 A `session_unknown` from any other address cannot be signed and says nothing of that session: it counts as no answer.
 
 A `status` that does not answer is asked again, three times in all, a few seconds each. Still none, or
@@ -2151,7 +2151,7 @@ a session that stays open, is refused `ticket_session_exists` with `retry_after_
 ## 17. Requests side by side in one session (2026-10-29)
 
 A seller's web app asks for many things at once: a page's scripts and pictures together, a film
-that plays for an hour, a WebSocket that stays open as long as the page does. Until 0.1.20 the
+that plays for an hour, a WebSocket that stays open as long as the page does. Until 0.2.0 the
 wallet sent one paid request at a time in a session, so a film or a socket held up every other
 request to that seller until the read timeout. Now requests in one session run side by side.
 
@@ -2164,7 +2164,7 @@ request to that seller until the read timeout. Now requests in one session run s
   past the window goes again once the seqs before it have arrived, or takes over a seq that no
   request holds any more (one given up when its connection failed). With a seller that states no
   window, which takes only the next seq, a request holds the session's `order` from its seq to its
-  head: one at a time, as before 0.1.20. Without a window, requests side by side arrived out of
+  head: one at a time, as before 0.2.0. Without a window, requests side by side arrived out of
   order and went again, a round trip each: over a relay a web app's page loaded in ten seconds.
 - **Receipts out of order.** Receipts come back in another order than the seller signed them. The
   wallet orders them by its own steps: a request it sent after it last took the seller's totals is

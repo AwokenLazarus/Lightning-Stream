@@ -559,7 +559,7 @@ wallet) and against a stand-in node in its tests.
   invoices of a first lock lapse after 60 s (`caps.first_lock_secs`), and the gateway gives one up
   unpaid 15 s after that, at 75 s, with its session's place, whatever `caps.first_use_secs` says;
   and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`). Until
-  0.1.20 a first lock's invoices lapsed after 20 s: a buyer whose payment took longer than that to
+  0.2.0 a first lock's invoices lapsed after 20 s: a buyer whose payment took longer than that to
   reach the seller over a slow route was refused at the seller's node every time, with nothing
   paid, and could never open a session (measured on the lab route at 8 to 22 s a hop under load).
   The steady number of places a stranger holds is set by the caps by address, not by how soon each
@@ -929,7 +929,7 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   still in flight holds nobody back: a seller that has not credited it is named in the owner's
   record (`ticket_prepay_overdue`), since a hop on the route, or the seller, holds it. The booking goes when the node shows the
   payment failed, or, for a payment the node never had, 60 seconds after the timeout. Until
-  0.1.20 the wait was the whole `timeout_s` (up to 600 s), and such a session was stopped as the
+  0.2.0 the wait was the whole `timeout_s` (up to 600 s), and such a session was stopped as the
   seller's fault, which left its credit with the seller.
 - A signer killed between a prepaid ticket's payment and the seller's credit has lost nothing: the
   book marks the ticket as it settles, the watcher shows the seller its preimage from the node's
