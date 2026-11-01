@@ -194,7 +194,7 @@ the lab), and cannot see `ACCEPTED` at all. A buyer that releases a ticket in th
 secret again. On the lab a buyer that paid as soon as its own node showed 8 tickets in flight was
 answered so and served on the retry. A buyer SHOULD wait for the seller's own word instead: the
 session's signed `status` (section 4) lists each ticket's state, and the wallet built here releases
-a ticket only after `status` has shown it `ACCEPTED`, for a bounded time (3 s by default), so that
+a ticket only after `status` has shown it `ACCEPTED`, for a bounded time (12 s by default), so that
 no secret leaves for a ticket the seller cannot yet use. Locked funds
 are not spent. They count against a cap on locked funds, not against a budget.
 
@@ -1775,6 +1775,9 @@ the session and blocks nothing.
 | The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its wait for a refill, 15 s by default), then releases. | Up to that wait. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
+| The wallet's chain node gives no tip, and none it gave in the last 5 minutes. | `ticket_chain` after up to `tickets.ready_wait_ms`, 12 s as shipped, all a release's waits together. | Nothing: no secret was released. |
+| The seller ended the answer a ticket is for while the ticket was awaited (its signed `status` lists it). | `ticket_answer_closed`. | Nothing: no secret was released. |
+| The seller shows no ticket three times running, with no byte delivered between them. | `ticket_seller_stalled`: the session is stopped. | Nothing more. |
 | The seller never shows a ticket `ACCEPTED`, and the wallet's own node calls its payment in flight and carries it on no channel (a node killed as it sent it). | The session is stopped (`ticket_session_ended`); the next call opens a new one, with a pool inside what the owner's cap for that seller has left. | Nothing: no secret was released. The ticket counts as locked until the node gives it up. |
 | Tickets failed on the wallet's node after their lock round was over. | The seller is asked to cancel their invoices before the next lock, once for each. | Nothing. Without it the seller refused the lock (`too_many_tickets`) until the invoices lapsed. |
 | The wallet's signer is killed. | On its next start every locked ticket is booked as if released and never released, and the sellers on record are asked to cancel. | The balance; and the pool's worst case held against the budgets until the node shows the tickets failed. |

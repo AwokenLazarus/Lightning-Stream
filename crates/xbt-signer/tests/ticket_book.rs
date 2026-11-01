@@ -1675,6 +1675,24 @@ fn a_ticket_given_up_that_reaches_the_node_late_is_booked_again() {
     assert_eq!(r.state_of(&sid, &late), "retired");
 }
 
+/// A chain node that gives no answer says nothing about a ticket's expiry: the last tip it gave holds for a while,
+/// and after that the release says what is wrong, and calls no ticket stale.
+#[test]
+fn a_release_on_a_tip_nobody_knows_says_so_and_calls_no_ticket_stale() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let sid = r.open();
+    r.fill(&sid);
+    assert_eq!(r.release(&sid)["verdict"], "allow");
+    r.chain.st.lock().unwrap().down = true;
+    assert_eq!(r.release(&sid)["verdict"], "allow", "the tip the node gave a moment ago");
+    r.clock.fetch_add(301, Ordering::SeqCst);
+    let d = r.release(&sid);
+    assert_eq!((d["rule"].as_str(), d.get("stale").is_none(), d["charged_sats"].as_i64()), (Some("ticket_chain"), true, Some(0)), "{d}");
+    r.chain.st.lock().unwrap().down = false;
+    assert_eq!(r.release(&sid)["verdict"], "allow");
+}
+
 #[test]
 fn a_send_that_waits_its_turn_longer_than_the_nodes_timeout_is_not_given_up() {
     let _g = env_lock();

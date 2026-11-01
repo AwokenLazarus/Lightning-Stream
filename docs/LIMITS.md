@@ -744,7 +744,7 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   next ticket is sent after every release, so a node that dies right after a paid request is
   more likely to be caught in that instant than it was with a pool of 8.
 - Such a ticket never arrives at the seller, and it is the oldest of its session. The first
-  release that waits for it (`tickets.ready_wait_ms`, 3 s) finds it on none of the node's
+  release that waits for it (`tickets.ready_wait_ms`, 12 s) finds it on none of the node's
   channels and ends the session (`ticket_session_ended`); the next call opens another. The
   ticket stays locked in the book. A new session's pool is sized inside what the owner's cap on
   tickets locked with one seller (2 as shipped) has left, so after one such ticket the wallet
@@ -936,9 +936,35 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   refused or failed. The answer is not read; a seller that does not cancel them holds its own
   places until the invoices lapse.
 - No ticket is released until the seller's signed `status` shows it locked. A seller that never
-  shows it is not paid (`ticket_not_ready` after 3 s), and its tickets stay locked until it
-  cancels them or they expire. The session goes on trying that ticket, its oldest, for as long
-  as the wallet's own node carries it on a channel.
+  shows it is not paid (`ticket_not_ready` after 12 s), and its tickets stay locked until it
+  cancels them or they expire. After three of those running with no byte delivered between them
+  the session ends (`ticket_seller_stalled`), and the next call opens another.
+- A release pauses for 12 s at most, all told, whatever it waits for (`tickets.ready_wait_ms`):
+  under the 15 s a seller as shipped keeps a paused answer open, so that no secret leaves for an
+  answer already over; just before the book the seller's signed `status` is asked whether it is.
+  A seller that closes a paused answer sooner than that is caught there, not before. For an answer
+  by the byte the 12 s run from its last byte, for a request from when its turn comes, and for an
+  answer by the second from each release, since each second's ticket can wait in its turn.
+- **An answer priced by the second is charged for the pauses.** It is the clock's price: the
+  seconds run while a ticket is late, whether anything arrives or not, and every ticket due meanwhile
+  can be late too. Measured at 400 sat a second: an answer of 3,600 sat came to 4,800 sat with the
+  seller's word held back to 11 s, and to 7,600 sat with its ticket 11 s past due. The wallet does not
+  try to tell this from an answer that is merely slow.
+- **A whole call has one deadline** (`tickets.max_answer_s`, 50 s), and answers plainly within about
+  55 s, before its caller's 60 s. A question to a node or a seller that hangs goes on behind on a
+  thread of its own and the call answers without it, and no secret leaves after the deadline, so a
+  caller that asks again does not pay twice. Three paths can still run past it: a prepaid ticket's
+  payment, which waits as long as `ln.timeout_s` (60 s); the checks of the wallet's nodes that begin
+  a call, each up to its client's 30 s, before there is a session to pay; and the watcher's reconcile
+  on a Lightning node that hangs, which asks after each ticket holding the book and the spend lock.
+- A ticket stuck in `sending` (the node calls it in flight and shows it on no way) for more than
+  `ln.timeout_s` and 30 s, 90 s as shipped, is taken for stranded: the session ends (`ticket_session_ended`). Until then each call
+  waits up to 12 s for it.
+- A ticket held on a channel that is down, or just back and not yet listing its HTLCs again (a
+  link that drops), may still come: it is taken for stranded only once seen on no channel with
+  every channel up for 20 s. A pause for such a ticket is not counted against the seller
+  (`ticket_seller_stalled`), and a refill refused for want of an active channel is asked again
+  inside the pause. A link down for longer than the pause ends the answer with the link's reason.
 - One paid request per seller at a time: a long answer delays every other call to that seller,
   and one session per seller node, so two origins of one node cannot be paid at once.
 - The ticket rail needs https, or http to the wallet's own machine. The wallet does not pin a
