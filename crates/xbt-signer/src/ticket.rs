@@ -88,6 +88,15 @@ pub const ROUTE_FULL: &str = "ticket_route_full";
 /// Refusals of a held ticket that are no fault of the seller's terms or the owner's budgets, and
 /// leave prepaid tickets, or another rail, as the way to pay: no slot, dust, a full route.
 pub const HOLD_SHORT: [&str; 4] = ["ticket_slots", "ticket_dust", ROUTE_FULL, "ticket_slots_short"];
+/// Why a session waits after a lock round that failed while the wallet's channels were out (or just after): the
+/// session buys prepaid tickets meanwhile and holds as many as before once the wait is over. A session opened with the
+/// seller during the wait waits out what is left of it ([`Book::outage_hold`]), and takes nothing else over: not one of
+/// [`HOLD_SHORT`], it is no sign of a full route. A session that already held less for a full route keeps that reason
+/// through such a wait ([`Session::outage_round`]).
+pub const OUTAGE_HOLD: &str = "ticket_outage";
+/// How long that wait is: no lock is tried again sooner, so an outage, or a full channel the wallet cannot tell from
+/// one, costs a round of failed payments at most every 30 s.
+pub const OUTAGE_HOLD_S: f64 = 30.0;
 /// The rule of a release refused because the chain node gave no tip to judge a ticket by.
 pub const TIP_UNKNOWN: &str = "ticket_chain";
 /// The rules of the wallet's checks of its Lightning node that the chain node's silence can cause
@@ -1447,6 +1456,21 @@ impl Session {
         self.prepaid_msat > 0 && (self.pool == 0 || now < self.hold_until || self.paid_first)
     }
 
+    /// Tickets of a lock round failed in an outage, whether or not others of it locked: a wait of [`OUTAGE_HOLD_S`]
+    /// ([`OUTAGE_HOLD`]), with the pool and the run of failed rounds as they were. A session that held less for a full
+    /// route ([`HOLD_SHORT`]) keeps that as its reason, so that what it learnt still passes to the next session with the
+    /// seller ([`Book::held_less`]). Returns whether anything changed.
+    pub fn outage_round(&mut self, now: f64) -> bool {
+        if now < self.hold_until {
+            return false;
+        }
+        self.hold_until = now + OUTAGE_HOLD_S;
+        if !HOLD_SHORT.contains(&self.hold_why.as_str()) {
+            self.hold_why = OUTAGE_HOLD.into();
+        }
+        true
+    }
+
     /// What a lock round came to: `locked` tickets the node holds, `slot_failed` that failed as a
     /// full channel does ([`slot_failure`]). A failure halves the pool (never below 1) and sets
     /// the wait; the third failed round in a row ends holding with this seller (a pool of none,
@@ -1707,6 +1731,13 @@ impl Book {
     pub fn held_less(&self, payee: &str, now: f64) -> Option<&Session> {
         self.sessions.values().filter(|s| s.payee == payee && HOLD_SHORT.contains(&s.hold_why.as_str()) && s.hold_why != "ticket_dust")
             .filter(|s| s.hold_until > now - SLOT_WAIT_MAX_S).max_by(|a, b| a.hold_until.total_cmp(&b.hold_until).then_with(|| a.opened_ts.total_cmp(&b.opened_ts)))
+    }
+
+    /// The latest wait of an earlier session with this payee after a round that failed in an outage ([`OUTAGE_HOLD`]),
+    /// if it is not over: a new session waits it out too (the wait only; its pool is its own), so that stopping one
+    /// session and opening another does not send a failing round each call.
+    pub fn outage_hold(&self, payee: &str, now: f64) -> Option<f64> {
+        self.sessions.values().filter(|s| s.payee == payee && s.hold_why == OUTAGE_HOLD && s.hold_until > now).map(|s| s.hold_until).reduce(f64::max)
     }
 
     /// A prepaid ticket another session bought of this payee that the seller may yet credit there,
@@ -2227,6 +2258,33 @@ mod tests {
         assert!(old.get("hold").is_none() && old.get("prepaid_msat").is_none());
         old["hold"] = json!({"fails": "x"});
         assert_eq!(Session::from_row(&old), None, "a damaged row is refused, not read as no wait");
+    }
+
+    /// A round that fails in an outage sets the short wait, and leaves what a session learnt of a full route as it was:
+    /// a session that halved its pool for a full route, its wait over, meets an outage at its next round. The next
+    /// session with the seller still starts from its smaller pool and its failed round, and waits out the outage's wait.
+    /// A session that never held less waits as an outage's does, and passes on the wait only.
+    ///
+    /// FAILS with the outage's reason written over the full route's: the session is no longer one that held less, and
+    /// the next session with the seller starts again from the full pool, with no failed round.
+    #[test]
+    fn a_round_that_fails_in_an_outage_keeps_what_a_session_learnt_of_a_full_route() {
+        let mut s = session("s1", 4);
+        assert!(s.lock_round(0, 1, 100.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until, s.hold_why.as_str()), (2, 1, 130.0, "ticket_slots"));
+        assert!(!s.outage_round(129.0), "a wait that is not over is left as it is");
+        assert!(s.outage_round(140.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until, s.hold_why.as_str()), (2, 1, 170.0, "ticket_slots"), "the outage's wait, the full route's reason");
+        let mut b = Book::default();
+        b.sessions.insert(s.id.clone(), s.clone());
+        assert_eq!(b.held_less("p", 150.0).map(|s| (s.pool, s.slot_fails, s.hold_until)), Some((2, 1, 170.0)), "what it learnt passes on, and the wait");
+        // a session that never held less: the outage's own reason, the wait passed on alone
+        let mut o = session("s2", 2);
+        o.payee = "q".into();
+        assert!(o.outage_round(140.0));
+        assert_eq!((o.pool, o.slot_fails, o.hold_until, o.hold_why.as_str()), (2, 0, 170.0, OUTAGE_HOLD));
+        b.sessions.insert(o.id.clone(), o);
+        assert_eq!((b.held_less("q", 150.0).map(|s| s.id.clone()), b.outage_hold("q", 150.0), b.outage_hold("q", 170.0)), (None, Some(170.0), None));
     }
 
     #[test]

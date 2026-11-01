@@ -823,6 +823,13 @@ impl Signer {
     /// `ticket_open`: a session with one seller under one of the owner's tasks. `terms` is the
     /// `accepts` entry of the seller's 402 as the caller received it. Nothing is paid or locked.
     pub(crate) fn ticket_open_locked(&self, p: &Value) -> Value {
+        self.ticket_open_in(p, true)
+    }
+
+    /// [`Signer::ticket_open_locked`]. `outage_wait`: the session waits out what is left of an earlier session's wait
+    /// after a round that failed in an outage ([`ticket::OUTAGE_HOLD`]). Only the second try of a resume
+    /// ([`Signer::ticket_pay_in`]) opens without it: that try is made once, and locks at once.
+    pub(crate) fn ticket_open_in(&self, p: &Value, outage_wait: bool) -> Value {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
@@ -976,6 +983,10 @@ impl Signer {
                 if now < b.hold_until {
                     (hold_until, hold_why) = (b.hold_until, b.hold_why.clone());
                 }
+            }
+            // and what is left of a wait after a round that failed in an outage: the wait only, never a smaller pool
+            if let Some(until) = st.book.outage_hold(&terms.payee, now).filter(|u| outage_wait && size.pool > 0 && *u > hold_until) {
+                (hold_until, hold_why) = (until, ticket::OUTAGE_HOLD.to_string());
             }
             let lp = LnPolicy::from_map(&cfg.ln);
             // a prepaid ticket is sized per purchase: where the seller lets the wallet ask for a smaller one,
@@ -1216,6 +1227,10 @@ impl Signer {
             Ok(p) => (Some(p), None),
             Err(e) => (ln.lookup(hash).ok().flatten(), Some(e)),
         }).collect();
+        // a round that failed while the wallet's channels were out (its peer's connection dropped) failed for the
+        // outage: no sign of a full channel, and the session holds no less for it. Asked of the node with no lock held
+        let any_failed = outcomes.iter().any(|(p, e)| e.is_some() || p.as_ref().is_some_and(|p| p.get("status").and_then(Value::as_str) == Some("FAILED")));
+        let outage = any_failed && self.ln_out_lately(Some(&*ln), lp.split(&self.chain));
         // what the node made of each
         let _g = self.lock();
         let mut tickets = vec![];
@@ -1223,7 +1238,7 @@ impl Signer {
         let res = (|| -> Result<()> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
-            let (mut locked, mut slot_failed) = (0usize, 0usize);
+            let (mut locked, mut slot_failed, mut outage_failed) = (0usize, 0usize, 0usize);
             for ((hash, _), (pmt, unsent)) in sends.iter().zip(outcomes) {
                 // an error the node's record did not replace: it goes with the ticket's row
                 let unsent = unsent.filter(|_| pmt.is_none());
@@ -1233,7 +1248,9 @@ impl Signer {
                 if let Some(t) = st.book.tickets.get(hash) {
                     locked += usize::from(t.state == TState::Locked);
                     // a payment that failed as a full channel does: the node names no slot, only a balance or a route
-                    slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note));
+                    let full = t.state == TState::Failed && ticket::slot_failure(&t.note);
+                    slot_failed += usize::from(full && !outage);
+                    outage_failed += usize::from(full && outage);
                     tickets.push(match &unsent {
                         Some(e) => node_said(with(t.public(), json!({"send_error": e.msg})), e),
                         None => node_failure(t.public(), pmt.as_ref().filter(|_| t.state == TState::Failed)),
@@ -1250,6 +1267,12 @@ impl Signer {
                                            "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why});
                         self.ticket_audit("ticket_slot_failure", with(json!({"session": sid, "dest": dest, "locked": locked}), held_less.clone()));
                     }
+                } else if outage_failed > 0 && s.outage_round(self.engine.now()) {
+                    // tickets that failed for an outage, whether or not others locked: a short wait before the missing
+                    // ones are tried again (prepaid tickets meanwhile, where the seller sells them), the pool as it was
+                    st.commit(&[s.row()])?;
+                    self.ticket_audit("ticket_outage_round", json!({"session": sid, "dest": dest, "failed": outage_failed, "pool": s.pool,
+                                                                    "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why}));
                 }
             }
             Ok(())
@@ -1550,7 +1573,7 @@ impl Signer {
             // a ticket that was in flight and then failed as a full channel does met a hop without a slot: its
             // payment left the wallet's node before that hop refused it. It counts as a failed round, once per
             // wait (the tickets of one round fail together)
-            if was_locked && ticket::slot_failure(&t.note) {
+            if was_locked && ticket::slot_failure(&t.note) && !self.ln_out_lately(None, 0) {
                 if let Some(mut s) = st.book.sessions.get(&t.session).filter(|s| s.state == SState::Open && now >= s.hold_until).cloned() {
                     let had = s.pool;
                     if s.lock_round(0, 1, now) {

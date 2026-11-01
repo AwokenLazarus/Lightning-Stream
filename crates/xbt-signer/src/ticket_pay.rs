@@ -357,8 +357,12 @@ fn refusal(rule: &str, reason: impl Into<String>) -> Value {
 /// channel out for a moment. Any other (a stopped session, a blocked seller, the owner's limits) stands.
 fn passing_refusal(why: &str) -> bool {
     let rule = why.split(':').next().unwrap_or_default();
-    ["ticket_not_ready", "ticket_busy", "ticket_answer_open", "ticket_seller", "ln_no_safe_channel", "ln_backend"].contains(&rule) || HOLD_SHORT.contains(&rule)
+    ["ticket_not_ready", "ticket_busy", "ticket_answer_open", "ticket_seller", "ln_no_safe_channel", "ln_backend", crate::ticket::OUTAGE_HOLD].contains(&rule)
+        || HOLD_SHORT.contains(&rule)
 }
+
+/// Why no ticket is locked meanwhile, after a round that failed in an outage ([`crate::ticket::OUTAGE_HOLD`]).
+const OUTAGE_WORDS: &str = "the channel to the seller was out a moment ago, and the wallet waits for it to come back before it locks again";
 
 fn answer_closed_refusal(hs: &HttpSession) -> Value {
     with(refusal("ticket_answer_closed", "the seller has ended the answer this ticket was for: no secret was released"),
@@ -2988,7 +2992,9 @@ impl Signer {
 
     /// [`Signer::ticket_pay`]. `again`: a resume (a call with a `range`) whose session ended under it before anything
     /// of it went out (the seller's places full, [`Signer::ticket_cap_full`], or the session forgotten by the seller) is
-    /// made once more in another session.
+    /// made once more in another session. That session takes over no wait after an outage's round
+    /// ([`crate::ticket::OUTAGE_HOLD`]): it tries a lock at once, as a resume did before that wait, even with a seller
+    /// that sells no prepaid tickets.
     fn ticket_pay_in(&self, c: &Call, acc: &Value, prepaid_acc: Option<&Value>, lightning: &str, again: bool) -> Tried {
         let terms = match PayTerms::parse(acc, lightning) {
             Ok(t) => t,
@@ -3085,8 +3091,9 @@ impl Signer {
                     }
                     let o = {
                         let _g = self.lock();
-                        self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
-                                                                 "fit_sats": c.max_sats.max(0), "charge_sats": c.charge_sats.max(0)}))
+                        // the second try of a resume does not wait out an earlier session's outage: it is made once
+                        self.ticket_open_in(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
+                                                             "fit_sats": c.max_sats.max(0), "charge_sats": c.charge_sats.max(0)}), again)
                     };
                     if o["verdict"] != "allow" {
                         let rule = str_or_empty(o.get("rule"));
@@ -3152,8 +3159,9 @@ impl Signer {
                             let stopped = self.ticket_http_stop(&h, "no ticket could be locked", Duration::ZERO);
                             if let Some(s) = wait {
                                 let why = if s.hold_why.is_empty() { "ticket_slots".to_string() } else { s.hold_why.clone() };
-                                break 'open Err(Tried::Done(with(refusal(&why, format!("no ticket is locked with this seller for another {:.0} s: a lock found no free slot \
-                                                                                        on the way to it, and its terms offer no prepaid tickets", (s.hold_until - now).max(0.0))),
+                                let what = if why == crate::ticket::OUTAGE_HOLD { OUTAGE_WORDS } else { "a lock found no free slot on the way to it" };
+                                break 'open Err(Tried::Done(with(refusal(&why, format!("no ticket is locked with this seller for another {:.0} s: {what}, and its terms offer \
+                                                                                        no prepaid tickets", (s.hold_until - now).max(0.0))),
                                                                  json!({"stopped": stopped, "retry_after_s": (s.hold_until - now).max(0.0).ceil(), "slot_fails": s.slot_fails}))));
                             }
                             break 'open Err(Tried::Done(with(refusal("ticket_lock", "no ticket was locked with this seller: its invoices did not pass the wallet's checks, or the \
@@ -4472,9 +4480,10 @@ impl Signer {
                     }
                     if now < s.hold_until {
                         filled?;
+                        let what = if s.hold_why == crate::ticket::OUTAGE_HOLD { OUTAGE_WORDS } else { "the last lock found no free slot on the way" };
                         return Err(with(refusal(if s.hold_why.is_empty() { "ticket_slots" } else { s.hold_why.as_str() },
-                                                format!("no ticket is locked with this seller for another {:.0} s: the last lock found no free slot on the way, and \
-                                                         the seller's terms offer no prepaid tickets", s.hold_until - now)),
+                                                format!("no ticket is locked with this seller for another {:.0} s: {what}, and the seller's terms offer no prepaid \
+                                                         tickets", s.hold_until - now)),
                                         json!({"session": hs.sid, "retry_after_s": (s.hold_until - now).ceil()})));
                     }
                 }
@@ -6461,6 +6470,15 @@ mod tests {
         let hashes = vec![0u8; 8];
         assert_eq!(super::in_parts(&hashes, 3).map(<[u8]>::len).collect::<Vec<_>>(), vec![3, 3, 2]);
         assert_eq!(super::in_parts(&hashes, 0).len(), 8, "a cap of none still names one at a time");
+    }
+
+    /// A wait after a round that failed in an outage passes by itself, as one for a full channel does: a socket or a
+    /// tunnel to a seller with no prepaid tickets rides it out rather than ending.
+    #[test]
+    fn a_wait_after_an_outage_passes_by_itself() {
+        assert!(passing_refusal(&format!("{}: no ticket is locked with this seller for another 20 s", crate::ticket::OUTAGE_HOLD)));
+        assert!(passing_refusal("ticket_slots: no ticket is locked"));
+        assert!(!passing_refusal("ticket_session: the session was stopped"));
     }
 
     /// Only a call refused before its request left is made again (a resume, in another session): one whose request left
