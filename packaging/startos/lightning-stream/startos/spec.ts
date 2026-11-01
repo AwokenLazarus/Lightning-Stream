@@ -6,7 +6,8 @@
  *
  * One package for the whole app, as the Umbrel app is: the wallet (signer, anchor witness, MCP server, web
  * UI, the connector that plays what is bought), the shop (the gateway) and hashrate (the hashmaker, which
- * rents this owner's miners out, and the hashtaker, which rents others' into the owner's DATUM Gateway).
+ * rents this owner's miners out, the hashtaker, which rents others' into a DATUM-protocol gateway, and that
+ * gateway, `datum`, which masks every job so a hashmaker can't tell which shares win).
  * Every service of a StartOS package shares one network namespace, so they reach each other on 127.0.0.1.
  *
  * The `main` volume is laid out as docs/CONTAINER.md §1. StartOS mounts a volume root-owned on every start,
@@ -30,9 +31,13 @@ export const PORTS = {
   vpnExternal: 51830,
   // the exit's tunnel endpoint: the gateway beside it joins buyers' paid tunnels here (never published)
   vpnTunnel: 51880,
+  /** the masking gateway's Stratum, for the hashtaker only (127.0.0.1: never an interface) */
+  datumStratum: 23339,
+  /** the masking gateway's API: /xbt/job opens each job for the hashtaker's check (127.0.0.1 only) */
+  datumApi: 7152,
 } as const
 
-export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui' | 'gateway' | 'connector' | 'hashlink' | 'vpn'
+export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui' | 'gateway' | 'connector' | 'hashlink' | 'vpn' | 'datum'
 export type DaemonId =
   | 'init'
   | 'node-keys'
@@ -45,6 +50,7 @@ export type DaemonId =
   | 'hashmaker'
   | 'hashtaker'
   | 'vpn'
+  | 'datum'
 
 /** A part of the `main` volume, or (with `dependency`) a folder of another package's volume, read-only. */
 export type MountSpec = {
@@ -152,8 +158,28 @@ export const FILE_BROWSER = {
   words: 'File Browser',
 } as const
 
-/** The DATUM Gateways the hashtaker sends rented work to, by their StartOS names (the BLAKE2b one first). */
-export const DATUM_CANDIDATES = ['datum-blake2b.startos:23336', 'datum.startos:23334']
+/**
+ * The masking gateway (the `datum` daemon, "Stream Gateway (DATUM-compatible)" to the owner): a DATUM-protocol gateway that gives every job a key of its own and
+ * opens each job, without the key, on /xbt/job, so the hashtaker checks a job is masked before a miner gets it.
+ * It reads the node through `rpc.cookie` (the Node connection action's user and password: xbt-init's `datum`
+ * component writes it, 0600, owned by xbt-datum 10021) and the config the Hashrate page's "Your gateway" writes
+ * (mode, payout address, the node's RPC URL; 0640, group xbt-datum; no secret). Its API has no admin password.
+ * Contract: run-handoff/mg-contract.md (W5).
+ * Both listen on 127.0.0.1 only, in this package's own network namespace: only its own services reach them.
+ */
+export const DATUM = {
+  config: '/data/run/datum/config.json',
+  cookie: '/data/run/datum/rpc.cookie',
+  stratum: `127.0.0.1:${PORTS.datumStratum}`,
+  api: `127.0.0.1:${PORTS.datumApi}`,
+} as const
+
+/**
+ * The DATUM gateways the hashtaker sends rented work to: the masking gateway in this package first, then other
+ * StartOS DATUM packages by their names (the BLAKE2b one first). Their jobs are checked on the masking gateway's
+ * /xbt/job, so only the bundled gateway's pass: a rental never runs on jobs that aren't masked.
+ */
+export const DATUM_CANDIDATES = [DATUM.stratum, 'datum-blake2b.startos:23336', 'datum.startos:23334']
 
 /** The Nostr relays listings are published on and found at. */
 export const RELAYS = ['wss://relay.lazarus-xbt.xyz', 'wss://relay.kilombino.com', 'wss://relay.damus.io', 'wss://nos.lol']
@@ -173,6 +199,8 @@ export const IMAGES: Record<ImageKey, string> = {
   hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
   vpn: 'xbt-vpn:0.1.0',
+  // not published yet (no line in images.lock): oci_build.sh --load tags it
+  datum: 'xbt-datum-gateway:0.1.0',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
@@ -208,7 +236,8 @@ export function services(cfg: Config): ServiceSpec[] {
   }
   const relays = RELAYS.join(',')
   const lan = cfg.lanHost || '127.0.0.1'
-  const components = ['signer', 'witness', 'mcp', 'ui', 'gateway', 'hashrate', 'vpn']
+  // datum: its folders, and run/datum/rpc.cookie from XBT_INIT_NODE_RPC_AUTH (the gateway's own, 0600)
+  const components = ['signer', 'witness', 'mcp', 'ui', 'gateway', 'hashrate', 'vpn', 'datum']
   return [
     {
       id: 'init',
@@ -332,6 +361,11 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_HASHER_TOKEN_FILE: '/data/run/hashrate/control-token',
         XBT_UI_HASHRENT: `http://${local(PORTS.hashtakerControl)}`,
         XBT_UI_HASHRENT_TOKEN_FILE: '/data/run/hashrate/control-token',
+        // the masking gateway: Services → Hashrate writes its config (no secret) into run/datum; the node it
+        // reads is the Node connection action's, its credentials in init's rpc.cookie
+        XBT_UI_DATUM_DIR: '/data/run/datum',
+        XBT_UI_DATUM_RPCURL: `http://${cfg.node.host}:${cfg.node.port}`,
+        XBT_UI_DATUM_API_PORT: String(PORTS.datumApi),
         // the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
         XBT_UI_ENROLL_CODE_FILE: '/data/run/enroll/enroll-code',
         // the shops without a web address the owner adds; the connector and the MCP read it
@@ -352,8 +386,8 @@ export function services(cfg: Config): ServiceSpec[] {
         // where the shop's gateway reaches the VPN service's tunnel endpoint, to sell this box's exit
         XBT_UI_VPN_TUNNEL_UPSTREAM: `http://${local(PORTS.vpnTunnel)}`,
       },
-      // the UI owns the MCP token and rotates it on its Agents page; its pages write run/ln, run/gateway and
-      // run/hashrate (the shop's and the hashrate settings)
+      // the UI owns the MCP token and rotates it on its Agents page; its pages write run/ln, run/gateway,
+      // run/hashrate and run/datum (the shop's, the hashrate and the masking gateway's settings)
       mounts: [
         vol('ui', '/data/ui'),
         vol('run/signer', '/data/run/signer', true),
@@ -361,6 +395,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/ln', '/data/run/ln'),
         vol('run/gateway', '/data/run/gateway'),
         vol('run/hashrate', '/data/run/hashrate'),
+        vol('run/datum', '/data/run/datum'),
         vol('run/shops', '/data/run/shops'),
         vol('run/ai', '/data/run/ai'),
         vol('run/vpn', '/data/run/vpn'),
@@ -458,9 +493,11 @@ export function services(cfg: Config): ServiceSpec[] {
       readyCommand: ['/usr/bin/xbt-hashlink', 'healthcheck', local(PORTS.hashmakerControl)],
     },
     {
-      // rents others' miners into the owner's own DATUM Gateway (Services → Hashrate), paying each piece of
-      // work through the signer as the "hashrate" task of the spending rules, on its own socket (run/rental), which
-      // no other service reaches and which the task's rental terms need
+      // rents others' miners into the masking gateway (Services → Hashrate), paying each piece of work through
+      // the signer as the "hashrate" task of the spending rules, on its own socket (run/rental), which no other
+      // service reaches and which the task's rental terms need. Every job is held to what the masking
+      // gateway's /xbt/job opens before a miner gets it; one that isn't masked ends the rental (never
+      // --allow-unblinded)
       id: 'hashtaker',
       image: 'hashlink',
       command: [
@@ -478,6 +515,8 @@ export function services(cfg: Config): ServiceSpec[] {
         'auto',
         '--datum-candidates',
         DATUM_CANDIDATES.join(','),
+        '--gateway-api',
+        DATUM.api,
         '--user',
         'rented',
         '--relays',
@@ -489,6 +528,9 @@ export function services(cfg: Config): ServiceSpec[] {
       ],
       env: {},
       mounts: [vol('hashrate', '/data/hashrate'), vol('run/hashrate', '/data/run/hashrate', true), vol('run/rental', '/data/run/rental', true)],
+      // not after the gateway: the renter takes 127.0.0.1:23339 as the bundled gateway whether it answers yet or
+      // not, and its page says in words what the gateway is doing (not running, waiting for the node, masking),
+      // so a node that can't be reached never leaves the renter's page dead
       requires: ['signer'],
     },
     {
@@ -513,6 +555,21 @@ export function services(cfg: Config): ServiceSpec[] {
       mounts: [vol('vpn', '/data/vpn'), vol('run/vpn', '/data/run/vpn', true), vol('run/vpn-status', '/data/run/vpn-status'),
                vol('run/signer', '/data/run/signer', true), vol('run/signer/streams', '/data/run/signer/streams'), vol('run/shops', '/data/run/shops', true)],
       requires: ['init'],
+    },
+    {
+      // the masking gateway: started once Services → Hashrate has written its config, and again when the config
+      // or the node's credentials change. Its submitted blocks are kept in datum/submitblocks (a found block
+      // survives a failed submitblock). Its Stratum and API are on 127.0.0.1 only (the config says so), so
+      // only this package's services reach them; /xbt/job answers loopback only (api.xbt_job_allow empty)
+      id: 'datum',
+      image: 'datum',
+      command: ['/usr/bin/xbt-supervise', '--wait', DATUM.config, '--watch', DATUM.cookie, '--', '/usr/bin/xbt-datum-gateway', '-c', DATUM.config],
+      env: {},
+      mounts: [vol('datum', '/data/datum'), vol('run/datum', '/data/run/datum', true)],
+      requires: ['init'],
+      port: PORTS.datumApi,
+      // its API answers, or it is idle by design: no config yet
+      readyCommand: ['/usr/bin/xbt-supervise', 'probe', `http://${DATUM.api}/`, '--waiting-for', DATUM.config],
     },
   ]
 }

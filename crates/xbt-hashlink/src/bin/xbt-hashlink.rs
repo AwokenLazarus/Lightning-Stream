@@ -14,7 +14,9 @@
 //!                         from F as they change; without --fallback and --config: one rental, then exit
 //! xbt-hashlink hashtaker --key F --control ADDR [--control-token-file F] --upstream ADDR|auto --user U --relays URL,URL
 //!                     [--signer SOCK --task T] [--expect-node HEX] [--datum-candidates ADDR,ADDR] [--state DIR]
-//!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum
+//!                     [--gateway-api ADDR] [--bundled-gateway ADDR|off]
+//!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum.
+//!                         The app's own Stream Gateway is 127.0.0.1:23339 when the candidates list it
 //! xbt-hashlink hashtaker  --key F --upstream ADDR --user U [--idle-s S] [--duration-s S] [--stop-paying-after N]
 //!                     [--rental ID] [--report F] [--miners N] [--budget-sats N]
 //!                     ( --hashmaker ADDR --hashmaker-key HEX --slice-work W --price-msat P [--grace-ms G]
@@ -71,6 +73,21 @@ pub(crate) fn num<T: std::str::FromStr>(f: &HashMap<String, String>, k: &str, de
     match f.get(k) {
         Some(v) => v.parse().map_err(|_| format!("--{k}: not a number: {v}")),
         None => default.ok_or_else(|| format!("--{k} is required")),
+    }
+}
+
+/// --allow-unblinded: rent without holding each job to a gateway's API. Never in a release build (Mike: no rental
+/// runs unmasked): only a build with the test-unblinded feature takes it, for stand-in pools that have no gateway to
+/// open their jobs, and its value is read (1 or true, 0 or false), not just its presence.
+pub(crate) fn allow_unblinded(f: &HashMap<String, String>) -> Result<bool, String> {
+    let Some(v) = f.get("allow-unblinded") else { return Ok(false) };
+    if !cfg!(feature = "test-unblinded") {
+        return Err("--allow-unblinded is for test builds only: a rental never runs on jobs it can't show masked".into());
+    }
+    match v.as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(format!("--allow-unblinded takes 1 or 0, not {v:?}")),
     }
 }
 
@@ -318,7 +335,7 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         report: f.get("report").map(PathBuf::from),
         payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
         gateway_api: f.get("gateway-api").cloned(),
-        allow_unblinded: f.contains_key("allow-unblinded"),
+        allow_unblinded: allow_unblinded(f)?,
     };
     let r = hashtaker::run(cfg, Box::<LabHashtaker>::default())?;
     eprintln!("hashtaker: done: released {} slices, {}", r["released"], r["closed"]);
@@ -335,4 +352,30 @@ pub(crate) fn write_secret(path: &str, s: &str) -> Result<(), String> {
     o.mode(0o600);
     let mut f = o.open(path).map_err(|e| format!("{path}: {e}"))?;
     f.write_all(s.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod allow_unblinded_tests {
+    use super::allow_unblinded;
+    use std::collections::HashMap;
+
+    fn f(v: Option<&str>) -> HashMap<String, String> {
+        v.map(|v| HashMap::from([("allow-unblinded".to_string(), v.to_string())])).unwrap_or_default()
+    }
+
+    /// Mike: no rental runs unmasked. A release build refuses the flag whatever its value; a test build reads it.
+    #[test]
+    fn allow_unblinded_is_a_test_build_flag_and_its_value_is_read() {
+        assert_eq!(allow_unblinded(&f(None)), Ok(false));
+        if cfg!(feature = "test-unblinded") {
+            assert_eq!(allow_unblinded(&f(Some("1"))), Ok(true));
+            assert_eq!(allow_unblinded(&f(Some("true"))), Ok(true));
+            assert_eq!(allow_unblinded(&f(Some("0"))), Ok(false), "0 means no, not the flag's presence");
+            assert!(allow_unblinded(&f(Some("yes please"))).is_err());
+        } else {
+            for v in ["1", "0", "true", ""] {
+                assert!(allow_unblinded(&f(Some(v))).unwrap_err().contains("test builds only"), "{v}");
+            }
+        }
+    }
 }

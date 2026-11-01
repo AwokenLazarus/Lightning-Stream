@@ -4062,3 +4062,311 @@ fn an_offer_shows_its_start_fee() {
     assert!(old.contains("Needs updating") && old.contains("<button disabled>Rent</button>"), "{old}");
     assert!(!old.contains("Start fee"), "{old}");
 }
+
+/// The renter's status with the bundled Stream Gateway in use: `state` as the renter reads it.
+fn bundled_status(running: bool, node: Option<bool>, masking: bool, moved: Option<&str>) -> Value {
+    let blinding = match (node, masking) {
+        (Some(true), true) => json!({"state": "blinded", "why": "solo", "words": "Blinded."}),
+        (Some(true), false) => json!({"state": "not blinded", "why": "this job isn't blinded: its key is null", "words": "Not blinded."}),
+        _ => json!({"state": "can't be checked", "why": "127.0.0.1:23339 gave no job to look at", "words": "This can't be checked."}),
+    };
+    json!({"datum": {"addr": "127.0.0.1:23339", "reachable": running, "found": ["127.0.0.1:23339"], "movedFrom": moved},
+           "bundled": {"addr": "127.0.0.1:23339", "inUse": true, "running": running, "node": node, "masking": masking},
+           "blinding": blinding, "rentals": []})
+}
+
+fn offers_one() -> Value {
+    json!({"offers": [{"name": "Big miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+                       "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": "https://miners.example/hashrate", "payNode": MINERS_NODE}]})
+}
+
+const MINERS_NODE: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+/// Spending rules that let the app pay the stand-in hashmaker (its origin listed, with its node).
+fn miners_allowed() -> Value {
+    json!({"allowlist": [PROVIDER, ADDR, "https://miners.example"], "counterparties": {"https://miners.example": {"ln_node": MINERS_NODE}}})
+}
+
+/// "Your gateway": the bundled Stream Gateway's settings are written to its config for each mode, an address is checked
+/// first (nothing written when it doesn't), no secret goes in, and renting waits for the gateway to be set up.
+#[test]
+fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_checked() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => bundled_status(false, None, false, None),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://xbt-knots_bitcoind_1:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Set up your gateway") && p.body.contains("Stream Gateway (DATUM-compatible)"), "{}", p.body);
+    assert!(!p.body.contains("DATUM Gateway"), "never the product name: {}", p.body);
+    assert!(p.body.contains("name=\"mode\" value=\"solo\" checked"), "solo is the default");
+    assert!(p.body.contains("could hide a block it finds from the pool, the same as any DATUM miner can today"));
+    let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
+    assert!(card[..card.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
+    let conf = gwdir.join("config.json");
+    // a mainnet address on this regtest node, and a typo: refused, nothing written
+    for bad in ["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt081", ""] {
+        let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", bad)]);
+        assert!(br.flash_after(&r).len() > 5);
+        assert!(!conf.exists(), "{bad}");
+    }
+    const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", ADDR)]);
+    assert!(br.flash_after(&r).starts_with("Saved."));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(&conf).unwrap()).unwrap();
+    assert_eq!(c["datum"], json!({"pool_host": "", "pooled_mining_only": false}));
+    assert_eq!(c["mining"]["pool_address"], ADDR);
+    assert_eq!(c["bitcoind"]["rpcurl"], "http://xbt-knots_bitcoind_1:18443");
+    assert_eq!(c["bitcoind"]["rpccookiefile"], "/data/run/datum/rpc.cookie");
+    assert_eq!((c["api"]["listen_addr"].as_str(), c["api"]["listen_port"].as_u64(), c["api"]["admin_password"].as_str(), c["api"]["xbt_job_allow"].as_str()),
+               (Some("127.0.0.1"), Some(7152), Some(""), Some("")));
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&conf).unwrap().mode() & 0o777, 0o640);
+    }
+    // Lazarus Pool: the pool's server and key, the same address and id
+    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "pool-key"), ("payout", ADDR)]);
+    assert!(br.flash_after(&r).contains("Lazarus Pool"));
+    let c2: Value = serde_json::from_str(&std::fs::read_to_string(&conf).unwrap()).unwrap();
+    assert_eq!((c2["datum"]["pool_host"].as_str(), c2["datum"]["pool_port"].as_u64(), c2["datum"]["pooled_mining_only"].as_bool()),
+               (Some("datum.lazarus-xbt.xyz"), Some(28915), Some(true)));
+    assert_eq!(c2["datum"]["pool_pubkey"].as_str().map(str::len), Some(128));
+    assert_eq!(c2["mining"]["coinbase_unique_id"], c["mining"]["coinbase_unique_id"]);
+    assert_eq!(c2["xbt"]["mode"], "pool-key");
+    // the page shows what was saved, and no longer asks to set it up
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("name=\"mode\" value=\"pool-key\" checked") && p.body.contains(ADDR), "{}", p.body);
+    assert!(!p.body.contains("Set up your gateway") && p.body.contains("Your gateway isn't running"), "{}", p.body);
+    // no secret of the box's in it: not the renter's token, not the UI's password
+    let text = std::fs::read_to_string(&conf).unwrap();
+    assert!(!text.contains(&"r".repeat(64)) && !text.contains("rpcpassword") && !text.contains("rpcuser"));
+}
+
+/// The bundled gateway's state on the rent page: running, connected to the node, masking, each said plainly, and
+/// Rent opens only once all three are so.
+#[test]
+fn the_rent_page_shows_the_bundled_gateways_state() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    type Answer = fn(&str, &str) -> Value;
+    let cases: [(Answer, &str, bool, usize); 4] = [
+        (|m, p| match (m, p) { ("GET", "/status") => bundled_status(false, None, false, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
+         "Your gateway isn't running", false, 0),
+        (|m, p| match (m, p) { ("GET", "/status") => bundled_status(true, Some(false), false, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
+         "Your gateway is waiting for your node", false, 1),
+        (|m, p| match (m, p) { ("GET", "/status") => bundled_status(true, Some(true), false, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
+         "Lazarus Pool doesn&#39;t take gateway keys yet", false, 2),
+        (|m, p| match (m, p) { ("GET", "/status") => bundled_status(true, Some(true), true, None), ("GET", "/offers") => offers_one(), _ => json!({}) },
+         "Ready to rent", true, 3),
+    ];
+    for (answer, head, can, good) in cases {
+        let (renter, _seen) = control_standin(answer);
+        let dir = tempfile::tempdir().unwrap();
+        let rtok = dir.path().join("renter-token");
+        std::fs::write(&rtok, "r".repeat(64)).unwrap();
+        let gwdir = dir.path().join("run/datum");
+        std::fs::create_dir_all(&gwdir).unwrap();
+        let bx = start(miners_allowed(), false, |c| {
+            c.hash.renter = Some(renter.clone());
+            c.hash.renter_token = Some(rtok.clone());
+            c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+            c.hash.stream_gw.dir = gwdir.clone();
+        });
+        let st = xbt_wallet_ui::config::StreamGwSetup { rpcurl: Some("http://node:18443".into()), dir: gwdir.clone(), ..Default::default() };
+        let s = xbt_wallet_ui::stream_gateway::Settings::new(xbt_wallet_ui::stream_gateway::Mode::Solo, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080");
+        xbt_wallet_ui::stream_gateway::write(&st, &s, "regtest").unwrap();
+        let mut br = logged_in(&bx);
+        let p = br.get("/hashrate");
+        assert!(p.body.contains(head), "{head}: {}", p.body);
+        let rows = &p.body[p.body.find("<ul class=\"plain\">").unwrap()..];
+        let rows = &rows[..rows.find("</ul>").unwrap()];
+        assert!(rows.contains("Running") && rows.contains("Connected to your node") && rows.contains("Masking its jobs"), "{rows}");
+        assert_eq!(rows.matches("pill good").count(), good, "{head}: {rows}");
+        let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
+        let card = &card[..card.find("</section>").unwrap()];
+        assert_eq!(card.contains("<button>Rent</button>"), can, "{head}: {card}");
+    }
+}
+
+/// An install moved to the bundled gateway at the upgrade is told so, with a one-click way back that the renter keeps;
+/// one on another gateway gets the one-click switch to the bundled one.
+#[test]
+fn a_moved_install_is_told_and_can_switch_either_way() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => bundled_status(true, Some(true), true, Some("datum_web_1:23334")),
+        ("GET", "/offers") => offers_one(),
+        ("POST", "/datum") => json!({"ok": true, "datum": "datum_web_1:23334", "reachable": true, "bundled": false}),
+        _ => json!({}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+        c.hash.stream_gw.dir = dir.path().to_path_buf();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Rented work now goes to the Stream Gateway (DATUM-compatible) that comes with this app") && p.body.contains("datum_web_1:23334"),
+            "{}", p.body);
+    assert!(p.body.contains("Use datum_web_1:23334 again"));
+    let r = br.act("/hashrate", "/hashrate", &[("action", "use-previous"), ("addr", "datum_web_1:23334")]);
+    assert!(br.flash_after(&r).starts_with("Saved."));
+    assert!(seen.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/datum" && b.contains("datum_web_1:23334")));
+
+    // on another gateway: the switch back to the bundled one
+    let (renter2, seen2) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum_web_1:23334", "reachable": true, "found": []},
+                                     "bundled": {"addr": "127.0.0.1:23339", "inUse": false, "running": true, "state": "not in use"},
+                                     "blinding": {"state": "can't be checked", "why": "the gateway's API: connection refused", "words": "x"}, "rentals": []}),
+        ("GET", "/offers") => offers_one(),
+        ("POST", "/datum") => json!({"ok": true, "datum": "127.0.0.1:23339", "reachable": true, "bundled": true}),
+        _ => json!({}),
+    });
+    let bx2 = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter2.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+        c.hash.stream_gw.dir = dir.path().to_path_buf();
+    });
+    let mut br2 = logged_in(&bx2);
+    let p = br2.get("/hashrate");
+    assert!(p.body.contains("Use the Stream Gateway (DATUM-compatible)") && p.body.contains("isn't masking its jobs"), "{}", p.body);
+    let r = br2.act("/hashrate", "/hashrate", &[("action", "use-bundled")]);
+    assert!(br2.flash_after(&r).contains("comes with this app"));
+    assert!(seen2.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/datum" && b.contains("127.0.0.1:23339")));
+}
+
+/// A build of the app without the bundled gateway (armv7): the rent page says the gateway isn't masking, Rent is off, and
+/// there are no gateway settings to fill in.
+#[test]
+fn without_the_bundled_gateway_renting_says_it_isnt_masking() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => bundled_status(false, None, false, None),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Your gateway isn't masking its jobs") && p.body.contains("doesn&#39;t include the Stream Gateway"), "{}", p.body);
+    assert!(!p.body.contains("name=\"payout\""), "no settings for a gateway that isn't here");
+    let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
+    assert!(card[..card.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
+}
+
+/// StartOS (W7): the bundled gateway up, with no Stratum yet while it waits for the node. The rent page says it waits for
+/// the node, never the generic "can't be checked: ... doesn't answer", and a rent sent anyway comes back in the gateway's words.
+#[test]
+fn a_bundled_gateway_waiting_for_its_node_reads_as_that_not_as_an_address_that_doesnt_answer() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        // as an older renter (or a stale look) words it: the generic words; the bundled state is the truth
+        ("GET", "/status") => json!({"datum": {"addr": "127.0.0.1:23339", "reachable": false, "found": []},
+            "bundled": {"addr": "127.0.0.1:23339", "inUse": true, "running": true, "node": false, "masking": false, "state": "waiting for the node"},
+            "blinding": {"state": "can't be checked", "why": "127.0.0.1:23339 doesn't answer",
+                         "words": "This can't be checked: 127.0.0.1:23339 doesn't answer. Without a look inside its jobs nobody can say a hashmaker can't drop the shares that win, so rentals to this upstream are refused."},
+            "rentals": []}),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+    });
+    let st = xbt_wallet_ui::config::StreamGwSetup { rpcurl: Some("http://node:18443".into()), dir: gwdir.clone(), ..Default::default() };
+    xbt_wallet_ui::stream_gateway::write(&st, &xbt_wallet_ui::stream_gateway::Settings::new(xbt_wallet_ui::stream_gateway::Mode::Solo,
+                                         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"), "regtest").unwrap();
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Your gateway is waiting for your node") && p.body.contains("has no work from your XBT node yet"), "{}", p.body);
+    for generic in ["doesn&#39;t answer", "doesn't answer", "can&#39;t be checked", "can't be checked", "Can&#39;t reach", "Can't reach", "isn&#39;t running", "isn't running"] {
+        assert!(!p.body.contains(generic), "{generic}: {}", p.body);
+    }
+    let rows = &p.body[p.body.find("<ul class=\"plain\">").unwrap()..];
+    let rows = &rows[..rows.find("</ul>").unwrap()];
+    assert_eq!(rows.matches("pill good").count(), 1, "running, and not yet connected to the node: {rows}");
+    let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
+    assert!(card[..card.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
+}
+
+/// Linux lane: another gateway's API can be given on the page (checked, and sent to the renter with the choice), and a
+/// gateway chosen here that the installer's changed settings overrode is said, with the way back.
+#[test]
+fn another_gateways_api_is_set_on_the_page_and_an_installer_override_is_said() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "10.0.0.6:23334", "api": "10.0.0.6:7160", "reachable": true, "found": [],
+                                               "installerWon": "127.0.0.1:23339"},
+                                     "bundled": {"addr": "127.0.0.1:23339", "inUse": false, "running": false, "state": "not running"},
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}, "rentals": []}),
+        ("GET", "/offers") => offers_one(),
+        ("POST", "/datum") => json!({"ok": true, "datum": "10.0.0.6:23334", "reachable": true, "bundled": false}),
+        _ => json!({}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://node:18443".into());
+        c.hash.stream_gw.dir = dir.path().to_path_buf();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    // the override, said, with the page's choice offered back
+    assert!(p.body.contains("The app's install settings changed since you chose <code>127.0.0.1:23339</code> on this page")
+            && p.body.contains("<code>10.0.0.6:23334</code> now, as they say") && p.body.contains("Use 127.0.0.1:23339 again"), "{}", p.body);
+    // the API field, filled with the API in use (not the one the address implies)
+    assert!(p.body.contains("name=\"api\" value=\"10.0.0.6:7160\""), "{}", p.body);
+    // a bad API address is refused on the page: nothing reaches the renter
+    for bad in ["nocolon", "10.0.0.6:port", "10.0.0.6:0", "10.0.0.6:70000", ":7152"] {
+        let r = br.act("/hashrate", "/hashrate", &[("action", "datum"), ("addr", "10.0.0.6:23334"), ("api", bad)]);
+        assert!(br.flash_after(&r).contains("the API address is host:port"), "{bad}");
+    }
+    assert!(!seen.lock().unwrap().iter().any(|(m, p, _, _)| m == "POST" && p == "/datum"));
+    // a good one goes with the choice
+    let r = br.act("/hashrate", "/hashrate", &[("action", "datum"), ("addr", "10.0.0.6:23334"), ("api", "10.0.0.7:7160")]);
+    assert!(br.flash_after(&r).starts_with("Saved."));
+    let sent = seen.lock().unwrap().iter().find(|(m, p, _, _)| m == "POST" && p == "/datum").cloned().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&sent.3).unwrap(), json!({"addr": "10.0.0.6:23334", "api": "10.0.0.7:7160"}));
+    // empty: none sent, the renter uses the host's 7152
+    let r = br.act("/hashrate", "/hashrate", &[("action", "datum"), ("addr", "10.0.0.6:23334"), ("api", "")]);
+    br.flash_after(&r);
+    let last = seen.lock().unwrap().iter().rfind(|(m, p, _, _)| m == "POST" && p == "/datum").cloned().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&last.3).unwrap(), json!({"addr": "10.0.0.6:23334"}));
+    // "use it again": the page's earlier choice, sent back
+    let r = br.act("/hashrate", "/hashrate", &[("action", "use-previous"), ("addr", "127.0.0.1:23339")]);
+    br.flash_after(&r);
+    assert!(seen.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/datum" && b.contains("127.0.0.1:23339")));
+}

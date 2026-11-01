@@ -90,6 +90,10 @@ GRACE_MS = 8000
 # the Lightning rail's fee limit on a ticket of TICKET_MSAT, as the wallet books it on a held one (1,015 sat)
 HELD_FEE_LIMIT_MSAT = 15_000
 HG = os.environ.get("P2P_HASH_GATEWAYS", os.path.expanduser("~/xbt-rnd/hash-gateways"))
+# the Stream Gateway the image ships (scripts/datum_gateway_build.sh), else the lab's own build of the same patch
+DATUM_GATEWAY = os.environ.get("P2P_HASH_DATUM_GATEWAY") or next(
+    (p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../dist/datum/x86_64-linux-musl/xbt-datum-gateway"),)
+     if os.path.exists(p)), f"{HG}/datum_gateway-blind")
 REAL_SECS = int(os.environ.get("P2P_HASH_REAL_SECS", "360"))
 REAL_BASE = B + 13
 REPORT: dict[str, Any] = {"checks": []}
@@ -191,6 +195,55 @@ def spawn(name: str, args: list[str]) -> subprocess.Popen[bytes]:
     p = subprocess.Popen([f"{BIN}/xbt-hashlink", *args], stdout=log, stderr=log)
     PROCS.append(p)
     return p
+
+
+class LatePool:
+    """Between the gateway and primed: holds what the pool sends for LATE seconds after each new block, so the
+    gateway's coinbaser (5 s timeout) is late and its first full jobs go out on coinbase[0]; the late coinbaser then
+    rewrites the job's coinbases in place (P2P_HASH_LATE_COINBASER=1)."""
+
+    LATE = 7.0
+
+    def __init__(self, listen: int, to: int, height: Any) -> None:
+        self.to, self.height, self.changed, self.held = to, height, 0.0, 0
+        self.server = socket.create_server(("127.0.0.1", listen))
+        threading.Thread(target=self.watch, daemon=True).start()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def watch(self) -> None:
+        last = None
+        while True:
+            try:
+                h = self.height()
+            except Exception:  # noqa: BLE001  (the node stopping at the end)
+                return
+            if last is not None and h != last:
+                self.changed = time.time()
+            last = h
+            time.sleep(0.3)
+
+    def serve(self) -> None:
+        while True:
+            a, _ = self.server.accept()
+            b = socket.create_connection(("127.0.0.1", self.to))
+            threading.Thread(target=self.pump, args=(a, b, False), daemon=True).start()
+            threading.Thread(target=self.pump, args=(b, a, True), daemon=True).start()
+
+    def pump(self, x: socket.socket, y: socket.socket, from_pool: bool) -> None:
+        try:
+            while data := x.recv(65536):
+                wait = self.changed + self.LATE - time.time()
+                if from_pool and wait > 0:
+                    self.held += 1
+                    time.sleep(wait)
+                y.sendall(data)
+        except OSError:
+            pass
+        for z in (x, y):
+            try:
+                z.close()
+            except OSError:
+                pass
 
 
 class Road:
@@ -723,7 +776,7 @@ def real_gateway_run(mode: str) -> None:
     """A rental paid with real money through the wallet, of real work for a real gateway on a chain of its own."""
     keys = mode == "solo" or os.environ.get("P2P_HASH_PRIMED_KEYS") == "1"
     primed = os.environ.get("P2P_HASH_PRIMED", f"{HG}/primed-main")
-    need = [f"{HG}/{b}" for b in ("bitcoind", "bitcoin-cli", "datum_gateway-blind", "stratum-grind")] + ([primed] if mode == "pool" else [])
+    need = [f"{HG}/{b}" for b in ("bitcoind", "bitcoin-cli", "stratum-grind")] + [DATUM_GATEWAY] + ([primed] if mode == "pool" else [])
     missing = [n for n in need if not os.path.exists(n)]
     if missing:
         REPORT.setdefault("skipped", []).append({"check": mode, "missing": missing})
@@ -778,7 +831,10 @@ def real_gateway_run(mode: str) -> None:
             log = open(f"{RUN}/{mode}-primed.log", "ab")
             PROCS.append(subprocess.Popen([primed, "-c", f"{home}/prime/prime.toml", "run"], stdout=log, stderr=log))
             lab.wait("primed", 30, lambda: socket.create_connection(("127.0.0.1", prime), 1).close() or True, every=0.5)
-            datum = {"pool_host": "127.0.0.1", "pool_port": prime, "pool_pubkey": pub, "pool_pass_workers": True, "pool_pass_full_users": True,
+            late = None
+            if os.environ.get("P2P_HASH_LATE_COINBASER") == "1":
+                late = LatePool(base + 6, prime, lambda: int(cli("getblockcount")))
+            datum = {"pool_host": "127.0.0.1", "pool_port": base + 6 if late else prime, "pool_pubkey": pub, "pool_pass_workers": True, "pool_pass_full_users": True,
                      "pooled_mining_only": True, "protocol_global_timeout": 60}
             pool_address = "bc1qt5praystcdle0nq04e3h02yjszha82uzhww85x6972lcy40k4eyqz9jfaq"
         with open(f"{home}/gw.json", "w") as f:
@@ -788,7 +844,9 @@ def real_gateway_run(mode: str) -> None:
                        "api": {"listen_addr": "127.0.0.1", "listen_port": api, "admin_password": ""},
                        "logger": {"log_to_console": True, "log_to_file": False, "log_level_console": 1}, "datum": datum}, f)
         log = open(f"{RUN}/{mode}-gateway.log", "ab")
-        PROCS.append(subprocess.Popen([f"{HG}/datum_gateway-blind", "-c", f"{home}/gw.json"], stdout=log, stderr=log, env=env))
+        PROCS.append(subprocess.Popen([DATUM_GATEWAY, "-c", f"{home}/gw.json"], stdout=log, stderr=log, env=env))
+        with open(DATUM_GATEWAY, "rb") as f:
+            REPORT[f"{mode}_gateway_binary"] = {"path": DATUM_GATEWAY, "sha256": hashlib.sha256(f.read()).hexdigest()}
         lab.wait(f"{mode}'s gateway", 60, lambda: socket.create_connection(("127.0.0.1", st), 1).close() or True, every=0.5)
         slice_work = 2**33
         t = ["--slice-work", str(slice_work), "--price-msat", str(PRICE_MSAT), "--grace-ms", "60000"]
@@ -798,7 +856,9 @@ def real_gateway_run(mode: str) -> None:
                                                  "--hashrate-hs", "60000000", "--listing-out", f"{RUN}/{mode}-listing.json"])
         lab.wait("the hashmaker's listing", 30, lambda: os.path.exists(f"{RUN}/{mode}-listing.json"), every=0.2)
         time.sleep(0.5)
-        check_flags = ["--gateway-api", f"127.0.0.1:{api}"] if keys else ["--allow-unblinded", "1"]
+        # Mike's rule: no rental runs unmasked, pool or solo. Every rental holds each job to the gateway's API, so a
+        # pool that doesn't take gateway keys gives jobs the renter must refuse
+        check_flags = ["--gateway-api", f"127.0.0.1:{api}"]
         hashtaker = spawn(f"{mode}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER), "--found-out", f"{RUN}/{mode}-found.json",
                                                  "--upstream", f"127.0.0.1:{st}", "--user", address, "--signer", d.RENTER_SOCK, "--task", "hashrate", "--max-sats", "1500", "--rental", f"rt-{mode}",
                                                  "--idle-s", str(REAL_SECS), "--duration-s", str(REAL_SECS), "--report", f"{RUN}/{mode}-buyer.json", *check_flags])
@@ -814,6 +874,14 @@ def real_gateway_run(mode: str) -> None:
         with open(f"{RUN}/{mode}-buyer.json") as f:
             bz = json.load(f)
         height1 = int(cli("getblockcount"))
+        if not keys:
+            # a pool on the null key: the gateway opens its jobs as pool-null, and the renter stops before any work
+            refused = [e for e in bz.get("events", []) if e.get("ev") == "a job not shown to be blinded"]
+            check(f"{mode}: a pool without gateway keys is refused: the renter stops at its first job and no share reaches the gateway",
+                  bool(refused) and "null" in refused[0].get("why", "") and bz.get("jobsShownBlinded", 0) == 0 and bz["meter"]["accepted"] == 0,
+                  {"closed": bz.get("closed"), "refused": refused[:1], "jobs shown blinded": bz.get("jobsShownBlinded"), "meter": bz.get("meter"),
+                   "paid before the first job (start fee)": len([p for p in bz.get("pays", []) if p.get("ok")])})
+            return
         blocks = []
         for h in range(height0 + 1, height1 + 1):
             block_id = cli("getblockhash", str(h))
@@ -853,6 +921,16 @@ def real_gateway_run(mode: str) -> None:
                   {"height": [height0, height1], "blocks": blocks})
             check(f"{mode}: the hashtaker held every job to what the gateway opened on its API", bz["jobsShownBlinded"] >= 1 and bz["closed"] == "rental time over",
                   {"jobs shown blinded": bz["jobsShownBlinded"], "closed": bz["closed"]})
+            # a rental keeps its miners across block changes: every new block's first (empty) job, and the jobs sent
+            # while a coinbaser is late, are opened on the API, so no block change ends it
+            prevs = {k["prevblock"] for k in bz.get("keysSeen", [])}
+            how = " with a late coinbaser" if mode == "pool" and os.environ.get("P2P_HASH_LATE_COINBASER") == "1" else ""
+            check(f"{mode}: the rental kept its miners across {len(blocks)} block changes{how}, to the end of its time",
+                  len(blocks) >= 2 and len(prevs) >= len(blocks) and bz["closed"] == "rental time over"
+                  and not [e for e in bz.get("events", []) if e.get("ev") == "a job not shown to be blinded"],
+                  {"blocks": len(blocks), "previous blocks its jobs were on": len(prevs), "closed": bz["closed"],
+                   "refused": [e for e in bz.get("events", []) if e.get("ev") == "a job not shown to be blinded"][:2],
+                   **({"pool replies held": late.held} if mode == "pool" and late else {})})
         else:
             REPORT.setdefault("skipped", []).append({"check": f"{mode}: masked blocks", "missing": "a primed that takes gateway-held keys"})
             print(f"SKIP  {mode}: masked blocks: no primed that takes gateway-held keys; this run's blocks are unblinded", flush=True)

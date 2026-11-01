@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install (or update) Lightning Stream on this Linux machine, beside your own XBT node, Lightning node
-# and DATUM Gateway. The guide is docs/LINUX.md. Run it from a checkout of the repository, as a user
+# Install (or update) Lightning Stream on this Linux machine, beside your own XBT node and Lightning
+# node. The guide is docs/LINUX.md. Run it from a checkout of the repository, as a user
 # that can use Docker:
 #
 #   packaging/linux/install.sh [--dir DIR] [--yes]
@@ -97,9 +97,61 @@ ask LS_NODE_RPC_USER "Its RPC user" ""
 [ -n "$LS_NODE_RPC_PASS" ] || ask_secret LS_NODE_RPC_PASS "Its RPC password"
 { [ -n "$LS_NODE_RPC_USER" ] && [ -n "$LS_NODE_RPC_PASS" ]; } || die "the XBT node's RPC user and password are needed. A cookie changes at every restart, so it cannot be used: if your node has only its cookie, add an rpcauth line for the app (docs/LINUX.md, What you need)"
 
+# the hashtaker's gateway: the Stream Gateway that comes with the app (masking; stratum 127.0.0.1:23339,
+# its API on LS_DATUM_API_PORT), or the owner's own. An install from before 0.2.0 has LS_DATUM (its own
+# gateway) and no LS_DATUM_GATEWAY: it is moved to the Stream Gateway, since renting refuses jobs that
+# aren't masked, and its address is kept as LS_DATUM_OWN to go back to
+LS_DATUM_API_PORT=${LS_DATUM_API_PORT:-7153}
+BUNDLED_DATUM=127.0.0.1:23339 BUNDLED_API=127.0.0.1:$LS_DATUM_API_PORT
+MOVED=0
+if [ -z "${LS_DATUM_GATEWAY:-}" ] && [ -n "${LS_DATUM:-}" ] && [ "$LS_DATUM" != "$BUNDLED_DATUM" ]; then
+  LS_DATUM_OWN=${LS_DATUM_OWN:-$LS_DATUM}
+  # said only to an install being updated: a first install has no "until now"
+  [ ! -f "$DIR/.env" ] || MOVED=1
+fi
 echo
-echo "Hashtaker: rented hashrate goes to your own DATUM Gateway."
-ask LS_DATUM "Your DATUM Gateway's Stratum address" "127.0.0.1:23334"
+echo "Hashtaker: rented hashrate goes to a DATUM gateway, which builds the blocks. The app comes with one,"
+echo "the Stream Gateway (DATUM-compatible), that masks its jobs: a hashmaker can't tell which shares would"
+echo "be blocks, so it can't keep those back. Renting needs that: the app checks every job is masked before"
+echo "a miner gets it."
+if [ "$MOVED" = 1 ]; then
+  echo "Until now rented hashrate went to your own DATUM Gateway at $LS_DATUM_OWN. This version moves it to"
+  echo "the Stream Gateway (its address is kept in .env as LS_DATUM_OWN; answer 2 to keep yours)."
+fi
+case ${LS_DATUM_GATEWAY:-} in
+  own | 2) gw_def=2 ;;
+  bundled | 1 | "") gw_def=1 ;;
+  *) die "LS_DATUM_GATEWAY is \"$LS_DATUM_GATEWAY\": use bundled (the Stream Gateway that comes with the app) or own (your own DATUM Gateway)" ;;
+esac
+LS_DATUM_GATEWAY=''
+ask LS_DATUM_GATEWAY "Use the Stream Gateway that comes with the app (1), or your own DATUM Gateway (2)?" "$gw_def"
+case $LS_DATUM_GATEWAY in
+  1 | bundled) LS_DATUM_GATEWAY=bundled ;;
+  2 | own) LS_DATUM_GATEWAY=own ;;
+  *) die "answer 1 (the Stream Gateway that comes with the app) or 2 (your own DATUM Gateway), not \"$LS_DATUM_GATEWAY\"" ;;
+esac
+if [ "$LS_DATUM_GATEWAY" = bundled ]; then
+  LS_DATUM=$BUNDLED_DATUM LS_GATEWAY_API=$BUNDLED_API LS_BUNDLED_GATEWAY=$BUNDLED_DATUM
+  echo "   The Stream Gateway: once the app is running, choose solo (paid to your own XBT address) or Lazarus"
+  echo "   Pool on Services → Hashrate, under Your gateway. It uses your XBT node above."
+  if [ "$MOVED" = 1 ]; then say "rented hashrate now goes to the Stream Gateway (yours was $LS_DATUM_OWN)"; fi
+else
+  echo
+  echo "   Rentals need masked jobs. The app opens each job on your gateway's API (/xbt/job) before a miner"
+  echo "   gets it, and refuses the rental if the job isn't masked. A stock DATUM Gateway doesn't mask its jobs"
+  echo "   and has no /xbt/job, so with one every rental is refused: nothing is paid, and the Hashrate page"
+  echo "   says why. Run this again and answer 1 to switch to the Stream Gateway."
+  # coming back from the app's gateway: the addresses default to the owner's own again
+  if [ "${LS_DATUM:-}" = "$BUNDLED_DATUM" ]; then LS_DATUM=${LS_DATUM_OWN:-}; fi
+  if [ "${LS_GATEWAY_API:-}" = "$BUNDLED_API" ]; then LS_GATEWAY_API=''; fi
+  ask LS_DATUM "Your DATUM Gateway's Stratum address" "${LS_DATUM_OWN:-127.0.0.1:23334}"
+  [[ $LS_DATUM == *:* ]] || die "the Stratum address is host:port, not \"$LS_DATUM\""
+  ask LS_GATEWAY_API "Its API address, where the app opens its jobs (/xbt/job)" "${LS_DATUM%:*}:7152"
+  [[ $LS_GATEWAY_API == *:* ]] || die "the API address is host:port, not \"$LS_GATEWAY_API\""
+  LS_DATUM_OWN=$LS_DATUM
+  # the hashtaker would otherwise move a gateway it wasn't given on its page to the Stream Gateway
+  LS_BUNDLED_GATEWAY=off
+fi
 ask LS_DATUM_USER "The user name rented miners use on it" "rented"
 
 echo
@@ -177,7 +229,8 @@ mkdir -p "$LS_DATA_DIR"
       if plain "$v"; then printf "%s=%s\n" "$1" "$v"; else printf "%s='%s'\n" "$1" "$v"; fi
     }
     asked=" COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT
-            LS_NODE_RPC_USER LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_VPN LS_VPN_PORT LS_VPN_ENDPOINT LS_VPN_REGION
+            LS_NODE_RPC_USER LS_NODE_RPC_PASS LS_DATUM_GATEWAY LS_DATUM LS_GATEWAY_API LS_DATUM_OWN LS_DATUM_API_PORT LS_BUNDLED_GATEWAY
+            LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_VPN LS_VPN_PORT LS_VPN_ENDPOINT LS_VPN_REGION
             LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_APP_PORTS
             LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS LS_FILES_PORT "
     for k in $asked; do line "$k"; done

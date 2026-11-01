@@ -118,6 +118,14 @@ pub const RUN_VPN_STATUS: &str = "vpn-status";
 /// The AI endpoint's files, which the UI and the connector (as the signer's user) both write: the
 /// credential store, the AI sellers the UI writes, and the sellers' health the endpoint writes.
 pub const RUN_AI: &str = "ai";
+/// The Stream Gateway (DATUM-compatible) that masks the renter's jobs: its blocks kept for a resubmit
+/// (`submitblocks/`).
+pub const DATUM: &str = "datum";
+/// Its config (`config.json`), written by the UI's Hashrate page, and the node's RPC cookie
+/// (`rpc.cookie`), written by init; the gateway reads both.
+pub const RUN_DATUM: &str = "datum";
+/// The node RPC cookie's name in `run/datum/`: `user:password`, no newline.
+pub const DATUM_RPC_COOKIE: &str = "rpc.cookie";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 

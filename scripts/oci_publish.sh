@@ -5,6 +5,7 @@
 #   xbt-hashlink
 #   xbt-stream-relay
 #   xbt-vpn
+#   xbt-datum-gateway (the Stream Gateway, DATUM-compatible)
 #   -> ghcr.io/awokenlazarus/<image>:<version>-<commit>, for linux/amd64, linux/arm64 and linux/arm/v7
 #
 # The build is scripts/oci_build.sh's (static musl binaries, cargo --locked, release, FROM scratch, the same
@@ -42,7 +43,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-IMAGES=(xbt-init xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-gateway lightning-stream xbt-hashlink xbt-stream-relay xbt-vpn)
+IMAGES=(xbt-init xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-gateway lightning-stream xbt-hashlink xbt-stream-relay xbt-vpn xbt-datum-gateway)
 if git status --porcelain --untracked-files=no | grep -q .; then
   echo "oci_publish: the tree has uncommitted changes; commit first (a published image names its commit)" >&2; exit 1
 fi

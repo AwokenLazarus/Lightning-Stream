@@ -48,7 +48,7 @@ PKGS = {
                                                "witness": ("xbt-anchor-witness", "xbt-anchor-witness"), "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"),
                                                "ui": ("xbt-wallet-ui", "xbt-wallet-ui"), "gateway": ("xbt-gateway", "xbt-gateway"),
                                                "connector": ("lightning-stream", "xbt-signer"), "hashlink": ("xbt-hashlink", "xbt-hashrate"),
-                                               "vpn": ("xbt-vpn", "xbt-vpn")}),
+                                               "vpn": ("xbt-vpn", "xbt-vpn"), "datum": ("xbt-datum-gateway", "xbt-datum")}),
 }
 probs, rep = [], {}
 for (pkg, (volumes, IMAGES)) in PKGS.items():

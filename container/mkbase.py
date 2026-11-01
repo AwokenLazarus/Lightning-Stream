@@ -37,6 +37,10 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
                     both the UI and the connector (which runs as the signer's user) write, the sellers the UI's AI
                     page writes, and the sellers' health the endpoint writes; the group (10014, a group only; 10011 to 10013 are reserved for xbt-compute) has
                     the signer and the UI in it, never the MCP
+  /data/datum       0700, the Stream Gateway's state: blocks it submitted, kept for a resubmit (xbt-datum, 10021)
+  /data/run/datum   0750 xbt-wallet-ui:xbt-datum, the gateway's config the UI's Hashrate page writes (0640, read
+                    through the group, which has the UI in it so the UI can hand its files to the group), and the
+                    node RPC cookie init writes (0600, the gateway's own); the renter reaches the gateway on loopback only
   xbt-shared-files (1000, a group only) has the UI in it: the gid another app's files carry when the Files
                     service shares them read-only (File Browser's on StartOS, Umbrel's Downloads)
 Uid 10004 is not used: it was the retired hub's, and the other uids keep their numbers.
@@ -47,12 +51,14 @@ import sys
 import tarfile
 
 USERS = [("xbt-signer", 10001), ("xbt-anchor-witness", 10002), ("xbt-wallet-mcp", 10003), ("xbt-wallet-ui", 10005),
-         ("xbt-work-relay", 10006), ("xbt-gateway", 10007), ("xbt-hashrate", 10010), ("xbt-stream-relay", 10016), ("xbt-vpn", 10018)]
+         ("xbt-work-relay", 10006), ("xbt-gateway", 10007), ("xbt-hashrate", 10010), ("xbt-stream-relay", 10016), ("xbt-vpn", 10018),
+         ("xbt-datum", 10021)]
 HOME = {"xbt-signer": "/data/signer", "xbt-anchor-witness": "/data/witness", "xbt-wallet-mcp": "/data/mcp",
         "xbt-wallet-ui": "/data/ui", "xbt-work-relay": "/data/relay", "xbt-gateway": "/data/gateway", "xbt-hashrate": "/data/hashrate",
-        "xbt-stream-relay": "/data/stream-relay", "xbt-vpn": "/data/vpn"}
+        "xbt-stream-relay": "/data/stream-relay", "xbt-vpn": "/data/vpn", "xbt-datum": "/data/datum"}
 MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui,xbt-hashrate,xbt-vpn", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
-           "xbt-gateway": "xbt-wallet-ui", "xbt-hashrate": "xbt-wallet-ui", "xbt-stream-relay": "xbt-wallet-ui", "xbt-vpn": "xbt-wallet-ui"}
+           "xbt-gateway": "xbt-wallet-ui", "xbt-hashrate": "xbt-wallet-ui", "xbt-stream-relay": "xbt-wallet-ui", "xbt-vpn": "xbt-wallet-ui",
+           "xbt-datum": "xbt-wallet-ui"}
 # groups with no user of their own
 GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui"),
           ("xbt-relay-status", 10017, "xbt-stream-relay,xbt-wallet-ui"),
@@ -72,7 +78,7 @@ group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in
 DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr/bin", 0, 0, 0o755), ("data", 0, 0, 0o755),
         # made here, not by COPY: a COPY --chmod=0444 that creates its destination folder gives the folder 0444
         # too, and the VPN service (uid 10018) could then not reach its country table (exits' regions unverified)
-        ("usr/share", 0, 0, 0o755), ("usr/share/xbt-vpn", 0, 0, 0o555),
+        ("usr/share", 0, 0, 0o755), ("usr/share/xbt-vpn", 0, 0, 0o555), ("usr/share/xbt-datum-gateway", 0, 0, 0o555),
         ("data/signer", 10001, 10001, 0o700), ("data/witness", 10002, 10002, 0o700), ("data/mcp", 10003, 10003, 0o700),
         ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/hashrate", 10010, 10010, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
@@ -80,7 +86,8 @@ DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr
         ("data/run/hashrate", 10005, 10010, 0o750), ("data/run/rental", 10001, 10010, 0o750),
         ("data/run/shops", 10005, 10001, 0o750),
         ("data/stream-relay", 10016, 10016, 0o700), ("data/run/relay", 10005, 10016, 0o750), ("data/run/relay-status", 10016, 10017, 0o750), ("data/run/ai", 10005, 10014, 0o770),
-        ("data/vpn", 10018, 10018, 0o700), ("data/run/vpn", 10005, 10018, 0o750), ("data/run/vpn-status", 10018, 10019, 0o750)]
+        ("data/vpn", 10018, 10018, 0o700), ("data/run/vpn", 10005, 10018, 0o750), ("data/run/vpn-status", 10018, 10019, 0o750),
+        ("data/datum", 10021, 10021, 0o700), ("data/run/datum", 10005, 10021, 0o750)]
 FILES = [("etc/passwd", passwd, 0o644), ("etc/group", group, 0o644)]
 
 entries = []

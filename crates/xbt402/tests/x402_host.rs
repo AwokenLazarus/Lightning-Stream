@@ -60,7 +60,10 @@ impl ProviderScheme for Selling {
         if payment["payload"]["word"] != "please" {
             return Err(refuse("bad_word"));
         }
-        if self.0.left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_err() {
+        // fetch_update is named try_update from Rust 1.99, where the old name warns; the workspace builds from 1.90
+        #[allow(deprecated)]
+        let took = self.0.left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+        if !took {
             return Err(refuse("no_beans"));
         }
         Ok(Box::new(Charge(self.0.clone())))

@@ -34,6 +34,8 @@ xbt402.workspace = true
 lightning-stream = { path = "../lightning-stream" }
 # VPN exits: devices' WireGuard keys, configs and QR codes, and the category blocklists' catalogue
 xbt-vpn = { path = "../xbt-vpn" }
+# the Stream Gateway's payout address is checked as a segwit address of the node's chain
+xbt-primitives.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
@@ -42,7 +44,6 @@ xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
 # the Connected apps page against the NWC service's real admin socket
 xbt-nwc = { path = "../xbt-nwc" }
 xbt402 = { workspace = true, features = ["http-client", "http-server"] }
-xbt-primitives.workspace = true
 # a TLS node for the certificate-pinning test (the gateway's own version and features)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # a seller's own web page in the browser test: the real connector, and a page served only compressed

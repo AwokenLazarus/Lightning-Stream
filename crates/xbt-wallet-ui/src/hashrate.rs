@@ -596,7 +596,7 @@ impl App {
             <input type=\"hidden\" name=\"action\" value=\"save\">\
             <label>Your own pool, where your miners hash when nobody rents them<input name=\"fallback\" value=\"{}\" required class=\"mono\" \
             pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:23334\" placeholder=\"192.168.1.20:23334\"></label>\
-            <p class=\"hint\">Your DATUM Gateway or your pool, as your miners use it today. Every miner nobody rents keeps hashing there.</p>\
+            <p class=\"hint\">Your gateway or your pool, as your miners use it today. Every miner nobody rents keeps hashing there.</p>\
             <fieldset><legend>Price for each piece of work</legend>\
             <label class=\"choice\"><input type=\"radio\" name=\"price_mode\" value=\"market\"{}><span><strong>Follow the market</strong>\
             <small>A percent of what the work is worth when mined at today's difficulty</small></span></label>\
@@ -747,7 +747,7 @@ impl App {
         let token = self.cfg.hash.renter_token.clone();
         let st = call(&base, &token, "GET", "/status", None);
         let csrf = App::csrf_input(ctx);
-        let mut b = String::from("<p class=\"lead\">Rent miners from other people, by the piece of work they do, into your own DATUM Gateway. \
+        let mut b = String::from("<p class=\"lead\">Rent miners from other people, by the piece of work they do, into your own gateway. \
             Paid as you use it, seconds at a time: you never have more paid for and not yet received than a minute of the miner's hashing, or one share, one slice and one ticket (546 sat at least), whichever is more, plus any start fee shown on the offer. You can cut a rental at any moment.</p>\
             <p class=\"hint\">Renting, you are the <strong>hashtaker</strong>: the hash comes to you. The people whose miners you rent are <strong>hashmakers</strong>.</p>");
         let st = match st {
@@ -757,27 +757,32 @@ impl App {
                 return self.html_page("Hashrate", "Hashrate", ctx, &b, "");
             }
         };
-        // the buyer's own DATUM Gateway: where rented work goes
-        let datum = st["datum"]["addr"].as_str().unwrap_or("");
+        // the hashtaker's own gateway: where rented work goes
         let reachable = st["datum"]["reachable"] == true;
         // renting needs a gateway that hides which shares win: checked from its jobs when this page loads, whatever pool
         let masked = st["blinding"]["state"] == "blinded";
         let ready = reachable && masked;
-        let found: Vec<String> = st["datum"]["found"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
-        let (class, head, next) = if datum.is_empty() {
-            ("warn", "No DATUM Gateway yet", "Rented work goes to your own DATUM Gateway, which builds the blocks and is paid through your pool. Set its address below.")
-        } else if !reachable {
-            ("bad", "Can't reach your DATUM Gateway", "Check that it is running, and that its address below is right.")
-        } else if !masked {
-            ("warn", "Your gateway isn't masking its jobs",
-             "Rented work goes to your DATUM Gateway, and its jobs have to hide which shares win, so a hashmaker can't keep back the ones that would \
-              be blocks. The gateway this app is set to isn't showing that. Check that the gateway that comes with this app is running, \
-              or, if you set the address below to another gateway, set it back to that one. Renting stays off until then, and nothing is paid.")
-        } else {
-            ("good", "Ready to rent", "")
-        };
+        let (class, head, next) = rent_status(&st, self.stream_gw_here(), self.stream_gw_settings().is_some());
         b.push_str(&format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{head}</p>{}</section>",
-                            if next.is_empty() { String::new() } else { format!("<p>{next}</p>") }));
+                            if next.is_empty() { String::new() } else { format!("<p>{}</p>", esc(&next)) }));
+        // moved to the bundled gateway at the upgrade: said once it happened, with the way back
+        if let Some(from) = st["datum"]["movedFrom"].as_str().filter(|_| st["bundled"]["inUse"] == true) {
+            b.push_str(&format!("<section class=\"card\"><p>Rented work now goes to the {} that comes with this app. It went to <code>{}</code> before, \
+                which can't show that its jobs are masked, so every rental there would be stopped.</p>\
+                <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"use-previous\">\
+                <input type=\"hidden\" name=\"addr\" value=\"{}\"><button class=\"secondary\">Use {} again</button></form></section>",
+                crate::stream_gateway::NAME, esc(from), esc(from), esc(from)));
+        }
+        // the installer's settings changed since a gateway was chosen here: theirs won, said with the way back
+        if let Some(was) = st["datum"]["installerWon"].as_str() {
+            let now = st["datum"]["addr"].as_str().unwrap_or("");
+            let now = if st["bundled"]["inUse"] == true { format!("the {}", crate::stream_gateway::NAME) } else { format!("<code>{}</code>", esc(now)) };
+            b.push_str(&format!("<section class=\"card\"><p>The app's install settings changed since you chose <code>{}</code> on this page, so rented \
+                work goes to {now} now, as they say.</p>\
+                <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"use-previous\">\
+                <input type=\"hidden\" name=\"addr\" value=\"{}\"><button class=\"secondary\">Use {} again</button></form></section>",
+                esc(was), esc(was), esc(was)));
+        }
 
         // the rentals going on and the last ones
         let rentals: Vec<Value> = st["rentals"].as_array().cloned().unwrap_or_default();
@@ -843,7 +848,7 @@ impl App {
                     };
                     let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
                         <input type=\"hidden\" name=\"key\" value=\"{}\">{}<p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
-                        about {}, and see what your own DATUM Gateway accepts before renting more. It is charged at most that, but your wallet {}; \
+                        about {}, and see what your gateway accepts before renting more. It is charged at most that, but your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
@@ -870,16 +875,8 @@ impl App {
         if masked {
             b.push_str(&blinding_card(&st["blinding"]));
         }
-        // the DATUM Gateway's address
-        b.push_str(&format!("<section class=\"card\"><h2>Your DATUM Gateway</h2><form method=\"post\" action=\"./hashrate\">{csrf}\
-            <input type=\"hidden\" name=\"action\" value=\"datum\">\
-            <label>Its address, with the port your miners use<input name=\"addr\" value=\"{}\" class=\"mono\" required placeholder=\"datum-gateway:23334\" \
-            pattern=\"[A-Za-z0-9.\\-\\[\\]:_]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:23334\"></label>{}\
-            <p class=\"hint\">The pool your rented work is paid through is chosen in your DATUM Gateway, not here.</p>\
-            <button class=\"secondary\">Save</button></form>\
-            <p class=\"small\">No DATUM Gateway yet? <a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">How to set one up</a> (it suggests Lazarus Pool).</p></section>",
-            esc(datum), if found.is_empty() || found.iter().any(|f| f == datum) { String::new() } else { format!("<p class=\"hint\">Found on this box: <code>{}</code></p>", esc(&found.join(", "))) },
-            esc(&self.cfg.hash.datum_guide)));
+        // your gateway: the bundled one's settings and state, and the way to another
+        b.push_str(&self.gateway_card(&csrf, &st));
         self.html_page("Hashrate", "Hashrate", ctx, &b, "")
     }
 
@@ -894,7 +891,7 @@ impl App {
         let n = |k: &str| g(k).parse::<u64>().unwrap_or(0);
         let r: Result<String, String> = match g("action").as_str() {
             "rent" | "trial" if call(&base, &token, "GET", "/status", None).is_ok_and(|st| st["blinding"]["state"] != "blinded") => {
-                Err("Renting needs a DATUM Gateway that masks its jobs. Nothing was paid.".into())
+                Err("Renting needs a gateway that masks its jobs. Nothing was paid.".into())
             }
             "rent" => {
                 if n("budget") == 0 {
@@ -903,7 +900,7 @@ impl App {
                     call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1),
                                                                      "once": g("once")})))
                         .and_then(|v| match v["rental"].as_str() {
-                            Some(_) => Ok(format!("Renting. The miners start on your DATUM Gateway in a few seconds; you pay as their work is accepted.{}", may_buy(&v))),
+                            Some(_) => Ok(format!("Renting. The miners start on your gateway in a few seconds; you pay as their work is accepted.{}", may_buy(&v))),
                             None => Err(v["error"].as_str().map(|e| format!("Not rented: {e}.")).unwrap_or_else(|| "Not rented.".into())),
                         })
                 }
@@ -921,15 +918,39 @@ impl App {
                 }),
             "cut" => call(&base, &token, "POST", "/cut", Some(&json!({"rental": g("rental")})))
                 .and_then(|v| if v["ok"] == true { Ok("Cut. The miners stop working for you and payments stop.".into()) } else { Err("That rental had ended already.".into()) }),
-            "datum" => call(&base, &token, "POST", "/datum", Some(&json!({"addr": g("addr")}))).and_then(|v| {
-                if v["ok"] != true {
-                    Err(v["error"].as_str().map(|e| format!("Not saved: {e}.")).unwrap_or_else(|| "Not saved.".into()))
-                } else if v["reachable"] == true {
-                    Ok("Saved. Your DATUM Gateway answers.".into())
-                } else {
-                    Ok("Saved, but nothing answers at that address yet. Check that your DATUM Gateway is running.".into())
+            "datum" | "use-previous" | "use-bundled" => {
+                let mut body = json!({"addr": g("addr")});
+                if !g("api").is_empty() {
+                    // host:port, the port a number: refused here before the renter sees it
+                    let port_ok = g("api").rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && !h.contains(' ') && p.parse::<u16>().is_ok_and(|p| p > 0));
+                    if !port_ok {
+                        self.flash(ctx, false, "Not saved: the API address is host:port, like 192.168.1.20:7152.");
+                        return Resp::redirect(back);
+                    }
+                    body["api"] = json!(g("api"));
                 }
-            }),
+                if g("action") == "use-bundled" {
+                    match call(&base, &token, "GET", "/status", None).ok().and_then(|st| st["bundled"]["addr"].as_str().map(str::to_string)) {
+                        Some(a) => body = json!({"addr": a}),
+                        None => {
+                            self.flash(ctx, false, format!("This install has no {}.", crate::stream_gateway::NAME));
+                            return Resp::redirect(back);
+                        }
+                    }
+                }
+                call(&base, &token, "POST", "/datum", Some(&body)).and_then(|v| {
+                    if v["ok"] != true {
+                        Err(v["error"].as_str().map(|e| format!("Not saved: {e}.")).unwrap_or_else(|| "Not saved.".into()))
+                    } else if v["bundled"] == true {
+                        Ok(format!("Rented work goes to the {} that comes with this app.", crate::stream_gateway::NAME))
+                    } else if v["reachable"] == true {
+                        Ok("Saved. Your gateway answers.".into())
+                    } else {
+                        Ok("Saved, but nothing answers at that address yet. Check that your gateway is running.".into())
+                    }
+                })
+            }
+            "gateway" => self.save_stream_gw(f),
             _ => Err("Unknown action.".into()),
         };
         match r {
@@ -937,6 +958,182 @@ impl App {
             Err(e) => self.flash(ctx, false, e),
         }
         Resp::redirect(back)
+    }
+}
+
+/// The rent page's notice: what renting waits for, from the renter's status. `here`: this install has the bundled
+/// Stream Gateway's settings; `set_up`: they have been saved (its config is written).
+fn rent_status(st: &Value, here: bool, set_up: bool) -> (&'static str, &'static str, String) {
+    use crate::stream_gateway::NAME;
+    let datum = st["datum"]["addr"].as_str().unwrap_or("");
+    let reachable = st["datum"]["reachable"] == true;
+    let masked = st["blinding"]["state"] == "blinded";
+    let b = &st["bundled"];
+    let on_bundled = b["inUse"] == true;
+    let not_masking = |why: String| ("warn", "Your gateway isn't masking its jobs", why);
+    const WHY: &str = "Rented work goes to your gateway, and its jobs have to hide which shares win, so a hashmaker can't keep back the ones that \
+        would be blocks.";
+    if on_bundled && !here {
+        // a build of the app without the gateway (armv7): selling works, renting waits
+        return not_masking(format!("{WHY} This build of the app doesn't include the {NAME}, so renting stays off here and nothing is paid. \
+            Renting your miners out works as usual."));
+    }
+    if on_bundled && !set_up {
+        return ("warn", "Set up your gateway",
+                format!("Rented work goes to the {NAME} that comes with this app. It masks its jobs, so a hashmaker can't keep back the shares that \
+                    would be blocks. Choose below where its blocks pay: solo, to an address of yours, or through Lazarus Pool. Renting starts once it runs."));
+    }
+    // the bundled gateway's own state first: its jobs' generic words ("can't be checked: … doesn't answer") are never
+    // shown for it while it isn't up or has no work from the node
+    let bstate = b["state"].as_str().unwrap_or("");
+    if on_bundled && (b["running"] != true || bstate == "not running") {
+        return ("bad", "Your gateway isn't running",
+                format!("The {NAME} starts a few seconds after its settings are saved. If it doesn't, restart Lightning Stream. Renting stays off \
+                    until then, and nothing is paid."));
+    }
+    if on_bundled && (b["node"] != true || bstate == "waiting for the node") {
+        return ("warn", "Your gateway is waiting for your node",
+                format!("The {NAME} runs, but it has no work from your XBT node yet. Check that the node is running and synced. Renting stays off \
+                    until then, and nothing is paid."));
+    }
+    if datum.is_empty() {
+        return ("warn", "No gateway yet", "Rented work goes to your own gateway, which builds the blocks. Set its address below.".into());
+    }
+    if !reachable {
+        return ("bad", "Can't reach your gateway", "Check that it is running, and that its address below is right.".into());
+    }
+    if !masked {
+        if on_bundled && st["blinding"]["why"].as_str().is_some_and(|w| w.contains("null")) {
+            return not_masking(format!("{WHY} Lazarus Pool doesn't take gateway keys yet, so the {NAME} can't mask its jobs there. Switch it to \
+                solo below to rent now. Renting stays off until then, and nothing is paid."));
+        }
+        return not_masking(format!("{WHY} The gateway this app is set to isn't showing that. Check that the gateway that comes with this app is \
+            running, or, if you set another gateway below, set it back to that one. Renting stays off until then, and nothing is paid."));
+    }
+    ("good", "Ready to rent", String::new())
+}
+
+/// A tick, a cross or a dash, with its words.
+fn state_row(ok: Option<bool>, what: &str) -> String {
+    let (class, mark) = match ok {
+        Some(true) => ("good", "Yes"),
+        Some(false) => ("bad", "No"),
+        None => ("", "Not known yet"),
+    };
+    format!("<li>{} <span class=\"pill {class}\">{mark}</span></li>", esc(what))
+}
+
+impl App {
+    /// This install comes with the Stream Gateway, and the page writes its config.
+    pub(crate) fn stream_gw_here(&self) -> bool {
+        self.cfg.hash.stream_gw.rpcurl.is_some()
+    }
+
+    /// The Stream Gateway's settings as saved, if they are.
+    pub(crate) fn stream_gw_settings(&self) -> Option<crate::stream_gateway::Settings> {
+        self.stream_gw_here().then(|| crate::stream_gateway::read(&self.cfg.hash.stream_gw.dir)).flatten()
+    }
+
+    /// "Your gateway": the bundled Stream Gateway's state and settings, when this install has it, and another gateway's
+    /// address, for an owner who runs one that masks its jobs.
+    fn gateway_card(&self, csrf: &str, st: &Value) -> String {
+        use crate::stream_gateway::{Mode, Settings, LAZARUS_HOST, LAZARUS_PORT, LAZARUS_PUBKEY, NAME};
+        let datum = st["datum"]["addr"].as_str().unwrap_or("");
+        let found: Vec<String> = st["datum"]["found"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+        let b = &st["bundled"];
+        let mut o = String::from("<section class=\"card\" id=\"gateway\"><h2>Your gateway</h2>");
+        if self.stream_gw_here() {
+            let saved = self.stream_gw_settings();
+            let s = saved.clone().unwrap_or_else(|| Settings::new(Mode::Solo, ""));
+            o.push_str(&format!("<p>The {NAME} comes with this app and runs beside it. It masks every job it hands out, so a hashmaker can't tell \
+                which shares win, and it takes its work from your own XBT node.</p>"));
+            if b["inUse"] == true {
+                let node = b["node"].as_bool();
+                o.push_str("<ul class=\"plain\">");
+                o.push_str(&state_row(Some(b["running"] == true), "Running"));
+                o.push_str(&state_row(if b["running"] == true { node } else { None }, "Connected to your node"));
+                o.push_str(&state_row(if node == Some(true) { Some(b["masking"] == true) } else { None }, "Masking its jobs"));
+                o.push_str("</ul>");
+            } else if !b.is_null() {
+                o.push_str(&format!("<p class=\"hint\">Rented work goes to another gateway now, at <code>{}</code>.</p>\
+                    <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"use-bundled\">\
+                    <button class=\"secondary\">Use the {NAME}</button></form>", esc(datum)));
+            }
+            let solo = s.mode == Mode::Solo;
+            let ck = |on: bool| if on { " checked" } else { "" };
+            o.push_str(&format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"gateway\">\
+                <fieldset><legend>Where its blocks pay</legend>\
+                <label><input type=\"radio\" name=\"mode\" value=\"solo\"{}> Solo: every block it finds pays your address, whole</label>\
+                <label><input type=\"radio\" name=\"mode\" value=\"pool-key\"{}> Lazarus Pool: blocks are shared through the pool, and you are paid for your share of its work</label>\
+                </fieldset>\
+                <label>Your XBT address<input name=\"payout\" value=\"{}\" class=\"mono\" required autocomplete=\"off\" spellcheck=\"false\" placeholder=\"bc1q…\"></label>\
+                <p class=\"hint\">Solo: where its blocks pay. Lazarus Pool: the address the pool pays you at. An address starting bc1q, bc1p, 1 or 3.</p>\
+                <p class=\"hint\">With Lazarus Pool, this gateway holds the key that masks its jobs, and hands it to the pool with a block. So it could hide \
+                a block it finds from the pool, the same as any DATUM miner can today. Lazarus Pool masks these jobs once it takes gateway keys; until then \
+                renting stays off in this mode, and solo works.</p>\
+                <details><summary>The pool's server</summary>\
+                <label>Host<input name=\"pool_host\" value=\"{}\" class=\"mono\"></label>\
+                <label>Port<input name=\"pool_port\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
+                <label>Its key<input name=\"pool_pubkey\" value=\"{}\" class=\"mono\" spellcheck=\"false\"></label>\
+                <p class=\"hint\">Lazarus Pool's own, as it publishes them. Change them only if the pool says so.</p></details>\
+                <button>Save</button></form>",
+                ck(solo), ck(!solo), esc(&s.payout),
+                esc(if solo { LAZARUS_HOST } else { &s.pool_host }), if solo { LAZARUS_PORT } else { s.pool_port },
+                esc(if solo { LAZARUS_PUBKEY } else { &s.pool_pubkey })));
+        }
+        // another gateway: for an owner who runs one that opens its jobs as this app's does
+        let other = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"datum\">\
+            <label>Its address, with the port your miners use<input name=\"addr\" value=\"{}\" class=\"mono\" required placeholder=\"datum-gateway:23334\" \
+            pattern=\"[A-Za-z0-9.\\-\\[\\]:_]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:23334\"></label>{}\
+            <label>Its API address, where the app opens its jobs (optional)<input name=\"api\" value=\"{}\" class=\"mono\" placeholder=\"the same host, port 7152\" \
+            pattern=\"[A-Za-z0-9.\\-\\[\\]:_]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:7152\"></label>\
+            <p class=\"hint\">Leave it empty when the API is on the same host at port 7152.</p>\
+            <p class=\"hint\">It has to show its jobs masked, the way the {NAME} does; a stock DATUM-compatible gateway can't, and renting stays off with it. \
+            The pool your rented work is paid through is chosen in that gateway, not here.</p>\
+            <button class=\"secondary\">Save</button></form>\
+            <p class=\"small\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">About gateways</a> (it suggests Lazarus Pool).</p>",
+            esc(if b["inUse"] == true { "" } else { datum }),
+            if found.is_empty() || found.iter().any(|f| f == datum) { String::new() } else { format!("<p class=\"hint\">Found on this box: <code>{}</code></p>", esc(&found.join(", "))) },
+            // its API as the renter uses it, when it isn't the one the address implies
+            esc(st["datum"]["api"].as_str().filter(|a| b["inUse"] != true && !datum.is_empty()
+                && datum.rsplit_once(':').is_none_or(|(h, _)| *a != format!("{h}:7152"))).unwrap_or("")),
+            esc(&self.cfg.hash.datum_guide));
+        if self.stream_gw_here() {
+            o.push_str(&format!("<details><summary>Use another gateway</summary>{other}</details>"));
+        } else {
+            o.push_str(&other);
+        }
+        o.push_str("</section>");
+        o
+    }
+
+    /// Save the Stream Gateway's settings from the page's form.
+    fn save_stream_gw(&self, f: &HashMap<String, String>) -> Result<String, String> {
+        use crate::stream_gateway::{self as sg, Mode, Settings};
+        if !self.stream_gw_here() {
+            return Err(format!("This install has no {}.", sg::NAME));
+        }
+        let g = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
+        let mode = Mode::from_name(&g("mode")).unwrap_or(Mode::Solo);
+        let mut s = Settings::new(mode, &g("payout"));
+        if mode == Mode::PoolKey {
+            if !g("pool_host").is_empty() {
+                s.pool_host = g("pool_host");
+            }
+            if !g("pool_port").is_empty() {
+                s.pool_port = g("pool_port").parse().map_err(|_| "The pool's port is a number, like 28915.".to_string())?;
+            }
+            if !g("pool_pubkey").is_empty() {
+                s.pool_pubkey = g("pool_pubkey").to_ascii_lowercase();
+            }
+        }
+        sg::write(&self.cfg.hash.stream_gw, &s, &self.signer_chain())?;
+        Ok(match mode {
+            Mode::Solo => format!("Saved. The {} starts with these settings in a few seconds; its blocks pay your address.", sg::NAME),
+            Mode::PoolKey => format!("Saved. The {} starts with these settings in a few seconds, mining through Lazarus Pool, which \
+                takes the gateway's key with a block. If the pool doesn't take it, renting stays off; solo always works. Pools \
+                that hold the key themselves (ABW) aren't supported yet.", sg::NAME),
+        })
     }
 }
 
@@ -1121,7 +1318,7 @@ fn result_box(r: &Value, trial: bool) -> String {
         _ => String::new(),
     };
     let head = if trial { "What the test slice showed" } else { "What this rental delivered" };
-    let after = if trial { "<p class=\"hint\">Your own DATUM Gateway checked every share. If this looks right, rent for longer below.</p>" } else { "" };
+    let after = if trial { "<p class=\"hint\">Your own gateway checked every share. If this looks right, rent for longer below.</p>" } else { "" };
     format!("<div class=\"result\"><p><strong>{head}:</strong> {}{vs} · stale shares {} · rejected {}{rt}</p>{after}</div>",
             speed(delivered), pct(r["staleShare"].as_f64().unwrap_or(0.0)), pct(r["rejectedShare"].as_f64().unwrap_or(0.0)))
 }
