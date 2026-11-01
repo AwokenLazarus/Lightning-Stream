@@ -17,9 +17,10 @@
 //! box only the signer reads the XBT node, so the difficulty and the block reward come from it (`mining_tip`). A
 //! piece is about one share of the fastest miner here, and a renter pays a start fee, in whole pieces, before the
 //! miners move. The price is worked out here, written into the hasher's settings and into the shop's route for
-//! paid pieces, which must say the same: a new price waits (`holdNew`, no new rental) until the rentals going on
-//! end, since the shop restarts to charge it and a rental keeps the terms it was made with
-//! ([`App::hash_reprice`]). No live price: no new rental; a price the owner typed needs none.
+//! paid pieces, which must say the same: while rentals go on, a new price waits (`holdNew`, no new rental) until
+//! they end, since the shop restarts to charge it and a rental keeps the terms it was made with
+//! ([`App::hash_reprice`]). With none going on it is in force at once; the hasher itself takes no new rental
+//! till the shop charges it. No live price: no new rental; a price the owner typed needs none.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -182,8 +183,6 @@ struct Seen {
     /// Miners are here, none measured yet: a piece can't be sized to them.
     measuring: bool,
     rentals: usize,
-    /// It takes no new rental now.
-    paused: bool,
 }
 
 fn seen(st: &Value) -> Seen {
@@ -193,7 +192,6 @@ fn seen(st: &Value) -> Seen {
         hs: (fastest > 0.0).then_some(fastest),
         measuring: !live.is_empty() && fastest <= 0.0,
         rentals: st["rentals"].as_array().map(Vec::len).unwrap_or(0),
-        paused: st["paused"].is_string(),
     }
 }
 
@@ -208,10 +206,29 @@ pub enum Repriced {
     Applied,
     /// The new price waits for this many rentals going on to end: no new rental till then.
     Held(usize),
-    /// No new rental while the shop starts with the new price.
-    Waiting,
     /// No live price: why.
     NoPrice(String),
+}
+
+/// The terms `w` the settings ask for, against those `applied` and the rentals going on: in force at once
+/// with none going on (the hasher's `holdNew` cleared), or, while rentals go on, `pending` with `holdNew`,
+/// the only time it is set: no new rental till they end.
+fn settle(s: &mut Value, w: Want, applied: Option<Want>, rentals: usize) -> Repriced {
+    let r = if Some(w) == applied {
+        Repriced::Same
+    } else if applied.is_none() || rentals == 0 {
+        w.write(s);
+        Repriced::Applied
+    } else {
+        s["pending"] = w.to_json();
+        s["holdNew"] = json!(true);
+        return Repriced::Held(rentals);
+    };
+    if let Some(m) = s.as_object_mut() {
+        m.remove("pending");
+    }
+    s["holdNew"] = json!(false);
+    r
 }
 
 /// One call to a service's control page.
@@ -364,23 +381,13 @@ impl App {
         tip_of(&v, crate::now().max(0) as u64)
     }
 
-    /// Whether the shop charges `price_sat` a piece of work now (its `/services`). A shop this app can't ask
-    /// (no health address) is taken at its config.
-    fn shop_charges(&self, price_sat: u64) -> bool {
-        let Some(origin) = self.cfg.gw.health_url.as_deref().and_then(crate::services::http_origin) else { return true };
-        let Ok((200, body)) = crate::app::http_get(&format!("{origin}{}", xbt_gateway::config::SERVICES_PATH)) else { return false };
-        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        let charged = v["routes"].as_array().into_iter().flatten().find(|r| r["path"] == "/hashrate/")
-            .and_then(|r| r["price"]["requestMsat"].as_str()).and_then(|p| p.parse::<u64>().ok());
-        charged == price_sat.checked_mul(1000)
-    }
-
     /// Price the hashmaker's work again: at the chain's difficulty (a market price) and the speed its miners show.
     /// Run every minute and at each Save (`saving`). A rental keeps the terms it was made with, and the shop
     /// charges one price, which it takes by restarting (a payment then fails, and the rental ends). So a new
-    /// price is put in force only with no rental going on and none starting: first the hasher is told to take
-    /// no new rental (`holdNew`, with the new terms `pending`), then, its rentals ended, the terms and the
-    /// shop's route are written, and new rentals start again once the shop charges the new price.
+    /// price is put in force only with no rental going on ([`settle`]). While rentals go on the hasher is told
+    /// to take no new rental (`holdNew`, with the new terms `pending`); once they have ended it takes the
+    /// `pending` terms itself, and here the terms and the shop's route are written. The hasher takes no new
+    /// rental till the shop charges what its terms say, which it asks the shop itself.
     pub fn hash_reprice(&self, saving: bool) -> Repriced {
         let mut s = self.hash_settings();
         if s["enabled"] != true {
@@ -419,41 +426,11 @@ impl App {
         let r = match want(&s, tip.as_ref().map_err(String::as_str), seen.hs) {
             // the price in force ages out at the hasher, within the hour; the rentals going on keep theirs
             Err(why) => Repriced::NoPrice(why),
-            Ok(w) if Some(w) == applied => {
-                if let Some(m) = s.as_object_mut() {
-                    m.remove("pending");
-                }
-                if s["holdNew"] == true && self.shop_charges(w.price_sat) {
-                    s["holdNew"] = json!(false);
-                }
-                if live && s["priceSeenMs"].as_u64().is_none_or(|t| now_ms.saturating_sub(t) >= PRICE_CONFIRM_MS) {
-                    s["priceSeenMs"] = json!(now_ms);
-                }
-                if s["holdNew"] == true {
-                    Repriced::Waiting
-                } else {
-                    Repriced::Same
-                }
-            }
-            // nothing priced yet, or no rental going on and none starting (or the owner saving): in force now
-            Ok(w) if applied.is_none() || (seen.rentals == 0 && (saving || seen.paused)) => {
-                w.write(&mut s);
-                if let Some(m) = s.as_object_mut() {
-                    m.remove("pending");
-                }
-                // till the shop charges it, when it can be asked
-                s["holdNew"] = json!(self.cfg.gw.health_url.is_some());
-                if live {
-                    s["priceSeenMs"] = json!(now_ms);
-                }
-                Repriced::Applied
-            }
-            Ok(w) => {
-                s["pending"] = w.to_json();
-                s["holdNew"] = json!(true);
-                Repriced::Held(seen.rentals)
-            }
+            Ok(w) => settle(&mut s, w, applied, seen.rentals),
         };
+        if live && (r == Repriced::Applied || (r == Repriced::Same && s["priceSeenMs"].as_u64().is_none_or(|t| now_ms.saturating_sub(t) >= PRICE_CONFIRM_MS))) {
+            s["priceSeenMs"] = json!(now_ms);
+        }
         if !live {
             if let Some(m) = s.as_object_mut() {
                 m.remove("priceSeenMs");
@@ -1070,6 +1047,12 @@ fn paused_words(why: &str) -> String {
         "a new price waits for the rentals going on to end" => {
             "Your new price starts once the rentals going on end and your shop has restarted with it. No new rental starts till then."
         }
+        "your shop does not charge this price yet" => {
+            "Your shop is restarting with your new price. Rentals start again once it charges that price, usually within a minute."
+        }
+        "your shop is not selling yet" => {
+            "Your shop isn't selling yet, so no renter could pay. Finish your shop on the Sell page: it starts selling once it's saved."
+        }
         w if w.contains("not been confirmed") => "The live price could not be checked against your XBT node for over an hour, so no new rental starts until it can.",
         _ => "No new rental starts for now.",
     };
@@ -1142,6 +1125,44 @@ fn th_hours(x: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A price saved with no rental going on is in force at once and holds no new rental: the first price, a
+    /// new one, and one confirmed again, even over a hold left from before.
+    #[test]
+    fn a_price_saved_with_no_rental_going_on_holds_nothing() {
+        let old = Want { price_sat: 90, slice_work: 1 << 40, start_slices: 2 };
+        let w = Want { price_sat: 100, ..old };
+        let mut held = json!({"holdNew": true, "pending": {"priceSat": 95}});
+        old.write(&mut held);
+        for (mut s, applied) in [(json!({}), None), (held.clone(), Some(old))] {
+            assert_eq!(settle(&mut s, w, applied, 0), Repriced::Applied);
+            assert_eq!((s["priceSat"].as_u64(), s["holdNew"].as_bool(), s.get("pending").is_none()), (Some(100), Some(false), true), "{s}");
+        }
+        let mut s = held;
+        assert_eq!(settle(&mut s, old, Some(old), 0), Repriced::Same);
+        assert_eq!((s["holdNew"].as_bool(), s.get("pending").is_none()), (Some(false), true), "{s}");
+    }
+
+    /// A price saved while a rental goes on waits for it, and holds new rentals till then; once it has ended
+    /// the price is in force and nothing is held.
+    #[test]
+    fn a_price_saved_while_a_rental_goes_on_holds_new_rentals_till_it_ends() {
+        let old = Want { price_sat: 90, slice_work: 1 << 40, start_slices: 2 };
+        let w = Want { price_sat: 100, ..old };
+        let mut s = json!({});
+        old.write(&mut s);
+        assert_eq!(settle(&mut s, w, Some(old), 1), Repriced::Held(1));
+        assert_eq!((s["priceSat"].as_u64(), s["holdNew"].as_bool(), s["pending"]["priceSat"].as_u64()), (Some(90), Some(true), Some(100)), "{s}");
+        assert_eq!(settle(&mut s, w, Some(old), 0), Repriced::Applied);
+        assert_eq!((s["priceSat"].as_u64(), s["holdNew"].as_bool(), s.get("pending").is_none()), (Some(100), Some(false), true), "{s}");
+    }
+
+    /// The hasher's reasons for no new rental, each in words, none shown raw.
+    #[test]
+    fn a_shop_not_charging_the_price_yet_is_explained() {
+        assert!(paused_words("your shop does not charge this price yet").contains("restarting with your new price"));
+        assert!(paused_words("your shop is not selling yet").contains("Finish your shop"));
+    }
+
     /// A miner held back for measuring is explained, with what to check if it stays held.
     #[test]
     fn a_miner_waiting_to_be_measured_is_explained() {
@@ -1352,9 +1373,9 @@ mod tests {
     fn what_the_hasher_shows_sizes_the_piece() {
         let st = json!({"miners": [{"connected": true, "hashrateHs": 4.1e12}, {"connected": true, "hashrateHs": 41e12}, {"connected": false, "hashrateHs": 99e12}],
                         "rentals": [{"rental": "r1"}], "paused": null});
-        assert_eq!(seen(&st), Seen { hs: Some(41e12), measuring: false, rentals: 1, paused: false });
+        assert_eq!(seen(&st), Seen { hs: Some(41e12), measuring: false, rentals: 1 });
         let new = json!({"miners": [{"connected": true, "hashrateHs": 0.0}], "rentals": [], "paused": "no miner measured yet"});
-        assert_eq!(seen(&new), Seen { hs: None, measuring: true, rentals: 0, paused: true });
+        assert_eq!(seen(&new), Seen { hs: None, measuring: true, rentals: 0 });
         assert_eq!(seen(&Value::Null), Seen::default());
     }
 

@@ -3848,7 +3848,7 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     let s = read();
     assert_eq!(terms(&s).0, Some(366));
     assert!(s.get("pending").is_none(), "{s}");
-    assert_eq!(s["holdNew"], false, "no shop health address to wait on here: {s}");
+    assert_eq!(s["holdNew"], false, "nothing held with no rental going on: {s}");
     assert_eq!(route(), Some(json!(366_000)));
     PAUSED.store(false, SeqCst);
     assert_eq!(bx._app.hash_reprice(false), Repriced::Same);

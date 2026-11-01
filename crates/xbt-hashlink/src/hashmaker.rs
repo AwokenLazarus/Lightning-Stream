@@ -691,6 +691,11 @@ impl Hashmaker {
         lock(&self.hub).capacity()
     }
 
+    /// How many rentals are going on now.
+    pub fn rentals_going_on(&self) -> usize {
+        lock(&self.hub).rentals.len()
+    }
+
     /// End a rental now, as the hashmaker (the hashtaker is told; its miners go back to the fallback).
     pub fn stop_rental(&self, id: &str) -> bool {
         let mut g = lock(&self.hub);
