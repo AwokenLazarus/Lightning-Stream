@@ -677,13 +677,16 @@ mod tests {
         serde_json::from_str(b.split_once("\r\n\r\n")?.1).ok()
     }
 
+    /// What a gateway stand-in noted each time it was asked: the hashmaker's `rentable` then, and its terms' price.
+    type Asked = Arc<Mutex<Vec<(Value, Value)>>>;
+
     /// A gateway stand-in that charges `charged` msat a slice, and notes, each time it is asked, what the hashmaker
     /// at `control` takes then (its `rentable`, with the price of its terms).
-    fn gateway(charged: Arc<std::sync::atomic::AtomicU64>, control: String) -> (String, Arc<Mutex<Vec<(Value, Value)>>>) {
+    fn gateway(charged: Arc<std::sync::atomic::AtomicU64>, control: String) -> (String, Asked) {
         use std::io::{Read, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
-        let asked: Arc<Mutex<Vec<(Value, Value)>>> = Arc::default();
+        let asked: Asked = Arc::default();
         let noted = asked.clone();
         std::thread::spawn(move || {
             for c in l.incoming() {
