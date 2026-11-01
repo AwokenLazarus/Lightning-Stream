@@ -48,8 +48,8 @@ const TIP_MAX_AGE_S: u64 = 24 * 3600;
 /// How often a live price is confirmed in the settings at most (the hasher takes no new rental after an
 /// hour without).
 const PRICE_CONFIRM_MS: u64 = 600_000;
-/// An automatic new price comes no sooner than this after the last one put in force: each restarts the shop, and the
-/// hasher takes no rental at the new terms till the shop has restarted.
+/// A live price moving with the chain is put in force no sooner than this after the last new price: each restarts the
+/// shop, and the hasher takes no rental at the new terms till the shop has restarted.
 const REPRICE_DWELL_MS: u64 = 600_000;
 /// How long a new price waits, as it is put in force, for the hasher to show it has read it (it reads every 2 s).
 const HASHER_READS: Duration = Duration::from_secs(5);
@@ -409,8 +409,8 @@ impl App {
     /// `pending` terms itself, and here the terms are written. The hasher takes no new rental till the shop charges
     /// what its terms say, which it asks the shop itself. The shop's route follows only once the hasher shows it
     /// has the new terms, with no rental going on ([`route_may_follow`]): a renter taken at the old terms in the
-    /// moment before it read them keeps a shop that charges those till its rental ends. An automatic new price
-    /// comes no sooner than [`REPRICE_DWELL_MS`] after the last, so the shop isn't kept restarting.
+    /// moment before it read them keeps a shop that charges those till its rental ends. A live price moving with the
+    /// chain comes no sooner than [`REPRICE_DWELL_MS`] after the last, so the shop isn't kept restarting.
     pub fn hash_reprice(&self, saving: bool) -> Repriced {
         let mut s = self.hash_settings();
         if s["enabled"] != true {
@@ -452,8 +452,9 @@ impl App {
                 s["routePriceSat"] = json!(a.price_sat);
             }
         }
-        // a new price the hasher waits on (`pending`) is never held back
-        let dwell = !saving && s.get("pending").is_none() && s["appliedMs"].as_u64().is_some_and(|t| now_ms.saturating_sub(t) < REPRICE_DWELL_MS);
+        // a live price moving with the chain waits out the dwell; a fixed one changes only as its owner sets it, and a new
+        // price the hasher waits on (`pending`) is never held back
+        let dwell = live && !saving && s.get("pending").is_none() && s["appliedMs"].as_u64().is_some_and(|t| now_ms.saturating_sub(t) < REPRICE_DWELL_MS);
         let r = match want(&s, tip.as_ref().map_err(String::as_str), seen.hs) {
             // the price in force ages out at the hasher, within the hour; the rentals going on keep theirs
             Err(why) => Repriced::NoPrice(why),

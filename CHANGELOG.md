@@ -201,7 +201,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   charges that price, and the Sell page says so. While rentals go on, a new price waits for them, and the hashmaker
   takes it for new rentals the moment the last one ends. The shop starts charging a new price only once the
   hashmaker shows it has the new terms with no rental going on, so a renter taken at the old terms in that moment
-  pays them to its end. An automatic new price comes at most once every ten minutes. Before, a price saved on a
+  pays them to its end. A market price moving with the chain changes at most once every ten minutes. Before, a price saved on a
   fresh install held every miner back, under "a new price waits for the rentals going on to end", until the app's
   next minute check found the shop charging it.
 - Every share carries the renter's own id to its gateway, so its verdict is always read; a share with no id, or
