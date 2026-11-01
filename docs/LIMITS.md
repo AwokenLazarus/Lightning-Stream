@@ -1213,8 +1213,9 @@ untrusted field.
 
 How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is protected".
 
-- A hashtaker can have paid for and not yet received up to a minute of the miner's hashing or 546 sat, whichever
-  is more, plus the start fee shown on the offer. That is what it loses to a hashmaker that takes a payment and
+- A hashtaker can have paid for and not yet received up to a minute of the miner's hashing, or one share, one
+  slice and one ticket (546 sat at least), whichever is more, plus the start fee shown on the offer: the slices
+  paid ahead and the credit left with the seller together. That is what it loses to a hashmaker that takes a payment and
   vanishes. Its app stops paying a seller after two first steps that delivered little.
 - A hashmaker forwards no share past what's paid. A renter that stops paying gets nothing more, and the miners go
   home 2 s after the first share that doesn't fit. A renter that walks away still cost the miners their move:

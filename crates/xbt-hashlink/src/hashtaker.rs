@@ -847,7 +847,8 @@ fn come_back(cfg: &Redial, tx: &Sender, st: &Arc<Mutex<St>>, why: &str) -> Optio
             Ok(Some(Msg::Welcome { terms_hash, proof, .. })) if terms_hash == hex::encode(cfg.terms.hash()) && proof.as_deref() == Some(PROOF) => {
                 tx.adopt(new_tx);
                 let mut g = lock(st);
-                g.events.push(json!({"ev": "rental resumed", "resendsAllowed": g.guard.resend_left, "atMs": now_ms()}));
+                let allowed = g.guard.resend_left;
+                g.events.push(json!({"ev": "rental resumed", "resendsAllowed": allowed, "atMs": now_ms()}));
                 g.guard.retire_until = Some(Instant::now() + RESEND_WINDOW);
                 let released = g.released;
                 for (slice, hash) in g.lock_hashes.clone() {

@@ -129,8 +129,15 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Both apps check every share's hash themselves, from the Stratum lines alone. A share counts only
   if it proves its work; neither side takes the other's word, and a renter's verdicts set nothing.
 - Renters: paid as you use it, seconds at a time. You never have more paid for and not yet received
-  than a minute of the miner's hashing or 546 sat, whichever is more, plus any start fee shown on
-  the offer. The app stops paying a seller after two first payments that delivered little.
+  than a minute of the miner's hashing, or one share, one slice and one ticket (546 sat at least),
+  whichever is more, plus any start fee shown on the offer. That counts the credit left with the seller
+  as well as the slices paid ahead: each ticket is sized to stay inside it. The app stops paying a seller
+  after two first payments that delivered little.
+- A rental's budget is a hard cap: no ticket takes spending past it, and the rental ends with "budget
+  reached" when what's left can't pay another slice.
+- No payment, not the start fee or the first ticket, until the gateway's own first job is shown masked.
+  Before, a renter pointed at a gateway that doesn't mask could pay 5 times before the first job's check
+  refused it.
 - Hashmakers: a renter gets no work it hasn't paid for. If it stops paying, your miners go back to
   your own pool within seconds. Measured on the real-money regtest: stopped with no work past what
   was paid. Hashmakers set no price by hand by default: it is the mining value at live difficulty.
@@ -158,7 +165,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Miners behind one address (a home router, or Docker on Umbrel and StartOS) move between rentals
   once each way, instead of bouncing between connections under load. In a test of 25 rentals of 3
   miners each at once, every rental received 98–99% of the work its miners could do in that time.
-  Buyers are charged only for work that reaches their pool.
+  Buyers pay a step ahead of the work and no more (see Renters, above).
 - A hashmaker rents out only miners that have connected and named themselves, so a rental never
   gets a silent connection that does no work.
 - After a break in the link, a rental keeps going even if a share's result was lost in the break.
@@ -169,18 +176,27 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   refused and the rental ended.
 - A hashtaker reconnecting over a link that has gone silent now gives up when its time to come back
   runs out, and its unused tickets go back. Before, it could wait for good with them still held.
-- A slice paid as the link breaks now waits up to 8 seconds for the rental to resume, and is paid and
-  charged once. Before, a break of 2 seconds could refuse it and end the rental as unpaid.
+- A slice paid as the link breaks is taken while the rental waits for its renter to come back, within the
+  rental's time to come back, and is paid and charged once. Before, a break of 2 seconds could refuse it and
+  end the rental as unpaid.
 - A renter can no longer hang a hashmaker's whole app by asking for an impossibly high difficulty. A
-  difficulty of two slices a share or more now ends that rental at once, whichever of its miners it was said to,
-  with all of that rental's miners; other rentals carry on. That is 65,536 and up at the default slice: about 56
-  TH/s on a miner at 0.2 shares a second, or any miner if the renter's gateway starts there. Larger slices are the
-  hashmaker's setting.
-- A rental whose renter never accepts a share ends after 8 slices' worth or 60 seconds, across link breaks too.
-  Before, it could keep a hashmaker's miners with nothing counted and nothing paid.
-- A hashmaker has to trust its renter's word for what it delivered. A renter's answers are the meter and can't be
-  checked yet, so a dishonest renter that accepts a few shares can underpay without limit while the rental runs,
-  and rent again. See docs/P2P-HASH.md.
+  difficulty of more than four slices a share now ends that rental at once, whichever of its miners it was said
+  to, with all of that rental's miners; other rentals carry on. That is above 131,072 at the default slice: above
+  about 113 TH/s on a miner at 0.2 shares a second, or any miner if the renter's gateway starts there. Larger
+  slices are the hashmaker's setting.
+- A renter's verdicts on shares no longer set what it owes: both sides count each share by its proof, so a renter
+  that turns every share down still owes for each one proven, and the hashmaker forwards none past what's paid.
+  Before, a renter that accepted a few shares could underpay without limit. See docs/P2P-HASH.md.
+- A hashmaker can no longer turn shares it held back into paid work by dropping the link and sending them again:
+  a share sent again goes on to the renter's gateway for its verdict, aged as of the drop, and the renter takes
+  only as many as its miners' rate says could have been on their way. A link that drops more than 8 times in an
+  hour ends the rental.
+- Every share carries the renter's own id to its gateway, so its verdict is always read; a share with no id, or
+  one still waiting for its verdict, is refused. A share whose time rolls back from its job's, or more than two
+  hours forward, is refused. Before, shares with no id escaped the check of how many the gateway turned down.
+- A hashmaker can't change what a share is worth at the renter's gateway: `mining.suggest_difficulty` and other
+  lines that aren't a miner's session go no further than the renter, and `mining.configure` goes on without
+  `minimum-difficulty`. After a new difficulty, shares wait for a job checked as masked at it.
 - Sell, Hashrate says this beside "Rent out my miners", and the box starts unticked for an owner who has never
   saved the form; one who has keeps their choice. A rental card says in plain words why the hashmaker ended it for
   these two reasons.
