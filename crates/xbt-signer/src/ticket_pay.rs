@@ -3651,7 +3651,7 @@ impl Signer {
     /// `true`: taken over.
     fn ticket_resume(&self, hs: &HttpSession) -> Resumed {
         let receipt_key = hex::encode(&hs.terms.receipt_key);
-        let candidates = self.ticket_resumable_all(&hs.terms.terms.payee, &receipt_key, &hs.origin, &hs.sid);
+        let candidates = self.ticket_resumable_all(&hs.terms.terms.payee, &receipt_key, &hs.origin, &hs.task, &hs.sid);
         let waiting = format!("resume:{}:{receipt_key}", hs.terms.terms.payee);
         let empty = |found: &crate::ticket_rail::Resumable| format!("empty:{}:{}", found.http.id, found.sent);
         // a seller session this process still holds for a session of its own, whatever the book says of that session (an

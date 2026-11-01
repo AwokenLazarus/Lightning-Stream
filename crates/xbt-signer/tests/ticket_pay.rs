@@ -7233,6 +7233,47 @@ fn credit_given_up_after_a_takeover_is_not_taken_over_through_the_earlier_sessio
     assert_eq!((node, seller, book), (2 * TICKET, 2 * TICKET, 2 * TICKET));
 }
 
+/// Credit one task leaves with a seller stays with that task. A task's budget is booked when a ticket
+/// is bought, to the task that bought it: a call of another task that took that credit over would
+/// spend it against neither budget, and so past its own. `film` buys a prepaid ticket, uses part of
+/// it and stops; `swarm` then calls the same shop. It takes nothing of `film`'s over, buys a ticket
+/// of its own, and that ticket is booked to `swarm`.
+#[test]
+fn credit_one_task_left_with_a_seller_is_not_taken_over_by_another_task() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let ledger_of = |task: &str| -> i64 {
+        r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some(task)).map(|row| row["amount_sats"].as_i64().unwrap()).sum()
+    };
+    let a = r.pay("/page/10", 2_000);
+    assert_eq!((a["status"].as_u64(), a["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{a}");
+    let a_seller = r.status()["paying"][0]["seller_session"].as_str().unwrap().to_string();
+    assert!(!a_seller.is_empty());
+    let stop = r.call("ticket_stop", json!({"session": a["session"]}));
+    let left: u64 = stop["http"]["left_with_seller_msat"].as_str().unwrap_or("0").parse().unwrap();
+    assert!(left > 0, "film left credit with the seller: {stop}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    let film_before = ledger_of("film");
+    assert_eq!((film_before, ledger_of("swarm")), (SETTLED, 0), "{:?}", r.ledger());
+    let b = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!(b["status"].as_u64(), Some(200), "{b}");
+    assert_ne!(b["session"], a["session"]);
+    let taken: Vec<Value> = r.audit("ticket_resumed").into_iter().filter(|e| e["seller_session"].as_str() == Some(a_seller.as_str())).collect();
+    assert!(taken.is_empty(), "swarm took over the credit film left with the seller: {taken:?}");
+    assert_eq!(b["tickets_prepaid"].as_u64(), Some(1), "swarm bought a ticket of its own: {b}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    assert_eq!((ledger_of("film"), ledger_of("swarm")), (film_before, SETTLED), "swarm's spend is booked to swarm, film's is unchanged: {:?}", r.ledger());
+    // film's credit is still there for film, once swarm's session is stopped (while it is open, a call to the same
+    // address is served by it whatever its task: a path of its own, not a takeover)
+    r.call("ticket_stop", json!({"session": b["session"]}));
+    let again = r.pay("/page/10", 2_000);
+    assert_eq!((again["status"].as_u64(), again["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "film pays from what it left: {again}");
+    assert_ne!(again["session"], b["session"]);
+    assert_eq!(r.audit("ticket_resumed").iter().filter(|e| e["seller_session"].as_str() == Some(a_seller.as_str())).count(), 1, "taken over by its own task");
+}
+
 /// A choices file that cannot be read holds an identified seller session back, and burns nothing:
 /// the credit is given up only where the owner's choice is known.
 #[test]
