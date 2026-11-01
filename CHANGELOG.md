@@ -197,6 +197,13 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Every share carries the renter's own id to its gateway, so its verdict is always read; a share with no id, or
   one still waiting for its verdict, is refused. A share whose time rolls back from its job's, or more than two
   hours forward, is refused. Before, shares with no id escaped the check of how many the gateway turned down.
+- A hashmaker with no fallback pool keeps its miners connected through a renter's wait for a payment on its way,
+  and they go on with the rental when it lands. Before, it let them go, and a miner that doesn't reconnect was lost
+  to the rental. A renter says a payment is on its way only when its ticket buys are measured too slow for the
+  hashmaker's 2 s clock.
+- A slice's payment waits for the wallet as long as the wallet works on it. Before, the renter gave up after 200 s
+  and took the slice as failed while the wallet might have paid it; a lost answer is now treated as possibly paid
+  and never paid again.
 - A hashmaker can't change what a share is worth at the renter's gateway: `mining.suggest_difficulty` and other
   lines that aren't a miner's session go no further than the renter, and `mining.configure` goes on without
   `minimum-difficulty`. After a new difficulty, shares wait for a job checked as masked at it.
