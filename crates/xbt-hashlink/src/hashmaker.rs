@@ -1002,9 +1002,12 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 let work_to = work.max(rs.work.saturating_sub(rs.cap_work)).min(rs.work);
                 let proven_to = proven.max(rs.proven.saturating_sub(rs.cap_shares)).min(rs.proven);
                 let (by_work, by_shares) = (rs.work - work_to, rs.proven - proven_to);
-                r.note(json!({"ev": "count after the resume", "hashtaker": work.to_string(), "was": rs.work.to_string(), "lowered": by_work.to_string(),
-                              "most": rs.cap_work.to_string(), "atMs": now_ms()}));
+                let said = |r: &mut Rental, lowered: u128| {
+                    r.note(json!({"ev": "count after the resume", "hashtaker": work.to_string(), "was": rs.work.to_string(), "lowered": lowered.to_string(),
+                                  "most": rs.cap_work.to_string(), "atMs": now_ms()}));
+                };
                 if by_work == 0 && by_shares == 0 {
+                    said(r, 0);
                     continue;
                 }
                 let now = Instant::now();
@@ -1012,9 +1015,11 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                     r.resyncs.pop_front();
                 }
                 if r.resyncs.len() >= RESYNCS_AN_HOUR {
+                    said(r, 0);
                     g.stop_unpaid(&id, "its count fell short after too many resumes");
                     return;
                 }
+                said(r, by_work);
                 r.resyncs.push_back(now);
                 r.meter.work -= by_work;
                 r.meter.proven -= by_shares;

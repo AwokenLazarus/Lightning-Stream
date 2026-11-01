@@ -533,6 +533,11 @@ impl Dropping {
     /// `verdicts_after`: the hashtaker's gateway takes this long to answer, through a stand-in. The miner
     /// hashes for `miner_secs`.
     fn start_with(name: &str, secs: u64, rate: f64, verdicts_after: Option<Duration>, miner_secs: u64) -> Dropping {
+        Dropping::start_on(name, secs, rate, miner_secs, &|pool: &str| verdicts_after.map_or(pool.to_string(), |d| slow_gateway(pool.to_string(), d)))
+    }
+
+    /// As [`Dropping::start_with`], the hashtaker's gateway what `upstream` makes of the pool's address.
+    fn start_on(name: &str, secs: u64, rate: f64, miner_secs: u64, upstream: &dyn Fn(&str) -> String) -> Dropping {
         let books: Arc<Books> = Default::default();
         let b2 = books.clone();
         let rig = rig_with(true, Relays::None, Box::new(move || Box::new(SellerBook(LabSeller::default(), b2.clone()))));
@@ -550,7 +555,7 @@ impl Dropping {
             hashmaker: front.addr.clone(),
             hashmaker_key: rig.hpub,
             key: noise::fresh_key(),
-            upstream: verdicts_after.map_or(pool.addr.clone(), |d| slow_gateway(pool.addr.clone(), d)),
+            upstream: upstream(&pool.addr),
             user: format!("{name}.rented"),
             terms: terms(),
             rental: name.into(),
@@ -638,6 +643,45 @@ fn slow_gateway(to: String, after: Duration) -> String {
         }
     });
     addr
+}
+
+/// A gateway in front of `to` whose sessions open now can all be closed at once (it starting again): returns its
+/// address and the switch.
+fn closing_gateway(to: String) -> (String, Arc<AtomicBool>) {
+    let [addr] = ports::<1>();
+    let l = TcpListener::bind(&addr).unwrap();
+    let close: Arc<AtomicBool> = Arc::default();
+    let open: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+    {
+        let (close, open) = (close.clone(), open.clone());
+        thread::spawn(move || loop {
+            if close.swap(false, Ordering::SeqCst) {
+                for s in open.lock().unwrap().drain(..) {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        });
+    }
+    let kept = open.clone();
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(a) = c else { continue };
+            let Ok(b) = TcpStream::connect(&to) else { continue };
+            kept.lock().unwrap().extend([a.try_clone().unwrap(), b.try_clone().unwrap()]);
+            let (mut a2, mut b2) = (a.try_clone().unwrap(), b.try_clone().unwrap());
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut a2, &mut b2);
+                let _ = b2.shutdown(std::net::Shutdown::Both);
+            });
+            let (mut a3, mut b3) = (a, b);
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut b3, &mut a3);
+                let _ = a3.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    (addr, close)
 }
 
 /// What each side's rail did, once a rental is over: what left the hashtaker reached the hashmaker, and
@@ -807,6 +851,46 @@ fn shares_lost_with_the_link_are_sent_again_and_counted_once() {
     let pool = d.pool.report();
     let proven = b["meter"]["proven"].as_u64().unwrap();
     assert_eq!(pool["accepted"].as_u64().unwrap(), proven, "pool {pool}\nhashtaker {b}");
+    d.rig.hashmaker.shutdown();
+}
+
+/// Shares the hashmaker counted are lost with the link, and the hashtaker's gateway starts again as the link drops, so
+/// the hashtaker can't send them on when they come again: it doesn't count them. After the resume each side says its
+/// count, and the hashmaker's comes down to the hashtaker's: both books end equal, the hashmaker is paid for no less
+/// than its gateway took, and the hashtaker pays for nothing it didn't prove. Without the count after the resume the
+/// hashmaker stayed ahead (the over_iroh 9-against-18 the review found).
+#[test]
+fn shares_the_hashtaker_could_not_send_on_after_a_drop_come_off_the_hashmakers_count() {
+    let _s = serial();
+    let gate: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::default();
+    let g2 = gate.clone();
+    let mut d = Dropping::start_on("resync", 40, 12.0, 14, &move |pool: &str| {
+        let (addr, close) = closing_gateway(pool.to_string());
+        *g2.lock().unwrap() = Some(close);
+        addr
+    });
+    d.front.lose_down.store(true, Ordering::SeqCst);
+    let before = d.maker("meter")["proven"].as_u64().unwrap_or(0);
+    let t0 = Instant::now();
+    while d.maker("meter")["proven"].as_u64().unwrap_or(0) < before + 2 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{}", d.rig.hashmaker.status());
+        thread::sleep(Duration::from_millis(2));
+    }
+    // the gateway starts again as the link drops: the sessions the shares sent again would go on are gone
+    gate.lock().unwrap().as_ref().unwrap().store(true, Ordering::SeqCst);
+    d.front.cut();
+    let b = d.hashtaker_ended_within(Duration::from_secs(40));
+    let r = finished(&d.rig.hashmaker, "resync");
+    eprintln!("MEASURED resync: hashmaker lowered {} after the resume; hashtaker refused {} sent again; counts {} / {}", r["loweredAfterResumes"],
+              b["resendsRefused"], r["meter"]["work"], b["meter"]["work"]);
+    assert!(b["resendsRefused"].as_u64().unwrap() >= 1, "a share the hashtaker couldn't send on: {b}");
+    assert!(r["loweredAfterResumes"].as_str().unwrap().parse::<u128>().unwrap() > 0, "{r}");
+    check_counts_agree(&r, &b);
+    check_paid(&r, &b);
+    // the hashmaker is paid for no less than the gateway took
+    let pool = d.pool.report();
+    let took = pool["work"].as_str().unwrap().parse::<u128>().unwrap();
+    assert!(took <= xbt_hashlink::order::paid_work(r["paid"].as_u64().unwrap(), 0, terms().slice_work), "pool {pool}\nhashmaker {r}");
     d.rig.hashmaker.shutdown();
 }
 

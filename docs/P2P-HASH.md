@@ -297,6 +297,14 @@ So shares held back can't be turned into paid work that never reaches the renter
 all 40 were counted and none reached the gateway). A link that drops more than 8 times in an hour ends the rental
 (`a_link_that_keeps_dropping_ends_the_rental`).
 
+Once the shares sent again are settled, each side says its count (`resynced`): the hashmaker its count when it sent
+them, the hashtaker its count at the drop and what it counted of them. The hashmaker's count comes down to the
+hashtaker's, by no more than the work it forwarded in the 2 s before it last heard from the hashtaker, so the two
+books agree and the loss of shares the hashtaker's gateway never took is the hashmaker's
+(`shares_the_hashtaker_could_not_send_on_after_a_drop_come_off_the_hashmakers_count`). A hashtaker that says a lower
+count than it has gets no more than that each time, and past 8 such resumes in an hour the rental ends
+(`a_renter_saying_a_low_count_after_each_resume_costs_the_hashmaker_no_more_than_was_in_flight`).
+
 **Follow-up, not built: refuse a key a block has revealed.** A found block publishes its key, so a hashmaker can
 work out that key's mask, and spot wins on any later job that commits to the same key. A gateway's own key changes
 with every template, and the app refuses a gateway key seen on two previous blocks. A key the pool holds (ABW) can

@@ -1228,6 +1228,10 @@ How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is
 - These figures assume firmware that hashes what Stratum gives it and honours `mining.set_difficulty`. No real
   firmware has been run against the check yet.
 - Writes to a miner and to the hashtaker's gateway have no time limit (from reading the code, not measured).
+- After a dropped link, the hashmaker can lose at most the work it forwarded in the 2 s before it last heard from the
+  renter that the renter's gateway never took (shares sent again the renter couldn't send on or count), at most 8
+  times an hour; past that the rental ends. After each resume both sides say their count, and the hashmaker's comes
+  down to the renter's by no more than that.
 - A rental's last ticket can pass its budget by less than a slice, which stays with the seller as credit for about
   20 hours: a ticket is never smaller than a slice, since the wallet refuses a charge cap under the price.
 - A new price waits until the hashmaker's running rentals end: its gateway restarts to take a new route price, and a
