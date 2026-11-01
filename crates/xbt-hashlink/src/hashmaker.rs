@@ -1593,11 +1593,12 @@ fn name_unit(g: &mut Hub, id: u64, worker: &str) {
         n += 1;
         name = format!("{worker} #{n}");
     }
-    let (mut carried, mut methods, peer) = (0u128, BTreeMap::new(), g.conns[&id].peer.clone());
+    let (mut carried, mut methods, mut placed, peer) = (0u128, BTreeMap::new(), None, g.conns[&id].peer.clone());
     if provisional {
         if let Some(u) = g.units.remove(&cur) {
             carried = u.work;
             methods = u.methods;
+            placed = u.rental;
         }
         for r in g.rentals.values_mut() {
             r.units.remove(&cur);
@@ -1618,6 +1619,15 @@ fn name_unit(g: &mut Hub, id: u64, worker: &str) {
     }
     if u.rental.as_ref().is_some_and(|r| !g.rentals.contains_key(r)) {
         u.rental = None;
+    }
+    // the rental that took it before it said its name keeps it (its miner is hashing for it now), unless
+    // its own record is still in a rental. Let go, it was offered again only at the next round, after any
+    // miner freed meanwhile that sorts before it: the rental took that one, and this miner was let go
+    if u.rental.is_none() {
+        if let Some(r) = placed.and_then(|r| g.rentals.get_mut(&r)) {
+            r.units.insert(name.clone());
+            g.units.get_mut(&name).unwrap().rental = Some(r.id.clone());
+        }
     }
     // the channels this connection uses credit their work to the miner's own name
     let chans: Vec<(String, u32)> = g.conns[&id].slots.values().filter_map(|s| match &s.kind {
@@ -2031,6 +2041,48 @@ mod tests {
         assert_eq!(code, 200);
         let r = &h.status()["rentals"][0];
         assert_eq!((r["paid"].as_u64(), r["ready"].as_bool()), (Some(1), Some(true)), "{r}");
+        h.shutdown();
+    }
+
+    /// A miner waits for the answer to its subscribe before it says its name, so with no fallback it is
+    /// taken by a rental before it is named. Named, it stays with that rental: the rental is not left one
+    /// short for the next round to fill, which takes a free miner whose name sorts first (one whose own
+    /// rental just ended) and lets this one go (`a_huge_difficulty_ends_that_rental_and_the_app_and_other_rentals_go_on`).
+    #[test]
+    fn a_miner_taken_before_it_says_its_name_stays_with_that_rental() {
+        let terms = Terms { slice_work: 1 << 20, price_msat: 5_000, grace_ms: 30_000, start_slices: 0 };
+        let s = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slices = s.local_addr().unwrap().to_string();
+        drop(s);
+        let (h, addr, hpub) = start(&terms, &slices);
+        let lk = link::dial(&addr, crate::noise::fresh_key(), hpub).unwrap();
+        lk.tx.send(&Msg::Hello { rental: "r".into(), listing: "l".into(), terms: terms.clone(), miners: 1, proof: Some(PROOF.into()) }).unwrap();
+        let mut rx = lk.rx;
+        assert!(matches!(rx.recv_within(Duration::from_secs(5)), Ok(Some(Msg::Welcome { .. }))));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = |unit: &str| Conn {
+            unit: Some(unit.into()), peer: "127.0.0.1".into(), w: TcpStream::connect(l.local_addr().unwrap()).unwrap(), local: String::new(), slots: BTreeMap::new(),
+            active: None, held: Vec::new(), subscribe: None, authorize: None, configure: None, extranonce: false, fb_meter: Verdicts::default(), close_at: None,
+            // the app's own rounds leave these two alone
+            busy: true, hinted: false,
+        };
+        let mut g = lock(&h.hub);
+        g.rentals.get_mut("r").unwrap().ready = true;
+        // placed by its address and taken by the rental
+        let placed = "127.0.0.1 #900".to_string();
+        g.conns.insert(900, conn(&placed));
+        g.units.insert(placed.clone(), Unit { provisional: true, conn: Some(900), rental: Some("r".into()), ..Unit::default() });
+        g.rentals.get_mut("r").unwrap().units.insert(placed.clone());
+        // a named miner, free, its name before the other's
+        g.conns.insert(901, conn("m0"));
+        g.units.insert("m0".into(), Unit { conn: Some(901), ..Unit::default() });
+        name_unit(&mut g, 900, "other");
+        assert_eq!(g.units["other"].rental.as_deref(), Some("r"), "named, it keeps its rental");
+        assert!(!g.units.contains_key(&placed));
+        assert!(!g.allocate(), "the rental has the miner it asked for");
+        assert_eq!(g.rentals["r"].units.iter().collect::<Vec<_>>(), ["other"]);
+        assert!(g.units["m0"].rental.is_none());
+        drop(g);
         h.shutdown();
     }
 
