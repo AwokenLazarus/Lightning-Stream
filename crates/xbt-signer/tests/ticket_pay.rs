@@ -11358,3 +11358,73 @@ fn a_rental_through_the_renters_socket_pays_on_its_own_terms() {
     // past the wallet's own limits for one payment and one seller's day, which a rental is not held to
     assert!(booked > 10_000 && booked == r.ledger_sum(), "{booked} of {}", r.ledger_sum());
 }
+
+// --- a session is its task's alone ------------------------------------------------------------------------------
+
+/// What the ledger holds under `task`'s memo.
+fn ledger_of(r: &Rig, task: &str) -> i64 {
+    r.ledger().iter().filter(|row| row["memo"].as_str().and_then(xbt_signer::ticket::memo_task) == Some(task)).map(|row| row["amount_sats"].as_i64().unwrap()).sum()
+}
+
+/// A call of one task is never served by another task's session. A task's budget is booked when its ticket
+/// is bought, so a `swarm` call paid from the session `film` has open at the same address spends film's
+/// credit, and the refills it buys there are booked to film: past swarm's own budget. With film's session
+/// open, swarm's call opens a session of its own beside it, buys its own ticket, and books it to swarm; film's
+/// next call is still served by film's session.
+#[test]
+fn a_call_of_another_task_opens_its_own_session_beside_an_open_one() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let a = r.pay("/page/10", 2_000);
+    assert_eq!((a["status"].as_u64(), a["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{a}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    let film_before = ledger_of(&r, "film");
+    let b = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!(b["status"].as_u64(), Some(200), "{b}");
+    assert_ne!(b["session"], a["session"], "swarm's call is served by a session of its own: {b}");
+    assert_eq!(b["tickets_prepaid"].as_u64(), Some(1), "swarm bought its own ticket: {b}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    r.tick();
+    assert_eq!((ledger_of(&r, "film"), ledger_of(&r, "swarm")), (film_before, SETTLED), "{:?}", r.ledger());
+    // both are open, and each task's call goes to its own
+    let c = r.pay("/page/10", 2_000);
+    let d = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!((c["status"].as_u64(), &c["session"], c["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), &a["session"], 0), "{c}");
+    assert_eq!((d["status"].as_u64(), &d["session"], d["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), &b["session"], 0), "{d}");
+    assert_eq!(r.money().0, 2 * TICKET, "two tickets, one each");
+}
+
+/// A call of one task at another address of the same seller does not stop the session another task has open
+/// there (as it does its own task's, to take over its balance): film's session goes on, and its next call
+/// is served by it, with nothing taken over.
+#[test]
+fn a_call_of_another_task_at_another_address_leaves_the_open_session_alone() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"ticket_msat": 1_000_000, "settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}, "alias": true}));
+    let a = r.pay("/page/10", 2_000);
+    assert_eq!(a["status"].as_u64(), Some(200), "{a}");
+    wait_for("nothing on its way", || r.status()["tickets"]["sending"].as_i64().unwrap_or(0) == 0);
+    let b = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10").replace("127.0.0.1", "localhost"), "max_sats": 2_000, "task": "swarm"}));
+    assert_eq!(b["status"].as_u64(), Some(200), "{b}");
+    assert_ne!(b["session"], a["session"]);
+    assert!(b.get("stopped").is_none(), "{b}");
+    let c = r.pay("/page/10", 2_000);
+    assert_eq!((c["status"].as_u64(), &c["session"]), (Some(200), &a["session"]), "film's session is still open: {c}");
+    assert!(r.audit("ticket_resumed").is_empty(), "nothing taken over: {:?}", r.audit("ticket_resumed"));
+}
+
+/// The guard against buying a ticket beside a prepaid one still pending holds that ticket's credit for its own
+/// task: another task can never take it over, so its call is not held back waiting for it, and buys its own.
+#[test]
+fn a_call_of_another_task_is_not_held_back_by_a_pending_prepaid_ticket_it_cannot_take() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true}, "alias": true}));
+    r.ln.st.lock().unwrap().held_back = true;
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["rule"].as_str(), Some("ticket_prepay_pending"), "{v}");
+    r.ln.st.lock().unwrap().held_back = false;
+    let other = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10").replace("127.0.0.1", "localhost"), "max_sats": CALL, "task": "swarm"}));
+    assert_eq!((other["status"].as_u64(), other["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{other}");
+    // (film's own call there is still held back for it: a_call_to_a_second_address_of_the_seller_buys_nothing_beside_a_pending_prepaid_ticket)
+}
