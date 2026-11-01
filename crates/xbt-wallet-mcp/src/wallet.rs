@@ -216,15 +216,24 @@ pub struct Wallet {
     pub ln_tools: bool,
     /// `XBT_MCP_TICKETS=1`: offer `ticket_status` and `ticket_stop` (the signer's policy must turn tickets on).
     pub ticket_tools: bool,
+    /// The longest a paying call waits for the signer's answer (`XBT_MCP_PAY_CEILING_S`): past it the answer counts as
+    /// lost (`signer_no_answer`), so that a signer that never answers (stuck, or stopped with its socket open) holds no
+    /// worker for ever. As shipped, the longest the signer keeps any answer open (`tickets.max_socket_s`, 6 h) and 5
+    /// minutes more: no call the signer works on is cut by it.
+    pub pay_ceiling: Duration,
 }
+
+/// [`Wallet::pay_ceiling`] as shipped, in seconds.
+pub const PAY_CEILING_S: u64 = xbt_signer::ticket::MAX_SOCKET_S as u64 + 300;
 
 impl Wallet {
     pub fn new(sock: PathBuf) -> Self {
         let wait = std::env::var("XBT_MCP_APPROVAL_WAIT_S").ok().and_then(|v| v.parse::<f64>().ok()).filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0);
         let ln_tools = std::env::var("XBT_MCP_LN").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
         let ticket_tools = std::env::var("XBT_MCP_TICKETS").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        let ceiling = std::env::var("XBT_MCP_PAY_CEILING_S").ok().and_then(|v| v.parse::<u64>().ok()).filter(|s| *s > 0).unwrap_or(PAY_CEILING_S);
         Self { sock, timeout: default_timeout(), approval_wait: Duration::from_secs_f64(wait.min(86_400.0)), ln_tools,
-               ticket_tools }
+               ticket_tools, pay_ceiling: Duration::from_secs(ceiling) }
     }
 
     /// B2's environment: `B2_SIGNER_SOCK` / `B2_ROOT`, `B2_SIGNER_TIMEOUT`. `XBT_MCP_PAYER=local` was
@@ -248,7 +257,7 @@ impl Wallet {
     /// call was sent (the signer stopped, the socket failed) is said as such, not as an error that
     /// reads as if nothing happened: the call may have paid, in part or in full.
     fn signer_pay(&self, method: &str, params: &Value) -> Result<Value, String> {
-        match signer_call_waiting(&self.sock, self.timeout, None, method, params) {
+        match signer_call_waiting(&self.sock, self.timeout, Some(self.pay_ceiling), method, params) {
             Ok(v) => Ok(v),
             Err((true, e)) if !e.starts_with("signer error:") => {
                 eprintln!("xbt-wallet-mcp: {method}: the answer was lost after the call was sent: {e}");
