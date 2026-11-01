@@ -248,8 +248,9 @@ share, one slice and one ticket (546 sat at least), whichever is more, plus any 
   smallest ticket, 546 sat or a slice, whichever is more), so the next ticket is bought while what's paid still
   runs. A slice the next share needs is paid whatever the step.
 - The renter says `paying` only when its measured ticket buys would not arrive within the hashmaker's 2 s clock.
-  A hashmaker with no fallback pool keeps its miners on the rental through the wait, connected, their shares held
-  for the payment, and they go on when it lands (`a_slow_honest_renter_keeps_its_miners_on_a_hashmaker_with_no_fallback`).
+  A hashmaker with no fallback pool keeps its miners on the rental through the wait, connected, with what they
+  find meanwhile going no further (it would reach the renter as late as shares held back), and they go on when the
+  payment lands (`a_slow_honest_renter_keeps_its_miners_on_a_hashmaker_with_no_fallback`).
 - A slice's payment waits for the wallet's answer as long as the wallet works on it. An answer lost after the
   payment was sent is unknown: the slice is never paid a second time, and the wallet's session is looked at for the
   credit it holds.

@@ -800,7 +800,7 @@ fn an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running() {
 }
 
 /// The same, on a hashmaker with no fallback pool, as many at home are: during each wait its miner stays connected
-/// on the rental, its shares held for the payment on its way, and goes on when it lands. A miner that doesn't come
+/// on the rental, what it finds meanwhile going no further, and goes on when the payment lands. A miner that doesn't come
 /// back when let go (as the stand-in here, which ignores `client.reconnect`) keeps hashing for the rental throughout.
 #[test]
 fn a_slow_honest_renter_keeps_its_miners_on_a_hashmaker_with_no_fallback() {
