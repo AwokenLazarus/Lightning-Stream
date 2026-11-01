@@ -148,6 +148,15 @@ fn release_hold(s: &mut Settings, going_on: usize) -> bool {
     true
 }
 
+/// New terms are about to be taken: with a gateway to ask, no new rental from this moment till it has been asked
+/// whether it charges them (just below, in the same turn), so none is taken at terms the gateway doesn't charge.
+fn hold_for_the_shop(h: &Hashmaker, f: &HashMap<String, String>, rentable: &mut Option<u32>) {
+    if f.contains_key("gateway") {
+        h.set_rentable(Some(0));
+        *rentable = Some(0);
+    }
+}
+
 /// How often the gateway is asked what it charges, while it is asked at all.
 const SHOP_ASKED_EVERY: Duration = Duration::from_secs(10);
 
@@ -418,6 +427,9 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
             release_hold(&mut next, h.rentals_going_on());
             if next != settings {
                 asked_now = next.terms.price_msat != settings.terms.price_msat;
+                if asked_now {
+                    hold_for_the_shop(&h, f, &mut rentable);
+                }
                 // a price confirmed again is no news
                 if (&next.terms, next.enabled, &next.fallback) != (&settings.terms, settings.enabled, &settings.fallback) {
                     eprintln!("hashmaker: new settings: renting {}, fallback {}, {} msat a slice of {}", if next.enabled { "on" } else { "off" },
@@ -432,6 +444,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         }
         // the last rental at the old price has ended: the new one is taken for rentals from now on
         if release_hold(&mut settings, h.rentals_going_on()) {
+            hold_for_the_shop(&h, f, &mut rentable);
             eprintln!("hashmaker: the rentals going on have ended: new rentals at {} msat a slice of {}", settings.terms.price_msat, settings.terms.slice_work);
             h.set_terms(settings.terms.clone());
             *shared.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();

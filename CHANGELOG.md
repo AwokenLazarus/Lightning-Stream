@@ -199,9 +199,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   more than 4 s before the drop. Before, a share sent again that the renter couldn't send on left the hashmaker's count ahead, and the rental could end unpaid.
 - A price saved with no rental going on holds no miner back: the hashmaker takes no new rental only until its shop
   charges that price, and the Sell page says so. While rentals go on, a new price waits for them, and the hashmaker
-  takes it for new rentals the moment the last one ends. Before, a price saved on a fresh install held every miner
-  back, under "a new price waits for the rentals going on to end", until the app's next minute check found the
-  shop charging it.
+  takes it for new rentals the moment the last one ends. The shop starts charging a new price only once the
+  hashmaker shows it has the new terms with no rental going on, so a renter taken at the old terms in that moment
+  pays them to its end. An automatic new price comes at most once every ten minutes. Before, a price saved on a
+  fresh install held every miner back, under "a new price waits for the rentals going on to end", until the app's
+  next minute check found the shop charging it.
 - Every share carries the renter's own id to its gateway, so its verdict is always read; a share with no id, or
   one still waiting for its verdict, is refused. A share whose time rolls back from its job's, or more than two
   hours forward, is refused. Before, shares with no id escaped the check of how many the gateway turned down.

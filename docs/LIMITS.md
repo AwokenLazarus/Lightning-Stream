@@ -1242,8 +1242,8 @@ How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is
 - A new price waits until the hashmaker's running rentals end: its gateway restarts to take a new route price, and a
   restart would fail a running rental's payment. While any rental runs, no new rental starts at the new price.
   With none running, no new rental starts until the gateway charges the new price (about the time it takes to
-  restart). A rental that starts in the second or two between the app reading the hashmaker's status and the
-  hashmaker reading its new terms keeps the old price, and its payments fail once the gateway has restarted.
+  restart). An automatic new price (the market price moving) comes at most once every ten minutes; a price the owner
+  saves is taken at once.
 - A renter that keeps reading its link, slowly, can hold up the hashmaker's sends to it for up to 5 s each: the
   write limit ends only a write that makes no progress (from reading the code, not measured).
 - Each side keeps the hashes of the shares a rental counted to refuse repeats, up to about 4 million, about 100 MB
