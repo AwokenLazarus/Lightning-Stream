@@ -249,9 +249,15 @@ struct Due<'a> {
 }
 
 impl Due<'_> {
-    /// When every wait of this release ends, its turn having come at `turn`.
-    fn pause_by(&self, tp: &TicketPolicy, turn: Instant) -> Instant {
-        (self.waiting_since.unwrap_or(turn) + Duration::from_millis(tp.ready_wait_ms.clamp(0, 600_000) as u64)).min(self.call_by)
+    /// When every wait of this release ends, its turn having come at `turn`: `tickets.ready_wait_ms` from when the
+    /// waiting began, and for an answer its seller keeps paused `refill_wait` (its terms' `refillWaitMs`), no later than a
+    /// margin before the seller ends it ([`crate::ticket_http::seller_pause`]).
+    fn pause_by(&self, tp: &TicketPolicy, turn: Instant, refill_wait: Option<Duration>) -> Instant {
+        let mut wait = Duration::from_millis(tp.ready_wait_ms.clamp(0, 600_000) as u64);
+        if let (Some(_), Some(w)) = (self.waiting_since, refill_wait) {
+            wait = wait.min(crate::ticket_http::seller_pause(w));
+        }
+        (self.waiting_since.unwrap_or(turn) + wait).min(self.call_by)
     }
 }
 
@@ -4274,7 +4280,7 @@ impl Signer {
                             json!({"session": hs.sid})));
         };
         let turn = Instant::now();
-        let pause_by = due.pause_by(&tp, turn);
+        let pause_by = due.pause_by(&tp, turn, hs.terms.refill_wait);
         if let Some(why) = hs.fault() {
             return Err(self.ticket_fault(hs, &why));
         }

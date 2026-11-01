@@ -354,6 +354,7 @@ impl Gateway {
             receipt_key: hex::encode(ecdsa::pubkey(&key)),
             session: ticket::SESSION_PATH.into(),
             seq_window: cfg.caps.seq_window.clamp(1, crate::book::SEQ_WINDOW_MAX),
+            refill_wait_ms: Some(u64::try_from(cfg.times.refill_wait.as_millis()).unwrap_or(u64::MAX)),
         };
         let (mut store, recs) =
             Store::open(&cfg.state_dir).map_err(|e| Error::Journal(e.to_string()))?;

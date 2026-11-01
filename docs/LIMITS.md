@@ -942,7 +942,10 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A release pauses for 12 s at most, all told, whatever it waits for (`tickets.ready_wait_ms`):
   under the 15 s a seller as shipped keeps a paused answer open, so that no secret leaves for an
   answer already over; just before the book the seller's signed `status` is asked whether it is.
-  A seller that closes a paused answer sooner than that is caught there, not before. For an answer
+  A seller that says in its terms how long it keeps a paused answer (`refillWaitMs`, from 0.2.0) has
+  the pause end a margin before then, a tenth of it but at least 1 s and at most 3 s (a seller that
+  waits 2 s: a pause of 1 s; one that waits 1 s or less: no pause), if that comes sooner. One that
+  closes a paused answer sooner and does not say so is caught there, not before. For an answer
   by the byte the 12 s run from its last byte, for a request from when its turn comes, and for an
   answer by the second from each release, since each second's ticket can wait in its turn.
 - **An answer priced by the second is charged for the pauses.** It is the clock's price: the

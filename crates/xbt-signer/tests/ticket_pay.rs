@@ -3194,10 +3194,41 @@ fn a_file_waits_for_a_ticket_the_seller_is_slow_to_show_locked() {
 
 /// A rig whose seller keeps a paused answer open as long as it does as shipped.
 fn seller_waits_as_shipped(extra: Value) -> Rig {
-    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    seller_waits(15_000, extra)
+}
+
+/// The seller's terms as one before 0.2.0 gives them: every 402 with `refillWaitMs` taken out, from the first, so that
+/// the session's terms never have it.
+fn says_no_refill_wait(r: &Rig) {
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        if let Some((_, v)) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = unb64json(v).unwrap();
+            for e in pr["accepts"].as_array_mut().unwrap() {
+                e["extra"].as_object_mut().map(|x| x.remove("refillWaitMs"));
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+}
+
+/// A rig whose seller keeps a paused answer `ms` before it ends it.
+fn seller_waits(ms: u64, extra: Value) -> Rig {
+    REFILL_WAIT_MS.store(ms, Ordering::SeqCst);
     let r = Rig::new(extra);
     REFILL_WAIT_MS.store(REFILL_WAIT_DEFAULT_MS, Ordering::SeqCst);
     r
+}
+
+/// The wallet's node shows none of the next tickets locked for 18 s: a release waits for it to the end of its pause.
+fn late_ticket(r: &Rig) {
+    let mut s = r.ln.st.lock().unwrap();
+    s.unseen_next = 1_000;
+    s.unseen_for = Duration::from_secs(18);
 }
 
 /// What the buyer's node paid, what the seller's node took, the book and the ledger are one number, and every secret that left is one of them.
@@ -3423,12 +3454,67 @@ fn no_ticket_is_released_after_the_seller_has_closed_the_answer() {
     assert_money_agrees(&r);
 }
 
-/// A seller that closes a paused answer sooner than the wallet's pause (this one after 2 s), and then shows the ticket:
-/// its signed `status` lists the answer as ended, and nothing is released into it.
+/// A seller that keeps a paused answer 6 s, less than the wallet's 12 s pause, and says so in its terms
+/// (`refillWaitMs`), with the wallet's node late with the ticket: the pause ends a margin before the seller would
+/// close the answer (5 s from the last byte), not 6 s after it is closed. Nothing more is released, and what arrived
+/// is what eight paid for.
+///
+/// FAILS with the pause held to `ready_wait_ms` alone: it runs its 12 s, past the seller's close.
+#[test]
+fn a_seller_that_keeps_a_paused_answer_less_than_the_wallets_pause_has_the_pause_end_before_its_close() {
+    let _g = env_lock();
+    let r = seller_waits(6_000, json!({}));
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    late_ticket(&r);
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    // the body's 39 MiB and the 5 s pause, with room for a loaded machine; the 12 s pause takes 12 s and more
+    assert!(took < Duration::from_secs(10), "the pause ended before the seller's 6 s: {took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert_eq!(v["bytes"].as_u64().unwrap() as usize, 39 * MIB, "what 7.8 tickets pay for: {v}");
+    assert_eq!(r.tap.secrets().len(), 8, "no secret after the pause: {v}");
+    r.shop.standin.hold_streams(false);
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+    assert_money_agrees(&r);
+}
+
+/// The same seller as one before 0.2.0, whose terms do not say how long it keeps a paused answer: the wallet pauses by
+/// its own limit, 12 s, as it always has, and still releases nothing after the seller's close.
+#[test]
+fn a_seller_whose_terms_do_not_say_its_wait_is_paused_for_by_the_wallets_own_limit() {
+    let _g = env_lock();
+    let r = seller_waits(6_000, json!({}));
+    says_no_refill_wait(&r);
+    first_call_with_the_pool_shown(&r);
+    r.shop.standin.hold_streams(true);
+    late_ticket(&r);
+    let n = 60 * MIB;
+    let t0 = Instant::now();
+    let v = r.pay(&format!("/files/{n}"), 20_000);
+    let took = t0.elapsed();
+    assert!(took >= Duration::from_secs(11), "the wallet's own 12 s: {took:?} {v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert_eq!(v["bytes"].as_u64().unwrap() as usize, 39 * MIB, "{v}");
+    assert_eq!(r.tap.secrets().len(), 8, "no secret after the pause: {v}");
+    r.shop.standin.hold_streams(false);
+    r.tap.clear();
+    stop_and_wait_for_tickets_back(&r, &v["session"]);
+    assert_eq!(r.tap.secrets().len(), 8, "{v}");
+    assert_money_agrees(&r);
+}
+
+/// A seller that closes a paused answer sooner than the wallet's pause (this one after 2 s) and does not say so in its
+/// terms (one before 0.2.0, `refillWaitMs` left out), and then shows the ticket: its signed `status` lists the answer as
+/// ended, and nothing is released into it. (A seller that says so has the pause end before its close, above.)
 #[test]
 fn a_close_by_the_seller_during_the_pause_is_noticed_and_nothing_is_released() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
+    says_no_refill_wait(&r);
     first_call_with_the_pool_shown(&r);
     r.shop.standin.hold_streams(true);
     let n = 60 * MIB;

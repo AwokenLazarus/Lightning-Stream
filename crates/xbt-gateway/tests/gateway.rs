@@ -81,6 +81,8 @@ fn an_unpaid_request_gets_the_terms_and_reaches_nothing() {
         json!({"requestMsat": "0", "byteMsat": "1000", "perBytes": "1048576", "secondMsat": "0"})
     );
     assert_eq!(x["receiptKey"], KEY(&rig));
+    // how long it keeps an answer paused for a release (`times.refill_wait_ms`, 300 in this rig)
+    assert_eq!(x["refillWaitMs"].as_u64(), Some(300));
     assert_eq!(pr["resource"]["url"], "http://gateway.test:8402/files/1000");
     assert_eq!(
         http(&rig.addr, "GET", "/verify/10", &[], b"", None).json()["accepts"][0]["extra"]
