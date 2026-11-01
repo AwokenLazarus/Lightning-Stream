@@ -195,8 +195,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   rate says could have been on their way count at once, and the rest only once the gateway takes them. A link
   that drops more than 8 times in an hour ends the rental.
 - After a dropped link both sides say their count once the shares sent again are settled, and the hashmaker's comes
-  down to the renter's by no more than what it forwarded in the 2 s before the drop. Before, a share sent again
-  that the renter couldn't send on left the hashmaker's count ahead, and the rental could end unpaid.
+  down to the renter's by no more than what it forwarded in the 2 s before the renter was last heard from, never
+  more than 4 s before the drop. Before, a share sent again that the renter couldn't send on left the hashmaker's count ahead, and the rental could end unpaid.
 - Every share carries the renter's own id to its gateway, so its verdict is always read; a share with no id, or
   one still waiting for its verdict, is refused. A share whose time rolls back from its job's, or more than two
   hours forward, is refused. Before, shares with no id escaped the check of how many the gateway turned down.
