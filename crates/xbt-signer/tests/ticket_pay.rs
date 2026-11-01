@@ -7463,7 +7463,9 @@ fn wins_at_the_sellers_count_go_first_before_the_next_stands_it_still() {
     let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "refill_wait_ms": 120_000,
                          "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
     let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
-                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}},
+                                   // the strict seller's 28 pieces 2 s apart take 56 s, past the 50 s a call read whole is given
+                                   "max_answer_s": 120}});
     let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
     {
         let mut s = r.ln.st.lock().unwrap();
