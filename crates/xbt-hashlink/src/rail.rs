@@ -294,9 +294,14 @@ impl SignerPayer {
     /// hashmaker knows whether it arrived, and ends the rental if it didn't).
     fn lost_answer(&mut self, why: &str) -> serde_json::Value {
         let status = self.session.clone().and_then(|s| signer_call(&self.sock, "ticket_status", &serde_json::json!({"session": s})).ok());
-        if let Some(b) = status.as_ref().and_then(|v| v.get("balance_msat")).and_then(serde_json::Value::as_str).and_then(|s| s.parse::<u64>().ok()) {
+        // the wallet's own count of what this session's seller holds: its entry in `paying`
+        let mine = status.as_ref().and_then(|v| v.get("paying")).and_then(serde_json::Value::as_array)
+            .and_then(|p| p.iter().find(|e| e.get("session").and_then(serde_json::Value::as_str) == self.session.as_deref()));
+        if let Some(b) = mine.and_then(|e| e.get("balance_msat")).and_then(serde_json::Value::as_str).and_then(|s| s.parse::<u64>().ok()) {
             self.credit_msat = b;
         }
+        // it may have been charged: counted as if it was, so what the budget has left is never overstated
+        self.charged_msat = self.charged_msat.saturating_add(self.price_msat);
         serde_json::json!({"verdict": "unknown", "rule": "signer_no_answer", "request_sent": true, "charged_sats": 0,
                            "reason": format!("the wallet's signer took the payment and its answer was lost ({why}): it may have paid"),
                            "ticket_status": status})
@@ -473,13 +478,16 @@ mod signer_wait_tests {
         let dir = scratch("lost");
         let sock = dir.join("signer.sock");
         let paid = serde_json::json!({"verdict": "allow", "status": 200, "price_msat": "404250", "balance_msat": "141750", "session": "s1"});
-        let seen = scripted(&sock, Duration::ZERO, vec![("xbt402_pay", Some(paid)), ("xbt402_pay", None), ("ticket_status", Some(serde_json::json!({"balance_msat": "123000"})))]);
-        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 404_250, None, None, Duration::from_secs(2));
+        // ticket_status as the signer answers it: each HTTP session's count under `paying`
+        let status = serde_json::json!({"paying": [{"session": "other", "balance_msat": "999000"}, {"session": "s1", "balance_msat": "123000", "spent_msat": "808500"}]});
+        let seen = scripted(&sock, Duration::ZERO, vec![("xbt402_pay", Some(paid)), ("xbt402_pay", None), ("ticket_status", Some(status))]);
+        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 404_250, Some(2_000), None, Duration::from_secs(2));
         assert_eq!(p.pay("r1", 1, &serde_json::json!({})).unwrap()["verdict"], "allow");
         let v = p.pay("r1", 2, &serde_json::json!({})).unwrap();
         assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["request_sent"].as_bool()), (Some("unknown"), Some("signer_no_answer"), Some(true)), "{v}");
         assert_eq!(*seen.lock().unwrap(), vec!["xbt402_pay", "xbt402_pay", "ticket_status"], "looked at, not paid again");
-        assert_eq!(Payer::held(&p).0, 123_000, "the credit the session holds now");
+        // the credit this session's seller holds now, and the slice counted as charged: the budget left is never overstated
+        assert_eq!(Payer::held(&p), (123_000, Some(2_000_000 - 2 * 404_250 - 123_000)));
     }
 
     /// The offer's price per slice goes with each payment as the wallet's `price_ceiling`, so a
