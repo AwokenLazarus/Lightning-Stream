@@ -62,6 +62,10 @@ real cause was the buyer's own rule: at most 5,000 sat a day to one seller, abou
   fee)", where it said 903. The same goes for "Paid so far" on Live connections. The spending rules still
   count each payment in whole sats, rounded up, which is the safe side. Recent activity on the Wallet page
   has **Show more**.
+- **Agents can see what they may buy.** The wallet's MCP server has a new read-only `list_services` tool. It
+  lists each service's kind, seller, price, the exact address to pay and whether the owner's rules allow it,
+  and gives the box's AI endpoint. The shop pay tool's description points to it. A shop reached by its key
+  had no address an agent could find or guess before.
 - **Shops: two sessions from one address on mainnet.** The Sell page's mainnet default is now 2 sessions
   per buyer address (was 1), which is the gateway's own default. With 1, a buyer's own stale session could
   shut that buyer out. Unpaid invoices from one address are still capped at 2.
