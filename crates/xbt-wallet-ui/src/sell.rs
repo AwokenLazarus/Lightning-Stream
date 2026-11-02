@@ -209,13 +209,33 @@ pub struct OfferApp {
     /// with the seller's API key kept beside the gateway's (docs/BUYER-ACCOUNTS.md). `None`: no
     /// accounts.
     pub accounts: Option<Vec<String>>,
+    /// Paths of the app (as the app sees it) served free, GET and HEAD only: its own web client's
+    /// files (Jellyfin's and Plex's `/web/`), so that loading the page costs a buyer nothing and
+    /// is sent compressed and kept by the browser. Each is a free route of its own under the app's
+    /// service, before its paid route ([`free_routes`]). `None`: never chosen (the form offers
+    /// [`DEFAULT_FREE_PATHS`] for a media server); `Some` of none: the seller chose none.
+    pub free: Option<Vec<String>>,
 }
+
+/// What a media server's page is offered as free paths: Jellyfin's and Plex's web client.
+pub const DEFAULT_FREE_PATHS: &str = "/web/";
+
+/// The most free paths one app may have.
+const MAX_FREE_PATHS: usize = 20;
 
 impl OfferApp {
     /// A path of the app (as the app sees it) as the shop's route sees it: under `base`.
     fn shop_path(&self, p: &str) -> String {
         format!("{}{}", self.base.trim_end_matches('/'), if p.starts_with('/') { p.to_string() } else { format!("/{p}") })
     }
+}
+
+/// A service that looks like a media server's web app (Jellyfin, Plex, Emby): its web client is
+/// under `/web/`.
+fn looks_like_media_app(o: &Offer) -> bool {
+    let words = format!("{} {}", o.name, o.address).to_ascii_lowercase();
+    o.app.is_some() && (o.kind == Kind::Media || ["jellyfin", "plex", "emby"].iter().any(|w| words.contains(w))
+                        || o.app.as_ref().is_some_and(|a| a.entry.ends_with("/web/") || a.entry.contains("/web/index.html")))
 }
 
 /// The paths a seller lists for an app, one per line or comma-separated: each starts with `/`.
@@ -231,6 +251,53 @@ fn app_paths(text: &str) -> Result<Vec<String>, String> {
         out.push(p.to_string());
     }
     Ok(out)
+}
+
+/// The free paths a seller lists for an app (one per line or comma-separated), each a path of the
+/// app below its own `/`: plain segments, no `.` or `..`.
+fn free_paths(text: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = vec![];
+    for p in text.split(['\n', ',']).map(str::trim).filter(|p| !p.is_empty()) {
+        let plain = p.starts_with('/') && p != "/" && p.len() <= 200 && !p.contains("//") && !p.contains(['?', '#', '%', ' ', '\\', '*'])
+            && p.bytes().all(|c| c.is_ascii_graphic()) && !p.split('/').any(|s| s == "." || s == "..");
+        if !plain {
+            return Err(format!("{p} is not a free path: it is a path below the app's own /, like /web/, with no spaces, . or .. in it."));
+        }
+        if out.len() >= MAX_FREE_PATHS {
+            return Err(format!("At most {MAX_FREE_PATHS} free paths."));
+        }
+        if !out.iter().any(|x| x == p) {
+            out.push(p.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// The free routes of an offer's web app ([`OfferApp::free`]): GET and HEAD, gzip, the app's refused
+/// and allowed paths, under the offer's service, with no price, no login and no live connections.
+/// None where the app's route passes requests on without its path (`strip`): a route strips all of
+/// its own path, so a free route below it would reach the service at the wrong place. A path that is
+/// a route of the shop already (`taken`) is left to it.
+fn free_routes(o: &Offer, taken: &std::collections::HashSet<String>) -> Vec<Value> {
+    let Some(app) = o.app.as_ref() else { return vec![] };
+    if o.strip && app.base != "/" {
+        return vec![];
+    }
+    let paths = |list: &[String]| json!(list.iter().map(|p| app.shop_path(p)).collect::<Vec<_>>());
+    app.free.iter().flatten().map(|p| app.shop_path(p)).filter(|p| *p != app.base && !taken.contains(p)).map(|p| {
+        let mut r = json!({"path": p, "upstream": o.address, "free": true, "methods": ["GET", "HEAD"], "accept_gzip": true});
+        if !app.deny.is_empty() {
+            r["deny_paths"] = paths(&app.deny);
+        }
+        if !app.allow.is_empty() {
+            r["allow_paths"] = paths(&app.allow);
+        }
+        // the app's service: one service to a buyer, however many routes (docs/CAPACITY.md)
+        if (1..=64).contains(&o.id.len()) {
+            r["service"] = json!(o.id);
+        }
+        r
+    }).collect()
 }
 
 /// The file beside the gateway's config that holds an offer's Jellyfin API key: read by the
@@ -253,7 +320,8 @@ fn api_key(s: &str) -> Result<String, String> {
 pub(crate) fn jellyfin_libraries(address: &str, key: &str) -> Result<Vec<(String, String)>, String> {
     let url = format!("{}/Library/VirtualFolders", address.trim_end_matches('/'));
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
-    let text = match agent.get(&url).set("X-Emby-Token", key).call() {
+    // the one header every Jellyfin takes: 10.11 and later refuse X-Emby-Token by default, a valid key included
+    let text = match agent.get(&url).set("Authorization", &xbt_gateway::jellyfin::admin_authorization(key)).call() {
         Ok(r) => r.into_string().map_err(|e| format!("Jellyfin's answer could not be read: {e}"))?,
         Err(ureq::Error::Status(401 | 403, _)) => return Err("Jellyfin did not accept that API key: make one under Dashboard, API Keys, and paste it here.".into()),
         Err(ureq::Error::Status(code, _)) => return Err(format!("Jellyfin at {address} answered {code}: is this its address?")),
@@ -492,6 +560,9 @@ fn offer_json(o: &Offer) -> Value {
         if let Some(l) = &a.accounts {
             v["app"]["accounts"] = json!(l);
         }
+        if let Some(f) = &a.free {
+            v["app"]["free"] = json!(f);
+        }
     }
     v
 }
@@ -517,7 +588,8 @@ fn offer_of(v: &Value) -> Option<Offer> {
             let list = |k: &str| a.get(k).and_then(Value::as_array).map(|x| x.iter().filter_map(|p| p.as_str().map(str::to_string)).collect()).unwrap_or_default();
             // an app saved before live connections were carried has them on
             OfferApp { base: t("base"), entry: t("entry"), login: t("login"), deny: list("deny"), allow: list("allow"), live: a.get("live").and_then(Value::as_bool).unwrap_or(true),
-                       accounts: a.get("accounts").filter(|l| l.is_array()).map(|_| list("accounts")) }
+                       accounts: a.get("accounts").filter(|l| l.is_array()).map(|_| list("accounts")),
+                       free: a.get("free").filter(|l| l.is_array()).map(|_| list("free")) }
         }).filter(|a| a.base.starts_with('/') && a.base.ends_with('/')),
         capacity: {
             let c = v.get("capacity");
@@ -860,7 +932,13 @@ impl App {
         let mut sections = vec![];
         // the shared folder's key: the route of a Files service adds it to every request ([`crate::files`])
         let files_key = if active.iter().any(|o| o.kind == Kind::Files) { Some(crate::files::key(&self.cfg.data_dir.join("secrets"))?) } else { None };
+        // the paths the services are sold under: a free path of an app that is one of them is left to it
+        let mut taken: std::collections::HashSet<String> = active.iter().flat_map(|o| o.paths.iter().cloned().chain(o.app.iter().map(|a| a.base.clone()))).collect();
         for o in &active {
+            // an app's free paths, written before its paid route
+            let free_app = free_routes(o, &taken);
+            taken.extend(free_app.iter().filter_map(|r| r["path"].as_str().map(str::to_string)));
+            let mut free_app = Some(free_app);
             let key_file = gw.dir.join(app_key_name(&o.id)).display().to_string();
             let price = match o.unit {
                 Unit::Mib => json!({"byte_msat": o.price_msat, "per_bytes": MIB}),
@@ -894,6 +972,7 @@ impl App {
                 } else {
                     m.remove("strip_prefix");
                 }
+                let is_app = o.app.as_ref().is_some_and(|a| a.base == *p);
                 app_route(m, o.app.as_ref().filter(|a| a.base == *p), &key_file);
                 if let (Kind::Files, Some(k)) = (o.kind, &files_key) {
                     // the folder answers GET and HEAD of a file, only with the key, and sees paths from its own root
@@ -907,6 +986,9 @@ impl App {
                 // one service to a buyer, however many routes: counted once over them (docs/CAPACITY.md)
                 if (1..=64).contains(&o.id.len()) {
                     m.insert("service".into(), json!(o.id));
+                }
+                if is_app {
+                    routes.extend(free_app.take().unwrap_or_default());
                 }
                 routes.push(r);
             }
@@ -935,6 +1017,7 @@ impl App {
                 if (1..=64).contains(&o.id.len()) {
                     m.insert("service".into(), json!(o.id));
                 }
+                routes.extend(free_app.take().unwrap_or_default());
                 routes.push(r);
             }
             let base = public_url.clone();
@@ -1441,6 +1524,12 @@ impl App {
             if saved_libs.is_some() && saved_key.is_none() { " open" } else { "" },
             if saved_key.is_some() { "saved: leave empty to keep it" } else { "Dashboard, API Keys" });
         let kind = Kind::parse(&fv("kind", editing.map(|o| o.kind.id().to_string()).unwrap_or_else(|| "media".into()))).unwrap_or(Kind::Media);
+        // what was chosen; where nothing was, /web/ for what looks like Jellyfin or Plex
+        let free_default = match editing.and_then(|o| o.app.as_ref()).and_then(|a| a.free.as_ref()) {
+            Some(f) => f.join("\n"),
+            None if editing.map_or(kind == Kind::Media, looks_like_media_app) => DEFAULT_FREE_PATHS.to_string(),
+            None => String::new(),
+        };
         let (sug_price, sug_unit) = kind.suggested();
         let unit = Unit::parse(&fv("unit", editing.map(|o| o.unit).unwrap_or(sug_unit).id().to_string())).unwrap_or(sug_unit);
         let kinds: String = [Kind::Media, Kind::Files, Kind::Ai, Kind::Web, Kind::Other].iter().map(|k| {
@@ -1507,7 +1596,12 @@ impl App {
             <textarea name=\"app_deny\" rows=\"4\" class=\"mono\" placeholder=\"/System/&#10;/Sessions\">{}</textarea></label>\
             <label>Only these paths <small>(optional, one per line)</small><textarea name=\"app_allow\" rows=\"3\" class=\"mono\">{}</textarea></label>\
             <p class=\"hint\">Paths as the page sees them. Where a path is under entries of both lists, the longer one decides: \
-            <code>/</code> in the second list and <code>/Users</code> in the first refuse <code>/Users</code> but serve the rest.</p></details>\
+            <code>/</code> in the second list and <code>/Users</code> in the first refuse <code>/Users</code> but serve the rest.</p>\
+            <label>Free paths, one per line <small>(the app's own web client: GET only, nothing to pay)</small>\
+            <textarea name=\"app_free\" rows=\"2\" class=\"mono\" placeholder=\"/web/\">{}</textarea></label>\
+            <p class=\"hint\">Buyers load these without paying, compressed, and their browser keeps them, so the page opens fast. Put only the app's \
+            own files here (Jellyfin and Plex: <code>/web/</code>), never films, downloads or anything a buyer should pay for: everything else \
+            under the page stays paid. Not used where requests are passed on without the path.</p></details>\
             <details><summary>Advanced</summary>\
             <label>Items to list for buyers (files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
             <p class=\"hint\">A link may start with <code>/</code>: it is then on your shop's address.</p>\
@@ -1529,6 +1623,7 @@ impl App {
             if editing.and_then(|o| o.app.as_ref()).is_none_or(|a| a.live) { " checked" } else { "" },
             esc(&fv("app_deny", editing.and_then(|o| o.app.as_ref()).map(|a| a.deny.join("\n")).unwrap_or_default())),
             esc(&fv("app_allow", editing.and_then(|o| o.app.as_ref()).map(|a| a.allow.join("\n")).unwrap_or_default())),
+            esc(&fv("app_free", free_default)),
             esc(&fv("titles", titles)),
             esc(&fv("paths", editing.map(|o| o.paths.join(", ")).unwrap_or_default())),
             if fv("strip", editing.map(|o| if o.strip { "1" } else { "" }.to_string()).unwrap_or_else(|| "1".into())) == "1" { " checked" } else { "" },
@@ -1748,7 +1843,12 @@ impl App {
                     } else {
                         None
                     };
-                    Some(OfferApp { base, entry, login, deny, allow, live: g("app_live") == "1", accounts })
+                    // a form without the field (an older page) keeps what was chosen
+                    let free = match f.get("app_free") {
+                        Some(t) => Some(free_paths(t)?),
+                        None => shop.offers.iter().find(|o| o.id == new_id).and_then(|o| o.app.as_ref()).and_then(|a| a.free.clone()),
+                    };
+                    Some(OfferApp { base, entry, login, deny, allow, live: g("app_live") == "1", accounts, free })
                 } else {
                     None
                 };
@@ -1925,6 +2025,38 @@ fn capacity_words(c: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// A Jellyfin's libraries are read with the one header every Jellyfin takes: one that refuses the older forms (10.11
+    /// and later, by default) and one that takes both (10.10) answer alike; a wrong key is still refused in words.
+    ///
+    /// FAILS before: the key went as X-Emby-Token, and a Jellyfin 10.11 said 401 to a valid key ("did not accept that API
+    /// key").
+    #[test]
+    fn a_jellyfins_libraries_are_read_whether_or_not_it_takes_the_older_headers() {
+        const KEY: &str = "0123456789abcdef0123456789abcdef";
+        struct Jf {
+            legacy: bool,
+        }
+        impl xbt_svc::http::Handler for Jf {
+            fn body_limit(&self, _: &str, _: &str) -> usize {
+                0
+            }
+            fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+                let modern = req.header("authorization").is_some_and(|a| a.starts_with("MediaBrowser ") && a.contains(&format!("Token=\"{KEY}\"")));
+                let legacy = self.legacy && req.header("x-emby-token") == Some(KEY);
+                if !(modern || legacy) {
+                    return xbt_svc::http::Response::text(401, "text/plain", "no");
+                }
+                xbt_svc::http::Response::text(200, "application/json", r#"[{"Name": "Films", "ItemId": "aaaa1111"}]"#)
+            }
+        }
+        for legacy in [false, true] {
+            let jf = xbt_svc::http::serve(std::sync::Arc::new(Jf { legacy }), std::net::TcpListener::bind("127.0.0.1:0").unwrap(), 2).unwrap();
+            let addr = format!("http://{}", jf.addr);
+            assert_eq!(jellyfin_libraries(&addr, KEY), Ok(vec![("aaaa1111".to_string(), "Films".to_string())]), "legacy forms taken: {legacy}");
+            assert!(jellyfin_libraries(&addr, "ffffffffffffffffffffffffffffffff").unwrap_err().contains("did not accept"), "legacy forms taken: {legacy}");
+        }
+    }
+
     #[test]
     fn the_settings_shown_hide_every_header_value() {
         let c = json!({"routes": [{"path": "/files/", "upstream_headers": {"x-stream-files-key": "secret1"}},
@@ -2030,7 +2162,7 @@ mod tests {
         assert_eq!(s.free_path("x402", Kind::Web, "c"), "/x402-2/");
         // a web app whose page sees the root holds it as well
         s.offers.push(Offer { id: "w".into(), paths: vec!["/w/".into()],
-                              app: Some(OfferApp { base: "/".into(), entry: "/".into(), login: String::new(), deny: vec![], allow: vec![], live: false, accounts: None }),
+                              app: Some(OfferApp { base: "/".into(), entry: "/".into(), login: String::new(), deny: vec![], allow: vec![], live: false, accounts: None, free: None }),
                               ..s.offers[0].clone() });
         s.offers.retain(|o| o.id != "a");
         assert_eq!(s.free_path("Films", Kind::Media, "a"), "/films/");

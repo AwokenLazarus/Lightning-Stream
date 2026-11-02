@@ -93,7 +93,7 @@ pub(crate) struct Ctx {
     pub(crate) flash: Option<(bool, String)>,
 }
 
-const INT_KEYS: [(&str, &str, &str); 13] = [
+pub(crate) const INT_KEYS: [(&str, &str, &str); 13] = [
     ("max_per_tx_sats", "Largest single payment (sats)", "budgets"),
     ("daily_budget_sats", "Spending limit for any 24 hours (sats)", "budgets"),
     ("weekly_budget_sats", "Spending limit for any 7 days (sats)", "more"),
@@ -124,6 +124,16 @@ pub fn stream_token(csrf: &str) -> String {
 /// What the starter rules let rented hashrate cost on mainnet in any 24 hours: about 70 minutes of a
 /// 4 TH/s miner at market. The owner's limit: a rental's own budget is inside it.
 pub const STARTER_RENTAL_BUDGET_SATS: i64 = 200_000;
+
+/// What the starter rules let one seller be paid on mainnet in any 24 hours (`per_counterparty_daily_sats`):
+/// a film on the demo shop (about 5,000 sat at 20 sat a MiB) several times over. 0.2.5's 5,000 stopped a film
+/// near its end.
+pub const STARTER_PER_SELLER_DAILY_SATS: i64 = 20_000;
+
+/// What the starter rules let the wallet spend on mainnet in any 24 hours (`daily_budget_sats`), and the
+/// day's budget of stream tickets: above [`STARTER_PER_SELLER_DAILY_SATS`], so a day at one shop leaves room
+/// for another.
+pub const STARTER_DAILY_SATS: i64 = 25_000;
 
 /// The least `ln.exposure_cap_sats` the starter rules set on mainnet: 1,000,000 sats, so a node of
 /// ordinary size is not refused at the first payment (0.2.1's 100,000 refused a node holding
@@ -166,19 +176,26 @@ pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
            "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300,
            "ln": {"enabled": true}, "tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 100000}, "hashrate": {"budget_sats": 100000}}}});
     if chain == "main" {
-        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000), ("per_counterparty_daily_sats", 5000),
-                       ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
+        // sized so that a first film at one shop (about 5,000 sat at 20 sat a MiB) and some AI fit in a day with that shop, and
+        // two or three shops in a day: the most to one seller in a day is under the day's total, and a week's under the week's
+        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", STARTER_DAILY_SATS), ("weekly_budget_sats", 60_000), ("per_counterparty_cap_sats", 50_000),
+                       ("per_counterparty_daily_sats", STARTER_PER_SELLER_DAILY_SATS), ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
             p[k] = json!(v);
         }
         p["ln"]["split_height"] = json!(MAINNET_SPLIT_HEIGHT);
         p["ln"]["exposure_cap_sats"] = json!(starter_exposure_cap(held.unwrap_or(0)));
-        p["tickets"]["tasks"]["default"]["budget_sats"] = json!(10000);
+        // the day's tickets: as much as the day's spending limit
+        p["tickets"]["tasks"]["default"]["budget_sats"] = json!(STARTER_DAILY_SATS);
         // market price for a 4 TH/s miner is about 165,000 sat an hour, which no limit above would let through: the
         // task pays by its own (`tickets.tasks.*.rental`), and the rest of the wallet stands
         p["tickets"]["tasks"]["hashrate"] = json!({"budget_sats": STARTER_RENTAL_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}});
     }
     p
 }
+
+/// The rows of Recent activity on the Wallet page, and with Show more.
+const RECENT_ROWS: usize = 15;
+const RECENT_MORE: usize = 200;
 
 /// A static asset. The pages ask for it as `?v=<content hash>`: that URL never changes meaning, so
 /// it is cached for a year; any other request for it, for a day.
@@ -237,6 +254,8 @@ impl App {
         if app.cfg.prefetch {
             app.prefetch();
         }
+        // the agents' catalog, for a box whose services file predates it (or was edited by hand)
+        app.write_catalog();
         Ok(app)
     }
 
@@ -439,7 +458,7 @@ impl App {
         }
         match req.path.as_str() {
             "/" => self.home(&ctx),
-            "/wallet" => self.overview(&ctx),
+            "/wallet" => self.overview(&ctx, &req.query),
             "/browse" => self.browse(&ctx, &req.query),
             "/service" => self.service_page(&ctx, &req),
             "/services" => self.services_page(&ctx),
@@ -804,7 +823,7 @@ impl App {
         b
     }
 
-    fn overview(&self, ctx: &Ctx) -> Resp {
+    fn overview(&self, ctx: &Ctx, query: &HashMap<String, String>) -> Resp {
         let health = match self.call("health", json!({})) {
             Ok(h) => h,
             Err(e) => return self.page("Wallet", ctx, Self::error_box(&e)),
@@ -858,7 +877,9 @@ impl App {
             b.push_str(&t);
         }
         b.push_str("</section>");
-        let recent = self.call("history", json!({"limit": 15}));
+        // the latest 15 events, or with "Show more" (`?more=1`) the latest 200
+        let more = query.get("more").is_some_and(|m| m == "1");
+        let recent = self.call("history", json!({"limit": if more { RECENT_MORE } else { RECENT_ROWS }}));
         // a seller by its name where the list of sellers has it, never by a made-up `…shop.invalid` address
         let known = self.services().unwrap_or_default();
         // a payment to `ln:<node>` by the name of the seller paid through that node: on file in the rules, or vouched for by its shop
@@ -938,6 +959,10 @@ impl App {
                                     esc(&who(&txt(e.get("dest").or(e.get("origin")))))));
             }
             b.push_str("</tbody></table></div>");
+            // there may be more than the page shows
+            if !more && h["events"].as_array().is_some_and(|a| a.len() >= RECENT_ROWS) {
+                b.push_str(&format!("<p class=\"small\"><a href=\"./wallet?more=1\">Show more</a> (the latest {RECENT_MORE})</p>"));
+            }
         }
         b.push_str("<details class=\"card\"><summary>Technical details</summary>");
         b.push_str(&kv(&[("Chain", escv(health.get("chain"))), ("Signer", escv(health.get("implementation"))),
@@ -2512,6 +2537,25 @@ mod handson_0202_tests {
         assert!(!rules_allow(&json!({"allowlist": ["https://a.example"]}), "https://a.example", None));
         assert_eq!(ln_line_node(&format!("ln:{node}")), Some(node.as_str()));
         assert_eq!(ln_line_node("bc1qcoin"), None);
+    }
+
+    /// The wallet's MCP server (`list_services`) marks a seller allowed as Browse does: the same answer for each case.
+    #[test]
+    fn the_agents_catalog_marks_a_seller_allowed_as_browse_does() {
+        let node = format!("035d867908cd{}0b7d", "0".repeat(50));
+        let shop = xbt402::shop::origin_for(&[0x5a; 32]);
+        let other = "02".repeat(33);
+        let rules = [json!({"allowlist": [shop.clone(), format!("ln:{node}")], "counterparties": {}}),
+                     json!({"allowlist": ["https://a.example"], "counterparties": {"https://a.example": {"ln_node": node}}}),
+                     json!({"allowlist": [format!("ln:{node}")], "counterparties": {"https://a.example": {"ln_node": node}}}),
+                     json!({"allowlist": ["https://a.example"]}), json!({}), json!({"allowlist": ["https://A.example:443/"], "counterparties": {"https://a.example": {"ln_node": node}}})];
+        for p in &rules {
+            for origin in [shop.as_str(), "https://a.example", "https://a.example/", "https://b.example"] {
+                for known in [None, Some(node.as_str()), Some(other.as_str())] {
+                    assert_eq!(xbt_wallet_mcp::catalog::allowed(p, origin, known), rules_allow(p, origin, known), "{p} {origin} {known:?}");
+                }
+            }
+        }
     }
 
     /// Home's Get started counts a shop allowed as the signer allows it: also one allowed only

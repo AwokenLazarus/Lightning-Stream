@@ -194,6 +194,7 @@ impl App {
         let n = new.len();
         all.extend(new);
         services::save(&self.cfg.services_path(), &all)?;
+        self.write_catalog();
         self.ai_sellers_follow(&listing.seller);
         let allowed = self.seller_allowed(&listing.seller);
         Ok(format!("{} {}: {n} service{} on Browse now.{}", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" },
@@ -215,6 +216,7 @@ impl App {
         shops.insert(listing.seller.clone(), crate::shops::Shop { receipt_key: listing.receipt_key.clone(), transport: found.transport });
         crate::shops::save(&self.cfg.shops_path(), &shops)?;
         services::save(&self.cfg.services_path(), &all)?;
+        self.write_catalog();
         self.ai_sellers_follow(&listing.seller);
         let allowed = self.seller_allowed(&listing.seller);
         Ok(format!("{} {}: {n} service{} on Browse now.{}", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" },
@@ -257,6 +259,17 @@ impl App {
 
     /// Whether the spending rules let the app pay the seller at `origin`: its address on the list,
     /// tied to a Lightning node.
+    /// Write the agents' catalog ([`services::catalog`]) from the services file as it is now. Unchecked: an agent
+    /// then sees the catalog of the last write, and the owner's log says why.
+    pub fn write_catalog(&self) {
+        let all = self.file_services().unwrap_or_default();
+        let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
+        let v = services::catalog(&all, &shops, self.cfg.ai.endpoint.as_deref(), xbt_nostr::now());
+        if let Err(e) = services::save_catalog(&self.cfg.catalog_path(), &v) {
+            eprintln!("xbt-wallet-ui: the agents' catalog was not written: {e}");
+        }
+    }
+
     pub(crate) fn seller_allowed(&self, origin: &str) -> bool {
         let Ok(p) = self.signer.call("policy_get", serde_json::json!({})) else { return false };
         crate::app::rules_allow(&p["policy"], origin, self.vouched_node(origin).as_deref())
@@ -312,6 +325,7 @@ impl App {
             return Err("That seller is not in the list.".into());
         }
         services::save(&self.cfg.services_path(), &all)?;
+        self.write_catalog();
         self.ai_sellers_follow(url);
         Ok("Seller removed. Their services are no longer on Browse.".into())
     }

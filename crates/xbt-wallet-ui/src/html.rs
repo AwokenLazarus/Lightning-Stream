@@ -65,13 +65,17 @@ pub fn msat_num(m: u64) -> String {
 
 /// What a payment cost, said one way on every page (0.2.3: Wallet, Live connections and the visit
 /// showed three figures for one payment). **Paid** is what left the node: the amount the payee got
-/// plus the routing fee, from the signer's settled record, in the whole sats the signer books (that
-/// sum rounded up); its two parts follow where the record has them. The other two figures a page
-/// names are **used** (what the seller drew) and **credit left** (paid and not used yet); a
-/// reservation before a payment settles is **reserved**, never paid.
+/// plus the routing fee, from the signer's settled record, exactly (`902.009`), with its two parts,
+/// where the record has them; else the whole sats the signer booked (`paid_sats`). The total is the
+/// sum of its parts, never the booked figure rounded up per payment beside them (0.2.5 said "903 sats
+/// (900 + 2.009 fee)"). The other two figures a page names are **used** (what the seller drew) and
+/// **credit left** (paid and not used yet); a reservation before a payment settles is **reserved**,
+/// never paid.
 pub fn paid_html(paid_sats: i64, parts_msat: Option<(u64, u64)>) -> String {
-    let parts = parts_msat.map(|(v, f)| format!(" <span class=\"small\">({} + {} fee)</span>", msat_num(v), msat_num(f))).unwrap_or_default();
-    format!("<span class=\"money\">{} sats</span>{parts}", group3(paid_sats.max(0).unsigned_abs()))
+    match parts_msat {
+        Some((v, f)) => format!("<span class=\"money\">{} sats</span> <span class=\"small\">({} + {} fee)</span>", msat_num(v.saturating_add(f)), msat_num(v), msat_num(f)),
+        None => format!("<span class=\"money\">{} sats</span>", group3(paid_sats.max(0).unsigned_abs())),
+    }
 }
 
 /// UTC `YYYY-MM-DD HH:MM:SS` from Unix seconds.
@@ -303,4 +307,20 @@ pub fn kv(rows: &[(&str, String)]) -> String {
 /// The JSON a signer returned, for a details box.
 pub fn json_block(v: &Value) -> String {
     format!("<pre class=\"json\">{}</pre>", esc(&serde_json::to_string_pretty(v).unwrap_or_default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A payment's total is the sum of its parts, exactly: 900 sat to the shop and a fee of 2.009 is 902.009, not the
+    /// 903 the signer books for it. Two such payments are 1,804.018.
+    ///
+    /// FAILS before: "903 sats (900 + 2.009 fee)".
+    #[test]
+    fn a_payment_is_shown_as_the_sum_of_its_parts() {
+        assert_eq!(paid_html(903, Some((900_000, 2_009))), "<span class=\"money\">902.009 sats</span> <span class=\"small\">(900 + 2.009 fee)</span>");
+        assert_eq!(paid_html(1_806, Some((1_800_000, 4_018))), "<span class=\"money\">1,804.018 sats</span> <span class=\"small\">(1,800 + 4.018 fee)</span>");
+        assert_eq!(paid_html(903, None), "<span class=\"money\">903 sats</span>");
+    }
 }

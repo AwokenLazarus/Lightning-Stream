@@ -59,6 +59,11 @@ enum Plan {
     Busy,
     /// Its HTTP layer gave up on a request the wallet sent late (408): no handler ran, and nothing was served or charged.
     TooLate,
+    /// The buyer's own spending rules refuse the payment (`.0` the rule, `.1` its limit in sats), before anything is
+    /// asked of the seller: the signer's words are raw, with no unit.
+    Policy(&'static str, u64),
+    /// The seller refused the wallet's lock with its own internal code (`too_many_tickets`).
+    LockRefused,
 }
 
 /// The caller's socket is still there (as the signer checks before it sends).
@@ -160,6 +165,10 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                                    "request_sent": true})
                         }
                         Plan::Refused => json!({"verdict": "deny", "rule": "allowlist", "reason": "destination not on allowlist", "charged_sats": 0}),
+                        Plan::Policy(rule, limit) => json!({"verdict": "deny", "rule": rule, "reason": format!("today's spend with this seller {} exceeds its daily cap {limit}", limit + 200),
+                                                            "limit_sats": limit, "charged_sats": 0, "request_sent": false}),
+                        Plan::LockRefused => json!({"verdict": "deny", "rule": "ticket_seller", "reason": "the seller refused the lock: HTTP 402 too_many_tickets",
+                                                    "charged_sats": 0, "request_sent": false}),
                         Plan::Busy => json!({"verdict": "deny", "rule": "seller_busy", "reason": "the seller's service is full (30 of 30 buyers): nothing was paid",
                                              "status": 503, "charged_sats": 0, "request_sent": false}),
                         Plan::TooLate => json!({"verdict": "deny", "rule": "ticket_seller", "reason": "the seller answered HTTP 408 without a receipt",
@@ -838,4 +847,90 @@ fn a_seller_added_to_the_sellers_file_is_usable_on_the_next_request() {
     let (status, _, body) = chat(&r, "mistral");
     assert_eq!(status, 200, "the owner just allowed this seller: {body}");
     assert_eq!(sellers_called(&r), ["third.example"]);
+}
+
+/// The error a program gets when the buyer's own spending rules refuse the payment: what it can act on.
+fn policy_error(status: u16, body: &str) -> (Value, String) {
+    let v: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{status} {body}: {e}"));
+    let m = v["error"]["message"].as_str().unwrap_or_default().to_string();
+    (v, m)
+}
+
+/// A payment the buyer's own spending rules refuse is an OpenAI-style error a program or agent can act on: a 4xx (402 for
+/// a limit, 429 for the payments-per-hour rule), `spending_limit_reached` with the rule, and a message that names the
+/// seller, the limit in sats and where to raise it, with none of the signer's or the seller's internal words.
+///
+/// FAILS before: 502 `upstream_failed`, "No seller could answer: today's spend with this seller 5200 exceeds its daily cap 5000".
+#[test]
+fn a_payment_the_buyers_spending_rules_refuse_is_an_error_a_program_can_act_on() {
+    // a cap on the wallet as a whole: no other seller is tried, since it would be refused the same
+    let r = rig(Plan::Policy("daily_budget", 10_000), Plan::Answer(1), 100);
+    let (status, _, body) = chat(&r, "llama");
+    let (v, m) = policy_error(status, &body);
+    assert_eq!(status, 402, "{body}");
+    assert_eq!((v["error"]["type"].as_str(), v["error"]["code"].as_str(), v["error"]["rule"].as_str()),
+               (Some("spending_limit_reached"), Some("spending_limit_reached"), Some("daily_budget")), "{body}");
+    assert!(v["error"].get("param").is_some(), "OpenAI's shape has a param: {body}");
+    assert!(m.contains("10,000 sats") && m.contains("Settings → Spending rules on the Lightning Stream app"), "{m}");
+    assert!(!m.contains("exceeds") && !m.contains("5200"), "the signer's raw words stay out: {m}");
+    assert_eq!(sellers_called(&r), ["cheap.example"], "a wallet-wide limit is not tried at another seller");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(spent(&r), 0);
+
+    // today's limit for one seller, asked of that seller by name
+    let r = rig(Plan::Policy("per_counterparty_daily", 5_000), Plan::Answer(1), 100);
+    let (status, _, body) = chat(&r, "cheap/llama");
+    let (v, m) = policy_error(status, &body);
+    assert_eq!((status, v["error"]["rule"].as_str()), (402, Some("per_counterparty_daily")), "{body}");
+    assert!(m.contains("today's limit for cheap") && m.contains("5,000 sats") && m.contains("Settings → Spending rules"), "{m}");
+    // by the plain name, another seller under its own limit serves it
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(sellers_called(&r), ["cheap.example", "cheap.example", "dear.example"]);
+
+    // the payments-per-hour rule is a rate limit
+    let r = rig(Plan::Policy("velocity", 0), Plan::Policy("velocity", 0), 100);
+    let (status, _, body) = chat(&r, "llama");
+    let (v, m) = policy_error(status, &body);
+    assert_eq!((status, v["error"]["code"].as_str()), (429, Some("spending_limit_reached")), "{body}");
+    assert!(m.contains("Settings → Spending rules"), "{m}");
+}
+
+/// A seller's own refusal of the wallet's lock reaches the client in plain words, without the seller's internal code.
+///
+/// FAILS before: "No seller could answer: the seller refused the lock: HTTP 402 too_many_tickets".
+#[test]
+fn a_sellers_internal_refusal_stays_out_of_the_error() {
+    let r = rig(Plan::LockRefused, Plan::LockRefused, 100);
+    let (status, _, body) = chat(&r, "llama");
+    assert_eq!(status, 502, "{body}");
+    let (v, m) = policy_error(status, &body);
+    assert_eq!(v["error"]["code"], "upstream_failed");
+    assert!(!m.contains("too_many") && !m.contains("HTTP 402") && !m.contains("lock"), "{m}");
+}
+
+/// A model is listed by its own name (the cheapest seller that offers it) and as `seller/model` (that seller only): both
+/// say so, and both reach the same seller, with the seller's own model name and the same payment.
+///
+/// FAILS before: neither entry said what it was, and the two looked like two models.
+#[test]
+fn a_model_and_its_seller_qualified_name_say_what_they_are_and_route_the_same() {
+    let r = rig(Plan::Answer(5), Plan::Answer(9), 100);
+    let (_, _, body) = call(&r.addr, "GET", "/v1/models", Some(&r.key), "", "");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let entry = |id: &str| v["data"].as_array().unwrap().iter().find(|m| m["id"] == id).cloned().unwrap_or_else(|| panic!("{id}: {body}"));
+    let plain = entry("qwen");
+    let pinned = entry("cheap/qwen");
+    let (dp, dq) = (plain["description"].as_str().unwrap_or_default(), pinned["description"].as_str().unwrap_or_default());
+    assert!(dp.contains("cheap/qwen"), "the plain name points to the seller-qualified one: {plain}");
+    assert!(dq.contains("cheap") && dq.contains("qwen") && dq.contains("same model"), "{pinned}");
+    assert_eq!(pinned["x_stream"]["model"], "qwen");
+    assert_eq!(pinned["x_stream"]["seller"], "cheap");
+    for model in ["qwen", "cheap/qwen"] {
+        let (status, _, body) = chat(&r, model);
+        assert_eq!(status, 200, "{model}: {body}");
+    }
+    let calls = r.sellers.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!((calls[0].0.as_str(), calls[0].1["model"].as_str()), (calls[1].0.as_str(), calls[1].1["model"].as_str()), "both names reach the same seller and model");
 }

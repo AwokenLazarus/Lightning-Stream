@@ -68,9 +68,9 @@ fn each_buyer_has_an_account_of_their_own_in_jellyfin() {
     let e = env();
     let admin = std::fs::read_to_string(&e.key_file).unwrap().lines().find(|l| !l.trim().is_empty()).unwrap().rsplit('=').next().unwrap().trim().to_string();
     // buyers' users left by an earlier run that stopped short
-    let users: Value = ureq::get(&format!("{}/Users", e.url)).set("X-Emby-Token", &admin).call().unwrap().into_string().ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap();
+    let users: Value = ureq::get(&format!("{}/Users", e.url)).set("Authorization", &xbt_gateway::jellyfin::admin_authorization(&admin)).call().unwrap().into_string().ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap();
     for u in users.as_array().unwrap().iter().filter(|u| u["Name"].as_str().unwrap_or("").starts_with("buyer-")) {
-        let _ = ureq::delete(&format!("{}/Users/{}", e.url, u["Id"].as_str().unwrap())).set("X-Emby-Token", &admin).call();
+        let _ = ureq::delete(&format!("{}/Users/{}", e.url, u["Id"].as_str().unwrap())).set("Authorization", &xbt_gateway::jellyfin::admin_authorization(&admin)).call();
     }
     let key_copy = tempfile::NamedTempFile::new().unwrap();
     std::fs::copy(&e.key_file, key_copy.path()).unwrap();
@@ -149,18 +149,18 @@ fn each_buyer_has_an_account_of_their_own_in_jellyfin() {
     // (a fresh account, its history gone with the old one) instead of a login that no longer works
     std::fs::copy(&e.key_file, key_copy.path()).unwrap();
     let id2 = kept.as_object().unwrap().values().map(|a| a["user_id"].as_str().unwrap().to_string())
-        .find(|id| ureq::get(&format!("{}/Users/{id}", e.url)).set("X-Emby-Token", &admin).call().ok()
+        .find(|id| ureq::get(&format!("{}/Users/{id}", e.url)).set("Authorization", &xbt_gateway::jellyfin::admin_authorization(&admin)).call().ok()
             .and_then(|r| r.into_string().ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok())
             .is_some_and(|u| u["Name"].as_str().is_some_and(|n| n.starts_with("buyer-")) && position_of(&e, &admin, &u, &e.item) == 2_222_000_000))
         .unwrap();
-    ureq::delete(&format!("{}/Users/{id2}", e.url)).set("X-Emby-Token", &admin).call().unwrap();
+    ureq::delete(&format!("{}/Users/{id2}", e.url)).set("Authorization", &xbt_gateway::jellyfin::admin_authorization(&admin)).call().unwrap();
     let back = ask(&mut a2, "GET", &format!("/UserItems/{}/UserData", e.item), b"", None);
     assert_eq!(back.status, 200, "made anew: {}", String::from_utf8_lossy(&back.body));
     // the accounts made here, deleted with the seller's real key
     let kept: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("accounts.json")).unwrap()).unwrap();
     for (_, a) in kept.as_object().unwrap() {
         let id = a["user_id"].as_str().unwrap();
-        let _ = ureq::delete(&format!("{}/Users/{id}", e.url)).set("X-Emby-Token", &admin).call();
+        let _ = ureq::delete(&format!("{}/Users/{id}", e.url)).set("Authorization", &xbt_gateway::jellyfin::admin_authorization(&admin)).call();
     }
 }
 
