@@ -49,6 +49,10 @@ the shop (healthy while it is not selling yet).
 
 StartOS terminates TLS and adds X-Forwarded-Proto, so the UI's cookie is `Secure` over https.
 
+Links for the buyer's own player (`/r/<token>`, made on a Files page) stay on the `ui` interface: StartOS
+puts no login of its own in front of a package's interface (umbrelOS does, hence Umbrel's port 33541), and
+the UI lets a link through on its token alone, so no `XBT_UI_LINKS_BIND` port is needed here.
+
 ## Actions
 
 | action | what |

@@ -271,6 +271,44 @@ impl xbt_svc::http::Handler for Ui {
     }
 }
 
+/// The player links' own listener (`XBT_UI_LINKS_BIND`): `GET /r/<token>`, through the UI's own
+/// relay ([`Ui::reply`]: the same checks, limits, counting and revocation), and nothing else: no page,
+/// no action, no download, no API. It is for a platform whose login sits in front of the UI's port
+/// (umbrelOS's app login), which a player on another device cannot pass.
+struct Links(Arc<App>);
+
+impl Links {
+    /// Whether this listener answers the request: a `GET` of `/r/<something>` (the token is checked by the relay).
+    fn serves(&self, rq: &xbt_svc::http::Request) -> bool {
+        let path = rq.target.split('?').next().unwrap_or("");
+        rq.method.eq_ignore_ascii_case("GET") && self.0.cfg.role != crate::config::Role::Gateway
+            && strip_base(path, &self.0.cfg.base_path).is_some_and(|p| p.strip_prefix("/r/").is_some_and(|t| !t.is_empty()))
+    }
+
+    fn not_found() -> xbt_svc::http::Response {
+        let mut r = Resp::text(404, "text/plain", "not found: this port serves only links for your player");
+        security_headers(&mut r);
+        xbt_svc::http::Response::new(r.status, r.headers, r.body)
+    }
+}
+
+impl xbt_svc::http::Handler for Links {
+    fn body_limit(&self, _method: &str, _target: &str) -> usize {
+        0
+    }
+
+    fn handle(&self, _rq: xbt_svc::http::Request) -> xbt_svc::http::Response {
+        Self::not_found()
+    }
+
+    fn reply(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Reply {
+        if !self.serves(&rq) {
+            return xbt_svc::http::Reply::Whole(Self::not_found());
+        }
+        xbt_svc::http::Handler::reply(&Ui(self.0.clone()), rq)
+    }
+}
+
 /// A path as the slow-request log line shows it: a link's token (`/r/`, `/s/~`) is never logged.
 pub fn log_path(path: &str) -> String {
     let cut = ["/r/", "/s/"].iter().filter_map(|m| path.find(m).map(|i| i + m.len())).min();
@@ -530,6 +568,8 @@ pub struct Running {
     apps: Vec<xbt_svc::http::Stop>,
     /// Where the shared folder is served ([`crate::files`]), when the box sells.
     pub files_addr: Option<std::net::SocketAddr>,
+    /// Where the player links' own listener answers (`XBT_UI_LINKS_BIND`), when it is set.
+    pub links_addr: Option<std::net::SocketAddr>,
 }
 
 impl Drop for Running {
@@ -571,7 +611,26 @@ pub fn spawn(app: Arc<App>) -> Result<Running, String> {
             None
         }
     };
-    Ok(Running { addr: run.addr, stop: run.stopper(), app_ports, apps, files_addr })
+    // the player links' own port, where the platform's login is in front of this one
+    let links_addr = match links_server(&app) {
+        Ok(Some(l)) => {
+            apps.push(l.stopper());
+            app.relays.set_served_at(l.addr);
+            Some(l.addr)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("xbt-wallet-ui: player links are not served on their own port (the page gives this one's address): {e}");
+            None
+        }
+    };
+    Ok(Running { addr: run.addr, stop: run.stopper(), app_ports, apps, files_addr, links_addr })
+}
+
+fn links_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String> {
+    let Some(bind) = app.cfg.links_bind.as_deref().filter(|_| app.cfg.role != crate::config::Role::Gateway) else { return Ok(None) };
+    let l = std::net::TcpListener::bind(bind).map_err(|e| format!("bind {bind}: {e}"))?;
+    xbt_svc::http::serve(Arc::new(Links(app.clone())), l, app.cfg.threads).map(Some).map_err(|e| format!("serve: {e}"))
 }
 
 fn files_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String> {

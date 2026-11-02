@@ -1524,6 +1524,131 @@ fn the_relay_passes_range_and_a_players_link_plays_its_one_file_until_it_expires
     assert!(!br.get(&play).body.contains("/r/"), "an expired link is not shown");
 }
 
+/// A plain GET, no cookie, no redirect followed: its status and body.
+fn plain_get(url: &str, extra: &[(&str, &str)]) -> (u16, Vec<u8>) {
+    use std::io::Read;
+    let mut rq = ureq::AgentBuilder::new().redirects(0).build().get(url);
+    for (k, v) in extra {
+        rq = rq.set(k, v);
+    }
+    let resp = match rq.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => panic!("{url}: {e}"),
+    };
+    let status = resp.status();
+    let mut body = vec![];
+    resp.into_reader().read_to_end(&mut body).unwrap();
+    (status, body)
+}
+
+/// The token of the first player's link a Files page shows after `prefix` (`…/r/`).
+fn link_on(page: &str, prefix: &str) -> String {
+    let at = page.find(prefix).unwrap_or_else(|| panic!("no link at {prefix} on the page"));
+    page[at + prefix.len()..at + prefix.len() + 64].to_string()
+}
+
+/// umbrelOS puts its own login in front of the app's port (8482), which a player on another device
+/// can't pass, so the links have a port of their own (`XBT_UI_LINKS_BIND`, 33541 there): it plays a
+/// live link with no cookie, refuses an unknown, revoked or expired one as the UI's port does, and
+/// serves nothing else (no page, no action, no download, no API). The Files page gives that port's
+/// address: the page's host on it, by IP where the page was opened by IP, or the configured address
+/// (`XBT_UI_LINKS_URL`), by IP likewise.
+#[test]
+fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..100_000u32).map(|i| (i % 251) as u8)).collect();
+    let (connector, seen) = range_connector(film.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}}]"#)).unwrap();
+    let ttl = Duration::from_secs(3);
+    let (services, conn) = (path.clone(), connector.clone());
+    let b = start(json!({}), false, move |c| {
+        c.connector = conn;
+        c.services_file = Some(services);
+        c.relay_ttl = ttl;
+        c.links_bind = Some("127.0.0.1:0".into());
+    });
+    let links = b._srv.links_addr.expect("the links' own port is served");
+    assert_ne!(links, b._srv.addr);
+    let mut br = logged_in(&b);
+    let play = format!("/service?seller={}&name={}", enc("https://stream.lazarus-xbt.xyz"), enc("Films"));
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+
+    // the page gives the links' port, on the host the page was opened at
+    let page = br.get(&play).body;
+    let own = format!("http://127.0.0.1:{}/r/", links.port());
+    let token = link_on(&page, &own);
+    assert!(page.contains(&format!("value=\"{own}{token}\"")), "the exact address to paste");
+    assert!(!page.contains(&format!("{}/r/", b.base)), "not the UI's own port, which the platform's login is in front of");
+    let by_ip = br.send("GET", &play, None, &[("Host", "192.168.1.20:8482")]).body;
+    assert!(by_ip.contains(&format!("value=\"http://192.168.1.20:{}/r/{token}\"", links.port())), "by IP where the page was opened by IP");
+
+    // the link plays there with no cookie, seeking included
+    let link = format!("{own}{token}");
+    let (status, body) = plain_get(&link, &[("Range", "bytes=5000-")]);
+    assert_eq!((status, body.as_slice()), (206, &film[5000..]));
+    let (status, body) = plain_get(&link, &[]);
+    assert_eq!((status, body.len()), (200, film.len()));
+    let n = seen.lock().unwrap().len();
+    assert_eq!(n, 2);
+
+    // nothing else of the UI is there, the login and the setup included; an unknown token is nothing
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let other = format!("{}{}", &token[..63], if token.ends_with('0') { "1" } else { "0" });
+    let base = format!("http://{links}");
+    for p in ["/".to_string(), "/wallet".into(), "/browse".into(), "/login".into(), "/setup".into(), "/api/status".into(), "/healthz".into(),
+              format!("/service?seller={}&name=Films", enc("https://stream.lazarus-xbt.xyz")), "/r/".into(), format!("/r/{other}"),
+              format!("/r/{token}/x"), format!("/s/{FILM}"), format!("/s/~{st}/{FILM}"), "/static/app.css".into()] {
+        let (status, _) = plain_get(&format!("{base}{p}"), &[("Cookie", &br.cookie)]);
+        assert_eq!(status, 404, "{p}");
+    }
+    // nor any other method, the link's own path included
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    for (m, p) in [("HEAD", format!("/r/{token}")), ("POST", format!("/r/{token}")), ("POST", "/file-link".to_string()), ("POST", "/login".into())] {
+        let status = match agent.request(m, &format!("{base}{p}")).set("Cookie", &br.cookie).call() {
+            Ok(r) => r.status(),
+            Err(ureq::Error::Status(s, _)) => s,
+            Err(e) => panic!("{m} {p}: {e}"),
+        };
+        assert_eq!(status, 404, "{m} {p}");
+    }
+    assert_eq!(seen.lock().unwrap().len(), n, "nothing refused reached the connector");
+
+    // revoked: it plays nothing there either
+    let r = br.act(&play, "/file-link", &[("action", "revoke"), ("item", FILM), ("token", &token)]);
+    assert!(br.flash_after(&r).contains("revoked"));
+    assert_eq!(plain_get(&link, &[]).0, 404);
+    // and a new one expires on its own
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let fresh = format!("{own}{}", link_on(&br.get(&play).body, &own));
+    assert_eq!(plain_get(&fresh, &[]).0, 200);
+    std::thread::sleep(ttl + Duration::from_millis(300));
+    assert_eq!(plain_get(&fresh, &[]).0, 404, "expired");
+    drop(b);
+
+    // with its address configured (Umbrel: http://umbrel.local:33541), the page gives it, by IP where it was opened by IP
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+        c.links_bind = Some("127.0.0.1:0".into());
+        c.links_url = Some("http://umbrel.local:33541".into());
+    });
+    let mut br = logged_in(&b);
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let by_name = br.send("GET", &play, None, &[("Host", "umbrel.local:8482")]).body;
+    let token = link_on(&by_name, "http://umbrel.local:33541/r/");
+    let by_ip = br.send("GET", &play, None, &[("Host", "192.168.1.20:8482")]).body;
+    assert!(by_ip.contains(&format!("value=\"http://192.168.1.20:33541/r/{token}\"")), "by IP where the page was opened by IP");
+    assert!(!by_ip.contains("umbrel.local:33541"));
+}
+
 /// Connected apps: a connection made on the NWC service's admin socket, its URI shown once (in the
 /// answer to the form, never stored here), listed with its budget, and revoked.
 #[test]

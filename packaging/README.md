@@ -148,7 +148,9 @@ The gateway:
 | UI | `xbt-wallet-ui` (10005), `XBT_UI_ROLE=gateway` | `ui/`, `run/ui/`, `run/gateway/`, `tls.cert` ro | 8481 behind the box's proxy |
 
 Lightning Stream (`lazarus-lightning-stream`) is those two sets in one app, plus the connector. The main
-page is port 8482. Agents use host port 33511 (the service port on the box network is still 33510). The
+page is port 8482. Agents use host port 33511 (the service port on the box network is still 33510). Links
+for the buyer's own player (`/r/<token>`, VLC on another device) are on host port 33541, which umbreld's
+login is not in front of and which serves nothing else (`XBT_UI_LINKS_BIND`, `XBT_UI_LINKS_URL`). The
 sell page is host port 8483. The connector (`lightning-stream`, user `xbt-signer`) shares the UI's
 network namespace, listens on `127.0.0.1:8484` and publishes no port. `B2_STREAM_DIR` is
 `/data/run/signer/streams` for the signer and the connector. The gateway publishes no host port and

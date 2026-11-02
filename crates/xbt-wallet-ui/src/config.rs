@@ -55,6 +55,8 @@
 //! | `XBT_UI_AI_SELLERS` | `$XBT_DATA_DIR/run/ai/sellers.json` | the AI sellers and the owner's pins and blocks, written by the AI page, read by the endpoint |
 //! | `XBT_UI_CREDENTIALS` | `$XBT_DATA_DIR/run/ai/credentials.json` | the store of AI keys and local links (hashed secrets, limits, spend), shared with the connector |
 //! | `XBT_UI_AI_STATE` | `$XBT_DATA_DIR/run/ai/state.json` | the endpoint's record of the sellers' health, shown on the AI page |
+//! | `XBT_UI_LINKS_BIND` | unset | a second listen address that serves the buyer's player links (`/r/<token>`) and nothing else, for a platform whose own login sits in front of the UI's port (Umbrel: `0.0.0.0:33541`). Unset: the links are on the UI's own address |
+//! | `XBT_UI_LINKS_URL` | `http://<the page's host>:<that port>` | the address of that listener as other devices reach it (`http://umbrel.local:33541`); by the box's IP where the page was opened by it |
 //! | `XBT_UI_RELAY_LINK_S` | `21600` (6 hours) | how long a link for the buyer's own player (VLC, mpv, a TV app) made on a Files service's page lives (60 s to 7 days) |
 //! | `XBT_UI_FILES_DIR` | `<data dir>/files` | the folder a Files service shares (Sell, "Files"): the UI serves it to the shop's gateway only (`docs/FILES.md`) |
 //! | `XBT_UI_FILES_ROOT_WORDS` | "the folder this box shares with the app" | what the Sell page calls `XBT_UI_FILES_ROOT` ("the Downloads folder in Umbrel's Files app") |
@@ -116,6 +118,10 @@ pub struct Config {
     pub app_ports: Vec<u16>,
     /// `XBT_UI_RELAY_LINK_S`: how long a link for the buyer's own player lives.
     pub relay_ttl: Duration,
+    /// `XBT_UI_LINKS_BIND`: the player links' own listener ([`crate::server::spawn`]), when set.
+    pub links_bind: Option<String>,
+    /// `XBT_UI_LINKS_URL`: that listener's address as other devices reach it ([`crate::relay::links_base`]).
+    pub links_url: Option<String>,
     /// The folder a Files service shares, where the UI serves it, and how the gateway reaches it.
     pub files: FilesSetup,
     /// `XBT_UI_NWC_SOCK`: the NWC wallet service's admin socket, when the box runs it.
@@ -422,6 +428,8 @@ impl Config {
             app_ports: env("XBT_UI_APP_PORTS").map(|v| v.split(',').filter_map(|p| p.trim().parse::<u16>().ok()).filter(|p| *p > 0).take(16).collect())
                 .unwrap_or_default(),
             relay_ttl: Duration::from_secs(secs("XBT_UI_RELAY_LINK_S", 6 * 3600).clamp(60, 7 * 86_400)),
+            links_bind: env("XBT_UI_LINKS_BIND"),
+            links_url: env("XBT_UI_LINKS_URL").filter(|u| u.starts_with("http://") || u.starts_with("https://")),
             files: {
                 let bind = env("XBT_UI_FILES_BIND").unwrap_or_else(|| "127.0.0.1:8486".into());
                 FilesSetup { dir: env("XBT_UI_FILES_DIR").map(PathBuf::from).unwrap_or_else(|| files_default.clone()),
@@ -516,7 +524,7 @@ impl Config {
                read_cache: Duration::ZERO, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), app_ports: vec![],
-               relay_ttl: Duration::from_secs(6 * 3600),
+               relay_ttl: Duration::from_secs(6 * 3600), links_bind: None, links_url: None,
                files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), choice: files_choice, ..Default::default() },
                nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), prefetch: false, relay_dir: None, relay_status: None,
                relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
