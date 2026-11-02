@@ -18,6 +18,10 @@ use crate::html::esc;
 use crate::server::Resp;
 
 /// A one-time code is good for this long.
+/// How long the Stop waits for the connector to settle the visit ([`App::visit_settled`]): it closes the shop's
+/// connection a moment after the stop (the frame's last report goes first), and the signer's word on the requests that were
+/// running follows within seconds.
+const SETTLE_READ: Duration = Duration::from_secs(15);
 const CODE_TTL: Duration = Duration::from_secs(60);
 /// The visit's limit the page suggests, in sats.
 pub const SUGGESTED_LIMIT: i64 = 1_000;
@@ -342,12 +346,21 @@ impl App {
         let mut ended = String::new();
         if visit.bytes().all(|b| b.is_ascii_hexdigit()) && !visit.is_empty() {
             let base = self.apps.lock().grants.values().find(|g| g.visit == visit).map(|g| g.base.clone());
+            let mut closed_by_connector = false;
             if !self.apps.lock().previews.remove(&visit) {
-                // the credit the connection holds, read before the stop closes it
-                let credit = self.visit_credit_msat(&visit);
                 let said = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
                 if let Ok((200, v)) = said {
+                    // the connector closes the shop's connection behind the stop and settles what was running: its word on
+                    // what the visit used and paid is final once it says `settled` (until then the last requests' cost is
+                    // still on its way, and a figure read at once said "nothing new was paid" after tickets were bought)
+                    let v = self.visit_settled(&visit).unwrap_or(v);
+                    closed_by_connector = v.get("connection_closed") == Some(&Value::Bool(true));
+                    // the credit the connection still holds, where it is open; a closed one leaves it with the shop
+                    let credit = if closed_by_connector { None } else { self.visit_credit_msat(&visit) };
                     used = visit_numbers(&v, credit).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
+                    if closed_by_connector {
+                        used.push_str(" What it did not use stays with the shop as credit for your next visit.");
+                    }
                 }
             }
             let origin = base.as_deref().and_then(crate::services::http_origin);
@@ -369,8 +382,13 @@ impl App {
                 s.grants.retain(|_, g| !gone.contains(&g.visit));
                 s.grants.values().any(|g| g.direct.is_none() && crate::services::http_origin(&g.base) == origin)
             };
-            // one Stop ends it all: the connection the visit paid through closes too, unless another open visit to that shop still uses it
-            if let Some(o) = origin.filter(|_| !still_used) {
+            // one Stop ends it all: the connection the visit paid through closes too, unless another open visit to that shop
+            // still uses it. The connector closes it behind the stop; this is for a connector that did not
+            if closed_by_connector {
+                if let Some(o) = &origin {
+                    ended = format!(" Its connection with {} is closed.", self.seller_name(o));
+                }
+            } else if let Some(o) = origin.filter(|_| !still_used) {
                 if self.stop_seller_sessions(&o) > 0 {
                     ended = format!(" Its connection with {} is closed.", self.seller_name(&o));
                 }
@@ -378,6 +396,30 @@ impl App {
         }
         self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{ended}{used}"));
         Resp::redirect("./browse")
+    }
+
+    /// The connector's report of stopped visit `id` once it is settled (every request ended, its cost said, the shop's
+    /// connection closed where no other visit uses it), read for up to [`SETTLE_READ`]; the last report read where it is
+    /// not settled by then (it says so), `None` where none could be read. A connector from before `settled` is not waited for.
+    fn visit_settled(&self, id: &str) -> Option<Value> {
+        let until = std::time::Instant::now() + SETTLE_READ;
+        let mut last = None;
+        loop {
+            match connector_json("GET", &format!("{}/visits/{id}", self.cfg.connector.trim_end_matches('/')), None) {
+                Ok((200, v)) => {
+                    let done = v.get("settled").is_none_or(|s| s == &Value::Bool(true));
+                    last = Some(v);
+                    if done {
+                        return last;
+                    }
+                }
+                _ => return last,
+            }
+            if std::time::Instant::now() >= until {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// Whether the connector holds visit `id` open (not ended, not gone): one at its limit counts, since it waits for its
@@ -499,22 +541,34 @@ pub(crate) fn visit_numbers(v: &Value, credit_msat: Option<u64>) -> Value {
     };
     let used = i64::try_from(used_msat.div_ceil(1000)).unwrap_or(i64::MAX);
     let paid = v.get("paid_sats").and_then(Value::as_i64).unwrap_or(0).max(0);
+    let tickets = v.get("tickets_bought").and_then(Value::as_u64).unwrap_or(0);
+    // every request's cost is in (a connector from before `settled` is taken as it says)
+    let settled = v.get("settled").and_then(Value::as_bool).unwrap_or(true);
     // rounded down: credit is never said to be more than it is
     let credit = credit_msat.map(|m| i64::try_from(m / 1000).unwrap_or(i64::MAX));
-    // the three figures every page names (crate::html::paid_html): used, paid (what left the node, as the
-    // signer charged it), credit left
-    let mut said = format!("This visit used {used} sat");
+    let g = |n: i64| crate::html::group3(n.max(0).unsigned_abs());
+    // the three figures every page names (crate::html::paid_html): used (from the credit with the shop, whatever bought it),
+    // what was newly paid during the visit (tickets, as the signer booked them, routing fees included), credit left
+    let mut said = format!("This visit used {} sat of your credit with the shop", g(used));
     if paid > 0 {
-        match credit {
-            Some(c) => said.push_str(&format!(". Paid: {paid} sat; credit left with the shop: {c} sat.")),
-            None => said.push_str(&format!(". Paid: {paid} sat.")),
-        }
-    } else if used > 0 {
-        said.push_str(" from your credit with the shop; nothing new was paid.");
-    } else {
-        said.push('.');
+        let what = match tickets {
+            0 => String::new(),
+            1 => " for 1 ticket".into(),
+            n => format!(" for {n} tickets"),
+        };
+        said.push_str(&format!(". New payments during it: {} sat{what}, routing fees included", g(paid)));
+    } else if settled {
+        said.push_str(". Nothing new was paid during it");
     }
-    json!({"used_sats": used, "spent_sats": used, "prepaid_sats": paid, "credit_sats": credit, "credit_msat": credit_msat.map(|m| m.to_string()),
+    if let Some(c) = credit {
+        said.push_str(&format!(". Credit left with the shop: {} sat", g(c)));
+    }
+    if !settled {
+        said.push_str(". Its last requests are still being counted");
+    }
+    said.push('.');
+    json!({"used_sats": used, "spent_sats": used, "prepaid_sats": paid, "tickets_bought": tickets, "settled": settled,
+           "credit_sats": credit, "credit_msat": credit_msat.map(|m| m.to_string()),
            "limit_sats": v["limit_sats"], "ended": v["ended"],
            "limit_reached": v.get("limit_reached").and_then(Value::as_bool).unwrap_or(false), "said": said})
 }
@@ -1006,11 +1060,12 @@ mod tests {
         // stopped: nothing held, 65 sat used
         let stopped = visit_numbers(&json!({"limit_sats": 559, "spent_sats": 0, "held_sats": 0, "used_msat": 64_870, "paid_sats": 0, "ended": "Stopped."}), None);
         assert_eq!(stopped["used_sats"].as_i64(), Some(65));
-        assert_eq!(stopped["said"], "This visit used 65 sat from your credit with the shop; nothing new was paid.");
+        assert_eq!(stopped["said"], "This visit used 65 sat of your credit with the shop. Nothing new was paid during it.");
         // a ticket bought in the visit: prepaid, and the rest left as credit
         let bought = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 559, "held_sats": 0, "used_msat": 64_870, "paid_sats": 559, "ended": null}), Some(493_130));
         assert_eq!((bought["used_sats"].as_i64(), bought["prepaid_sats"].as_i64(), bought["credit_sats"].as_i64()), (Some(65), Some(559), Some(493)));
-        assert_eq!(bought["said"], "This visit used 65 sat. Paid: 559 sat; credit left with the shop: 493 sat.");
+        assert_eq!(bought["said"], "This visit used 65 sat of your credit with the shop. New payments during it: 559 sat, routing fees included. \
+                                    Credit left with the shop: 493 sat.");
         // an older connector: as before
         assert_eq!(visit_numbers(&json!({"limit_sats": 559, "spent_sats": 12}), None)["spent_sats"].as_i64(), Some(12));
     }
@@ -1024,11 +1079,31 @@ mod tests {
     fn the_visit_bars_credit_is_the_connections_balance_rounded_down() {
         let v = visit_numbers(&json!({"limit_sats": 2000, "spent_sats": 600, "held_sats": 0, "used_msat": 12_000, "paid_sats": 600, "ended": null}), Some(542_324));
         assert_eq!((v["credit_sats"].as_i64(), v["credit_msat"].as_str()), (Some(542), Some("542324")), "{v}");
-        assert_eq!(v["said"], "This visit used 12 sat. Paid: 600 sat; credit left with the shop: 542 sat.");
+        assert_eq!(v["said"], "This visit used 12 sat of your credit with the shop. New payments during it: 600 sat, routing fees included. \
+                               Credit left with the shop: 542 sat.");
         // not known: not said, never guessed
         let v = visit_numbers(&json!({"limit_sats": 2000, "spent_sats": 600, "held_sats": 0, "used_msat": 12_000, "paid_sats": 600, "ended": null}), None);
         assert!(v["credit_sats"].is_null(), "{v}");
-        assert_eq!(v["said"], "This visit used 12 sat. Paid: 600 sat.");
+        assert_eq!(v["said"], "This visit used 12 sat of your credit with the shop. New payments during it: 600 sat, routing fees included.");
+    }
+
+    /// The Stop's words say what was newly paid during the visit (the tickets bought, as the signer booked them) and what
+    /// the visit used, once the connector's word on every request is in; before that, never "nothing new was paid".
+    ///
+    /// FAILS before: read at once after the Stop, a visit that had bought three tickets (2,706 sat) said "This visit used
+    /// 520 sat from your credit with the shop; nothing new was paid."
+    #[test]
+    fn the_stop_says_the_new_payments_and_what_was_used_once_settled() {
+        let v = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 0, "held_sats": 0, "used_msat": 1_546_830, "paid_sats": 2_709, "tickets_bought": 3,
+                                      "settled": true, "ended": "Stopped."}), Some(2_462_787));
+        assert_eq!(v["said"], "This visit used 1,547 sat of your credit with the shop. New payments during it: 2,709 sat for 3 tickets, routing fees \
+                               included. Credit left with the shop: 2,462 sat.");
+        assert_eq!((v["tickets_bought"].as_u64(), v["settled"].as_bool()), (Some(3), Some(true)));
+        // not settled yet: what is known so far, and that more is coming; never "nothing new was paid"
+        let v = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 900, "held_sats": 900, "used_msat": 520_000, "paid_sats": 0, "tickets_bought": 0,
+                                      "settled": false, "ended": "Stopped."}), None);
+        let said = v["said"].as_str().unwrap();
+        assert!(!said.contains("Nothing new was paid") && said.contains("still being counted"), "{said}");
     }
 
     /// The owner is offered "Stay anonymous here" for a shop where any route keeps accounts, not only

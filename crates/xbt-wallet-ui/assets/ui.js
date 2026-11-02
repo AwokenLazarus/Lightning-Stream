@@ -510,7 +510,9 @@
         // at its limit the visit waits for the owner: the page stays as it is, and Add lets it go on
         if (v.limit_reached) return;
         if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
-          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat" + (typeof v.credit_sats === "number" ? " · credit left " + v.credit_sats.toLocaleString() + " sat" : "")
+          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat"
+            + (typeof v.tickets_bought === "number" && v.tickets_bought > 0 ? " for " + v.tickets_bought + (v.tickets_bought === 1 ? " ticket" : " tickets") : "")
+            + (typeof v.credit_sats === "number" ? " · credit left " + v.credit_sats.toLocaleString() + " sat" : "")
           : typeof v.credit_left_sats === "number" ? " · from your credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat left" : "";
         if (refusal) showRefusal(v.refusal);
         if (v.ended) ended(String(v.ended));

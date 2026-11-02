@@ -96,6 +96,17 @@ const SOCKET_SHARE: i64 = 50;
 const ANSWER_SHARE: i64 = 1_000;
 /// The least share of a request, where the limit is small.
 const MIN_SHARE: i64 = 10;
+/// How long after the buyer's stop a page's small report still goes ([`Visit::take_grace`]): a media server's frame
+/// sends "playback stopped" (Jellyfin's `POST /Sessions/Playing/Stopped`) as it closes, a moment after the stop.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+/// The largest body of a request let through in that grace.
+const GRACE_BODY: usize = 64 << 10;
+/// How long a stop waits for the requests let through in its grace before it closes the shop's connection.
+const GRACE_WAIT: Duration = Duration::from_secs(10);
+/// How long a stop waits, after closing the shop's connection, for the signer's word on the requests that were running,
+/// so that the visit's report is final ([`Visit::report`]'s `settled`). The signer ends a stopped connection's answers
+/// within its own wait for them (15 s), and says what each cost.
+const STOP_SETTLE_WAIT: Duration = Duration::from_secs(30);
 /// The largest `/services` document of a seller read for its free routes.
 const SERVICES_MAX: u64 = 256 << 10;
 /// The longest part of a range a request asks for: `bytes=N-` and longer ranges become
@@ -175,6 +186,18 @@ struct State {
     /// the signer's words and the owner's limit (`limit_sats`). The visit ends with it ([`Visit::policy_stop`]), and each
     /// later request is refused with it, not asked of the seller.
     policy: Option<Value>,
+    /// When the buyer stopped the visit: for [`STOP_GRACE`] after it, a page's small `POST` (a media server's "playback
+    /// stopped" report as its frame closes) still goes, on the credit the shop holds and within the visit's limit.
+    stopped_at: Option<Instant>,
+    /// Requests let through in that grace that have not ended: the shop's connection is closed after them.
+    grace_open: u32,
+    /// The tickets the wallet paid for in this visit, by the signer's word on each call (`tickets_released`).
+    tickets: u64,
+    /// A stop is being carried out ([`Connector::finish_stop`]): the shop's connection closed where no other open visit
+    /// uses it, and the requests that were running settled.
+    closing: bool,
+    /// Whether that stop closed the shop's connection (`None`: not decided yet, or no stop).
+    connection_closed: Option<bool>,
 }
 
 /// A route of the seller, as its `/services` names it.
@@ -190,6 +213,8 @@ struct OpenStream {
     /// The share it holds, where it holds one apart from [`State::sockets`].
     share: i64,
     opened: Instant,
+    /// Let through in the grace after a stop ([`STOP_GRACE`]): a stop does not shut it.
+    grace: bool,
 }
 
 impl State {
@@ -230,11 +255,55 @@ impl Visit {
     /// more is paid for it.
     fn stop(&self) {
         let mut s = self.lock();
+        if !s.stopped {
+            s.stopped_at = Some(Instant::now());
+        }
         s.stopped = true;
         s.ended.get_or_insert_with(|| "Stopped.".into());
-        for (_, open) in s.streams.drain() {
+        s.streams.retain(|_, open| {
+            if open.grace {
+                return true;
+            }
             let _ = open.socket.shutdown(std::net::Shutdown::Both);
+            false
+        });
+        drop(s);
+        self.turn.notify_all();
+    }
+
+    /// Whether the buyer stopped the visit: a call waiting to begin gives up ([`start_call`]).
+    fn is_stopped(&self) -> bool {
+        self.lock().stopped
+    }
+
+    /// Whether `req`, coming after the buyer's stop, is a small report of the page that still goes ([`STOP_GRACE`]): a
+    /// `POST` of at most [`GRACE_BODY`] bytes, no range, within the grace. It is then counted among the grace's requests.
+    fn take_grace(&self, req: &Request) -> bool {
+        let mut s = self.lock();
+        let small_post = req.method.eq_ignore_ascii_case("POST") && req.body.len() <= GRACE_BODY && req.header("Range").is_none();
+        let ok = s.stopped && s.policy.is_none() && small_post && s.stopped_at.is_some_and(|t| t.elapsed() < STOP_GRACE);
+        if ok {
+            s.grace_open += 1;
         }
+        ok
+    }
+
+    /// A share for a request let through in the grace: an ordinary one, of what is left of the limit, at once or not at
+    /// all. The visit has ended, so [`Visit::reserve`] hands none out.
+    fn reserve_grace(&self) -> Option<i64> {
+        let mut s = self.lock();
+        let share = (self.limit() - s.spent).min(self.answer_share());
+        (share >= 1).then(|| {
+            s.spent += share;
+            s.held += share;
+            share
+        })
+    }
+
+    /// A request let through in the grace has ended.
+    fn grace_done(&self) {
+        let mut s = self.lock();
+        s.grace_open = s.grace_open.saturating_sub(1);
         drop(s);
         self.turn.notify_all();
     }
@@ -242,15 +311,20 @@ impl Visit {
     /// An answer's stream socket, for [`Visit::stop`] to shut until the guard is dropped; one that
     /// arrives after a stop is shut at once. `share`: what it holds apart from a WebSocket's.
     fn track(self: &Arc<Self>, src: &UnixStream, share: i64) -> Tracked {
+        self.track_as(src, share, false)
+    }
+
+    /// [`Visit::track`]; `grace`: a request let through in the grace after a stop, which the stop leaves to end.
+    fn track_as(self: &Arc<Self>, src: &UnixStream, share: i64, grace: bool) -> Tracked {
         let open = src.try_clone().ok();
         let mut s = self.lock();
         s.next_stream += 1;
         let id = s.next_stream;
         if let Some(socket) = open {
-            if s.stopped {
+            if s.stopped && !grace {
                 let _ = socket.shutdown(std::net::Shutdown::Both);
             } else {
-                s.streams.insert(id, OpenStream { socket, share, opened: Instant::now() });
+                s.streams.insert(id, OpenStream { socket, share, opened: Instant::now(), grace });
             }
         }
         Tracked { visit: Arc::clone(self), id }
@@ -258,6 +332,18 @@ impl Visit {
 
     fn limit(&self) -> i64 {
         self.limit.load(Ordering::SeqCst)
+    }
+
+    /// The seller's origin (`https://host:port`), as the signer names a connection with it.
+    fn origin(&self) -> String {
+        origin_of(&self.base)
+    }
+
+    /// Whether the visit holds the shop's connection open: not ended, or ended at its limit and waiting for its owner
+    /// to raise it.
+    fn holds_open(&self) -> bool {
+        let s = self.lock();
+        s.ended.is_none() || (s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped)
     }
 
     /// The buyer raises the visit's limit to `to` sat, more than it was (at most what a visit may have):
@@ -280,7 +366,11 @@ impl Visit {
 
     fn report(&self) -> Value {
         let s = self.lock();
+        // settled: every request of the visit has ended and the signer has said what each cost (and a stop has been carried
+        // out), so `used_msat`, `paid_sats` and `tickets_bought` are final for what has run
+        let settled = s.held == 0 && !s.closing && s.grace_open == 0;
         json!({"base": self.base, "limit_sats": self.limit(), "spent_sats": s.spent, "held_sats": s.held, "used_msat": s.used_msat, "paid_sats": s.paid,
+               "tickets_bought": s.tickets, "settled": settled, "connection_closed": s.connection_closed,
                "ended": s.ended, "limit_reached": s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped, "calls": s.calls, "policy_refused": s.policy})
     }
 
@@ -354,13 +444,22 @@ impl Visit {
         // what one ticket of the seller books, from what the tickets released for this call came to
         if let Some(n) = num("tickets_released").filter(|n| *n > 0) {
             s.ticket = s.ticket.max(i64::try_from(charged / n).unwrap_or(0));
+            s.tickets = s.tickets.saturating_add(n);
         }
     }
 
-    /// The credit the visit keeps ahead of its requests: four requests' shares, at most a ticket. Below it, a
-    /// request may cut short where the credit ends, its own share too small for the next ticket.
-    fn credit_floor(&self, ticket: i64) -> i64 {
-        (self.answer_share() * 4).min(ticket).max(1)
+    /// The credit the visit keeps ahead of its requests: what the answers running now may still draw (their shares,
+    /// each the most its answer may charge) and one request's share more, at most a ticket, and never more than what is
+    /// left of the visit's limit for its answers. Below it, a request may cut short where the credit ends, its own share
+    /// too small for the next ticket. Above it, nothing is bought ahead: the credit covers every answer that could be
+    /// running, and the visit buys only when that is no longer so.
+    ///
+    /// (Before 0.2.7 it was four shares whatever was running: a 1,000 sat visit topped up below 500 sat of credit while
+    /// signing in, a ticket its page never needed.)
+    fn credit_floor(&self, s: &State, ticket: i64) -> i64 {
+        let running = (s.held - s.settling).max(0);
+        let left = (self.limit() - s.spent + s.held).max(0);
+        running.saturating_add(self.answer_share()).min(ticket).min(left).max(1)
     }
 
     /// The lane, where the credit is low: a share with room for a ticket, and the credit to top up to
@@ -374,7 +473,7 @@ impl Visit {
         // ticket fits (the signer releases none past the call's limit)
         let ticket = if s.ticket > 0 { s.ticket } else { self.limit() / 2 };
         let credit = s.credit_msat?;
-        let floor = self.credit_floor(ticket);
+        let floor = self.credit_floor(&s, ticket);
         let most = self.answer_share().saturating_add(ticket);
         if ticket <= 0 || s.lane || s.alone > 0 || s.ended.is_some() || credit >= floor.unsigned_abs() * 1000 || most > self.limit() - s.spent + s.held - s.sockets - s.settling - s.long_open() {
             return None;
@@ -665,6 +764,12 @@ impl Visits {
         self.open.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
     }
 
+    /// Whether a visit other than `id` to the shop at `origin` holds its connection open ([`Visit::holds_open`]).
+    fn other_open(&self, origin: &str, id: &str) -> bool {
+        let all: Vec<(String, Arc<Visit>)> = self.open.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        all.iter().any(|(k, v)| k != id && v.origin() == origin && v.holds_open())
+    }
+
     fn open(&self, base: String, limit: i64, ceiling: Option<Value>) -> Result<String, String> {
         let mut m = self.open.lock().unwrap_or_else(|p| p.into_inner());
         m.retain(|_, v| {
@@ -672,7 +777,8 @@ impl Visits {
             // an answer still open keeps its visit, however long ago it was asked for, so that a stop finds it
             // and one at its limit waits for the buyer to raise it, as an open one does
             let waiting = s.ended.is_none() || (s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped);
-            !s.streams.is_empty() || (waiting && s.last.is_none_or(|t| t.elapsed() < IDLE))
+            // and one whose stop is still being carried out is kept for its report
+            !s.streams.is_empty() || s.closing || (waiting && s.last.is_none_or(|t| t.elapsed() < IDLE))
         });
         if m.len() >= MAX_VISITS {
             return Err("too many visits open".into());
@@ -680,6 +786,14 @@ impl Visits {
         let id = random_hex();
         m.insert(id.clone(), Arc::new(Visit { base, limit: limit.into(), ceiling, state: Mutex::new(State { last: Some(Instant::now()), ..State::default() }), turn: Condvar::new() }));
         Ok(id)
+    }
+}
+
+/// The origin of an absolute URL: its scheme and authority, without the path.
+fn origin_of(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => format!("{scheme}://{}", rest.split(['/', '?', '#']).next().unwrap_or(rest)),
+        None => url.to_string(),
     }
 }
 
@@ -745,7 +859,16 @@ impl Connector {
                 if req.method != "POST" {
                     return Some(Reply::Whole(json_response(405, &json!({"error": "POST to stop"}))));
                 }
+                let first = !v.is_stopped();
                 v.stop();
+                if first {
+                    // decided now, before the shop's connection is closed behind the stop's grace: another visit opened
+                    // after this stop starts its own requests on a new connection
+                    let others = self.visits.other_open(&v.origin(), id);
+                    v.lock().closing = true;
+                    let (cfg, visit) = (self.cfg.clone(), v.clone());
+                    std::thread::spawn(move || finish_stop(&cfg, &visit, others));
+                }
             }
             return Some(Reply::Whole(json_response(200, &v.report())));
         }
@@ -766,13 +889,19 @@ impl Connector {
         if let Some(r) = visit.policy_refusal() {
             return Reply::Whole(r);
         }
+        // a small report of the page just after the buyer's stop (a media server's "playback stopped" as its frame
+        // closes) still goes, on the shop's credit and within the visit's limit; nothing else does
+        let grace = visit.lock().ended.is_some() && visit.take_grace(req);
         {
             let mut s = visit.lock();
-            if let Some(e) = &s.ended {
+            if let (Some(e), false) = (&s.ended, grace) {
                 return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"})));
             }
             s.calls += 1;
             s.last = Some(Instant::now());
+        }
+        if grace {
+            return self.visit_grace_call(visit, path, req);
         }
         let url = format!("{}{path}", visit.base);
         let headers: Vec<Value> = req.headers.iter().filter(|(k, _)| PASSED.contains(&k.to_ascii_lowercase().as_str()))
@@ -800,7 +929,7 @@ impl Connector {
             if let Some(m) = params.as_object_mut() {
                 xbt_wallet_mcp::wallet::with_transport(m);
             }
-            self.start(params)
+            self.start_in(&visit, params, false)
         };
         let call = |max_sats: i64| call_as(max_sats, true);
         // the lane: room for a ticket, and the credit topped up before the request leaves
@@ -819,7 +948,7 @@ impl Connector {
             if let Some(m) = params.as_object_mut() {
                 xbt_wallet_mcp::wallet::with_transport(m);
             }
-            self.start(params)
+            self.start_in(&visit, params, false)
         };
         let max_sats = |f: &Failed| f.v.get("rule").and_then(Value::as_str) == Some("max_sats");
         // a path the seller serves free: asked for as it is (the signer asks it unpaid, as for a price, and is answered),
@@ -915,57 +1044,99 @@ impl Connector {
                 }
             }
         };
-        let Started { head, first, src, done } = started;
-        let status = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).unwrap_or(502);
         if std::env::var_os("XBT_TRACE_WIRE").is_some() {
+            let status = started.head.get("status").and_then(Value::as_u64).unwrap_or(502);
             let p: String = path.split('?').next().unwrap_or("/").chars().take(60).collect();
             eprintln!("visit: {} {p} {status} {} ms", req.method, t0.elapsed().as_millis());
         }
-        let mut out_headers: Vec<(String, String)> = vec![];
-        for h in head.get("headers").and_then(Value::as_array).into_iter().flatten() {
-            if let (Some(k), Some(v)) = (h.get(0).and_then(Value::as_str), h.get(1).and_then(Value::as_str)) {
-                // what frames the body is this answer's own
-                if !["content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"].contains(&k.to_ascii_lowercase().as_str()) {
-                    out_headers.push((k.to_string(), v.to_string()));
-                }
-            }
-        }
-        if !out_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
-            if let Some(t) = head.get("content_type").and_then(Value::as_str) {
-                out_headers.push(("Content-Type".into(), t.into()));
-            }
-        }
-        let length = head.get("content_length").and_then(Value::as_u64);
-        let tracked = visit.track(&src, share);
-        let mut settle = Settle { visit, share, tracked: Some(tracked), src: Some(src), done: Some(done) };
-        Reply::Stream(Streamed {
-            status,
-            headers: out_headers,
-            length,
-            body: Box::new(move |out: &mut dyn BodyWriter| {
-                out.send(&first)?;
-                let mut sent = first.len() as u64;
-                let mut buf = vec![0u8; 64 << 10];
-                while let Some(src) = settle.src.as_mut() {
-                    let n = src.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    out.send(&buf[..n])?;
-                    sent += n as u64;
-                }
-                drop(settle.src.take());
-                // the signer's account, where the length does not say: an answer it ended early is cut short for the page too
-                let r = whole(length, sent, || settle.account());
-                // the owner's log says why a page saw an answer cut short (its status and the wallet's words; no URL)
-                if let Err(e) = &r {
-                    eprintln!("lightning-stream: a page's answer (HTTP {status}) was cut short: {e}");
-                }
-                r
-            }),
-        })
+        answer_reply(visit, started, share, false)
     }
 
+    /// One request of a page let through in the grace after the buyer's stop ([`Visit::take_grace`]): on an ordinary
+    /// share of what is left of the limit, drawing only on the credit the shop holds (`credit_only`: no ticket is bought
+    /// for it), and refused at once where no share is left.
+    fn visit_grace_call(&self, visit: Arc<Visit>, path: &str, req: &Request) -> Reply {
+        let Some(share) = visit.reserve_grace() else {
+            visit.grace_done();
+            return Reply::Whole(json_response(402, &json!({"error": LIMIT_REACHED, "rule": "visit"})));
+        };
+        let headers: Vec<Value> = req.headers.iter().filter(|(k, _)| PASSED.contains(&k.to_ascii_lowercase().as_str()))
+            .take(24).map(|(k, v)| json!([k, v])).collect();
+        let mut params = json!({"url": format!("{}{path}", visit.base), "method": "POST", "max_sats": share, "task": self.cfg.task, "headers": headers,
+                                "head_headers": true, "known_terms": true, "credit_only": true});
+        if !req.body.is_empty() {
+            use base64::Engine as _;
+            params["body_b64"] = base64::engine::general_purpose::STANDARD.encode(&req.body).into();
+        }
+        if let Some(c) = &visit.ceiling {
+            params["price_ceiling"] = c.clone();
+        }
+        if let Some(m) = params.as_object_mut() {
+            xbt_wallet_mcp::wallet::with_transport(m);
+        }
+        match self.start_in(&visit, params, true) {
+            Ok(started) => answer_reply(visit, started, share, true),
+            Err(f) => {
+                let v = f.v.clone();
+                visit.refused(share, f);
+                visit.grace_done();
+                Reply::Whole(refusal(&v))
+            }
+        }
+    }
+}
+
+/// A paid request's answer handed on to the page as it arrives, its share settled however it ends; `grace`: one let
+/// through after the buyer's stop, which the stop leaves to end and which is counted done when it has.
+fn answer_reply(visit: Arc<Visit>, started: Started, share: i64, grace: bool) -> Reply {
+    let Started { head, first, src, done } = started;
+    let status = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).unwrap_or(502);
+    let mut out_headers: Vec<(String, String)> = vec![];
+    for h in head.get("headers").and_then(Value::as_array).into_iter().flatten() {
+        if let (Some(k), Some(v)) = (h.get(0).and_then(Value::as_str), h.get(1).and_then(Value::as_str)) {
+            // what frames the body is this answer's own
+            if !["content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"].contains(&k.to_ascii_lowercase().as_str()) {
+                out_headers.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    if !out_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+        if let Some(t) = head.get("content_type").and_then(Value::as_str) {
+            out_headers.push(("Content-Type".into(), t.into()));
+        }
+    }
+    let length = head.get("content_length").and_then(Value::as_u64);
+    let tracked = visit.track_as(&src, share, grace);
+    let mut settle = Settle { visit, share, tracked: Some(tracked), src: Some(src), done: Some(done), grace };
+    Reply::Stream(Streamed {
+        status,
+        headers: out_headers,
+        length,
+        body: Box::new(move |out: &mut dyn BodyWriter| {
+            out.send(&first)?;
+            let mut sent = first.len() as u64;
+            let mut buf = vec![0u8; 64 << 10];
+            while let Some(src) = settle.src.as_mut() {
+                let n = src.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                out.send(&buf[..n])?;
+                sent += n as u64;
+            }
+            drop(settle.src.take());
+            // the signer's account, where the length does not say: an answer it ended early is cut short for the page too
+            let r = whole(length, sent, || settle.account());
+            // the owner's log says why a page saw an answer cut short (its status and the wallet's words; no URL)
+            if let Err(e) = &r {
+                eprintln!("lightning-stream: a page's answer (HTTP {status}) was cut short: {e}");
+            }
+            r
+        }),
+    })
+}
+
+impl Connector {
     /// A page's WebSocket: paid for as its bytes pass, both ways, from a share of the visit's limit
     /// held while it is open ([`SOCKET_SHARE`]).
     fn visit_socket(&self, visit: Arc<Visit>, path: &str, req: &Request) -> Reply {
@@ -992,7 +1163,7 @@ impl Connector {
         if let Some(m) = params.as_object_mut() {
             xbt_wallet_mcp::wallet::with_transport(m);
         }
-        let Started { head, first, src, done } = match self.start(params) {
+        let Started { head, first, src, done } = match self.start_in(&visit, params, false) {
             Ok(s) => s,
             Err(f) => {
                 let v = f.v.clone();
@@ -1032,6 +1203,12 @@ impl Connector {
     fn start(&self, params: Value) -> Result<Started, Failed> {
         start_call(&self.cfg, params)
     }
+
+    /// [`Connector::start`] for a request of `visit`: given up while it waits to begin, where the visit is stopped (unless it
+    /// is let through in the grace after the stop, `grace`).
+    fn start_in(&self, visit: &Visit, params: Value, grace: bool) -> Result<Started, Failed> {
+        start_call_until(&self.cfg, params, &|| !grace && visit.is_stopped())
+    }
 }
 
 /// A WebSocket's share, from the seller's 101 until it is settled: by [`SocketHold::settle`] when the
@@ -1060,6 +1237,41 @@ impl Drop for SocketHold {
         visit.settle_begin(share, true);
         std::thread::spawn(move || visit.settle_end(share, done, true));
     }
+}
+
+/// The rest of a buyer's stop, behind its answer: once the requests let through in the stop's grace have ended, the shop's
+/// connection is closed where no other open visit uses it (`others`), as Stop on Live connections closes it. That ends at
+/// the signer what the visit's own stop could not reach: answers whose page side is gone but whose seller still sends
+/// (and charges) the bytes on their way, a call still paying for a ticket before its head, a top-up, a WebSocket held
+/// open. Their shares are then settled by the signer's word on each, waited for up to [`STOP_SETTLE_WAIT`], so that the
+/// visit's report (`settled`) says what it used and what was paid in it.
+fn finish_stop(cfg: &Config, visit: &Visit, others: bool) {
+    let until = Instant::now() + GRACE_WAIT;
+    let mut s = visit.lock();
+    while (s.stopped_at.is_some_and(|t| t.elapsed() < STOP_GRACE) || s.grace_open > 0) && Instant::now() < until {
+        s = visit.turn.wait_timeout(s, Duration::from_millis(100)).unwrap_or_else(|p| p.into_inner()).0;
+    }
+    drop(s);
+    let closed = !others && {
+        let r = xbt_wallet_mcp::wallet::signer_call(&cfg.signer, Duration::from_secs(90), "ticket_stop",
+                                                    &json!({"seller": visit.origin(), "why": "the buyer stopped the visit"}));
+        match r {
+            Ok(v) => v.get("verdict").and_then(Value::as_str).is_some_and(|d| d == "allow" || d == "partial"),
+            Err(e) => {
+                eprintln!("lightning-stream: a stopped visit's connection with the shop could not be closed: {e}");
+                false
+            }
+        }
+    };
+    let until = Instant::now() + STOP_SETTLE_WAIT;
+    let mut s = visit.lock();
+    s.connection_closed = Some(closed);
+    while s.held > 0 && Instant::now() < until {
+        s = visit.turn.wait_timeout(s, Duration::from_millis(100)).unwrap_or_else(|p| p.into_inner()).0;
+    }
+    s.closing = false;
+    drop(s);
+    visit.turn.notify_all();
 }
 
 /// [`read_routes`] on a thread of its own, unless a read is under way already.
@@ -1107,7 +1319,14 @@ fn read_routes(cfg: &Config, visit: &Visit, gen: u64) -> bool {
 }
 
 /// [`Connector::start`].
-fn start_call(cfg: &Config, mut params: Value) -> Result<Started, Failed> {
+fn start_call(cfg: &Config, params: Value) -> Result<Started, Failed> {
+    start_call_until(cfg, params, &|| false)
+}
+
+/// [`start_call`], given up where `stopped` says so while it waits for the signer to begin the answer (the visit was
+/// stopped): the stream socket goes, so the answer has no reader, and the signer's word on the call is still waited for
+/// ([`Visit::settle`]), the share held until it comes.
+fn start_call_until(cfg: &Config, mut params: Value, stopped: &dyn Fn() -> bool) -> Result<Started, Failed> {
     let name = format!("ls-{}", random_hex());
     let path = cfg.stream_dir.join(&name);
     let listener = listen_stream(&path).map_err(|e| Failed { v: json!({"error": format!("stream socket: {e}")}), done: None, unknown: false })?;
@@ -1140,6 +1359,10 @@ fn start_call(cfg: &Config, mut params: Value) -> Result<Started, Failed> {
             let _ = std::fs::remove_file(&path);
             let unknown = d.is_err() && !unsent.load(Ordering::SeqCst);
             return Err(Failed { v: d.unwrap_or_else(|e| json!({"error": e})), done: None, unknown });
+        }
+        if stopped() {
+            let _ = std::fs::remove_file(&path);
+            return Err(Failed { v: json!({"error": "Stopped."}), done: Some(done), unknown: false });
         }
         if started.elapsed() > FIRST_ANSWER {
             let _ = std::fs::remove_file(&path);
@@ -1204,6 +1427,8 @@ struct Settle {
     tracked: Option<Tracked>,
     src: Option<UnixStream>,
     done: Option<mpsc::Receiver<Result<Value, String>>>,
+    /// Let through in the grace after a stop: counted done once settled.
+    grace: bool,
 }
 
 impl Settle {
@@ -1225,6 +1450,9 @@ impl Drop for Settle {
         drop(self.tracked.take());
         // the signer's count of what left the wallet for this answer; nothing known is the whole share, kept spent
         self.visit.settle(self.share, self.done.take(), false);
+        if self.grace {
+            self.visit.grace_done();
+        }
     }
 }
 
@@ -1736,7 +1964,8 @@ mod tests {
         assert!(v.take_lane().is_none(), "no room in the limit for a ticket");
         v.lock().spent = 0;
         let (most, top) = v.take_lane().expect("the credit is low: the lane");
-        assert_eq!((most, top), (125 + 600, 500));
+        // the credit kept ahead is what could be drawn now (nothing runs: one request's share), not four shares
+        assert_eq!((most, top), (125 + 600, 125));
         assert!(v.take_lane().is_none(), "one request holds the lane");
         assert_eq!(v.lock().spent, most);
         v.lane_done();
