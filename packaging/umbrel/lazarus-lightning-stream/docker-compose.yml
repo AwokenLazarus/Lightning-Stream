@@ -87,7 +87,7 @@ services:
       APP_PORT: 8482
 
   init:
-    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-b8a60adfece2@sha256:e18deaf67bfba78a90ea998055ca151843468a7f20177106b81124f5ae7fc60f
+    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-83d8839bc267@sha256:a3246217bb72725e77723703400c77b1328f048d266e1f422b71aa7369e613a9
     user: "0:0"
     restart: "no"
     network_mode: none
@@ -112,7 +112,7 @@ services:
 
   witness:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-c8ba24a813dc@sha256:c4b8e7ec74f880ee71436edb057ed8ba117929bbeb415ac2ffc19debb92d7f68
+    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-83d8839bc267@sha256:1ebfa6370947ae8930b7a9230b0384c2f89a95c19a373fbf15a70f8979ac1bd6
     network_mode: none
     stop_grace_period: 30s
     volumes:
@@ -121,7 +121,7 @@ services:
 
   signer:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-c8ba24a813dc@sha256:e421803110285fe778987312e9cb27bacb498ab7ff5208aa0eeaad250c5a12ce
+    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-83d8839bc267@sha256:67cba183c7da8adca868f641ee745d32f1527c2c4cdf309c5efdd1bc85ece39e
     entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
     stop_grace_period: 1m
     environment:
@@ -152,7 +152,7 @@ services:
 
   mcp:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-c8ba24a813dc@sha256:556e7098323602ce1b6b699cfb299050e27276b954f3a7eecbb18e0499641d45
+    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-83d8839bc267@sha256:fb7d5de56901ac230a023ff43d22fa222bb9c27fea234b91c345f826752f1327
     stop_grace_period: 30s
     environment:
       # an over-threshold payment waits this long for the owner's approval in the UI
@@ -173,7 +173,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-d43386c2da47@sha256:6231aef23717b7c8051e706c52fddf598061e2d94a56aab9e29a2af19713009d
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-83d8839bc267@sha256:1d1d31013c89675db0d13e54e85b63daf8c50f59474d950fd9e1bf859722553c
     stop_grace_period: 15s
     ports:
       # sellers' own web pages, framed by the app's page on the same host (umbreld proxies the page itself)
@@ -289,7 +289,7 @@ services:
   # network of this app's own could not hold another app's container (no narrower network to give it).
   node-keys-bake:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-d43386c2da47@sha256:6231aef23717b7c8051e706c52fddf598061e2d94a56aab9e29a2af19713009d
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-83d8839bc267@sha256:1d1d31013c89675db0d13e54e85b63daf8c50f59474d950fd9e1bf859722553c
     command: ["node-keys"]
     user: "1000:1000"
     restart: "no"
@@ -320,7 +320,7 @@ services:
   # key id, removes it from the hand-over, and exits once every key is in place.
   node-keys:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-d43386c2da47@sha256:6231aef23717b7c8051e706c52fddf598061e2d94a56aab9e29a2af19713009d
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-83d8839bc267@sha256:1d1d31013c89675db0d13e54e85b63daf8c50f59474d950fd9e1bf859722553c
     command: ["node-keys"]
     restart: "no"
     # it only moves files: no network at all (the node's address below is only what the tool asks for)
@@ -340,7 +340,7 @@ services:
 
   connector:
     <<: *service
-    image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-d43386c2da47@sha256:a9a80455ca8da7c8fe1eaa7beae93351dd2428a4ad32fc2cf97faa8def2fac9b
+    image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-83d8839bc267@sha256:802bdfb7f9dab443ac1db3caf6e24211850aa685198f50c0d664a5fdc209953a
     network_mode: "service:ui"
     stop_grace_period: 15s
     depends_on:
@@ -375,7 +375,7 @@ services:
 
   gateway:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-b8a60adfece2@sha256:c1969c9e93fb8bda6e481f11c71a4b099cbbe76faaea4ad0d458090068d31022
+    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-83d8839bc267@sha256:9f06ae2ad745d50eb5d44612a7b6a42288c7d08deca27e9a47af7d85e8aa9f5a
     # each held ticket is followed on its own connection to the node; a stop cancels nothing.
     # the image starts the gateway only once run/gateway/config.json exists, and publishes no host port
     stop_grace_period: 30s
@@ -386,7 +386,7 @@ services:
 
   hasher:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-b8a60adfece2@sha256:5bc4b1fb7d5e666e70e66928d1e9994d06cd4db03079ebc0b8dba49d4a245c87
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-83d8839bc267@sha256:c101244d8acb0c5aba9729be3b3df2732f5a2ba327bcaf8d4e3e0b1b769f1341
     stop_grace_period: 15s
     command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
               "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "0.0.0.0:23344",
@@ -406,7 +406,7 @@ services:
 
   renter:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-b8a60adfece2@sha256:5bc4b1fb7d5e666e70e66928d1e9994d06cd4db03079ebc0b8dba49d4a245c87
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-83d8839bc267@sha256:c101244d8acb0c5aba9729be3b3df2732f5a2ba327bcaf8d4e3e0b1b769f1341
     stop_grace_period: 15s
     depends_on:
       init:
@@ -434,7 +434,7 @@ services:
   # on loopback and exits when it stops answering; restart: on-failure then starts it in the renter's new one.
   datum:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-datum-gateway:0.1.0-b8a60adfece2@sha256:05aa9519c24e6b915ecbfdd45946367c6eda597af5474968a9814b7709b7585a
+    image: ghcr.io/awokenlazarus/xbt-datum-gateway:0.1.0-83d8839bc267@sha256:b8c84dfe26ebc16cd9e745ea04ecd011578138f523793259cc970c3c37807a48
     network_mode: "service:renter"
     stop_grace_period: 20s
     depends_on:
@@ -462,7 +462,7 @@ services:
   # offered; it restarts itself when they change.
   vpn:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-vpn:0.1.0-c8ba24a813dc@sha256:21a886fc41d25146afd8a9cfc2b8136c386375d6ce251cb9b0ff3b8ecdda732c
+    image: ghcr.io/awokenlazarus/xbt-vpn:0.1.0-83d8839bc267@sha256:41047ce1594794a1cde8b5d26b133e7af38d1ad6c317de695f8b2bfbc1f69e0c
     stop_grace_period: 10s
     environment:
       XBT_VPN_NOSTR_RELAYS: wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol
