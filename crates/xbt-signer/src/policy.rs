@@ -127,7 +127,7 @@ impl Decision {
 /// The setting of `c`, in sats, that `rule` holds a payment to ([`PolicyEngine::limit_of`]).
 fn limit_in(c: &PolicyConfig, rule: &str) -> Option<i64> {
     Some(match rule {
-        "max_per_tx" | "split_bypass" => c.max_per_tx_sats,
+        "max_per_tx" => c.max_per_tx_sats,
         "daily_budget" => c.daily_budget_sats,
         "weekly_budget" => c.weekly_budget_sats,
         "per_counterparty" => c.per_counterparty_cap_sats,
@@ -851,11 +851,16 @@ impl PolicyEngine {
         // still count in the window of every other payment to that seller.
         if !admitted {
             let split_sum = Self::spent(&ledger, cfg.split_window_s as f64, now, Some(&p.dest))?.saturating_add(booked_sats);
+            // the split rule holds the window's sum to one of two settings: the one it was held to is its limit
             if split_sum > cfg.max_per_tx_sats {
-                return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} would exceed max_per_tx {}", cfg.max_per_tx_sats), None, None));
+                let mut d = decide(Deny, "split_bypass", format!("split window sum {split_sum} would exceed max_per_tx {}", cfg.max_per_tx_sats), None, None);
+                d.limit_sats = Some(cfg.max_per_tx_sats);
+                return Ok(d);
             }
             if !human && split_sum >= cfg.human_threshold_sats && p.amount_sats < cfg.human_threshold_sats {
-                return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} evades human_threshold {}", cfg.human_threshold_sats), None, None));
+                let mut d = decide(Deny, "split_bypass", format!("split window sum {split_sum} evades human_threshold {}", cfg.human_threshold_sats), None, None);
+                d.limit_sats = Some(cfg.human_threshold_sats);
+                return Ok(d);
             }
         }
         let (day_sum, week_sum, cpty_sum) = (daily.saturating_add(booked_sats), weekly.saturating_add(booked_sats), cpty.saturating_add(booked_sats));

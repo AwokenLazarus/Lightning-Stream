@@ -3294,9 +3294,16 @@ impl Signer {
         let streaming = hs.streaming.load(Ordering::SeqCst);
         // the buyer's own rules refused the session's last ticket: another session would be refused by the same rule, and
         // each one opened would take a place of the seller's (`too_many_sessions`). Kept, and the caller told that rule
-        if let Some(d) = lock(&hs.policy_refused).clone() {
-            self.ticket_audit("ticket_cap_full_kept", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "policy_rule": d.get("rule")}));
-            return None;
+        // Asked again now, not taken from the last refusal: the owner may have raised the limit, or the day's window moved on
+        if lock(&hs.policy_refused).is_some() {
+            let refused = self.ticket_prepaid_size(&hs.sid, None, None).and_then(|(m, _, _)| self.ticket_prepay_precheck(&hs.sid, m).err()).filter(is_owner_limit);
+            match refused {
+                Some(d) => {
+                    self.ticket_audit("ticket_cap_full_kept", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "policy_rule": d.get("rule")}));
+                    return None;
+                }
+                None => *lock(&hs.policy_refused) = None,
+            }
         }
         if owed > 0 || streaming > 0 {
             self.ticket_audit("ticket_cap_full_kept", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "owed_msat": owed.to_string(),
@@ -3702,8 +3709,12 @@ impl Signer {
         // the owner's own caps and spending rules, before the seller is asked for anything: a ticket they refuse is never
         // locked, so it holds none of the places the seller gives the session and this address
         if let Some((m, _, _)) = size {
-            if let Err(d) = self.ticket_prepay_precheck(&hs.sid, m) {
-                return Err(self.ticket_policy_refused(hs, spent, d, None));
+            match self.ticket_prepay_precheck(&hs.sid, m) {
+                Err(d) if is_owner_limit(&d) => return Err(self.ticket_policy_refused(hs, spent, d, None)),
+                Err(d) => return Err(d),
+                // the owner's rules allow it now (a limit raised, or the day's window moved on): the session is no longer
+                // one they refuse
+                Ok(()) => *lock(&hs.policy_refused) = None,
             }
         }
         // a rental task's sizes aren't its seller's own (`topTicketMsat`): each is asked for by name
