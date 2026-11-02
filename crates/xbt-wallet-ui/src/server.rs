@@ -302,7 +302,72 @@ const RELAYED: [&str; 5] = ["Content-Type", "Content-Range", "Accept-Ranges", "E
 
 /// Stream the connector's answer for a seller URL to the reader, with the reader's `Range` (the
 /// connector takes one plain byte range and ignores any other).
-fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option<&serde_json::Value>, limit: Option<(u64, i64)>) -> xbt_svc::http::Reply {
+fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option<&serde_json::Value>, mut limit: Option<(u64, i64)>) -> xbt_svc::http::Reply {
+    let mut retried = false;
+    loop {
+        match relay_once(url, range, if_range, ceiling, limit) {
+            Relayed::Reply(r) => return r,
+            // the seller's smallest ticket is above the call's limit, and nothing was paid: asked once
+            // more with the limit the wallet named, where it is a modest one
+            Relayed::Refused(body) => match (limit, (!retried).then(|| ticket_retry_sats(&body, limit.map(|(_, s)| s))).flatten()) {
+                (Some((size, _)), Some(n)) => {
+                    retried = true;
+                    limit = Some((size, n));
+                }
+                _ => return refused_page(&body),
+            },
+        }
+    }
+}
+
+/// The most a download's first call is asked again with when the wallet's refusal names the
+/// seller's smallest ticket: a few tickets of the protocol's smallest. A shop whose ticket is
+/// larger is not paid from a Download without the owner's word; its refusal is shown.
+pub const RETRY_MOST_SATS: i64 = 2_000;
+
+/// The `max_sats` to call again with, from the connector's 402 `body`: where the wallet refused a
+/// call whose limit (`sent`) is below the seller's smallest ticket and paid nothing, the limit it
+/// names, when that is more than was sent and at most [`RETRY_MOST_SATS`].
+pub fn ticket_retry_sats(body: &str, sent: Option<i64>) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let words = v.get("error").and_then(serde_json::Value::as_str)?;
+    if v.get("rule").and_then(serde_json::Value::as_str) != Some("max_sats") || !words.contains("nothing was paid") {
+        return None;
+    }
+    let (_, after) = words.split_once("max_sats of at least ")?;
+    let n: i64 = after.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()?;
+    (n > sent.unwrap_or(0) && n <= RETRY_MOST_SATS).then_some(n)
+}
+
+/// A refusal of the wallet's, as a page a person reads rather than the connector's JSON.
+pub fn refused_html(body: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let words = v.get("error").and_then(serde_json::Value::as_str).filter(|w| !w.is_empty()).unwrap_or("The wallet did not pay for this file.");
+    let rule = v.get("rule").and_then(serde_json::Value::as_str).unwrap_or("");
+    let more = if rule == "max_sats" {
+        format!("A download from Lightning Stream pays at most {RETRY_MOST_SATS} sat for its first ticket with a shop, and what it does not use \
+                 stays as credit with the shop. Your spending rules apply as well.")
+    } else {
+        "Your spending rules decide what the wallet pays: see Rules in Lightning Stream.".to_string()
+    };
+    format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
+             <title>Not paid</title></head><body><h1>This file was not paid for</h1><p>{}</p><p>{}</p>\
+             <p>Go back to Lightning Stream to try again.</p></body></html>", crate::html::esc(words), crate::html::esc(&more))
+}
+
+fn refused_page(body: &str) -> xbt_svc::http::Reply {
+    let mut whole = Resp::html(402, refused_html(body));
+    security_headers(&mut whole);
+    xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body))
+}
+
+/// One call to the connector: its answer for the reader, or the body of the wallet's 402 refusal.
+enum Relayed {
+    Reply(xbt_svc::http::Reply),
+    Refused(String),
+}
+
+fn relay_once(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option<&serde_json::Value>, limit: Option<(u64, i64)>) -> Relayed {
     let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).redirects(0).build();
     let mut rq = agent.get(url);
     if let Some(c) = ceiling {
@@ -335,18 +400,22 @@ fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option
             // a file larger than its listing before any of it was read
             let said = String::from_utf8_lossy(&body);
             if limit.is_some() && matches!(code, 412 | 502) && (said.contains("larger_than_shown") || said.contains("the buyer was shown")) {
-                return larger_than_listed();
+                return Relayed::Reply(larger_than_listed());
+            }
+            // the wallet's refusal (nothing paid): asked again, or shown in words
+            if code == 402 {
+                return Relayed::Refused(said.into_owned());
             }
             let mut whole = Resp::text(code, "application/json", body);
             whole.headers.extend(headers);
             security_headers(&mut whole);
-            return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
+            return Relayed::Reply(xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body)));
         }
         Err(e) => {
             let v = serde_json::json!({"error": format!("the connector: {e}")});
             let mut whole = Resp::json(502, &v);
             security_headers(&mut whole);
-            return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
+            return Relayed::Reply(xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body)));
         }
     };
     let status = resp.status();
@@ -361,18 +430,18 @@ fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option
     // the wallet pays for none of it (at most the part's head), and the buyer is told why
     if let Some((size, _)) = limit {
         if more_than_listed(status, resp.header("Content-Length"), resp.header("Content-Range"), size) {
-            return larger_than_listed();
+            return Relayed::Reply(larger_than_listed());
         }
     }
     // and one that sends more than that without saying so is cut there
     let left = limit.map_or(u64::MAX, |(size, _)| size);
     let mut src = resp.into_reader();
-    xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed {
+    Relayed::Reply(xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed {
         status,
         headers,
         length,
         body: Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| send_within(&mut src, left, out)),
-    })
+    }))
 }
 
 /// A relayed body, at most `left` bytes of it. One that has more than that ends in an error, so that
@@ -500,6 +569,25 @@ mod tests {
         assert_eq!(send(200_000, 100_000), (false, 100_000), "past it, over several reads");
         assert_eq!(send(1_000, 1_000), (true, 1_000), "the size");
         assert_eq!(send(999, 1_000), (true, 999), "less");
+    }
+
+    /// The wallet's refusal of a call under the seller's smallest ticket names the limit that would do:
+    /// asked once more with it, when nothing was paid and it is a modest one; every other refusal is
+    /// a page in words, never the connector's JSON.
+    #[test]
+    fn a_refusal_under_the_smallest_ticket_is_asked_again_once_and_others_are_words() {
+        let genesis = r#"{"error": "the smallest prepaid ticket this seller sells is 546 sat (up to 13 sat more in routing fees), over this call's limit of 284 sat: nothing was paid; call again with max_sats of at least 559", "rule": "max_sats"}"#;
+        assert_eq!(ticket_retry_sats(genesis, Some(284)), Some(559));
+        assert_eq!(ticket_retry_sats(genesis, Some(559)), None, "not again with the same limit");
+        let big = genesis.replace("at least 559", "at least 50013");
+        assert_eq!(ticket_retry_sats(&big, Some(284)), None, "a large ticket is not bought from a Download");
+        let some_paid = r#"{"error": "the next ticket of this seller is 546 sat, and only 10 sat of this call's limit of 559 sat is left: no more was paid", "rule": "max_sats"}"#;
+        assert_eq!(ticket_retry_sats(some_paid, Some(559)), None);
+        assert_eq!(ticket_retry_sats(r#"{"error": "over the daily budget", "rule": "budget"}"#, Some(559)), None);
+        let page = refused_html(r#"{"error": "over the <per-payment> cap", "rule": "max_payment_sats"}"#);
+        assert!(page.starts_with("<!doctype html>") && page.contains("This file was not paid for") && page.contains("over the &lt;per-payment&gt; cap"), "{page}");
+        assert!(refused_html(&big).contains("at most 2000 sat for its first ticket"));
+        assert!(refused_html("not json").contains("The wallet did not pay for this file."));
     }
 
     #[test]

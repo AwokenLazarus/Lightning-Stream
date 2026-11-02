@@ -3713,6 +3713,8 @@ fn a_file_is_paid_no_further_than_its_listed_size() {
     const OK: &str = "https://files.example/f/ok.bin";
     const BIG: &str = "https://files.example/f/big.bin";
     const QUIET: &str = "https://files.example/f/quiet.bin";
+    const TICKET: &str = "https://files.example/f/ticket.bin";
+    const CAPPED: &str = "https://files.example/f/capped.bin";
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let connector = format!("http://{}", l.local_addr().unwrap());
     let max_sats: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3724,7 +3726,7 @@ fn a_file_is_paid_no_further_than_its_listed_size() {
             let asked = String::from_utf8_lossy(&head[..n]).to_string();
             let path = asked.split(' ').nth(1).unwrap_or("").to_string();
             let cap = asked.lines().find_map(|l| l.strip_prefix("X-Max-Sats: ").or_else(|| l.strip_prefix("x-max-sats: "))).map(str::to_string);
-            log.lock().unwrap().push((path.clone(), cap));
+            log.lock().unwrap().push((path.clone(), cap.clone()));
             let body = vec![7u8; 5_000];
             if path == format!("/s/{OK}") {
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n");
@@ -3732,6 +3734,16 @@ fn a_file_is_paid_no_further_than_its_listed_size() {
             } else if path == format!("/s/{BIG}") {
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n");
                 let _ = s.write_all(&body);
+            } else if path == format!("/s/{TICKET}") && cap.as_deref() != Some("700") {
+                // a shop whose smallest ticket books 700 sat: the wallet refuses a smaller limit, paying nothing
+                let no = r#"{"error": "the smallest prepaid ticket this seller sells is 690 sat (up to 10 sat more in routing fees), over this call's limit of 559 sat: nothing was paid; call again with max_sats of at least 700", "rule": "max_sats"}"#;
+                let _ = write!(s, "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{no}", no.len());
+            } else if path == format!("/s/{TICKET}") {
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(&body[..1000]);
+            } else if path == format!("/s/{CAPPED}") {
+                let no = r#"{"error": "over the <per-payment> cap of your rules", "rule": "max_payment_sats"}"#;
+                let _ = write!(s, "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{no}", no.len());
             } else if path == format!("/s/{QUIET}") {
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n");
                 let _ = s.write_all(&body);
@@ -3747,7 +3759,9 @@ fn a_file_is_paid_no_further_than_its_listed_size() {
          "prices": {{"request_msat": 1000, "byte_msat": 1, "per_bytes": 1}},
          "items": [{{"title": "ok", "year": 2020, "url": "{OK}", "credit": "1.0 KB"}},
                    {{"title": "big", "year": 2020, "url": "{BIG}", "credit": "1.0 KB"}},
-                   {{"title": "quiet", "year": 2020, "url": "{QUIET}", "credit": "1.0 KB"}}]}}
+                   {{"title": "quiet", "year": 2020, "url": "{QUIET}", "credit": "1.0 KB"}},
+                   {{"title": "ticket", "year": 2020, "url": "{TICKET}", "credit": "1.0 KB"}},
+                   {{"title": "capped", "year": 2020, "url": "{CAPPED}", "credit": "1.0 KB"}}]}}
     ]"#)).unwrap();
     let services = path.clone();
     let b = start(json!({}), false, move |c| {
@@ -3768,10 +3782,21 @@ fn a_file_is_paid_no_further_than_its_listed_size() {
         let clean = resp.into_reader().read_to_end(&mut body).is_ok();
         (status, body, clean)
     };
-    // 1.0 KB stands for at most 1,050 bytes: 1,000 msat a request + 1,050 msat, +2%, is 3 sats, +1
+    // 1.0 KB stands for at most 1,050 bytes: 1,000 msat a request + 1,050 msat, +2%, is 3 sats, +1. Under the
+    // smallest ticket a seller sells with its fees (546 + 13 sat): the call may buy that one ticket, and the rest stays as credit
     let (status, body, clean) = get(OK);
     assert_eq!((status, body.len(), clean), (200, 1000, true));
-    assert_eq!(max_sats.lock().unwrap().last().unwrap().1.as_deref(), Some("4"), "the call's cap is the listed size's price");
+    assert_eq!(max_sats.lock().unwrap().last().unwrap().1.as_deref(), Some("559"), "the call's cap is one smallest ticket, over the listed size's price");
+    // a shop whose smallest ticket is larger: the wallet's refusal names the limit, and the call is made once more with it
+    let (status, body, _) = get(TICKET);
+    assert_eq!((status, body.len()), (200, 1000), "{}", String::from_utf8_lossy(&body));
+    let caps: Vec<_> = max_sats.lock().unwrap().iter().filter(|(p, _)| p.ends_with("ticket.bin")).map(|(_, c)| c.clone().unwrap_or_default()).collect();
+    assert_eq!(caps, ["559", "700"]);
+    // any other refusal is a page in words, not the connector's JSON
+    let (status, body, _) = get(CAPPED);
+    let page = String::from_utf8_lossy(&body);
+    assert_eq!(status, 402);
+    assert!(page.starts_with("<!doctype html>") && page.contains("over the &lt;per-payment&gt; cap") && !page.contains("\"rule\""), "{page}");
     let (status, body, _) = get(BIG);
     assert_eq!(status, 502, "a seller saying it sends 5,000 bytes of a 1.0 KB file is refused");
     assert!(String::from_utf8_lossy(&body).contains("more than the size its listing shows"));

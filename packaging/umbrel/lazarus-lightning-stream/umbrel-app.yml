@@ -55,6 +55,9 @@ gallery:
 releaseNotes: >-
   0.2.1: on Browse, Found on Nostr, a shop reached by its key (such as the demo shop, Lightning
   Stream Genesis) now offers Add this shop, in place of a check that failed with a name-lookup error.
+  A file cheaper than a shop's smallest ticket (546 sat) can be downloaded: its first call buys one
+  ticket and the rest stays as credit, and a refusal is a page in words, not raw JSON. A web-app visit
+  needs a limit of at least 559 sat; a smaller one is refused with the reason and set to 559.
   0.2.0, a public test release: hashrate rentals with masked jobs, through the Stream Gateway
   (DATUM-compatible) that now comes with the app, so rented miners can't see a winning block and can't
   withhold it; solo, or on Lazarus Pool. Every rental is checked masked job by job or refused. Sell your

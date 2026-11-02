@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::app::{App, Ctx};
+use crate::app::{App, Ctx, MIN_CALL_SATS, MIN_TICKET_SATS};
 use crate::html::esc;
 use crate::server::Resp;
 
@@ -21,6 +21,28 @@ use crate::server::Resp;
 const CODE_TTL: Duration = Duration::from_secs(60);
 /// The visit's limit the page suggests, in sats.
 pub const SUGGESTED_LIMIT: i64 = 1_000;
+// the form's own suggestion opens a visit that can buy a ticket
+const _: () = assert!(SUGGESTED_LIMIT >= MIN_CALL_SATS);
+/// The largest limit a visit may have, in sats.
+const MAX_VISIT_SATS: i64 = 10_000_000;
+
+/// The visit's limit from what the owner entered. A limit under the smallest ticket a shop sells
+/// with its routing fees ([`MIN_CALL_SATS`]) would open a visit whose first request is refused
+/// with nothing spent, so it is refused here, in words, with the form set to that least limit
+/// (`Err((words, Some(limit)))`) for the owner to confirm.
+pub(crate) fn visit_limit(entered: Option<&str>) -> Result<i64, (String, Option<i64>)> {
+    let n: i64 = entered.and_then(|v| v.trim().replace(',', "").parse().ok()).unwrap_or(0);
+    if !(1..=MAX_VISIT_SATS).contains(&n) {
+        return Err((format!("Set a limit of {MIN_CALL_SATS} sat or more."), None));
+    }
+    if n < MIN_CALL_SATS {
+        return Err((format!("A shop's smallest ticket is {MIN_TICKET_SATS} sat, so with routing fees a visit needs at least {MIN_CALL_SATS} sat: \
+                             the limit is now set to {MIN_CALL_SATS} sat. Press Open the app to go on. What you don't use stays as credit with the shop."),
+                    Some(MIN_CALL_SATS)));
+    }
+    Ok(n)
+}
+
 /// The largest request body a page sends.
 const MAX_BODY: usize = 1 << 20;
 
@@ -144,12 +166,15 @@ impl App {
                 esc(&svc.name), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base));
             return self.page("Open the app", ctx, b);
         }
+        // a limit the owner entered under the smallest ticket comes back raised to it (see [`visit_limit`])
+        let suggested = q.get("limit").and_then(|v| v.parse::<i64>().ok()).filter(|n| (MIN_CALL_SATS..=MAX_VISIT_SATS).contains(n)).unwrap_or(SUGGESTED_LIMIT);
         let b = format!("<section class=\"card primary\"><h2>Open {}'s app</h2>\
             <p>You use <strong>{}</strong> as it is on {}'s own network, inside this page. What it loads is paid at {}, \
             and stops at the limit you set here.</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
-            <label>Spend at most, on this visit, in sats<input name=\"limit\" value=\"{SUGGESTED_LIMIT}\" required inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
-            <p class=\"hint\">A seller sells in tickets, often 546 sats or more, so a visit needs at least that. Your spending rules apply as well.</p>\
+            <label>Spend at most, on this visit, in sats<input name=\"limit\" value=\"{suggested}\" required inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
+            <p class=\"hint\">A shop sells in tickets of at least {MIN_TICKET_SATS} sat, so with routing fees a visit needs at least {MIN_CALL_SATS} sat. \
+            What you don't use stays as credit with the shop. Your spending rules apply as well.</p>\
             <div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
             <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
             esc(&host), esc(&svc.name), esc(&host), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), self.identity_card(ctx, &svc.seller, &base, &entry));
@@ -216,11 +241,16 @@ impl App {
         } else {
             None
         };
-        let limit: i64 = if preview { 0 } else { f.get("limit").and_then(|v| v.trim().replace(',', "").parse().ok()).unwrap_or(0) };
-        if !preview && !(1..=10_000_000).contains(&limit) {
-            self.flash(ctx, false, "Set a limit of 1 sat or more.");
-            return Resp::redirect(&format!("./app?u={}&b={}", crate::services::urlenc(&entry), crate::services::urlenc(&base)));
-        }
+        let limit = if preview { 0 } else {
+            match visit_limit(f.get("limit").map(String::as_str)) {
+                Ok(n) => n,
+                Err((words, raised)) => {
+                    self.flash(ctx, false, words);
+                    let again = raised.map(|n| format!("&limit={n}")).unwrap_or_default();
+                    return Resp::redirect(&format!("./app?u={}&b={}{again}", crate::services::urlenc(&entry), crate::services::urlenc(&base)));
+                }
+            }
+        };
         // one port, one cookie prefix, for each app: a seller's two apps never share a page's state
         let Some((port, other)) = self.port_for(&base) else {
             self.flash(ctx, false, "This box does not open sellers' apps.");
@@ -702,6 +732,19 @@ pub fn spawn(app: &Arc<App>, strict: bool) -> Result<Vec<(u16, xbt_svc::http::Ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A visit limit of 500 sat is under the smallest ticket with its fees: refused in words, with
+    /// the form set to 559, and not opened to fail at its first request with nothing spent.
+    #[test]
+    fn a_visit_limit_under_the_smallest_ticket_is_raised_with_words() {
+        let (words, raised) = visit_limit(Some("500")).unwrap_err();
+        assert_eq!(raised, Some(559));
+        assert!(words.contains("smallest ticket is 546 sat") && words.contains("set to 559 sat") && words.contains("stays as credit with the shop"), "{words}");
+        assert_eq!(visit_limit(Some("559")), Ok(559));
+        assert_eq!(visit_limit(Some("1,000")), Ok(1_000));
+        assert_eq!(visit_limit(Some("0")).unwrap_err().1, None);
+        assert_eq!(visit_limit(None).unwrap_err().1, None);
+    }
 
     /// The owner is offered "Stay anonymous here" for a shop where any route keeps accounts, not only
     /// the one its app is listed under: a Jellyfin listed at `/films/` asks `/` for its accounts.

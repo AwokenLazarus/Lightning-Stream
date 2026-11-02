@@ -306,8 +306,9 @@ impl App {
     }
 
     /// What one relayed part of a listed file may cost, from its listing: the most bytes its listed
-    /// size can stand for ([`crate::files::size_most`]) and, for a part of `range_len` bytes, the most
-    /// sats at the listed prices with 2% slack. `None`: no listed size or price to hold the seller to.
+    /// size can stand for ([`crate::files::size_most`]) and, for a part of `range_len` bytes, the
+    /// call's limit ([`file_call_sats`]: the listed prices with 2% slack, at least one ticket).
+    /// `None`: no listed size or price to hold the seller to.
     pub fn relay_limit(&self, req: &Req, item: &str, range_len: Option<u64>) -> Option<(u64, i64)> {
         let path = strip_base(&req.path, &self.cfg.base_path)?;
         let service = match path.strip_prefix("/r/") {
@@ -318,11 +319,7 @@ impl App {
         let (svc, it) = crate::services::find_item_of(&all, &service, item)?;
         let size = crate::files::size_most(&it.credit)?;
         let c = svc.price_ceiling()?;
-        let n = |k: &str| c.get(k).and_then(Value::as_u64).unwrap_or(0) as u128;
-        let bytes = range_len.map_or(size, |r| r.min(size)) as u128;
-        let msat = n("request_msat") + (n("gib_msat") * bytes).div_ceil(1 << 30);
-        let sats = (msat * 102 / 100).div_ceil(1000) + 1;
-        Some((size, i64::try_from(sats).unwrap_or(i64::MAX)))
+        Some((size, file_call_sats(&c, range_len.map_or(size, |r| r.min(size)))))
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {
@@ -1838,6 +1835,53 @@ pub fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
     }
     let rest = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://"));
     rest.is_some_and(|r| !r.is_empty() && !r.contains('/') && host_allowed(r, allowed))
+}
+
+/// The smallest prepaid ticket a seller may sell, in sats: the protocol's dust floor
+/// ([`xbt402::ticket::MIN_HELD_TICKET_MSAT`], 546 sat). A listing does not name its shop's own
+/// smallest ticket, so this is the least a first call to a seller the buyer has no credit with needs.
+pub const MIN_TICKET_SATS: i64 = (xbt402::ticket::MIN_HELD_TICKET_MSAT / 1000) as i64;
+
+/// What the signer books for that ticket at its default routing-fee limit (10 sat + 5,000 ppm),
+/// 559 sat: the least `max_sats` a call to a seller with no credit buys a ticket with. Less pays
+/// nothing ("call again with max_sats of at least 559").
+pub const MIN_CALL_SATS: i64 = {
+    let t = xbt402::ticket::MIN_HELD_TICKET_MSAT / 1000;
+    (t + 10 + (t * 5_000).div_ceil(1_000_000)) as i64
+};
+
+/// The `max_sats` of one relayed call for `bytes` of a listed file at the listing's `ceiling`
+/// ([`crate::services::Service::price_ceiling`]): its price with 2% slack, and never under
+/// [`MIN_CALL_SATS`]. A file that costs less than a ticket still buys one whole ticket on a first
+/// call, and what the file does not use stays as credit with the seller. The owner's spending rules
+/// still bound every payment; this is only the call's own limit.
+pub fn file_call_sats(ceiling: &Value, bytes: u64) -> i64 {
+    let n = |k: &str| ceiling.get(k).and_then(Value::as_u64).unwrap_or(0) as u128;
+    let msat = n("request_msat") + (n("gib_msat") * u128::from(bytes)).div_ceil(1 << 30);
+    let sats = (msat * 102 / 100).div_ceil(1000) + 1;
+    i64::try_from(sats).unwrap_or(i64::MAX).max(MIN_CALL_SATS)
+}
+
+#[cfg(test)]
+mod file_call_tests {
+    use super::*;
+
+    /// Big Buck Bunny at Lightning Stream Genesis: 276 MB at 1,000 sat/GB is about 284 sat with the
+    /// slack, under the smallest ticket's 559: the call's limit is a whole ticket, not the file's price.
+    #[test]
+    fn a_small_file_call_can_buy_the_smallest_ticket() {
+        assert_eq!((MIN_TICKET_SATS, MIN_CALL_SATS), (546, 559));
+        let genesis = xbt402::listing::price_ceiling(&json!({"byte_msat": 1_000_000, "per_bytes": 1_000_000_000u64}));
+        let bunny = crate::files::size_most("276 MB").unwrap();
+        // its price alone, with the slack: the 284 sat limit the signer refused
+        let n = |k: &str| genesis[k].as_u64().unwrap() as u128;
+        let price = ((n("request_msat") + (n("gib_msat") * u128::from(bunny)).div_ceil(1 << 30)) * 102 / 100).div_ceil(1000) + 1;
+        assert_eq!(price, 284);
+        assert_eq!(file_call_sats(&genesis, bunny), 559, "a 276 MB file buys one 546-sat ticket");
+        assert_eq!(file_call_sats(&genesis, 4 << 20), 559, "and so does a player's 4 MiB part");
+        // a file that costs more than a ticket keeps its own price
+        assert_eq!(file_call_sats(&genesis, 2_000_000_000), 2_042);
+    }
 }
 
 #[cfg(test)]
