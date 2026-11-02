@@ -183,7 +183,7 @@ fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 // the connection the visits paid through: one open session with the seller last paid, until it is stopped
                 if req["method"] == "ticket_status" {
-                    let origin = urls.lock().unwrap().last().and_then(|u| u.split('/').take(3).collect::<Vec<_>>().join("/").into()).unwrap_or_default();
+                    let origin: String = urls.lock().unwrap().last().map(|u: &String| u.split('/').take(3).collect::<Vec<&str>>().join("/")).unwrap_or_default();
                     let id = format!("s-{}", origin.len());
                     let state = if STOPPED.lock().unwrap().contains(&id) { "closed" } else { "open" };
                     let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"sessions": [{"session": id, "origin": origin, "state": state}], "paying": []}}));

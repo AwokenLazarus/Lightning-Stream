@@ -257,7 +257,7 @@ fn the_hashrate_page_asks_status_and_offers_at_once_and_keeps_the_offers() {
 #[test]
 fn kept_reads_serve_a_page_opened_seconds_later() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    assert!(xbt_wallet_ui::config::DEFAULT_CACHE_S >= 15);
+    const { assert!(xbt_wallet_ui::config::DEFAULT_CACHE_S >= 15) };
     assert!(xbt_wallet_ui::link::READS.contains(&"settled_amounts"), "the Wallet page's read of what each payment cost forgets nothing");
     let bx = start(Duration::from_secs(xbt_wallet_ui::config::DEFAULT_CACHE_S));
     let mut br = B::login(&bx);
