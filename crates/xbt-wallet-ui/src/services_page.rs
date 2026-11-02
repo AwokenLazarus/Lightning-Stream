@@ -99,7 +99,7 @@ impl App {
                     // a shop known by its key can be linked to on this page, by that key
                     let anchor = if xbt402::shop::is_shop(&origin) { format!(" id=\"key-{}\"", esc(&xbt402::shop::display(&origin))) } else { String::new() };
                     b.push_str(&format!("<section class=\"card seller\"{anchor}><h3>{}</h3><p class=\"small\">{shown}</p><ul class=\"offers\">",
-                                        esc(&list[0].name)));
+                                        esc(&services::seller_name(&all, &origin))));
                     for s in &list {
                         let n = s.items.len();
                         b.push_str(&format!("<li><span class=\"pill cat-{}\">{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
@@ -126,6 +126,7 @@ impl App {
                 }
             }
         }
+        b.push_str(&self.still_allowed(&self.file_services().unwrap_or_default()));
         self.page("Sellers", ctx, b)
     }
 
@@ -137,7 +138,11 @@ impl App {
         };
         let result = match f.get("action").map(String::as_str) {
             Some("add") | Some("refresh") => self.add_seller(&url, get_page),
-            Some("remove") => self.remove_seller(&url),
+            Some("remove") => self.remove_seller(&url).map(|m| if self.in_rules(&url) {
+                format!("{m} It is still allowed to be paid in your spending rules: review it below.")
+            } else {
+                m
+            }),
             Some("allow") => match self.allow_link(&url, get_page) {
                 Ok(link) => return Resp::redirect(&link),
                 Err(e) => Err(e),
@@ -195,6 +200,39 @@ impl App {
                    if allowed { "" } else { " To let the app pay this seller, press \"Allow this seller to be paid\" below." }))
     }
 
+    /// The seller's name for any page: the shop's listing name, else its short address
+    /// ([`services::seller_name`]). For the pages that name a seller by its origin alone (a visit, an
+    /// activity line).
+    pub fn seller_name(&self, origin: &str) -> String {
+        services::seller_name(&self.file_services().unwrap_or_default(), origin)
+    }
+
+    /// Whether the spending rules name the seller at `origin` at all: on the list that may be paid,
+    /// or tied to a Lightning node.
+    pub(crate) fn in_rules(&self, origin: &str) -> bool {
+        let Ok(p) = self.signer.call("policy_get", serde_json::json!({})) else { return false };
+        rules_naming(&p["policy"], &[]).iter().any(|o| services::same_origin(o, origin))
+    }
+
+    /// The sellers the spending rules still allow to be paid that are not on the list of sellers
+    /// (removed there, say): each with a link that opens the rules with it ticked for removal.
+    fn still_allowed(&self, have: &[Service]) -> String {
+        let Ok(p) = self.signer.call("policy_get", serde_json::json!({})) else { return String::new() };
+        let gone = rules_naming(&p["policy"], have);
+        if gone.is_empty() {
+            return String::new();
+        }
+        let mut b = String::from("<section class=\"card\" id=\"still-allowed\"><h2>Still allowed to be paid</h2>\
+            <p>Your spending rules still allow these sellers to be paid, though they are not on your list. Review them to remove them there too.</p><ul>");
+        for o in &gone {
+            b.push_str(&format!("<li><strong>{}</strong> <span class=\"small\"><code class=\"key\">{}</code></span> \
+                                 <a href=\"./policy?drop={}\">Review in your spending rules</a></li>",
+                                esc(&services::seller_name(have, o)), esc(&xbt402::shop::display(o)), services::urlenc(o)));
+        }
+        b.push_str("</ul></section>");
+        b
+    }
+
     /// Whether the spending rules let the app pay the seller at `origin`: its address on the list,
     /// tied to a Lightning node.
     pub(crate) fn seller_allowed(&self, origin: &str) -> bool {
@@ -245,4 +283,18 @@ impl App {
         self.ai_sellers_follow(url);
         Ok("Seller removed. Their services are no longer on Browse.".into())
     }
+}
+
+/// The web addresses (and shop keys) the rules `p` name, on the list that may be paid or tied to a
+/// node, that no service in `have` is sold by. With `have` empty: every one.
+fn rules_naming(p: &serde_json::Value, have: &[Service]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let listed = p["allowlist"].as_array().into_iter().flatten().filter_map(|x| x.as_str());
+    let tied = p["counterparties"].as_object().into_iter().flat_map(|m| m.keys().map(String::as_str));
+    for o in listed.chain(tied).filter_map(services::http_origin) {
+        if !out.contains(&o) && !have.iter().any(|s| services::same_origin(&s.seller, &o)) {
+            out.push(o);
+        }
+    }
+    out
 }

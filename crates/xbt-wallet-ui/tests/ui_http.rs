@@ -442,7 +442,7 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
         let v = field(&page, &format!("f_{k}"));
         form.push((format!("f_{k}"), v));
     }
-    form.push(("f_allowlist".into(), PROVIDER.into()));
+    form.push(("f_sellers".into(), field(&page, "f_sellers")));
     let post = |br: &mut B, f: &[(String, String)]| br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>());
     let mut bad = form.clone();
     bad.iter_mut().find(|(k, _)| k == "f_max_per_tx_sats").unwrap().1 = "lots".into();
@@ -567,7 +567,7 @@ fn policy_form_fields(page: &str) -> Vec<(String, String)> {
               "split_window_s", "velocity_max", "velocity_window_s", "hot_balance_cap_sats", "anchor_interval_s", "treasury_csv"] {
         form.push((format!("f_{k}"), field(page, &format!("f_{k}"))));
     }
-    form.push(("f_allowlist".into(), PROVIDER.into()));
+    form.push(("f_sellers".into(), field(page, "f_sellers")));
     form.push(("f_unseen".into(), field(page, "f_unseen")));
     form
 }
@@ -3094,6 +3094,12 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
     assert!(r.location().contains(&format!("node={node_hex}")) && r.location().contains("shop.invalid"), "{}", r.location());
     let rules = br.get(r.location().trim_start_matches('.')).body;
     assert!(rules.contains(&format!("Allow {npub} to be paid")), "the rules page names the shop by its key");
+    // and in the list of who may be paid, by its listing's name, with its key under it (#37 items 7, 11)
+    assert!(rules.contains("<strong>Home films</strong><br><code class=\"key small\">") && rules.contains(&format!("title=\"{node_hex}\"")), "{rules}");
+    // Found on Nostr knows it is on the list (#37 items 6, 15). FAILS before: "Add this shop" still, no mark
+    let found = br.get("/nostr").body;
+    assert!(found.contains(">On your list<") && found.contains(">Check for updates<") && !found.contains(">Add this shop<"), "{found}");
+    assert!(found.contains("A shop reached by its key: its address is that key"), "the intro fits shops reached by their key: {found}");
 
     // a wrong key, and an unknown one
     // the last character changed to a different one: bech32's checksum catches any one changed character
@@ -4434,4 +4440,169 @@ fn another_gateways_api_is_set_on_the_page_and_an_installer_override_is_said() {
     let r = br.act("/hashrate", "/hashrate", &[("action", "use-previous"), ("addr", "127.0.0.1:23339")]);
     br.flash_after(&r);
     assert!(seen.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/datum" && b.contains("127.0.0.1:23339")));
+}
+
+// --- who may be paid: sellers by name, never a node lost (0.2.2, #37) ---------------------------------
+
+/// A shop reached by its key, as Mike's Genesis was: its listing's services in the services file
+/// (named `shop: service`, as several are), and its link vouched for by `node` in the shops file.
+/// Returns the shop's origin, its npub and the node's id.
+fn genesis_shop(bx: &Box_) -> (String, String, String) {
+    let shop_pk = [0x4e; 32];
+    let shop = xbt402::shop::origin_for(&shop_pk);
+    let npub = xbt402::shop::npub(&shop_pk);
+    let (sk, pk) = receipt_key(b"genesis");
+    let node = Sk::from_slice(&[9u8; 32]).unwrap();
+    let node_hex = hex::encode(xbt_primitives::ecdsa::pubkey(&node));
+    let expires = xbt_nostr::now() + 30 * 86_400;
+    let ep = "ab".repeat(32);
+    let link = xbt402::transport::Link { kind: "iroh".into(), endpoint_id: ep.clone(), relays: vec!["https://relay.example".into()], direct: vec![], expires,
+                                         node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) };
+    let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &[link], "2026-11-01"));
+    let mut shops = std::collections::BTreeMap::new();
+    shops.insert(shop.clone(), xbt_wallet_ui::shops::Shop { receipt_key: pk, transport: Some(t) });
+    let cfg = &bx._app.cfg;
+    std::fs::create_dir_all(cfg.shops_path().parent().unwrap()).unwrap();
+    xbt_wallet_ui::shops::save(&cfg.shops_path(), &shops).unwrap();
+    std::fs::write(cfg.services_path(), json!([
+        {"name": "Lightning Stream Genesis: Blender open films (Jellyfin)", "kind": "video", "seller": shop, "price_text": "20 sat a MiB", "items": []},
+        {"name": "Lightning Stream Genesis: Notes", "kind": "api", "seller": shop, "price_text": "1 sat a request", "items": []},
+    ]).to_string()).unwrap();
+    assert_eq!(xbt_wallet_ui::shops::node(&shops[&shop], &shop, xbt_nostr::now()).as_deref(), Some(node_hex.as_str()));
+    (shop, npub, node_hex)
+}
+
+const OTHER: &str = "https://other.example";
+
+/// Spending rules → "Who may be paid" is a list of sellers, by name, with their key and node, and a
+/// Remove box. Editing the rules takes whole sellers out and can never cut a seller's node off: 0.2.1
+/// had a free-text box where Genesis's line wrapped, and an edit saved it with no node, so every
+/// payment to it was refused. A seller on the list with no node is a warning, before signing.
+///
+/// FAILS without the list: the page has the two text boxes, no `f_sellers`, no names and no warning.
+#[test]
+fn editing_the_rules_never_drops_a_seller_s_node_and_a_seller_without_one_is_warned_before_signing() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let other_node = hex::encode(xbt_primitives::ecdsa::pubkey(&Sk::from_slice(&[7u8; 32]).unwrap()));
+    let bx = start(json!({"ln": {"enabled": true}}), false, |_| {});
+    let (shop, npub, node_hex) = genesis_shop(&bx);
+    // the rules: the rig's own (PROVIDER, with no node, and a coin address), Genesis and another seller, each with its node
+    let mut p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    p["allowlist"] = json!([PROVIDER, ADDR, shop, OTHER]);
+    p["counterparties"] = json!({shop.clone(): {"ln_node": node_hex}, OTHER: {"ln_node": other_node}});
+    let mut br = logged_in(&bx);
+    let csrf = field(&br.get("/policy").body, "csrf");
+    let prev = br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", &p.to_string())]).body;
+    assert!(prev.contains("Sign and apply"), "{prev}");
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &csrf), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
+    assert!(br.flash_after(&r).starts_with("Policy applied"));
+
+    let page = br.get("/policy").body;
+    // a list, not free text
+    assert!(!page.contains("name=\"f_allowlist\"") && !page.contains("name=\"f_counterparties\""), "{page}");
+    assert!(page.contains("<table class=\"sellers\">"), "{page}");
+    // the shop by its listing's name and its key; its node shortened, in full on hover
+    let rules = &page[page.find("id=\"sellers\"").unwrap()..];
+    let rules = &rules[..rules.find("</fieldset>").unwrap()];
+    assert!(rules.contains("<strong>Lightning Stream Genesis</strong>") && rules.contains(&npub), "{rules}");
+    assert!(rules.contains(&format!("title=\"{node_hex}\"")) && rules.contains(&format!("{}…{}", &node_hex[..8], &node_hex[58..])), "{rules}");
+    assert!(!rules.contains(&format!(">{shop}<")) && rules.contains(&format!("<code class=\"key small\">{npub}</code>")), "no made-up address shown: {rules}");
+    // the rig's PROVIDER is on the list with no node: said, with what follows
+    let warn = "this seller will be refused: it has no Lightning node on file";
+    assert!(page.contains(warn) && page.contains("seller-warning"), "{page}");
+
+    // an edit: another rule changed and the other seller removed; Genesis keeps its node
+    let mut form = policy_form_fields(&page);
+    form.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "4000".into();
+    let other_row = rules[..rules.find(&format!("value=\"{OTHER}\"")).unwrap()].rfind("name=\"f_drop_").unwrap();
+    let name = rules[other_row + 6..].split('"').next().unwrap().to_string();
+    form.push((name, OTHER.into()));
+    // the review warns about PROVIDER too, before anything is signed
+    let review = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    assert!(review.contains(warn) && review.contains("Sign and apply"), "{review}");
+    let flash = sign_policy_form(&mut br, &form);
+    assert!(flash.starts_with("Policy applied"), "{flash}");
+    let p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    assert_eq!(p["human_threshold_sats"], 4000);
+    assert_eq!(p["counterparties"][&shop]["ln_node"], json!(node_hex), "the node is kept: {p}");
+    assert_eq!(p["allowlist"], json!([PROVIDER, ADDR, shop]), "{p}");
+    assert!(p["counterparties"].get(OTHER).is_none(), "{p}");
+
+    // a page from before (free text, the node cut off, no list): the sellers stay as they are
+    let page = br.get("/policy").body;
+    let mut old: Vec<(String, String)> = policy_form_fields(&page).into_iter().filter(|(k, _)| k != "f_sellers").collect();
+    old.push(("f_allowlist".into(), shop.clone()));
+    old.push(("f_counterparties".into(), shop.clone()));
+    old.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "3000".into();
+    assert!(sign_policy_form(&mut br, &old).starts_with("Policy applied"));
+    let p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    assert_eq!(p["human_threshold_sats"], 3000);
+    assert_eq!(p["counterparties"][&shop]["ln_node"], json!(node_hex), "an old page cannot drop the node: {p}");
+    assert_eq!(p["allowlist"], json!([PROVIDER, ADDR, shop]), "{p}");
+
+    // the expert's file: a node other than the one the shop vouches for is a warning, with the fix
+    let mut wrong = p.clone();
+    wrong["counterparties"][&shop]["ln_node"] = json!(other_node);
+    let review = br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", &wrong.to_string())]).body;
+    assert!(review.contains("this seller will be refused: its Lightning node on file is not the one the shop vouches for now"), "{review}");
+    assert!(review.contains(&format!("Lightning Stream Genesis ({npub}) › ln_node")), "the change names the shop: {review}");
+    let mut none = p.clone();
+    none["counterparties"] = json!({});
+    let review = br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", &none.to_string())]).body;
+    assert!(review.contains("<strong>Lightning Stream Genesis</strong>: this seller will be refused: it has no Lightning node on file"), "{review}");
+}
+
+/// Sellers names a shop by its listing's name, not after its first service; removing a seller there
+/// says it is still allowed to be paid and opens the rules with it ticked for removal; the version
+/// is in the footer and Settings.
+///
+/// FAILS before: the heading was "Lightning Stream Genesis: Blender open films (Jellyfin)", the removal
+/// said nothing of the rules, and no version was shown.
+#[test]
+fn sellers_are_named_by_their_shop_and_a_removed_seller_still_in_the_rules_is_offered_for_removal() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({"ln": {"enabled": true}}), false, |_| {});
+    let (shop, npub, node_hex) = genesis_shop(&bx);
+    let mut br = logged_in(&bx);
+    let csrf = field(&br.get("/policy").body, "csrf");
+    let mut p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    p["allowlist"] = json!([ADDR, shop]);
+    p["counterparties"] = json!({shop.clone(): {"ln_node": node_hex}});
+    let prev = br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", &p.to_string())]).body;
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &csrf), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
+    assert!(br.flash_after(&r).starts_with("Policy applied"));
+
+    let sellers = br.get("/services").body;
+    assert!(sellers.contains("<h3>Lightning Stream Genesis</h3>"), "{sellers}");
+    assert!(!sellers.contains("Still allowed to be paid"), "it is on the list");
+    // the version: the release's, not the crate's 0.1.0
+    let v = xbt_wallet_ui::release_version();
+    assert_ne!(v, "0.1.0");
+    assert!(sellers.contains(&format!("Lightning Stream {v}</span></footer>")), "{sellers}");
+    assert!(br.get("/setup").body.contains(&format!("Lightning Stream version {v}")));
+
+    let r = br.act("/services", "/services", &[("action", "remove"), ("url", &shop)]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("Seller removed") && f.contains("still allowed to be paid in your spending rules"), "{f}");
+    let sellers = br.get("/services").body;
+    let link = format!("./policy?drop={}", xbt_wallet_ui::services::urlenc(&shop));
+    assert!(sellers.contains("Still allowed to be paid") && sellers.contains(&link) && sellers.contains(&npub), "{sellers}");
+    // the rules, with it ticked for removal; signed, it is gone from both lists
+    let page = br.get(link.trim_start_matches('.')).body;
+    assert!(page.contains("is still allowed to be paid. It is ticked for removal"), "{page}");
+    let row = &page[page.find(&format!("value=\"{shop}\" checked")).expect("ticked")..];
+    assert!(row.starts_with(&format!("value=\"{shop}\" checked")));
+    let i = page[..page.find(&format!("value=\"{shop}\" checked")).unwrap()].rfind("name=\"f_drop_").unwrap();
+    let name = page[i + 6..].split('"').next().unwrap().to_string();
+    let mut form = policy_form_fields(&page);
+    form.push((name, shop.clone()));
+    assert!(sign_policy_form(&mut br, &form).starts_with("Policy applied"));
+    let p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    assert_eq!(p["allowlist"], json!([ADDR]), "{p}");
+    assert_eq!(p["counterparties"], json!({}), "{p}");
+    assert!(!br.get("/services").body.contains("Still allowed to be paid"));
 }

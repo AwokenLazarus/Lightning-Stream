@@ -612,8 +612,10 @@ fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value
         let (spent, _) = spent_of(&paying, id, counts.booked_sats);
         total = total.saturating_add(spent);
         open += usize::from(state == "open");
-        let svc = names.iter().filter(|n| services::same_origin(&n.seller, origin)).map(|n| n.name.as_str()).collect::<Vec<_>>();
-        let name = if svc.is_empty() { host(origin) } else { svc.join(", ") };
+        // the shop by its listing's name, never its made-up `…shop.invalid` address
+        let name = services::seller_name(names, origin);
+        // its key (npub) or web address under Details
+        let origin = &xbt402::shop::display(origin);
         let opened = num(s.get("opened_ts"));
         let minutes = if opened > 0.0 { ((now as f64 - opened) / 60.0).max(0.0) } else { 0.0 };
         cards.push_str(&session_card(ctx, id, &name, origin, state, &counts, &paying, spent, minutes, err.as_deref()));

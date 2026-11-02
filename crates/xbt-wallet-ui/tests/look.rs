@@ -89,12 +89,15 @@ fn the_look_in_headless_chrome() {
         return eprintln!("node or chrome not found: skipped");
     };
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let rig = Rig::new(json!({"human_pubkey": ""}), true);
+    // who may be paid (Spending rules): the shop reached by its key below, by name, with its node, and the rig's
+    // own seller with no node, which the page warns will be refused
+    let home_shop = xbt402::shop::origin_for(&[0x5a; 32]);
+    let rig = Rig::new(json!({"human_pubkey": "", "allowlist": [PROVIDER, ADDR, home_shop],
+                              "counterparties": {home_shop.clone(): {"ln_node": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}}}), true);
     let sock_path = rig.dir.path().join("signer.sock");
     let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
     let data = tempfile::tempdir().unwrap();
     let services = data.path().join("services.json");
-    let home_shop = xbt402::shop::origin_for(&[0x5a; 32]);
     std::fs::write(&services, json!([
         // a media server, shared as its own web app (the app has no player of its own)
         {"name": "Creative Commons films", "kind": "video", "seller": "https://media.example", "price_text": "20 sat a MiB", "items": [],

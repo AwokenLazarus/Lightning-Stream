@@ -60,6 +60,24 @@ pub fn river_js() -> &'static str {
     &SERVED
 }
 
+/// The Umbrel package's manifest, read when this crate is built: its `version` is the release.
+const UMBREL_APP_YML: &str = include_str!("../../../packaging/umbrel/lazarus-lightning-stream/umbrel-app.yml");
+
+/// The release this app is part of (`0.2.2`), as the footer and Settings show it. It is the
+/// version of the Umbrel package (`packaging/umbrel/lazarus-lightning-stream/umbrel-app.yml`),
+/// read at build time: the release bumps that file in any case, and every package (Umbrel,
+/// StartOS, Linux) is built from the same tree, so the number cannot drift from what the owner
+/// installed. The crate's own version (`CARGO_PKG_VERSION`) is the workspace's, not the release.
+pub fn release_version() -> &'static str {
+    static V: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| version_in(UMBREL_APP_YML).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()));
+    &V
+}
+
+/// The top-level `version:` of a manifest, without quotes.
+fn version_in(yml: &str) -> Option<String> {
+    yml.lines().find_map(|l| l.strip_prefix("version:")).map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string()).filter(|v| !v.is_empty())
+}
+
 /// OS randomness.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
@@ -78,4 +96,20 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod version_tests {
+    /// The footer and Settings name the release, not the crate's 0.1.0 (#37 item 10).
+    ///
+    /// FAILS with `env!("CARGO_PKG_VERSION")`: 0.1.0.
+    #[test]
+    fn the_release_version_is_the_umbrel_package_s() {
+        assert_eq!(super::version_in("manifestVersion: 1.1\nid: x\nversion: \"0.2.2\"\ntagline: t\n").as_deref(), Some("0.2.2"));
+        assert_eq!(super::version_in("version: 0.3.0\n").as_deref(), Some("0.3.0"));
+        let v = super::release_version();
+        assert_ne!(v, env!("CARGO_PKG_VERSION"), "the release, not the crate's version");
+        let parts: Vec<&str> = v.split('.').collect();
+        assert!(parts.len() == 3 && parts.iter().all(|p| p.parse::<u32>().is_ok()), "{v}");
+    }
 }

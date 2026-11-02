@@ -223,10 +223,10 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
              <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
              <header>{brand}{menu}</header>\
              <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>\
-             <footer>Your money stays on your own Lightning node. Nobody else holds it.</footer>\
+             <footer>Your money stays on your own Lightning node. Nobody else holds it. <span class=\"version\">Lightning Stream {}</span></footer>\
              <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
             asset_version(crate::MARK_SVG), esc(title), esc(nav.brand), asset_version(crate::UI_CSS), asset_version(crate::VT_JS), esc(title),
-            asset_version(crate::UI_JS), asset_version(crate::river_js()))
+            esc(crate::release_version()), asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
 
 /// The app's mark in the header and as the page icon: assets/mark.svg, one theme's logo.
