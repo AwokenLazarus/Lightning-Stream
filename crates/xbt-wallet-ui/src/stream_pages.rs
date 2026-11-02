@@ -789,6 +789,16 @@ mod tests {
         assert_eq!((c.never_sent, c.cancelled_at_stop, c.payment_failed), (1, 1, 1));
     }
 
+    /// A visit's Stop closes the open connections with its shop, and only those.
+    #[test]
+    fn the_open_connections_of_one_shop_are_the_ones_a_visits_stop_ends() {
+        let st = json!({"sessions": [{"session": "a", "origin": "http://127.0.0.1:9001", "state": "open"},
+                                     {"session": "b", "origin": "http://127.0.0.1:9001", "state": "closed"},
+                                     {"session": "c", "origin": "https://other.example", "state": "open"}]});
+        assert_eq!(open_ids(&st, Some(&["http://127.0.0.1:9001/".to_string()])), vec!["a".to_string()]);
+        assert_eq!(open_ids(&st, None).len(), 2);
+    }
+
     #[test]
     fn a_prepaid_ticket_that_settled_still_counts_as_paid_and_the_usage_shows() {
         // a prepaid ticket settles as soon as it arrives; the page once read it as nothing paid

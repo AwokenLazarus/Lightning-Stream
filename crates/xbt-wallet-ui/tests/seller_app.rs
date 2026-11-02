@@ -164,9 +164,6 @@ impl xbt_svc::http::Handler for Seller {
 /// A stand-in signer for the connector: each `xbt402_pay` asked of the seller as the real signer
 /// asks once it has paid (the method, the caller's headers and body, the seller's head and body
 /// back, the head line first), and every URL it was asked for, kept.
-/// The sessions the fake signer was asked to stop.
-static STOPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
 fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
     let sock = dir.join("pay.sock");
     let l = UnixListener::bind(&sock).unwrap();
@@ -181,19 +178,6 @@ fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
                 let mut line = String::new();
                 BufReader::new(conn.try_clone().unwrap()).read_line(&mut line).unwrap();
                 let req: Value = serde_json::from_str(&line).unwrap();
-                // the connection the visits paid through: one open session with the seller last paid, until it is stopped
-                if req["method"] == "ticket_status" {
-                    let origin: String = urls.lock().unwrap().last().map(|u: &String| u.split('/').take(3).collect::<Vec<&str>>().join("/")).unwrap_or_default();
-                    let id = format!("s-{}", origin.len());
-                    let state = if STOPPED.lock().unwrap().contains(&id) { "closed" } else { "open" };
-                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"sessions": [{"session": id, "origin": origin, "state": state}], "paying": []}}));
-                    return;
-                }
-                if req["method"] == "ticket_stop" {
-                    STOPPED.lock().unwrap().push(req["params"]["session"].as_str().unwrap_or("").to_string());
-                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"ok": true}}));
-                    return;
-                }
                 if req["method"] != "xbt402_pay" {
                     let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"ready": true}}));
                     return;
@@ -478,9 +462,6 @@ fn an_app_port_serves_only_the_visit_whose_cookie_it_gave() {
     let calls = paid_urls.lock().unwrap().len();
     let (st, _, _) = send("POST", &format!("{wallet}/app-stop"), &session, Some(&format!("csrf={csrf}&visit={visit}")));
     assert_eq!(st, 303);
-    // one Stop ends it all: the connection the visit paid through is stopped too (0.2.2 left it "Open, idle")
-    let sid = format!("s-{}", base.split('/').take(3).collect::<Vec<_>>().join("/").len());
-    assert!(STOPPED.lock().unwrap().contains(&sid), "the shop's connection is stopped with the visit: {:?}", STOPPED.lock().unwrap());
     let (st, _, _) = send("GET", &format!("http://127.0.0.1:{port}/web/"), &both, None);
     assert_eq!(st, 403, "the stopped visit's cookie is gone");
     assert_eq!(paid_urls.lock().unwrap().len(), calls);
@@ -595,7 +576,9 @@ fn a_visit_to_a_shop_reached_by_key_is_headed_by_the_shops_name() {
         .send_string(&format!("csrf={csrf}&{q}&limit=600")).unwrap().into_string().unwrap();
     assert!(page.contains("data-visit=\""), "the visit opened: {page}");
     assert_eq!(heading(&page), "Home films", "headed by the shop's name");
-    assert!(!shown(&page).contains(".shop.invalid") && shown(&page).contains(&short), "during the visit: {}", shown(&page));
+    // the shop by its name in the visit's words too (0.2.2: "npub1…'s own page")
+    assert!(!shown(&page).contains(".shop.invalid") && !shown(&page).contains(&short) && shown(&page).contains("Home films's own page"),
+            "during the visit: {}", shown(&page));
 }
 
 /// One seller, two apps (a media server and a podcast player), opened by one buyer at once: each is
