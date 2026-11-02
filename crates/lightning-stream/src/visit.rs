@@ -1200,6 +1200,7 @@ impl Connector {
 
     /// Ask the signer to pay for one request and stream its answer: the head line and the first
     /// bytes, or `Err` with the signer's answer when it ended before any byte came (a refusal).
+    #[cfg(test)]
     fn start(&self, params: Value) -> Result<Started, Failed> {
         start_call(&self.cfg, params)
     }
