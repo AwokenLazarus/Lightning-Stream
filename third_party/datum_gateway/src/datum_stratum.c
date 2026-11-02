@@ -1445,14 +1445,16 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	// update connection and gateway-local totals
 	stratum_note_share(m, true, job_diff);
 	{
-		const int missing_zeros = (int)datum_missing_block_zero_bits(share_hash, job->block_target, was_block);
+		// Lightning Stream: under this gateway's key the share hash is masked; the zeros a block lacks are
+		// counted on the hash only it can read (block_hash_le, the share hash itself when unmasked)
+		const int missing_zeros = (int)datum_missing_block_zero_bits(block_hash_le, job->block_target, was_block);
 		const uint64_t vardiff = m->current_diff ? m->current_diff : job_diff;
 		long double bld = job->nbits[0] ? calc_network_difficulty(job->nbits) : 0.0L;
 		const uint64_t blockdiff = (bld > 0.0L && bld < (long double)UINT64_MAX) ? (uint64_t)(bld + 0.5L) : 0;
 		stratum_log_share_result(c, username_s, true, was_block ? "block" : "ok", job_diff, vardiff, blockdiff, missing_zeros);
 		if (was_block) {
 			char hash_hex[65];
-			datum_share_hash_to_hex(hash_hex, share_hash);
+			datum_share_hash_to_hex(hash_hex, block_hash_le);
 			DLOG_INFO("SHARE %s mode=block d=%" PRIu64 " => submitted", hash_hex, job_diff);
 		}
 		datum_maybe_validate_share_on_node(block_header, full_cb_txn, full_cb_txn_size, job, empty_work, extranonce_bin, share_hash, job_diff, was_block, missing_zeros);
@@ -2605,7 +2607,11 @@ static char *datum_write_assembled_block_hex(char *ptr, uint8_t *block_header, u
 	}
 	memset(en, 0, sizeof(en));
 	if (extranonce) memcpy(en, extranonce, 12);
-	datum_blake2b_serialize_block_header(v2hdr, job->version_uint, job->prevhash_bin, merkle, job->blake2b_time_on_wire, job->nbits_uint, block_header + 32, block_header + 40, en, txcount, job->blake2b_flags, 0, (const unsigned char[16]){0}, (uint32_t)job->height, (const unsigned char[32]){0});
+	// Lightning Stream: the block as assembleBlockAndSubmit would send it, under this gateway's key when the job uses it
+	const bool own_key = datum_stratum_job_uses_own_key(job);
+	const uint8_t xor_clear_bits = own_key ? datum_blake2b_abw_clear_bits(coinbase_txn[job->target_pot_index]) : 0;
+	const unsigned char * const xor_key = own_key ? td->own_xor_key : (const unsigned char[16]){0};
+	datum_blake2b_serialize_block_header(v2hdr, job->version_uint, job->prevhash_bin, merkle, job->blake2b_time_on_wire, job->nbits_uint, block_header + 32, block_header + 40, en, txcount, job->blake2b_flags, xor_clear_bits, xor_key, (uint32_t)job->height, (const unsigned char[32]){0});
 	for(i=0;i<DATUM_BLAKE2B_BLOCK_HEADER_SIZE;i++) {
 		ptr += sprintf(ptr, "%2.2x", v2hdr[i]);
 	}
