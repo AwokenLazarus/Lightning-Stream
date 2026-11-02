@@ -8982,16 +8982,17 @@ fn where_the_offer_gives_no_invoice_the_prepaid_ticket_is_paid_by_the_sellers_in
 }
 
 /// The owner's rules hold for a payment by offer as for one by invoice: a task's budget below a
-/// ticket pays nothing, whatever the offer gave; and a refusal by the book is not undone by the
-/// seller's invoice.
+/// ticket pays nothing, whatever the offer would give; and a refusal by the owner's rules is not
+/// undone by the seller's invoice. Since 0.2.6 the rules are asked before anything is asked of the
+/// seller: no invoice is fetched for the offer, nor one locked by invoice.
 #[test]
 fn a_payment_by_offer_is_held_to_the_owners_budgets() {
     let _g = env_lock();
     let r = Rig::shipped(json!({"tickets": {"enabled": true, "tasks": {"film": {"budget_sats": BOOKING - 1}}}}), 30, offer_shop());
     let v = r.pay("/page/10", CALL);
-    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_task_budget")), "{v}");
-    assert_eq!(r.ln.st.lock().unwrap().fetched_notes.len(), 1, "an invoice was fetched, and not paid");
-    assert_eq!((r.ln.state().payments.len(), r.ledger_sum(), r.shop.standin.offer_counts()), (0, 0, (1, 0)));
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["limit_sats"].as_i64()), (Some("deny"), Some("ticket_task_budget"), Some(BOOKING - 1)), "{v}");
+    assert_eq!(r.ln.st.lock().unwrap().fetched_notes.len(), 0, "no invoice was fetched for a ticket the rules refuse");
+    assert_eq!((r.ln.state().payments.len(), r.ledger_sum(), r.shop.standin.offer_counts()), (0, 0, (0, 0)));
     assert!(lock_bodies(&r).iter().all(|l| l.get("count").is_none()), "the seller's invoice is not tried after the book refused");
 }
 
