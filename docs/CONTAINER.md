@@ -484,7 +484,7 @@ over RPC alone, and notices new blocks by polling. It starts once the UI writes 
 
 Pools: solo (the default; the renter's own address is paid), and Lazarus Pool with gateway-held keys (once
 the pool enables them; until then its jobs come back `pool-null` and the renter refuses them). Accepted
-risk, Mike 2026-10-31: on a pool that takes gateway-held keys, the renter's gateway learns of a win before
+risk (2026-10-31): on a pool that takes gateway-held keys, the renter's gateway learns of a win before
 the pool does, and could keep it from the pool. That is the same exposure a pool has to any DATUM miner
 today.
 

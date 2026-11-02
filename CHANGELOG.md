@@ -7,7 +7,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 
 ## 0.2.3 (2026-11-02)
 
-Usability, from Mike's hands-on run of 0.2.2 on Umbrel. The wallet UI, the VPN service and the signer
+Usability, from a hands-on run of 0.2.2 on Umbrel. The wallet UI, the VPN service and the signer
 change (one read added; payments are unchanged).
 
 - **Buy and Sell.** The main menu's Services is now Buy, beside Sell. Settings keeps Setup, Your node,
