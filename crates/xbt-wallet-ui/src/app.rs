@@ -1978,7 +1978,9 @@ pub(crate) fn rules_allow(p: &Value, origin: &str, known_node: Option<&str>) -> 
     }
     let list: Vec<String> = p.get("allowlist").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str)
         .map(|x| x.trim().to_ascii_lowercase()).collect();
-    [me.and_then(|r| r.node.as_deref()), known_node].into_iter().flatten().any(|n| list.contains(&format!("ln:{}", n.trim().to_ascii_lowercase())))
+    let nodes = [me.and_then(|r| r.node.as_deref()), known_node];
+    let covered = nodes.into_iter().flatten().any(|n| list.contains(&format!("ln:{}", n.trim().to_ascii_lowercase())));
+    covered
 }
 
 /// The node of an `ln:<node>` line of the rules, if `key` is one.
