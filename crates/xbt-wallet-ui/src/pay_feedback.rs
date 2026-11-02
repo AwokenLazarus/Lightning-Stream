@@ -272,7 +272,7 @@ mod tests {
     /// FAILS before: nothing was said until the payment failed on a white page.
     #[test]
     fn the_cant_send_warning_shows_under_the_ticket_size() {
-        let umbrel = json!({"configured": true, "channels": [{"usable": true, "capacity_sats": 1_000_000, "local_sats": 10_300}]});
+        let umbrel = json!({"configured": true, "channels": [{"usable": true, "capacity_sats": 1_000_000, "local_sats": 10_000}]});
         let card = cant_send_card(spendable_sats(&umbrel), 559, "this shop");
         assert!(card.contains("Your Lightning node can&#39;t send to this shop right now: your channels hold about 0 sat you can spend"), "{card}");
         assert!(card.contains("Add sending balance") && card.contains("./lightning") && card.contains(GUIDE_CHANNEL));
