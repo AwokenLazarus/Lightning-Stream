@@ -1367,7 +1367,7 @@ impl App {
         let real = matches!(confirmed, Some(Ok(true)));
         let ack_needed = !real && self.ack_needed();
         let m = if !pr.is_empty() {
-            format!("Policy applied{}. One part waits for the app to restart ({pr}): {}.", if real { ", and the app may pay with real money within it" } else { "" },
+            format!("Policy applied{}. One part waits for the app to restart ({pr}): {}.", if real { ", and the app may now pay with real money within it" } else { "" },
                     self.cfg.restart_hint)
         } else if real {
             "Policy applied, and the app may now pay with real money within it. It is in force now.".into()
