@@ -109,6 +109,15 @@ pub(crate) const INT_KEYS: [(&str, &str, &str); 13] = [
     ("treasury_csv", "Treasury delay (blocks; not used by this signer)", "anchor"),
 ];
 
+/// The stream tickets' own limit (`tickets.tasks.default.budget_sats`), a field beside the other spending limits.
+/// 0.2.6 showed it only in the rules file, by its raw name, and its refusal sent the owner there.
+pub(crate) const TICKETS_BUDGET_LABEL: &str = "Most for paid services (stream tickets) in 24 hours (sats)";
+
+/// The stream tickets' budget the rules `p` set, where they have a tickets section.
+fn tickets_budget(p: &Value) -> Option<&Value> {
+    p.get("tickets")?.get("tasks")?.get("default")?.get("budget_sats")
+}
+
 /// The height the XBT chain split from the SHA-256 chain at: a Lightning channel funded only from
 /// coins older than this exists on both chains, and the rail refuses it.
 pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
@@ -465,7 +474,7 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
-            "/ai" => self.ai_page(&ctx, req.header("x-forwarded-host").split(',').next().filter(|h| !h.trim().is_empty()).unwrap_or(req.header("host")).trim()),
+            "/ai" => self.ai_page(&ctx, crate::inference_page::page_host(req)),
             "/vpn" => self.vpn_page(&ctx, &req.query),
             "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
@@ -636,7 +645,7 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),
             "/hashrate" => self.hashrate_post(ctx, f),
-            "/ai" => self.ai_post(ctx, f),
+            "/ai" => self.ai_post(ctx, f, crate::inference_page::page_host(req)),
             "/file-link" => self.file_link(ctx, f),
             "/vpn" => self.vpn_post(ctx, f),
             "/sell-vpn" if self.cfg.sell => self.sell_vpn_post(ctx, f),
@@ -906,9 +915,10 @@ impl App {
         if let Ok(h) = recent {
             b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
             // the bookkeeping of a reservation (its booking made what was paid) is not a row of its own
-            let events: Vec<Value> = h["events"].as_array().cloned().unwrap_or_default().into_iter().filter(|e| e["type"] != "ln_amend").collect();
+            let all: Vec<Value> = h["events"].as_array().cloned().unwrap_or_default();
+            let events: Vec<Value> = all.iter().filter(|e| activity_row(e, &all)).cloned().collect();
             // what each settled payment cost, from its settled record: one read for the page
-            let hashes: Vec<&str> = events.iter().filter(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled")))
+            let hashes: Vec<&str> = events.iter().filter(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_prepaid")))
                 .filter_map(|e| e["payment_hash"].as_str()).collect();
             let settled = if hashes.is_empty() { Value::Null } else {
                 self.call("settled_amounts", json!({"hashes": hashes})).map(|v| v["settled"].clone()).unwrap_or(Value::Null)
@@ -923,8 +933,10 @@ impl App {
                 let what = match e["type"].as_str() {
                     Some("commit") if reserved => "Reserved".into(),
                     Some("commit") => "Sent on chain".into(),
-                    Some("ticket_settled" | "ln_settled") => "Paid".into(),
+                    Some("ticket_settled" | "ln_settled" | "ticket_prepaid") => "Paid".into(),
+                    Some("ticket_prepay") => "Reserved".into(),
                     Some("ticket_left_with_seller") => "Credit left with the shop".into(),
+                    Some("ticket_seller_forgot") => "The shop had forgotten an earlier connection".into(),
                     Some("decision") => match e["verdict"].as_str() { Some("allow") => "Allowed".into(), Some("deny") => "Refused".into(),
                                                                        Some("needs_human") => "Asked for your approval".into(), v => format!("Decision: {}", v.unwrap_or("")) },
                     Some("ticket_over_cap") => "A seller charged past the limit".into(),
@@ -944,7 +956,9 @@ impl App {
                     Some(r) if what == "Paid" => crate::html::paid_html(int(r.get("paid_sats")),
                         Some((txt(r.get("value_msat")).parse().unwrap_or(0), txt(r.get("fee_msat")).parse().unwrap_or(0)))),
                     _ if what == "Paid" => e.get("spent_sats").map(|a| crate::html::paid_html(int(Some(a)), None)).unwrap_or_default(),
-                    _ if reserved => e.get("amount_sats").map(|a| format!("{} <span class=\"small\">reserved</span>", money(int(Some(a))))).unwrap_or_default(),
+                    // a reservation is the most the payment may cost, routing fees included: said so, beside the exact Paid row
+                    _ if reserved => e.get("amount_sats").map(|a| format!("{} <span class=\"small\">reserved, the most it may cost</span>", money(int(Some(a))))).unwrap_or_default(),
+                    _ if e["type"] == "ticket_prepay" => e.get("booked_sats").map(|a| format!("{} <span class=\"small\">reserved, the most it may cost</span>", money(int(Some(a))))).unwrap_or_default(),
                     _ => match ["amount_sats", "spent_sats"].iter().find_map(|k| e.get(*k)) {
                         Some(a) => money(int(Some(a))),
                         None => e.get("booked_sats").map(|a| format!("{} <span class=\"small\">reserved</span>", money(int(Some(a))))).unwrap_or_default(),
@@ -953,7 +967,7 @@ impl App {
                 // a refusal in the refusal pages' plain words, the signer's own under Details
                 let (what, detail) = match refusal_words(e) {
                     Some((title, words)) => (title, format!("{} <details><summary>Details</summary>{}</details>", esc(&words), esc(&short(&txt(e.get("reason")), 300)))),
-                    None => (what, esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))),
+                    None => (what, activity_detail(e, reserved)),
                 };
                 b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{detail}</td></tr>", utc(int(e.get("ts"))), esc(&what),
                                     esc(&who(&txt(e.get("dest").or(e.get("origin")))))));
@@ -1115,6 +1129,13 @@ impl App {
                     <p class=\"hint\">Your node's channels hold {} now. Keep this above that: while the node holds more, the app pays nothing. \
                     It does not change what the app may spend{}.</p>",
                     esc(&value), money(held), if main { ". On mainnet it is required" } else { "" }));
+            }
+            // the stream tickets' budget: its own limit, beside the others (the hashrate task's stays in the rules file)
+            if g == "budgets" && p.get("tickets").is_some_and(Value::is_object) {
+                let value = tickets_budget(p).map(|v| txt(Some(v))).unwrap_or_default();
+                fields.push_str(&format!("<label>{}<input name=\"f_tickets_budget_sats\" value=\"{}\" inputmode=\"numeric\"></label>\
+                    <p class=\"hint\">What the app may pay shops for web apps, files and AI, a little at a time, in any 24 hours. \
+                    It counts within the spending limit above.</p>", esc(TICKETS_BUDGET_LABEL), esc(&value)));
             }
             if g == "anchor" {
                 fields.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the separate record keeper (after a restart)</label>",
@@ -1430,6 +1451,18 @@ impl App {
                 p.insert("ln".into(), Value::Object(ln));
             }
         }
+        // the stream tickets' budget: set where the rules have a tickets section; empty leaves it as it is (a task needs one)
+        if let Some(v) = f.get("f_tickets_budget_sats").map(|v| v.trim().replace(',', "")).filter(|v| !v.is_empty()) {
+            if let Some(t) = p.get_mut("tickets").and_then(Value::as_object_mut) {
+                let tasks = t.entry("tasks").or_insert_with(|| json!({}));
+                if let Some(tasks) = tasks.as_object_mut() {
+                    let d = tasks.entry("default").or_insert_with(|| json!({}));
+                    if let Some(d) = d.as_object_mut() {
+                        d.insert("budget_sats".into(), num(&v));
+                    }
+                }
+            }
+        }
         p.insert("anchor_required".into(), Value::Bool(f.contains_key("f_anchor_required")));
         // the sellers: the list the page showed (`f_sellers`), less those ticked for removal. Nothing on
         // the page is typed, so a seller's node is never lost to an edit (0.2.1: a node wrapped in a
@@ -1656,9 +1689,10 @@ impl App {
                           else { format!("<span class=\"tag bad\">FAILED</span> {}", esc(&s["chain"].to_string())) }),
             ("Anchor witness", if a["enabled"] == true { "enabled".into() } else { "<span class=\"tag warn\">not configured</span>".into() }),
             ("Anchored lines", escv(a.get("anchored_n"))), ("Log lines", escv(a.get("log_lines"))),
-            ("Not yet anchored", escv(a.get("unanchored_lines"))), ("Last anchor", match (int(a.get("anchored_at")), int(a.get("anchored_n"))) {
-                // lines anchored with no time on file: said, not a bare "-" beside a count (0.2.1)
-                (0, n) if n > 0 => "<span class=\"small\">its time was not recorded</span>".into(),
+            ("Not yet anchored", escv(a.get("unanchored_lines"))), ("Last sealed", match (int(a.get("anchored_at")), int(a.get("anchored_n"))) {
+                // lines sealed with no time on file: said, not a bare "-" beside a count (0.2.1), in plain words (0.2.6 said
+                // "its time was not recorded")
+                (0, n) if n > 0 => "<span class=\"small\">time not known</span>".into(),
                 (0, _) => "none yet".into(),
                 (t, _) => utc(t),
             }),
@@ -1676,7 +1710,8 @@ impl App {
         for e in rows.iter().rev() {
             let (rule, method) = (txt(e.get("rule")), txt(e.get("method")));
             b.push_str(&format!("<tr><td>{}</td><td>{}</td><td><span title=\"{}\">{}</span></td><td><span title=\"{}\">{}</span></td><td>{}</td><td><code>{}</code></td></tr>",
-                                utc(int(e.get("ts"))), escv(e.get("kind")), esc(&rule), esc(&rule_words(&rule)), esc(&method), esc(&method_words(&method)),
+                                utc(int(e.get("ts"))), format!("<span title=\"{}\">{}</span>", esc(&txt(e.get("kind"))), esc(&kind_words(&txt(e.get("kind"))))),
+                                esc(&rule), esc(&rule_words(&rule)), esc(&method), esc(&method_words(&method)),
                                 esc(&dest_words(&txt(e.get("dest")), &nodes, &known)), esc(&short(&txt(e.get("sig_sha256")), 16))));
         }
         b.push_str("</tbody></table></div>");
@@ -2052,7 +2087,7 @@ pub(crate) fn ln_line_node(key: &str) -> Option<&str> {
 /// 0.2.2 showed the signer's own words ("Ln refused … the LN node holds 287070 sats … above ln.…").
 pub(crate) fn refusal_words(e: &Value) -> Option<(String, String)> {
     let t = e["type"].as_str().unwrap_or("");
-    let refused = t.ends_with("_refused") || t.ends_with("_denied") || (t == "decision" && e["verdict"] == "deny");
+    let refused = t.ends_with("_refused") || t.ends_with("_denied") || t.ends_with("_refused_by_policy") || (t == "decision" && e["verdict"] == "deny");
     let reason = txt(e.get("reason"));
     if !refused || reason.is_empty() {
         return None;
@@ -2064,6 +2099,36 @@ pub(crate) fn refusal_words(e: &Value) -> Option<(String, String)> {
     }
     let plain = crate::setup::plain_reason(&reason);
     Some(("Not paid".into(), if plain.starts_with("Your node said:") { format!("The wallet did not pay. {reason}") } else { format!("Not paid. {plain}") }))
+}
+
+/// Whether the wallet's event `e` is a row of Recent activity, among `all` the page read. Left out: a reservation's
+/// bookkeeping (its booking made what was paid), the signer's start (no shop to name), a prepaid ticket's booking and
+/// payment where the reservation and the exact Paid row of the same payment say them (0.2.6 showed both, rounded and exact).
+pub(crate) fn activity_row(e: &Value, all: &[Value]) -> bool {
+    let hash = e["payment_hash"].as_str().unwrap_or("");
+    match e["type"].as_str() {
+        Some("ln_amend" | "ticket_start") => false,
+        Some("ticket_prepay") if !hash.is_empty() => !all.iter().any(|x| x["type"] == "commit" && x["txid"].as_str() == Some(&format!("ticket:{hash}"))),
+        Some("ticket_prepaid") if !hash.is_empty() => {
+            !all.iter().any(|x| matches!(x["type"].as_str(), Some("ticket_settled" | "ln_settled")) && x["payment_hash"].as_str() == Some(hash))
+        }
+        _ => true,
+    }
+}
+
+/// A row's Detail in plain words: the signer's word where it is one a person reads, nothing where it is an id
+/// (0.2.6 showed `ticket:<hash>` and "all policy rules passed").
+pub(crate) fn activity_detail(e: &Value, reserved: bool) -> String {
+    if reserved {
+        return String::new();
+    }
+    let said = txt(e.get("reason").or(e.get("txid")));
+    match e["type"].as_str() {
+        Some("decision") if e["verdict"] == "allow" && (e["rule"] == "ok" || said == "all policy rules passed") => "Within your spending rules".into(),
+        Some("ticket_seller_forgot") => "A new one was opened".into(),
+        _ if said.starts_with("ticket:") || said.starts_with("ln:") => String::new(),
+        _ => esc(&short(&said, 80)),
+    }
 }
 
 /// The credit left with each shop once its connections closed, by origin, in msat: from the wallet's
@@ -2125,6 +2190,22 @@ pub(crate) fn rule_words(rule: &str) -> String {
         r if r.starts_with("method:") => "The signer's own rule for this kind of request".into(),
         r if r.starts_with("watcher:") => "The payment watcher".into(),
         r => capital(&r.replace([':', '_'], " ")),
+    }
+}
+
+/// A signed record's kind, in words (the signer's own word in the cell's tooltip): 0.2.6 showed `ticket_settled`.
+pub(crate) fn kind_words(kind: &str) -> String {
+    match kind {
+        "ticket_settled" => "Ticket paid".into(),
+        "ticket_prepay" => "Ticket paid ahead".into(),
+        "ticket_release" => "Ticket released, not paid".into(),
+        "ln_payment" => "Lightning payment".into(),
+        "lottery_win_pay" => "Winning draw paid".into(),
+        "human_sweep" => "Coins sent, with your approval".into(),
+        "rotation_sweep" => "Coins moved to a new key".into(),
+        "retired_sweep" => "Coins moved from a retired key".into(),
+        "" => "—".into(),
+        k => capital(&k.replace('_', " ")),
     }
 }
 
@@ -2226,6 +2307,15 @@ fn change_words(k: &str, old: Option<&Value>, new: Option<&Value>) -> (String, V
         ("ln" | "tickets", _) => {
             leaf_changes("", old, new, &mut details);
             details.retain(|d| !d.starts_with("enabled:"));
+            // the stream tickets' budget by its field's label
+            if k == "tickets" {
+                let label = TICKETS_BUDGET_LABEL.split(" (sats)").next().unwrap_or(TICKETS_BUDGET_LABEL);
+                for d in &mut details {
+                    if let Some(rest) = d.strip_prefix("tasks › default › budget_sats:") {
+                        *d = format!("{label}:{rest}");
+                    }
+                }
+            }
             match old {
                 Some(_) if on(old) == on(new) => format!("{name}: {}", word(on(new))),
                 Some(_) => format!("{name}: {} (was {})", word(on(new)), word(on(old))),
@@ -2610,5 +2700,52 @@ mod handson_0202_tests {
         let e = json!({"type": "decision", "verdict": "deny", "rule": "allowlist", "reason": "not on allowlist"});
         assert_eq!(refusal_words(&e).unwrap().0, "This shop isn't allowed yet");
         assert!(refusal_words(&json!({"type": "ticket_settled", "reason": "x"})).is_none());
+        // a prepaid ticket refused by the owner's rules: their words, not the signer's (`budget_sats`)
+        let e = json!({"type": "ticket_prepay_refused_by_policy", "rule": "ticket_task_budget", "dest": "ln:aa",
+                       "reason": "with this ticket's 915 sats, 10618 would be above the task's budget_sats (10000)"});
+        let (what, words) = refusal_words(&e).unwrap();
+        assert!(what == "Today's limit for paid services is reached" && words.contains("Most for paid services"), "{what}: {words}");
+    }
+
+    /// Recent activity names what happened in plain words: no `ticket:<hash>`, no "all policy rules passed", no signer
+    /// start with no shop, and a prepaid ticket once as reserved (the most it may cost) and once as paid, exactly.
+    ///
+    /// FAILS before (0.2.6): "Ticket prepay 915 sats" beside "Reserved 915 sats ticket:8e2b…", "Ticket prepaid 903 sats"
+    /// beside "Paid 902.009 sats", "Ticket start" with no shop, "Ticket seller forgot".
+    #[test]
+    fn recent_activity_is_in_plain_words_and_says_each_payment_once() {
+        let h = "8e2b82a0";
+        let all = vec![
+            json!({"type": "ticket_start", "retired": 0}),
+            json!({"type": "commit", "txid": format!("ticket:{h}"), "amount_sats": 915, "dest": "ln:aa"}),
+            json!({"type": "ticket_prepay", "payment_hash": h, "booked_sats": 915, "dest": "ln:aa"}),
+            json!({"type": "ln_settled", "payment_hash": h, "dest": "ln:aa"}),
+            json!({"type": "ticket_prepaid", "payment_hash": h, "spent_sats": 903, "dest": "ln:aa"}),
+            json!({"type": "ticket_prepaid", "payment_hash": "other", "spent_sats": 10, "dest": "ln:aa"}),
+            json!({"type": "ticket_prepay", "payment_hash": "lone", "booked_sats": 20, "dest": "ln:aa"}),
+            json!({"type": "ln_amend"}),
+        ];
+        let kept: Vec<&str> = all.iter().filter(|e| activity_row(e, &all)).map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(kept, vec!["commit", "ln_settled", "ticket_prepaid", "ticket_prepay"], "a payment once, its unpaired records kept");
+        assert_eq!(activity_detail(&all[1], true), "", "no ticket:<hash>");
+        assert_eq!(activity_detail(&json!({"type": "decision", "verdict": "allow", "rule": "ok", "reason": "all policy rules passed"}), false),
+                   "Within your spending rules");
+        assert_eq!(activity_detail(&json!({"type": "commit", "txid": "ln:abc"}), false), "");
+        assert_eq!(activity_detail(&json!({"type": "ticket_seller_forgot", "origin": "https://a.example"}), false), "A new one was opened");
+        assert_eq!(activity_detail(&json!({"type": "commit", "txid": "d00d"}), false), "d00d", "a coin send's txid stays");
+    }
+
+    /// Records' Kind column in plain words; the signer's own word is its tooltip.
+    ///
+    /// FAILS before (0.2.6): the column showed `ticket_settled` and `ticket_prepay`.
+    #[test]
+    fn a_records_kind_is_in_plain_words() {
+        assert_eq!(kind_words("ticket_settled"), "Ticket paid");
+        assert_eq!(kind_words("ticket_prepay"), "Ticket paid ahead");
+        assert_eq!(kind_words("ln_payment"), "Lightning payment");
+        assert_eq!(kind_words("something_new"), "Something new");
+        for k in ["ticket_settled", "ticket_prepay", "ticket_release", "ln_payment", "lottery_win_pay", "human_sweep"] {
+            assert!(!kind_words(k).contains('_'), "{k}");
+        }
     }
 }

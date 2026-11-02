@@ -501,8 +501,11 @@
       fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
         if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
         if (limitEl && typeof v.limit_sats === "number") limitEl.textContent = v.limit_sats.toLocaleString();
-        var near = typeof v.spent_sats === "number" && typeof v.limit_sats === "number" && v.spent_sats >= 0.8 * v.limit_sats;
-        if (add) add.hidden = !(near || v.limit_reached);
+        // Add shows once 80% of the limit is used, or at the limit: never at the start of a visit. What was used, not what
+        // was paid ahead (an older connector's spent_sats counts the first ticket, most of a small limit)
+        var used = typeof v.used_sats === "number" ? v.used_sats : v.spent_sats;
+        var near = typeof used === "number" && typeof v.limit_sats === "number" && v.limit_sats > 0 && used > 0 && used >= 0.8 * v.limit_sats;
+        if (add) add.hidden = v.ended && !v.limit_reached ? true : !(near || v.limit_reached === true);
         if (state) {
           if (v.limit_reached) { state.textContent = "Limit reached"; state.className = "pill warn"; }
           else if (!v.ended) { state.textContent = "Open"; state.className = "pill good"; }

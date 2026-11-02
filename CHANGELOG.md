@@ -5,6 +5,34 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.7 (2026-11-03)
+
+- **Wallet activity in plain words.** A reservation no longer shows its `ticket:<hash>` id, an allowed
+  payment says "Within your spending rules" instead of "all policy rules passed", and the signer's start
+  (a row with no shop) is gone. A prepaid ticket is shown once as reserved, marked as the most it may cost,
+  and once as paid, with the exact amount and its fee (0.2.6 also showed "Ticket prepay 915 sats" and
+  "Ticket prepaid 903 sats" beside them). "Ticket seller forgot" reads "The shop had forgotten an earlier
+  connection". A prepaid ticket your rules refused is said in the rules' words.
+- **Records in plain words.** The Kind column says "Ticket paid", "Ticket paid ahead" and so on, with the
+  signer's own word as its tooltip. "Last anchor: its time was not recorded" reads "Last sealed: time not
+  known".
+- **The stream tickets' budget is a spending limit like the others.** Spending rules shows it beside the
+  daily limit as "Most for paid services (stream tickets) in 24 hours", to edit and sign like the rest.
+  Before, it was only in the rules file, under its raw name. When it stops a payment, the message names
+  that field and links to the rules. The hashrate rental's budget is unchanged and stays separate.
+- **Your own hashrate offer.** It shows its address beside its name, keeps the "Your offer" note, and no
+  longer shows "Allow this hashmaker to be paid", "Try one slice first" or the Rent form.
+- **Browse → Hashrate.** With no hashrate service on the list of sellers, the category leads to the
+  Hashrate page, where miners for rent are listed, instead of "No services in this category yet".
+- **AI page.** After a key is made, the address by IP is the box's own, as on the page before (0.2.6
+  showed the example 192.168.1.20). Each key's spending reads one way: "10 sats of 50 sats". In `/v1/models`,
+  a one-seller entry reads "laz-mini, always from Lightning Stream Genesis", not "from Lightning Stream
+  Genesis: laz-mini only".
+- **Player links.** A new link's time left is rounded the way its message rounds it: "stops working in 6
+  hours", then "6 hours left" (0.2.6 said "5 hours left" a second later).
+- **The visit bar's Add** shows only once 80% of the limit is used, or at the limit, counting what the
+  visit used, never what was paid ahead.
+
 ## 0.2.6 (2026-11-02)
 
 Spending limits that say what they are, from a hands-on run of 0.2.5 with the demo shop's Jellyfin. A film

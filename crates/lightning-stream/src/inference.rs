@@ -169,12 +169,19 @@ impl Catalogue {
             data.push(json!({"id": id, "object": "model", "owned_by": "lightning-stream", "description": description, "x_stream": {"sellers": sellers}}));
         }
         for o in &self.offers {
-            let description = format!("{} from {} only: the same model as {}, kept to this seller.", o.model, o.seller, o.model);
+            let description = one_seller_words(&o.seller, &o.model);
             data.push(json!({"id": format!("{}/{}", o.seller, o.model), "object": "model", "owned_by": o.seller, "description": description,
                              "x_stream": {"seller": o.seller, "model": o.model}}));
         }
         json!({"object": "list", "data": data})
     }
+}
+
+/// What a `seller/model` entry is, in plain words. A seller named after its service ("Shop: model") is named
+/// by its shop alone (0.2.6 said "laz-mini from Lightning Stream Genesis: laz-mini only").
+pub fn one_seller_words(seller: &str, model: &str) -> String {
+    let shop = seller.strip_suffix(&format!(": {model}")).filter(|s| !s.trim().is_empty()).unwrap_or(seller);
+    format!("{model}, always from {shop}. To let the cheapest seller you allow answer, ask for {model}.")
 }
 
 /// One seller's recent record.
@@ -299,6 +306,21 @@ pub fn request_bounds(body: &Value, raw_len: usize, default_max: u64) -> (u64, u
 
 #[cfg(test)]
 mod tests {
+    /// A one-seller entry reads naturally, its seller named by its shop where the name repeats the model.
+    ///
+    /// FAILS before (0.2.6): "laz-mini from Lightning Stream Genesis: laz-mini only: the same model as laz-mini, kept to this seller."
+    #[test]
+    fn a_one_seller_model_is_described_in_plain_words() {
+        assert_eq!(super::one_seller_words("Lightning Stream Genesis: laz-mini", "laz-mini"),
+                   "laz-mini, always from Lightning Stream Genesis. To let the cheapest seller you allow answer, ask for laz-mini.");
+        assert_eq!(super::one_seller_words("by-token", "llama"), "llama, always from by-token. To let the cheapest seller you allow answer, ask for llama.");
+        let mut c = super::Catalogue::default();
+        c.add_seller("Shop: m", "https://a.example/ai/", &serde_json::json!({"per_1k_output_msat": "1000"}), 1024, &serde_json::json!({"data": [{"id": "m"}]}));
+        let shown = c.models_json();
+        let one = shown["data"].as_array().unwrap().iter().find(|d| d["id"] == "Shop: m/m").unwrap();
+        assert_eq!(one["description"], "m, always from Shop. To let the cheapest seller you allow answer, ask for m.");
+    }
+
     /// A seller's price for each request counts in its rank and is shown beside its token prices:
     /// a seller cheap by the token but dear by the request is not taken for the cheapest. Prices
     /// written with spaces around them are read.

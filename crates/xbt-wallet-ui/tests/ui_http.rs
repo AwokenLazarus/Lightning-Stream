@@ -520,6 +520,35 @@ fn with_paying_off_the_rules_page_opens_on_the_starter_rules_and_signing_them_tu
     assert!(signed["ln"].get("exposure_cap_sats").is_none() && signed["ln"]["enabled"] == json!(true), "{signed}");
 }
 
+/// The stream tickets' budget is a field beside the other spending limits: what is typed there is what is signed, in
+/// `tickets.tasks.default.budget_sats`, named by its label in the review; the hashrate task's budget is left as it was.
+///
+/// FAILS before (0.2.6): the budget was only in the rules file, by its raw name.
+#[test]
+fn the_stream_tickets_budget_is_a_field_and_is_signed_as_typed() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let page = br.get("/policy").body;
+    assert!(page.contains("Most for paid services (stream tickets) in 24 hours (sats)"), "{page}");
+    let starter = xbt_wallet_ui::app::starter_policy("regtest");
+    let shown = field(&page, "f_tickets_budget_sats");
+    assert_eq!(shown, starter["tickets"]["tasks"]["default"]["budget_sats"].to_string(), "{page}");
+    let mut f = policy_form_fields(&page);
+    f.push(("f_tickets_budget_sats".into(), "25,000".into()));
+    let prev = br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    let signed: Value = serde_json::from_str(&field(&prev, "text")).unwrap();
+    assert_eq!(signed["tickets"]["tasks"]["default"]["budget_sats"], json!(25_000), "{signed}");
+    assert!(prev.contains("Most for paid services (stream tickets) in 24 hours: 25,000 sats"), "named by its label in the review: {prev}");
+    assert_eq!(signed["tickets"]["tasks"]["hashrate"], starter["tickets"]["tasks"]["hashrate"], "the hashrate task's budget is its own: {signed}");
+    assert!(xbt_signer::policy::validate_policy(&signed).0.is_empty(), "{signed}");
+    // left empty: as it was
+    f.iter_mut().find(|(k, _)| k == "f_tickets_budget_sats").unwrap().1 = "".into();
+    let prev = br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    let signed: Value = serde_json::from_str(&field(&prev, "text")).unwrap();
+    assert_eq!(signed["tickets"]["tasks"]["default"]["budget_sats"], starter["tickets"]["tasks"]["default"]["budget_sats"], "{signed}");
+}
+
 #[test]
 fn the_mainnet_starter_rules_set_the_node_s_exposure_cap_from_what_it_holds() {
     use xbt_wallet_ui::app::{starter_exposure_cap, starter_policy, starter_policy_for, STARTER_EXPOSURE_CAP_SATS};
@@ -3971,6 +4000,10 @@ fn the_ai_page_makes_a_key_shown_once_and_keeps_its_hash_and_writes_pins_for_the
     let made = br.act("/ai", "/ai", &[("do", "make"), ("name", "Open WebUI"), ("limit_sats", "500")]);
     assert_eq!(made.status, 200, "{}", made.body);
     assert_eq!(made.headers.get("cache-control").map(String::as_str), Some("no-store"));
+    // the address by IP is the page's own, as before the key was made (0.2.6 showed the example 192.168.1.20 here)
+    assert!(made.body.contains("value=\"http://127.0.0.1:33540/v1\"") && !made.body.contains("192.168.1.20"), "{}", made.body);
+    // what each key spent of its limit, one way
+    assert!(made.body.contains("0 sats <span class=\"small\">of 500 sats</span>") && !made.body.contains("XBT) of"), "{}", made.body);
     let at = made.body.find("sk-stream-").expect("the key is shown");
     let key: String = made.body[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
     assert_eq!(key.len(), "sk-stream-".len() + 22);
@@ -4424,6 +4457,50 @@ fn an_offer_shows_its_start_fee() {
     let old = card("Old miners");
     assert!(old.contains("Needs updating") && old.contains("<button disabled>Rent</button>"), "{old}");
     assert!(!old.contains("Start fee"), "{old}");
+}
+
+/// This box's own offer says what it is, with its address beside its name, and offers nothing to allow, try or rent; the
+/// "Your offer" note stays. Another hashmaker's offer keeps its Rent.
+///
+/// FAILS before (0.2.6): the own offer showed "Allow this hashmaker to be paid", "Try one slice first" and the Rent form,
+/// and no address beside "Laz Hash".
+#[test]
+fn the_boxs_own_hashrate_offer_has_its_address_and_nothing_to_rent() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
+        ("GET", "/offers") => json!({"offers": [
+            {"name": "Laz Hash", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": "https://own.example/hashrate", "payNode": "02aa"},
+            {"name": "Big miners", "linkKey": "02cc", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "payUrl": "https://miners.example/hashrate", "payNode": "02dd"}]}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let settings = dir.path().join("hashrate-settings.json");
+    std::fs::write(&settings, json!({"enabled": true, "payUrl": "https://own.example/hashrate"}).to_string()).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    let card = |name: &str| {
+        let c = &p.body[p.body.find(&format!("<h3>{name}</h3>")).unwrap()..];
+        c[..c.find("</section>").unwrap()].to_string()
+    };
+    let own = card("Laz Hash");
+    assert!(own.contains("Your offer") && own.contains("Sold by own.example")
+            && (own.contains("You can&#39;t rent it from here") || own.contains("You can't rent it from here")), "{own}");
+    for gone in ["Allow this hashmaker to be paid", "Try one slice first", ">Rent<", "name=\"budget\"", "Rent is off"] {
+        assert!(!own.contains(gone), "{gone}: {own}");
+    }
+    let other = card("Big miners");
+    assert!(other.contains("Sold by miners.example") && other.contains("Try one slice first") && other.contains("Rent</button>"), "{other}");
 }
 
 /// The renter's status with the bundled Stream Gateway in use: `state` as the renter reads it.

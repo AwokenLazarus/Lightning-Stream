@@ -21,6 +21,12 @@ use crate::html::{esc, sats};
 use crate::server::Resp;
 use crate::services::{self, Service};
 
+/// How the browser reached the page (`X-Forwarded-Host`, else `Host`): the page's AI address by IP and the
+/// one shown after a key is made read it alike (0.2.6 showed an example IP after a key was made).
+pub(crate) fn page_host(req: &crate::server::Req) -> &str {
+    req.header("x-forwarded-host").split(',').next().filter(|h| !h.trim().is_empty()).unwrap_or(req.header("host")).trim()
+}
+
 /// The AI address by the box's IP, for devices that can't resolve its name (`umbrel.local`): the IP the
 /// browser reached this page at, where it did by IP; else how to find it.
 pub(crate) fn by_ip(endpoint: &str, page_host: &str) -> String {
@@ -128,11 +134,22 @@ fn health_html(state: &Value, name: &str) -> String {
     format!("{tag}<span class=\"small\">{ok} answered, {failed} failed{speed}</span>")
 }
 
+/// What a key spent of its limit, one way for every key: "under 1 sat of 2,000 sats", "10 sats of 50 sats". A key that
+/// spent less than a sat is not shown as unused (0.2.1 said "0 sats" after paid answers); 0.2.6 wrote one line with
+/// XBT figures and the next without.
+pub(crate) fn spent_of(spent_msat: u64, limit_sats: u64) -> String {
+    let spent = match spent_msat {
+        1..=999 => "under 1 sat".to_string(),
+        m => format!("{} sat{}", crate::html::group3(m / 1000), if m / 1000 == 1 { "" } else { "s" }),
+    };
+    format!("{spent} <span class=\"small\">of {} sats</span>", crate::html::group3(limit_sats))
+}
+
 fn key_row(ctx: &Ctx, e: &Entry, today: u64) -> String {
     let state = if e.paused || e.left_msat(today) == 0 { "<span class=\"tag warn\">at its limit</span>" } else { "<span class=\"tag ok\">active</span>" };
-    let day = e.per_day_sats.map(|d| format!("<div class=\"small\">at most {} a day</div>", sats(d as i64))).unwrap_or_default();
+    let day = e.per_day_sats.map(|d| format!("<div class=\"small\">at most {} sats a day</div>", crate::html::group3(d))).unwrap_or_default();
     format!(
-        "<tr><td>{} {state}<div class=\"small\">made {}</div></td><td>{} <span class=\"small\">of {}</span>{day}</td>\
+        "<tr><td>{} {state}<div class=\"small\">made {}</div></td><td>{}{day}</td>\
          <td><details><summary>Change the limit</summary><form method=\"post\" action=\"./ai\" class=\"stack\">{}\
          <input type=\"hidden\" name=\"do\" value=\"limit\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
          <label>Limit (sats in all)<input name=\"limit_sats\" type=\"number\" min=\"0\" step=\"1\" value=\"{}\"></label>\
@@ -141,8 +158,7 @@ fn key_row(ctx: &Ctx, e: &Entry, today: u64) -> String {
          <form method=\"post\" action=\"./ai\" class=\"inline\">{}<input type=\"hidden\" name=\"do\" value=\"revoke\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
          <button class=\"danger\" type=\"submit\">Revoke</button></form></td></tr>",
         esc(&e.name), crate::html::utc(e.created as i64),
-        // a key that spent less than a sat is not shown as unused (0.2.1 said "0 sats" after paid answers)
-        if e.spent_msat > 0 && e.spent_msat < 1000 { "under 1 sat".to_string() } else { sats((e.spent_msat / 1000) as i64) }, sats(e.limit_sats as i64),
+        spent_of(e.spent_msat, e.limit_sats),
         App::csrf_input(ctx), esc(&e.id), e.limit_sats, e.per_day_sats.map(|d| d.to_string()).unwrap_or_default(), App::csrf_input(ctx), esc(&e.id))
 }
 
@@ -284,7 +300,7 @@ impl App {
                  <button type=\"submit\">Read the sellers' prices again</button></form></section>", App::csrf_input(ctx))
     }
 
-    pub(crate) fn ai_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+    pub(crate) fn ai_post(&self, ctx: &Ctx, f: &HashMap<String, String>, host: &str) -> Resp {
         let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
         let today = credentials::day_of(credentials::now());
         let n = |k: &str| g(k).parse::<u64>().ok();
@@ -321,7 +337,7 @@ impl App {
                 match store(&|s| { *made.borrow_mut() = s.make(Kind::AiKey, &name, limit, n("per_day_sats").filter(|d| *d > 0), None).1; Ok(String::new()) }) {
                     Ok(_) => {
                         let key = made.into_inner();
-                        let body = self.ai_html(ctx, Some((&name, &key)), "");
+                        let body = self.ai_html(ctx, Some((&name, &key)), host);
                         return self.page("AI", ctx, body).header("Cache-Control", "no-store");
                     }
                     Err(e) => Err(e),
@@ -365,6 +381,15 @@ mod tests {
         assert!(by_ip("http://10.0.0.5:33540/v1", "umbrel.local").is_empty(), "already an IP");
     }
     use crate::services::Item;
+
+    /// A key's spend, one format for every key: 0.2.6 wrote "under 1 sat of 2,000 sats" and "0 sats (0.00000000 XBT) of 50 sats".
+    #[test]
+    fn a_keys_spend_is_said_one_way() {
+        assert_eq!(spent_of(500, 2_000), "under 1 sat <span class=\"small\">of 2,000 sats</span>");
+        assert_eq!(spent_of(0, 50), "0 sats <span class=\"small\">of 50 sats</span>");
+        assert_eq!(spent_of(1_000, 50), "1 sat <span class=\"small\">of 50 sats</span>");
+        assert_eq!(spent_of(10_400, 1_000_000), "10 sats <span class=\"small\">of 1,000,000 sats</span>");
+    }
 
     fn ai(name: &str, seller: &str, address: &str) -> Service {
         Service { name: name.into(), kind: services::Kind::Ai, seller: seller.into(), price_text: "10 sat per 1,000 tokens".into(), prices: Value::Null, items: Vec::<Item>::new(),

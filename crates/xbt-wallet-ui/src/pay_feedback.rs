@@ -100,7 +100,7 @@ pub fn rule_field(rule: &str) -> Option<(&'static str, Option<&'static str>)> {
         "per_counterparty_daily" => ("Most to any one seller in 24 hours", Some("More rules")),
         "human_threshold" => ("Ask me first for a payment of at least", None),
         "velocity" => ("At most this many payments…", Some("More rules, How fast")),
-        "ticket_task_budget" => ("the budget of the stream tickets' task (Advanced: tickets › tasks › budget_sats)", None),
+        "ticket_task_budget" => ("Most for paid services (stream tickets) in 24 hours", None),
         _ => return None,
     })
 }
@@ -161,8 +161,9 @@ pub fn explain_at(body: &str, spendable: Option<i64>, file: bool, shop: Option<&
             "per_counterparty" | "ticket_seller_cap" => ("This week's limit for this shop is reached",
                 format!("You've reached this week's limit for {shop}{limit}. Nothing more was paid."),
                 format!("{} Or wait: the limit counts the last 7 days.", raise_words(rule, "Raise it:")), rules()),
-            "ticket_task_budget" => ("Spending cap reached", format!("You've reached the budget your rules give stream tickets{limit}. Nothing more was paid."),
-                raise_words(rule, "Raise"), rules()),
+            "ticket_task_budget" => ("Today's limit for paid services is reached",
+                format!("You've reached the most your spending rules let the app pay shops in 24 hours{limit}. Nothing more was paid."),
+                format!("{} Or wait: the limit counts the last 24 hours.", raise_words(rule, "Raise it:")), rules()),
             "velocity" => ("Too many payments at once", format!("Your spending rules allow only so many payments in a while, and {shop} asked for more. Nothing more was paid."),
                 format!("{} Or wait a while.", raise_words(rule, "Raise")), rules()),
             _ => {
@@ -355,6 +356,21 @@ mod tests {
                                    "human_threshold_sats" => "human_threshold", "velocity_max" => "velocity", _ => continue };
             assert!(label.starts_with(rule_field(rule).unwrap().0), "{key}: {label}");
         }
+        assert!(crate::app::TICKETS_BUDGET_LABEL.starts_with(rule_field("ticket_task_budget").unwrap().0));
+    }
+
+    /// The stream tickets' budget is refused in words that name its field on the Spending rules page, with the limit and
+    /// a link there.
+    ///
+    /// FAILS before (0.2.6): "the budget your rules give stream tickets" and "(Advanced: tickets › tasks › budget_sats)".
+    #[test]
+    fn the_stream_tickets_budget_is_named_by_its_field() {
+        let e = explain_at(&json!({"error": "with this ticket's 915 sats, 10618 would be above the task's budget_sats (10000)", "rule": "ticket_task_budget",
+                                   "limit_sats": 10_000}).to_string(), None, false, Some("Demo"));
+        assert_eq!(e.title, "Today's limit for paid services is reached");
+        assert!(e.words.contains("10,000 sat") && !e.words.contains("budget_sats"), "{e:?}");
+        assert_eq!(e.fix, "Raise it: \"Most for paid services (stream tickets) in 24 hours\" in Settings → Spending rules. Or wait: the limit counts the last 24 hours.");
+        assert!(e.links.iter().any(|(to, _)| to == "policy"), "{e:?}");
     }
 
     #[test]
