@@ -94,9 +94,9 @@ pub(crate) struct Ctx {
 const INT_KEYS: [(&str, &str, &str); 13] = [
     ("max_per_tx_sats", "Largest single payment (sats)", "budgets"),
     ("daily_budget_sats", "Spending limit for any 24 hours (sats)", "budgets"),
-    ("weekly_budget_sats", "Spending limit for any 7 days (sats)", "budgets"),
-    ("per_counterparty_cap_sats", "Most to any one seller in 7 days (sats)", "budgets"),
-    ("per_counterparty_daily_sats", "Most to any one seller in 24 hours (sats)", "budgets"),
+    ("weekly_budget_sats", "Spending limit for any 7 days (sats)", "more"),
+    ("per_counterparty_cap_sats", "Most to any one seller in 7 days (sats)", "more"),
+    ("per_counterparty_daily_sats", "Most to any one seller in 24 hours (sats)", "more"),
     ("human_threshold_sats", "Ask me first for a payment of at least (sats)", "human"),
     ("approval_ttl_s", "A request for your approval expires after (seconds)", "human"),
     ("split_window_s", "Smaller payments to one seller within this many seconds count as one (so a large payment can't be split to avoid asking you)", "human"),
@@ -123,8 +123,10 @@ pub fn stream_token(csrf: &str) -> String {
 /// 4 TH/s miner at market. The owner's limit: a rental's own budget is inside it.
 pub const STARTER_RENTAL_BUDGET_SATS: i64 = 200_000;
 
-/// The least `ln.exposure_cap_sats` the starter rules set on mainnet.
-pub const STARTER_EXPOSURE_CAP_SATS: i64 = 100_000;
+/// The least `ln.exposure_cap_sats` the starter rules set on mainnet: 1,000,000 sats, so a node of
+/// ordinary size is not refused at the first payment (0.2.1's 100,000 refused a node holding
+/// 287,070). What the app may spend stays under the spending limits; this only bounds the node.
+pub const STARTER_EXPOSURE_CAP_SATS: i64 = 1_000_000;
 
 /// The exposure cap the starter rules suggest for a node that holds `held` sats in its channels:
 /// twice that, rounded up to 10,000 sats, and never below [`STARTER_EXPOSURE_CAP_SATS`]. The signer
@@ -442,7 +444,7 @@ impl App {
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
             "/keys" => self.keys(&ctx),
-            "/agents" => self.agents(&ctx),
+            "/agents" => self.agents(&ctx, false),
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
@@ -642,6 +644,9 @@ impl App {
                              &|v| format!("Swept {} sats to {} (txid {}).", int(v.get("swept_sats")), txt(v.get("to")), txt(v.get("txid")))),
             "/rotate" => back("./keys", self.call("rotate_hot_key_signed", json!({"expiry": i("expiry"), "signature": sig()})),
                               &|v| format!("Hot key rotated: new address {}.", txt(v.get("new_address")))),
+            // the access key is in a page only when the owner asks for it, by a POST with the CSRF token:
+            // never in the source of the page as it opens (0.2.1 hands-on run)
+            "/agents-key" => self.agents(ctx, true),
             "/rotate-token" => {
                 if g("confirm") != "1" {
                     self.flash(ctx, false, "tick the box to rotate the agent token");
@@ -678,20 +683,9 @@ impl App {
         let mut b = String::new();
         let human = !self.human_pub().is_empty();
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
-        let (ready, connected, why) = self.node_state();
-        let ack = connected && why == crate::setup::ACK_NEEDED;
-        if ack && human {
-            b.push_str(&format!("<section class=\"card primary\"><h2>Start paying</h2><p>{}</p>\
-                <p><a class=\"button-link primary\" href=\"./lightning#ack\">Start paying</a></p></section>", esc(&why)));
-        } else if !human || !ready {
-            b.push_str(&progress(2));
-            b.push_str(&format!("<section class=\"card primary\"><h2>Finish setting up</h2><p>{}</p>\
-                <p><a class=\"button-link primary\" href=\"./setup\">Continue setup</a></p></section>",
-                esc(&if !human && connected { "Make your approval key, then sign the safe starter rules. It takes a few minutes, once.".to_string() }
-                     else if !human { "Make your approval key and connect your Lightning node. It takes a few minutes, once.".to_string() }
-                     else if connected { why.clone() }
-                     else { "Connect your Lightning node, so the app can pay for services.".to_string() })));
-        }
+        let (ready, connected, _) = self.node_state();
+        let ack = connected && self.ack_needed();
+        b.push_str(&self.get_started(ctx, human, connected, ack));
         let services = self.file_services().unwrap_or_default();
         let sellers = {
             let mut o: Vec<String> = services.iter().filter_map(|s| crate::services::http_origin(&s.seller)).collect();
@@ -716,7 +710,8 @@ impl App {
         b.push_str("</section>");
         let line = if ready {
             let n = int(ln.get("usable_channels"));
-            format!("<span class=\"pill good\">Ready to pay</span> Your Lightning node is connected, with {n} channel{} to pay through.", if n == 1 { "" } else { "s" })
+            let can = crate::pay_feedback::spendable_sats(&ln).map(|c| format!(" It can send about {} now.", money(c))).unwrap_or_default();
+            format!("<span class=\"pill good\">Ready to pay</span> Your Lightning node is connected, with {n} channel{} to pay through.{can}", if n == 1 { "" } else { "s" })
         } else if ack {
             "<span class=\"pill warn\">One last step</span> Confirm that the app may pay with real money. <a href=\"./lightning#ack\">Start paying</a>".into()
         } else if connected {
@@ -726,6 +721,58 @@ impl App {
         };
         b.push_str(&format!("<p class=\"status-line\">{line} · <a href=\"./wallet\">Wallet</a></p>"));
         self.page("Home", ctx, b)
+    }
+
+    /// Home's "Get started" list, until every step is done: the approval key, the node, the starter
+    /// rules, paying with real money (mainnet), a shop allowed (the demo shop in one press where the box
+    /// suggests one) and a first purchase. Each step says what it is; the next one to do has its button.
+    fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool) -> String {
+        let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
+        let paying = paying_on(&pol);
+        let allowed = rule_sellers(&pol).iter().any(|r| r.listed && r.origin.is_some() && r.node.is_some());
+        let bought = self.call("history", json!({"limit": 500})).ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter()
+            .any(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_open" | "ticket_paid_first")));
+        let demo = self.first_suggestion();
+        let main = self.signer_chain() == "main";
+        // (done, title, what it is, where to go, its button)
+        let mut steps: Vec<(bool, &str, &str, String, &str)> = vec![
+            (human, "Make your approval key", "It is how you say yes to a rule change or a large payment. It stays in this browser.",
+             "./setup".into(), "Make the key")];
+        if !connected {
+            steps.push((false, "Connect your Lightning node", "The app pays through your own node.", "./lightning".into(), "Connect it"));
+        }
+        steps.push((paying, "Sign the starter rules", "Low limits on what the app may spend. You can change them any time.",
+                    "./policy?template=starter".into(), "Open the starter rules"));
+        if main {
+            steps.push((connected && !ack, "Pay with real money", "Confirm once that the app may pay from your node.", "./lightning#ack".into(), "Start paying"));
+        }
+        steps.push((allowed, if demo.is_some() { "Try the demo shop" } else { "Allow a shop" },
+                    if demo.is_some() { "Add Lightning Stream Genesis and allow it to be paid, with one signature." }
+                    else { "Add a shop on Sellers and allow it to be paid." }, "./services".into(), "Add a shop"));
+        steps.push((bought, "Buy something", "Open a shop's app or download a file. Stop it any time on Live connections.", "./browse".into(), "Browse"));
+        let done = steps.iter().filter(|s| s.0).count();
+        if done == steps.len() {
+            return String::new();
+        }
+        let next = steps.iter().position(|s| !s.0).unwrap_or(0);
+        let mut b = format!("<section class=\"card primary\" id=\"get-started\"><h2>Get started</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
+                            steps.len());
+        for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
+            let action = if i != next {
+                String::new()
+            } else if *title == "Try the demo shop" {
+                format!("<form method=\"post\" action=\"./services\">{}<input type=\"hidden\" name=\"action\" value=\"try\">\
+                         <input type=\"hidden\" name=\"url\" value=\"{}\"><button>Try the demo shop</button></form>",
+                        Self::csrf_input(ctx), esc(demo.as_deref().unwrap_or_default()))
+            } else {
+                format!("<p><a class=\"button-link primary\" href=\"{href}\">{}</a></p>", esc(button))
+            };
+            b.push_str(&format!("<li class=\"{}\"{}><strong>{}</strong> <span class=\"small\">{}</span>{action}</li>",
+                                if *ok { "done" } else if i == next { "now" } else { "" }, if i == next { " aria-current=\"step\"" } else { "" },
+                                esc(title), esc(what)));
+        }
+        b.push_str("</ol></section>");
+        b
     }
 
     fn overview(&self, ctx: &Ctx) -> Resp {
@@ -749,10 +796,22 @@ impl App {
                         Paying over Lightning does not need it. Check that the node is running and that the app has its address and \
                         password (on Linux: LS_NODE_RPC_* in .env).</div>");
         }
-        b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Money</h2>");
-        b.push_str(&kv(&[("On your node", money(int(bal.get("trusted_sats")))), ("On its way to your node", money(int(bal.get("untrusted_pending_sats")))),
+        // Lightning first: what pays for services. The XBT node's on-chain coins are another wallet, said apart
+        // (0.2.1 showed "On your node 0 sats" while the channels held 286,000)
+        let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
+        let (ready, _, _) = self.node_state();
+        let pol = self.call("policy_get", json!({})).map(|v| v["effective"].clone()).unwrap_or(Value::Null);
+        b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Lightning</h2>");
+        b.push_str(&kv(&[("Can send now", crate::pay_feedback::spendable_sats(&ln).map(|c| format!("about {}", money(c))).unwrap_or_else(|| "not known".into())),
+                         ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Not ready</span> <a href=\"./lightning\">See why</a>".into() }),
+                         ("Spending limit, 24 hours", pol.get("daily_budget_sats").map(|v| money(int(Some(v)))).unwrap_or_else(|| "—".into())),
+                         ("Spending limit, 7 days", pol.get("weekly_budget_sats").map(|v| money(int(Some(v)))).unwrap_or_else(|| "—".into()))]));
+        b.push_str("<p class=\"small\">Credit left with shops is on <a href=\"./connections\">Live connections</a>. \
+                    <a href=\"./policy\">Change your limits</a></p></div>");
+        b.push_str("<div class=\"card\"><h2>XBT on chain</h2>");
+        b.push_str(&kv(&[("On your XBT node", money(int(bal.get("trusted_sats")))), ("On its way to your XBT node", money(int(bal.get("untrusted_pending_sats")))),
                          ("On this box, for agents", money(int(hot.get("hot_sats")))),
-                         ("Most this box may hold", if int(hot.get("hot_cap_sats")) > 0 { money(int(hot.get("hot_cap_sats"))) } else { "no limit".into() }),
+                         ("Most this box may hold for agents", if int(hot.get("hot_cap_sats")) > 0 { money(int(hot.get("hot_cap_sats"))) } else { "no limit".into() }),
                          ("Status", if hot["hot_over_cap"] == true { "<span class=\"pill bad\">Over the limit</span>".into() } else { "<span class=\"pill good\">Within the limit</span>".into() }),
                          ("Keys locked with encryption", if hot["hot_encrypted"] == true { "yes".into() } else { "<span class=\"pill bad\">no</span>".into() })]));
         b.push_str("</div>");
@@ -927,9 +986,11 @@ impl App {
         let mut fields = String::new();
         fields.push_str(&format!("<form method=\"post\" action=\"./policy\" class=\"policy\">{}<input type=\"hidden\" name=\"mode\" value=\"form\">", Self::csrf_input(ctx)));
         let mut cap_suggested: Option<i64> = None;
-        let groups = [("budgets", "Spending limits"), ("human", "Ask me first"), ("velocity", "How fast"), ("hot", "Money on this box"), ("anchor", "Records")];
+        // the limits a first-time owner reads up front; the rest under More rules
+        let groups = [("budgets", "Spending limits"), ("human", "Ask me first"), ("more", "More spending limits"), ("velocity", "How fast"),
+                      ("hot", "Money on this box"), ("anchor", "Records")];
         for (g, title) in groups {
-            if g == "velocity" {
+            if g == "more" {
                 fields.push_str("<details><summary>More rules</summary>");
             }
             fields.push_str(&format!("<fieldset><legend>{title}</legend>"));
@@ -951,10 +1012,11 @@ impl App {
                     }
                     None => String::new(),
                 };
-                fields.push_str(&format!("<label>The most your Lightning node may hold that this app trusts it with (sats)\
+                fields.push_str(&format!("<label>Most your Lightning node may hold (sats)\
                     <input name=\"f_ln_exposure_cap_sats\" value=\"{}\" inputmode=\"numeric\"></label>\
-                    <p class=\"hint\">Your node's channels hold {} now. The app pays through the node only while it holds no more than this{}.</p>",
-                    esc(&value), money(held), if main { "; on mainnet it is required" } else { "" }));
+                    <p class=\"hint\">Your node's channels hold {} now. Keep this above that: while the node holds more, the app pays nothing. \
+                    It does not change what the app may spend{}.</p>",
+                    esc(&value), money(held), if main { ". On mainnet it is required" } else { "" }));
             }
             if g == "anchor" {
                 fields.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the separate record keeper (after a restart)</label>",
@@ -967,7 +1029,7 @@ impl App {
         }
         if let Some(c) = cap_suggested {
             b.push_str(&format!("<div class=\"flash warn\"><p>Your Lightning node needs a limit before the app can pay through it: \
-                {} is filled in below (\"The most your Lightning node may hold\"). Review it, then sign.</p></div>", money(c)));
+                {} is filled in below (\"Most your Lightning node may hold\"). Review it, then sign.</p></div>", money(c)));
         }
         if !lowered.is_empty() {
             b.push_str(&format!("<div class=\"flash warn\"><p>Your rules leave these out, so the safe starter values are filled in below \
@@ -1187,7 +1249,7 @@ impl App {
                 p["counterparties"][origin.as_str()] = json!({"ln_node": node});
                 let cap = p.get("per_counterparty_cap_sats").or(cur["effective"].get("per_counterparty_cap_sats")).and_then(Value::as_i64).unwrap_or(0);
                 b.push_str(&format!("<div class=\"flash ok\"><p><strong>Allow {} to be paid.</strong> Sign below with your approval key. \
-                    The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&xbt402::shop::display(&origin)), money(cap)));
+                    The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&self.seller_name(&origin)), money(cap)));
             }
         }
         if !drop.is_empty() {
@@ -1541,7 +1603,7 @@ impl App {
     /// How an agent connects: the MCP endpoint and its bearer token (AGP-040). A box has no terminal, so
     /// this page is where the owner gets them. The token lets an agent pay allowlisted services within the
     /// policy and below the human threshold; it cannot approve, change the policy or move keys.
-    fn agents(&self, ctx: &Ctx) -> Resp {
+    fn agents(&self, ctx: &Ctx, reveal: bool) -> Resp {
         let mut b = String::from("<p class=\"lead\">Let an AI agent pay for services on its own, within your spending rules. It cannot approve \
             payments, change your rules or move your money. (For other apps, such as a phone wallet, see <a href=\"./apps\">Apps</a>.)</p>\
             <section class=\"card\"><h2>Connect an agent</h2>");
@@ -1572,8 +1634,14 @@ impl App {
             Some(t) => {
                 let url = urls.first().cloned().unwrap_or_else(|| "http://<this box>:33510/mcp".into());
                 let snippet = json!({"mcpServers": {"xbt-wallet": {"type": "http", "url": url, "headers": {"Authorization": format!("Bearer {t}")}}}});
-                b.push_str(&format!("<details><summary>Show the access key</summary><p><code id=\"mcp-token\">{}</code></p>\
-                                     <p>A configuration to paste into an agent that speaks MCP:</p>{}</details>", esc(&t), json_block(&snippet)));
+                b.push_str(&if reveal {
+                    format!("<section class=\"card\" id=\"access-key\"><h3>The access key</h3><p><code id=\"mcp-token\">{}</code></p>\
+                             <p>A configuration to paste into an agent that speaks MCP:</p>{}<p><a href=\"./agents\">Hide it</a></p></section>",
+                            esc(&t), json_block(&snippet))
+                } else {
+                    format!("<form method=\"post\" action=\"./agents-key\">{}<button class=\"secondary\">Show the access key</button></form>",
+                            Self::csrf_input(ctx))
+                });
                 b.push_str(&format!("<form method=\"post\" action=\"./rotate-token\" class=\"stack\">{}<h3>Replace the access key</h3><p>If the key \
                     leaked, replace it here. Every agent loses access until you give it the new one.</p>\
                     <label class=\"check\"><input type=\"checkbox\" name=\"confirm\" value=\"1\" required> I will give my agents the new key</label>\
@@ -1652,18 +1720,21 @@ impl App {
         let events = hist["events"].as_array().cloned().unwrap_or_default();
         let seen = |t: &str| events.iter().any(|e| e["type"] == t);
         let human = txt(ks.get("human_pubkey"));
-        let allow_n = pol["policy"]["allowlist"].as_array().map(|a| a.len()).unwrap_or(0);
+        // a seller counts once: its address and its `ln:` node line are one seller (0.2.1 said "2 sellers" for one)
+        let allow_n = rule_sellers(&pol["policy"]).iter().filter(|r| r.listed && r.origin.is_some()).count();
         let step = |done: bool, title: &str, body: String| {
             format!("<li class=\"step {}\"><h2>{}</h2>{body}</li>", if done { "done" } else { "todo" }, esc(title))
         };
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
         let enc = ks["encrypted"] == true;
         let ack_needed = ln["real_money_ack_needed"] == true;
+        let main = self.signer_chain() == "main";
         let done = [true, !human.is_empty(), seen("policy_change"), ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
-        let n = done.iter().filter(|d| **d).count();
-        let mut b = progress(if n == done.len() { 3 } else { 2 });
-        b.push_str(&format!("<p class=\"lead\">{n} of {} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">",
-                            done.len()));
+        // the count is of the steps shown: on mainnet the real-money step is one of them, done or not
+        let ack_done = !ack_needed && (ln["ready"] == true || ln["configured"] == true);
+        let n = done.iter().filter(|d| **d).count() + usize::from(main && ack_done);
+        let total = done.len() + usize::from(main);
+        let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">");
         b.push_str(&step(true, "Password", if self.platform.is_some() {
             "<p>Not needed: you opened the app from your box's dashboard, which already asked who you are.</p>".into()
         } else {
@@ -1683,8 +1754,8 @@ impl App {
             format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>\
                      <p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>", allow_n, if allow_n == 1 { "" } else { "s" })));
         // on mainnet: straight after the rules, the confirmation that the app may pay with real money
-        if ack_needed {
-            b.push_str(&step(false, "Pay with real money",
+        if main {
+            b.push_str(&step(ack_done, "Pay with real money",
                 "<p>This box's Lightning node holds real money. Until you confirm that the app may pay with it, the app pays nothing, \
                  even with your rules signed.</p><p><a href=\"./lightning#ack\">Start paying →</a></p>".into()));
         }

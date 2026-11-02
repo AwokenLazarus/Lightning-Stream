@@ -497,7 +497,7 @@ fn with_paying_off_the_rules_page_opens_on_the_starter_rules_and_signing_them_tu
     assert!(page.contains("Paying is not turned on yet, so the safe starter rules are filled in below"), "{page}");
     assert!(page.contains("name=\"f_max_per_tx_sats\" value=\"100000\""), "the starter value, not the rule in force");
     // the node's limit: shown in words, empty off mainnet (not required there)
-    assert!(page.contains("The most your Lightning node may hold that this app trusts it with (sats)"), "{page}");
+    assert!(page.contains("Most your Lightning node may hold (sats)"), "{page}");
     assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"\""), "{page}");
     // what is posted: the starter's Lightning and ticket sections come along, and a cap typed in lands in ln
     let mut f = policy_form_fields(&page);
@@ -516,15 +516,17 @@ fn with_paying_off_the_rules_page_opens_on_the_starter_rules_and_signing_them_tu
 #[test]
 fn the_mainnet_starter_rules_set_the_node_s_exposure_cap_from_what_it_holds() {
     use xbt_wallet_ui::app::{starter_exposure_cap, starter_policy, starter_policy_for, STARTER_EXPOSURE_CAP_SATS};
-    assert_eq!(STARTER_EXPOSURE_CAP_SATS, 100_000);
+    // 0.2.3: a node of ordinary size (287,070 sats in 0.2.1's hands-on run) is not refused at the first payment
+    assert_eq!(STARTER_EXPOSURE_CAP_SATS, 1_000_000);
     // twice what the channels hold, rounded up to 10,000, never below the least cap
-    for (held, cap) in [(0, 100_000), (29_692, 100_000), (50_000, 100_000), (50_001, 110_000), (70_000, 140_000), (-5, 100_000), (i64::MAX, i64::MAX / 10_000 * 10_000)] {
+    for (held, cap) in [(0, 1_000_000), (287_070, 1_000_000), (500_000, 1_000_000), (500_001, 1_010_000), (700_000, 1_400_000), (-5, 1_000_000),
+                        (i64::MAX, i64::MAX / 10_000 * 10_000)] {
         assert_eq!(starter_exposure_cap(held), cap, "held {held}");
     }
     let m = starter_policy("main");
-    // exactly the Lightning section the signer's mainnet readiness test signs (xbt-signer tests/ln_rail.rs)
-    assert_eq!(m["ln"], json!({"enabled": true, "split_height": xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT, "exposure_cap_sats": 100_000}));
-    assert_eq!(starter_policy_for("main", Some(70_000))["ln"]["exposure_cap_sats"], json!(140_000));
+    // the Lightning section the signer's mainnet readiness test signs (xbt-signer tests/ln_rail.rs), with the starter's least cap
+    assert_eq!(m["ln"], json!({"enabled": true, "split_height": xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT, "exposure_cap_sats": 1_000_000}));
+    assert_eq!(starter_policy_for("main", Some(700_000))["ln"]["exposure_cap_sats"], json!(1_400_000));
     // off mainnet the signer needs no cap: none is set
     assert!(starter_policy_for("regtest", Some(70_000))["ln"].get("exposure_cap_sats").is_none());
     assert!(xbt_signer::policy::validate_policy(&m).0.is_empty(), "{m}");
@@ -555,7 +557,8 @@ fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     // confirmed: the step and the warning are gone
     std::fs::write(&ack_file, format!("{}\n", xbt402::ticket::MAINNET_ACK)).unwrap();
     assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], false);
-    assert!(!unescape(&br.get("/setup").body).contains("Pay with real money"));
+    // the step stays in the list, done, so the count of steps does not change under the owner
+    assert!(unescape(&br.get("/setup").body).contains("<li class=\"step done\"><h2>Pay with real money</h2>"));
     assert!(!unescape(&br.get("/policy").body).contains("pays nothing until you confirm"));
     std::env::remove_var(xbt_signer::ticket::MAINNET_ACK_ENV);
 }
@@ -631,7 +634,9 @@ fn enrol_and_replace_the_human_key_then_sweep_rotate_backup_and_anchor() {
     let setup = br.get("/setup").body;
     assert!(setup.contains("id=\"keygen\"") && setup.contains("./human-key-enroll"));
     assert!(br.get("/wallet").body.contains("No approval key yet"));
-    assert!(br.get("/").body.contains("Finish setting up"), "home says what is left to do");
+    let home = br.get("/").body;
+    assert!(home.contains("Get started") && home.contains("Make your approval key") && home.contains("aria-current=\"step\""),
+            "home says what is left to do, the next step first: {home}");
     let pubhex = hex::encode(human().verifying_key().to_bytes());
     let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex), ("code", "0000-0000-0000")]);
     assert!(br.flash_after(&r).contains("enrolment code"), "AGP-063 W4: the code from the signer's log, not trust on first use");
@@ -750,8 +755,12 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     // as xbt-init leaves it on a box: 0640, the MCP reads it by group
     xbt_svc::replace_secret_file(&tok, format!("{}\n", "ab".repeat(32)).as_bytes(), 0o640).unwrap();
     let page = br.get("/agents").body;
-    assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
+    // the key is not in the page as it opens: only on "Show the access key", a POST with the CSRF token
+    assert!(!page.contains(&"ab".repeat(32)) && !page.contains("Bearer ") && page.contains("action=\"./agents-key\""), "{page}");
     assert!(page.contains("aria-current=\"page\">AI agents") && page.contains("Rotate the token"), "{page}");
+    assert!(!br.post("/agents-key", &[]).body.contains(&"ab".repeat(32)), "not without the CSRF token");
+    let page = br.act("/agents", "/agents-key", &[]).body;
+    assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer "), "{page}");
     // AGP-042: the real MCP HTTP transport, reading the same file (the UI never calls it to rotate)
     let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock")));
     // a port of its own (0: the system picks a free one), bound before the server starts, so a request
@@ -783,7 +792,7 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     assert!(flash.contains("Agent token rotated"), "{flash}");
     // the old token is refused on the next request; the new one (shown only on this page) works
     assert_eq!(mcp_init(&"ab".repeat(32)), 401);
-    let page = br.get("/agents").body;
+    let page = br.act("/agents", "/agents-key", &[]).body;
     let new = regex_token(&page);
     assert!(new.len() == 64 && new != "ab".repeat(32));
     assert_eq!(std::fs::read_to_string(&tok).unwrap().trim(), new);
@@ -2907,11 +2916,12 @@ fn allowing_a_seller_fills_in_the_spending_rules_for_one_signature() {
     let b = start(json!({}), false, |_| {});
     let mut br = logged_in(&b);
     let page = br.get(&format!("/policy?allow={}&node={node}", enc("https://seller.example"))).body;
-    assert!(page.contains("Allow https://seller.example to be paid") && page.contains("in any 7 days"), "{page}");
+    // by its name where the list of sellers has one, else its short address
+    assert!(page.contains("Allow seller.example to be paid") && page.contains("in any 7 days"), "{page}");
     assert!(page.contains("https://seller.example") && page.contains(&node), "{page}");
     // a bad node is ignored: nothing filled in
     let page = br.get(&format!("/policy?allow={}&node=zz", enc("https://seller.example"))).body;
-    assert!(!page.contains("Allow https://seller.example to be paid"));
+    assert!(!page.contains("Allow seller.example to be paid"));
 }
 
 /// The Sell page offers the services it finds on the box, in one click.
@@ -2954,8 +2964,8 @@ fn on_mainnet_the_rules_page_suggests_the_node_s_limit_and_never_prefills_the_si
     let mut br = logged_in(&bx);
     let page = br.get("/policy").body;
     assert!(!page.contains("Paying is not turned on yet"), "paying is on: the rules in force are edited");
-    assert!(page.contains("Your Lightning node needs a limit before the app can pay through it: <span class=\"money\">100,000 sats"), "{page}");
-    assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"100000\""), "{page}");
+    assert!(page.contains("Your Lightning node needs a limit before the app can pay through it: <span class=\"money\">1,000,000 sats"), "{page}");
+    assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"1000000\""), "{page}");
     assert!(page.contains("the safe starter values are filled in below instead of the signer&#39;s built-in ones")
             || page.contains("the safe starter values are filled in below instead of the signer's built-in ones"), "{page}");
     let starter = xbt_wallet_ui::app::starter_policy("main");
@@ -2970,7 +2980,7 @@ fn on_mainnet_the_rules_page_suggests_the_node_s_limit_and_never_prefills_the_si
     let prev = br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
     let signed: Value = serde_json::from_str(&field(&prev, "text")).unwrap();
     assert_eq!((signed["ln"]["enabled"].clone(), signed["ln"]["exposure_cap_sats"].clone(), signed["max_per_tx_sats"].clone()),
-               (json!(true), json!(100000), starter["max_per_tx_sats"].clone()), "{signed}");
+               (json!(true), json!(1000000), starter["max_per_tx_sats"].clone()), "{signed}");
 }
 
 /// A seller that charged a call past its limit is said at the top of the wallet page, with the

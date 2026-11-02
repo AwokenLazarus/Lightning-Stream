@@ -154,7 +154,7 @@ pub(crate) fn plain_reason(r: &str) -> String {
         match (after("holds "), after("exposure_cap_sats ")) {
             (Some(held), Some(cap)) => format!("Your Lightning node holds {held} sats, more than the {cap} sats your spending rules allow it to hold. \
                 Raise the limit (one click: \"Raise the limit\" below), or move some funds off the node."),
-            _ => "Your Lightning node holds more than your spending rules allow it to. Raise \"The most your Lightning node may hold\" in Settings → Spending rules, or move some funds off the node.".into(),
+            _ => "Your Lightning node holds more than your spending rules allow it to. Raise \"Most your Lightning node may hold\" in Settings → Spending rules, or move some funds off the node.".into(),
         }
     } else if l.contains("watchtower") {
         "Your node's watchtower can't be checked. Remove unknown watchtowers in your node's app, or list the ones you trust under Advanced in Settings → Spending rules.".into()

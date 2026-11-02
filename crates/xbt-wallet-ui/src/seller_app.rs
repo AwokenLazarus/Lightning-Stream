@@ -178,12 +178,11 @@ impl App {
         // the shop by its listed name ("Lightning Stream Genesis"), never its key or made-up address
         let shop = self.seller_name(&svc.seller);
         let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
-            <p>You use <strong>{}</strong> as it is on {}'s own network, inside this page. What it loads is paid at {}, \
-            and stops at the limit you set here.</p>\
+            <p>You use <strong>{}</strong> inside this page. What it loads is paid at {}, and stops at the limit you set here.</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
             {}<div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
             <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
-            esc(&shop), esc(&svc.name), esc(&crate::app::stream_pages::host(&svc.seller)), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
+            esc(&shop), esc(&svc.name), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
             self.identity_card(ctx, &svc.seller, &base, &entry));
         self.page("Open the app", ctx, b)
     }
@@ -392,10 +391,10 @@ pub(crate) fn visit_numbers(v: &Value) -> Value {
 
 /// The visit limit's field, with the least a visit needs up front, set to `suggested`.
 fn limit_field(suggested: i64) -> String {
-    format!("<label>Spend at most, on this visit, in sats: at least {MIN_CALL_SATS} sat for this shop\
+    format!("<label>Spend at most on this visit: at least {MIN_CALL_SATS} sat\
              <input name=\"limit\" value=\"{suggested}\" required inputmode=\"numeric\" pattern=\"[0-9,]+\"></label>\
-             <p class=\"hint\">A shop sells in tickets of at least {MIN_TICKET_SATS} sat; with routing fees a visit needs {MIN_CALL_SATS} sat. \
-             What you don't use stays as credit with the shop. Your spending rules apply as well.</p>")
+             <p class=\"hint\">The shop is paid ahead in steps of {MIN_TICKET_SATS} sat or more, plus routing fees. \
+             What you don't use stays with the shop as credit for next time.</p>")
 }
 
 /// One app port: a seller's own page, for the visit whose cookie the browser holds.
@@ -829,7 +828,7 @@ mod tests {
     #[test]
     fn the_visit_limit_field_says_the_least_up_front_and_starts_at_1000() {
         let f = limit_field(SUGGESTED_LIMIT);
-        assert!(f.starts_with("<label>Spend at most, on this visit, in sats: at least 559 sat for this shop<input"), "{f}");
+        assert!(f.starts_with("<label>Spend at most on this visit: at least 559 sat<input"), "{f}");
         assert!(f.contains("value=\"1000\""));
     }
 

@@ -125,7 +125,7 @@ pub fn explain(body: &str, spendable: Option<i64>, file: bool) -> Explained {
                 _ => "Your Lightning node holds more in its channels than your spending rules let the app pay through. Nothing was paid.".into(),
             };
             ("Your node holds more than your rules allow", words,
-             "Raise \"The most your Lightning node may hold\" in Spending rules and sign, or move funds off the node.".into(), rules())
+             "Raise \"Most your Lightning node may hold\" in Spending rules and sign, or move funds off the node.".into(), rules())
         }
         Kind::Visit => ("This visit has ended", if raw.is_empty() { "This visit has ended.".into() } else { raw.clone() },
                         "Open the app again with a new limit. What you don't use stays as credit with the shop.".into(), vec![("browse".into(), "Browse".into())]),
@@ -264,7 +264,7 @@ mod tests {
         let e = explain(r#"{"error": "the LN node holds 287070 sats in its channels (local 287070, HTLCs 0), above ln.exposure_cap_sats 100000: move funds off it before paying through it"}"#, None, false);
         assert_eq!(e.kind, Kind::NodeCap);
         assert!(e.words.contains("287,070") && e.words.contains("100,000"), "{}", e.words);
-        assert!(e.fix.contains("The most your Lightning node may hold"), "{}", e.fix);
+        assert!(e.fix.contains("Most your Lightning node may hold"), "{}", e.fix);
         assert!(explain(r#"{"error": "x", "rule": "max_sats"}"#, None, true).fix.contains("at most 2,000 sat for its first ticket"));
         assert!(explain(r#"{"error": "x", "rule": "max_per_tx"}"#, None, false).fix.contains("most per payment"));
         assert_eq!(explain("not json", None, true).words, "The wallet did not pay for this file.");

@@ -325,3 +325,14 @@ table.files td:last-child .row { justify-content: flex-end; }
   table.files td:nth-child(2), table.files td:nth-child(3) { display: inline-block; margin-right: 12px; color: var(--muted); }
   table.files td:last-child .row { justify-content: flex-start; margin-top: 6px; }
 }
+/* Home's Get started list: one line a step, the next one with its button */
+ol.checklist { list-style: none; padding: 0; margin: 8px 0 0; counter-reset: check; }
+ol.checklist li { position: relative; padding: 10px 0 10px 40px; border-top: 1px solid var(--card-edge); counter-increment: check; }
+ol.checklist li:first-child { border-top: 0; }
+ol.checklist li::before { content: counter(check); position: absolute; left: 0; top: 9px; width: 26px; height: 26px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 0.8rem; font-weight: 700; color: var(--muted); box-shadow: inset 0 0 0 1px var(--card-edge); }
+ol.checklist li.done::before { content: "✓"; color: var(--ok); background: var(--ok-bg); box-shadow: none; }
+ol.checklist li.done strong { color: var(--muted); font-weight: 600; }
+ol.checklist li.now::before { color: var(--accent-fg); background: var(--accent); box-shadow: none; }
+ol.checklist li .small { display: block; }
+ol.checklist li form, ol.checklist li p { margin: 8px 0 0; }

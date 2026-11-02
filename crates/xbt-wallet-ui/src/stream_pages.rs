@@ -43,6 +43,15 @@ impl App {
     }
 
     /// One-click forms for the suggested sellers not added yet.
+    /// The first suggested seller not added yet, if any: the demo shop on a box as installed.
+    pub(crate) fn first_suggestion(&self) -> Option<String> {
+        let have = self.file_services().unwrap_or_default();
+        self.cfg.suggested_sellers.iter().find(|u| {
+            let origin = xbt402::shop::parse(u).unwrap_or_else(|| u.to_string());
+            !have.iter().any(|s| services::same_origin(&s.seller, &origin))
+        }).cloned()
+    }
+
     pub(crate) fn suggested(&self, ctx: &Ctx, have: &[Service]) -> String {
         let mut b = String::new();
         // a suggestion is a web address or a shop key: matched against the sellers added by the address it names
@@ -50,13 +59,16 @@ impl App {
             let origin = xbt402::shop::parse(u).unwrap_or_else(|| u.to_string());
             !have.iter().any(|s| services::same_origin(&s.seller, &origin))
         }) {
-            let shown = if url.starts_with("npub1") && url.len() > 16 {
+            let shown = if url == DEMO_SHOP {
+                "Lightning Stream Genesis, the demo shop".to_string()
+            } else if url.starts_with("npub1") && url.len() > 16 {
                 format!("shop key {}…{}", &url[..10], &url[url.len() - 6..])
             } else {
                 url.trim_start_matches("https://").to_string()
             };
-            b.push_str(&format!("<form method=\"post\" action=\"./services\" class=\"row suggested\">{}<input type=\"hidden\" name=\"action\" value=\"add\">\
-                <input type=\"hidden\" name=\"url\" value=\"{}\"><span>Suggested: <strong>{}</strong></span><button class=\"secondary\">Add this seller</button></form>",
+            // one press adds the shop and opens the rules with it allowed: one signature, no second visit to Sellers
+            b.push_str(&format!("<form method=\"post\" action=\"./services\" class=\"row suggested\">{}<input type=\"hidden\" name=\"action\" value=\"try\">\
+                <input type=\"hidden\" name=\"url\" value=\"{}\"><span>Suggested: <strong>{}</strong></span><button class=\"secondary\">Add and allow</button></form>",
                 App::csrf_input(ctx), esc(url), esc(&shown)));
         }
         b
@@ -71,7 +83,17 @@ impl App {
         match found {
             Some(svc) => {
                 let own = self.is_own_shop(&svc.seller);
-                let mut body = service_html(&svc, own);
+                let mut body = String::new();
+                // a shop the rules don't allow yet: said before the owner tries it and is refused, with the one button that fixes it
+                if !own && svc.kind != Kind::Hashrate && !self.seller_allowed(&svc.seller) {
+                    let origin = services::http_origin(&svc.seller).unwrap_or_else(|| svc.seller.clone());
+                    body.push_str(&format!("<section class=\"flash warn\" id=\"not-allowed\"><p><strong>Allow {} first.</strong> Your spending rules don't \
+                        allow this shop yet, so the app would refuse to pay it. Allowing it takes one signature.</p>\
+                        <form method=\"post\" action=\"./services\">{}<input type=\"hidden\" name=\"action\" value=\"allow\">\
+                        <input type=\"hidden\" name=\"url\" value=\"{}\"><button>Allow this seller to be paid</button></form></section>",
+                        esc(&self.seller_name(&origin)), App::csrf_input(ctx), esc(&origin)));
+                }
+                body.push_str(&service_html(&svc, own, &seller_words(&self.file_services().unwrap_or_default(), &svc.seller)));
                 if svc.has_files() {
                     // the node can't send a first ticket: said before a download is started
                     if !own {
@@ -215,6 +237,9 @@ impl App {
     }
 }
 
+/// The demo shop every package suggests (Lightning Stream Genesis), named on the pages that offer it.
+pub(crate) const DEMO_SHOP: &str = "npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a";
+
 fn empty_how(suggested: &str) -> String {
     format!("<section class=\"card empty-card\"><p class=\"empty\">No services yet.</p>\
      <p>Add a seller to see what they offer: web apps such as a media server, AI models to ask, hashrate, data and other services, each paid a little at a time.</p>\
@@ -268,7 +293,7 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
                              <p class=\"price\">{}</p><p class=\"small\">{} · {}</p></a>",
                             service_href(s), s.category(), esc(s.category_words()),
                             if mine { " <span class=\"pill good\">Your shop</span>" } else { "" },
-                            esc(&s.name), esc(&s.price_text), esc(&what), esc(&host(&s.seller))));
+                            esc(&s.name), esc(&s.price_text), esc(&what), esc(&seller_words(all, &s.seller))));
     }
     b.push_str("</div>");
     b
@@ -276,6 +301,15 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
 
 /// A seller as the pages show it: its web address's host, or for a shop reached by its key, that key
 /// shortened (its made-up `<key>.shop.invalid` name means nothing to a person, and is too long for a line).
+/// A seller as a line under a service names it: a shop known by its key by its listing's name
+/// ("Lightning Stream Genesis"), a seller with a web address by its host.
+pub(crate) fn seller_words(all: &[Service], seller: &str) -> String {
+    match services::http_origin(seller) {
+        Some(o) if xbt402::shop::is_shop(&o) => services::seller_name(all, &o),
+        _ => host(seller),
+    }
+}
+
 pub(crate) fn host(url: &str) -> String {
     if let Some(pk) = xbt402::shop::key_of(url) {
         let npub = xbt402::shop::npub(&pk);
@@ -294,11 +328,11 @@ fn service_href(s: &Service) -> String {
 
 /// A service's own page: its price and seller, then what its category needs. `own`: the seller is
 /// this box's own shop, which this box cannot buy from: its app opens as a free preview instead.
-fn service_html(s: &Service, own: bool) -> String {
+fn service_html(s: &Service, own: bool, seller: &str) -> String {
     let mut b = format!("<p class=\"small\"><a href=\"./browse?cat={}\">← {}</a></p>\
         <section class=\"card\"><div class=\"offer-head\"><span class=\"pill cat-{}\">{}</span><span class=\"price\">{}</span></div>\
         <p class=\"small\">Sold by {}</p></section>",
-        s.category(), esc(s.category_words()), s.category(), esc(s.category_words()), esc(&s.price_text), esc(&host(&s.seller)));
+        s.category(), esc(s.category_words()), s.category(), esc(s.category_words()), esc(&s.price_text), esc(seller));
     if own {
         b.push_str(if s.app.is_empty() {
             "<section class=\"status ok\"><p class=\"status-head\">This is your shop</p><p>Buyers pay for this. Your box can't buy from \
@@ -309,7 +343,6 @@ fn service_html(s: &Service, own: bool) -> String {
         });
     }
     if !s.app.is_empty() {
-        let seller = host(&s.seller);
         b.push_str(&if own {
             format!("<section class=\"card\"><h2>Its own app</h2><p>Buyers can open this service's own web page inside their app, \
                 and pay your price for what it loads. You can try it here for free.</p>\
@@ -319,7 +352,7 @@ fn service_html(s: &Service, own: bool) -> String {
             format!("<section class=\"card primary\"><h2>Its own app</h2><p>Use {}'s own page for this service, inside Lightning Stream. \
                 What it loads is paid at the price above, up to a limit you set.</p>\
                 <div class=\"row\"><a class=\"button-link primary\" href=\"./app?u={}&amp;b={}\">Open {}'s app</a></div></section>",
-                esc(&seller), services::urlenc(&s.app), services::urlenc(&s.app_base), esc(&seller))
+                esc(seller), services::urlenc(&s.app), services::urlenc(&s.app_base), esc(seller))
         });
     }
     match s.kind {
@@ -567,11 +600,11 @@ fn balance_cell(paying: &Value, sid: &str, booked_sats: i64) -> String {
     let row = paying.as_array().and_then(|a| a.iter().find(|p| p.get("session").and_then(Value::as_str) == Some(sid)));
     if let Some(msat) = row.and_then(|p| p.get("balance_msat")).and_then(msat_of) {
         let whole = i64::try_from(msat / 1000).unwrap_or(i64::MAX);
-        let rem = msat % 1000;
-        if rem == 0 {
+        if msat % 1000 == 0 {
             return sats(whole);
         }
-        return format!("{} <span class=\"small\">+ {rem} msat</span>", sats(whole));
+        // one figure, as the rest of the page writes it: 558.479 sats, not "558 sats + 479 msat"
+        return msat_text(msat);
     }
     if let Some(paid) = row.and_then(|p| p.get("paid_sats")).map(|v| int(Some(v))) {
         return format!("{} <span class=\"small\">paid</span>", sats(paid));
@@ -586,8 +619,8 @@ fn balance_cell(paying: &Value, sid: &str, booked_sats: i64) -> String {
 fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value, String>, names: &[Service], now: i64, more: bool) -> String {
     let csrf = App::csrf_input(ctx);
     let mut b = String::from("<p class=\"lead\">Every service you are paying for right now. Stop one and its payments end at once. \
-                              A ticket held but not yet taken comes back to you; credit left from a prepaid ticket stays with that \
-                              seller and is spent first next time. This page updates every few seconds.</p>");
+                              Money paid ahead and not used stays with that shop as credit, and is spent first next time. \
+                              This page updates every few seconds.</p>");
     if let Some(e) = st.get("error").and_then(Value::as_str) {
         b.push_str(&App::error_box(e));
     }
@@ -648,21 +681,21 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
     // the rate is of what the seller used, where its receipts say: a prepaid ticket is paid all at once
     let used_msat = row.and_then(|p| p.get("spent_msat")).and_then(msat_of);
     let per_min = used_msat.map_or(spent as f64, |m| m as f64 / 1000.0) / minutes.max(1.0);
-    let rate = if open && minutes >= 1.0 && per_min > 0.0 {
+    let rate = if open && streaming && minutes >= 1.0 && per_min > 0.0 {
         format!(" · about <span class=\"money\">{}</span> a minute", msat_text((per_min * 1000.0).round() as u64))
     } else {
         String::new()
     };
     let how_long = if minutes >= 1.0 { format!(" · open {} min", minutes.round() as i64) } else { String::new() };
-    let failed = format!("never sent {}<br>cancelled at stop {}<br>payment failed {}", c.never_sent, c.cancelled_at_stop, c.payment_failed);
+    let failed = format!("{} never sent · {} cancelled at Stop · {} failed", c.never_sent, c.cancelled_at_stop, c.payment_failed);
     let err = err.map(|e| format!("<p class=\"hint bad\">{}</p>", esc(e))).unwrap_or_default();
     let used = usage_line(row);
     format!("<section class=\"card live\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
              <p>Paid so far: <span class=\"money\">{}</span>{rate}{how_long}</p>{used}{err}<div class=\"row\">{stop}</div>\
-             <details><summary>Details</summary><p class=\"small\">{} · connection <code>{}</code></p><div class=\"scroll\"><table><thead><tr><th>Locked</th>\
-             <th>Released</th><th>Prepaid</th><th>Settled</th><th>Failed by</th><th>Balance</th></tr></thead><tbody><tr><td>{}</td><td>{}</td><td>{}</td>\
-             <td>{}</td><td class=\"small\">{failed}</td><td>{}</td></tr></tbody></table></div></details></section>",
-            esc(name), sats_short(spent), esc(origin), esc(id), c.locked, c.released, c.prepaid, c.settled, balance_cell(paying, id, c.booked_sats))
+             <details><summary>Details</summary><p class=\"small\">{} · connection <code>{}</code></p>{}</details></section>",
+            esc(name), sats_short(spent), esc(origin), esc(id),
+            crate::html::kv(&[("Payments held", c.locked.to_string()), ("Given back", c.released.to_string()), ("Paid ahead", c.prepaid.to_string()),
+                              ("Paid", c.settled.to_string()), ("Not paid", failed), ("Credit with the shop", balance_cell(paying, id, c.booked_sats))]))
 }
 
 /// What the seller has drawn from what was paid, and the credit it still holds, from the seller's
@@ -740,7 +773,7 @@ mod tests {
         assert_eq!((all[0].kind, all[0].price_text.as_str()), (Kind::Hashrate, "40 sat a piece of work"));
         let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| false);
         assert!(html.contains("cat-hashrate") && html.contains("Rent miners by the piece of work") && html.contains("href=\"./hashrate\""), "{html}");
-        assert!(service_html(&all[0], false).contains("href=\"./hashrate\""));
+        assert!(service_html(&all[0], false, "x").contains("href=\"./hashrate\""));
     }
 
     /// Two services list the same file at different prices: the Download and the player's link carry

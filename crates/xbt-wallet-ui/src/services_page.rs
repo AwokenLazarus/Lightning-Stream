@@ -143,6 +143,15 @@ impl App {
             } else {
                 m
             }),
+            // "Try the demo shop": add the seller, then straight to the rules with it allowed, ready to sign once
+            Some("try") => match self.add_seller(&url, get_page) {
+                Ok(_) if self.seller_allowed(&url) => Ok(format!("{} is on Browse and allowed to be paid.", self.seller_name(&url))),
+                Ok(_) => match self.allow_link(&url, get_page) {
+                    Ok(link) => return Resp::redirect(&link),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
             Some("allow") => match self.allow_link(&url, get_page) {
                 Ok(link) => return Resp::redirect(&link),
                 Err(e) => Err(e),
