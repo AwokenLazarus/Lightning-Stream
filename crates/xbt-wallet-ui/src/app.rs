@@ -52,6 +52,8 @@ pub struct App {
     pub files_error: std::sync::Mutex<Option<String>>,
     /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
     pub nostr: crate::nostr::NostrCache,
+    /// VPN exits on the owner's relays, for the VPN page's Found on Nostr.
+    pub vpn_exits: crate::nostr::ExitCache,
     /// Stream relays: the owner's choices, those announced on Nostr, and their probes ([`crate::relaynet`]).
     pub relay_net: crate::relaynet::RelayNet,
     /// The platform's login proxy, when it does the login ([`crate::auth::PlatformLogin`]).
@@ -218,6 +220,7 @@ impl App {
         let auth = Auth::open(&cfg.data_dir, cfg.password.as_deref(), cfg.setup_open, cfg.session_idle, cfg.session_max)?;
         let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90)).keeping(cfg.read_cache);
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
+        let vpn_exits = crate::nostr::ExitCache::new(cfg.nostr_relays.clone());
         let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
         let relays = crate::relay::RelayLinks::new(cfg.relay_ttl);
@@ -229,7 +232,7 @@ impl App {
             Err(e) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret was left as it was: {e}"),
         }
         Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None),
-                         files_error: std::sync::Mutex::new(None), nostr, relay_net, platform,
+                         files_error: std::sync::Mutex::new(None), nostr, vpn_exits, relay_net, platform,
                          apps: Default::default() }))
     }
 
@@ -426,7 +429,7 @@ impl App {
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
             "/ai" => self.ai_page(&ctx),
-            "/vpn" => self.vpn_page(&ctx),
+            "/vpn" => self.vpn_page(&ctx, &req.query),
             "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/relays" => self.relays_page(&ctx, &req.query),

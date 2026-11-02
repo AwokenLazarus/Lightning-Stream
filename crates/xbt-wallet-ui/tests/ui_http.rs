@@ -4765,3 +4765,71 @@ fn sellers_are_named_by_their_shop_and_a_removed_seller_still_in_the_rules_is_of
     assert_eq!(p["counterparties"], json!({}), "{p}");
     assert!(!br.get("/services").body.contains("Still allowed to be paid"));
 }
+
+/// The VPN page lists the exits the owner's Nostr relays carry, and *Add this exit* hands one to the VPN
+/// service: its signed announcement as the relays gave it goes into devices.json (the devices stay), the
+/// service reads it back through the same checks and every device prefers it. An exit the relays don't
+/// carry can't be added by naming it. Every exit the service found is listed, a paid one not yet checked
+/// as "not checked" (Mike's Umbrel: the Pi Demo exit was found but never shown).
+#[test]
+fn the_vpn_page_lists_exits_found_on_nostr_and_adds_one_for_the_vpn_service() {
+    use xbt_nostr::{event::Keys, oneshot, standin::StandinRelay};
+    use xbt_vpn::announce::{self, ExitOffer};
+    use base64::Engine;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let nostr = vec![relay.url.clone()];
+    let (secret, shop) = ([9u8; 32], xbt402::shop::origin_for(&[0x5a; 32]));
+    let exit = hex::encode(xbt_vpn::sealed::public_of(&secret));
+    let offer = ExitOffer { exit: exit.clone(), region: "SV".into(), price_msat_per_gb: 1_000_000, tunnel: Some(format!("{shop}/vpn/tunnel")),
+                            ttl_s: 86_400, ..ExitOffer::default() };
+    let ev = announce::announcement_event(&Keys::generate(), &secret, &offer, xbt_nostr::now()).unwrap();
+    assert_eq!(oneshot::publish(&nostr, &ev, Duration::from_secs(5))[0].result, Ok(()));
+    let vpn = tempfile::tempdir().unwrap();
+    let vdir = vpn.path().to_path_buf();
+    let key = base64::engine::general_purpose::STANDARD.encode([3u8; 32]);
+    std::fs::write(vdir.join("devices.json"), json!({"devices": [{"id": "a1", "name": "Phone", "public_key": key, "tunnel_ip": "10.66.0.2",
+                                                                    "policy": {"kind": "private"}}]}).to_string()).unwrap();
+    // the service's status: it found the exit and could not check its country (a paid exit no device asks SV of)
+    std::fs::write(vdir.join("status.json"), json!({"devices": [], "exits": [{"exit": exit, "region": "SV", "verified": false, "checked_at": 0,
+        "region_check": "Not checked: a paid exit's country is checked once a device asks for SV.", "price_msat_gb": 1_000_000, "added": false}]}).to_string()).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.nostr_relays = nostr.clone();
+        c.vpn = xbt_wallet_ui::config::VpnSetup { status_dir: vdir.clone(), dir: vdir.clone(), endpoint: None, tunnel_upstream: None };
+    });
+    let mut br = logged_in(&bx);
+    let page = unescape(&br.get("/vpn?refresh=1").body);
+    let found = &page[page.find("id=\"exits\"").expect("the exits the service found")..];
+    assert!(found.contains(&format!("{}…", &exit[..12])) && found.contains(">not checked<") && found.contains("1,000 sat/GB"), "{found}");
+    let nostr_part = &page[page.find("id=\"found-exits\"").expect("Found on Nostr")..];
+    assert!(nostr_part.contains("Add this exit") && nostr_part.contains(">SV<") && nostr_part.contains("found by the VPN service"), "{nostr_part}");
+
+    // an exit the relays don't carry: refused, nothing written
+    let r = br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &"ab".repeat(32))]);
+    assert!(br.flash_after(&r).contains("no longer on your Nostr relays"));
+    assert!(read_json(&vdir.join("devices.json")).get("exits").is_none());
+
+    let r = br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &exit)]);
+    assert!(br.flash_after(&r).starts_with("Added the exit in SV."));
+    let file = read_json(&vdir.join("devices.json"));
+    assert_eq!(file["devices"][0]["name"], "Phone", "the devices stay: {file}");
+    assert_eq!(file["exits"], json!([ev.to_value()]), "the signed announcement as the relays gave it");
+    // as the VPN service reads it
+    let (got, refused) = announce::collect(&xbt_vpn::service::added_exits(&file), xbt_nostr::now());
+    assert_eq!((got.len(), refused, got[0].exit.id.as_str()), (1, 0, exit.as_str()));
+    assert_eq!(xbt_vpn::service::devices_from(&file)[0].requirements.prefer, vec![exit.clone()]);
+    let page = unescape(&br.get("/vpn").body);
+    let nostr_part = &page[page.find("id=\"found-exits\"").unwrap()..];
+    assert!(nostr_part.contains(">added<") && !nostr_part.contains("Add this exit"), "{nostr_part}");
+    // adding it again keeps one copy; removing it leaves the devices
+    br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &exit)]);
+    assert_eq!(read_json(&vdir.join("devices.json"))["exits"].as_array().unwrap().len(), 1);
+    let r = br.act("/vpn", "/vpn", &[("do", "remove_exit"), ("exit", &exit)]);
+    assert!(br.flash_after(&r).starts_with("Removed the exit"));
+    let file = read_json(&vdir.join("devices.json"));
+    assert_eq!((file["exits"].as_array().unwrap().len(), file["devices"][0]["name"].as_str()), (0, Some("Phone")));
+}
+
+fn read_json(p: &std::path::Path) -> Value {
+    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+}

@@ -518,8 +518,10 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         _exit_link = Some(link);
     }
 
-    // the buyer: the devices of devices.json, each with its own policy
-    let entries = devices_from(&read_json(&devices_path));
+    // the buyer: the devices of devices.json, each with its own policy, and the exits the owner added there
+    let devices_json = read_json(&devices_path);
+    let entries = devices_from(&devices_json);
+    let (added, added_ids) = (service::added_exits(&devices_json), service::added_exit_ids(&devices_json));
     let buyer_link = Link::start_alpn(service::secret_in(&keys_dir.join("buyer.key"))?, opts(false), ALPN_VPN)?;
     let rt = buyer_link.runtime();
     let devices: HashMap<IpAddr, Arc<Device>> = entries
@@ -558,7 +560,7 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
 
     // exits, found on Nostr every 10 minutes; each announced region verified, and checked again every 6 h
     {
-        let (buyer, link, nostr, own, relay, rt) = (buyer.clone(), buyer_link.clone(), nostr.clone(), own_exit.clone(), relay.clone(), rt.clone());
+        let (buyer, link, nostr, own, relay, rt, added) = (buyer.clone(), buyer_link.clone(), nostr.clone(), own_exit.clone(), relay.clone(), rt.clone(), added.clone());
         let gate_file = keys_dir.join("region-checks.json");
         std::thread::spawn(move || {
             let mut checked: HashMap<String, (String, bool, std::time::Instant)> = HashMap::new();
@@ -569,8 +571,12 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             // not start the day's budget again
             let mut gate = xbt_vpn::holds::CheckGate::load(&gate_file);
             loop {
-                if !nostr.is_empty() {
-                    let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
+                // the exits the owner added count with those the relays give (the newest announcement of each)
+                if !nostr.is_empty() || !added.is_empty() {
+                    let mut events = added.clone();
+                    if !nostr.is_empty() {
+                        events.extend(xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15)).0);
+                    }
                     let (found, _) = announce::collect(&events, xbt_nostr::now());
                     // a priced exit that names no tunnel can't be paid: not used
                     let mut found: Vec<_> = found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref() && (a.exit.price_msat_per_gb == 0 || a.tunnel.is_some())).collect();
@@ -612,17 +618,8 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
                 service::with_use(device_status(e, c.as_ref().map_or(0, |c| c.up_bytes), c.as_ref().map_or(0, |c| c.down_bytes), why), exit.as_deref(), used_msat)
             })
             .collect();
-        // each exit's region check, in plain words, for the page
-        let exits: Vec<serde_json::Value> = buyer.region_results().into_iter().map(|(id, region, r, at)| {
-            let words = match &r {
-                xbt_vpn::region::RegionCheck::Verified => format!("Checked: its traffic comes out in {region}."),
-                xbt_vpn::region::RegionCheck::Elsewhere(cc) => format!("Its traffic comes out in {cc}, not {region}: not used for {region}."),
-                xbt_vpn::region::RegionCheck::TooFast => format!("It answers faster than {region} is from here: not used for {region}."),
-                xbt_vpn::region::RegionCheck::Unknown => "Not checked yet: no country table, or the address checks didn't agree.".to_string(),
-            };
-            let secs = at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            serde_json::json!({ "exit": id, "region": region, "verified": r == xbt_vpn::region::RegionCheck::Verified, "region_check": words, "checked_at": secs })
-        }).collect();
+        // every exit found, with its region check in plain words, for the page
+        let exits = service::exits_status(&rt.block_on(buyer.exits()), &buyer.region_results(), &added_ids);
         let _ = write_json(&status_dir.join("status.json"), &serde_json::json!({ "devices": rows, "exits": exits }));
         let c = exit_meter.counts();
         let exit_status = match &own_exit {
