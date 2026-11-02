@@ -2336,11 +2336,12 @@ impl Signer {
     /// `Err`: the refusal, with the rule and the owner's limit (`limit_sats`) that refused it and
     /// `before_lock`. Whatever else the book would refuse is left to the book.
     pub(crate) fn ticket_prepay_precheck(&self, sid: &str, msat: u64) -> std::result::Result<(), Value> {
+        // the spend lock, as every check of the book against the ledger is made under (the book read whole first)
+        let _g = self.lock();
         let tp = self.ticket_synced()?;
         let cfg = self.config();
         let lp = LnPolicy::from_map(&cfg.ln);
         let now = self.engine.now();
-        let _g = self.lock();
         let g = self.ticket_store().map_err(|e| refusal("ticket", e.msg))?;
         let Some(st) = g.as_ref() else { return Ok(()) };
         let Some(s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open) else { return Ok(()) };
