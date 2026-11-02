@@ -1451,7 +1451,7 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		// counted on the hash only it can read (block_hash_le, the share hash itself when unmasked)
 		const int missing_zeros = (int)datum_missing_block_zero_bits(block_hash_le, job->block_target, was_block);
 		const uint64_t vardiff = m->current_diff ? m->current_diff : job_diff;
-		long double bld = job->nbits[0] ? calc_network_difficulty(job->nbits) : 0.0L;
+		long double bld = job->nbits_uint ? calc_network_difficulty_blake2b(job->nbits_uint) : 0.0L;
 		const uint64_t blockdiff = (bld > 0.0L && bld < (long double)UINT64_MAX) ? (uint64_t)(bld + 0.5L) : 0;
 		stratum_log_share_result(c, username_s, true, was_block ? "block" : "ok", job_diff, vardiff, blockdiff, missing_zeros);
 		if (was_block) {
