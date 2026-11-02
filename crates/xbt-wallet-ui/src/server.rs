@@ -193,8 +193,22 @@ impl xbt_svc::http::Handler for Ui {
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
         let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: rq.body, peer };
+        let get = req.method == "GET" || req.method == "HEAD";
+        // an action changes what the pages show: they ask the signer afresh, during it and after it
+        if !get {
+            self.0.signer.forget();
+        }
+        let timing = crate::perf::Request::begin(get);
         let mut resp = self.0.handle(req);
+        if !get {
+            self.0.signer.forget();
+        }
         security_headers(&mut resp);
+        resp.headers.push(("Server-Timing".into(), timing.server_timing()));
+        if timing.elapsed() >= crate::perf::slow_limit() {
+            eprintln!("xbt-wallet-ui: slow request: {} {} took {:.0} ms ({})", rq.method.to_uppercase(), log_path(raw_path),
+                      timing.elapsed().as_secs_f64() * 1000.0, timing.server_timing());
+        }
         xbt_svc::http::Response::new(resp.status, resp.headers, resp.body)
     }
 
@@ -242,6 +256,16 @@ impl xbt_svc::http::Handler for Ui {
             }
         }
     }
+}
+
+/// A path as the slow-request log line shows it: a link's token (`/r/`, `/s/~`) is never logged.
+pub fn log_path(path: &str) -> String {
+    let cut = ["/r/", "/s/"].iter().filter_map(|m| path.find(m).map(|i| i + m.len())).min();
+    let p = match cut {
+        Some(i) => format!("{}…", &path[..i]),
+        None => path.to_string(),
+    };
+    p.chars().take(80).collect()
 }
 
 /// The most one ranged request of a reader buys at once: 4 MiB.

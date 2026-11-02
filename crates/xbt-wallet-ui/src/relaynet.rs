@@ -13,15 +13,17 @@
 //! the app keeps it and ranks by it. Both lists are written when the owner changes a choice and
 //! each time the page probes.
 //!
-//! The Nostr relays are asked, and the relays probed, only when the owner opens the page: never
-//! in the background. A probe is one TLS WebSocket upgrade on `/relay`, closed at once.
+//! The Nostr relays are asked, and the relays probed, only when the owner opens the page. The page
+//! shows the last snapshot at once, and when it is older than [`FRESH`] makes a new one behind it
+//! for the next visit; only the first visit waits for one, at most [`crate::nostr::FIRST_WAIT`].
+//! A probe is one TLS WebSocket upgrade on `/relay`, closed at once.
 //!
 //! An owner who runs a relay can announce it from here. The announcement is signed with a key of
 //! its own, `secrets/relay-operator.key` (mode 600), made the first time; it is not the shop's key
 //! and not the wallet's.
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -52,12 +54,15 @@ pub struct Snapshot {
     pub nostr: Vec<Outcome>,
 }
 
+#[derive(Clone)]
 pub struct RelayNet {
     nostr_relays: Vec<String>,
     file: PathBuf,
     key_file: PathBuf,
     default_relay: String,
-    snap: Mutex<Option<Snapshot>>,
+    snap: Arc<Mutex<Option<Snapshot>>>,
+    /// Who makes the next snapshot, and when (in the background once there is one).
+    making: crate::perf::Swr<Snapshot>,
 }
 
 fn list(v: &Value, k: &str) -> Vec<String> {
@@ -71,7 +76,8 @@ impl RelayNet {
 
     pub fn with_default(nostr_relays: Vec<String>, data_dir: &std::path::Path, default_relay: &str) -> Self {
         Self { nostr_relays, file: data_dir.join("relays.json"), key_file: data_dir.join("secrets").join("relay-operator.key"),
-               default_relay: relays::canonical_relay(default_relay).unwrap_or_else(|_| DEFAULT_RELAY.into()), snap: Mutex::new(None) }
+               default_relay: relays::canonical_relay(default_relay).unwrap_or_else(|_| DEFAULT_RELAY.into()), snap: Default::default(),
+               making: crate::perf::Swr::new() }
     }
 
     pub fn default_relay(&self) -> &str {
@@ -126,13 +132,21 @@ impl RelayNet {
         std::fs::rename(&tmp, &self.file).map_err(|e| format!("{}: {e}", self.file.display()))
     }
 
-    /// The announcements and the probes, asking again when there is nothing fresh (or `refresh`).
+    /// The announcements and the probes: the last snapshot at once, a new one made behind it when
+    /// it is older than [`FRESH`]. `refresh` (the owner asked to look again) waits for a new one.
     pub fn get(&self, refresh: bool) -> Snapshot {
-        if let Some(s) = self.snap.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            if !refresh && s.at.elapsed() < FRESH {
-                return s.clone();
-            }
+        if refresh {
+            return self.making.refresh(|| self.make());
         }
+        let me = self.clone();
+        self.making.get(FRESH, crate::nostr::FIRST_WAIT, move || me.make()).unwrap_or_else(|| Snapshot {
+            at: Instant::now(), announced: vec![], refused: 0, probes: HashMap::new(), errors: HashMap::new(),
+            nostr: self.nostr_relays.iter().map(|r| Outcome { relay: r.clone(), result: Err(crate::nostr::STILL_ASKING.into()) }).collect(),
+        })
+    }
+
+    /// Ask the Nostr relays and probe the relays, keep the snapshot and write the choice.
+    fn make(&self) -> Snapshot {
         let (announced, refused, nostr) = if self.nostr_relays.is_empty() {
             (Vec::new(), 0, Vec::new())
         } else {

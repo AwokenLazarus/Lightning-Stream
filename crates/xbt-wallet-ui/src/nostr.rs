@@ -2,11 +2,13 @@
 //! hold, each checked by [`xbt_nostr::market`] (the event, the listing and the binding all verify),
 //! kept for a while, and turned into services a service page can open.
 //!
-//! The relays are asked only when the owner opens the Nostr page, never in the background, and
-//! never with no relays set (the default). A seller found here is unvetted: its listing is signed
+//! The relays are asked only when the owner opens the Nostr page, and never with no relays set (the
+//! default). The page shows the last answer at once: when it is older than [`FRESH`] the relays are
+//! asked again behind it, and the next visit shows that. Only the first visit waits for them, at most
+//! [`FIRST_WAIT`]; *Look again* waits for them in full. A seller found here is unvetted: its listing is signed
 //! by a receipt key, but only the seller's own 402 terms say that key is the seller's. The page's
 //! Check button asks the seller that ([`check`]).
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use xbt402::listing::{self, Page};
@@ -15,8 +17,13 @@ use xbt_nostr::oneshot::{self, Outcome};
 
 use crate::services::Service;
 
-/// A query older than this is asked again when the page opens.
+/// A query older than this is asked again (in the background) when the page opens.
 pub const FRESH: Duration = Duration::from_secs(120);
+/// The first visit waits this long at most for the relays; after that the page says they are still
+/// being asked.
+pub const FIRST_WAIT: Duration = Duration::from_millis(1500);
+/// What a relay not done yet at the first visit is said to be doing.
+pub const STILL_ASKING: &str = "still being asked: reload this page in a few seconds";
 /// Each relay gets this long to send what it has.
 pub const QUERY_WAIT: Duration = Duration::from_secs(8);
 /// How many listings each relay is asked for.
@@ -31,38 +38,55 @@ pub struct Snapshot {
     pub relays: Vec<Outcome>,
 }
 
+/// How the relays are asked: the query of [`NostrCache::get`] (a test gives its own).
+pub type Query = Arc<dyn Fn(&[String]) -> (Vec<xbt_nostr::event::Event>, Vec<Outcome>) + Send + Sync>;
+
 pub struct NostrCache {
     relays: Vec<String>,
-    snap: Mutex<Option<Snapshot>>,
+    snap: crate::perf::Swr<Snapshot>,
+    query: Query,
 }
 
 impl NostrCache {
     pub fn new(relays: Vec<String>) -> Self {
-        Self { relays, snap: Mutex::new(None) }
+        Self::with_query(relays, Arc::new(|r: &[String]| oneshot::query(r, &market::filter(QUERY_LIMIT), QUERY_WAIT)))
+    }
+
+    pub fn with_query(relays: Vec<String>, query: Query) -> Self {
+        Self { relays, snap: crate::perf::Swr::new(), query }
+    }
+
+    /// How many times the relays were asked for the listings.
+    pub fn queries(&self) -> u64 {
+        self.snap.made()
     }
 
     pub fn enabled(&self) -> bool {
         !self.relays.is_empty()
     }
 
-    /// The listings, asking the relays when there is nothing fresh (or `refresh`).
+    /// The listings: the last answer at once, the relays asked again behind it when it is older
+    /// than [`FRESH`]. `refresh` (the owner asked to look again) waits for the relays.
     pub fn get(&self, refresh: bool) -> Snapshot {
-        if let Some(s) = self.snap.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            if !refresh && s.at.elapsed() < FRESH {
-                return s.clone();
-            }
+        let (relays, query) = (self.relays.clone(), self.query.clone());
+        let make = move || {
+            let (events, outcomes) = crate::perf::timed(|| query(&relays));
+            let (listings, refused) = market::collect(&events, xbt_nostr::now());
+            Snapshot { at: Instant::now(), listings, refused, relays: outcomes }
+        };
+        if refresh {
+            return self.snap.refresh(make);
         }
-        let (events, relays) = oneshot::query(&self.relays, &market::filter(QUERY_LIMIT), QUERY_WAIT);
-        let (listings, refused) = market::collect(&events, xbt_nostr::now());
-        let s = Snapshot { at: Instant::now(), listings, refused, relays };
-        *self.snap.lock().unwrap_or_else(|p| p.into_inner()) = Some(s.clone());
-        s
+        self.snap.get(FRESH, FIRST_WAIT, make).unwrap_or_else(|| Snapshot {
+            at: Instant::now(), listings: vec![], refused: 0,
+            relays: self.relays.iter().map(|r| Outcome { relay: r.clone(), result: Err(STILL_ASKING.into()) }).collect(),
+        })
     }
 
     /// The services found the last time the page asked, without asking again: what a service page
     /// may open.
     pub fn services(&self) -> Vec<Service> {
-        self.snap.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|s| s.listings.iter().flat_map(to_services).collect()).unwrap_or_default()
+        self.snap.peek().map(|(_, s)| s.listings.iter().flat_map(to_services).collect()).unwrap_or_default()
     }
 
     /// The shop with Nostr key `pk` (a shop without a web address, `docs/DIRECT-LINKS.md`): its
@@ -123,4 +147,56 @@ pub fn check_with(n: &NostrListing, get: impl FnMut(&str) -> Result<Page, String
         return Err("the seller's own terms name another receipt key: this Nostr listing is not the seller's".into());
     }
     Ok(own)
+}
+
+#[cfg(test)]
+mod swr_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Found on Nostr never waits for the relays once it has an answer (0.2.2: the page took up to
+    /// the relays' 8 s each time its last answer was over two minutes old).
+    #[test]
+    fn the_page_serves_the_last_answer_and_asks_the_relays_behind_it() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        let c = NostrCache::with_query(vec!["wss://relay.example".into()], Arc::new(move |r: &[String]| {
+            a.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            (vec![], r.iter().map(|r| Outcome { relay: r.clone(), result: Ok(()) }).collect())
+        }));
+        // the first visit waits for them (within FIRST_WAIT)
+        let s = c.get(false);
+        assert!(s.relays.iter().all(|o| o.result.is_ok()), "{:?}", s.relays);
+        // fresh: no asking
+        let t = Instant::now();
+        c.get(false);
+        assert!(t.elapsed() < Duration::from_millis(100));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // stale: served at once, asked again behind it
+        c.snap.expire();
+        let t = Instant::now();
+        let s = c.get(false);
+        assert!(t.elapsed() < Duration::from_millis(100), "a stale answer is served at once: {:?}", t.elapsed());
+        assert!(s.relays.iter().all(|o| o.result.is_ok()));
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "asked again in the background");
+        // Look again waits for the relays
+        let t = Instant::now();
+        c.get(true);
+        assert!(t.elapsed() >= Duration::from_millis(400));
+        assert_eq!(c.queries(), 3);
+    }
+
+    #[test]
+    fn a_slow_first_visit_says_the_relays_are_still_being_asked() {
+        let c = NostrCache::with_query(vec!["wss://slow.example".into()], Arc::new(|_: &[String]| {
+            std::thread::sleep(FIRST_WAIT + Duration::from_millis(800));
+            (vec![], vec![])
+        }));
+        let t = Instant::now();
+        let s = c.get(false);
+        assert!(t.elapsed() < FIRST_WAIT + Duration::from_millis(400));
+        assert_eq!(s.relays, vec![Outcome { relay: "wss://slow.example".into(), result: Err(STILL_ASKING.into()) }]);
+    }
 }

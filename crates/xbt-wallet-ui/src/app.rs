@@ -214,7 +214,7 @@ fn reason_of(r: &Value) -> String {
 impl App {
     pub fn new(cfg: Config) -> Result<Arc<Self>, String> {
         let auth = Auth::open(&cfg.data_dir, cfg.password.as_deref(), cfg.setup_open, cfg.session_idle, cfg.session_max)?;
-        let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90));
+        let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90)).keeping(cfg.read_cache);
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
         let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
@@ -1946,6 +1946,7 @@ pub fn http_get(url: &str) -> Result<(u16, String), String> {
 
 /// [`http_get`] with extra request headers (the gateway's health token).
 pub fn http_get_with(url: &str, headers: &[(&str, &str)]) -> Result<(u16, String), String> {
+    let _timed = crate::perf::Upstream::start();
     use std::io::{Read, Write};
     let rest = url.strip_prefix("http://").ok_or("only http:// URLs are probed")?;
     let (hostport, path) = match rest.find('/') {
