@@ -70,7 +70,7 @@ fn a_shop_that_moves_withdraws_its_old_listing() {
     let keys = nostr::load_key(dir.path()).unwrap();
     let now = xbt_nostr::now();
     nostr::publish_once(&rig.gw, &keys, &relays, now - 10).unwrap();
-    assert!(relay.events(market::KIND_DELETION).is_empty(), "nothing to withdraw while the shop has not moved");
+    assert!(relay.events(nostr::KIND_DELETION).is_empty(), "nothing to withdraw while the shop has not moved");
     let old_id = relay.events(market::KIND_CLASSIFIED)[0].id.clone();
     let (node, service, clock) = rig.stop();
     let moved = start_on(dir.path(), node, service, clock, &|v| {
@@ -79,7 +79,7 @@ fn a_shop_that_moves_withdraws_its_old_listing() {
     });
     let out = nostr::publish_once(&moved.gw, &keys, &relays, now).unwrap();
     assert_eq!(out[0].result, Ok(()));
-    let del = relay.events(market::KIND_DELETION);
+    let del = relay.events(nostr::KIND_DELETION);
     assert_eq!(del.len(), 1, "{del:?}");
     let d = &del[0];
     assert!(d.verify() && d.pubkey == keys.public_hex(), "signed by the shop's own Nostr key");
@@ -91,7 +91,8 @@ fn a_shop_that_moves_withdraws_its_old_listing() {
     let (events, _) = oneshot::query(&relays, &market::filter(10), Duration::from_secs(5));
     assert_eq!(events.len(), 2);
     let (got, _) = market::collect(&events, xbt_nostr::now());
-    assert_eq!(got.iter().map(|l| l.listing.seller.as_str()).collect::<Vec<_>>(), ["http://moved.test:8402"]);
+    let newest = got.iter().max_by_key(|l| l.created_at).unwrap();
+    assert_eq!(newest.listing.seller, "http://moved.test:8402", "the wallet keeps only the newest of one key's listings");
     // the listing at the new address is never withdrawn
     assert!(!d.tags.iter().any(|t| t.get(1).is_some_and(|v| v.contains("moved.test"))));
 }

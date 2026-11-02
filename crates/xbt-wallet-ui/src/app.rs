@@ -832,7 +832,8 @@ impl App {
         b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Lightning</h2>");
         b.push_str(&kv(&[("Can send now", crate::pay_feedback::spendable_sats(&ln).map(|c| format!("about {}", money(c))).unwrap_or_else(|| "not known".into())),
                          ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Not ready</span> <a href=\"./lightning\">See why</a>".into() })]));
-        b.push_str("<p class=\"small\">Credit left with shops is on <a href=\"./connections\">Live connections</a>. \
+        b.push_str("<p class=\"small\">Credit left with shops is on <a href=\"./services\">Sellers</a> and on each shop's service page \
+                    (on <a href=\"./connections\">Live connections</a> while a connection is open). \
                     What the app may spend is in your <a href=\"./policy\">spending rules</a>.</p></div>");
         b.push_str("<div class=\"card\"><h2>XBT on chain</h2>");
         b.push_str(&kv(&[("On your XBT node", money(int(bal.get("trusted_sats")))), ("On its way to your XBT node", money(int(bal.get("untrusted_pending_sats")))),
@@ -864,13 +865,7 @@ impl App {
         // (read only where a row names a node: the page's reads stay few)
         let named_nodes = recent.as_ref().ok().and_then(|h| h["events"].as_array())
             .is_some_and(|a| a.iter().any(|e| e["dest"].as_str().is_some_and(|d| d.starts_with("ln:"))));
-        let nodes: Vec<(String, String)> = if !named_nodes { Vec::new() } else {
-            let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
-            let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
-            let mut v: Vec<(String, String)> = rule_sellers(&pol).into_iter().filter_map(|r| Some((r.node?.to_ascii_lowercase(), r.origin?))).collect();
-            v.extend(shops.iter().filter_map(|(o, sh)| crate::shops::node(sh, o, xbt_nostr::now()).map(|n| (n.to_ascii_lowercase(), o.clone()))));
-            v
-        };
+        let nodes: Vec<(String, String)> = if !named_nodes { Vec::new() } else { self.seller_nodes() };
         let who = |d: &str| {
             if let Some(o) = d.strip_prefix("ln:").and_then(|n| nodes.iter().find(|(x, _)| x.eq_ignore_ascii_case(n.trim()))).map(|(_, o)| o) {
                 return crate::services::seller_name(&known, o);
@@ -1129,7 +1124,8 @@ impl App {
     /// address on the list that may be paid with no Lightning node on file, or a shop reached by its
     /// key whose node on file is not the one the shop vouches for now ([`crate::shops::node`]).
     fn seller_checks(&self, p: &Value) -> Vec<SellerCheck> {
-        let all = self.file_services().unwrap_or_default();
+        // names from the list of sellers and from Found on Nostr
+        let all = self.services().unwrap_or_default();
         let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
         let now = xbt_nostr::now();
         let rows = rule_sellers(p);
@@ -1138,6 +1134,10 @@ impl App {
         let node_name = |n: &str| rows.iter().zip(&vouched).find_map(|(r, v)| {
             let o = r.origin.as_ref()?;
             [r.node.as_deref(), v.as_deref()].into_iter().flatten().any(|x| x.eq_ignore_ascii_case(n)).then(|| crate::services::seller_name(&all, o))
+        }).or_else(|| {
+            // a seller allowed only by its node's line: the shop on file that vouches for that node
+            shops.iter().find(|(o, sh)| crate::shops::node(sh, o, now).is_some_and(|x| x.eq_ignore_ascii_case(n)))
+                .map(|(o, _)| crate::services::seller_name(&all, o))
         });
         rows.iter().zip(&vouched).map(|(r, vouched)| {
             let name = match (&r.origin, ln_line_node(&r.key)) {
@@ -1173,9 +1173,11 @@ impl App {
             b.push_str("<div class=\"scroll\"><table class=\"sellers\"><thead><tr><th>Seller</th><th>Lightning node</th><th></th></tr></thead><tbody>");
             for (i, c) in checks.iter().enumerate() {
                 let r = &c.rule;
-                let addr = match &r.origin {
-                    Some(o) => xbt402::shop::display(o),
-                    None => r.key.clone(),
+                // a node's line by its node, short (the full key in its tooltip): never the raw `ln:` line
+                let addr = match (&r.origin, ln_line_node(&r.key)) {
+                    (Some(o), _) => xbt402::shop::display(o),
+                    (None, Some(n)) => format!("node {}", short_node(n)),
+                    (None, None) => r.key.clone(),
                 };
                 let node = match (&r.node, &r.origin, ln_line_node(&r.key)) {
                     (Some(n), _, _) => format!("<code title=\"{}\">{}</code>", esc(n), esc(&short_node(n))),
@@ -1605,6 +1607,16 @@ impl App {
 
     // --- signatures ---------------------------------------------------------------------------------
 
+    /// Each seller's Lightning node (lowercase) and its origin: on file in the spending rules, or vouched
+    /// for by its shop. For naming an `ln:<node>` destination by its seller.
+    fn seller_nodes(&self) -> Vec<(String, String)> {
+        let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
+        let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
+        let mut v: Vec<(String, String)> = rule_sellers(&pol).into_iter().filter_map(|r| Some((r.node?.to_ascii_lowercase(), r.origin?))).collect();
+        v.extend(shops.iter().filter_map(|(o, sh)| crate::shops::node(sh, o, xbt_nostr::now()).map(|n| (n.to_ascii_lowercase(), o.clone()))));
+        v
+    }
+
     fn signatures(&self, ctx: &Ctx) -> Resp {
         let s = match self.call("signatures", json!({"limit": 200})) {
             Ok(v) => v,
@@ -1631,11 +1643,16 @@ impl App {
             b.push_str(&Self::error_box(&txt(Some(e))));
         }
         b.push_str(&format!("<form method=\"post\" action=\"./anchor-now\">{}<button class=\"secondary\">Seal the record now</button></form>", Self::csrf_input(ctx)));
-        b.push_str("<div class=\"scroll\"><table><thead><tr><th>When</th><th>Kind</th><th>Authorised by</th><th>Method</th><th>Destination</th><th>Signature hash</th></tr></thead><tbody>");
-        for e in s["signatures"].as_array().cloned().unwrap_or_default().iter().rev() {
-            b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>", utc(int(e.get("ts"))),
-                                escv(e.get("kind")), escv(e.get("rule")), escv(e.get("method")), esc(&short(&txt(e.get("dest")), 40)),
-                                esc(&short(&txt(e.get("sig_sha256")), 16))));
+        b.push_str("<div class=\"scroll\"><table><thead><tr><th>When</th><th>Kind</th><th>Authorized by</th><th>Method</th><th>Destination</th><th>Signature hash</th></tr></thead><tbody>");
+        let rows = s["signatures"].as_array().cloned().unwrap_or_default();
+        // the seller, by name, for a destination that is its Lightning node or its address (read only where a row needs it)
+        let nodes = if rows.iter().any(|e| txt(e.get("dest")).starts_with("ln:")) { self.seller_nodes() } else { Vec::new() };
+        let known = if rows.iter().any(|e| !txt(e.get("dest")).is_empty()) { self.services().unwrap_or_default() } else { Vec::new() };
+        for e in rows.iter().rev() {
+            let (rule, method) = (txt(e.get("rule")), txt(e.get("method")));
+            b.push_str(&format!("<tr><td>{}</td><td>{}</td><td><span title=\"{}\">{}</span></td><td><span title=\"{}\">{}</span></td><td>{}</td><td><code>{}</code></td></tr>",
+                                utc(int(e.get("ts"))), escv(e.get("kind")), esc(&rule), esc(&rule_words(&rule)), esc(&method), esc(&method_words(&method)),
+                                esc(&dest_words(&txt(e.get("dest")), &nodes, &known)), esc(&short(&txt(e.get("sig_sha256")), 16))));
         }
         b.push_str("</tbody></table></div>");
         self.page("Records", ctx, b)
@@ -1650,13 +1667,13 @@ impl App {
         let enroll_form = if enroll {
             let code_field = match &given {
                 Some(c) => format!("<input type=\"hidden\" name=\"code\" value=\"{}\">", esc(c)),
-                None => "<label>Enrolment code<input name=\"code\" class=\"mono\" autocomplete=\"off\" required placeholder=\"XXXX-XXXX-XXXX\"></label>\
+                None => "<label>Enrollment code<input name=\"code\" class=\"mono\" autocomplete=\"off\" required placeholder=\"XXXX-XXXX-XXXX\"></label>\
                      <p class=\"hint\">The signer prints a one-time code in its log while no key is enrolled (Umbrel: the app's log; StartOS: Logs; \
                      a server: the signer's stderr or <code>.run/enroll-code</code>).</p>".to_string(),
             };
             format!("<form method=\"post\" action=\"./human-key-enroll\" id=\"enroll-form\" hidden>{}<input type=\"hidden\" name=\"pubkey\" value=\"\">\
                      {code_field}<button>{}</button></form>", Self::csrf_input(ctx),
-                    if given.is_some() { "Use this key for approvals" } else { "Enrol this public key with the signer" })
+                    if given.is_some() { "Use this key for approvals" } else { "Enroll this public key with the signer" })
         } else {
             String::new()
         };
@@ -2071,6 +2088,48 @@ fn seller_warnings_box(checks: &[SellerCheck]) -> String {
 }
 
 /// A node id, short: `02abcdef…12345678`.
+/// What authorized a signature, as the Records page says it (`policy:ok` is your spending rules).
+/// The signer's own word stays in the cell's tooltip.
+pub(crate) fn rule_words(rule: &str) -> String {
+    match rule {
+        "policy:ok" | "policy" => "Your spending rules".into(),
+        "watcher:auto_refund" => "Automatic refund".into(),
+        "unattributed" | "" => "Not recorded".into(),
+        "ticket_refused" => "A ticket your rules refused".into(),
+        r if r.starts_with("approval") || r.starts_with("human:") => "Your approval key".into(),
+        r if r.starts_with("method:") => "The signer's own rule for this kind of request".into(),
+        r if r.starts_with("watcher:") => "The payment watcher".into(),
+        r => capital(&r.replace([':', '_'], " ")),
+    }
+}
+
+/// The signer's method, in words (`xbt402_pay` is paying a service).
+pub(crate) fn method_words(method: &str) -> String {
+    match method {
+        "xbt402_pay" => "Paid a service".into(),
+        "" => "—".into(),
+        m if m.starts_with("ticket_") => "Stream ticket".into(),
+        m if m.starts_with("ln_") => "Lightning payment".into(),
+        m if m.starts_with("policy_") => "Spending rules".into(),
+        m => capital(&m.replace('_', " ")),
+    }
+}
+
+/// A destination as a person reads it: `ln:<node>` as "Lightning node of <seller>" (`nodes`, from
+/// [`App::seller_nodes`]), a shop's address by its name, never its `…shop.invalid` address.
+pub(crate) fn dest_words(d: &str, nodes: &[(String, String)], known: &[crate::services::Service]) -> String {
+    if let Some(n) = d.strip_prefix("ln:").map(str::trim) {
+        return match nodes.iter().find(|(x, _)| x.eq_ignore_ascii_case(n)) {
+            Some((_, o)) => format!("Lightning node of {}", crate::services::seller_name(known, o)),
+            None => format!("Lightning node {}", short_node(n)),
+        };
+    }
+    match crate::services::http_origin(d) {
+        Some(o) if xbt402::shop::is_shop(&o) || crate::services::shop_name(known, &o).is_some() => crate::services::seller_name(known, &o),
+        _ => short(d, 40),
+    }
+}
+
 fn short_node(n: &str) -> String {
     if n.len() <= 20 || !n.is_ascii() { n.to_string() } else { format!("{}…{}", &n[..8], &n[n.len() - 8..]) }
 }
@@ -2351,6 +2410,21 @@ mod file_call_tests {
 #[cfg(test)]
 mod change_tests {
     use super::*;
+
+    /// Records and the Wallet say who authorized a signature, what it was and where it went in words:
+    /// not `policy:ok`, `xbt402_pay` or `ln:035d…`.
+    #[test]
+    fn a_record_is_said_in_words() {
+        assert_eq!(rule_words("policy:ok"), "Your spending rules");
+        assert_eq!(rule_words("human:approval_signature"), "Your approval key");
+        assert_eq!(method_words("xbt402_pay"), "Paid a service");
+        let node = format!("02{}", "ab".repeat(32));
+        let nodes = vec![(node.clone(), "https://films.example".to_string())];
+        let shop = crate::services::Service { name: "Demo Films".into(), kind: crate::services::Kind::Api, seller: "https://films.example".into(),
+            price_text: String::new(), prices: Value::Null, items: vec![], address: String::new(), app: String::new(), app_base: String::new() };
+        assert_eq!(dest_words(&format!("ln:{node}"), &nodes, std::slice::from_ref(&shop)), "Lightning node of Demo Films");
+        assert!(dest_words(&format!("ln:03{}", "cd".repeat(32)), &nodes, &[shop]).starts_with("Lightning node 03cdcdcd…"));
+    }
 
     /// The rules form takes whole sellers out, and nothing else: a node is never cut off by an edit
     /// (0.2.1: a node wrapped in a free-text box and was saved without it), and a form with no list of

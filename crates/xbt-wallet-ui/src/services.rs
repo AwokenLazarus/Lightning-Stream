@@ -494,6 +494,32 @@ pub fn short_address(origin: &str) -> String {
     http_origin(origin).unwrap_or_else(|| origin.to_string()).trim_start_matches("https://").trim_start_matches("http://").to_string()
 }
 
+/// A URL or path as a person reads it: percent-escapes decoded (`%20` a space), `+` left as it is
+/// (it is a plus in a path). Text that does not decode to UTF-8 is shown as it came. For display only.
+pub fn path_words(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    match String::from_utf8(out) {
+        // a decoded control character is never shown: the escape stays
+        Ok(t) if !t.chars().any(char::is_control) => t,
+        _ => s.to_string(),
+    }
+}
+
 /// The first integer in a price line (`"20 sat a MiB"` → 20, `"about 1,200 sat"` → 1200).
 pub fn price_num(s: &str) -> Option<u64> {
     let b = s.as_bytes();
@@ -632,6 +658,14 @@ mod tests {
             licence: String::new(), credits: String::new() }
     }
     use super::*;
+
+    #[test]
+    fn a_path_is_shown_decoded() {
+        assert_eq!(path_words("/files/My%20film%20(2010).mkv"), "/files/My film (2010).mkv");
+        assert_eq!(path_words("/a+b%2"), "/a+b%2");
+        assert_eq!(path_words("/x%0Ay"), "/x%0Ay", "no control characters");
+        assert_eq!(path_words("/caf%C3%A9"), "/café");
+    }
 
     /// A shop is named by its listing's name (#37 item 16), whatever [`from_listing`] made of its services,
     /// and one reached by its key is never named by its made-up `…shop.invalid` address (items 7, 11, 20).

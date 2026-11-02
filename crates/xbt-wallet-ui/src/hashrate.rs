@@ -280,6 +280,9 @@ fn rent_offers(base: &str, token: &Option<PathBuf>, keep: bool) -> Result<Value,
     }
 }
 
+/// Shop names by origin, each with when it was asked.
+type Names = std::sync::Mutex<HashMap<String, (std::time::Instant, Option<String>)>>;
+
 /// How long a shop name read from a hashmaker's own shop is kept.
 const SHOP_NAME_FRESH: Duration = Duration::from_secs(3600);
 
@@ -288,7 +291,6 @@ const SHOP_NAME_FRESH: Duration = Duration::from_secs(3600);
 /// waits: the first ask goes on behind the page, and the page names the shop by its address until it
 /// answers. `None` while unknown, or when the shop serves no listing of its own address.
 fn listed_shop_name(origin: &str) -> Option<String> {
-    type Names = std::sync::Mutex<HashMap<String, (std::time::Instant, Option<String>)>>;
     static NAMES: std::sync::LazyLock<std::sync::Arc<Names>> = std::sync::LazyLock::new(Default::default);
     if (!origin.starts_with("https://") && !origin.starts_with("http://")) || xbt402::shop::is_shop(origin) {
         return None;
@@ -314,7 +316,7 @@ fn listed_shop_name(origin: &str) -> Option<String> {
     None
 }
 
-fn spawn_name_lookup(names: std::sync::Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, Option<String>)>>>, origin: &str) {
+fn spawn_name_lookup(names: std::sync::Arc<Names>, origin: &str) {
     let o = origin.to_string();
     std::thread::spawn(move || {
         let Some(name) = crate::nostr::own_listing_name(&o) else { return };

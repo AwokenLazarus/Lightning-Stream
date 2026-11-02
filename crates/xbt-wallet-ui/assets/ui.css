@@ -394,12 +394,14 @@ form.policy > fieldset, form.policy > details > fieldset { background: var(--car
 ul.changes li { overflow-wrap: anywhere; }
 /* a seller's own app, framed: the visit bar above it, as tall as the screen allows */
 .app-visit { padding-bottom: 16px; }
-.app-visit > p { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 12px 0 0; padding: 10px 14px; border-radius: var(--radius);
+.app-visit > .visit-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 12px 0 0; padding: 10px 14px; border-radius: var(--radius);
                  background: var(--input); border: 1px solid var(--line); font-variant-numeric: tabular-nums; }
-.app-visit > p.hint { background: none; border: 0; padding: 0; margin-top: 10px; }
-.app-visit > p strong { color: var(--money); }
+.app-visit > p.hint { margin: 10px 0 0; }
+.app-visit > .visit-bar strong { color: var(--money); }
 .app-visit iframe.seller-app { display: block; width: 100%; height: 72vh; min-height: 420px; border: 1px solid var(--line-2); border-radius: var(--radius);
-                               background: #fff; margin: 12px 0 0; box-shadow: 0 30px 80px -40px rgba(0,0,0,0.9); }
+                               background: var(--bg-2); margin: 12px 0 0; box-shadow: 0 30px 80px -40px rgba(0,0,0,0.9); }
+/* dark (the theme's own) while the app loads, then white under a page that sets no background of its own */
+.app-visit iframe.seller-app.loaded { background: #fff; }
 .app-visit form.inline { display: inline; margin: 0 0 0 auto; }
 .app-visit form.inline button { min-height: 36px; padding: 4px 16px; font-size: 0.88rem; }
 @media (max-width: 600px) { .app-visit { padding: 16px 12px 12px; } .app-visit iframe.seller-app { height: 78vh; min-height: 360px; } }

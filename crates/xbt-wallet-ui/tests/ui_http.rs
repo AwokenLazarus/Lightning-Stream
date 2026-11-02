@@ -3012,14 +3012,14 @@ fn the_enrolment_code_the_box_gives_is_filled_in() {
     let mut br = logged_in(&b);
     let page = br.get("/setup").body;
     assert!(page.contains("<input type=\"hidden\" name=\"code\" value=\"ABCD-EFGH-IJKL\">"), "{page}");
-    assert!(!page.contains("Enrolment code<input") && page.contains("Use this key for approvals"), "{page}");
+    assert!(!page.contains("Enrollment code<input") && page.contains("Use this key for approvals"), "{page}");
     assert!(page.contains("Download the approval key backup (this is not your passphrase)") && page.contains("I saved the downloaded file somewhere safe"), "{page}");
     // what saving needs is said before Save is pressed: the download and the tick, or the last 8 characters
     assert!(page.contains("keep its backup in one of two ways") && page.contains("type the backup's last 8 characters"), "{page}");
     // without the box's copy the code is asked as before
     let b = start_on(Rig::new(json!({"human_pubkey": ""}), false), |_| {});
     let mut br = logged_in(&b);
-    assert!(br.get("/setup").body.contains("Enrolment code<input"));
+    assert!(br.get("/setup").body.contains("Enrollment code<input"));
 }
 
 

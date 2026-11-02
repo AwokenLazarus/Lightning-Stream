@@ -193,7 +193,10 @@ impl App {
         let suggested = q.get("limit").and_then(|v| v.parse::<i64>().ok()).filter(|n| (MIN_CALL_SATS..=MAX_VISIT_SATS).contains(n)).unwrap_or_else(|| suggested_limit(&svc));
         // the shop by its listed name ("Lightning Stream Genesis"), never its key or made-up address
         let shop = self.seller_name(&svc.seller);
-        let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
+        // the credit left with the shop, as a file's page says it: a visit spends it first
+        let credit = crate::services::http_origin(&svc.seller).and_then(|o| self.credits().get(&o).copied())
+            .map(|m| crate::app::credit_line(&shop, m)).unwrap_or_default();
+        let b = format!("{warn}{credit}<section class=\"card primary\"><h2>Open {}'s app</h2>\
             <p>You use <strong>{}</strong> inside this page. What it loads is paid at {}, and stops at the limit you set here.</p>\
             <p class=\"small\">Shop address: {}</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
@@ -214,12 +217,12 @@ impl App {
         let known = self.call("identity_get", json!({"origin": origin})).unwrap_or(Value::Null);
         // the wallet cannot read its choices: it stays anonymous everywhere, and there is nothing to choose until that is mended
         if known.get("damaged") == Some(&json!(true)) {
-            return "<section class=\"card\"><h3>Your history at this shop</h3><p>The wallet cannot read its record of which shops may recognise you, so it stays anonymous \
+            return "<section class=\"card\"><h3>Your history at this shop</h3><p>The wallet cannot read its record of which shops may recognize you, so it stays anonymous \
                     at every shop for now. A shop with no shared guest refuses you until that file (identity.json) is mended or removed.</p></section>".to_string();
         }
         let anonymous = known.get("here") == Some(&json!(true));
         let (state, button, to) = if anonymous {
-            ("You stay anonymous at this shop: it does not keep your history, and you use its shared guest where it has one.", "Let this shop recognise me", "0")
+            ("You stay anonymous at this shop: it does not keep your history, and you use its shared guest where it has one.", "Let this shop recognize me", "0")
         } else {
             ("This shop keeps your watch history. It sees a private handle, not who you are, and it is the same each time you come back.", "Stay anonymous here", "1")
         };
@@ -236,7 +239,7 @@ impl App {
         let g = |k: &str| f.get(k).cloned().unwrap_or_default();
         match self.call("identity_set", json!({"origin": g("origin"), "anonymous": g("anonymous") == "1"})) {
             Ok(v) if v.get("ok") == Some(&json!(true)) => {
-                let said = if g("anonymous") == "1" { format!("You stay anonymous at that shop.{}", stopped_note(&v)) } else { "That shop recognises you now.".to_string() };
+                let said = if g("anonymous") == "1" { format!("You stay anonymous at that shop.{}", stopped_note(&v)) } else { "That shop recognizes you now.".to_string() };
                 self.flash(ctx, true, said)
             }
             Ok(v) => self.flash(ctx, false, format!("Not changed: {}", v.get("reason").and_then(Value::as_str).unwrap_or("the wallet refused"))),
@@ -314,8 +317,8 @@ impl App {
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
             <div class=\"card primary refusal\" data-visit-refusal hidden></div>\
-            <p>{} &middot; {} \
-            <form method=\"post\" action=\"./app-stop\" class=\"inline\">{}<input type=\"hidden\" name=\"visit\" value=\"{}\"><button class=\"danger\">Stop</button></form></p>\
+            <div class=\"visit-bar\">{} &middot; {} \
+            <form method=\"post\" action=\"./app-stop\" class=\"inline\">{}<input type=\"hidden\" name=\"visit\" value=\"{}\"><button class=\"danger\">Stop</button></form></div>\
             <iframe class=\"seller-app\" title=\"{}\" sandbox=\"allow-scripts allow-same-origin allow-forms allow-downloads allow-modals allow-pointer-lock\" \
             allow=\"fullscreen; autoplay; encrypted-media; picture-in-picture\" referrerpolicy=\"no-referrer\"></iframe>\
             <p class=\"hint\" data-visit-note>{}'s own page. It cannot see your wallet. Close this page or press Stop to end the visit.</p></section>",

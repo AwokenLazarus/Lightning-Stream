@@ -187,48 +187,6 @@ pub fn listing_event_with(keys: &Keys, signed: &Value, bind_sig: &str, transport
     Ok(ev)
 }
 
-/// NIP-09: a request to delete events, by their ids (`e`) or their address (`a`).
-pub const KIND_DELETION: u64 = 5;
-
-/// The filter that asks a relay for the Lightning Stream listings `author` (hex) signed.
-pub fn own_filter(author: &str) -> Value {
-    json!({"kinds": [KIND_CLASSIFIED], "authors": [author], "#t": [TOPIC], "limit": 50})
-}
-
-/// The listings among `events` that `author` signed for another seller than `current` (a canonical
-/// origin): what a shop left behind when it moved, or changed how buyers reach it (a web address,
-/// then its key). Each by its `d` (the old seller), with the ids of its events, sorted.
-pub fn left_behind(events: &[Event], author: &str, current: &str, now: u64) -> Vec<(String, Vec<String>)> {
-    let mut old: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for ev in events.iter().filter(|e| e.pubkey == author) {
-        let Ok(n) = read_event(ev, now) else { continue };
-        let d = canonical_origin(&n.listing.seller);
-        if d != current {
-            let ids = old.entry(d).or_default();
-            if !ids.contains(&ev.id) {
-                ids.push(ev.id.clone());
-            }
-        }
-    }
-    old.into_iter().collect()
-}
-
-/// A NIP-09 deletion of the listings `old` names ([`left_behind`]), signed by the key that published
-/// them: each by its address (`30402:<author>:<d>`, every version up to now) and by its event ids.
-pub fn withdrawal_event(keys: &Keys, old: &[(String, Vec<String>)], created_at: u64) -> Event {
-    let author = keys.public_hex();
-    let mut tags = Vec::new();
-    for (d, ids) in old {
-        tags.push(tag("a", &format!("{KIND_CLASSIFIED}:{author}:{d}")));
-        for id in ids {
-            tags.push(tag("e", id));
-        }
-    }
-    tags.push(tag("k", &KIND_CLASSIFIED.to_string()));
-    let content = "This shop's listing at an address it no longer uses is withdrawn: it lists itself at its new one.".to_string();
-    Event::sign(keys, created_at, KIND_DELETION, tags, content)
-}
-
 /// The filter that asks a relay for Lightning Stream listings.
 pub fn filter(limit: usize) -> Value {
     json!({"kinds": [KIND_CLASSIFIED], "#t": [TOPIC], "limit": limit})
@@ -294,16 +252,7 @@ pub fn collect(events: &[Event], now: u64) -> (Vec<NostrListing>, usize) {
             Err(_) => refused += 1,
         }
     }
-    // a shop that changed its address (or went from a web address to its key) left its old listing
-    // behind: of one author's listings under one receipt key, only the newest is the shop as it is now
-    let mut newest: HashMap<(String, String), u64> = HashMap::new();
-    for n in best.values() {
-        let t = newest.entry((n.listing.receipt_key.clone(), n.author.clone())).or_insert(n.created_at);
-        *t = (*t).max(n.created_at);
-    }
-    let mut v: Vec<NostrListing> = best.into_values()
-        .filter(|n| newest.get(&(n.listing.receipt_key.clone(), n.author.clone())).is_none_or(|t| n.created_at >= *t))
-        .collect();
+    let mut v: Vec<NostrListing> = best.into_values().collect();
     v.sort_by(|a, b| a.listing.name.to_ascii_lowercase().cmp(&b.listing.name.to_ascii_lowercase()).then(a.listing.seller.cmp(&b.listing.seller)));
     (v, refused)
 }
