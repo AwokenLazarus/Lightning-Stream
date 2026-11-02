@@ -51,9 +51,6 @@
 #include "datum_jsonrpc.h"
 #include "datum_utils.h"
 #include "datum_sockets.h"
-#ifdef ENABLE_API
-#include "datum_api.h"
-#endif
 
 global_config_t datum_config;
 
@@ -91,6 +88,8 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "listen_port",				.description = "Listening port for Stratum Gateway",
 		.example_default = true,
 		.required = false, .ptr = &datum_config.stratum_v1_listen_port, 				.default_int = 23334 },
+	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "listen_backlog",			.description = "listen(2) accept-queue depth on the Stratum sockets. Not the connected-client cap. Kernel may clamp to somaxconn. Minimum 1.",
+		.required = false, .ptr = &datum_config.stratum_v1_listen_backlog, 			.default_int = 20 },
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "max_clients_per_thread",	.description = "Maximum clients per Stratum server thread",
 		.required = false, .ptr = &datum_config.stratum_v1_max_clients_per_thread, 		.default_int = 128 },
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "max_threads",				.description = "Maximum Stratum server threads",
@@ -131,8 +130,16 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 		.required = false, .ptr = datum_config.mining_coinbase_tag_secondary,			.default_string[0] = "DATUM User", .max_string_len = sizeof(datum_config.mining_coinbase_tag_secondary) },
 	{ .var_type = DATUM_CONF_INT, 		.category = "mining", 		.name = "coinbase_unique_id",		.description = "A unique ID between 1 and 65535. This is appended to the coinbase. Make unique per instance of datum with the same coinbase tags.",
 		.required = false, .ptr = &datum_config.coinbase_unique_id, 		.default_int = 4242 },
-	{ .var_type = DATUM_CONF_STRING, 	.category = "mining", 		.name = "save_submitblocks_dir",	.description = "Directory to save all submitted blocks to as submitblock JSON files",
+	{ .var_type = DATUM_CONF_STRING, 	.category = "mining", 		.name = "save_submitblocks_dir",	.description = "Directory to save submitted blocks as submitblock JSON (datum_submitblock_<height>_<first7 GIT_COMMIT_HASH>.json and datum_submitblock_last.json). Empty disables.",
 		.required = false, .ptr = datum_config.mining_save_submitblocks_dir,			.default_string[0] = "", .max_string_len = sizeof(datum_config.mining_save_submitblocks_dir) },
+	{ .var_type = DATUM_CONF_INT, 		.category = "mining", 		.name = "share_node_check_missingzeros",	.description = "If >= 0, only log SHARE lines and node-check shares with missingzeros <= this value (overrides share_node_check_every). -1 = infinity (log all, use every-N).",
+		.required = false, .ptr = &datum_config.mining_share_node_check_missingzeros, 	.default_int = -1 },
+	{ .var_type = DATUM_CONF_BOOL, 		.category = "mining", 		.name = "validate_shares_on_node",	.description = "Ask the local node about sampled accepted shares (proposal or submitblock). Real blocks are always submitted separately.",
+		.required = false, .ptr = &datum_config.mining_validate_shares_on_node, 		.default_bool = false },
+	{ .var_type = DATUM_CONF_STRING, 	.category = "mining", 		.name = "share_node_check",		.description = "How to ask the node about a share: proposal (GBT mode=proposal, skips PoW) or submitblock (PoW checked first, usually high-hash).",
+		.required = false, .ptr = datum_config.mining_share_node_check,				.default_string[0] = "proposal", .max_string_len = sizeof(datum_config.mining_share_node_check) },
+	{ .var_type = DATUM_CONF_INT, 		.category = "mining", 		.name = "share_node_check_every",	.description = "Validate 1 of every N accepted shares on the node (1 = every share). Real blocks are always submitted separately.",
+		.required = false, .ptr = &datum_config.mining_share_node_check_every, 		.default_int = 16 },
 	{ .var_type = DATUM_CONF_BOOL, 		.category = "mining", 		.name = "allow_hasher_time_rolling",	.description = "Allow hasher time rolling for BLAKE2b jobs",
 		.required = false, .ptr = &datum_config.mining_allow_hasher_time_rolling, 		.default_bool = false },
 	{ .var_type = DATUM_CONF_BOOL, 		.category = "mining", 		.name = "abw_verify_all_shares_on_disclosure",	.description = "Retain ABW proofs until key disclosure and alarm if the pool ignored a block",
@@ -147,8 +154,6 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 		.required = false, .ptr = &datum_config.api_allow_insecure_auth,				.default_bool = false },
 	{ .var_type = DATUM_CONF_STRING, 	.category = "api", 			.name = "listen_addr",					.description = "IP address to listen for API/dashboard requests",
 		.required = false, .ptr = datum_config.api_listen_addr,				.default_string[0] = "", .max_string_len = sizeof(datum_config.api_listen_addr) },
-	{ .var_type = DATUM_CONF_STRING, 	.category = "api", 			.name = "xbt_job_allow",				.description = "Comma-separated IP addresses or CIDRs, besides loopback, that may read /xbt/job. It discloses the consensus target: never list anything a hashmaker can reach it from",
-		.required = false, .ptr = datum_config.api_xbt_job_allow,				.default_string[0] = "", .max_string_len = sizeof(datum_config.api_xbt_job_allow) },
 	{ .var_type = DATUM_CONF_INT, 		.category = "api",	 		.name = "listen_port",				.description = "Port to listen for API/dashboard requests (0=disabled)",
 		.example = "7152",
 		.required = false, .ptr = &datum_config.api_listen_port, 						.default_int = 0 },
@@ -183,6 +188,10 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 	{ .var_type = DATUM_CONF_INT, 		.category = "logger",	.name = "log_level_file",				.description = "Minimum log level for log file messages (0=All, 1=Debug, 2=Info, 3=Warn, 4=Error, 5=Fatal)",
 		.example_default = true,
 		.required = false, .ptr = &datum_config.clog_level_file, .default_int = 1 },
+	{ .var_type = DATUM_CONF_BOOL, 		.category = "logger", 		.name = "log_shares",				.description = "Log the result of every incoming share at INFO (level 2): accepted or rejected with reason",
+		.required = false, .ptr = &datum_config.logger_log_shares, 		.default_bool = false },
+	{ .var_type = DATUM_CONF_BOOL,          .category = "logger",           .name = "console_collapse_job_updates",         .description = "Collapse repeating stratum job update logs into a single line counter to prevent console flooding.",
+		.required = false, .ptr = &datum_config.clog_console_collapse_jobs,          .default_bool = false },
 	
 	// datum options
 	{ .var_type = DATUM_CONF_STRING, 	.category = "datum", 		.name = "pool_host",					.description = "Remote DATUM server host/ip to use for decentralized pooled mining (set to \"\" to disable pooled mining)",
@@ -676,10 +685,6 @@ int datum_read_config(const char *conffile) {
 		DLOG_WARN("API is enabled in configuration, but this build was compiled without API support");
 	}
 #else
-	if (!datum_api_xbt_job_allow_valid(datum_config.api_xbt_job_allow)) {
-		DLOG_FATAL("api.xbt_job_allow must be comma-separated IP addresses or CIDRs with no spaces, and none may have a /0 prefix");
-		return 0;
-	}
 	datum_config.api_admin_password_len = strlen(datum_config.api_admin_password);
 	if (datum_config.api_admin_password_len) {
 		static const char hash_tag[] = "DATUM Anti-CSRF Token";

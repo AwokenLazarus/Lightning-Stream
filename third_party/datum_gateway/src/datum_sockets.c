@@ -578,8 +578,12 @@ const char *datum_sockets_setup_listen_sock(const int listen_sock, const struct 
 		return "bind failed";
 	}
 	
-	if (listen(listen_sock, 10) < 0) {
-		return "listen failed";
+	{
+		int backlog = datum_config.stratum_v1_listen_backlog;
+		if (backlog < 1) backlog = 1;
+		if (listen(listen_sock, backlog) < 0) {
+			return "listen failed";
+		}
 	}
 	
 	return NULL;
@@ -680,7 +684,7 @@ void *datum_gateway_listener_thread(void *arg) {
 		return NULL;
 	}
 	
-	DLOG_DEBUG("Setting up app '%s' on address %s port %d. (T:%d/TC:%d/C:%d)", app->name, datum_config.stratum_v1_listen_addr[0] ? datum_config.stratum_v1_listen_addr : "(any)", app->listen_port, app->max_threads, app->max_clients_thread, app->max_clients);
+	DLOG_DEBUG("Setting up app '%s' on address %s port %d. (T:%d/TC:%d/C:%d/backlog:%d)", app->name, datum_config.stratum_v1_listen_addr[0] ? datum_config.stratum_v1_listen_addr : "(any)", app->listen_port, app->max_threads, app->max_clients_thread, app->max_clients, datum_config.stratum_v1_listen_backlog < 1 ? 1 : datum_config.stratum_v1_listen_backlog);
 	
 	// we assume the caller sets up the thread data in some way
 	// don't clobber those pointers
