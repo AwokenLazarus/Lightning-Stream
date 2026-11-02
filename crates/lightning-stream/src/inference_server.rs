@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Handler, Reply, Request, Response, Streamed};
 
 use crate::credentials::{self, Kind, Store};
-use crate::inference::{error_body, refusal_answer, request_bounds, Catalogue, Health, Outcome, Prefs, Router};
+use crate::inference::{error_body, is_spending_rule, refusal_answer, request_bounds, spending_refusal, wallet_wide, Catalogue, Health, Outcome, Prefs, Router};
 
 /// How long the catalogue of models is kept before the sellers are asked again.
 pub const CATALOGUE_TTL: Duration = Duration::from_secs(300);
@@ -231,6 +231,32 @@ struct Failed {
     /// not the seller.
     paying: bool,
     account: Account,
+    /// The owner's own spending rules refused the payment (the rule, and its limit in sats where the wallet said it):
+    /// the buyer's limit, not the seller's failure.
+    spending: Option<(String, Option<u64>)>,
+}
+
+/// The wallet's refusal of a call, where it was the owner's own spending rules: the rule, and its limit in sats where
+/// the wallet said it (`limit_sats`).
+fn spending_of(v: &Value) -> Option<(String, Option<u64>)> {
+    let rule = v.get("rule").and_then(Value::as_str).filter(|r| is_spending_rule(r))?;
+    (v.get("verdict").and_then(Value::as_str) != Some("allow")).then(|| (rule.to_string(), v.get("limit_sats").and_then(Value::as_u64)))
+}
+
+/// What the client is told of a call the wallet ended before the seller's answer: plain words. The wallet's own (which
+/// may repeat the seller's internal codes, `too_many_tickets` say) go to the owner's log only.
+fn wallet_said(v: &Value, url: &str, paid_call: bool) -> String {
+    let rule = v.get("rule").and_then(Value::as_str).unwrap_or("");
+    let reason = v.get("reason").and_then(Value::as_str).unwrap_or("");
+    let host = url.split('/').nth(2).unwrap_or("");
+    // a free read (a seller's list of models) that is not free is the catalogue's business, asked again every few minutes
+    if paid_call {
+        eprintln!("lightning-stream: AI call to {host} ended before an answer: {rule}: {reason}");
+    }
+    if rule == "seller_busy" {
+        return "the seller is busy".into();
+    }
+    "the wallet could not pay the seller for this request just now".into()
 }
 
 /// Where a paid call was when its socket said nothing more in time.
@@ -298,7 +324,7 @@ fn given_up(cfg: &Config, stage: Stage, rx: mpsc::Receiver<Result<Value, String>
     if stage == Stage::Paid {
         // told the request is paid for and leaving: it may be served, and charged, whatever comes next
         return Failed { status: 504, message: format!("the seller sent nothing within {} s of being paid", first_byte.as_secs()), final_answer: None,
-                        paid: true, paying: false, account: Account::Pending(rx) };
+                        paid: true, paying: false, account: Account::Pending(rx), spending: None };
     }
     // paying (again), or no line at all: the wallet says whether the request left. Its socket is closed, so it sends
     // nothing more on this call
@@ -306,7 +332,7 @@ fn given_up(cfg: &Config, stage: Stage, rx: mpsc::Receiver<Result<Value, String>
     let paying = stage == Stage::Paying;
     let message = if paying { format!("the wallet's payment of the seller took more than {} s", cfg.pay_wait.as_secs()) }
                   else { format!("the seller sent nothing within {} s", first_byte.as_secs()) };
-    Failed { status: 504, message, final_answer: None, paid: !another_may_serve(account.said()), paying, account }
+    Failed { status: 504, message, final_answer: None, paid: !another_may_serve(account.said()), paying, account, spending: None }
 }
 
 /// Has the signer pay for one call and stream its body to a socket of ours; waits for the head
@@ -317,7 +343,7 @@ fn given_up(cfg: &Config, stage: Stage, rx: mpsc::Receiver<Result<Value, String>
 /// have reached this one ([`Failed::paid`]).
 /// `ceiling`: the seller's listed prices, the most the wallet pays it (none for a free read).
 fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration, ceiling: Option<&Value>) -> Result<Begun, Failed> {
-    let fail = |status: u16, message: String| Failed { status, message, final_answer: None, paid: false, paying: false, account: Account::Unknown };
+    let fail = |status: u16, message: String| Failed { status, message, final_answer: None, paid: false, paying: false, account: Account::Unknown, spending: None };
     let name = format!("ai-{}", random_hex());
     let path = cfg.stream_dir.join(&name);
     let listener = listen_stream(&path).map_err(|e| fail(500, format!("stream socket: {e}")))?;
@@ -353,7 +379,7 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
                 // the wallet may be paying, or sending: another seller only once it says the request never left
                 let account = hear(rx, cfg.pay_wait);
                 return Err(Failed { status: 500, message: format!("stream socket: {e}"), final_answer: None, paid: !another_may_serve(account.said()),
-                                    paying: false, account });
+                                    paying: false, account, spending: None });
             }
         }
         if let Ok(done) = rx.try_recv() {
@@ -362,10 +388,11 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
             return Err(match done {
                 Ok(v) => Failed {
                     status: 502,
-                    message: v.get("reason").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| "the wallet would not pay this seller".into()),
+                    message: wallet_said(&v, url, paid_call),
                     final_answer: None,
                     paid: paid_call && !another_may_serve(Some(&v)),
                     paying: false,
+                    spending: spending_of(&v),
                     account: Account::Said(v),
                 },
                 Err(e) => Failed { paid: paid_call, ..fail(502, e) },
@@ -382,7 +409,7 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
             // the wallet is still at the payment: another seller is tried only once it has said the request never left
             let account = hear(rx, cfg.pay_wait);
             return Err(Failed { status: 504, message: format!("the wallet's payment of the seller took more than {} s", cfg.pay_wait.as_secs()),
-                                final_answer: None, paid: !another_may_serve(account.said()), paying: true, account });
+                                final_answer: None, paid: !another_may_serve(account.said()), paying: true, account, spending: None });
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -428,9 +455,10 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
     let Some(status) = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s)) else {
         drop(src);
         let account = hear(rx, if paid_call { cfg.pay_wait } else { Duration::from_secs(5) });
-        let why = account.said().and_then(|v| v.get("reason")).and_then(Value::as_str).map(str::to_string);
+        let why = account.said().map(|v| wallet_said(v, url, paid_call));
+        let spending = account.said().and_then(spending_of);
         return Err(Failed { status: 502, message: why.unwrap_or_else(|| "the wallet sent no head for the seller's answer".into()), final_answer: None,
-                            paid: paid_call && !another_may_serve(account.said()), paying: false, account });
+                            paid: paid_call && !another_may_serve(account.said()), paying: false, account, spending });
     };
     // a signed head that is an answer (not a failure of the seller's): the request is the seller's, and no other is tried
     let answering = paid_call && !sellers_failure(status) && status < 400;
@@ -640,6 +668,9 @@ impl AiServer {
                 &format!("No seller you allowed offers the model {model}, or every one is resting after failures."))));
         }
         let mut last: Option<(u16, String)> = None;
+        // the first refusal by the owner's own spending rules, and the seller it was for: what the client is told when no
+        // seller answers, since it is what the owner can act on
+        let mut spending: Option<(String, Option<u64>, String)> = None;
         for offer in offers {
             let bound = offer.bound_msat(input, max_tokens);
             // one lock for both reads (a guard held in an `if let` scrutinee lives through its block)
@@ -663,7 +694,7 @@ impl AiServer {
             // the seller's own listed prices are the most it is paid: a 402 asking more is refused
             match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, self.cfg.first_byte, Some(&offer.ceiling)) {
                 Ok(b) => return self.relay(b, offer.seller.clone(), key_id.to_string(), today, bound),
-                Err(Failed { status, message, final_answer, paid, paying, account }) => {
+                Err(Failed { status, message, final_answer, paid, paying, account, spending: refused_by }) => {
                     // whatever the call cost this seller is booked to the key, now or when the wallet says; where it
                     // never says and the request may have reached the seller, the most the request may cost
                     self.book_later(key_id, today, account, bound, paid);
@@ -671,6 +702,16 @@ impl AiServer {
                         // the seller refused the request itself: said to the client as the seller said it
                         let headers = vec![("Content-Type".into(), ct.unwrap_or_else(|| "application/json".into())), ("Cache-Control".into(), "no-store".into())];
                         return Reply::Whole(Response::new(status, headers, whole));
+                    }
+                    // the owner's own limit: not the seller's failure. One on the wallet as a whole holds at every seller, and
+                    // none is tried; one on this seller leaves the next
+                    if let Some((rule, limit)) = refused_by {
+                        let wide = wallet_wide(&rule);
+                        spending.get_or_insert((rule, limit, offer.seller.clone()));
+                        if wide || paid {
+                            break;
+                        }
+                        continue;
                     }
                     // a payment that outlasted its wait is the buyer's route, not the seller's failure
                     if !paying {
@@ -684,6 +725,10 @@ impl AiServer {
                     }
                 }
             }
+        }
+        if let Some((rule, limit, seller)) = spending {
+            let (status, body) = spending_refusal(&rule, limit, &seller);
+            return Reply::Whole(json_response(status, &body));
         }
         let (status, message) = last.unwrap_or((502, "no seller answered".into()));
         Reply::Whole(json_response(status, &error_body("upstream_failed", "api_error", &format!("No seller could answer: {message}"))))
@@ -821,6 +866,12 @@ impl Settle {
     /// Whether it was whole.
     fn account(&self, account: &Value, ttft_ms: u64) -> bool {
         let complete = account.get("complete").and_then(Value::as_bool).unwrap_or(false);
+        // the answer came, but the owner's spending rules kept the credit with the seller from being topped up: the
+        // next call may be refused, and the owner's log says why
+        if let Some(t) = account.get("top_up_refused").filter(|t| t.is_object()) {
+            eprintln!("lightning-stream: the credit with the AI seller {} was not topped up: {}: {}", self.seller,
+                      t.get("rule").and_then(Value::as_str).unwrap_or(""), t.get("reason").and_then(Value::as_str).unwrap_or(""));
+        }
         book(&self.credentials, &self.inner, &self.key_id, self.today, cost_msat(account, self.bound));
         let mut g = lock(&self.inner);
         g.router.record(&self.seller, if complete { Outcome::Answered { ttft_ms } } else { Outcome::CutMidAnswer }, credentials::now());
