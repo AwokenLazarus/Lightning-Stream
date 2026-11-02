@@ -381,6 +381,17 @@ fn service_html(s: &Service, own: bool, seller: &str) -> String {
         Kind::Video => b.push_str("<section class=\"status warn\"><p class=\"status-head\">This shop uses an older media listing</p>\
             <p>It names nothing to download or open. Ask the seller to share their media server as a web app: Lightning Stream opens \
             a seller's own app (Jellyfin, Plex) and pays for what it loads.</p></section>"),
+        // an AI seller is used through this box's own AI address (any OpenAI-style program, with a key of its own), which
+        // picks the cheapest allowed seller; the seller's own address (for a shop reached by its key, a made-up one only
+        // this wallet's agents can reach) stays in the details
+        Kind::Ai => b.push_str(&format!("<section class=\"card primary\"><h2>Use it</h2>\
+            <p>Use this seller's models from any program that works with OpenAI's API (Open WebUI, coding agents, your own scripts): \
+            give the program this box's AI address and a key of its own, both on the AI page. Each request is paid by the word as it arrives, \
+            within your spending rules.</p>\
+            <div class=\"row\"><a class=\"button-link primary\" href=\"./ai\">Get the AI address and a key</a>\
+            <a class=\"button-link\" href=\"./agents\">Connect an AI agent</a></div>\
+            <details><summary>Technical details</summary><p class=\"small\">The seller's own address, for agents connected to this wallet: \
+            <code>{}</code></p></details></section>", esc(s.address()))),
         Kind::Hashrate => b.push_str("<section class=\"card primary\"><h2>Rent miners</h2>\
             <p>This seller rents out its miners: they hash for your own pool, and you pay for each piece of work as it is done.</p>\
             <div class=\"row\"><a class=\"button-link primary\" href=\"./hashrate\">Rent hashrate</a></div></section>"),

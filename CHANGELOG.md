@@ -5,6 +5,33 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.4 (2026-11-02)
+
+Web apps in visits, from a hands-on run of 0.2.3 with the demo shop's Jellyfin. The connector and the
+wallet UI change; payments and the signer are unchanged.
+
+- **Web apps load at once.** A web app such as Jellyfin asks for about a hundred things as it opens. Each
+  request of a visit now holds an eighth of the visit's limit (10 to 1,000 sats) instead of room for a whole
+  ticket, so a 1,000 sat visit runs eight requests at once. Before, the first request held the whole limit
+  and the others waited for it one at a time: the page stayed white for 20 to 100 seconds. A request that
+  needs to buy a ticket asks again with room for one, and then alone, as before. The visit still never
+  spends more than its limit.
+- **Sign-in no longer hangs.** A web app's live connection (a WebSocket, which Jellyfin opens after sign-in)
+  holds at most 50 sats while it is open, and a visit's live connections together at most half of its limit.
+  Before, it held the whole limit for as long as the page was open, and every request after it was refused
+  after two minutes: the sign-in spun forever.
+- **Free parts of a shop are not paid for.** A visit reads which of the shop's routes are free and asks for
+  those directly, with nothing to spend, in one round trip. Before, it sent them as paid, the shop refused
+  them, and the wallet asked again.
+- **Rent on Hashrate says why it is off.** A disabled Rent button says why, beside it and as its tooltip, and
+  an offer paid where this box's hashmaker is paid is shown as your own.
+- **Get started counts a shop allowed through its node.** Home's Get started now counts a shop allowed through
+  its Lightning node's line in your rules, as the wallet pays it. Before, it kept saying "Allow a shop" and
+  left "Buy something" unticked.
+- **An AI seller's page points to your AI address.** It sends programs to the AI page, for this box's AI
+  address and a key of their own, instead of showing the seller's own address (for a shop reached by its key,
+  a made-up one only this wallet's agents can reach). That address is still under Technical details.
+
 ## 0.2.3 (2026-11-02)
 
 Usability, from a hands-on run of 0.2.2 on Umbrel. The wallet UI, the VPN service and the signer

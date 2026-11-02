@@ -742,7 +742,11 @@ impl App {
     fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool) -> String {
         let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
         let paying = paying_on(&pol);
-        let allowed = rule_sellers(&pol).iter().any(|r| r.listed && r.origin.is_some() && r.node.is_some());
+        // allowed as the signer decides: also a shop allowed only through its node's `ln:` line
+        let at = xbt_nostr::now();
+        let shops: Vec<(String, Option<String>)> = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default().iter()
+            .map(|(o, s)| (o.clone(), crate::shops::node(s, o, at))).collect();
+        let allowed = any_seller_allowed(&pol, &shops);
         // the history is read only once a shop is allowed: nothing can have been bought before
         let bought = allowed && self.call("history", json!({"limit": 500})).ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter()
             .any(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_open" | "ticket_paid_first")));
@@ -1986,6 +1990,15 @@ pub(crate) fn rules_allow(p: &Value, origin: &str, known_node: Option<&str>) -> 
     covered
 }
 
+/// Whether the rules `p` let the signer pay any seller: one of the rules' own, or a shop added in the
+/// app (`shops`: its origin and the node its entry vouches for), as [`rules_allow`] decides. Home's
+/// Get started counted only a seller listed by its address with its node on file, so a shop allowed
+/// through its node's `ln:` line never counted.
+pub(crate) fn any_seller_allowed(p: &Value, shops: &[(String, Option<String>)]) -> bool {
+    rule_sellers(p).into_iter().filter_map(|r| r.origin).map(|o| (o, None)).chain(shops.iter().cloned())
+        .any(|(o, node)| rules_allow(p, &o, node.as_deref()))
+}
+
 /// The node of an `ln:<node>` line of the rules, if `key` is one.
 pub(crate) fn ln_line_node(key: &str) -> Option<&str> {
     key.strip_prefix("ln:").map(str::trim).filter(|n| n.len() == 66 && n.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -2424,6 +2437,30 @@ mod handson_0202_tests {
         assert!(!rules_allow(&json!({"allowlist": ["https://a.example"]}), "https://a.example", None));
         assert_eq!(ln_line_node(&format!("ln:{node}")), Some(node.as_str()));
         assert_eq!(ln_line_node("bc1qcoin"), None);
+    }
+
+    /// Home's Get started counts a shop allowed as the signer allows it: also one allowed only
+    /// through its node's `ln:` line, its node known from its shop entry or on file.
+    ///
+    /// FAILS before: only a seller listed by its address with its node on file counted, so Home kept
+    /// saying "Allow a shop" for a shop the wallet pays.
+    #[test]
+    fn get_started_counts_a_shop_allowed_through_its_node() {
+        let node = format!("03{}", "ab".repeat(32));
+        let shop = xbt402::shop::origin_for(&[0x5a; 32]);
+        let line = json!({"allowlist": [format!("ln:{node}")], "counterparties": {}});
+        assert!(any_seller_allowed(&line, &[(shop.clone(), Some(node.clone()))]), "its node line, its node from its shop entry");
+        assert!(!any_seller_allowed(&line, &[(shop.clone(), None)]), "no node known for it");
+        assert!(!any_seller_allowed(&line, &[(shop.clone(), Some("02".repeat(33)))]), "another node");
+        assert!(!any_seller_allowed(&line, &[]));
+        // its node on file, the address not listed
+        let on_file = json!({"allowlist": [format!("ln:{node}")], "counterparties": {"https://a.example": {"ln_node": node}}});
+        assert!(any_seller_allowed(&on_file, &[]));
+        // the address listed with its node on file, as before
+        let web = json!({"allowlist": ["https://a.example"], "counterparties": {"https://a.example": {"ln_node": node}}});
+        assert!(any_seller_allowed(&web, &[]));
+        // listed with no node anywhere: refused, as the signer refuses it
+        assert!(!any_seller_allowed(&json!({"allowlist": ["https://a.example"]}), &[]));
     }
 
     /// The credit left with a shop: its newest `ticket_left_with_seller`, until a session with its node

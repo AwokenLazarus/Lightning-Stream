@@ -184,7 +184,11 @@ fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
                 }
                 let p = &req["params"];
                 let url = p["url"].as_str().unwrap().to_string();
-                urls.lock().unwrap().push(url.clone());
+                // the connector's own read of the seller's routes as a visit opens is unpaid (max_sats 0), at the
+                // seller's root: not one of the page's requests
+                if !(p["max_sats"] == 0 && url.ends_with("/services")) {
+                    urls.lock().unwrap().push(url.clone());
+                }
                 if p["upgrade"] == true {
                     // a WebSocket, asked of the seller as one, joined to the stream socket both ways
                     let rest = url.strip_prefix("http://").unwrap();
