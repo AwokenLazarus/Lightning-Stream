@@ -1964,6 +1964,15 @@ struct Mark {
     metered: bool,
 }
 
+/// How long the head of `c`'s answer may take where it is a model's whole answer ([`xbt402::tokens::WHOLE_ANSWER_S`]):
+/// a request on a route priced by the token that asks for no stream, streamed on to a caller that waits for it
+/// (`stream_to`). `None`: any other request, held to `tickets.read_timeout_s` within the call's deadline. A caller
+/// that reads the answer whole from the call itself waits 60 s, and is held to those.
+fn whole_model_answer(price: &Price, c: &Call) -> Option<Duration> {
+    let stream = || serde_json::from_slice::<Value>(c.body).ok().and_then(|v| v.get("stream").and_then(Value::as_bool)) == Some(true);
+    (price.tokens.active() && c.stream_to.is_some() && !c.upgrade && !stream()).then_some(Duration::from_secs(xbt402::tokens::WHOLE_ANSWER_S))
+}
+
 /// How long an answer paid as it arrives stays open, and which of the owner's limits that is. A
 /// WebSocket: as long as its page keeps it. An answer streamed on to its caller as it arrives (a film,
 /// a download, an AI stream): as long as it delivers. Any other is read whole for a caller that waits
@@ -5083,9 +5092,15 @@ impl Signer {
                         u.answer
                     })
                 } else {
-                    // inside the call's deadline, a second at least: a seller slow to answer is a plain refusal in time
-                    let left = c.by.saturating_duration_since(Instant::now()).max(Duration::from_secs(1));
-                    self.wire(c.method, c.url, c.body, &headers, Self::ticket_read_timeout(&tp).min(left))
+                    // inside the call's deadline, a second at least: a seller slow to answer is a plain refusal in time. A
+                    // model's whole answer streamed on to its caller (the AI endpoint, which waits for it) starts only once
+                    // the model has written all of it: its head is waited for that long, past both
+                    let (by, read) = match whole_model_answer(price, c) {
+                        Some(w) => (c.by.max(Instant::now() + w), Self::ticket_read_timeout(&tp).max(w)),
+                        None => (c.by, Self::ticket_read_timeout(&tp)),
+                    };
+                    let left = by.saturating_duration_since(Instant::now()).max(Duration::from_secs(1));
+                    self.wire(c.method, c.url, c.body, &headers, read.min(left))
                 };
                 let ans = match sent {
                     Ok(a) => a,
