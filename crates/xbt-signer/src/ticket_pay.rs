@@ -1735,6 +1735,12 @@ struct Call<'a> {
     /// The most bytes the caller was shown the resource has (`max_size`, a listed file's size): sent
     /// to the seller ([`xbt402::ticket::MAX_SIZE_HEADER`]), and an answer that states more is not read.
     max_size: Option<u64>,
+    /// Before the request leaves, the session's balance is topped up to at least this (`top_up_sats`,
+    /// in msat here) with whole tickets, as far as `max_sats` allows: a caller that runs many requests
+    /// on one session (a web app's page) keeps its credit ahead of the answers, so that an answer is
+    /// not cut where the credit ends and the next ticket does not fit its own small limit. Best effort:
+    /// a ticket of the top-up that does not fit, or cannot go, leaves the request to go on as it would.
+    top_up_msat: u64,
 }
 
 impl Call<'_> {
@@ -2830,7 +2836,14 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { by: call_by, url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, if_range, extra, head_headers, upgrade, credit_only, charge_sats, max_size };
+        let top_up_msat = match p.get("top_up_sats").filter(|v| !v.is_null()) {
+            None => 0,
+            Some(v) => match py_int(Some(v)) {
+                Some(n) if n >= 0 => (n as u64).saturating_mul(1000),
+                _ => return deny("top_up_sats", "top_up_sats is a whole number of sats, 0 or more"),
+            },
+        };
+        let call = Call { by: call_by, url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, if_range, extra, head_headers, upgrade, credit_only, charge_sats, max_size, top_up_msat };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // a route that gives each buyer an account is paid with tickets only: draws serve no buyer as its account
@@ -4867,6 +4880,20 @@ impl Signer {
                 let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &short_now, answer: None };
                 if let Err(d) = self.ticket_release_one(hs, &mut spent, &due) {
                     return fail(hs, &spent, d);
+                }
+            }
+            // the caller's top-up (`top_up_sats`), past what the head wants: best effort, a ticket that does not fit the call's
+            // `max_sats` or cannot go now leaves the request to go on with the balance it has. Not for a call that buys none
+            let low = || {
+                let m = lock_money(hs);
+                m.est_balance() < c.top_up_msat && m.pending.is_none()
+            };
+            let mut topped = 0;
+            while !c.credit_only && c.top_up_msat > 0 && topped < 4 && low() {
+                topped += 1;
+                let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &low, answer: None };
+                if self.ticket_release_one(hs, &mut spent, &due).is_err() {
+                    break;
                 }
             }
             // stopped while this call waited for a ticket (the owner turned anonymous here, say): nothing more goes out on it

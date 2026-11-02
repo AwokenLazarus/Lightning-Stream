@@ -49,6 +49,8 @@ const IDLE: Duration = Duration::from_secs(30 * 60);
 pub const MAX_BODY: usize = 1 << 20;
 /// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
+/// How long the request that tops the visit's credit up waits for room for a ticket ([`Visit::take_lane`]).
+const LANE_WAIT: Duration = Duration::from_secs(15);
 /// An answer open this long may run for hours (a film): a request waiting to run alone does not wait for it.
 const LONG_OPEN: Duration = Duration::from_secs(30);
 /// How long a request whose answer has stopped waits for the signer to say what it cost, past which
@@ -147,6 +149,11 @@ struct State {
     next_stream: u64,
     /// The buyer stopped the visit (`ended` says so too, or the limit it reached first).
     stopped: bool,
+    /// The session's credit with the seller after the latest call that said (`balance_msat`): below
+    /// [`Visit::credit_floor`], the next request takes the lane ([`Visit::take_lane`]).
+    credit_msat: Option<u64>,
+    /// A request holds the lane: it runs with room for a ticket and tops the credit up before it leaves.
+    lane: bool,
 }
 
 /// A route of the seller, as its `/services` names it.
@@ -237,9 +244,70 @@ impl Visit {
     /// paid for tickets for it, counted for the visit's report.
     fn account(&self, v: &Value) {
         let num = |k: &str| v.get(k).and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())));
+        // what the answer took from the credit: the seller's signed charge where it is more than the wallet's own count (an
+        // answer cut short or left by the page, whose bytes on their way were charged), so that what the visit says it used
+        // is what the connection's credit fell by
+        let signed = v.pointer("/receipt/last/charged").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())));
+        let used = num("price_msat").unwrap_or(0).max(signed.unwrap_or(0));
+        let charged = num("charged_sats").unwrap_or(0);
         let mut s = self.lock();
-        s.used_msat = s.used_msat.saturating_add(num("price_msat").unwrap_or(0));
-        s.paid = s.paid.saturating_add(i64::try_from(num("charged_sats").unwrap_or(0)).unwrap_or(0));
+        s.used_msat = s.used_msat.saturating_add(used);
+        s.paid = s.paid.saturating_add(i64::try_from(charged).unwrap_or(0));
+        if let Some(b) = num("balance_msat") {
+            s.credit_msat = Some(b);
+        }
+        // what one ticket of the seller books, from what the tickets released for this call came to
+        if let Some(n) = num("tickets_released").filter(|n| *n > 0) {
+            s.ticket = s.ticket.max(i64::try_from(charged / n).unwrap_or(0));
+        }
+    }
+
+    /// The credit the visit keeps ahead of its requests: four requests' shares, at most a ticket. Below it, a
+    /// request may cut short where the credit ends, its own share too small for the next ticket.
+    fn credit_floor(&self, ticket: i64) -> i64 {
+        (self.answer_share() * 4).min(ticket).max(1)
+    }
+
+    /// The lane, where the credit is low: a share with room for a ticket, and the credit to top up to
+    /// (`top_up_sats`) before the request leaves. One request holds it at a time. It goes first, as a
+    /// request waiting to run alone does: no new share is handed out while it waits for that much of
+    /// the limit to be free, which the requests running now give back as they end; past [`LANE_WAIT`]
+    /// it runs on an ordinary share instead. `None`: an ordinary share.
+    fn take_lane(&self) -> Option<(i64, i64)> {
+        let mut s = self.lock();
+        // a ticket of a size the visit has not seen yet: room for half of the limit, which the top-up spends only where a
+        // ticket fits (the signer releases none past the call's limit)
+        let ticket = if s.ticket > 0 { s.ticket } else { self.limit / 2 };
+        let credit = s.credit_msat?;
+        let floor = self.credit_floor(ticket);
+        let most = self.answer_share().saturating_add(ticket);
+        if ticket <= 0 || s.lane || s.alone > 0 || s.ended.is_some() || credit >= floor.unsigned_abs() * 1000 || most > self.limit - s.spent + s.held - s.sockets - s.settling - s.long_open() {
+            return None;
+        }
+        s.lane = true;
+        s.alone += 1;
+        let until = Instant::now() + LANE_WAIT;
+        while s.ended.is_none() && self.limit - s.spent < most && Instant::now() < until {
+            let left = until.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
+            s = self.turn.wait_timeout(s, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        s.alone -= 1;
+        let got = s.ended.is_none() && self.limit - s.spent >= most;
+        if got {
+            s.spent += most;
+            s.held += most;
+        } else {
+            s.lane = false;
+        }
+        drop(s);
+        self.turn.notify_all();
+        got.then_some((most, floor))
+    }
+
+    /// The lane's request has its answer, or none: the lane is free.
+    fn lane_done(&self) {
+        self.lock().lane = false;
+        self.turn.notify_all();
     }
 
     /// A request's share of the limit: an eighth of it, at least [`MIN_SHARE`] and at most
@@ -611,6 +679,24 @@ impl Connector {
             self.start(params)
         };
         let call = |max_sats: i64| call_as(max_sats, true);
+        // the lane: room for a ticket, and the credit topped up before the request leaves
+        let call_topped = |max_sats: i64, top_up: i64| -> Result<Started, Failed> {
+            let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true,
+                                    "known_terms": true, "top_up_sats": top_up});
+            if let Some(b) = &body {
+                params["body_b64"] = b.clone().into();
+            }
+            if let Some(c) = &visit.ceiling {
+                params["price_ceiling"] = c.clone();
+            }
+            if let Some(r) = &range {
+                params["range"] = r.clone().into();
+            }
+            if let Some(m) = params.as_object_mut() {
+                xbt_wallet_mcp::wallet::with_transport(m);
+            }
+            self.start(params)
+        };
         let max_sats = |f: &Failed| f.v.get("rule").and_then(Value::as_str) == Some("max_sats");
         // a path the seller serves free: asked for as it is (the signer asks it unpaid, as for a price, and is answered),
         // with nothing to spend and no share held. Sent on another route's terms it would be refused unpaid and asked
@@ -629,7 +715,28 @@ impl Connector {
         } else {
             None
         };
-        let (started, share) = if let Some(s) = free { (s, 0) } else {
+        let lane = if free.is_none() { visit.take_lane() } else { None };
+        let laned = match lane {
+            Some((share, top_up)) => {
+                let got = call_topped(share, top_up);
+                visit.lane_done();
+                match got {
+                    Ok(s) => Some((s, share)),
+                    // its room was too small after all (a ticket dearer than the visit knew): the ordinary way, which learns it
+                    Err(f) if max_sats(&f) => {
+                        visit.refused(share, f);
+                        None
+                    }
+                    Err(f) => {
+                        let v = f.v.clone();
+                        visit.refused(share, f);
+                        return Reply::Whole(refusal(&v));
+                    }
+                }
+            }
+            None => None,
+        };
+        let (started, share) = if let Some(s) = free { (s, 0) } else if let Some(x) = laned { x } else {
             // a share of what is left: the most this answer may charge, tickets bought for it included
             let share = match visit.reserve_answer() {
                 Ok(n) => n,
@@ -1393,6 +1500,47 @@ mod tests {
         v.settle(share, Some(done), false);
         let r = v.report();
         assert_eq!((r["used_msat"].as_u64(), r["paid_sats"].as_i64()), (Some(65_870), Some(559)));
+    }
+
+    /// What a visit used is what the seller's signed receipt charged where that is more than the
+    /// wallet's own count: an answer cut short, or left by the page, was charged for the bytes on
+    /// their way, and that is what the connection's credit fell by.
+    ///
+    /// FAILS before: the visit counted only the wallet's count (`price_msat`), and its bar said 85 sat
+    /// used where the connection's credit had fallen by about 164.
+    #[test]
+    fn what_a_visit_used_is_what_the_seller_charged_where_that_is_more() {
+        let v = visit(1_000);
+        v.account(&json!({"price_msat": "40000", "charged_sats": 0, "receipt": {"signed": true, "last": {"charged": "79000"}}}));
+        v.account(&json!({"price_msat": "5000", "charged_sats": 0, "receipt": {"signed": true, "last": {"charged": "5000"}}}));
+        v.account(&json!({"price_msat": "1000", "charged_sats": 0}));
+        assert_eq!(v.lock().used_msat, 85_000);
+    }
+
+    /// Where a call says the session's credit is low, the next request takes the lane: room for a
+    /// ticket and a top-up, one request at a time, within the limit. With credit enough, or nothing
+    /// said of it, or no room in the limit, it does not.
+    ///
+    /// FAILS before: there was no lane, and a request whose answer outran the credit was cut.
+    #[test]
+    fn one_request_at_a_time_tops_the_credit_up_where_it_is_low() {
+        let v = visit(1_000);
+        assert!(v.take_lane().is_none(), "nothing is known of the credit yet");
+        v.account(&json!({"price_msat": "100000", "charged_sats": 600, "tickets_released": 1, "balance_msat": "900000"}));
+        assert_eq!(v.lock().ticket, 600);
+        assert!(v.take_lane().is_none(), "the credit is ample");
+        // spent 600 of 1,000: room for a share and a ticket (725) is not there
+        v.lock().spent = 600;
+        v.account(&json!({"price_msat": "100000", "charged_sats": 0, "balance_msat": "50000"}));
+        assert!(v.take_lane().is_none(), "no room in the limit for a ticket");
+        v.lock().spent = 0;
+        let (most, top) = v.take_lane().expect("the credit is low: the lane");
+        assert_eq!((most, top), (125 + 600, 500));
+        assert!(v.take_lane().is_none(), "one request holds the lane");
+        assert_eq!(v.lock().spent, most);
+        v.lane_done();
+        v.release(most, 600);
+        assert_eq!((v.lock().spent, v.lock().held), (600, 0));
     }
 
     /// A call whose signer answer never came (the call to the signer failed or timed out) may have

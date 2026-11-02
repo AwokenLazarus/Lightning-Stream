@@ -320,7 +320,7 @@ impl Handler for Service {
         }
         // a stand-in Jellyfin, as a web app's page reaches it: an empty style sheet, an empty chunked answer, a 204 to a
         // POST, a bitrate test of `Size` bytes with its length stated, a script sent compressed and chunked, a font
-        if let Some(rest) = path.strip_prefix("/jf/").or_else(|| path.strip_prefix("/jfweb/")) {
+        if let Some(rest) = path.strip_prefix("/jf/").or_else(|| path.strip_prefix("/jfweb/")).or_else(|| path.strip_prefix("/jfx/")) {
             use std::io::Write as _;
             let size = req.target.split_once("Size=").and_then(|(_, n)| n.split('&').next()?.parse::<usize>().ok()).unwrap_or(0);
             return match rest {
@@ -414,6 +414,8 @@ fn routes() -> Value {
         // a Jellyfin as the demo shop sells it: its web client free and compressed, the rest at 20 sat a MiB
         {"path": "/jfweb/", "free": true, "methods": ["GET", "HEAD"], "accept_gzip": true},
         {"path": "/jf/", "methods": ["GET", "HEAD", "POST"], "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}, "max_body": 65536},
+        // the same, dearer: a ticket of 1,000 sat pays for 5 MiB
+        {"path": "/jfx/", "methods": ["GET", "HEAD", "POST"], "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}, "max_body": 65536},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
         {"path": "/v1/", "methods": ["GET", "POST"], "price": {"per_1k_input_msat": 4000, "per_1k_output_msat": 20_000}, "max_output_tokens": 500, "max_body": 65536},
         // a dear one: its longest reply (500 tokens) costs most of a ticket
@@ -15779,6 +15781,12 @@ fn a_call_naming_no_task_that_resolves_to_the_rental_task_is_refused() {
 /// head first (`stream_head`, `head_headers`), on the route's known terms. `(the call's answer, the
 /// head line, the body the reader got)`.
 fn page_call(r: &Rig, dir: &std::path::Path, name: &str, path: &str, method: &str, body: Option<&[u8]>, max_sats: i64) -> (Value, Value, Vec<u8>) {
+    page_call_with(r, dir, name, path, method, body, max_sats, json!({}))
+}
+
+/// [`page_call`] with more of the call's parameters (`more`, merged over the call's own).
+#[allow(clippy::too_many_arguments)]
+fn page_call_with(r: &Rig, dir: &std::path::Path, name: &str, path: &str, method: &str, body: Option<&[u8]>, max_sats: i64, more: Value) -> (Value, Value, Vec<u8>) {
     use std::io::{BufRead as _, Read as _};
     let l = std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap();
     let reader = std::thread::spawn(move || {
@@ -15794,6 +15802,9 @@ fn page_call(r: &Rig, dir: &std::path::Path, name: &str, path: &str, method: &st
                        "head_headers": true, "known_terms": true, "headers": []});
     if let Some(b) = body {
         p["body_b64"] = B64.encode(b).into();
+    }
+    for (k, x) in more.as_object().into_iter().flatten() {
+        p[k] = x.clone();
     }
     let v = r.call("xbt402_pay", p);
     let t = Instant::now();
@@ -15842,5 +15853,48 @@ fn a_web_apps_answers_come_whole_through_the_gateway() {
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A web app's page runs many requests on one session, each within a small share of the visit's
+/// limit, too small for a ticket: an answer that outruns the session's credit is cut where the
+/// credit ends. A call that names `top_up_sats` (with room for a ticket) buys one before its request
+/// leaves, however small its own answer, so that the credit stays ahead of the requests beside it.
+///
+/// FAILS before: `top_up_sats` was not read; the small request bought nothing, and the next answer
+/// was cut where the credit ran out.
+#[test]
+fn a_call_that_asks_for_a_top_up_keeps_the_credit_ahead_of_a_pages_requests() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // one ticket, nearly all of it used: 4.9 MiB at 200 sat a MiB leaves about 20 sat of credit
+    let n = 49 * MIB / 10;
+    let (v, _, got) = page_call(&r, dir.path(), "drain", &format!("/jfx/Playback/BitrateTest?Size={n}"), "GET", None, BOOKING);
+    assert_eq!((v["complete"].as_bool(), got.len(), v["charged_sats"].as_i64()), (Some(true), n, Some(BOOKING)), "{v}");
+    // the cause: an answer of 95 sat on a share of 125 sat, with 20 sat of credit, is cut where the credit ends
+    let (v, head, got) = page_call(&r, dir.path(), "cut", "/jfx/Playback/BitrateTest?Size=500000", "GET", None, 125);
+    assert_eq!((v["complete"].as_bool(), head["content_length"].as_u64()), (Some(false), Some(500_000)), "{v}");
+    assert!(got.len() < 500_000, "{} {v}", got.len());
+    // with no credit left, what an empty answer and a 204 come to (said for the record; a page's
+    // requests at the edge of the credit)
+    for (name, path, method) in [("css0", "/jfx/Branding/Css", "GET"), ("caps0", "/jfx/Sessions/Capabilities/Full", "POST")] {
+        let (v, head, got) = page_call(&r, dir.path(), name, path, method, Some(b"{}").filter(|_| method == "POST"), 125);
+        eprintln!("at no credit: {method} {path}: {} bytes, head {head}, answer complete {} ended {} rule {} reason {}", got.len(), v["complete"], v["ended"], v["rule"], v["reason"]);
+    }
+    // a small request that tops the credit up: a ticket before it leaves
+    let (v, _, got) = page_call_with(&r, dir.path(), "lane", "/jfx/Branding/Css", "GET", None, 125 + BOOKING, json!({"top_up_sats": 500}));
+    assert_eq!((v["complete"].as_bool(), got.len()), (Some(true), 0), "{v}");
+    assert_eq!(v["charged_sats"].as_i64(), Some(BOOKING), "{v}");
+    assert!(v["balance_msat"].as_str().and_then(|b| b.parse::<u64>().ok()).is_some_and(|b| b >= 500_000), "{v}");
+    // and the answers beside it run on that credit, whole, within their small shares
+    for i in 0..3 {
+        let (v, _, got) = page_call(&r, dir.path(), &format!("after{i}"), "/jfx/Playback/BitrateTest?Size=500000", "GET", None, 125);
+        assert_eq!((v["complete"].as_bool(), got.len(), v["charged_sats"].as_i64()), (Some(true), 500_000, Some(0)), "{v}");
+    }
+    // a top-up past what the call may spend buys nothing and refuses nothing: the request goes on as it would
+    let (v, _, got) = page_call_with(&r, dir.path(), "small", "/jfx/Playback/BitrateTest?Size=1000", "GET", None, 125, json!({"top_up_sats": 5_000}));
+    assert_eq!((v["complete"].as_bool(), got.len(), v["charged_sats"].as_i64()), (Some(true), 1000, Some(0)), "{v}");
     std::env::remove_var("B2_STREAM_DIR");
 }
