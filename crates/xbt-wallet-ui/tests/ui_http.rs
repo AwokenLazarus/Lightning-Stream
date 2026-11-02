@@ -2273,9 +2273,11 @@ fn a_seller_added_by_address_shows_its_services_on_browse() {
     assert!(page.contains("Mike&#39;s box: Films") && page.contains("20 sat a MiB") && page.contains("0.5 sat a request"), "{page}");
     let browse = br.get("/browse").body;
     assert!(browse.contains("Mike&#39;s box: Films") && browse.contains("Mike&#39;s box: Model") && browse.contains("cat-ai"), "{browse}");
-    // the model's page gives the address apps and agents use it at; the films (an older listing) are files
+    // the model's page sends programs to this box's AI address (the AI page), and keeps the seller's own address, for
+    // connected agents, in its details; the films (an older listing) are files
     let model = br.get(&format!("/service?seller={}&name={}", enc(origin), enc("Mike's box: Model"))).body;
-    assert!(model.contains("value=\"https://seller.example/ai/\"") && model.contains("0.5 sat a request") && !model.contains("<video"), "{model}");
+    assert!(model.contains("href=\"./ai\">Get the AI address and a key") && model.contains("<code>https://seller.example/ai/</code>")
+            && !model.contains("id=\"service-address\"") && model.contains("0.5 sat a request") && !model.contains("<video"), "{model}");
     let films = br.get(&format!("/service?seller={}&name={}", enc(origin), enc("Mike's box: Films"))).body;
     assert!(films.contains("Sintel") && films.contains(">Download</a>") && !films.contains("./play?item="), "{films}");
     // again: replaced, not doubled
