@@ -8,6 +8,8 @@
 //! over Lightning for tickets in this visit (`paid_sats`: prepaid, what is not used stays as credit
 //! with the seller).
 //! `POST /visits/<id>/stop`: end it; its next request is refused.
+//! `POST /visits/<id>/limit` `{"limit_sats": N}`: raise its limit to N (never lower it); a visit that
+//! ended at its limit goes on (the report's `limit_reached` says it may), one the buyer stopped does not.
 //! `<any method> /v/<id>/<path>`: one request of the page, sent to `base` + `path` and paid.
 //!
 //! **The limit, exactly.** A page asks for many things at once. Each request of a visit holds a share
@@ -42,11 +44,15 @@ use xbt_svc::http::{BodyWriter, Reply, Request, Response, Streamed};
 
 use crate::{listen_stream, one_range, random_hex, whole, Config, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
 
+/// The largest limit a visit may have, in sats.
+const MAX_LIMIT: i64 = 10_000_000;
 /// The most visits open at once; an idle one ends after [`IDLE`].
 const MAX_VISITS: usize = 32;
 const IDLE: Duration = Duration::from_secs(30 * 60);
 /// The largest request body of a page passed on.
 pub const MAX_BODY: usize = 1 << 20;
+/// Why a visit ended when its limit is spent: the one ending a raise of the limit undoes ([`Visit::raise`]).
+const LIMIT_REACHED: &str = "This visit's spending limit is reached.";
 /// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
 /// How long the request that tops the visit's credit up waits for room for a ticket ([`Visit::take_lane`]).
@@ -191,7 +197,8 @@ enum Kind {
 
 pub struct Visit {
     base: String,
-    limit: i64,
+    /// The visit's limit: raised by the buyer while it is open ([`Visit::raise`]), never lowered.
+    limit: std::sync::atomic::AtomicI64,
     /// The seller's listed prices as the most each of the visit's calls pays (`price_ceiling`, from
     /// the listing the buyer chose the app from): a seller whose terms ask more is paid nothing.
     ceiling: Option<Value>,
@@ -234,10 +241,32 @@ impl Visit {
         Tracked { visit: Arc::clone(self), id }
     }
 
+    fn limit(&self) -> i64 {
+        self.limit.load(Ordering::SeqCst)
+    }
+
+    /// The buyer raises the visit's limit to `to` sat, more than it was (at most what a visit may have):
+    /// a visit that ended at its limit goes on, its page as it was; one the buyer stopped does not.
+    fn raise(&self, to: i64) -> Result<(), String> {
+        let mut s = self.lock();
+        if s.stopped || s.ended.as_deref().is_some_and(|e| e != LIMIT_REACHED) {
+            return Err("This visit has ended. Open the app again.".into());
+        }
+        if !(self.limit() + 1..=MAX_LIMIT).contains(&to) {
+            return Err(format!("A visit's limit is raised, to at most {MAX_LIMIT} sat."));
+        }
+        // under the state's lock: no share is handed out against the old limit after this
+        self.limit.store(to, Ordering::SeqCst);
+        s.ended = None;
+        drop(s);
+        self.turn.notify_all();
+        Ok(())
+    }
+
     fn report(&self) -> Value {
         let s = self.lock();
-        json!({"base": self.base, "limit_sats": self.limit, "spent_sats": s.spent, "held_sats": s.held, "used_msat": s.used_msat, "paid_sats": s.paid,
-               "ended": s.ended, "calls": s.calls})
+        json!({"base": self.base, "limit_sats": self.limit(), "spent_sats": s.spent, "held_sats": s.held, "used_msat": s.used_msat, "paid_sats": s.paid,
+               "ended": s.ended, "limit_reached": s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped, "calls": s.calls})
     }
 
     /// The signer's final word on one call: what the seller charged for its answer and what was
@@ -277,22 +306,22 @@ impl Visit {
         let mut s = self.lock();
         // a ticket of a size the visit has not seen yet: room for half of the limit, which the top-up spends only where a
         // ticket fits (the signer releases none past the call's limit)
-        let ticket = if s.ticket > 0 { s.ticket } else { self.limit / 2 };
+        let ticket = if s.ticket > 0 { s.ticket } else { self.limit() / 2 };
         let credit = s.credit_msat?;
         let floor = self.credit_floor(ticket);
         let most = self.answer_share().saturating_add(ticket);
-        if ticket <= 0 || s.lane || s.alone > 0 || s.ended.is_some() || credit >= floor.unsigned_abs() * 1000 || most > self.limit - s.spent + s.held - s.sockets - s.settling - s.long_open() {
+        if ticket <= 0 || s.lane || s.alone > 0 || s.ended.is_some() || credit >= floor.unsigned_abs() * 1000 || most > self.limit() - s.spent + s.held - s.sockets - s.settling - s.long_open() {
             return None;
         }
         s.lane = true;
         s.alone += 1;
         let until = Instant::now() + LANE_WAIT;
-        while s.ended.is_none() && self.limit - s.spent < most && Instant::now() < until {
+        while s.ended.is_none() && self.limit() - s.spent < most && Instant::now() < until {
             let left = until.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
             s = self.turn.wait_timeout(s, left).unwrap_or_else(|p| p.into_inner()).0;
         }
         s.alone -= 1;
-        let got = s.ended.is_none() && self.limit - s.spent >= most;
+        let got = s.ended.is_none() && self.limit() - s.spent >= most;
         if got {
             s.spent += most;
             s.held += most;
@@ -313,7 +342,7 @@ impl Visit {
     /// A request's share of the limit: an eighth of it, at least [`MIN_SHARE`] and at most
     /// [`ANSWER_SHARE`]. A 1,000 sat visit runs eight requests at once.
     fn answer_share(&self) -> i64 {
-        (self.limit / 8).clamp(MIN_SHARE, ANSWER_SHARE)
+        (self.limit() / 8).clamp(MIN_SHARE, ANSWER_SHARE)
     }
 
     /// A request's share asked again after its answer or ticket did not fit: its share and room for
@@ -359,13 +388,13 @@ impl Visit {
             }
             let mut most = most;
             if kind == Kind::Socket {
-                let room = self.limit / 2 - s.sockets - s.socket_settling;
+                let room = self.limit() / 2 - s.sockets - s.socket_settling;
                 if room < 1 {
                     return Err("This page has too many live connections open at once.".into());
                 }
                 most = most.min(room);
             }
-            let share = (self.limit - s.spent).min(most);
+            let share = (self.limit() - s.spent).min(most);
             if share >= 1 {
                 s.spent += share;
                 s.held += share;
@@ -375,7 +404,7 @@ impl Visit {
                 return Ok(share);
             }
             if s.held == 0 {
-                s.ended = Some("This visit's spending limit is reached.".into());
+                s.ended = Some(LIMIT_REACHED.into());
                 return Err(s.ended.clone().unwrap_or_default());
             }
             let now = Instant::now();
@@ -415,8 +444,8 @@ impl Visit {
     /// visit, and it ends. `true`: ended.
     fn spent_out(&self, share: i64) -> bool {
         let mut s = self.lock();
-        if s.held == 0 && self.limit - s.spent <= share {
-            s.ended.get_or_insert_with(|| "This visit's spending limit is reached.".into());
+        if s.held == 0 && self.limit() - s.spent <= share {
+            s.ended.get_or_insert_with(|| LIMIT_REACHED.into());
             return true;
         }
         false
@@ -576,7 +605,7 @@ impl Visits {
             return Err("too many visits open".into());
         }
         let id = random_hex();
-        m.insert(id.clone(), Arc::new(Visit { base, limit, ceiling, state: Mutex::new(State { last: Some(Instant::now()), ..State::default() }), turn: Condvar::new() }));
+        m.insert(id.clone(), Arc::new(Visit { base, limit: limit.into(), ceiling, state: Mutex::new(State { last: Some(Instant::now()), ..State::default() }), turn: Condvar::new() }));
         Ok(id)
     }
 }
@@ -597,7 +626,7 @@ impl Connector {
             let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             let base = v.get("base").and_then(Value::as_str).unwrap_or("").to_string();
             let limit = v.get("limit_sats").and_then(Value::as_i64).unwrap_or(0);
-            if !base_ok(&base) || !(1..=10_000_000).contains(&limit) {
+            if !base_ok(&base) || !(1..=MAX_LIMIT).contains(&limit) {
                 return Some(Reply::Whole(json_response(400, &json!({"error": "a visit is a seller URL ending in / and a limit of 1 sat or more"}))));
             }
             let ceiling = v.get("price_ceiling").filter(|c| c.is_object()).cloned();
@@ -613,6 +642,19 @@ impl Connector {
             }));
         }
         if let Some(rest) = t.strip_prefix("/visits/") {
+            if let Some(id) = rest.strip_suffix("/limit") {
+                let Some(v) = self.visits.get(id) else {
+                    return Some(Reply::Whole(json_response(404, &json!({"error": "no such visit"}))));
+                };
+                if req.method != "POST" {
+                    return Some(Reply::Whole(json_response(405, &json!({"error": "POST a new limit"}))));
+                }
+                let to = serde_json::from_slice::<Value>(&req.body).ok().and_then(|b| b.get("limit_sats").and_then(Value::as_i64)).unwrap_or(0);
+                return Some(Reply::Whole(match v.raise(to) {
+                    Ok(()) => json_response(200, &v.report()),
+                    Err(e) => json_response(409, &json!({"error": e})),
+                }));
+            }
             let (id, stop) = match rest.strip_suffix("/stop") {
                 Some(id) => (id, true),
                 None => (rest, false),
@@ -750,7 +792,7 @@ impl Connector {
                     // have ended
                     visit.refused(share, f);
                     if visit.spent_out(share) {
-                        return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+                        return Reply::Whole(json_response(402, &json!({"error": LIMIT_REACHED, "rule": "visit"})));
                     }
                     let again = match visit.reserve(visit.ticket_share()) {
                         Ok(n) => n,
@@ -771,7 +813,7 @@ impl Connector {
                                     let out = max_sats(&f);
                                     visit.refused(share, f);
                                     if out && visit.spent_out(share) {
-                                        return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+                                        return Reply::Whole(json_response(402, &json!({"error": LIMIT_REACHED, "rule": "visit"})));
                                     }
                                     return Reply::Whole(refusal(&v));
                                 }
@@ -832,7 +874,12 @@ impl Connector {
                 }
                 drop(settle.src.take());
                 // the signer's account, where the length does not say: an answer it ended early is cut short for the page too
-                whole(length, sent, || settle.account())
+                let r = whole(length, sent, || settle.account());
+                // the owner's log says why a page saw an answer cut short (its status and the wallet's words; no URL)
+                if let Err(e) = &r {
+                    eprintln!("lightning-stream: a page's answer (HTTP {status}) was cut short: {e}");
+                }
+                r
             }),
         })
     }
@@ -1149,7 +1196,7 @@ mod tests {
     use super::*;
 
     fn visit(limit: i64) -> Arc<Visit> {
-        Arc::new(Visit { base: String::new(), limit, ceiling: None, state: Mutex::new(State::default()), turn: Condvar::new() })
+        Arc::new(Visit { base: String::new(), limit: limit.into(), ceiling: None, state: Mutex::new(State::default()), turn: Condvar::new() })
     }
 
     /// A film may run for hours: a request waiting to run alone does not wait for an answer that has
@@ -1500,6 +1547,26 @@ mod tests {
         v.settle(share, Some(done), false);
         let r = v.report();
         assert_eq!((r["used_msat"].as_u64(), r["paid_sats"].as_i64()), (Some(65_870), Some(559)));
+    }
+
+    /// A film outruns a small limit: the buyer raises it, and the visit that ended at its limit goes on,
+    /// with the new limit for its requests. A limit is never lowered, and a stopped visit stays stopped.
+    ///
+    /// FAILS before: a visit's limit was fixed; at its end the frame closed and the film stopped.
+    #[test]
+    fn a_visit_that_reached_its_limit_goes_on_once_the_buyer_raises_it() {
+        let v = visit(100);
+        let a = v.reserve(100).unwrap();
+        v.release(a, 100);
+        assert_eq!(v.reserve(10).unwrap_err(), LIMIT_REACHED);
+        assert_eq!(v.report()["limit_reached"], true);
+        assert!(v.raise(100).is_err() && v.raise(50).is_err() && v.raise(MAX_LIMIT + 1).is_err());
+        v.raise(1_000).unwrap();
+        assert_eq!((v.report()["limit_reached"].as_bool(), v.report()["limit_sats"].as_i64()), (Some(false), Some(1_000)));
+        assert_eq!(v.reserve(10_000), Ok(900));
+        v.stop();
+        assert!(v.raise(2_000).is_err(), "a stopped visit stays stopped");
+        assert_eq!(v.report()["limit_reached"], false);
     }
 
     /// What a visit used is what the seller's signed receipt charged where that is more than the

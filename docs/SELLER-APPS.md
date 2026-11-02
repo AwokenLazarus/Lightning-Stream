@@ -32,6 +32,21 @@ browser                         the buyer's box                                 
   methods and headers the app needs. The service may answer compressed (`accept_gzip`): the
   gateway unpacks it and meters and signs the plain body. It may also add the seller's guest
   login (`upstream_headers`), which never reaches the buyer.
+- **Caching.** A browser keeps a free route's answers for an hour where the service says nothing of
+  caching (Jellyfin sends its web client with a validator and no `Cache-Control`), so a buyer's next
+  visit loads the scripts and styles from the browser instead of over the link. HTML pages are left
+  as they are, so an upgraded app's page is never kept stale. A route's `cache` sets how long, in
+  seconds, on any route (`"cache": 86400` keeps a day; `0` adds nothing). The gateway adds
+  `Cache-Control: public, max-age=…` only to a GET or HEAD whose answer says nothing of caching and
+  sets no cookie, and `private` where the request carried a login or a cookie.
+- **Credit kept ahead.** A visit's requests each hold a small share of its limit, too small for a
+  ticket. When a call says the session's credit is low, the visit's next request goes first with
+  room for a ticket and asks the signer to top the credit up before it leaves (`top_up_sats`), so
+  that no answer is cut where the credit ends.
+- **The limit.** A video app priced by the byte is offered a limit for about ten minutes of 1080p at
+  its price (1,000 to 20,000 sats); other apps, 1,000. Once four fifths of the limit is used, the
+  bar offers **Add**, which raises it by the first limit. At the limit the page waits for the owner,
+  and goes on after Add; nothing is raised without a click.
 
 ## Why a hostile seller page cannot reach the wallet
 

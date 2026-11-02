@@ -15877,12 +15877,15 @@ fn a_call_that_asks_for_a_top_up_keeps_the_credit_ahead_of_a_pages_requests() {
     let (v, head, got) = page_call(&r, dir.path(), "cut", "/jfx/Playback/BitrateTest?Size=500000", "GET", None, 125);
     assert_eq!((v["complete"].as_bool(), head["content_length"].as_u64()), (Some(false), Some(500_000)), "{v}");
     assert!(got.len() < 500_000, "{} {v}", got.len());
-    // with no credit left, what an empty answer and a 204 come to (said for the record; a page's
-    // requests at the edge of the credit)
+    // with no credit left, an empty answer and a 204 are refused before they leave, for the ticket that does not fit:
+    // nothing is cut, and the page's request is asked again with room for one (which it waits for)
     for (name, path, method) in [("css0", "/jfx/Branding/Css", "GET"), ("caps0", "/jfx/Sessions/Capabilities/Full", "POST")] {
-        let (v, head, got) = page_call(&r, dir.path(), name, path, method, Some(&b"{}"[..]).filter(|_| method == "POST"), 125);
-        eprintln!("at no credit: {method} {path}: {} bytes, head {head}, answer complete {} ended {} rule {} reason {}", got.len(), v["complete"], v["ended"], v["rule"], v["reason"]);
+        let (v, _, got) = page_call(&r, dir.path(), name, path, method, Some(&b"{}"[..]).filter(|_| method == "POST"), 125);
+        assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64(), got.len()), (Some("max_sats"), Some(0), 0), "{v}");
     }
+    // a second ticket, nearly all of it used again: about 20 sat of credit, which covers a small request's head
+    let (v, _, got) = page_call(&r, dir.path(), "drain2", &format!("/jfx/Playback/BitrateTest?Size={n}"), "GET", None, BOOKING);
+    assert_eq!((v["complete"].as_bool(), got.len(), v["charged_sats"].as_i64()), (Some(true), n, Some(BOOKING)), "{v}");
     // a small request that tops the credit up: a ticket before it leaves
     let (v, _, got) = page_call_with(&r, dir.path(), "lane", "/jfx/Branding/Css", "GET", None, 125 + BOOKING, json!({"top_up_sats": 500}));
     assert_eq!((v["complete"].as_bool(), got.len()), (Some(true), 0), "{v}");
