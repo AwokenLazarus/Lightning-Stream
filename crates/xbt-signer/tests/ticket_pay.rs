@@ -15916,13 +15916,16 @@ fn a_top_up_that_cannot_be_had_neither_holds_up_nor_stops_the_session() {
     let first = first_call_with_the_pool_shown(&r);
     let sid = first["session"].as_str().unwrap().to_string();
     r.shop.standin.hold_streams(true);
-    for i in 0..6 {
+    // each call may buy one ticket for its top-up: past the tickets the seller had shown (the pool), the next is never shown
+    let mut topped = 0;
+    for i in 0..14 {
         let t = Instant::now();
         let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/1000"), "max_sats": 2_000, "task": "film", "top_up_sats": 1_000_000}));
+        topped += usize::from(v["charged_sats"].as_i64().unwrap_or(0) > 0);
         assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "call {i}: {v}");
         assert!(t.elapsed() < Duration::from_millis(2_500), "call {i} waited {:?} for a top-up: {v}", t.elapsed());
     }
+    assert!(topped < 14, "every top-up found a ticket shown: the test never reached one that is not ({topped})");
     assert_eq!(r.session(&sid)["sessions"][0]["state"], "open", "the session was stopped by a top-up");
     r.shop.standin.hold_streams(false);
-    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty());
 }
