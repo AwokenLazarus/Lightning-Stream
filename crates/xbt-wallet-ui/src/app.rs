@@ -193,6 +193,10 @@ pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
     p
 }
 
+/// The rows of Recent activity on the Wallet page, and with Show more.
+const RECENT_ROWS: usize = 15;
+const RECENT_MORE: usize = 200;
+
 /// A static asset. The pages ask for it as `?v=<content hash>`: that URL never changes meaning, so
 /// it is cached for a year; any other request for it, for a day.
 fn asset(req: &Req, ctype: &str, body: &'static str) -> Resp {
@@ -452,7 +456,7 @@ impl App {
         }
         match req.path.as_str() {
             "/" => self.home(&ctx),
-            "/wallet" => self.overview(&ctx),
+            "/wallet" => self.overview(&ctx, &req.query),
             "/browse" => self.browse(&ctx, &req.query),
             "/service" => self.service_page(&ctx, &req),
             "/services" => self.services_page(&ctx),
@@ -817,7 +821,7 @@ impl App {
         b
     }
 
-    fn overview(&self, ctx: &Ctx) -> Resp {
+    fn overview(&self, ctx: &Ctx, query: &HashMap<String, String>) -> Resp {
         let health = match self.call("health", json!({})) {
             Ok(h) => h,
             Err(e) => return self.page("Wallet", ctx, Self::error_box(&e)),
@@ -870,7 +874,9 @@ impl App {
             b.push_str(&t);
         }
         b.push_str("</section>");
-        let recent = self.call("history", json!({"limit": 15}));
+        // the latest 15 events, or with "Show more" (`?more=1`) the latest 200
+        let more = query.get("more").is_some_and(|m| m == "1");
+        let recent = self.call("history", json!({"limit": if more { RECENT_MORE } else { RECENT_ROWS }}));
         // a seller by its name where the list of sellers has it, never by a made-up `…shop.invalid` address
         let known = self.services().unwrap_or_default();
         // a payment to `ln:<node>` by the name of the seller paid through that node: on file in the rules, or vouched for by its shop
@@ -956,6 +962,10 @@ impl App {
                                     esc(&who(&txt(e.get("dest").or(e.get("origin")))))));
             }
             b.push_str("</tbody></table></div>");
+            // there may be more than the page shows
+            if !more && h["events"].as_array().is_some_and(|a| a.len() >= RECENT_ROWS) {
+                b.push_str(&format!("<p class=\"small\"><a href=\"./wallet?more=1\">Show more</a> (the latest {RECENT_MORE})</p>"));
+            }
         }
         b.push_str("<details class=\"card\"><summary>Technical details</summary>");
         b.push_str(&kv(&[("Chain", escv(health.get("chain"))), ("Signer", escv(health.get("implementation"))),
