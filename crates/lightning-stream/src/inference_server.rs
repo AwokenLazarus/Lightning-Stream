@@ -233,14 +233,14 @@ struct Failed {
     account: Account,
     /// The owner's own spending rules refused the payment (the rule, and its limit in sats where the wallet said it):
     /// the buyer's limit, not the seller's failure.
-    spending: Option<(String, Option<u64>)>,
+    spending: Option<Box<(String, Option<u64>)>>,
 }
 
 /// The wallet's refusal of a call, where it was the owner's own spending rules: the rule, and its limit in sats where
 /// the wallet said it (`limit_sats`).
-fn spending_of(v: &Value) -> Option<(String, Option<u64>)> {
+fn spending_of(v: &Value) -> Option<Box<(String, Option<u64>)>> {
     let rule = v.get("rule").and_then(Value::as_str).filter(|r| is_spending_rule(r))?;
-    (v.get("verdict").and_then(Value::as_str) != Some("allow")).then(|| (rule.to_string(), v.get("limit_sats").and_then(Value::as_u64)))
+    (v.get("verdict").and_then(Value::as_str) != Some("allow")).then(|| Box::new((rule.to_string(), v.get("limit_sats").and_then(Value::as_u64))))
 }
 
 /// What the client is told of a call the wallet ended before the seller's answer: plain words. The wallet's own (which
@@ -705,7 +705,7 @@ impl AiServer {
                     }
                     // the owner's own limit: not the seller's failure. One on the wallet as a whole holds at every seller, and
                     // none is tried; one on this seller leaves the next
-                    if let Some((rule, limit)) = refused_by {
+                    if let Some((rule, limit)) = refused_by.map(|b| *b) {
                         let wide = wallet_wide(&rule);
                         spending.get_or_insert((rule, limit, offer.seller.clone()));
                         if wide || paid {
