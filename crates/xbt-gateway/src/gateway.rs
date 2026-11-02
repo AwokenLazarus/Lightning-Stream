@@ -250,6 +250,25 @@ fn larger_than_shown(most: Option<u64>, answer: &Answer) -> Option<(u64, u64)> {
     (total > most).then_some((total, most))
 }
 
+/// Whether a free route's answer goes to the buyer gzip-compressed ([`Gateway::free`]): a GET whose
+/// buyer takes gzip (`Accept-Encoding`), answered 200 with text the size of a web app's parts (HTML,
+/// scripts, styles, JSON, SVG, XML, WebAssembly), whole (no range) and not compressed already.
+fn gzip_for(req: &Request, answer: &Answer) -> bool {
+    let header = |h: &[(String, String)], n: &str| h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.to_ascii_lowercase());
+    let takes = header(&req.headers, "accept-encoding").is_some_and(|a| a.split(',').any(|e| {
+        let mut parts = e.split(';');
+        let name = parts.next().unwrap_or("").trim();
+        // `gzip;q=0` refuses it
+        name == "gzip" && !parts.any(|p| p.trim().replace(' ', "") == "q=0")
+    }));
+    let t = header(&answer.headers, "content-type").unwrap_or_default();
+    let t = t.split(';').next().unwrap_or("").trim();
+    let text = t.starts_with("text/") || t.ends_with("+json") || t.ends_with("+xml")
+        || ["application/javascript", "application/json", "application/xml", "application/wasm", "image/svg+xml", "application/manifest+json"].contains(&t);
+    req.method == "GET" && takes && answer.status == 200 && text && header(&answer.headers, "content-range").is_none()
+        && header(&answer.headers, "content-encoding").is_none() && answer.length.is_none_or(|n| n >= 256)
+}
+
 fn addr_name(client: Option<IpAddr>) -> String {
     match client.map(AddrKey::of) {
         Some(AddrKey::V4(a)) => format!("v4:{a}"),
@@ -1678,6 +1697,39 @@ impl Gateway {
         } else {
             None
         };
+        // a buyer that takes gzip gets a free route's text compressed: nothing of a free answer is metered or signed, and
+        // over a slow link (a relay far away) a web app's scripts and styles are a third of the bytes. The buyer's client
+        // unpacks it (the wallet's does, as it asks)
+        if gzip_for(req, &answer) {
+            headers.push(("Content-Encoding".into(), "gzip".into()));
+            headers.push(("Vary".into(), "Accept-Encoding".into()));
+            let (status, mut src) = (answer.status, answer.body);
+            return Reply::Stream(Streamed {
+                status,
+                headers,
+                length: None,
+                body: Box::new(move |out| {
+                    use std::io::Write as _;
+                    let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    let mut buf = vec![0u8; CHUNK];
+                    loop {
+                        let n = src.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        z.write_all(&buf[..n])?;
+                        if !z.get_ref().is_empty() {
+                            let done = std::mem::take(z.get_mut());
+                            out.send(&done)?;
+                            if let Some(slot) = &slot {
+                                slot.sent(done.len() as u64);
+                            }
+                        }
+                    }
+                    out.send(&z.finish()?)
+                }),
+            });
+        }
         let (status, length, mut src) = (answer.status, answer.length, answer.body);
         Reply::Stream(Streamed {
             status,

@@ -140,11 +140,18 @@ impl Handler for Service {
                 b"ok".to_vec(),
             ),
             "/pay" => Response::text(402, "text/plain", "pay me instead"),
+            // a web app's free parts, as a media server sends them: a validator, no Cache-Control
+            "/files/free/app.js" => Response::new(200, vec![("Content-Type".into(), "application/javascript".into()), ("ETag".into(), "\"js\"".into())],
+                                                  APP_JS.repeat(10_000).into_bytes()),
+            "/files/free/index.html" => Response::new(200, vec![("Content-Type".into(), "text/html; charset=utf-8".into())], b"<!doctype html><title>app</title>".repeat(20)),
             "/moved" => Response::new(302, vec![("Location".into(), "/api".into())], vec![]),
             _ => Response::text(404, "text/plain", "no such thing"),
         })
     }
 }
+
+/// A line of a web app's script.
+pub const APP_JS: &str = "function a(b){return b+1}\n";
 
 pub fn start_service() -> (Running, Arc<Service>) {
     let s = Arc::new(Service::default());

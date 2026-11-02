@@ -2172,3 +2172,33 @@ fn a_gateway_whose_terms_name_no_smallest_size_ignores_a_size_asked_for() {
     b.release(&s);
     assert_eq!(b.balance(), 1_000_000, "the one size of its terms");
 }
+
+/// A free route's scripts go to a buyer that takes gzip compressed (a third of the bytes over a slow
+/// link; nothing of a free answer is metered or signed), whole, and to one that does not as they are;
+/// a browser may keep them an hour, where the service said nothing of it. A page of HTML is not kept,
+/// and a file that is not text is sent as it is.
+///
+/// FAILS before: the gateway sent the plain script, and no `Cache-Control`.
+#[test]
+fn a_free_routes_scripts_go_compressed_and_are_kept_by_the_browser() {
+    use std::io::Read as _;
+    let (rig, _d) = start(&|_| {});
+    let plain = APP_JS.repeat(10_000);
+    let zipped = http(&rig.addr, "GET", "/files/free/app.js", &[("Accept-Encoding", "gzip")], b"", None);
+    assert_eq!((zipped.status, zipped.complete, zipped.header("Content-Encoding")), (200, true, Some("gzip")));
+    assert!(zipped.body.len() * 3 < plain.len(), "{} of {}", zipped.body.len(), plain.len());
+    let mut out = String::new();
+    flate2::read::GzDecoder::new(&zipped.body[..]).read_to_string(&mut out).unwrap();
+    assert_eq!(out, plain);
+    assert_eq!(zipped.header("Cache-Control"), Some("public, max-age=3600"));
+    assert_eq!(zipped.header("ETag"), Some("\"js\""));
+    let as_is = http(&rig.addr, "GET", "/files/free/app.js", &[], b"", None);
+    assert_eq!((as_is.status, as_is.complete, as_is.header("Content-Encoding"), as_is.body.len()), (200, true, None, plain.len()));
+    let refused = http(&rig.addr, "GET", "/files/free/app.js", &[("Accept-Encoding", "gzip;q=0, identity")], b"", None);
+    assert_eq!((refused.header("Content-Encoding"), refused.body.len()), (None, plain.len()));
+    let page = http(&rig.addr, "GET", "/files/free/index.html", &[("Accept-Encoding", "gzip")], b"", None);
+    assert_eq!((page.status, page.header("Cache-Control")), (200, None), "an app's page is asked again");
+    // a free file that is not text is sent as it is
+    let file = http(&rig.addr, "GET", "/files/free/5000", &[("Accept-Encoding", "gzip")], b"", None);
+    assert_eq!((file.header("Content-Encoding"), file.body.len()), (None, 5000));
+}
