@@ -21,11 +21,7 @@ impl App {
         let snap = self.nostr.get(q.get("refresh").is_some_and(|v| v == "1"));
         let have = self.file_services().unwrap_or_default();
         // this box's own shop, by its web address or its shop key: marked, never offered to add (a box can't buy from itself)
-        let own_key = if self.cfg.sell {
-            self.link_status().and_then(|v| v.get("npub").and_then(serde_json::Value::as_str).and_then(xbt402::shop::parse))
-        } else {
-            None
-        };
+        let own_key = self.own_shop_key_origin();
         let own = |seller: &str| self.is_own_shop(seller) || own_key.as_deref().is_some_and(|k| services::same_origin(k, seller));
         self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have, &own), "")
     }

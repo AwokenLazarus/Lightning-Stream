@@ -366,6 +366,17 @@ fn blinding_card(b: &Value) -> String {
     format!("<section class=\"card\"><p><span class=\"pill {class}\">{head}</span></p><p>{}</p></section>", esc(words))
 }
 
+/// What a rental says when the hashmaker's pay address doesn't answer.
+const PAY_ADDRESS_GONE: &str = "This hashmaker's offer points at an address that doesn't answer (it may have moved). Ask the seller to update, or try again later.";
+
+/// Whether the wallet's reason for not paying a piece of work is that the hashmaker's pay address
+/// doesn't answer: no resume answer from it, not found, refused or not reached.
+fn pay_address_gone(why: &str) -> bool {
+    let w = why.to_ascii_lowercase();
+    ["the seller has not said what an earlier session left", "404", "not found", "connection refused", "could not reach", "can't reach",
+     "cannot reach", "no such host", "failed to lookup", "dns"].iter().any(|m| w.contains(m))
+}
+
 /// A closed rental's reason, in words.
 fn ended_words(why: &str) -> String {
     // the earlier role names too: a hashlink from before the rename words its reasons with them
@@ -543,6 +554,11 @@ impl App {
             return self.html_page("Sell hashrate", "Sell hashrate", ctx,
                 "<p class=\"empty\">Renting out miners is off in this install. On Umbrel it is part of the app; on Linux, run install.sh again and turn the hashmaker on.</p>", "");
         };
+        // a pay address left behind by a change of reach (a shop gone Private under 0.2.2) is put right here,
+        // and the hashmaker republishes its offer
+        if self.hash_settings()["enabled"] == true {
+            let _ = self.follow_reach(&self.shop(), self.own_shop_key_origin().as_deref());
+        }
         let st = call(&base, &self.cfg.hash.hasher_token, "GET", "/status", None);
         let saved = self.hash_settings();
         let csrf = App::csrf_input(ctx);
@@ -760,8 +776,9 @@ impl App {
                 }
                 // empty clears it: no listing on public relays until it is set
                 v["linkPublic"] = json!(link);
-                if !shop.public_url.is_empty() {
-                    v["payUrl"] = json!(format!("{}/hashrate", shop.public_url.trim_end_matches('/')));
+                // paid at the shop's web address, or at its key address when it is reached by its key (Private)
+                if let Some(pay) = crate::app::sell::pay_url_for(&shop, self.own_shop_key_origin().as_deref()) {
+                    v["payUrl"] = json!(pay);
                 }
                 write_settings(&self.cfg.hash.settings, &v)?;
                 // priced now, unless rentals are going on: the price they pay stays till they end
@@ -1237,7 +1254,11 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     } else {
         "<span class=\"pill good\">Hashing</span>".to_string()
     };
-    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}{}</p>", esc(&ended_words(w)),
+    // the hashmaker's pay address that doesn't answer (a shop that moved or turned Private): said as that, not as a
+    // wallet that "could not pay" (0.2.2, Mike's Umbrel: the reason was only in the API)
+    let unreachable = live["pays"].as_array().into_iter().flatten().filter_map(|p| p["why"].as_str()).any(pay_address_gone);
+    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}{}</p>",
+                                                     esc(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { ended_words(w) }),
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
     // a payment the wallet refused: the hashmaker will only say a piece went unpaid, and the reason is this wallet's,
     // in words where it has them (xbt_hashlink::rail::BIG_TICKETS_ONLY and those beside it)
@@ -1769,6 +1790,10 @@ mod tests {
         assert_eq!(sats_n(4093.4), "4,093 sats");
         assert_eq!(sats_n(1.0), "1 sat");
         assert_eq!(ended_words("hasher closed: unpaid"), "A piece of work was not paid in time.");
+        // the hashmaker's pay address gone (a shop that turned Private under 0.2.2): told as that
+        assert!(pay_address_gone("the seller has not said what an earlier session left with it (origin https://stream.lazarus-xbt.xyz)"));
+        assert!(pay_address_gone("the seller answered 404 Not Found"));
+        assert!(!pay_address_gone("Your wallet's rules stopped this payment: over the daily budget"));
         assert_eq!(ended_words("cut by the buyer"), "You cut it.");
         assert_eq!(ended_words("hashtaker closed: cut by the hashtaker"), "You cut it.");
         assert_eq!(ended_words("hashmaker closed: stopped by the hashmaker"), "The hashmaker stopped it.");

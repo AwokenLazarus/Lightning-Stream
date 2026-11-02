@@ -2077,6 +2077,49 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!(n.relays, ["wss://relay.one.example", "wss://relay.two.example", "wss://relay.own.example"]);
 }
 
+/// A shop that turns Private (reached by its key, no web address) takes its hashrate payments along:
+/// the hashmaker's pay address becomes the shop's key address, and turning back to the web address
+/// moves it back.
+///
+/// FAILS before: payUrl kept the old web address (Mike's Umbrel, 0.2.2), which no longer answered,
+/// and every rental failed at its first piece of work.
+#[test]
+fn a_shop_gone_private_is_paid_for_hashrate_at_its_key_address() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    const NPUB: &str = "npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a";
+    // the gateway's link status names the shop's key, as the real one does
+    let gateway = mock_http(|path| if path == "/.well-known/lightning-stream-link.json" {
+        (200, r#"{"npub": "npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a", "private": true}"#)
+    } else { (200, "{}") });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.gw.health_url = Some(format!("http://{gateway}/x402/ticket/health"));
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = dir.join("hashrate-settings.json");
+    });
+    let mut br = logged_in(&bx);
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    assert_eq!(r.status, 303);
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("reach", "web"), ("public_url", "https://stream.example")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    // renting set up while the shop sold at its web address
+    std::fs::write(dir.join("hashrate-settings.json"), json!({"enabled": true, "payUrl": "https://stream.example/hashrate"}).to_string()).unwrap();
+    let pay = || serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("hashrate-settings.json")).unwrap()).unwrap()["payUrl"].clone();
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("reach", "direct"), ("private", "1")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    let key = xbt402::shop::parse(NPUB).unwrap();
+    assert_eq!(pay(), json!(format!("{key}/hashrate")), "paid at the shop's key address once it is Private");
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("reach", "web"), ("public_url", "https://stream.example")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert_eq!(pay(), json!("https://stream.example/hashrate"), "and back at the web address");
+}
+
 #[test]
 fn without_sell_the_wallet_has_no_sell_page() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
