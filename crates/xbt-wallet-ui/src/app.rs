@@ -1483,7 +1483,12 @@ impl App {
                           else { format!("<span class=\"tag bad\">FAILED</span> {}", esc(&s["chain"].to_string())) }),
             ("Anchor witness", if a["enabled"] == true { "enabled".into() } else { "<span class=\"tag warn\">not configured</span>".into() }),
             ("Anchored lines", escv(a.get("anchored_n"))), ("Log lines", escv(a.get("log_lines"))),
-            ("Not yet anchored", escv(a.get("unanchored_lines"))), ("Last anchor", utc(int(a.get("anchored_at")))),
+            ("Not yet anchored", escv(a.get("unanchored_lines"))), ("Last anchor", match (int(a.get("anchored_at")), int(a.get("anchored_n"))) {
+                // lines anchored with no time on file: said, not a bare "-" beside a count (0.2.1)
+                (0, n) if n > 0 => "<span class=\"small\">its time was not recorded</span>".into(),
+                (0, _) => "none yet".into(),
+                (t, _) => utc(t),
+            }),
             ("Anchored head", format!("<code>{}</code>", esc(&short(&txt(a.get("anchored_head")), 20)))),
         ]));
         if let Some(e) = s.get("chain").and_then(|c| c.get("anchor_error")).or(s.get("anchor_error")) {

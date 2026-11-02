@@ -248,9 +248,13 @@ impl App {
         let Ok(p) = self.signer.call("policy_get", serde_json::json!({})) else { return false };
         let pol = &p["policy"];
         let o = services::http_origin(origin).unwrap_or_default();
-        let listed = pol["allowlist"].as_array().is_some_and(|a| a.iter().filter_map(|x| x.as_str()).any(|x| services::http_origin(x).as_deref() == Some(o.as_str())));
-        listed && pol["counterparties"].as_object().is_some_and(|m| m.iter().any(|(k, v)|
-            services::http_origin(k).as_deref() == Some(o.as_str()) && v["ln_node"].as_str().is_some_and(|n| !n.is_empty())))
+        let list: Vec<&str> = pol["allowlist"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+        let listed = list.iter().any(|x| services::http_origin(x).as_deref() == Some(o.as_str()));
+        // the node the rules tie this seller to; its `ln:<node>` line on the list allows it as well (the signer pays
+        // either: 0.2.1 marked a seller it had paid "not allowed")
+        let node = pol["counterparties"].as_object().and_then(|m| m.iter().find_map(|(k, v)|
+            (services::http_origin(k).as_deref() == Some(o.as_str())).then(|| v["ln_node"].as_str()).flatten().filter(|n| !n.is_empty())));
+        node.is_some_and(|n| listed || list.iter().any(|x| x.strip_prefix("ln:").is_some_and(|x| x.eq_ignore_ascii_case(n))))
     }
 
     /// The spending rules page with this seller added, ready to sign: the seller's node is read from

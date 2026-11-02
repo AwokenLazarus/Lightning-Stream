@@ -20,7 +20,14 @@ impl App {
         }
         let snap = self.nostr.get(q.get("refresh").is_some_and(|v| v == "1"));
         let have = self.file_services().unwrap_or_default();
-        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have), "")
+        // this box's own shop, by its web address or its shop key: marked, never offered to add (a box can't buy from itself)
+        let own_key = if self.cfg.sell {
+            self.link_status().and_then(|v| v.get("npub").and_then(serde_json::Value::as_str).and_then(xbt402::shop::parse))
+        } else {
+            None
+        };
+        let own = |seller: &str| self.is_own_shop(seller) || own_key.as_deref().is_some_and(|k| services::same_origin(k, seller));
+        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have, &own), "")
     }
 
     /// `POST /nostr-check`: ask the seller whether the listing found on Nostr is its own.
@@ -41,7 +48,7 @@ impl App {
 }
 
 /// `have`: the sellers on the owner's list, marked "On your list".
-fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service]) -> String {
+fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -> bool) -> String {
     let mut b = String::from("<p class=\"small\"><a href=\"./browse\">← Your services</a> · <a href=\"./nostr?refresh=1\">Look again</a></p>\
         <div class=\"flash warn\"><strong>Unvetted.</strong> These sellers published their lists on Nostr, each signed by the \
         seller's own key, but nobody has checked who runs them. A shop reached by its key: its address is that key, so the list is its own. \
@@ -61,6 +68,12 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service]) -> String {
         return b;
     }
     for n in &snap.listings {
+        if own(&n.listing.seller) {
+            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill good\">Your shop</span></div>\
+                                 <p class=\"small\">This is the listing your box publishes. See it on <a href=\"./sell\">Sell</a>.</p></section>",
+                                esc(&n.listing.name)));
+            continue;
+        }
         let added = have.iter().any(|s| services::same_origin(&s.seller, &n.listing.seller));
         let mine = if added { "<span class=\"pill good\">On your list</span>" } else { "" };
         let (add_label, add_class) = if added { ("Check for updates", " class=\"secondary\"") } else { ("Add this shop", "") };

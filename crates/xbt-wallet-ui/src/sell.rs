@@ -1494,7 +1494,7 @@ impl App {
             <form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"advanced\">\
             <label>Buyers at once<input name=\"max_sessions\" value=\"{ms}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             <label>Buyers at once from one address<input name=\"sessions_per_address\" value=\"{spa}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
-            <label>Payments held open at once (1,000 sat each, on your inbound channels)<input name=\"max_held_tickets\" value=\"{mh}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
+            <label>Payments held open at once (each up to 900 sat, on your inbound channels)<input name=\"max_held_tickets\" value=\"{mh}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             <label>Your proxy's addresses, whose word on the buyer's address the shop believes (comma-separated)<input name=\"proxies\" value=\"{}\" class=\"mono\"></label>\
             <label>Test chain only: its network id<input name=\"network\" value=\"{}\" class=\"mono\" placeholder=\"bip122:…\"></label>\
             <button>Save advanced settings</button></form>\

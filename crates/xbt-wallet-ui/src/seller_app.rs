@@ -179,10 +179,11 @@ impl App {
         let shop = self.seller_name(&svc.seller);
         let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
             <p>You use <strong>{}</strong> inside this page. What it loads is paid at {}, and stops at the limit you set here.</p>\
+            <p class=\"small\">Shop address: {}</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
             {}<div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
             <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
-            esc(&shop), esc(&svc.name), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
+            esc(&shop), esc(&svc.name), esc(&svc.price_text), esc(&crate::app::stream_pages::host(&svc.seller)), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
             self.identity_card(ctx, &svc.seller, &base, &entry));
         self.page("Open the app", ctx, b)
     }

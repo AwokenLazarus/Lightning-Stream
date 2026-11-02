@@ -115,7 +115,9 @@ fn key_row(ctx: &Ctx, e: &Entry, today: u64) -> String {
          <button type=\"submit\">Save the limit</button></form></details>\
          <form method=\"post\" action=\"./ai\" class=\"inline\">{}<input type=\"hidden\" name=\"do\" value=\"revoke\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
          <button class=\"danger\" type=\"submit\">Revoke</button></form></td></tr>",
-        esc(&e.name), crate::html::utc(e.created as i64), sats((e.spent_msat / 1000) as i64), sats(e.limit_sats as i64),
+        esc(&e.name), crate::html::utc(e.created as i64),
+        // a key that spent less than a sat is not shown as unused (0.2.1 said "0 sats" after paid answers)
+        if e.spent_msat > 0 && e.spent_msat < 1000 { "under 1 sat".to_string() } else { sats((e.spent_msat / 1000) as i64) }, sats(e.limit_sats as i64),
         App::csrf_input(ctx), esc(&e.id), e.limit_sats, e.per_day_sats.map(|d| d.to_string()).unwrap_or_default(), App::csrf_input(ctx), esc(&e.id))
 }
 

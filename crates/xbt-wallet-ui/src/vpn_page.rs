@@ -195,6 +195,13 @@ impl App {
                 <div class=\"scroll\"><table><thead><tr><th>Exit</th><th>Says</th><th>Check</th></tr></thead><tbody>{rows}</tbody></table></div>\
                 <p class=\"small\"><a href=\"https://db-ip.com\" rel=\"noopener\">IP geolocation by DB-IP</a> (CC BY 4.0).</p></section>"));
         }
+        if exits.is_empty() {
+            // where exits come from, said where there are none (0.2.1 listed nothing and said nothing)
+            b.push_str("<section class=\"card\" id=\"no-exits\"><h2>Exits</h2><p class=\"empty\">No exit found yet.</p>\
+                <p class=\"small\">Exits are boxes that sell their internet connection. Their owners publish them on Nostr, and this box's VPN \
+                service looks for them there by itself and checks each one's country; there is nothing to add by hand. If none shows up after \
+                a few minutes, the relays it reads may carry none yet.</p></section>");
+        }
         if ready {
             b.push_str(&format!(
                 "<section class=\"card\"><h2>Add a device</h2><form method=\"post\" action=\"./vpn\" class=\"stack\">{}\

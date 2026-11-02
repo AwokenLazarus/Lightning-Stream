@@ -261,6 +261,12 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     let count = |id: &str| all.iter().filter(|s| id.is_empty() || s.category() == id).count();
     for (id, words) in std::iter::once(("", "All")).chain(services::CATEGORIES.iter().copied()) {
         let cur = if id == cat { " aria-current=\"page\"" } else { "" };
+        // hashrate is offered on Rent hashrate, from listings the shops publish, not from the list of sellers: with
+        // none on that list the chip leads there, with no count (0.2.1 said "Hashrate 0" beside an offer)
+        if id == "hashrate" && count(id) == 0 {
+            b.push_str(&format!("<a href=\"./hashrate\">{}</a>", esc(words)));
+            continue;
+        }
         b.push_str(&format!("<a href=\"./browse?cat={id}{sort_q}\"{cur}>{} <span class=\"count\">{}</span></a>", esc(words), count(id)));
     }
     b.push_str("</nav>");

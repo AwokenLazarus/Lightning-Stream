@@ -899,7 +899,17 @@ impl App {
                             crate::services::urlenc(&o), esc(n)),
                         _ => String::new(),
                     };
-                    let can = ready && allowed && !old && (free > 0 || total == 0);
+                    // this box's own offer: marked, and not rented (a box can't pay itself)
+                    let mine = self.is_own_shop(pay_url);
+                    let can = ready && allowed && !old && !mine && (free > 0 || total == 0);
+                    // the seller by name: an offer called just "Hashrate" says whose it is
+                    let seller = crate::services::http_origin(pay_url).map(|o| self.seller_name(&o)).unwrap_or_default();
+                    let title = match (x["name"].as_str().unwrap_or("Miners"), seller.is_empty()) {
+                        (n, false) if n.eq_ignore_ascii_case("hashrate") || n.eq_ignore_ascii_case("miners") => format!("Miners from {seller}"),
+                        (n, _) => n.to_string(),
+                    };
+                    let whose = if mine { "<span class=\"pill good\">Your offer</span><p class=\"hint\">This is your own box's offer: buyers rent it. You can't rent it from here.</p>".to_string() }
+                                else if seller.is_empty() { String::new() } else { format!("<p class=\"small\">Sold by {}</p>", esc(&seller)) };
                     let old = if old {
                         "<p class=\"hint\"><span class=\"pill warn\">Needs updating</span> This hashmaker's app doesn't prove the work it sells, so it can't be rented.</p>"
                     } else {
@@ -920,7 +930,7 @@ impl App {
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
-                    b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
+                    b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
                         <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
@@ -929,7 +939,7 @@ impl App {
                         <p class=\"hint\">About an hour of one machine{}. The rental ends when this much is spent, but however small it is, your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button{}>Rent</button></form></section>",
-                        esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
+                        esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
                         if can { "" } else { " disabled" }));
@@ -1329,8 +1339,9 @@ fn price_words(w: &Result<Want, String>, tip: Option<&Tip>, hs: Option<f64>, mar
         Ok(w) => w,
         Err(why) => {
             let fixed = if market { " A fixed price works without it." } else { "" };
-            return format!("<p class=\"hint\"><span class=\"pill warn\">No live price</span> This app can't read today's difficulty: {}. \
-                            Following the market needs it, so no new rental starts until it can. Rentals going on keep their price.{fixed}</p>", esc(why));
+            return format!("<p class=\"hint\"><span class=\"pill warn\">No live price</span> A live price follows what a piece of work earns today, \
+                            which comes from the XBT chain's difficulty, read from your XBT node. This app can't read it now ({}): \
+                            check that your XBT node is running and synced. Until then no new rental starts; rentals going on keep their price.{fixed}</p>", esc(why));
         }
     };
     let (miner, at) = match hs {
