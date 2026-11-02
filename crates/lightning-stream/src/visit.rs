@@ -599,7 +599,9 @@ impl Visits {
         m.retain(|_, v| {
             let s = v.lock();
             // an answer still open keeps its visit, however long ago it was asked for, so that a stop finds it
-            !s.streams.is_empty() || (s.ended.is_none() && s.last.is_none_or(|t| t.elapsed() < IDLE))
+            // and one at its limit waits for the buyer to raise it, as an open one does
+            let waiting = s.ended.is_none() || (s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped);
+            !s.streams.is_empty() || (waiting && s.last.is_none_or(|t| t.elapsed() < IDLE))
         });
         if m.len() >= MAX_VISITS {
             return Err("too many visits open".into());
