@@ -55,3 +55,43 @@ fn without_a_listing_nothing_is_published() {
     assert!(nostr::publish_once(&rig.gw, &keys, std::slice::from_ref(&relay.url), xbt_nostr::now()).is_err());
     assert!(relay.events(market::KIND_CLASSIFIED).is_empty());
 }
+
+/// #40: a shop that moves (here a new web address; turning Private moves it to its key's address the
+/// same way) lists itself under the new address, and withdraws the listing it left at the old one with
+/// a NIP-09 deletion signed by the same key. A buyer's app reads only the shop as it is now, also from
+/// a relay that keeps deleted events.
+///
+/// FAILS before: the old listing stayed, nothing withdrew it, and Found on Nostr listed the shop twice.
+#[test]
+fn a_shop_that_moves_withdraws_its_old_listing() {
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    let (rig, dir) = start(&with_listing);
+    let keys = nostr::load_key(dir.path()).unwrap();
+    let now = xbt_nostr::now();
+    nostr::publish_once(&rig.gw, &keys, &relays, now - 10).unwrap();
+    assert!(relay.events(market::KIND_DELETION).is_empty(), "nothing to withdraw while the shop has not moved");
+    let old_id = relay.events(market::KIND_CLASSIFIED)[0].id.clone();
+    let (node, service, clock) = rig.stop();
+    let moved = start_on(dir.path(), node, service, clock, &|v| {
+        with_listing(v);
+        v["public_url"] = json!("http://moved.test:8402");
+    });
+    let out = nostr::publish_once(&moved.gw, &keys, &relays, now).unwrap();
+    assert_eq!(out[0].result, Ok(()));
+    let del = relay.events(market::KIND_DELETION);
+    assert_eq!(del.len(), 1, "{del:?}");
+    let d = &del[0];
+    assert!(d.verify() && d.pubkey == keys.public_hex(), "signed by the shop's own Nostr key");
+    let tags = |n: &str| d.tags.iter().filter(|t| t[0] == n).map(|t| t[1].clone()).collect::<Vec<_>>();
+    assert_eq!(tags("a"), [format!("30402:{}:http://gateway.test:8402", keys.public_hex())]);
+    assert_eq!(tags("e"), [old_id]);
+    assert_eq!(tags("k"), ["30402"]);
+    // the stand-in keeps both listings, as a relay that ignores deletions does: the reader keeps the newest
+    let (events, _) = oneshot::query(&relays, &market::filter(10), Duration::from_secs(5));
+    assert_eq!(events.len(), 2);
+    let (got, _) = market::collect(&events, xbt_nostr::now());
+    assert_eq!(got.iter().map(|l| l.listing.seller.as_str()).collect::<Vec<_>>(), ["http://moved.test:8402"]);
+    // the listing at the new address is never withdrawn
+    assert!(!d.tags.iter().any(|t| t.get(1).is_some_and(|v| v.contains("moved.test"))));
+}

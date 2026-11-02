@@ -1058,6 +1058,30 @@ impl App {
         Ok(true)
     }
 
+    /// At start: [`App::follow_reach`] for the shop as it is saved, so a pay address left behind by a
+    /// change of reach before this version (a shop gone Private under 0.2.2) is put right without the
+    /// owner opening a page, and the hashmaker republishes its offer with the shop's address.
+    /// `Some(true)`: the address was changed. `None`: the shop is reached by its key and the gateway has
+    /// not said its key yet (it may still be starting); ask again.
+    ///
+    /// 0.2.5 did this only when the shop was saved or Sell → Hashrate was opened: a shop that went
+    /// Private before 0.2.3 kept a pay address that no longer answered, and renters failed at the
+    /// first piece of work.
+    pub fn follow_reach_at_start(&self) -> Option<bool> {
+        if !self.cfg.sell || self.hash_settings().get("payUrl").and_then(Value::as_str).is_none() {
+            return Some(false);
+        }
+        let shop = self.shop();
+        let key = if shop.direct { Some(self.own_shop_key_origin()?) } else { None };
+        match self.follow_reach(&shop, key.as_deref()) {
+            Ok(moved) => Some(moved),
+            Err(e) => {
+                eprintln!("xbt-wallet-ui: the hashmaker's pay address: {e}");
+                Some(false)
+            }
+        }
+    }
+
     /// Save the shop, and the gateway's config when the shop is complete and the config changes.
     /// A config that differs from the one there is only by the listing's date is not written: the
     /// gateway restarts on any change to it, and that would cut buyers' sessions for nothing.
@@ -1091,6 +1115,8 @@ impl App {
         if chain.is_empty() {
             return None;
         }
+        // the hashmaker is paid where buyers reach the shop now (main also asks again while the key is unknown)
+        let _ = self.follow_reach_at_start();
         let Ok(new) = self.shop_config(&self.shop(), &chain) else { return Some("not complete") };
         if self.config_is(&new) {
             return Some("unchanged");
@@ -1596,6 +1622,7 @@ impl App {
                 })
             })(),
             "shop" => {
+                let was_at = (!shop.direct && !shop.public_url.is_empty()).then(|| shop.public_url.clone());
                 shop.name = g("name").chars().take(200).collect();
                 // without a choice (an older page), a typed https address means a web shop
                 shop.direct = match g("reach").as_str() { "direct" => true, "web" => false, _ => g("public_url").trim().is_empty() };
@@ -1614,6 +1641,11 @@ impl App {
                     self.commit(&shop, "Saved.").and_then(|words| {
                         let key = key.or_else(|| self.own_shop_key_origin());
                         self.follow_reach(&shop, key.as_deref()).map(|_| words)
+                    }).map(|words| match was_at.filter(|_| shop.direct) {
+                        // #40: the gateway withdraws the old listing itself; a tunnel to the old address is the owner's
+                        Some(old) => format!("{words} Your shop's listing at {old} is withdrawn on Nostr when the shop restarts. \
+                            If a tunnel or proxy still sends {old} to this box, remove it there: the shop no longer uses that address."),
+                        None => words,
                     })
                 }
             }

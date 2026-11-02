@@ -280,6 +280,58 @@ fn rent_offers(base: &str, token: &Option<PathBuf>, keep: bool) -> Result<Value,
     }
 }
 
+/// How long a shop name read from a hashmaker's own shop is kept.
+const SHOP_NAME_FRESH: Duration = Duration::from_secs(3600);
+
+/// The name a hashmaker's shop gives itself in its own signed listing at `origin`
+/// (`/.well-known/lightning-stream.json`), for an offer whose shop is in no listing the app has. Never
+/// waits: the first ask goes on behind the page, and the page names the shop by its address until it
+/// answers. `None` while unknown, or when the shop serves no listing of its own address.
+fn listed_shop_name(origin: &str) -> Option<String> {
+    type Names = std::sync::Mutex<HashMap<String, (std::time::Instant, Option<String>)>>;
+    static NAMES: std::sync::LazyLock<std::sync::Arc<Names>> = std::sync::LazyLock::new(Default::default);
+    if (!origin.starts_with("https://") && !origin.starts_with("http://")) || xbt402::shop::is_shop(origin) {
+        return None;
+    }
+    let mut names = NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    match names.get(origin) {
+        Some((at, name)) if at.elapsed() < SHOP_NAME_FRESH => return name.clone(),
+        Some((_, name)) => {
+            let name = name.clone();
+            // asked again behind the page; the last answer serves meanwhile
+            names.insert(origin.to_string(), (std::time::Instant::now(), name.clone()));
+            spawn_name_lookup(NAMES.clone(), origin);
+            return name;
+        }
+        None => {}
+    }
+    names.insert(origin.to_string(), (std::time::Instant::now(), None));
+    if names.len() > 256 {
+        names.retain(|_, (at, _)| at.elapsed() < SHOP_NAME_FRESH);
+    }
+    drop(names);
+    spawn_name_lookup(NAMES.clone(), origin);
+    None
+}
+
+fn spawn_name_lookup(names: std::sync::Arc<std::sync::Mutex<HashMap<String, (std::time::Instant, Option<String>)>>>, origin: &str) {
+    let o = origin.to_string();
+    std::thread::spawn(move || {
+        let Some(name) = crate::nostr::own_listing_name(&o) else { return };
+        names.lock().unwrap_or_else(|p| p.into_inner()).insert(o, (std::time::Instant::now(), Some(name)));
+    });
+}
+
+/// Who sells an offer, as a person reads it: the shop's name from its listing (the Browse list, Found
+/// on Nostr, else the shop's own listing at its address), with its address only while none names it.
+/// 0.2.5 said "Miners from stream.example" for a shop with a name.
+pub(crate) fn offer_seller(known: &[crate::services::Service], pay_url: &str) -> String {
+    let Some(origin) = crate::services::http_origin(pay_url) else { return String::new() };
+    crate::services::shop_name(known, &origin)
+        .or_else(|| listed_shop_name(&origin))
+        .unwrap_or_else(|| crate::services::short_address(&origin))
+}
+
 /// One call to a service's control page.
 fn call(base: &str, token: &Option<PathBuf>, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
     crate::perf::timed(|| call_once(base, token, method, path, body))
@@ -907,6 +959,8 @@ impl App {
                     b.push_str("<p class=\"hint warn\">The only miners listed right now are your own, and a box can't rent from itself. \
                         Other people's offers appear here when they list them; your gateway is ready for them.</p>");
                 }
+                // the shops the app knows, read once for every offer's seller
+                let known = self.services().unwrap_or_default();
                 for x in &offers {
                     let price = num(&x["priceMsat"]) / 1000.0;
                     let slice = num(&x["sliceWork"]);
@@ -942,7 +996,7 @@ impl App {
                                  why_off.iter().map(|w| format!("<li>{}</li>", esc(w))).collect::<String>()))
                     };
                     // the seller by name: an offer called just "Hashrate" says whose it is
-                    let seller = crate::services::http_origin(pay_url).map(|o| self.seller_name(&o)).unwrap_or_default();
+                    let seller = offer_seller(&known, pay_url);
                     let title = match (x["name"].as_str().unwrap_or("Miners"), seller.is_empty()) {
                         (n, false) if n.eq_ignore_ascii_case("hashrate") || n.eq_ignore_ascii_case("miners") => format!("Miners from {seller}"),
                         (n, _) => n.to_string(),
@@ -1170,6 +1224,16 @@ fn state_row(ok: Option<bool>, what: &str) -> String {
     format!("<li>{} <span class=\"pill {class}\">{mark}</span></li>", esc(what))
 }
 
+/// Whether a job from the gateway was fetched and checked: what "your node" is, as the renter can see it.
+fn jobs_row(ok: Option<bool>) -> String {
+    let (class, mark) = match ok {
+        Some(true) => ("good", "checked"),
+        Some(false) => ("bad", "not yet"),
+        None => ("", "Not known yet"),
+    };
+    format!("<li>Jobs from your node <span class=\"pill {class}\">{mark}</span></li>")
+}
+
 impl App {
     /// This install comes with the Stream Gateway, and the page writes its config.
     pub(crate) fn stream_gw_here(&self) -> bool {
@@ -1193,12 +1257,14 @@ impl App {
             let saved = self.stream_gw_settings();
             let s = saved.clone().unwrap_or_else(|| Settings::new(Mode::Solo, ""));
             o.push_str(&format!("<p>The {NAME} comes with this app and runs beside it. It masks every job it hands out, so a hashmaker can't tell \
-                which shares win, and it takes its work from your own XBT node.</p>"));
+                which shares win, and it takes its work from your own XBT node.</p>\
+                <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>"));
             if b["inUse"] == true {
                 let node = b["node"].as_bool();
                 o.push_str("<ul class=\"plain\">");
                 o.push_str(&state_row(Some(b["running"] == true), "Running"));
-                o.push_str(&state_row(if b["running"] == true { node } else { None }, "Connected to your node"));
+                // what it measures: a job was fetched from the gateway and checked (it comes from your node)
+                o.push_str(&jobs_row(if b["running"] == true { node } else { None }));
                 o.push_str(&state_row(if node == Some(true) { Some(b["masking"] == true) } else { None }, "Masking its jobs"));
                 o.push_str("</ul>");
             } else if !b.is_null() {
@@ -1531,6 +1597,19 @@ fn th_hours(x: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An offer names its seller by the shop's listed name; its address only where no listing names it.
+    #[test]
+    fn an_offer_is_sold_by_the_shop_s_name() {
+        let shop = crate::services::Service {
+            name: "Demo Films".into(), kind: crate::services::Kind::Api, seller: "https://stream.example".into(), price_text: String::new(),
+            prices: serde_json::Value::Null, items: vec![], address: String::new(), app: String::new(), app_base: String::new(),
+        };
+        assert_eq!(super::offer_seller(std::slice::from_ref(&shop), "https://stream.example/hashrate"), "Demo Films");
+        // not in any listing the app has (and nothing answers there): its host, as a fallback
+        assert_eq!(super::offer_seller(&[shop], "https://other.invalid/hashrate"), "other.invalid");
+        assert_eq!(super::offer_seller(&[], ""), "");
+    }
+
     /// A disabled Rent says why: the gateway's state (in the page notice's own words), an unallowed hashmaker, an
     /// old app, no free machines; your own offer says only that; an offer that can be rented says nothing.
     #[test]

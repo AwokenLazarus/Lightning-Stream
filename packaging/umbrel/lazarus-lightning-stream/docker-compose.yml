@@ -413,9 +413,12 @@ services:
         condition: service_completed_successfully
       signer:
         condition: service_started
+    # --datum-candidates: the app's own Stream Gateway first. Umbrel's own DATUM Gateway app (datum_web_1)
+    # serves Bitcoin, so it is not offered as "found on this box" (0.2.6); an install that saved it is
+    # moved to the app's own gateway at start, as before.
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "0.0.0.0:23343",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
-              "--upstream", "auto", "--datum-candidates", "127.0.0.1:23339,datum_web_1:23334,datum-gateway_web_1:23334",
+              "--upstream", "auto", "--datum-candidates", "127.0.0.1:23339,datum-gateway_web_1:23334",
               "--user", "rented", "--relays", "wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
               "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:

@@ -22,12 +22,42 @@ pub fn load_key(state_dir: &std::path::Path) -> Result<Keys, String> {
     Keys::from_hex(&hex::encode(sk.secret_bytes())).ok_or_else(|| "nostr.key is not a key".into())
 }
 
-/// Sign the listing as it is now and send it to `relays` once. `now` dates the event.
+/// Each relay gets this long to list the gateway's own listings, for [`withdraw_left_behind`].
+pub const QUERY_WAIT: Duration = Duration::from_secs(10);
+
+/// Sign the listing as it is now and send it to `relays` once. `now` dates the event. Then withdraw
+/// any listing this key left on them for another address ([`withdraw_left_behind`]).
 pub fn publish_once(gw: &Gateway, keys: &Keys, relays: &[String], now: u64) -> Result<Vec<Outcome>, String> {
     let doc = gw.listing().ok_or("the gateway has no listing")?;
     let bind = gw.bind_nostr(&keys.public.serialize());
     let ev = market::listing_event_with(keys, &doc, &bind, gw.transport().as_ref(), now)?;
-    Ok(oneshot::publish(relays, &ev, PUBLISH_WAIT))
+    let out = oneshot::publish(relays, &ev, PUBLISH_WAIT);
+    let seller = xbt402::listing::verify_self(&doc).map(|l| xbt402::wire::canonical_origin(&l.seller))?;
+    match withdraw_left_behind(keys, relays, &seller, now) {
+        Ok(gone) if !gone.is_empty() => eprintln!("xbt-gateway: withdrew this shop's listing at {} on Nostr: it lists itself at {seller} now", gone.join(", ")),
+        Ok(_) => {}
+        Err(e) => eprintln!("xbt-gateway: an old listing was not withdrawn on Nostr: {e}"),
+    }
+    Ok(out)
+}
+
+/// A shop that changes its address, or how buyers reach it (its web address, then its key when it
+/// turns Private), lists itself under the new one: the listing is addressed by its seller, so the old
+/// one stayed on the relays beside it, and buyers saw the shop twice, once at an address that no
+/// longer sells (#40). This asks `relays` for the listings this key signed, and withdraws those for any
+/// other seller than `current` with a NIP-09 deletion signed by the same key. `Ok`: the old sellers
+/// withdrawn (none: nothing to do). Asked again at each publish, for a relay that missed it.
+pub fn withdraw_left_behind(keys: &Keys, relays: &[String], current: &str, now: u64) -> Result<Vec<String>, String> {
+    let (events, _) = oneshot::query(relays, &market::own_filter(&keys.public_hex()), QUERY_WAIT);
+    let old = market::left_behind(&events, &keys.public_hex(), current, now);
+    if old.is_empty() {
+        return Ok(vec![]);
+    }
+    let out = oneshot::publish(relays, &market::withdrawal_event(keys, &old, now), PUBLISH_WAIT);
+    if !out.iter().any(|o| o.result.is_ok()) {
+        return Err(out.iter().filter_map(|o| o.result.as_ref().err().map(|e| format!("{}: {e}", o.relay))).collect::<Vec<_>>().join("; "));
+    }
+    Ok(old.into_iter().map(|(d, _)| d).collect())
 }
 
 /// Publish now and every `cfg.republish` until the gateway stops.

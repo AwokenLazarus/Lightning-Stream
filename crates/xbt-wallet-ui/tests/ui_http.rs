@@ -2227,6 +2227,45 @@ fn a_shop_gone_private_is_paid_for_hashrate_at_its_key_address() {
     assert_eq!(pay(), json!("https://stream.example/hashrate"), "and back at the web address");
 }
 
+/// At start, with no save and no page opened: a shop that went Private before the pay address followed
+/// it (0.2.2) still has its old web address in the hashmaker's settings; the app puts it right, and the
+/// hashmaker republishes its offer with it.
+///
+/// FAILS before (0.2.5): the address followed only a Save or Sell → Hashrate, so renters kept failing at
+/// the first piece of work.
+#[test]
+fn at_start_the_hashmaker_is_paid_where_a_private_shop_is_reached() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    const NPUB: &str = "npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a";
+    let gateway = mock_http(|path| if path == "/.well-known/lightning-stream-link.json" {
+        (200, r#"{"npub": "npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a", "private": true}"#)
+    } else { (200, "{}") });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.gw.health_url = Some(format!("http://{gateway}/x402/ticket/health"));
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = dir.join("hashrate-settings.json");
+    });
+    let mut br = logged_in(&bx);
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    assert_eq!(r.status, 303);
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("reach", "direct"), ("private", "1")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    // the settings as a shop that went Private under 0.2.2 left them
+    std::fs::write(dir.join("hashrate-settings.json"), json!({"enabled": true, "payUrl": "https://stream.example/hashrate"}).to_string()).unwrap();
+    let pay = || serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("hashrate-settings.json")).unwrap()).unwrap()["payUrl"].clone();
+    assert!(bx._app.refresh_shop_config().is_some());
+    let key = xbt402::shop::parse(NPUB).unwrap();
+    assert_eq!(pay(), json!(format!("{key}/hashrate")), "paid at the shop's key address, at start");
+    assert_eq!(bx._app.follow_reach_at_start(), Some(false), "and only once");
+}
+
 #[test]
 fn without_sell_the_wallet_has_no_sell_page() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -4424,7 +4463,7 @@ fn the_rent_page_shows_the_bundled_gateways_state() {
         assert!(p.body.contains(head), "{head}: {}", p.body);
         let rows = &p.body[p.body.find("<ul class=\"plain\">").unwrap()..];
         let rows = &rows[..rows.find("</ul>").unwrap()];
-        assert!(rows.contains("Running") && rows.contains("Connected to your node") && rows.contains("Masking its jobs"), "{rows}");
+        assert!(rows.contains("Running") && rows.contains("Jobs from your node") && rows.contains("Masking its jobs"), "{rows}");
         assert_eq!(rows.matches("pill good").count(), good, "{head}: {rows}");
         let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
         let card = &card[..card.find("</section>").unwrap()];
