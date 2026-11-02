@@ -10,7 +10,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 Spending limits that say what they are, from a hands-on run of 0.2.5 with the demo shop's Jellyfin. A film
 froze near its end and the buyer was shown "the seller refused the lock: HTTP 402 too_many_sessions". The
 real cause was the buyer's own rule: at most 5,000 sat a day to one seller, about what one film costs at
-20 sat a MiB. The signer, the connector, the wallet UI and the seller's Sell page change.
+20 sat a MiB. The signer, the connector, the wallet UI and the seller's gateway change.
 
 - **A ticket your own rules refuse is never asked for.** The signer checked a prepaid ticket against the
   owner's spending rules only after the seller had issued its invoice. A refused ticket's invoice stayed
@@ -48,6 +48,20 @@ real cause was the buyer's own rule: at most 5,000 sat a day to one seller, abou
   and HEAD, compressed) under the app's own listing. Everything else under the app stays paid. Before, a
   free route added to the gateway's config by hand was dropped each time the app started or the Sell page
   was saved.
+- **Selling a Jellyfin 10.11 or newer works.** Newer Jellyfin turns off the older ways of passing a key
+  (`X-Emby-Token` and `api_key`), so the Sell page said a valid key was not accepted, and buyers' own accounts
+  could not be made or used. The Sell page's library check, the gateway's account calls and every buyer
+  request now pass the key or token in the `Authorization: MediaBrowser` header, which Jellyfin 10.10 accepts
+  too. In a buyer's request, the gateway keeps the app's own Client, Device, DeviceId and Version, and sends
+  exactly one token: the buyer's. The app's own tokens are removed, and the seller's key is never sent.
+- **The visit's credit is the connection's real balance.** The visit bar worked its credit out as what this
+  visit paid less what it used. That left out routing fees, credit from earlier visits and other use of the
+  same connection: it once showed 588 sat where 542.324 was left. It now shows the signer's balance for the
+  connection, as Live connections does, rounded down.
+- **Paid amounts add up.** A payment is shown as the exact sum of its parts, "902.009 sats (900 + 2.009
+  fee)", where it said 903. The same goes for "Paid so far" on Live connections. The spending rules still
+  count each payment in whole sats, rounded up, which is the safe side. Recent activity on the Wallet page
+  has **Show more**.
 - **Shops: two sessions from one address on mainnet.** The Sell page's mainnet default is now 2 sessions
   per buyer address (was 1), which is the gateway's own default. With 1, a buyer's own stale session could
   shut that buyer out. Unpaid invoices from one address are still capped at 2.
