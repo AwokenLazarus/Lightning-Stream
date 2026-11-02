@@ -5,6 +5,45 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.3 (2026-11-02)
+
+Usability, from Mike's hands-on run of 0.2.2 on Umbrel. The wallet UI, the VPN service and the signer
+change (one read added; payments are unchanged).
+
+- **Buy and Sell.** The main menu's Services is now Buy, beside Sell. Settings keeps Setup, Your node,
+  Spending rules and Keys and backup as tabs; Records, Stream relays and Old channels are under Advanced.
+- **Get started on Home.** A list of what is left (approval key, node, starter rules, a shop, a first
+  purchase), with the next step's button. The demo shop is added and allowed in one press, a service's page
+  says when its shop isn't allowed yet, with the button, and a shop is named by its listing everywhere.
+- **Real money in the same signature as the rules.** On mainnet, signing the starter rules carries one box,
+  "I understand the app pays with real money, within these rules", which writes the same confirmation Your
+  node writes; no separate page. Your node can still turn paying with real money off and on.
+- **One figure for what a payment cost.** Paid is what left your node: the shop's amount plus the routing fee,
+  from the wallet's settled record, with its two parts ("903 sats (900 + 2.009 fee)"). Wallet, Live
+  connections and the visit bar name the same three figures: paid, used and credit left. A booking before a
+  payment settles is shown as reserved, never as paid.
+- **Credit you have with a shop.** After a connection closes, what it left with the shop shows on Sellers, on
+  the shop's service page and on the Wallet's row. A visit that runs on earlier credit says how much is left.
+- **One Stop.** Stopping a visit also closes its connection with the shop, unless another visit to that shop
+  is still using it.
+- **Allowed means paid.** A shop allowed through its Lightning node's line in your rules is shown as allowed.
+  Before, Sellers, AI and Spending rules said it couldn't be paid while the wallet paid it. A node line is
+  shown as the shop's Lightning node, not as a coin address. A shop with no node on file gets a one-press fix.
+- **VPN exits.** Every exit the VPN service finds is listed, also a paid exit whose country isn't checked yet.
+  Before, a paid exit such as the Pi Demo's (SV, 1,000 sat/GB) was found but never shown. Found on Nostr on
+  the VPN page lists the exits your relays carry, with **Add this exit**; your devices then prefer it whenever
+  it meets their rules.
+- **Hashrate.** A shop that goes Private is paid at its key address. Before, the hashmaker went on publishing
+  the old web address and every rental failed at its first piece of work.
+- **Plain words and fewer keys.** Refused payments in Wallet activity are explained as the refusal pages
+  explain them. A shop is named by its name on the service and visit pages and in Wallet activity. Your
+  node's raw status is under Technical details. The AI address is also given by the box's IP address.
+- **Faster first pages.** Found on Nostr, Stream relays, VPN and Hashrate are asked once at start, in the
+  background. The signer's slow-changing reads now serve pages for 20 s (they were kept 3 s, too short to
+  help).
+- **Also:** the agent access key is shown only after Show the access key; starter rules' least node limit is
+  1,000,000 sats; Setup counts each seller and step once; Live connections shows a rate only while streaming.
+
 ## 0.2.2 (2026-11-02)
 
 A fix release for a first purchase, from a tester's hands-on run of 0.2.1.
