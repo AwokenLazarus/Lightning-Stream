@@ -1725,6 +1725,88 @@ fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {
     assert!(unescape(&r.body).contains("already uses /Videos/1/, so Other cannot have it"), "{}", r.body);
 }
 
+/// A web app's free paths (the Sell page's "Free paths"): each is a free GET/HEAD route of its own,
+/// with gzip, under the app's service and before its paid route, listed nowhere else. A media server
+/// is offered `/web/` (Jellyfin's and Plex's web client). They are the offer's, so the config the
+/// app writes again at every start and Save keeps them; a path under the app that is not one of
+/// them stays paid.
+#[cfg(unix)]
+#[test]
+fn a_web_apps_free_paths_are_free_routes_that_survive_a_refresh_and_the_rest_stays_paid() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    // a new media server's form offers /web/ as a free path
+    let page = unescape(&br.get("/sell").body);
+    assert!(page.contains("name=\"app_free\"") && page.contains(">/web/</textarea>"), "the form offers /web/ free");
+    let addr = format!("http://{media}");
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Jellyfin"),
+                                       ("app", "1"), ("app_entry", "/web/"), ("app_login", "X-Emby-Token: guest-1"), ("app_deny", "/web/admin/"),
+                                       ("app_free", "/web/")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    let id = shop["offers"][0]["id"].as_str().unwrap().to_string();
+    let check = |why: &str| {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+        let at = |p: &str| cfg.routes.iter().position(|r| r.path == p).unwrap_or_else(|| panic!("{why}: no route {p}: {c}"));
+        let (web, root) = (&cfg.routes[at("/web/")], &cfg.routes[at("/")]);
+        assert!(at("/web/") < at("/"), "{why}: the free route is written before the app's paid one");
+        assert!(web.free && web.accept_gzip, "{why}: /web/ is free, with gzip");
+        assert_eq!(web.methods, ["GET", "HEAD"], "{why}: a free path is read only");
+        assert_eq!((web.service.as_str(), web.upstream.as_deref()), (id.as_str(), Some(addr.as_str())), "{why}: the app's own service");
+        assert!(web.upstream_headers.is_empty() && !web.websocket, "{why}: the seller's guest login is never sent on a free route");
+        assert!(web.path_refused("/web/admin/x"), "{why}: the app's refused paths hold on its free path too");
+        assert!(!root.free && root.price.byte_msat == 20_000, "{why}: the app's own route stays paid");
+        // longest prefix: a path under the app that is not a free one is the paid route's
+        assert_eq!(cfg.route("/Videos/abc/stream").map(|r| (r.path.as_str(), r.free)), Some(("/", false)), "{why}");
+        assert_eq!(cfg.route("/web/main.bundle.js").map(|r| (r.path.as_str(), r.free)), Some(("/web/", true)), "{why}");
+        assert_eq!(cfg.route("/webhooks").map(|r| r.free), Some(false), "{why}: only under /web/");
+        let l = cfg.listing.unwrap();
+        assert_eq!(l.services.iter().filter(|s| s.path == "/web/").count(), 0, "{why}: no listing entry of its own");
+        assert_eq!(l.services.len(), 2, "{why}: the media server and its web app, as before: {:?}", l.services);
+    };
+    check("saved");
+    // written again at start: unchanged, and a route lost by hand comes back
+    assert_eq!(bx._app.refresh_shop_config(), Some("unchanged"));
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    c["routes"].as_array_mut().unwrap().retain(|r| r["path"] != "/web/");
+    std::fs::write(dir.join("config.json"), c.to_string()).unwrap();
+    assert_eq!(bx._app.refresh_shop_config(), Some("written"));
+    check("after a refresh");
+    // the form shows what was saved
+    let page = unescape(&br.get(&format!("/sell?edit={id}")).body);
+    assert!(page.contains(">/web/</textarea>"), "the saved free path is shown");
+    // emptied: the free route goes, and /web/ is the paid route's again
+    br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Jellyfin"),
+                               ("app", "1"), ("app_entry", "/web/"), ("app_free", "")]);
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    assert_eq!(cfg.route("/web/main.bundle.js").map(|r| (r.path.as_str(), r.free)), Some(("/", false)));
+    let page = unescape(&br.get(&format!("/sell?edit={id}")).body);
+    assert!(!page.contains(">/web/</textarea>"), "an emptied list is not offered again");
+    // what is not a path below the app is refused in plain words
+    for bad in ["/", "web/", "/web/../System/", "/a b/"] {
+        let r = br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+                                           ("name", "Jellyfin"), ("app", "1"), ("app_free", bad)]);
+        assert!(unescape(&r.body).contains("free path"), "{bad}: {}", r.body);
+    }
+}
+
 /// Buyers' own accounts set up on the Sell page (docs/BUYER-ACCOUNTS.md): the seller pastes the
 /// Jellyfin API key, the shop checks it against the service and lists its libraries, keeps the key
 /// in a file beside the gateway's config that the page never shows again, and the route names the
