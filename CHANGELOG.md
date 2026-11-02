@@ -5,6 +5,26 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.1 (2026-11-02)
+
+A fix to 0.2.0.
+
+- On Browse, **Found on Nostr**, a shop reached by its key (such as the demo shop, Lightning Stream
+  Genesis) now offers **Add this shop**. Its list is signed by the key that is its address, so it is the
+  shop's own. Before, it offered only *Check with the seller*, which asks the seller's web address; a
+  shop reached by its key has none, so the check failed with a name-lookup error. Adding the shop by its
+  key under Sellers worked all along.
+- **A file that costs less than a shop's smallest ticket can be bought.** A Download, or a file opened
+  in your player, now lets its first call buy one whole ticket (546 sat, 559 with routing fees, at the
+  least) even when the file costs less, such as Big Buck Bunny at Lightning Stream Genesis (about 284
+  sat). What the file doesn't use stays as credit with the shop. Before, the call's limit was the
+  file's own price, so a buyer with no credit got a raw JSON refusal and nothing was paid. Where the
+  wallet names a larger smallest ticket (up to 2,000 sat), the call is made once more with it, and any
+  other refusal is now a page in words. Your spending rules still apply to every payment.
+- **A web-app visit needs a limit of at least 559 sat.** A smaller limit opened a visit whose first
+  request said the limit was reached with nothing spent. The form now refuses it, says why, and sets
+  the limit to 559 sat for you to confirm; what a visit doesn't use stays as credit with the shop.
+
 ## 0.2.0 (2026-11-01)
 
 A public test release. What is new since 0.1.19, in short; the sections below give the details.

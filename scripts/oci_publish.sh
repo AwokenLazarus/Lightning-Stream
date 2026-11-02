@@ -39,11 +39,20 @@ while [ $# -gt 0 ]; do
     --skip-cargo) SKIP=(--skip-cargo) ;;
     --registry) REGISTRY=${2%/}; shift ;;
     --no-pin) PIN=0 ;;
-    *) echo "usage: $0 [--skip-cargo] [--registry ghcr.io/OWNER] [--no-pin]" >&2; exit 2 ;;
+    --only) ONLY=$2; shift ;;
+    *) echo "usage: $0 [--skip-cargo] [--registry ghcr.io/OWNER] [--no-pin] [--only IMAGE[,IMAGE...]]" >&2; exit 2 ;;
   esac
   shift
 done
 IMAGES=(xbt-init xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-gateway lightning-stream xbt-hashlink xbt-stream-relay xbt-vpn xbt-datum-gateway)
+# --only: a fix release rebuilds the images it changes; the lock keeps the other images' lines as they are
+KEEP=()
+if [ -n "${ONLY:-}" ]; then
+  IFS=, read -r -a WANT <<<"$ONLY"
+  for i in "${WANT[@]}"; do [[ " ${IMAGES[*]} " == *" $i "* ]] || { echo "oci_publish: no image $i" >&2; exit 2; }; done
+  for i in "${IMAGES[@]}"; do [[ " ${WANT[*]} " == *" $i "* ]] || KEEP+=("$i"); done
+  IMAGES=("${WANT[@]}")
+fi
 if git status --porcelain --untracked-files=no | grep -q .; then
   echo "oci_publish: the tree has uncommitted changes; commit first (a published image names its commit)" >&2; exit 1
 fi
@@ -62,10 +71,11 @@ done
 scripts/oci_build.sh "${SKIP[@]}" --only "$(IFS=,; echo "${IMAGES[*]}")" --push "$REGISTRY"
 
 # the registry serves, under the tag, the very index of the inspected archive, with the three platforms
-python3 - "$OUT" "$REGISTRY" "$TAG" "$LOCK" "$REV" "${IMAGES[@]}" <<'PY'
+KEEP_LINES=$(for i in "${KEEP[@]}"; do grep -E "^$i " "$LOCK" || { echo "oci_publish: $LOCK has no line for $i to keep" >&2; exit 1; }; done)
+python3 - "$OUT" "$REGISTRY" "$TAG" "$LOCK" "$REV" "$KEEP_LINES" "${IMAGES[@]}" <<'PY'
 import hashlib, json, subprocess, sys, tarfile
-out, registry, tag, lock, rev, *images = sys.argv[1:]
-lines = []
+out, registry, tag, lock, rev, keep, *images = sys.argv[1:]
+lines = [l for l in keep.splitlines() if l.strip()]
 for img in images:
     with tarfile.open(f"{out}/{img}.tar") as t:
         archive = json.load(t.extractfile("index.json"))["manifests"][0]["digest"]
@@ -82,7 +92,8 @@ for img in images:
 with open(lock, "w") as f:
     f.write("# The published images the packages pin, written by scripts/oci_publish.sh. One line per image:\n"
             "#   <image> <registry>/<image>:<version>-<commit>@<index digest>\n"
-            f"# Built from commit {rev} for linux/amd64, linux/arm64 and linux/arm/v7. packaging/pin_images.py writes\n"
+            f"# Built from commit {rev}" + (" (" + ", ".join(images) + "; the other lines are kept from the lock before)" if keep.strip() else "")
+            + " for linux/amd64, linux/arm64 and linux/arm/v7. packaging/pin_images.py writes\n"
             "# them into the Umbrel compose files and the StartOS specs; packaging/umbrel/lint.py checks they agree.\n")
     f.write("\n".join(lines) + "\n")
 PY

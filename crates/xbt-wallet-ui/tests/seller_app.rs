@@ -573,7 +573,7 @@ fn a_visit_to_a_shop_reached_by_key_is_headed_by_the_shops_name() {
     assert!(!shown(&page).contains(".shop.invalid") && shown(&page).contains(&short), "before the visit: {}", shown(&page));
     let csrf = { let i = page.find("name=\"csrf\" value=\"").unwrap() + 19; page[i..i + page[i..].find('"').unwrap()].to_string() };
     let page = agent.post(&format!("{wallet}/app")).set("Cookie", &session).set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string(&format!("csrf={csrf}&{q}&limit=500")).unwrap().into_string().unwrap();
+        .send_string(&format!("csrf={csrf}&{q}&limit=600")).unwrap().into_string().unwrap();
     assert!(page.contains("data-visit=\""), "the visit opened: {page}");
     assert_eq!(heading(&page), "Home films", "headed by the shop's name");
     assert!(!shown(&page).contains(".shop.invalid") && shown(&page).contains(&short), "during the visit: {}", shown(&page));
@@ -653,12 +653,12 @@ fn two_apps_of_one_seller_are_two_visits_on_two_origins() {
     assert!(page_of(&format!("{jf}web/"), &jf).contains("You stay anonymous at this shop"));
     assert_eq!(rig.call("identity_get", json!({}))["anonymous"], json!([seller.clone()]));
     let (jf_visit, jf_port, jf_cookie, csrf) = open(&format!("{jf}web/"), &jf, 900);
-    let (pod_visit, pod_port, pod_cookie, _) = open(&pod, &pod, 300);
+    let (pod_visit, pod_port, pod_cookie, _) = open(&pod, &pod, 600);
     assert_ne!(jf_port, pod_port, "two apps of one seller are two origins");
     assert!(ports.contains(&jf_port) && ports.contains(&pod_port));
     assert_ne!(jf_visit, pod_visit);
     // each visit has the limit it was opened with
-    for (v, limit) in [(&jf_visit, 900), (&pod_visit, 300)] {
+    for (v, limit) in [(&jf_visit, 900), (&pod_visit, 600)] {
         let (_, _, body) = send("GET", &format!("http://{}/visits/{v}", crun.addr), "", None);
         assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["limit_sats"], limit, "{body}");
     }

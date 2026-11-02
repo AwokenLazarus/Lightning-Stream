@@ -12,6 +12,11 @@ name: Publish images
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Rebuild only these images (comma-separated), keeping the lock's other lines; empty builds all"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -67,7 +72,8 @@ jobs:
       - name: Build and publish
         env:
           OWNER: ${{ github.repository_owner }}
-        run: scripts/oci_publish.sh --no-pin --registry "ghcr.io/${OWNER,,}"
+          ONLY: ${{ inputs.only }}
+        run: scripts/oci_publish.sh --no-pin --registry "ghcr.io/${OWNER,,}" ${ONLY:+--only "$ONLY"}
       - name: Keep the digests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
