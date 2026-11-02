@@ -121,7 +121,8 @@ def run_one(name: str, gw: str, mode: str, a: argparse.Namespace) -> dict[str, A
         f.write("regtest=1\nserver=1\nlistenonion=0\ndiscover=0\ndnsseed=0\nfixedseeds=0\nfallbackfee=0.0002\ntxindex=1\nblake2b_headline=Lazarus\n"
                 f"[regtest]\nlisten=1\nbind=127.0.0.1\nport={p2p}\nrpcbind=127.0.0.1\nrpcallowip=127.0.0.1\nrpcport={rpc}\n"
                 f"testactivationheight=blake2b@101\nmaxtipage=315360000\n"
-                f"blocknotify=/bin/sh -c 'echo %s $(date +%s.%N) >> {stamps}; /usr/bin/curl -fsS -m 2 -o /dev/null http://127.0.0.1:{api}/NOTIFY'\n")
+                # the node puts the block hash for every %s: the clock's own %s is split so it isn't one
+                f"blocknotify=/bin/sh -c 'echo %s $(date \"+%\"\"s.%N\") >> {stamps}; /usr/bin/curl -fsS -m 2 -o /dev/null http://127.0.0.1:{api}/NOTIFY'\n")
     env = {**os.environ, "LD_LIBRARY_PATH": f"{HG}/lib"}
     procs: list[subprocess.Popen[bytes]] = []
     clients: list[Client] = []
@@ -180,6 +181,8 @@ def run_one(name: str, gw: str, mode: str, a: argparse.Namespace) -> dict[str, A
             for _ in range(a.txs):
                 cli("-rpcwallet=w", "sendtoaddress", address, "0.001")
             time.sleep(a.settle_s)  # the gateway's own template refresh (work_update_seconds) takes the transactions in
+            with clients[0].lock:
+                known = {e[2] for e in clients[0].events}  # previous blocks seen so far: a new one is this block's
             prev = cli("generatetoaddress", "1", address)
             block = json.loads(prev)[0]
             deadline = time.time() + 20
@@ -189,7 +192,7 @@ def run_one(name: str, gw: str, mode: str, a: argparse.Namespace) -> dict[str, A
                 firsts, fulls = [], []
                 for c in clients:
                     with c.lock:
-                        ev = [e for e in c.events if e[2] and prevhash_matches(e[2], block)]
+                        ev = [e for e in c.events if e[2] and (prevhash_matches(e[2], block) or e[2] not in known)]
                     if ev:
                         firsts.append(ev[0][0])
                         full = [e for e in ev if not e[1].startswith(("N", "Q"))]
