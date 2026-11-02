@@ -27,6 +27,8 @@ impl App {
         let snap = self.nostr.get(false);
         match snap.listings.iter().find(|n| n.event_id == id) {
             None => self.flash(ctx, false, "That listing is no longer on the relays. Reload the page."),
+            // a shop reached by its key has no web address to ask: the key that signed the list is its address
+            Some(n) if key_shop(n) => self.flash(ctx, true, format!("{} is reached by its key, and this list is signed by that key: it is the shop's own. Press Add this shop.", n.listing.name)),
             Some(n) => match nostr::check(n) {
                 Ok(_) => self.flash(ctx, true, format!("{} confirms this listing is its own: it signs with the same key.", n.listing.seller)),
                 Err(e) => self.flash(ctx, false, format!("{}: {e}", n.listing.seller)),
@@ -55,12 +57,24 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot) -> String {
         return b;
     }
     for n in &snap.listings {
-        b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill warn\">unvetted</span></div>\
-                             <p class=\"small\">{}</p><details><summary>Keys</summary><p class=\"small\">Nostr key <code>{}</code>, receipt key <code>{}</code></p></details>\
-                             <form method=\"post\" action=\"./nostr-check\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-                             <input type=\"hidden\" name=\"event\" value=\"{}\"><button type=\"submit\" class=\"secondary\">Check with the seller</button></form>",
-                            esc(&n.listing.name), esc(&n.listing.seller), esc(&n.author), esc(&n.listing.receipt_key),
-                            esc(&ctx.csrf), esc(&n.event_id)));
+        if key_shop(n) {
+            // a shop without a web address: its address is its key, and the listing is signed by that key, so
+            // there is no other address to ask. It is added as a shop key on Sellers ([`App::add_seller`])
+            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill\">reached by its key</span></div>\
+                                 <p class=\"small\">Shop key <code class=\"key\">{}</code>. This list is signed by that key, so it is the shop's own; \
+                                 who runs the shop is not checked by anyone.</p>\
+                                 <form method=\"post\" action=\"./services\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+                                 <input type=\"hidden\" name=\"action\" value=\"add\"><input type=\"hidden\" name=\"url\" value=\"{}\">\
+                                 <button type=\"submit\">Add this shop</button></form>",
+                                esc(&n.listing.name), esc(&xbt402::shop::display(&n.listing.seller)), esc(&ctx.csrf), esc(&n.listing.seller)));
+        } else {
+            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill warn\">unvetted</span></div>\
+                                 <p class=\"small\">{}</p><details><summary>Keys</summary><p class=\"small\">Nostr key <code>{}</code>, receipt key <code>{}</code></p></details>\
+                                 <form method=\"post\" action=\"./nostr-check\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+                                 <input type=\"hidden\" name=\"event\" value=\"{}\"><button type=\"submit\" class=\"secondary\">Check with the seller</button></form>",
+                                esc(&n.listing.name), esc(&n.listing.seller), esc(&n.author), esc(&n.listing.receipt_key),
+                                esc(&ctx.csrf), esc(&n.event_id)));
+        }
         for s in nostr::to_services(n) {
             b.push_str(&format!("<h3>{} <span class=\"pill cat-{}\">{}</span></h3><p class=\"price\">{}</p>", esc(&s.name), s.category(),
                                 esc(s.category_words()), esc(&s.price_text)));
@@ -77,4 +91,38 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot) -> String {
         b.push_str("</section>");
     }
     b
+}
+
+/// Whether `n` is the listing of a shop without a web address whose address is the key that signed it.
+fn key_shop(n: &xbt_nostr::market::NostrListing) -> bool {
+    xbt402::shop::key_of(&n.listing.seller).is_some_and(|k| hex::encode(k) == n.author.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_shop;
+    use serde_json::json;
+
+    fn listing(seller: &str, author: &str) -> xbt_nostr::market::NostrListing {
+        xbt_nostr::market::NostrListing {
+            listing: xbt402::listing::Listing { name: "Shop".into(), kind: "shop".into(), seller: seller.into(), receipt_key: String::new(), prices: json!({}),
+                                                items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![] },
+            author: author.into(), event_id: "e".into(), created_at: 0, transport: None,
+        }
+    }
+
+    /// A shop reached by its key is offered to add: its address is the key that signed its list. Its list can't be
+    /// checked with the seller over the web, so Found on Nostr must not offer only that check (it failed on a name
+    /// lookup of the shop's made-up address, the 0.2.0 Genesis report).
+    ///
+    /// FAILS without `key_shop`: the card offers "Check with the seller" alone.
+    #[test]
+    fn a_shop_reached_by_its_key_is_offered_to_add_when_its_key_signed_the_list() {
+        let pk = [7u8; 32];
+        let origin = xbt402::shop::origin_for(&pk);
+        assert!(key_shop(&listing(&origin, &hex::encode(pk))), "the key in the address signed it");
+        assert!(key_shop(&listing(&origin, &hex::encode(pk).to_uppercase())));
+        assert!(!key_shop(&listing(&origin, &hex::encode([8u8; 32]))), "another key signed a list naming this address");
+        assert!(!key_shop(&listing("https://seller.example", &hex::encode(pk))), "a shop with a web address is checked with the seller");
+    }
 }
