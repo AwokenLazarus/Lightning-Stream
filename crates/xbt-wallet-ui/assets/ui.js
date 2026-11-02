@@ -525,6 +525,22 @@
         toggle.setAttribute("aria-expanded", open ? "true" : "false");
       });
     }
+    // The theme: dark by default, light when the owner picks it here; kept in this browser
+    // (vt.js applies it before the next page's first paint).
+    var theme = $(".theme-toggle"), html = doc.documentElement;
+    if (theme) {
+      var show = function () {
+        var light = html.getAttribute("data-theme") === "light";
+        theme.setAttribute("aria-pressed", light ? "true" : "false");
+      };
+      show();
+      theme.addEventListener("click", function () {
+        var light = html.getAttribute("data-theme") !== "light";
+        if (light) html.setAttribute("data-theme", "light"); else html.removeAttribute("data-theme");
+        try { root.localStorage.setItem("ls-theme", light ? "light" : "dark"); } catch (e) { /* no storage: this page only */ }
+        show();
+      });
+    }
   }
 
   // Live connections: when money moved since the last look, a pulse runs down the river.
