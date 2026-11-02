@@ -805,3 +805,80 @@ fn a_media_servers_answers_come_whole_to_the_browser() {
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
+
+/// A visit to a shop that ended without its Stop (its page closed, its limit reached) does not keep the
+/// shop's connection open when the next visit to that shop is stopped: the visit's Stop closes the
+/// connection unless another visit the connector still holds open uses it, and the ended visit's grant
+/// is dropped.
+///
+/// FAILS before: any grant to the shop counted, however long ago its visit ended, so after one earlier
+/// visit the Stop left the connection "Open, idle" on Live connections.
+#[test]
+fn a_visits_stop_is_not_held_back_by_an_earlier_visit_that_ended() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let sl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let seller = format!("http://{}", sl.local_addr().unwrap());
+    let _srun = xbt_svc::http::serve(Arc::new(Seller { report: Arc::new(Mutex::new(None)) }), sl, 8).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (pay_sock, _) = signer(dir.path());
+    let crun = lightning_stream::serve(lightning_stream::Config { signer: pay_sock, stream_dir: dir.path().to_path_buf(), task: "app".into(), max_sats: 2_000 },
+                                       std::net::TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
+    let rig = Rig::new(json!({}), true);
+    let sock_path = rig.dir.path().join("signer.sock");
+    let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("ui")).unwrap();
+    let jf = format!("{seller}/jf/");
+    std::fs::write(data.path().join("ui/services.json"), json!([
+        {"name": "Films", "kind": "video", "seller": seller, "price_text": "20 sat a MiB", "items": [], "app": format!("{jf}web/"), "app_base": jf}]).to_string()).unwrap();
+    let (srv, _) = spawn_ui(1, |ports| {
+        let mut cfg = Config::for_test(sock_path.clone(), data.path().join("ui"), "127.0.0.1:0");
+        cfg.connector = format!("http://{}", crun.addr);
+        cfg.app_ports = ports;
+        cfg
+    });
+    let wallet = format!("http://{}", srv.addr);
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let r = agent.post(&format!("{wallet}/setup-password")).set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&format!("code={}&password=a+long+box+password&password2=a+long+box+password", code.trim()));
+    let r = match r { Ok(x) | Err(ureq::Error::Status(_, x)) => x, Err(e) => panic!("{e}") };
+    let session = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let enc = xbt_wallet_ui::services::urlenc;
+    let q = format!("u={}&b={}", enc(&format!("{jf}web/")), enc(&jf));
+    let open = || {
+        let page = agent.get(&format!("{wallet}/app?{q}")).set("Cookie", &session).call().unwrap().into_string().unwrap();
+        let csrf = { let i = page.find("name=\"csrf\" value=\"").unwrap() + 19; page[i..i + page[i..].find('"').unwrap()].to_string() };
+        let page = agent.post(&format!("{wallet}/app")).set("Cookie", &session).set("Content-Type", "application/x-www-form-urlencoded")
+            .send_string(&format!("csrf={csrf}&{q}&limit=1000")).unwrap().into_string().unwrap();
+        let field = |attr: &str| { let i = page.find(&format!("{attr}=\"")).unwrap() + attr.len() + 2; page[i..i + page[i..].find('"').unwrap()].to_string() };
+        let (visit, port, code) = (field("data-visit"), field("data-port").parse::<u16>().unwrap(), field("data-code"));
+        let r = agent.get(&format!("http://127.0.0.1:{port}/__ls/enter?c={code}")).call().unwrap();
+        (visit, port, r.header("set-cookie").unwrap().split(';').next().unwrap().to_string(), csrf)
+    };
+    let (first, port, first_cookie, _) = open();
+    // the first visit ends without its Stop: the connector holds it no more (its limit, its page closed)
+    let (st, _, _) = browser_ask_url(&format!("http://{}/visits/{first}/stop", crun.addr));
+    assert_eq!(st, 200);
+    let (second, port2, _, csrf) = open();
+    assert_eq!(port, port2, "one shop, one port");
+    let r = agent.post(&format!("{wallet}/app-stop")).set("Cookie", &session).set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&format!("csrf={csrf}&visit={second}"));
+    assert_eq!(match r { Ok(x) | Err(ureq::Error::Status(_, x)) => x.status(), Err(e) => panic!("{e}") }, 303);
+    // the ended visit's grant went with it: its cookie opens nothing more on the port
+    let got = browser_ask(port, "GET", "/web/", &first_cookie, b"").unwrap();
+    assert_eq!(got.0, 403, "{}", got.1);
+}
+
+/// A POST with an empty body to `url`, read whole: (status, head, body).
+fn browser_ask_url(url: &str) -> (u16, String, Vec<u8>) {
+    let rest = url.strip_prefix("http://").unwrap();
+    let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap();
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    write!(s, "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    let mut all = vec![];
+    let _ = s.read_to_end(&mut all);
+    let split = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&all[..split]).to_string();
+    (head[9..12].parse().unwrap(), head, all[split + 4..].to_vec())
+}
