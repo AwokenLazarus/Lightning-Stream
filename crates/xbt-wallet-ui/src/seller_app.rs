@@ -340,10 +340,10 @@ impl App {
             };
             // another visit to the shop counts only while the connector holds it open: a grant outlives a visit that ended
             // without a Stop (its page closed, its limit reached, its idle time out), and such a grant kept the connection open
-            let ended: Vec<String> = others.into_iter().filter(|id| !self.visit_open(id)).collect();
+            let gone: Vec<String> = others.into_iter().filter(|id| !self.visit_open(id)).collect();
             let still_used = {
                 let mut s = self.apps.lock();
-                s.grants.retain(|_, g| !ended.contains(&g.visit));
+                s.grants.retain(|_, g| !gone.contains(&g.visit));
                 s.grants.values().any(|g| g.direct.is_none() && crate::services::http_origin(&g.base) == origin)
             };
             // one Stop ends it all: the connection the visit paid through closes too, unless another open visit to that shop still uses it
