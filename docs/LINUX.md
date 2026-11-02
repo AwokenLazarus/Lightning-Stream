@@ -44,7 +44,7 @@ amounts only: the software is tested on mainnet with small amounts.
 - **For a hashtaker, nothing more:** the app comes with the Stream Gateway (DATUM-compatible), a gateway
   that masks its jobs, so a hashmaker can't tell which shares would be blocks and keep those back. It
   works on your XBT node above, over RPC, with no change to the node's config. You choose solo (blocks
-  paid to your own XBT address) or Lazarus Pool on **Services → Hashrate**, under *Your gateway*.
+  paid to your own XBT address) or Lazarus Pool on **Buy → Hashrate**, under *Your gateway*.
   - **Your own DATUM Gateway instead:** `install.sh` asks. The app opens each job on your gateway's API
     (`/xbt/job`) before a miner gets it and refuses the rental if the job isn't masked. A stock DATUM
     Gateway doesn't mask its jobs and has no `/xbt/job`, so with one every rental is refused (nothing is
@@ -169,7 +169,7 @@ If a payment can't find a route:
 
 Programs on this machine that work with OpenAI's API (Open WebUI, coding agents, scripts) can use
 the AI sellers you allowed through `http://127.0.0.1:33540/v1`, each with a key you make on
-**Services → AI**. To let programs on other machines of your LAN use it, set
+**Buy → AI**. To let programs on other machines of your LAN use it, set
 `LS_AI_BIND=0.0.0.0:33540` and `LS_AI_ADDRESS=http://<this machine's LAN address>:33540/v1` in `.env`,
 then `docker compose up -d`. Every request needs a key either way. docs/INFERENCE.md has the rest.
 
@@ -177,7 +177,7 @@ then `docker compose up -d`. Every request needs a key either way. docs/INFERENC
 
 You rent hashrate into the Stream Gateway and pay for each piece of work:
 
-1. **Services → Hashrate.** Under *Your gateway*, choose solo and your XBT payout address, or Lazarus
+1. **Buy → Hashrate.** Under *Your gateway*, choose solo and your XBT payout address, or Lazarus
    Pool. Then check that it says *Ready to rent*: the gateway answers and its jobs are masked.
 2. **Miners for rent** lists the offers hashmakers publish on Nostr (relay.lazarus-xbt.xyz,
    relay.kilombino.com, relay.damus.io and nos.lol by default). For a hashmaker you haven't paid before, press **Allow this hashmaker to be paid**. The rules

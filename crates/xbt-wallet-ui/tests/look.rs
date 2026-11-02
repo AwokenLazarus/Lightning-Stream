@@ -182,7 +182,7 @@ fn the_look_in_headless_chrome() {
         ["browse-apps", apps.clone()], ["browse-files", "/browse?cat=files"],
         ["service-files", format!("/service?seller={}&name={}", enc("https://files.example"), enc("Open films and books"))], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
         ["sell", "/sell"], ["sell-files", "/sell#service-form"], ["sell-reach", "/sell#shop-reach"], ["sell-capacity", "/sell#capacity"], ["wallet", "/wallet"],
-        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"], ["ai", "/ai"], ["vpn", "/vpn"], ["sell-vpn", "/sell-vpn"]]).to_string();
+        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["records", "/signatures"], ["relays", "/relays"], ["ai", "/ai"], ["vpn", "/vpn"], ["sell-vpn", "/sell-vpn"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
         .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),
@@ -214,7 +214,7 @@ fn the_look_in_headless_chrome() {
 
 /// The Hashrate pages against running hashrate services (`XBT_UI_HASH_SHOTS=1`, with
 /// `XBT_UI_HASH_HASHER` and `XBT_UI_HASH_RENTER` their control pages, `XBT_UI_HASH_TOKEN` the
-/// token file): screenshots of Sell → Hashrate, Services → Hashrate and Live connections, in light,
+/// token file): screenshots of Sell → Hashrate, Buy → Hashrate and Live connections, in light,
 /// dark and at phone width, into `$XBT_UI_LOOK_DIR`.
 #[test]
 fn the_hashrate_pages_in_headless_chrome() {

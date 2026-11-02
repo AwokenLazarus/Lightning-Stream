@@ -6,7 +6,7 @@
 //! rental. Renters pay each piece of work through this box's shop, which sells it under
 //! `/hashrate/` (the route [`App::hash_route`] adds).
 //!
-//! Services → Hashrate (`XBT_UI_HASHRENT`): the owner rents other people's miners into their own
+//! Buy → Hashrate (`XBT_UI_HASHRENT`): the owner rents other people's miners into their own
 //! DATUM Gateway (the pool is chosen there, not here), with a budget, and can cut a rental at any
 //! time. Rentals also show on Live connections.
 //!
@@ -806,7 +806,7 @@ impl App {
         Resp::redirect("./sell-hashrate")
     }
 
-    // --- Services → Hashrate ---------------------------------------------------------------------
+    // --- Buy → Hashrate ------------------------------------------------------------------------
 
     /// Rentals going on (for Live connections): cards with a Cut button, and what they spent.
     pub(crate) fn hash_live_cards(&self, ctx: &Ctx) -> (String, i64) {

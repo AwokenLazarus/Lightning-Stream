@@ -49,7 +49,7 @@
 //! | `XBT_UI_HASHER_SETTINGS` | `$XBT_DATA_DIR/run/hashrate/settings.json` | the settings file the Hashrate page writes and the hasher service reads |
 //! | `XBT_UI_HASHER_SLICES` | | where the shop passes paid slices of work to the hasher service (`http://…`): the shop then sells them under `/hashrate/` |
 //! | `XBT_UI_HASHER_TOKEN_FILE` | | the hasher service's control token (its `--control-token-file`) |
-//! | `XBT_UI_HASHRENT` | | the renter service's control page (`http://…`): turns on Services → Hashrate, renting other people's miners |
+//! | `XBT_UI_HASHRENT` | | the renter service's control page (`http://…`): turns on Buy → Hashrate, renting other people's miners |
 //! | `XBT_UI_HASHRENT_TOKEN_FILE` | | the renter service's control token |
 //! | `XBT_UI_AI_ENDPOINT` | | the AI endpoint's address for programs on the owner's network (`http://umbrel.local:33540/v1`): turns on the AI page's address and keys |
 //! | `XBT_UI_AI_SELLERS` | `$XBT_DATA_DIR/run/ai/sellers.json` | the AI sellers and the owner's pins and blocks, written by the AI page, read by the endpoint |

@@ -78,6 +78,9 @@ nav.tabs a { color: var(--muted); text-decoration: none; padding: 6px 14px; bord
              background: var(--card); }
 nav.tabs a:hover { color: var(--fg); border-color: var(--accent); }
 nav.tabs a[aria-current=page] { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); font-weight: 600; }
+/* a section's Advanced pages: a second, smaller row under its tabs */
+nav.tabs.sub { margin-top: -6px; padding-left: 12px; border-left: 2px solid var(--line); }
+nav.tabs.sub a { padding: 4px 12px; font-size: 0.86rem; }
 a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
   outline: 3px solid var(--accent); outline-offset: 2px; }
 

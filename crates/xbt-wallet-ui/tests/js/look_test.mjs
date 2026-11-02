@@ -146,7 +146,8 @@ try {
       cdp("Page.screencastFrameAck", { sessionId: p.sessionId }).catch(() => { /* the page moved on */ });
     });
     await cdp("Page.startScreencast", { format: "png", everyNthFrame: 1, maxWidth: 1280, maxHeight: 900 });
-    await ev("setTimeout(function(){Array.from(document.querySelectorAll('header nav a')).filter(function(a){return !a.getAttribute('aria-current')})[1].click()},0)");
+    // to Wallet, by its name (the menu's order is Buy, Sell, Wallet, ...)
+    await ev("setTimeout(function(){Array.from(document.querySelectorAll('header nav a')).find(function(a){return a.textContent.trim().indexOf('Wallet')===0}).click()},0)");
     await sleep(900);
     await cdp("Page.stopScreencast"); listeners.delete("Page.screencastFrame");
     await loaded(); await sleep(1500); steady.push(await grab());

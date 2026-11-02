@@ -82,7 +82,7 @@ well-known DNS-over-HTTPS services and QUIC, which closes the common routes.
 
 ## The app
 
-- **Services → VPN** (buyers): devices, each with its rules, what it's using now and why it's
+- **Buy → VPN** (buyers): devices, each with its rules, what it's using now and why it's
   blocked if it is; adding a device gives its WireGuard settings and a QR code, shown once.
 - **Sell → VPN exit** (operators): offer the connection as an exit, after a plain warning; price a GB;
   private or filtered; categories and an own list; protections under Advanced.

@@ -55,8 +55,8 @@ buying, selling, hashrate, and the wallet your agents pay with.
   reach your miners through the app's direct link, encrypted end to end: no port forward or address
   is needed. Only hashtakers on apps from before the direct link need a forwarded TCP port 23341 (the *Hashrate
   link*), which you can enter under Advanced on the page.
-- **Rent others' miners** (Services → Hashrate): the work goes to your own DATUM Gateway.
-- **AI for your programs** (Services → AI): programs on your LAN that work with OpenAI's API use the
+- **Rent others' miners** (Buy → Hashrate): the work goes to your own DATUM Gateway.
+- **AI for your programs** (Buy → AI): programs on your LAN that work with OpenAI's API use the
   AI sellers you allowed through the *AI address for programs* interface, each with a key you make
   on that page. See docs/INFERENCE.md.
 

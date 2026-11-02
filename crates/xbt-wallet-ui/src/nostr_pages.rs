@@ -45,7 +45,7 @@ impl App {
 
 /// `have`: the sellers on the owner's list, marked "On your list".
 fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -> bool) -> String {
-    let mut b = String::from("<p class=\"small\"><a href=\"./browse\">← Your services</a> · <a href=\"./nostr?refresh=1\">Look again</a></p>\
+    let mut b = String::from("<p class=\"small\"><a href=\"./browse\">← Browse</a> · <a href=\"./nostr?refresh=1\">Look again</a></p>\
         <div class=\"flash warn\"><strong>Unvetted.</strong> These sellers published their lists on Nostr, each signed by the \
         seller's own key, but nobody has checked who runs them. A shop reached by its key: its address is that key, so the list is its own. \
         A seller with a web address: press Check with the seller, and the app asks that address whether the list is theirs. \

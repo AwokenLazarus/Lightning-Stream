@@ -974,6 +974,45 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     xbt_gateway::config::Config::from_json(&c).unwrap();
 }
 
+/// The menu: Buy beside Sell (no "Services"); Records, Stream relays and Old channels sit behind one
+/// Advanced tab in Settings, with their own row of tabs once there.
+#[test]
+fn the_menu_says_buy_and_sell_and_settings_keeps_the_rare_pages_under_advanced() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |c| c.sell = true);
+    let mut br = logged_in(&bx);
+    let browse = br.get("/browse").body;
+    let menu = &browse[browse.find("id=\"site-nav\"").unwrap()..browse.find("</header>").unwrap()];
+    assert!(!menu.contains(">Services<"), "{menu}");
+    let (buy, sell) = (menu.find(">Buy<").expect("Buy in the menu"), menu.find(">Sell<").expect("Sell in the menu"));
+    assert!(buy < sell, "Buy comes first, then Sell: {menu}");
+    assert!(menu.contains("<a href=\"./browse\" aria-current=\"page\">Buy<"), "Browse is under Buy: {menu}");
+
+    let setup = br.get("/setup").body;
+    let tabs = &setup[setup.find("<nav class=\"tabs\" aria-label=\"Settings\">").unwrap()..];
+    let tabs = &tabs[..tabs.find("</nav>").unwrap()];
+    for t in ["Setup", "Your node", "Spending rules", "Keys and backup"] {
+        assert!(tabs.contains(&format!(">{t}</a>")), "{t}: {tabs}");
+    }
+    for t in ["Records", "Stream relays", "Old channels"] {
+        assert!(!tabs.contains(&format!(">{t}</a>")), "{t} is under Advanced, not a tab of its own: {tabs}");
+        assert!(!setup.contains(&format!(">{t}</a>")), "{t}");
+    }
+    assert!(tabs.contains("<a href=\"./signatures\">Advanced</a>"), "{tabs}");
+
+    for (path, here) in [("/signatures", "Records"), ("/relays", "Stream relays"), ("/channels", "Old channels")] {
+        let p = br.get(path).body;
+        assert!(p.contains("aria-current=\"page\">Settings<"), "{path} is in Settings");
+        assert!(p.contains("<a href=\"./signatures\" aria-current=\"page\">Advanced</a>"), "{path}: Advanced is the current tab");
+        let sub = &p[p.find("<nav class=\"tabs sub\" aria-label=\"Advanced\">").expect("the Advanced row")..];
+        let sub = &sub[..sub.find("</nav>").unwrap()];
+        assert!(sub.contains(&format!("aria-current=\"page\">{here}</a>")), "{path}: {sub}");
+        for t in ["Records", "Stream relays", "Old channels"] {
+            assert!(sub.contains(&format!(">{t}</a>")), "{t}: {sub}");
+        }
+    }
+}
+
 const FILM: &str = "https://stream.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true";
 const NOTES: &str = "https://files.example/notes?a=1&b=2";
 
@@ -996,7 +1035,7 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
 
     let page = br.get("/browse");
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("aria-current=\"page\">Browse") && page.body.contains("aria-current=\"page\">Services"));
+    assert!(page.body.contains("aria-current=\"page\">Browse") && page.body.contains("aria-current=\"page\">Buy"));
     assert!(page.body.contains("href=\"./services\"") && page.body.contains("href=\"./connections\""));
     assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
     assert!(page.body.contains(">Web apps <") && page.body.contains(">Files <") && page.body.contains(">Data &amp; APIs <"), "the categories");

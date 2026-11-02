@@ -43,7 +43,7 @@ The Linux package has a relay built in. On a server with a public address:
    **DNS only**, not proxied).
 3. **Open TCP 443** (and UDP 7842 if you want QUIC address discovery) in the server's firewall and
    the provider's.
-4. In the app, **Settings → Stream relays → Run a relay for the Stream network**: enter the domain
+4. In the app, **Settings → Advanced → Stream relays → Run a relay for the Stream network**: enter the domain
    and an e-mail address for Let's Encrypt, and switch it on.
 
 Before anything is asked of Let's Encrypt, the relay checks:
@@ -279,7 +279,7 @@ Apps learn of relays from announcements on Nostr: a signed note with the relay's
 where it runs, roughly what it can carry and, optionally, how to reach you. An announcement
 lasts at most 30 days; announce again to stay listed (a monthly timer is fine).
 
-- **From the Lightning Stream app:** Settings → Stream relays → *Announce your relay*. The app
+- **From the Lightning Stream app:** Settings → Advanced → Stream relays → *Announce your relay*. The app
   signs it with a key it keeps for this (`secrets/relay-operator.key`) and lists the relay as yours.
 - **From the relay server itself**, with the `xbt-relay-announce` tool from this repository:
 
@@ -300,7 +300,7 @@ that answer, nearest first.
 
 ## How apps choose
 
-Settings → Stream relays shows every relay the app knows, how fast each answers, and the order
+Settings → Advanced → Stream relays shows every relay the app knows, how fast each answers, and the order
 the app uses them in. The first is the app's home relay; the others follow; ours
 (`iroh.lazarus-xbt.xyz`) is always last unless the owner blocks it; iroh's public relays come
 after those, for address discovery and as a final fallback. The owner can:
