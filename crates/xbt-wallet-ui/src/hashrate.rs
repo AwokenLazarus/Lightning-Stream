@@ -1221,7 +1221,9 @@ impl App {
             let s = saved.clone().unwrap_or_else(|| Settings::new(Mode::Solo, ""));
             o.push_str(&format!("<p>The {NAME} comes with this app and runs beside it. It masks every job it hands out, so a hashmaker can't tell \
                 which shares win, and it takes its work from your own XBT node.</p>\
-                <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>"));
+                <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>\
+                <p class=\"small\">Built on <a href=\"https://github.com/FlyTheElephant1/datum_gateway\" target=\"_blank\" rel=\"noopener noreferrer\">FlyTheElephant's \
+                DATUM Gateway</a>, with Lightning Stream's job masking.</p>"));
             if b["inUse"] == true {
                 let node = b["node"].as_bool();
                 o.push_str("<ul class=\"plain\">");

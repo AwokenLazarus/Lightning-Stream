@@ -319,6 +319,10 @@ so it waits for that plumbing.
 
 ## The Stream Gateway that comes with the app
 
+The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's DATUM Gateway
+(<https://github.com/FlyTheElephant1/datum_gateway>), with Lightning Stream's job masking added. The app's
+Hashrate page says so under **Your gateway**.
+
 The app runs its own gateway beside the renter: the **Stream Gateway (DATUM-compatible)**. It is FlyTheElephant's
 `datum_gateway` (MIT, master 280cf54, merged with CONVOY's 971af86, the fork it comes from) with a patch that
 masks every job with a key of the gateway's own, a new key for each block template, and opens each job to the

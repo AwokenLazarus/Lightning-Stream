@@ -460,6 +460,9 @@ Compared (the lead's options):
 
 ## The Stream Gateway (xbt-datum-gateway)
 
+The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's DATUM Gateway
+(<https://github.com/FlyTheElephant1/datum_gateway>), with Lightning Stream's job masking added.
+
 The renter's own gateway, bundled so that rented hashrate is never mined unmasked. In product text it is
 **"Stream Gateway (DATUM-compatible)"**. No product text calls it "DATUM Gateway": its MIT licence grants
 no right to the DATUM name. It is FlyTheElephant's `datum_gateway` (master 280cf54, MIT), merged with CONVOY's
