@@ -383,7 +383,7 @@ mod tests {
         fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
             self.seen.lock().unwrap().push((req.target.clone(), req.headers.clone()));
             let path = req.path().to_string();
-            let json = |v: Value| xbt_svc::http::Response::text(200, "application/json", &v.to_string());
+            let json = |v: Value| xbt_svc::http::Response::text(200, "application/json", v.to_string());
             if path == "/Users/AuthenticateByName" {
                 return json(json!({"AccessToken": BUYER_TOKEN}));
             }
