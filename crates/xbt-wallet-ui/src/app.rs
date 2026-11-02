@@ -436,7 +436,8 @@ impl App {
             "/policy" => match req.query.get("fix").map(String::as_str) {
                 Some("cap") => self.policy_fix_cap(&ctx),
                 _ => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false),
-                                      req.query.get("allow").zip(req.query.get("node")).map(|(a, n)| (a.as_str(), n.as_str()))),
+                                      req.query.get("allow").zip(req.query.get("node")).map(|(a, n)| (a.as_str(), n.as_str())),
+                                      &req.query.get("drop").and_then(|d| crate::services::http_origin(d)).into_iter().collect::<Vec<_>>()),
             },
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
@@ -772,12 +773,18 @@ impl App {
         }
         b.push_str("</section>");
         let recent = self.call("history", json!({"limit": 15}));
+        // a seller by its name where the list of sellers has it, never by a made-up `…shop.invalid` address
+        let known = self.file_services().unwrap_or_default();
+        let who = |d: &str| match crate::services::http_origin(d) {
+            Some(o) if xbt402::shop::is_shop(&o) || crate::services::shop_name(&known, &o).is_some() => crate::services::seller_name(&known, &o),
+            _ => short(d, 40),
+        };
         // a seller that charged more than a call allowed: said at the top, with the numbers
         if let Some(e) = recent.as_ref().ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter().rev().find(|e| e["type"] == "ticket_over_cap") {
             let msat = |k: &str| e.get(k).and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or(v.as_u64())).unwrap_or(0);
             b.push_str(&format!("<div class=\"flash bad\">{} charged {} sats for one answer, more than the {} sats the call allowed. \
                                  The app stopped paying that seller in that session; the seller's signed receipt is kept in the wallet's records.</div>",
-                                esc(&txt(e.get("origin"))), sats_of_msat(msat("charged_msat")), msat("max_msat") / 1000));
+                                esc(&who(&txt(e.get("origin")))), sats_of_msat(msat("charged_msat")), msat("max_msat") / 1000));
         }
         if let Ok(h) = recent {
             b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
@@ -796,7 +803,7 @@ impl App {
                 };
                 let amt = e.get("amount_sats").map(|a| money(int(Some(a)))).unwrap_or_default();
                 b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{}</td></tr>", utc(int(e.get("ts"))), esc(&what),
-                                    esc(&short(&txt(e.get("dest")), 40)), esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))));
+                                    esc(&who(&txt(e.get("dest").or(e.get("origin"))))), esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))));
             }
             b.push_str("</tbody></table></div>");
         }
@@ -871,7 +878,8 @@ impl App {
     // --- policy -------------------------------------------------------------------------------------
 
     /// `eff`: the signer's values in force (defaults included), shown where policy.json leaves a key out.
-    fn policy_form(&self, ctx: &Ctx, p: &Value, eff: &Value, errors: &[String], warnings: &[String]) -> String {
+    /// `drop`: sellers shown ticked for removal (from Sellers, after the owner removed one there).
+    fn policy_form(&self, ctx: &Ctx, p: &Value, eff: &Value, errors: &[String], warnings: &[String], drop: &[String]) -> String {
         let mut b = String::new();
         if !errors.is_empty() {
             b.push_str("<div class=\"flash bad\"><p>The signer refuses this policy:</p><ul>");
@@ -887,6 +895,7 @@ impl App {
             }
             b.push_str("</ul></div>");
         }
+        b.push_str(&seller_warnings_box(&self.seller_checks(p)));
         let main = self.signer_chain() == "main";
         let starter = starter_policy("main");
         // on mainnet, a limit the rules leave out is shown at its starter value, not at the signer's
@@ -966,19 +975,82 @@ impl App {
                 esc(&lowered.join("; "))));
         }
         b.push_str(&fields);
-        let allow = p.get("allowlist").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
-        let cps = p.get("counterparties").and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| format!("{k} {}", txt(v.get("ln_node")))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
-        b.push_str(&format!("<fieldset><legend>Who may be paid</legend>\
-            <label>Sellers agents may pay, one per line: a web address such as <code>https://api.example.net</code>, or a coin address\
-            <textarea name=\"f_allowlist\" rows=\"4\">{}</textarea></label>\
-            <label>Sellers paid through their Lightning node, one per line: the web address, a space, then the node's id\
-            <textarea name=\"f_counterparties\" rows=\"3\">{}</textarea></label></fieldset>\
-            <input type=\"hidden\" name=\"f_unseen\" value=\"{}\">\
+        b.push_str(&self.sellers_fieldset(p, drop));
+        b.push_str(&format!("<input type=\"hidden\" name=\"f_unseen\" value=\"{}\">\
             <div class=\"row\"><button>Review the change</button> <a class=\"button-link\" href=\"./policy?template=starter\">Start from the safe starter rules</a></div></form>",
-            esc(&allow), esc(&cps), esc(&Self::unseen_sections(p).to_string())));
-        b.push_str(&format!("<details><summary>Advanced: edit the rules as a file</summary><form method=\"post\" action=\"./policy\">{}\
+            esc(&Self::unseen_sections(p).to_string())));
+        b.push_str(&format!("<details><summary>Advanced: edit the rules as a file (each seller's address and node as the rules hold them)</summary><form method=\"post\" action=\"./policy\">{}\
             <input type=\"hidden\" name=\"mode\" value=\"json\"><textarea name=\"json\" rows=\"20\" class=\"mono\">{}</textarea>\
             <button>Review the change</button></form></details>", Self::csrf_input(ctx), esc(&serde_json::to_string_pretty(p).unwrap_or_default())));
+        b
+    }
+
+    /// Each seller the rules `p` name, with its name and what would make the signer refuse it: an
+    /// address on the list that may be paid with no Lightning node on file, or a shop reached by its
+    /// key whose node on file is not the one the shop vouches for now ([`crate::shops::node`]).
+    fn seller_checks(&self, p: &Value) -> Vec<SellerCheck> {
+        let all = self.file_services().unwrap_or_default();
+        let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
+        let now = xbt_nostr::now();
+        rule_sellers(p).into_iter().map(|r| {
+            let name = match &r.origin {
+                Some(o) => crate::services::seller_name(&all, o),
+                None => "A coin address".into(),
+            };
+            let vouched = r.origin.as_ref().and_then(|o| shops.get(o).and_then(|s| crate::shops::node(s, o, now)));
+            let problem = match (&r.origin, &r.node, &vouched) {
+                (Some(_), None, _) if r.listed => Some("this seller will be refused: it has no Lightning node on file"),
+                (Some(_), Some(n), Some(v)) if r.listed && !n.eq_ignore_ascii_case(v) =>
+                    Some("this seller will be refused: its Lightning node on file is not the one the shop vouches for now"),
+                _ => None,
+            };
+            SellerCheck { rule: r, name, vouched, problem }
+        }).collect()
+    }
+
+    /// "Who may be paid": one row per seller the rules name, by name, with its shop key or web
+    /// address and its node, and a Remove box. The list itself goes with the form unchanged
+    /// (`f_sellers`): only whole sellers are taken out, so a node is never cut off by an edit.
+    fn sellers_fieldset(&self, p: &Value, drop: &[String]) -> String {
+        let checks = self.seller_checks(p);
+        let shown = json!({"allowlist": p.get("allowlist").cloned().unwrap_or(json!([])), "counterparties": p.get("counterparties").cloned().unwrap_or(json!({}))});
+        let mut b = format!("<fieldset id=\"sellers\"><legend>Who may be paid</legend><input type=\"hidden\" name=\"f_sellers\" value=\"{}\">", esc(&shown.to_string()));
+        if checks.is_empty() {
+            b.push_str("<p class=\"empty\">No seller may be paid yet.</p>");
+        } else {
+            b.push_str("<div class=\"scroll\"><table class=\"sellers\"><thead><tr><th>Seller</th><th>Lightning node</th><th></th></tr></thead><tbody>");
+            for (i, c) in checks.iter().enumerate() {
+                let r = &c.rule;
+                let addr = match &r.origin {
+                    Some(o) => xbt402::shop::display(o),
+                    None => r.key.clone(),
+                };
+                let node = match (&r.node, &r.origin) {
+                    (Some(n), _) => format!("<code title=\"{}\">{}</code>", esc(n), esc(&short_node(n))),
+                    (None, Some(_)) => "<span class=\"tag warn\">none on file</span>".into(),
+                    (None, None) => "<span class=\"small\">not needed</span>".into(),
+                };
+                let mut notes = String::new();
+                if !r.listed {
+                    notes.push_str("<br><span class=\"small\">Not on the list that may be paid: only its node is kept.</span>");
+                }
+                if let Some(why) = c.problem {
+                    notes.push_str(&format!("<br><span class=\"tag bad\">{}</span>", esc(&capital(why))));
+                    match (&c.vouched, &r.origin) {
+                        (Some(v), Some(o)) => notes.push_str(&format!(" <a href=\"./policy?allow={}&amp;node={}\">Use the node the shop vouches for</a>",
+                                                                         crate::services::urlenc(o), esc(v))),
+                        _ => notes.push_str(" <a href=\"./services\">Allow it again on Sellers</a>"),
+                    }
+                }
+                let ticked = r.origin.as_ref().is_some_and(|o| drop.contains(o));
+                b.push_str(&format!("<tr><td><strong>{}</strong><br><code class=\"key small\">{}</code>{notes}</td><td>{node}</td>\
+                    <td><label class=\"check\"><input type=\"checkbox\" name=\"f_drop_{i}\" value=\"{}\"{}> Remove</label></td></tr>",
+                    esc(&c.name), esc(&addr), esc(&r.key), if ticked { " checked" } else { "" }));
+            }
+            b.push_str("</tbody></table></div>");
+        }
+        b.push_str("<p class=\"hint\">To add a seller, open <a href=\"./services\">Sellers</a> and press \"Allow this seller to be paid\". \
+            To change an address or a node by hand, use Advanced below.</p></fieldset>");
         b
     }
 
@@ -1013,7 +1085,7 @@ impl App {
             rounded up); nothing else changes. Review it, then sign.</div>", money(held), money(cap));
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
-        b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns));
+        b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns, &[]));
         self.page("Spending rules", ctx, b)
     }
 
@@ -1050,7 +1122,7 @@ impl App {
         b
     }
 
-    fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>) -> Resp {
+    fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>, drop: &[String]) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
             Err(e) => return self.page("Spending rules", ctx, Self::error_box(&e)),
@@ -1118,9 +1190,15 @@ impl App {
                     The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&xbt402::shop::display(&origin)), money(cap)));
             }
         }
+        if !drop.is_empty() {
+            let all = self.file_services().unwrap_or_default();
+            let names: Vec<String> = drop.iter().map(|o| crate::services::seller_name(&all, o)).collect();
+            b.push_str(&format!("<div class=\"flash warn\"><p>{} is still allowed to be paid. It is ticked for removal under \"Who may be paid\" below: \
+                review the change, then sign it. To keep it allowed, leave this page.</p></div>", esc(&names.join(", "))));
+        }
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
-        b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns));
+        b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns, drop));
         b.push_str(&format!("<details><summary>Advanced: the rules file's fingerprint</summary><p class=\"small\">policy.json SHA-256 <code>{}</code></p></details>",
                             escv(cur.get("sha256"))));
         self.page("Spending rules", ctx, b)
@@ -1172,24 +1250,28 @@ impl App {
             }
         }
         p.insert("anchor_required".into(), Value::Bool(f.contains_key("f_anchor_required")));
-        let lines = |k: &str| -> Vec<String> { f.get(k).map(|v| v.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()).unwrap_or_default() };
-        p.insert("allowlist".into(), Value::from(lines("f_allowlist")));
-        let old_cp = cur.get("counterparties").and_then(Value::as_object).cloned().unwrap_or_default();
-        let mut cps = Map::new();
-        for l in lines("f_counterparties") {
-            let mut it = l.split_whitespace();
-            let (Some(origin), node) = (it.next(), it.next().unwrap_or("")) else { continue };
-            let mut e = old_cp.get(origin).and_then(Value::as_object).cloned().unwrap_or_default();
-            // the payTo key of an on-chain channel: that rail was removed and the signer ignores the key
-            e.remove("pay_to");
-            if node.is_empty() {
-                e.remove("ln_node");
-            } else {
-                e.insert("ln_node".into(), node.into());
+        // the sellers: the list the page showed (`f_sellers`), less those ticked for removal. Nothing on
+        // the page is typed, so a seller's node is never lost to an edit (0.2.1: a node wrapped in a
+        // text box and cut off left its seller refused). A form without the list (an older page) keeps
+        // the sellers as they are; an expert changes them in Advanced.
+        if let Some(Value::Object(shown)) = f.get("f_sellers").and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+            let drops: Vec<&String> = f.iter().filter(|(k, _)| k.starts_with("f_drop_")).map(|(_, v)| v).collect();
+            let dropped = |key: &str| drops.iter().any(|d| d.as_str() == key || crate::services::http_origin(d).is_some_and(|o| crate::services::http_origin(key) == Some(o)));
+            let allow: Vec<Value> = shown.get("allowlist").and_then(Value::as_array).cloned().unwrap_or_default().into_iter()
+                .filter(|x| !dropped(&txt(Some(x)))).collect();
+            let mut cps = Map::new();
+            for (k, v) in shown.get("counterparties").and_then(Value::as_object).cloned().unwrap_or_default() {
+                if dropped(&k) {
+                    continue;
+                }
+                let mut e = v.as_object().cloned().unwrap_or_default();
+                // the payTo key of an on-chain channel: that rail was removed and the signer ignores the key
+                e.remove("pay_to");
+                cps.insert(k, Value::Object(e));
             }
-            cps.insert(origin.into(), Value::Object(e));
+            p.insert("allowlist".into(), Value::from(allow));
+            p.insert("counterparties".into(), Value::Object(cps));
         }
-        p.insert("counterparties".into(), Value::Object(cps));
         // the section of the retired hub routing and the settings of the removed on-chain channel: the
         // signer ignores them, so the form leaves them out
         for k in ["routing", "channel_expiry_blocks", "refund_enabled", "refund_margin_blocks", "open_wait_s", "open_retry_s", "close_fee_max_sats", "channel_rail"] {
@@ -1207,7 +1289,7 @@ impl App {
             match serde_json::from_str::<Value>(f.get("json").map(String::as_str).unwrap_or("")) {
                 Ok(v) => v,
                 Err(e) => {
-                    let body = self.policy_form(ctx, &cur["policy"], &cur["effective"], &[format!("policy.json: {e}")], &[]);
+                    let body = self.policy_form(ctx, &cur["policy"], &cur["effective"], &[format!("policy.json: {e}")], &[], &[]);
                     return self.page("Spending rules", ctx, body);
                 }
             }
@@ -1220,10 +1302,16 @@ impl App {
         };
         let strs = |k: &str| -> Vec<String> { prep[k].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default() };
         if prep["ok"] != true {
-            let body = self.policy_form(ctx, &proposed, &cur["effective"], &strs("errors"), &strs("warnings"));
+            let body = self.policy_form(ctx, &proposed, &cur["effective"], &strs("errors"), &strs("warnings"), &[]);
             return self.page("Spending rules", ctx, body);
         }
         let mut b = String::from("<p>Check the change, then sign it with your approval key.</p>");
+        // a seller the signed rules would leave refused: said before anything is signed
+        let checks = self.seller_checks(&proposed);
+        b.push_str(&seller_warnings_box(&checks));
+        // the sellers by name in the list of changes, not by their made-up `…shop.invalid` addresses
+        let named = |d: &str| checks.iter().filter_map(|c| c.rule.origin.as_ref().map(|o| (o, c))).filter(|(o, _)| xbt402::shop::is_shop(o))
+            .fold(d.to_string(), |d, (o, c)| d.replace(o.as_str(), &format!("{} ({})", c.name, xbt402::shop::display(o))));
         let diff = prep["diff"].as_array().cloned().unwrap_or_default();
         if diff.is_empty() {
             b.push_str("<p class=\"empty\">No change.</p>");
@@ -1233,7 +1321,7 @@ impl App {
                 let k = txt(d.get("key"));
                 let (head, details) = change_words(&k, d.get("old").filter(|v| !v.is_null()), d.get("new").filter(|v| !v.is_null()));
                 let sub = if details.is_empty() { String::new() } else {
-                    format!("<ul>{}</ul>", details.iter().map(|x| format!("<li>{}</li>", esc(x))).collect::<String>())
+                    format!("<ul>{}</ul>", details.iter().map(|x| format!("<li>{}</li>", esc(&named(x)))).collect::<String>())
                 };
                 b.push_str(&format!("<li>{}{}{sub}</li>", esc(&head),
                                     if d["restart"] == true { " <span class=\"tag warn\">after the app restarts</span>" } else { "" }));
@@ -1613,10 +1701,82 @@ impl App {
                     if enc { "locked with encryption" } else { "<strong>not</strong> locked with encryption" },
                     if seen("backup_export") { "A backup was exported." } else { "No backup yet." })));
         b.push_str("</ol>");
+        b.push_str(&format!("<p class=\"small\" id=\"version\">Lightning Stream version {}</p>", esc(crate::release_version())));
         self.page("Setup", ctx, b)
     }
 }
 
+
+/// One seller the rules name: its address as the rules hold it (`key`), that address as a web origin
+/// (none for a coin address), whether it is on the list that may be paid, and the node it is tied to.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuleSeller {
+    pub key: String,
+    pub origin: Option<String>,
+    pub listed: bool,
+    pub node: Option<String>,
+}
+
+/// A seller of the rules, as the rules page shows it.
+pub(crate) struct SellerCheck {
+    rule: RuleSeller,
+    name: String,
+    /// The node a shop reached by its key vouches for now.
+    vouched: Option<String>,
+    /// Why the signer will refuse it, in words.
+    problem: Option<&'static str>,
+}
+
+/// The sellers the rules `p` name: those on the list that may be paid, in its order, then those
+/// tied to a node only. An address and its node match by web origin.
+pub(crate) fn rule_sellers(p: &Value) -> Vec<RuleSeller> {
+    let cps = p.get("counterparties").and_then(Value::as_object);
+    let same = |a: &str, ao: &Option<String>, b: &str| a == b || (ao.is_some() && crate::services::http_origin(b) == *ao);
+    let node_of = |key: &str, origin: &Option<String>| -> Option<String> {
+        cps?.iter().find(|(k, _)| same(key, origin, k)).and_then(|(_, v)| v.get("ln_node")).and_then(Value::as_str)
+            .map(str::trim).filter(|n| !n.is_empty()).map(str::to_string)
+    };
+    let mut out: Vec<RuleSeller> = vec![];
+    for x in p.get("allowlist").and_then(Value::as_array).into_iter().flatten() {
+        let key = txt(Some(x));
+        let origin = crate::services::http_origin(&key);
+        if key.is_empty() || out.iter().any(|r| same(&key, &origin, &r.key)) {
+            continue;
+        }
+        let node = node_of(&key, &origin);
+        out.push(RuleSeller { key, origin, listed: true, node });
+    }
+    for k in cps.into_iter().flat_map(|m| m.keys()) {
+        let origin = crate::services::http_origin(k);
+        if out.iter().any(|r| same(k, &origin, &r.key)) {
+            continue;
+        }
+        let node = node_of(k, &origin);
+        out.push(RuleSeller { key: k.clone(), origin, listed: false, node });
+    }
+    out
+}
+
+/// The warning over the rules: each seller the signer will refuse, by name, and why.
+fn seller_warnings_box(checks: &[SellerCheck]) -> String {
+    let bad: Vec<String> = checks.iter().filter_map(|c| c.problem.map(|why| format!("<li><strong>{}</strong>: {}.</li>", esc(&c.name), esc(why)))).collect();
+    if bad.is_empty() {
+        return String::new();
+    }
+    format!("<div class=\"flash bad seller-warning\"><p>Check who may be paid:</p><ul>{}</ul><p>Remove it below, then allow it again from \
+             <a href=\"./services\">Sellers</a>, or use the fix shown next to it.</p></div>", bad.concat())
+}
+
+/// A node id, short: `02abcdef…12345678`.
+fn short_node(n: &str) -> String {
+    if n.len() <= 20 || !n.is_ascii() { n.to_string() } else { format!("{}…{}", &n[..8], &n[n.len() - 8..]) }
+}
+
+/// `s` with its first letter in capitals.
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
 
 /// `?k=v&...` for a redirect back to the same page (empty when there is no query).
 fn query_string(q: &HashMap<String, String>) -> String {
@@ -1887,6 +2047,42 @@ mod file_call_tests {
 #[cfg(test)]
 mod change_tests {
     use super::*;
+
+    /// The rules form takes whole sellers out, and nothing else: a node is never cut off by an edit
+    /// (0.2.1: a node wrapped in a free-text box and was saved without it), and a form with no list of
+    /// sellers (an older page) keeps them as they are.
+    ///
+    /// FAILS before: the parse read free text, and a line with no node dropped `ln_node`.
+    #[test]
+    fn the_rules_form_takes_whole_sellers_out_and_never_a_node() {
+        let shop = xbt402::shop::origin_for(&[4u8; 32]);
+        let node = format!("02{}", "a".repeat(64));
+        let cur = json!({"allowlist": ["https://a.example", "bc1qcoin", shop], "human_threshold_sats": 1,
+                         "counterparties": {shop.clone(): {"ln_node": node, "pay_to": "x"}, "https://a.example": {"ln_node": "03bb"}, "https://b.example": {"ln_node": "03cc"}}});
+        let sellers = json!({"allowlist": cur["allowlist"], "counterparties": cur["counterparties"]}).to_string();
+        let form = |extra: &[(&str, &str)]| -> HashMap<String, String> {
+            let mut f: HashMap<String, String> = extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            f.insert("f_human_threshold_sats".into(), "5".into());
+            f
+        };
+        // untouched: every seller and node as it was (the old on-chain payTo key left out)
+        let p = App::proposed_from_form(&cur, &form(&[("f_sellers", &sellers)]));
+        assert_eq!(p["counterparties"][&shop], json!({"ln_node": node}));
+        assert_eq!(p["allowlist"], cur["allowlist"]);
+        // one removed: gone from both lists, the others whole
+        let p = App::proposed_from_form(&cur, &form(&[("f_sellers", &sellers), ("f_drop_0", "https://a.example/")]));
+        assert_eq!(p["allowlist"], json!(["bc1qcoin", shop]));
+        assert!(p["counterparties"].get("https://a.example").is_none() && p["counterparties"][&shop]["ln_node"] == json!(node), "{p}");
+        // an older page's free text, with the node cut off, and no list: nothing changes
+        let p = App::proposed_from_form(&cur, &form(&[("f_allowlist", &shop), ("f_counterparties", &shop)]));
+        assert_eq!((p["allowlist"].clone(), p["counterparties"].clone()), (cur["allowlist"].clone(), cur["counterparties"].clone()));
+        assert_eq!(p["human_threshold_sats"], 5);
+        // the rows: on the list in order (a coin address too), then a node alone
+        let rows = rule_sellers(&cur);
+        assert_eq!(rows.iter().map(|r| (r.key.as_str(), r.listed, r.node.as_deref())).collect::<Vec<_>>(),
+                   vec![("https://a.example", true, Some("03bb")), ("bc1qcoin", true, None), (shop.as_str(), true, Some(node.as_str())),
+                        ("https://b.example", false, Some("03cc"))]);
+    }
 
     #[test]
     fn a_nested_change_is_shown_key_by_key_and_never_hidden_behind_a_count() {

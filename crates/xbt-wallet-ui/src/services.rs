@@ -459,6 +459,41 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
     out
 }
 
+/// The shop's own name, as its listing names it, from the services the file keeps for the seller at
+/// `origin`. [`from_listing`] names a shop's one service after the shop, and each of several services
+/// `shop name: service name`, so the name is the part before `: ` that all of several share, else
+/// the first service's name. `None`: no service of that seller is kept.
+pub fn shop_name(all: &[Service], origin: &str) -> Option<String> {
+    let mine: Vec<&str> = all.iter().filter(|s| same_origin(&s.seller, origin)).map(|s| s.name.as_str()).collect();
+    let first = *mine.first()?;
+    if mine.len() > 1 {
+        if let Some((prefix, _)) = first.split_once(": ") {
+            let head = format!("{prefix}: ");
+            if mine.iter().all(|n| n.starts_with(&head)) {
+                return Some(prefix.to_string());
+            }
+        }
+    }
+    Some(first.to_string())
+}
+
+/// A seller as a person reads it: the shop's name ([`shop_name`]) where the services file keeps it,
+/// else its address shortened (a shop reached by its key: that key, `npub1…`). Never the made-up
+/// `…shop.invalid` address. The key in full is [`xbt402::shop::display`], for the line under it.
+pub fn seller_name(all: &[Service], origin: &str) -> String {
+    shop_name(all, origin).unwrap_or_else(|| short_address(origin))
+}
+
+/// A seller's address, short: its host, or for a shop reached by its key that key, shortened
+/// (`npub1abcdefgh…wxyz`).
+pub fn short_address(origin: &str) -> String {
+    if let Some(pk) = xbt402::shop::key_of(origin) {
+        let npub = xbt402::shop::npub(&pk);
+        return format!("{}…{}", &npub[..13], &npub[npub.len() - 4..]);
+    }
+    http_origin(origin).unwrap_or_else(|| origin.to_string()).trim_start_matches("https://").trim_start_matches("http://").to_string()
+}
+
 /// The first integer in a price line (`"20 sat a MiB"` → 20, `"about 1,200 sat"` → 1200).
 pub fn price_num(s: &str) -> Option<u64> {
     let b = s.as_bytes();
@@ -597,6 +632,29 @@ mod tests {
             licence: String::new(), credits: String::new() }
     }
     use super::*;
+
+    /// A shop is named by its listing's name (#37 item 16), whatever [`from_listing`] made of its services,
+    /// and one reached by its key is never named by its made-up `…shop.invalid` address (items 7, 11, 20).
+    ///
+    /// FAILS before: Sellers took the first service's name, "Genesis: Films".
+    #[test]
+    fn a_seller_is_named_by_its_listing_and_a_shop_by_its_key_never_by_its_made_up_address() {
+        let shop = xbt402::shop::origin_for(&[4u8; 32]);
+        let listing = |name: &str, secs: Vec<xbt402::listing::Section>| xbt402::listing::Listing {
+            name: name.into(), kind: "shop".into(), seller: shop.clone(), receipt_key: String::new(), prices: Default::default(), items: vec![],
+            licence: String::new(), credits: String::new(), updated: String::new(), services: secs };
+        let several = from_listing(&listing("Lightning Stream Genesis", vec![sec("Films", "video", "/films/", vec![]), sec("Notes", "api", "/notes/", vec![]),
+                                                                             sec("Films", "app", "/films/", vec![])]));
+        assert_eq!(several[0].name, "Lightning Stream Genesis: Films");
+        assert_eq!(seller_name(&several, &shop), "Lightning Stream Genesis");
+        let one = from_listing(&listing("Genesis: the shop", vec![sec("Films", "video", "/", vec![]), sec("Player", "app", "/play/", vec![])]));
+        assert_eq!(seller_name(&one, &shop), "Genesis: the shop", "one service and an app of its own: the listing's name, colon and all");
+        // not on the list: its key, short; a web seller: its host
+        let npub = xbt402::shop::npub(&[4u8; 32]);
+        assert_eq!(seller_name(&[], &shop), format!("{}…{}", &npub[..13], &npub[npub.len() - 4..]));
+        assert!(!seller_name(&[], &shop).contains("shop.invalid"));
+        assert_eq!(seller_name(&[], "https://Media.Example/x"), "media.example");
+    }
 
     #[test]
     fn the_example_lists_the_three_films() {

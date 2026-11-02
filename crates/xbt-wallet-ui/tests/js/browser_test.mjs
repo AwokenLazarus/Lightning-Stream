@@ -151,7 +151,7 @@ try {
   // 4. a policy change, signed in the page
   await go("/policy?template=starter");
   await shot("04-policy", 1100);
-  await set("[name=f_allowlist]", "http://127.0.0.1:33210");
+  check("the rules list each seller, with no free-text box to cut a node off", await ev("!!document.querySelector('#sellers table.sellers') && !document.querySelector('[name=f_allowlist], [name=f_counterparties]')"));
   await set("[name=f_per_counterparty_cap_sats]", "9400");
   await submitAndWait("document.querySelector('form.policy').submit()");
   check("the review shows the text to sign", await ev("!!document.querySelector('pre.signed-text')"));
