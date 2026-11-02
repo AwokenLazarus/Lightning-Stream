@@ -4955,7 +4955,7 @@ fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
     let act = &w[w.find("Recent activity").unwrap()..];
     assert!(!act.contains(&format!("ln:{}", &node[..8])), "a node by its shop's name: {act}");
     assert!(act.contains("<td>Alpha films</td>"), "{act}");
-    assert!(act.contains("<td>Paid</td>") && act.contains("903 sats</span> <span class=\"small\">(900 + 2.009 fee)</span>"), "paid, with its parts: {act}");
+    assert!(act.contains("<td>Paid</td>") && act.contains("902.009 sats</span> <span class=\"small\">(900 + 2.009 fee)</span>"), "paid, exactly, with its parts: {act}");
     assert!(act.contains("<td>Reserved</td>") && act.contains("reserved</span>") && !act.contains("<td>Commit</td>"), "{act}");
     assert!(!act.contains("Ln amend"), "the booking's correction is no row of its own: {act}");
     assert!(act.contains("<td>Credit left with the shop</td>") && act.contains("475.9 sats</span> <span class=\"small\">credit left"), "{act}");
