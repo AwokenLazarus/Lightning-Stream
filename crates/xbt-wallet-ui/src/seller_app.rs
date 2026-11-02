@@ -375,11 +375,12 @@ impl App {
         Resp::redirect("./browse")
     }
 
-    /// Whether the connector holds visit `id` open (not ended, not gone). A connector that cannot be
-    /// asked is taken to hold it, so that a Stop never closes a connection another visit may use.
+    /// Whether the connector holds visit `id` open (not ended, not gone): one at its limit counts, since it waits for its
+    /// owner to raise it and goes on with the connection it has. A connector that cannot be asked is taken to hold it, so
+    /// that a Stop never closes a connection another visit may use.
     fn visit_open(&self, id: &str) -> bool {
         match connector_json("GET", &format!("{}/visits/{id}", self.cfg.connector.trim_end_matches('/')), None) {
-            Ok((200, v)) => v.get("ended").is_none_or(Value::is_null),
+            Ok((200, v)) => holds_open(&v),
             Ok((404, _)) => false,
             _ => true,
         }
@@ -455,6 +456,12 @@ impl App {
     pub(crate) fn spendable_sats(&self) -> Option<i64> {
         self.call("ln_status", json!({})).ok().and_then(|v| crate::pay_feedback::spendable_sats(&v))
     }
+}
+
+/// Whether the connector's report of a visit says it is open: not ended, or ended at its limit, where it waits for its owner
+/// to raise it (with the connection it has, and its page as it was).
+pub(crate) fn holds_open(report: &Value) -> bool {
+    report.get("ended").is_none_or(Value::is_null) || report.get("limit_reached") == Some(&Value::Bool(true))
 }
 
 /// The visit's numbers for its page, from the connector's report: what its answers used (`used_sats`,
@@ -901,6 +908,19 @@ pub fn spawn(app: &Arc<App>, strict: bool) -> Result<Vec<(u16, xbt_svc::http::Ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A visit that reached its limit waits for its owner to raise it: it is open, so stopping another visit to the same shop
+    /// leaves the connection it will go on with. One stopped, or ended any other way, is not.
+    ///
+    /// FAILS before: any visit that had ended counted as gone, the one at its limit too: stopping another visit to the shop
+    /// dropped its grant and closed its connection, and its Add then led to a page that answered 403.
+    #[test]
+    fn a_visit_at_its_limit_still_holds_the_shops_connection() {
+        assert!(holds_open(&json!({"ended": null, "limit_reached": false})));
+        assert!(holds_open(&json!({"ended": "This visit's spending limit is reached.", "limit_reached": true})));
+        assert!(!holds_open(&json!({"ended": "Stopped.", "limit_reached": false})));
+        assert!(!holds_open(&json!({"ended": "This visit's spending limit is reached."})), "a connector that does not say it may go on");
+    }
 
     /// A video app priced by the byte is offered a limit for about ten minutes of 1080p at its price,
     /// not the 1,000 sat a film at 20 sat a MiB spends in under a minute; other apps keep 1,000.

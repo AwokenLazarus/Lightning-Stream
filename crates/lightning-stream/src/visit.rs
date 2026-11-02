@@ -269,15 +269,19 @@ impl Visit {
                "ended": s.ended, "limit_reached": s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped, "calls": s.calls})
     }
 
-    /// The signer's final word on one call: what the seller charged for its answer and what was
+    /// The signer's final word on one call that held `share`: what the seller charged for its answer and what was
     /// paid for tickets for it, counted for the visit's report.
-    fn account(&self, v: &Value) {
+    fn account(&self, v: &Value, share: i64) {
         let num = |k: &str| v.get(k).and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())));
         // what the answer took from the credit: the seller's signed charge where it is more than the wallet's own count (an
         // answer cut short or left by the page, whose bytes on their way were charged), so that what the visit says it used
         // is what the connection's credit fell by
-        let signed = v.pointer("/receipt/last/charged").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())));
-        let used = num("price_msat").unwrap_or(0).max(signed.unwrap_or(0));
+        // Only where the signer found no fault with the seller (a charge past the call's cap is one), and no more than the
+        // call's own cap (its share) past the wallet's count: a seller's word is not taken for more than the call allowed
+        let signed = v.pointer("/receipt/last/charged").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())))
+            .filter(|_| v.get("seller_fault").is_none_or(Value::is_null));
+        let price = num("price_msat").unwrap_or(0);
+        let used = price.max(signed.unwrap_or(0).min(price.saturating_add(share.max(0).unsigned_abs().saturating_mul(1000))));
         let charged = num("charged_sats").unwrap_or(0);
         let mut s = self.lock();
         s.used_msat = s.used_msat.saturating_add(used);
@@ -322,6 +326,10 @@ impl Visit {
         }
         s.alone -= 1;
         let got = s.ended.is_none() && self.limit() - s.spent >= most;
+        // the credit heard of is spent on this decision: the next request waits for the signer's word after the top-up (or
+        // after the requests running now), not the same low figure, so that it does not take the lane again on it and hold
+        // every request up behind it
+        s.credit_msat = None;
         if got {
             s.spent += most;
             s.held += most;
@@ -460,7 +468,7 @@ impl Visit {
             s.ticket = s.ticket.max(t);
         }
         if let Some(c) = v.get("charged_sats").and_then(Value::as_i64) {
-            self.account(&v);
+            self.account(&v, share);
             return self.release(share, c);
         }
         match done {
@@ -555,7 +563,7 @@ impl Visit {
     fn settle_end(&self, share: i64, done: Option<mpsc::Receiver<Result<Value, String>>>, socket: bool) {
         let reply = done.and_then(|d| d.recv_timeout(SETTLE_WAIT).ok()).and_then(Result::ok);
         if let Some(v) = &reply {
-            self.account(v);
+            self.account(v, share);
         }
         let charged = reply.and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
         let mut s = self.lock();
@@ -650,6 +658,12 @@ impl Connector {
                 };
                 if req.method != "POST" {
                     return Some(Reply::Whole(json_response(405, &json!({"error": "POST a new limit"}))));
+                }
+                // asked by the wallet on this box, never by a page: a browser's request (it names its `Origin`) or a form's (not
+                // JSON) is refused, so that no page can raise what the owner may spend
+                let json_body = req.header("Content-Type").is_some_and(|t| t.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"));
+                if req.header("Origin").is_some() || !json_body {
+                    return Some(Reply::Whole(json_response(403, &json!({"error": "a visit's limit is raised by the wallet, as JSON"}))));
                 }
                 let to = serde_json::from_slice::<Value>(&req.body).ok().and_then(|b| b.get("limit_sats").and_then(Value::as_i64)).unwrap_or(0);
                 return Some(Reply::Whole(match v.raise(to) {
@@ -1580,10 +1594,18 @@ mod tests {
     #[test]
     fn what_a_visit_used_is_what_the_seller_charged_where_that_is_more() {
         let v = visit(1_000);
-        v.account(&json!({"price_msat": "40000", "charged_sats": 0, "receipt": {"signed": true, "last": {"charged": "79000"}}}));
-        v.account(&json!({"price_msat": "5000", "charged_sats": 0, "receipt": {"signed": true, "last": {"charged": "5000"}}}));
-        v.account(&json!({"price_msat": "1000", "charged_sats": 0}));
+        v.account(&json!({"price_msat": "40000", "charged_sats": 0, "receipt": {"signed": true, "last": {"charged": "79000"}}}), 125);
+        v.account(&json!({"price_msat": "5000", "charged_sats": 0, "receipt": {"signed": true, "last": {"charged": "5000"}}}), 125);
+        v.account(&json!({"price_msat": "1000", "charged_sats": 0}), 125);
         assert_eq!(v.lock().used_msat, 85_000);
+        // a charge the signer found at fault (past the call's cap, say) is not taken: the wallet's own count is
+        v.account(&json!({"price_msat": "2000", "charged_sats": 0, "seller_fault": "charged past the cap",
+                          "receipt": {"signed": true, "last": {"charged": "900000"}}}), 125);
+        assert_eq!(v.lock().used_msat, 87_000);
+        // and one past the call's own cap is taken only as far as that cap past the wallet's count
+        // (FAILS before: the seller's word was taken whole, fault or not)
+        v.account(&json!({"price_msat": "1000", "charged_sats": 0, "receipt": {"signed": true, "last": {"charged": "900000"}}}), 10);
+        assert_eq!(v.lock().used_msat, 87_000 + 1_000 + 10_000);
     }
 
     /// Where a call says the session's credit is low, the next request takes the lane: room for a
@@ -1595,12 +1617,12 @@ mod tests {
     fn one_request_at_a_time_tops_the_credit_up_where_it_is_low() {
         let v = visit(1_000);
         assert!(v.take_lane().is_none(), "nothing is known of the credit yet");
-        v.account(&json!({"price_msat": "100000", "charged_sats": 600, "tickets_released": 1, "balance_msat": "900000"}));
+        v.account(&json!({"price_msat": "100000", "charged_sats": 600, "tickets_released": 1, "balance_msat": "900000"}), 725);
         assert_eq!(v.lock().ticket, 600);
         assert!(v.take_lane().is_none(), "the credit is ample");
         // spent 600 of 1,000: room for a share and a ticket (725) is not there
         v.lock().spent = 600;
-        v.account(&json!({"price_msat": "100000", "charged_sats": 0, "balance_msat": "50000"}));
+        v.account(&json!({"price_msat": "100000", "charged_sats": 0, "balance_msat": "50000"}), 125);
         assert!(v.take_lane().is_none(), "no room in the limit for a ticket");
         v.lock().spent = 0;
         let (most, top) = v.take_lane().expect("the credit is low: the lane");
@@ -1608,6 +1630,9 @@ mod tests {
         assert!(v.take_lane().is_none(), "one request holds the lane");
         assert_eq!(v.lock().spent, most);
         v.lane_done();
+        // the lane is free again, but the low credit it was taken on is old news: no request takes it again until a call
+        // says what the credit is now (FAILS before: the next request took the lane on the same figure, and the one after)
+        assert!(v.take_lane().is_none(), "the lane was taken again on the credit it was taken on");
         v.release(most, 600);
         let st = v.lock();
         assert_eq!((st.spent, st.held, st.lane), (600, 0, false));

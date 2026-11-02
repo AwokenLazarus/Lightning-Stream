@@ -143,6 +143,7 @@ impl Handler for Service {
             // a web app's free parts, as a media server sends them: a validator, no Cache-Control
             "/files/free/app.js" => Response::new(200, vec![("Content-Type".into(), "application/javascript".into()), ("ETag".into(), "\"js\"".into())],
                                                   APP_JS.repeat(10_000).into_bytes()),
+            "/files/free/events" => Response::new(200, vec![("Content-Type".into(), "text/event-stream".into())], b"data: 1\n\n".repeat(100)),
             "/files/free/index.html" => Response::new(200, vec![("Content-Type".into(), "text/html; charset=utf-8".into())], b"<!doctype html><title>app</title>".repeat(20)),
             "/moved" => Response::new(302, vec![("Location".into(), "/api".into())], vec![]),
             _ => Response::text(404, "text/plain", "no such thing"),

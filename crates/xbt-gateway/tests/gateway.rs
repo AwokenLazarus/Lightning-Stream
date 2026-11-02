@@ -2191,14 +2191,18 @@ fn a_free_routes_scripts_go_compressed_and_are_kept_by_the_browser() {
     flate2::read::GzDecoder::new(&zipped.body[..]).read_to_string(&mut out).unwrap();
     assert_eq!(out, plain);
     assert_eq!(zipped.header("Cache-Control"), Some("public, max-age=3600"));
-    assert_eq!(zipped.header("ETag"), Some("\"js\""));
+    // the compressed bytes are not the service's: the validator is weakened, and no range of them offered
+    assert_eq!((zipped.header("ETag"), zipped.header("Accept-Ranges")), (Some("W/\"js\""), None));
     let as_is = http(&rig.addr, "GET", "/files/free/app.js", &[], b"", None);
+    assert_eq!(as_is.header("ETag"), Some("\"js\""));
     assert_eq!((as_is.status, as_is.complete, as_is.header("Content-Encoding"), as_is.body.len()), (200, true, None, plain.len()));
     let refused = http(&rig.addr, "GET", "/files/free/app.js", &[("Accept-Encoding", "gzip;q=0, identity")], b"", None);
     assert_eq!((refused.header("Content-Encoding"), refused.body.len()), (None, plain.len()));
     let page = http(&rig.addr, "GET", "/files/free/index.html", &[("Accept-Encoding", "gzip")], b"", None);
     assert_eq!((page.status, page.header("Cache-Control")), (200, None), "an app's page is asked again");
-    // a free file that is not text is sent as it is
+    // a free file that is not text is sent as it is, and so is an event stream
     let file = http(&rig.addr, "GET", "/files/free/5000", &[("Accept-Encoding", "gzip")], b"", None);
     assert_eq!((file.header("Content-Encoding"), file.body.len()), (None, 5000));
+    let events = http(&rig.addr, "GET", "/files/free/events", &[("Accept-Encoding", "gzip")], b"", None);
+    assert_eq!((events.status, events.header("Content-Encoding")), (200, None));
 }

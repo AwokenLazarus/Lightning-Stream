@@ -36,13 +36,18 @@ browser                         the buyer's box                                 
   caching (Jellyfin sends its web client with a validator and no `Cache-Control`), so a buyer's next
   visit loads the scripts and styles from the browser instead of over the link. HTML pages are left
   as they are, so an upgraded app's page is never kept stale. A route's `cache` sets how long, in
-  seconds, on any route (`"cache": 86400` keeps a day; `0` adds nothing). The gateway adds
-  `Cache-Control: public, max-age=…` only to a GET or HEAD whose answer says nothing of caching and
-  sets no cookie, and `private` where the request carried a login or a cookie.
+  seconds (`"cache": 86400` keeps a day; `0` adds nothing). The gateway adds `Cache-Control` only to
+  a GET or HEAD whose answer says nothing of caching and sets no cookie: `public, max-age=…` (with a
+  `Vary` on the login headers) on a free route for a request with no login, cookie or key in its
+  query, and `private, max-age=…` otherwise, always on a priced route or one with buyers' accounts,
+  so that a shared cache in front of the shop never serves a paid answer unpaid or one buyer's to
+  another. A compressed answer (a free route's text, to a buyer that takes gzip) carries a weak
+  `ETag` and no `Accept-Ranges`; an event stream is never compressed.
 - **Credit kept ahead.** A visit's requests each hold a small share of its limit, too small for a
   ticket. When a call says the session's credit is low, the visit's next request goes first with
   room for a ticket and asks the signer to top the credit up before it leaves (`top_up_sats`), so
-  that no answer is cut where the credit ends.
+  that no answer is cut where the credit ends. The top-up is best effort: where no ticket can be had at
+  once it buys nothing, and the request goes on as it would; it never stops the session.
 - **The limit.** A video app priced by the byte is offered a limit for about ten minutes of 1080p at
   its price (1,000 to 20,000 sats); other apps, 1,000. Once four fifths of the limit is used, the
   bar offers **Add**, which raises it by the first limit. At the limit the page waits for the owner,

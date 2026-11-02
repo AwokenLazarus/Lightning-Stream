@@ -83,7 +83,7 @@ pub struct Route {
     /// body, which is what it meters and signs.
     pub accept_gzip: bool,
     /// How long a buyer's browser may keep this route's answers (`cache`, seconds), where the service
-    /// says nothing of it ([`Route::cache_control`]). `None`: a free route's answers other than HTML
+    /// says nothing of it ([`Route::cache_headers`]). `None`: a free route's answers other than HTML
     /// pages are kept [`FREE_CACHE_S`], a priced route's are left as the service sent them; `Some(0)`:
     /// nothing is added.
     pub cache_s: Option<u64>,
@@ -152,18 +152,20 @@ pub enum Accounts {
 }
 
 impl Route {
-    /// The `Cache-Control` the gateway adds to an answer of this route: only to a GET or HEAD answered
-    /// 200, 203, 204, 206, 301 or 304, whose service said nothing of caching (no `Cache-Control`,
-    /// `Expires` or `Pragma`) and set no cookie, by the route's `cache`, else (a free route, an answer
-    /// that is not an HTML page) [`FREE_CACHE_S`]. `private` where the request carried a login or a
-    /// cookie, so that only the buyer's own browser keeps it. `None`: nothing is added.
-    pub fn cache_control(&self, method: &str, status: u16, request: &[(String, String)], answer: &[(String, String)]) -> Option<String> {
+    /// The headers the gateway adds to an answer of this route for a browser's cache: a `Cache-Control`, only to a GET or
+    /// HEAD answered 200, 203, 204, 206, 301 or 304, whose service said nothing of caching (no `Cache-Control`, `Expires`
+    /// or `Pragma`) and set no cookie, for the route's `cache`, else (a free route, an answer that is not an HTML page)
+    /// [`FREE_CACHE_S`]. `public` only on a free route and for a request that carries no credential ([`CREDENTIAL_HEADERS`],
+    /// or a key in its query, [`CREDENTIAL_PARAMS`]), with a `Vary` on those headers; `private` otherwise, and always on a
+    /// priced route or one with buyers' accounts, so that a shared cache in front of the gateway never serves a paid or a
+    /// buyer's own answer to another. Empty: nothing is added.
+    pub fn cache_headers(&self, method: &str, target: &str, status: u16, request: &[(String, String)], answer: &[(String, String)]) -> Vec<(String, String)> {
         let has = |h: &[(String, String)], n: &str| h.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
         if !matches!(method, "GET" | "HEAD") || !matches!(status, 200 | 203 | 204 | 206 | 301 | 304) {
-            return None;
+            return vec![];
         }
         if ["cache-control", "expires", "pragma", "set-cookie"].iter().any(|n| has(answer, n)) {
-            return None;
+            return vec![];
         }
         let html = answer.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.trim_start().to_ascii_lowercase().starts_with("text/html"));
         let secs = match self.cache_s {
@@ -172,10 +174,16 @@ impl Route {
             None => 0,
         };
         if secs == 0 {
-            return None;
+            return vec![];
         }
-        let private = ["authorization", "cookie", "x-emby-authorization", "x-mediabrowser-token"].iter().any(|n| has(request, n));
-        Some(format!("{}, max-age={secs}", if private { "private" } else { "public" }))
+        let query_key = target.split_once('?').is_some_and(|(_, q)| {
+            q.split('&').any(|kv| CREDENTIAL_PARAMS.contains(&kv.split('=').next().unwrap_or("").to_ascii_lowercase().as_str()))
+        });
+        let credential = CREDENTIAL_HEADERS.iter().any(|n| has(request, n)) || query_key;
+        if !self.free || self.accounts.is_some() || credential {
+            return vec![("Cache-Control".into(), format!("private, max-age={secs}"))];
+        }
+        vec![("Cache-Control".into(), format!("public, max-age={secs}")), ("Vary".into(), CREDENTIAL_HEADERS.join(", "))]
     }
 
     /// Whether the gateway refuses `path` (decoded) on this route. The longest prefix of the two
@@ -325,6 +333,10 @@ pub struct LinkConfig {
 /// How long a buyer's browser keeps a free route's answers that say nothing of it (a web app's
 /// scripts, styles and images, which a media server sends with a validator and no `Cache-Control`).
 pub const FREE_CACHE_S: u64 = 3600;
+/// Request headers that carry a buyer's credential: an answer to a request with one is never `public` ([`Route::cache_headers`]).
+pub const CREDENTIAL_HEADERS: [&str; 7] = ["Authorization", "Cookie", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token", "X-Api-Key", "X-Auth-Token"];
+/// Query parameters that carry one (lower case).
+pub const CREDENTIAL_PARAMS: [&str; 5] = ["api_key", "apikey", "access_token", "token", "x-emby-token"];
 /// The longest a route's `cache` may be: a year.
 pub const MAX_CACHE_S: u64 = 365 * 86_400;
 
@@ -1543,34 +1555,57 @@ mod tests {
     /// caching (a media server sends a validator and no `Cache-Control`), so that the next visit loads
     /// the web client from the browser and not again over a slow link; a route's `cache` sets how long,
     /// on any route, and 0 adds nothing. An HTML page, an answer the service said something of, one that
-    /// sets a cookie, a POST and an error are left as they are; a request with a login is kept private.
+    /// sets a cookie, a POST and an error are left as they are. Only a free route's answer to a request
+    /// with no credential is `public`, with a `Vary` on the credential headers; a priced route's, an
+    /// accounts route's, and any answer to a request with a login, a cookie or a key in its query is
+    /// `private`, so that a shared cache in front of the gateway never serves a paid answer unpaid or one
+    /// buyer's to another.
     ///
-    /// FAILS before: no `cache`, and nothing was added: a fresh visit loaded 3.3 MB of the web client again.
+    /// FAILS before: a priced route's `cache` made its paid answers `public`, and a key in the query or an
+    /// `X-Emby-Token` left a buyer's answer `public`.
     #[test]
-    fn a_free_routes_static_answers_are_kept_by_the_browser() {
+    fn a_free_routes_static_answers_are_kept_by_the_browser_and_paid_ones_only_privately() {
         let h = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let cc = |r: &Route, m: &str, t: &str, st: u16, req: &[(String, String)], ans: &[(String, String)]| {
+            let got = r.cache_headers(m, t, st, req, ans);
+            let vary = got.iter().find(|(k, _)| k == "Vary").map(|(_, v)| v.clone());
+            // `public` comes with a Vary on the credential headers, `private` with none
+            let c = got.iter().find(|(k, _)| k == "Cache-Control").map(|(_, v)| v.clone());
+            assert_eq!(vary.is_some(), c.as_deref().is_some_and(|c| c.starts_with("public")), "{got:?}");
+            if let Some(v) = vary {
+                assert!(v.contains("Authorization") && v.contains("X-Emby-Token") && v.contains("Cookie"), "{v}");
+            }
+            c
+        };
         let js = h(&[("Content-Type", "application/javascript"), ("ETag", "\"a\"")]);
         let mut free = parse_route_for_tests("/web/");
         free.free = true;
-        assert_eq!(free.cache_control("GET", 200, &[], &js).as_deref(), Some("public, max-age=3600"));
-        assert_eq!(free.cache_control("HEAD", 304, &[], &js).as_deref(), Some("public, max-age=3600"));
-        assert_eq!(free.cache_control("GET", 200, &h(&[("Cookie", "jf=1")]), &js).as_deref(), Some("private, max-age=3600"));
-        assert_eq!(free.cache_control("GET", 200, &[], &h(&[("Content-Type", "text/html; charset=utf-8")])), None, "an app's page is asked again");
-        assert_eq!(free.cache_control("GET", 200, &[], &h(&[("Content-Type", "text/css"), ("Cache-Control", "no-cache")])), None);
-        assert_eq!(free.cache_control("GET", 200, &[], &h(&[("Content-Type", "text/css"), ("Set-Cookie", "a=b")])), None);
-        assert_eq!(free.cache_control("POST", 200, &[], &js), None);
-        assert_eq!(free.cache_control("GET", 404, &[], &js), None);
+        assert_eq!(cc(&free, "GET", "/web/a.js", 200, &[], &js).as_deref(), Some("public, max-age=3600"));
+        assert_eq!(cc(&free, "HEAD", "/web/a.js", 304, &[], &js).as_deref(), Some("public, max-age=3600"));
+        for cred in ["Cookie", "Authorization", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token", "X-Api-Key"] {
+            assert_eq!(cc(&free, "GET", "/web/a.js", 200, &h(&[(cred, "x")]), &js).as_deref(), Some("private, max-age=3600"), "{cred}");
+        }
+        for q in ["/web/a.js?api_key=k", "/web/a.js?v=1&ApiKey=k", "/web/a.js?access_token=k"] {
+            assert_eq!(cc(&free, "GET", q, 200, &[], &js).as_deref(), Some("private, max-age=3600"), "{q}");
+        }
+        assert_eq!(cc(&free, "GET", "/web/a.js?v=1", 200, &[], &js).as_deref(), Some("public, max-age=3600"));
+        assert_eq!(cc(&free, "GET", "/web/", 200, &[], &h(&[("Content-Type", "text/html; charset=utf-8")])), None, "an app's page is asked again");
+        assert_eq!(cc(&free, "GET", "/web/a.css", 200, &[], &h(&[("Content-Type", "text/css"), ("Cache-Control", "no-cache")])), None);
+        assert_eq!(cc(&free, "GET", "/web/a.css", 200, &[], &h(&[("Content-Type", "text/css"), ("Set-Cookie", "a=b")])), None);
+        assert_eq!(cc(&free, "POST", "/web/a.js", 200, &[], &js), None);
+        assert_eq!(cc(&free, "GET", "/web/a.js", 404, &[], &js), None);
         let paid = parse_route_for_tests("/");
-        assert_eq!(paid.cache_control("GET", 200, &[], &js), None, "a priced route is left as it is");
+        assert_eq!(cc(&paid, "GET", "/a.js", 200, &[], &js), None, "a priced route is left as it is");
         // `cache` in the config
         let mut v = base();
         v["routes"] = json!([{"path": "/web/", "free": true, "cache": 86_400}, {"path": "/img/", "free": true, "cache": 0},
                              {"path": "/", "price": {"request_msat": 1000}, "cache": 600}]);
         let c = Config::from_json(&v).unwrap();
         let r = |p: &str| c.routes.iter().find(|r| r.path == p).unwrap().clone();
-        assert_eq!(r("/web/").cache_control("GET", 200, &[], &h(&[("Content-Type", "text/html")])).as_deref(), Some("public, max-age=86400"));
-        assert_eq!(r("/img/").cache_control("GET", 200, &[], &js), None);
-        assert_eq!(r("/").cache_control("GET", 200, &[], &js).as_deref(), Some("public, max-age=600"));
+        assert_eq!(cc(&r("/web/"), "GET", "/web/", 200, &[], &h(&[("Content-Type", "text/html")])).as_deref(), Some("public, max-age=86400"));
+        assert_eq!(cc(&r("/img/"), "GET", "/img/a.png", 200, &[], &js), None);
+        // a paid answer is kept by the buyer's own browser alone, whatever is asked
+        assert_eq!(cc(&r("/"), "GET", "/a.js", 200, &[], &js).as_deref(), Some("private, max-age=600"));
         for bad in [json!(-1), json!("3600"), json!(1.5), json!(MAX_CACHE_S + 1)] {
             v["routes"] = json!([{"path": "/web/", "free": true, "cache": bad.clone()}]);
             assert!(Config::from_json(&v).is_err(), "{bad}");
