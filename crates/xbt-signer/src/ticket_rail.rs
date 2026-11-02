@@ -621,8 +621,8 @@ impl Signer {
             }
         }
         let ln = self.ln_book.all();
-        for h in hashes.iter().filter(|h| !out.contains_key(*h)) {
-            let Some(r) = ln.get(h) else { continue };
+        for h in &hashes {
+            let Some(r) = ln.get(h).filter(|_| !out.contains_key(h)) else { continue };
             if r.get("state").and_then(Value::as_str) != Some("settled") || r.get("preimage_ok") == Some(&Value::Bool(false)) {
                 continue;
             }
