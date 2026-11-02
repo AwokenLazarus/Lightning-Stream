@@ -10786,6 +10786,34 @@ fn a_prepaid_ticket_the_node_settles_after_its_call_is_shown_to_the_seller_and_c
     assert_eq!(r.tap.seen("/x402/ticket/release").len(), n, "not presented again");
 }
 
+/// `settled_amounts`: what each settled payment cost, from its settled record, for the app's pages
+/// (0.2.3: the wallet's pages showed a reservation, a rounded charge and the node's own figures for one
+/// payment). A ticket from the ticket book, a Lightning payment from the payments book: the amount the
+/// payee got, the routing fee, and the whole sats booked. Nothing unsettled, unproven or unknown.
+#[test]
+fn settled_amounts_says_what_each_settled_payment_cost_from_its_record() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, prepaid_only_shop());
+    a_prepaid_ticket_late_after_its_call(&r);
+    wait_for("the late ticket settled", || {
+        r.tick();
+        !r.audit("ticket_settled").is_empty()
+    });
+    let hash = r.audit("ticket_settled")[0]["payment_hash"].as_str().unwrap().to_string();
+    // a Lightning payment the payments book holds as settled, one it holds unproven, one still sending
+    let (ln, unproven, sending) = ("ab".repeat(32), "cd".repeat(32), "ef".repeat(32));
+    r.s.ln_book.put(&ln, json!({"state": "settled", "value_msat": 900_000, "fee_msat": 2_009, "spent_sats": 903})).unwrap();
+    r.s.ln_book.put(&unproven, json!({"state": "settled", "preimage_ok": false, "value_msat": 900_000, "fee_msat": 0, "spent_sats": 915})).unwrap();
+    r.s.ln_book.put(&sending, json!({"state": "sending", "booked_sats": 915})).unwrap();
+    let v = r.call("settled_amounts", json!({"hashes": [hash, ln, unproven, sending, "12".repeat(32), "not a hash"]}));
+    assert_eq!(v["ok"], true, "{v}");
+    let got = v["settled"].as_object().unwrap();
+    assert_eq!(got.len(), 2, "only the two settled and proven: {v}");
+    assert_eq!(got[&hash], json!({"rail": "ticket", "value_msat": TICKET.to_string(), "fee_msat": FEE_MSAT.to_string(), "paid_sats": SETTLED}));
+    assert_eq!(got[&ln], json!({"rail": "ln", "value_msat": "900000", "fee_msat": "2009", "paid_sats": 903}));
+    assert_eq!(r.call("settled_amounts", json!({}))["settled"], json!({}));
+}
+
 /// The wallet's account of a session against the seller's own: what the seller credited in it and
 /// what is left there, as the wallet's stop tells them and as the seller's `status` does. What is left.
 fn new_sid_of(v: &Value) -> String {

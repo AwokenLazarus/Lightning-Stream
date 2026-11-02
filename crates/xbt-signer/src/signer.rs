@@ -662,6 +662,8 @@ impl Signer {
                 let _g = self.lock();
                 sanitize(self.ticket_status_locked(p))
             }
+            // what each settled payment cost: read only, from the books, without the spend lock
+            "settled_amounts" => sanitize(self.settled_amounts(p)),
             "watch_tick" => sanitize(json!({"actions": self.watch_tick()})),
             "sweep_hot" => {
                 let _g = self.lock();
