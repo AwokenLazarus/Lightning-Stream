@@ -118,7 +118,7 @@ try {
 
   // 1. a model's chat page: served only compressed, its answer streamed
   await openApp(opens.chat);
-  check("chat: the visit bar says what is spent and has Stop", (await ev("document.body.innerText")).includes("spent on this visit") && await ev("!!document.querySelector('.app-visit button.danger')"));
+  check("chat: the visit bar says what is used and has Stop", (await ev("document.body.innerText")).includes("sat used of") && await ev("!!document.querySelector('.app-visit button.danger')"));
   const chat = await frameTitle("chat-", 20000);
   check("chat: the page loaded and the streamed answer arrived", chat.t === "chat-done", chat.t);
   check("chat: the answer reads whole", chat.f && (await ev("document.getElementById('out').textContent", chat.f.id)) === "Hello from the model");

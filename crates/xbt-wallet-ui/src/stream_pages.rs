@@ -23,7 +23,15 @@ impl App {
         let cat = q.get("cat").or(q.get("kind")).map(String::as_str).unwrap_or("");
         let sort = Sort::parse(q.get("sort").map(String::as_str).unwrap_or(""));
         let body = match self.file_services() {
-            Ok(all) => browse_html(&all, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller)),
+            Ok(all) => {
+                // sellers to pay, and a node that can't send a first ticket to any: said before anything is opened
+                let warn = if all.iter().any(|s| !self.is_own_shop(&s.seller)) {
+                    crate::pay_feedback::cant_send_card(self.spendable_sats(), crate::app::MIN_CALL_SATS, "your sellers")
+                } else {
+                    String::new()
+                };
+                format!("{warn}{}", browse_html(&all, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller)))
+            }
             Err(e) => format!("{}{}", Self::error_box(&e), empty_how(&self.suggested(ctx, &[]))),
         };
         let more = if self.nostr.enabled() {
@@ -65,6 +73,10 @@ impl App {
                 let own = self.is_own_shop(&svc.seller);
                 let mut body = service_html(&svc, own);
                 if svc.has_files() {
+                    // the node can't send a first ticket: said before a download is started
+                    if !own {
+                        body.push_str(&crate::pay_feedback::cant_send_card(self.spendable_sats(), crate::app::MIN_CALL_SATS, "this shop"));
+                    }
                     body.push_str(&files_html(ctx, &svc, own, &self.link_base(req), &|item| self.relays.of_item(item)));
                 }
                 self.html_page("Service", &svc.name, ctx, &body, "")
