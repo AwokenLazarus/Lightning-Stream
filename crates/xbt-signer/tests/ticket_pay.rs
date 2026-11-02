@@ -15902,3 +15902,27 @@ fn a_call_that_asks_for_a_top_up_keeps_the_credit_ahead_of_a_pages_requests() {
     assert_eq!((v["complete"].as_bool(), got.len(), v["charged_sats"].as_i64()), (Some(true), 1000, Some(0)), "{v}");
     std::env::remove_var("B2_STREAM_DIR");
 }
+
+/// A top-up (`top_up_sats`) is best effort, and a request paid for already is never held up or failed by it: where the
+/// seller does not show a new ticket locked, the top-up releases nothing at once and moves on. It waits for no pause,
+/// counts no stall, and never stops the session that the page's other answers (a film) are using.
+///
+/// FAILS before: the top-up went through the release an answer makes, so each call waited out the seller's pause, and
+/// after a few the stall count stopped the session and failed the funded request with it.
+#[test]
+fn a_top_up_that_cannot_be_had_neither_holds_up_nor_stops_the_session() {
+    let _g = env_lock();
+    let r = seller_waits_as_shipped(json!({"tickets": {"ready_wait_ms": 3_000}}));
+    let first = first_call_with_the_pool_shown(&r);
+    let sid = first["session"].as_str().unwrap().to_string();
+    r.shop.standin.hold_streams(true);
+    for i in 0..6 {
+        let t = Instant::now();
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/1000"), "max_sats": 2_000, "task": "film", "top_up_sats": 1_000_000}));
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "call {i}: {v}");
+        assert!(t.elapsed() < Duration::from_millis(2_500), "call {i} waited {:?} for a top-up: {v}", t.elapsed());
+    }
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "open", "the session was stopped by a top-up");
+    r.shop.standin.hold_streams(false);
+    wait_for("the tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty());
+}

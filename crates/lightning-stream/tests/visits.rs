@@ -664,3 +664,25 @@ fn a_visit_tops_its_credit_up_before_an_answer_runs_out_of_it() {
     assert_eq!((r["used_msat"].as_u64(), r["held_sats"].as_i64()), (Some(6 * COST as u64 * 1000), Some(0)), "{r}");
     assert!(r["spent_sats"].as_i64().unwrap() <= 1_000, "{r}");
 }
+
+/// A visit's limit is raised by the wallet on this box, as JSON: a request that names an `Origin` (a browser's, a page
+/// that found the connector's port) or that is not JSON (a form) is refused, and the limit stays as it was.
+///
+/// FAILS before: any POST raised it.
+#[test]
+fn a_visits_limit_is_raised_only_by_the_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, _) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 1_000);
+    let raise = |extra: &str, body: &[u8]| ask(&addr, "POST", &format!("/visits/{visit}/limit"), extra, body).0;
+    let body = json!({"limit_sats": 5_000}).to_string();
+    assert_eq!(raise("Content-Type: application/json\r\nOrigin: http://evil.example\r\n", body.as_bytes()), 403);
+    assert_eq!(raise("Content-Type: application/x-www-form-urlencoded\r\n", b"limit_sats=5000"), 403);
+    assert_eq!(raise("Content-Type: text/plain\r\n", body.as_bytes()), 403);
+    let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["limit_sats"], 1_000);
+    assert_eq!(raise("Content-Type: application/json\r\n", body.as_bytes()), 200);
+    let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["limit_sats"], 5_000);
+}

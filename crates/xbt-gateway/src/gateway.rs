@@ -263,7 +263,8 @@ fn gzip_for(req: &Request, answer: &Answer) -> bool {
     }));
     let t = header(&answer.headers, "content-type").unwrap_or_default();
     let t = t.split(';').next().unwrap_or("").trim();
-    let text = t.starts_with("text/") || t.ends_with("+json") || t.ends_with("+xml")
+    // an event stream is sent as it is: each event as it comes
+    let text = (t.starts_with("text/") && t != "text/event-stream") || t.ends_with("+json") || t.ends_with("+xml")
         || ["application/javascript", "application/json", "application/xml", "application/wasm", "image/svg+xml", "application/manifest+json"].contains(&t);
     req.method == "GET" && takes && answer.status == 200 && text && header(&answer.headers, "content-range").is_none()
         && header(&answer.headers, "content-encoding").is_none() && answer.length.is_none_or(|n| n >= 256)
@@ -1685,9 +1686,7 @@ impl Gateway {
             }
         };
         let mut headers = Self::passed_headers(&answer);
-        if let Some(cc) = route.cache_control(&req.method, answer.status, &req.headers, &answer.headers) {
-            headers.push(("Cache-Control".into(), cc));
-        }
+        headers.extend(route.cache_headers(&req.method, &req.target, answer.status, &req.headers, &answer.headers));
         // a free route's long answers count against its `max_streams` and rate too
         let slot = if answer.status < 300 && admission::is_long(&answer.headers, answer.length) {
             match self.load.stream(route, "") {
@@ -1701,6 +1700,13 @@ impl Gateway {
         // over a slow link (a relay far away) a web app's scripts and styles are a third of the bytes. The buyer's client
         // unpacks it (the wallet's does, as it asks)
         if gzip_for(req, &answer) {
+            // the compressed bytes are not the service's: its validator is weakened (a range resumed by `If-Range` compares
+            // strongly, so never matches it and gets the whole body; a revalidation compares weakly, and still does), and no
+            // range of them is offered
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("accept-ranges"));
+            for h in headers.iter_mut().filter(|(k, v)| k.eq_ignore_ascii_case("etag") && !v.trim_start().starts_with("W/")) {
+                h.1 = format!("W/{}", h.1.trim());
+            }
             headers.push(("Content-Encoding".into(), "gzip".into()));
             headers.push(("Vary".into(), "Accept-Encoding".into()));
             let (status, mut src) = (answer.status, answer.body);
@@ -1718,6 +1724,8 @@ impl Gateway {
                             break;
                         }
                         z.write_all(&buf[..n])?;
+                        // what came is sent now, whole: a slow answer is not held back for the next chunk
+                        z.flush()?;
                         if !z.get_ref().is_empty() {
                             let done = std::mem::take(z.get_mut());
                             out.send(&done)?;
@@ -1973,9 +1981,7 @@ impl Gateway {
         };
         let mut headers = Self::passed_headers(&answer);
         // the route's `cache`: how long the buyer's browser keeps the answer, where the service said nothing of it
-        if let Some(cc) = route.cache_control(&req.method, answer.status, &req.headers, &answer.headers) {
-            headers.push(("Cache-Control".into(), cc));
-        }
+        headers.extend(route.cache_headers(&req.method, &req.target, answer.status, &req.headers, &answer.headers));
         if answer.status >= 400 {
             // an error is not a piece: passed on, capped, not charged
             refund(reserve);
