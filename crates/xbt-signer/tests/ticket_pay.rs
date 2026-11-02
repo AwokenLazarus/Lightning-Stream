@@ -15880,7 +15880,7 @@ fn a_call_that_asks_for_a_top_up_keeps_the_credit_ahead_of_a_pages_requests() {
     // with no credit left, what an empty answer and a 204 come to (said for the record; a page's
     // requests at the edge of the credit)
     for (name, path, method) in [("css0", "/jfx/Branding/Css", "GET"), ("caps0", "/jfx/Sessions/Capabilities/Full", "POST")] {
-        let (v, head, got) = page_call(&r, dir.path(), name, path, method, Some(b"{}").filter(|_| method == "POST"), 125);
+        let (v, head, got) = page_call(&r, dir.path(), name, path, method, Some(&b"{}"[..]).filter(|_| method == "POST"), 125);
         eprintln!("at no credit: {method} {path}: {} bytes, head {head}, answer complete {} ended {} rule {} reason {}", got.len(), v["complete"], v["ended"], v["rule"], v["reason"]);
     }
     // a small request that tops the credit up: a ticket before it leaves

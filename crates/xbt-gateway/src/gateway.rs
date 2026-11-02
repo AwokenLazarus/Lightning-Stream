@@ -1665,7 +1665,10 @@ impl Gateway {
                 ))
             }
         };
-        let headers = Self::passed_headers(&answer);
+        let mut headers = Self::passed_headers(&answer);
+        if let Some(cc) = route.cache_control(&req.method, answer.status, &req.headers, &answer.headers) {
+            headers.push(("Cache-Control".into(), cc));
+        }
         // a free route's long answers count against its `max_streams` and rate too
         let slot = if answer.status < 300 && admission::is_long(&answer.headers, answer.length) {
             match self.load.stream(route, "") {
@@ -1916,7 +1919,11 @@ impl Gateway {
                 ));
             }
         };
-        let headers = Self::passed_headers(&answer);
+        let mut headers = Self::passed_headers(&answer);
+        // the route's `cache`: how long the buyer's browser keeps the answer, where the service said nothing of it
+        if let Some(cc) = route.cache_control(&req.method, answer.status, &req.headers, &answer.headers) {
+            headers.push(("Cache-Control".into(), cc));
+        }
         if answer.status >= 400 {
             // an error is not a piece: passed on, capped, not charged
             refund(reserve);

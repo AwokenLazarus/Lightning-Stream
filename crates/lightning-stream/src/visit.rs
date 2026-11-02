@@ -1540,7 +1540,8 @@ mod tests {
         assert_eq!(v.lock().spent, most);
         v.lane_done();
         v.release(most, 600);
-        assert_eq!((v.lock().spent, v.lock().held), (600, 0));
+        let st = v.lock();
+        assert_eq!((st.spent, st.held, st.lane), (600, 0, false));
     }
 
     /// A call whose signer answer never came (the call to the signer failed or timed out) may have
