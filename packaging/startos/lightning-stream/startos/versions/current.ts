@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.1:0',
+  version: '0.2.2:0',
   releaseNotes: {
     en_US:
-      'A fix to 0.2.0: on Browse, Found on Nostr, a shop reached by its key (such as the demo shop, Lightning Stream Genesis) now offers Add this shop. Before, it offered only a check with the seller, which failed with a name-lookup error. A file cheaper than the smallest ticket a shop sells (546 sat) can now be downloaded: its first call buys one ticket and the rest stays as credit, and a refusal is a page in words, not raw JSON. A web-app visit needs a limit of at least 559 sat; a smaller one is refused with the reason and set to 559.',
+      'A fix release for first purchases. Sellers show by name everywhere; who may be paid is a list you can only remove whole sellers from, and the app warns before signing if a seller has no Lightning node. When a payment cannot happen, the app says why in plain words instead of a blank page, and warns before paying when your node cannot send. A visit shows what it used and what is left as credit. The version shows in the footer and Setup. Pages that waited on relays or the hashrate service open at once.',
   },
   migrations: {
     up: async () => {},

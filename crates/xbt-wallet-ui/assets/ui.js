@@ -431,6 +431,7 @@
   // frame is closed when the visit ends (stopped, or its limit reached).
   $$(".app-visit[data-visit]").forEach(function (box) {
     var frame = $("iframe.seller-app", box), spent = $("[data-visit-spent]", box), state = $("[data-visit-state]", box), note = $("[data-visit-note]", box);
+    var paid = $("[data-visit-paid]", box), refusal = $("[data-visit-refusal]", box), shown = "";
     var visit = box.getAttribute("data-visit"), port = box.getAttribute("data-port"), code = box.getAttribute("data-code");
     if (!frame || !/^[0-9a-f]+$/.test(visit || "") || !/^[0-9]+$/.test(port || "") || !/^[0-9a-f]+$/.test(code || "")) return;
     frame.src = location.protocol + "//" + location.hostname + ":" + port + "/__ls/enter?c=" + code;
@@ -444,9 +445,42 @@
       frame.removeAttribute("src");
       frame.hidden = true;
     }
+    // the wallet's refusal of a request of the visit, in words, with the links to its fix
+    function showRefusal(r) {
+      var key = r ? JSON.stringify(r) : "";
+      if (key === shown) return;
+      shown = key;
+      while (refusal.firstChild) refusal.removeChild(refusal.firstChild);
+      refusal.hidden = !r;
+      if (!r) return;
+      function add(tag, text, parent) { var el = document.createElement(tag); if (text) el.textContent = text; (parent || refusal).appendChild(el); return el; }
+      add("h3", String(r.title || "Not paid"));
+      add("p", String(r.words || ""));
+      if (r.fix) add("p", String(r.fix));
+      var row = null;
+      (Array.isArray(r.links) ? r.links : []).forEach(function (l) {
+        var to = String(l[0] || "");
+        if (!/^\.\/[a-z-]+$/.test(to) && to.indexOf("https://lightning-stream.com/") !== 0) return;
+        if (!row) { row = add("p"); row.className = "row"; }
+        var a = add("a", String(l[1] || to), row);
+        a.className = "button-link";
+        a.href = to;
+        if (to.indexOf("https://") === 0) { a.target = "_blank"; a.rel = "noopener noreferrer"; }
+      });
+      if (r.details) {
+        var d = add("details");
+        add("summary", "Details", d);
+        var p = add("p", "", d);
+        p.className = "small";
+        add("code", String(r.details), p);
+      }
+    }
     function ask() {
       fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
         if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
+        if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
+          ? " · " + v.prepaid_sats.toLocaleString() + " sat prepaid, " + (v.credit_sats || 0).toLocaleString() + " sat of it left as credit with the shop" : "";
+        if (refusal) showRefusal(v.refusal);
         if (v.ended) ended(String(v.ended));
       }).catch(function () {});
     }

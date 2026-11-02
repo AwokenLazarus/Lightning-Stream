@@ -1152,7 +1152,10 @@ impl App {
         let mut each = HashMap::new();
         // in parallel: a service that does not answer costs its wait once, not once per service
         let probes: Vec<(String, bool)> = std::thread::scope(|s| {
-            let hs: Vec<_> = shop.offers.iter().filter(|o| !o.paused).map(|o| s.spawn(move || (o.id.clone(), Self::reachable(&o.address)))).collect();
+            let hs: Vec<_> = shop.offers.iter().filter(|o| !o.paused).map(|o| {
+                let req = crate::perf::carry();
+                s.spawn(move || req.enter(|| (o.id.clone(), Self::reachable(&o.address))))
+            }).collect();
             hs.into_iter().filter_map(|h| h.join().ok()).collect()
         });
         for o in &shop.offers {

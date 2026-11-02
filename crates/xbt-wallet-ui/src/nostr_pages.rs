@@ -7,6 +7,7 @@ use super::{App, Ctx};
 use crate::html::esc;
 use crate::nostr::{self, Snapshot};
 use crate::server::Resp;
+use crate::services::{self, Service};
 
 impl App {
     pub(crate) fn nostr_page(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
@@ -18,7 +19,8 @@ impl App {
             return self.html_page("Browse", "Found on Nostr", ctx, body, "");
         }
         let snap = self.nostr.get(q.get("refresh").is_some_and(|v| v == "1"));
-        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap), "")
+        let have = self.file_services().unwrap_or_default();
+        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have), "")
     }
 
     /// `POST /nostr-check`: ask the seller whether the listing found on Nostr is its own.
@@ -38,11 +40,13 @@ impl App {
     }
 }
 
-fn nostr_html(ctx: &Ctx, snap: &Snapshot) -> String {
+/// `have`: the sellers on the owner's list, marked "On your list".
+fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service]) -> String {
     let mut b = String::from("<p class=\"small\"><a href=\"./browse\">← Your services</a> · <a href=\"./nostr?refresh=1\">Look again</a></p>\
-        <div class=\"flash warn\"><strong>Unvetted.</strong> These sellers published their lists on Nostr. Each list is signed by the seller's \
-        own key, but nobody has checked who the seller is. Check one before you pay it: the app then asks the seller's own address whether \
-        the list is theirs. Payments still keep to your spending rules.</div>");
+        <div class=\"flash warn\"><strong>Unvetted.</strong> These sellers published their lists on Nostr, each signed by the \
+        seller's own key, but nobody has checked who runs them. A shop reached by its key: its address is that key, so the list is its own. \
+        A seller with a web address: press Check with the seller, and the app asks that address whether the list is theirs. \
+        Payments still keep to your spending rules.</div>");
     let up = snap.relays.iter().filter(|r| r.result.is_ok()).count();
     b.push_str(&format!("<p class=\"small\">{up} of {} relays answered", snap.relays.len()));
     if snap.refused > 0 {
@@ -57,18 +61,22 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot) -> String {
         return b;
     }
     for n in &snap.listings {
+        let added = have.iter().any(|s| services::same_origin(&s.seller, &n.listing.seller));
+        let mine = if added { "<span class=\"pill good\">On your list</span>" } else { "" };
+        let (add_label, add_class) = if added { ("Check for updates", " class=\"secondary\"") } else { ("Add this shop", "") };
         if key_shop(n) {
             // a shop without a web address: its address is its key, and the listing is signed by that key, so
             // there is no other address to ask. It is added as a shop key on Sellers ([`App::add_seller`])
-            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill\">reached by its key</span></div>\
+            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill\">reached by its key</span>{mine}</div>\
                                  <p class=\"small\">Shop key <code class=\"key\">{}</code>. This list is signed by that key, so it is the shop's own; \
                                  who runs the shop is not checked by anyone.</p>\
                                  <form method=\"post\" action=\"./services\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
                                  <input type=\"hidden\" name=\"action\" value=\"add\"><input type=\"hidden\" name=\"url\" value=\"{}\">\
-                                 <button type=\"submit\">Add this shop</button></form>",
+                                 <button type=\"submit\"{add_class}>{add_label}</button></form>",
                                 esc(&n.listing.name), esc(&xbt402::shop::display(&n.listing.seller)), esc(&ctx.csrf), esc(&n.listing.seller)));
         } else {
-            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill warn\">unvetted</span></div>\
+            let pill = if added { mine } else { "<span class=\"pill warn\">unvetted</span>" };
+            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
                                  <p class=\"small\">{}</p><details><summary>Keys</summary><p class=\"small\">Nostr key <code>{}</code>, receipt key <code>{}</code></p></details>\
                                  <form method=\"post\" action=\"./nostr-check\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
                                  <input type=\"hidden\" name=\"event\" value=\"{}\"><button type=\"submit\" class=\"secondary\">Check with the seller</button></form>",

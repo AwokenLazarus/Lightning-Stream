@@ -72,7 +72,13 @@ struct State {
     grants: HashMap<String, Grant>,
     /// The owner's free previews, by visit id: nothing to ask the connector about.
     previews: std::collections::HashSet<String>,
+    /// The wallet's latest refusal of a request of each visit, and when: shown above the frame, in
+    /// words, by the visit's page ([`App::api_visit`]).
+    refusals: HashMap<String, (Instant, String)>,
 }
+
+/// A refusal is shown above a visit's frame for this long after it came.
+const REFUSAL_SHOWN: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub struct AppOrigins {
@@ -156,7 +162,6 @@ impl App {
         if self.app_ports().is_empty() {
             return self.page("Open the app", ctx, "<p class=\"empty\">This box does not open sellers' apps.</p>".into());
         }
-        let host = crate::app::stream_pages::host(&svc.seller);
         if self.is_own_shop(&svc.seller) {
             let b = format!("<section class=\"card primary\"><h2>Preview your own app</h2>\
                 <p>This is your shop: buyers open <strong>{}</strong> here and pay {} for what it loads. You can try it for free: it comes \
@@ -166,18 +171,20 @@ impl App {
                 esc(&svc.name), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base));
             return self.page("Open the app", ctx, b);
         }
+        // the node can't send a first ticket: said before anything is paid
+        let warn = crate::pay_feedback::cant_send_card(self.spendable_sats(), MIN_CALL_SATS, "this shop");
         // a limit the owner entered under the smallest ticket comes back raised to it (see [`visit_limit`])
         let suggested = q.get("limit").and_then(|v| v.parse::<i64>().ok()).filter(|n| (MIN_CALL_SATS..=MAX_VISIT_SATS).contains(n)).unwrap_or(SUGGESTED_LIMIT);
-        let b = format!("<section class=\"card primary\"><h2>Open {}'s app</h2>\
+        // the shop by its listed name ("Lightning Stream Genesis"), never its key or made-up address
+        let shop = self.seller_name(&svc.seller);
+        let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
             <p>You use <strong>{}</strong> as it is on {}'s own network, inside this page. What it loads is paid at {}, \
             and stops at the limit you set here.</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
-            <label>Spend at most, on this visit, in sats<input name=\"limit\" value=\"{suggested}\" required inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
-            <p class=\"hint\">A shop sells in tickets of at least {MIN_TICKET_SATS} sat, so with routing fees a visit needs at least {MIN_CALL_SATS} sat. \
-            What you don't use stays as credit with the shop. Your spending rules apply as well.</p>\
-            <div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
+            {}<div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
             <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
-            esc(&host), esc(&svc.name), esc(&host), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), self.identity_card(ctx, &svc.seller, &base, &entry));
+            esc(&shop), esc(&svc.name), esc(&crate::app::stream_pages::host(&svc.seller)), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
+            self.identity_card(ctx, &svc.seller, &base, &entry));
         self.page("Open the app", ctx, b)
     }
 
@@ -289,13 +296,16 @@ impl App {
         let host = crate::app::stream_pages::host(&svc.seller);
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
+            <div class=\"card primary refusal\" data-visit-refusal hidden></div>\
             <p>{} &middot; {} \
             <form method=\"post\" action=\"./app-stop\" class=\"inline\">{}<input type=\"hidden\" name=\"visit\" value=\"{}\"><button class=\"danger\">Stop</button></form></p>\
             <iframe class=\"seller-app\" title=\"{}\" sandbox=\"allow-scripts allow-same-origin allow-forms allow-downloads allow-modals allow-pointer-lock\" \
             allow=\"fullscreen; autoplay; encrypted-media; picture-in-picture\" referrerpolicy=\"no-referrer\"></iframe>\
             <p class=\"hint\" data-visit-note>{}'s own page. It cannot see your wallet. Close this page or press Stop to end the visit.</p></section>",
             esc(&visit), esc(&code),
-            if preview { "Your own shop, free: nothing is paid".to_string() } else { format!("<span data-visit-spent>0</span> of <strong>{limit} sat</strong> spent on this visit") },
+            if preview { "Your own shop, free: nothing is paid".to_string() } else {
+                format!("<span data-visit-spent>0</span> sat used of <strong>{} sat</strong> on this visit<span data-visit-paid></span>", crate::html::group3(limit.unsigned_abs()))
+            },
             esc(&svc.price_text), App::csrf_input(ctx), esc(&visit), esc(&svc.name), esc(&host));
         let frames: String = self.app_ports().iter().map(|p| format!(" http://*:{p} https://*:{p}")).collect();
         let csp = format!("{}; media-src 'self'; frame-src{frames}", crate::server::CSP);
@@ -306,13 +316,19 @@ impl App {
     /// `POST /app-stop`.
     pub(crate) fn app_stop(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let visit = f.get("visit").cloned().unwrap_or_default();
+        let mut used = String::new();
         if visit.bytes().all(|b| b.is_ascii_hexdigit()) && !visit.is_empty() {
             if !self.apps.lock().previews.remove(&visit) {
-                let _ = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
+                let said = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
+                if let Ok((200, v)) = said {
+                    used = visit_numbers(&v).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
+                }
             }
-            self.apps.lock().grants.retain(|_, g| g.visit != visit);
+            let mut s = self.apps.lock();
+            s.grants.retain(|_, g| g.visit != visit);
+            s.refusals.remove(&visit);
         }
-        self.flash(ctx, true, "Stopped. The app is closed and nothing more is paid for it.");
+        self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{used}"));
         Resp::redirect("./browse")
     }
 
@@ -325,13 +341,61 @@ impl App {
         if self.apps.lock().previews.contains(&visit) {
             return Resp::json(200, &json!({"spent_sats": 0, "ended": null}));
         }
+        let refused = {
+            let mut s = self.apps.lock();
+            s.refusals.retain(|_, (t, _)| t.elapsed() < 10 * REFUSAL_SHOWN);
+            s.refusals.get(&visit).filter(|(t, _)| t.elapsed() < REFUSAL_SHOWN).map(|(_, b)| b.clone())
+        };
+        // the refusal in words, with what the node can send where it found no route
+        let refusal = refused.map(|body| {
+            let no_route = crate::pay_feedback::explain(&body, None, false).kind == crate::pay_feedback::Kind::NoRoute;
+            crate::pay_feedback::as_json(&crate::pay_feedback::explain(&body, if no_route { self.spendable_sats() } else { None }, false))
+        });
         match connector_json("GET", &format!("{}/visits/{visit}", self.cfg.connector.trim_end_matches('/')), None) {
             Ok((200, v)) => {
-                Resp::json(200, &json!({"spent_sats": v["spent_sats"], "limit_sats": v["limit_sats"], "ended": v["ended"]}))
+                let mut out = visit_numbers(&v);
+                out["refusal"] = refusal.unwrap_or(Value::Null);
+                Resp::json(200, &out)
             }
             _ => Resp::json(200, &json!({"ended": "This visit has ended."})),
         }
     }
+
+    /// What the node can send now, about ([`crate::pay_feedback::spendable_sats`]); `None` where the
+    /// signer does not say.
+    pub(crate) fn spendable_sats(&self) -> Option<i64> {
+        self.call("ln_status", json!({})).ok().and_then(|v| crate::pay_feedback::spendable_sats(&v))
+    }
+}
+
+/// The visit's numbers for its page, from the connector's report: what its answers used (`used_sats`,
+/// and `spent_sats`, the same), what was paid for tickets in it (`prepaid_sats`) and what of that is
+/// left as credit with the shop (`credit_sats`), its limit, and `said`, the line in words. A
+/// connector that does not count what was used gives its `spent_sats` as before.
+pub(crate) fn visit_numbers(v: &Value) -> Value {
+    let Some(used_msat) = v.get("used_msat").and_then(Value::as_u64) else {
+        return json!({"spent_sats": v["spent_sats"], "limit_sats": v["limit_sats"], "ended": v["ended"]});
+    };
+    let used = i64::try_from(used_msat.div_ceil(1000)).unwrap_or(i64::MAX);
+    let paid = v.get("paid_sats").and_then(Value::as_i64).unwrap_or(0).max(0);
+    let credit = i64::try_from((paid.unsigned_abs() * 1000).saturating_sub(used_msat) / 1000).unwrap_or(0);
+    let mut said = format!("This visit used {used} sat");
+    if paid > 0 {
+        said.push_str(&format!("; {paid} sat was prepaid, and {credit} sat of it stays as credit with the shop."));
+    } else if used > 0 {
+        said.push_str(" from your credit with the shop; nothing new was paid.");
+    } else {
+        said.push('.');
+    }
+    json!({"used_sats": used, "spent_sats": used, "prepaid_sats": paid, "credit_sats": credit, "limit_sats": v["limit_sats"], "ended": v["ended"], "said": said})
+}
+
+/// The visit limit's field, with the least a visit needs up front, set to `suggested`.
+fn limit_field(suggested: i64) -> String {
+    format!("<label>Spend at most, on this visit, in sats: at least {MIN_CALL_SATS} sat for this shop\
+             <input name=\"limit\" value=\"{suggested}\" required inputmode=\"numeric\" pattern=\"[0-9,]+\"></label>\
+             <p class=\"hint\">A shop sells in tickets of at least {MIN_TICKET_SATS} sat; with routing fees a visit needs {MIN_CALL_SATS} sat. \
+             What you don't use stays as credit with the shop. Your spending rules apply as well.</p>")
 }
 
 /// One app port: a seller's own page, for the visit whose cookie the browser holds.
@@ -345,8 +409,18 @@ const PASSED: [&str; 12] = ["accept", "accept-language", "content-type", "if-mod
                             "x-emby-authorization", "x-mediabrowser-token", "x-requested-with", "x-csrf-token"];
 
 fn text(status: u16, s: &str) -> xbt_svc::http::Reply {
-    let html = format!("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Lightning Stream</title>\
-        <body style=\"font:16px system-ui,sans-serif;margin:2rem;color:#222\"><p>{}</p></body>", esc(s));
+    frame_reply(status, crate::pay_feedback::frame_page("", s, "", ""))
+}
+
+/// The wallet's refusal of a request of the visit, as the frame shows it: in words, with the fix,
+/// its own words under Details; the links to the fix are above the frame.
+fn refused_in_frame(status: u16, body: &str) -> xbt_svc::http::Reply {
+    let e = crate::pay_feedback::explain(body, None, false);
+    let fix = format!("{} The links are above this frame.", e.fix);
+    frame_reply(status, crate::pay_feedback::frame_page(&e.title, &e.words, &fix, &e.raw))
+}
+
+fn frame_reply(status: u16, html: String) -> xbt_svc::http::Reply {
     xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(status, vec![("Content-Type".into(), "text/html; charset=utf-8".into()),
         ("Cache-Control".into(), "no-store".into()), ("Content-Security-Policy".into(), "default-src 'none'; style-src 'unsafe-inline'".into())], html.into_bytes()))
 }
@@ -470,13 +544,16 @@ impl xbt_svc::http::Handler for AppOrigin {
         let status = resp.status();
         // the connector's own refusal (the visit ended, the limit reached): in words, for the frame
         if resp.header("x-ls-refusal").is_some() {
-            let v: Value = serde_json::from_str(&resp.into_string().unwrap_or_default()).unwrap_or(Value::Null);
+            let body = resp.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let words = v.get("error").and_then(Value::as_str).unwrap_or("The visit has ended.");
             // the seller's service is full: nothing was charged, and this page can simply be loaded again
             if v.get("rule").and_then(Value::as_str) == Some("seller_busy") {
                 return text(503, &format!("{words} Nothing was charged. Reload this page to try again."));
             }
-            return text(status, &format!("{words} Back in Lightning Stream, you can open the app again with a new limit."));
+            // shown above the frame too, with the links to the fix ([`App::api_visit`])
+            self.app.apps.lock().refusals.insert(g.visit.clone(), (Instant::now(), body.clone()));
+            return refused_in_frame(status, &body);
         }
         let mut headers = vec![];
         for name in resp.headers_names() {
@@ -744,6 +821,38 @@ mod tests {
         assert_eq!(visit_limit(Some("1,000")), Ok(1_000));
         assert_eq!(visit_limit(Some("0")).unwrap_err().1, None);
         assert_eq!(visit_limit(None).unwrap_err().1, None);
+    }
+
+    /// The limit field says the least a visit needs up front, and starts at 1,000 sat.
+    ///
+    /// FAILS before: the least was said only under the field, after the owner typed 500.
+    #[test]
+    fn the_visit_limit_field_says_the_least_up_front_and_starts_at_1000() {
+        let f = limit_field(SUGGESTED_LIMIT);
+        assert!(f.starts_with("<label>Spend at most, on this visit, in sats: at least 559 sat for this shop<input"), "{f}");
+        assert!(f.contains("value=\"1000\""));
+    }
+
+    /// The visit's counter: what was used, apart from what was prepaid and is left as credit, during
+    /// and after the visit; not the shares held while requests run.
+    ///
+    /// FAILS before: `spent_sats` was the connector's budget count: 559 of 559 while the film played,
+    /// 0 after Stop, though 65 sat were used.
+    #[test]
+    fn the_visit_counter_shows_what_was_used_and_what_was_prepaid() {
+        // playing: the whole limit is held, 30 sat used so far, from credit bought on an earlier visit
+        let playing = visit_numbers(&json!({"limit_sats": 559, "spent_sats": 559, "held_sats": 559, "used_msat": 29_400, "paid_sats": 0, "ended": null}));
+        assert_eq!((playing["spent_sats"].as_i64(), playing["used_sats"].as_i64(), playing["prepaid_sats"].as_i64()), (Some(30), Some(30), Some(0)));
+        // stopped: nothing held, 65 sat used
+        let stopped = visit_numbers(&json!({"limit_sats": 559, "spent_sats": 0, "held_sats": 0, "used_msat": 64_870, "paid_sats": 0, "ended": "Stopped."}));
+        assert_eq!(stopped["used_sats"].as_i64(), Some(65));
+        assert_eq!(stopped["said"], "This visit used 65 sat from your credit with the shop; nothing new was paid.");
+        // a ticket bought in the visit: prepaid, and the rest left as credit
+        let bought = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 559, "held_sats": 0, "used_msat": 64_870, "paid_sats": 559, "ended": null}));
+        assert_eq!((bought["used_sats"].as_i64(), bought["prepaid_sats"].as_i64(), bought["credit_sats"].as_i64()), (Some(65), Some(559), Some(494)));
+        assert_eq!(bought["said"], "This visit used 65 sat; 559 sat was prepaid, and 494 sat of it stays as credit with the shop.");
+        // an older connector: as before
+        assert_eq!(visit_numbers(&json!({"limit_sats": 559, "spent_sats": 12}))["spent_sats"].as_i64(), Some(12));
     }
 
     /// The owner is offered "Stay anonymous here" for a shop where any route keeps accounts, not only

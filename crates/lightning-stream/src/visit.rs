@@ -2,7 +2,11 @@
 //! owner set for the visit (docs/SELLER-APPS.md).
 //!
 //! `POST /visits` `{"base": "<seller URL ending in />", "limit_sats": N}` → `{"visit": id}`.
-//! `GET /visits/<id>`: what the visit has spent, its limit, and whether it has ended.
+//! `GET /visits/<id>`: what the visit has spent of its limit (`spent_sats`, the shares of the requests
+//! running now in it whole), its limit, and whether it has ended; and, by the signer's word on each
+//! answer that has ended, what the seller charged for them (`used_msat`) and what the wallet paid
+//! over Lightning for tickets in this visit (`paid_sats`: prepaid, what is not used stays as credit
+//! with the seller).
 //! `POST /visits/<id>/stop`: end it; its next request is refused.
 //! `<any method> /v/<id>/<path>`: one request of the page, sent to `base` + `path` and paid.
 //!
@@ -101,6 +105,12 @@ struct State {
     /// What one of the seller's tickets books, fee included, as a refusal named it: each share has
     /// room for one beside its own part, so that a request can buy the ticket it needs.
     ticket: i64,
+    /// What the seller charged for the visit's answers that have ended, by the signer's word
+    /// (`price_msat`): what the visit used, whether from tickets bought in it or from credit.
+    used_msat: u64,
+    /// What the wallet paid over Lightning for tickets in this visit, by the signer's word
+    /// (`charged_sats`): prepaid, so it may be more than was used.
+    paid: i64,
     ended: Option<String>,
     calls: u64,
     last: Option<Instant>,
@@ -178,7 +188,17 @@ impl Visit {
 
     fn report(&self) -> Value {
         let s = self.lock();
-        json!({"base": self.base, "limit_sats": self.limit, "spent_sats": s.spent, "ended": s.ended, "calls": s.calls})
+        json!({"base": self.base, "limit_sats": self.limit, "spent_sats": s.spent, "held_sats": s.held, "used_msat": s.used_msat, "paid_sats": s.paid,
+               "ended": s.ended, "calls": s.calls})
+    }
+
+    /// The signer's final word on one call: what the seller charged for its answer and what was
+    /// paid for tickets for it, counted for the visit's report.
+    fn account(&self, v: &Value) {
+        let num = |k: &str| v.get(k).and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())));
+        let mut s = self.lock();
+        s.used_msat = s.used_msat.saturating_add(num("price_msat").unwrap_or(0));
+        s.paid = s.paid.saturating_add(i64::try_from(num("charged_sats").unwrap_or(0)).unwrap_or(0));
     }
 
     /// Hold up to `most` of what is left of the limit for one request, and room for a ticket once
@@ -268,6 +288,7 @@ impl Visit {
             s.ticket = s.ticket.max(t);
         }
         if let Some(c) = v.get("charged_sats").and_then(Value::as_i64) {
+            self.account(&v);
             return self.release(share, c);
         }
         match done {
@@ -303,8 +324,11 @@ impl Visit {
         }
         drop(s);
         self.turn.notify_all();
-        let charged = done.and_then(|d| d.recv_timeout(SETTLE_WAIT).ok()).and_then(Result::ok)
-            .and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
+        let reply = done.and_then(|d| d.recv_timeout(SETTLE_WAIT).ok()).and_then(Result::ok);
+        if let Some(v) = &reply {
+            self.account(v);
+        }
+        let charged = reply.and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
         self.lock().settling -= share;
         self.release(share, charged);
     }
@@ -860,6 +884,32 @@ mod tests {
         });
         let s = v.lock();
         assert_eq!((s.spent, s.held, s.settling), (12, 0, 0));
+    }
+
+    /// The visit's report says what its answers used and what was paid for tickets, apart from the
+    /// shares held while requests run: during an answer the limit is all held, and after it only
+    /// what it charged stays, though what it used came from credit bought earlier.
+    ///
+    /// FAILS before: the report had only `spent_sats`, the whole limit while an answer ran and 0
+    /// once it ended on credit, with nothing of the 65 sat it used.
+    #[test]
+    fn the_report_says_what_was_used_and_what_was_paid() {
+        let v = visit(559);
+        let share = v.reserve(ANSWER_SHARE).unwrap();
+        let r = v.report();
+        assert_eq!((r["spent_sats"].as_i64(), r["held_sats"].as_i64(), r["used_msat"].as_u64(), r["paid_sats"].as_i64()), (Some(559), Some(559), Some(0), Some(0)));
+        let (tx, done) = mpsc::channel::<Result<Value, String>>();
+        tx.send(Ok(json!({"charged_sats": 0, "price_msat": "64870"}))).unwrap();
+        v.settle(share, Some(done), false);
+        let r = v.report();
+        assert_eq!((r["spent_sats"].as_i64(), r["held_sats"].as_i64(), r["used_msat"].as_u64(), r["paid_sats"].as_i64()), (Some(0), Some(0), Some(64_870), Some(0)));
+        // a ticket bought for the next answer: paid, and what it used
+        let share = v.reserve(ANSWER_SHARE).unwrap();
+        let (tx, done) = mpsc::channel::<Result<Value, String>>();
+        tx.send(Ok(json!({"charged_sats": 559, "price_msat": 1_000}))).unwrap();
+        v.settle(share, Some(done), false);
+        let r = v.report();
+        assert_eq!((r["used_msat"].as_u64(), r["paid_sats"].as_i64()), (Some(65_870), Some(559)));
     }
 
     /// A call whose signer answer never came (the call to the signer failed or timed out) may have

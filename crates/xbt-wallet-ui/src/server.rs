@@ -193,8 +193,22 @@ impl xbt_svc::http::Handler for Ui {
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
         let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: rq.body, peer };
+        let get = req.method == "GET" || req.method == "HEAD";
+        // an action changes what the pages show: they ask the signer afresh, during it and after it
+        if !get {
+            self.0.signer.forget();
+        }
+        let timing = crate::perf::Request::begin(get);
         let mut resp = self.0.handle(req);
+        if !get {
+            self.0.signer.forget();
+        }
         security_headers(&mut resp);
+        resp.headers.push(("Server-Timing".into(), timing.server_timing()));
+        if timing.elapsed() >= crate::perf::slow_limit() {
+            eprintln!("xbt-wallet-ui: slow request: {} {} took {:.0} ms ({})", rq.method.to_uppercase(), log_path(raw_path),
+                      timing.elapsed().as_secs_f64() * 1000.0, timing.server_timing());
+        }
         xbt_svc::http::Response::new(resp.status, resp.headers, resp.body)
     }
 
@@ -231,10 +245,27 @@ impl xbt_svc::http::Handler for Ui {
                 let ceiling = self.0.relay_ceiling(&req, &item);
                 // and its listed size: the most bytes, and so sats, one part may cost
                 let limit = self.0.relay_limit(&req, &item, range.as_deref().and_then(range_len));
-                relay(&url, range.as_deref(), req.headers.get("if-range").map(String::as_str), ceiling.as_ref(), limit)
+                // a refusal is a page of the app's, in words; one of no route says what the node can send
+                let base = self.0.cfg.base_path.clone();
+                let app = self.0.clone();
+                let page = move |body: &str| {
+                    let no_route = crate::pay_feedback::explain(body, None, true).kind == crate::pay_feedback::Kind::NoRoute;
+                    refused_html(body, &base, if no_route { app.spendable_sats() } else { None })
+                };
+                relay(&url, range.as_deref(), req.headers.get("if-range").map(String::as_str), ceiling.as_ref(), limit, &page)
             }
         }
     }
+}
+
+/// A path as the slow-request log line shows it: a link's token (`/r/`, `/s/~`) is never logged.
+pub fn log_path(path: &str) -> String {
+    let cut = ["/r/", "/s/"].iter().filter_map(|m| path.find(m).map(|i| i + m.len())).min();
+    let p = match cut {
+        Some(i) => format!("{}…", &path[..i]),
+        None => path.to_string(),
+    };
+    p.chars().take(80).collect()
 }
 
 /// The most one ranged request of a reader buys at once: 4 MiB.
@@ -302,7 +333,8 @@ const RELAYED: [&str; 5] = ["Content-Type", "Content-Range", "Accept-Ranges", "E
 
 /// Stream the connector's answer for a seller URL to the reader, with the reader's `Range` (the
 /// connector takes one plain byte range and ignores any other).
-fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option<&serde_json::Value>, mut limit: Option<(u64, i64)>) -> xbt_svc::http::Reply {
+fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option<&serde_json::Value>, mut limit: Option<(u64, i64)>,
+         page: &dyn Fn(&str) -> String) -> xbt_svc::http::Reply {
     let mut retried = false;
     loop {
         match relay_once(url, range, if_range, ceiling, limit) {
@@ -314,7 +346,7 @@ fn relay(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: Option
                     retried = true;
                     limit = Some((size, n));
                 }
-                _ => return refused_page(&body),
+                _ => return refused_page(page(&body)),
             },
         }
     }
@@ -339,24 +371,16 @@ pub fn ticket_retry_sats(body: &str, sent: Option<i64>) -> Option<i64> {
     (n > sent.unwrap_or(0) && n <= RETRY_MOST_SATS).then_some(n)
 }
 
-/// A refusal of the wallet's, as a page a person reads rather than the connector's JSON.
-pub fn refused_html(body: &str) -> String {
-    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
-    let words = v.get("error").and_then(serde_json::Value::as_str).filter(|w| !w.is_empty()).unwrap_or("The wallet did not pay for this file.");
-    let rule = v.get("rule").and_then(serde_json::Value::as_str).unwrap_or("");
-    let more = if rule == "max_sats" {
-        format!("A download from Lightning Stream pays at most {RETRY_MOST_SATS} sat for its first ticket with a shop, and what it does not use \
-                 stays as credit with the shop. Your spending rules apply as well.")
-    } else {
-        "Your spending rules decide what the wallet pays: see Rules in Lightning Stream.".to_string()
-    };
-    format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
-             <title>Not paid</title></head><body><h1>This file was not paid for</h1><p>{}</p><p>{}</p>\
-             <p>Go back to Lightning Stream to try again.</p></body></html>", crate::html::esc(words), crate::html::esc(&more))
+/// A refusal of the wallet's, as a page a person reads rather than the connector's JSON: the app's
+/// look, the refusal in plain words with its fix, the wallet's words under Details, and a way back.
+/// `base`: the app's base path; `spendable`: what the node can send, said with a refusal of no route.
+pub fn refused_html(body: &str, base: &str, spendable: Option<i64>) -> String {
+    let base = if base.ends_with('/') { base.to_string() } else { format!("{base}/") };
+    crate::pay_feedback::page(&crate::pay_feedback::explain(body, spendable, true), &base, "This file was not paid for")
 }
 
-fn refused_page(body: &str) -> xbt_svc::http::Reply {
-    let mut whole = Resp::html(402, refused_html(body));
+fn refused_page(html: String) -> xbt_svc::http::Reply {
+    let mut whole = Resp::html(402, html);
     security_headers(&mut whole);
     xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body))
 }
@@ -584,10 +608,18 @@ mod tests {
         let some_paid = r#"{"error": "the next ticket of this seller is 546 sat, and only 10 sat of this call's limit of 559 sat is left: no more was paid", "rule": "max_sats"}"#;
         assert_eq!(ticket_retry_sats(some_paid, Some(559)), None);
         assert_eq!(ticket_retry_sats(r#"{"error": "over the daily budget", "rule": "budget"}"#, Some(559)), None);
-        let page = refused_html(r#"{"error": "over the <per-payment> cap", "rule": "max_payment_sats"}"#);
+        let page = refused_html(r#"{"error": "over the <per-payment> cap", "rule": "max_payment_sats"}"#, "/", None);
         assert!(page.starts_with("<!doctype html>") && page.contains("This file was not paid for") && page.contains("over the &lt;per-payment&gt; cap"), "{page}");
-        assert!(refused_html(&big).contains("at most 2000 sat for its first ticket"));
-        assert!(refused_html("not json").contains("The wallet did not pay for this file."));
+        assert!(page.contains("href=\"/ui.css") && page.contains("Back to Browse"), "the app's look and a way back: {page}");
+        assert!(refused_html(&big, "/", None).contains("at most 2,000 sat for its first ticket"));
+        assert!(refused_html("not json", "/", None).contains("The wallet did not pay for this file."));
+        // the common rules in plain words, with the fix
+        let not_named = r#"{"error": "the owner has not named the seller 03ab and task \"stream\" pays only named sellers", "rule": "ticket_admission"}"#;
+        let page = refused_html(not_named, "/ls", None);
+        assert!(page.contains("Your spending rules don&#39;t allow this shop yet") && page.contains("Allow this seller to be paid") && page.contains("href=\"/ls/services\""), "{page}");
+        let no_route = r#"{"error": "the wallet's node has found no route to the seller for 8.0 s: nothing was sent", "rule": "ln_no_route"}"#;
+        let page = refused_html(no_route, "/", Some(0));
+        assert!(page.contains("can&#39;t send to this shop right now: your channels hold about 0 sat you can spend") && page.contains("download/#channel"), "{page}");
     }
 
     #[test]

@@ -86,9 +86,11 @@ def pinned(text: str, pat: re.Pattern, pins: dict[str, str], release: bool = Fal
 IMAGE_SOURCES = ["crates", "Cargo.toml", "Cargo.lock", "container", ":(glob,exclude)crates/*/tests/**"]
 
 
-# sources only one image is built from (no other crate depends on them): a change there makes only that image's
-# pin stale, so a fix release may rebuild that image alone and keep the others' pins (0.2.1 rebuilt xbt-wallet-ui)
-OWN_SOURCES = {"xbt-wallet-ui": ["crates/xbt-wallet-ui"]}
+# sources only some images are built from (no other image's crates depend on them): a change there makes only those
+# images' pins stale, so a fix release may rebuild them alone and keep the others' pins (0.2.1: xbt-wallet-ui;
+# 0.2.2: xbt-wallet-ui and lightning-stream)
+# path -> the images built from it (no other image's crates depend on it)
+OWN_SOURCES = {"crates/xbt-wallet-ui": {"xbt-wallet-ui"}, "crates/lightning-stream": {"lightning-stream", "xbt-wallet-ui"}}
 
 
 def stale(pins: dict[str, str]) -> list[str]:
@@ -98,7 +100,7 @@ def stale(pins: dict[str, str]) -> list[str]:
     for commit in sorted({REF.match(r)["tag"].rsplit("-", 1)[1] for r in pins.values()}):
         at = {img for img, r in pins.items() if REF.match(r)["tag"].rsplit("-", 1)[1] == commit}
         # what only images built from another commit are made of does not make these stale
-        others = [f":(exclude){p}" for img, paths in OWN_SOURCES.items() if img not in at for p in paths]
+        others = [f":(exclude){p}" for p, owners in OWN_SOURCES.items() if not owners & at]
         r = subprocess.run(["git", "-C", str(HERE.parent), "diff", "--quiet", commit, "HEAD", "--", *IMAGE_SOURCES, *others])
         if r.returncode == 1:
             out.append(f"images.lock pins images built from {commit}; their sources changed since (git diff {commit} HEAD -- {' '.join(IMAGE_SOURCES)})")

@@ -5,6 +5,31 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.2 (2026-11-02)
+
+A fix release for a first purchase, from a tester's hands-on run of 0.2.1.
+
+- **Sellers by name.** Sellers, Spending rules, Wallet activity, Live connections, Found on Nostr and the visit
+  pages name a shop by its listing ("Lightning Stream Genesis"), never by its key or its made-up
+  `….shop.invalid` address. Found on Nostr marks shops already on your list.
+- **Who may be paid is a list.** Spending rules show one row per seller: name, key or address, its Lightning
+  node, and Remove. An edit can no longer cut a seller's node off; before, a long line wrapped in a text box
+  and editing it could drop the node, after which every payment to that seller was refused. A seller with no
+  node, or with a node other than the one the shop vouches for, is warned about before you sign. Removing a
+  seller from Sellers points you to the rules where it is still allowed.
+- **No blank pages.** When the wallet won't pay (a seller not allowed, no route, a limit or cap, your node over
+  "The most your Lightning node may hold"), the app shows why in plain words, what fixes it, and links, with
+  the wallet's own words under Details.
+- **Your node can't send.** Before opening a shop's app or downloading, and on Browse, the app warns when your
+  node's channels hold too little you can spend (after the channel reserve), with how much and what to do.
+- **A visit's numbers.** The visit bar shows what was used, what was prepaid and what is left as credit with
+  the shop; Stop says what the visit used. The limit field says the least a shop needs (559 sat for a 546-sat
+  ticket) and starts at 1,000.
+- **Version.** The app's version is in the footer and on Setup.
+- **Faster pages.** Found on Nostr, Stream relays and Hashrate show what they last knew at once and ask the
+  relays and the hashrate service in the background; repeated reads from the signer within a few seconds are
+  answered once. Each response carries a `Server-Timing` header.
+
 ## 0.2.1 (2026-11-02)
 
 A fix to 0.2.0.
