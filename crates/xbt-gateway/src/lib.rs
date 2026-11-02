@@ -35,6 +35,7 @@ pub enum Error {
 pub mod book;
 pub mod config;
 pub mod gateway;
+pub mod jellyfin;
 pub mod lottery;
 pub mod node;
 pub mod nostr;
