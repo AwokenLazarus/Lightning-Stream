@@ -14,7 +14,9 @@
 #   * the VPN service (profile "vpn", off unless LS_VPN=1): UDP 51820 for the owner's devices'
 #     WireGuard (keep it on the LAN), on its own network (not the host's);
 #   * the AI endpoint (33540), only if the owner sets LS_AI_BIND to a LAN address in .env: programs
-#     on the LAN then use AI sellers through it, each with a key made on the AI page.
+#     on the LAN then use AI sellers through it, each with a key made on the AI page;
+#   * links for the buyer's own player (33541), only if the owner sets LS_LINKS_BIND in .env: the UI then
+#     serves /r/<token> (and nothing else) there, and the Files page gives LS_LINKS_ADDRESS.
 # The UI asks for the password in .env (LS_UI_PASSWORD), set at install. Of the Lightning node's files
 # the services mount only tls.cert; the admin macaroon reaches node-keys on standard input, once, and
 # is never written (install.sh pipes it in). All state is in LS_DATA_DIR. The project's name, and so
@@ -133,6 +135,10 @@ services:
       XBT_UI_BIND: 127.0.0.1:${LS_UI_PORT:-8482}
       # the Files folder, served to the shop's gateway on this machine only
       XBT_UI_FILES_BIND: 127.0.0.1:${LS_FILES_PORT:-8486}
+      # links for the buyer's own player on another device: unset (the UI's own loopback address) unless the
+      # owner sets LS_LINKS_BIND (0.0.0.0:33541), a port that serves /r/<token> only, and LS_LINKS_ADDRESS
+      XBT_UI_LINKS_BIND: ${LS_LINKS_BIND:-}
+      XBT_UI_LINKS_URL: ${LS_LINKS_ADDRESS:-}
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
       XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
       XBT_UI_MCP_URL: http://127.0.0.1:${LS_MCP_PORT:-33511}/mcp

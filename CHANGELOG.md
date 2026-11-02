@@ -7,6 +7,57 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 
 ## 0.2.7 (2026-11-03)
 
+Visits that stop when you press Stop, top-ups only when they are needed, and an AI endpoint and player links
+that work on Umbrel. These fixes come from a hands-on run of 0.2.6 on an Umbrel box, buying the demo shop's
+Jellyfin, its AI model and its files over mainnet. The connector, the wallet UI, the signer and the seller's
+gateway change, and the Umbrel app publishes one more port.
+
+- **Stop ends the visit, playing or not.** After a film had played, the visit bar's Stop left the connection
+  with the shop open and "Streaming" on Live connections. It went on using credit after the browser was
+  closed (572 sat in one run), and later tried to buy another ticket. The visit's Stop ended only the answers
+  already on their way to the page. A request still waiting for its answer went on. So did whatever the
+  wallet was still doing for the page at the shop: answers the page had left, a ticket being paid, a top-up
+  or a held WebSocket. Now a request still waiting gives up at the Stop. The connector then closes the
+  connection with the shop, as Stop on Live connections does, unless another open visit to that shop uses
+  it. Every request of the visit is then settled at the price the signer says it cost. Credit that is not
+  used stays with the shop, as before.
+- **A page's last report still goes.** Jellyfin sends "playback stopped" as its page closes, a moment after
+  the Stop, and it was refused, so Jellyfin lost the place to resume from. For 2 seconds after a Stop, a
+  page's small `POST` (64 KiB at most) still goes. It is paid only from credit the shop already holds and
+  within the visit's limit. No ticket is bought for it.
+- **No top-up while the credit is ample.** A visit topped up its credit with a new ticket whenever the
+  credit fell below four requests' shares (500 sat of a 1,000 sat visit), whatever was running. A visit
+  that started with 526 sat of credit bought a 614 sat ticket while signing in, then used 561 sat in all.
+  Now a visit tops up only when the credit is below what the answers running at that moment could still
+  draw, plus one request. The top-up is never more than one ticket, and never more than what is left of
+  the visit's limit. Tickets bought in a visit count toward its limit, as before.
+- **The Stop says what was paid and what was used.** The Stop read the visit's figures at once, before the
+  signer had said what its last requests cost. It said "This visit used 520 sat … nothing new was paid"
+  after three tickets (2,706 sat) had been bought during the visit. Now the Stop waits until every request
+  is settled, up to 15 seconds. It then says the credit the visit used and the new payments made during it,
+  for example "New payments during it: 2,709 sat for 3 tickets, routing fees included". It says "Nothing new
+  was paid" only once every cost is in, and otherwise says the last requests are still being counted. The
+  visit bar names the tickets bought as well. The connector's visit report has `settled`,
+  `connection_closed` and `tickets_bought`.
+- **Long AI answers no longer fail with 502.** A non-streaming chat completion that took more than about 10
+  seconds failed with "No seller could answer: the seller answered 502". The seller's gateway waited 10
+  seconds (`times.upstream_wait_secs`) for any service to start its answer, and a model starts a
+  non-streaming answer only once all of it is written. A route priced by the token now waits up to 5
+  minutes (`times.ai_upstream_wait_secs`, 300 by default). The connector's AI endpoint and the wallet wait
+  as long for a non-streaming answer to start. Streams are unchanged. A shop needs the 0.2.7 gateway and no
+  change to its config.
+- **Player links work from another device on Umbrel.** A Files page's player link (`/r/…`) pointed at the
+  app's own port, which umbrelOS puts behind its login, so VLC or mpv on another device got the login page.
+  On Umbrel, the links now have a port of their own, 33541. That port serves player links and nothing else.
+  The Files page gives the link with the box's address, by IP when the page was opened by IP. A link is
+  still allowed by its own token alone, and keeps its expiry, revocation and limits. On Linux, set
+  `LS_LINKS_BIND` and `LS_LINKS_ADDRESS` in `.env` to serve the links on the LAN. StartOS puts no login in
+  front of the app's address, so it needs no change.
+- **Shops: a media server with no way in for buyers is flagged.** A seller saved a Jellyfin web app with
+  neither "Each buyer gets their own Jellyfin account" nor a shared guest login. Buyers paid a ticket and
+  landed on the owner's Jellyfin sign-in page. The Sell page now warns on such an offer: "Buyers will see
+  your Jellyfin's sign-in page and can't get in." Save asks you to tick "Publish without buyer accounts
+  anyway" before it saves one.
 - **Wallet activity in plain words.** A reservation no longer shows its `ticket:<hash>` id, an allowed
   payment says "Within your spending rules" instead of "all policy rules passed", and the signer's start
   (a row with no shop) is gone. A prepaid ticket is shown once as reserved, marked as the most it may cost,

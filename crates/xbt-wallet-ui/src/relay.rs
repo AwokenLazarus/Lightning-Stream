@@ -9,6 +9,10 @@
 //!   revoked on that page, and lives in memory only: a restart of the UI revokes every link.
 //! * At most [`MAX_LINKS`] are live; a new one past that replaces the oldest.
 //!
+//! * Where the platform's own login sits in front of the UI's port (umbrelOS's app login), the links
+//!   are served on a port of their own (`XBT_UI_LINKS_BIND`), which answers `GET /r/<token>` and
+//!   nothing else, through the same checks ([`crate::server::spawn`]); the page gives that address.
+//!
 //! What a link can spend is what the connector spends for that one file: each request through it
 //! is one paid call under the connector's task and per-call cap, within the owner's budgets. It
 //! cannot reach any page of the UI, any other file, or the signer.
@@ -82,6 +86,37 @@ impl Drop for OpenGuard {
 pub struct RelayLinks {
     links: Mutex<Vec<Link>>,
     ttl: Duration,
+    /// Where the links' own listener answers (`XBT_UI_LINKS_BIND`), once it does.
+    served_at: Mutex<Option<std::net::SocketAddr>>,
+}
+
+/// The address a player's link starts with (ending in `/`, the token's `r/<token>` follows) when the
+/// links have a listener of their own on `port`: `url` (`XBT_UI_LINKS_URL`), by the box's IP where the
+/// page was opened by its IPv4 address (as the AI page gives its address), since another device may not
+/// resolve the box's name; without `url`, the page's own host on that port. `None`: no host to name.
+pub fn links_base(url: Option<&str>, port: u16, page_host: &str) -> Option<String> {
+    let page_host = page_host.trim();
+    let page_name = if page_host.starts_with('[') {
+        page_host.split_inclusive(']').next().unwrap_or("")
+    } else {
+        page_host.rsplit_once(':').map_or(page_host, |(h, _)| h)
+    };
+    let page_ip = page_name.parse::<std::net::Ipv4Addr>().ok().filter(|a| !a.is_loopback() && !a.is_unspecified());
+    let Some(url) = url else {
+        return (!page_name.is_empty()).then(|| format!("http://{page_name}:{port}/"));
+    };
+    let url = url.trim_end_matches('/');
+    let (scheme, rest) = url.split_once("://")?;
+    let cut = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(cut);
+    let (host, port_part) = match authority.rsplit_once(':') {
+        Some((h, p)) if !authority.starts_with('[') => (h, format!(":{p}")),
+        _ => (authority, String::new()),
+    };
+    Some(match page_ip {
+        Some(ip) if !host.starts_with('[') && host.parse::<std::net::IpAddr>().is_err() => format!("{scheme}://{ip}{port_part}{path}/"),
+        _ => format!("{url}/"),
+    })
 }
 
 /// A live link, as a Files service's page lists it.
@@ -98,7 +133,17 @@ pub struct Shown {
 
 impl RelayLinks {
     pub fn new(ttl: Duration) -> Self {
-        Self { links: Mutex::new(Vec::new()), ttl }
+        Self { links: Mutex::new(Vec::new()), ttl, served_at: Mutex::new(None) }
+    }
+
+    /// The links' own listener answers at `addr`.
+    pub fn set_served_at(&self, addr: std::net::SocketAddr) {
+        *self.served_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(addr);
+    }
+
+    /// Where the links' own listener answers; `None`: the links are on the UI's own address.
+    pub fn served_at(&self) -> Option<std::net::SocketAddr> {
+        *self.served_at.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, Vec<Link>> {
@@ -173,6 +218,25 @@ impl RelayLinks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link on its own port: the configured address, by the IP the page was opened at where it was,
+    /// else the page's host on that port.
+    #[test]
+    fn a_links_address_is_by_ip_where_the_page_was_opened_by_ip() {
+        let url = Some("http://umbrel.local:33541");
+        assert_eq!(links_base(url, 33541, "192.168.1.20:8482").as_deref(), Some("http://192.168.1.20:33541/"));
+        assert_eq!(links_base(url, 33541, "192.168.1.20").as_deref(), Some("http://192.168.1.20:33541/"));
+        assert_eq!(links_base(url, 33541, "umbrel.local:8482").as_deref(), Some("http://umbrel.local:33541/"));
+        // a loopback page (an ssh tunnel) says nothing of where other devices find the box
+        assert_eq!(links_base(url, 33541, "127.0.0.1:8482").as_deref(), Some("http://umbrel.local:33541/"));
+        assert_eq!(links_base(url, 33541, "[fe80::1]:8482").as_deref(), Some("http://umbrel.local:33541/"));
+        // an address that is already an IP is kept
+        assert_eq!(links_base(Some("http://10.0.0.5:33541/"), 33541, "192.168.1.20:8482").as_deref(), Some("http://10.0.0.5:33541/"));
+        // no address configured: the page's host on the links' port
+        assert_eq!(links_base(None, 33541, "umbrel.local:8482").as_deref(), Some("http://umbrel.local:33541/"));
+        assert_eq!(links_base(None, 40001, "[::1]:8482").as_deref(), Some("http://[::1]:40001/"));
+        assert_eq!(links_base(None, 33541, ""), None);
+    }
 
     /// A link counts what it carries while a request is open, and keeps the total after.
     #[test]

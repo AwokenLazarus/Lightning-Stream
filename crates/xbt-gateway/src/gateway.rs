@@ -415,10 +415,15 @@ impl Gateway {
             Some(l) => Some(draws::Lottery::open(l, &cfg.state_dir, clock())?),
             None => None,
         };
-        let mut upstreams = HashMap::new();
-        for base in cfg.upstream.iter().chain(cfg.routes.iter().filter_map(|r| r.upstream.as_ref())) {
-            upstreams.entry(base.clone()).or_insert_with(|| Upstream::new(base, cfg.times.upstream_wait));
+        // one client a service, with the longest wait of the routes that reach it (an AI model's whole answer is long to start)
+        let mut waits: HashMap<&String, Duration> = cfg.upstream.iter().map(|b| (b, cfg.times.upstream_wait)).collect();
+        for r in &cfg.routes {
+            if let Some(base) = r.upstream.as_ref().or(cfg.upstream.as_ref()) {
+                let w = waits.entry(base).or_insert(cfg.times.upstream_wait);
+                *w = (*w).max(cfg.times.upstream_wait_for(r));
+            }
         }
+        let upstreams: HashMap<String, Upstream> = waits.into_iter().map(|(base, wait)| (base.clone(), Upstream::new(base, wait))).collect();
         // the node's offer, made (or found again) before anything is served: terms that name it are
         // terms the node can be paid on
         let offers = Self::make_offer(&*node, &cfg, clock())?;

@@ -183,8 +183,13 @@ impl App {
     }
 
     /// The address of this UI as the browser reached it, for a link another device opens:
-    /// `http(s)://<Host><base path>`. The Host was checked against the allowed names already.
+    /// `http(s)://<Host><base path>`. The Host was checked against the allowed names already. Where the
+    /// links have a port of their own (`XBT_UI_LINKS_BIND`), that port's address instead.
     fn link_base(&self, req: &Req) -> String {
+        // the links' own port (a platform's login is in front of this page's): its address, by IP where this page was
+        if let Some(base) = self.relays.served_at().and_then(|a| crate::relay::links_base(self.cfg.links_url.as_deref(), a.port(), req.header("host"))) {
+            return base;
+        }
         let https = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
         let host = req.header("host").trim();
         let base = if self.cfg.base_path.ends_with('/') { self.cfg.base_path.clone() } else { format!("{}/", self.cfg.base_path) };

@@ -1553,6 +1553,131 @@ fn the_relay_passes_range_and_a_players_link_plays_its_one_file_until_it_expires
     assert!(!br.get(&play).body.contains("/r/"), "an expired link is not shown");
 }
 
+/// A plain GET, no cookie, no redirect followed: its status and body.
+fn plain_get(url: &str, extra: &[(&str, &str)]) -> (u16, Vec<u8>) {
+    use std::io::Read;
+    let mut rq = ureq::AgentBuilder::new().redirects(0).build().get(url);
+    for (k, v) in extra {
+        rq = rq.set(k, v);
+    }
+    let resp = match rq.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => panic!("{url}: {e}"),
+    };
+    let status = resp.status();
+    let mut body = vec![];
+    resp.into_reader().read_to_end(&mut body).unwrap();
+    (status, body)
+}
+
+/// The token of the first player's link a Files page shows after `prefix` (`…/r/`).
+fn link_on(page: &str, prefix: &str) -> String {
+    let at = page.find(prefix).unwrap_or_else(|| panic!("no link at {prefix} on the page"));
+    page[at + prefix.len()..at + prefix.len() + 64].to_string()
+}
+
+/// umbrelOS puts its own login in front of the app's port (8482), which a player on another device
+/// can't pass, so the links have a port of their own (`XBT_UI_LINKS_BIND`, 33541 there): it plays a
+/// live link with no cookie, refuses an unknown, revoked or expired one as the UI's port does, and
+/// serves nothing else (no page, no action, no download, no API). The Files page gives that port's
+/// address: the page's host on it, by IP where the page was opened by IP, or the configured address
+/// (`XBT_UI_LINKS_URL`), by IP likewise.
+#[test]
+fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..100_000u32).map(|i| (i % 251) as u8)).collect();
+    let (connector, seen) = range_connector(film.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}}]"#)).unwrap();
+    let ttl = Duration::from_secs(3);
+    let (services, conn) = (path.clone(), connector.clone());
+    let b = start(json!({}), false, move |c| {
+        c.connector = conn;
+        c.services_file = Some(services);
+        c.relay_ttl = ttl;
+        c.links_bind = Some("127.0.0.1:0".into());
+    });
+    let links = b._srv.links_addr.expect("the links' own port is served");
+    assert_ne!(links, b._srv.addr);
+    let mut br = logged_in(&b);
+    let play = format!("/service?seller={}&name={}", enc("https://stream.lazarus-xbt.xyz"), enc("Films"));
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+
+    // the page gives the links' port, on the host the page was opened at
+    let page = br.get(&play).body;
+    let own = format!("http://127.0.0.1:{}/r/", links.port());
+    let token = link_on(&page, &own);
+    assert!(page.contains(&format!("value=\"{own}{token}\"")), "the exact address to paste");
+    assert!(!page.contains(&format!("{}/r/", b.base)), "not the UI's own port, which the platform's login is in front of");
+    let by_ip = br.send("GET", &play, None, &[("Host", "192.168.1.20:8482")]).body;
+    assert!(by_ip.contains(&format!("value=\"http://192.168.1.20:{}/r/{token}\"", links.port())), "by IP where the page was opened by IP");
+
+    // the link plays there with no cookie, seeking included
+    let link = format!("{own}{token}");
+    let (status, body) = plain_get(&link, &[("Range", "bytes=5000-")]);
+    assert_eq!((status, body.as_slice()), (206, &film[5000..]));
+    let (status, body) = plain_get(&link, &[]);
+    assert_eq!((status, body.len()), (200, film.len()));
+    let n = seen.lock().unwrap().len();
+    assert_eq!(n, 2);
+
+    // nothing else of the UI is there, the login and the setup included; an unknown token is nothing
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let other = format!("{}{}", &token[..63], if token.ends_with('0') { "1" } else { "0" });
+    let base = format!("http://{links}");
+    for p in ["/".to_string(), "/wallet".into(), "/browse".into(), "/login".into(), "/setup".into(), "/api/status".into(), "/healthz".into(),
+              format!("/service?seller={}&name=Films", enc("https://stream.lazarus-xbt.xyz")), "/r/".into(), format!("/r/{other}"),
+              format!("/r/{token}/x"), format!("/s/{FILM}"), format!("/s/~{st}/{FILM}"), "/static/app.css".into()] {
+        let (status, _) = plain_get(&format!("{base}{p}"), &[("Cookie", &br.cookie)]);
+        assert_eq!(status, 404, "{p}");
+    }
+    // nor any other method, the link's own path included
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    for (m, p) in [("HEAD", format!("/r/{token}")), ("POST", format!("/r/{token}")), ("POST", "/file-link".to_string()), ("POST", "/login".into())] {
+        let status = match agent.request(m, &format!("{base}{p}")).set("Cookie", &br.cookie).call() {
+            Ok(r) => r.status(),
+            Err(ureq::Error::Status(s, _)) => s,
+            Err(e) => panic!("{m} {p}: {e}"),
+        };
+        assert_eq!(status, 404, "{m} {p}");
+    }
+    assert_eq!(seen.lock().unwrap().len(), n, "nothing refused reached the connector");
+
+    // revoked: it plays nothing there either
+    let r = br.act(&play, "/file-link", &[("action", "revoke"), ("item", FILM), ("token", &token)]);
+    assert!(br.flash_after(&r).contains("revoked"));
+    assert_eq!(plain_get(&link, &[]).0, 404);
+    // and a new one expires on its own
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let fresh = format!("{own}{}", link_on(&br.get(&play).body, &own));
+    assert_eq!(plain_get(&fresh, &[]).0, 200);
+    std::thread::sleep(ttl + Duration::from_millis(300));
+    assert_eq!(plain_get(&fresh, &[]).0, 404, "expired");
+    drop(b);
+
+    // with its address configured (Umbrel: http://umbrel.local:33541), the page gives it, by IP where it was opened by IP
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+        c.links_bind = Some("127.0.0.1:0".into());
+        c.links_url = Some("http://umbrel.local:33541".into());
+    });
+    let mut br = logged_in(&b);
+    let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let by_name = br.send("GET", &play, None, &[("Host", "umbrel.local:8482")]).body;
+    let token = link_on(&by_name, "http://umbrel.local:33541/r/");
+    let by_ip = br.send("GET", &play, None, &[("Host", "192.168.1.20:8482")]).body;
+    assert!(by_ip.contains(&format!("value=\"http://192.168.1.20:33541/r/{token}\"")), "by IP where the page was opened by IP");
+    assert!(!by_ip.contains("umbrel.local:33541"));
+}
+
 /// Connected apps: a connection made on the NWC service's admin socket, its URI shown once (in the
 /// answer to the form, never stored here), listed with its budget, and revoked.
 #[test]
@@ -1657,13 +1782,14 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
     assert!(br.get("/sell").body.contains("How many buyers at once"));
     let addr = format!("http://{media}");
     // a number that is not one: refused, in words
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"),
                                        ("paths", "/Videos/1/"), ("cap_buyers", "many")]);
     assert_eq!(r.status, 200, "the form comes back with what is wrong");
     assert!(r.body.contains("Most buyers at once is a whole number"), "{}", r.body);
     // films with 5 buyers and 3 streams at once, the page at the root with them
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
-                                       ("paths", "/Videos/1/"), ("app", "1"), ("cap_buyers", "5"), ("cap_streams", "3"), ("cap_streams_buyer", "")]);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+                                       ("paths", "/Videos/1/"), ("app", "1"), ("cap_buyers", "5"), ("cap_streams", "3"), ("cap_streams_buyer", ""),
+                                       ("app_no_accounts", "1")]);
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     // a free service with a stream limit only
     let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", "http://127.0.0.1:9"), ("price", "0"), ("unit", "request"),
@@ -1686,6 +1812,63 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
     assert!(page.contains("name=\"cap_streams\""));
     // the limits of the whole shop, which a seller meets before any of these, are said beside them
     assert!(page.contains("Your whole shop serves up to 30 buyers at once and 512 open connections"), "{page}");
+}
+
+/// A media server shared with neither accounts for buyers nor a guest login shows buyers its own sign-in page: they pay
+/// and cannot get in. The Sell page says so on the offer, and Save asks the seller to say they mean it.
+///
+/// FAILS before: it was saved without a word (a hands-on run's buyers paid a ticket for Laz Flix and landed on the
+/// owner's Jellyfin sign-in page).
+#[cfg(unix)]
+#[test]
+fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller_says_so() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    let addr = format!("http://{media}");
+    let form = |extra: &[(&'static str, &'static str)]| {
+        let mut f: Vec<(&str, &str)> = vec![("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Laz Flix"),
+                                             ("app", "1"), ("app_entry", "/web/"), ("app_free", "/web/")];
+        f.extend_from_slice(extra);
+        f.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>()
+    };
+    let saved = || std::fs::read_to_string(bx.data.path().join("ui/sell.json")).ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok()).map_or(0, |v| v["offers"].as_array().map_or(0, Vec::len));
+    // neither accounts nor a guest login: the form comes back with why, and nothing is saved
+    let f = form(&[]);
+    let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+    assert_eq!(r.status, 200, "the form comes back");
+    let body = unescape(&r.body);
+    assert!(body.contains("Buyers will see your Jellyfin's sign-in page and can't get in") && body.contains("Publish without buyer accounts anyway"), "{body}");
+    assert_eq!(saved(), 0, "saved without the seller's say");
+    // said so: saved, and the offer carries the warning
+    let f = form(&[("app_no_accounts", "1")]);
+    let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert_eq!(saved(), 1);
+    assert!(unescape(&br.get("/sell").body).contains("Buyers will see your Jellyfin's sign-in page and can't get in"));
+    // with a shared guest login it is saved at once, and no warning is shown
+    let id = serde_json::from_str::<Value>(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap()["offers"][0]["id"]
+        .as_str().unwrap().to_string();
+    let mut f = form(&[("app_login", "X-Emby-Token: guest-1")]);
+    f.push(("id".into(), id));
+    let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert!(!unescape(&br.get("/sell").body).contains("can't get in"));
 }
 
 #[cfg(unix)]
@@ -1711,7 +1894,7 @@ fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {
     assert!(br.get("/sell").body.contains("Buyers can open its own web page inside their app"));
     let addr = format!("http://{media}");
     // films sold under one path, the media server's own page at the root, with a guest login
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"),
                                        ("paths", "/Videos/1/"), ("app", "1"), ("app_entry", "/web/"), ("app_login", "X-Emby-Token: guest-1")]);
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     // the model, its page at its own path
@@ -1783,7 +1966,7 @@ fn a_web_apps_free_paths_are_free_routes_that_survive_a_refresh_and_the_rest_sta
     let page = unescape(&br.get("/sell").body);
     assert!(page.contains("name=\"app_free\"") && page.contains(">/web/</textarea>"), "the form offers /web/ free");
     let addr = format!("http://{media}");
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Jellyfin"),
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Jellyfin"),
                                        ("app", "1"), ("app_entry", "/web/"), ("app_login", "X-Emby-Token: guest-1"), ("app_deny", "/web/admin/"),
                                        ("app_free", "/web/")]);
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
@@ -1821,8 +2004,8 @@ fn a_web_apps_free_paths_are_free_routes_that_survive_a_refresh_and_the_rest_sta
     let page = unescape(&br.get(&format!("/sell?edit={id}")).body);
     assert!(page.contains(">/web/</textarea>"), "the saved free path is shown");
     // emptied: the free route goes, and /web/ is the paid route's again
-    br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Jellyfin"),
-                               ("app", "1"), ("app_entry", "/web/"), ("app_free", "")]);
+    br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Jellyfin"),
+                               ("app", "1"), ("app_entry", "/web/"), ("app_free", ""), ("app_no_accounts", "1")]);
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
     assert_eq!(cfg.route("/web/main.bundle.js").map(|r| (r.path.as_str(), r.free)), Some(("/", false)));
@@ -1830,7 +2013,7 @@ fn a_web_apps_free_paths_are_free_routes_that_survive_a_refresh_and_the_rest_sta
     assert!(!page.contains(">/web/</textarea>"), "an emptied list is not offered again");
     // what is not a path below the app is refused in plain words
     for bad in ["/", "web/", "/web/../System/", "/a b/"] {
-        let r = br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+        let r = br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"),
                                            ("name", "Jellyfin"), ("app", "1"), ("app_free", bad)]);
         assert!(unescape(&r.body).contains("free path"), "{bad}: {}", r.body);
     }
@@ -1883,7 +2066,7 @@ fn the_sell_page_sets_up_buyers_own_accounts_with_the_sellers_jellyfin_key() {
     assert!(br.get("/sell").body.contains("Each buyer gets their own Jellyfin account"));
     let addr = format!("http://{jf}");
     fn service<'a>(addr: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-        let mut f = vec![("action", "service"), ("kind", "media"), ("address", addr), ("price", "20"), ("unit", "mib"), ("app", "1"),
+        let mut f = vec![("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", addr), ("price", "20"), ("unit", "mib"), ("app", "1"),
                          ("app_entry", "/web/"), ("app_accounts", "1")];
         f.extend_from_slice(extra);
         f
@@ -1899,7 +2082,7 @@ fn the_sell_page_sets_up_buyers_own_accounts_with_the_sellers_jellyfin_key() {
     assert!(unescape(&r.body).contains("That is not a Jellyfin API key"), "{}", r.body);
     let r = br.act("/sell", "/sell", &service(&addr, &[("app_key", "ffffffffffffffffffffffffffffffff")]));
     assert!(unescape(&r.body).contains("Jellyfin did not accept that API key"), "{}", r.body);
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "0"), ("unit", "mib"), ("app", "1"),
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "0"), ("unit", "mib"), ("app", "1"),
                                        ("app_accounts", "1"), ("app_key", KEY)]);
     assert!(unescape(&r.body).contains("only on a priced service"), "{}", r.body);
     assert!(!dir.join("config.json").exists() || routes().0.routes.iter().all(|r| r.accounts.is_none()));
@@ -1927,7 +2110,7 @@ fn the_sell_page_sets_up_buyers_own_accounts_with_the_sellers_jellyfin_key() {
     let root = routes().0.routes.into_iter().find(|r| r.path == "/").unwrap();
     assert_eq!(root.accounts, Some(xbt_gateway::config::Accounts::Jellyfin { admin_key_file: key_file.clone(), libraries: vec!["bbbb2222".into()] }));
     // accounts off: the route has none, and the key is gone
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("app", "1"), ("app_entry", "/web/")]);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("app", "1"), ("app_entry", "/web/")]);
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     assert!(routes().0.routes.iter().all(|r| r.accounts.is_none()));
     assert!(!key_file.exists());
@@ -2169,14 +2352,14 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
 
     // a price that is not a number is said so, and nothing changes
     let addr = format!("http://{media}");
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "twenty"), ("unit", "mib")]);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "twenty"), ("unit", "mib")]);
     assert_eq!(r.status, 200);
     assert!(unescape(&r.body).contains("The price is a number of sats"));
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", "jellyfin:8096"), ("price", "20"), ("unit", "mib")]);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", "jellyfin:8096"), ("price", "20"), ("unit", "mib")]);
     assert!(unescape(&r.body).contains("not an address this box can reach"));
     // the media server: the first service gets the root, and is shared as its own web app (films listed for the
     // old built-in player are not kept)
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("strip", "1"),
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("strip", "1"),
                                        ("titles", "Sintel | /Videos/s/stream")]);
     assert!(br.flash_after(&r).contains("restarts"));
     // an AI model nobody answers for: its own path, requests passed on without it, and POST
@@ -3800,7 +3983,7 @@ fn services_added_in_any_order_each_get_their_own_path() {
     let web_addr = format!("http://{web}");
     added(&mut br, &[("action", "service"), ("kind", "web"), ("address", &web_addr), ("price", "1"), ("unit", "request"), ("name", "Notes"), ("app", "1")]);
     let media_addr = format!("http://{media}");
-    added(&mut br, &[("action", "service"), ("kind", "media"), ("address", &media_addr), ("price", "1"), ("unit", "mib"), ("app_entry", "/web/")]);
+    added(&mut br, &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &media_addr), ("price", "1"), ("unit", "mib"), ("app_entry", "/web/")]);
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
     let mut routes: Vec<(String, String)> = cfg.routes.iter().map(|r| (r.path.clone(), r.upstream.clone().unwrap_or_default())).collect();
@@ -3811,7 +3994,7 @@ fn services_added_in_any_order_each_get_their_own_path() {
     let page = br.get("/sell").body;
     assert!(!page.contains("already uses"), "{page}");
     // a second media server: the root is taken, and the page names who has it
-    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &media_addr), ("price", "1"), ("unit", "mib"), ("name", "Plex")]);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &media_addr), ("price", "1"), ("unit", "mib"), ("name", "Plex")]);
     let f = unescape(&r.body);
     assert!(f.contains("Media server already uses /, so Plex cannot have it"), "{f}");
 }
@@ -3882,7 +4065,7 @@ fn a_direct_shop_lists_its_media_servers_web_app() {
     br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
                                ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
     let addr = format!("http://{media}");
-    br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "1"), ("unit", "mib"), ("app_entry", "/web/")]);
+    br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "1"), ("unit", "mib"), ("app_entry", "/web/")]);
     br.act("/sell", "/sell", &[("action", "service"), ("kind", "files"), ("address", ""), ("price", "1000"), ("unit", "gb"), ("name", "My files")]);
     br.act("/sell", "/sell", &[("action", "service"), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
                                ("name", "Model")]);

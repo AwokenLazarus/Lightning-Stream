@@ -270,6 +270,9 @@ fn serve() -> i32 {
     match xbt_wallet_ui::server::spawn(app.clone()) {
         Ok(r) => {
             eprintln!("xbt-wallet-ui listening on http://{}{} (signer {})", r.addr, app.cfg.base_path, app.cfg.signer_sock.display());
+            if let Some(l) = r.links_addr {
+                eprintln!("xbt-wallet-ui: player links on http://{l}/r/<token> (nothing else on that port)");
+            }
             let sig = signals.wait();
             xbt_svc::shutdown::say_stopping("xbt-wallet-ui", sig);
             let drained = r.finish(xbt_svc::shutdown::DRAIN);

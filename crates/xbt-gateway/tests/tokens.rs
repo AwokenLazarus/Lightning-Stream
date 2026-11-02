@@ -16,7 +16,8 @@ use xbt_svc::http::{serve_with, Handler, Limits, Reply, Request, Response, Runni
 
 /// The stand-in model. A request's own fields choose what it does: `x_n` tokens of output (at
 /// most its `max_tokens`), `x_prompt` tokens of input stated, `x_usage` false states no counts,
-/// `x_said` states another output count than it streams, `x_pause_ms` between tokens.
+/// `x_said` states another output count than it streams, `x_pause_ms` between tokens, `x_wait_ms`
+/// before a whole answer (a model writing it all before it sends anything).
 #[derive(Default)]
 struct Model {
     seen: Mutex<Vec<Value>>,
@@ -48,6 +49,7 @@ impl Handler for Model {
         let usage = v["x_usage"].as_bool().unwrap_or(true);
         let pause = Duration::from_millis(v["x_pause_ms"].as_u64().unwrap_or(0));
         if v["stream"] != true {
+            std::thread::sleep(Duration::from_millis(v["x_wait_ms"].as_u64().unwrap_or(0)));
             let mut body = json!({"choices": [{"message": {"role": "assistant", "content": "abcd".repeat(n as usize)}}]});
             if usage {
                 body["usage"] = json!({"prompt_tokens": prompt, "completion_tokens": said});
@@ -96,6 +98,11 @@ fn start_model() -> (Running, Arc<Model>) {
 /// A gateway whose `/v1/` route is the model, priced at `input`/`output` msat per 1,000 tokens,
 /// its output capped at `cap` tokens.
 fn rig(input: u64, output: u64, cap: u64) -> (Rig, tempfile::TempDir, Arc<Model>, Running) {
+    rig_with(input, output, cap, &|_| {})
+}
+
+/// [`rig`], its config changed by `edit` too.
+fn rig_with(input: u64, output: u64, cap: u64, edit: &dyn Fn(&mut Value)) -> (Rig, tempfile::TempDir, Arc<Model>, Running) {
     let (model_run, model) = start_model();
     let up = format!("http://{}", model_run.addr);
     let dir = tempfile::tempdir().unwrap();
@@ -106,6 +113,7 @@ fn rig(input: u64, output: u64, cap: u64) -> (Rig, tempfile::TempDir, Arc<Model>
         }
         v["routes"].as_array_mut().unwrap().push(json!({"path": "/v1/", "methods": ["GET", "POST"], "upstream": up, "price": price,
                                                        "max_output_tokens": cap, "max_body": 65536}));
+        edit(v);
     });
     (rig, dir, model, model_run)
 }
@@ -197,6 +205,28 @@ fn a_whole_answer_is_charged_from_its_counts() {
     let body_len = json!({"x_n": 25, "x_usage": false}).to_string().len() as u64;
     let input = body_len.div_ceil(4);
     assert_eq!(b.balance(), 1_000_000 - 30 - 250 - input - 250);
+}
+
+/// A whole answer (not a stream) comes only once the model has written all of it: on a seller's own
+/// box a few thousand tokens take a minute or more. The gateway waits for it, under the shipped
+/// times, as long as it would for a stream's next token.
+///
+/// FAILS before: every service had `times.upstream_wait_secs` (10 s) to start its answer, and a whole
+/// answer of 700 tokens or more on a real box was a 502 ("the seller answered 502" at the buyer).
+#[test]
+fn a_whole_answer_slower_than_an_ordinary_service_start_is_waited_for() {
+    // the shipped wait, not the rig's 2 s
+    let (rig, _dir, _model, _m) = rig_with(0, 10_000, 500, &|v| {
+        v["times"].as_object_mut().unwrap().remove("upstream_wait_secs");
+    });
+    let mut b = Buyer::new(&rig, 9);
+    let s = b.lock(&rig, 1);
+    let t = std::time::Instant::now();
+    let got = post(&mut b, "/v1/chat/completions", &json!({"x_n": 25, "x_wait_ms": 12_000}), Some(&s[0]));
+    assert_eq!(got.status, 200, "an answer that took 12 s: {}", String::from_utf8_lossy(&got.body));
+    assert!(t.elapsed() >= Duration::from_secs(12), "{:?}", t.elapsed());
+    assert_eq!(got.json()["usage"]["completion_tokens"], 25);
+    assert_eq!(b.balance(), 1_000_000 - 250);
 }
 
 #[test]

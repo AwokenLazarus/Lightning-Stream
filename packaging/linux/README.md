@@ -33,10 +33,13 @@ can follow if testers ask.
 - **The host's network.** An owner's lnd, Knots and DATUM Gateway listen on 127.0.0.1 by default. A
   container on a bridge network can't reach the host's loopback without the owner changing each node's
   listen address and its certificate. So every service uses `network_mode: host`, and every port the
-  app opens is bound to 127.0.0.1, with two exceptions:
+  app opens is bound to 127.0.0.1, with these exceptions:
   - the hashmaker's miners port (23340) and link port (23341), only when the owner turns the hashmaker
     on (Compose profile `hashmaker`);
   - the gateway's selling port, once the owner saves a shop with an https address.
+  - the AI endpoint (33540) and the links for the buyer's own player (33541, `/r/<token>` only), each
+    only when the owner sets its address in `.env` (`LS_AI_BIND`; `LS_LINKS_BIND` with `LS_LINKS_ADDRESS`).
+    Without it a player link is on the UI's own loopback address, as before.
 
   The witness has no network at all, and the services talk to the signer over its unix socket, as on
   Umbrel.

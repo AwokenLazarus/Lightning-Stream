@@ -29,6 +29,14 @@ pub const MAX_EVENT: usize = 1 << 20;
 /// The largest whole (not streamed) answer that is read: it is held whole until it is paid for.
 pub const MAX_WHOLE: usize = 8 << 20;
 
+/// How long a model's whole answer (not a stream) may take to start, in seconds: it is sent only
+/// once the model has written all of it. A model on a seller's own box writes 10 to 50 tokens a
+/// second (500 in 10.7 s on an Umbrel's llama.cpp), so a few thousand tokens take a minute or more
+/// on a fast one and several on a slow one. The seller's gateway waits this long for its model on a
+/// route priced by the token (`times.ai_upstream_wait_secs`), the wallet for that answer's head, and
+/// the AI endpoint for a whole answer.
+pub const WHOLE_ANSWER_S: u64 = 300;
+
 /// The route's cap on output tokens when the runner names none.
 pub const DEFAULT_MAX_OUTPUT: u64 = 1024;
 
