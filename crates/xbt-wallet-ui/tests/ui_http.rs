@@ -557,8 +557,7 @@ fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     // confirmed: the step and the warning are gone
     std::fs::write(&ack_file, format!("{}\n", xbt402::ticket::MAINNET_ACK)).unwrap();
     assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], false);
-    // the step stays in the list, done, so the count of steps does not change under the owner
-    assert!(unescape(&br.get("/setup").body).contains("<li class=\"step done\"><h2>Pay with real money</h2>"));
+    assert!(!unescape(&br.get("/setup").body).contains("Pay with real money"));
     assert!(!unescape(&br.get("/policy").body).contains("pays nothing until you confirm"));
     std::env::remove_var(xbt_signer::ticket::MAINNET_ACK_ENV);
 }

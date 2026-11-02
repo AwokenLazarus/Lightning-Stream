@@ -730,10 +730,12 @@ impl App {
         let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
         let paying = paying_on(&pol);
         let allowed = rule_sellers(&pol).iter().any(|r| r.listed && r.origin.is_some() && r.node.is_some());
-        let bought = self.call("history", json!({"limit": 500})).ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter()
+        // the history is read only once a shop is allowed: nothing can have been bought before
+        let bought = allowed && self.call("history", json!({"limit": 500})).ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter()
             .any(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_open" | "ticket_paid_first")));
         let demo = self.first_suggestion();
-        let main = self.signer_chain() == "main";
+        // mainnet, without another read of the signer: it asks for the confirmation, or the confirmation is on file
+        let main = ack || self.cfg.ln.dir.join(crate::setup::MAINNET_ACK_FILE).is_file();
         // (done, title, what it is, where to go, its button)
         let mut steps: Vec<(bool, &str, &str, String, &str)> = vec![
             (human, "Make your approval key", "It is how you say yes to a rule change or a large payment. It stays in this browser.",
@@ -799,15 +801,12 @@ impl App {
         // Lightning first: what pays for services. The XBT node's on-chain coins are another wallet, said apart
         // (0.2.1 showed "On your node 0 sats" while the channels held 286,000)
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
-        let (ready, _, _) = self.node_state();
-        let pol = self.call("policy_get", json!({})).map(|v| v["effective"].clone()).unwrap_or(Value::Null);
+        let ready = ln["ready"] == true && ln["real_money_ack_needed"] != true;
         b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Lightning</h2>");
         b.push_str(&kv(&[("Can send now", crate::pay_feedback::spendable_sats(&ln).map(|c| format!("about {}", money(c))).unwrap_or_else(|| "not known".into())),
-                         ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Not ready</span> <a href=\"./lightning\">See why</a>".into() }),
-                         ("Spending limit, 24 hours", pol.get("daily_budget_sats").map(|v| money(int(Some(v)))).unwrap_or_else(|| "—".into())),
-                         ("Spending limit, 7 days", pol.get("weekly_budget_sats").map(|v| money(int(Some(v)))).unwrap_or_else(|| "—".into()))]));
+                         ("Status", if ready { "<span class=\"pill good\">Ready to pay</span>".into() } else { "<span class=\"pill warn\">Not ready</span> <a href=\"./lightning\">See why</a>".into() })]));
         b.push_str("<p class=\"small\">Credit left with shops is on <a href=\"./connections\">Live connections</a>. \
-                    <a href=\"./policy\">Change your limits</a></p></div>");
+                    What the app may spend is in your <a href=\"./policy\">spending rules</a>.</p></div>");
         b.push_str("<div class=\"card\"><h2>XBT on chain</h2>");
         b.push_str(&kv(&[("On your XBT node", money(int(bal.get("trusted_sats")))), ("On its way to your XBT node", money(int(bal.get("untrusted_pending_sats")))),
                          ("On this box, for agents", money(int(hot.get("hot_sats")))),
@@ -1734,12 +1733,10 @@ impl App {
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
         let enc = ks["encrypted"] == true;
         let ack_needed = ln["real_money_ack_needed"] == true;
-        let main = self.signer_chain() == "main";
         let done = [true, !human.is_empty(), seen("policy_change"), ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
-        // the count is of the steps shown: on mainnet the real-money step is one of them, done or not
-        let ack_done = !ack_needed && (ln["ready"] == true || ln["configured"] == true);
-        let n = done.iter().filter(|d| **d).count() + usize::from(main && ack_done);
-        let total = done.len() + usize::from(main);
+        // the count is of the steps shown: the real-money step, while it is listed, is one of them (0.2.1 said "4 of 5" beside other steps)
+        let n = done.iter().filter(|d| **d).count();
+        let total = done.len() + usize::from(ack_needed);
         let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">");
         b.push_str(&step(true, "Password", if self.platform.is_some() {
             "<p>Not needed: you opened the app from your box's dashboard, which already asked who you are.</p>".into()
@@ -1760,8 +1757,8 @@ impl App {
             format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>\
                      <p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>", allow_n, if allow_n == 1 { "" } else { "s" })));
         // on mainnet: straight after the rules, the confirmation that the app may pay with real money
-        if main {
-            b.push_str(&step(ack_done, "Pay with real money",
+        if ack_needed {
+            b.push_str(&step(false, "Pay with real money",
                 "<p>This box's Lightning node holds real money. Until you confirm that the app may pay with it, the app pays nothing, \
                  even with your rules signed.</p><p><a href=\"./lightning#ack\">Start paying →</a></p>".into()));
         }
