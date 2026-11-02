@@ -14,7 +14,9 @@ same place for both builds. Per block:
   first_job_ms      blocknotify -> the first mining.notify on the new previous block, at the first client
   all_clients_ms    blocknotify -> the last client's first notify on it (the fan-out)
   full_job_ms       blocknotify -> the first client's first job with the template's transactions (a job id with
-                    no N prefix): the template update. Pool mode: after the pool's split (the coinbaser)
+                    no N prefix): the template update
+  split_job_ms      the same for the first full job whose coinbase class isn't 00: in pool mode, the one carrying
+                    the pool's split (class 00 pays only the pool: class00_full_jobs counts those sent, every client)
 CPU: the gateway's utime+stime (/proc/<pid>/stat) over IDLE_S seconds with the clients connected and no block, and
 over the block phase, as a share of one core.
 
@@ -189,7 +191,7 @@ def run_one(name: str, gw: str, mode: str, a: argparse.Namespace) -> dict[str, A
             while time.time() < deadline:
                 with open(stamps) as f:
                     t_block = next((float(ln.split()[1]) for ln in f if ln.split()[0] == block), None)
-                firsts, fulls = [], []
+                firsts, fulls, splits, pool_only = [], [], [], 0
                 for c in clients:
                     with c.lock:
                         ev = [e for e in c.events if e[2] and (prevhash_matches(e[2], block) or e[2] not in known)]
@@ -198,7 +200,12 @@ def run_one(name: str, gw: str, mode: str, a: argparse.Namespace) -> dict[str, A
                         full = [e for e in ev if not e[1].startswith(("N", "Q"))]
                         if full:
                             fulls.append(full[0][0])
-                if t_block and len(firsts) == len(clients) and fulls:
+                        # a full template whose coinbase class is 00 pays only the pool (pool mode): the late-coinbaser window
+                        split = [e for e in full if not e[1].endswith("00")]
+                        if split:
+                            splits.append(split[0][0])
+                        pool_only += len([e for e in full if e[1].endswith("00")])
+                if t_block and len(firsts) == len(clients) and splits:
                     break
                 time.sleep(0.05)
             if not (t_block and firsts):
@@ -206,7 +213,9 @@ def run_one(name: str, gw: str, mode: str, a: argparse.Namespace) -> dict[str, A
                 continue
             samples.append({"block": block, "first_job_ms": round(1000 * (min(firsts) - t_block), 2),
                             "all_clients_ms": round(1000 * (max(firsts) - t_block), 2) if len(firsts) == len(clients) else None,
-                            "full_job_ms": round(1000 * (min(fulls) - t_block), 2) if fulls else None})
+                            "full_job_ms": round(1000 * (min(fulls) - t_block), 2) if fulls else None,
+                            "split_job_ms": round(1000 * (min(splits) - t_block), 2) if splits else None,
+                            "class00_full_jobs": pool_only if mode == "pool" else 0})
         busy = (cpu_ticks(gwp.pid) - c1) / TICK / (time.time() - t1)
         with open(f"{home}/gateway.log", errors="replace") as f:
             banner = next((ln.strip() for ln in f if "git commit" in ln), "")
@@ -250,12 +259,13 @@ def summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for r in runs:
         k = f"{r['name']}/{r['mode']}"
-        s = out.setdefault(k, {"first_job_ms": [], "all_clients_ms": [], "full_job_ms": [], "cpu_idle_core": [], "cpu_blocks_core": [], "errors": 0})
+        s = out.setdefault(k, {"first_job_ms": [], "all_clients_ms": [], "full_job_ms": [], "split_job_ms": [], "class00_full_jobs": [],
+                               "cpu_idle_core": [], "cpu_blocks_core": [], "errors": 0})
         for x in r["samples"]:
             if "error" in x:
                 s["errors"] += 1
                 continue
-            for m in ("first_job_ms", "all_clients_ms", "full_job_ms"):
+            for m in ("first_job_ms", "all_clients_ms", "full_job_ms", "split_job_ms", "class00_full_jobs"):
                 if x.get(m) is not None:
                     s[m].append(x[m])
         s["cpu_idle_core"].append(r["cpu_idle_core"])
@@ -263,8 +273,9 @@ def summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
     table = {}
     for k, s in out.items():
         table[k] = {"blocks": len(s["first_job_ms"]), "errors": s["errors"],
-                    **{f"{m}_p50": pct(s[m], 0.5) for m in ("first_job_ms", "all_clients_ms", "full_job_ms")},
-                    **{f"{m}_p90": pct(s[m], 0.9) for m in ("first_job_ms", "all_clients_ms", "full_job_ms")},
+                    **{f"{m}_p50": pct(s[m], 0.5) for m in ("first_job_ms", "all_clients_ms", "full_job_ms", "split_job_ms")},
+                    **{f"{m}_p90": pct(s[m], 0.9) for m in ("first_job_ms", "all_clients_ms", "full_job_ms", "split_job_ms")},
+                    "class00_full_jobs": sum(s["class00_full_jobs"]),
                     "full_job_ms_mean": round(statistics.mean(s["full_job_ms"]), 2) if s["full_job_ms"] else None,
                     "cpu_idle_pct_core": round(100 * statistics.mean(s["cpu_idle_core"]), 3),
                     "cpu_blocks_pct_core": round(100 * statistics.mean(s["cpu_blocks_core"]), 3)}
