@@ -1783,7 +1783,7 @@ past what the wallet has counted of it** (`uncounted_most` in `ticket_pay.rs`):
 - **What cheating inside these bounds costs:** the seller takes them and is not caught, once per
   request: the wallet cannot tell such a charge from an honest one. Over a day, the owner's
   spending rules cap what any one seller is paid (`per_counterparty_daily_sats`: 20,000 sat on a
-  new install, 5,000 on mainnet, beside the weekly `per_counterparty_cap_sats`).
+  new install, also 20,000 on mainnet from 0.2.6 (5,000 before), beside the weekly `per_counterparty_cap_sats`).
 
 **A seller caught over-charging is blocked.** Over-charging is a charge past an answer's cost or
 quote or past the call's limit, a spend past what the wallet can account for, or charging lost

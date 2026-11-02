@@ -170,8 +170,8 @@ same holds up to about 2.8 Gbit/s.
 
 **What 4K costs.** At 20 sat/MiB, the films' price today, 4K is about 72,000 sat an hour. A price
 for long viewing is about 1 sat/MiB: 4K for about 3,600 sat an hour, 1080p for about 1,800, and a
-900-sat ticket lasts about 90 s of 4K. The starter rules' 10,000 sat a day allow a little under
-three hours of 4K at that price, and a seller that charges by the MiB should say so in its terms.
+900-sat ticket lasts about 90 s of 4K. The starter rules' 20,000 sat a day with one seller allow
+about five and a half hours of 4K at that price, and a seller that charges by the MiB should say so in its terms.
 
 ### 4K and HDR from a media server: what the seller's box has to do
 

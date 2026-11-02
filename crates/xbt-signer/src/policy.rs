@@ -105,6 +105,9 @@ pub struct Decision {
     pub residual_daily_sats: i64,
     pub residual_weekly_sats: i64,
     pub residual_counterparty_sats: i64,
+    /// The owner's limit, in sats, that refused it (the rule's own setting), where the rule has one in sats.
+    /// Not part of [`Decision::as_value`] (B2's shape): a caller adds it where it says why.
+    pub limit_sats: Option<i64>,
 }
 
 impl Decision {
@@ -120,6 +123,25 @@ impl Decision {
                "residual_weekly_sats": self.residual_weekly_sats, "residual_counterparty_sats": self.residual_counterparty_sats})
     }
 }
+
+/// The setting of `c`, in sats, that `rule` holds a payment to ([`PolicyEngine::limit_of`]).
+fn limit_in(c: &PolicyConfig, rule: &str) -> Option<i64> {
+    Some(match rule {
+        "max_per_tx" | "split_bypass" => c.max_per_tx_sats,
+        "daily_budget" => c.daily_budget_sats,
+        "weekly_budget" => c.weekly_budget_sats,
+        "per_counterparty" => c.per_counterparty_cap_sats,
+        "per_counterparty_daily" => c.per_counterparty_daily_sats,
+        "human_threshold" => c.human_threshold_sats,
+        _ => return None,
+    })
+}
+
+/// The owner's spending rules a stream ticket can be refused by, by their rule names: the engine's
+/// and the ticket book's caps of the owner's own setting. A refusal by one of them is the buyer's
+/// own limit, never the seller's doing.
+pub const OWNER_LIMIT_RULES: [&str; 10] = ["max_per_tx", "split_bypass", "daily_budget", "weekly_budget", "per_counterparty", "per_counterparty_daily", "velocity",
+                                           "human_threshold", "ticket_task_budget", "ticket_seller_cap"];
 
 /// B2's `PolicyConfig` (policy.json), defaults included.
 /// What one seller is paid at most in 24 hours where policy.json does not say.
@@ -740,7 +762,7 @@ impl PolicyEngine {
     /// threshold, approvals); `booked_sats` is the most the ledger gains from it (the sums).
     /// They differ on a channel, where the signed increase is known only from its state.
     pub fn evaluate_booking(&self, payment: &Payment, booked_sats: i64, human: bool) -> Result<Decision> {
-        self.decide(payment, booked_sats, human, false, false)
+        self.decide(payment, booked_sats, human, false, false, false)
     }
 
     /// Stream tickets: [`Self::evaluate_booking`] for a seller the caller has already admitted
@@ -748,16 +770,29 @@ impl PolicyEngine {
     /// any seller under its own budget and per-seller cap). The allowlist is the one rule not
     /// applied; every other rule is, and no human approval is asked for.
     pub fn evaluate_admitted(&self, payment: &Payment, booked_sats: i64) -> Result<Decision> {
-        self.decide(payment, booked_sats, false, true, false)
+        self.decide(payment, booked_sats, false, true, false, false)
     }
 
     /// A payment of a task the owner gave a [`crate::ticket::TaskRental`]: admitted, and outside the
     /// rules of this engine. The caller holds it to the task's own limits.
     pub fn evaluate_rental(&self, payment: &Payment, booked_sats: i64) -> Result<Decision> {
-        self.decide(payment, booked_sats, false, true, true)
+        self.decide(payment, booked_sats, false, true, true, false)
     }
 
-    fn decide(&self, payment: &Payment, booked_sats: i64, human: bool, admitted: bool, rental: bool) -> Result<Decision> {
+    /// What [`Self::evaluate_admitted`] (or, `rental`, [`Self::evaluate_rental`]) would decide now, and
+    /// nothing else: no audit row, no approval stored. A stream ticket is asked this before the
+    /// seller is asked for an invoice, so that one the owner's rules would refuse is never locked.
+    pub fn check_admitted(&self, payment: &Payment, booked_sats: i64, rental: bool) -> Result<Decision> {
+        self.decide(payment, booked_sats, false, true, rental, true)
+    }
+
+    /// The owner's setting, in sats, that `rule` holds a payment to: `None` for a rule that is not
+    /// a sum of sats (velocity, the allowlist, a bad amount).
+    pub fn limit_of(&self, rule: &str) -> Option<i64> {
+        limit_in(&self.config(), rule)
+    }
+
+    fn decide(&self, payment: &Payment, booked_sats: i64, human: bool, admitted: bool, rental: bool, dry: bool) -> Result<Decision> {
         let now = self.now();
         let p = payment.normalized(now);
         let cfg = &self.config();
@@ -775,11 +810,16 @@ impl PolicyEngine {
         let rw = (cfg.weekly_budget_sats - weekly).max(0);
         let rc = (cfg.per_counterparty_cap_sats - cpty).max(0);
         let decide = |verdict: Verdict, rule: &str, reason: String, token: Option<String>, expires: Option<i64>| -> Decision {
+            let limit_sats = if verdict == Verdict::Allow { None } else { limit_in(cfg, rule) };
+            if dry {
+                return Decision { verdict, reason, rule: rule.into(), approval_token: None, approval_expires: None, dest: p.dest.clone(),
+                                  amount_sats: p.amount_sats, residual_daily_sats: rd, residual_weekly_sats: rw, residual_counterparty_sats: rc, limit_sats };
+            }
             self.audit.append(json!({"type": "decision", "verdict": verdict.as_str(), "rule": rule, "reason": reason,
                                      "dest": p.dest, "amount_sats": p.amount_sats, "human": human, "ts": ts_value(now),
                                      "approval_token": token}));
             Decision { verdict, reason, rule: rule.into(), approval_token: token, approval_expires: expires, dest: p.dest.clone(),
-                       amount_sats: p.amount_sats, residual_daily_sats: rd, residual_weekly_sats: rw, residual_counterparty_sats: rc }
+                       amount_sats: p.amount_sats, residual_daily_sats: rd, residual_weekly_sats: rw, residual_counterparty_sats: rc, limit_sats }
         };
         use Verdict::*;
         if p.amount_sats <= 0 {
@@ -840,6 +880,9 @@ impl PolicyEngine {
             return Ok(decide(Deny, "velocity", format!("already {} payments in the last {}s", cfg.velocity_max, cfg.velocity_window_s), None, None));
         }
         if !human && p.amount_sats >= cfg.human_threshold_sats {
+            if dry {
+                return Ok(decide(NeedsHuman, "human_threshold", format!("{} sats is at or above human_threshold {}", p.amount_sats, cfg.human_threshold_sats), None, None));
+            }
             let token = token_urlsafe();
             let expires = (now + cfg.approval_ttl_s as f64) as i64;
             self.store.put_approval(&token, json!({"dest": p.dest, "amount_sats": p.amount_sats, "memo": p.memo, "expires": expires,

@@ -170,11 +170,18 @@ fn sig(m: &[u8]) -> String {
 fn the_starter_rules_on_mainnet_are_those_the_signer_is_tested_at_market_with() {
     let p = xbt_wallet_ui::app::starter_policy("main");
     assert_eq!(p["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}));
-    for (k, v) in [("max_per_tx_sats", 2_000), ("daily_budget_sats", 10_000), ("weekly_budget_sats", 30_000), ("per_counterparty_cap_sats", 10_000),
-                   ("per_counterparty_daily_sats", 5_000), ("velocity_max", 60), ("velocity_window_s", 3600), ("human_threshold_sats", 1_000), ("split_window_s", 600)] {
+    for (k, v) in [("max_per_tx_sats", 2_000), ("daily_budget_sats", 25_000), ("weekly_budget_sats", 60_000), ("per_counterparty_cap_sats", 50_000),
+                   ("per_counterparty_daily_sats", 20_000), ("velocity_max", 60), ("velocity_window_s", 3600), ("human_threshold_sats", 1_000), ("split_window_s", 600)] {
         assert_eq!(p[k], json!(v), "{k}");
     }
-    assert_eq!(p["tickets"]["tasks"]["default"]["budget_sats"], 10_000);
+    assert_eq!(p["tickets"]["tasks"]["default"]["budget_sats"], 25_000);
+    // the caps nest: one seller's day under the day's total and under its own week, and the day under the week
+    let n = |k: &str| p[k].as_i64().unwrap();
+    assert!(n("per_counterparty_daily_sats") <= n("daily_budget_sats") && n("per_counterparty_daily_sats") <= n("per_counterparty_cap_sats"));
+    assert!(n("daily_budget_sats") <= n("weekly_budget_sats") && n("per_counterparty_cap_sats") <= n("weekly_budget_sats"));
+    assert!(n("daily_budget_sats") <= n("hot_balance_cap_sats") && p["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() >= n("per_counterparty_daily_sats"));
+    // a film at 20 sat a MiB (about 5,000 sat) and a ticket after it fit in one seller's day
+    assert!(n("per_counterparty_daily_sats") >= 5_000 + 2 * 1_003);
     // off mainnet the task is as it was
     assert_eq!(xbt_wallet_ui::app::starter_policy("regtest")["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 100_000}));
 }
@@ -949,8 +956,8 @@ fn the_starter_policy_turns_the_rail_and_tickets_on_and_is_low_on_mainnet() {
     assert!(t["ln"].get("split_height").is_none());
     let m = xbt_wallet_ui::app::starter_policy("main");
     assert_eq!(m["ln"]["split_height"], json!(xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT));
-    assert!(m["max_per_tx_sats"].as_i64().unwrap() <= 2000 && m["daily_budget_sats"].as_i64().unwrap() <= 10000);
-    assert!(m["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() <= 10000);
+    assert!(m["max_per_tx_sats"].as_i64().unwrap() <= 2000 && m["daily_budget_sats"].as_i64().unwrap() <= 25_000);
+    assert!(m["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() <= 25_000);
     // renting miners pays under its own task: there from the start, and only to listed sellers. On mainnet it's a rental
     // task (Mike's decision for 0.2.0): a budget of 200,000 sat, tickets of at most 10,000 sat, 600 sends an hour
     assert_eq!(m["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 200_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}));

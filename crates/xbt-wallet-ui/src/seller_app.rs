@@ -422,15 +422,22 @@ impl App {
             s.refusals.retain(|_, (t, _)| t.elapsed() < 10 * REFUSAL_SHOWN);
             s.refusals.get(&visit).filter(|(t, _)| t.elapsed() < REFUSAL_SHOWN).map(|(_, b)| b.clone())
         };
+        // the shop's name, for a refusal by the buyer's own rules that names it
+        let shop = self.apps.lock().grants.values().find(|g| g.visit == visit).and_then(|g| crate::services::http_origin(&g.base)).map(|o| self.seller_name(&o));
         // the refusal in words, with what the node can send where it found no route
         let refusal = refused.map(|body| {
             let no_route = crate::pay_feedback::explain(&body, None, false).kind == crate::pay_feedback::Kind::NoRoute;
-            crate::pay_feedback::as_json(&crate::pay_feedback::explain(&body, if no_route { self.spendable_sats() } else { None }, false))
+            crate::pay_feedback::as_json(&crate::pay_feedback::explain_at(&body, if no_route { self.spendable_sats() } else { None }, false, shop.as_deref()))
         });
         match connector_json("GET", &format!("{}/visits/{visit}", self.cfg.connector.trim_end_matches('/')), None) {
             Ok((200, v)) => {
                 let mut out = visit_numbers(&v);
-                out["refusal"] = refusal.unwrap_or(Value::Null);
+                // the visit ended by the buyer's own spending rules (a top-up refused, say): said as such a refusal is, with
+                // the shop, the limit and the field to raise, where the frame has shown nothing newer
+                let by_rules = v.get("policy_refused").filter(|p| p.is_object())
+                    .map(|p| crate::pay_feedback::as_json(&crate::pay_feedback::explain_at(&json!({"error": p["reason"], "rule": p["rule"], "limit_sats": p["limit_sats"]}).to_string(),
+                                                                                           None, false, shop.as_deref())));
+                out["refusal"] = refusal.or(by_rules).unwrap_or(Value::Null);
                 // a visit that runs on earlier credit pays nothing new: the bar says what is left of that credit
                 if out["prepaid_sats"].as_i64() == Some(0) && out["used_sats"].as_i64().unwrap_or(0) > 0 {
                     let origin = self.apps.lock().grants.values().find(|g| g.visit == visit).and_then(|g| crate::services::http_origin(&g.base));

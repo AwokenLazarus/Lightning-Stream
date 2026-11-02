@@ -93,7 +93,7 @@ pub(crate) struct Ctx {
     pub(crate) flash: Option<(bool, String)>,
 }
 
-const INT_KEYS: [(&str, &str, &str); 13] = [
+pub(crate) const INT_KEYS: [(&str, &str, &str); 13] = [
     ("max_per_tx_sats", "Largest single payment (sats)", "budgets"),
     ("daily_budget_sats", "Spending limit for any 24 hours (sats)", "budgets"),
     ("weekly_budget_sats", "Spending limit for any 7 days (sats)", "more"),
@@ -124,6 +124,16 @@ pub fn stream_token(csrf: &str) -> String {
 /// What the starter rules let rented hashrate cost on mainnet in any 24 hours: about 70 minutes of a
 /// 4 TH/s miner at market. The owner's limit: a rental's own budget is inside it.
 pub const STARTER_RENTAL_BUDGET_SATS: i64 = 200_000;
+
+/// What the starter rules let one seller be paid on mainnet in any 24 hours (`per_counterparty_daily_sats`):
+/// a film on the demo shop (about 5,000 sat at 20 sat a MiB) several times over. 0.2.5's 5,000 stopped a film
+/// near its end.
+pub const STARTER_PER_SELLER_DAILY_SATS: i64 = 20_000;
+
+/// What the starter rules let the wallet spend on mainnet in any 24 hours (`daily_budget_sats`), and the
+/// day's budget of stream tickets: above [`STARTER_PER_SELLER_DAILY_SATS`], so a day at one shop leaves room
+/// for another.
+pub const STARTER_DAILY_SATS: i64 = 25_000;
 
 /// The least `ln.exposure_cap_sats` the starter rules set on mainnet: 1,000,000 sats, so a node of
 /// ordinary size is not refused at the first payment (0.2.1's 100,000 refused a node holding
@@ -166,13 +176,16 @@ pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
            "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300,
            "ln": {"enabled": true}, "tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 100000}, "hashrate": {"budget_sats": 100000}}}});
     if chain == "main" {
-        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000), ("per_counterparty_daily_sats", 5000),
-                       ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
+        // sized so that a first film at one shop (about 5,000 sat at 20 sat a MiB) and some AI fit in a day with that shop, and
+        // two or three shops in a day: the most to one seller in a day is under the day's total, and a week's under the week's
+        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", STARTER_DAILY_SATS), ("weekly_budget_sats", 60_000), ("per_counterparty_cap_sats", 50_000),
+                       ("per_counterparty_daily_sats", STARTER_PER_SELLER_DAILY_SATS), ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
             p[k] = json!(v);
         }
         p["ln"]["split_height"] = json!(MAINNET_SPLIT_HEIGHT);
         p["ln"]["exposure_cap_sats"] = json!(starter_exposure_cap(held.unwrap_or(0)));
-        p["tickets"]["tasks"]["default"]["budget_sats"] = json!(10000);
+        // the day's tickets: as much as the day's spending limit
+        p["tickets"]["tasks"]["default"]["budget_sats"] = json!(STARTER_DAILY_SATS);
         // market price for a 4 TH/s miner is about 165,000 sat an hour, which no limit above would let through: the
         // task pays by its own (`tickets.tasks.*.rental`), and the rest of the wallet stands
         p["tickets"]["tasks"]["hashrate"] = json!({"budget_sats": STARTER_RENTAL_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}});
