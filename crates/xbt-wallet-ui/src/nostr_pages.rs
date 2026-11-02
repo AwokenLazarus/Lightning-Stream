@@ -98,7 +98,8 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -
                 b.push_str("<div class=\"grid\">");
                 for item in &s.items {
                     // the file's path at the shop, not its made-up `…shop.invalid` address
-                    let path = services::http_origin(&item.url).and_then(|o| item.url.strip_prefix(&o).map(str::to_string)).unwrap_or_else(|| item.url.clone());
+                    let path = services::http_origin(&item.url).filter(|o| xbt402::shop::is_shop(o))
+                        .and_then(|o| item.url.strip_prefix(&o).map(str::to_string)).unwrap_or_else(|| item.url.clone());
                     let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&path));
                     b.push_str(&format!("<article class=\"card\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>{open}</article>",
                                         esc(&item.title), esc(&item.year), esc(&item.credit)));
