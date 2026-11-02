@@ -5,6 +5,16 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.1 (2026-11-02)
+
+A fix to 0.2.0.
+
+- On Browse, **Found on Nostr**, a shop reached by its key (such as the demo shop, Lightning Stream
+  Genesis) now offers **Add this shop**. Its list is signed by the key that is its address, so it is the
+  shop's own. Before, it offered only *Check with the seller*, which asks the seller's web address; a
+  shop reached by its key has none, so the check failed with a name-lookup error. Adding the shop by its
+  key under Sellers worked all along.
+
 ## 0.2.0 (2026-11-01)
 
 A public test release. What is new since 0.1.19, in short; the sections below give the details.
