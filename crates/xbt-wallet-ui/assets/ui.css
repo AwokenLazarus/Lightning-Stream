@@ -198,6 +198,11 @@ pre.hex { word-break: break-all; }
 .msg.ok, .hint.ok { color: var(--ok); }
 .hint { margin: 0 0 10px; font-size: 0.92em; color: var(--muted); }
 .hint.warn { color: var(--warn); }
+/* why an offer's Rent is off: said beside the button, not left to a tooltip phones never show */
+.btn-why { display: inline-block; }
+.rent-off { margin-top: 10px; padding: 8px 12px; border: 1px solid var(--warn-line); border-radius: 10px; background: var(--warn-bg); color: var(--warn); }
+.rent-off ul { margin: 4px 0 0; padding-left: 18px; }
+.rent-off strong { color: var(--warn); }
 .small { color: var(--muted); font-size: 0.86em; }
 .empty { color: var(--muted); text-align: center; padding: 30px 12px; margin: 0; }
 .empty::before { content: ""; display: block; width: 44px; height: 44px; margin: 0 auto 14px; border-radius: 50%;

@@ -926,6 +926,13 @@ impl App {
                     // this box's own offer: marked, and not rented (a box can't pay itself)
                     let mine = self.is_own_shop(pay_url);
                     let can = ready && allowed && !old && !mine && (free > 0 || total == 0);
+                    // why Rent is off, said beside the buttons (and as their tooltip), so nobody is left guessing
+                    let why_off = rent_off_reasons(ready, head, allowed, old, mine, free, total);
+                    let (tip, off_note) = if can || why_off.is_empty() { (String::new(), String::new()) } else {
+                        (format!(" title=\"Rent is off: {}\"", esc(&why_off.join("; "))),
+                         format!("<div class=\"hint rent-off\"><strong>Rent is off because:</strong><ul>{}</ul></div>",
+                                 why_off.iter().map(|w| format!("<li>{}</li>", esc(w))).collect::<String>()))
+                    };
                     // the seller by name: an offer called just "Hashrate" says whose it is
                     let seller = crate::services::http_origin(pay_url).map(|o| self.seller_name(&o)).unwrap_or_default();
                     let title = match (x["name"].as_str().unwrap_or("Miners"), seller.is_empty()) {
@@ -951,7 +958,7 @@ impl App {
                         <input type=\"hidden\" name=\"key\" value=\"{}\">{}<p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
                         about {}, and see what your gateway accepts before renting more. It is charged at most that, but your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
-                        <button class=\"secondary\"{}>Try one slice first</button></form>",
+                        <span class=\"btn-why\"{tip}><button class=\"secondary\"{}>Try one slice first</button></span></form>",
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
@@ -962,7 +969,7 @@ impl App {
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <p class=\"hint\">About an hour of one machine{}. The rental ends when this much is spent, but however small it is, your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
-                        <button{}>Rent</button></form></section>",
+                        <span class=\"btn-why\"{tip}><button{}>Rent</button></span>{off_note}</form></section>",
                         esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
@@ -1066,6 +1073,29 @@ impl App {
 
 /// The rent page's notice: what renting waits for, from the renter's status. `here`: this install has the bundled
 /// Stream Gateway's settings; `set_up`: they have been saved (its config is written).
+/// Why an offer's Rent (and Try one slice first) is off, in the order a renter fixes them; empty when it is on.
+/// `gateway` is the heading `rent_status` gives the gateway's state, so the reason matches the notice on the page.
+fn rent_off_reasons(ready: bool, gateway: &str, allowed: bool, old: bool, mine: bool, free: u64, total: u64) -> Vec<String> {
+    let mut why = Vec::new();
+    if mine {
+        why.push("This is your own box's offer: buyers rent it from their apps".to_string());
+        return why;
+    }
+    if !ready {
+        why.push(format!("{} (see Your gateway below)", gateway.trim_end_matches('.')));
+    }
+    if !allowed {
+        why.push("This hashmaker isn't allowed to be paid yet: press Allow this hashmaker to be paid above, and sign the change".to_string());
+    }
+    if old {
+        why.push("This hashmaker's app needs updating: it doesn't prove the work it sells".to_string());
+    }
+    if total > 0 && free == 0 {
+        why.push("All of its machines are rented right now; try again later".to_string());
+    }
+    why
+}
+
 fn rent_status(st: &Value, here: bool, set_up: bool) -> (&'static str, &'static str, String) {
     use crate::stream_gateway::NAME;
     let datum = st["datum"]["addr"].as_str().unwrap_or("");
@@ -1487,6 +1517,22 @@ fn th_hours(x: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A disabled Rent says why: the gateway's state (in the page notice's own words), an unallowed hashmaker, an
+    /// old app, no free machines; your own offer says only that; an offer that can be rented says nothing.
+    #[test]
+    fn a_disabled_rent_says_why() {
+        let r = super::rent_off_reasons(false, "Your gateway isn't running", false, false, false, 1, 1);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].starts_with("Your gateway isn't running"), "{r:?}");
+        assert!(r[1].contains("Allow this hashmaker to be paid"), "{r:?}");
+        let r = super::rent_off_reasons(true, "", true, true, false, 0, 3);
+        assert!(r[0].contains("needs updating") && r[1].contains("rented right now"), "{r:?}");
+        let r = super::rent_off_reasons(false, "Set up your gateway", false, true, true, 0, 1);
+        assert_eq!(r, vec!["This is your own box's offer: buyers rent it from their apps".to_string()]);
+        assert!(super::rent_off_reasons(true, "", true, false, false, 1, 1).is_empty());
+        assert!(super::rent_off_reasons(true, "", true, false, false, 0, 0).is_empty(), "no machine count given is not 'all rented'");
+    }
+
     /// A price saved with no rental going on is in force at once and holds no new rental: the first price, a
     /// new one, and one confirmed again, even over a hold left from before.
     #[test]
