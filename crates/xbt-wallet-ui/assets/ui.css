@@ -20,9 +20,9 @@
   --accent: #ffd60a; --accent-2: #ffe766; --accent-soft: rgba(255,214,10,0.10); --accent-line: rgba(255,214,10,0.42); --accent-fg: #0a0900;
   --link: #ffd60a; --link-hover: #ffe766; --data: #9fd8ff; --data-soft: rgba(159,216,255,0.10);
   --cta: #ffd60a; --cta-2: #ffe766; --cta-fg: #0a0900; --cta-glow: 0 0 32px -4px rgba(255,214,10,0.55); --money: #ffd60a;
-  --ok: #6be3a4; --ok-bg: #0c1f17; --ok-line: rgba(107,227,164,0.35);
-  --bad: #ff8080; --bad-bg: #2a1013; --bad-line: rgba(255,107,107,0.4);
-  --warn: #ffb648; --warn-bg: #261a08; --warn-line: rgba(255,182,72,0.4);
+  --ok: #6be3a4; --ok-bg: #0b1813; --ok-line: rgba(107,227,164,0.35);
+  --bad: #ff8a8a; --bad-bg: #1e0c0f; --bad-line: rgba(255,107,107,0.4);
+  --warn: #ffb648; --warn-bg: #1b1309; --warn-line: rgba(255,182,72,0.4);
   --shadow: 0 1px 0 rgba(255,255,255,0.03) inset, 0 24px 60px -36px rgba(0,0,0,0.9);
   --card-bg: linear-gradient(180deg, rgba(16,19,26,0.92), rgba(10,12,16,0.94));
   --glow-1: rgba(255,214,10,0.07); --glow-2: rgba(90,174,255,0.08);
@@ -97,6 +97,8 @@ header nav form.inline button.link:hover { color: var(--fg); }
 .menu-toggle, .theme-toggle { min-height: 38px; padding: 6px 16px; background: transparent; color: var(--fg); border: 1px solid var(--line-2);
                               box-shadow: none; font-weight: 500; font-size: 0.92rem; border-radius: 999px; }
 .menu-toggle { display: none; margin-left: auto; }
+/* with no menu (before the first login) the theme button still sits at the right */
+.brand + .theme-toggle { margin-left: auto; }
 .menu-toggle:hover, .theme-toggle:hover { background: rgba(255,255,255,0.07); box-shadow: none; }
 :root[data-theme="light"] .menu-toggle:hover, :root[data-theme="light"] .theme-toggle:hover { background: rgba(11,12,16,0.05); }
 /* the theme button: a sun in the dark theme (to switch to light), a moon in the light one */
@@ -210,6 +212,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 input[readonly] { color: var(--muted); }
 input[type=checkbox], input[type=radio] { width: 20px; height: 20px; min-height: 0; margin: 0; accent-color: var(--accent); flex: none; }
 textarea { min-height: 0; }
+select { -webkit-appearance: none; appearance: none; padding-right: 42px; background-repeat: no-repeat; background-position: right 16px center; background-size: 12px 8px;
+         background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%238a8f99' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
 fieldset { border: 1px solid var(--line); border-radius: var(--radius-lg); margin: 0 0 18px; padding: 12px 20px 16px; }
 legend { font-weight: 650; padding: 0 6px; color: var(--fg); }
 details { margin: 10px 0; }
@@ -304,7 +308,8 @@ a.button-link.primary:hover, :root[data-theme="light"] a.button-link.primary:hov
 details.card.advanced > summary { font-weight: 600; }
 ul.offers { list-style: none; padding: 0; margin: 0 0 8px; display: grid; gap: 6px; }
 .price { font-weight: 650; color: var(--money); font-variant-numeric: tabular-nums; }
-input:invalid:not(:placeholder-shown) { border-color: var(--bad); }
+/* a field turns red once the owner has typed something it can't take, never before */
+input:user-invalid { border-color: var(--bad); }
 
 /* first run: where the owner is, in three steps */
 ol.progress { list-style: none; display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 0; margin: 0 0 20px; counter-reset: none; }
@@ -338,6 +343,7 @@ a.service-card:hover { border-color: var(--accent-line); transform: translateY(-
                        background: linear-gradient(180deg, color-mix(in srgb, var(--volt) 6%, var(--card)), var(--card)); }
 a.service-card h2 { margin: 6px 0 0; font-size: 1.1rem; }
 a.service-card p { margin: 0; color: var(--muted); }
+a.service-card p.price, a.service-card .price { color: var(--money); }
 a.service-card .pill { align-self: flex-start; }
 /* one accent per kind of service, as on the website */
 .pill.cat-media, .pill.cat-apps { --k: #ffb648; }
