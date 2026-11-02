@@ -928,7 +928,7 @@ impl App {
                     let can = ready && allowed && !old && !mine && (free > 0 || total == 0);
                     // why Rent is off, said beside the buttons (and as their tooltip), so nobody is left guessing
                     let why_off = rent_off_reasons(ready, head, allowed, old, mine, free, total);
-                    let (tip, off_note) = if can || why_off.is_empty() { (String::new(), String::new()) } else {
+                    let (off_tip, off_note) = if can || why_off.is_empty() { (String::new(), String::new()) } else {
                         (format!(" title=\"Rent is off: {}\"", esc(&why_off.join("; "))),
                          format!("<div class=\"hint rent-off\"><strong>Rent is off because:</strong><ul>{}</ul></div>",
                                  why_off.iter().map(|w| format!("<li>{}</li>", esc(w))).collect::<String>()))
@@ -958,7 +958,7 @@ impl App {
                         <input type=\"hidden\" name=\"key\" value=\"{}\">{}<p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
                         about {}, and see what your gateway accepts before renting more. It is charged at most that, but your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
-                        <span class=\"btn-why\"{tip}><button class=\"secondary\"{}>Try one slice first</button></span></form>",
+                        <span class=\"btn-why\"{off_tip}><button class=\"secondary\"{}>Try one slice first</button></span></form>",
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
@@ -969,7 +969,7 @@ impl App {
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <p class=\"hint\">About an hour of one machine{}. The rental ends when this much is spent, but however small it is, your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
-                        <span class=\"btn-why\"{tip}><button{}>Rent</button></span>{off_note}</form></section>",
+                        <span class=\"btn-why\"{off_tip}><button{}>Rent</button></span>{off_note}</form></section>",
                         esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
