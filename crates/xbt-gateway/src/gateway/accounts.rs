@@ -371,9 +371,12 @@ mod tests {
     /// A Jellyfin enough for a buyer's account: as 10.11 and later are by default (`legacy` false: the key only in
     /// `Authorization: MediaBrowser … Token="…"`), or as 10.10 (`legacy`: X-Emby-Token too). It answers 401 to any other
     /// way, and records every request's headers.
+    /// A request the stand-in got: its target and headers.
+    type Seen = (String, Vec<(String, String)>);
+
     struct Jf {
         legacy: bool,
-        seen: std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>,
+        seen: std::sync::Mutex<Vec<Seen>>,
     }
 
     impl xbt_svc::http::Handler for Jf {
