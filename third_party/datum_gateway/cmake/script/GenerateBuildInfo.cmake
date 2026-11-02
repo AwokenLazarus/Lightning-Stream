@@ -134,6 +134,13 @@ else()
   set(HEAD_COMMIT UNKNOWN_GIT_HASH)
 endif()
 
+# Lightning Stream: a vendored tree's git is ours, not upstream's, so the build names itself
+# (upstream commit + our revision; scripts/datum_gateway_build.sh sets it)
+if(NOT "$ENV{XBT_DATUM_BUILD_NAME}" STREQUAL "")
+  set(HEAD_COMMIT "$ENV{XBT_DATUM_BUILD_NAME}")
+  set(GIT_TAG)
+endif()
+
 set(NEWINFO "#define GIT_COMMIT_HASH \"${HEAD_COMMIT}\"")
 if(GIT_TAG)
   string(APPEND NEWINFO "\n#define BUILD_GIT_TAG \"${GIT_TAG}\"")
