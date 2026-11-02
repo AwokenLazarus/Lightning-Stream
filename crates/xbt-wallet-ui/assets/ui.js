@@ -479,7 +479,8 @@
       fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
         if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
         if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
-          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat · credit left " + (v.credit_sats || 0).toLocaleString() + " sat" : "";
+          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat · credit left " + (v.credit_sats || 0).toLocaleString() + " sat"
+          : typeof v.credit_left_sats === "number" ? " · from your credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat left" : "";
         if (refusal) showRefusal(v.refusal);
         if (v.ended) ended(String(v.ended));
       }).catch(function () {});

@@ -33,7 +33,7 @@ struct Kept {
 
 /// Reads: what a GET may take from the cache. Asking anything else forgets the cache.
 pub const READS: &[&str] = &["approvals", "balance", "channel_reports", "channels", "health", "history", "identity_get", "keystore_status",
-                             "ln_status", "mining_tip", "node_status", "policy_get", "seller_blocks", "signatures", "ticket_status"];
+                             "ln_status", "mining_tip", "node_status", "policy_get", "seller_blocks", "settled_amounts", "signatures", "ticket_status"];
 
 /// The reads that change slowly (the node's state, balances and channels, the rules, the keys), kept
 /// for [`SignerLink::keep`] across requests. The others (approvals waiting, the live connections, the

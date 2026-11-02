@@ -293,7 +293,8 @@ impl App {
             s.codes.retain(|_, (t, _, _)| t.elapsed() < CODE_TTL);
             s.codes.insert(code.clone(), (Instant::now(), grant, other));
         }
-        let host = crate::app::stream_pages::host(&svc.seller);
+        // the shop by its name in the visit's words (its key only in small detail text)
+        let host = self.seller_name(&svc.seller);
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
             <div class=\"card primary refusal\" data-visit-refusal hidden></div>\
@@ -317,18 +318,30 @@ impl App {
     pub(crate) fn app_stop(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let visit = f.get("visit").cloned().unwrap_or_default();
         let mut used = String::new();
+        let mut ended = String::new();
         if visit.bytes().all(|b| b.is_ascii_hexdigit()) && !visit.is_empty() {
+            let base = self.apps.lock().grants.values().find(|g| g.visit == visit).map(|g| g.base.clone());
             if !self.apps.lock().previews.remove(&visit) {
                 let said = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
                 if let Ok((200, v)) = said {
                     used = visit_numbers(&v).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
                 }
             }
-            let mut s = self.apps.lock();
-            s.grants.retain(|_, g| g.visit != visit);
-            s.refusals.remove(&visit);
+            let others = {
+                let mut s = self.apps.lock();
+                s.grants.retain(|_, g| g.visit != visit);
+                s.refusals.remove(&visit);
+                let origin = base.as_deref().and_then(crate::services::http_origin);
+                origin.filter(|o| !s.grants.values().any(|g| crate::services::http_origin(&g.base).as_deref() == Some(o.as_str())))
+            };
+            // one Stop ends it all: the connection the visit paid through closes too, unless another visit to that shop still uses it
+            if let Some(o) = others {
+                if self.stop_seller_sessions(&o) > 0 {
+                    ended = format!(" Its connection with {} is closed.", self.seller_name(&o));
+                }
+            }
         }
-        self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{used}"));
+        self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{ended}{used}"));
         Resp::redirect("./browse")
     }
 
@@ -355,10 +368,24 @@ impl App {
             Ok((200, v)) => {
                 let mut out = visit_numbers(&v);
                 out["refusal"] = refusal.unwrap_or(Value::Null);
+                // a visit that runs on earlier credit pays nothing new: the bar says what is left of that credit
+                if out["prepaid_sats"].as_i64() == Some(0) && out["used_sats"].as_i64().unwrap_or(0) > 0 {
+                    let origin = self.apps.lock().grants.values().find(|g| g.visit == visit).and_then(|g| crate::services::http_origin(&g.base));
+                    if let Some(m) = origin.and_then(|o| self.live_credit_msat(&o)) {
+                        out["credit_left_sats"] = json!(m / 1000);
+                    }
+                }
                 Resp::json(200, &out)
             }
             _ => Resp::json(200, &json!({"ended": "This visit has ended."})),
         }
+    }
+
+    /// The credit the open connection with the shop at `origin` holds now (msat), by the wallet's count.
+    fn live_credit_msat(&self, origin: &str) -> Option<u64> {
+        let st = self.call("ticket_status", json!({})).ok()?;
+        st["paying"].as_array()?.iter().filter(|p| p["origin"].as_str().and_then(crate::services::http_origin).as_deref() == Some(origin))
+            .filter_map(|p| p["balance_msat"].as_str().and_then(|s| s.parse::<u64>().ok())).max()
     }
 
     /// What the node can send now, about ([`crate::pay_feedback::spendable_sats`]); `None` where the

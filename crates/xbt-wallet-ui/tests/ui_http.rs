@@ -4833,3 +4833,50 @@ fn the_vpn_page_lists_exits_found_on_nostr_and_adds_one_for_the_vpn_service() {
 fn read_json(p: &std::path::Path) -> Value {
     serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
 }
+
+/// The 0.2.2 hands-on run on Mike's Umbrel, on the Wallet and the rules pages: a payment to `ln:<node>`
+/// named by its shop; a settled payment "Paid" with its two parts from the signer's settled record and
+/// its booking "Reserved"; the credit a closed connection left, with its amount, on the Wallet, Sellers and
+/// the service's page; a refusal in plain words; and the `ln:` line of the rules a Lightning node, by
+/// its seller's name, never "a coin address".
+#[test]
+fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let node = format!("03bb{}", "0".repeat(62));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, json!([{"name": "Alpha films", "kind": "files", "seller": "https://a.example", "price_text": "5 sat a file",
+        "items": [{"title": "A", "url": "https://a.example/a.mkv", "credit": "1 GB"}]}]).to_string()).unwrap();
+    let policy = json!({"allowlist": ["https://a.example", format!("ln:{node}")], "counterparties": {"https://a.example": {"ln_node": node}}});
+    let bx = start(policy, false, |c| c.services_file = Some(path.clone()));
+    let hash = "ab".repeat(32);
+    bx.rig.s.ln_book.put(&hash, json!({"state": "settled", "value_msat": 900_000, "fee_msat": 2_009, "spent_sats": 903})).unwrap();
+    let a = &bx.rig.s.engine.audit;
+    a.append(json!({"type": "commit", "dest": format!("ln:{node}"), "amount_sats": 915, "txid": format!("ln:{hash}"), "ts": 1_793_000_000}));
+    a.append(json!({"type": "ln_amend", "txid": format!("ln:{hash}"), "booked_sats": 915, "amount_sats": 903, "ts": 1_793_000_001}));
+    a.append(json!({"type": "ln_settled", "dest": format!("ln:{node}"), "payment_hash": hash, "spent_sats": 903, "fee_msat": 2009, "ts": 1_793_000_002}));
+    a.append(json!({"type": "ticket_left_with_seller", "session": "s1", "dest": format!("ln:{node}"), "origin": "https://a.example", "left_msat": "475900",
+                    "why": "stopped", "ts": 1_793_000_003}));
+    a.append(json!({"type": "ln_refused", "dest": format!("ln:{node}"), "reason": "the LN node holds 287070 sats in its channels, above ln.exposure_cap_sats 100000",
+                    "ts": 1_793_000_004}));
+    let mut br = logged_in(&bx);
+    let w = unescape(&br.get("/wallet").body);
+    let act = &w[w.find("Recent activity").unwrap()..];
+    assert!(!act.contains(&format!("ln:{}", &node[..8])), "a node by its shop's name: {act}");
+    assert!(act.contains("<td>Alpha films</td>"), "{act}");
+    assert!(act.contains("<td>Paid</td>") && act.contains("903 sats</span> <span class=\"small\">(900 + 2.009 fee)</span>"), "paid, with its parts: {act}");
+    assert!(act.contains("<td>Reserved</td>") && act.contains("reserved</span>") && !act.contains("<td>Commit</td>"), "{act}");
+    assert!(!act.contains("Ln amend"), "the booking's correction is no row of its own: {act}");
+    assert!(act.contains("<td>Credit left with the shop</td>") && act.contains("475.9 sats</span> <span class=\"small\">credit left"), "{act}");
+    assert!(!act.contains("<td>Ln refused</td>"), "a refusal in plain words: {act}");
+    assert!(act.contains("more than the 100000 sats") || act.contains("node holds"), "{act}");
+    // the credit on Sellers and on the service's page
+    let sellers = unescape(&br.get("/services").body);
+    assert!(sellers.contains("You have about 476 sat of credit with Alpha films; it's used first next time."), "{sellers}");
+    let svc = unescape(&br.get("/service?seller=https%3A%2F%2Fa.example&name=Alpha%20films").body);
+    assert!(svc.contains("about 476 sat of credit with Alpha films"), "{svc}");
+    // the rules: the `ln:` line is the seller's Lightning node
+    let rules = unescape(&br.get("/policy").body);
+    let who = &rules[rules.find("id=\"sellers\"").unwrap()..];
+    assert!(who.contains("Lightning node of Alpha films") && !who.contains("A coin address"), "{who}");
+}

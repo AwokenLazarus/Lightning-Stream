@@ -93,7 +93,12 @@ impl App {
                         <input type=\"hidden\" name=\"url\" value=\"{}\"><button>Allow this seller to be paid</button></form></section>",
                         esc(&self.seller_name(&origin)), App::csrf_input(ctx), esc(&origin)));
                 }
-                body.push_str(&service_html(&svc, own, &seller_words(&self.file_services().unwrap_or_default(), &svc.seller)));
+                if !own {
+                    if let Some(m) = services::http_origin(&svc.seller).and_then(|o| self.credits().get(&o).copied()) {
+                        body.push_str(&crate::app::credit_line(&self.seller_name(&svc.seller), m));
+                    }
+                }
+                body.push_str(&service_html(&svc, own, &seller_words(&self.services().unwrap_or_default(), &svc.seller)));
                 if svc.has_files() {
                     // the node can't send a first ticket: said before a download is started
                     if !own {
@@ -209,6 +214,13 @@ impl App {
     /// `nav`: the page as the menu knows it; `title`: its heading.
     pub(crate) fn html_page(&self, nav: &str, title: &str, ctx: &Ctx, body: &str, head: &str) -> Resp {
         Resp::html(200, html::page_head(title, &self.nav(nav, &ctx.csrf, true), ctx.flash.clone(), body, head))
+    }
+
+    /// Stop every open connection with the seller at `origin`: how many were stopped.
+    pub(crate) fn stop_seller_sessions(&self, origin: &str) -> usize {
+        let Ok(st) = self.call("ticket_status", json!({})) else { return 0 };
+        open_ids(&st, Some(&[origin.to_string()])).iter()
+            .filter(|id| self.call("ticket_stop", json!({"session": id})).is_ok_and(|v| ok_of(&v))).count()
     }
 
     fn flash_stops(&self, ctx: &Ctx, ids: &[String], seller: &str) {

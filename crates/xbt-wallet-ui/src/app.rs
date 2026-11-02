@@ -231,9 +231,27 @@ impl App {
             Ok(false) => {}
             Err(e) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret was left as it was: {e}"),
         }
-        Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None),
+        let app = Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None),
                          files_error: std::sync::Mutex::new(None), nostr, vpn_exits, relay_net, platform,
-                         apps: Default::default() }))
+                         apps: Default::default() });
+        if app.cfg.prefetch {
+            app.prefetch();
+        }
+        Ok(app)
+    }
+
+    /// The slow sources asked once in the background ([`Config::prefetch`]): the first visit to their
+    /// pages then serves an answer at once, and the pages ask again behind it as they always did.
+    pub fn prefetch(self: &Arc<Self>) {
+        let me = self.clone();
+        std::thread::spawn(move || {
+            if me.nostr.enabled() {
+                let _ = me.nostr.get(false);
+                let _ = me.vpn_exits.get(false);
+                let _ = me.relay_net.get(false);
+            }
+            me.hashrate_prefetch();
+        });
     }
 
     pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -428,7 +446,7 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
-            "/ai" => self.ai_page(&ctx),
+            "/ai" => self.ai_page(&ctx, req.header("x-forwarded-host").split(',').next().filter(|h| !h.trim().is_empty()).unwrap_or(req.header("host")).trim()),
             "/vpn" => self.vpn_page(&ctx, &req.query),
             "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
@@ -836,10 +854,23 @@ impl App {
         b.push_str("</section>");
         let recent = self.call("history", json!({"limit": 15}));
         // a seller by its name where the list of sellers has it, never by a made-up `…shop.invalid` address
-        let known = self.file_services().unwrap_or_default();
-        let who = |d: &str| match crate::services::http_origin(d) {
-            Some(o) if xbt402::shop::is_shop(&o) || crate::services::shop_name(&known, &o).is_some() => crate::services::seller_name(&known, &o),
-            _ => short(d, 40),
+        let known = self.services().unwrap_or_default();
+        // a payment to `ln:<node>` by the name of the seller paid through that node: on file in the rules, or vouched for by its shop
+        let nodes: Vec<(String, String)> = {
+            let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
+            let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
+            let mut v: Vec<(String, String)> = rule_sellers(&pol).into_iter().filter_map(|r| Some((r.node?.to_ascii_lowercase(), r.origin?))).collect();
+            v.extend(shops.iter().filter_map(|(o, sh)| crate::shops::node(sh, o, xbt_nostr::now()).map(|n| (n.to_ascii_lowercase(), o.clone()))));
+            v
+        };
+        let who = |d: &str| {
+            if let Some(o) = d.strip_prefix("ln:").and_then(|n| nodes.iter().find(|(x, _)| x.eq_ignore_ascii_case(n.trim()))).map(|(_, o)| o) {
+                return crate::services::seller_name(&known, o);
+            }
+            match crate::services::http_origin(d) {
+                Some(o) if xbt402::shop::is_shop(&o) || crate::services::shop_name(&known, &o).is_some() => crate::services::seller_name(&known, &o),
+                _ => short(d, 40),
+            }
         };
         // a seller that charged more than a call allowed: said at the top, with the numbers
         if let Some(e) = recent.as_ref().ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter().rev().find(|e| e["type"] == "ticket_over_cap") {
@@ -869,6 +900,7 @@ impl App {
                     Some("commit") if reserved => "Reserved".into(),
                     Some("commit") => "Sent on chain".into(),
                     Some("ticket_settled" | "ln_settled") => "Paid".into(),
+                    Some("ticket_left_with_seller") => "Credit left with the shop".into(),
                     Some("decision") => match e["verdict"].as_str() { Some("allow") => "Allowed".into(), Some("deny") => "Refused".into(),
                                                                        Some("needs_human") => "Asked for your approval".into(), v => format!("Decision: {}", v.unwrap_or("")) },
                     Some("ticket_over_cap") => "A seller charged past the limit".into(),
@@ -879,7 +911,12 @@ impl App {
                 // a ticket's row has its amount too (0.2.1 showed none). A settled payment: what was paid, as its settled record says,
                 // with its two parts; what was booked before it settled: reserved
                 let rec = e["payment_hash"].as_str().and_then(|h| settled.get(h));
+                let left = e["type"] == "ticket_left_with_seller";
                 let amt = match rec {
+                    _ if left => match txt(e.get("left_msat")).parse::<u64>() {
+                        Ok(m) => format!("<span class=\"money\">{} sats</span> <span class=\"small\">credit left</span>", crate::html::msat_num(m)),
+                        Err(_) => "<span class=\"small\">not said by the shop</span>".into(),
+                    },
                     Some(r) if what == "Paid" => crate::html::paid_html(int(r.get("paid_sats")),
                         Some((txt(r.get("value_msat")).parse().unwrap_or(0), txt(r.get("fee_msat")).parse().unwrap_or(0)))),
                     _ if what == "Paid" => e.get("spent_sats").map(|a| crate::html::paid_html(int(Some(a)), None)).unwrap_or_default(),
@@ -889,8 +926,13 @@ impl App {
                         None => e.get("booked_sats").map(|a| format!("{} <span class=\"small\">reserved</span>", money(int(Some(a))))).unwrap_or_default(),
                     },
                 };
-                b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{}</td></tr>", utc(int(e.get("ts"))), esc(&what),
-                                    esc(&who(&txt(e.get("dest").or(e.get("origin"))))), esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))));
+                // a refusal in the refusal pages' plain words, the signer's own under Details
+                let (what, detail) = match refusal_words(e) {
+                    Some((title, words)) => (title, format!("{} <details><summary>Details</summary>{}</details>", esc(&words), esc(&short(&txt(e.get("reason")), 300)))),
+                    None => (what, esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))),
+                };
+                b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{detail}</td></tr>", utc(int(e.get("ts"))), esc(&what),
+                                    esc(&who(&txt(e.get("dest").or(e.get("origin")))))));
             }
             b.push_str("</tbody></table></div>");
         }
@@ -1082,19 +1124,31 @@ impl App {
         let all = self.file_services().unwrap_or_default();
         let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
         let now = xbt_nostr::now();
-        rule_sellers(p).into_iter().map(|r| {
-            let name = match &r.origin {
-                Some(o) => crate::services::seller_name(&all, o),
-                None => "A coin address".into(),
+        let rows = rule_sellers(p);
+        // each seller's node: on file in the rules, else the one its shop vouches for
+        let vouched: Vec<Option<String>> = rows.iter().map(|r| r.origin.as_ref().and_then(|o| shops.get(o).and_then(|s| crate::shops::node(s, o, now)))).collect();
+        let node_name = |n: &str| rows.iter().zip(&vouched).find_map(|(r, v)| {
+            let o = r.origin.as_ref()?;
+            [r.node.as_deref(), v.as_deref()].into_iter().flatten().any(|x| x.eq_ignore_ascii_case(n)).then(|| crate::services::seller_name(&all, o))
+        });
+        rows.iter().zip(&vouched).map(|(r, vouched)| {
+            let name = match (&r.origin, ln_line_node(&r.key)) {
+                (Some(o), _) => crate::services::seller_name(&all, o),
+                // an `ln:` line is a seller's Lightning node, never a coin address
+                (None, Some(n)) => match node_name(n) {
+                    Some(who) => format!("Lightning node of {who}"),
+                    None => format!("Lightning node {}", short_node(n)),
+                },
+                (None, None) => "A coin address".into(),
             };
-            let vouched = r.origin.as_ref().and_then(|o| shops.get(o).and_then(|s| crate::shops::node(s, o, now)));
-            let problem = match (&r.origin, &r.node, &vouched) {
-                (Some(_), None, _) if r.listed => Some("this seller will be refused: it has no Lightning node on file"),
+            let through_node = r.origin.as_ref().is_some_and(|o| rules_allow(p, o, vouched.as_deref())) && r.node.is_none();
+            let problem = match (&r.origin, &r.node, vouched) {
+                (Some(_), None, _) if r.listed && !through_node => Some("this seller will be refused: it has no Lightning node on file"),
                 (Some(_), Some(n), Some(v)) if r.listed && !n.eq_ignore_ascii_case(v) =>
                     Some("this seller will be refused: its Lightning node on file is not the one the shop vouches for now"),
                 _ => None,
             };
-            SellerCheck { rule: r, name, vouched, problem }
+            SellerCheck { rule: r.clone(), name, vouched: vouched.clone(), problem, through_node }
         }).collect()
     }
 
@@ -1115,10 +1169,12 @@ impl App {
                     Some(o) => xbt402::shop::display(o),
                     None => r.key.clone(),
                 };
-                let node = match (&r.node, &r.origin) {
-                    (Some(n), _) => format!("<code title=\"{}\">{}</code>", esc(n), esc(&short_node(n))),
-                    (None, Some(_)) => "<span class=\"tag warn\">none on file</span>".into(),
-                    (None, None) => "<span class=\"small\">not needed</span>".into(),
+                let node = match (&r.node, &r.origin, ln_line_node(&r.key)) {
+                    (Some(n), _, _) => format!("<code title=\"{}\">{}</code>", esc(n), esc(&short_node(n))),
+                    (None, Some(_), _) if c.through_node => "<span class=\"tag ok\">allowed through its node line</span>".into(),
+                    (None, Some(_), _) => "<span class=\"tag warn\">none on file</span>".into(),
+                    (None, None, Some(n)) => format!("<code title=\"{}\">{}</code>", esc(n), esc(&short_node(n))),
+                    (None, None, None) => "<span class=\"small\">not needed</span>".into(),
                 };
                 let mut notes = String::new();
                 if !r.listed {
@@ -1875,6 +1931,8 @@ pub(crate) struct SellerCheck {
     vouched: Option<String>,
     /// Why the signer will refuse it, in words.
     problem: Option<&'static str>,
+    /// No node on file for its address, and paid all the same: its node's `ln:` line covers it.
+    through_node: bool,
 }
 
 /// The sellers the rules `p` name: those on the list that may be paid, in its order, then those
@@ -1905,6 +1963,82 @@ pub(crate) fn rule_sellers(p: &Value) -> Vec<RuleSeller> {
         out.push(RuleSeller { key: k.clone(), origin, listed: false, node });
     }
     out
+}
+
+/// Whether the rules `p` let the signer pay the seller at `origin`, as its `ticket_listed` decides: the
+/// seller's address on the list with its node on file, or `ln:<node>` on the list for its node on file
+/// or for `known_node` (the node its shop entry vouches for). 0.2.2 called a seller allowed only through
+/// its address and node, and said Genesis, allowed by its `ln:` line, could not be paid.
+pub(crate) fn rules_allow(p: &Value, origin: &str, known_node: Option<&str>) -> bool {
+    let o = crate::services::http_origin(origin);
+    let rows = rule_sellers(p);
+    let me = rows.iter().find(|r| r.origin.is_some() && r.origin == o);
+    if me.is_some_and(|r| r.listed && r.node.is_some()) {
+        return true;
+    }
+    let list: Vec<String> = p.get("allowlist").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str)
+        .map(|x| x.trim().to_ascii_lowercase()).collect();
+    [me.and_then(|r| r.node.as_deref()), known_node].into_iter().flatten().any(|n| list.contains(&format!("ln:{}", n.trim().to_ascii_lowercase())))
+}
+
+/// The node of an `ln:<node>` line of the rules, if `key` is one.
+pub(crate) fn ln_line_node(key: &str) -> Option<&str> {
+    key.strip_prefix("ln:").map(str::trim).filter(|n| n.len() == 66 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A refused payment of the history as the refusal pages say it ([`crate::pay_feedback::explain`], and the
+/// node's own limits as Your node says them): (what, the words). `None` for anything that is not a refusal.
+/// 0.2.2 showed the signer's own words ("Ln refused … the LN node holds 287070 sats … above ln.…").
+pub(crate) fn refusal_words(e: &Value) -> Option<(String, String)> {
+    let t = e["type"].as_str().unwrap_or("");
+    let refused = t.ends_with("_refused") || t.ends_with("_denied") || (t == "decision" && e["verdict"] == "deny");
+    let reason = txt(e.get("reason"));
+    if !refused || reason.is_empty() {
+        return None;
+    }
+    let rule = txt(e.get("rule"));
+    let x = crate::pay_feedback::explain(&json!({"reason": reason, "rule": rule}).to_string(), None, false);
+    if x.kind != crate::pay_feedback::Kind::Other {
+        return Some((x.title, format!("{} {}", x.words, x.fix).trim().to_string()));
+    }
+    let plain = crate::setup::plain_reason(&reason);
+    Some(("Not paid".into(), if plain.starts_with("Your node said:") { format!("The wallet did not pay. {reason}") } else { format!("Not paid. {plain}") }))
+}
+
+/// The credit left with each shop once its connections closed, by origin, in msat: from the wallet's
+/// history (oldest first), the newest `ticket_left_with_seller` of each shop's node, until a later
+/// session with that node opens (it is then that session's, drawn first) or the credit is given up.
+/// About: the shop's own count may differ by what was in flight.
+pub(crate) fn credit_left(events: &[Value]) -> HashMap<String, u64> {
+    let msat = |v: Option<&Value>| v.and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())));
+    // by the seller's node: (origin, session, msat)
+    let mut by_dest: HashMap<String, (String, String, u64)> = HashMap::new();
+    for e in events {
+        let dest = txt(e.get("dest"));
+        match e["type"].as_str() {
+            Some("ticket_left_with_seller") => match (crate::services::http_origin(&txt(e.get("origin"))), msat(e.get("left_msat"))) {
+                (Some(o), Some(m)) if m > 0 => { by_dest.insert(dest, (o, txt(e.get("session")), m)); }
+                _ => { by_dest.remove(&dest); }
+            },
+            Some("ticket_open" | "ticket_session_again") => { by_dest.remove(&dest); }
+            Some("ticket_credit_given_up") => {
+                let sid = txt(e.get("session"));
+                by_dest.retain(|_, v| v.1 != sid);
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashMap::new();
+    for (o, _, m) in by_dest.into_values() {
+        *out.entry(o).or_insert(0) += m;
+    }
+    out
+}
+
+/// "You have about 476 sat of credit with …": the line Sellers and a service's page show.
+pub(crate) fn credit_line(name: &str, msat: u64) -> String {
+    format!("<p class=\"credit\"><span class=\"pill good\">Credit</span> You have about {} sat of credit with {}; it's used first next time.</p>",
+            crate::html::group3(msat.saturating_add(500) / 1000), esc(name))
 }
 
 /// The warning over the rules: each seller the signer will refuse, by name, and why.
@@ -2257,5 +2391,63 @@ mod change_tests {
         let many: serde_json::Map<String, Value> = (0..50).map(|i| (format!("k{i:02}"), json!(i))).collect();
         let (_, d) = change_words("ln", None, Some(&Value::Object(many)));
         assert_eq!((d.len(), d.last().map(String::as_str)), (MAX_DETAILS + 1, Some("and 10 more: see Advanced")));
+    }
+}
+
+#[cfg(test)]
+mod handson_0202_tests {
+    use super::*;
+
+    /// Mike's rules (0.2.2 hands-on): Genesis by its key address with no node on file, and its node's
+    /// `ln:` line. The signer pays it (`ticket_listed`: the `ln:` line); the UI said it couldn't be paid.
+    #[test]
+    fn a_seller_allowed_through_its_node_line_is_allowed_as_the_signer_decides() {
+        let node = &format!("035d867908cd{}0b7d", "0".repeat(50));
+        assert_eq!(node.len(), 66);
+        let shop = xbt402::shop::origin_for(&[0x5a; 32]);
+        let p = json!({"allowlist": [shop, format!("ln:{node}")], "counterparties": {}});
+        assert!(rules_allow(&p, &shop, Some(node)), "its node, from its shop entry, is on the list");
+        assert!(!rules_allow(&p, &shop, None), "no node known: nothing says it is paid");
+        assert!(!rules_allow(&p, &shop, Some(&"02".repeat(33))), "another node");
+        // the address listed with its node on file, no `ln:` line
+        let web = json!({"allowlist": ["https://a.example"], "counterparties": {"https://a.example": {"ln_node": node}}});
+        assert!(rules_allow(&web, "https://a.example/", None));
+        // its node line alone (the address not listed), the node on file
+        let line = json!({"allowlist": [format!("ln:{node}")], "counterparties": {"https://a.example": {"ln_node": node}}});
+        assert!(rules_allow(&line, "https://a.example", None));
+        // listed, no node anywhere: refused, as the signer refuses it
+        assert!(!rules_allow(&json!({"allowlist": ["https://a.example"]}), "https://a.example", None));
+        assert_eq!(ln_line_node(&format!("ln:{node}")), Some(node.as_str()));
+        assert_eq!(ln_line_node("bc1qcoin"), None);
+    }
+
+    /// The credit left with a shop: its newest `ticket_left_with_seller`, until a session with its node
+    /// opens again or the credit is given up.
+    #[test]
+    fn the_credit_left_with_a_shop_is_read_from_the_history() {
+        let left = |sid: &str, dest: &str, origin: &str, m: Option<&str>| json!({"type": "ticket_left_with_seller", "session": sid, "dest": dest, "origin": origin, "left_msat": m});
+        let ev = vec![left("s1", "ln:aa", "http://a.shop.invalid", Some("475900")), left("s2", "ln:bb", "https://b.example", Some("1000")),
+                      json!({"type": "ticket_open", "session": "s3", "dest": "ln:bb"}), left("s4", "ln:cc", "https://c.example", None)];
+        let c = credit_left(&ev);
+        assert_eq!(c.get("http://a.shop.invalid"), Some(&475_900));
+        assert!(!c.contains_key("https://b.example"), "a later session with its node took it");
+        assert!(!c.contains_key("https://c.example"), "not said by the shop: nothing claimed");
+        let mut given = ev.clone();
+        given.push(json!({"type": "ticket_credit_given_up", "session": "s1"}));
+        assert!(credit_left(&given).is_empty());
+        let line = credit_line("Lightning Stream Genesis", 475_900);
+        assert!(line.contains("about 476 sat of credit with Lightning Stream Genesis; it's used first next time"), "{line}");
+    }
+
+    /// A refused payment in the Wallet's history is said as the refusal pages say it, not in the signer's
+    /// words (0.2.2: "Ln refused … the LN node holds 287070 sats … above ln.…").
+    #[test]
+    fn a_refused_payment_in_the_history_is_in_plain_words() {
+        let e = json!({"type": "ln_refused", "reason": "the LN node holds 287070 sats in its channels, above ln.exposure_cap_sats 100000", "dest": "ln:aa"});
+        let (what, words) = refusal_words(&e).unwrap();
+        assert!(!words.contains("ln.exposure_cap_sats") && !what.is_empty(), "{what}: {words}");
+        let e = json!({"type": "decision", "verdict": "deny", "rule": "allowlist", "reason": "not on allowlist"});
+        assert_eq!(refusal_words(&e).unwrap().0, "This shop isn't allowed yet");
+        assert!(refusal_words(&json!({"type": "ticket_settled", "reason": "x"})).is_none());
     }
 }

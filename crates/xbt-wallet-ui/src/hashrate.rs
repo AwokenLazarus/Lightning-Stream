@@ -821,6 +821,13 @@ impl App {
         (cards, spent)
     }
 
+    /// The renter's offers asked once, kept for the first Hashrate page ([`App::prefetch`]).
+    pub(crate) fn hashrate_prefetch(&self) {
+        if let (Some(base), false) = (self.cfg.hash.renter.clone(), self.cfg.read_cache.is_zero()) {
+            let _ = rent_offers(&base, &self.cfg.hash.renter_token, true);
+        }
+    }
+
     pub(crate) fn hashrate_page(&self, ctx: &Ctx) -> Resp {
         let Some(base) = self.cfg.hash.renter.clone() else {
             return self.html_page("Hashrate", "Hashrate", ctx,

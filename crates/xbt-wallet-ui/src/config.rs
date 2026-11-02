@@ -73,6 +73,11 @@ use std::time::Duration;
 /// How the owner restarts the app where the platform does not say (`XBT_UI_RESTART_HINT`).
 pub const RESTART_HINT: &str = "restart Lightning Stream from your Umbrel or StartOS dashboard";
 
+/// How long the signer's slow-changing reads serve later pages by default (`XBT_UI_CACHE_S`). 0.2.2
+/// kept them 3 s, less than the time between two pages, so a page never found one kept ("2 calls,
+/// 0 cached" on every page); an action through the app forgets them at once whatever this is.
+pub const DEFAULT_CACHE_S: u64 = 20;
+
 #[derive(Debug, Clone)]
 
 pub struct Config {
@@ -93,7 +98,7 @@ pub struct Config {
     pub mcp_urls: Vec<String>,
     pub mcp_token_file: PathBuf,
     pub threads: usize,
-    /// `XBT_UI_CACHE_S` (default 3, 0 to turn it off): how long the signer's slow-changing reads
+    /// `XBT_UI_CACHE_S` (default [`DEFAULT_CACHE_S`], 0 to turn it off): how long the signer's slow-changing reads
     /// (the node's state, balances, the rules) serve later pages ([`crate::link::SignerLink::keep`]).
     /// Zero also asks the renter for its offers on each Hashrate page instead of keeping them.
     pub read_cache: Duration,
@@ -120,6 +125,10 @@ pub struct Config {
     /// `XBT_UI_STREAM_RELAY`: the Stream relay a direct link falls back to last
     /// (`docs/RUN-A-RELAY.md`); ours by default.
     pub stream_relay: String,
+    /// Ask the slow sources (the Nostr relays, the Stream relays, the renter's offers) once at start, in
+    /// the background, so the first Found on Nostr, Stream relays, VPN and Hashrate pages show an answer
+    /// at once (0.2.2: 1.5 s, and 3.7 s for Hashrate, on the first visit after a start). Off in tests.
+    pub prefetch: bool,
     /// `XBT_UI_RELAY_DIR`: where the package's own relay service reads the owner's settings
     /// (`relay.json`) and writes its status (`XBT_UI_RELAY_STATUS`); unset: this box has no relay
     /// service.
@@ -403,7 +412,7 @@ impl Config {
                 .unwrap_or_else(|| data_dir.join("secrets").join("mcp-http-token")),
             data_dir,
             threads: secs("XBT_UI_THREADS", 4) as usize,
-            read_cache: Duration::from_secs(env("XBT_UI_CACHE_S").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(3).min(60)),
+            read_cache: Duration::from_secs(env("XBT_UI_CACHE_S").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(DEFAULT_CACHE_S).min(60)),
             role,
             ln,
             gw,
@@ -428,6 +437,7 @@ impl Config {
             relay_status: env("XBT_UI_RELAY_STATUS").map(PathBuf::from),
             relay_unavailable: env("XBT_UI_RELAY_UNAVAILABLE").filter(|s| !s.trim().is_empty()),
             relay_start_hint: env("XBT_UI_RELAY_START_HINT").filter(|s| !s.trim().is_empty()),
+            prefetch: true,
             stream_relay: match env("XBT_UI_STREAM_RELAY") {
                 Some(u) => xbt_nostr::relays::canonical_relay(&u).map_err(|e| format!("XBT_UI_STREAM_RELAY: {e}"))?,
                 None => crate::relaynet::DEFAULT_RELAY.to_string(),
@@ -502,7 +512,7 @@ impl Config {
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), app_ports: vec![],
                relay_ttl: Duration::from_secs(6 * 3600),
                files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), choice: files_choice, ..Default::default() },
-               nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), relay_dir: None, relay_status: None,
+               nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), prefetch: false, relay_dir: None, relay_status: None,
                relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
                restart_hint: RESTART_HINT.into(), local_services: vec![],
                ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),

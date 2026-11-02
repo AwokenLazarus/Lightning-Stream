@@ -404,7 +404,9 @@ impl App {
             }),
             ("Chain", esc(&chain)),
         ]));
-        b.push_str(&format!("<p>What the wallet sees of the node:</p>{}", json_block(&status)));
+        // the signer's whole answer (150 lines on a real node): collapsed on its own, for whoever helps debug
+        b.push_str(&format!("<details class=\"technical\"><summary>Technical details</summary><p class=\"small\">What the wallet sees of the node:</p>{}</details>",
+                            json_block(&status)));
         if have {
             b.push_str(&format!("<form method=\"post\" action=\"./lightning\">{}<input type=\"hidden\" name=\"action\" value=\"remove\">\
                 <h3>Disconnect</h3><p>Removes the key from this box; the app then pays nothing. Revoke it in your node's app too if it may have \
