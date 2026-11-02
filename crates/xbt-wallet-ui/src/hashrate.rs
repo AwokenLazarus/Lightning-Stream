@@ -899,6 +899,14 @@ impl App {
                     b.push_str("<p class=\"empty\">No miners for rent found right now. Hashmakers publish their offers on Nostr; look again in a while.</p>");
                 }
                 b.push_str("<div class=\"grid services\">");
+                // this box's own hashmaker's pay address: its offer is ours even when the shop is reached by its key (Private),
+                // where the shop's config has no web address to compare with
+                let own_pay = self.hash_settings()["payUrl"].as_str().and_then(crate::services::http_origin);
+                // "Ready to rent" is about your gateway; when every offer listed is your own, say there's nothing to rent yet
+                if !offers.is_empty() && offers.iter().all(|x| own_offer(self.is_own_shop(x["payUrl"].as_str().unwrap_or("")), &own_pay, x["payUrl"].as_str().unwrap_or(""))) {
+                    b.push_str("<p class=\"hint warn\">The only miners listed right now are your own, and a box can't rent from itself. \
+                        Other people's offers appear here when they list them; your gateway is ready for them.</p>");
+                }
                 for x in &offers {
                     let price = num(&x["priceMsat"]) / 1000.0;
                     let slice = num(&x["sliceWork"]);
@@ -924,7 +932,7 @@ impl App {
                         _ => String::new(),
                     };
                     // this box's own offer: marked, and not rented (a box can't pay itself)
-                    let mine = self.is_own_shop(pay_url);
+                    let mine = own_offer(self.is_own_shop(pay_url), &own_pay, pay_url);
                     let can = ready && allowed && !old && !mine && (free > 0 || total == 0);
                     // why Rent is off, said beside the buttons (and as their tooltip), so nobody is left guessing
                     let why_off = rent_off_reasons(ready, head, allowed, old, mine, free, total);
@@ -1073,6 +1081,12 @@ impl App {
 
 /// The rent page's notice: what renting waits for, from the renter's status. `here`: this install has the bundled
 /// Stream Gateway's settings; `set_up`: they have been saved (its config is written).
+/// Whether an offer is this box's own: its shop's web address says so, or the offer is paid where this box's own
+/// hashmaker is paid.
+fn own_offer(own_shop: bool, own_pay: &Option<String>, pay_url: &str) -> bool {
+    own_shop || own_pay.as_ref().is_some_and(|o| crate::services::http_origin(pay_url).as_ref() == Some(o))
+}
+
 /// Why an offer's Rent (and Try one slice first) is off, in the order a renter fixes them; empty when it is on.
 /// `gateway` is the heading `rent_status` gives the gateway's state, so the reason matches the notice on the page.
 fn rent_off_reasons(ready: bool, gateway: &str, allowed: bool, old: bool, mine: bool, free: u64, total: u64) -> Vec<String> {
@@ -1519,6 +1533,16 @@ fn th_hours(x: f64) -> String {
 mod tests {
     /// A disabled Rent says why: the gateway's state (in the page notice's own words), an unallowed hashmaker, an
     /// old app, no free machines; your own offer says only that; an offer that can be rented says nothing.
+    #[test]
+    fn an_offer_paid_where_this_box_s_hashmaker_is_paid_is_its_own() {
+        // a Private shop: its config has no web address, but its hashmaker's pay address names the offer as ours
+        let own = Some("http://abc.shop.invalid".to_string());
+        assert!(super::own_offer(false, &own, "http://abc.shop.invalid/hashrate/pay"));
+        assert!(!super::own_offer(false, &own, "https://other.example/hashrate/pay"));
+        assert!(!super::own_offer(false, &None, "https://other.example/hashrate/pay"));
+        assert!(super::own_offer(true, &None, "https://x.example/"));
+    }
+
     #[test]
     fn a_disabled_rent_says_why() {
         let r = super::rent_off_reasons(false, "Your gateway isn't running", false, false, false, 1, 1);
