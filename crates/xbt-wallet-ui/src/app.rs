@@ -850,12 +850,25 @@ impl App {
         }
         if let Ok(h) = recent {
             b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
-            let events = h["events"].as_array().cloned().unwrap_or_default();
+            // the bookkeeping of a reservation (its booking made what was paid) is not a row of its own
+            let events: Vec<Value> = h["events"].as_array().cloned().unwrap_or_default().into_iter().filter(|e| e["type"] != "ln_amend").collect();
+            // what each settled payment cost, from its settled record: one read for the page
+            let hashes: Vec<&str> = events.iter().filter(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled")))
+                .filter_map(|e| e["payment_hash"].as_str()).collect();
+            let settled = if hashes.is_empty() { Value::Null } else {
+                self.call("settled_amounts", json!({"hashes": hashes})).map(|v| v["settled"].clone()).unwrap_or(Value::Null)
+            };
             if events.is_empty() {
                 b.push_str("<tr><td colspan=\"5\" class=\"small\">Nothing yet.</td></tr>");
             }
             for e in events.iter().rev() {
+                let txid = txt(e.get("txid"));
+                // a booking before a payment settles (a ticket, a Lightning payment, a coin send not yet answered) is a reservation
+                let reserved = e["type"] == "commit" && ["ln:", "ticket:", "onchain:unconfirmed:"].iter().any(|p| txid.starts_with(p));
                 let what = match e["type"].as_str() {
+                    Some("commit") if reserved => "Reserved".into(),
+                    Some("commit") => "Sent on chain".into(),
+                    Some("ticket_settled" | "ln_settled") => "Paid".into(),
                     Some("decision") => match e["verdict"].as_str() { Some("allow") => "Allowed".into(), Some("deny") => "Refused".into(),
                                                                        Some("needs_human") => "Asked for your approval".into(), v => format!("Decision: {}", v.unwrap_or("")) },
                     Some("ticket_over_cap") => "A seller charged past the limit".into(),
@@ -863,8 +876,19 @@ impl App {
                     Some(t) => { let t = t.replace('_', " "); let mut c = t.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }
                     None => String::new(),
                 };
-                // a ticket's row has its amount too: what it cost, else what was booked for it (0.2.1 showed none)
-                let amt = ["amount_sats", "spent_sats", "booked_sats"].iter().find_map(|k| e.get(*k)).map(|a| money(int(Some(a)))).unwrap_or_default();
+                // a ticket's row has its amount too (0.2.1 showed none). A settled payment: what was paid, as its settled record says,
+                // with its two parts; what was booked before it settled: reserved
+                let rec = e["payment_hash"].as_str().and_then(|h| settled.get(h));
+                let amt = match rec {
+                    Some(r) if what == "Paid" => crate::html::paid_html(int(r.get("paid_sats")),
+                        Some((txt(r.get("value_msat")).parse().unwrap_or(0), txt(r.get("fee_msat")).parse().unwrap_or(0)))),
+                    _ if what == "Paid" => e.get("spent_sats").map(|a| crate::html::paid_html(int(Some(a)), None)).unwrap_or_default(),
+                    _ if reserved => e.get("amount_sats").map(|a| format!("{} <span class=\"small\">reserved</span>", money(int(Some(a))))).unwrap_or_default(),
+                    _ => match ["amount_sats", "spent_sats"].iter().find_map(|k| e.get(*k)) {
+                        Some(a) => money(int(Some(a))),
+                        None => e.get("booked_sats").map(|a| format!("{} <span class=\"small\">reserved</span>", money(int(Some(a))))).unwrap_or_default(),
+                    },
+                };
                 b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{}</td></tr>", utc(int(e.get("ts"))), esc(&what),
                                     esc(&who(&txt(e.get("dest").or(e.get("origin"))))), esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))));
             }

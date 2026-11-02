@@ -57,6 +57,23 @@ pub fn sats(n: i64) -> String {
     format!("{sign}{} sats <span class=\"xbt\">({sign}{}.{:08} XBT)</span>", group3(a), a / 100_000_000, a % 100_000_000)
 }
 
+/// Millisats as sats, without a unit, with the fraction where there is one: `900`, `2.009`, `1,250.5`.
+pub fn msat_num(m: u64) -> String {
+    let whole = group3(m / 1000);
+    if m.is_multiple_of(1000) { whole } else { format!("{whole}.{}", format!("{:03}", m % 1000).trim_end_matches('0')) }
+}
+
+/// What a payment cost, said one way on every page (0.2.3: Wallet, Live connections and the visit
+/// showed three figures for one payment). **Paid** is what left the node: the amount the payee got
+/// plus the routing fee, from the signer's settled record, in the whole sats the signer books (that
+/// sum rounded up); its two parts follow where the record has them. The other two figures a page
+/// names are **used** (what the seller drew) and **credit left** (paid and not used yet); a
+/// reservation before a payment settles is **reserved**, never paid.
+pub fn paid_html(paid_sats: i64, parts_msat: Option<(u64, u64)>) -> String {
+    let parts = parts_msat.map(|(v, f)| format!(" <span class=\"small\">({} + {} fee)</span>", msat_num(v), msat_num(f))).unwrap_or_default();
+    format!("<span class=\"money\">{} sats</span>{parts}", group3(paid_sats.max(0).unsigned_abs()))
+}
+
 /// UTC `YYYY-MM-DD HH:MM:SS` from Unix seconds.
 pub fn utc(t: i64) -> String {
     if t <= 0 {

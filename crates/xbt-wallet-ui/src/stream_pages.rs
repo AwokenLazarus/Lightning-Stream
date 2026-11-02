@@ -530,6 +530,13 @@ struct Counts {
     cancelled_at_stop: u64,
     payment_failed: u64,
     booked_sats: i64,
+    /// What left the node for the session's settled tickets, as the signer booked it (whole sats), and
+    /// its two parts: what the seller's node got and the routing fee ([`crate::html::paid_html`]).
+    paid_sats: i64,
+    paid_value_msat: u64,
+    paid_fee_msat: u64,
+    /// Booked for tickets whose secret left and that have not settled yet: reserved, not paid.
+    reserved_sats: i64,
 }
 
 /// Counts for one session, from `session_tickets` and the session's `stopped_ts`.
@@ -547,13 +554,20 @@ fn counts_of(tickets: &Value, stopped_ts: f64) -> Counts {
             Some("released") => {
                 c.released += 1;
                 c.booked_sats = c.booked_sats.saturating_add(int(t.get("booked_sats")));
+                c.reserved_sats = c.reserved_sats.saturating_add(int(t.get("booked_sats")));
             }
-            Some("retired") => c.booked_sats = c.booked_sats.saturating_add(int(t.get("booked_sats"))),
+            Some("retired") => {
+                c.booked_sats = c.booked_sats.saturating_add(int(t.get("booked_sats")));
+                c.reserved_sats = c.reserved_sats.saturating_add(int(t.get("booked_sats")));
+            }
             // a settled ticket was paid: a prepaid one settles as soon as it arrives, a held one when the
             // seller collects it, and either way it is money that left the node
             Some("settled") => {
                 c.settled += 1;
                 c.booked_sats = c.booked_sats.saturating_add(int(t.get("booked_sats")));
+                c.paid_sats = c.paid_sats.saturating_add(int(t.get("booked_sats")));
+                c.paid_value_msat = c.paid_value_msat.saturating_add(t.get("msat").and_then(msat_of).unwrap_or(0));
+                c.paid_fee_msat = c.paid_fee_msat.saturating_add(t.get("fee_msat").and_then(msat_of).unwrap_or(0));
             }
             Some("failed") => match failed_as(t, stopped_ts) {
                 "never_sent" => c.never_sent += 1,
@@ -592,14 +606,16 @@ fn msat_of(v: &Value) -> Option<u64> {
     }
 }
 
-/// What a session has cost so far, in sats, and the part of a sat the seller still holds (msat).
-fn spent_of(paying: &Value, sid: &str, booked_sats: i64) -> (i64, u64) {
+/// What a session has paid so far ([`crate::html::paid_html`]): its settled tickets as the signer
+/// booked them, with their two parts; or, where the wallet's count of the session says more was paid
+/// (a payment of a call that was not a ticket), that count, whole sats only.
+fn paid_of(paying: &Value, sid: &str, c: &Counts) -> (i64, Option<(u64, u64)>) {
     let row = paying.as_array().and_then(|a| a.iter().find(|p| p.get("session").and_then(Value::as_str) == Some(sid)));
-    if let Some(paid) = row.and_then(|p| p.get("paid_sats")).map(|v| int(Some(v))) {
-        return (paid.max(booked_sats), 0);
+    let counted = row.and_then(|p| p.get("paid_sats")).map(|v| int(Some(v))).unwrap_or(0);
+    if counted > c.paid_sats {
+        return (counted, None);
     }
-    let rem = row.and_then(|p| p.get("balance_msat")).and_then(msat_of).map(|m| m % 1000).unwrap_or(0);
-    (booked_sats, rem)
+    (c.paid_sats, (c.settled > 0 && c.paid_value_msat > 0).then_some((c.paid_value_msat, c.paid_fee_msat)))
 }
 
 fn balance_cell(paying: &Value, sid: &str, booked_sats: i64) -> String {
@@ -616,7 +632,7 @@ fn balance_cell(paying: &Value, sid: &str, booked_sats: i64) -> String {
         return format!("{} <span class=\"small\">paid</span>", sats(paid));
     }
     if booked_sats > 0 {
-        return format!("{} <span class=\"small\">booked</span>", sats(booked_sats));
+        return format!("{} <span class=\"small\">reserved</span>", sats(booked_sats));
     }
     "—".into()
 }
@@ -648,8 +664,8 @@ fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value
             Ok(d) => (counts_of(d.get("session_tickets").unwrap_or(&json!([])), num(s.get("stopped_ts"))), None),
             Err(e) => (Counts::default(), Some(e)),
         };
-        let (spent, _) = spent_of(&paying, id, counts.booked_sats);
-        total = total.saturating_add(spent);
+        let paid = paid_of(&paying, id, &counts);
+        total = total.saturating_add(paid.0);
         open += usize::from(state == "open");
         // the shop by its listing's name, never its made-up `…shop.invalid` address
         let name = services::seller_name(names, origin);
@@ -657,7 +673,7 @@ fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value
         let origin = &xbt402::shop::display(origin);
         let opened = num(s.get("opened_ts"));
         let minutes = if opened > 0.0 { ((now as f64 - opened) / 60.0).max(0.0) } else { 0.0 };
-        cards.push_str(&session_card(ctx, id, &name, origin, state, &counts, &paying, spent, minutes, err.as_deref()));
+        cards.push_str(&session_card(ctx, id, &name, origin, state, &counts, &paying, paid, minutes, err.as_deref()));
     }
     if open > 1 {
         b.push_str(&format!("<form method=\"post\" action=\"./connections\" class=\"row\">{csrf}\
@@ -668,7 +684,9 @@ fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value
 }
 
 #[allow(clippy::too_many_arguments)]
-fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &Counts, paying: &Value, spent: i64, minutes: f64, err: Option<&str>) -> String {
+fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &Counts, paying: &Value, paid: (i64, Option<(u64, u64)>), minutes: f64,
+                err: Option<&str>) -> String {
+    let spent = paid.0;
     let open = state == "open";
     let stop = if open && !id.is_empty() {
         format!("<form method=\"post\" action=\"./connections\">{}<input type=\"hidden\" name=\"session\" value=\"{}\">\
@@ -696,12 +714,14 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
     let failed = format!("{} never sent · {} cancelled at Stop · {} failed", c.never_sent, c.cancelled_at_stop, c.payment_failed);
     let err = err.map(|e| format!("<p class=\"hint bad\">{}</p>", esc(e))).unwrap_or_default();
     let used = usage_line(row);
+    // booked for tickets whose secret left and that have not settled: reserved, not paid yet
+    let reserved = if c.reserved_sats > 0 { format!(" · <span class=\"small\">{} reserved</span>", sats_short(c.reserved_sats)) } else { String::new() };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
-             <p>Paid so far: <span class=\"money\">{}</span>{rate}{how_long}</p>{used}{err}<div class=\"row\">{stop}</div>\
+             <p>Paid so far: {}{reserved}{rate}{how_long}</p>{used}{err}<div class=\"row\">{stop}</div>\
              <details><summary>Details</summary><p class=\"small\">{} · connection <code>{}</code></p>{}</details></section>",
-            esc(name), sats_short(spent), esc(origin), esc(id),
-            crate::html::kv(&[("Payments held", c.locked.to_string()), ("Given back", c.released.to_string()), ("Paid ahead", c.prepaid.to_string()),
-                              ("Paid", c.settled.to_string()), ("Not paid", failed), ("Credit with the shop", balance_cell(paying, id, c.booked_sats))]))
+            esc(name), crate::html::paid_html(paid.0, paid.1), esc(origin), esc(id),
+            crate::html::kv(&[("Payments held", c.locked.to_string()), ("Given back", c.released.to_string()), ("Paid ahead (tickets)", c.prepaid.to_string()),
+                              ("Settled", c.settled.to_string()), ("Not paid", failed), ("Credit left", balance_cell(paying, id, c.booked_sats))]))
 }
 
 /// What the seller has drawn from what was paid, and the credit it still holds, from the seller's
@@ -713,7 +733,7 @@ fn usage_line(row: Option<&Value>) -> String {
     if spent == 0 && left == 0 {
         return String::new();
     }
-    format!("<p class=\"small\">Used: <span class=\"money\">{}</span> · credit left with this seller: <span class=\"money\">{}</span></p>",
+    format!("<p class=\"small\">Used: <span class=\"money\">{}</span> · credit left: <span class=\"money\">{}</span></p>",
             msat_text(spent), msat_text(left))
 }
 

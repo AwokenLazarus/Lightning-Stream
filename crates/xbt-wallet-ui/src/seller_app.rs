@@ -379,9 +379,11 @@ pub(crate) fn visit_numbers(v: &Value) -> Value {
     let used = i64::try_from(used_msat.div_ceil(1000)).unwrap_or(i64::MAX);
     let paid = v.get("paid_sats").and_then(Value::as_i64).unwrap_or(0).max(0);
     let credit = i64::try_from((paid.unsigned_abs() * 1000).saturating_sub(used_msat) / 1000).unwrap_or(0);
+    // the three figures every page names (crate::html::paid_html): used, paid (what left the node, as the
+    // signer charged it), credit left
     let mut said = format!("This visit used {used} sat");
     if paid > 0 {
-        said.push_str(&format!("; {paid} sat was prepaid, and {credit} sat of it stays as credit with the shop."));
+        said.push_str(&format!(". Paid: {paid} sat; credit left with the shop: {credit} sat."));
     } else if used > 0 {
         said.push_str(" from your credit with the shop; nothing new was paid.");
     } else {
@@ -850,7 +852,7 @@ mod tests {
         // a ticket bought in the visit: prepaid, and the rest left as credit
         let bought = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 559, "held_sats": 0, "used_msat": 64_870, "paid_sats": 559, "ended": null}));
         assert_eq!((bought["used_sats"].as_i64(), bought["prepaid_sats"].as_i64(), bought["credit_sats"].as_i64()), (Some(65), Some(559), Some(494)));
-        assert_eq!(bought["said"], "This visit used 65 sat; 559 sat was prepaid, and 494 sat of it stays as credit with the shop.");
+        assert_eq!(bought["said"], "This visit used 65 sat. Paid: 559 sat; credit left with the shop: 494 sat.");
         // an older connector: as before
         assert_eq!(visit_numbers(&json!({"limit_sats": 559, "spent_sats": 12}))["spent_sats"].as_i64(), Some(12));
     }
