@@ -1709,8 +1709,9 @@ impl App {
         let known = if rows.iter().any(|e| !txt(e.get("dest")).is_empty()) { self.services().unwrap_or_default() } else { Vec::new() };
         for e in rows.iter().rev() {
             let (rule, method) = (txt(e.get("rule")), txt(e.get("method")));
-            b.push_str(&format!("<tr><td>{}</td><td>{}</td><td><span title=\"{}\">{}</span></td><td><span title=\"{}\">{}</span></td><td>{}</td><td><code>{}</code></td></tr>",
-                                utc(int(e.get("ts"))), format!("<span title=\"{}\">{}</span>", esc(&txt(e.get("kind"))), esc(&kind_words(&txt(e.get("kind"))))),
+            let kind = txt(e.get("kind"));
+            b.push_str(&format!("<tr><td>{}</td><td><span title=\"{}\">{}</span></td><td><span title=\"{}\">{}</span></td><td><span title=\"{}\">{}</span></td><td>{}</td><td><code>{}</code></td></tr>",
+                                utc(int(e.get("ts"))), esc(&kind), esc(&kind_words(&kind)),
                                 esc(&rule), esc(&rule_words(&rule)), esc(&method), esc(&method_words(&method)),
                                 esc(&dest_words(&txt(e.get("dest")), &nodes, &known)), esc(&short(&txt(e.get("sig_sha256")), 16))));
         }
