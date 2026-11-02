@@ -5,6 +5,56 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.6 (2026-11-02)
+
+Plain words and loose ends, from issues #40 and #42 and from hands-on runs of 0.2.5. The wallet UI and the
+seller's gateway change; the Umbrel app's renter no longer offers Umbrel's DATUM Gateway app.
+
+- **A shop that turns Private is listed once (#40).** A shop's Nostr listing is addressed by its seller, so a
+  shop that changed its address, or went from its web address to its key, left its old listing on the relays
+  beside the new one: buyers saw the shop twice, once at an address that no longer sells. At each publish
+  the gateway now asks its relays for the listings its own key signed, and withdraws those for any other
+  address with a NIP-09 deletion signed by that key. A relay that keeps deleted events is covered too: Found
+  on Nostr keeps only the newest of one key's listings under one receipt key. Saving a shop that goes Private
+  also says to remove a tunnel or proxy that still sends the old address to the box.
+- **Hashrate is paid where the shop is reached, also after an update.** The hashmaker's pay address
+  followed a change of reach only when the shop was saved or Sell → Hashrate was opened. A shop that went
+  Private before 0.2.3 kept a pay address that no longer answered, and renters failed at the first piece of
+  work. The app now puts it right at start (waiting for the gateway to say the shop's key), and the hashmaker
+  republishes its offer with it.
+- **A hashrate offer names its shop.** An offer said "Miners from stream.example". It now names the shop
+  as its listing does: from Browse, from Found on Nostr, else from the shop's own signed listing at its
+  address. The address is shown only while no listing names the shop.
+- **Hashrate → Your gateway, in words.** The line "Connected to your node" said more than it measured; it
+  is now "Jobs from your node: checked / not yet" (a job was fetched from the gateway and checked). The page
+  says that no separate DATUM app is needed, and that Umbrel's own DATUM Gateway app is for Bitcoin and won't
+  work here. On Umbrel the renter no longer lists that app (`datum_web_1:23334`) as a gateway found on the
+  box; an install that saved it is still moved to the app's own gateway at start, as before.
+- **Live connections.** A connection that ran on credit paid on an earlier one says "Paid from earlier
+  credit" instead of "Paid so far: 0" beside what it used. The "about N sats a minute" rate shows only while
+  the seller's count of what was used grows, not as an old average while the connection idles.
+- **Where credit is.** The Wallet page said credit with shops is on Live connections, which shows nothing
+  once a connection closes. It now points to Sellers and each shop's service page (and Live connections while
+  one is open). A web app's "Open the app" page shows the credit line a Files page shows.
+- **No raw text.** Records says who authorized each signature, what it was and where it went in words
+  ("Your spending rules", "Paid a service", "Lightning node of Demo Films"), with the signer's own word in
+  the tooltip. The Spending rules row of a seller allowed by its node says "Lightning node of <shop>",
+  also for a shop known only from the shops it vouches for, and shows the node short instead of its raw
+  `ln:` line. Found on Nostr shows a file's path decoded ("My film.mkv", not "My%20film.mkv") and a shop
+  reached by its key by its key, never its made-up address. The VPN page names an exit by its shop and
+  country ("Exit from Demo Films, in DE"), with its id in the tooltip.
+- **American spelling** in the wallet: "Authorized by", "canceled at Stop", "Enrollment code", "recognize".
+- **Setup.** Under "Made and enrolled.", a browser without the approval key is told calmly, as a hint, that
+  it can't sign, and how to sign: in the browser the key was made in, with "Sign on another device", or by
+  putting the key in this browser from its backup. It was a red error.
+- **The visit page.** The empty rounded bar between Stop and the frame is gone (the bar was a paragraph
+  that the Stop form split in two). The frame is the page's own dark color while the app loads, so there is
+  no white flash in dark mode.
+- **Player links count what they carry.** On a Files page, each link for your player (`/r/…`) shows the bytes
+  it has carried and about what they cost at the file's listed price, running while the player reads and as
+  a short total after. The sats are figured from the listed price: what each call paid stays with the
+  connector, and per-connection byte records come in 0.2.7.
+
 ## 0.2.5 (2026-11-02)
 
 Web apps in visits, faster and whole, from a hands-on run of 0.2.4 with the demo shop's Jellyfin over a
