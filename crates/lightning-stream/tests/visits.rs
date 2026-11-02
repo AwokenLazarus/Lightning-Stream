@@ -102,6 +102,7 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                 // a seller that has not answered yet: the call holds a handler slot of the connector, waiting
                 // (until the connection with the seller is closed: the signer then ends the call, charging nothing)
                 if url.contains("/hang/") {
+                    session.lock().unwrap().calls.push(p.clone());
                     let t = std::time::Instant::now();
                     while session.lock().unwrap().stops.is_empty() && t.elapsed() < std::time::Duration::from_secs(120) {
                         std::thread::sleep(std::time::Duration::from_millis(20));
