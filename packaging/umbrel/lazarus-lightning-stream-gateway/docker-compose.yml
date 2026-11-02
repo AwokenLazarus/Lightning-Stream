@@ -76,7 +76,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-c8ba24a813dc@sha256:9606256238117883bcff3465b6128b45db2a13217d2e787ed608238975273163
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-d43386c2da47@sha256:6231aef23717b7c8051e706c52fddf598061e2d94a56aab9e29a2af19713009d
     stop_grace_period: 15s
     environment:
       XBT_UI_ROLE: gateway

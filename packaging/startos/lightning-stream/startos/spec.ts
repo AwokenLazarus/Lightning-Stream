@@ -193,9 +193,9 @@ export const IMAGES: Record<ImageKey, string> = {
   signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-c8ba24a813dc@sha256:e421803110285fe778987312e9cb27bacb498ab7ff5208aa0eeaad250c5a12ce',
   witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-c8ba24a813dc@sha256:c4b8e7ec74f880ee71436edb057ed8ba117929bbeb415ac2ffc19debb92d7f68',
   mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-c8ba24a813dc@sha256:556e7098323602ce1b6b699cfb299050e27276b954f3a7eecbb18e0499641d45',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-c8ba24a813dc@sha256:9606256238117883bcff3465b6128b45db2a13217d2e787ed608238975273163',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-d43386c2da47@sha256:6231aef23717b7c8051e706c52fddf598061e2d94a56aab9e29a2af19713009d',
   gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-b8a60adfece2@sha256:c1969c9e93fb8bda6e481f11c71a4b099cbbe76faaea4ad0d458090068d31022',
-  connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-04de2e2f25e5@sha256:f032cd33a0909b94276d2fec8a2809d6583474318d18128e3f89c06c51bcfc53',
+  connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-d43386c2da47@sha256:a9a80455ca8da7c8fe1eaa7beae93351dd2428a4ad32fc2cf97faa8def2fac9b',
   hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-b8a60adfece2@sha256:5bc4b1fb7d5e666e70e66928d1e9994d06cd4db03079ebc0b8dba49d4a245c87',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
   vpn: 'ghcr.io/awokenlazarus/xbt-vpn:0.1.0-c8ba24a813dc@sha256:21a886fc41d25146afd8a9cfc2b8136c386375d6ce251cb9b0ff3b8ecdda732c',
