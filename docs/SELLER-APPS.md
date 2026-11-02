@@ -103,6 +103,14 @@ On Sell, a service gets **Buyers can open its own web page**, with:
 - optionally **a guest login header** the gateway adds to every request, for a service that needs
   a login. For Jellyfin, a user the seller makes for buyers, limited to the libraries on sale.
   Never use an owner or admin account.
+- **free paths** (from 0.2.6): paths of the app served free, GET and HEAD only, such as the app's
+  own web client (Jellyfin and Plex: `/web/`, offered for a media server). Each is a free route of
+  its own under the app's service, with gzip and the app's refused and allowed paths, before the
+  app's paid route and with no listing entry of its own; it carries no guest login and no live
+  connections. The longest route decides, so everything else under the app (films, downloads, its
+  API) stays paid. They are saved with the service, so the config the app writes at every start
+  and Save keeps them (a route added to the config by hand is not). Not used where the app's
+  route passes requests on without its path (a route strips all of its own path).
 
 **Parts a buyer must not reach.** A web app sold whole also serves its admin pages, other
 users' sessions and its settings. The gateway's route takes two lists of path prefixes, matched
