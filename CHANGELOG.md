@@ -78,7 +78,9 @@ Gateway app.
   shop that changed its address, or went from its web address to its key, left its old listing on the relays
   beside the new one: buyers saw the shop twice, once at an address that no longer sells. At each publish
   the gateway now asks its relays for the listings its own key signed, and withdraws those for any other
-  address with a NIP-09 deletion signed by that key. A relay that keeps deleted events is covered too: Found
+  address with a NIP-09 deletion signed by that key, on each relay that took the new listing (one that
+  refused it keeps the old, so the shop stays listed there), and once per relay and event while the gateway
+  runs. A relay that keeps deleted events is covered too: Found
   on Nostr keeps only the newest of one key's listings under one receipt key. Saving a shop that goes Private
   also says to remove a tunnel or proxy that still sends the old address to the box.
 - **Hashrate is paid where the shop is reached, also after an update.** The hashmaker's pay address
@@ -87,8 +89,9 @@ Gateway app.
   work. The app now puts it right at start (waiting for the gateway to say the shop's key), and the hashmaker
   republishes its offer with it.
 - **A hashrate offer names its shop.** An offer said "Miners from stream.example". It now names the shop
-  as its listing does: from Browse, from Found on Nostr, else from the shop's own signed listing at its
-  address. The address is shown only while no listing names the shop.
+  as a listing the app already has names it (Browse, or Found on Nostr), with its address beside it:
+  "Miners from Demo Films (stream.example)". Nothing is fetched from the address an offer names, so
+  viewing offers tells no publisher the box's address. Where no listing names the shop, its address alone.
 - **Hashrate → Your gateway, in words.** The line "Connected to your node" said more than it measured; it
   is now "Jobs from your node: checked / not yet" (a job was fetched from the gateway and checked). The page
   says that no separate DATUM app is needed, and that Umbrel's own DATUM Gateway app is for Bitcoin and won't
@@ -115,8 +118,8 @@ Gateway app.
   that the Stop form split in two). The frame is the page's own dark color while the app loads, so there is
   no white flash in dark mode.
 - **Player links count what they carry.** On a Files page, each link for your player (`/r/…`) shows the bytes
-  it has carried and about what they cost at the file's listed price, running while the player reads and as
-  a short total after. The sats are figured from the listed price: what each call paid stays with the
+  it has carried and about what they cost at the file's listed price: "Playing" while bytes move, "Open"
+  while the player holds the link paused, and a short total after. The sats are figured from the listed price: what each call paid stays with the
   connector, and per-connection byte records come in 0.2.7.
 
 ## 0.2.5 (2026-11-02)

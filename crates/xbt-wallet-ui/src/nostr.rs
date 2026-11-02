@@ -203,17 +203,6 @@ pub fn newest_per_shop(listings: Vec<NostrListing>) -> Vec<NostrListing> {
 
 const MAX_BODY: u64 = 256 * 1024;
 
-/// The name in the signed listing a shop serves at its own address, when the listing holds under the
-/// receipt key it names and is for that address. For naming a seller on a page only: nothing is
-/// trusted from it.
-pub fn own_listing_name(origin: &str) -> Option<String> {
-    let page = get(&format!("{}{}", origin.trim_end_matches('/'), listing::PATH)).ok().filter(|p| p.status == 200)?;
-    let doc: serde_json::Value = serde_json::from_str(&page.body).ok()?;
-    let l = listing::verify_self(&doc).ok()?;
-    let name = l.name.trim();
-    (crate::services::same_origin(&l.seller, origin) && !name.is_empty()).then(|| name.chars().take(80).collect())
-}
-
 /// One GET for [`listing::fetch`]: the status, headers and body, a 402 included.
 fn get(url: &str) -> Result<Page, String> {
     let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(15)).redirects(0).build();

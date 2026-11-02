@@ -481,8 +481,6 @@ fn relay_once(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: O
     }))
 }
 
-/// A relayed body, at most `left` bytes of it. One that has more than that ends in an error, so that
-/// its reader sees a cut and not a whole file of the listed size.
 /// A player's body as it is sent, counted for its link ([`crate::relay::LinkUse`]).
 struct Counted<'a> {
     out: &'a mut dyn xbt_svc::http::BodyWriter,
@@ -501,6 +499,8 @@ impl xbt_svc::http::BodyWriter for Counted<'_> {
     }
 }
 
+/// A relayed body, at most `left` bytes of it. One that has more than that ends in an error, so that
+/// its reader sees a cut and not a whole file of the listed size.
 fn send_within(src: &mut dyn std::io::Read, mut left: u64, out: &mut dyn xbt_svc::http::BodyWriter) -> std::io::Result<()> {
     let mut buf = vec![0u8; 64 << 10];
     loop {

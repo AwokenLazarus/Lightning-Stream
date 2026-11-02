@@ -33,7 +33,13 @@ pub fn publish_once(gw: &Gateway, keys: &Keys, relays: &[String], now: u64) -> R
     let ev = market::listing_event_with(keys, &doc, &bind, gw.transport().as_ref(), now)?;
     let out = oneshot::publish(relays, &ev, PUBLISH_WAIT);
     let seller = xbt402::listing::verify_self(&doc).map(|l| xbt402::wire::canonical_origin(&l.seller))?;
-    match withdraw_left_behind(keys, relays, &seller, now) {
+    // only where the listing at the new address went in: a relay that refused it keeps the old one, or
+    // the shop would vanish there
+    let took: Vec<String> = out.iter().filter(|o| o.result.is_ok()).map(|o| o.relay.clone()).collect();
+    if took.is_empty() {
+        return Ok(out);
+    }
+    match withdraw_left_behind(keys, &took, &seller, now) {
         Ok(gone) if !gone.is_empty() => eprintln!("xbt-gateway: withdrew this shop's listing at {} on Nostr: it lists itself at {seller} now", gone.join(", ")),
         Ok(_) => {}
         Err(e) => eprintln!("xbt-gateway: an old listing was not withdrawn on Nostr: {e}"),
@@ -44,20 +50,54 @@ pub fn publish_once(gw: &Gateway, keys: &Keys, relays: &[String], now: u64) -> R
 /// A shop that changes its address, or how buyers reach it (its web address, then its key when it
 /// turns Private), lists itself under the new one: the listing is addressed by its seller, so the old
 /// one stayed on the relays beside it, and buyers saw the shop twice, once at an address that no
-/// longer sells (#40). This asks `relays` for the listings this key signed, and withdraws those for any
-/// other seller than `current` with a NIP-09 deletion signed by the same key. `Ok`: the old sellers
-/// withdrawn (none: nothing to do). Asked again at each publish, for a relay that missed it.
+/// longer sells (#40). This asks each of `relays` for the listings this key signed, and withdraws those
+/// for any other seller than `current` with a NIP-09 deletion signed by the same key, on that relay.
+/// Asked again at each publish, for a relay that missed it; a relay is sent the deletion of one event
+/// once while this gateway runs, so one that keeps deleted events is not sent it again every time.
+/// `Ok`: the old sellers withdrawn (none: nothing to do).
 pub fn withdraw_left_behind(keys: &Keys, relays: &[String], current: &str, now: u64) -> Result<Vec<String>, String> {
-    let (events, _) = oneshot::query(relays, &own_filter(&keys.public_hex()), QUERY_WAIT);
-    let old = left_behind(&events, &keys.public_hex(), current, now);
-    if old.is_empty() {
-        return Ok(vec![]);
+    // (relay, event id) a deletion was taken for
+    static SENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> = std::sync::LazyLock::new(Default::default);
+    let author = keys.public_hex();
+    // each relay apart: what it still holds is what it is sent
+    let held: Vec<(String, Vec<(String, Vec<String>)>)> = std::thread::scope(|s| {
+        let asks: Vec<_> = relays.iter().map(|r| s.spawn(|| {
+            let (events, _) = oneshot::query(std::slice::from_ref(r), &own_filter(&author), QUERY_WAIT);
+            (r.clone(), left_behind(&events, &author, current, now))
+        })).collect();
+        asks.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let mut gone: Vec<String> = vec![];
+    let mut errors: Vec<String> = vec![];
+    for (relay, old) in held {
+        let new: Vec<(String, Vec<String>)> = {
+            let sent = SENT.lock().unwrap_or_else(|p| p.into_inner());
+            old.into_iter().map(|(d, ids)| (d, ids.into_iter().filter(|id| !sent.contains(&(relay.clone(), id.clone()))).collect::<Vec<_>>()))
+                .filter(|(_, ids)| !ids.is_empty()).collect()
+        };
+        if new.is_empty() {
+            continue;
+        }
+        let out = oneshot::publish(std::slice::from_ref(&relay), &withdrawal_event(keys, &new, now), PUBLISH_WAIT);
+        match out.first().map(|o| &o.result) {
+            Some(Ok(())) => {
+                let mut sent = SENT.lock().unwrap_or_else(|p| p.into_inner());
+                for (d, ids) in new {
+                    sent.extend(ids.into_iter().map(|id| (relay.clone(), id)));
+                    if !gone.contains(&d) {
+                        gone.push(d);
+                    }
+                }
+            }
+            Some(Err(e)) => errors.push(format!("{relay}: {e}")),
+            None => errors.push(format!("{relay}: no answer")),
+        }
     }
-    let out = oneshot::publish(relays, &withdrawal_event(keys, &old, now), PUBLISH_WAIT);
-    if !out.iter().any(|o| o.result.is_ok()) {
-        return Err(out.iter().filter_map(|o| o.result.as_ref().err().map(|e| format!("{}: {e}", o.relay))).collect::<Vec<_>>().join("; "));
+    if gone.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
     }
-    Ok(old.into_iter().map(|(d, _)| d).collect())
+    gone.sort();
+    Ok(gone)
 }
 
 /// NIP-09: a request to delete events, by their ids (`e`) or their address (`a`).

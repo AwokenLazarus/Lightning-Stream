@@ -280,58 +280,19 @@ fn rent_offers(base: &str, token: &Option<PathBuf>, keep: bool) -> Result<Value,
     }
 }
 
-/// Shop names by origin, each with when it was asked.
-type Names = std::sync::Mutex<HashMap<String, (std::time::Instant, Option<String>)>>;
-
-/// How long a shop name read from a hashmaker's own shop is kept.
-const SHOP_NAME_FRESH: Duration = Duration::from_secs(3600);
-
-/// The name a hashmaker's shop gives itself in its own signed listing at `origin`
-/// (`/.well-known/lightning-stream.json`), for an offer whose shop is in no listing the app has. Never
-/// waits: the first ask goes on behind the page, and the page names the shop by its address until it
-/// answers. `None` while unknown, or when the shop serves no listing of its own address.
-fn listed_shop_name(origin: &str) -> Option<String> {
-    static NAMES: std::sync::LazyLock<std::sync::Arc<Names>> = std::sync::LazyLock::new(Default::default);
-    if (!origin.starts_with("https://") && !origin.starts_with("http://")) || xbt402::shop::is_shop(origin) {
-        return None;
-    }
-    let mut names = NAMES.lock().unwrap_or_else(|p| p.into_inner());
-    match names.get(origin) {
-        Some((at, name)) if at.elapsed() < SHOP_NAME_FRESH => return name.clone(),
-        Some((_, name)) => {
-            let name = name.clone();
-            // asked again behind the page; the last answer serves meanwhile
-            names.insert(origin.to_string(), (std::time::Instant::now(), name.clone()));
-            spawn_name_lookup(NAMES.clone(), origin);
-            return name;
-        }
-        None => {}
-    }
-    names.insert(origin.to_string(), (std::time::Instant::now(), None));
-    if names.len() > 256 {
-        names.retain(|_, (at, _)| at.elapsed() < SHOP_NAME_FRESH);
-    }
-    drop(names);
-    spawn_name_lookup(NAMES.clone(), origin);
-    None
-}
-
-fn spawn_name_lookup(names: std::sync::Arc<Names>, origin: &str) {
-    let o = origin.to_string();
-    std::thread::spawn(move || {
-        let Some(name) = crate::nostr::own_listing_name(&o) else { return };
-        names.lock().unwrap_or_else(|p| p.into_inner()).insert(o, (std::time::Instant::now(), Some(name)));
-    });
-}
-
-/// Who sells an offer, as a person reads it: the shop's name from its listing (the Browse list, Found
-/// on Nostr, else the shop's own listing at its address), with its address only while none names it.
-/// 0.2.5 said "Miners from stream.example" for a shop with a name.
+/// Who sells an offer, as a person reads it: the shop's name where a listing the app already has names
+/// it (Browse's sellers, and Found on Nostr's listings, whose receipt key bound them to the seller), with
+/// its address beside it, small: "Lazarus Pool (pool.example)". Its address alone where none names it.
+/// Nothing is fetched for it: anyone can publish an offer with any address, and asking that address would
+/// tell its publisher this box's IP, and reach whatever it names. 0.2.5 said "stream.example" for a shop
+/// with a name.
 pub(crate) fn offer_seller(known: &[crate::services::Service], pay_url: &str) -> String {
     let Some(origin) = crate::services::http_origin(pay_url) else { return String::new() };
-    crate::services::shop_name(known, &origin)
-        .or_else(|| listed_shop_name(&origin))
-        .unwrap_or_else(|| crate::services::short_address(&origin))
+    let host = crate::services::short_address(&origin);
+    match crate::services::shop_name(known, &origin) {
+        Some(name) if name != host => format!("{name} ({host})"),
+        _ => host,
+    }
 }
 
 /// One call to a service's control page.
@@ -1606,8 +1567,8 @@ mod tests {
             name: "Demo Films".into(), kind: crate::services::Kind::Api, seller: "https://stream.example".into(), price_text: String::new(),
             prices: serde_json::Value::Null, items: vec![], address: String::new(), app: String::new(), app_base: String::new(),
         };
-        assert_eq!(super::offer_seller(std::slice::from_ref(&shop), "https://stream.example/hashrate"), "Demo Films");
-        // not in any listing the app has (and nothing answers there): its host, as a fallback
+        assert_eq!(super::offer_seller(std::slice::from_ref(&shop), "https://stream.example/hashrate"), "Demo Films (stream.example)");
+        // in no listing the app has: its host, and nothing is asked of it
         assert_eq!(super::offer_seller(&[shop], "https://other.invalid/hashrate"), "other.invalid");
         assert_eq!(super::offer_seller(&[], ""), "");
     }

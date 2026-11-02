@@ -36,12 +36,31 @@ struct Link {
 pub struct LinkUse {
     bytes: AtomicU64,
     open: AtomicUsize,
+    /// When bytes last went to the player, in ms since [`epoch`].
+    last_ms: AtomicU64,
+}
+
+/// How recently bytes must have moved for a link to read as playing.
+pub const PLAYING_WITHIN: Duration = Duration::from_secs(10);
+
+/// A fixed instant of this process, to date a link's last bytes by.
+fn epoch() -> Instant {
+    static AT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    *AT
 }
 
 impl LinkUse {
     /// `n` more bytes went to the player.
     pub fn sent(&self, n: u64) {
         self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.last_ms.store(u64::try_from(epoch().elapsed().as_millis()).unwrap_or(u64::MAX).max(1), Ordering::Relaxed);
+    }
+
+    /// A request is open and bytes moved within [`PLAYING_WITHIN`].
+    fn playing(&self) -> bool {
+        let last = self.last_ms.load(Ordering::Relaxed);
+        let now = u64::try_from(epoch().elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.open.load(Ordering::Relaxed) > 0 && last > 0 && now.saturating_sub(last) < PLAYING_WITHIN.as_millis() as u64
     }
 
     /// A request through the link starts; it ends when the guard drops.
@@ -71,8 +90,10 @@ pub struct Shown {
     pub left: Duration,
     /// The bytes it has carried so far.
     pub bytes: u64,
-    /// A request through it is open now (the player is reading).
+    /// A request through it is open now (the player holds it).
     pub in_use: bool,
+    /// And bytes moved through it within [`PLAYING_WITHIN`] (the player is reading).
+    pub playing: bool,
 }
 
 impl RelayLinks {
@@ -144,7 +165,7 @@ impl RelayLinks {
         let now = Instant::now();
         self.live().iter().rev().filter(|x| x.item == item).map(|x| Shown {
             token: x.token.clone(), left: x.expires - now,
-            bytes: x.used.bytes.load(Ordering::Relaxed), in_use: x.used.open.load(Ordering::Relaxed) > 0,
+            bytes: x.used.bytes.load(Ordering::Relaxed), in_use: x.used.open.load(Ordering::Relaxed) > 0, playing: x.used.playing(),
         }).collect()
     }
 }
@@ -163,10 +184,10 @@ mod tests {
         u.sent(1000);
         u.sent(500);
         let s = &links.of_item("https://box.example/files/a.mkv")[0];
-        assert_eq!((s.bytes, s.in_use), (1500, true));
+        assert_eq!((s.bytes, s.in_use, s.playing), (1500, true, true));
         drop(g);
         let s = &links.of_item("https://box.example/files/a.mkv")[0];
-        assert_eq!((s.bytes, s.in_use), (1500, false));
+        assert_eq!((s.bytes, s.in_use, s.playing), (1500, false, false));
         assert!(links.usage(&"0".repeat(64)).is_none());
     }
 

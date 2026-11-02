@@ -464,13 +464,15 @@ fn about_sats(bytes: f64, per_byte: f64) -> String {
 /// What a player's link has carried, beside it on the Files page: running while the player reads, a
 /// short total once it stops. The sats are the file's listed price for those bytes (the UI relays the
 /// bytes; what each call paid stays with the connector), so "about".
-fn link_use(bytes: u64, in_use: bool, per_byte: Option<f64>) -> String {
+fn link_use(bytes: u64, in_use: bool, playing: bool, per_byte: Option<f64>) -> String {
     if bytes == 0 && !in_use {
         return String::new();
     }
     let sats = per_byte.map(|p| format!(", {}", about_sats(bytes as f64, p))).unwrap_or_default();
     if in_use {
-        format!("<span class=\"small link-use\"><span class=\"pill good\">Playing</span> {} so far{sats}</span>", bytes_words(bytes))
+        // "Playing" only while bytes move; a player that holds the link paused is "Open"
+        let pill = if playing { "<span class=\"pill good\">Playing</span>" } else { "<span class=\"pill\">Open</span>" };
+        format!("<span class=\"small link-use\">{pill} {} so far{sats}</span>", bytes_words(bytes))
     } else {
         format!("<span class=\"small link-use\">Carried {}{sats}</span>", bytes_words(bytes))
     }
@@ -531,7 +533,7 @@ fn files_html(ctx: &Ctx, s: &Service, own: bool, base: &str, links: &dyn Fn(&str
             let mut l = String::new();
             for (j, x) in shown.iter().enumerate() {
                 let id = format!("link-{i}-{j}");
-                let carried = link_use(x.bytes, x.in_use, per_byte);
+                let carried = link_use(x.bytes, x.in_use, x.playing, per_byte);
                 l.push_str(&format!("<div class=\"row\"><input id=\"{id}\" readonly class=\"mono relay-link\" aria-label=\"Link for your player\" value=\"{}\">\
                     <button type=\"button\" class=\"secondary\" data-copy=\"{id}\">Copy</button><span class=\"small\">{} left</span>{carried}\
                     <form method=\"post\" action=\"./file-link\" class=\"inline\">{csrf}<input type=\"hidden\" name=\"action\" value=\"revoke\">\
@@ -910,10 +912,12 @@ mod tests {
     #[test]
     fn a_player_link_shows_its_bytes_and_sats() {
         let per = sat_a_byte("1000 sat a GB");
-        assert_eq!(link_use(0, false, per), "");
-        let playing = link_use(250_000_000, true, per);
+        assert_eq!(link_use(0, false, false, per), "");
+        let playing = link_use(250_000_000, true, true, per);
         assert!(playing.contains("Playing") && playing.contains("250.0 MB so far") && playing.contains("about 250 sat"), "{playing}");
-        let after = link_use(1_400_000_000, false, per);
+        let paused = link_use(250_000_000, true, false, per);
+        assert!(paused.contains(">Open<") && !paused.contains("Playing"), "{paused}");
+        let after = link_use(1_400_000_000, false, false, per);
         assert!(after.contains("Carried 1.40 GB, about 1,400 sat") && !after.contains("Playing"), "{after}");
         assert_eq!(bytes_words(800), "800 bytes");
     }

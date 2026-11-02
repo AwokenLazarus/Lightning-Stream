@@ -95,4 +95,7 @@ fn a_shop_that_moves_withdraws_its_old_listing() {
     assert_eq!(newest.listing.seller, "http://moved.test:8402", "the wallet keeps only the newest of one key's listings");
     // the listing at the new address is never withdrawn
     assert!(!d.tags.iter().any(|t| t.get(1).is_some_and(|v| v.contains("moved.test"))));
+    // the next publish does not send the relay the same deletion again (it keeps the deleted event)
+    nostr::publish_once(&moved.gw, &keys, &relays, now + 1).unwrap();
+    assert_eq!(relay.events(nostr::KIND_DELETION).len(), 1, "sent once to a relay that ignores it");
 }
