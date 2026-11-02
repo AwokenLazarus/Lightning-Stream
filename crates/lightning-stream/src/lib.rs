@@ -97,6 +97,7 @@ pub(crate) fn whole(length: Option<u64>, sent: u64, account: impl FnOnce() -> Op
     }
 }
 
+#[derive(Clone)]
 pub struct Config {
     /// The signer's socket.
     pub signer: PathBuf,

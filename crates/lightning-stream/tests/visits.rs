@@ -71,13 +71,36 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                     let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 502, "charged_sats": ticket, "complete": false}}));
                     return;
                 }
+                // the seller's routes, read unpaid as a visit opens (not counted among the page's calls): its web client is free
+                if url.ends_with("/services") {
+                    let doc = json!({"routes": [{"path": "/app/web/", "free": true, "methods": ["GET", "HEAD"]},
+                                                {"path": "/", "free": false, "methods": ["GET", "POST"]}]}).to_string();
+                    let mut out = UnixStream::connect(stream_dir.join(p["stream_to"].as_str().unwrap())).unwrap();
+                    let _ = writeln!(out, "{}", json!({"status": 200, "content_length": doc.len(), "content_type": "application/json"}));
+                    let _ = out.write_all(doc.as_bytes());
+                    drop(out);
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "rule": "free", "status": 200, "charged_sats": 0, "complete": true}}));
+                    return;
+                }
+                // a path that was free and is sold now: asked for unpaid, the seller's 402 is refused with nothing to spend
+                if url.contains("/app/web/gone/") && max == 0 {
+                    session.lock().unwrap().calls.push(p.clone());
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "max_sats", "reason": "the seller asks to be paid",
+                                                                            "charged_sats": 0}}));
+                    return;
+                }
                 // a seller that has not answered yet: the call holds a handler slot of the connector, waiting
                 if url.contains("/hang/") {
                     std::thread::sleep(std::time::Duration::from_secs(120));
                     return;
                 }
-                // the session's credit, or a ticket where the call may spend one
-                let charged = {
+                // a free path asked for as it is (no terms of another route) is served free; the session's credit, or a
+                // ticket where the call may spend one, pays any other
+                let free = url.contains("/app/web/") && !url.contains("/app/web/gone/") && p["known_terms"] != true;
+                let charged = if free {
+                    session.lock().unwrap().calls.push(p.clone());
+                    0
+                } else {
                     let mut s = session.lock().unwrap();
                     s.calls.push(p.clone());
                     let mut charged = 0;
@@ -307,8 +330,10 @@ fn a_range_goes_in_parts_each_within_a_share_of_the_limit() {
     assert_eq!(v["spent_sats"].as_i64(), Some(charged), "only what was bought stays spent once every request ended: {v}");
 }
 
+/// A ticket dearer than a request's share is bought by a request asked again with room for one
+/// beside its share; the requests after it hold a share of their own and run on the credit it bought.
 #[test]
-fn a_ticket_dearer_than_a_share_is_bought_and_the_shares_after_it_have_room_for_one() {
+fn a_ticket_dearer_than_a_share_is_bought_by_a_request_asked_again_with_room_for_one() {
     let dir = tempfile::tempdir().unwrap();
     let (sock, session) = signer_at(dir.path(), 1_002);
     let addr = start(sock, dir.path());
@@ -323,11 +348,12 @@ fn a_ticket_dearer_than_a_share_is_bought_and_the_shares_after_it_have_room_for_
     assert!(results.iter().all(|s| *s == 200), "{results:?}");
     let charged = session.lock().unwrap().charged;
     assert!((1_002..=30_000).contains(&charged), "{charged}");
-    // once the seller's ticket is known every share has room for one
+    // the tickets were bought by requests asked again with room for one; a request on the credit holds its own share
+    assert!(session.lock().unwrap().calls.iter().any(|c| c["max_sats"].as_i64().unwrap() >= 1_002));
     let (_, _, b) = ask(&addr, "GET", &format!("/v/{visit}/next.js"), "", b"");
     assert!(!b.is_empty());
     let last = session.lock().unwrap().calls.last().cloned().unwrap();
-    assert!(last["max_sats"].as_i64().unwrap() >= 1_002, "{last}");
+    assert!((1..=1_000).contains(&last["max_sats"].as_i64().unwrap()), "{last}");
     let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert!(v["ended"].is_null(), "{v}");
@@ -475,4 +501,60 @@ fn a_visit_stops_with_every_handler_slot_held() {
     assert!(at.elapsed() < std::time::Duration::from_secs(2), "the stop waited {:?} behind the stuck requests", at.elapsed());
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert_eq!(v["ended"], "Stopped.", "{v}");
+}
+
+/// A path the seller serves free (its `/services` names the route free, as a media server's static
+/// web client) is asked for as it is: with nothing to spend (`max_sats` 0), not on the terms of
+/// another route (`known_terms`), and with no share of the visit held, however many at once. One
+/// that is sold now goes the paid way.
+///
+/// FAILS before: a visit sent every path paid on the terms the signer kept for the seller, which a
+/// free route refuses (`terms_changed`), so each free path took two round trips and made the
+/// signer forget the seller's terms.
+#[test]
+fn a_path_on_a_free_route_is_asked_for_unpaid() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 1_000);
+    let report = |addr: &str| serde_json::from_slice::<Value>(&ask(addr, "GET", &format!("/visits/{visit}"), "", b"").2).unwrap();
+    // the seller's routes are read beside the page's first requests, which go the paid way until then
+    let t = std::time::Instant::now();
+    loop {
+        let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/web/index.html"), "", b"");
+        assert_eq!(st, 200, "{head}");
+        let last = session.lock().unwrap().calls.last().cloned().unwrap();
+        if last["max_sats"] == 0 {
+            assert_ne!(last["known_terms"], true, "{last}");
+            break;
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "the free route was never learned: {last}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let before = report(&addr)["spent_sats"].clone();
+    let calls = session.lock().unwrap().calls.len();
+    let results: Vec<u16> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..30).map(|i| { let (addr, visit) = (addr.clone(), visit.clone()); s.spawn(move || {
+            ask(&addr, "GET", &format!("/v/{visit}/web/{i}.js"), "", b"").0
+        }) }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(results.iter().all(|s| *s == 200), "{results:?}");
+    let free: Vec<Value> = session.lock().unwrap().calls[calls..].to_vec();
+    assert_eq!(free.len(), 30, "{free:?}");
+    assert!(free.iter().all(|c| c["max_sats"] == 0 && c["known_terms"] != true), "{free:?}");
+    let r = report(&addr);
+    assert_eq!((r["spent_sats"].clone(), r["held_sats"].as_i64()), (before, Some(0)), "{r}");
+    // a paid path pays as before
+    let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/Users/Me"), "", b"");
+    assert_eq!(st, 200, "{head}");
+    let last = session.lock().unwrap().calls.last().cloned().unwrap();
+    assert!(last["max_sats"].as_i64().unwrap() >= 1 && last["known_terms"] == true, "{last}");
+    // a path no longer free: refused with nothing to spend, then paid
+    let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/web/gone/a.js"), "", b"");
+    assert_eq!(st, 200, "{head}");
+    let gone: Vec<Value> = session.lock().unwrap().calls.iter().filter(|c| c["url"].as_str().unwrap().contains("/web/gone/")).cloned().collect();
+    assert_eq!(gone.len(), 2, "{gone:?}");
+    assert_eq!((gone[0]["max_sats"].as_i64(), gone[1]["known_terms"].as_bool()), (Some(0), Some(true)), "{gone:?}");
+    assert!(gone[1]["max_sats"].as_i64().unwrap() >= 1, "{gone:?}");
 }

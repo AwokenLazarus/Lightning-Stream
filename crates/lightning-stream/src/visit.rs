@@ -11,17 +11,21 @@
 //! `<any method> /v/<id>/<path>`: one request of the page, sent to `base` + `path` and paid.
 //!
 //! **The limit, exactly.** A page asks for many things at once. Each request of a visit holds a share
-//! of what is left of the limit while it runs (at most [`ANSWER_SHARE`], a WebSocket
-//! [`SOCKET_SHARE`]), and is sent with its share as the most its answer may charge: the seller is
+//! of what is left of the limit while it runs (an eighth of the limit, at most [`ANSWER_SHARE`]; a
+//! WebSocket [`SOCKET_SHARE`], and the visit's WebSockets together at most half of the limit), so that
+//! a page's requests run side by side, and is sent with its share as the most its answer may charge: the seller is
 //! told that figure and stops the answer there, and the signer buys tickets for it within it,
 //! before its head or as its body arrives. The shares held at once never add up to more than the
 //! limit, so answers running side by side cannot together spend past it; when one ends, only what
 //! it cost stays spent; where the signer has not said what it cost (an answer that never started),
 //! all of the share stays spent until it does (for good, where it says nothing within
-//! [`SETTLE_WAIT`]), and where the signer could not be reached at all, none of it. A request that finds no share free waits for one; one that needs more than a
-//! share runs alone once the others have ended or stopped (an open WebSocket, or an answer whose cost
+//! [`SETTLE_WAIT`]), and where the signer could not be reached at all, none of it. A request that finds no share free waits for one; one whose
+//! answer or ticket does not fit in its share asks once more with room for a ticket beside it, and
+//! then runs alone once the others have ended or stopped (an open WebSocket, or an answer whose cost
 //! the signer has yet to say, holds no answer it must wait for), and no new share is handed out
-//! while it waits. A range is asked for in
+//! while it waits. A path the seller serves free (its `/services` says so) is asked for with no
+//! share and `max_sats` 0: nothing can be paid for it, and where it is no longer free the request
+//! goes the paid way. A range is asked for in
 //! parts of at most [`RANGE_CHUNK`], as a player asks for its next part, so that no answer needs
 //! more than its share.
 
@@ -36,7 +40,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Reply, Request, Response, Streamed};
 
-use crate::{listen_stream, one_range, random_hex, whole, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
+use crate::{listen_stream, one_range, random_hex, whole, Config, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
 
 /// The most visits open at once; an idle one ends after [`IDLE`].
 const MAX_VISITS: usize = 32;
@@ -60,12 +64,21 @@ const LONG_OPEN: Duration = Duration::from_secs(30);
 /// it waits, so nothing else waits for it.
 const SETTLE_WAIT: Duration = Duration::from_secs(3600 + 60 + xbt402::ticket::ORDINARY_PAY_S as u64 + 5 + 11 + 2 * FIRST_BYTE.as_secs());
 /// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
-/// ends, then only what it cost, with room for a ticket beside it as for [`ANSWER_SHARE`].
-const SOCKET_SHARE: i64 = 1_000;
+/// ends, then only what it cost. It is held for as long as the page is open (a media server's
+/// live connection after sign-in), so it is small and has no room for a ticket: a socket pays from
+/// the credit the page's requests bought, and the visit's sockets together hold at most half of
+/// the limit ([`Visit::reserve_socket`]), so that they never starve the page's requests.
+const SOCKET_SHARE: i64 = 50;
 /// The most of a visit's limit one request holds while it runs for its answer, a part of a range
-/// ([`RANGE_CHUNK`]) at the prices sellers ask; once a refusal has named what one of the seller's
-/// tickets books, each share also has room for one to be bought.
+/// ([`RANGE_CHUNK`]) at the prices sellers ask. A request's share is an eighth of the limit, at
+/// least [`MIN_SHARE`] and at most this ([`Visit::answer_share`]), so that a page's many requests run
+/// side by side; a request whose answer or ticket does not fit asks again with room for a ticket
+/// beside its share, then alone.
 const ANSWER_SHARE: i64 = 1_000;
+/// The least share of a request, where the limit is small.
+const MIN_SHARE: i64 = 10;
+/// The largest `/services` document of a seller read for its free routes.
+const SERVICES_MAX: u64 = 256 << 10;
 /// The longest part of a range a request asks for: `bytes=N-` and longer ranges become
 /// `bytes=N-(N+RANGE_CHUNK-1)`, and the page's player asks for the next part as it plays.
 const RANGE_CHUNK: u64 = 4 << 20;
@@ -102,9 +115,12 @@ struct State {
     /// cost ([`Visit::settle`]): they hold no answer open, so a request waiting to run alone does not
     /// wait for them either, and what is left of the limit beside them is its.
     settling: i64,
-    /// What one of the seller's tickets books, fee included, as a refusal named it: each share has
-    /// room for one beside its own part, so that a request can buy the ticket it needs.
+    /// What one of the seller's tickets books, fee included, as a refusal named it: a request asked
+    /// again after a refusal has room for one beside its share, so that it can buy the ticket it needs.
     ticket: i64,
+    /// The seller's routes, from its `/services` ([`Visit::learn_routes`]): a path on a free one is
+    /// asked for unpaid. `None` until read, and again once a path taken for free was not.
+    routes: Option<Vec<SellerRoute>>,
     /// What the seller charged for the visit's answers that have ended, by the signer's word
     /// (`price_msat`): what the visit used, whether from tickets bought in it or from credit.
     used_msat: u64,
@@ -125,6 +141,13 @@ struct State {
     stopped: bool,
 }
 
+/// A route of the seller, as its `/services` names it.
+struct SellerRoute {
+    path: String,
+    free: bool,
+    methods: Vec<String>,
+}
+
 /// An answer open now in a visit.
 struct OpenStream {
     socket: UnixStream,
@@ -139,6 +162,16 @@ impl State {
     fn long_open(&self) -> i64 {
         self.streams.values().filter(|o| o.opened.elapsed() >= LONG_OPEN).map(|o| o.share).sum()
     }
+}
+
+/// What a share is for ([`Visit::reserve_as`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Answer,
+    /// A request waiting to run alone ([`Visit::reserve_alone`]).
+    Alone,
+    /// A WebSocket ([`Visit::reserve_socket`]).
+    Socket,
 }
 
 pub struct Visit {
@@ -201,15 +234,38 @@ impl Visit {
         s.paid = s.paid.saturating_add(i64::try_from(num("charged_sats").unwrap_or(0)).unwrap_or(0));
     }
 
-    /// Hold up to `most` of what is left of the limit for one request, and room for a ticket once
-    /// the seller's price of one is known, waiting for a running one to
+    /// A request's share of the limit: an eighth of it, at least [`MIN_SHARE`] and at most
+    /// [`ANSWER_SHARE`]. A 1,000 sat visit runs eight requests at once.
+    fn answer_share(&self) -> i64 {
+        (self.limit / 8).clamp(MIN_SHARE, ANSWER_SHARE)
+    }
+
+    /// A request's share asked again after its answer or ticket did not fit: its share and room for
+    /// one of the seller's tickets, where a refusal named what one books.
+    fn ticket_share(&self) -> i64 {
+        self.answer_share().saturating_add(self.lock().ticket)
+    }
+
+    /// Hold up to `most` of what is left of the limit for one request, waiting for a running one to
     /// give its share back where none is free. `Err`: the visit has ended, its limit is spent (with
     /// nothing running that could give some back), or the wait was too long.
     fn reserve(&self, most: i64) -> Result<i64, String> {
-        self.reserve_as(most, false)
+        self.reserve_as(most, Kind::Answer)
     }
 
-    fn reserve_as(&self, most: i64, alone: bool) -> Result<i64, String> {
+    /// A request's share ([`Visit::answer_share`]).
+    fn reserve_answer(&self) -> Result<i64, String> {
+        self.reserve(self.answer_share())
+    }
+
+    /// A WebSocket's share, counted as the sockets' ([`State::sockets`]) as it is handed out: at most
+    /// [`SOCKET_SHARE`], and the visit's sockets together at most half of the limit, so that the
+    /// rest is always the page's requests'. `Err` at once where the sockets hold that half already.
+    fn reserve_socket(&self) -> Result<i64, String> {
+        self.reserve_as(SOCKET_SHARE, Kind::Socket)
+    }
+
+    fn reserve_as(&self, most: i64, kind: Kind) -> Result<i64, String> {
         let mut s = self.lock();
         let until = Instant::now() + TURN_WAIT;
         loop {
@@ -217,7 +273,7 @@ impl Visit {
                 return Err(e.clone());
             }
             // a request waiting to run alone goes first: no share is handed out past it
-            if !alone && s.alone > 0 {
+            if kind != Kind::Alone && s.alone > 0 {
                 let now = Instant::now();
                 if now >= until {
                     return Err("The page asked for too much at once: try again.".into());
@@ -225,10 +281,21 @@ impl Visit {
                 s = self.turn.wait_timeout(s, until - now).unwrap_or_else(|p| p.into_inner()).0;
                 continue;
             }
-            let share = (self.limit - s.spent).min(most.saturating_add(s.ticket));
+            let mut most = most;
+            if kind == Kind::Socket {
+                let room = (self.limit / 2).max(1) - s.sockets;
+                if room < 1 {
+                    return Err("This page has too many live connections open at once.".into());
+                }
+                most = most.min(room);
+            }
+            let share = (self.limit - s.spent).min(most);
             if share >= 1 {
                 s.spent += share;
                 s.held += share;
+                if kind == Kind::Socket {
+                    s.sockets += share;
+                }
                 return Ok(share);
             }
             if s.held == 0 {
@@ -261,7 +328,7 @@ impl Visit {
             s = self.turn.wait_timeout(s, (until - now).min(Duration::from_secs(1))).unwrap_or_else(|p| p.into_inner()).0;
         }
         drop(s);
-        let got = if timed_out { Err("The page asked for too much at once: try again.".into()) } else { self.reserve_as(most, true) };
+        let got = if timed_out { Err("The page asked for too much at once: try again.".into()) } else { self.reserve_as(most, Kind::Alone) };
         self.lock().alone -= 1;
         self.turn.notify_all();
         got
@@ -305,12 +372,49 @@ impl Visit {
         }
     }
 
-    /// A share held by a WebSocket from `open` until it ends ([`State::sockets`]).
-    fn socket(&self, share: i64, open: bool) {
+    /// A WebSocket's share ([`Visit::reserve_socket`]) is no longer an open socket's: it did not open.
+    fn socket_closed(&self, share: i64) {
         let mut s = self.lock();
-        s.sockets += if open { share } else { -share };
+        s.sockets -= share;
         drop(s);
         self.turn.notify_all();
+    }
+
+    /// The seller's routes from its `/services` document: which of them are free, for which methods.
+    fn learn_routes(&self, services: &Value) {
+        let Some(all) = services.get("routes").and_then(Value::as_array) else { return };
+        let routes: Vec<SellerRoute> = all.iter().take(256).filter_map(|r| {
+            let path = r.get("path")?.as_str()?.to_string();
+            let methods = r.get("methods").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str)
+                .map(str::to_ascii_uppercase).collect();
+            path.starts_with('/').then_some(SellerRoute { path, free: r.get("free").and_then(Value::as_bool) == Some(true), methods })
+        }).collect();
+        self.lock().routes = Some(routes);
+    }
+
+    /// Whether `url` asked for with `method` is on a free route of the seller, as its gateway takes a
+    /// path: the longest route whose path ends in `/` and starts the URL's path, or that is the whole
+    /// path. A path taken for free that is not is refused by the signer before anything is paid
+    /// (`max_sats` 0), and then goes the paid way.
+    fn is_free(&self, url: &str, method: &str) -> bool {
+        if !matches!(method, "GET" | "HEAD") {
+            return false;
+        }
+        let path = url.split_once("://").and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..])).unwrap_or("/");
+        let path = path.split(['?', '#']).next().unwrap_or("/");
+        // a path the gateway may read otherwise once decoded or normalized goes the paid way
+        if path.contains(['%', '\\']) || path.split('/').any(|seg| seg == "." || seg == "..") {
+            return false;
+        }
+        let s = self.lock();
+        let Some(routes) = &s.routes else { return false };
+        routes.iter().filter(|r| if r.path.ends_with('/') { path.starts_with(r.path.as_str()) } else { path == r.path })
+            .max_by_key(|r| r.path.len()).is_some_and(|r| r.free && r.methods.iter().any(|m| m == method))
+    }
+
+    /// A path taken for free was not: the seller's routes are read again before any is taken for free.
+    fn forget_routes(&self) {
+        self.lock().routes = None;
     }
 
     /// A request that held `share` has stopped (a WebSocket's, `socket`: and closed): what the signer
@@ -390,7 +494,14 @@ impl Connector {
             }
             let ceiling = v.get("price_ceiling").filter(|c| c.is_object()).cloned();
             return Some(Reply::Whole(match self.visits.open(base, limit, ceiling) {
-                Ok(id) => json_response(200, &json!({"visit": id})),
+                Ok(id) => {
+                    // the seller's free routes, read beside the page's first requests (which go the paid way until then)
+                    if let Some(visit) = self.visits.get(&id) {
+                        let cfg = self.cfg.clone();
+                        std::thread::spawn(move || read_routes(&cfg, &visit));
+                    }
+                    json_response(200, &json!({"visit": id}))
+                }
                 Err(e) => json_response(503, &json!({"error": e})),
             }));
         }
@@ -442,10 +553,10 @@ impl Connector {
             use base64::Engine as _;
             Some(base64::engine::general_purpose::STANDARD.encode(&req.body))
         };
-        let call = |max_sats: i64| -> Result<Started, Failed> {
+        let call_as = |max_sats: i64, known_terms: bool| -> Result<Started, Failed> {
             // a page's many reads are paid on the terms the seller stated for their route, without asking each one's price
             let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true,
-                                    "known_terms": true});
+                                    "known_terms": known_terms});
             if let Some(b) = &body {
                 params["body_b64"] = b.clone().into();
             }
@@ -460,58 +571,80 @@ impl Connector {
             }
             self.start(params)
         };
-        // a share of what is left: the most this answer may charge, tickets bought for it included
-        let share = match visit.reserve(ANSWER_SHARE) {
-            Ok(n) => n,
-            Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
-        };
+        let call = |max_sats: i64| call_as(max_sats, true);
         let max_sats = |f: &Failed| f.v.get("rule").and_then(Value::as_str) == Some("max_sats");
-        let (started, share) = match call(share) {
-            Ok(s) => (s, share),
-            Err(f) if max_sats(&f) => {
-                // a ticket did not fit in the share: the refusal named what one books, and the shares from here have room
-                // for one. Asked again with such a share; where that is still too small, with all that is left once the
-                // others have ended
-                visit.refused(share, f);
-                if visit.spent_out(share) {
-                    return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+        // a path the seller serves free: asked for as it is (the signer asks it unpaid, as for a price, and is answered),
+        // with nothing to spend and no share held. Sent on another route's terms it would be refused unpaid and asked
+        // again, and the terms the signer kept for the seller forgotten
+        let free = if visit.is_free(&url, &method) {
+            match call_as(0, false) {
+                Ok(s) => Some(s),
+                // not free now: the paid way, and the seller's routes read again before a path is taken for free
+                Err(f) if max_sats(&f) => {
+                    visit.forget_routes();
+                    let visit = visit.clone();
+                    let cfg = self.cfg.clone();
+                    std::thread::spawn(move || read_routes(&cfg, &visit));
+                    None
                 }
-                let again = match visit.reserve(ANSWER_SHARE) {
-                    Ok(n) => n,
-                    Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
-                };
-                match call(again) {
-                    Ok(s) => (s, again),
-                    Err(f) if max_sats(&f) => {
-                        visit.refused(again, f);
-                        let share = match visit.reserve_alone(i64::MAX) {
-                            Ok(n) => n,
-                            Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
-                        };
-                        match call(share) {
-                            Ok(s) => (s, share),
-                            Err(f) => {
-                                let v = f.v.clone();
-                                let out = max_sats(&f);
-                                visit.refused(share, f);
-                                if out && visit.spent_out(share) {
-                                    return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+                Err(f) => return Reply::Whole(refusal(&f.v)),
+            }
+        } else {
+            None
+        };
+        let (started, share) = if let Some(s) = free { (s, 0) } else {
+            // a share of what is left: the most this answer may charge, tickets bought for it included
+            let share = match visit.reserve_answer() {
+                Ok(n) => n,
+                Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
+            };
+            match call(share) {
+                Ok(s) => (s, share),
+                Err(f) if max_sats(&f) => {
+                    // the answer or a ticket did not fit in the share: the refusal named what one books. Asked again with
+                    // room for one beside the share; where that is still too small, with all that is left once the others
+                    // have ended
+                    visit.refused(share, f);
+                    if visit.spent_out(share) {
+                        return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+                    }
+                    let again = match visit.reserve(visit.ticket_share()) {
+                        Ok(n) => n,
+                        Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
+                    };
+                    match call(again) {
+                        Ok(s) => (s, again),
+                        Err(f) if max_sats(&f) => {
+                            visit.refused(again, f);
+                            let share = match visit.reserve_alone(i64::MAX) {
+                                Ok(n) => n,
+                                Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
+                            };
+                            match call(share) {
+                                Ok(s) => (s, share),
+                                Err(f) => {
+                                    let v = f.v.clone();
+                                    let out = max_sats(&f);
+                                    visit.refused(share, f);
+                                    if out && visit.spent_out(share) {
+                                        return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+                                    }
+                                    return Reply::Whole(refusal(&v));
                                 }
-                                return Reply::Whole(refusal(&v));
                             }
                         }
-                    }
-                    Err(f) => {
-                        let v = f.v.clone();
-                        visit.refused(again, f);
-                        return Reply::Whole(refusal(&v));
+                        Err(f) => {
+                            let v = f.v.clone();
+                            visit.refused(again, f);
+                            return Reply::Whole(refusal(&v));
+                        }
                     }
                 }
-            }
-            Err(f) => {
-                let v = f.v.clone();
-                visit.refused(share, f);
-                return Reply::Whole(refusal(&v));
+                Err(f) => {
+                    let v = f.v.clone();
+                    visit.refused(share, f);
+                    return Reply::Whole(refusal(&v));
+                }
             }
         };
         let Started { head, first, src, done } = started;
@@ -571,11 +704,10 @@ impl Connector {
             s.calls += 1;
             s.last = Some(Instant::now());
         }
-        let share = match visit.reserve(SOCKET_SHARE) {
+        let share = match visit.reserve_socket() {
             Ok(n) => n,
             Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
         };
-        visit.socket(share, true);
         let headers: Vec<Value> = req.headers.iter()
             .filter(|(k, _)| { let l = k.to_ascii_lowercase(); PASSED.contains(&l.as_str()) || SOCKET_HEADERS.contains(&l.as_str()) })
             .take(24).map(|(k, v)| json!([k, v])).collect();
@@ -591,7 +723,7 @@ impl Connector {
             Ok(s) => s,
             Err(f) => {
                 let v = f.v.clone();
-                visit.socket(share, false);
+                visit.socket_closed(share);
                 visit.refused(share, f);
                 return Reply::Whole(refusal(&v));
             }
@@ -621,64 +753,93 @@ impl Connector {
 
     /// Ask the signer to pay for one request and stream its answer: the head line and the first
     /// bytes, or `Err` with the signer's answer when it ended before any byte came (a refusal).
-    fn start(&self, mut params: Value) -> Result<Started, Failed> {
-        let name = format!("ls-{}", random_hex());
-        let path = self.cfg.stream_dir.join(&name);
-        let listener = listen_stream(&path).map_err(|e| Failed { v: json!({"error": format!("stream socket: {e}")}), done: None, unknown: false })?;
-        let _ = listener.set_nonblocking(true);
-        params["stream_to"] = name.into();
-        params["stream_head"] = true.into();
-        let (tx, done) = mpsc::channel::<Result<Value, String>>();
-        let signer = self.cfg.signer.clone();
-        // the signer could not be reached: nothing was sent, and nothing charged
-        let unsent = Arc::new(AtomicBool::new(false));
-        let u = unsent.clone();
-        std::thread::spawn(move || {
-            let r = xbt_wallet_mcp::wallet::signer_call_sent(&signer, LONGEST, "xbt402_pay", &params).map_err(|(sent, e)| {
-                u.store(!sent, Ordering::SeqCst);
-                e
-            });
-            let _ = tx.send(r);
-        });
-        let started = Instant::now();
-        let src = loop {
-            match listener.accept() {
-                Ok((s, _)) => break s,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(Failed { v: json!({"error": format!("stream socket: {e}")}), done: Some(done), unknown: false });
-                }
-            }
-            if let Ok(d) = done.try_recv() {
-                let _ = std::fs::remove_file(&path);
-                let unknown = d.is_err() && !unsent.load(Ordering::SeqCst);
-                return Err(Failed { v: d.unwrap_or_else(|e| json!({"error": e})), done: None, unknown });
-            }
-            if started.elapsed() > FIRST_ANSWER {
-                let _ = std::fs::remove_file(&path);
-                return Err(Failed { v: json!({"error": format!("the seller sent nothing within {} s", FIRST_ANSWER.as_secs())}), done: Some(done), unknown: false });
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let _ = std::fs::remove_file(&path);
-        let _ = src.set_nonblocking(false);
-        let _ = src.set_read_timeout(Some(FIRST_BYTE));
-        let mut r = BufReader::new(src);
-        let mut line = String::new();
-        let ok = (&mut r).take(HEAD_LINE * 16).read_line(&mut line).is_ok() && line.ends_with('\n');
-        let head: Value = if ok { serde_json::from_str(&line).unwrap_or(Value::Null) } else { Value::Null };
-        if head.get("status").is_none() {
-            return Err(Failed { v: json!({"error": "the signer sent no head for the answer"}), done: Some(done), unknown: false });
-        }
-        if let Some(why) = head.get("error").and_then(Value::as_str) {
-            return Err(Failed { v: json!({"error": why}), done: Some(done), unknown: false });
-        }
-        let first = r.buffer().to_vec();
-        let src = r.into_inner();
-        let _ = src.set_read_timeout(None);
-        Ok(Started { head, first, src, done })
+    fn start(&self, params: Value) -> Result<Started, Failed> {
+        start_call(&self.cfg, params)
     }
+}
+
+/// The seller's routes, from its `/services` (unsigned, read unpaid: `max_sats` 0), for the visit to
+/// ask for a path on a free one unpaid ([`Visit::learn_routes`]). Nothing read, nothing learned: the
+/// page's requests go the paid way, as before.
+fn read_routes(cfg: &Config, visit: &Visit) {
+    let Some((scheme, rest)) = visit.base.split_once("://") else { return };
+    let host = rest.split('/').next().unwrap_or(rest);
+    let mut params = json!({"url": format!("{scheme}://{host}/services"), "method": "GET", "max_sats": 0, "task": cfg.task});
+    if let Some(m) = params.as_object_mut() {
+        xbt_wallet_mcp::wallet::with_transport(m);
+    }
+    let Ok(Started { head, first, src, done: _ }) = start_call(cfg, params) else { return };
+    if head.get("status").and_then(Value::as_u64) != Some(200) {
+        return;
+    }
+    let _ = src.set_read_timeout(Some(FIRST_BYTE));
+    let mut body = first;
+    if (&src).take(SERVICES_MAX.saturating_sub(body.len() as u64)).read_to_end(&mut body).is_err() {
+        return;
+    }
+    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+        visit.learn_routes(&v);
+    }
+}
+
+/// [`Connector::start`].
+fn start_call(cfg: &Config, mut params: Value) -> Result<Started, Failed> {
+    let name = format!("ls-{}", random_hex());
+    let path = cfg.stream_dir.join(&name);
+    let listener = listen_stream(&path).map_err(|e| Failed { v: json!({"error": format!("stream socket: {e}")}), done: None, unknown: false })?;
+    let _ = listener.set_nonblocking(true);
+    params["stream_to"] = name.into();
+    params["stream_head"] = true.into();
+    let (tx, done) = mpsc::channel::<Result<Value, String>>();
+    let signer = cfg.signer.clone();
+    // the signer could not be reached: nothing was sent, and nothing charged
+    let unsent = Arc::new(AtomicBool::new(false));
+    let u = unsent.clone();
+    std::thread::spawn(move || {
+        let r = xbt_wallet_mcp::wallet::signer_call_sent(&signer, LONGEST, "xbt402_pay", &params).map_err(|(sent, e)| {
+            u.store(!sent, Ordering::SeqCst);
+            e
+        });
+        let _ = tx.send(r);
+    });
+    let started = Instant::now();
+    let src = loop {
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(Failed { v: json!({"error": format!("stream socket: {e}")}), done: Some(done), unknown: false });
+            }
+        }
+        if let Ok(d) = done.try_recv() {
+            let _ = std::fs::remove_file(&path);
+            let unknown = d.is_err() && !unsent.load(Ordering::SeqCst);
+            return Err(Failed { v: d.unwrap_or_else(|e| json!({"error": e})), done: None, unknown });
+        }
+        if started.elapsed() > FIRST_ANSWER {
+            let _ = std::fs::remove_file(&path);
+            return Err(Failed { v: json!({"error": format!("the seller sent nothing within {} s", FIRST_ANSWER.as_secs())}), done: Some(done), unknown: false });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = src.set_nonblocking(false);
+    let _ = src.set_read_timeout(Some(FIRST_BYTE));
+    let mut r = BufReader::new(src);
+    let mut line = String::new();
+    let ok = (&mut r).take(HEAD_LINE * 16).read_line(&mut line).is_ok() && line.ends_with('\n');
+    let head: Value = if ok { serde_json::from_str(&line).unwrap_or(Value::Null) } else { Value::Null };
+    if head.get("status").is_none() {
+        return Err(Failed { v: json!({"error": "the signer sent no head for the answer"}), done: Some(done), unknown: false });
+    }
+    if let Some(why) = head.get("error").and_then(Value::as_str) {
+        return Err(Failed { v: json!({"error": why}), done: Some(done), unknown: false });
+    }
+    let first = r.buffer().to_vec();
+    let src = r.into_inner();
+    let _ = src.set_read_timeout(None);
+    Ok(Started { head, first, src, done })
 }
 
 /// A call that ended before any byte of its answer came: the signer's answer, or why there is none;
@@ -843,8 +1004,7 @@ mod tests {
     #[test]
     fn a_request_that_runs_alone_does_not_wait_for_an_open_websocket() {
         let v = visit(100_000);
-        let ws = v.reserve(SOCKET_SHARE).unwrap();
-        v.socket(ws, true);
+        let ws = v.reserve_socket().unwrap();
         let page = v.reserve(ANSWER_SHARE).unwrap();
         let t = Instant::now();
         std::thread::scope(|s| {
@@ -858,6 +1018,125 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         // and once it has its share, the next requests get theirs as before
         assert!(v.lock().alone == 0);
+    }
+
+    /// `f` on a thread of its own, or `None` where it took longer than `d`: a request that waits for a
+    /// share waits up to [`TURN_WAIT`], which a test does not.
+    fn within<T: Send + 'static>(d: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(d).ok()
+    }
+
+    /// The wallet's suggested 1,000 sat visit, with the seller's ticket (909 sat booked) known: a
+    /// page's requests each hold a share of it at once, as a web app's first load asks for dozens.
+    ///
+    /// FAILS before: the first request's share had room for a ticket beside it, 1,000 + 909, which is
+    /// all of the limit, and each other request waited for it to end: a page of a hundred requests
+    /// over a slow link loaded one at a time.
+    #[test]
+    fn a_small_visits_requests_run_side_by_side_once_a_ticket_is_known() {
+        let v = visit(1_000);
+        v.lock().ticket = 909;
+        let w = v.clone();
+        let shares = within(Duration::from_secs(5), move || (0..8).map(|_| w.reserve_answer()).collect::<Vec<_>>())
+            .expect("a request waited for another's share");
+        assert!(shares.iter().all(|s| matches!(s, Ok(n) if *n >= MIN_SHARE)), "{shares:?}");
+        let s = v.lock();
+        assert!(s.spent <= 1_000 && s.held == s.spent, "{} {}", s.spent, s.held);
+    }
+
+    /// A WebSocket held open after sign-in does not hold up the page's other requests: it holds a
+    /// small share, and the visit's sockets together at most half of the limit.
+    ///
+    /// FAILS before: the socket held 1,000 sat and room for a ticket, all of a 1,000 sat visit, for
+    /// as long as it was open, and every request after it waited two minutes and was refused.
+    #[test]
+    fn an_open_websocket_does_not_hold_up_the_pages_requests() {
+        let v = visit(1_000);
+        v.lock().ticket = 909;
+        let ws = v.reserve_socket().unwrap();
+        assert!((1..=SOCKET_SHARE).contains(&ws), "{ws}");
+        let w = v.clone();
+        let got = within(Duration::from_secs(5), move || w.reserve_answer()).expect("the request waited behind the WebSocket").unwrap();
+        assert!(got >= MIN_SHARE, "{got}");
+        // more sockets: refused at once past half of the limit, and the page's requests still get theirs
+        let w = v.clone();
+        let opened = within(Duration::from_secs(5), move || (0..100).map_while(|_| w.reserve_socket().ok()).count()).expect("a socket waited");
+        assert!(opened < 100, "{opened}");
+        assert!(v.lock().sockets <= 500, "{}", v.lock().sockets);
+        let w = v.clone();
+        assert!(within(Duration::from_secs(5), move || w.reserve_answer()).expect("the request waited behind the WebSockets").is_ok());
+    }
+
+    /// However many requests and WebSockets run at once, the shares held never add up to more than
+    /// the limit, and what stays spent is what they were charged, at most the limit.
+    #[test]
+    fn the_limit_holds_however_many_requests_and_sockets_run_at_once() {
+        use std::sync::atomic::AtomicI64;
+        let v = visit(1_000);
+        v.lock().ticket = 909;
+        let charged = AtomicI64::new(0);
+        std::thread::scope(|sc| {
+            for t in 0..16 {
+                let (v, charged) = (&v, &charged);
+                sc.spawn(move || {
+                    for i in 0..300 {
+                        let socket = (t + i) % 5 == 0;
+                        let Ok(n) = (if socket { v.reserve_socket() } else { v.reserve_answer() }) else {
+                            if v.lock().ended.is_some() {
+                                break;
+                            }
+                            continue;
+                        };
+                        {
+                            let s = v.lock();
+                            assert!(s.spent <= 1_000 && s.held <= s.spent && s.sockets <= s.held, "{} {} {}", s.spent, s.held, s.sockets);
+                        }
+                        std::thread::sleep(Duration::from_micros(200));
+                        let c = n.min(1 + (i as i64 % 3));
+                        if socket {
+                            v.socket_closed(n);
+                        }
+                        charged.fetch_add(c, Ordering::SeqCst);
+                        v.release(n, c);
+                    }
+                });
+            }
+        });
+        let s = v.lock();
+        assert_eq!((s.spent, s.held, s.sockets), (charged.load(Ordering::SeqCst), 0, 0));
+        assert!(s.spent <= 1_000, "{}", s.spent);
+    }
+
+    /// A path on a route the seller's `/services` names free is taken for free, as its gateway takes
+    /// the path: the longest route that holds it, for the methods it names. Nothing read, or the
+    /// routes forgotten: nothing is.
+    ///
+    /// FAILS before: a visit knew nothing of free routes, and sent a free path paid, on another
+    /// route's terms.
+    #[test]
+    fn a_path_on_a_free_route_of_the_seller_is_taken_for_free() {
+        let v = visit(1_000);
+        let at = |p: &str| format!("https://s.example{p}");
+        assert!(!v.is_free(&at("/web/main.js"), "GET"), "nothing read yet");
+        v.learn_routes(&json!({"routes": [{"path": "/web/", "free": true, "methods": ["GET", "HEAD"]},
+                                          {"path": "/web/paid/", "free": false, "methods": ["GET"]},
+                                          {"path": "/", "free": false, "methods": ["GET", "POST"]},
+                                          {"path": "/robots.txt", "free": true, "methods": ["GET"]}]}));
+        assert!(v.is_free(&at("/web/main.js?v=1"), "GET"));
+        assert!(v.is_free(&at("/web/index.html"), "HEAD"));
+        assert!(!v.is_free(&at("/web/main.js"), "POST"));
+        assert!(!v.is_free(&at("/web/paid/a.js"), "GET"), "a longer paid route holds it");
+        assert!(!v.is_free(&at("/Users/Me"), "GET"));
+        assert!(v.is_free(&at("/robots.txt"), "GET"));
+        assert!(!v.is_free(&at("/robots.txt/x"), "GET"));
+        assert!(!v.is_free(&at("/web/../Users"), "GET"));
+        assert!(!v.is_free(&at("/web/%2e%2e/Users"), "GET"));
+        v.forget_routes();
+        assert!(!v.is_free(&at("/web/main.js"), "GET"));
     }
 
     /// An answer that has stopped and waits for the signer to say what it cost holds no answer open:
