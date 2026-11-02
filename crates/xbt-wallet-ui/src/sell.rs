@@ -320,7 +320,8 @@ fn api_key(s: &str) -> Result<String, String> {
 pub(crate) fn jellyfin_libraries(address: &str, key: &str) -> Result<Vec<(String, String)>, String> {
     let url = format!("{}/Library/VirtualFolders", address.trim_end_matches('/'));
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
-    let text = match agent.get(&url).set("X-Emby-Token", key).call() {
+    // the one header every Jellyfin takes: 10.11 and later refuse X-Emby-Token by default, a valid key included
+    let text = match agent.get(&url).set("Authorization", &xbt_gateway::jellyfin::admin_authorization(key)).call() {
         Ok(r) => r.into_string().map_err(|e| format!("Jellyfin's answer could not be read: {e}"))?,
         Err(ureq::Error::Status(401 | 403, _)) => return Err("Jellyfin did not accept that API key: make one under Dashboard, API Keys, and paste it here.".into()),
         Err(ureq::Error::Status(code, _)) => return Err(format!("Jellyfin at {address} answered {code}: is this its address?")),
@@ -1991,6 +1992,38 @@ fn capacity_words(c: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Jellyfin's libraries are read with the one header every Jellyfin takes: one that refuses the older forms (10.11
+    /// and later, by default) and one that takes both (10.10) answer alike; a wrong key is still refused in words.
+    ///
+    /// FAILS before: the key went as X-Emby-Token, and a Jellyfin 10.11 said 401 to a valid key ("did not accept that API
+    /// key").
+    #[test]
+    fn a_jellyfins_libraries_are_read_whether_or_not_it_takes_the_older_headers() {
+        const KEY: &str = "0123456789abcdef0123456789abcdef";
+        struct Jf {
+            legacy: bool,
+        }
+        impl xbt_svc::http::Handler for Jf {
+            fn body_limit(&self, _: &str, _: &str) -> usize {
+                0
+            }
+            fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+                let modern = req.header("authorization").is_some_and(|a| a.starts_with("MediaBrowser ") && a.contains(&format!("Token=\"{KEY}\"")));
+                let legacy = self.legacy && req.header("x-emby-token") == Some(KEY);
+                if !(modern || legacy) {
+                    return xbt_svc::http::Response::text(401, "text/plain", "no");
+                }
+                xbt_svc::http::Response::text(200, "application/json", r#"[{"Name": "Films", "ItemId": "aaaa1111"}]"#)
+            }
+        }
+        for legacy in [false, true] {
+            let jf = xbt_svc::http::serve(std::sync::Arc::new(Jf { legacy }), std::net::TcpListener::bind("127.0.0.1:0").unwrap(), 2).unwrap();
+            let addr = format!("http://{}", jf.addr);
+            assert_eq!(jellyfin_libraries(&addr, KEY), Ok(vec![("aaaa1111".to_string(), "Films".to_string())]), "legacy forms taken: {legacy}");
+            assert!(jellyfin_libraries(&addr, "ffffffffffffffffffffffffffffffff").unwrap_err().contains("did not accept"), "legacy forms taken: {legacy}");
+        }
+    }
 
     #[test]
     fn the_settings_shown_hide_every_header_value() {

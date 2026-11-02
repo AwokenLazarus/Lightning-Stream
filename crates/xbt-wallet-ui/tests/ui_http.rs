@@ -1822,7 +1822,10 @@ fn the_sell_page_sets_up_buyers_own_accounts_with_the_sellers_jellyfin_key() {
             0
         }
         fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
-            if req.header("x-emby-token") != Some(KEY) {
+            // as Jellyfin 10.11 and later are by default: the key only in `Authorization: MediaBrowser … Token="…"`; X-Emby-Token
+            // and api_key are refused, a valid key included
+            let auth = req.header("authorization").unwrap_or("");
+            if !(auth.starts_with("MediaBrowser ") && auth.contains(&format!("Token=\"{KEY}\""))) || req.header("x-emby-token").is_some() {
                 return xbt_svc::http::Response::text(401, "text/plain", "no");
             }
             match req.path() {

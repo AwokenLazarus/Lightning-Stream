@@ -40,7 +40,13 @@ account; the client's own login is replaced by the gateway's, so no buyer can ac
   - the login page shows the buyer one user, their own, with no password: one tap logs them in, as
     themselves;
   - every request's token (headers, and the `api_key` of a stream's or a socket's URL) is replaced
-    by the buyer's own; a path naming another user's id is refused.
+    by the buyer's own; a path naming another user's id is refused. The buyer's token goes in one
+    header, `Authorization: MediaBrowser Client="…", Device="…", DeviceId="…", Version="…",
+    Token="…"`: the client's own Client, Device, DeviceId and Version are kept from the header it
+    sent (Lightning Stream's where it sent none), and every other way it said who it is
+    (`X-Emby-Authorization`, `X-Emby-Token`, `X-MediaBrowser-Token`) is dropped. The seller's key,
+    too, goes to Jellyfin only in that header. From 0.2.6: Jellyfin 10.11 and later refuse
+    `X-Emby-Token` and `api_key` by default, and the `Authorization` header works on 10.10 as well.
 - **Any other app**: a hook the seller provides (`"kind": "hook", "command": "…"`), given the
   buyer's handle and returning the headers or the cookie to send as that buyer.
 - **An app without accounts** keeps the shared guest (`upstream_headers`).

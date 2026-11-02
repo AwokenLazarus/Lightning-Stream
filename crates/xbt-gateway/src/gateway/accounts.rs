@@ -182,7 +182,9 @@ fn call(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&Value>)
 /// sale only, nothing downloaded or deleted; and its login.
 fn jellyfin_make(base: &str, key: &str, libraries: &[String], buyer: &str) -> Result<Account, String> {
     let base = base.trim_end_matches('/');
-    let admin = [("X-Emby-Token", key)];
+    // the one header every Jellyfin takes (10.11 and later refuse X-Emby-Token by default)
+    let auth = crate::jellyfin::admin_authorization(key);
+    let admin = [("Authorization", auth.as_str())];
     let name = format!("buyer-{}", handle(buyer));
     let password = random_password();
     let user_id = match call("POST", &format!("{base}/Users/New"), &admin, Some(&json!({"Name": name, "Password": password}))) {
@@ -266,17 +268,15 @@ pub fn jellyfin_request(a: &Account, method: &str, target: &str, headers: &[(Str
         if k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("apikey") { format!("{k}={}", a.token) } else { q.to_string() }
     }).collect();
     let target = if query.is_empty() { path.to_string() } else { format!("{path}?{}", query.join("&")) };
-    let mut out: Vec<(String, String)> = vec![];
-    for (k, v) in headers {
-        let l = k.to_ascii_lowercase();
-        match l.as_str() {
-            "x-emby-token" | "x-mediabrowser-token" => {}
-            // the client's own fields kept, its token not
-            "authorization" | "x-emby-authorization" => out.push((k.clone(), v.split(',').filter(|f| !f.trim().to_ascii_lowercase().starts_with("token=")).collect::<Vec<_>>().join(","))),
-            _ => out.push((k.clone(), v.clone())),
-        }
-    }
-    out.push(("X-Emby-Token".into(), a.token.clone()));
+    // every way the client said who it is goes, and one `Authorization: MediaBrowser` header says the buyer's token: the
+    // client's own fields (its name, device and version) kept from its header, where it sent one. One token, the buyer's,
+    // in the one form every Jellyfin takes (10.11 and later refuse X-Emby-Token by default)
+    let client = ["authorization", "x-emby-authorization"].iter()
+        .find_map(|n| headers.iter().find(|(k, v)| k.eq_ignore_ascii_case(n) && crate::jellyfin::fields(v).is_some()).map(|(_, v)| v.as_str()));
+    let mut out: Vec<(String, String)> = headers.iter()
+        .filter(|(k, _)| !matches!(k.to_ascii_lowercase().as_str(), "authorization" | "x-emby-authorization" | "x-emby-token" | "x-mediabrowser-token"))
+        .cloned().collect();
+    out.push(("Authorization".into(), crate::jellyfin::authorization(client, &a.token, &format!("ls-{}", a.name))));
     // any login is the buyer's own: the client's name and password are replaced by the account's
     let login = method == "POST" && lower == "/users/authenticatebyname";
     AsAccount::Send { target, headers: out, body: login.then(|| json!({"Username": a.name, "Pw": a.password}).to_string().into_bytes()) }
@@ -345,6 +345,112 @@ impl Gateway {
                 AsAccount::Send { target: target.to_string(), headers: h, body: None }
             }
             _ => jellyfin_request(a, method, target, headers),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    const ADMIN: &str = "5e11e7a9c0ffee5e11e7a9c0ffee5e11";
+    const BUYER_TOKEN: &str = "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
+    const USER: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The token an `Authorization: MediaBrowser …` value carries, and how many it carries.
+    fn tokens_in(v: &str) -> Vec<String> {
+        v.split(',').filter_map(|f| {
+            let f = f.trim();
+            let f = f.strip_prefix("MediaBrowser ").unwrap_or(f).trim();
+            let (k, val) = f.split_once('=')?;
+            k.trim().eq_ignore_ascii_case("token").then(|| val.trim().trim_matches('"').to_string())
+        }).collect()
+    }
+
+    /// A Jellyfin enough for a buyer's account: as 10.11 and later are by default (`legacy` false: the key only in
+    /// `Authorization: MediaBrowser … Token="…"`), or as 10.10 (`legacy`: X-Emby-Token too). It answers 401 to any other
+    /// way, and records every request's headers.
+    struct Jf {
+        legacy: bool,
+        seen: std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>,
+    }
+
+    impl xbt_svc::http::Handler for Jf {
+        fn body_limit(&self, _: &str, _: &str) -> usize {
+            1 << 16
+        }
+        fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+            self.seen.lock().unwrap().push((req.target.clone(), req.headers.clone()));
+            let path = req.path().to_string();
+            let json = |v: Value| xbt_svc::http::Response::text(200, "application/json", &v.to_string());
+            if path == "/Users/AuthenticateByName" {
+                return json(json!({"AccessToken": BUYER_TOKEN}));
+            }
+            let token = req.header("authorization").map(tokens_in).filter(|t| t.len() == 1).map(|t| t[0].clone())
+                .or_else(|| self.legacy.then(|| req.header("x-emby-token").map(str::to_string)).flatten());
+            match (token.as_deref(), path.as_str()) {
+                (Some(ADMIN), "/Users/New") => json(json!({"Id": USER})),
+                (Some(ADMIN), p) if p == format!("/Users/{USER}") => json(json!({"Id": USER, "Policy": {"IsAdministrator": false}})),
+                (Some(ADMIN), p) if p == format!("/Users/{USER}/Policy") => xbt_svc::http::Response::text(204, "text/plain", ""),
+                (Some(BUYER_TOKEN), "/Items") => json(json!({"Items": []})),
+                _ => xbt_svc::http::Response::text(401, "text/plain", "no"),
+            }
+        }
+    }
+
+    /// A buyer's account is made with the seller's key in the one header every Jellyfin takes, and the buyer's requests go
+    /// with one token, theirs, in that header: the web client's own fields (its name, device and version) kept, every
+    /// other token it sent dropped, and never the seller's key. Alike against a Jellyfin that refuses the older headers
+    /// (10.11 and later, by default) and one that takes both (10.10).
+    ///
+    /// FAILS before: the seller's key went as X-Emby-Token and the buyer's token too, so a Jellyfin 10.11 refused the
+    /// account (401) and would have refused every buyer request; a client header that began with its token kept it.
+    #[test]
+    fn a_buyers_account_and_requests_use_the_header_every_jellyfin_takes() {
+        for legacy in [false, true] {
+            let jf = Arc::new(Jf { legacy, seen: std::sync::Mutex::new(vec![]) });
+            let running = xbt_svc::http::serve(jf.clone(), std::net::TcpListener::bind("127.0.0.1:0").unwrap(), 4).unwrap();
+            let base = format!("http://{}", running.addr);
+            let a = jellyfin_make(&base, ADMIN, &["aaaa1111".to_string()], "buyer-key").unwrap_or_else(|e| panic!("legacy {legacy}: {e}"));
+            assert_eq!((a.user_id.as_str(), a.token.as_str()), (USER, BUYER_TOKEN));
+            // the seller's key went in the Authorization header only
+            for (t, h) in jf.seen.lock().unwrap().iter().filter(|(t, _)| !t.contains("AuthenticateByName")) {
+                assert!(h.iter().all(|(k, _)| !k.eq_ignore_ascii_case("x-emby-token")), "{t}: {h:?}");
+            }
+            // a request of Jellyfin's web client: its own header and token, and older ones beside them
+            let web = r#"MediaBrowser Token="client-tok", Client="Jellyfin Web", Device="Firefox", DeviceId="TW96aWxsYQ==", Version="10.11.0""#;
+            let headers: Vec<(String, String)> = vec![("Authorization".into(), web.into()), ("X-Emby-Token".into(), "client-2".into()),
+                                                      ("X-MediaBrowser-Token".into(), "client-3".into()), ("X-Emby-Authorization".into(), "MediaBrowser Token=\"client-4\"".into()),
+                                                      ("Accept".into(), "application/json".into())];
+            let AsAccount::Send { target, headers: out, body } = jellyfin_request(&a, "GET", "/Items?api_key=client-tok&Recursive=true", &headers) else {
+                panic!("sent on")
+            };
+            assert!(body.is_none());
+            assert_eq!(target, format!("/Items?api_key={BUYER_TOKEN}&Recursive=true"));
+            let auth: Vec<&(String, String)> = out.iter().filter(|(k, _)| ["authorization", "x-emby-authorization", "x-emby-token", "x-mediabrowser-token"]
+                .contains(&k.to_ascii_lowercase().as_str())).collect();
+            assert_eq!(auth.len(), 1, "one way to say who it is: {out:?}");
+            assert!(auth[0].0.eq_ignore_ascii_case("authorization"), "{out:?}");
+            assert_eq!(tokens_in(&auth[0].1), vec![BUYER_TOKEN.to_string()], "one token, the buyer's: {out:?}");
+            for kept in ["Client=\"Jellyfin Web\"", "Device=\"Firefox\"", "DeviceId=\"TW96aWxsYQ==\"", "Version=\"10.11.0\""] {
+                assert!(auth[0].1.contains(kept), "the client's {kept} kept: {}", auth[0].1);
+            }
+            assert!(out.iter().any(|(k, v)| k == "Accept" && v == "application/json"), "{out:?}");
+            assert!(!format!("{out:?}{target}").contains(ADMIN), "the seller's key never goes with a buyer's request");
+            // and Jellyfin takes it
+            let mut r = ureq::get(&format!("{base}/Items"));
+            for (k, v) in &out {
+                r = r.set(k, v);
+            }
+            assert_eq!(r.call().map(|r| r.status()).unwrap_or_else(|e| match e { ureq::Error::Status(c, _) => c, _ => 0 }), 200, "legacy {legacy}: {out:?}");
+            // no header of the client's: one of ours, with the buyer's token
+            let AsAccount::Send { headers: out, .. } = jellyfin_request(&a, "GET", "/Items", &[]) else { panic!("sent on") };
+            let auth: Vec<&String> = out.iter().filter(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v).collect();
+            assert_eq!(auth.len(), 1, "{out:?}");
+            assert!(auth[0].starts_with("MediaBrowser ") && auth[0].contains("Client=\"Lightning Stream\""), "{out:?}");
+            assert_eq!(tokens_in(auth[0]), vec![BUYER_TOKEN.to_string()]);
+            running.stopper().stop();
         }
     }
 }
