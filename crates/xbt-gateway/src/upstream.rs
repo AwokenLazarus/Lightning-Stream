@@ -394,6 +394,7 @@ mod tests {
             upstream: None,
             strip_prefix: false,
             accept_gzip: false,
+            cache_s: None,
             upstream_headers: vec![],
             deny_paths: vec![],
             allow_paths: vec![],

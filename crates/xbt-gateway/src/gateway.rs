@@ -250,6 +250,26 @@ fn larger_than_shown(most: Option<u64>, answer: &Answer) -> Option<(u64, u64)> {
     (total > most).then_some((total, most))
 }
 
+/// Whether a free route's answer goes to the buyer gzip-compressed ([`Gateway::free`]): a GET whose
+/// buyer takes gzip (`Accept-Encoding`), answered 200 with text the size of a web app's parts (HTML,
+/// scripts, styles, JSON, SVG, XML, WebAssembly), whole (no range) and not compressed already.
+fn gzip_for(req: &Request, answer: &Answer) -> bool {
+    let header = |h: &[(String, String)], n: &str| h.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.to_ascii_lowercase());
+    let takes = header(&req.headers, "accept-encoding").is_some_and(|a| a.split(',').any(|e| {
+        let mut parts = e.split(';');
+        let name = parts.next().unwrap_or("").trim();
+        // `gzip;q=0` refuses it
+        name == "gzip" && !parts.any(|p| p.trim().replace(' ', "") == "q=0")
+    }));
+    let t = header(&answer.headers, "content-type").unwrap_or_default();
+    let t = t.split(';').next().unwrap_or("").trim();
+    // an event stream is sent as it is: each event as it comes
+    let text = (t.starts_with("text/") && t != "text/event-stream") || t.ends_with("+json") || t.ends_with("+xml")
+        || ["application/javascript", "application/json", "application/xml", "application/wasm", "image/svg+xml", "application/manifest+json"].contains(&t);
+    req.method == "GET" && takes && answer.status == 200 && text && header(&answer.headers, "content-range").is_none()
+        && header(&answer.headers, "content-encoding").is_none() && answer.length.is_none_or(|n| n >= 256)
+}
+
 fn addr_name(client: Option<IpAddr>) -> String {
     match client.map(AddrKey::of) {
         Some(AddrKey::V4(a)) => format!("v4:{a}"),
@@ -1665,7 +1685,8 @@ impl Gateway {
                 ))
             }
         };
-        let headers = Self::passed_headers(&answer);
+        let mut headers = Self::passed_headers(&answer);
+        headers.extend(route.cache_headers(&req.method, &req.target, answer.status, &req.headers, &answer.headers));
         // a free route's long answers count against its `max_streams` and rate too
         let slot = if answer.status < 300 && admission::is_long(&answer.headers, answer.length) {
             match self.load.stream(route, "") {
@@ -1675,6 +1696,48 @@ impl Gateway {
         } else {
             None
         };
+        // a buyer that takes gzip gets a free route's text compressed: nothing of a free answer is metered or signed, and
+        // over a slow link (a relay far away) a web app's scripts and styles are a third of the bytes. The buyer's client
+        // unpacks it (the wallet's does, as it asks)
+        if gzip_for(req, &answer) {
+            // the compressed bytes are not the service's: its validator is weakened (a range resumed by `If-Range` compares
+            // strongly, so never matches it and gets the whole body; a revalidation compares weakly, and still does), and no
+            // range of them is offered
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("accept-ranges"));
+            for h in headers.iter_mut().filter(|(k, v)| k.eq_ignore_ascii_case("etag") && !v.trim_start().starts_with("W/")) {
+                h.1 = format!("W/{}", h.1.trim());
+            }
+            headers.push(("Content-Encoding".into(), "gzip".into()));
+            headers.push(("Vary".into(), "Accept-Encoding".into()));
+            let (status, mut src) = (answer.status, answer.body);
+            return Reply::Stream(Streamed {
+                status,
+                headers,
+                length: None,
+                body: Box::new(move |out| {
+                    use std::io::Write as _;
+                    let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    let mut buf = vec![0u8; CHUNK];
+                    loop {
+                        let n = src.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        z.write_all(&buf[..n])?;
+                        // what came is sent now, whole: a slow answer is not held back for the next chunk
+                        z.flush()?;
+                        if !z.get_ref().is_empty() {
+                            let done = std::mem::take(z.get_mut());
+                            out.send(&done)?;
+                            if let Some(slot) = &slot {
+                                slot.sent(done.len() as u64);
+                            }
+                        }
+                    }
+                    out.send(&z.finish()?)
+                }),
+            });
+        }
         let (status, length, mut src) = (answer.status, answer.length, answer.body);
         Reply::Stream(Streamed {
             status,
@@ -1916,7 +1979,9 @@ impl Gateway {
                 ));
             }
         };
-        let headers = Self::passed_headers(&answer);
+        let mut headers = Self::passed_headers(&answer);
+        // the route's `cache`: how long the buyer's browser keeps the answer, where the service said nothing of it
+        headers.extend(route.cache_headers(&req.method, &req.target, answer.status, &req.headers, &answer.headers));
         if answer.status >= 400 {
             // an error is not a piece: passed on, capped, not charged
             refund(reserve);
@@ -1953,7 +2018,6 @@ impl Gateway {
             // answer keeps the length the service stated (what a HEAD is asked for).
             refund(first_second);
             let charged = reserve.saturating_sub(first_second);
-            let mut headers = headers;
             let receipt = self.receipt(
                 &a.session,
                 a.seq,
@@ -2018,7 +2082,6 @@ impl Gateway {
             slot,
         };
         self.flush();
-        let mut headers = headers;
         if let Some(head) = self.receipt(&a.session, a.seq, reserve, &a.digest, answer.status, "") {
             let mut sr = settlement_response(&head, &self.cfg.network, "", true);
             sr["extra"]["stream"] = true.into();

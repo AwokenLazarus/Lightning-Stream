@@ -432,6 +432,8 @@
   $$(".app-visit[data-visit]").forEach(function (box) {
     var frame = $("iframe.seller-app", box), spent = $("[data-visit-spent]", box), state = $("[data-visit-state]", box), note = $("[data-visit-note]", box);
     var paid = $("[data-visit-paid]", box), refusal = $("[data-visit-refusal]", box), shown = "";
+    // the visit's limit as it stands, and the owner's button to add to it once most of it is used (never by itself)
+    var limitEl = $("[data-visit-limit]", box), add = $("[data-visit-add]", box), csrf = $("input[name='csrf']", box);
     var visit = box.getAttribute("data-visit"), port = box.getAttribute("data-port"), code = box.getAttribute("data-code");
     if (!frame || !/^[0-9a-f]+$/.test(visit || "") || !/^[0-9]+$/.test(port || "") || !/^[0-9a-f]+$/.test(code || "")) return;
     frame.src = location.protocol + "//" + location.hostname + ":" + port + "/__ls/enter?c=" + code;
@@ -475,9 +477,29 @@
         add("code", String(r.details), p);
       }
     }
+    if (add && csrf) {
+      add.addEventListener("click", function () {
+        add.disabled = true;
+        var body = new URLSearchParams();
+        body.set("csrf", csrf.value);
+        body.set("visit", visit);
+        body.set("add", add.getAttribute("data-visit-add") || "0");
+        fetch("./app-limit", { method: "POST", credentials: "same-origin", body: body }).then(function () { add.disabled = false; ask(); })
+          .catch(function () { add.disabled = false; });
+      });
+    }
     function ask() {
       fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
         if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
+        if (limitEl && typeof v.limit_sats === "number") limitEl.textContent = v.limit_sats.toLocaleString();
+        var near = typeof v.spent_sats === "number" && typeof v.limit_sats === "number" && v.spent_sats >= 0.8 * v.limit_sats;
+        if (add) add.hidden = !(near || v.limit_reached);
+        if (state) {
+          if (v.limit_reached) { state.textContent = "Limit reached"; state.className = "pill warn"; }
+          else if (!v.ended) { state.textContent = "Open"; state.className = "pill good"; }
+        }
+        // at its limit the visit waits for the owner: the page stays as it is, and Add lets it go on
+        if (v.limit_reached) return;
         if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
           ? " · paid " + v.prepaid_sats.toLocaleString() + " sat · credit left " + (v.credit_sats || 0).toLocaleString() + " sat"
           : typeof v.credit_left_sats === "number" ? " · from your credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat left" : "";

@@ -82,6 +82,11 @@ pub struct Route {
     /// compressed (llama.cpp's server does). The gateway unpacks it and sends the buyer the plain
     /// body, which is what it meters and signs.
     pub accept_gzip: bool,
+    /// How long a buyer's browser may keep this route's answers (`cache`, seconds), where the service
+    /// says nothing of it ([`Route::cache_headers`]). `None`: a free route's answers other than HTML
+    /// pages are kept [`FREE_CACHE_S`], a priced route's are left as the service sent them; `Some(0)`:
+    /// nothing is added.
+    pub cache_s: Option<u64>,
     /// Headers the gateway adds to every request of this route (`upstream_headers`), over any the
     /// buyer sent of the same name: the seller's guest login for a service that needs one. They
     /// never go to the buyer.
@@ -147,6 +152,40 @@ pub enum Accounts {
 }
 
 impl Route {
+    /// The headers the gateway adds to an answer of this route for a browser's cache: a `Cache-Control`, only to a GET or
+    /// HEAD answered 200, 203, 204, 206, 301 or 304, whose service said nothing of caching (no `Cache-Control`, `Expires`
+    /// or `Pragma`) and set no cookie, for the route's `cache`, else (a free route, an answer that is not an HTML page)
+    /// [`FREE_CACHE_S`]. `public` only on a free route and for a request that carries no credential ([`CREDENTIAL_HEADERS`],
+    /// or a key in its query, [`CREDENTIAL_PARAMS`]), with a `Vary` on those headers; `private` otherwise, and always on a
+    /// priced route or one with buyers' accounts, so that a shared cache in front of the gateway never serves a paid or a
+    /// buyer's own answer to another. Empty: nothing is added.
+    pub fn cache_headers(&self, method: &str, target: &str, status: u16, request: &[(String, String)], answer: &[(String, String)]) -> Vec<(String, String)> {
+        let has = |h: &[(String, String)], n: &str| h.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
+        if !matches!(method, "GET" | "HEAD") || !matches!(status, 200 | 203 | 204 | 206 | 301 | 304) {
+            return vec![];
+        }
+        if ["cache-control", "expires", "pragma", "set-cookie"].iter().any(|n| has(answer, n)) {
+            return vec![];
+        }
+        let html = answer.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.trim_start().to_ascii_lowercase().starts_with("text/html"));
+        let secs = match self.cache_s {
+            Some(n) => n,
+            None if self.free && !html => FREE_CACHE_S,
+            None => 0,
+        };
+        if secs == 0 {
+            return vec![];
+        }
+        let query_key = target.split_once('?').is_some_and(|(_, q)| {
+            q.split('&').any(|kv| CREDENTIAL_PARAMS.contains(&kv.split('=').next().unwrap_or("").to_ascii_lowercase().as_str()))
+        });
+        let credential = CREDENTIAL_HEADERS.iter().any(|n| has(request, n)) || query_key;
+        if !self.free || self.accounts.is_some() || credential {
+            return vec![("Cache-Control".into(), format!("private, max-age={secs}"))];
+        }
+        vec![("Cache-Control".into(), format!("public, max-age={secs}")), ("Vary".into(), CREDENTIAL_HEADERS.join(", "))]
+    }
+
     /// Whether the gateway refuses `path` (decoded) on this route. The longest prefix of the two
     /// lists that `path` starts with decides: a `deny_paths` entry refuses, an `allow_paths` entry
     /// serves; one that starts with neither is served when `allow_paths` is empty and refused when
@@ -284,7 +323,22 @@ pub struct LinkConfig {
     /// connection to its relay, and a relay limits each connection on its own, so buyers relayed
     /// to the shop share several instead of one; buyers spread over them and fall back to another.
     pub endpoints: usize,
+    /// The first of the fixed UDP ports the link's keys bind (`link.port`): key `i` binds `port + i`,
+    /// on IPv4 and IPv6. A seller who allows inbound UDP on those ports is reached directly by buyers
+    /// behind a NAT that gives each destination another port (commercial VPNs, carrier NAT), where a
+    /// random port would leave them on a relay. `None`: a random port per key and family, as before.
+    pub port: Option<u16>,
 }
+
+/// How long a buyer's browser keeps a free route's answers that say nothing of it (a web app's
+/// scripts, styles and images, which a media server sends with a validator and no `Cache-Control`).
+pub const FREE_CACHE_S: u64 = 3600;
+/// Request headers that carry a buyer's credential: an answer to a request with one is never `public` ([`Route::cache_headers`]).
+pub const CREDENTIAL_HEADERS: [&str; 7] = ["Authorization", "Cookie", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token", "X-Api-Key", "X-Auth-Token"];
+/// Query parameters that carry one (lower case).
+pub const CREDENTIAL_PARAMS: [&str; 5] = ["api_key", "apikey", "access_token", "token", "x-emby-token"];
+/// The longest a route's `cache` may be: a year.
+pub const MAX_CACHE_S: u64 = 365 * 86_400;
 
 /// The link keys a gateway serves on unless its `link.endpoints` says otherwise.
 pub const DEFAULT_LINK_ENDPOINTS: usize = 4;
@@ -299,7 +353,7 @@ pub const MAX_LINK_RELAYS: usize = 4;
 
 impl LinkConfig {
     fn parse(v: &Value) -> Result<Self, String> {
-        let m = obj(v, "link", &["relays", "private", "endpoints"])?;
+        let m = obj(v, "link", &["relays", "private", "endpoints", "port"])?;
         let relays = match m.get("relays") {
             None => Vec::new(),
             Some(Value::Array(a)) => a
@@ -331,7 +385,16 @@ impl LinkConfig {
                 _ => return Err(format!("link.endpoints is a whole number from 1 to {MAX_LINK_ENDPOINTS}")),
             },
         };
-        Ok(Self { relays, private, endpoints })
+        // every key's port, base + i, is a port above the privileged ones
+        let port = match m.get("port") {
+            None | Some(Value::Null) => None,
+            Some(n) => match n.as_u64() {
+                Some(p) if p >= 1024 && p + endpoints as u64 - 1 <= u64::from(u16::MAX) => Some(p as u16),
+                _ => return Err(format!("link.port is the first UDP port of the link's keys, a whole number from 1024 to {} (key i binds port + i)",
+                                        u64::from(u16::MAX) + 1 - endpoints as u64)),
+            },
+        };
+        Ok(Self { relays, private, endpoints, port })
     }
 }
 
@@ -987,6 +1050,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "strip_prefix",
             "max_output_tokens",
             "accept_gzip",
+            "cache",
             "upstream_headers",
             "deny_paths",
             "allow_paths",
@@ -1115,6 +1179,13 @@ fn route(v: &Value) -> Result<Route, String> {
         Some(Value::Bool(b)) => *b,
         _ => return Err(bad("accept_gzip is true or false")),
     };
+    let cache_s = match r.get("cache") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= MAX_CACHE_S => Some(n),
+            _ => return Err(bad(&format!("cache is how many seconds a buyer's browser may keep this route's answers, a whole number from 0 to {MAX_CACHE_S}"))),
+        },
+    };
     let mut upstream_headers = vec![];
     if let Some(h) = r.get("upstream_headers") {
         let m = h.as_object().ok_or_else(|| bad("upstream_headers is an object of header names and values"))?;
@@ -1226,6 +1297,7 @@ fn route(v: &Value) -> Result<Route, String> {
         upstream,
         strip_prefix,
         accept_gzip,
+        cache_s,
         upstream_headers,
         deny_paths,
         allow_paths,
@@ -1475,6 +1547,88 @@ mod tests {
         assert_eq!(Config::from_json(&v).unwrap().link.unwrap().endpoints, 1);
         for bad in [json!(0), json!(9), json!(2.5), json!("2")] {
             v["link"] = json!({"endpoints": bad.clone()});
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
+    }
+
+    /// A browser keeps a free route's scripts and styles for an hour where the service said nothing of
+    /// caching (a media server sends a validator and no `Cache-Control`), so that the next visit loads
+    /// the web client from the browser and not again over a slow link; a route's `cache` sets how long,
+    /// on any route, and 0 adds nothing. An HTML page, an answer the service said something of, one that
+    /// sets a cookie, a POST and an error are left as they are. Only a free route's answer to a request
+    /// with no credential is `public`, with a `Vary` on the credential headers; a priced route's, an
+    /// accounts route's, and any answer to a request with a login, a cookie or a key in its query is
+    /// `private`, so that a shared cache in front of the gateway never serves a paid answer unpaid or one
+    /// buyer's to another.
+    ///
+    /// FAILS before: a priced route's `cache` made its paid answers `public`, and a key in the query or an
+    /// `X-Emby-Token` left a buyer's answer `public`.
+    #[test]
+    fn a_free_routes_static_answers_are_kept_by_the_browser_and_paid_ones_only_privately() {
+        let h = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let cc = |r: &Route, m: &str, t: &str, st: u16, req: &[(String, String)], ans: &[(String, String)]| {
+            let got = r.cache_headers(m, t, st, req, ans);
+            let vary = got.iter().find(|(k, _)| k == "Vary").map(|(_, v)| v.clone());
+            // `public` comes with a Vary on the credential headers, `private` with none
+            let c = got.iter().find(|(k, _)| k == "Cache-Control").map(|(_, v)| v.clone());
+            assert_eq!(vary.is_some(), c.as_deref().is_some_and(|c| c.starts_with("public")), "{got:?}");
+            if let Some(v) = vary {
+                assert!(v.contains("Authorization") && v.contains("X-Emby-Token") && v.contains("Cookie"), "{v}");
+            }
+            c
+        };
+        let js = h(&[("Content-Type", "application/javascript"), ("ETag", "\"a\"")]);
+        let mut free = parse_route_for_tests("/web/");
+        free.free = true;
+        assert_eq!(cc(&free, "GET", "/web/a.js", 200, &[], &js).as_deref(), Some("public, max-age=3600"));
+        assert_eq!(cc(&free, "HEAD", "/web/a.js", 304, &[], &js).as_deref(), Some("public, max-age=3600"));
+        for cred in ["Cookie", "Authorization", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token", "X-Api-Key"] {
+            assert_eq!(cc(&free, "GET", "/web/a.js", 200, &h(&[(cred, "x")]), &js).as_deref(), Some("private, max-age=3600"), "{cred}");
+        }
+        for q in ["/web/a.js?api_key=k", "/web/a.js?v=1&ApiKey=k", "/web/a.js?access_token=k"] {
+            assert_eq!(cc(&free, "GET", q, 200, &[], &js).as_deref(), Some("private, max-age=3600"), "{q}");
+        }
+        assert_eq!(cc(&free, "GET", "/web/a.js?v=1", 200, &[], &js).as_deref(), Some("public, max-age=3600"));
+        assert_eq!(cc(&free, "GET", "/web/", 200, &[], &h(&[("Content-Type", "text/html; charset=utf-8")])), None, "an app's page is asked again");
+        assert_eq!(cc(&free, "GET", "/web/a.css", 200, &[], &h(&[("Content-Type", "text/css"), ("Cache-Control", "no-cache")])), None);
+        assert_eq!(cc(&free, "GET", "/web/a.css", 200, &[], &h(&[("Content-Type", "text/css"), ("Set-Cookie", "a=b")])), None);
+        assert_eq!(cc(&free, "POST", "/web/a.js", 200, &[], &js), None);
+        assert_eq!(cc(&free, "GET", "/web/a.js", 404, &[], &js), None);
+        let paid = parse_route_for_tests("/");
+        assert_eq!(cc(&paid, "GET", "/a.js", 200, &[], &js), None, "a priced route is left as it is");
+        // `cache` in the config
+        let mut v = base();
+        v["routes"] = json!([{"path": "/web/", "free": true, "cache": 86_400}, {"path": "/img/", "free": true, "cache": 0},
+                             {"path": "/", "price": {"request_msat": 1000}, "cache": 600}]);
+        let c = Config::from_json(&v).unwrap();
+        let r = |p: &str| c.routes.iter().find(|r| r.path == p).unwrap().clone();
+        assert_eq!(cc(&r("/web/"), "GET", "/web/", 200, &[], &h(&[("Content-Type", "text/html")])).as_deref(), Some("public, max-age=86400"));
+        assert_eq!(cc(&r("/img/"), "GET", "/img/a.png", 200, &[], &js), None);
+        // a paid answer is kept by the buyer's own browser alone, whatever is asked
+        assert_eq!(cc(&r("/"), "GET", "/a.js", 200, &[], &js).as_deref(), Some("private, max-age=600"));
+        for bad in [json!(-1), json!("3600"), json!(1.5), json!(MAX_CACHE_S + 1)] {
+            v["routes"] = json!([{"path": "/web/", "free": true, "cache": bad.clone()}]);
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
+    }
+
+    /// `link.port` fixes the link's UDP ports, key i on port + i; with none, the ports are random.
+    #[test]
+    fn a_link_binds_fixed_ports_where_its_config_names_the_first() {
+        let mut v = base();
+        v["public_url"] = json!("link");
+        v["link"] = json!({});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().port, None);
+        v["link"] = json!({"port": 7850});
+        let l = Config::from_json(&v).unwrap().link.unwrap();
+        assert_eq!((l.port, l.endpoints), (Some(7850), DEFAULT_LINK_ENDPOINTS));
+        // the last key's port is in range: 65532 + 3 is 65535
+        v["link"] = json!({"port": 65532});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().port, Some(65532));
+        v["link"] = json!({"port": 65535, "endpoints": 1});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().port, Some(65535));
+        for bad in [json!(0), json!(80), json!(1023), json!(65533), json!(70000), json!(7850.5), json!("7850"), json!(-1)] {
+            v["link"] = json!({"port": bad.clone()});
             assert!(Config::from_json(&v).is_err(), "{bad}");
         }
     }

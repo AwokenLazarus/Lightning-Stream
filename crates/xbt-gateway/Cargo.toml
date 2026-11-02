@@ -26,6 +26,8 @@ getrandom = "0.2"
 # TLS to the node, pinned to its own certificate (as the wallet's Lightning rail pins it)
 secp256k1.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# a free route's text answers sent compressed to a buyer that takes gzip (already in the tree through ureq)
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

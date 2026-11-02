@@ -195,3 +195,23 @@ fn a_shop_key_that_hangs_costs_a_buyer_half_a_second_not_the_whole_wait() {
     get(port, &shop, size);
     assert!(t.elapsed() < Duration::from_millis(400), "the next answer took {:?}", t.elapsed());
 }
+
+/// A seller's link on a fixed UDP port (the gateway's `link.port`) binds that port, so that a
+/// seller who opens it is reached directly; one with none binds a random port, as before. A port
+/// already taken is an error at start, not a silent random port.
+#[test]
+fn a_link_on_a_fixed_port_binds_that_port() {
+    use xbt_iroh_link::Options;
+    // a free UDP port, found by binding one and letting it go
+    let port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap().local_addr().unwrap().port();
+    let opts = || Options { relays: Relays::None, serving: true, private: false, lookup: None };
+    let link = Link::start_on_port(secret(), opts(), Some(port)).unwrap();
+    let bound = link.bound_sockets();
+    assert!(bound.iter().any(|a| a.is_ipv4() && a.port() == port), "{bound:?}");
+    assert!(bound.iter().all(|a| a.port() == port), "every family on the fixed port: {bound:?}");
+    // the port is the link's: a second link cannot take it
+    assert!(Link::start_on_port(secret(), opts(), Some(port)).is_err(), "a second link took the same port");
+    drop(link);
+    let random = Link::start_on_port(secret(), opts(), None).unwrap();
+    assert!(random.bound_sockets().iter().any(|a| a.is_ipv4() && a.port() != 0), "{:?}", random.bound_sockets());
+}

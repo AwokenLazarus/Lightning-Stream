@@ -570,3 +570,119 @@ fn a_path_on_a_free_route_is_asked_for_unpaid() {
     assert!(gone.len() >= 2 && gone[0]["max_sats"] == 0, "{gone:?}");
     assert!(gone[1..].iter().all(|c| c["known_terms"] == true && c["max_sats"].as_i64().unwrap() >= 1), "{gone:?}");
 }
+
+/// A stand-in signer whose session starts with `credit` sat and sells tickets of [`TICKET`] sat:
+/// each answer under `/part/` costs [`COST`] and has [`PART`] bytes. As the signer does, an answer
+/// whose credit runs out and whose call has no room left for a ticket is cut half-way (its length
+/// stated, its call not whole); a call that names `top_up_sats` buys tickets before it goes until the
+/// credit covers that, within its `max_sats`. Each reply says the balance left and the tickets bought.
+fn signer_with_credit(dir: &Path, credit: i64) -> (PathBuf, Arc<Mutex<Session>>) {
+    let sock = dir.join("signer.sock");
+    let l = UnixListener::bind(&sock).unwrap();
+    let stream_dir = dir.to_path_buf();
+    let session = Arc::new(Mutex::new(Session { credit, ..Session::default() }));
+    let s2 = session.clone();
+    std::thread::spawn(move || {
+        for conn in l.incoming() {
+            let mut conn = conn.unwrap();
+            let (stream_dir, session) = (stream_dir.clone(), s2.clone());
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                BufReader::new(conn.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let p: Value = serde_json::from_str::<Value>(&line).unwrap()["params"].clone();
+                let url = p["url"].as_str().unwrap_or("").to_string();
+                if !url.contains("/part/") {
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "xbt402", "reason": "no such thing", "charged_sats": 0}}));
+                    return;
+                }
+                let (max, top) = (p["max_sats"].as_i64().unwrap(), p["top_up_sats"].as_i64().unwrap_or(0));
+                let mut s = session.lock().unwrap();
+                s.calls.push(p.clone());
+                let mut charged = 0;
+                while s.credit < top && max - charged >= TICKET {
+                    s.credit += TICKET;
+                    charged += TICKET;
+                }
+                let whole = if s.credit >= COST {
+                    true
+                } else if max - charged >= TICKET {
+                    s.credit += TICKET;
+                    charged += TICKET;
+                    true
+                } else {
+                    false
+                };
+                let used = if whole { COST } else { s.credit };
+                s.credit -= used;
+                s.charged += charged;
+                let balance = s.credit;
+                drop(s);
+                let mut out = UnixStream::connect(stream_dir.join(p["stream_to"].as_str().unwrap())).unwrap();
+                let _ = writeln!(out, "{}", json!({"status": 200, "content_length": PART, "content_type": "application/octet-stream"}));
+                let body = vec![5u8; PART];
+                let _ = out.write_all(if whole { &body } else { &body[..PART / 2] });
+                drop(out);
+                let mut r = json!({"verdict": "allow", "status": 200, "charged_sats": charged, "tickets_released": charged / TICKET, "complete": whole,
+                                   "price_msat": (used * 1000).to_string(), "balance_msat": (balance * 1000).to_string()});
+                if !whole {
+                    r["ended"] = "stopped by the wallet: max_sats: the next ticket of this seller is over this call's limit".into();
+                }
+                let _ = writeln!(conn, "{}", json!({"id": 1, "result": r}));
+            });
+        }
+    });
+    (sock, session)
+}
+
+const PART: usize = 200_000;
+
+/// A visit that starts on a little credit left from an earlier one keeps that credit ahead of its
+/// requests: once a call says the credit is low, the next request tops it up with a ticket before it
+/// goes, so that no answer is cut where the credit ends. Every answer comes whole, and the visit
+/// spends within its limit.
+///
+/// FAILS before: each request ran with its share (125 sat of 1,000), too small for a 600 sat ticket,
+/// and the answer that found the credit spent was cut half-way: the browser saw a body short of its
+/// `Content-Length` (a bitrate test, a film's range).
+#[test]
+fn a_visit_tops_its_credit_up_before_an_answer_runs_out_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer_with_credit(dir.path(), 150);
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 1_000);
+    for i in 0..6 {
+        let (status, head, body) = ask(&addr, "GET", &format!("/v/{visit}/part/{i}"), "", b"");
+        assert_eq!((status, body.len()), (200, PART), "part {i}: {head}");
+    }
+    let s = session.lock().unwrap();
+    assert!(s.charged > 0 && s.charged <= 1_000, "{}", s.charged);
+    // the top-up went with the lane's request only
+    assert!(s.calls.iter().filter(|c| c["top_up_sats"].as_i64().unwrap_or(0) > 0).count() >= 1);
+    drop(s);
+    let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+    let r: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!((r["used_msat"].as_u64(), r["held_sats"].as_i64()), (Some(6 * COST as u64 * 1000), Some(0)), "{r}");
+    assert!(r["spent_sats"].as_i64().unwrap() <= 1_000, "{r}");
+}
+
+/// A visit's limit is raised by the wallet on this box, as JSON: a request that names an `Origin` (a browser's, a page
+/// that found the connector's port) or that is not JSON (a form) is refused, and the limit stays as it was.
+///
+/// FAILS before: any POST raised it.
+#[test]
+fn a_visits_limit_is_raised_only_by_the_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, _) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 1_000);
+    let raise = |extra: &str, body: &[u8]| ask(&addr, "POST", &format!("/visits/{visit}/limit"), extra, body).0;
+    let body = json!({"limit_sats": 5_000}).to_string();
+    assert_eq!(raise("Content-Type: application/json\r\nOrigin: http://evil.example\r\n", body.as_bytes()), 403);
+    assert_eq!(raise("Content-Type: application/x-www-form-urlencoded\r\n", b"limit_sats=5000"), 403);
+    assert_eq!(raise("Content-Type: text/plain\r\n", body.as_bytes()), 403);
+    let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["limit_sats"], 1_000);
+    assert_eq!(raise("Content-Type: application/json\r\n", body.as_bytes()), 200);
+    let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["limit_sats"], 5_000);
+}

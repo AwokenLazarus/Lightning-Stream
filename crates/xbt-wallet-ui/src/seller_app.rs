@@ -25,6 +25,22 @@ pub const SUGGESTED_LIMIT: i64 = 1_000;
 const _: () = assert!(SUGGESTED_LIMIT >= MIN_CALL_SATS);
 /// The largest limit a visit may have, in sats.
 const MAX_VISIT_SATS: i64 = 10_000_000;
+/// The most the page suggests for a video app: what it asks for ten minutes of film at 1 MiB/s (about
+/// 1080p) by its listed price, at least [`SUGGESTED_LIMIT`] and at most this. The bar offers more as the
+/// visit nears its limit ([`App::app_limit`]); nothing is raised without the owner's click.
+const SUGGESTED_VIDEO_MAX: i64 = 20_000;
+
+/// The limit the page suggests for `svc`: [`SUGGESTED_LIMIT`], or for a video app priced by the byte,
+/// ten minutes of 1080p at its listed price (whole thousands, at most [`SUGGESTED_VIDEO_MAX`]).
+pub(crate) fn suggested_limit(svc: &crate::services::Service) -> i64 {
+    if svc.kind != crate::services::Kind::Video {
+        return SUGGESTED_LIMIT;
+    }
+    let gib_msat = svc.price_ceiling().and_then(|c| c.get("gib_msat").and_then(Value::as_u64)).unwrap_or(0);
+    // 600 MiB, in sats
+    let ten_minutes = i64::try_from((u128::from(gib_msat) * 600 / 1024).div_ceil(1000)).unwrap_or(i64::MAX);
+    (ten_minutes.saturating_add(999) / 1000).saturating_mul(1000).clamp(SUGGESTED_LIMIT, SUGGESTED_VIDEO_MAX)
+}
 
 /// The visit's limit from what the owner entered. A limit under the smallest ticket a shop sells
 /// with its routing fees ([`MIN_CALL_SATS`]) would open a visit whose first request is refused
@@ -174,7 +190,7 @@ impl App {
         // the node can't send a first ticket: said before anything is paid
         let warn = crate::pay_feedback::cant_send_card(self.spendable_sats(), MIN_CALL_SATS, "this shop");
         // a limit the owner entered under the smallest ticket comes back raised to it (see [`visit_limit`])
-        let suggested = q.get("limit").and_then(|v| v.parse::<i64>().ok()).filter(|n| (MIN_CALL_SATS..=MAX_VISIT_SATS).contains(n)).unwrap_or(SUGGESTED_LIMIT);
+        let suggested = q.get("limit").and_then(|v| v.parse::<i64>().ok()).filter(|n| (MIN_CALL_SATS..=MAX_VISIT_SATS).contains(n)).unwrap_or_else(|| suggested_limit(&svc));
         // the shop by its listed name ("Lightning Stream Genesis"), never its key or made-up address
         let shop = self.seller_name(&svc.seller);
         let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
@@ -305,7 +321,9 @@ impl App {
             <p class=\"hint\" data-visit-note>{}'s own page. It cannot see your wallet. Close this page or press Stop to end the visit.</p></section>",
             esc(&visit), esc(&code),
             if preview { "Your own shop, free: nothing is paid".to_string() } else {
-                format!("<span data-visit-spent>0</span> sat used of <strong>{} sat</strong> on this visit<span data-visit-paid></span>", crate::html::group3(limit.unsigned_abs()))
+                format!("<span data-visit-spent>0</span> sat used of <strong><span data-visit-limit>{}</span> sat</strong> on this visit<span data-visit-paid></span> \
+                         <button type=\"button\" class=\"secondary\" data-visit-add=\"{}\" hidden>Add {} sat</button>",
+                        crate::html::group3(limit.unsigned_abs()), limit, crate::html::group3(limit.unsigned_abs()))
             },
             esc(&svc.price_text), App::csrf_input(ctx), esc(&visit), esc(&svc.name), esc(&host));
         let frames: String = self.app_ports().iter().map(|p| format!(" http://*:{p} https://*:{p}")).collect();
@@ -327,15 +345,27 @@ impl App {
                     used = visit_numbers(&v).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
                 }
             }
-            let others = {
+            let origin = base.as_deref().and_then(crate::services::http_origin);
+            let others: Vec<String> = {
                 let mut s = self.apps.lock();
                 s.grants.retain(|_, g| g.visit != visit);
                 s.refusals.remove(&visit);
-                let origin = base.as_deref().and_then(crate::services::http_origin);
-                origin.filter(|o| !s.grants.values().any(|g| crate::services::http_origin(&g.base).as_deref() == Some(o.as_str())))
+                let mut v: Vec<String> = s.grants.values().filter(|g| g.direct.is_none() && crate::services::http_origin(&g.base) == origin)
+                    .map(|g| g.visit.clone()).collect();
+                v.sort();
+                v.dedup();
+                v
             };
-            // one Stop ends it all: the connection the visit paid through closes too, unless another visit to that shop still uses it
-            if let Some(o) = others {
+            // another visit to the shop counts only while the connector holds it open: a grant outlives a visit that ended
+            // without a Stop (its page closed, its limit reached, its idle time out), and such a grant kept the connection open
+            let gone: Vec<String> = others.into_iter().filter(|id| !self.visit_open(id)).collect();
+            let still_used = {
+                let mut s = self.apps.lock();
+                s.grants.retain(|_, g| !gone.contains(&g.visit));
+                s.grants.values().any(|g| g.direct.is_none() && crate::services::http_origin(&g.base) == origin)
+            };
+            // one Stop ends it all: the connection the visit paid through closes too, unless another open visit to that shop still uses it
+            if let Some(o) = origin.filter(|_| !still_used) {
                 if self.stop_seller_sessions(&o) > 0 {
                     ended = format!(" Its connection with {} is closed.", self.seller_name(&o));
                 }
@@ -343,6 +373,39 @@ impl App {
         }
         self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{ended}{used}"));
         Resp::redirect("./browse")
+    }
+
+    /// Whether the connector holds visit `id` open (not ended, not gone): one at its limit counts, since it waits for its
+    /// owner to raise it and goes on with the connection it has. A connector that cannot be asked is taken to hold it, so
+    /// that a Stop never closes a connection another visit may use.
+    fn visit_open(&self, id: &str) -> bool {
+        match connector_json("GET", &format!("{}/visits/{id}", self.cfg.connector.trim_end_matches('/')), None) {
+            Ok((200, v)) => holds_open(&v),
+            Ok((404, _)) => false,
+            _ => true,
+        }
+    }
+
+    /// `POST /app-limit` (`visit`, `add`): the owner raises an open visit's limit by `add` sat (the bar's
+    /// "Add" button, as the visit nears its limit); a visit that ended at its limit goes on. JSON, for
+    /// the bar: the visit's numbers, or why not.
+    pub(crate) fn app_limit(&self, f: &HashMap<String, String>) -> Resp {
+        let visit = f.get("visit").cloned().unwrap_or_default();
+        let add = f.get("add").and_then(|v| v.trim().replace(',', "").parse::<i64>().ok()).unwrap_or(0);
+        if visit.is_empty() || !visit.bytes().all(|b| b.is_ascii_hexdigit()) || !(1..=MAX_VISIT_SATS).contains(&add) {
+            return Resp::json(400, &json!({"error": "no visit, or no amount to add"}));
+        }
+        let base = self.cfg.connector.trim_end_matches('/').to_string();
+        let now = match connector_json("GET", &format!("{base}/visits/{visit}"), None) {
+            Ok((200, v)) => v.get("limit_sats").and_then(Value::as_i64).unwrap_or(0),
+            _ => return Resp::json(404, &json!({"error": "This visit has ended. Open the app again."})),
+        };
+        let to = now.saturating_add(add).min(MAX_VISIT_SATS);
+        match connector_json("POST", &format!("{base}/visits/{visit}/limit"), Some(&json!({"limit_sats": to}))) {
+            Ok((200, v)) => Resp::json(200, &visit_numbers(&v)),
+            Ok((_, v)) => Resp::json(409, &json!({"error": v.get("error").and_then(Value::as_str).unwrap_or("The limit was not raised.")})),
+            Err(e) => Resp::json(502, &json!({"error": e})),
+        }
     }
 
     /// `GET /api/visit?v=<id>`: what the visit has spent.
@@ -395,13 +458,19 @@ impl App {
     }
 }
 
+/// Whether the connector's report of a visit says it is open: not ended, or ended at its limit, where it waits for its owner
+/// to raise it (with the connection it has, and its page as it was).
+pub(crate) fn holds_open(report: &Value) -> bool {
+    report.get("ended").is_none_or(Value::is_null) || report.get("limit_reached") == Some(&Value::Bool(true))
+}
+
 /// The visit's numbers for its page, from the connector's report: what its answers used (`used_sats`,
 /// and `spent_sats`, the same), what was paid for tickets in it (`prepaid_sats`) and what of that is
 /// left as credit with the shop (`credit_sats`), its limit, and `said`, the line in words. A
 /// connector that does not count what was used gives its `spent_sats` as before.
 pub(crate) fn visit_numbers(v: &Value) -> Value {
     let Some(used_msat) = v.get("used_msat").and_then(Value::as_u64) else {
-        return json!({"spent_sats": v["spent_sats"], "limit_sats": v["limit_sats"], "ended": v["ended"]});
+        return json!({"spent_sats": v["spent_sats"], "limit_sats": v["limit_sats"], "ended": v["ended"], "limit_reached": v["limit_reached"]});
     };
     let used = i64::try_from(used_msat.div_ceil(1000)).unwrap_or(i64::MAX);
     let paid = v.get("paid_sats").and_then(Value::as_i64).unwrap_or(0).max(0);
@@ -416,7 +485,8 @@ pub(crate) fn visit_numbers(v: &Value) -> Value {
     } else {
         said.push('.');
     }
-    json!({"used_sats": used, "spent_sats": used, "prepaid_sats": paid, "credit_sats": credit, "limit_sats": v["limit_sats"], "ended": v["ended"], "said": said})
+    json!({"used_sats": used, "spent_sats": used, "prepaid_sats": paid, "credit_sats": credit, "limit_sats": v["limit_sats"], "ended": v["ended"],
+           "limit_reached": v.get("limit_reached").and_then(Value::as_bool).unwrap_or(false), "said": said})
 }
 
 /// The visit limit's field, with the least a visit needs up front, set to `suggested`.
@@ -838,6 +908,37 @@ pub fn spawn(app: &Arc<App>, strict: bool) -> Result<Vec<(u16, xbt_svc::http::Ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A visit that reached its limit waits for its owner to raise it: it is open, so stopping another visit to the same shop
+    /// leaves the connection it will go on with. One stopped, or ended any other way, is not.
+    ///
+    /// FAILS before: any visit that had ended counted as gone, the one at its limit too: stopping another visit to the shop
+    /// dropped its grant and closed its connection, and its Add then led to a page that answered 403.
+    #[test]
+    fn a_visit_at_its_limit_still_holds_the_shops_connection() {
+        assert!(holds_open(&json!({"ended": null, "limit_reached": false})));
+        assert!(holds_open(&json!({"ended": "This visit's spending limit is reached.", "limit_reached": true})));
+        assert!(!holds_open(&json!({"ended": "Stopped.", "limit_reached": false})));
+        assert!(!holds_open(&json!({"ended": "This visit's spending limit is reached."})), "a connector that does not say it may go on");
+    }
+
+    /// A video app priced by the byte is offered a limit for about ten minutes of 1080p at its price,
+    /// not the 1,000 sat a film at 20 sat a MiB spends in under a minute; other apps keep 1,000.
+    ///
+    /// FAILS before: every app was offered 1,000 sat.
+    #[test]
+    fn a_video_app_is_offered_a_limit_for_minutes_of_film() {
+        let svc = |kind: &str, prices: Value| crate::services::parse(&json!([{"name": "x", "kind": kind, "seller": "http://s.example", "price_text": "a price",
+                                                                              "items": [], "app": "http://s.example/web/", "app_base": "http://s.example/",
+                                                                              "prices": prices}]).to_string()).unwrap().remove(0);
+        // 20 sat a MiB: 600 MiB is 12,000 sat
+        assert_eq!(suggested_limit(&svc("video", json!({"byte_msat": 20_000, "per_bytes": 1_048_576}))), 12_000);
+        // dear: at most 20,000; cheap: at least 1,000
+        assert_eq!(suggested_limit(&svc("video", json!({"byte_msat": 100_000, "per_bytes": 1_048_576}))), SUGGESTED_VIDEO_MAX);
+        assert_eq!(suggested_limit(&svc("video", json!({"byte_msat": 100, "per_bytes": 1_048_576}))), SUGGESTED_LIMIT);
+        assert_eq!(suggested_limit(&svc("video", json!({"request_msat": 1000}))), SUGGESTED_LIMIT);
+        assert_eq!(suggested_limit(&svc("api", json!({"byte_msat": 20_000, "per_bytes": 1_048_576}))), SUGGESTED_LIMIT);
+    }
 
     /// A visit limit of 500 sat is under the smallest ticket with its fees: refused in words, with
     /// the form set to 559, and not opened to fail at its first request with nothing spent.

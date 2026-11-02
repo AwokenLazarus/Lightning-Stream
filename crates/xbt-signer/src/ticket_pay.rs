@@ -246,6 +246,12 @@ struct Due<'a> {
     still_due: &'a dyn Fn() -> bool,
     /// The open answer it pays for, as the seller's signed `status` would list it once it has ended: seq, digest, status.
     answer: Option<(u64, &'a str, u16)>,
+    /// A top-up the caller asked for (`top_up_sats`) past what its request needs: a ticket is released only where one can
+    /// be at once. Where it cannot, the release says so and does nothing more to the session: it stops nothing, counts no
+    /// stall, strands nothing and acts on no fault (the request asks for those itself, as it starts), waits for no tail, no
+    /// fill, no chain node and no ticket the seller has yet to show, and takes `paying` only where it is free now. A
+    /// request that is paid for already is never held up or failed by it.
+    best_effort: bool,
 }
 
 impl Due<'_> {
@@ -1735,6 +1741,12 @@ struct Call<'a> {
     /// The most bytes the caller was shown the resource has (`max_size`, a listed file's size): sent
     /// to the seller ([`xbt402::ticket::MAX_SIZE_HEADER`]), and an answer that states more is not read.
     max_size: Option<u64>,
+    /// Before the request leaves, the session's balance is topped up to at least this (`top_up_sats`,
+    /// in msat here) with whole tickets, as far as `max_sats` allows: a caller that runs many requests
+    /// on one session (a web app's page) keeps its credit ahead of the answers, so that an answer is
+    /// not cut where the credit ends and the next ticket does not fit its own small limit. Best effort:
+    /// a ticket of the top-up that does not fit, or cannot go, leaves the request to go on as it would.
+    top_up_msat: u64,
 }
 
 impl Call<'_> {
@@ -2830,7 +2842,14 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { by: call_by, url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, if_range, extra, head_headers, upgrade, credit_only, charge_sats, max_size };
+        let top_up_msat = match p.get("top_up_sats").filter(|v| !v.is_null()) {
+            None => 0,
+            Some(v) => match py_int(Some(v)) {
+                Some(n) if n >= 0 => (n as u64).saturating_mul(1000),
+                _ => return deny("top_up_sats", "top_up_sats is a whole number of sats, 0 or more"),
+            },
+        };
+        let call = Call { by: call_by, url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, stream_paid, range, if_range, extra, head_headers, upgrade, credit_only, charge_sats, max_size, top_up_msat };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // a route that gives each buyer an account is paid with tickets only: draws serve no buyer as its account
@@ -4371,6 +4390,11 @@ impl Signer {
         // answers that opened after it was left (`opened`): one open before it was already drawing on the balance beside
         // it, and goes on within its own call's limit
         let blocking = |m: &Money| m.tails.iter().filter(|t| t.since <= opened).map(|t| t.since).min();
+        // a top-up does nothing it would have to wait for, and nothing to the session; it says why it released nothing
+        let skipped = |why: &str| with(refusal("ticket_top_up_skipped", format!("no ticket was released for the top-up: {why}")), json!({"session": hs.sid}));
+        if due.best_effort && blocking(&lock_money(hs)).is_some() {
+            return Err(skipped("an answer the wallet stopped reading is not closed yet"));
+        }
         if blocking(&lock_money(hs)).is_some() {
             let deadline = (Instant::now() + TAIL_WAIT).min(due.call_by);
             loop {
@@ -4397,13 +4421,19 @@ impl Signer {
             }
         }
         // in turn, no later than the call's deadline: the release ahead pauses for itself, and this one's pause begins here
-        let Some(_paying) = lock_paying_by(hs, due.call_by) else {
+        let Some(_paying) = lock_paying_by(hs, if due.best_effort { Instant::now() } else { due.call_by }) else {
+            if due.best_effort {
+                return Err(skipped("another call is paying this seller now"));
+            }
             return Err(with(refusal("ticket_busy", "other calls to this seller have been paying for as long as this call may wait: no secret was released; call again"),
                             json!({"session": hs.sid})));
         };
         let turn = Instant::now();
         let pause_by = due.pause_by(&tp, turn, hs.terms.refill_wait);
         if let Some(why) = hs.fault() {
+            if due.best_effort {
+                return Err(skipped(&format!("the seller is at fault: {why}")));
+            }
             return Err(self.ticket_fault(hs, &why));
         }
         if !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
@@ -4416,6 +4446,9 @@ impl Signer {
         // a secret that has left and was not confirmed goes first, the same one: that is this release. It is delivered
         // even to a session being stopped: it has left already, and the seller holds it either way
         if lock_money(hs).pending.is_some() {
+            if due.best_effort {
+                return Err(skipped("a ticket on its way to the seller is not confirmed yet"));
+            }
             return self.ticket_deliver(hs, due.call_by + DELIVER_PAST_CALL);
         }
         // a session being stopped is released nothing more: its open answers end on the credit they have. Asked under
@@ -4428,6 +4461,15 @@ impl Signer {
             return Ok(());
         }
         let mut next = self.ticket_next(&hs.sid).0;
+        // none held: a top-up buys a prepaid ticket where the seller sells them now, and otherwise leaves it (no fill, no
+        // wait, and never the stop that a session with no way to pay comes to)
+        if next.is_none() && due.best_effort {
+            let now = self.engine.now();
+            if self.ticket_session(&hs.sid).filter(|s| s.state == SState::Open).is_some_and(|s| s.prepaid_now(now)) {
+                return self.ticket_buy_prepaid(hs, spent);
+            }
+            return Err(skipped("no ticket is held with this seller now"));
+        }
         if next.is_none() {
             self.ticket_await_chain(hs, pause_by)?;
             next = self.ticket_next(&hs.sid).0;
@@ -4534,6 +4576,10 @@ impl Signer {
         // 1. the seller's own word, bounded
         let deadline = pause_by;
         let mut wait = Duration::from_millis(10);
+        // a top-up takes a ticket the seller has shown locked, and waits for none
+        if due.best_effort && !lock_money(hs).ready.contains(&hash) {
+            return Err(skipped("the seller has not shown the next ticket locked yet"));
+        }
         while !lock_money(hs).ready.contains(&hash) {
             let status = match self.ticket_status_by(hs, true, deadline) {
                 Ok(v) => v,
@@ -4594,6 +4640,9 @@ impl Signer {
             wait = (wait * 2).min(PAUSE_POLL_MOST);
         }
         if let Some(why) = hs.fault() {
+            if due.best_effort {
+                return Err(skipped(&format!("the seller is at fault: {why}")));
+            }
             return Err(self.ticket_fault(hs, &why));
         }
         // the call's max_sats bounds what leaves for it, a whole ticket included. A held ticket that does not fit
@@ -4608,6 +4657,9 @@ impl Signer {
         // asked again just before the book: another answer may have found the seller at fault while this one waited for it
         // to show the ticket ready, and nothing more is released to a seller at fault, or into a session being stopped
         if let Some(why) = hs.fault() {
+            if due.best_effort {
+                return Err(skipped(&format!("the seller is at fault: {why}")));
+            }
             return Err(self.ticket_fault(hs, &why));
         }
         if hs.ending.load(Ordering::SeqCst) {
@@ -4864,10 +4916,28 @@ impl Signer {
                     s.head(&json!({"paying": true}));
                     paying_told = true;
                 }
-                let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &short_now, answer: None };
+                let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &short_now, answer: None, best_effort: false };
                 if let Err(d) = self.ticket_release_one(hs, &mut spent, &due) {
                     return fail(hs, &spent, d);
                 }
+            }
+            // the caller's top-up (`top_up_sats`), past what the head wants: best effort, a ticket that does not fit the call's
+            // `max_sats` or cannot go now leaves the request to go on with the balance it has. Not for a call that buys none
+            let low = || {
+                let m = lock_money(hs);
+                m.est_balance() < c.top_up_msat && m.pending.is_none()
+            };
+            let mut topped = 0;
+            while !c.credit_only && c.top_up_msat > 0 && topped < 4 && low() {
+                topped += 1;
+                let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &low, answer: None, best_effort: true };
+                if self.ticket_release_one(hs, &mut spent, &due).is_err() {
+                    break;
+                }
+            }
+            // a fault the top-up came upon is acted on here, as at the call's start: nothing goes to a seller at fault
+            if let Some(why) = hs.fault() {
+                return fail(hs, &spent, self.ticket_fault(hs, &why));
             }
             // stopped while this call waited for a ticket (the owner turned anonymous here, say): nothing more goes out on it
             // (`ending` first: a stop sets it before it closes the session on the book)
@@ -5318,7 +5388,7 @@ impl Signer {
             // an answer by the byte stops at the edge of its credit, and its seller waits from there. One by the second, or
             // a socket, may be quiet for as long as it likes with its seller waiting for nothing
             let waiting_since = Some(if price.second_msat == 0 && up_writer_absent { *lock(&last_byte) } else { Instant::now() });
-            let release = Due { opened: st.started, waiting_since, call_by: st.started + st.max_open, still_due: &still, answer: Some((seq, digest, answer_status)) };
+            let release = Due { opened: st.started, waiting_since, call_by: st.started + st.max_open, still_due: &still, answer: Some((seq, digest, answer_status)), best_effort: false };
             match self.ticket_release_one(hs, &mut lock(&spent_cell), &release) {
                 Ok(()) => {
                     self.ticket_refill_later(hs);

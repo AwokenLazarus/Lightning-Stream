@@ -207,6 +207,23 @@ impl Link {
     /// Like [`Link::start_alpn`], serving several protocols on one endpoint (each accepted
     /// connection's [`LinkConnection::alpn`] says which); `alpn` is the one it opens by default.
     pub fn start_alpns(secret: [u8; 32], opts: Options, alpn: &'static [u8], serve: &[&'static [u8]]) -> io::Result<Arc<Link>> {
+        Self::start_bound(secret, opts, alpn, serve, None)
+    }
+
+    /// [`Link::start_with`] on a fixed UDP port (`port`, on IPv4 and IPv6) instead of a random one:
+    /// a seller that allows inbound UDP there is reached directly by buyers behind a NAT that gives
+    /// each destination another port. `None`: random ports, as [`Link::start_with`]. Ignored in
+    /// private mode, which binds no IP socket.
+    pub fn start_on_port(secret: [u8; 32], opts: Options, port: Option<u16>) -> io::Result<Arc<Link>> {
+        Self::start_bound(secret, opts, ALPN, &[ALPN], port)
+    }
+
+    /// The IP sockets the link is bound on: their ports are where it is reached directly.
+    pub fn bound_sockets(&self) -> Vec<SocketAddr> {
+        self.ep.bound_sockets()
+    }
+
+    fn start_bound(secret: [u8; 32], opts: Options, alpn: &'static [u8], serve: &[&'static [u8]], port: Option<u16>) -> io::Result<Arc<Link>> {
         let Options { relays, serving, private, lookup } = opts;
         if private && matches!(relays, Relays::None) {
             return Err(io_err("private mode needs a relay"));
@@ -231,6 +248,12 @@ impl Link {
         }
         if private {
             b = b.clear_ip_transports();
+        } else if let Some(port) = port {
+            // in place of the unspecified address on a random port, for each family. IPv6 is allowed to
+            // fail, as iroh's own default is (a box with no IPv6)
+            b = b.bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))).map_err(io_err)?;
+            b = b.bind_addr_with_opts(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)), iroh::endpoint::BindOpts::default().set_is_required(false))
+                .map_err(io_err)?;
         }
         if let Some(l) = &lookup {
             l.set_own(SecretKey::from_bytes(&secret).public());

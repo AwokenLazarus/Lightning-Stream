@@ -611,6 +611,7 @@ impl App {
         match req.path.as_str() {
             "/app" => self.app_open(ctx, f),
             "/app-stop" => self.app_stop(ctx, f),
+            "/app-limit" => self.app_limit(f),
             "/identity" => self.identity(ctx, f),
             "/services" => self.services_post(ctx, f),
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
