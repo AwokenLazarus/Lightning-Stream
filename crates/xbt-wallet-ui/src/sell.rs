@@ -233,9 +233,23 @@ impl OfferApp {
 /// A service that looks like a media server's web app (Jellyfin, Plex, Emby): its web client is
 /// under `/web/`.
 fn looks_like_media_app(o: &Offer) -> bool {
-    let words = format!("{} {}", o.name, o.address).to_ascii_lowercase();
-    o.app.is_some() && (o.kind == Kind::Media || ["jellyfin", "plex", "emby"].iter().any(|w| words.contains(w))
-                        || o.app.as_ref().is_some_and(|a| a.entry.ends_with("/web/") || a.entry.contains("/web/index.html")))
+    o.app.as_ref().is_some_and(|a| media_words(o.kind, &o.name, &o.address, &a.entry))
+}
+
+/// [`looks_like_media_app`], from a service's kind, name, address and the path its page opens at.
+fn media_words(kind: Kind, name: &str, address: &str, entry: &str) -> bool {
+    let words = format!("{name} {address}").to_ascii_lowercase();
+    kind == Kind::Media || ["jellyfin", "plex", "emby"].iter().any(|w| words.contains(w)) || entry.ends_with("/web/") || entry.contains("/web/index.html")
+}
+
+/// What the Sell page says of a media server's web app shared with no way in for buyers: neither an account of their own
+/// nor a guest login, so they pay and land on the server's own sign-in page.
+const NO_BUYER_LOGIN: &str = "Buyers will see your Jellyfin's sign-in page and can't get in. Turn on \"Each buyer gets their own Jellyfin account\" \
+                              (and paste an API key), or set a shared guest login.";
+
+/// Whether `o` is a media server's web app with no way in for buyers ([`NO_BUYER_LOGIN`]).
+fn media_without_buyer_login(o: &Offer) -> bool {
+    looks_like_media_app(o) && o.app.as_ref().is_some_and(|a| a.accounts.as_ref().is_none_or(Vec::is_empty) && a.login.trim().is_empty())
 }
 
 /// The paths a seller lists for an app, one per line or comma-separated: each starts with `/`.
@@ -1459,6 +1473,9 @@ impl App {
                 next_hint.push_str("<p class=\"hint warn\">Buyers' apps no longer have a player of their own: they use your media server's own web app. \
                     Edit this service and save it to share it that way. A list of films is no longer needed.</p>");
             }
+            if media_without_buyer_login(o) {
+                next_hint.push_str(&format!("<p class=\"hint warn\">{}</p>", esc(NO_BUYER_LOGIN)));
+            }
             next_hint.push_str(&now);
             let btn = |action: &str, label: &str, class: &str| format!("<form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                 <input type=\"hidden\" name=\"id\" value=\"{}\"><button{class}>{label}</button></form>", esc(&o.id));
@@ -1519,7 +1536,9 @@ impl App {
             <details{}><summary>Buyers' accounts</summary>\
             <label>Your Jellyfin API key <small>({})</small><input name=\"app_key\" type=\"password\" autocomplete=\"off\" class=\"mono\"></label>\
             <p class=\"hint\">Make one in Jellyfin under Dashboard, API Keys. The shop makes each buyer's account with it. It stays on this box, \
-            beside the shop's own keys, and is never shown again. Buyers who stay anonymous use the guest login below, if you give one.</p>{libraries}</details>",
+            beside the shop's own keys, and is never shown again. Buyers who stay anonymous use the guest login below, if you give one.</p>{libraries}</details>\
+            <label class=\"check\"><input type=\"checkbox\" name=\"app_no_accounts\" value=\"1\"> Publish without buyer accounts anyway \
+            <small>(a media server with neither accounts for buyers nor a guest login shows them its sign-in page)</small></label>",
             if fv("app_accounts", if saved_libs.is_some() { "1".into() } else { String::new() }) == "1" { " checked" } else { "" },
             if saved_libs.is_some() && saved_key.is_none() { " open" } else { "" },
             if saved_key.is_some() { "saved: leave empty to keep it" } else { "Dashboard, API Keys" });
@@ -1867,6 +1886,13 @@ impl App {
                     max_streams_per_buyer: limit("cap_streams_buyer", "Most streams for one buyer")?,
                     max_mbit: limit("cap_mbit", "Most Mbit/s together")?,
                 };
+                // a media server shared with no way in for buyers: they would pay and land on its sign-in page. Saved only
+                // once the seller says so
+                if let Some(a) = app.as_ref().filter(|a| media_words(kind, &name, &address, &a.entry)) {
+                    if a.accounts.as_ref().is_none_or(Vec::is_empty) && a.login.trim().is_empty() && g("app_no_accounts") != "1" {
+                        return Err(format!("{NO_BUYER_LOGIN} To publish it as it is, tick \"Publish without buyer accounts anyway\" and save again."));
+                    }
+                }
                 let strip = g("strip") == "1" || kind == Kind::Files;
                 let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip, titles, app, capacity };
                 match shop.offers.iter_mut().find(|o| o.id == new_id) {

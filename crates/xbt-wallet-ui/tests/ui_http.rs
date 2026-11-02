@@ -1759,7 +1759,8 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
     assert!(r.body.contains("Most buyers at once is a whole number"), "{}", r.body);
     // films with 5 buyers and 3 streams at once, the page at the root with them
     let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
-                                       ("paths", "/Videos/1/"), ("app", "1"), ("cap_buyers", "5"), ("cap_streams", "3"), ("cap_streams_buyer", "")]);
+                                       ("paths", "/Videos/1/"), ("app", "1"), ("cap_buyers", "5"), ("cap_streams", "3"), ("cap_streams_buyer", ""),
+                                       ("app_no_accounts", "1")]);
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     // a free service with a stream limit only
     let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", "http://127.0.0.1:9"), ("price", "0"), ("unit", "request"),
@@ -1782,6 +1783,63 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
     assert!(page.contains("name=\"cap_streams\""));
     // the limits of the whole shop, which a seller meets before any of these, are said beside them
     assert!(page.contains("Your whole shop serves up to 30 buyers at once and 512 open connections"), "{page}");
+}
+
+/// A media server shared with neither accounts for buyers nor a guest login shows buyers its own sign-in page: they pay
+/// and cannot get in. The Sell page says so on the offer, and Save asks the seller to say they mean it.
+///
+/// FAILS before: it was saved without a word (a hands-on run's buyers paid a ticket for Laz Flix and landed on the
+/// owner's Jellyfin sign-in page).
+#[cfg(unix)]
+#[test]
+fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller_says_so() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    let addr = format!("http://{media}");
+    let form = |extra: &[(&'static str, &'static str)]| {
+        let mut f: Vec<(&str, &str)> = vec![("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Laz Flix"),
+                                             ("app", "1"), ("app_entry", "/web/"), ("app_free", "/web/")];
+        f.extend_from_slice(extra);
+        f.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>()
+    };
+    let saved = || std::fs::read_to_string(bx.data.path().join("ui/sell.json")).ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok()).map_or(0, |v| v["offers"].as_array().map_or(0, Vec::len));
+    // neither accounts nor a guest login: the form comes back with why, and nothing is saved
+    let f = form(&[]);
+    let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+    assert_eq!(r.status, 200, "the form comes back");
+    let body = unescape(&r.body);
+    assert!(body.contains("Buyers will see your Jellyfin's sign-in page and can't get in") && body.contains("Publish without buyer accounts anyway"), "{body}");
+    assert_eq!(saved(), 0, "saved without the seller's say");
+    // said so: saved, and the offer carries the warning
+    let f = form(&[("app_no_accounts", "1")]);
+    let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert_eq!(saved(), 1);
+    assert!(unescape(&br.get("/sell").body).contains("Buyers will see your Jellyfin's sign-in page and can't get in"));
+    // with a shared guest login it is saved at once, and no warning is shown
+    let id = serde_json::from_str::<Value>(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap()["offers"][0]["id"]
+        .as_str().unwrap().to_string();
+    let mut f = form(&[("app_login", "X-Emby-Token: guest-1")]);
+    f.push(("id".into(), id));
+    let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert!(!unescape(&br.get("/sell").body).contains("can't get in"));
 }
 
 #[cfg(unix)]
@@ -1918,7 +1976,7 @@ fn a_web_apps_free_paths_are_free_routes_that_survive_a_refresh_and_the_rest_sta
     assert!(page.contains(">/web/</textarea>"), "the saved free path is shown");
     // emptied: the free route goes, and /web/ is the paid route's again
     br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Jellyfin"),
-                               ("app", "1"), ("app_entry", "/web/"), ("app_free", "")]);
+                               ("app", "1"), ("app_entry", "/web/"), ("app_free", ""), ("app_no_accounts", "1")]);
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
     assert_eq!(cfg.route("/web/main.bundle.js").map(|r| (r.path.as_str(), r.free)), Some(("/", false)));
