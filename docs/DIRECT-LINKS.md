@@ -117,6 +117,26 @@ reach through a relay shares that one connection among all of them; on four keys
 
 What it does not raise: the seller's own upload. When the home link is full, more keys do not help.
 
+### Fixed UDP ports for the link (`link.port`)
+
+Each link key binds a UDP port of its own, on IPv4 and IPv6. Unless set, the ports are random, and
+a buyer behind a NAT that gives each destination another port (a commercial VPN, carrier-grade NAT,
+many office networks) cannot open a direct path to a shop behind a NAT of its own: it stays on a
+relay. Set `link.port` to the first of a run of fixed ports, and key *i* (counting from 0) binds
+`port + i`:
+
+```json
+"link": {"endpoints": 4, "port": 7850}
+```
+
+binds UDP 7850, 7851, 7852 and 7853. **Allow inbound UDP on those ports** (forward them on the
+router to the box that runs the gateway, and open them in its firewall); then such a buyer reaches
+the shop directly, and a relay carries only the start of its connection. The port is a whole number
+from 1024 up, with the last key's port at most 65535. A port that is already taken stops the
+gateway at start, with the port named. The gateway logs the ports each key bound as it starts. In
+private mode (`link.private`) no IP socket is bound, and `link.port` is not used. Unset, nothing
+changes: random ports, as before.
+
 ### The seller's side of the relay connection (BBR)
 
 The bytes a shop sends through a relay leave over its own TCP connection to the relay, so the

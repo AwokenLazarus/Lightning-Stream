@@ -284,6 +284,11 @@ pub struct LinkConfig {
     /// connection to its relay, and a relay limits each connection on its own, so buyers relayed
     /// to the shop share several instead of one; buyers spread over them and fall back to another.
     pub endpoints: usize,
+    /// The first of the fixed UDP ports the link's keys bind (`link.port`): key `i` binds `port + i`,
+    /// on IPv4 and IPv6. A seller who allows inbound UDP on those ports is reached directly by buyers
+    /// behind a NAT that gives each destination another port (commercial VPNs, carrier NAT), where a
+    /// random port would leave them on a relay. `None`: a random port per key and family, as before.
+    pub port: Option<u16>,
 }
 
 /// The link keys a gateway serves on unless its `link.endpoints` says otherwise.
@@ -299,7 +304,7 @@ pub const MAX_LINK_RELAYS: usize = 4;
 
 impl LinkConfig {
     fn parse(v: &Value) -> Result<Self, String> {
-        let m = obj(v, "link", &["relays", "private", "endpoints"])?;
+        let m = obj(v, "link", &["relays", "private", "endpoints", "port"])?;
         let relays = match m.get("relays") {
             None => Vec::new(),
             Some(Value::Array(a)) => a
@@ -331,7 +336,16 @@ impl LinkConfig {
                 _ => return Err(format!("link.endpoints is a whole number from 1 to {MAX_LINK_ENDPOINTS}")),
             },
         };
-        Ok(Self { relays, private, endpoints })
+        // every key's port, base + i, is a port above the privileged ones
+        let port = match m.get("port") {
+            None | Some(Value::Null) => None,
+            Some(n) => match n.as_u64() {
+                Some(p) if p >= 1024 && p + endpoints as u64 - 1 <= u64::from(u16::MAX) => Some(p as u16),
+                _ => return Err(format!("link.port is the first UDP port of the link's keys, a whole number from 1024 to {} (key i binds port + i)",
+                                        u64::from(u16::MAX) + 1 - endpoints as u64)),
+            },
+        };
+        Ok(Self { relays, private, endpoints, port })
     }
 }
 
@@ -1475,6 +1489,27 @@ mod tests {
         assert_eq!(Config::from_json(&v).unwrap().link.unwrap().endpoints, 1);
         for bad in [json!(0), json!(9), json!(2.5), json!("2")] {
             v["link"] = json!({"endpoints": bad.clone()});
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
+    }
+
+    /// `link.port` fixes the link's UDP ports, key i on port + i; with none, the ports are random.
+    #[test]
+    fn a_link_binds_fixed_ports_where_its_config_names_the_first() {
+        let mut v = base();
+        v["public_url"] = json!("link");
+        v["link"] = json!({});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().port, None);
+        v["link"] = json!({"port": 7850});
+        let l = Config::from_json(&v).unwrap().link.unwrap();
+        assert_eq!((l.port, l.endpoints), (Some(7850), DEFAULT_LINK_ENDPOINTS));
+        // the last key's port is in range: 65532 + 3 is 65535
+        v["link"] = json!({"port": 65532});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().port, Some(65532));
+        v["link"] = json!({"port": 65535, "endpoints": 1});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().port, Some(65535));
+        for bad in [json!(0), json!(80), json!(1023), json!(65533), json!(70000), json!(7850.5), json!("7850"), json!(-1)] {
+            v["link"] = json!({"port": bad.clone()});
             assert!(Config::from_json(&v).is_err(), "{bad}");
         }
     }

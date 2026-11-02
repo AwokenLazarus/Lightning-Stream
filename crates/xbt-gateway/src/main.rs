@@ -225,8 +225,18 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
             xbt_iroh_link::Relays::Ours(r)
         };
         let lookup = Some(Arc::new(xbt_iroh_link::nostr_lookup::NostrLookup::new(keys.clone(), nostr_relays.clone())));
-        let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private, lookup })
-            .map_err(|e| format!("link: {e}"))?;
+        // `link.port`: key i on the fixed UDP port base + i (the seller allows inbound UDP there); else random ports
+        let port = l.port.filter(|_| !l.private).map(|p| p + i as u16);
+        let link = xbt_iroh_link::Link::start_on_port(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private, lookup }, port)
+            .map_err(|e| match port {
+                Some(p) => format!("link: key {} on UDP port {p} (link.port): {e}", i + 1),
+                None => format!("link: {e}"),
+            })?;
+        if !l.private {
+            let bound: Vec<String> = link.bound_sockets().iter().map(|a| a.to_string()).collect();
+            eprintln!("xbt-gateway: link key {} bound on UDP {}{}", i + 1, bound.join(", "),
+                      if port.is_some() { " (link.port: allow inbound UDP there)" } else { " (random ports: set link.port to fix them)" });
+        }
         link.serve(upstream);
         links.push(link);
     }
