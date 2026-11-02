@@ -43,6 +43,11 @@ change (one read added; payments are unchanged).
   help).
 - **Also:** the agent access key is shown only after Show the access key; starter rules' least node limit is
   1,000,000 sats; Setup counts each seller and step once; Live connections shows a rate only while streaming.
+- **The look of lightning-stream.com.** The app is dark by default, with the website's near-black ground,
+  lightning-yellow main buttons and amounts, white-blue accents, its Inter type and its mark. A light theme
+  in the same colors is one button away in the bar, and the browser remembers it. The background's electric
+  river is slower and finer, in yellow and electric blue, still reacts to the pointer and to clicks, and
+  stays still with reduced motion and on low-power devices. Every page works at phone width.
 
 ## 0.2.2 (2026-11-02)
 

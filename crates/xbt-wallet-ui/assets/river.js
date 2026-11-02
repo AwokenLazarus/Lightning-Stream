@@ -6,10 +6,12 @@
 // lands about midway between two streams, an arc to the other one too), with a few forks, fading in well under a second. Drawn in a worker on an OffscreenCanvas where the browser has one (the
 // page's thread only forwards the pointer), else in the page. 30 fps while something moves, 1.5 at
 // rest (a frame costs the compositor far more than the drawing, and the streams barely move at
-// rest), none while hidden or a video plays; half resolution; one still frame for reduced motion.
+// rest), none while hidden or a video plays; half resolution; one still frame for reduced motion
+// and on a low-power device (two cores or less, 2 GB or less, or Save-Data).
 // The streams' shape is a function of the clock, so every page shows the same frame at the same
 // moment: a new page starts where the last one left off, with a first frame drawn before it shows.
-// Colours: --river-* in ui.css.
+// Colours: --river-* in ui.css (lightning yellow and electric blue on the dark ground, as on the
+// website), read again when the owner switches the theme.
 (function () {
   "use strict";
   var STEP = 24, REACH = 140, FAST = 1000 / 30, SLOW = 1000 / 1.5, IDLE = 8000, FRONT = 0.09, LIFE = 900;
@@ -97,11 +99,14 @@
           stroke(col.glow * 1.6 * s.near * col.halo, 10 * s.width * col.width);
           stroke(col.core * 1.3 * s.near * col.halo, 2.2 * s.width * col.width);
         }
-        cx.fillStyle = col.spark; cx.globalAlpha = col.core * 1.6 * col.sparks;
+        // payments along the stream: a small light with a soft halo of the stream's colour
         if (col.sparks > 0)
         s.sparks.forEach(function (u) {
-          var f = ((u + t * s.speed) % 1) * end, c = Math.floor(f), n = s.ys[Math.min(c + 1, end)];
-          cx.beginPath(); cx.arc(f * STEP, s.ys[c] + (n - s.ys[c]) * (f - c), 1.6, 0, 7); cx.fill();
+          var f = ((u + t * s.speed) % 1) * end, c = Math.floor(f), n = s.ys[Math.min(c + 1, end)], y = s.ys[c] + (n - s.ys[c]) * (f - c);
+          cx.fillStyle = col[s.hue]; cx.globalAlpha = col.core * 0.9 * col.sparks;
+          cx.beginPath(); cx.arc(f * STEP, y, 4.5, 0, 7); cx.fill();
+          cx.fillStyle = col.spark; cx.globalAlpha = col.core * 3.2 * col.sparks;
+          cx.beginPath(); cx.arc(f * STEP, y, 1.3, 0, 7); cx.fill();
         });
       });
       if (now === undefined) return;
@@ -211,7 +216,7 @@
       if (m.tap && !still) tap(m.tap[0], m.tap[1]);
       if (m.pulse !== undefined) discharge(m.pulse, 0, performance.now(), 1);
       // a frame at once on a new size (the first one too): never a blank canvas while waiting
-      if (W && (m.size || still)) draw(Date.now() / 1000);
+      if (W && (m.size || m.col || still)) draw(Date.now() / 1000);
       if (first && W) { first = false; report({ drawn: 1 }); }
       wake();
     };
@@ -228,7 +233,10 @@
 
   var cv = document.getElementById("river");
   if (!cv || !cv.getContext) return;
-  var reduce = matchMedia("(prefers-reduced-motion: reduce)"), stats = {}, send;
+  var reduce = matchMedia("(prefers-reduced-motion: reduce)"), stats = {}, send, nav = navigator, conn = nav.connection || {};
+  // a small or saving device gets the still frame: the page stays light on a Pi with a slow screen
+  var low = (nav.hardwareConcurrency && nav.hardwareConcurrency <= 2) || (nav.deviceMemory && nav.deviceMemory <= 2) || conn.saveData === true;
+  function calm() { return reduce.matches || !!low; }
   function colours() {
     var s = getComputedStyle(document.documentElement);
     function v(k) { return s.getPropertyValue("--river-" + k).trim(); }
@@ -237,7 +245,7 @@
       pace: n("pace", 1), reach: n("reach", 1), width: n("width", 1), halo: n("halo", 1), bump: n("bump", 1), sparks: n("sparks", 1), zap: n("zap", 1) };
   }
   function playing() { var v = document.querySelector("video"); return !!v && !v.paused && !v.ended; }
-  function state() { return { size: [innerWidth, innerHeight, Math.min(devicePixelRatio || 1, 1.5) / 2], col: colours(), still: reduce.matches, paused: document.hidden || playing() }; }
+  function state() { return { size: [innerWidth, innerHeight, Math.min(devicePixelRatio || 1, 1.5) / 2], col: colours(), still: calm(), paused: document.hidden || playing() }; }
   try {
     var w = new Worker(document.currentScript.src), off = cv.transferControlToOffscreen();
     // the first frame, drawn here at once on a canvas of its own, so the page never shows without
@@ -266,6 +274,8 @@
   var later = 0;
   addEventListener("resize", function () { clearTimeout(later); later = setTimeout(function () { send(state()); }, 150); });
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () { send({ col: colours() }); });
-  reduce.addEventListener("change", function () { send({ still: reduce.matches }); });
-  window.lsRiver = { pulse: function (s) { if (!reduce.matches) send({ pulse: s === undefined ? (Math.random() * 97) | 0 : s }); }, stats: stats };
+  // the owner's theme switch (the bar's button sets data-theme on the page)
+  if (window.MutationObserver) new MutationObserver(function () { send({ col: colours() }); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  reduce.addEventListener("change", function () { send({ still: calm() }); });
+  window.lsRiver = { pulse: function (s) { if (!calm()) send({ pulse: s === undefined ? (Math.random() * 97) | 0 : s }); }, stats: stats };
 })();

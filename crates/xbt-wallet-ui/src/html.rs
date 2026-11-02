@@ -267,7 +267,7 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
              <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" type=\"image/svg+xml\" href=\"./mark.svg?v={}\"><title>{} · {}</title>\
              <link rel=\"stylesheet\" href=\"./ui.css?v={}\"><script src=\"./vt.js?v={}\"></script></head><body>\
              <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
-             <header>{brand}{menu}</header>\
+             <header>{brand}{menu}{THEME_TOGGLE}</header>\
              <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>\
              <footer>Your money stays on your own Lightning node. Nobody else holds it. <span class=\"version\">Lightning Stream {}</span></footer>\
              <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
@@ -275,8 +275,15 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
             esc(crate::release_version()), asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
 
-/// The app's mark in the header and as the page icon: assets/mark.svg, one theme's logo.
+/// The app's mark in the header and as the page icon: assets/mark.svg, the website's mark.
 const MARK: &str = crate::MARK_SVG;
+
+/// The bar's theme button: dark is the default, light is the owner's choice, kept in this browser
+/// (ui.js switches it, vt.js applies it before the first paint). Shown only with scripts on.
+const THEME_TOGGLE: &str = "<button type=\"button\" class=\"theme-toggle\" aria-label=\"Light theme\" aria-pressed=\"false\" title=\"Light or dark\">\
+    <svg class=\"sun\" viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><circle cx=\"12\" cy=\"12\" r=\"4\"/>\
+    <path d=\"M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6\"/></svg>\
+    <svg class=\"moon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z\"/></svg></button>";
 
 /// A short content hash for cache busting.
 pub fn asset_version(s: &str) -> String {

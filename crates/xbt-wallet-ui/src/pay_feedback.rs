@@ -201,13 +201,12 @@ pub fn frame_page(title: &str, words: &str, fix: &str, raw: &str) -> String {
             if title.is_empty() { String::new() } else { format!("<h1>{}</h1>", esc(title)) }, esc(words), if fix.is_empty() { String::new() } else { format!("<p>{}</p>", esc(fix)) })
 }
 
-/// The app's look for [`frame_page`]: its colors (light and dark) and its card.
-const FRAME_CSS: &str = ":root{--bg:#f6f7f9;--fg:#111418;--muted:#4f5763;--card:#fff;--edge:#e3e6eb;--mono:#eef0f3;color-scheme:light}\
-@media (prefers-color-scheme:dark){:root{--bg:#0d0f12;--fg:#e8eaed;--muted:#a0a8b3;--card:#15181d;--edge:#23272e;--mono:#1b1f25;color-scheme:dark}}\
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif}\
-main{max-width:640px;margin:0 auto;padding:24px 16px}.card{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:20px}\
-h1{font-size:1.2rem;margin:0 0 8px}p{margin:0 0 10px}details{color:var(--muted);font-size:.92em}\
-code{background:var(--mono);border-radius:4px;padding:1px 4px;overflow-wrap:anywhere}";
+/// The app's look for [`frame_page`]: its dark ground and its card.
+const FRAME_CSS: &str = ":root{--bg:#050507;--fg:#f5f5f2;--muted:#a4a8b1;--card:#0d0f14;--edge:rgba(255,255,255,.1);--mono:rgba(255,255,255,.06);--warn:#ffb648;color-scheme:dark}\
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 Inter,system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;-webkit-font-smoothing:antialiased}\
+main{max-width:640px;margin:0 auto;padding:24px 16px}.card{background:var(--card);border:1px solid var(--edge);border-left:2px solid var(--warn);border-radius:20px;padding:22px 24px}\
+h1{font-size:1.2rem;letter-spacing:-.02em;margin:0 0 8px}p{margin:0 0 10px}details{color:var(--muted);font-size:.92em}\
+code{background:var(--mono);border-radius:6px;padding:1px 5px;overflow-wrap:anywhere}";
 
 /// A refusal as `/api/visit` gives it to the visit's page, which shows it above the frame.
 pub fn as_json(e: &Explained) -> Value {
@@ -303,6 +302,6 @@ mod tests {
     #[test]
     fn the_frame_page_has_the_apps_look_and_details() {
         let p = frame_page("This shop isn't allowed yet", "Your <rules>", "Go to Sellers", "raw & words");
-        assert!(p.contains("<style>") && p.contains("prefers-color-scheme:dark") && p.contains("Your &lt;rules&gt;") && p.contains("raw &amp; words"));
+        assert!(p.contains("<style>") && p.contains("color-scheme:dark") && p.contains("Your &lt;rules&gt;") && p.contains("raw &amp; words"));
     }
 }

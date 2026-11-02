@@ -1,4 +1,4 @@
-// The look of the app in a real headless Chrome: screenshots of the main pages in light, dark and
+// The look of the app in a real headless Chrome: screenshots of the main pages in dark, light and
 // at phone width, the cost of the river background (CPU and frame time, with and without it), and
 // the contrast of text over the brightest point the river reaches.
 //   node look_test.mjs WALLET_BASE SETUP_CODE GATEWAY_BASE GATEWAY_SETUP_CODE OUT APPS_PATH SECONDS PAGES
@@ -65,7 +65,14 @@ async function submitAndWait(expr) {
   for (let i = 0; i < 400; i++) { await sleep(50); try { if ((await ev("performance.timeOrigin")) !== before && (await ev("document.readyState")) === "complete") return; } catch (e) { /* navigating */ } }
 }
 const set = (sel, v) => ev(`(function(){var e=document.querySelector(${JSON.stringify(sel)});e.value=${JSON.stringify(v)};return true})()`);
-async function scheme(s) { await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: s }] }); }
+// the theme: dark is the app's default, light the owner's choice kept in the browser (the bar's
+// theme button); each page loaded after this call opens in theme `s`
+let themeScript = null;
+async function scheme(s) {
+  await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: s }] });
+  if (themeScript) await cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier: themeScript });
+  themeScript = (await cdp("Page.addScriptToEvaluateOnNewDocument", { source: `try{localStorage.setItem("ls-theme",${JSON.stringify(s)})}catch(e){}` })).identifier;
+}
 async function size(width, height) { await cdp("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: width < 600 }); }
 async function sweep(x0, y0) {
   // the pointer drifts across the middle of the screen, so a shot shows the bend and the glow
@@ -125,6 +132,22 @@ try {
       const png = await cdp("Page.captureScreenshot", { format: "png" });
       writeFileSync(join(dir, `${n}.png`), Buffer.from(png.data, "base64"));
     }
+  }
+  // the theme button: dark by default; a click turns the page light, and the next page opens light
+  {
+    if (themeScript) { await cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier: themeScript }); themeScript = null; }
+    await size(1280, 900); await go(BASE + "/wallet"); await ev("localStorage.removeItem('ls-theme')"); await go(BASE + "/wallet");
+    const before = await ev("document.documentElement.getAttribute('data-theme') || 'dark'");
+    const bg0 = await ev("getComputedStyle(document.body).backgroundColor");
+    await ev("document.querySelector('.theme-toggle').click()"); await sleep(200);
+    const after = await ev("document.documentElement.getAttribute('data-theme')");
+    const pressed = await ev("document.querySelector('.theme-toggle').getAttribute('aria-pressed')");
+    await go(BASE + "/browse");
+    const next = await ev("document.documentElement.getAttribute('data-theme')");
+    const bg1 = await ev("getComputedStyle(document.body).backgroundColor");
+    await ev("document.querySelector('.theme-toggle').click()"); await sleep(100);
+    const back = await ev("document.documentElement.getAttribute('data-theme') || 'dark'");
+    result.theme = { default: before, after_click: after, pressed, next_page: next, back, dark_bg: bg0, light_bg: bg1 };
   }
   // the phone's menu, opened
   await scheme("light"); await size(390, 844); await go(BASE + "/browse"); await ev("document.querySelector('.menu-toggle').click()"); await sleep(200);

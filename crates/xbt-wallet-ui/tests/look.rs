@@ -72,7 +72,8 @@ fn the_river_and_the_stylesheet_are_local_cached_by_hash_and_the_csp_stays_self_
     assert!(h["content-type"].starts_with("text/css"));
     assert_eq!(h["cache-control"], "public, max-age=31536000, immutable");
     assert!(!css.contains("url(http") && !css.contains("@import"), "the stylesheet loads nothing from elsewhere");
-    for token in ["--river-a", "--river-b", "--river-spark", "--river-blend", "prefers-color-scheme: dark"] {
+    // dark by default, light as the owner's choice (the bar's theme button)
+    for token in ["--river-a", "--river-b", "--river-spark", "--river-blend", "color-scheme: dark", ":root[data-theme=\"light\"]"] {
         assert!(css.contains(token), "{token}");
     }
 }
@@ -198,6 +199,10 @@ fn the_look_in_headless_chrome() {
         assert!(r["contrast"][s]["text"].as_f64().unwrap() >= 7.0, "body text over the brightest river point: {r}");
         assert!(r["contrast"][s]["muted"].as_f64().unwrap() >= 4.5, "secondary text over the brightest river point: {r}");
     }
+    let t = &r["theme"];
+    assert!(t["default"] == "dark" && t["after_click"] == "light" && t["pressed"] == "true" && t["next_page"] == "light" && t["back"] == "dark",
+            "dark by default; the bar's button turns it light, and the choice is kept from page to page: {r}");
+    assert_ne!(t["dark_bg"], t["light_bg"], "{r}");
     assert!(r["flicker"]["frames"].as_u64().unwrap() >= 5, "{r}");
     assert!(r["flicker"]["min_ratio"].as_f64().unwrap() >= 0.5, "no blank or reset river while moving between pages: {r}");
     for k in ["desktop", "phone-menu"] {
