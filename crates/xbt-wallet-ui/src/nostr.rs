@@ -72,6 +72,7 @@ impl NostrCache {
         let make = move || {
             let (events, outcomes) = crate::perf::timed(|| query(&relays));
             let (listings, refused) = market::collect(&events, xbt_nostr::now());
+            let listings = newest_per_shop(listings);
             Snapshot { at: Instant::now(), listings, refused, relays: outcomes }
         };
         if refresh {
@@ -188,6 +189,18 @@ pub fn to_services(n: &NostrListing) -> Vec<Service> {
     crate::services::from_listing(&n.listing)
 }
 
+/// Of one author's listings under one receipt key, only the newest: a shop that changed its address
+/// (or went from a web address to its key, #40) left its old listing behind on relays that keep it
+/// after its withdrawal, and Found on Nostr listed the shop twice.
+pub fn newest_per_shop(listings: Vec<NostrListing>) -> Vec<NostrListing> {
+    let mut newest: std::collections::HashMap<(String, String), u64> = Default::default();
+    for n in &listings {
+        let t = newest.entry((n.listing.receipt_key.clone(), n.author.clone())).or_insert(n.created_at);
+        *t = (*t).max(n.created_at);
+    }
+    listings.into_iter().filter(|n| newest.get(&(n.listing.receipt_key.clone(), n.author.clone())).is_none_or(|t| n.created_at >= *t)).collect()
+}
+
 const MAX_BODY: u64 = 256 * 1024;
 
 /// One GET for [`listing::fetch`]: the status, headers and body, a 402 included.
@@ -225,6 +238,19 @@ pub fn check_with(n: &NostrListing, get: impl FnMut(&str) -> Result<Page, String
 mod swr_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// #40: a shop that went Private is listed once, at its key, not also at its old web address.
+    #[test]
+    fn a_shop_that_moved_is_listed_once() {
+        let l = |seller: &str, author: &str, at: u64| NostrListing {
+            listing: xbt402::listing::Listing { name: "Demo".into(), kind: "video".into(), seller: seller.into(), receipt_key: "rk".into(),
+                prices: serde_json::Value::Null, items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![] },
+            author: author.into(), event_id: format!("{seller}{at}"), created_at: at, transport: None,
+        };
+        let got = newest_per_shop(vec![l("https://stream.example", "a1", 100), l("http://key.shop.invalid", "a1", 200), l("https://other.example", "a2", 50)]);
+        let sellers: Vec<&str> = got.iter().map(|n| n.listing.seller.as_str()).collect();
+        assert_eq!(sellers, ["http://key.shop.invalid", "https://other.example"]);
+    }
 
     /// Found on Nostr never waits for the relays once it has an answer (0.2.2: the page took up to
     /// the relays' 8 s each time its last answer was over two minutes old).

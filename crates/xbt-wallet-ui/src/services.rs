@@ -371,6 +371,44 @@ pub fn save(path: &Path, services: &[Service]) -> Result<(), String> {
     res.map_err(|e| format!("services file {}: {e}", path.display()))
 }
 
+/// The catalog an agent reads through the wallet's MCP server (`list_services`, `xbt_wallet_mcp::catalog`):
+/// Browse's services as this app shows them, each with its category (`kind`: `apps`, `files`, `ai`,
+/// `hashrate`, `data`), its seller's name, its price in words and the exact address to pay it at
+/// (`pay_address`); a web app's page (`app`); files with each item's address; and for a shop reached by
+/// its key the node its entry vouches for now (`node`, from `shops`), which the MCP server matches against
+/// the owner's rules. `ai_endpoint`: the box's OpenAI-compatible address for programs, where it serves one.
+pub fn catalog(all: &[Service], shops: &std::collections::BTreeMap<String, crate::shops::Shop>, ai_endpoint: Option<&str>, now: u64) -> Value {
+    let services: Vec<Value> = all.iter().map(|s| {
+        let origin = http_origin(&s.seller).unwrap_or_else(|| s.seller.clone());
+        let mut v = json!({"name": s.name, "seller": origin, "seller_name": seller_name(all, &s.seller), "kind": s.category(),
+                           "kind_words": s.category_words(), "price_text": s.price_text, "pay_address": s.address()});
+        if !s.app.is_empty() {
+            v["app"] = json!(s.app);
+        }
+        if s.has_files() {
+            v["items"] = s.items.iter().map(|i| json!({"title": i.title, "url": i.url})).collect::<Vec<_>>().into();
+        }
+        if let Some(n) = shops.get(&origin).and_then(|sh| crate::shops::node(sh, &origin, now)) {
+            v["node"] = json!(n);
+        }
+        v
+    }).collect();
+    json!({"version": 1, "ai_endpoint": ai_endpoint, "services": services})
+}
+
+/// Write the agents' catalog ([`catalog`]) whole: a temp file beside it, then renamed over it.
+pub fn save_catalog(path: &Path, catalog: &Value) -> Result<(), String> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| format!("catalog: {e}"))?;
+    let tmp = dir.join(format!(".catalog.{}.tmp", hex::encode(crate::random_bytes::<6>())));
+    let text = serde_json::to_string_pretty(catalog).map_err(|e| e.to_string())? + "\n";
+    let res = std::fs::write(&tmp, text.as_bytes()).and_then(|_| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res.map_err(|e| format!("catalog {}: {e}", path.display()))
+}
+
 /// A price as a person reads it: `20 sat a MiB`, `5 sat a request`, `0.5 sat a second`.
 pub fn price_words(prices: &Value) -> String {
     let n = |k: &str| prices.get(k).and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64())).unwrap_or(0);
@@ -492,6 +530,32 @@ pub fn short_address(origin: &str) -> String {
         return format!("{}…{}", &npub[..13], &npub[npub.len() - 4..]);
     }
     http_origin(origin).unwrap_or_else(|| origin.to_string()).trim_start_matches("https://").trim_start_matches("http://").to_string()
+}
+
+/// A URL or path as a person reads it: percent-escapes decoded (`%20` a space), `+` left as it is
+/// (it is a plus in a path). Text that does not decode to UTF-8 is shown as it came. For display only.
+pub fn path_words(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    match String::from_utf8(out) {
+        // a decoded control character is never shown: the escape stays
+        Ok(t) if !t.chars().any(char::is_control) => t,
+        _ => s.to_string(),
+    }
 }
 
 /// The first integer in a price line (`"20 sat a MiB"` → 20, `"about 1,200 sat"` → 1200).
@@ -632,6 +696,48 @@ mod tests {
             licence: String::new(), credits: String::new() }
     }
     use super::*;
+
+    #[test]
+    fn a_path_is_shown_decoded() {
+        assert_eq!(path_words("/files/My%20film%20(2010).mkv"), "/files/My film (2010).mkv");
+        assert_eq!(path_words("/a+b%2"), "/a+b%2");
+        assert_eq!(path_words("/x%0Ay"), "/x%0Ay", "no control characters");
+        assert_eq!(path_words("/caf%C3%A9"), "/café");
+    }
+
+    /// The catalog agents read names each service's category, seller, price and exact address to pay, a web app's page,
+    /// and each file's address, and the MCP server's `list_services` reads it as written.
+    ///
+    /// FAILS before: no catalog was written, and an agent could not find a shop reached by its key.
+    #[test]
+    fn the_agents_catalog_names_what_to_pay_and_where() {
+        let shop = xbt402::shop::origin_for(&[0x5b; 32]);
+        let films = Service { name: "Box: Films".into(), kind: Kind::Files, seller: "https://box.example".into(), price_text: "20 sat a MiB".into(), prices: Value::Null,
+                              items: vec![Item { title: "A film".into(), year: String::new(), url: "https://box.example/files/a.mkv".into(), credit: String::new() }],
+                              address: "https://box.example/files/".into(), app: String::new(), app_base: String::new() };
+        let jf = Service { name: "Box: Jellyfin".into(), kind: Kind::Video, seller: "https://box.example".into(), price_text: "20 sat a MiB".into(), prices: Value::Null,
+                           items: vec![], address: String::new(), app: "https://box.example/web/".into(), app_base: "https://box.example/".into() };
+        let ai = Service { name: "Genesis".into(), kind: Kind::Ai, seller: shop.clone(), price_text: "4 sat per 1,000 tokens".into(), prices: Value::Null,
+                           items: vec![], address: format!("{shop}/v1/"), app: String::new(), app_base: String::new() };
+        let all = vec![films, jf, ai];
+        let c = catalog(&all, &Default::default(), Some("http://box.local:33540/v1"), 0);
+        let s = &c["services"];
+        assert_eq!((s[0]["kind"].as_str(), s[0]["seller_name"].as_str(), s[0]["pay_address"].as_str()), (Some("files"), Some("Box"), Some("https://box.example/files/")));
+        assert_eq!(s[0]["items"][0]["url"], "https://box.example/files/a.mkv");
+        assert_eq!((s[1]["kind"].as_str(), s[1]["app"].as_str(), s[1]["pay_address"].as_str()), (Some("apps"), Some("https://box.example/web/"), Some("https://box.example")));
+        assert_eq!((s[2]["kind"].as_str(), s[2]["pay_address"].as_str()), (Some("ai"), Some(format!("{shop}/v1/").as_str())));
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("catalog.json");
+        save_catalog(&p, &c).unwrap();
+        let read = xbt_wallet_mcp::catalog::read_catalog(&p).unwrap();
+        let listed = xbt_wallet_mcp::catalog::list(&read, &json!({}), "");
+        assert_eq!((listed["services"].as_array().unwrap().len(), listed["allowed"].as_u64()), (3, Some(0)));
+        assert_eq!(listed["ai_endpoint"], "http://box.local:33540/v1");
+        // the seller's words (an item's title) under the untrusted mark, its address beside them
+        let files = &xbt_wallet_mcp::catalog::list(&read, &json!({}), "files")["services"][0];
+        assert_eq!((files["untrusted_provider_response"]["item_titles"][0].as_str(), files["items"][0]["url"].as_str()),
+                   (Some("A film"), Some("https://box.example/files/a.mkv")), "{files}");
+    }
 
     /// A shop is named by its listing's name (#37 item 16), whatever [`from_listing`] made of its services,
     /// and one reached by its key is never named by its made-up `…shop.invalid` address (items 7, 11, 20).

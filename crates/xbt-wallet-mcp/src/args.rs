@@ -56,12 +56,15 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
     // AGP-082: amount_sats, for a BOLT 12 offer that names no amount (0: not given)
     static LN_PAY: [Arg; 4] = [req("invoice", Ty::Str), req("max_sats", Ty::Int), opt("description", Ty::Str, empty),
                                opt("amount_sats", Ty::Int, || Value::from(0))];
+    static LIST_SERVICES: [Arg; 1] = [opt("kind", Ty::Str, empty)];
     static TICKET_STATUS: [Arg; 1] = [opt("session", Ty::Str, empty)];
     static TICKET_STOP: [Arg; 2] = [opt("session", Ty::Str, empty), opt("seller", Ty::Str, empty)];
     Some(match tool {
         "balance" | "channels" => &[],
         "quote_payment" | "pay" => &PAYMENT,
         "history" => &HISTORY,
+        // what the wallet may buy (not B2's): `kind` filters by Browse's category
+        "list_services" => &LIST_SERVICES,
         "xbt402_pay" => &XBT402_PAY,
         // AGP-048 (not B2's)
         "ln_pay" => &LN_PAY,

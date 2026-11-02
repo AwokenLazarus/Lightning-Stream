@@ -252,7 +252,20 @@ impl xbt_svc::http::Handler for Ui {
                     let no_route = crate::pay_feedback::explain(body, None, true).kind == crate::pay_feedback::Kind::NoRoute;
                     refused_html(body, &base, if no_route { app.spendable_sats() } else { None })
                 };
-                relay(&url, range.as_deref(), req.headers.get("if-range").map(String::as_str), ceiling.as_ref(), limit, &page)
+                // a player's link counts what it carries, for its row on the Files page
+                let used = strip_base(&req.path, &self.0.cfg.base_path).and_then(|p| p.strip_prefix("/r/").and_then(|t| self.0.relays.usage(t)));
+                let reply = relay(&url, range.as_deref(), req.headers.get("if-range").map(String::as_str), ceiling.as_ref(), limit, &page);
+                match (used, reply) {
+                    (Some(used), xbt_svc::http::Reply::Stream(mut s)) => {
+                        let body = s.body;
+                        s.body = Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| {
+                            let _open = used.start();
+                            body(&mut Counted { out, used: &used })
+                        });
+                        xbt_svc::http::Reply::Stream(s)
+                    }
+                    (_, r) => r,
+                }
             }
         }
     }
@@ -466,6 +479,24 @@ fn relay_once(url: &str, range: Option<&str>, if_range: Option<&str>, ceiling: O
         length,
         body: Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| send_within(&mut src, left, out)),
     }))
+}
+
+/// A player's body as it is sent, counted for its link ([`crate::relay::LinkUse`]).
+struct Counted<'a> {
+    out: &'a mut dyn xbt_svc::http::BodyWriter,
+    used: &'a crate::relay::LinkUse,
+}
+
+impl xbt_svc::http::BodyWriter for Counted<'_> {
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.out.send(bytes)?;
+        self.used.sent(bytes.len() as u64);
+        Ok(())
+    }
+
+    fn gone(&mut self) -> bool {
+        self.out.gone()
+    }
 }
 
 /// A relayed body, at most `left` bytes of it. One that has more than that ends in an error, so that

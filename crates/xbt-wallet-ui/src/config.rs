@@ -500,6 +500,12 @@ impl Config {
         }
     }
 
+    /// The catalog agents read (`list_services` of the wallet's MCP server): `catalog.json` beside the shops
+    /// file, in the directory the MCP server already reads.
+    pub fn catalog_path(&self) -> PathBuf {
+        self.shops_path().with_file_name("catalog.json")
+    }
+
     /// A test or embedding configuration.
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         let files_dir = data_dir.join("files");

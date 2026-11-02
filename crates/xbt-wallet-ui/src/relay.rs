@@ -12,7 +12,8 @@
 //! What a link can spend is what the connector spends for that one file: each request through it
 //! is one paid call under the connector's task and per-call cap, within the owner's budgets. It
 //! cannot reach any page of the UI, any other file, or the signer.
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{ct_eq, random_bytes};
@@ -25,6 +26,57 @@ struct Link {
     /// The service it was made for ([`crate::services::Service::id`]).
     service: String,
     expires: Instant,
+    used: Arc<LinkUse>,
+}
+
+/// What a link carried, as the UI relayed it: the bytes sent to the player, and how many of its
+/// requests are open now. Counted here, at the relay: the sats are figured from the file's listed
+/// price, not from the seller's receipts (the connector does not tell the UI what each call paid).
+#[derive(Default)]
+pub struct LinkUse {
+    bytes: AtomicU64,
+    open: AtomicUsize,
+    /// When bytes last went to the player, in ms since [`epoch`].
+    last_ms: AtomicU64,
+}
+
+/// How recently bytes must have moved for a link to read as playing.
+pub const PLAYING_WITHIN: Duration = Duration::from_secs(10);
+
+/// A fixed instant of this process, to date a link's last bytes by.
+fn epoch() -> Instant {
+    static AT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    *AT
+}
+
+impl LinkUse {
+    /// `n` more bytes went to the player.
+    pub fn sent(&self, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.last_ms.store(u64::try_from(epoch().elapsed().as_millis()).unwrap_or(u64::MAX).max(1), Ordering::Relaxed);
+    }
+
+    /// A request is open and bytes moved within [`PLAYING_WITHIN`].
+    fn playing(&self) -> bool {
+        let last = self.last_ms.load(Ordering::Relaxed);
+        let now = u64::try_from(epoch().elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.open.load(Ordering::Relaxed) > 0 && last > 0 && now.saturating_sub(last) < PLAYING_WITHIN.as_millis() as u64
+    }
+
+    /// A request through the link starts; it ends when the guard drops.
+    pub fn start(self: &Arc<Self>) -> OpenGuard {
+        self.open.fetch_add(1, Ordering::Relaxed);
+        OpenGuard(self.clone())
+    }
+}
+
+/// One request of a link in progress ([`LinkUse::start`]).
+pub struct OpenGuard(Arc<LinkUse>);
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct RelayLinks {
@@ -36,6 +88,12 @@ pub struct RelayLinks {
 pub struct Shown {
     pub token: String,
     pub left: Duration,
+    /// The bytes it has carried so far.
+    pub bytes: u64,
+    /// A request through it is open now (the player holds it).
+    pub in_use: bool,
+    /// And bytes moved through it within [`PLAYING_WITHIN`] (the player is reading).
+    pub playing: bool,
 }
 
 impl RelayLinks {
@@ -62,7 +120,7 @@ impl RelayLinks {
         if l.len() >= MAX_LINKS {
             l.remove(0);
         }
-        l.push(Link { token: token.clone(), item: item.to_string(), service: service.to_string(), expires: Instant::now() + self.ttl });
+        l.push(Link { token: token.clone(), item: item.to_string(), service: service.to_string(), expires: Instant::now() + self.ttl, used: Arc::default() });
         token
     }
 
@@ -85,6 +143,15 @@ impl RelayLinks {
         l.iter().fold(None, |found, x| if ct_eq(x.token.as_bytes(), token.as_bytes()) { Some(x.service.clone()) } else { found })
     }
 
+    /// The counter of what a live token carries.
+    pub fn usage(&self, token: &str) -> Option<Arc<LinkUse>> {
+        if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let l = self.live();
+        l.iter().fold(None, |found, x| if ct_eq(x.token.as_bytes(), token.as_bytes()) { Some(x.used.clone()) } else { found })
+    }
+
     /// Revoke a link. True: it was live.
     pub fn revoke(&self, token: &str) -> bool {
         let mut l = self.live();
@@ -96,13 +163,33 @@ impl RelayLinks {
     /// The live links of `item`, newest first.
     pub fn of_item(&self, item: &str) -> Vec<Shown> {
         let now = Instant::now();
-        self.live().iter().rev().filter(|x| x.item == item).map(|x| Shown { token: x.token.clone(), left: x.expires - now }).collect()
+        self.live().iter().rev().filter(|x| x.item == item).map(|x| Shown {
+            token: x.token.clone(), left: x.expires - now,
+            bytes: x.used.bytes.load(Ordering::Relaxed), in_use: x.used.open.load(Ordering::Relaxed) > 0, playing: x.used.playing(),
+        }).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link counts what it carries while a request is open, and keeps the total after.
+    #[test]
+    fn a_link_counts_its_bytes_while_in_use_and_keeps_the_total() {
+        let links = RelayLinks::new(Duration::from_secs(60));
+        let t = links.create("https://box.example/files/a.mkv");
+        let u = links.usage(&t).unwrap();
+        let g = u.start();
+        u.sent(1000);
+        u.sent(500);
+        let s = &links.of_item("https://box.example/files/a.mkv")[0];
+        assert_eq!((s.bytes, s.in_use, s.playing), (1500, true, true));
+        drop(g);
+        let s = &links.of_item("https://box.example/files/a.mkv")[0];
+        assert_eq!((s.bytes, s.in_use, s.playing), (1500, false, false));
+        assert!(links.usage(&"0".repeat(64)).is_none());
+    }
 
     #[test]
     fn a_link_names_its_item_until_it_expires_or_is_revoked() {

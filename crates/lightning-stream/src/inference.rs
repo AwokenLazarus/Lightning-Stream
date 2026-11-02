@@ -35,6 +35,60 @@ pub fn error_body(code: &str, kind: &str, message: &str) -> Value {
     json!({"error": {"message": message, "type": kind, "code": code}})
 }
 
+/// The rules of the owner's own spending policy (the signer's `rule` when one refuses a payment): a refusal by one
+/// of them is the buyer's limit, not a failure of the seller's.
+pub const SPENDING_RULES: [&str; 10] = ["max_per_tx", "daily_budget", "weekly_budget", "per_counterparty", "per_counterparty_daily", "velocity",
+                                        "human_threshold", "split_bypass", "ticket_task_budget", "ticket_seller_cap"];
+
+/// Whether `rule` is one of the owner's spending rules ([`SPENDING_RULES`]).
+pub fn is_spending_rule(rule: &str) -> bool {
+    SPENDING_RULES.contains(&rule)
+}
+
+/// Whether a refusal by the spending rule `rule` holds at any seller (a limit on the wallet as a whole), so that no
+/// other seller is tried; a limit on one seller leaves the others.
+pub fn wallet_wide(rule: &str) -> bool {
+    !matches!(rule, "per_counterparty" | "per_counterparty_daily" | "ticket_seller_cap" | "max_per_tx" | "human_threshold" | "split_bypass")
+}
+
+/// `n` with a comma between thousands: 20000 is "20,000".
+fn thousands(n: u64) -> String {
+    let d = n.to_string();
+    let mut out = String::new();
+    for (i, c) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A payment the owner's spending rule `rule` refused, as OpenAI's clients read it: 402 for a limit on what is
+/// spent, 429 for the limit on payments an hour, `spending_limit_reached` with the rule, and words that name the
+/// seller, the limit in sats (`limit_sats`, where the wallet said it) and where to raise it. None of the signer's or
+/// the seller's own words.
+pub fn spending_refusal(rule: &str, limit_sats: Option<u64>, seller: &str) -> (u16, Value) {
+    let n = limit_sats.map_or_else(|| "your limit".to_string(), |l| format!("{} sats", thousands(l)));
+    let said = match rule {
+        "per_counterparty_daily" => format!("You've reached today's limit for {seller} ({n})."),
+        "per_counterparty" => format!("You've reached this week's limit for {seller} ({n})."),
+        "ticket_seller_cap" => format!("You've reached your limit for {seller} ({n})."),
+        "daily_budget" => format!("You've reached today's spending limit ({n}), so a payment to {seller} for this request was refused."),
+        "weekly_budget" => format!("You've reached this week's spending limit ({n}), so a payment to {seller} for this request was refused."),
+        "ticket_task_budget" => format!("You've reached the budget for these calls ({n}), so a payment to {seller} for this request was refused."),
+        "max_per_tx" => format!("A payment to {seller} for this request would be above your largest single payment ({n})."),
+        "split_bypass" => format!("Payments to {seller} in the last few minutes add up to more than your spending rules allow without asking you ({n})."),
+        "human_threshold" => format!("A payment to {seller} for this request is at or above the amount you approve first ({n})."),
+        "velocity" => format!("You've made as many payments as your spending rules allow in a while, so this one to {seller} waits. Try again later."),
+        _ => format!("Your spending rules refused a payment to {seller}."),
+    };
+    let message = format!("{said} Raise it in Settings → Spending rules on the Lightning Stream app.");
+    let status = if rule == "velocity" { 429 } else { 402 };
+    (status, json!({"error": {"message": message, "type": "spending_limit_reached", "code": "spending_limit_reached", "param": null, "rule": rule,
+                              "seller": seller, "limit_sats": limit_sats}}))
+}
+
 /// A key refused, as OpenAI's clients read it: an unknown or revoked key is 401, a key at its limit
 /// 402 with words the client shows.
 pub fn refusal_answer(r: &Refusal) -> (u16, Value) {
@@ -97,7 +151,8 @@ impl Catalogue {
 
     /// `GET /v1/models`: one entry per model, with every seller's price under `x_stream`, which
     /// clients that do not know it leave alone. A model is listed both as `model` (route me) and as
-    /// `seller/model` (this seller only).
+    /// `seller/model` (this seller only): the same model, which each entry's `description` says, and
+    /// both reach a seller the same way ([`Router::order`]).
     pub fn models_json(&self) -> Value {
         let mut ids: Vec<&str> = self.offers.iter().map(|o| o.model.as_str()).collect();
         ids.sort_unstable();
@@ -108,10 +163,15 @@ impl Catalogue {
                 .map(|o| json!({"seller": o.seller, "per_1k_input_msat": o.input_per_1k_msat, "per_1k_output_msat": o.output_per_1k_msat,
                                 "request_msat": o.request_msat}))
                 .collect();
-            data.push(json!({"id": id, "object": "model", "owned_by": "lightning-stream", "x_stream": {"sellers": sellers}}));
+            let pinned: Vec<String> = self.offers.iter().filter(|o| o.model == id).map(|o| format!("{}/{}", o.seller, o.model)).collect();
+            let description = format!("{id}, from the cheapest seller you allow that offers it (another if it fails before answering). To use one seller \
+                                       only, ask for {}.", pinned.join(" or "));
+            data.push(json!({"id": id, "object": "model", "owned_by": "lightning-stream", "description": description, "x_stream": {"sellers": sellers}}));
         }
         for o in &self.offers {
-            data.push(json!({"id": format!("{}/{}", o.seller, o.model), "object": "model", "owned_by": o.seller}));
+            let description = format!("{} from {} only: the same model as {}, kept to this seller.", o.model, o.seller, o.model);
+            data.push(json!({"id": format!("{}/{}", o.seller, o.model), "object": "model", "owned_by": o.seller, "description": description,
+                             "x_stream": {"seller": o.seller, "model": o.model}}));
         }
         json!({"object": "list", "data": data})
     }
@@ -174,9 +234,10 @@ impl Router {
     /// (that seller only). Blocked and resting sellers are left out; pinned ones come first; the
     /// rest go by what this request may cost, with the faster seller first in a near-tie.
     pub fn order(&self, model: &str, input_tokens: u64, max_tokens: u64, now: u64) -> Vec<&Offer> {
-        let (want_seller, id) = match model.split_once('/') {
-            Some((s, m)) if self.catalogue.offers.iter().any(|o| o.seller == s && o.model == m) => (Some(s), m),
-            _ => (None, model),
+        // `seller/model` as listed, whole: a seller's name or a model's id may hold a `/` of its own
+        let (want_seller, id) = match self.catalogue.offers.iter().find(|o| model.strip_prefix(o.seller.as_str()).and_then(|r| r.strip_prefix('/')) == Some(o.model.as_str())) {
+            Some(o) => (Some(o.seller.as_str()), o.model.as_str()),
+            None => (None, model),
         };
         let mut c: Vec<&Offer> = self.catalogue.offers.iter()
             .filter(|o| o.model == id && want_seller.is_none_or(|s| o.seller == s))
@@ -328,6 +389,33 @@ mod tests {
         assert!(sellers(&r, 1000 + COOL_OFF_S).contains(&"cheap".to_string()), "and is tried again after the rest");
         r.record("cheap", Outcome::Answered { ttft_ms: 10 }, 1000 + COOL_OFF_S);
         assert_eq!(r.health["cheap"].fails_in_a_row, 0);
+    }
+
+    #[test]
+    fn a_seller_qualified_name_is_read_whole_where_a_model_id_holds_a_slash() {
+        let mut c = Catalogue::default();
+        c.add_seller("Shop: ai", "https://a.example/ai/", &json!({"per_1k_output_msat": 5000}), 1024, &json!({"data": [{"id": "org/model"}]}));
+        let r = Router { catalogue: c, ..Default::default() };
+        let got = |m: &str| r.order(m, 1, 1, 0).iter().map(|o| (o.seller.clone(), o.model.clone())).collect::<Vec<_>>();
+        assert_eq!(got("Shop: ai/org/model"), [("Shop: ai".to_string(), "org/model".to_string())]);
+        assert_eq!(got("org/model"), got("Shop: ai/org/model"), "both names route the same");
+    }
+
+    #[test]
+    fn a_spending_rule_refusal_names_the_seller_the_limit_in_sats_and_where_to_raise_it() {
+        let (status, v) = spending_refusal("per_counterparty_daily", Some(20_000), "Genesis");
+        let m = v["error"]["message"].as_str().unwrap();
+        assert_eq!(status, 402);
+        assert_eq!(m, "You've reached today's limit for Genesis (20,000 sats). Raise it in Settings → Spending rules on the Lightning Stream app.");
+        assert_eq!(spending_refusal("velocity", None, "Genesis").0, 429);
+        for rule in SPENDING_RULES {
+            let (_, v) = spending_refusal(rule, Some(1_234_567), "Genesis");
+            let m = v["error"]["message"].as_str().unwrap();
+            assert!(m.contains("Genesis") && m.contains("Settings → Spending rules") && v["error"]["rule"] == rule, "{rule}: {m}");
+            assert!(rule == "velocity" || m.contains("1,234,567 sats"), "{rule}: {m}");
+        }
+        assert!(spending_refusal("daily_budget", None, "G").1["error"]["message"].as_str().unwrap().contains("(your limit)"));
+        assert_eq!((thousands(0), thousands(999), thousands(1000), thousands(5_000)), ("0".into(), "999".into(), "1,000".into(), "5,000".into()));
     }
 
     #[test]

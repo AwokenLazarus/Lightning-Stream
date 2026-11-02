@@ -38,7 +38,8 @@ pub fn kind_of(rule: &str, words: &str) -> Kind {
         "ticket_admission" | "allowlist" | "dest" => Kind::Admission,
         "ln_no_route" => Kind::NoRoute,
         "max_sats" | "max_per_tx" | "max_payment_sats" | "split_bypass" => Kind::Limit,
-        "daily_budget" | "weekly_budget" | "per_counterparty_daily" | "per_counterparty" => Kind::Cap,
+        "daily_budget" | "weekly_budget" | "per_counterparty_daily" | "per_counterparty" | "ticket_task_budget" | "ticket_seller_cap" | "velocity" => Kind::Cap,
+        "human_threshold" => Kind::Limit,
         "visit" => Kind::Visit,
         "seller_busy" => Kind::Busy,
         _ if w.contains("exposure_cap_sats") => Kind::NodeCap,
@@ -84,16 +85,55 @@ fn node_links() -> Vec<(String, String)> {
     vec![("lightning".into(), "Your node and channels".into()), (GUIDE_CHANNEL.into(), "Get a channel".into())]
 }
 
+/// Where the owner's spending rules are changed, in the words the app's menus use.
+pub const RULES_AT: &str = "Settings → Spending rules";
+
+/// The field of the Spending rules page that holds the owner's rule `rule` (a refusal's rule name): its label as the
+/// page shows it, and the part of the page it is in (`None`: the first part, open). `None` for a rule that is not one
+/// of the owner's spending rules.
+pub fn rule_field(rule: &str) -> Option<(&'static str, Option<&'static str>)> {
+    Some(match rule {
+        "max_per_tx" | "split_bypass" => ("Largest single payment", None),
+        "daily_budget" => ("Spending limit for any 24 hours", None),
+        "weekly_budget" => ("Spending limit for any 7 days", Some("More rules")),
+        "per_counterparty" | "ticket_seller_cap" => ("Most to any one seller in 7 days", Some("More rules")),
+        "per_counterparty_daily" => ("Most to any one seller in 24 hours", Some("More rules")),
+        "human_threshold" => ("Ask me first for a payment of at least", None),
+        "velocity" => ("At most this many payments…", Some("More rules, How fast")),
+        "ticket_task_budget" => ("the budget of the stream tickets' task (Advanced: tickets › tasks › budget_sats)", None),
+        _ => return None,
+    })
+}
+
+/// "Raise "<field>" in Settings → Spending rules (under More rules)": where the owner changes `rule`.
+fn raise_words(rule: &str, verb: &str) -> String {
+    match rule_field(rule) {
+        Some((label, Some(part))) => format!("{verb} \"{label}\" in {RULES_AT} (under {part})."),
+        Some((label, None)) => format!("{verb} \"{label}\" in {RULES_AT}."),
+        None => format!("Change it in {RULES_AT}."),
+    }
+}
+
 /// The wallet's refusal `body` (the connector's JSON, or any text) in words. `spendable`: what the
 /// node can send now ([`spendable_sats`]), said with a no-route refusal where known. `file`: a
 /// download or a player's link, rather than a page of a shop's app.
 pub fn explain(body: &str, spendable: Option<i64>, file: bool) -> Explained {
+    explain_at(body, spendable, file, None)
+}
+
+/// [`explain`], for a refusal at the shop named `shop` (`None`: "this shop"). A refusal by one of the owner's spending
+/// rules names that rule as the Spending rules page shows it, the owner's limit where the refusal says it
+/// (`limit_sats`), and where to raise it; the wallet's words stay under Details.
+pub fn explain_at(body: &str, spendable: Option<i64>, file: bool, shop: Option<&str>) -> Explained {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let raw = v.get("error").or(v.get("reason")).and_then(Value::as_str).filter(|w| !w.is_empty()).map(str::to_string)
         .unwrap_or_else(|| if v.is_null() && !body.trim().is_empty() && body.len() <= 2000 { body.trim().to_string() } else { String::new() });
     let rule = v.get("rule").and_then(Value::as_str).unwrap_or("");
     let kind = kind_of(rule, &raw);
     let rules = || vec![("policy".to_string(), "Spending rules".to_string())];
+    let shop = shop.filter(|s| !s.trim().is_empty()).unwrap_or("this shop");
+    // the owner's limit, where the refusal says it: " (5,000 sat)"
+    let limit = v.get("limit_sats").and_then(Value::as_i64).filter(|n| *n > 0 && *n < i64::MAX).map(|n| format!(" ({})", sat(n))).unwrap_or_default();
     let (title, words, fix, links): (&str, String, String, Vec<(String, String)>) = match kind {
         Kind::Admission => ("This shop isn't allowed yet", "Your spending rules don't allow this shop yet. Nothing was paid.".into(),
                             "Go to Sellers and choose Allow this seller to be paid.".into(),
@@ -109,13 +149,29 @@ pub fn explain(body: &str, spendable: Option<i64>, file: bool) -> Explained {
                      with the shop. Your spending rules apply as well.", sat(crate::server::RETRY_MOST_SATS)), rules()),
         Kind::Limit if rule == "max_sats" => ("Over this visit's limit", "The next ticket costs more than is left of this visit's limit. Nothing more was paid.".into(),
             "Open the app again with a higher limit. What you don't use stays as credit with the shop.".into(), vec![("browse".into(), "Browse".into())]),
-        Kind::Limit => ("Over your limit", "This payment is larger than your spending rules allow for one payment. Nothing was paid.".into(),
-                        "Raise the most per payment in Spending rules, if you want to allow it.".into(), rules()),
-        Kind::Cap => {
-            let when = if rule == "weekly_budget" { "this week's" } else { "today's" };
-            ("Spending cap reached", format!("You've reached {when} spending cap in your rules. Nothing was paid."),
-             format!("Raise the cap in Spending rules, or wait until {}.", if rule == "weekly_budget" { "next week" } else { "tomorrow" }), rules())
-        }
+        Kind::Limit if rule == "human_threshold" => ("Needs your approval",
+            format!("Your spending rules ask you first for a payment this large{limit}, and a payment for {shop} can't wait for you. Nothing was paid."),
+            raise_words(rule, "Raise"), rules()),
+        Kind::Limit => ("Over your limit", format!("This payment is larger than your spending rules allow for one payment{limit}. Nothing was paid."),
+                        format!("Raise the most per payment, if you want to allow it: \"Largest single payment\" in {RULES_AT}."), rules()),
+        Kind::Cap => match rule {
+            "per_counterparty_daily" => ("Today's limit for this shop is reached",
+                format!("You've reached today's limit for {shop}{limit}. Nothing more was paid."),
+                format!("{} Or wait: the limit counts the last 24 hours.", raise_words(rule, "Raise it:")), rules()),
+            "per_counterparty" | "ticket_seller_cap" => ("This week's limit for this shop is reached",
+                format!("You've reached this week's limit for {shop}{limit}. Nothing more was paid."),
+                format!("{} Or wait: the limit counts the last 7 days.", raise_words(rule, "Raise it:")), rules()),
+            "ticket_task_budget" => ("Spending cap reached", format!("You've reached the budget your rules give stream tickets{limit}. Nothing more was paid."),
+                raise_words(rule, "Raise"), rules()),
+            "velocity" => ("Too many payments at once", format!("Your spending rules allow only so many payments in a while, and {shop} asked for more. Nothing more was paid."),
+                format!("{} Or wait a while.", raise_words(rule, "Raise")), rules()),
+            _ => {
+                let when = if rule == "weekly_budget" { "this week's" } else { "today's" };
+                ("Spending cap reached", format!("You've reached {when} spending cap in your rules{limit}. Nothing was paid."),
+                 format!("{} Or wait until {}.", raise_words(if rule == "weekly_budget" { rule } else { "daily_budget" }, "Raise the cap:"),
+                         if rule == "weekly_budget" { "next week" } else { "tomorrow" }), rules())
+            }
+        },
         Kind::NodeCap => {
             // "the LN node holds N sats in its channels (…), above ln.exposure_cap_sats C: …"
             let num = |key: &str| raw.split(key).nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())).and_then(|s| s.parse::<i64>().ok());
@@ -131,7 +187,7 @@ pub fn explain(body: &str, spendable: Option<i64>, file: bool) -> Explained {
                         "Open the app again with a new limit. What you don't use stays as credit with the shop.".into(), vec![("browse".into(), "Browse".into())]),
         Kind::Busy => ("This shop is busy", "The shop's service is full right now. Nothing was charged.".into(), "Reload the page to try again.".into(), vec![]),
         Kind::Other => ("Not paid", if file { "The wallet did not pay for this file.".into() } else { "The wallet did not pay for this.".into() },
-                        "Your spending rules decide what the wallet pays.".into(), rules()),
+                        format!("Your spending rules decide what the wallet pays ({RULES_AT})."), rules()),
     };
     Explained { kind, title: title.into(), words, fix, links, raw }
 }
@@ -253,6 +309,52 @@ mod tests {
         let e = explain(NO_ROUTE, Some(50_000), false);
         assert!(e.words.contains("found no route to this shop's node"), "{e:?}");
         assert_eq!(explain(r#"{"error": "the wallet's node has found no route to the seller for 8.0 s: nothing was sent"}"#, None, true).kind, Kind::NoRoute);
+    }
+
+    /// The buyer's own daily cap with one shop: the page says, in plain words, that today's limit for that shop is
+    /// reached, with the limit, the field to raise on the Spending rules page and where it is, and a link there. The
+    /// seller's words never appear.
+    ///
+    /// FAILS before: "Spending cap reached ... today's spending cap", with no shop, no limit and no field.
+    #[test]
+    fn a_shops_daily_limit_is_told_with_the_shop_the_limit_and_the_field() {
+        let body = r#"{"error": "today's spend with this seller 5203 exceeds its daily cap 5000", "rule": "per_counterparty_daily", "limit_sats": 5000}"#;
+        let e = explain_at(body, None, false, Some("Demo Films"));
+        assert_eq!(e.kind, Kind::Cap);
+        assert!(e.words.starts_with("You've reached today's limit for Demo Films (5,000 sat)."), "{e:?}");
+        assert!(e.fix.contains("\"Most to any one seller in 24 hours\" in Settings → Spending rules (under More rules)"), "{e:?}");
+        assert_eq!(e.links, vec![("policy".to_string(), "Spending rules".to_string())]);
+        assert!(!format!("{e:?}").contains("too_many"), "{e:?}");
+        // without the shop's name or the limit: still the rule, in words
+        let e = explain(r#"{"error": "x", "rule": "per_counterparty_daily"}"#, None, false);
+        assert!(e.words.starts_with("You've reached today's limit for this shop."), "{e:?}");
+    }
+
+    /// Every one of the owner's spending rules that can refuse a payment is named on the "Not paid" page: the field
+    /// as the Spending rules page shows it, and where to change it. None falls through to the bare "Not paid".
+    ///
+    /// FAILS before: the task's budget, the cap on one seller, velocity and the approval threshold said only "Not
+    /// paid. Your spending rules decide what the wallet pays."
+    #[test]
+    fn every_spending_rule_is_named_where_a_payment_is_refused() {
+        for rule in ["max_per_tx", "split_bypass", "daily_budget", "weekly_budget", "per_counterparty", "per_counterparty_daily", "velocity", "human_threshold",
+                     "ticket_task_budget", "ticket_seller_cap"] {
+            let e = explain_at(&json!({"error": "x", "rule": rule, "limit_sats": 1234}).to_string(), None, false, Some("Demo"));
+            assert_ne!(e.kind, Kind::Other, "{rule}: {e:?}");
+            let (label, _) = rule_field(rule).unwrap();
+            assert!(e.fix.contains(label) && e.fix.contains(RULES_AT), "{rule}: {e:?}");
+            assert!(e.links.iter().any(|(to, _)| to == "policy"), "{rule}: {e:?}");
+            if rule != "velocity" {
+                assert!(e.words.contains("1,234 sat"), "{rule}: the limit is said: {e:?}");
+            }
+        }
+        // the labels are the page's own
+        for (key, label, _) in crate::app::INT_KEYS {
+            let rule = match key { "max_per_tx_sats" => "max_per_tx", "daily_budget_sats" => "daily_budget", "weekly_budget_sats" => "weekly_budget",
+                                   "per_counterparty_cap_sats" => "per_counterparty", "per_counterparty_daily_sats" => "per_counterparty_daily",
+                                   "human_threshold_sats" => "human_threshold", "velocity_max" => "velocity", _ => continue };
+            assert!(label.starts_with(rule_field(rule).unwrap().0), "{key}: {label}");
+        }
     }
 
     #[test]

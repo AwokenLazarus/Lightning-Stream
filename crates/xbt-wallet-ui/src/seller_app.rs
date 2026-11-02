@@ -193,7 +193,10 @@ impl App {
         let suggested = q.get("limit").and_then(|v| v.parse::<i64>().ok()).filter(|n| (MIN_CALL_SATS..=MAX_VISIT_SATS).contains(n)).unwrap_or_else(|| suggested_limit(&svc));
         // the shop by its listed name ("Lightning Stream Genesis"), never its key or made-up address
         let shop = self.seller_name(&svc.seller);
-        let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
+        // the credit left with the shop, as a file's page says it: a visit spends it first
+        let credit = crate::services::http_origin(&svc.seller).and_then(|o| self.credits().get(&o).copied())
+            .map(|m| crate::app::credit_line(&shop, m)).unwrap_or_default();
+        let b = format!("{warn}{credit}<section class=\"card primary\"><h2>Open {}'s app</h2>\
             <p>You use <strong>{}</strong> inside this page. What it loads is paid at {}, and stops at the limit you set here.</p>\
             <p class=\"small\">Shop address: {}</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
@@ -214,12 +217,12 @@ impl App {
         let known = self.call("identity_get", json!({"origin": origin})).unwrap_or(Value::Null);
         // the wallet cannot read its choices: it stays anonymous everywhere, and there is nothing to choose until that is mended
         if known.get("damaged") == Some(&json!(true)) {
-            return "<section class=\"card\"><h3>Your history at this shop</h3><p>The wallet cannot read its record of which shops may recognise you, so it stays anonymous \
+            return "<section class=\"card\"><h3>Your history at this shop</h3><p>The wallet cannot read its record of which shops may recognize you, so it stays anonymous \
                     at every shop for now. A shop with no shared guest refuses you until that file (identity.json) is mended or removed.</p></section>".to_string();
         }
         let anonymous = known.get("here") == Some(&json!(true));
         let (state, button, to) = if anonymous {
-            ("You stay anonymous at this shop: it does not keep your history, and you use its shared guest where it has one.", "Let this shop recognise me", "0")
+            ("You stay anonymous at this shop: it does not keep your history, and you use its shared guest where it has one.", "Let this shop recognize me", "0")
         } else {
             ("This shop keeps your watch history. It sees a private handle, not who you are, and it is the same each time you come back.", "Stay anonymous here", "1")
         };
@@ -236,7 +239,7 @@ impl App {
         let g = |k: &str| f.get(k).cloned().unwrap_or_default();
         match self.call("identity_set", json!({"origin": g("origin"), "anonymous": g("anonymous") == "1"})) {
             Ok(v) if v.get("ok") == Some(&json!(true)) => {
-                let said = if g("anonymous") == "1" { format!("You stay anonymous at that shop.{}", stopped_note(&v)) } else { "That shop recognises you now.".to_string() };
+                let said = if g("anonymous") == "1" { format!("You stay anonymous at that shop.{}", stopped_note(&v)) } else { "That shop recognizes you now.".to_string() };
                 self.flash(ctx, true, said)
             }
             Ok(v) => self.flash(ctx, false, format!("Not changed: {}", v.get("reason").and_then(Value::as_str).unwrap_or("the wallet refused"))),
@@ -314,8 +317,8 @@ impl App {
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
             <div class=\"card primary refusal\" data-visit-refusal hidden></div>\
-            <p>{} &middot; {} \
-            <form method=\"post\" action=\"./app-stop\" class=\"inline\">{}<input type=\"hidden\" name=\"visit\" value=\"{}\"><button class=\"danger\">Stop</button></form></p>\
+            <div class=\"visit-bar\">{} &middot; {} \
+            <form method=\"post\" action=\"./app-stop\" class=\"inline\">{}<input type=\"hidden\" name=\"visit\" value=\"{}\"><button class=\"danger\">Stop</button></form></div>\
             <iframe class=\"seller-app\" title=\"{}\" sandbox=\"allow-scripts allow-same-origin allow-forms allow-downloads allow-modals allow-pointer-lock\" \
             allow=\"fullscreen; autoplay; encrypted-media; picture-in-picture\" referrerpolicy=\"no-referrer\"></iframe>\
             <p class=\"hint\" data-visit-note>{}'s own page. It cannot see your wallet. Close this page or press Stop to end the visit.</p></section>",
@@ -340,9 +343,11 @@ impl App {
         if visit.bytes().all(|b| b.is_ascii_hexdigit()) && !visit.is_empty() {
             let base = self.apps.lock().grants.values().find(|g| g.visit == visit).map(|g| g.base.clone());
             if !self.apps.lock().previews.remove(&visit) {
+                // the credit the connection holds, read before the stop closes it
+                let credit = self.visit_credit_msat(&visit);
                 let said = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
                 if let Ok((200, v)) = said {
-                    used = visit_numbers(&v).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
+                    used = visit_numbers(&v, credit).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
                 }
             }
             let origin = base.as_deref().and_then(crate::services::http_origin);
@@ -402,7 +407,7 @@ impl App {
         };
         let to = now.saturating_add(add).min(MAX_VISIT_SATS);
         match connector_json("POST", &format!("{base}/visits/{visit}/limit"), Some(&json!({"limit_sats": to}))) {
-            Ok((200, v)) => Resp::json(200, &visit_numbers(&v)),
+            Ok((200, v)) => Resp::json(200, &visit_numbers(&v, self.visit_credit_msat(&visit))),
             Ok((_, v)) => Resp::json(409, &json!({"error": v.get("error").and_then(Value::as_str).unwrap_or("The limit was not raised.")})),
             Err(e) => Resp::json(502, &json!({"error": e})),
         }
@@ -422,19 +427,26 @@ impl App {
             s.refusals.retain(|_, (t, _)| t.elapsed() < 10 * REFUSAL_SHOWN);
             s.refusals.get(&visit).filter(|(t, _)| t.elapsed() < REFUSAL_SHOWN).map(|(_, b)| b.clone())
         };
+        // the shop's name, for a refusal by the buyer's own rules that names it
+        let shop = self.apps.lock().grants.values().find(|g| g.visit == visit).and_then(|g| crate::services::http_origin(&g.base)).map(|o| self.seller_name(&o));
         // the refusal in words, with what the node can send where it found no route
         let refusal = refused.map(|body| {
             let no_route = crate::pay_feedback::explain(&body, None, false).kind == crate::pay_feedback::Kind::NoRoute;
-            crate::pay_feedback::as_json(&crate::pay_feedback::explain(&body, if no_route { self.spendable_sats() } else { None }, false))
+            crate::pay_feedback::as_json(&crate::pay_feedback::explain_at(&body, if no_route { self.spendable_sats() } else { None }, false, shop.as_deref()))
         });
         match connector_json("GET", &format!("{}/visits/{visit}", self.cfg.connector.trim_end_matches('/')), None) {
             Ok((200, v)) => {
-                let mut out = visit_numbers(&v);
-                out["refusal"] = refusal.unwrap_or(Value::Null);
+                let credit = self.visit_credit_msat(&visit);
+                let mut out = visit_numbers(&v, credit);
+                // the visit ended by the buyer's own spending rules: said from the visit's report, with the shop, the limit
+                // and the field to raise (the frame's answer, which the seller's page also sees, names only the rule)
+                let by_rules = v.get("policy_refused").filter(|p| p.is_object())
+                    .map(|p| crate::pay_feedback::as_json(&crate::pay_feedback::explain_at(&json!({"error": p["reason"], "rule": p["rule"], "limit_sats": p["limit_sats"]}).to_string(),
+                                                                                           None, false, shop.as_deref())));
+                out["refusal"] = by_rules.or(refusal).unwrap_or(Value::Null);
                 // a visit that runs on earlier credit pays nothing new: the bar says what is left of that credit
                 if out["prepaid_sats"].as_i64() == Some(0) && out["used_sats"].as_i64().unwrap_or(0) > 0 {
-                    let origin = self.apps.lock().grants.values().find(|g| g.visit == visit).and_then(|g| crate::services::http_origin(&g.base));
-                    if let Some(m) = origin.and_then(|o| self.live_credit_msat(&o)) {
+                    if let Some(m) = credit {
                         out["credit_left_sats"] = json!(m / 1000);
                     }
                 }
@@ -442,6 +454,13 @@ impl App {
             }
             _ => Resp::json(200, &json!({"ended": "This visit has ended."})),
         }
+    }
+
+    /// The credit the open connection with the shop of visit `visit` holds now (msat), by the wallet's count
+    /// ([`App::live_credit_msat`]): `None` where the visit or its connection is not known.
+    fn visit_credit_msat(&self, visit: &str) -> Option<u64> {
+        let origin = self.apps.lock().grants.values().find(|g| g.visit == visit).and_then(|g| crate::services::http_origin(&g.base))?;
+        self.live_credit_msat(&origin)
     }
 
     /// The credit the open connection with the shop at `origin` holds now (msat), by the wallet's count.
@@ -465,27 +484,38 @@ pub(crate) fn holds_open(report: &Value) -> bool {
 }
 
 /// The visit's numbers for its page, from the connector's report: what its answers used (`used_sats`,
-/// and `spent_sats`, the same), what was paid for tickets in it (`prepaid_sats`) and what of that is
-/// left as credit with the shop (`credit_sats`), its limit, and `said`, the line in words. A
-/// connector that does not count what was used gives its `spent_sats` as before.
-pub(crate) fn visit_numbers(v: &Value) -> Value {
+/// and `spent_sats`, the same), what was paid for tickets in it (`prepaid_sats`), the credit the
+/// connection with the shop holds (`credit_sats`, whole sats rounded down, and `credit_msat`), its
+/// limit, and `said`, the line in words. A connector that does not count what was used gives its
+/// `spent_sats` as before.
+///
+/// The credit is the signer's balance of the connection (`credit_msat`, as Live connections shows it),
+/// never worked out from this visit's figures: what was paid includes the routing fee, the connection
+/// may hold credit from an earlier visit, and other use of it draws on the same balance. `None`: not
+/// known, and not said.
+pub(crate) fn visit_numbers(v: &Value, credit_msat: Option<u64>) -> Value {
     let Some(used_msat) = v.get("used_msat").and_then(Value::as_u64) else {
         return json!({"spent_sats": v["spent_sats"], "limit_sats": v["limit_sats"], "ended": v["ended"], "limit_reached": v["limit_reached"]});
     };
     let used = i64::try_from(used_msat.div_ceil(1000)).unwrap_or(i64::MAX);
     let paid = v.get("paid_sats").and_then(Value::as_i64).unwrap_or(0).max(0);
-    let credit = i64::try_from((paid.unsigned_abs() * 1000).saturating_sub(used_msat) / 1000).unwrap_or(0);
+    // rounded down: credit is never said to be more than it is
+    let credit = credit_msat.map(|m| i64::try_from(m / 1000).unwrap_or(i64::MAX));
     // the three figures every page names (crate::html::paid_html): used, paid (what left the node, as the
     // signer charged it), credit left
     let mut said = format!("This visit used {used} sat");
     if paid > 0 {
-        said.push_str(&format!(". Paid: {paid} sat; credit left with the shop: {credit} sat."));
+        match credit {
+            Some(c) => said.push_str(&format!(". Paid: {paid} sat; credit left with the shop: {c} sat.")),
+            None => said.push_str(&format!(". Paid: {paid} sat.")),
+        }
     } else if used > 0 {
         said.push_str(" from your credit with the shop; nothing new was paid.");
     } else {
         said.push('.');
     }
-    json!({"used_sats": used, "spent_sats": used, "prepaid_sats": paid, "credit_sats": credit, "limit_sats": v["limit_sats"], "ended": v["ended"],
+    json!({"used_sats": used, "spent_sats": used, "prepaid_sats": paid, "credit_sats": credit, "credit_msat": credit_msat.map(|m| m.to_string()),
+           "limit_sats": v["limit_sats"], "ended": v["ended"],
            "limit_reached": v.get("limit_reached").and_then(Value::as_bool).unwrap_or(false), "said": said})
 }
 
@@ -971,18 +1001,34 @@ mod tests {
     #[test]
     fn the_visit_counter_shows_what_was_used_and_what_was_prepaid() {
         // playing: the whole limit is held, 30 sat used so far, from credit bought on an earlier visit
-        let playing = visit_numbers(&json!({"limit_sats": 559, "spent_sats": 559, "held_sats": 559, "used_msat": 29_400, "paid_sats": 0, "ended": null}));
+        let playing = visit_numbers(&json!({"limit_sats": 559, "spent_sats": 559, "held_sats": 559, "used_msat": 29_400, "paid_sats": 0, "ended": null}), None);
         assert_eq!((playing["spent_sats"].as_i64(), playing["used_sats"].as_i64(), playing["prepaid_sats"].as_i64()), (Some(30), Some(30), Some(0)));
         // stopped: nothing held, 65 sat used
-        let stopped = visit_numbers(&json!({"limit_sats": 559, "spent_sats": 0, "held_sats": 0, "used_msat": 64_870, "paid_sats": 0, "ended": "Stopped."}));
+        let stopped = visit_numbers(&json!({"limit_sats": 559, "spent_sats": 0, "held_sats": 0, "used_msat": 64_870, "paid_sats": 0, "ended": "Stopped."}), None);
         assert_eq!(stopped["used_sats"].as_i64(), Some(65));
         assert_eq!(stopped["said"], "This visit used 65 sat from your credit with the shop; nothing new was paid.");
         // a ticket bought in the visit: prepaid, and the rest left as credit
-        let bought = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 559, "held_sats": 0, "used_msat": 64_870, "paid_sats": 559, "ended": null}));
-        assert_eq!((bought["used_sats"].as_i64(), bought["prepaid_sats"].as_i64(), bought["credit_sats"].as_i64()), (Some(65), Some(559), Some(494)));
-        assert_eq!(bought["said"], "This visit used 65 sat. Paid: 559 sat; credit left with the shop: 494 sat.");
+        let bought = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 559, "held_sats": 0, "used_msat": 64_870, "paid_sats": 559, "ended": null}), Some(493_130));
+        assert_eq!((bought["used_sats"].as_i64(), bought["prepaid_sats"].as_i64(), bought["credit_sats"].as_i64()), (Some(65), Some(559), Some(493)));
+        assert_eq!(bought["said"], "This visit used 65 sat. Paid: 559 sat; credit left with the shop: 493 sat.");
         // an older connector: as before
-        assert_eq!(visit_numbers(&json!({"limit_sats": 559, "spent_sats": 12}))["spent_sats"].as_i64(), Some(12));
+        assert_eq!(visit_numbers(&json!({"limit_sats": 559, "spent_sats": 12}), None)["spent_sats"].as_i64(), Some(12));
+    }
+
+    /// The visit bar's credit is the connection's balance as the signer keeps it, never paid less this visit's use:
+    /// that left out the routing fee in what was paid, credit carried in from an earlier visit, and other use of the
+    /// connection. The money audit of 2026-11-02 found the bar saying 588 sat where the balance was 542.324.
+    ///
+    /// FAILS before: the credit was worked out as 600 paid less 12 used, 588.
+    #[test]
+    fn the_visit_bars_credit_is_the_connections_balance_rounded_down() {
+        let v = visit_numbers(&json!({"limit_sats": 2000, "spent_sats": 600, "held_sats": 0, "used_msat": 12_000, "paid_sats": 600, "ended": null}), Some(542_324));
+        assert_eq!((v["credit_sats"].as_i64(), v["credit_msat"].as_str()), (Some(542), Some("542324")), "{v}");
+        assert_eq!(v["said"], "This visit used 12 sat. Paid: 600 sat; credit left with the shop: 542 sat.");
+        // not known: not said, never guessed
+        let v = visit_numbers(&json!({"limit_sats": 2000, "spent_sats": 600, "held_sats": 0, "used_msat": 12_000, "paid_sats": 600, "ended": null}), None);
+        assert!(v["credit_sats"].is_null(), "{v}");
+        assert_eq!(v["said"], "This visit used 12 sat. Paid: 600 sat.");
     }
 
     /// The owner is offered "Stay anonymous here" for a shop where any route keeps accounts, not only

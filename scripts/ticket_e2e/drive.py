@@ -2884,7 +2884,9 @@ def jellyfin_api(method: str, path: str, key: str, body: dict[str, Any] | None =
     conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
     try:
         conn.request(method, path, body=json.dumps(body).encode() if body is not None else None,
-                     headers={"X-Emby-Token": key, **({"Content-Type": "application/json"} if body is not None else {})})
+                     # the one header every Jellyfin takes: 10.11 and later refuse X-Emby-Token by default
+                     headers={"Authorization": f'MediaBrowser Client="Lightning Stream", Device="lab", DeviceId="ticket-e2e", Version="1", Token="{key}"',
+                              **({"Content-Type": "application/json"} if body is not None else {})})
         r = conn.getresponse()
         text = r.read()
         if r.status >= 400:

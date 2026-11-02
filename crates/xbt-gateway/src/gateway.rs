@@ -1675,7 +1675,10 @@ impl Gateway {
     }
 
     fn free(&self, req: &Request, route: &Route) -> Reply {
-        let answer = match self.send_upstream(route, req) {
+        // a key in the query (Jellyfin's `api_key`) does not reach the service through a free route: a path freed by
+        // mistake (a media server's `/Videos/`) would otherwise stream to anyone who brings a key of their own, unpaid
+        let unkeyed = without_key_params(&req.target).map(|target| Request { target, ..req.clone() });
+        let answer = match self.send_upstream(route, unkeyed.as_ref().unwrap_or(req)) {
             Ok(a) if a.status != 402 => a,
             _ => {
                 return Reply::Whole(error(
@@ -2537,8 +2540,31 @@ impl Handler for Service {
     }
 }
 
+/// `target` without the query parameters that carry a media server's key (`api_key`, `apikey`, any case), or `None`
+/// where it has none.
+fn without_key_params(target: &str) -> Option<String> {
+    let (path, query) = target.split_once('?')?;
+    let is_key = |kv: &&str| matches!(kv.split('=').next().unwrap_or("").to_ascii_lowercase().as_str(), "api_key" | "apikey");
+    if !query.split('&').any(|kv| is_key(&kv)) {
+        return None;
+    }
+    let kept: Vec<&str> = query.split('&').filter(|kv| !is_key(kv) && !kv.is_empty()).collect();
+    Some(if kept.is_empty() { path.to_string() } else { format!("{path}?{}", kept.join("&")) })
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A free route's request reaches the service without a media server's key in its query: a path freed by mistake
+    /// streams nothing to a buyer who brings a key of their own. Other parameters stay as they were.
+    #[test]
+    fn a_free_route_drops_a_key_from_the_query() {
+        assert_eq!(without_key_params("/web/a.js?v=1"), None);
+        assert_eq!(without_key_params("/web/a.js"), None);
+        assert_eq!(without_key_params("/Videos/1/stream?api_key=k").as_deref(), Some("/Videos/1/stream"));
+        assert_eq!(without_key_params("/Videos/1/stream?Static=true&ApiKey=k&x=2").as_deref(), Some("/Videos/1/stream?Static=true&x=2"));
+        assert_eq!(without_key_params("/a?API_KEY=k&api_key=j").as_deref(), Some("/a"));
+    }
     use super::*;
 
     use xbt402::lottery::DrawError;

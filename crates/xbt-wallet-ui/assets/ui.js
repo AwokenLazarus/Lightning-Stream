@@ -340,7 +340,14 @@
     else if (pend && mine && mine.pub === enrolled) { dropKey(PENDING); }
     var st = $("#browser-key");
     if (st) {
-      if (!mine) say(st, "This browser holds no approval key yet.", true);
+      if (!mine && enrolled) {
+        // a hint, not an error: the key is enrolled and lives in another browser (0.2.5 said it in red)
+        st.textContent = "This browser can't sign approvals: your approval key is in the browser you made it in. Sign there, " +
+          "or use \u201cSign on another device\u201d under an approval. To sign here, put the key in this browser from its backup.";
+        st.classList.remove("ok", "bad");
+        st.classList.add("msg", "hint");
+      }
+      else if (!mine) say(st, "This browser holds no approval key yet.", true);
       else if (!enrolled) say(st, "This browser holds a key (" + mine.pub.slice(0, 16) + "…), not enrolled yet.", true);
       else if (mine.pub === enrolled) say(st, "This browser holds the enrolled approval key (" + mine.pub.slice(0, 16) + "…).");
       else say(st, "This browser holds another key (" + mine.pub.slice(0, 16) + "…), not the enrolled one.", true);
@@ -416,7 +423,7 @@
             var code = $("[name=code]", f);
             // the box gave the enrolment code: one step, nothing more to do here
             if (code && code.type === "hidden" && code.value) { say(msg, "Saved in this browser. Setting it up…"); f.submit(); }
-            else { f.hidden = false; say(msg, "Saved in this browser. Public key " + pub + ". Enrol it below."); }
+            else { f.hidden = false; say(msg, "Saved in this browser. Public key " + pub + ". Enroll it below."); }
           }
           else say(msg, "Saved in this browser. Public key " + pub + ".");
         } catch (e) { say(msg, e.message, true); }
@@ -436,6 +443,8 @@
     var limitEl = $("[data-visit-limit]", box), add = $("[data-visit-add]", box), csrf = $("input[name='csrf']", box);
     var visit = box.getAttribute("data-visit"), port = box.getAttribute("data-port"), code = box.getAttribute("data-code");
     if (!frame || !/^[0-9a-f]+$/.test(visit || "") || !/^[0-9]+$/.test(port || "") || !/^[0-9a-f]+$/.test(code || "")) return;
+    // the frame keeps the page's own background until the app has loaded: no white flash in dark mode
+    frame.addEventListener("load", function () { frame.classList.add("loaded"); });
     frame.src = location.protocol + "//" + location.hostname + ":" + port + "/__ls/enter?c=" + code;
     box.removeAttribute("data-code");
     var timer = null;
@@ -501,7 +510,7 @@
         // at its limit the visit waits for the owner: the page stays as it is, and Add lets it go on
         if (v.limit_reached) return;
         if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
-          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat · credit left " + (v.credit_sats || 0).toLocaleString() + " sat"
+          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat" + (typeof v.credit_sats === "number" ? " · credit left " + v.credit_sats.toLocaleString() + " sat" : "")
           : typeof v.credit_left_sats === "number" ? " · from your credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat left" : "";
         if (refusal) showRefusal(v.refusal);
         if (v.ended) ended(String(v.ended));

@@ -1637,6 +1637,10 @@ pub(crate) struct HttpSession {
     /// seller's before: a resume refused by that alone is made again in another session. One the seller is at fault
     /// for (a receipt that does not hold, a charge above what arrived) is never made again.
     forgotten: AtomicBool,
+    /// The owner's own spending rules refused this session's last prepaid ticket ([`Signer::ticket_buy_prepaid`]): the
+    /// refusal. Cleared once a ticket is bought again. While it is set, a seller's `too_many_tickets` is never a reason to
+    /// stop the session and open another ([`Signer::ticket_cap_full`]): a new session would be refused by the same rule.
+    policy_refused: Mutex<Option<Value>>,
 }
 
 impl HttpSession {
@@ -1865,6 +1869,12 @@ pub(crate) fn passed_headers(headers: &[(String, String)]) -> Value {
     Value::Array(v)
 }
 
+/// A refusal by the owner's own caps or spending rules ([`crate::policy::OWNER_LIMIT_RULES`]): the buyer's limit, never
+/// the seller's doing.
+fn is_owner_limit(d: &Value) -> bool {
+    d.get("rule").and_then(Value::as_str).is_some_and(|r| crate::policy::OWNER_LIMIT_RULES.contains(&r))
+}
+
 /// What one call released: the hashes, the sats the book put in the ledger for them, and how many
 /// of them were prepaid tickets. `limit_sats` is the call's `max_sats`: no ticket is released or
 /// bought for the call that could take what the book puts in the ledger above it ([`Spent::room`]).
@@ -1885,6 +1895,13 @@ struct Spent {
     /// A request the seller may serve, or charge, has left for it (`request_sent` in the answer):
     /// not one the seller refused unserved and signed so (a 402, 503 or `identify_first`).
     sent: bool,
+    /// The caller's top-up (`top_up_sats`) was refused by the owner's own caps or spending rules: the rule, why, and the
+    /// limit (`top_up_refused` in the answer). The request went on with the credit it had.
+    top_up_refused: Option<Value>,
+    /// The owner's own caps or spending rules refused a prepaid ticket for the call (for its request, its answer as it
+    /// went on, or its top-up): the rule, why, and the limit (`policy_refused` in the answer). An answer stopped for it
+    /// says only "stopped by the wallet" in `ended`; this says which of the owner's rules it was.
+    policy_refused: Option<Value>,
 }
 
 impl Spent {
@@ -3134,7 +3151,7 @@ impl Signer {
                                                    money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), ending: AtomicBool::new(false), refilling: AtomicBool::new(false), stalls: AtomicUsize::new(0),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None), key_on_record: AtomicBool::new(false),
                                                    cancel_asked: Mutex::new(HashSet::new()), cap_full: AtomicBool::new(false),
-                                                   forgotten: AtomicBool::new(false) });
+                                                   forgotten: AtomicBool::new(false), policy_refused: Mutex::new(None) });
                     // a balance the wallet left with this seller in a session it stopped (a restart, or an idle stop) is
                     // used first, not left there while a new ticket is bought
                     // and where it could not be taken over because the seller has yet to follow a prepaid ticket of that session,
@@ -3275,6 +3292,19 @@ impl Signer {
             m.consumed.saturating_sub(m.absorbed_mark).saturating_add(m.reserved).saturating_sub(m.acct.balance())
         };
         let streaming = hs.streaming.load(Ordering::SeqCst);
+        // the buyer's own rules refused the session's last ticket: another session would be refused by the same rule, and
+        // each one opened would take a place of the seller's (`too_many_sessions`). Kept, and the caller told that rule
+        // Asked again now, not taken from the last refusal: the owner may have raised the limit, or the day's window moved on
+        if lock(&hs.policy_refused).is_some() {
+            let refused = self.ticket_prepaid_size(&hs.sid, None, None).and_then(|(m, _, _)| self.ticket_prepay_precheck(&hs.sid, m).err()).filter(is_owner_limit);
+            match refused {
+                Some(d) => {
+                    self.ticket_audit("ticket_cap_full_kept", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "policy_rule": d.get("rule")}));
+                    return None;
+                }
+                None => *lock(&hs.policy_refused) = None,
+            }
+        }
         if owed > 0 || streaming > 0 {
             self.ticket_audit("ticket_cap_full_kept", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "owed_msat": owed.to_string(),
                                                             "streaming": streaming}));
@@ -3676,6 +3706,17 @@ impl Signer {
         // is asked of the seller where none fits
         let size = self.ticket_prepaid_size(&hs.sid, spent.left(), spent.charge_sats);
         spent.room(size.map(|(_, face, booked)| (face, booked)), true)?;
+        // the owner's own caps and spending rules, before the seller is asked for anything: a ticket they refuse is never
+        // locked, so it holds none of the places the seller gives the session and this address
+        if let Some((m, _, _)) = size {
+            match self.ticket_prepay_precheck(&hs.sid, m) {
+                Err(d) if is_owner_limit(&d) => return Err(self.ticket_policy_refused(hs, spent, d, None)),
+                Err(d) => return Err(d),
+                // the owner's rules allow it now (a limit raised, or the day's window moved on): the session is no longer
+                // one they refuse
+                Ok(()) => *lock(&hs.policy_refused) = None,
+            }
+        }
         // a rental task's sizes aren't its seller's own (`topTicketMsat`): each is asked for by name
         let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m || self.ticket_policy().is_rental(&s.task)));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
@@ -3707,7 +3748,15 @@ impl Signer {
                 if let Some(d) = at_fault() {
                     return Err(d);
                 }
-                self.ticket_prepay(&p)
+                let r = self.ticket_prepay(&p);
+                // refused by the owner's rules all the same (they changed between the check and the invoice, or a payment
+                // beside this one took the room): the invoice is never paid, and the seller is asked to cancel it now, so
+                // that it does not hold a place until it lapses
+                if r["verdict"] == "deny" && is_owner_limit(&r) {
+                    let hash = str_or_empty(first.get("hash"));
+                    return Err(self.ticket_policy_refused(hs, spent, r, Some(hash)));
+                }
+                r
             }
         };
         // what the book booked for the ticket left with the call, however its payment ended: paid, not final yet, or
@@ -3732,8 +3781,12 @@ impl Signer {
             return Err(with(refusal("ticket_prepay_pending", why), json!({"session": hs.sid, "hash": str_or_empty(r.get("hash")), "stopped": stopped})));
         }
         if r["verdict"] != "allow" {
+            if is_owner_limit(&r) {
+                return Err(self.ticket_policy_refused(hs, spent, r, None));
+            }
             return Err(r);
         }
+        *lock(&hs.policy_refused) = None;
         let (Some(secret), hash) = (r.get("ticket_secret").and_then(Value::as_str), str_or_empty(r.get("hash"))) else {
             return Err(refusal("ticket", "the book paid a prepaid ticket and returned no preimage"));
         };
@@ -3747,6 +3800,24 @@ impl Signer {
         spent.hashes.push(hash);
         spent.prepaid += 1;
         self.ticket_deliver(hs, Instant::now() + Self::ticket_read_timeout(&self.ticket_policy()))
+    }
+
+    /// A prepaid ticket of the session refused by the owner's own caps or spending rules (`d`): noted on the session
+    /// ([`HttpSession::policy_refused`]) and in the owner's audit, and, where the seller had already issued an invoice for
+    /// it (`invoiced`, its hash), the seller asked to cancel that invoice. Returns the refusal the caller is told.
+    fn ticket_policy_refused(&self, hs: &HttpSession, spent: &mut Spent, d: Value, invoiced: Option<String>) -> Value {
+        let mut cancel_asked = false;
+        if let Some(hash) = invoiced.filter(|h| xbt402::ticket::hex32(h).is_some()) {
+            // unchecked, as every cancel of an invoice the wallet will not pay: one the seller does not cancel lapses
+            cancel_asked = matches!(self.ticket_call(hs, "cancel", &json!({"hashes": [hash]}), true), Ok((200, _, _)));
+            lock(&hs.cancel_asked).insert(hash);
+        }
+        self.ticket_audit("ticket_prepay_refused_by_policy", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "rule": d.get("rule"),
+                                                                     "reason": d.get("reason"), "limit_sats": d.get("limit_sats"),
+                                                                     "before_lock": d.get("before_lock").is_some(), "cancel_asked": cancel_asked}));
+        *lock(&hs.policy_refused) = Some(d.clone());
+        spent.policy_refused = Some(json!({"rule": d.get("rule"), "reason": d.get("reason"), "limit_sats": d.get("limit_sats")}));
+        d
     }
 
     /// A prepaid ticket by the seller's offer: the seller's side of the session first (a lock by
@@ -4856,9 +4927,16 @@ impl Signer {
         let dest = format!("ln:{}", hs.terms.terms.payee);
         let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), charge_sats: Some(c.charge_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
         let about = |hs: &HttpSession, spent: &Spent| {
-            json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
-                   "tickets_prepaid": spent.prepaid, "request_sent": spent.sent,
-                   "balance_msat": hs.balance().to_string(), "credited_msat": hs.credited().to_string(), "tickets": self.ticket_session_counts(&hs.sid)})
+            let mut v = json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
+                               "tickets_prepaid": spent.prepaid, "request_sent": spent.sent,
+                               "balance_msat": hs.balance().to_string(), "credited_msat": hs.credited().to_string(), "tickets": self.ticket_session_counts(&hs.sid)});
+            if let Some(t) = &spent.top_up_refused {
+                v["top_up_refused"] = t.clone();
+            }
+            if let Some(t) = &spent.policy_refused {
+                v["policy_refused"] = t.clone();
+            }
+            v
         };
         let fail = |hs: &HttpSession, spent: &Spent, d: Value| with(d, about(hs, spent));
         // by the token, the most the request can cost is wanted in the balance before it is served
@@ -4931,7 +5009,11 @@ impl Signer {
             while !c.credit_only && c.top_up_msat > 0 && topped < 4 && low() {
                 topped += 1;
                 let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &low, answer: None, best_effort: true };
-                if self.ticket_release_one(hs, &mut spent, &due).is_err() {
+                if let Err(d) = self.ticket_release_one(hs, &mut spent, &due) {
+                    // the owner's own limit: said in the answer, so that the caller (a visit) can say it and stop asking
+                    if is_owner_limit(&d) {
+                        spent.top_up_refused = Some(json!({"rule": d.get("rule"), "reason": d.get("reason"), "limit_sats": d.get("limit_sats")}));
+                    }
                     break;
                 }
             }

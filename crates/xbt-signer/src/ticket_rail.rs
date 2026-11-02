@@ -1517,7 +1517,7 @@ impl Signer {
                         (spent.seller.saturating_add(sats), cap_spend, "ticket_seller_cap", "the owner's cap on sats paid to this seller"),
                         (if s.max_sats > 0 { session_booked.saturating_add(sats) } else { 0 }, s.max_sats.max(0), "max_sats", "the session's max_sats")];
             if let Some((have, cap, rule, name)) = over.iter().find(|(have, cap, _, _)| have > cap) {
-                return Ok(refusal(rule, format!("with this ticket's {sats} sats, {have} would be above {name} ({cap})")));
+                return Ok(with(refusal(rule, format!("with this ticket's {sats} sats, {have} would be above {name} ({cap})")), json!({"limit_sats": cap})));
             }
             // the wallet's own rules: per payment, daily and weekly budgets, the counterparty cap, velocity, the human threshold
             let pay = Payment::new(&dest, sats, &ticket::memo(&s.task, &s.id));
@@ -1526,8 +1526,7 @@ impl Signer {
                 if let Some(tok) = &d.approval_token {
                     self.engine.store.pop_approval(tok)?;
                 }
-                return Ok(with(with(d.as_value(), json!({"verdict": "deny", "rail": "ticket", "charged_sats": 0, "approval_token": null, "approval_expires": null})),
-                               json!({"session": sid})));
+                return Ok(policy_denied(&d, &sid));
             }
             let seed = self.ticket_seed(&st.book)?;
             let secret = seed.secret(&t.nonce);
@@ -2328,6 +2327,47 @@ impl Signer {
             .filter(|t| matches!(t.state, TState::Released | TState::Settled)).fold(0u64, |a, t| a.saturating_add(t.msat))
     }
 
+    /// Whether a prepaid ticket of `msat` for the session `sid` would pass the owner's caps and
+    /// spending rules now, as [`Self::ticket_book_prepay`] holds it to them once its invoice is in
+    /// hand: asked before the seller is asked for that invoice, so that a ticket the owner's rules
+    /// refuse is never locked. An invoice locked and then refused would hold one of the places the
+    /// seller gives the session (and the buyer's address) until it lapses, and the next lock would
+    /// be refused `too_many_tickets`. Nothing is written: no audit row, no approval, no booking.
+    /// `Err`: the refusal, with the rule and the owner's limit (`limit_sats`) that refused it and
+    /// `before_lock`. Whatever else the book would refuse is left to the book.
+    pub(crate) fn ticket_prepay_precheck(&self, sid: &str, msat: u64) -> std::result::Result<(), Value> {
+        // the spend lock, as every check of the book against the ledger is made under (the book read whole first)
+        let _g = self.lock();
+        let tp = self.ticket_synced()?;
+        let cfg = self.config();
+        let lp = LnPolicy::from_map(&cfg.ln);
+        let now = self.engine.now();
+        let g = self.ticket_store().map_err(|e| refusal("ticket", e.msg))?;
+        let Some(st) = g.as_ref() else { return Ok(()) };
+        let Some(s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open) else { return Ok(()) };
+        let Some(task) = tp.tasks.get(&s.task) else { return Ok(()) };
+        let listed = self.ticket_listed(&cfg, &s.payee, &s.origin) && s.listed;
+        let dest = format!("ln:{}", s.payee);
+        let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
+        let sats = booking_sats(msat, fee_limit_msat);
+        let before = json!({"session": sid, "before_lock": true, "charged_sats": 0});
+        let (_, _, cap_spend, seller_window) = Self::ticket_seller_caps(&cfg, &tp, task, listed);
+        let spent = self.ticket_spent(now, &s.task, task.window_s as f64, &dest, seller_window).map_err(|e| refusal("ticket", e.msg))?;
+        let session_booked = st.book.of_session(sid).iter().fold(0i64, |a, x| a.saturating_add(x.booked_sats));
+        let over = [(spent.task.saturating_add(sats), task.budget_sats, "ticket_task_budget", "the task's budget_sats"),
+                    (spent.seller.saturating_add(sats), cap_spend, "ticket_seller_cap", "the owner's cap on sats paid to this seller"),
+                    (if s.max_sats > 0 { session_booked.saturating_add(sats) } else { 0 }, s.max_sats.max(0), "max_sats", "the session's max_sats")];
+        if let Some((have, cap, rule, name)) = over.iter().find(|(have, cap, _, _)| have > cap) {
+            return Err(with(with(refusal(rule, format!("with this ticket's {sats} sats, {have} would be above {name} ({cap})")), json!({"limit_sats": cap})), before));
+        }
+        let pay = Payment::new(&dest, sats, &ticket::memo(&s.task, &s.id));
+        let d = self.engine.check_admitted(&pay, sats, task.rental.is_some()).map_err(|e| refusal("policy", e.msg))?;
+        if !d.allowed() {
+            return Err(with(policy_denied(&d, sid), before));
+        }
+        Ok(())
+    }
+
     /// The rules and the two rows of a prepaid ticket, or of a win (the caller holds the spend
     /// lock): what [`Self::ticket_release_locked`] checks of a held ticket's release, then the
     /// book row, then the ledger row, then the signature log. Returns the send; an `Err` inside is
@@ -2418,7 +2458,7 @@ impl Signer {
                     (spent.seller.saturating_add(sats), cap_spend, "ticket_seller_cap", "the owner's cap on sats paid to this seller"),
                     (if s.max_sats > 0 { session_booked.saturating_add(sats) } else { 0 }, s.max_sats.max(0), "max_sats", "the session's max_sats")];
         if let Some((have, cap, rule, name)) = over.iter().find(|(have, cap, _, _)| have > cap) {
-            return Ok(Err(refusal(rule, format!("with this ticket's {sats} sats, {have} would be above {name} ({cap})"))));
+            return Ok(Err(with(refusal(rule, format!("with this ticket's {sats} sats, {have} would be above {name} ({cap})")), json!({"limit_sats": cap}))));
         }
         // the wallet's own rules: per payment, daily and weekly budgets, the counterparty cap, velocity, the human threshold
         let pay = Payment::new(&dest, sats, &ticket::memo(&s.task, &s.id));
@@ -2427,8 +2467,7 @@ impl Signer {
             if let Some(tok) = &d.approval_token {
                 self.engine.store.pop_approval(tok)?;
             }
-            return Ok(Err(with(with(d.as_value(), json!({"verdict": "deny", "rail": "ticket", "charged_sats": 0, "approval_token": null, "approval_expires": null})),
-                               json!({"session": sid}))));
+            return Ok(Err(policy_denied(&d, sid)));
         }
         let seed = self.ticket_seed(&st.book)?;
         let nonce = random_bytes::<16>();
@@ -3426,6 +3465,18 @@ fn has_blinded_paths(decoded: &Value) -> bool {
     decoded.get("blinded_paths").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
 }
 
+/// A ticket refused by the owner's spending rules (`d`), as the caller is told: the decision, as a
+/// denial that charged nothing, with the session and the owner's limit that refused it
+/// (`limit_sats`, where the rule has one in sats).
+fn policy_denied(d: &crate::policy::Decision, sid: &str) -> Value {
+    let mut v = with(with(d.as_value(), json!({"verdict": "deny", "rail": "ticket", "charged_sats": 0, "approval_token": null, "approval_expires": null})),
+                     json!({"session": sid}));
+    if let Some(l) = d.limit_sats {
+        v["limit_sats"] = l.into();
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3724,3 +3775,4 @@ mod tests {
         assert!(!payment_over(&json!({})), "no status is no end");
     }
 }
+

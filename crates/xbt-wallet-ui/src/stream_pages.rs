@@ -461,6 +461,34 @@ fn about_sats(bytes: f64, per_byte: f64) -> String {
     format!("about {out} sat")
 }
 
+/// What a player's link has carried, beside it on the Files page: running while the player reads, a
+/// short total once it stops. The sats are the file's listed price for those bytes (the UI relays the
+/// bytes; what each call paid stays with the connector), so "about".
+fn link_use(bytes: u64, in_use: bool, playing: bool, per_byte: Option<f64>) -> String {
+    if bytes == 0 && !in_use {
+        return String::new();
+    }
+    let sats = per_byte.map(|p| format!(", {}", about_sats(bytes as f64, p))).unwrap_or_default();
+    if in_use {
+        // "Playing" only while bytes move; a player that holds the link paused is "Open"
+        let pill = if playing { "<span class=\"pill good\">Playing</span>" } else { "<span class=\"pill\">Open</span>" };
+        format!("<span class=\"small link-use\">{pill} {} so far{sats}</span>", bytes_words(bytes))
+    } else {
+        format!("<span class=\"small link-use\">Carried {}{sats}</span>", bytes_words(bytes))
+    }
+}
+
+/// `12.3 MB`, `1.40 GB`, `800 bytes`, as file sizes are listed (powers of 1,000).
+fn bytes_words(n: u64) -> String {
+    let f = n as f64;
+    match n {
+        0..1_000 => format!("{n} bytes"),
+        1_000..1_000_000 => format!("{:.0} KB", f / 1e3),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", f / 1e6),
+        _ => format!("{:.2} GB", f / 1e9),
+    }
+}
+
 /// `6 hours`, `90 minutes`, `45 seconds`.
 fn lasts(d: std::time::Duration) -> String {
     let s = d.as_secs();
@@ -505,8 +533,9 @@ fn files_html(ctx: &Ctx, s: &Service, own: bool, base: &str, links: &dyn Fn(&str
             let mut l = String::new();
             for (j, x) in shown.iter().enumerate() {
                 let id = format!("link-{i}-{j}");
+                let carried = link_use(x.bytes, x.in_use, x.playing, per_byte);
                 l.push_str(&format!("<div class=\"row\"><input id=\"{id}\" readonly class=\"mono relay-link\" aria-label=\"Link for your player\" value=\"{}\">\
-                    <button type=\"button\" class=\"secondary\" data-copy=\"{id}\">Copy</button><span class=\"small\">{} left</span>\
+                    <button type=\"button\" class=\"secondary\" data-copy=\"{id}\">Copy</button><span class=\"small\">{} left</span>{carried}\
                     <form method=\"post\" action=\"./file-link\" class=\"inline\">{csrf}<input type=\"hidden\" name=\"action\" value=\"revoke\">\
                     <input type=\"hidden\" name=\"item\" value=\"{}\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
                     <button class=\"link\" type=\"submit\">Revoke</button></form></div>",
@@ -725,26 +754,64 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
         "stopping" | "stopped" => "<span class=\"pill warn\">Stopping</span>",
         _ => "<span class=\"pill\">Closed</span>",
     };
-    // the rate is of what the seller used, where its receipts say: a prepaid ticket is paid all at once
+    // the rate is of what the seller used, where its receipts say: a prepaid ticket is paid all at once.
+    // Only while bytes flow: an answer held open with nothing moving (a web app's event stream) showed the
+    // connection's old average as if it were spending now
     let used_msat = row.and_then(|p| p.get("spent_msat")).and_then(msat_of);
     let per_min = used_msat.map_or(spent as f64, |m| m as f64 / 1000.0) / minutes.max(1.0);
-    let rate = if open && streaming && minutes >= 1.0 && per_min > 0.0 {
+    let flowing = used_msat.is_some_and(|m| use_moving(id, m, std::time::Instant::now()));
+    let rate = if open && streaming && flowing && minutes >= 1.0 && per_min > 0.0 {
         format!(" · about <span class=\"money\">{}</span> a minute", msat_text((per_min * 1000.0).round() as u64))
     } else {
         String::new()
     };
+    // nothing paid on this connection, yet something used: it ran on credit paid on an earlier one
+    let paid_words = if paid.0 == 0 && used_msat.is_some_and(|m| m > 0) {
+        "Paid from earlier credit: nothing new paid on this connection".to_string()
+    } else {
+        format!("Paid so far: {}", crate::html::paid_html(paid.0, paid.1))
+    };
     let how_long = if minutes >= 1.0 { format!(" · open {} min", minutes.round() as i64) } else { String::new() };
-    let failed = format!("{} never sent · {} cancelled at Stop · {} failed", c.never_sent, c.cancelled_at_stop, c.payment_failed);
+    let failed = format!("{} never sent · {} canceled at Stop · {} failed", c.never_sent, c.cancelled_at_stop, c.payment_failed);
     let err = err.map(|e| format!("<p class=\"hint bad\">{}</p>", esc(e))).unwrap_or_default();
     let used = usage_line(row);
     // booked for tickets whose secret left and that have not settled: reserved, not paid yet
     let reserved = if c.reserved_sats > 0 { format!(" · <span class=\"small\">{} reserved</span>", sats_short(c.reserved_sats)) } else { String::new() };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
-             <p>Paid so far: {}{reserved}{rate}{how_long}</p>{used}{err}<div class=\"row\">{stop}</div>\
+             <p>{paid_words}{reserved}{rate}{how_long}</p>{used}{err}<div class=\"row\">{stop}</div>\
              <details><summary>Details</summary><p class=\"small\">{} · connection <code>{}</code></p>{}</details></section>",
-            esc(name), crate::html::paid_html(paid.0, paid.1), esc(origin), esc(id),
+            esc(name), esc(origin), esc(id),
             crate::html::kv(&[("Payments held", c.locked.to_string()), ("Given back", c.released.to_string()), ("Paid ahead (tickets)", c.prepaid.to_string()),
                               ("Settled", c.settled.to_string()), ("Not paid", failed), ("Credit left", balance_cell(paying, id, c.booked_sats))]))
+}
+
+/// How long after the seller's count last grew a connection still counts as moving bytes.
+const MOVING_FOR: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether the seller's count of what connection `id` used (`used_msat`) grew within [`MOVING_FOR`] of
+/// `now`, by what the page saw on its last looks (it refreshes every few seconds). A connection seen for
+/// the first time is not moving yet: its rate shows from the next look on, if it is.
+fn use_moving(id: &str, used_msat: u64, now: std::time::Instant) -> bool {
+    type Seen = std::sync::Mutex<HashMap<String, (u64, std::time::Instant)>>;
+    static SEEN: std::sync::LazyLock<Seen> = std::sync::LazyLock::new(Default::default);
+    let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    if seen.len() > 512 {
+        seen.retain(|_, (_, at)| now.saturating_duration_since(*at) < MOVING_FOR);
+    }
+    match seen.get_mut(id) {
+        Some((last, at)) => {
+            if used_msat > *last {
+                *last = used_msat;
+                *at = now;
+            }
+            now.saturating_duration_since(*at) < MOVING_FOR
+        }
+        None => {
+            // first seen: dated long enough ago that it reads as idle until the count grows
+            seen.insert(id.to_string(), (used_msat, now.checked_sub(MOVING_FOR).unwrap_or(now)));
+            false
+        }
+    }
 }
 
 /// What the seller has drawn from what was paid, and the credit it still holds, from the seller's
@@ -820,6 +887,39 @@ mod tests {
         assert!(html.contains("Used: <span class=\"money\">0.12 sats</span>") && html.contains("879.88 sats"), "{html}");
         assert!(usage_line(Some(&json!({"spent_msat": "0", "balance_msat": "0"}))).is_empty());
         assert_eq!(msat_text(40_000), sats_short(40));
+    }
+
+    /// A connection that runs on credit paid on an earlier one says so, not "Paid so far: 0" beside what it
+    /// used; and its rate shows only while the seller's count grows, not as an old average while it is idle.
+    #[test]
+    fn a_connection_on_earlier_credit_and_its_rate_only_while_bytes_flow() {
+        let ctx = crate::app::Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let paying = |spent: &str| json!([{"session": "on-credit", "spent_msat": spent, "balance_msat": "500000", "answer_open": true}]);
+        let card = |spent: &str| session_card(&ctx, "on-credit", "Demo Films", "https://films.example", "open", &Counts::default(), &paying(spent), (0, None), 10.0, None);
+        let first = card("499000");
+        assert!(first.contains("Paid from earlier credit") && !first.contains("Paid so far"), "{first}");
+        assert!(!first.contains("a minute"), "first look: not known to be moving: {first}");
+        assert!(card("520000").contains("a minute"), "the count grew: bytes are flowing");
+        let t = std::time::Instant::now();
+        assert!(!use_moving("idle", 5, t) && use_moving("idle", 9, t) && use_moving("idle", 9, t + std::time::Duration::from_secs(5)));
+        assert!(!use_moving("idle", 9, t + MOVING_FOR + std::time::Duration::from_secs(1)), "idle since: no rate");
+        // nothing used yet: the paid line as before
+        let fresh = session_card(&ctx, "fresh", "Demo Films", "https://films.example", "open", &Counts::default(), &json!([]), (0, None), 0.0, None);
+        assert!(fresh.contains("Paid so far"), "{fresh}");
+    }
+
+    /// A player's link shows what it carried: running while it plays, a total after.
+    #[test]
+    fn a_player_link_shows_its_bytes_and_sats() {
+        let per = sat_a_byte("1000 sat a GB");
+        assert_eq!(link_use(0, false, false, per), "");
+        let playing = link_use(250_000_000, true, true, per);
+        assert!(playing.contains("Playing") && playing.contains("250.0 MB so far") && playing.contains("about 250 sat"), "{playing}");
+        let paused = link_use(250_000_000, true, false, per);
+        assert!(paused.contains(">Open<") && !paused.contains("Playing"), "{paused}");
+        let after = link_use(1_400_000_000, false, false, per);
+        assert!(after.contains("Carried 1.40 GB, about 1,400 sat") && !after.contains("Playing"), "{after}");
+        assert_eq!(bytes_words(800), "800 bytes");
     }
 
     #[test]

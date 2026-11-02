@@ -39,8 +39,11 @@ pub const GW_INFO: &str = "info.macaroon";
 pub const GW_SIGN: &str = "sign.macaroon";
 
 /// The caps the gateway page writes on mainnet unless the owner sets others: 25 buyers at a time
-/// (a buyer costs the box little; what is at stake is held tickets), and at most 4 held tickets of 1,000 sat on the node's inbound channels.
-pub const MAINNET_CAPS: (u32, u32, u32) = (25, 1, 4);
+/// (a buyer costs the box little; what is at stake is held tickets), 2 from one address, and at most 4 held tickets of 1,000 sat on the node's inbound channels.
+/// Two from one address, as the gateway's own default: a buyer whose earlier session is still open (a page left
+/// open, a session the wallet stopped that the seller has not yet given up) can open the next. The gateway's
+/// bound on what one address can hold unpaid is `caps.unpaid_per_address` (2), which this does not change.
+pub const MAINNET_CAPS: (u32, u32, u32) = (25, 2, 4);
 /// The gateway's own defaults on a test chain (`xbt-gateway`'s config).
 pub const TEST_CAPS: (u32, u32, u32) = (100, 2, 15);
 /// The gateway's own default for connections open at once (`http.connections`).

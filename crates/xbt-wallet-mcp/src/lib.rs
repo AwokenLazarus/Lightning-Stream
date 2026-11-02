@@ -11,10 +11,12 @@
 //!   AGP-048 adds [`mcp::LN_TOOL_NAMES`] (`ln_pay`, `ln_status`), offered only with `XBT_MCP_LN=1`.
 //!   Stream tickets add [`mcp::TICKET_TOOL_NAMES`] (`ticket_status`, `ticket_stop`), offered only with
 //!   `XBT_MCP_TICKETS=1`; locking and releasing tickets are not tools.
+//! * [`catalog`]: `list_services`, what the agent may buy, from the catalog the wallet UI writes.
 //! * [`args`]: pydantic-compatible argument validation; [`pyrepr`]: Python reprs for its messages.
 //! * [`wallet`]: the signer socket and B2's `_pack` (sanitize, refuse key material, print).
 //! * [`transport`]: stdio and streamable HTTP.
 pub mod args;
+pub mod catalog;
 pub mod mcp;
 pub mod pyrepr;
 pub mod transport;

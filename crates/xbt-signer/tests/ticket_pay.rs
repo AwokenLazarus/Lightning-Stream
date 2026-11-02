@@ -8982,16 +8982,17 @@ fn where_the_offer_gives_no_invoice_the_prepaid_ticket_is_paid_by_the_sellers_in
 }
 
 /// The owner's rules hold for a payment by offer as for one by invoice: a task's budget below a
-/// ticket pays nothing, whatever the offer gave; and a refusal by the book is not undone by the
-/// seller's invoice.
+/// ticket pays nothing, whatever the offer would give; and a refusal by the owner's rules is not
+/// undone by the seller's invoice. Since 0.2.6 the rules are asked before anything is asked of the
+/// seller: no invoice is fetched for the offer, nor one locked by invoice.
 #[test]
 fn a_payment_by_offer_is_held_to_the_owners_budgets() {
     let _g = env_lock();
     let r = Rig::shipped(json!({"tickets": {"enabled": true, "tasks": {"film": {"budget_sats": BOOKING - 1}}}}), 30, offer_shop());
     let v = r.pay("/page/10", CALL);
-    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_task_budget")), "{v}");
-    assert_eq!(r.ln.st.lock().unwrap().fetched_notes.len(), 1, "an invoice was fetched, and not paid");
-    assert_eq!((r.ln.state().payments.len(), r.ledger_sum(), r.shop.standin.offer_counts()), (0, 0, (1, 0)));
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["limit_sats"].as_i64()), (Some("deny"), Some("ticket_task_budget"), Some(BOOKING - 1)), "{v}");
+    assert_eq!(r.ln.st.lock().unwrap().fetched_notes.len(), 0, "no invoice was fetched for a ticket the rules refuse");
+    assert_eq!((r.ln.state().payments.len(), r.ledger_sum(), r.shop.standin.offer_counts()), (0, 0, (0, 0)));
     assert!(lock_bodies(&r).iter().all(|l| l.get("count").is_none()), "the seller's invoice is not tried after the book refused");
 }
 
@@ -15195,11 +15196,11 @@ const SLICE_WORK: u128 = 1 << 45;
 /// holds to these) with the caps the signer takes on mainnet where the rules leave them out
 /// (`ticket::MAINNET_DEFAULTS`), on this rig's regtest chain. `hashrate`: that task's entry.
 fn mainnet_starter(hashrate: Value) -> Value {
-    json!({"max_per_tx_sats": 2_000, "daily_budget_sats": 10_000, "weekly_budget_sats": 30_000, "per_counterparty_cap_sats": 10_000, "per_counterparty_daily_sats": 5_000,
+    json!({"max_per_tx_sats": 2_000, "daily_budget_sats": 25_000, "weekly_budget_sats": 60_000, "per_counterparty_cap_sats": 50_000, "per_counterparty_daily_sats": 20_000,
            "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 1_000, "split_window_s": 600,
            "ln": {"max_fee_base_sats": 10, "max_fee_ppm": 5_000},
            "tickets": {"max_locked_tickets": 4, "max_locked_sats": 4_000, "max_sellers": 4, "max_new_sellers_per_min": 4, "max_sends_per_hour": 120,
-                       "tasks": {"default": {"budget_sats": 10_000}, "hashrate": hashrate}}})
+                       "tasks": {"default": {"budget_sats": 25_000}, "hashrate": hashrate}}})
 }
 
 fn starter_rental() -> Value {
@@ -15928,4 +15929,130 @@ fn a_top_up_that_cannot_be_had_neither_holds_up_nor_stops_the_session() {
     assert!(topped < 14, "every top-up found a ticket shown: the test never reached one that is not ({topped})");
     assert_eq!(r.session(&sid)["sessions"][0]["state"], "open", "the session was stopped by a top-up");
     r.shop.standin.hold_streams(false);
+}
+
+// --- the buyer's own spending rules refuse a prepaid ticket: nothing is locked, nothing piles up -------------------
+
+/// A seller that sells only prepaid tickets (as the demo shop's Jellyfin does), one session an address as the
+/// mainnet gateway ships, and a buyer whose rules allow `per_seller_daily` sats a day with it.
+fn prepaid_shop_with_daily_cap(per_seller_daily: i64) -> Rig {
+    Rig::shipped(json!({"per_counterparty_daily_sats": per_seller_daily}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 1}}))
+}
+
+fn first_locks(r: &Rig) -> usize {
+    r.tap.seen("/x402/ticket/lock").iter().filter(|l| serde_json::from_str::<Value>(&l.body).ok().is_some_and(|b| b.get("session").is_none())).count()
+}
+
+/// The buyer's own rules (here the cap on a day's spend with one seller) refuse the next prepaid ticket: the
+/// wallet says so with the rule and the owner's limit, and asks the seller for nothing. No invoice is locked for a
+/// ticket that will not be paid, so none holds a place of the seller's (`too_many_tickets`), the session is not
+/// stopped for it, and no new session is opened (`too_many_sessions`): each later call is refused by the same rule,
+/// at once.
+///
+/// FAILS before: the seller was asked for the ticket's invoice first and the rules ran after, so each refused ticket
+/// left an unpaid invoice at the seller, which held a place until it lapsed (75 s); the next lock was refused
+/// `too_many_tickets`, the session was stopped and new ones opened, and the buyer was told the seller's
+/// `too_many_sessions` instead of its own limit.
+#[test]
+fn a_prepaid_ticket_the_buyers_own_rules_refuse_is_never_locked_and_opens_no_session() {
+    let _g = env_lock();
+    // two tickets of 1,003 sat booked fit; a third does not
+    let r = prepaid_shop_with_daily_cap(2_100);
+    // refused for the call's request, or as its answer went on (then it ends "stopped by the wallet")
+    let by_the_cap = |v: &Value| v["rule"] == "per_counterparty_daily" || v["ended"].as_str().is_some_and(|e| e.contains("per_counterparty_daily"));
+    let mut refused = None;
+    for i in 0..6 {
+        let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+        if by_the_cap(&v) {
+            refused = Some(v);
+            break;
+        }
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "call {i}: {v}");
+    }
+    let v = refused.expect("the buyer's daily cap with this seller refused a ticket");
+    r.tick();
+    let paid = r.ln.state().payments.len();
+    let locks = r.tap.seen("/x402/ticket/lock").len();
+    assert_eq!(locks, paid, "a lock was made for a ticket the buyer's rules refused: {locks} locks, {paid} tickets paid: {v}");
+    assert_eq!(r.shop.standin.count(InvoiceState::Open), 0, "an unpaid invoice was left at the seller: {v}");
+    // the rule and the owner's limit, whether the call was refused or its answer stopped
+    let said = if v["rule"] == "per_counterparty_daily" { v.clone() } else { v["policy_refused"].clone() };
+    assert_eq!((said["rule"].as_str(), said["limit_sats"].as_i64()), (Some("per_counterparty_daily"), Some(2_100)), "the refusal names the rule and the owner's limit: {v}");
+    assert!(said["reason"].as_str().is_some_and(|w| w.contains("daily cap")), "{v}");
+    // the calls after it: the same rule, at once, and still nothing asked of the seller and no session opened
+    for i in 0..3 {
+        let t = Instant::now();
+        let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+        assert!(by_the_cap(&v) || v["policy_refused"]["rule"] == "per_counterparty_daily", "call {i} after: {v}");
+        assert!(!v.to_string().contains("too_many"), "call {i} after: the seller's refusal reached the buyer: {v}");
+        assert!(t.elapsed() < Duration::from_secs(5), "call {i} after waited {:?}: {v}", t.elapsed());
+    }
+    assert_eq!(r.tap.seen("/x402/ticket/lock").len(), locks, "a later call asked the seller for a ticket");
+    assert_eq!(first_locks(&r), 1, "a new session was opened with the seller");
+    assert_eq!(r.shop.standin.count(InvoiceState::Open), 0);
+    r.assert_booked();
+}
+
+/// A top-up (`top_up_sats`) the buyer's own rules refuse says so in the call's answer (`top_up_refused`, with the
+/// rule and the owner's limit), and the request goes on with the credit it has: the caller (a visit) can then say
+/// why and stop asking.
+///
+/// FAILS before: the top-up's refusal was dropped, and the caller kept asking until the credit was gone; it then saw
+/// only the seller's latest refusal.
+#[test]
+fn a_top_up_the_buyers_own_rules_refuse_is_said_in_the_answer() {
+    let _g = env_lock();
+    let r = prepaid_shop_with_daily_cap(1_100);
+    let v = r.pay(&format!("/files/{}", MIB), 5_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["tickets_prepaid"].as_u64()), (Some(200), Some(true), Some(1)), "{v}");
+    assert!(v.get("top_up_refused").is_none(), "{v}");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", MIB / 4)), "max_sats": 5_000, "task": "film", "top_up_sats": 2_000}));
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "the request went on: {v}");
+    let t = &v["top_up_refused"];
+    assert_eq!((t["rule"].as_str(), t["limit_sats"].as_i64()), (Some("per_counterparty_daily"), Some(1_100)), "{v}");
+    assert_eq!(r.shop.standin.count(InvoiceState::Open), 0, "an unpaid invoice was left at the seller: {v}");
+    r.assert_booked();
+}
+
+/// After the buyer's own rules refused a ticket, the owner raises the limit (or the day's window moves on): the
+/// session is no longer held as one the rules refuse. Where the seller then refuses its next lock at its cap
+/// (`too_many_tickets`, tickets it still holds for the session), the session is stopped and the next call opens
+/// another, as for any session at the seller's cap.
+///
+/// FAILS before: the refusal stayed marked on the session until a ticket was bought in it, which the seller's cap
+/// kept from happening, so the session was kept at the cap ("ticket_cap_full_kept") until the seller's tickets lapsed.
+#[test]
+fn a_session_the_rules_refused_is_not_held_so_once_the_limit_is_raised() {
+    let _g = env_lock();
+    let r = prepaid_shop_with_daily_cap(2_100);
+    let by_the_cap = |v: &Value| v["rule"] == "per_counterparty_daily" || v["ended"].as_str().is_some_and(|e| e.contains("per_counterparty_daily"));
+    let mut refused = None;
+    for _ in 0..6 {
+        let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+        if by_the_cap(&v) {
+            refused = Some(v);
+            break;
+        }
+    }
+    let v = refused.expect("the buyer's daily cap with this seller refused a ticket");
+    let sid = v["session"].as_str().unwrap().to_string();
+    // the owner raises the cap, signed as the Spending rules page signs it
+    let mut pol = r.call("policy_get", json!({}))["policy"].clone();
+    pol["per_counterparty_daily_sats"] = 60_000.into();
+    let prep = r.call("policy_prepare", json!({"policy": pol}));
+    assert_eq!(prep["ok"], true, "{prep}");
+    let sig = ed25519_dalek::Signer::sign(&human(), &hex::decode(prep["message_hex"].as_str().unwrap()).unwrap());
+    let set = r.call("policy_set", json!({"text": prep["text"], "prev_sha256": prep["prev_sha256"], "expiry": prep["expiry"], "signature": hex::encode(sig.to_bytes())}));
+    assert_eq!(set["ok"], true, "{set}");
+    // the seller still holds the session's places: its next lock is refused at its cap, once
+    let once = AtomicBool::new(true);
+    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\"") && once.swap(false, Ordering::SeqCst))
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+    r.tap.clear();
+    assert!(!r.audit("ticket_cap_full_kept").iter().any(|e| !e["policy_rule"].is_null()), "the session was kept for a refusal of the rules that no longer holds: {v}");
+    assert_ne!(r.session(&sid)["sessions"][0]["state"], "open", "the session at the seller's cap was stopped: {v}");
+    let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "the next call is served in another session: {v}");
+    r.assert_booked();
 }

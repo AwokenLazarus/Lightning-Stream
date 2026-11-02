@@ -53,6 +53,17 @@ const IDLE: Duration = Duration::from_secs(30 * 60);
 pub const MAX_BODY: usize = 1 << 20;
 /// Why a visit ended when its limit is spent: the one ending a raise of the limit undoes ([`Visit::raise`]).
 const LIMIT_REACHED: &str = "This visit's spending limit is reached.";
+/// The buyer's own spending rules (policy.json) a payment can be refused by, by their rule names
+/// (`xbt_signer::policy::OWNER_LIMIT_RULES`): a refusal by one of them is the buyer's own limit, which no
+/// later request of the visit gets past, never the seller's doing.
+const OWNER_LIMIT_RULES: [&str; 10] = ["max_per_tx", "split_bypass", "daily_budget", "weekly_budget", "per_counterparty", "per_counterparty_daily", "velocity",
+                                       "human_threshold", "ticket_task_budget", "ticket_seller_cap"];
+
+/// Whether the signer's answer `v` is a refusal by one of the buyer's own spending rules ([`OWNER_LIMIT_RULES`]).
+fn owner_limit(v: &Value) -> bool {
+    v.get("rule").and_then(Value::as_str).is_some_and(|r| OWNER_LIMIT_RULES.contains(&r))
+}
+
 /// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
 /// How long the request that tops the visit's credit up waits for room for a ticket ([`Visit::take_lane`]).
@@ -160,6 +171,10 @@ struct State {
     credit_msat: Option<u64>,
     /// A request holds the lane: it runs with room for a ticket and tops the credit up before it leaves.
     lane: bool,
+    /// The buyer's own spending rules refused a payment of the visit (a ticket for a request, or a top-up): the rule,
+    /// the signer's words and the owner's limit (`limit_sats`). The visit ends with it ([`Visit::policy_stop`]), and each
+    /// later request is refused with it, not asked of the seller.
+    policy: Option<Value>,
 }
 
 /// A route of the seller, as its `/services` names it.
@@ -266,7 +281,49 @@ impl Visit {
     fn report(&self) -> Value {
         let s = self.lock();
         json!({"base": self.base, "limit_sats": self.limit(), "spent_sats": s.spent, "held_sats": s.held, "used_msat": s.used_msat, "paid_sats": s.paid,
-               "ended": s.ended, "limit_reached": s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped, "calls": s.calls})
+               "ended": s.ended, "limit_reached": s.ended.as_deref() == Some(LIMIT_REACHED) && !s.stopped, "calls": s.calls, "policy_refused": s.policy})
+    }
+
+    /// The buyer's own spending rules refused a payment of this visit (`v`, the signer's refusal, or a call's
+    /// `top_up_refused`): the visit ends with that rule's words, which the owner's log gets too, and its later requests
+    /// are refused with it ([`Visit::policy_refusal`]) instead of asking the seller again and again. Another
+    /// refusal is left as it is. `true`: ended for it.
+    fn policy_stop(&self, v: &Value) -> bool {
+        if !owner_limit(v) {
+            return false;
+        }
+        let rule = v.get("rule").and_then(Value::as_str).unwrap_or("");
+        let reason = v.get("reason").or(v.get("error")).and_then(Value::as_str).unwrap_or("");
+        let limit = v.get("limit_sats").and_then(Value::as_i64);
+        let mut s = self.lock();
+        if s.policy.is_none() {
+            eprintln!("lightning-stream: a visit ended: your spending rules refused a payment ({rule}{}): {reason}",
+                      limit.map(|l| format!(", your limit {l} sat")).unwrap_or_default());
+        }
+        s.policy = Some(json!({"rule": rule, "reason": reason, "limit_sats": limit}));
+        // the words the visit ends with: in plain words; the page that shows them names the shop and the field
+        let words = match rule {
+            "per_counterparty_daily" => "You've reached today's spending limit for this shop in your spending rules.",
+            "per_counterparty" | "ticket_seller_cap" => "You've reached this week's spending limit for this shop in your spending rules.",
+            "daily_budget" => "You've reached today's spending limit in your spending rules.",
+            "weekly_budget" => "You've reached this week's spending limit in your spending rules.",
+            _ => "Your spending rules refused the next payment of this visit.",
+        };
+        if s.ended.is_none() || s.ended.as_deref() == Some(LIMIT_REACHED) {
+            s.ended = Some(format!("{words} Raise it in Settings → Spending rules."));
+        }
+        drop(s);
+        self.turn.notify_all();
+        true
+    }
+
+    /// A request of a visit that the buyer's own spending rules ended: refused with that rule and the visit's words, as
+    /// the connector's own refusal (`None`: the visit did not end so). The seller's page sees this answer: the owner's
+    /// limit and the wallet's sums stay out of it (the wallet's pages read them from the visit's report).
+    fn policy_refusal(&self) -> Option<Response> {
+        let s = self.lock();
+        let p = s.policy.as_ref()?;
+        Some(json_response(402, &json!({"error": s.ended, "rule": p["rule"]})))
     }
 
     /// The signer's final word on one call that held `share`: what the seller charged for its answer and what was
@@ -283,6 +340,11 @@ impl Visit {
         let price = num("price_msat").unwrap_or(0);
         let used = price.max(signed.unwrap_or(0).min(price.saturating_add(share.max(0).unsigned_abs().saturating_mul(1000))));
         let charged = num("charged_sats").unwrap_or(0);
+        // a top-up the buyer's own rules refused: the request went on, and the visit ends with that rule's words
+        // (or a ticket for the answer, which stopped where the credit ended: `policy_refused`)
+        if let Some(t) = v.get("top_up_refused").or(v.get("policy_refused")).filter(|t| t.is_object()) {
+            self.policy_stop(t);
+        }
         let mut s = self.lock();
         s.used_msat = s.used_msat.saturating_add(used);
         s.paid = s.paid.saturating_add(i64::try_from(charged).unwrap_or(0));
@@ -463,6 +525,7 @@ impl Visit {
     /// spent, and what a ticket of the seller's books, where the reply names it, is kept.
     fn refused(self: &Arc<Self>, share: i64, f: Failed) {
         let Failed { v, done, unknown } = f;
+        self.policy_stop(&v);
         if let Some(t) = v.get("ticket_booking_sats").and_then(Value::as_i64) {
             let mut s = self.lock();
             s.ticket = s.ticket.max(t);
@@ -699,6 +762,9 @@ impl Connector {
         let t0 = Instant::now();
         if req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
             return self.visit_socket(visit, path, req);
+        }
+        if let Some(r) = visit.policy_refusal() {
+            return Reply::Whole(r);
         }
         {
             let mut s = visit.lock();
@@ -1204,6 +1270,9 @@ fn refusal(v: &Value) -> Response {
         r.headers.push(("Retry-After".into(), retry.to_string()));
         return r;
     }
+    // the seller's page sees this answer: a refusal by the buyer's own spending rules names the rule, never the owner's
+    // limit or the wallet's sums with this and other sellers (the wallet's pages read those from the visit's report)
+    let reason = if owner_limit(v) { "Your spending rules refused this payment." } else { reason };
     json_response(if rule.is_empty() { 502 } else { 402 }, &json!({"error": reason, "rule": rule}))
 }
 
@@ -1213,6 +1282,47 @@ mod tests {
 
     fn visit(limit: i64) -> Arc<Visit> {
         Arc::new(Visit { base: String::new(), limit: limit.into(), ceiling: None, state: Mutex::new(State::default()), turn: Condvar::new() })
+    }
+
+    /// The buyer's own spending rules refuse a payment of the visit (here the cap on a day's spend with one shop): the
+    /// visit ends with that rule's words, its report says the rule and the limit, and each later request is refused
+    /// with them at once, not asked of the seller. A top-up the rules refused, said in a call's answer that went on,
+    /// ends it the same way. Any other refusal leaves the visit open.
+    ///
+    /// FAILS before: the refusal was passed on and the visit went on, each request asking again; a refused top-up
+    /// was not read at all, and the page saw the seller's refusals that followed (`too_many_sessions`).
+    #[test]
+    fn a_payment_the_buyers_own_rules_refuse_ends_the_visit_with_the_rule() {
+        let v = visit(1_000);
+        let share = v.reserve_answer().unwrap();
+        v.refused(share, Failed { v: json!({"rule": "ticket_seller", "reason": "the seller refused the lock: HTTP 402 too_many_tickets", "charged_sats": 0}),
+                                  done: None, unknown: false });
+        assert!(v.policy_refusal().is_none() && v.report()["ended"].is_null(), "a seller's refusal does not end the visit: {}", v.report());
+        let share = v.reserve_answer().unwrap();
+        v.refused(share, Failed { v: json!({"rule": "per_counterparty_daily", "reason": "today's spend with this seller 5203 exceeds its daily cap 5000",
+                                            "limit_sats": 5000, "charged_sats": 0}), done: None, unknown: false });
+        let r = v.report();
+        assert_eq!((r["policy_refused"]["rule"].as_str(), r["policy_refused"]["limit_sats"].as_i64()), (Some("per_counterparty_daily"), Some(5000)), "{r}");
+        let ended = r["ended"].as_str().unwrap_or("");
+        assert!(ended.contains("today's spending limit for this shop") && ended.contains("Settings → Spending rules"), "{r}");
+        assert!(!r.to_string().contains("too_many"), "{r}");
+        let refused = v.policy_refusal().expect("later requests are refused with the rule");
+        assert_eq!(refused.status, 402);
+        let body: Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(body["rule"].as_str(), Some("per_counterparty_daily"), "{body}");
+        // the seller's page is told the rule, never the owner's limit or the wallet's sums
+        assert!(body.get("limit_sats").is_none() && !body.to_string().contains("5203") && !body.to_string().contains("5000"), "{body}");
+        let page = refusal(&json!({"rule": "per_counterparty_daily", "reason": "today's spend with this seller 5203 exceeds its daily cap 5000", "limit_sats": 5000}));
+        let body: Value = serde_json::from_slice(&page.body).unwrap();
+        assert!(!body.to_string().contains("5203") && !body.to_string().contains("5000") && body.get("limit_sats").is_none(), "{body}");
+        assert!(v.raise(2_000).is_err(), "a higher visit limit does not get past the owner's rules");
+        // a top-up refused by the rules, in the answer of a call that went on
+        let v = visit(1_000);
+        v.account(&json!({"price_msat": "1000", "charged_sats": 0, "top_up_refused": {"rule": "daily_budget", "reason": "daily spend 25003 exceeds budget 25000",
+                                                                                         "limit_sats": 25000}}), 125);
+        let r = v.report();
+        assert_eq!(r["policy_refused"]["rule"].as_str(), Some("daily_budget"), "{r}");
+        assert!(r["ended"].as_str().unwrap_or("").contains("today's spending limit"), "{r}");
     }
 
     /// A film may run for hours: a request waiting to run alone does not wait for an answer that has

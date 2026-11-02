@@ -150,6 +150,14 @@ impl App {
             .filter_map(|e| xbt_nostr::event::Event::from_value(e).and_then(|e| e.tag("exit").map(str::to_string))).collect()).unwrap_or_default()
     }
 
+    /// An exit as a person reads it: its shop's name (the shop it is paid through, by its listing) and
+    /// its country, from what Found on Nostr last saw. Its id stays in the tooltip.
+    fn vpn_exit_name(&self, id: &str, region: &str) -> String {
+        let shop = self.vpn_exits.find(id).and_then(|f| f.exit.tunnel.as_deref().and_then(crate::services::http_origin))
+            .map(|o| self.seller_name(&o)).unwrap_or_default();
+        exit_words(&shop, region)
+    }
+
     /// Found on Nostr: the exits the owner's relays carry, each checked, with *Add this exit* for one the
     /// owner wants: the service then reads it with the ones it finds, and every device prefers it.
     fn vpn_found_on_nostr(&self, ctx: &Ctx, in_use: &[&Value], refresh: bool) -> String {
@@ -181,8 +189,8 @@ impl App {
                          <input type=\"hidden\" name=\"exit\" value=\"{}\"><button class=\"secondary\" type=\"submit\">Add this exit</button></form>", App::csrf_input(ctx), esc(&e.id))
             };
             let seen = if in_use.iter().any(|x| x["exit"].as_str() == Some(e.id.as_str())) { " <span class=\"tag ok\">found by the VPN service</span>" } else { "" };
-            format!("<tr><td><code>{}…</code>{seen}<div class=\"small\">{}{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{action}</td></tr>",
-                    esc(&e.id.chars().take(12).collect::<String>()), if e.filtered { "filtered" } else { "private" },
+            format!("<tr><td><span title=\"{}\">{}</span>{seen}<div class=\"small\">{}{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{action}</td></tr>",
+                    esc(&e.id), esc(&exit_words(&shop, &e.region)), if e.filtered { "filtered" } else { "private" },
                     if shop.is_empty() { String::new() } else { format!(" · paid through {}", esc(&shop)) },
                     esc(&e.region), price_words(Some(e.price_msat_per_gb)), if e.logs { "says it keeps logs" } else { "says no logs" })
         }).collect();
@@ -220,13 +228,19 @@ impl App {
         }
         let status = read(&self.cfg.vpn.status_dir.join("status.json"));
         let devices = self.vpn_devices();
+        // an exit by its shop's name and country, never by its hex id alone
+        let exit_name = |id: &str, region: &str| esc(&self.vpn_exit_name(id, region));
         let live: Vec<&Value> = devices.iter().filter(|d| d["revoked"].as_bool() != Some(true)).collect();
         let rows: String = live.iter().map(|d| {
             let id = d["id"].as_str().unwrap_or("");
             let (st, why) = device_line(&status, id);
             let state = match (why, st["exit"].as_str()) {
                 (Some(why), _) => format!("<span class=\"tag bad\">blocked</span> <span class=\"small\">{}</span>", esc(why)),
-                (None, Some(exit)) => format!("<span class=\"tag ok\">out through {}</span>", esc(exit)),
+                (None, Some(exit)) => {
+                    let region = status["exits"].as_array().into_iter().flatten().find(|e| e["exit"].as_str() == Some(exit))
+                        .and_then(|e| e["region"].as_str()).unwrap_or("");
+                    format!("<span class=\"tag ok\" title=\"{}\">out through {}</span>", esc(exit), exit_name(exit, region))
+                }
                 _ => "<span class=\"tag\">no traffic yet</span>".to_string(),
             };
             let used = st["used_msat"].as_u64().unwrap_or(0) / 1000;
@@ -253,8 +267,8 @@ impl App {
                           else if e["checked_at"].as_u64().unwrap_or(0) == 0 && e.get("checked_at").is_some() { "<span class=\"tag\">not checked</span>" }
                           else { "<span class=\"tag\">not used for its country</span>" };
                 let added = if e["added"] == true { " <span class=\"tag ok\">added</span>" } else { "" };
-                format!("<tr><td><code>{}…</code>{added}</td><td>{}</td><td>{}</td><td>{tag} <span class=\"small\">{}</span></td></tr>",
-                        esc(&id.chars().take(12).collect::<String>()), esc(e["region"].as_str().unwrap_or("")), price_words(e["price_msat_gb"].as_u64()),
+                format!("<tr><td><span title=\"{}\">{}</span>{added}</td><td>{}</td><td>{}</td><td>{tag} <span class=\"small\">{}</span></td></tr>",
+                        esc(id), exit_name(id, e["region"].as_str().unwrap_or("")), esc(e["region"].as_str().unwrap_or("")), price_words(e["price_msat_gb"].as_u64()),
                         esc(e["region_check"].as_str().unwrap_or("")))
             }).collect();
             b.push_str(&format!("<section class=\"card\" id=\"exits\"><h2>Exits found</h2><p class=\"small\">The exits this box's VPN service can use. \
@@ -553,8 +567,26 @@ fn charged_in(health: &str) -> Option<u64> {
     serde_json::from_str::<Value>(health).ok()?.get("chargedMsat")?.as_str()?.parse().ok()
 }
 
+/// "Exit from Demo Films, in DE", "Exit in DE", "An exit": what the VPN page names an exit by.
+fn exit_words(shop: &str, region: &str) -> String {
+    let region = region.trim();
+    match (shop.is_empty(), region.is_empty()) {
+        (false, false) => format!("Exit from {shop}, in {region}"),
+        (false, true) => format!("Exit from {shop}"),
+        (true, false) => format!("Exit in {region}"),
+        (true, true) => "An exit".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_exit_is_named_by_its_shop_and_country() {
+        assert_eq!(super::exit_words("Demo Films", "DE"), "Exit from Demo Films, in DE");
+        assert_eq!(super::exit_words("", "NL"), "Exit in NL");
+        assert_eq!(super::exit_words("", ""), "An exit");
+    }
+
     use super::*;
 
     #[test]
@@ -643,3 +675,4 @@ mod tests {
         assert!(leftovers.is_empty(), "no half-written file left behind");
     }
 }
+

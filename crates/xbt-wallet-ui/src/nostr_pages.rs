@@ -88,7 +88,7 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -
                                  <p class=\"small\">{}</p><details><summary>Keys</summary><p class=\"small\">Nostr key <code>{}</code>, receipt key <code>{}</code></p></details>\
                                  <form method=\"post\" action=\"./nostr-check\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
                                  <input type=\"hidden\" name=\"event\" value=\"{}\"><button type=\"submit\" class=\"secondary\">Check with the seller</button></form>",
-                                esc(&n.listing.name), esc(&n.listing.seller), esc(&n.author), esc(&n.listing.receipt_key),
+                                esc(&n.listing.name), esc(&xbt402::shop::display(&n.listing.seller)), esc(&n.author), esc(&n.listing.receipt_key),
                                 esc(&ctx.csrf), esc(&n.event_id)));
         }
         for s in nostr::to_services(n) {
@@ -100,7 +100,8 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -
                     // the file's path at the shop, not its made-up `…shop.invalid` address
                     let path = services::http_origin(&item.url).filter(|o| xbt402::shop::is_shop(o))
                         .and_then(|o| item.url.strip_prefix(&o).map(str::to_string)).unwrap_or_else(|| item.url.clone());
-                    let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&path));
+                    // shown decoded ("My film.mkv", not "My%20film.mkv"); the link itself is not changed
+                    let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&crate::services::path_words(&path)));
                     b.push_str(&format!("<article class=\"card\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>{open}</article>",
                                         esc(&item.title), esc(&item.year), esc(&item.credit)));
                 }

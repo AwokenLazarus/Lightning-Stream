@@ -5,6 +5,123 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.6 (2026-11-02)
+
+Spending limits that say what they are, from a hands-on run of 0.2.5 with the demo shop's Jellyfin. A film
+froze near its end and the buyer was shown "the seller refused the lock: HTTP 402 too_many_sessions". The
+real cause was the buyer's own rule: at most 5,000 sat a day to one seller, about what one film costs at
+20 sat a MiB. The signer, the connector, the wallet UI and the seller's gateway change.
+
+- **A ticket your own rules refuse is never asked for.** The signer checked a prepaid ticket against the
+  owner's spending rules only after the seller had issued its invoice. A refused ticket's invoice stayed
+  unpaid for 75 seconds and held one of the places the seller gives a session and an address. The next
+  ticket was then refused `too_many_tickets`, the wallet opened new sessions, and those were refused
+  `too_many_sessions`, again and again. Now each prepaid ticket is checked against the owner's caps and
+  rules before the seller is asked for anything. The check writes nothing and stores no approval. If a
+  refusal still comes after an invoice was issued (the rules changed in between), the wallet asks the
+  seller to cancel that invoice. A session your own rules stopped is never replaced by a new one.
+- **The reason reaches you.** A refusal by one of your spending rules now carries the limit that refused it
+  (`limit_sats`). A top-up your rules refuse is reported in the call's answer (`top_up_refused`, with the rule
+  and the limit) instead of being dropped. A visit that meets such a refusal ends with it, and logs it. Its
+  later requests are refused with your rule at once instead of asking the seller again.
+- **Plain words for every spending rule.** The visit bar and the "Not paid" page name the rule as the
+  Spending rules page shows it, with your limit and where to raise it. For example: "You've reached today's
+  limit for Demo Films (5,000 sat)", then "Raise it: "Most to any one seller in 24 hours" in Settings →
+  Spending rules (under More rules)", with a link. The seller's internal errors are no longer shown there.
+  This covers the daily and weekly budgets, both per-seller caps, the largest single payment, the approval
+  threshold, the payment rate and the stream tickets' budget.
+- **The AI endpoint says when your limit is reached.** When your spending rules refuse a call, the
+  OpenAI-compatible endpoint now answers 402 (429 for the payment-rate rule). It uses OpenAI's error shape
+  with `type` and `code` `spending_limit_reached`, the rule and the limit. The message names the seller,
+  the limit in sats and where to raise it. A seller's internal refusal is no longer passed on in the error,
+  and is logged instead. A limit for one seller lets the next seller offering the model answer; a limit for
+  the whole wallet stops at once. `/v1/models` says in each entry's description that a model's short name
+  and its seller-qualified name are the same model. The short name goes to the cheapest seller that offers
+  it, and the qualified name goes to that one seller.
+- **Starter limits that fit a film.** New mainnet wallets start with 20,000 sat a day to any one seller
+  (was 5,000), 50,000 sat in 7 days to one seller (was 10,000), a 25,000 sat daily limit (was 10,000), a
+  60,000 sat weekly limit (was 30,000), and a 25,000 sat daily budget for stream tickets (was 10,000). The
+  largest single payment stays 2,000 sat, and payments of 1,000 sat or more still ask you first. An existing
+  wallet keeps its rules; raise them on the Spending rules page.
+- **Shops: free paths for a web app.** The Sell page has a "Free paths" field for a web app. It suggests
+  `/web/` for Jellyfin and other media servers, and the seller can edit it. Each path is served free (GET
+  and HEAD, compressed) under the app's own listing. Everything else under the app stays paid. Before, a
+  free route added to the gateway's config by hand was dropped each time the app started or the Sell page
+  was saved.
+- **Selling a Jellyfin 10.11 or newer works.** Newer Jellyfin turns off the older ways of passing a key
+  (`X-Emby-Token` and `api_key`), so the Sell page said a valid key was not accepted, and buyers' own accounts
+  could not be made or used. The Sell page's library check, the gateway's account calls and every buyer
+  request now pass the key or token in the `Authorization: MediaBrowser` header, which Jellyfin 10.10 accepts
+  too. In a buyer's request, the gateway keeps the app's own Client, Device, DeviceId and Version, and sends
+  exactly one token: the buyer's. The app's own tokens are removed, and the seller's key is never sent.
+- **The visit's credit is the connection's real balance.** The visit bar worked its credit out as what this
+  visit paid less what it used. That left out routing fees, credit from earlier visits and other use of the
+  same connection: it once showed 588 sat where 542.324 was left. It now shows the signer's balance for the
+  connection, as Live connections does, rounded down.
+- **Paid amounts add up.** A payment is shown as the exact sum of its parts, "902.009 sats (900 + 2.009
+  fee)", where it said 903. The same goes for "Paid so far" on Live connections. The spending rules still
+  count each payment in whole sats, rounded up, which is the safe side. Recent activity on the Wallet page
+  has **Show more**.
+- **Agents can see what they may buy.** The wallet's MCP server has a new read-only `list_services` tool. It
+  lists each service's kind, seller, price, the exact address to pay and whether the owner's rules allow it,
+  and gives the box's AI endpoint. The shop pay tool's description points to it. A shop reached by its key
+  had no address an agent could find or guess before.
+- **Shops: two sessions from one address on mainnet.** The Sell page's mainnet default is now 2 sessions
+  per buyer address (was 1), which is the gateway's own default. With 1, a buyer's own stale session could
+  shut that buyer out. Unpaid invoices from one address are still capped at 2.
+
+Also plain words and loose ends, from issues #40 and #42 and from hands-on runs of 0.2.5. For these the
+wallet UI and the seller's gateway change, and the Umbrel app's renter no longer offers Umbrel's DATUM
+Gateway app.
+
+- **A shop that turns Private is listed once (#40).** A shop's Nostr listing is addressed by its seller, so a
+  shop that changed its address, or went from its web address to its key, left its old listing on the relays
+  beside the new one: buyers saw the shop twice, once at an address that no longer sells. At each publish
+  the gateway now asks its relays for the listings its own key signed, and withdraws those for any other
+  address with a NIP-09 deletion signed by that key, on each relay that took the new listing (one that
+  refused it keeps the old, so the shop stays listed there), and once per relay and event while the gateway
+  runs. A relay that keeps deleted events is covered too: Found
+  on Nostr keeps only the newest of one key's listings under one receipt key. Saving a shop that goes Private
+  also says to remove a tunnel or proxy that still sends the old address to the box.
+- **Hashrate is paid where the shop is reached, also after an update.** The hashmaker's pay address
+  followed a change of reach only when the shop was saved or Sell → Hashrate was opened. A shop that went
+  Private before 0.2.3 kept a pay address that no longer answered, and renters failed at the first piece of
+  work. The app now puts it right at start (waiting for the gateway to say the shop's key), and the hashmaker
+  republishes its offer with it.
+- **A hashrate offer names its shop.** An offer said "Miners from stream.example". It now names the shop
+  as a listing the app already has names it (Browse, or Found on Nostr), with its address beside it:
+  "Miners from Demo Films (stream.example)". Nothing is fetched from the address an offer names, so
+  viewing offers tells no publisher the box's address. Where no listing names the shop, its address alone.
+- **Hashrate → Your gateway, in words.** The line "Connected to your node" said more than it measured; it
+  is now "Jobs from your node: checked / not yet" (a job was fetched from the gateway and checked). The page
+  says that no separate DATUM app is needed, and that Umbrel's own DATUM Gateway app is for Bitcoin and won't
+  work here. On Umbrel the renter no longer lists that app (`datum_web_1:23334`) as a gateway found on the
+  box; an install that saved it is still moved to the app's own gateway at start, as before.
+- **Live connections.** A connection that ran on credit paid on an earlier one says "Paid from earlier
+  credit" instead of "Paid so far: 0" beside what it used. The "about N sats a minute" rate shows only while
+  the seller's count of what was used grows, not as an old average while the connection idles.
+- **Where credit is.** The Wallet page said credit with shops is on Live connections, which shows nothing
+  once a connection closes. It now points to Sellers and each shop's service page (and Live connections while
+  one is open). A web app's "Open the app" page shows the credit line a Files page shows.
+- **No raw text.** Records says who authorized each signature, what it was and where it went in words
+  ("Your spending rules", "Paid a service", "Lightning node of Demo Films"), with the signer's own word in
+  the tooltip. The Spending rules row of a seller allowed by its node says "Lightning node of <shop>",
+  also for a shop known only from the shops it vouches for, and shows the node short instead of its raw
+  `ln:` line. Found on Nostr shows a file's path decoded ("My film.mkv", not "My%20film.mkv") and a shop
+  reached by its key by its key, never its made-up address. The VPN page names an exit by its shop and
+  country ("Exit from Demo Films, in DE"), with its id in the tooltip.
+- **American spelling** in the wallet: "Authorized by", "canceled at Stop", "Enrollment code", "recognize".
+- **Setup.** Under "Made and enrolled.", a browser without the approval key is told calmly, as a hint, that
+  it can't sign, and how to sign: in the browser the key was made in, with "Sign on another device", or by
+  putting the key in this browser from its backup. It was a red error.
+- **The visit page.** The empty rounded bar between Stop and the frame is gone (the bar was a paragraph
+  that the Stop form split in two). The frame is the page's own dark color while the app loads, so there is
+  no white flash in dark mode.
+- **Player links count what they carry.** On a Files page, each link for your player (`/r/…`) shows the bytes
+  it has carried and about what they cost at the file's listed price: "Playing" while bytes move, "Open"
+  while the player holds the link paused, and a short total after. The sats are figured from the listed price: what each call paid stays with the
+  connector, and per-connection byte records come in 0.2.7.
+
 ## 0.2.5 (2026-11-02)
 
 Web apps in visits, faster and whole, from a hands-on run of 0.2.4 with the demo shop's Jellyfin over a

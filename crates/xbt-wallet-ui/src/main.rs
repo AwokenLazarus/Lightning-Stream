@@ -242,6 +242,19 @@ fn serve() -> i32 {
                         continue;
                     }
                 }
+                break;
+            }
+            // the hashmaker's pay address follows the shop's reach: a shop reached by its key waits for the
+            // gateway to say its key (up to two minutes)
+            for _ in 0..24 {
+                match app.follow_reach_at_start() {
+                    Some(true) => eprintln!("xbt-wallet-ui: the hashmaker is now paid where buyers reach the shop; it republishes its offer"),
+                    Some(false) => {}
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                }
                 return;
             }
         });
