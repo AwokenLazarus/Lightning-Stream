@@ -96,7 +96,11 @@ OWN_SOURCES = {
     # 0.2.3: the VPN service is also linked into the wallet UI; the signer crate into the wallet UI, the
     # wallet MCP (and its xbt-nwc) and the anchor witness, which builds from the same package
     "crates/xbt-vpn": {"xbt-vpn", "xbt-wallet-ui"},
-    "crates/xbt-signer": {"xbt-signer", "xbt-anchor-witness", "xbt-wallet-mcp", "xbt-wallet-ui"},
+    "crates/xbt-signer": {"xbt-signer", "xbt-anchor-witness", "xbt-wallet-mcp", "xbt-wallet-ui", "xbt-vpn"},
+    # 0.2.6: the gateway crate is linked into the signer (and so the anchor witness) and the wallet UI; the wallet MCP
+    # crate into the connector, the VPN service and the wallet UI
+    "crates/xbt-gateway": {"xbt-gateway", "xbt-signer", "xbt-anchor-witness", "xbt-wallet-ui"},
+    "crates/xbt-wallet-mcp": {"xbt-wallet-mcp", "lightning-stream", "xbt-vpn", "xbt-wallet-ui"},
 }
 
 
