@@ -318,6 +318,32 @@ impl Handler for Service {
             return Reply::Whole(Response::new(200, vec![("Content-Type".into(), "application/json".into()), ("Set-Cookie".into(), "jf=abc; Path=/; HttpOnly".into()),
                                                         ("X-Seller-App".into(), "yes".into()), ("Payment-Made-Up".into(), "no".into())], v.to_string().into_bytes()));
         }
+        // a stand-in Jellyfin, as a web app's page reaches it: an empty style sheet, an empty chunked answer, a 204 to a
+        // POST, a bitrate test of `Size` bytes with its length stated, a script sent compressed and chunked, a font
+        if let Some(rest) = path.strip_prefix("/jf/").or_else(|| path.strip_prefix("/jfweb/")) {
+            use std::io::Write as _;
+            let size = req.target.split_once("Size=").and_then(|(_, n)| n.split('&').next()?.parse::<usize>().ok()).unwrap_or(0);
+            return match rest {
+                "Branding/Css" => Reply::Whole(Response::new(200, vec![("Content-Type".into(), "text/css; charset=utf-8".into())], vec![])),
+                "empty-chunked" => Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], length: None,
+                                                            body: Box::new(|_| Ok(())) }),
+                "Sessions/Capabilities/Full" | "Sessions/Playing" => Reply::Whole(Response::new(204, vec![], vec![])),
+                "Playback/BitrateTest" => stream(size, Some(size as u64), body(size, 64 << 10, Duration::ZERO)),
+                "users/public" => Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], length: None,
+                                                           body: Box::new(|out| out.send(b"[]")) }),
+                "main.js" if req.header("Accept-Encoding").is_some_and(|a| a.contains("gzip")) => {
+                    let plain: Vec<u8> = (0..300_000).map(|i| b"jellyfin;\n"[i % 10]).collect();
+                    let mut z = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+                    z.write_all(&plain).unwrap();
+                    let packed = z.finish().unwrap();
+                    Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/javascript".into()), ("Content-Encoding".into(), "gzip".into()),
+                                                                       ("ETag".into(), "\"js1\"".into())],
+                                             length: None, body: Box::new(move |out| { for c in packed.chunks(4096) { out.send(c)?; } Ok(()) }) })
+                }
+                "font.woff2" => stream(13_332, Some(13_332), body(13_332, 4096, Duration::ZERO)),
+                _ => Reply::Whole(Response::text(404, "text/plain", "no such thing")),
+            };
+        }
         Reply::Whole(match path.as_str() {
             "/api" => Response::text(200, "application/json", json!({"method": req.method, "body": String::from_utf8_lossy(&req.body)}).to_string()),
             p if p.starts_with("/hashrate/") => Response::text(200, "application/json", "{\"counted\":true}"),
@@ -385,6 +411,9 @@ fn routes() -> Value {
          "deny_paths": ["/acct/admin"]},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true},
+        // a Jellyfin as the demo shop sells it: its web client free and compressed, the rest at 20 sat a MiB
+        {"path": "/jfweb/", "free": true, "methods": ["GET", "HEAD"], "accept_gzip": true},
+        {"path": "/jf/", "methods": ["GET", "HEAD", "POST"], "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}, "max_body": 65536},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
         {"path": "/v1/", "methods": ["GET", "POST"], "price": {"per_1k_input_msat": 4000, "per_1k_output_msat": 20_000}, "max_output_tokens": 500, "max_body": 65536},
         // a dear one: its longest reply (500 tokens) costs most of a ticket
@@ -15744,4 +15773,74 @@ fn a_call_naming_no_task_that_resolves_to_the_rental_task_is_refused() {
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/hashrate/r1/0"), "method": "POST", "body": "{}", "max_sats": 2_000}));
     assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("ticket_rental_payer"), 0), "{v}");
     assert_eq!((r.ledger_sum(), r.ln.paid_msat()), (0, 0));
+}
+
+/// One request of a web app's page, as the app's connector makes it: streamed to a reader with the
+/// head first (`stream_head`, `head_headers`), on the route's known terms. `(the call's answer, the
+/// head line, the body the reader got)`.
+fn page_call(r: &Rig, dir: &std::path::Path, name: &str, path: &str, method: &str, body: Option<&[u8]>, max_sats: i64) -> (Value, Value, Vec<u8>) {
+    use std::io::{BufRead as _, Read as _};
+    let l = std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut s = std::io::BufReader::new(s);
+        let mut line = String::new();
+        let _ = s.read_line(&mut line);
+        let mut all = vec![];
+        let _ = s.read_to_end(&mut all);
+        (serde_json::from_str::<Value>(&line).unwrap_or(Value::Null), all)
+    });
+    let mut p = json!({"url": r.shop.url(path), "method": method, "max_sats": max_sats, "task": "film", "stream_to": name, "stream_head": true,
+                       "head_headers": true, "known_terms": true, "headers": []});
+    if let Some(b) = body {
+        p["body_b64"] = B64.encode(b).into();
+    }
+    let v = r.call("xbt402_pay", p);
+    let t = Instant::now();
+    while !reader.is_finished() && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !reader.is_finished() {
+        let _ = std::os::unix::net::UnixStream::connect(dir.join(name));
+    }
+    let (head, got) = reader.join().unwrap();
+    (v, head, got)
+}
+
+/// A media server's page through the gateway, each answer whole and said to be whole: an empty style
+/// sheet, an empty chunked answer, a 204 to a POST (with and without a body), a bitrate test with its
+/// length stated, a free script sent compressed and chunked, and a free font. Each is asked within a
+/// visit's share (125 sat), once the session holds credit, as the app asks them.
+#[test]
+fn a_web_apps_answers_come_whole_through_the_gateway() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // the visit's first request buys the session's ticket
+    let (v, _, got) = page_call(&r, dir.path(), "first", "/jf/Playback/BitrateTest?Size=1000", "GET", None, CALL);
+    assert_eq!((v["complete"].as_bool(), got.len()), (Some(true), 1000), "{v}");
+    let cases: Vec<(&str, &str, &str, Option<&[u8]>, u64, usize)> = vec![
+        ("css", "/jf/Branding/Css", "GET", None, 200, 0),
+        ("chunked", "/jf/empty-chunked", "GET", None, 200, 0),
+        ("users", "/jf/users/public", "GET", None, 200, 2),
+        ("caps", "/jf/Sessions/Capabilities/Full", "POST", Some(b"{\"PlayableMediaTypes\":[\"Video\"]}"), 204, 0),
+        ("playing", "/jf/Sessions/Playing", "POST", None, 204, 0),
+        ("bitrate", "/jf/Playback/BitrateTest?Size=500000", "GET", None, 200, 500_000),
+        ("js", "/jfweb/main.js", "GET", None, 200, 300_000),
+        ("font", "/jfweb/font.woff2", "GET", None, 200, 13_332),
+        ("head", "/jf/Playback/BitrateTest?Size=4096", "HEAD", None, 200, 0),
+    ];
+    let mut wrong = vec![];
+    for (name, path, method, body, status, len) in cases {
+        let (v, head, got) = page_call(&r, dir.path(), name, path, method, body, 125);
+        let stated = head["content_length"].as_u64();
+        let ok = v["status"].as_u64() == Some(status) && head["status"].as_u64() == Some(status) && v["complete"].as_bool() == Some(true) && got.len() == len
+            && (method == "HEAD" || stated.is_none_or(|n| n == len as u64));
+        if !ok {
+            wrong.push(format!("{name}: {method} {path}: got {} bytes of {len}, head {head}, answer {v}", got.len()));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    std::env::remove_var("B2_STREAM_DIR");
 }
