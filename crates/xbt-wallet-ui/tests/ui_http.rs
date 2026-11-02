@@ -4802,7 +4802,7 @@ fn the_vpn_page_lists_exits_found_on_nostr_and_adds_one_for_the_vpn_service() {
     let found = &page[page.find("id=\"exits\"").expect("the exits the service found")..];
     assert!(found.contains(&format!("{}…", &exit[..12])) && found.contains(">not checked<") && found.contains("1,000 sat/GB"), "{found}");
     let nostr_part = &page[page.find("id=\"found-exits\"").expect("Found on Nostr")..];
-    assert!(nostr_part.contains("Add this exit") && nostr_part.contains(">SV<") && nostr_part.contains("found by the VPN service"), "{nostr_part}");
+    assert!(nostr_part.contains(">Add this exit</button>") && nostr_part.contains(">SV<") && nostr_part.contains("found by the VPN service"), "{nostr_part}");
 
     // an exit the relays don't carry: refused, nothing written
     let r = br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &"ab".repeat(32))]);
@@ -4820,7 +4820,7 @@ fn the_vpn_page_lists_exits_found_on_nostr_and_adds_one_for_the_vpn_service() {
     assert_eq!(xbt_vpn::service::devices_from(&file)[0].requirements.prefer, vec![exit.clone()]);
     let page = unescape(&br.get("/vpn").body);
     let nostr_part = &page[page.find("id=\"found-exits\"").unwrap()..];
-    assert!(nostr_part.contains(">added<") && !nostr_part.contains("Add this exit"), "{nostr_part}");
+    assert!(nostr_part.contains(">added<") && !nostr_part.contains("value=\"add_exit\""), "{nostr_part}");
     // adding it again keeps one copy; removing it leaves the devices
     br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &exit)]);
     assert_eq!(read_json(&vdir.join("devices.json"))["exits"].as_array().unwrap().len(), 1);
