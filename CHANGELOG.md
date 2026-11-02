@@ -5,6 +5,14 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.3 (not yet released)
+
+- **The look of lightning-stream.com.** The app is dark by default, with the website's near-black ground,
+  lightning-yellow main buttons and amounts, white-blue accents, its Inter type and its mark. A light theme
+  in the same colors is one button away in the bar, and the browser remembers it. The background's electric
+  river is slower and finer, in yellow and electric blue, still reacts to the pointer and to clicks, and
+  stays still with reduced motion and on low-power devices. Every page works at phone width.
+
 ## 0.2.2 (2026-11-02)
 
 A fix release for a first purchase, from a tester's hands-on run of 0.2.1.
