@@ -16013,3 +16013,46 @@ fn a_top_up_the_buyers_own_rules_refuse_is_said_in_the_answer() {
     assert_eq!(r.shop.standin.count(InvoiceState::Open), 0, "an unpaid invoice was left at the seller: {v}");
     r.assert_booked();
 }
+
+/// After the buyer's own rules refused a ticket, the owner raises the limit (or the day's window moves on): the
+/// session is no longer held as one the rules refuse. Where the seller then refuses its next lock at its cap
+/// (`too_many_tickets`, tickets it still holds for the session), the session is stopped and the next call opens
+/// another, as for any session at the seller's cap.
+///
+/// FAILS before: the refusal stayed marked on the session until a ticket was bought in it, which the seller's cap
+/// kept from happening, so the session was kept at the cap ("ticket_cap_full_kept") until the seller's tickets lapsed.
+#[test]
+fn a_session_the_rules_refused_is_not_held_so_once_the_limit_is_raised() {
+    let _g = env_lock();
+    let r = prepaid_shop_with_daily_cap(2_100);
+    let by_the_cap = |v: &Value| v["rule"] == "per_counterparty_daily" || v["ended"].as_str().is_some_and(|e| e.contains("per_counterparty_daily"));
+    let mut refused = None;
+    for _ in 0..6 {
+        let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+        if by_the_cap(&v) {
+            refused = Some(v);
+            break;
+        }
+    }
+    let v = refused.expect("the buyer's daily cap with this seller refused a ticket");
+    let sid = v["session"].as_str().unwrap().to_string();
+    // the owner raises the cap, signed as the Spending rules page signs it
+    let mut pol = r.call("policy_get", json!({}))["policy"].clone();
+    pol["per_counterparty_daily_sats"] = 60_000.into();
+    let prep = r.call("policy_prepare", json!({"policy": pol}));
+    assert_eq!(prep["ok"], true, "{prep}");
+    let sig = ed25519_dalek::Signer::sign(&human(), &hex::decode(prep["message_hex"].as_str().unwrap()).unwrap());
+    let set = r.call("policy_set", json!({"text": prep["text"], "prev_sha256": prep["prev_sha256"], "expiry": prep["expiry"], "signature": hex::encode(sig.to_bytes())}));
+    assert_eq!(set["ok"], true, "{set}");
+    // the seller still holds the session's places: its next lock is refused at its cap, once
+    let once = AtomicBool::new(true);
+    r.tap.set(Box::new(move |seen, _real| (seen.path.ends_with("/lock") && seen.body.contains("\"session\"") && once.swap(false, Ordering::SeqCst))
+        .then(|| Ok(answer(402, vec![], json!({"error": "too_many_tickets"}).to_string().into_bytes())))));
+    let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+    r.tap.clear();
+    assert!(!r.audit("ticket_cap_full_kept").iter().any(|e| !e["policy_rule"].is_null()), "the session was kept for a refusal of the rules that no longer holds: {v}");
+    assert_ne!(r.session(&sid)["sessions"][0]["state"], "open", "the session at the seller's cap was stopped: {v}");
+    let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "the next call is served in another session: {v}");
+    r.assert_booked();
+}

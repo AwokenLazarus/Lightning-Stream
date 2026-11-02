@@ -435,12 +435,12 @@ impl App {
             Ok((200, v)) => {
                 let credit = self.visit_credit_msat(&visit);
                 let mut out = visit_numbers(&v, credit);
-                // the visit ended by the buyer's own spending rules (a top-up refused, say): said as such a refusal is, with
-                // the shop, the limit and the field to raise, where the frame has shown nothing newer
+                // the visit ended by the buyer's own spending rules: said from the visit's report, with the shop, the limit
+                // and the field to raise (the frame's answer, which the seller's page also sees, names only the rule)
                 let by_rules = v.get("policy_refused").filter(|p| p.is_object())
                     .map(|p| crate::pay_feedback::as_json(&crate::pay_feedback::explain_at(&json!({"error": p["reason"], "rule": p["rule"], "limit_sats": p["limit_sats"]}).to_string(),
                                                                                            None, false, shop.as_deref())));
-                out["refusal"] = refusal.or(by_rules).unwrap_or(Value::Null);
+                out["refusal"] = by_rules.or(refusal).unwrap_or(Value::Null);
                 // a visit that runs on earlier credit pays nothing new: the bar says what is left of that credit
                 if out["prepaid_sats"].as_i64() == Some(0) && out["used_sats"].as_i64().unwrap_or(0) > 0 {
                     if let Some(m) = credit {

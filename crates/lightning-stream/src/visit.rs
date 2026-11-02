@@ -317,12 +317,13 @@ impl Visit {
         true
     }
 
-    /// A request of a visit that the buyer's own spending rules ended: refused with that rule, the owner's limit and
-    /// the visit's words, as the connector's own refusal (`None`: the visit did not end so).
+    /// A request of a visit that the buyer's own spending rules ended: refused with that rule and the visit's words, as
+    /// the connector's own refusal (`None`: the visit did not end so). The seller's page sees this answer: the owner's
+    /// limit and the wallet's sums stay out of it (the wallet's pages read them from the visit's report).
     fn policy_refusal(&self) -> Option<Response> {
         let s = self.lock();
         let p = s.policy.as_ref()?;
-        Some(json_response(402, &json!({"error": s.ended, "rule": p["rule"], "limit_sats": p["limit_sats"], "reason": p["reason"]})))
+        Some(json_response(402, &json!({"error": s.ended, "rule": p["rule"]})))
     }
 
     /// The signer's final word on one call that held `share`: what the seller charged for its answer and what was
@@ -1269,12 +1270,10 @@ fn refusal(v: &Value) -> Response {
         r.headers.push(("Retry-After".into(), retry.to_string()));
         return r;
     }
-    let mut body = json!({"error": reason, "rule": rule});
-    // the buyer's own limit that refused it, for the page that says so
-    if let Some(l) = v.get("limit_sats").filter(|l| l.is_i64()) {
-        body["limit_sats"] = l.clone();
-    }
-    json_response(if rule.is_empty() { 502 } else { 402 }, &body)
+    // the seller's page sees this answer: a refusal by the buyer's own spending rules names the rule, never the owner's
+    // limit or the wallet's sums with this and other sellers (the wallet's pages read those from the visit's report)
+    let reason = if owner_limit(v) { "Your spending rules refused this payment." } else { reason };
+    json_response(if rule.is_empty() { 502 } else { 402 }, &json!({"error": reason, "rule": rule}))
 }
 
 #[cfg(test)]
@@ -1310,7 +1309,12 @@ mod tests {
         let refused = v.policy_refusal().expect("later requests are refused with the rule");
         assert_eq!(refused.status, 402);
         let body: Value = serde_json::from_slice(&refused.body).unwrap();
-        assert_eq!((body["rule"].as_str(), body["limit_sats"].as_i64()), (Some("per_counterparty_daily"), Some(5000)), "{body}");
+        assert_eq!(body["rule"].as_str(), Some("per_counterparty_daily"), "{body}");
+        // the seller's page is told the rule, never the owner's limit or the wallet's sums
+        assert!(body.get("limit_sats").is_none() && !body.to_string().contains("5203") && !body.to_string().contains("5000"), "{body}");
+        let page = refusal(&json!({"rule": "per_counterparty_daily", "reason": "today's spend with this seller 5203 exceeds its daily cap 5000", "limit_sats": 5000}));
+        let body: Value = serde_json::from_slice(&page.body).unwrap();
+        assert!(!body.to_string().contains("5203") && !body.to_string().contains("5000") && body.get("limit_sats").is_none(), "{body}");
         assert!(v.raise(2_000).is_err(), "a higher visit limit does not get past the owner's rules");
         // a top-up refused by the rules, in the answer of a call that went on
         let v = visit(1_000);
