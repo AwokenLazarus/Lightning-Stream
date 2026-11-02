@@ -421,8 +421,10 @@ bool stratum_job_coinbaser_ready(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM
 	
 	// backup timeout for coinbaser on these jobs
 	// (only once we know it isn't here: this thread may be looking at the job late)
-	if ((sdata->loop_tsms > job->tsms) && (sdata->loop_tsms - job->tsms) > 5000) {
+	if (!datum_protocol_is_active() && (sdata->loop_tsms > job->tsms) && (sdata->loop_tsms - job->tsms) > 5000) {
 		// enforce a timeout of 5 seconds on waiting on a coinbaser...
+		// Solo only. Pooled, giving up publishes a full template whose coinbase cannot pay the
+		// pool's split; miners keep their current work until the coinbaser lands instead.
 		sdata->full_coinbase_ready = false;
 		return true;
 	}
@@ -1564,7 +1566,13 @@ unsigned int datum_stratum_coinbase_index(
 	if (new_block) return DATUM_COINBASE_ID_EMPTY;
 	if (!sdata || !sdata->cur_stratum_job ||
 	    sdata->cur_stratum_job->job_state < JOB_STATE_FULL_PRIORITY_WAIT_COINBASER ||
-	    !sdata->full_coinbase_ready) return 0;
+	    !sdata->full_coinbase_ready) {
+		// Class 0 pays only the pool. Pooled, a job whose coinbaser is not in yet gets the
+		// subsidy-only coinbase or nothing (see send_mining_notify), never class 0 on a full
+		// template: a block found on that pays the pool alone. Solo, class 0 pays the
+		// configured address and stays.
+		return datum_protocol_is_active() ? DATUM_COINBASE_ID_EMPTY : 0;
+	}
 	return COINBASE_TYPE_YUGE;
 }
 
@@ -1586,6 +1594,20 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 	
 	if (!j) {
 		return -1;
+	}
+	
+	if (datum_protocol_is_active() && !new_block) {
+		// This thread may not have looked at the job's coinbaser yet (a client arriving on a
+		// thread with no other miners, or a vardiff resend while the blast waits), so ask now.
+		if (!sdata->full_coinbase_ready && j->job_state >= JOB_STATE_FULL_PRIORITY_WAIT_COINBASER) {
+			stratum_job_coinbaser_ready(sdata, j);
+		}
+		// Still not ready and this job has no subsidy-only coinbase (only a new height's job
+		// does): send nothing. The miner keeps the work it has and gets this job with the split
+		// when the coinbaser lands.
+		if (!j->is_new_block && datum_stratum_coinbase_index(sdata, m, false) == DATUM_COINBASE_ID_EMPTY) {
+			return 0;
+		}
 	}
 	
 	//job_id - ID of the job. Use this ID while submitting share generated from this job.
