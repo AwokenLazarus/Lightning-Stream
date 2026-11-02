@@ -136,8 +136,8 @@ ENV XBT_VPN_DIR=/data/run/vpn XBT_VPN_STATUS=/data/run/vpn-status XBT_VPN_KEYS=/
 ENTRYPOINT ["/usr/bin/xbt-vpn", "serve"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-vpn", "healthcheck"]
 
-# The Stream Gateway (DATUM-compatible): CONVOY's datum_gateway with Lightning Stream's masking
-# (third_party/datum_gateway), the renter's own gateway. Every job is masked with a fresh key it holds, and
+# The Stream Gateway (DATUM-compatible): FlyTheElephant's datum_gateway (on CONVOY's) with Lightning Stream's
+# masking (third_party/datum_gateway), the renter's own gateway. Every job is masked with a fresh key it holds, and
 # its loopback API opens each job, without the key, at /xbt/job for the renter's check. Run it in the
 # renter's network namespace (or on the host's loopback): the API and Stratum listen on 127.0.0.1 only. It
 # starts once the UI writes /data/run/datum/config.json (mode, payout address, pool), and again when that

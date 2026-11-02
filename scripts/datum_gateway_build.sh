@@ -1,7 +1,7 @@
 #!/bin/bash
-# The Stream Gateway (DATUM-compatible): third_party/datum_gateway (CONVOY 971af86 + the masking patch) as a
-# static musl binary for each image platform, through zig (tools/zig-cc), like the Rust images. No system
-# cross toolchain, no sudo.
+# The Stream Gateway (DATUM-compatible): third_party/datum_gateway (FlyTheElephant's master 280cf54 merged with
+# CONVOY 971af86, + the masking patch and the late-coinbaser fix) as a static musl binary for each image platform,
+# through zig (tools/zig-cc), like the Rust images. No system cross toolchain, no sudo.
 #
 #   scripts/datum_gateway_build.sh [--out DIR] [--targets T,T,...] [--test]
 #
@@ -75,8 +75,12 @@ if [ -n "$DIRTY" ] && [ "${XBT_DATUM_RELEASE:-}" = 1 ]; then
 fi
 [ -n "$DIRTY" ] && echo "datum_gateway_build: warning: the tree has changes not committed; the NOTICE says so (not for release)" >&2
 REV=$COMMIT${DIRTY:+-dirty}
-# what the gateway tells a pool it is (the hello's second user-agent field): upstream's commit, then ours
-export XBT_DATUM_BUILD_NAME="971af86b93de+xbt-mask.$REV"
+# what the gateway tells a pool it is (the hello's second user-agent field): upstream's commits (FlyTheElephant's
+# master, then the CONVOY commit merged into it), then ours. Its first 7 characters also name the blocks it saves
+# (submitblocks/datum_submitblock_<height>_<those 7>.json)
+UPSTREAM_FTE=280cf543b57608ba9d79cac1438029a6f02caa27
+UPSTREAM_CONVOY=971af86b93de088e217a9e74d1ac70188565dbb7
+export XBT_DATUM_BUILD_NAME="${UPSTREAM_FTE:0:12}+${UPSTREAM_CONVOY:0:12}+xbt-mask.$REV"
 
 unpack() { # NAME DIR: a clean copy of a checked source in DIR
   rm -rf "$2" && mkdir -p "$2"
@@ -195,8 +199,9 @@ L=$OUT/licenses
 rm -rf "$L" && mkdir -p "$L"
 # the NOTICE names the commit this binary was built from, so the source it points to is that exact tree
 LOCAL=${DIRTY:+, with changes not committed (a local build, not for release)}
-sed -e "s/@BUILD@/$XBT_DATUM_BUILD_NAME/g" -e "s/@COMMIT@/$COMMIT/g" -e "s/@LOCAL@/$LOCAL/g" "$ROOT/container/datum-gateway-NOTICE" > "$L/NOTICE"
-grep -q '@BUILD@\|@COMMIT@\|@LOCAL@' "$L/NOTICE" && { echo "datum_gateway_build: NOTICE not filled in" >&2; exit 1; }
+sed -e "s/@BUILD@/$XBT_DATUM_BUILD_NAME/g" -e "s/@COMMIT@/$COMMIT/g" -e "s/@LOCAL@/$LOCAL/g" \
+  -e "s/@UPSTREAM_FTE@/$UPSTREAM_FTE/g" -e "s/@UPSTREAM_CONVOY@/$UPSTREAM_CONVOY/g" "$ROOT/container/datum-gateway-NOTICE" > "$L/NOTICE"
+grep -q '@[A-Z_]\+@' "$L/NOTICE" && { echo "datum_gateway_build: NOTICE not filled in" >&2; exit 1; }
 cp "$ROOT/third_party/datum_gateway/LICENSE" "$L/datum_gateway.LICENSE"
 tar xOf "$CACHE/libsodium-1.0.20.tar.gz" libsodium-1.0.20/LICENSE > "$L/libsodium.LICENSE"
 tar xOf "$CACHE/jansson-2.14.tar.gz" jansson-2.14/LICENSE > "$L/jansson.LICENSE"

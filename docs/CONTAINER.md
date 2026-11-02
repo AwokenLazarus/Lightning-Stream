@@ -462,12 +462,17 @@ Compared (the lead's options):
 
 The renter's own gateway, bundled so that rented hashrate is never mined unmasked. In product text it is
 **"Stream Gateway (DATUM-compatible)"**. No product text calls it "DATUM Gateway": its MIT licence grants
-no right to the DATUM name. It is CONVOY's `datum_gateway` (commit 971af86, MIT), vendored unmodified in
-`third_party/datum_gateway/`, plus two commits of ours:
+no right to the DATUM name. It is FlyTheElephant's `datum_gateway` (master 280cf54, MIT), merged with CONVOY's
+971af86 (the fork FlyTheElephant's descends from, and the base until 0.2.6), vendored in
+`third_party/datum_gateway/` as one commit with no change of ours, plus our commits:
 - every job, solo or pool, is masked with a fresh `xor_key` per block template, which the gateway holds,
   with `clear_bits` = 32 + the share's power of two;
 - each job can be opened, without its key, at `GET /xbt/job` on its loopback API. The renter recomputes
-  the job's commitment from that and holds it to the `coinb1` its miner gets (`crates/xbt-hashlink/src/blind.rs`).
+  the job's commitment from that and holds it to the `coinb1` its miner gets (`crates/xbt-hashlink/src/blind.rs`);
+- pooled, a job whose coinbaser (the pool's split) is not in yet is never sent as a full template whose
+  coinbase pays only the pool: the miner gets the new block's subsidy-only job or keeps its work until the
+  split lands (the late-coinbaser fix; solo is unchanged);
+- FlyTheElephant's share log and his optional node-side share check read the unmasked block hash and header.
 
 It is C, so `scripts/datum_gateway_build.sh` builds it, static musl through zig for the three platforms, with
 its libraries from pinned, hash-checked sources. Its image layer carries the binary, `xbt-supervise`, and in

@@ -101,13 +101,18 @@ nodes with the same settings. The lab itself is cloned when a regtest script run
 this tree. At that commit the lab repository carries no licence file, so no licence covers those
 lines. They are a list of lnd options, kept to what the overlay needs, and are credited here.
 
-### CONVOY datum_gateway (vendored, with our changes), and the C libraries it links
+### FlyTheElephant's and CONVOY's datum_gateway (vendored, with our changes), and the C libraries it links
 
-`third_party/datum_gateway` is CONVOY's `datum_gateway` (<https://github.com/CONVOYMining/datum_gateway>,
-commit 971af86), MIT licence, Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and individual
-contributors (`third_party/datum_gateway/LICENSE`). Its first commit here is upstream's tree unchanged; our
-changes follow as separate commits (every job masked with a key the gateway holds, `/xbt/job`, gateway-held
-keys on pool jobs, a build name). The licence grants no right to the DATUM name or other marks of their
+`third_party/datum_gateway` is FlyTheElephant's `datum_gateway` (<https://github.com/FlyTheElephant1/datum_gateway>,
+master at commit 280cf54), merged with CONVOY's `datum_gateway` (<https://github.com/CONVOYMining/datum_gateway>,
+commit 971af86), the fork it descends from: OCEAN's DATUM Gateway as CONVOY maintains it, with FlyTheElephant's
+performance and logging changes. MIT licence, Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and
+individual contributors (`third_party/datum_gateway/LICENSE`, the same text in both). Until 0.2.6 it was
+CONVOY's 971af86 alone; that tree's first commit here is upstream's unchanged. The move to FlyTheElephant's
+base is one commit with no change of ours in it (the merge, and how its three conflicts were resolved, is in
+its message); our changes follow as separate commits (every job masked with a key the gateway holds,
+`/xbt/job`, gateway-held keys on pool jobs, a build name, FlyTheElephant's share log and node-side check
+reading the unmasked block, and the late-coinbaser fix from the Lazarus Pool's review of FlyTheElephant's gateway). The licence grants no right to the DATUM name or other marks of their
 owners: the product calls it "Stream Gateway (DATUM-compatible)". `scripts/datum_gateway_build.sh` links it
 statically, in the `xbt-datum-gateway` image only, with libsodium 1.0.20 (ISC), jansson 2.14 (MIT), libcurl
 8.11.1 (curl licence), libmicrohttpd 1.0.1 (GNU LGPL 2.1 or later, or eCos) and argp-standalone 1.5.0 (GNU
