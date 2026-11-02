@@ -5,6 +5,43 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.5 (2026-11-02)
+
+Web apps in visits, faster and whole, from a hands-on run of 0.2.4 with the demo shop's Jellyfin over a
+relayed link. The connector, the wallet UI, the signer and the seller's gateway change.
+
+- **Answers are no longer cut where the credit ends.** Each request of a visit runs within a small share of
+  the visit's limit, too small for a ticket. An answer that ran past the credit with the shop was cut where
+  the credit ended: a bitrate test or a part of a film came short of its length, and Jellyfin fell back to a
+  720p transcode. Now, when a call says the credit is low, the visit's next request goes first with room
+  for a ticket and tops the credit up before it leaves (the signer's new `top_up_sats`). The visit still
+  never spends more than its limit, and each share is settled once.
+- **Requests no longer wait two minutes at the edge of the credit.** With no credit left, a page's requests
+  (Jellyfin's sign-in and playback reports among them) were refused and asked again one at a time, and the
+  page gave up on them. The credit is now topped up before it runs out.
+- **"Used" is what the connection's credit fell by.** For an answer cut short or left by the page, the
+  visit now counts the seller's signed charge, which includes the bytes that were on their way. Before, the
+  bar could say 85 sat used where the credit had fallen by about 164.
+- **Stop closes the shop's connection.** The visit's Stop now also closes the connection with the shop
+  when no other open visit uses it, as Stop on Live connections does. Before, an earlier visit to the same
+  shop, closed without Stop, kept it open.
+- **A limit sized for film, and more on request.** A video app priced by the byte is offered a limit for
+  about ten minutes of 1080p at its price (1,000 to 20,000 sats); other apps keep 1,000. Once four fifths
+  of the limit is used, the bar offers **Add**, which raises it. At the limit the page waits for you
+  instead of closing. Nothing is raised without a click.
+- **Shops: web clients load faster and are kept.** On a free route, the gateway sends text (scripts,
+  styles, JSON) gzip-compressed to a buyer that takes it, about a third of the bytes over a slow link.
+  Nothing on a free route is metered or signed, so this changes no price. It also adds
+  `Cache-Control: public, max-age=3600` to a free route's answers that say nothing of caching (HTML pages
+  excepted), so a buyer's next visit loads the web client from the browser. A route's new `cache` option
+  sets how long, on any route, or turns it off (`0`).
+- **Shops: fixed UDP ports for the link.** A new `link.port` in the gateway's config fixes the link's UDP
+  ports (key *i* on `port + i`, IPv4 and IPv6). A shop that allows inbound UDP on them is reached directly
+  by buyers behind a NAT that gives each destination another port (commercial VPNs, carrier-grade NAT).
+  Unset, the ports stay random. The gateway logs the ports it bound.
+- **A cut answer is logged.** The connector logs why a page's answer was cut short (its status and the
+  wallet's words, no address).
+
 ## 0.2.4 (2026-11-02)
 
 Web apps in visits, from a hands-on run of 0.2.3 with the demo shop's Jellyfin. The connector and the

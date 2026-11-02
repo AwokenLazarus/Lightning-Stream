@@ -39,7 +39,7 @@ pub(crate) fn suggested_limit(svc: &crate::services::Service) -> i64 {
     let gib_msat = svc.price_ceiling().and_then(|c| c.get("gib_msat").and_then(Value::as_u64)).unwrap_or(0);
     // 600 MiB, in sats
     let ten_minutes = i64::try_from((u128::from(gib_msat) * 600 / 1024).div_ceil(1000)).unwrap_or(i64::MAX);
-    (ten_minutes.div_ceil(1000).saturating_mul(1000)).clamp(SUGGESTED_LIMIT, SUGGESTED_VIDEO_MAX)
+    (ten_minutes.saturating_add(999) / 1000).saturating_mul(1000).clamp(SUGGESTED_LIMIT, SUGGESTED_VIDEO_MAX)
 }
 
 /// The visit's limit from what the owner entered. A limit under the smallest ticket a shop sells

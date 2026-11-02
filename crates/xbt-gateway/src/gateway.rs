@@ -2012,7 +2012,6 @@ impl Gateway {
             // answer keeps the length the service stated (what a HEAD is asked for).
             refund(first_second);
             let charged = reserve.saturating_sub(first_second);
-            let mut headers = headers;
             let receipt = self.receipt(
                 &a.session,
                 a.seq,
@@ -2077,7 +2076,6 @@ impl Gateway {
             slot,
         };
         self.flush();
-        let mut headers = headers;
         if let Some(head) = self.receipt(&a.session, a.seq, reserve, &a.digest, answer.status, "") {
             let mut sr = settlement_response(&head, &self.cfg.network, "", true);
             sr["extra"]["stream"] = true.into();
