@@ -699,7 +699,10 @@ mod tests {
         let listed = xbt_wallet_mcp::catalog::list(&read, &json!({}), "");
         assert_eq!((listed["services"].as_array().unwrap().len(), listed["allowed"].as_u64()), (3, Some(0)));
         assert_eq!(listed["ai_endpoint"], "http://box.local:33540/v1");
-        assert_eq!(xbt_wallet_mcp::catalog::list(&read, &json!({}), "files")["services"][0]["items"][0]["title"], "A film");
+        // the seller's words (an item's title) under the untrusted mark, its address beside them
+        let files = &xbt_wallet_mcp::catalog::list(&read, &json!({}), "files")["services"][0];
+        assert_eq!((files["untrusted_provider_response"]["item_titles"][0].as_str(), files["items"][0]["url"].as_str()),
+                   (Some("A film"), Some("https://box.example/files/a.mkv")), "{files}");
     }
 
     /// A shop is named by its listing's name (#37 item 16), whatever [`from_listing`] made of its services,

@@ -80,7 +80,7 @@ pub fn spending_refusal(rule: &str, limit_sats: Option<u64>, seller: &str) -> (u
         "max_per_tx" => format!("A payment to {seller} for this request would be above your largest single payment ({n})."),
         "split_bypass" => format!("Payments to {seller} in the last few minutes add up to more than your spending rules allow without asking you ({n})."),
         "human_threshold" => format!("A payment to {seller} for this request is at or above the amount you approve first ({n})."),
-        "velocity" => format!("You've made as many payments as your spending rules allow in a while. Try again later."),
+        "velocity" => format!("You've made as many payments as your spending rules allow in a while, so this one to {seller} waits. Try again later."),
         _ => format!("Your spending rules refused a payment to {seller}."),
     };
     let message = format!("{said} Raise it in Settings → Spending rules on the Lightning Stream app.");
