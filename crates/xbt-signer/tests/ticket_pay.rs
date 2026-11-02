@@ -15831,7 +15831,8 @@ fn a_web_apps_answers_come_whole_through_the_gateway() {
     // the visit's first request buys the session's ticket
     let (v, _, got) = page_call(&r, dir.path(), "first", "/jf/Playback/BitrateTest?Size=1000", "GET", None, CALL);
     assert_eq!((v["complete"].as_bool(), got.len()), (Some(true), 1000), "{v}");
-    let cases: Vec<(&str, &str, &str, Option<&[u8]>, u64, usize)> = vec![
+    type Case<'a> = (&'a str, &'a str, &'a str, Option<&'a [u8]>, u64, usize);
+    let cases: Vec<Case> = vec![
         ("css", "/jf/Branding/Css", "GET", None, 200, 0),
         ("chunked", "/jf/empty-chunked", "GET", None, 200, 0),
         ("users", "/jf/users/public", "GET", None, 200, 2),
@@ -15880,7 +15881,7 @@ fn a_call_that_asks_for_a_top_up_keeps_the_credit_ahead_of_a_pages_requests() {
     // with no credit left, an empty answer and a 204 are refused before they leave, for the ticket that does not fit:
     // nothing is cut, and the page's request is asked again with room for one (which it waits for)
     for (name, path, method) in [("css0", "/jfx/Branding/Css", "GET"), ("caps0", "/jfx/Sessions/Capabilities/Full", "POST")] {
-        let (v, _, got) = page_call(&r, dir.path(), name, path, method, Some(&b"{}"[..]).filter(|_| method == "POST"), 125);
+        let (v, _, got) = page_call(&r, dir.path(), name, path, method, (method == "POST").then_some(&b"{}"[..]), 125);
         assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64(), got.len()), (Some("max_sats"), Some(0), 0), "{v}");
     }
     // a second ticket, nearly all of it used again: about 20 sat of credit, which covers a small request's head

@@ -908,7 +908,7 @@ mod tests {
     /// FAILS before: every app was offered 1,000 sat.
     #[test]
     fn a_video_app_is_offered_a_limit_for_minutes_of_film() {
-        let svc = |kind: &str, prices: Value| crate::services::parse(&json!([{"name": "x", "kind": kind, "seller": "http://s.example", "price_text": "",
+        let svc = |kind: &str, prices: Value| crate::services::parse(&json!([{"name": "x", "kind": kind, "seller": "http://s.example", "price_text": "a price",
                                                                               "items": [], "app": "http://s.example/web/", "app_base": "http://s.example/",
                                                                               "prices": prices}]).to_string()).unwrap().remove(0);
         // 20 sat a MiB: 600 MiB is 12,000 sat
