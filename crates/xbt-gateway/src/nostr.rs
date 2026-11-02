@@ -47,6 +47,9 @@ pub fn publish_once(gw: &Gateway, keys: &Keys, relays: &[String], now: u64) -> R
     Ok(out)
 }
 
+/// What [`left_behind`] finds: each old seller (`d`) with the ids of its events.
+type Left = Vec<(String, Vec<String>)>;
+
 /// A shop that changes its address, or how buyers reach it (its web address, then its key when it
 /// turns Private), lists itself under the new one: the listing is addressed by its seller, so the old
 /// one stayed on the relays beside it, and buyers saw the shop twice, once at an address that no
@@ -60,7 +63,7 @@ pub fn withdraw_left_behind(keys: &Keys, relays: &[String], current: &str, now: 
     static SENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> = std::sync::LazyLock::new(Default::default);
     let author = keys.public_hex();
     // each relay apart: what it still holds is what it is sent
-    let held: Vec<(String, Vec<(String, Vec<String>)>)> = std::thread::scope(|s| {
+    let held: Vec<(String, Left)> = std::thread::scope(|s| {
         let asks: Vec<_> = relays.iter().map(|r| s.spawn(|| {
             let (events, _) = oneshot::query(std::slice::from_ref(r), &own_filter(&author), QUERY_WAIT);
             (r.clone(), left_behind(&events, &author, current, now))
