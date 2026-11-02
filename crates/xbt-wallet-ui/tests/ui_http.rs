@@ -4474,7 +4474,11 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     let mut br = logged_in(&bx);
     let p = br.get("/hashrate");
     assert!(p.body.contains("Set up your gateway") && p.body.contains("Stream Gateway (DATUM-compatible)"), "{}", p.body);
-    assert!(!p.body.contains("DATUM Gateway"), "never the product name: {}", p.body);
+    // the product name only where the page says Umbrel's DATUM Gateway app is for Bitcoin and won't work here
+    let warned = "Umbrel&#39;s own DATUM Gateway app is for Bitcoin, and won&#39;t work here.";
+    let warned_raw = "Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.";
+    assert!(p.body.contains(warned) || p.body.contains(warned_raw), "{}", p.body);
+    assert!(!p.body.replace(warned, "").replace(warned_raw, "").contains("DATUM Gateway"), "never the product name otherwise: {}", p.body);
     assert!(p.body.contains("name=\"mode\" value=\"solo\" checked"), "solo is the default");
     assert!(p.body.contains("could hide a block it finds from the pool, the same as any DATUM miner can today"));
     let card = &p.body[p.body.find("<h3>Big miners</h3>").unwrap()..];
@@ -4933,7 +4937,9 @@ fn the_vpn_page_lists_exits_found_on_nostr_and_adds_one_for_the_vpn_service() {
     let mut br = logged_in(&bx);
     let page = unescape(&br.get("/vpn?refresh=1").body);
     let found = &page[page.find("id=\"exits\"").expect("the exits the service found")..];
-    assert!(found.contains(&format!("{}…", &exit[..12])) && found.contains(">not checked<") && found.contains("1,000 sat/GB"), "{found}");
+    // the exit by its country (and its shop, where Found on Nostr names it), its id in the tooltip only
+    assert!(found.contains(&format!("title=\"{exit}\"")) && found.contains("Exit") && found.contains(" in SV<") && found.contains(">not checked<")
+            && found.contains("1,000 sat/GB"), "{found}");
     let nostr_part = &page[page.find("id=\"found-exits\"").expect("Found on Nostr")..];
     assert!(nostr_part.contains(">Add this exit</button>") && nostr_part.contains(">SV<") && nostr_part.contains("found by the VPN service"), "{nostr_part}");
 
