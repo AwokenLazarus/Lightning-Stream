@@ -183,7 +183,7 @@ impl App {
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
             {}<div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
             <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
-            esc(&shop), esc(&svc.name), esc(&shop), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
+            esc(&shop), esc(&svc.name), esc(&crate::app::stream_pages::host(&svc.seller)), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
             self.identity_card(ctx, &svc.seller, &base, &entry));
         self.page("Open the app", ctx, b)
     }
@@ -293,8 +293,7 @@ impl App {
             s.codes.retain(|_, (t, _, _)| t.elapsed() < CODE_TTL);
             s.codes.insert(code.clone(), (Instant::now(), grant, other));
         }
-        // the shop by its listed name, never its key or made-up address
-        let host = self.seller_name(&svc.seller);
+        let host = crate::app::stream_pages::host(&svc.seller);
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
             <div class=\"card primary refusal\" data-visit-refusal hidden></div>\
