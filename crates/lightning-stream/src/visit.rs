@@ -115,12 +115,20 @@ struct State {
     /// cost ([`Visit::settle`]): they hold no answer open, so a request waiting to run alone does not
     /// wait for them either, and what is left of the limit beside them is its.
     settling: i64,
+    /// The part of `settling` of WebSockets that have closed: still counted within the sockets' half
+    /// of the limit until the signer says what they cost, so that a page whose live connection keeps
+    /// reconnecting does not park share after share beside it.
+    socket_settling: i64,
     /// What one of the seller's tickets books, fee included, as a refusal named it: a request asked
     /// again after a refusal has room for one beside its share, so that it can buy the ticket it needs.
     ticket: i64,
     /// The seller's routes, from its `/services` ([`Visit::learn_routes`]): a path on a free one is
     /// asked for unpaid. `None` until read, and again once a path taken for free was not.
     routes: Option<Vec<SellerRoute>>,
+    /// Counts each [`Visit::forget_routes`]: a read of the routes begun before one is not kept.
+    routes_gen: u64,
+    /// A read of the seller's routes is under way ([`spawn_read_routes`]): no second one is started.
+    routes_reading: bool,
     /// What the seller charged for the visit's answers that have ended, by the signer's word
     /// (`price_msat`): what the visit used, whether from tickets bought in it or from credit.
     used_msat: u64,
@@ -283,7 +291,7 @@ impl Visit {
             }
             let mut most = most;
             if kind == Kind::Socket {
-                let room = (self.limit / 2).max(1) - s.sockets;
+                let room = self.limit / 2 - s.sockets - s.socket_settling;
                 if room < 1 {
                     return Err("This page has too many live connections open at once.".into());
                 }
@@ -380,16 +388,23 @@ impl Visit {
         self.turn.notify_all();
     }
 
-    /// The seller's routes from its `/services` document: which of them are free, for which methods.
-    fn learn_routes(&self, services: &Value) {
-        let Some(all) = services.get("routes").and_then(Value::as_array) else { return };
+    /// The seller's routes from its `/services` document, read since the `gen`th forgetting
+    /// ([`State::routes_gen`]): which of them are free, for which methods. A read begun before the
+    /// routes were last forgotten is not kept. `true`: kept.
+    fn learn_routes(&self, services: &Value, gen: u64) -> bool {
+        let Some(all) = services.get("routes").and_then(Value::as_array) else { return false };
         let routes: Vec<SellerRoute> = all.iter().take(256).filter_map(|r| {
             let path = r.get("path")?.as_str()?.to_string();
             let methods = r.get("methods").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str)
                 .map(str::to_ascii_uppercase).collect();
             path.starts_with('/').then_some(SellerRoute { path, free: r.get("free").and_then(Value::as_bool) == Some(true), methods })
         }).collect();
-        self.lock().routes = Some(routes);
+        let mut s = self.lock();
+        if s.routes_gen != gen {
+            return false;
+        }
+        s.routes = Some(routes);
+        true
     }
 
     /// Whether `url` asked for with `method` is on a free route of the seller, as its gateway takes a
@@ -414,34 +429,59 @@ impl Visit {
 
     /// A path taken for free was not: the seller's routes are read again before any is taken for free.
     fn forget_routes(&self) {
-        self.lock().routes = None;
+        let mut s = self.lock();
+        s.routes = None;
+        s.routes_gen += 1;
     }
 
     /// A request that held `share` has stopped (a WebSocket's, `socket`: and closed): what the signer
     /// says it charged (`done`), within [`SETTLE_WAIT`], stays spent, all of the share where it says
     /// nothing. Its share is counted apart while it waits ([`State::settling`]).
     fn settle(&self, share: i64, done: Option<mpsc::Receiver<Result<Value, String>>>, socket: bool) {
+        self.settle_begin(share, socket);
+        self.settle_end(share, done, socket);
+    }
+
+    /// The first half of [`Visit::settle`], at once: the share is counted apart.
+    fn settle_begin(&self, share: i64, socket: bool) {
         let mut s = self.lock();
         s.settling += share;
         if socket {
             s.sockets -= share;
+            s.socket_settling += share;
         }
         drop(s);
         self.turn.notify_all();
+    }
+
+    /// The second half of [`Visit::settle`]: the wait for the signer's word, and the release.
+    fn settle_end(&self, share: i64, done: Option<mpsc::Receiver<Result<Value, String>>>, socket: bool) {
         let reply = done.and_then(|d| d.recv_timeout(SETTLE_WAIT).ok()).and_then(Result::ok);
         if let Some(v) = &reply {
             self.account(v);
         }
         let charged = reply.and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
-        self.lock().settling -= share;
+        let mut s = self.lock();
+        s.settling -= share;
+        if socket {
+            s.socket_settling -= share;
+        }
+        drop(s);
         self.release(share, charged);
     }
 
-    /// A request that held `share` has ended, having cost `charged`: only that stays spent.
+    /// A request that held `share` has ended, having cost `charged`: only that stays spent. A signer
+    /// that says it charged more than the share it was allowed (or anything for a free path, share 0)
+    /// is not hidden: all of it stays spent, it is logged, and the visit ends.
     fn release(&self, share: i64, charged: i64) {
+        let charged = charged.max(0);
         let mut s = self.lock();
-        s.spent = s.spent - share + charged.clamp(0, share);
+        s.spent = s.spent - share + charged;
         s.held -= share;
+        if charged > share {
+            eprintln!("lightning-stream: the wallet says a request of a visit cost {charged} sat, past the {share} sat it was allowed: counted, and the visit ends");
+            s.ended.get_or_insert_with(|| "The wallet spent past this visit's share for a request: the visit has ended.".into());
+        }
         drop(s);
         self.turn.notify_all();
     }
@@ -497,8 +537,7 @@ impl Connector {
                 Ok(id) => {
                     // the seller's free routes, read beside the page's first requests (which go the paid way until then)
                     if let Some(visit) = self.visits.get(&id) {
-                        let cfg = self.cfg.clone();
-                        std::thread::spawn(move || read_routes(&cfg, &visit));
+                        spawn_read_routes(&self.cfg, &visit);
                     }
                     json_response(200, &json!({"visit": id}))
                 }
@@ -582,9 +621,7 @@ impl Connector {
                 // not free now: the paid way, and the seller's routes read again before a path is taken for free
                 Err(f) if max_sats(&f) => {
                     visit.forget_routes();
-                    let visit = visit.clone();
-                    let cfg = self.cfg.clone();
-                    std::thread::spawn(move || read_routes(&cfg, &visit));
+                    spawn_read_routes(&self.cfg, &visit);
                     None
                 }
                 Err(f) => return Reply::Whole(refusal(&f.v)),
@@ -728,11 +765,14 @@ impl Connector {
                 return Reply::Whole(refusal(&v));
             }
         };
+        // from here the share is settled however the socket ends, also where the page's side never opens
+        // (the 101 could not be written to it) or its join panics: the run below is then never called
+        let hold = SocketHold { visit: visit.clone(), share, done: Some(done) };
         let status = head.get("status").and_then(Value::as_u64).unwrap_or(502);
         if status != 101 {
             drop(src);
             // nothing said of what it charged: all of the share stays spent
-            visit.settle(share, Some(done), true);
+            hold.settle();
             return Reply::Whole(json_response(502, &json!({"error": format!("the seller did not open the WebSocket (HTTP {status})")})));
         }
         let headers: Vec<(String, String)> = head.get("headers").and_then(Value::as_array).into_iter().flatten()
@@ -746,7 +786,7 @@ impl Connector {
             run: Box::new(move |client, early| {
                 join_socket(client, early, src, first);
                 drop(tracked);
-                visit.settle(share, Some(done), true);
+                hold.settle();
             }),
         })
     }
@@ -758,28 +798,76 @@ impl Connector {
     }
 }
 
+/// A WebSocket's share, from the seller's 101 until it is settled: by [`SocketHold::settle`] when the
+/// socket ends, or, where that never comes (the page's side never opened, a panic), when it is
+/// dropped, the wait for the signer's word then on a thread of its own.
+struct SocketHold {
+    visit: Arc<Visit>,
+    share: i64,
+    done: Option<mpsc::Receiver<Result<Value, String>>>,
+}
+
+impl SocketHold {
+    fn settle(mut self) {
+        let done = self.done.take();
+        self.visit.settle(self.share, done, true);
+        self.share = 0;
+    }
+}
+
+impl Drop for SocketHold {
+    fn drop(&mut self) {
+        if self.share == 0 {
+            return;
+        }
+        let (visit, share, done) = (self.visit.clone(), self.share, self.done.take());
+        visit.settle_begin(share, true);
+        std::thread::spawn(move || visit.settle_end(share, done, true));
+    }
+}
+
+/// [`read_routes`] on a thread of its own, unless a read is under way already.
+fn spawn_read_routes(cfg: &Config, visit: &Arc<Visit>) {
+    {
+        let mut s = visit.lock();
+        if s.routes_reading {
+            return;
+        }
+        s.routes_reading = true;
+    }
+    let (cfg, visit) = (cfg.clone(), visit.clone());
+    std::thread::spawn(move || {
+        // a read begun before the routes were forgotten is not kept: read again, a few times at most
+        for _ in 0..3 {
+            let gen = visit.lock().routes_gen;
+            if read_routes(&cfg, &visit, gen) || visit.lock().routes_gen == gen {
+                break;
+            }
+        }
+        visit.lock().routes_reading = false;
+    });
+}
+
 /// The seller's routes, from its `/services` (unsigned, read unpaid: `max_sats` 0), for the visit to
 /// ask for a path on a free one unpaid ([`Visit::learn_routes`]). Nothing read, nothing learned: the
-/// page's requests go the paid way, as before.
-fn read_routes(cfg: &Config, visit: &Visit) {
-    let Some((scheme, rest)) = visit.base.split_once("://") else { return };
+/// page's requests go the paid way, as before. `true`: learned.
+fn read_routes(cfg: &Config, visit: &Visit, gen: u64) -> bool {
+    let Some((scheme, rest)) = visit.base.split_once("://") else { return false };
     let host = rest.split('/').next().unwrap_or(rest);
     let mut params = json!({"url": format!("{scheme}://{host}/services"), "method": "GET", "max_sats": 0, "task": cfg.task});
     if let Some(m) = params.as_object_mut() {
         xbt_wallet_mcp::wallet::with_transport(m);
     }
-    let Ok(Started { head, first, src, done: _ }) = start_call(cfg, params) else { return };
+    let Ok(Started { head, first, src, done: _ }) = start_call(cfg, params) else { return false };
     if head.get("status").and_then(Value::as_u64) != Some(200) {
-        return;
+        return false;
     }
     let _ = src.set_read_timeout(Some(FIRST_BYTE));
     let mut body = first;
     if (&src).take(SERVICES_MAX.saturating_sub(body.len() as u64)).read_to_end(&mut body).is_err() {
-        return;
+        return false;
     }
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-        visit.learn_routes(&v);
-    }
+    serde_json::from_slice::<Value>(&body).is_ok_and(|v| visit.learn_routes(&v, gen))
 }
 
 /// [`Connector::start`].
@@ -1122,10 +1210,10 @@ mod tests {
         let v = visit(1_000);
         let at = |p: &str| format!("https://s.example{p}");
         assert!(!v.is_free(&at("/web/main.js"), "GET"), "nothing read yet");
-        v.learn_routes(&json!({"routes": [{"path": "/web/", "free": true, "methods": ["GET", "HEAD"]},
+        assert!(v.learn_routes(&json!({"routes": [{"path": "/web/", "free": true, "methods": ["GET", "HEAD"]},
                                           {"path": "/web/paid/", "free": false, "methods": ["GET"]},
                                           {"path": "/", "free": false, "methods": ["GET", "POST"]},
-                                          {"path": "/robots.txt", "free": true, "methods": ["GET"]}]}));
+                                          {"path": "/robots.txt", "free": true, "methods": ["GET"]}]}), 0));
         assert!(v.is_free(&at("/web/main.js?v=1"), "GET"));
         assert!(v.is_free(&at("/web/index.html"), "HEAD"));
         assert!(!v.is_free(&at("/web/main.js"), "POST"));
@@ -1137,6 +1225,122 @@ mod tests {
         assert!(!v.is_free(&at("/web/%2e%2e/Users"), "GET"));
         v.forget_routes();
         assert!(!v.is_free(&at("/web/main.js"), "GET"));
+    }
+
+    /// A WebSocket whose page side never opens (the 101 could not be written to it, so the server drops
+    /// the upgrade's run uncalled) still has its share settled: what the signer says it cost stays
+    /// spent, and the rest goes back.
+    ///
+    /// FAILS before: the share was settled only inside the run, and stayed held for good: the visit's
+    /// "limit reached" never came, and its requests waited two minutes each.
+    #[test]
+    fn a_websockets_share_is_settled_when_its_page_side_never_opens() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("signer.sock");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let streams = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let (mut conn, _) = l.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(conn.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let p: Value = serde_json::from_str(&line).unwrap();
+            let mut out = UnixStream::connect(streams.join(p["params"]["stream_to"].as_str().unwrap())).unwrap();
+            writeln!(out, "{}", json!({"status": 101, "headers": [["Sec-WebSocket-Accept", "x"]]})).unwrap();
+            // the socket's stream ends when the connector lets it go
+            let _ = out.read(&mut [0u8; 1]);
+            writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 101, "charged_sats": 3}})).unwrap();
+        });
+        let c = Connector::new(crate::Config { signer: sock, stream_dir: dir.path().to_path_buf(), task: "t".into(), max_sats: 10 });
+        let v = visit(1_000);
+        let req = Request { method: "GET".into(), target: "/v/x/socket".into(), headers: vec![("Upgrade".into(), "websocket".into())], body: vec![], peer: None };
+        let reply = c.visit_socket(v.clone(), "socket", &req);
+        assert!(matches!(reply, Reply::Upgrade(_)));
+        let held = v.lock().held;
+        assert!(held >= 1, "{held}");
+        // as the server does where the 101 cannot be written: the run is dropped, never called
+        drop(reply);
+        let t = Instant::now();
+        loop {
+            let s = v.lock();
+            if s.held == 0 {
+                assert_eq!((s.spent, s.sockets, s.settling), (3, 0, 0));
+                break;
+            }
+            drop(s);
+            assert!(t.elapsed() < Duration::from_secs(5), "the socket's share is still held");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Closed WebSockets whose cost the signer has yet to say still count within the sockets' half of
+    /// the limit: a live connection that keeps reconnecting does not park share after share and
+    /// starve the page's requests.
+    ///
+    /// FAILS before: a closed socket's share left the sockets' count as it began settling, so new
+    /// sockets took the whole limit and the page's next request waited.
+    #[test]
+    fn closed_websockets_waiting_for_their_cost_count_within_the_sockets_half() {
+        let v = visit(1_000);
+        let w = v.clone();
+        let (opened, keep) = within(Duration::from_secs(10), move || {
+            let mut keep = vec![];
+            while let Ok(share) = w.reserve_socket() {
+                // closed at once, the signer's word on its cost still to come
+                let (tx, rx) = mpsc::channel::<Result<Value, String>>();
+                let w2 = w.clone();
+                std::thread::spawn(move || w2.settle(share, Some(rx), true));
+                keep.push(tx);
+                std::thread::sleep(Duration::from_millis(20));
+                if keep.len() > 40 {
+                    break;
+                }
+            }
+            (keep.len(), keep)
+        }).expect("a socket waited for a share");
+        assert!(opened <= 10, "{opened}");
+        let w = v.clone();
+        assert!(within(Duration::from_secs(5), move || w.reserve_answer()).expect("the request waited behind the sockets").is_ok());
+        drop(keep);
+    }
+
+    /// A signer that says a request cost more than the share it was allowed is not hidden: all of it
+    /// stays spent and the visit ends.
+    ///
+    /// FAILS before: what it said was cut to the share.
+    #[test]
+    fn a_charge_past_its_share_is_counted_and_ends_the_visit() {
+        let v = visit(1_000);
+        let share = v.reserve_answer().unwrap();
+        v.release(share, share + 7);
+        let s = v.lock();
+        assert_eq!((s.spent, s.held), (share + 7, 0));
+        assert!(s.ended.is_some());
+    }
+
+    /// A visit of 1 sat has no half of its limit for a WebSocket: it is refused, and the page's
+    /// requests have the sat.
+    ///
+    /// FAILS before: the socket took the visit's one sat.
+    #[test]
+    fn a_one_sat_visit_opens_no_websocket() {
+        assert!(visit(1).reserve_socket().is_err());
+        assert_eq!(visit(1).reserve_answer(), Ok(1));
+    }
+
+    /// A read of the seller's routes begun before they were forgotten (a path taken for free was
+    /// not) is not kept: the routes it read may be those the seller has just changed.
+    #[test]
+    fn a_read_of_the_routes_begun_before_they_were_forgotten_is_not_kept() {
+        let v = visit(1_000);
+        let doc = json!({"routes": [{"path": "/web/", "free": true, "methods": ["GET"]}]});
+        let before = v.lock().routes_gen;
+        v.forget_routes();
+        assert!(!v.learn_routes(&doc, before));
+        assert!(!v.is_free("https://s.example/web/a.js", "GET"));
+        let now = v.lock().routes_gen;
+        assert!(v.learn_routes(&doc, now));
+        assert!(v.is_free("https://s.example/web/a.js", "GET"));
     }
 
     /// An answer that has stopped and waits for the signer to say what it cost holds no answer open:
