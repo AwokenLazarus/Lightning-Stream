@@ -88,17 +88,57 @@ pub const ROUTE_FULL: &str = "ticket_route_full";
 /// Refusals of a held ticket that are no fault of the seller's terms or the owner's budgets, and
 /// leave prepaid tickets, or another rail, as the way to pay: no slot, dust, a full route.
 pub const HOLD_SHORT: [&str; 4] = ["ticket_slots", "ticket_dust", ROUTE_FULL, "ticket_slots_short"];
+/// Why a session waits after a lock round that failed while the wallet's channels were out (or just after): the
+/// session buys prepaid tickets meanwhile and holds as many as before once the wait is over. A session opened with the
+/// seller during the wait waits out what is left of it ([`Book::outage_hold`]), and takes nothing else over: not one of
+/// [`HOLD_SHORT`], it is no sign of a full route. A session that already held less for a full route keeps that reason
+/// through such a wait ([`Session::outage_round`]).
+pub const OUTAGE_HOLD: &str = "ticket_outage";
+/// How long that wait is: no lock is tried again sooner, so an outage, or a full channel the wallet cannot tell from
+/// one, costs a round of failed payments at most every 30 s.
+pub const OUTAGE_HOLD_S: f64 = 30.0;
+/// The rule of a release refused because the chain node gave no tip to judge a ticket by.
+pub const TIP_UNKNOWN: &str = "ticket_chain";
+/// The rules of the wallet's checks of its Lightning node that the chain node's silence can cause
+/// ([`crate::ln::verify_backend`] asks it too).
+pub const CHAIN_RULES: [&str; 2] = ["ln_chain", "ln_backend"];
+/// The rules of a fill refused because a node or a channel is away for a moment: those, and a channel of the wallet's node
+/// that is down (a link that drops). Asked again inside a release's pause.
+pub const NODE_AWAY_RULES: [&str; 3] = ["ln_chain", "ln_backend", "ln_no_safe_channel"];
 /// The default of `tickets.http_idle_s`: a session the wallet pays over HTTP is stopped, and its
 /// unused tickets cancelled, after this long without a paid request. Below the gateway's own five
 /// minutes, so that the wallet cancels before the seller does.
 pub const HTTP_IDLE_S: i64 = 120;
-/// The default of `tickets.ready_wait_ms`: how long a release waits for the seller's own word that
-/// the ticket is locked on its node.
-pub const READY_WAIT_MS: i64 = 3_000;
-/// The default of `tickets.max_answer_s`: the longest the wallet keeps an answer that is paid for
-/// as it arrives open. Below the 60 seconds a caller of the signer's socket waits by default, so
-/// that a call ends, and says where it stopped, before its caller gives up on it.
+/// The default of `tickets.ready_wait_ms`: the most a release pauses for, all told, whatever it waits for: the
+/// seller's own word that the ticket is locked on its node, the wallet's node to show it locked, or a quiet chain node.
+/// Under the 15 s a seller as shipped keeps a paused answer open, by a margin for the way between them.
+pub const READY_WAIT_MS: i64 = 12_000;
+/// The default of `tickets.max_answer_s`: the deadline of a paid call, from when the wallet takes it, for an answer it
+/// reads whole for its caller or one priced by the second (its clock bills whether bytes come or not): every wait of its
+/// releases, the seller's head and the reading of its answer end by then, and its last receipt is waited for a few seconds
+/// past it ([`crate::ticket_pay`]). Below the 60 seconds a caller of the signer's socket waits by default, so that a call
+/// ends, and says where it stopped, before its caller gives up on it. An answer streamed on to its caller has
+/// `max_stream_s`, and a socket `max_socket_s`.
 pub const MAX_ANSWER_S: i64 = 50;
+/// The default of `tickets.max_stream_s`: the longest the wallet keeps open an answer it streams on
+/// to its caller as it arrives (a film, a download, an AI stream), paid for what arrives. As long as
+/// the connector follows one by default. A seller that stops sending is ended sooner, by
+/// `tickets.read_timeout_s` between bytes, and past [`STREAM_FLOOR_AFTER_S`] by [`PROGRESS_FLOOR_BYTES`].
+pub const MAX_STREAM_S: i64 = 21_600;
+/// The default of `tickets.stream_floor_after_s`: how long an answer streamed on to its caller runs
+/// before [`PROGRESS_FLOOR_BYTES`] applies. An AI model reasoning behind keep-alives sends next to
+/// nothing for minutes, and only the wait for the next byte holds it to account until then.
+pub const STREAM_FLOOR_AFTER_S: i64 = 600;
+/// The least of an answer held open by [`MAX_STREAM_S`] that must arrive in each
+/// `tickets.read_timeout_s` the wallet spends waiting on its seller: well below any film, so that a
+/// seller that drips bytes, each just inside the wait for the next one, cannot hold a call and its
+/// session for hours. Time the wallet itself holds the answer up (its reader stalled, a ticket being
+/// paid) does not count.
+pub const PROGRESS_FLOOR_BYTES: u64 = 16 << 10;
+/// The default of `tickets.max_socket_s`: the longest the wallet keeps a WebSocket open, paid as its
+/// bytes pass. A web app keeps one open while its page is (live updates); the seller's gateway ends
+/// one after six hours too.
+pub const MAX_SOCKET_S: i64 = 21_600;
 /// The default of `tickets.read_timeout_s`: how long the wallet waits for the next byte of a
 /// seller's answer before it gives the answer up.
 pub const READ_TIMEOUT_S: i64 = 30;
@@ -141,6 +181,17 @@ impl Seed {
 
     pub fn bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// The key this wallet is known by to the seller whose receipt key is `receipt_key`, and to
+    /// no other (docs/BUYER-ACCOUNTS.md): the same for every session with that seller, and for any
+    /// wallet with this seed; unrelated to its key for any other seller, and to the node's keys.
+    pub fn buyer_key(&self, receipt_key: &str) -> xbt402::xbt_primitives::secp256k1::SecretKey {
+        let label = xbt402::ticket::BUYER_TAG.as_bytes();
+        let key = receipt_key.to_ascii_lowercase();
+        // a digest that is not a valid key (one in 2^128) is followed by the next
+        (0u8..=255).find_map(|i| xbt402::xbt_primitives::secp256k1::SecretKey::from_slice(&hmac(&*self.0, &[label, key.as_bytes(), &[i]])).ok())
+            .expect("a valid key among 256 tries")
     }
 
     /// The secret of the ticket with this nonce.
@@ -323,6 +374,27 @@ pub struct TaskPolicy {
     pub unlisted_max_locked_sats: i64,
     /// How this task's sellers are paid where their terms offer both tickets and the lottery.
     pub meter: crate::lottery::Meter,
+    /// The owner's standing word for a task that pays for work as it arrives ([`TaskRental`]).
+    pub rental: Option<TaskRental>,
+}
+
+/// policy.json `tickets.tasks.<task>.rental`: a task that pays for rented work seconds at a time, at a
+/// rate no other use of the wallet needs. It pays by prepaid tickets only, so it locks nothing. Its
+/// tickets are bounded by `max_ticket_sats`, its sends by `max_sends_per_hour`, and its spending by the
+/// task's own budget; the wallet's limits for one payment and for a day or a week, its cap for one
+/// seller and its velocity don't apply to it, and its payments don't count against them, so every
+/// other use of the wallet stands as it did. A wider grant than any other in `tickets`, so it is only
+/// what the owner signed: a task without it is paid as every other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRental {
+    pub max_ticket_sats: i64,
+    pub max_sends_per_hour: i64,
+}
+
+impl TaskRental {
+    pub fn max_ticket_msat(&self) -> u64 {
+        (self.max_ticket_sats.max(0) as u64).saturating_mul(1000)
+    }
 }
 
 /// policy.json `tickets`: the ticket rail's own settings. The allowlist, the daily and weekly
@@ -364,6 +436,10 @@ pub struct TicketPolicy {
     pub read_timeout_s: i64,
     /// The longest an answer that is paid for as it arrives stays open, in seconds.
     pub max_answer_s: i64,
+    /// The longest a WebSocket stays open, in seconds.
+    pub max_socket_s: i64,
+    pub max_stream_s: i64,
+    pub stream_floor_after_s: i64,
     /// The fee rate a held ticket's floor is sized for where a channel without anchors may be on
     /// its route, in sat per 1,000 weight units; 0: the chain's default ([`FEERATE_CAP_MAIN`],
     /// [`FEERATE_CAP_TEST`]).
@@ -410,7 +486,7 @@ impl Default for TicketPolicy {
                seller_max_locked_sats: POOL_FEW as i64 * 1_000, max_sellers: half,
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
-               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, feerate_cap_sat_per_kw: 0,
+               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, max_socket_s: MAX_SOCKET_S, max_stream_s: MAX_STREAM_S, stream_floor_after_s: STREAM_FLOOR_AFTER_S, feerate_cap_sat_per_kw: 0,
                lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, offers: true, seller_tls: BTreeMap::new(), mainnet_ack: false, mainnet_off: None,
                tasks: BTreeMap::new() }
     }
@@ -470,16 +546,22 @@ pub fn mainnet_ack_file() -> bool {
 pub const MAINNET_DEFAULTS: [(&str, i64); 5] = [("max_locked_tickets", 4), ("max_locked_sats", 4_000), ("max_sellers", 4), ("max_new_sellers_per_min", 4),
                                                ("max_sends_per_hour", 120)];
 
-pub const TICKET_INT_KEYS: [&str; 20] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
+pub const TICKET_INT_KEYS: [&str; 23] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
                                          "max_new_sellers_per_min", "max_sends_per_hour", "pool", "pool_many", "many_sellers", "floor_ticket_sats",
-                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "feerate_cap_sat_per_kw"];
+                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "max_socket_s", "max_stream_s", "stream_floor_after_s", "feerate_cap_sat_per_kw"];
+pub const RENTAL_INT_KEYS: [&str; 2] = ["max_ticket_sats", "max_sends_per_hour"];
 pub const TASK_INT_KEYS: [&str; 8] = ["budget_sats", "window_s", "max_locked_sats", "max_locked_tickets", "max_sellers",
                                       "unlisted_max_spend_sats", "unlisted_max_tickets", "unlisted_max_locked_sats"];
 /// The longest window a task's budget can be read over: what the ledger keeps.
 pub const MAX_TASK_WINDOW_S: i64 = 7 * 86_400;
 
 impl TicketPolicy {
+    /// Whether `task` has a [`TaskRental`], so that its payments count only against itself.
+    pub fn is_rental(&self, task: &str) -> bool {
+        self.tasks.get(task).is_some_and(|t| t.rental.is_some())
+    }
+
     /// From policy.json `tickets`. A number that is missing takes the default; one that is not a
     /// non-negative integer is 0 here (it refuses, never widens) and an error in [`validate`].
     pub fn from_map(m: &Map<String, Value>) -> Self {
@@ -507,6 +589,9 @@ impl TicketPolicy {
                            },
                            http_idle_s: i(m, "http_idle_s", d.http_idle_s), ready_wait_ms: i(m, "ready_wait_ms", d.ready_wait_ms),
                            read_timeout_s: i(m, "read_timeout_s", d.read_timeout_s), max_answer_s: i(m, "max_answer_s", d.max_answer_s),
+                           max_socket_s: i(m, "max_socket_s", d.max_socket_s),
+                           max_stream_s: i(m, "max_stream_s", d.max_stream_s),
+                           stream_floor_after_s: i(m, "stream_floor_after_s", d.stream_floor_after_s),
                            feerate_cap_sat_per_kw: i(m, "feerate_cap_sat_per_kw", d.feerate_cap_sat_per_kw),
                            // an entry that is not an object is no permission: the lottery is off
                            lottery: match m.get("lottery").filter(|v| !v.is_null()) {
@@ -538,7 +623,10 @@ impl TicketPolicy {
                 max_sellers: i(t, "max_sellers", p.max_sellers),
                 admit: if t.get("admit").and_then(Value::as_str) == Some("any") { Admit::Any } else { Admit::Listed },
                 unlisted_max_spend_sats: i(t, "unlisted_max_spend_sats", two.saturating_mul(2)), unlisted_max_tickets: i(t, "unlisted_max_tickets", p.pool_many.min(1)),
-                unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two), meter: crate::lottery::Meter::parse(t.get("meter")) });
+                unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two), meter: crate::lottery::Meter::parse(t.get("meter")),
+                // anything but an object is no grant
+                rental: t.get("rental").and_then(Value::as_object).map(|r| TaskRental { max_ticket_sats: i(r, "max_ticket_sats", p.max_ticket_sats).min(i64::MAX / 1000),
+                                                                                        max_sends_per_hour: i(r, "max_sends_per_hour", p.max_sends_per_hour) }) });
         }
         p.max_ticket_sats = p.max_ticket_sats.min(i64::MAX / 1000);
         p
@@ -690,8 +778,19 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
                         errors.push(format!("policy.json {at}.meter: must be \"auto\" (the wallet's rule), \"tickets\" or \"draws\""));
                     }
                 }
+                match t.get("rental").filter(|v| !v.is_null()) {
+                    None => {}
+                    Some(Value::Object(r)) => {
+                        ints(r, &RENTAL_INT_KEYS, &format!("{at}.rental"), errors);
+                        for k in r.keys().filter(|k| !RENTAL_INT_KEYS.contains(&k.as_str())) {
+                            warnings.push(format!("policy.json {at}.rental.{k}: unknown key (the signer ignores it)"));
+                        }
+                        warnings.push(format!("policy.json {at}.rental: this task's payments are outside the wallet's limits for one payment, a day, a week and one seller; only its budget_sats bounds them"));
+                    }
+                    Some(_) => errors.push(format!("policy.json {at}.rental: must be an object")),
+                }
                 for k in t.keys() {
-                    if k != "admit" && k != "meter" && !TASK_INT_KEYS.contains(&k.as_str()) {
+                    if k != "admit" && k != "meter" && k != "rental" && !TASK_INT_KEYS.contains(&k.as_str()) {
                         warnings.push(format!("policy.json {at}.{k}: unknown key (the signer ignores it)"));
                     }
                 }
@@ -897,7 +996,7 @@ pub struct Sizing {
 pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_msat: Option<u64>, cap_tickets: i64, cap_locked_sats: i64, dust_msat: u64,
               slot_room: i64) -> Result<Sizing, Refusal> {
     let many = sellers_in_task as i64 > pol.many_sellers;
-    let floor_msat = (pol.floor_ticket_sats.max(0) as u64).saturating_mul(1000).max(dust_msat).max(FLOOR_MSAT);
+    let floor_msat = held_floor_msat(pol, dust_msat);
     let pool_of = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
     if i64::from(terms.ticket_blocks) > pol.max_ticket_blocks {
         return refuse("ticket_blocks", format!("ticketBlocks {} is above the owner's tickets.max_ticket_blocks {}", terms.ticket_blocks, pol.max_ticket_blocks));
@@ -944,6 +1043,12 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
     Ok(Sizing { ticket_msat, pool: pool as u32 })
 }
 
+/// The smallest ticket [`sizing`] holds: the owner's floor, the channels' dust limit
+/// ([`Limits::dust_msat`]) and [`FLOOR_MSAT`], whichever is largest.
+pub fn held_floor_msat(pol: &TicketPolicy, dust_msat: u64) -> u64 {
+    (pol.floor_ticket_sats.max(0) as u64).saturating_mul(1000).max(dust_msat).max(FLOOR_MSAT)
+}
+
 /// The size of a prepaid ticket with this seller, from its `on-arrival` terms: the seller's one
 /// size, inside the owner's largest ticket. It is paid at once and never held, so neither a dust
 /// limit nor a slot bounds it.
@@ -959,6 +1064,39 @@ pub fn prepaid_size(terms: &Terms, pol: &TicketPolicy) -> Result<u64, Refusal> {
         return refuse("ticket_size", "a ticket below 1 sat: no node forwards it");
     }
     Ok(terms.ticket_msat)
+}
+
+/// Why a session whose prepaid ticket had no final answer in time was stopped: not the seller's fault.
+/// Why a session opened for one call was stopped at once, that call told to come back: such a
+/// session bought nothing and holds nothing, and is not a seller newly opened
+/// ([`Book::opened_since`]). (A session's reason is kept cut short.)
+pub const RESUME_WAIT_WHY: &str = "the seller has not said what an earlier session left with it";
+pub const PREPAY_FOLLOW_WHY: &str = "an earlier prepaid ticket with this seller is not followed yet";
+pub const PREPAY_PENDING_WHY: &str = "the payment of a prepaid ticket has no final answer from the wallet's node yet: it is booked as spent until the node shows it \
+                                      failed, and a later call takes up its credit with this seller once the node shows it paid";
+/// How long past a prepaid invoice's life the wallet waits for the seller to follow its payment: the
+/// gateway's 15 s after an invoice's life before its sweep, and a round of that sweep.
+pub const PREPAY_FOLLOW_GRACE_S: f64 = 15.0 + 10.0;
+
+/// [`prepaid_size`] for a task with a [`TaskRental`]: the largest ticket the seller sells on this
+/// route (`top_msat`, its `topTicketMsat`, beside its own size), clamped to what the owner allows the
+/// task where the seller lets the wallet ask for a smaller one, not refused. Refused only where the
+/// seller's smallest is above that.
+pub fn rental_prepaid_size(terms: &Terms, top_msat: Option<u64>, rental: &TaskRental, pol: &TicketPolicy) -> Result<u64, Refusal> {
+    if i64::from(terms.ticket_blocks) > pol.max_ticket_blocks {
+        return refuse("ticket_blocks", format!("ticketBlocks {} is above the owner's tickets.max_ticket_blocks {}", terms.ticket_blocks, pol.max_ticket_blocks));
+    }
+    let most = rental.max_ticket_msat();
+    let own = match terms.min_ticket_msat {
+        Some(m) if m <= most => terms.ticket_msat.max(top_msat.unwrap_or(0)).min(most),
+        Some(m) => return refuse("ticket_size", format!("this seller's smallest ticket of {m} msat is above the {most} msat the owner allows this task (its rental.max_ticket_sats)")),
+        None if terms.ticket_msat > most => return refuse("ticket_size", format!("this seller's ticket of {} msat is above the {most} msat the owner allows this task (its rental.max_ticket_sats)", terms.ticket_msat)),
+        None => terms.ticket_msat,
+    };
+    if own < 1000 {
+        return refuse("ticket_size", "a ticket below 1 sat: no node forwards it");
+    }
+    Ok(own)
 }
 
 /// Whether a prepaid ticket of `msat` may be bought in session `s`: its seller's size, or a
@@ -990,6 +1128,9 @@ pub fn slot_failure(reason: &str) -> bool {
     let r = reason.to_ascii_uppercase();
     ["INSUFFICIENT_BALANCE", "NO_ROUTE", "FAILURE_REASON_ERROR"].iter().any(|k| r.contains(k)) || r == "ERROR"
 }
+
+/// A prepaid ticket's or a win's invoice is refused this close to its expiry: the payment needs the time to arrive.
+pub(crate) const PREPAID_EXPIRY_MARGIN_S: f64 = 5.0;
 
 /// How long nothing is locked after the `fails`-th failed round in a row: 30 s, doubling to 10 minutes.
 pub fn slot_wait_s(fails: u32) -> f64 {
@@ -1062,6 +1203,24 @@ impl TState {
     /// A payment for it may be on the node and not final.
     pub fn in_flight(self) -> bool {
         matches!(self, TState::Sending | TState::Locked | TState::Released | TState::Retired)
+    }
+}
+
+impl Ticket {
+    /// The seller may still hold this ticket's HTLC, so a cancel of a session's tickets names it:
+    /// on its way or locked (retired, if that was at a start of the signer), or a held ticket booked
+    /// as released, whose secret may never have reached the seller. A seller that took the secret
+    /// keeps it whatever the cancel says; a prepaid ticket is not held at all.
+    pub fn may_be_held(&self) -> bool {
+        matches!(self.state, TState::Sending | TState::Locked | TState::Retired) || (self.state == TState::Released && !self.prepaid)
+    }
+
+    /// What a cancel of a session's tickets names: what the seller may hold, and a hash offered
+    /// lately and never paid, whose invoice the seller may have issued: unpaid, it still takes a
+    /// place in that seller session until it lapses, and a later session wants the place. A seller
+    /// that never issued it passes over its name.
+    pub fn may_take_a_place(&self, now: f64) -> bool {
+        self.may_be_held() || (!self.prepaid && self.sent_ts == 0.0 && now - self.ts < OFFER_TTL_S && matches!(self.state, TState::Offered | TState::Failed))
     }
 }
 
@@ -1233,6 +1392,13 @@ pub struct SellerSession {
     pub id: String,
     pub key: [u8; 32],
     pub base: String,
+    /// The wallet told the seller who it is in this session (`identify`, docs/BUYER-ACCOUNTS.md),
+    /// or was about to: set and on disk before the call goes out. A session the owner has since
+    /// chosen to stay anonymous at is not taken over by a later one.
+    pub identified: bool,
+    /// The receipt key of the seller's terms, hex: who this seller is, whatever its address. Empty
+    /// in a row from before 0.2.0.
+    pub receipt_key: String,
 }
 
 impl std::fmt::Debug for SellerSession {
@@ -1249,6 +1415,13 @@ impl Session {
                "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why});
         if let Some(h) = &self.http {
             r["http"] = json!({"id": h.id, "key": hex::encode(h.key), "base": h.base});
+            // written only when set: a row from before reads as a session nothing was said in
+            if h.identified {
+                r["http"]["identified"] = true.into();
+            }
+            if !h.receipt_key.is_empty() {
+                r["http"]["receipt_key"] = h.receipt_key.clone().into();
+            }
         }
         // written only when set: a row from before reads as a session that holds and waits for nothing
         if self.prepaid_msat > 0 {
@@ -1281,6 +1454,21 @@ impl Session {
     /// locked before a prepaid one is paid ([`Session::paid_first`]).
     pub fn prepaid_now(&self, now: f64) -> bool {
         self.prepaid_msat > 0 && (self.pool == 0 || now < self.hold_until || self.paid_first)
+    }
+
+    /// Tickets of a lock round failed in an outage, whether or not others of it locked: a wait of [`OUTAGE_HOLD_S`]
+    /// ([`OUTAGE_HOLD`]), with the pool and the run of failed rounds as they were. A session that held less for a full
+    /// route ([`HOLD_SHORT`]) keeps that as its reason, so that what it learnt still passes to the next session with the
+    /// seller ([`Book::held_less`]). Returns whether anything changed.
+    pub fn outage_round(&mut self, now: f64) -> bool {
+        if now < self.hold_until {
+            return false;
+        }
+        self.hold_until = now + OUTAGE_HOLD_S;
+        if !HOLD_SHORT.contains(&self.hold_why.as_str()) {
+            self.hold_why = OUTAGE_HOLD.into();
+        }
+        true
     }
 
     /// What a lock round came to: `locked` tickets the node holds, `slot_failed` that failed as a
@@ -1329,7 +1517,11 @@ impl Session {
                         None => None,
                         // a row that names a seller session names all of it, or the row is damage
                         Some(h) => Some(SellerSession { id: str_or_empty(h.get("id")), key: hex::decode(str_or_empty(h.get("key"))).ok()?.try_into().ok()?,
-                                                        base: str_or_empty(h.get("base")) }),
+                                                        base: str_or_empty(h.get("base")), receipt_key: str_or_empty(h.get("receipt_key")),
+                                                        identified: match h.get("identified") {
+                                                            None => false,
+                                                            Some(v) => v.as_bool()?,
+                                                        } }),
                     },
                     prepaid_msat: match r.get("prepaid_msat") {
                         None => 0,
@@ -1462,17 +1654,18 @@ impl Book {
         l
     }
 
-    /// The open ticket session with this seller, if there is one. A session that pays by draws
-    /// holds nothing with the seller's node and is found by [`Self::draws_open_with`].
-    pub fn open_with(&self, payee: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.draws.is_none())
+    /// The open ticket session with this seller under `task`, if there is one. A session is its task's
+    /// alone, so each task has its own with a seller. A session that pays by draws holds nothing with
+    /// the seller's node and is found by [`Self::draws_open_with`].
+    pub fn open_with(&self, payee: &str, task: &str) -> Option<&Session> {
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.task == task && s.draws.is_none())
     }
 
     /// The open session that pays this seller's node by draws at `origin`, if there is one. One
     /// node may sell at several origins (a node that runs several services), and each is a
-    /// session of its own.
-    pub fn draws_open_with(&self, payee: &str, origin: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.origin == origin && s.draws.is_some())
+    /// session of its own, and so is each task's.
+    pub fn draws_open_with(&self, payee: &str, origin: &str, task: &str) -> Option<&Session> {
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.origin == origin && s.task == task && s.draws.is_some())
     }
 
     /// The payment of a win of a session that is in the book and has not failed: a win with one is
@@ -1499,12 +1692,17 @@ impl Book {
 
     /// Sessions opened since `t`.
     pub fn opened_since(&self, t: f64) -> usize {
-        self.sessions.values().filter(|s| s.opened_ts >= t).count()
+        self.sessions.values().filter(|s| s.opened_ts >= t && !s.why.starts_with(&RESUME_WAIT_WHY[..40]) && !s.why.starts_with(&PREPAY_FOLLOW_WHY[..40])).count()
     }
 
     /// Ticket payments handed to the router since `t`.
     pub fn sends_since(&self, t: f64) -> usize {
-        self.tickets.values().filter(|x| x.sent_ts > 0.0 && x.sent_ts >= t).count()
+        self.sends_since_where(t, |_| true)
+    }
+
+    /// [`Book::sends_since`], of the tasks `of` names.
+    pub fn sends_since_where(&self, t: f64, of: impl Fn(&str) -> bool) -> usize {
+        self.tickets.values().filter(|x| x.sent_ts > 0.0 && x.sent_ts >= t && of(&x.task)).count()
     }
 
     /// A session's tickets, oldest first.
@@ -1533,6 +1731,53 @@ impl Book {
     pub fn held_less(&self, payee: &str, now: f64) -> Option<&Session> {
         self.sessions.values().filter(|s| s.payee == payee && HOLD_SHORT.contains(&s.hold_why.as_str()) && s.hold_why != "ticket_dust")
             .filter(|s| s.hold_until > now - SLOT_WAIT_MAX_S).max_by(|a, b| a.hold_until.total_cmp(&b.hold_until).then_with(|| a.opened_ts.total_cmp(&b.opened_ts)))
+    }
+
+    /// The latest wait of an earlier session with this payee after a round that failed in an outage ([`OUTAGE_HOLD`]),
+    /// if it is not over: a new session waits it out too (the wait only; its pool is its own), so that stopping one
+    /// session and opening another does not send a failing round each call.
+    pub fn outage_hold(&self, payee: &str, now: f64) -> Option<f64> {
+        self.sessions.values().filter(|s| s.payee == payee && s.hold_why == OUTAGE_HOLD && s.hold_until > now).map(|s| s.hold_until).reduce(f64::max)
+    }
+
+    /// A prepaid ticket another session bought of this payee that the seller may yet credit there,
+    /// and how many seconds from `now` the wallet stops waiting for it: not final on the wallet's
+    /// node, or settled after its call was stopped for having no final answer
+    /// ([`PREPAY_PENDING_WHY`]), which the seller credits when the preimage is shown or on its own
+    /// sweep. Until then a ticket bought in another session would be a second one, and the first's
+    /// credit left behind. Bounded by the invoice's life and [`PREPAY_FOLLOW_GRACE_S`], so that a
+    /// payment stuck at a hop does not hold the buyer back for longer. Not one of the seller session
+    /// `own`: taken over, its credit is this session's. Nor one of another task's session (where
+    /// `session` is in the book): its credit is that task's, which this session never takes over, so
+    /// there is nothing to wait for.
+    pub fn prepaid_unfollowed(&self, payee: &str, session: &str, own: Option<&str>, now: f64) -> Option<(&Ticket, f64)> {
+        let task = self.sessions.get(session).map(|s| s.task.as_str());
+        self.tickets.values().filter(|t| t.prepaid && t.win == 0 && t.payee == payee && t.session != session && t.invoice_expires > 0.0).filter_map(|t| {
+            let s = self.sessions.get(&t.session)?;
+            if task.is_some_and(|task| s.task != task) {
+                return None;
+            }
+            let waits = match t.state {
+                TState::Released | TState::Sending | TState::Locked => true,
+                // (a session's reason is kept cut short)
+                TState::Settled => s.why.starts_with(&PREPAY_PENDING_WHY[..50]),
+                _ => false,
+            };
+            let until = t.invoice_expires.min(t.sent_ts + f64::from(xbt402::ticket::INVOICE_EXPIRY_S)) + PREPAY_FOLLOW_GRACE_S;
+            let taken_over = own.is_some() && s.http.as_ref().map(|h| h.id.as_str()) == own;
+            (waits && !taken_over && now <= until).then_some((t, until - now))
+        }).max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// Prepaid tickets of stopped sessions past the wait of [`Book::prepaid_unfollowed`] that the
+    /// seller may not have credited: the node still calls the payment in flight (a hop, or the seller,
+    /// holds it), or shows it paid after its call was stopped for having no final answer (the seller
+    /// has the money, and may have kept it).
+    pub fn prepaid_overdue(&self, now: f64) -> Vec<(Ticket, Session)> {
+        self.tickets.values().filter(|t| t.prepaid && t.win == 0 && matches!(t.state, TState::Released | TState::Settled) && t.invoice_expires > 0.0)
+            .filter(|t| now > t.invoice_expires.min(t.sent_ts + f64::from(xbt402::ticket::INVOICE_EXPIRY_S)) + PREPAY_FOLLOW_GRACE_S)
+            .filter_map(|t| self.sessions.get(&t.session).filter(|s| s.state != SState::Open).map(|s| (t.clone(), s.clone())))
+            .filter(|(t, s)| t.state == TState::Released || s.why.starts_with(&PREPAY_PENDING_WHY[..50])).collect()
     }
 
     /// A prepaid ticket of the session whose payment is not final: the next is bought only after it.
@@ -1576,6 +1821,13 @@ impl Book {
         self.of_session(session).into_iter().find(|t| t.state == TState::Locked && usable_at(t, tip))
     }
 
+    /// The ticket `hash` of a session, where it is locked and the seller will still accept it at height
+    /// `tip`: what a release that names it takes. A ticket of the session locked since it was chosen is
+    /// no reason to refuse it, though that one may sort first (offered in the same second, or locked late).
+    pub fn usable_named(&self, session: &str, tip: i64, hash: &str) -> Option<&Ticket> {
+        self.tickets.get(hash).filter(|t| t.session == session && t.state == TState::Locked && usable_at(t, tip))
+    }
+
     /// Locked tickets of a session that are too close to their expiry to be released.
     pub fn stale(&self, session: &str, tip: i64) -> Vec<String> {
         self.of_session(session).into_iter().filter(|t| t.state == TState::Locked && !usable_at(t, tip)).map(|t| t.hash.clone()).collect()
@@ -1609,7 +1861,7 @@ pub fn check_ticket_invoice(inv: &crate::bolt11::Invoice, s: &Session, pol: &Tic
         return refuse("ticket_expiry", format!("the invoice stays payable for {} s, above the owner's tickets.max_invoice_expiry_s {}", inv.expiry_s,
                                                pol.max_invoice_expiry_s));
     }
-    if (inv.expires_at() as f64) < now + 5.0 {
+    if (inv.expires_at() as f64) < now + PREPAID_EXPIRY_MARGIN_S {
         return refuse("ticket_expiry", "the invoice has expired, or does within 5 s");
     }
     if inv.payment_secret.is_none() {
@@ -1644,7 +1896,7 @@ pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, msat: u6
         return refuse("ticket_expiry", format!("the invoice stays payable for {} s, above the owner's tickets.max_invoice_expiry_s {}", inv.expiry_s,
                                                pol.max_invoice_expiry_s));
     }
-    if (inv.expires_at() as f64) < now + 5.0 {
+    if (inv.expires_at() as f64) < now + PREPAID_EXPIRY_MARGIN_S {
         return refuse("ticket_expiry", "the invoice has expired, or does within 5 s");
     }
     if inv.payment_secret.is_none() {
@@ -1656,6 +1908,21 @@ pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, msat: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A buyer's key for a seller (docs/BUYER-ACCOUNTS.md): one seed, one key at that seller, in
+    /// every session and on every wallet with the seed; another seller, an unrelated key.
+    #[test]
+    fn a_buyer_key_is_the_same_at_one_seller_and_unrelated_at_another() {
+        let (a, b) = ("02".to_string() + &"11".repeat(32), "03".to_string() + &"22".repeat(32));
+        let seed = Seed::new([7u8; 32]);
+        let again = Seed::new([7u8; 32]);
+        assert_eq!(seed.buyer_key(&a).secret_bytes(), again.buyer_key(&a).secret_bytes(), "a restored wallet is the same buyer");
+        assert_eq!(seed.buyer_key(&a).secret_bytes(), seed.buyer_key(&a.to_uppercase()).secret_bytes(), "the key's spelling does not matter");
+        assert_ne!(seed.buyer_key(&a).secret_bytes(), seed.buyer_key(&b).secret_bytes(), "two sellers, two keys");
+        assert_ne!(seed.buyer_key(&a).secret_bytes(), Seed::new([8u8; 32]).buyer_key(&a).secret_bytes(), "two wallets, two buyers");
+        // nothing a ticket's secret is made of: the label is the buyer's own
+        assert_ne!(&seed.buyer_key(&a).secret_bytes(), &*seed.secret(&[0u8; 16]));
+    }
 
     fn seed() -> Seed {
         Seed::new([7u8; 32])
@@ -1993,6 +2260,33 @@ mod tests {
         assert_eq!(Session::from_row(&old), None, "a damaged row is refused, not read as no wait");
     }
 
+    /// A round that fails in an outage sets the short wait, and leaves what a session learnt of a full route as it was:
+    /// a session that halved its pool for a full route, its wait over, meets an outage at its next round. The next
+    /// session with the seller still starts from its smaller pool and its failed round, and waits out the outage's wait.
+    /// A session that never held less waits as an outage's does, and passes on the wait only.
+    ///
+    /// FAILS with the outage's reason written over the full route's: the session is no longer one that held less, and
+    /// the next session with the seller starts again from the full pool, with no failed round.
+    #[test]
+    fn a_round_that_fails_in_an_outage_keeps_what_a_session_learnt_of_a_full_route() {
+        let mut s = session("s1", 4);
+        assert!(s.lock_round(0, 1, 100.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until, s.hold_why.as_str()), (2, 1, 130.0, "ticket_slots"));
+        assert!(!s.outage_round(129.0), "a wait that is not over is left as it is");
+        assert!(s.outage_round(140.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until, s.hold_why.as_str()), (2, 1, 170.0, "ticket_slots"), "the outage's wait, the full route's reason");
+        let mut b = Book::default();
+        b.sessions.insert(s.id.clone(), s.clone());
+        assert_eq!(b.held_less("p", 150.0).map(|s| (s.pool, s.slot_fails, s.hold_until)), Some((2, 1, 170.0)), "what it learnt passes on, and the wait");
+        // a session that never held less: the outage's own reason, the wait passed on alone
+        let mut o = session("s2", 2);
+        o.payee = "q".into();
+        assert!(o.outage_round(140.0));
+        assert_eq!((o.pool, o.slot_fails, o.hold_until, o.hold_why.as_str()), (2, 0, 170.0, OUTAGE_HOLD));
+        b.sessions.insert(o.id.clone(), o);
+        assert_eq!((b.held_less("q", 150.0).map(|s| s.id.clone()), b.outage_hold("q", 150.0), b.outage_hold("q", 170.0)), (None, Some(170.0), None));
+    }
+
     #[test]
     fn a_session_that_pays_a_prepaid_ticket_first_offers_no_hash_until_then() {
         let mut b = Book::default();
@@ -2116,12 +2410,22 @@ mod tests {
     fn the_sellers_side_of_a_session_is_kept_in_its_row_and_a_damaged_one_refuses_the_row() {
         let mut s = session("s1", 8);
         assert_eq!(Session::from_row(&s.row()), Some(s.clone()), "a row from before the HTTP binding has no seller side");
-        s.http = Some(SellerSession { id: "ab".repeat(16), key: [7u8; 32], base: "https://seller.example/x402/ticket".into() });
+        s.http = Some(SellerSession { id: "ab".repeat(16), key: [7u8; 32], base: "https://seller.example/x402/ticket".into(), receipt_key: String::new(), identified: false });
         let row = s.row();
         assert_eq!(Session::from_row(&row), Some(s.clone()));
+        assert!(row["http"].get("identified").is_none(), "unset, not written: a row as before");
+        // the wallet said who it is in it: kept, and a row that says it some other way is damage
+        let mut known = s.clone();
+        known.http.as_mut().unwrap().identified = true;
+        assert_eq!(Session::from_row(&known.row()), Some(known.clone()));
+        let mut odd = known.row();
+        odd["http"]["identified"] = "yes".into();
+        assert_eq!(Session::from_row(&odd), None);
         assert_eq!(s.public()["http"], true);
         assert!(!s.public().to_string().contains(&hex::encode([7u8; 32])), "the key is not in what a caller is shown");
         assert!(!format!("{s:?}").contains("0707"), "nor in a debug print");
+        s.http.as_mut().unwrap().receipt_key = "02".repeat(33);
+        assert_eq!(Session::from_row(&s.row()), Some(s.clone()), "the receipt key is kept");
         let mut bent = row.clone();
         bent["http"]["key"] = "07".into();
         assert_eq!(Session::from_row(&bent), None);
@@ -2306,6 +2610,14 @@ mod tests {
         assert_eq!(b.usable("s1", 115), None);
         assert_eq!(b.usable("s1", 0), None, "our own tip unknown: nothing is released");
         assert_eq!(b.usable("s2", 99), None);
+        // named: that one, wherever it sorts, on the same terms
+        assert_eq!(b.usable_named("s1", 99, &new.hash).map(|t| t.hash.clone()), Some(new.hash.clone()), "an older one locked is no reason to refuse it");
+        assert_eq!(b.usable_named("s1", 100, &old.hash), None, "25 left");
+        assert_eq!(b.usable_named("s1", 99, &blind.hash), None);
+        assert_eq!(b.usable_named("s2", 99, &new.hash), None, "another session's");
+        assert_eq!(b.usable_named("s1", 99, "none"), None);
+        b.tickets.get_mut(&new.hash).unwrap().state = TState::Released;
+        assert_eq!(b.usable_named("s1", 99, &new.hash), None, "released once");
     }
 
     #[test]

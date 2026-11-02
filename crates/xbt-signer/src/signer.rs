@@ -31,6 +31,7 @@ use crate::ln::{LnBackend, LnBook, LndRest};
 use crate::node::{self, KnotsRpc, Node};
 use crate::policy::{normalize_dest, AuditLog, Clock, Payment, PolicyConfig, PolicyEngine, PolicyStore};
 use crate::pyjson::{py_int, str_or_empty, truthy, ts_value};
+pub use crate::renter::Caller;
 use crate::sanitize::sanitize;
 use crate::sigaudit::{self, check_chain, SigAudit};
 use crate::{err, Result};
@@ -169,6 +170,12 @@ pub fn address_to_spk(addr: &str, hrp: &str) -> Result<Vec<u8>> {
     Ok(spk)
 }
 
+/// How long the last tip the chain node gave stands in for one it does not give: minutes, against a
+/// ticket's margin of [`crate::ticket::USABLE_MARGIN_BLOCKS`] blocks, so it decides nothing a fresh one would not.
+const TIP_KEPT_S: f64 = 300.0;
+/// How long a question about the tip is waited for: longer, and the last tip stands in for the answer.
+const TIP_ASK_MOST: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How to build a signer (tests inject a node, a clock).
 #[derive(Default)]
 pub struct SignerOptions {
@@ -228,6 +235,21 @@ pub struct Signer {
     pub(crate) ticket_synced: std::sync::atomic::AtomicBool,
     /// How many ticket payments are with the node's router at once ([`crate::ticket_rail::Pace`]).
     pub(crate) ticket_pace: crate::ticket_rail::Pace,
+    /// Since when the node's channels have been out, and when that was last seen
+    /// ([`Self::ln_channels_back`]).
+    pub(crate) ln_channels_out: Mutex<Option<(std::time::Instant, std::time::Instant)>>,
+    /// When the wallet last saw every channel that could pay out (inactive), its peer's connection down: a ticket
+    /// that fails then failed for the outage, not for a full channel ([`crate::ln::OUTAGE_LATELY`]).
+    pub(crate) ln_last_out: Mutex<Option<std::time::Instant>>,
+    /// The last tip the chain node gave, and when ([`Self::tip_known`]).
+    tip_seen: Mutex<Option<(i64, f64)>>,
+    /// A question about the tip is out ([`Self::height_asked`]).
+    tip_asking: std::sync::atomic::AtomicBool,
+    /// The sessions a round of questions to the Lightning node is out for ([`Self::ticket_refresh_coming`]).
+    pub(crate) ticket_refreshing: Mutex<HashSet<String>>,
+    /// Tickets seen in flight on the node and on none of its channels, every channel up, and since when
+    /// ([`Self::ticket_stranded`]).
+    pub(crate) ticket_off_channel: Mutex<HashMap<String, f64>>,
     /// Held tickets booked `sending` whose send has not come back yet: waiting their turn in
     /// [`Self::ticket_pace`] or with the node. The node may have no record of one yet, and that
     /// is not a sign it never reached the node.
@@ -236,15 +258,35 @@ pub struct Signer {
     /// for its session, the sessions of an earlier run whose cancel was asked for, and this signer
     /// itself (for the thread that refills a pool behind a call).
     pub(crate) ticket_wire: Arc<dyn crate::ticket_pay::TicketWire>,
-    pub(crate) ticket_http: Mutex<HashMap<String, Arc<crate::ticket_pay::Slot>>>,
-    /// The sessions this process pays by draws, by the seller's origin (`docs/TICKETS.md`, section 9).
-    pub(crate) draw_http: Mutex<HashMap<String, Arc<crate::ticket_pay::DrawSession>>>,
+    pub(crate) ticket_http: Mutex<HashMap<crate::ticket_pay::SlotKey, Arc<crate::ticket_pay::Slot>>>,
+    /// The sessions this process pays by draws, by the seller's origin and the task (`docs/TICKETS.md`, section 9).
+    pub(crate) draw_http: Mutex<HashMap<crate::ticket_pay::SlotKey, Arc<crate::ticket_pay::DrawSession>>>,
+    /// The terms a seller last stated for each of its routes, by origin then route path, where its
+    /// gateway refuses a paid request that repeats another route's terms (`termsChecked`): a request
+    /// on a known route is then paid without asking its price first, a round trip saved.
+    pub(crate) route_terms: Mutex<HashMap<String, HashMap<String, Value>>>,
+    /// One change at a time of the owner's choices file (`identity_set`).
+    pub(crate) identity_write: Mutex<()>,
     pub(crate) ticket_cancel_tried: Mutex<HashSet<String>>,
+    /// Late prepaid tickets whose seller gave no answer that settles them: the tries so far and when
+    /// to try again, by hash. In memory: a start tries each once more.
+    pub(crate) ticket_late_tries: Mutex<HashMap<String, (u32, f64)>>,
+    /// Sessions this start stopped: the watcher asks their sellers, once, what credit they left.
+    pub(crate) ticket_start_stopped: Mutex<Vec<String>>,
+    /// The last refusal of a call by address and task, for the wait for a seller's word
+    /// (`ticket_seller_unanswered`): when, and the answer. Calls that queued behind it have it at once.
+    pub(crate) ticket_unanswered: Mutex<HashMap<crate::ticket_pay::SlotKey, (f64, Value)>>,
+    /// Sessions whose stop has begun and that the book still shows open, while their streams end
+    /// ([`crate::ticket_pay`]'s `ticket_http_stop`): the book books nothing more for them, a release,
+    /// a lock or a prepaid ticket, however far a call had got when the stop came.
+    pub(crate) ticket_stopping: Mutex<HashSet<String>>,
     pub(crate) me: std::sync::OnceLock<std::sync::Weak<Signer>>,
     /// AGP-063 W4: the one-time code that enrols the first human key.
     pub(crate) enroll: Mutex<crate::admin::EnrollCode>,
     /// AGP-089: the human-signed messages already used (one signature, one operation).
     pub(crate) used_sigs: crate::admin::UsedSigs,
+    /// Sellers caught charging more than the wallet could account for, blocked until the owner lifts it.
+    pub(crate) seller_blocks: crate::seller_block::SellerBlocks,
 }
 
 impl Signer {
@@ -313,15 +355,17 @@ impl Signer {
         };
         let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
         let ln_funding = crate::ln_funding::Kept::open(&run.join(crate::ln_funding::KEPT_FILE));
+        let seller_blocks = crate::seller_block::SellerBlocks::open(&run);
         let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
                                 ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
-                                ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
-                                ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::default())),
-                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
-                                used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });
+                                ticket_pace: crate::ticket_rail::Pace::default(), ln_channels_out: Mutex::new(None), ln_last_out: Mutex::new(None), tip_seen: Mutex::new(None), tip_asking: std::sync::atomic::AtomicBool::new(false), ticket_refreshing: Mutex::new(HashSet::new()), ticket_off_channel: Mutex::new(HashMap::new()), ticket_queued: Mutex::new(Default::default()),
+                                ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
+                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_late_tries: Mutex::new(HashMap::new()), ticket_start_stopped: Mutex::new(vec![]), ticket_unanswered: Mutex::new(HashMap::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
+                                used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),
+                                seller_blocks });
         let _ = s.me.set(Arc::downgrade(&s));
         // before any request: what the book holds locked is retired (a start may be a restore)
         s.ticket_start();
@@ -386,6 +430,18 @@ impl Signer {
         *self.human_pubkey.write().unwrap_or_else(|p| p.into_inner()) = k;
     }
 
+    /// [`Self::lock`], given up at `by`: whoever holds it may be waiting on a node that hangs.
+    pub(crate) fn lock_by(&self, by: std::time::Instant) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            match self.spend.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() >= by => return None,
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
     pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
         match self.spend.lock() {
             Ok(g) => g,
@@ -405,11 +461,42 @@ impl Signer {
     }
 
     fn height(&self) -> Result<i64> {
-        node::height(&*self.node).map(|h| h as i64)
+        let h = node::height(&*self.node).map(|h| h as i64)?;
+        *self.tip_seen.lock().unwrap_or_else(|p| p.into_inner()) = Some((h, self.now()));
+        Ok(h)
     }
 
+    /// The chain node's word on its height, waited for [`TIP_ASK_MOST`] at most: a node that hangs takes a thread, not
+    /// the caller. One question at a time: while one is out the node has given no answer, and `None` says so.
+    fn height_asked(&self) -> Option<i64> {
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else { return self.height().ok() };
+        if self.tip_asking.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        crate::ticket_rail::within(std::time::Instant::now() + TIP_ASK_MOST, move || {
+            let h = me.height().ok();
+            me.tip_asking.store(false, std::sync::atomic::Ordering::SeqCst);
+            h
+        }).flatten()
+    }
+
+    /// The chain's tip: the node's word, or, where the node gives none in time (busy, restarting, hung), the last it
+    /// gave within [`TIP_KEPT_S`]. `None`: not known, which says nothing about any height.
+    pub(crate) fn tip_known(&self) -> Option<i64> {
+        self.height_asked().or_else(|| {
+            let seen = *self.tip_seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.filter(|(_, at)| self.now() - at <= TIP_KEPT_S).map(|(h, _)| h)
+        })
+    }
+
+    /// Whether the chain node answers now.
+    pub(crate) fn chain_answers(&self) -> bool {
+        self.height_asked().is_some()
+    }
+
+    /// [`Self::tip_known`], with 0 for a tip not known: for a report, and for a bound that 0 leaves open.
     pub(crate) fn height_safe(&self) -> i64 {
-        self.height().unwrap_or(0)
+        self.tip_known().unwrap_or(0)
     }
 
     /// The chain's network id (`bip122:...`, P4), as a seller's 402 names it. A wrong mainnet anchor
@@ -432,15 +519,27 @@ impl Signer {
         }
     }
 
-    /// Handle one request; every signature made meanwhile is logged under its method.
+    /// Handle one request from the wallet's socket; every signature made meanwhile is logged under its method.
     pub fn handle(&self, method: &str, params: &Value) -> Result<Value> {
+        self.handle_as(Caller::Wallet, method, params)
+    }
+
+    /// Handle one request from `caller`'s socket ([`crate::renter`]): the renter's answers only its own
+    /// methods, and only it pays under a task's rental terms.
+    pub fn handle_as(&self, caller: Caller, method: &str, params: &Value) -> Result<Value> {
         let _ctx = sigaudit::context(Some(method), Some(&format!("method:{method}")));
         let empty = json!({});
         let p = if params.is_object() { params } else { &empty };
-        self.dispatch(method, p)
+        if caller == Caller::Renter && !crate::renter::RENTER_METHODS.contains(&method) {
+            return Err(err("renter_socket", format!("{method} is not answered on the hashrate renter's socket, which pays a rental's pieces of work and nothing else")));
+        }
+        if let Some(refused) = self.renter_gate(caller, method, p) {
+            return Ok(sanitize(refused));
+        }
+        self.dispatch(caller, method, p)
     }
 
-    fn dispatch(&self, method: &str, p: &Value) -> Result<Value> {
+    fn dispatch(&self, caller: Caller, method: &str, p: &Value) -> Result<Value> {
         let s = |k: &str| str_or_empty(p.get(k));
         Ok(match method {
             "balance" => {
@@ -474,6 +573,34 @@ impl Signer {
                 Ok(h) => json!({"reachable": true, "chain": self.chain, "height": h}),
                 Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
             },
+            // what a hashmaker's price follows (Sell → Hashrate): the tip's difficulty and subsidy as the node says them.
+            // What it does not say is left out, for the caller to refuse: nothing here is made up. A node that won't
+            // answer `getblockstats` for the tip (`subsidyError`) still says the height and its chain, and the subsidy is
+            // then the chain's own schedule at that height (`subsidyFrom`: "schedule"). A pruned Knots keeps the tip and
+            // answers it (Knots v29.4.2, -prune=550, regtest: only a pruned height gives "Block not available (pruned
+            // data)"); this is for one that refuses it all the same (an older node, an RPC whitelist)
+            "mining_tip" => match self.node.call("getblockchaininfo", json!([])) {
+                Ok(i) => {
+                    let height = i.get("blocks").and_then(Value::as_u64);
+                    let stats = height.map(|h| self.node.call("getblockstats", json!([h, ["subsidy"]])));
+                    let said = stats.as_ref().and_then(|r| r.as_ref().ok()).and_then(|s| s.get("subsidy").and_then(Value::as_u64));
+                    let chain = i.get("chain").and_then(Value::as_str).and_then(|c| xbt_primitives::network::Chain::from_name(c).ok());
+                    let (subsidy, from) = match (said, height, chain) {
+                        (Some(s), ..) => (Some(s), Value::from("getblockstats")),
+                        (None, Some(h), Some(c)) => (Some(c.block_subsidy(h)), Value::from("schedule")),
+                        _ => (None, Value::Null),
+                    };
+                    let why = match stats {
+                        Some(Err(e)) => Value::from(e.msg.chars().take(200).collect::<String>()),
+                        Some(Ok(_)) if said.is_none() => Value::from("getblockstats gave no subsidy"),
+                        _ => Value::Null,
+                    };
+                    json!({"reachable": true, "chain": self.chain, "height": height, "headers": i.get("headers"), "difficulty": i.get("difficulty"),
+                           "tipTime": i.get("time"), "syncing": i.get("initialblockdownload"), "subsidySats": subsidy, "subsidyFrom": from,
+                           "subsidyError": why})
+                }
+                Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
+            },
             "channels" => {
                 // `channels` lists what an earlier version's on-chain channel book holds; this version adds none
                 let mut out = json!({"channels": self.legacy_channels.public(), "legacy_channels": self.legacy_channels.notice(), "height": self.height_safe()});
@@ -491,7 +618,15 @@ impl Signer {
                 sanitize(with(self.hot.status(), json!({"noticed": n})))
             }
             // takes the spend lock itself, and only for each lock and release, where an answer may be long (crate::ticket_pay)
-            "xbt402_pay" => sanitize(self.xbt402_pay(p)),
+            "xbt402_pay" => sanitize(self.xbt402_pay(p, caller)),
+            // the sellers this wallet stays anonymous at (docs/BUYER-ACCOUNTS.md)
+            // `damaged`: the choices file is there and cannot be read, and the wallet stays anonymous everywhere until it is mended
+            // `here`: with `origin`, whether the owner's choice covers that shop, under this address or another of the same seller
+            "identity_get" => {
+                let here = p.get("origin").and_then(Value::as_str).map(|o| self.anonymous_listed(o, None));
+                sanitize(json!({"ok": true, "anonymous": self.anonymous_origins(), "damaged": self.identity_damaged(), "here": here}))
+            }
+            "identity_set" => sanitize(self.identity_set(p)),
             // AGP-048 rail=ln
             "ln_pay" => {
                 let _g = self.lock();
@@ -521,6 +656,8 @@ impl Signer {
             }
             // takes the spend lock itself, and not while the seller is asked to cancel
             "ticket_stop" => sanitize(self.ticket_stop_by(p)),
+            // the sellers caught charging more than the wallet could account for (lifting a block is signed: admin)
+            "seller_blocks" => sanitize(json!({"ok": true, "blocked": self.seller_blocks.list()})),
             "ticket_status" => {
                 let _g = self.lock();
                 sanitize(self.ticket_status_locked(p))

@@ -77,7 +77,14 @@ pub struct Session {
 
 pub struct Server {
     pub wallet: Arc<Wallet>,
+    /// Paying calls in progress ([`PAYING_MOST`]).
+    paying: std::sync::atomic::AtomicUsize,
 }
+
+/// The most paying calls (`xbt402_pay`, `ln_pay`) in progress at once: two fewer than the HTTP transport's workers,
+/// so that however long they wait for the signer, a `ticket_stop` (or a status) always finds one. Past it a paying
+/// call is refused at once, and may be made again.
+pub const PAYING_MOST: usize = crate::transport::HTTP_WORKERS - 2;
 
 fn ok(id: &Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
@@ -98,7 +105,7 @@ fn tool_error(text: String) -> Value {
 
 impl Server {
     pub fn new(wallet: Arc<Wallet>) -> Self {
-        Self { wallet }
+        Self { wallet, paying: std::sync::atomic::AtomicUsize::new(0) }
     }
 
     /// Whether `msg` is a request that may take long (a tool call): transports run those off the
@@ -188,6 +195,23 @@ impl Server {
         let params = match args::validate_for(name, args, self.wallet.ticket_tools) {
             Ok(p) => p,
             Err(e) => return tool_error(format!("Error executing tool {name}: {e}")),
+        };
+        // a paying call takes one of the places for paying calls, for as long as it lasts
+        struct Place<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Place<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _place = if matches!(name, "xbt402_pay" | "ln_pay") {
+            if self.paying.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= PAYING_MOST {
+                self.paying.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return tool_error(format!("Error executing tool {name}: {PAYING_MOST} paying calls are in progress, the most at once: nothing was \
+                                           sent; call again when one has ended"));
+            }
+            Some(Place(&self.paying))
+        } else {
+            None
         };
         match self.wallet.call_tool(name, params) {
             Ok(text) => json!({"content": [{"type": "text", "text": text}], "structuredContent": {"result": text}, "isError": false}),

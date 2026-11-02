@@ -79,11 +79,11 @@ fn by_seller(all: &[Service]) -> Vec<(String, Vec<&Service>)> {
 impl App {
     pub(crate) fn services_page(&self, ctx: &Ctx) -> Resp {
         let mut b = String::from("<p class=\"lead\">Add a seller to see what they offer on <a href=\"./browse\">Browse</a>. \
-            Paste the address the seller gave you. The app checks that the list really comes from that seller.</p>");
+            Paste what the seller gave you: a web address, or a shop key that starts with npub. The app checks that the list really comes from that seller.</p>");
         let all = self.file_services();
         b.push_str(&format!("<form method=\"post\" action=\"./services\" class=\"card primary add\">{}<input type=\"hidden\" name=\"action\" value=\"add\">\
-            <label>Seller's address<input name=\"url\" type=\"url\" inputmode=\"url\" required placeholder=\"https://seller.example\" \
-            pattern=\"https?://.+\" title=\"Paste the seller's web address, starting with https://\" autocomplete=\"off\"></label>\
+            <label>Seller's address or shop key<input name=\"url\" type=\"text\" inputmode=\"url\" required placeholder=\"https://seller.example or npub1…\" \
+            pattern=\"(https?://|npub1|nostr:).+\" title=\"Paste the seller's web address (https://…) or shop key (npub1…)\" autocomplete=\"off\" spellcheck=\"false\"></label>\
             <button>Add seller</button></form>{}", App::csrf_input(ctx), self.suggested(ctx, all.as_deref().unwrap_or(&[]))));
         match all {
             Err(e) => b.push_str(&App::error_box(&format!("The list of sellers could not be read: {e}"))),
@@ -91,12 +91,19 @@ impl App {
             Ok(all) => {
                 b.push_str("<h2>Your sellers</h2>");
                 for (origin, list) in by_seller(&all) {
-                    b.push_str(&format!("<section class=\"card seller\"><h3>{}</h3><p class=\"small\">{}</p><ul class=\"offers\">",
-                                        esc(&list[0].name), esc(&origin)));
+                    let shown = if xbt402::shop::is_shop(&origin) {
+                        format!("Shop key <code class=\"key\">{}</code> <span class=\"pill\">Direct link</span>", esc(&xbt402::shop::display(&origin)))
+                    } else {
+                        esc(&origin)
+                    };
+                    // a shop known by its key can be linked to on this page, by that key
+                    let anchor = if xbt402::shop::is_shop(&origin) { format!(" id=\"key-{}\"", esc(&xbt402::shop::display(&origin))) } else { String::new() };
+                    b.push_str(&format!("<section class=\"card seller\"{anchor}><h3>{}</h3><p class=\"small\">{shown}</p><ul class=\"offers\">",
+                                        esc(&list[0].name)));
                     for s in &list {
                         let n = s.items.len();
                         b.push_str(&format!("<li><span class=\"pill cat-{}\">{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
-                                            s.kind.category(), esc(s.kind.category_words()), esc(&s.name), esc(&s.price_text),
+                                            s.category(), esc(s.category_words()), esc(&s.name), esc(&s.price_text),
                                             if n > 0 { format!(" <span class=\"small\">{n} to choose from</span>") } else { String::new() }));
                     }
                     b.push_str("</ul>");
@@ -123,7 +130,11 @@ impl App {
     }
 
     pub(crate) fn services_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
-        let url = f.get("url").map(|s| s.trim().trim_end_matches('/').to_string()).unwrap_or_default();
+        let typed = f.get("url").map(|s| s.trim().trim_end_matches('/').to_string()).unwrap_or_default();
+        let Some(url) = xbt402::shop::parse(&typed) else {
+            self.flash(ctx, false, "That shop key is not a valid one. Check it: a shop key starts with npub1, and one wrong letter makes it invalid.");
+            return Resp::redirect("./services");
+        };
         let result = match f.get("action").map(String::as_str) {
             Some("add") | Some("refresh") => self.add_seller(&url, get_page),
             Some("remove") => self.remove_seller(&url),
@@ -142,6 +153,10 @@ impl App {
 
     /// Fetch and check `url`'s listing, and put its services in place of the seller's old ones.
     pub fn add_seller(&self, url: &str, get: impl FnMut(&str) -> Result<xbt402::listing::Page, String>) -> Result<String, String> {
+        if let Some(pk) = xbt402::shop::key_of(url) {
+            let found = self.nostr.find_shop(&pk).map_err(|e| format!("That shop could not be found: {e}"))?;
+            return self.add_shop(found);
+        }
         if services::http_origin(url).is_none() {
             return Err("That is not a web address. Paste the seller's address, starting with https://".into());
         }
@@ -153,6 +168,28 @@ impl App {
         let n = new.len();
         all.extend(new);
         services::save(&self.cfg.services_path(), &all)?;
+        self.ai_sellers_follow(&listing.seller);
+        let allowed = self.seller_allowed(&listing.seller);
+        Ok(format!("{} {}: {n} service{} on Browse now.{}", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" },
+                   if allowed { "" } else { " To let the app pay this seller, press \"Allow this seller to be paid\" below." }))
+    }
+
+    /// Put a shop without a web address in the list, from its checked Nostr listing, and keep how to
+    /// reach it. Its listing came from the key in its name ([`crate::nostr::shop_listing`]), so it is
+    /// the shop's own.
+    pub fn add_shop(&self, found: xbt_nostr::market::NostrListing) -> Result<String, String> {
+        let listing = found.listing;
+        let new = services::from_listing(&listing);
+        let mut all = self.file_services().unwrap_or_default();
+        let had = all.iter().any(|s| services::same_origin(&s.seller, &listing.seller));
+        all.retain(|s| !services::same_origin(&s.seller, &listing.seller));
+        let n = new.len();
+        all.extend(new);
+        let mut shops = crate::shops::load(&self.cfg.shops_path())?;
+        shops.insert(listing.seller.clone(), crate::shops::Shop { receipt_key: listing.receipt_key.clone(), transport: found.transport });
+        crate::shops::save(&self.cfg.shops_path(), &shops)?;
+        services::save(&self.cfg.services_path(), &all)?;
+        self.ai_sellers_follow(&listing.seller);
         let allowed = self.seller_allowed(&listing.seller);
         Ok(format!("{} {}: {n} service{} on Browse now.{}", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" },
                    if allowed { "" } else { " To let the app pay this seller, press \"Allow this seller to be paid\" below." }))
@@ -173,6 +210,13 @@ impl App {
     /// its own 402 terms, at its priced items first.
     pub fn allow_link(&self, url: &str, get: impl FnMut(&str) -> Result<xbt402::listing::Page, String>) -> Result<String, String> {
         let origin = services::http_origin(url).ok_or("That is not a web address.")?;
+        if xbt402::shop::is_shop(&origin) {
+            let shops = crate::shops::load(&self.cfg.shops_path())?;
+            let shop = shops.get(&origin).ok_or("Add this shop again: the app has not kept how to reach it.")?;
+            let node = crate::shops::node(shop, &origin, xbt_nostr::now())
+                .ok_or("This seller could not be allowed: its listing names no direct link that its Lightning node vouches for now. Press Check for updates, or ask the seller.")?;
+            return Ok(format!("./policy?allow={}&node={}", services::urlenc(&origin), node));
+        }
         // the seller's priced places: each service's address, then a priced item of each, on the seller's own
         // address (a seller that moved may still list items at its old one, which answers the same). The bare
         // address last: a shop need not price its front page
@@ -198,6 +242,7 @@ impl App {
             return Err("That seller is not in the list.".into());
         }
         services::save(&self.cfg.services_path(), &all)?;
+        self.ai_sellers_follow(url);
         Ok("Seller removed. Their services are no longer on Browse.".into())
     }
 }

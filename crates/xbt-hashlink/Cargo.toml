@@ -1,11 +1,16 @@
 [package]
 name = "xbt-hashlink"
-description = "p2p-hash: rented hashrate over Lightning Stream. The hashrate link (BOLT 8 Noise_XK between the hashmaker's app and the hashtaker's app), the hashmaker's Stratum V1 endpoint for its miners, the hashtaker's Stratum V1 client to its own DATUM Gateway, the work meter and per-slice ticket releases"
+description = "p2p-hash: rented hashrate over Lightning Stream. The hashrate link (BOLT 8 Noise_XK between the hashmaker's app and the hashtaker's app, carried over iroh or plain TCP), the hashmaker's Stratum V1 endpoint for its miners, the hashtaker's Stratum V1 client to its own DATUM Gateway, the work meter and per-slice ticket releases"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[features]
+# --allow-unblinded on the command line, for test builds against stand-in pools that have no gateway to open
+# their jobs. Never in a release build: no rental runs unmasked (Mike), and the images are built without it.
+test-unblinded = []
 
 [dependencies]
 # BOLT 8: secp256k1 ECDH, SHA-256, HKDF (HMAC-SHA256), ChaCha20-Poly1305. All already in the tree
@@ -19,8 +24,17 @@ getrandom = "0.2"
 base64.workspace = true
 # the hashrate listing on Nostr (NIP-99), and the stand-in relay for the lab
 xbt-nostr.workspace = true
+# the hashrate link over iroh: no port forward, through our relay or directly (the link's own Noise
+# handshake runs inside it, unchanged)
+xbt-iroh-link = { path = "../xbt-iroh-link" }
 # the stand-in pool's and miner's share hash (lab only)
 blake2.workspace = true
+# a stand-in miner connecting from an address of its own, as miners on a LAN do (lab only; already in the tree)
+socket2 = "0.6"
+
+[dev-dependencies]
+# the chain's own header code, to test the share check against
+xbt-primitives.workspace = true
 
 [[bin]]
 name = "xbt-hashlink"

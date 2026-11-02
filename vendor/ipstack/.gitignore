@@ -1,0 +1,13 @@
+/bench_results
+.env
+.vscode/
+.VSCodeCounter/
+/target/
+Cargo.lock
+.DS_Store
+.AppleDouble
+**/*.rs.bk
+flamegraph.html
+flamegraph.svg
+perf.data
+perf.data.old

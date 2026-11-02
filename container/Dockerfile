@@ -1,7 +1,8 @@
 # The images, one per service, FROM scratch (docs/CONTAINER.md): the signer, the anchor witness, the MCP
 # server, the wallet UI, xbt-init (the one-shot that fixes a bind mount's owners before the services
 # start), xbt-work-relay (the blinded receipt relay of pay-with-work), xbt-gateway (the seller gateway),
-# lightning-stream (the connector) and xbt-hashlink (p2p-hash).
+# lightning-stream (the connector), xbt-hashlink (p2p-hash) and xbt-datum-gateway (the Stream Gateway,
+# DATUM-compatible: the renter's own masking gateway, a C program; scripts/datum_gateway_build.sh).
 # Built by scripts/oci_build.sh with docker buildx for linux/amd64, linux/arm64 and linux/arm/v7 from the
 # static musl binaries it stages under bin/<arch>/. There is no RUN, so no emulator is needed.
 # Layer 1 (base.tar: passwd/group, /tmp, the /data skeleton with each component's owner) is byte-identical
@@ -119,6 +120,52 @@ ENTRYPOINT ["/usr/bin/xbt-init"]
 CMD ["init"]
 HEALTHCHECK NONE
 
+# The VPN service (docs/VPN-EXITS.md): the WireGuard endpoint the owner's devices pair with, and this
+# box's exit if the owner offers one. Userspace WireGuard and a userspace TCP/IP stack: no TUN device,
+# no extra capabilities. It reads the devices and exit the UI's VPN pages write and writes its status
+# for them.
+FROM base AS xbt-vpn
+ARG TARGETARCH
+ARG TARGETVARIANT
+# the binary and the country table exits' regions are checked against, shipped so a box needs no
+# download (CC BY 4.0), in one layer: a root scripts/oci_build.sh stages with its modes (binary 0555,
+# table 0444, its folder 0555)
+COPY bin/${TARGETARCH}${TARGETVARIANT}/xbt-vpn.root/ /
+USER xbt-vpn
+ENV XBT_VPN_DIR=/data/run/vpn XBT_VPN_STATUS=/data/run/vpn-status XBT_VPN_KEYS=/data/vpn XBT_VPN_WG_LISTEN=0.0.0.0:51820 XBT_VPN_TUNNEL_LISTEN=0.0.0.0:51880 RUST_LOG=warn NO_COLOR=1
+ENTRYPOINT ["/usr/bin/xbt-vpn", "serve"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-vpn", "healthcheck"]
+
+# The Stream Gateway (DATUM-compatible): CONVOY's datum_gateway with Lightning Stream's masking
+# (third_party/datum_gateway), the renter's own gateway. Every job is masked with a fresh key it holds, and
+# its loopback API opens each job, without the key, at /xbt/job for the renter's check. Run it in the
+# renter's network namespace (or on the host's loopback): the API and Stratum listen on 127.0.0.1 only. It
+# starts once the UI writes /data/run/datum/config.json (mode, payout address, pool), and again when that
+# or the node's RPC cookie (written by init) changes. Until then it waits, and that is healthy. One layer:
+# the binary, xbt-supervise, and the gateway's notice and its libraries' licences (scripts/oci_build.sh
+# stages that root with its modes). Blocks it submits are kept in /data/datum/submitblocks.
+FROM base AS xbt-datum-gateway
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY bin/${TARGETARCH}${TARGETVARIANT}/xbt-datum-gateway.root/ /
+USER xbt-datum
+ENTRYPOINT ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--", \
+            "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:7152/", "--waiting-for", "/data/run/datum/config.json"]
+
 # `--build-arg IMAGE=<name>` without `--target` builds that one image (the ARG is at the top): for a
 # builder with no target option. scripts/oci_build.sh uses --target.
 FROM ${IMAGE} AS selected
+
+# The built-in Stream relay (docs/RUN-A-RELAY.md): off until the owner switches it on in the app, then
+# iroh-relay's server behind a pre-flight check. Unprivileged: the package maps the public port 443
+# to 8443 here.
+FROM base AS xbt-stream-relay
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-stream-relay /usr/bin/xbt-stream-relay
+USER xbt-stream-relay
+ENV XBT_RELAY_LISTEN=0.0.0.0:8443 XBT_RELAY_QUIC_LISTEN=0.0.0.0:7842 RUST_LOG=warn,[conn]=off NO_COLOR=1
+ENTRYPOINT ["/usr/bin/xbt-stream-relay"]
+# alive when its loop rewrote its status file within 2 minutes (it does every 5 s, on or off)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 CMD ["/usr/bin/xbt-stream-relay", "healthcheck"]

@@ -76,7 +76,16 @@ impl Drawer {
     }
 
     fn open_sized(rig: &Rig, tag: u8, win_msat: Option<&str>) -> Self {
-        let got = Self::open_raw(rig, &json!({"version": "lottery/0", "winMsat": win_msat}));
+        Self::open_body(rig, tag, &json!({"version": "lottery/0", "winMsat": win_msat}))
+    }
+
+    /// A buyer that says it asks for a failed win's invoice to be cancelled (a wallet from 0.2.0).
+    fn open_cancelling(rig: &Rig, tag: u8) -> Self {
+        Self::open_body(rig, tag, &json!({"version": "lottery/0", "canCancel": true}))
+    }
+
+    fn open_body(rig: &Rig, tag: u8, body: &Value) -> Self {
+        let got = Self::open_raw(rig, body);
         assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
         let j = got.json();
         let session = j["session"].as_str().unwrap().to_string();
@@ -316,7 +325,12 @@ fn a_page_is_paid_by_draws_and_a_win_is_paid_when_the_node_says_so() {
 
 #[test]
 fn a_body_priced_per_byte_is_cut_into_pieces_that_are_each_a_draw() {
-    let (rig, _d) = start(&lottery);
+    // about drawing piece by piece, not about the wait for a draw running out: a slow box's draw took longer than the
+    // rig's 300 ms and the body was cut (shipped: 15 s)
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["times"]["refill_wait_ms"] = json!(5_000);
+    });
     let mut b = Drawer::open(&rig, 2);
     // 10 pieces and 100 bytes: 10 full pieces of 1,000 msat and a last one of 2 msat
     let size = 10 * PIECE as usize + 100;
@@ -621,6 +635,33 @@ fn sessions_are_capped_a_wrong_size_is_refused_and_a_session_outlives_the_gatewa
     assert_eq!((got.status, got.error().as_str()), (402, "session_unknown"));
     assert!(got.header("PAYMENT-RESPONSE").is_none(), "a forgotten session has no totals to sign");
     assert_eq!(rig.gw.stats().held_tickets, 0);
+}
+
+/// A route that gives each buyer an account (docs/BUYER-ACCOUNTS.md) is paid with tickets only:
+/// the draws path serves no buyer as its account, so a draw there would be served as nobody. Not in
+/// its 402, not in the list of what is sold, and a buyer that names the lottery for it all the same
+/// is refused before the service is asked.
+#[test]
+fn a_route_with_accounts_is_not_drawn_for() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["routes"].as_array_mut().unwrap().push(json!({"path": "/acct/", "price": {"request_msat": 2500},
+                                                        "accounts": {"kind": "hook", "command": "/bin/true"}}));
+    });
+    // the same price as /api, which is drawn for: tickets only on the route with accounts
+    let api = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert_eq!(api["accepts"].as_array().unwrap().last().unwrap()["scheme"], "lottery", "{api}");
+    let j = http(&rig.addr, "GET", "/acct/x", &[], b"", None).json();
+    assert!(j["accepts"].as_array().unwrap().iter().all(|a| a["scheme"] == "ticket"), "{j}");
+    let s = http(&rig.addr, "GET", "/services", &[], b"", None).json();
+    let by = |p: &str| s["routes"].as_array().unwrap().iter().find(|r| r["path"] == p).unwrap()["lottery"].clone();
+    assert_eq!((by("/api"), by("/acct/")), (json!(true), json!(false)));
+    // a buyer that reads no 402 and names the lottery for it: refused, signed, nothing charged, the service not asked
+    let mut b = Drawer::open(&rig, 40);
+    let (_, got) = b.get("/acct/x");
+    assert_eq!(got.status, 402, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(receipt_of(&got, &b.receipt_key)["charged"], "0");
+    assert_eq!(rig.hits(), 0);
 }
 
 #[test]
@@ -1101,3 +1142,173 @@ fn a_win_paid_by_offer_with_its_own_note_is_paid_once_and_its_invoice_cancelled(
     assert_eq!(st["session"]["paidMsat"].as_str(), Some(b.win_msat.to_string().as_str()));
     assert_eq!(rig.gw.stats().prepaid_tickets, 0);
 }
+
+#[test]
+fn the_operators_view_answers_the_app_in_another_container_by_its_token_only() {
+    // Umbrel's and StartOS's apps reach the gateway over their private network, never its loopback:
+    // the token the app wrote into the gateway's config is what lets it read the operator's view
+    const TOKEN: &str = "app-health-token-0123456789abcdefghijklmnop";
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["http"] = json!({"forwarded_address": {"header": "X-Real-IP", "proxies": ["127.0.0.1"]}});
+        v["health_token"] = json!(TOKEN);
+    });
+    let health = |headers: &[(&str, &str)]| http(&rig.addr, "GET", "/x402/ticket/health", headers, b"", None).status;
+    let elsewhere = ("X-Real-IP", "10.21.0.4");
+    assert_eq!(health(&[elsewhere]), 404, "another container without the token");
+    assert_eq!(health(&[elsewhere, ("X-Xbt402-Health-Token", "app-health-token-0123456789abcdefghijklmnoX")]), 404, "a wrong token");
+    assert_eq!(health(&[elsewhere, ("X-Xbt402-Health-Token", TOKEN)]), 200, "the app's token");
+    assert_eq!(health(&[("X-Real-IP", "127.0.0.1")]), 200, "this machine, as before");
+}
+
+/// A session with an unpaid win: the session, the answer that lists it, and its draw and invoice.
+fn with_a_win(rig: &Rig, tag: u8) -> (Drawer, u64, Hash) {
+    win_in(Drawer::open(rig, tag))
+}
+
+fn win_in(mut b: Drawer) -> (Drawer, u64, Hash) {
+    loop {
+        let (seq, got) = b.get("/api");
+        assert_eq!(got.status, 200);
+        let p = b.piece(seq, "/api", Kind::Request, 0, 2500);
+        let j = b.draw(&[p]);
+        if !b.owed.is_empty() {
+            let draw = b.owed[0];
+            let hash = b.invoice_hash(&j, draw);
+            return (b, draw, hash);
+        }
+    }
+}
+
+fn ask_cancel(b: &mut Drawer, draw: u64, hash: &Hash) -> Value {
+    let got = b.call("cancel", &json!({"draw": draw, "hash": hex::encode(hash)}));
+    assert_eq!(got.status, 200, "{}", got.json());
+    got.json()
+}
+
+/// A buyer that says at the open that it asks for cancels gets win invoices of `invoice_secs_cancel` (180 s as
+/// shipped), past the grace; one that says nothing (a wallet before 0.2.0) keeps the grace's. A failed win on a long
+/// invoice is cancelled and its next invoice comes at once, the grace unchanged.
+///
+/// FAILS with the long invoice for every buyer (an old wallet waits out a failed win's invoice past the grace, and is
+/// refused `win_unpaid` meanwhile), or for none (the queue lapses a new wallet's invoices).
+#[test]
+fn a_buyer_that_can_cancel_gets_long_win_invoices_and_one_that_cannot_keeps_the_graces() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["grace_seconds"] = json!(20);
+    });
+    let (_old, _, old_first) = with_a_win(&rig, 80);
+    assert_eq!(rig.node.expiry_of(&old_first), Some(20), "an old wallet's invoice lives as long as the grace");
+    let (mut b, draw, first) = win_in(Drawer::open_cancelling(&rig, 81));
+    assert_eq!(rig.node.expiry_of(&first), Some(180), "a wallet that can cancel: 180 s, past the grace of 20");
+    // its payment fails: it asks for the cancel, and the next invoice comes at once, as long
+    let j = ask_cancel(&mut b, draw, &first);
+    assert_eq!(j["cancelled"], true, "{j}");
+    let next = Drawer::hash_in(&j, draw);
+    assert!(next != first && rig.node.state_of(&next) == Some(InvoiceState::Open));
+    assert_eq!(rig.node.expiry_of(&next), Some(180));
+    assert!(rig.node.pay(&next));
+    assert_eq!(b.get("/api").1.status, 200);
+}
+
+/// The buyer's payment failed, and it asks for the invoice to be cancelled: the node's next invoice comes in
+/// the answer. The win's grace still runs from its draw: a cancel buys no time.
+#[test]
+fn a_cancelled_invoice_is_replaced_at_once_and_buys_no_time() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["grace_seconds"] = json!(20);
+    });
+    let (mut b, draw, first) = with_a_win(&rig, 70);
+    let j = ask_cancel(&mut b, draw, &first);
+    assert_eq!(j["cancelled"], true, "{j}");
+    assert_eq!(rig.node.state_of(&first), Some(InvoiceState::Canceled));
+    let next = Drawer::hash_in(&j, draw);
+    assert!(next != first && rig.node.state_of(&next) == Some(InvoiceState::Open));
+    // the grace is what it was
+    rig.advance(21);
+    let (_, got) = b.get("/api");
+    assert_eq!((got.status, got.error().as_str()), (402, "win_unpaid"), "a cancel moved the grace");
+    assert!(rig.node.pay(&next));
+    assert_eq!(b.get("/api").1.status, 200);
+}
+
+/// Only the session's own unpaid win's current invoice is cancelled, and only by the session's key.
+///
+/// FAILS with the buyer's word taken for which invoice: another's is cancelled.
+#[test]
+fn a_cancel_reaches_only_the_sessions_own_current_invoice() {
+    let (rig, _d) = start(&lottery);
+    let (mut a, _, a_hash) = with_a_win(&rig, 71);
+    let (mut b, b_draw, b_hash) = with_a_win(&rig, 72);
+    // no signature
+    let body = json!({"draw": b_draw, "hash": hex::encode(b_hash)}).to_string();
+    assert_eq!(http(&rig.addr, "POST", "/x402/lottery/cancel", &[], body.as_bytes(), None).status, 401);
+    // another session's invoice, by its draw and its hash
+    assert_eq!(ask_cancel(&mut a, b_draw, &b_hash)["cancelled"], false);
+    assert_eq!(rig.node.state_of(&b_hash), Some(InvoiceState::Open));
+    // an invoice that is not a win's, a draw that did not win, a body that names nothing
+    assert_eq!(ask_cancel(&mut a, 999_999, &a_hash)["cancelled"], false);
+    assert_eq!(rig.node.state_of(&a_hash), Some(InvoiceState::Open));
+    assert_eq!(a.call("cancel", &json!({})).json()["cancelled"], false);
+    // its own, replaced: the old one asks for nothing
+    let replaced = ask_cancel(&mut b, b_draw, &b_hash);
+    assert_eq!(replaced["cancelled"], true);
+    let next = Drawer::hash_in(&replaced, b_draw);
+    assert_eq!(ask_cancel(&mut b, b_draw, &b_hash)["cancelled"], false);
+    assert_eq!(rig.node.state_of(&next), Some(InvoiceState::Open));
+}
+
+/// A cancel that races a payment really on its way. Settled first: the win is paid, once, and no invoice is
+/// made. Cancelled first: the node refuses the late payment, nothing is paid for it, and the next invoice
+/// pays the win, once.
+///
+/// FAILS with the buyer's word taken over the node's: a settled win gets a second invoice.
+#[test]
+fn a_cancel_that_races_a_payment_leaves_each_win_paid_once() {
+    let (rig, _d) = start(&lottery);
+    let wins_paid = |rig: &Rig| http(&rig.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "127.0.0.1")], b"", None).json()["lottery"]["paidWins"].as_u64();
+    // the payment arrives first, with a node that says yes to a cancel of what it has settled
+    let (mut b, draw, first) = with_a_win(&rig, 73);
+    rig.node.cancel_answers_yes_for_settled();
+    assert!(rig.node.pay(&first));
+    let j = ask_cancel(&mut b, draw, &first);
+    assert_eq!(j["cancelled"], false, "{j}");
+    assert_eq!(rig.node.state_of(&first), Some(InvoiceState::Settled));
+    assert!(!j["wins"].as_array().unwrap().iter().any(|w| w["draw"].as_u64() == Some(draw)), "paid, and no next invoice: {j}");
+    assert_eq!(wins_paid(&rig), Some(1));
+    // the cancel arrives first
+    let (mut c, draw, first) = with_a_win(&rig, 74);
+    let j = ask_cancel(&mut c, draw, &first);
+    assert_eq!(j["cancelled"], true, "{j}");
+    assert!(!rig.node.pay(&first), "the node refuses the late payment");
+    let next = Drawer::hash_in(&j, draw);
+    assert_eq!(wins_paid(&rig), Some(1));
+    assert!(rig.node.pay(&next));
+    rig.gw.tick();
+    assert_eq!(wins_paid(&rig), Some(2));
+}
+
+/// A buyer cannot have a seller make invoices without limit: past `max_win_cancels` the session is told so, its
+/// invoice stands, and it lapses as any invoice does.
+///
+/// FAILS with no cap: an invoice from the node at every ask.
+#[test]
+fn a_session_may_have_only_so_many_invoices_cancelled() {
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["max_win_cancels"] = json!(2);
+    });
+    let (mut b, draw, mut hash) = with_a_win(&rig, 75);
+    for _ in 0..2 {
+        let j = ask_cancel(&mut b, draw, &hash);
+        assert_eq!(j["cancelled"], true, "{j}");
+        hash = Drawer::hash_in(&j, draw);
+    }
+    let j = ask_cancel(&mut b, draw, &hash);
+    assert_eq!((j["cancelled"].as_bool(), j["refused"].as_str()), (Some(false), Some("too_many_cancels")), "{j}");
+    assert_eq!(rig.node.state_of(&hash), Some(InvoiceState::Open));
+    assert_eq!(Drawer::hash_in(&j, draw), hash, "no invoice was made for it");
+}
+

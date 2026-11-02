@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt-signer", "crates/xbt-wallet-mcp", "crates/xbt-svc", "crates/xbt-wallet-ui", "crates/xbt-work", "crates/xbt-work-relay", "crates/xbt-gateway", "crates/lightning-stream", "crates/xbt-nwc", "crates/xbt-nostr", "crates/xbt-hashlink"]
+members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt-signer", "crates/xbt-wallet-mcp", "crates/xbt-svc", "crates/xbt-wallet-ui", "crates/xbt-work", "crates/xbt-work-relay", "crates/xbt-gateway", "crates/lightning-stream", "crates/xbt-nwc", "crates/xbt-nostr", "crates/xbt-hashlink", "crates/xbt-iroh-link", "crates/xbt-stream-relay", "crates/xbt-vpn"]
 # ureq 2.12.1 with one patch (a chunked body cut short is an error): see vendor/ureq/XBT-PATCH.md
 exclude = ["vendor"]
 
@@ -40,6 +40,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
+# the hashrate lab's stand-in miners and pools hash with BLAKE2b; unoptimised, dozens of them starve a
+# test machine's CPU and a load test measures that instead of the hashmaker
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 opt-level = 3
@@ -63,3 +67,7 @@ panic = "abort"
 
 [patch.crates-io]
 ureq = { path = "vendor/ureq" }
+# iroh 1.4.1 with one patch (a preferred home relay): see vendor/iroh/XBT-PATCH.md
+iroh = { path = "vendor/iroh" }
+# ipstack 1.0.1 with one fix (a closed write half sends its FIN once the data in flight is acknowledged): see vendor/ipstack/XBT-PATCH.md
+ipstack = { path = "vendor/ipstack" }

@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.19"
+version: "0.2.0"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -12,18 +12,21 @@ description: >-
   service that can spend.
 
 
-  Setup takes a few minutes and no keys to copy. The app connects to this box's Lightning node by
-  itself: a one-shot service asks the node to make the app's own narrow keys (it can pay only within
-  your spending rules, and the selling side can only ask for payments), each revocable alone in the
-  node's app. You open the app from your Umbrel dashboard and log in with the app password Umbrel
+  Setup takes a few minutes and no keys to copy. Create your Lightning wallet in Lightning Fork first;
+  Lightning Stream picks it up automatically, also when you make the wallet after installing it, with no
+  restart. A one-shot service asks the node to make the app's own narrow keys (it can pay only within
+  your spending rules, and the selling side can only ask for payments or vouch for its own link), each
+  revocable alone in the node's app. You open the app from your Umbrel dashboard and log in with the app password Umbrel
   shows for it (its default credentials). Then make your approval
   key in the browser (download its backup), confirm that the app pays with real money, and sign the
   starter spending rules.
 
 
-  To sell, open Sell: name your shop, say where buyers find you (an https address; the page explains
-  Cloudflare Tunnel, another tunnel app or your own proxy), and add each service you sell: the page lists
-  media servers and AI models it finds on this box. To buy, add a seller on Services and allow it to be
+  To sell, open Sell: name your shop and add each service you sell: a web app such as Jellyfin (each
+  buyer gets an account of their own), a folder of files from Umbrel's Downloads (read only), an AI
+  model, a VPN exit from your own connection, or your miners' hashrate. Buyers reach your shop by its key
+  over an encrypted link, with no domain or port forward; an https address (Cloudflare Tunnel or your own
+  proxy) is optional. To buy, add a seller on Services and allow it to be
   paid with one signature. Agents on the LAN use port 33511, with the bearer token from the Agents page.
 
 
@@ -50,6 +53,14 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.2.0, a public test release: hashrate rentals with masked jobs, through the Stream Gateway
+  (DATUM-compatible) that now comes with the app, so rented miners can't see a winning block and can't
+  withhold it; solo, or on Lazarus Pool. Every rental is checked masked job by job or refused. Sell your
+  own web apps (for example Jellyfin's full interface, up to 4K) and a folder of files; the built-in
+  player is gone. Shops can be reached by their key alone over an encrypted link, through a relay where
+  needed, with no domain. VPN exits, paid by the GB as you use them. Your wallet pays a shop no more than
+  its listing shows, blocks one caught over-charging, and caps each shop per day. Fixes for slow routes,
+  channel drops and long downloads. Paid relays come in an update.
   0.1.19: a session busy spending its credit stays open, so long films and rentals no longer strand
   credit. New: a local AI address (Services, AI) any AI app can use, paid per token. Hashrate rentals
   survive a short break in the link. A new, calmer look.
@@ -139,6 +150,9 @@ dependencies:
   # which is in its author's community store: umbrelOS resolves dependencies by installed app id
   - bitcoin
   - paulscode-lightning-fork
+# Files reads a folder the owner picks under Umbrel's shared Downloads, read-only
+permissions:
+  - STORAGE_DOWNLOADS
 path: ""
 defaultUsername: ""
 deterministicPassword: true

@@ -15,7 +15,7 @@
 //! wallet ties the seller's origin to a node it trusts), or that the hashrate is real (the meter
 //! pays only for accepted work).
 
-use crate::msg::Terms;
+use crate::msg::{Terms, PROOF};
 use secp256k1::ecdsa::Signature;
 use secp256k1::{Message, PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -33,6 +33,10 @@ pub const VERSION: &str = "hashrate/0";
 const BIND: &str = "xbt-hashlink/nostr-bind/0";
 /// An event dated further ahead than this is refused.
 const MAX_AHEAD_S: u64 = 600;
+/// A listing older than this is refused: its hashmaker publishes again well within it while it is there
+/// (every few hours at the least), so one this old is from a hashmaker that has gone. Its event also says so to
+/// other clients (NIP-40 `expiration`).
+pub const MAX_AGE_S: u64 = 48 * 3600;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hashrate {
@@ -41,16 +45,45 @@ pub struct Hashrate {
     pub algorithm: String,
     /// Hashrate on offer, hashes a second.
     pub hashrate_hs: u64,
-    /// Where the hashmaker's link answers, and its static key.
+    /// Where the hashmaker's link answers over plain TCP (a forwarded port), and its static key. Empty
+    /// when the link is reached over iroh only.
     pub link_addr: String,
     pub link_key: PublicKey,
+    /// Where the link answers over iroh: no port forward needed. The Noise handshake with
+    /// `link_key` runs inside it as over TCP, so this needs no proof of its own.
+    pub iroh: Option<IrohLink>,
     /// Where finished slices are paid (the hashmaker's gateway route), and the node its tickets pay.
     pub pay_url: String,
     pub pay_node: String,
     pub terms: Terms,
+    /// How its shares are proven ([`PROOF`]). None: a listing from before shares were proven.
+    pub proof: Option<String>,
     /// Miners behind the hashmaker's app, and how many of them (with how much hashrate) are free to
     /// rent now. A rental takes whole miners. Zero miners: the listing does not say.
     pub capacity: Capacity,
+}
+
+/// A hashmaker's iroh link: its key (hex, 32 bytes) and where it can be found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IrohLink {
+    pub id: String,
+    pub relays: Vec<String>,
+    pub direct: Vec<String>,
+}
+
+impl IrohLink {
+    fn to_json(&self) -> Value {
+        json!({"id": self.id, "relays": self.relays, "direct": self.direct})
+    }
+
+    fn from_json(v: &Value) -> Option<IrohLink> {
+        let id = v.get("id")?.as_str()?.to_ascii_lowercase();
+        if hex::decode(&id).ok()?.len() != 32 {
+            return None;
+        }
+        let list = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+        Some(IrohLink { id, relays: list("relays"), direct: list("direct") })
+    }
 }
 
 /// What a hashmaker has, and what of it is free, as the listing says when it was published.
@@ -73,9 +106,13 @@ impl Hashrate {
     pub fn to_json(&self) -> Value {
         json!({
             "version": VERSION, "name": self.name, "algorithm": self.algorithm, "hashrateHs": self.hashrate_hs.to_string(),
-            "link": {"addr": self.link_addr, "key": hex::encode(self.link_key.serialize())},
+            "link": match &self.iroh {
+                Some(i) => json!({"addr": self.link_addr, "key": hex::encode(self.link_key.serialize()), "iroh": i.to_json()}),
+                None => json!({"addr": self.link_addr, "key": hex::encode(self.link_key.serialize())}),
+            },
             "pay": {"url": self.pay_url, "node": self.pay_node},
             "terms": self.terms.to_json(),
+            "proof": self.proof,
             "capacity": {"miners": self.capacity.miners, "freeMiners": self.capacity.free_miners, "freeHs": self.capacity.free_hs.to_string()},
         })
     }
@@ -92,9 +129,13 @@ impl Hashrate {
             hashrate_hs: s("/hashrateHs")?.parse().map_err(|_| "bad hashrate")?,
             link_addr: s("/link/addr")?,
             link_key: key,
+            // optional: a listing from before the iroh link has none; an unreadable one is ignored
+            iroh: v.pointer("/link/iroh").and_then(IrohLink::from_json),
             pay_url: s("/pay/url")?,
             pay_node: s("/pay/node")?,
             terms: Terms::from_json(v.get("terms").ok_or("terms missing")?).ok_or("bad terms")?,
+            // optional: a listing from before it said nothing, and is told apart by [`Hashrate::proves`]
+            proof: v.get("proof").and_then(Value::as_str).map(str::to_string),
             // optional: a listing from before several hashtakers says nothing of its capacity
             capacity: v.get("capacity").map(|c| Capacity {
                 miners: c.get("miners").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
@@ -102,6 +143,12 @@ impl Hashrate {
                 free_hs: c.get("freeHs").and_then(Value::as_str).and_then(|h| h.parse().ok()).unwrap_or(0),
             }).unwrap_or_default(),
         })
+    }
+
+    /// Whether this hashmaker says it proves shares as this app checks them. A hashtaker that rents from one that
+    /// doesn't is refused at the handshake anyway.
+    pub fn proves(&self) -> bool {
+        self.proof.as_deref() == Some(PROOF)
     }
 
     /// The listing event, by the Nostr key `nostr`, bound to the link key `link`.
@@ -114,7 +161,7 @@ impl Hashrate {
         let tags = vec![
             tag("d", &hex::encode(self.link_key.serialize())),
             tag("title", &self.name),
-            tag("summary", &format!("{} hashrate, {} sat a slice, paid as accepted work arrives", self.algorithm, price_sat)),
+            tag("summary", &format!("{} hashrate, {} sat a slice, paid as it is used, seconds at a time", self.algorithm, price_sat)),
             tag("published_at", &created_at.to_string()),
             tag("t", TOPIC),
             tag("t", "hashrate"),
@@ -122,6 +169,7 @@ impl Hashrate {
             vec!["price".into(), price_sat, "SAT".into(), "slice".into()],
             tag(DOC_TAG, &self.to_json().to_string()),
             tag(BIND_TAG, &hex::encode(bind.serialize_compact())),
+            tag("expiration", &(created_at + MAX_AGE_S).to_string()),
         ];
         let free = if self.capacity.miners > 0 {
             format!(" {} of {} miners free now, about {:.2} TH/s.", self.capacity.free_miners, self.capacity.miners, self.capacity.free_hs as f64 / 1e12)
@@ -129,7 +177,7 @@ impl Hashrate {
             String::new()
         };
         let content = format!(
-            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM Gateway. Paid per slice of accepted work over Lightning Stream.{free}\n",
+            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM-compatible gateway. Paid as it is used, seconds at a time, over Lightning Stream.{free}\n",
             self.name,
             self.algorithm,
             self.hashrate_hs as f64 / 1e12
@@ -144,6 +192,12 @@ impl Hashrate {
         }
         if ev.created_at > now + MAX_AHEAD_S {
             return Err("dated in the future".into());
+        }
+        if ev.created_at.saturating_add(MAX_AGE_S) <= now {
+            return Err("more than two days old: its hashmaker has stopped publishing it".into());
+        }
+        if ev.tag("expiration").and_then(|e| e.parse::<u64>().ok()).is_some_and(|e| e <= now) {
+            return Err("expired".into());
         }
         if !ev.tags.iter().any(|t| t.len() >= 2 && t[0] == "t" && t[1] == TOPIC) {
             return Err("not a hashrate listing".into());
@@ -162,8 +216,9 @@ impl Hashrate {
     }
 }
 
-pub fn filter(limit: usize) -> Value {
-    json!({"kinds": [KIND], "#t": [TOPIC], "limit": limit})
+/// The listings published since `since`, newest first.
+pub fn filter(limit: usize, since: u64) -> Value {
+    json!({"kinds": [KIND], "#t": [TOPIC], "since": since, "limit": limit})
 }
 
 /// Publish a listing to each relay: what each said.
@@ -176,7 +231,7 @@ pub fn publish(relays: &[String], ev: &Event) -> Vec<Value> {
 
 /// Every good listing on the relays, newest per link key; and how many events were refused.
 pub fn find(relays: &[String], now: u64) -> (Vec<(Hashrate, Event)>, usize) {
-    let (events, _) = xbt_nostr::oneshot::query(relays, &filter(100), Duration::from_secs(10));
+    let (events, _) = xbt_nostr::oneshot::query(relays, &filter(100, now.saturating_sub(MAX_AGE_S)), Duration::from_secs(10));
     let mut best: Vec<(Hashrate, Event)> = Vec::new();
     let mut refused = 0;
     for ev in events {
@@ -203,9 +258,11 @@ mod tests {
             hashrate_hs: 4_100_000_000_000,
             link_addr: "192.0.2.1:9".into(),
             link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, link),
+            iroh: None,
             pay_url: "https://192.0.2.1:8443/hashrate".into(),
             pay_node: "02".to_string() + &"11".repeat(32),
-            terms: Terms { slice_work: 1 << 50, price_msat: 40_000, grace_ms: 30_000 },
+            terms: Terms { slice_work: 1 << 50, price_msat: 40_000, grace_ms: 30_000, start_slices: 0 },
+            proof: Some(PROOF.into()),
             capacity: Capacity { miners: 4, free_miners: 1, free_hs: 4_100_000_000_000 },
         }
     }
@@ -232,5 +289,80 @@ mod tests {
         assert!(Hashrate::read_event(&Event::sign(&nostr, 1000, KIND, tags, String::new()), 1000).is_err());
         assert!(Hashrate::read_event(&ev, 0).is_err(), "dated ahead");
         assert!(h.event(&link2, &nostr, 1).is_err());
+    }
+
+    #[test]
+    fn a_listing_expires_after_two_days() {
+        let link = SecretKey::from_slice(&[5; 32]).unwrap();
+        let nostr = Keys::generate();
+        let h = listing(&link);
+        let ev = h.event(&link, &nostr, 1000).unwrap();
+        assert_eq!(ev.tag("expiration"), Some((1000 + MAX_AGE_S).to_string().as_str()), "other clients are told too (NIP-40)");
+        assert!(Hashrate::read_event(&ev, 1000 + MAX_AGE_S - 1).is_ok());
+        assert!(Hashrate::read_event(&ev, 1000 + MAX_AGE_S).unwrap_err().contains("two days old"));
+        // a listing that says it expires sooner is taken at its word
+        let mut tags = ev.tags.clone();
+        tags.last_mut().unwrap()[1] = "2000".into();
+        let soon = Event::sign(&nostr, 1000, KIND, tags, String::new());
+        assert!(Hashrate::read_event(&soon, 1999).is_ok());
+        assert!(Hashrate::read_event(&soon, 2000).is_err());
+        // one without the tag (an older app's) still ages out by its date
+        let tags: Vec<Vec<String>> = ev.tags.iter().filter(|t| t[0] != "expiration").cloned().collect();
+        let old = Event::sign(&nostr, 1000, KIND, tags, String::new());
+        assert!(Hashrate::read_event(&old, 1000 + MAX_AGE_S - 1).is_ok());
+        assert!(Hashrate::read_event(&old, 1000 + MAX_AGE_S).is_err());
+    }
+
+    /// On a relay: a hashmaker that stopped publishing three days ago is not offered; one that publishes is.
+    #[test]
+    fn a_hashmaker_gone_for_days_is_not_found() {
+        let relay = xbt_nostr::standin::StandinRelay::start().unwrap();
+        let relays = vec![relay.url.clone()];
+        let now = xbt_nostr::now();
+        let (gone, here) = (SecretKey::from_slice(&[7; 32]).unwrap(), SecretKey::from_slice(&[8; 32]).unwrap());
+        publish(&relays, &listing(&gone).event(&gone, &Keys::generate(), now - 3 * 86_400).unwrap());
+        publish(&relays, &listing(&here).event(&here, &Keys::generate(), now - 6 * 3600).unwrap());
+        let (found, _) = find(&relays, now);
+        let keys: Vec<PublicKey> = found.iter().map(|(h, _)| h.link_key).collect();
+        assert_eq!(keys, [PublicKey::from_secret_key(secp256k1::SECP256K1, &here)]);
+    }
+
+    #[test]
+    fn the_proof_is_carried_and_a_listing_without_one_reads_as_not_proving() {
+        let link = SecretKey::from_slice(&[5; 32]).unwrap();
+        let nostr = Keys::generate();
+        let h = listing(&link);
+        assert_eq!(h.to_json()["proof"], PROOF);
+        let back = Hashrate::read_event(&h.event(&link, &nostr, 1000).unwrap(), 1000).unwrap();
+        assert_eq!(back.proof.as_deref(), Some(PROOF));
+        assert!(back.proves());
+        // a listing from before the field: still read, and not one that proves
+        let mut v = h.to_json();
+        v.as_object_mut().unwrap().remove("proof");
+        let old = Hashrate::from_json(&v).unwrap();
+        assert_eq!(old.proof, None);
+        assert!(!old.proves());
+        // another proof is not this one
+        v["proof"] = json!("something-else/1");
+        assert!(!Hashrate::from_json(&v).unwrap().proves());
+    }
+
+    #[test]
+    fn an_iroh_link_is_carried_and_an_old_or_odd_one_is_read_as_none() {
+        let link = SecretKey::from_slice(&[5; 32]).unwrap();
+        let nostr = Keys::generate();
+        let h = Hashrate {
+            link_addr: String::new(),
+            iroh: Some(IrohLink { id: "ab".repeat(32), relays: vec!["https://relay.example".into()], direct: vec![] }),
+            ..listing(&link)
+        };
+        let ev = h.event(&link, &nostr, 1000).unwrap();
+        assert_eq!(Hashrate::read_event(&ev, 1000).unwrap(), h);
+        // a listing from before the iroh link: none
+        assert_eq!(Hashrate::from_json(&listing(&link).to_json()).unwrap().iroh, None);
+        // a malformed iroh key: ignored, the listing still reads (its TCP address, if any, still works)
+        let mut v = h.to_json();
+        v["link"]["iroh"]["id"] = json!("abcd");
+        assert_eq!(Hashrate::from_json(&v).unwrap().iroh, None);
     }
 }

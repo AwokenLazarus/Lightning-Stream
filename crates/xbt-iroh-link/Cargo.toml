@@ -1,0 +1,22 @@
+[package]
+name = "xbt-iroh-link"
+description = "A seller reached by its key instead of a web address: HTTP between a buyer's gateway and a seller's gateway over iroh (QUIC, hole punching, relay fallback), end-to-end encrypted with no certificate and no port forward, and the claim by which the seller's Lightning node vouches for the key"
+version.workspace = true
+edition.workspace = true
+# iroh 1.4 needs 1.91; the rest of the workspace keeps its own floor
+rust-version = "1.91"
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring", "portmapper"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+xbt402.workspace = true
+xbt-nostr.workspace = true
+n0-future = "0.3.2"
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+getrandom = "0.2"

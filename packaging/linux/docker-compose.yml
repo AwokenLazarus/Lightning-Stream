@@ -1,13 +1,18 @@
 # Lightning Stream on a plain Linux machine: the same images as the Umbrel app, for an owner who runs
-# their own XBT node, Lightning node (lnd-family) and DATUM Gateway on this machine.
+# their own XBT node and Lightning node (lnd-family) on this machine. A masking gateway comes with it,
+# the Stream Gateway (DATUM-compatible, service "datum"); an owner may use their own DATUM Gateway instead.
 #
 # install.sh writes .env beside this file and starts it; docs/LINUX.md is the guide. Every service
-# uses the host's network, so the app reaches the owner's node, Lightning node and DATUM Gateway on
+# uses the host's network, so the app reaches the owner's node, Lightning node and own DATUM Gateway on
 # 127.0.0.1, where they listen by default, and every port of the app is on 127.0.0.1 too, except:
 #   * the gateway (selling port 8402): it listens beyond loopback only once the owner saves a shop
 #     with an https:// address on the Sell page (the owner's reverse proxy or tunnel leads there);
 #   * the hashmaker (profile "hashmaker", off unless LS_HASHMAKER=1): this machine's miners on 23340
 #     (keep it on the LAN) and hashtakers' apps on 23341 (a port forward or tunnel makes it public);
+#   * the built-in Stream relay (profile "relay", off unless LS_RELAY=1): public TCP 443 and UDP 7842,
+#     on its own network (not the host's), and idle until the owner switches it on in the app.
+#   * the VPN service (profile "vpn", off unless LS_VPN=1): UDP 51820 for the owner's devices'
+#     WireGuard (keep it on the LAN), on its own network (not the host's);
 #   * the AI endpoint (33540), only if the owner sets LS_AI_BIND to a LAN address in .env: programs
 #     on the LAN then use AI sellers through it, each with a key made on the AI page.
 # The UI asks for the password in .env (LS_UI_PASSWORD), set at install. Of the Lightning node's files
@@ -54,10 +59,12 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay,vpn,datum
       XBT_INIT_NODE_RPC_USER: ${LS_NODE_RPC_USER:?set LS_NODE_RPC_USER in .env, the XBT node's RPC user}
       XBT_INIT_NODE_RPC_PASS: ${LS_NODE_RPC_PASS:?set LS_NODE_RPC_PASS in .env, the XBT node's RPC password}
       XBT_INIT_UI_PASSWORD: ${LS_UI_PASSWORD:?set LS_UI_PASSWORD in .env, the app's login password}
+      # the Stream Gateway's node login: init writes it as run/datum/rpc.cookie (user:password, 0600, its
+      # user's) from the two RPC settings above, and makes run/datum/ (the UI writes, the gateway reads)
     volumes:
       - ${LS_DATA_DIR:?LS_DATA_DIR}:/data
 
@@ -86,9 +93,15 @@ services:
       B2_LN_TLS_CERT: /data/lightning/tls.cert
       B2_STREAM_DIR: /data/run/signer/streams
       B2_ENROLL_CODE_COPY: /data/run/enroll/enroll-code
+      # shops reached by key (no web address): their transport documents, written by the ui; the
+      # signer reads them for callers that pass none (the AI address, agents)
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       - ${LS_DATA_DIR}/signer:/data/signer
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
       - ${LS_DATA_DIR}/run/signer:/data/run/signer
+      # the hashrate renter's own socket: the one way to the "hashrate" task's rental terms
+      - ${LS_DATA_DIR}/run/rental:/data/run/rental
       - ${LS_DATA_DIR}/run/anchor:/data/run/anchor:ro
       - ${LS_DATA_DIR}/run/ln:/data/run/ln:ro
       - ${LS_DATA_DIR}/run/enroll:/data/run/enroll
@@ -104,10 +117,12 @@ services:
       XBT_MCP_APPROVAL_WAIT_S: "300"
       XBT_MCP_LN: "1"
       XBT_MCP_TICKETS: "1"
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       - ${LS_DATA_DIR}/mcp:/data/mcp
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
       - ${LS_DATA_DIR}/run/ui:/data/run/ui:ro
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
 
   ui:
     <<: *service
@@ -116,18 +131,22 @@ services:
     environment:
       # loopback only: from another machine, use an ssh tunnel (docs/LINUX.md)
       XBT_UI_BIND: 127.0.0.1:${LS_UI_PORT:-8482}
+      # the Files folder, served to the shop's gateway on this machine only
+      XBT_UI_FILES_BIND: 127.0.0.1:${LS_FILES_PORT:-8486}
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
       XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
       XBT_UI_MCP_URL: http://127.0.0.1:${LS_MCP_PORT:-33511}/mcp
       XBT_UI_LN_REST: ${LS_LND_REST}
       XBT_UI_LN_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_CONNECTOR: http://127.0.0.1:${LS_CONNECTOR_PORT:-8484}
+      # a seller's own web page, opened inside the app: one origin per port, on the UI's own address (docs/SELLER-APPS.md)
+      XBT_UI_APP_PORTS: ${LS_APP_PORTS:-33521,33522,33523,33524}
       XBT_UI_SELL: "1"
       XBT_UI_GW_PORT: ${LS_GW_PORT:-8402}
       XBT_UI_GW_NODE_REST: ${LS_LND_REST}
       XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_GW_HEALTH_URL: http://127.0.0.1:${LS_GW_PORT:-8402}/x402/ticket/health
-      XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-https://stream.lazarus-xbt.xyz}
+      XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a}
       XBT_UI_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
       # the hashmaker's pages: set by install.sh only when LS_HASHMAKER=1
       XBT_UI_HASHER: ${LS_UI_HASHMAKER:-}
@@ -137,12 +156,27 @@ services:
       XBT_UI_HASHRENT: http://127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}
       XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
       XBT_UI_RESTART_HINT: "in the folder you installed it to (~/lightning-stream unless you chose another), run: docker compose restart"
+      # the built-in Stream relay's settings and status (Settings → Stream relays)
+      XBT_UI_RELAY_DIR: /data/run/relay
+      XBT_UI_RELAY_STATUS: /data/run/relay-status/status.json
+      XBT_UI_VPN_DIR: /data/run/vpn
+      XBT_UI_VPN_STATUS_DIR: /data/run/vpn-status
+      # where the shop's gateway reaches the VPN service's tunnel endpoint (published on this machine's loopback only)
+      XBT_UI_VPN_TUNNEL_UPSTREAM: http://127.0.0.1:${LS_VPN_TUNNEL_PORT:-51880}
+      XBT_UI_VPN_ENDPOINT: ${LS_VPN_ENDPOINT:-}
+      XBT_UI_RELAY_START_HINT: "in the folder you installed it to, run: docker compose --profile relay up -d (or run install.sh again and answer 1 to the relay)"
       # AI: the address programs use (served by the connector) and the files the AI page shares with it
       XBT_UI_AI_ENDPOINT: ${LS_AI_ADDRESS:-http://127.0.0.1:33540/v1}
       XBT_UI_AI_SELLERS: /data/run/ai/sellers.json
       XBT_UI_CREDENTIALS: /data/run/ai/credentials.json
       XBT_UI_AI_STATE: /data/run/ai/state.json
+      # the Stream Gateway (Services → Hashrate → Your gateway): the UI writes its config.json (no secret in
+      # it) into this dir, for this node, with the API on this port (stratum is 127.0.0.1:23339)
+      XBT_UI_DATUM_DIR: /data/run/datum
+      XBT_UI_DATUM_RPCURL: http://${LS_NODE_RPC_HOST:-127.0.0.1}:${LS_NODE_RPC_PORT}
+      XBT_UI_DATUM_API_PORT: ${LS_DATUM_API_PORT:-7153}
     volumes:
       - ${LS_DATA_DIR}/ui:/data/ui
       - ${LS_DATA_DIR}/run/ai:/data/run/ai
@@ -151,7 +185,13 @@ services:
       - ${LS_DATA_DIR}/run/ln:/data/run/ln
       - ${LS_DATA_DIR}/run/gateway:/data/run/gateway
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops
       - ${LS_DATA_DIR}/run/enroll:/data/run/enroll:ro
+      - ${LS_DATA_DIR}/run/relay:/data/run/relay
+      - ${LS_DATA_DIR}/run/relay-status:/data/run/relay-status:ro
+      - ${LS_DATA_DIR}/run/vpn:/data/run/vpn
+      - ${LS_DATA_DIR}/run/vpn-status:/data/run/vpn-status:ro
+      - ${LS_DATA_DIR}/run/datum:/data/run/datum
       - *lightning-cert
 
   # One-shot, run by install.sh (`docker compose --profile setup run --rm -T node-keys < admin.macaroon`): has the
@@ -191,6 +231,7 @@ services:
       LS_TASK: default
       LS_MAX_SATS: "20000"
       LS_LISTEN: 127.0.0.1:${LS_CONNECTOR_PORT:-8484}
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
       # the AI endpoint: loopback unless the owner sets LS_AI_BIND (0.0.0.0:33540 for the LAN); every
       # program needs a key from the AI page either way
       LS_AI_LISTEN: ${LS_AI_BIND:-127.0.0.1:33540}
@@ -201,12 +242,22 @@ services:
       - ${LS_DATA_DIR}/run/ai:/data/run/ai
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
       - ${LS_DATA_DIR}/run/signer/streams:/data/run/signer/streams
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
 
   # idle until the owner saves a shop on the Sell page, which writes run/gateway/config.json
   gateway:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-12b8182c0bf6@sha256:feaf8a21dd394273760916757c7b80ac93c600a93a90d2e2453f960b60b93eb6
     stop_grace_period: 30s
+    # probed at the port the Sell page gives the gateway (LS_GW_PORT), not the image's default 8402: a gateway on
+    # another port was shown unhealthy forever
+    healthcheck:
+      test: ["CMD", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:${LS_GW_PORT:-8402}/x402/ticket/health",
+             "--waiting-for", "/data/run/gateway/config.json"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     volumes:
       - ${LS_DATA_DIR}/gateway:/data/gateway
       - ${LS_DATA_DIR}/run/gateway:/data/run/gateway:ro
@@ -229,8 +280,40 @@ services:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
 
-  # The hashtaker: rents other people's miners into the owner's own DATUM Gateway (Services → Hashrate)
-  # and pays each piece of work through the signer, as the "hashrate" task of the spending rules.
+  # The Stream Gateway (DATUM-compatible), the masking gateway that comes with the app: rented miners work
+  # on its jobs, solo on the owner's XBT node or for Lazarus Pool, as set on Services → Hashrate. Each job
+  # is masked with a key of the gateway's own, so a hashmaker can't tell which shares would be blocks and
+  # keep those back; the hashtaker opens every job on the API's /xbt/job before a miner gets it. Both
+  # ports are on loopback (stratum 23339; API LS_DATUM_API_PORT, 7153, not 7152, which an owner's own
+  # gateway may hold), and /xbt/job and the dashboard answer loopback only (no admin password: every
+  # admin endpoint refuses). The node is reached over RPC with the login init writes
+  # (run/datum/rpc.cookie); no ZMQ: new blocks are found by polling the node. Idle until the UI writes
+  # run/datum/config.json; a found block is also saved under LS_DATA_DIR/datum/submitblocks.
+  datum:
+    <<: *service
+    image: xbt-datum-gateway:0.1.0
+    stop_grace_period: 30s
+    entrypoint: ["/usr/bin/xbt-supervise", "--wait", "/data/run/datum/config.json", "--watch", "/data/run/datum/rpc.cookie", "--",
+                 "/usr/bin/xbt-datum-gateway", "-c", "/data/run/datum/config.json"]
+    # probed at the port this install gives the API, not the image's default 7152
+    healthcheck:
+      test: ["CMD", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:${LS_DATUM_API_PORT:-7153}/",
+             "--waiting-for", "/data/run/datum/config.json"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    volumes:
+      - ${LS_DATA_DIR}/datum:/data/datum
+      - ${LS_DATA_DIR}/run/datum:/data/run/datum:ro
+
+  # The hashtaker: rents other people's miners into a DATUM-protocol gateway (the one above unless the
+  # owner chose their own: LS_DATUM_GATEWAY) and pays each piece of work through the signer, as the
+  # "hashrate" task of the spending rules, on the renter's own socket (run/rental), which no other service
+  # reaches and which the task's rental terms need. Every job is opened on LS_GATEWAY_API (or the API saved with a
+  # gateway chosen on the page) and checked to be masked before a miner gets it; a rental to a gateway whose
+  # jobs aren't is refused. LS_BUNDLED_GATEWAY is "off" when the owner chose their own gateway at install,
+  # so the hashtaker keeps it rather than moving to the Stream Gateway.
   hashtaker:
     <<: *service
     image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd
@@ -242,10 +325,68 @@ services:
         condition: service_started
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
-              "--upstream", "${LS_DATUM:-127.0.0.1:23334}", "--user", "${LS_DATUM_USER:-rented}",
+              "--upstream", "${LS_DATUM:-127.0.0.1:23339}", "--gateway-api", "${LS_GATEWAY_API:-127.0.0.1:7153}",
+              "--datum-candidates", "127.0.0.1:23339", "--bundled-gateway", "${LS_BUNDLED_GATEWAY:-127.0.0.1:23339}",
+              "--user", "${LS_DATUM_USER:-rented}",
               "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
-              "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
+              "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
+      - ${LS_DATA_DIR}/run/rental:/data/run/rental:ro
+
+  # The built-in Stream relay (docs/RUN-A-RELAY.md): carries direct links between other people's apps
+  # when their routers block a direct connection. Profile "relay": started only with LS_RELAY=1,
+  # because it takes the machine's public port 443 (and UDP 7842). It runs on Docker's own network,
+  # unprivileged (443 is mapped to 8443 inside), and does nothing until the owner switches it on under
+  # Settings → Stream relays and its checks pass.
+  stream-relay:
+    <<: *service
+    image: xbt-stream-relay:0.1.0
+    profiles: ["relay"]
+    network_mode: bridge
+    ports:
+      - "443:8443"
+      - "7842:7842/udp"
+    stop_grace_period: 15s
+    environment:
+      XBT_RELAY_SETTINGS: /data/run/relay/relay.json
+      XBT_RELAY_STATUS: /data/run/relay-status/status.json
+      XBT_RELAY_STATE: /data/stream-relay
+    volumes:
+      - ${LS_DATA_DIR}/stream-relay:/data/stream-relay
+      - ${LS_DATA_DIR}/run/relay:/data/run/relay:ro
+      - ${LS_DATA_DIR}/run/relay-status:/data/run/relay-status
+
+  # The VPN service (docs/VPN-EXITS.md): the WireGuard endpoint the owner's devices pair with (UDP
+  # 51820, LS_VPN_PORT), and this box's exit if the owner offers one on the VPN page. Profile "vpn":
+  # started only with LS_VPN=1. Userspace WireGuard and TCP/IP: no TUN device and no capabilities. It
+  # runs on Docker's own network, so the exit never reaches this machine's own services, and restarts
+  # itself when the owner changes the devices or the exit. Exits are found on, and an offered exit is
+  # announced to, the Nostr relays of LS_RELAYS; an exit is announced only with its country set
+  # (LS_VPN_REGION, two letters).
+  vpn:
+    <<: *service
+    image: xbt-vpn:0.1.0
+    profiles: ["vpn"]
+    network_mode: bridge
+    ports:
+      - "${LS_VPN_PORT:-51820}:51820/udp"
+      # the exit's tunnel endpoint, for the shop's gateway on this machine only
+      - "127.0.0.1:${LS_VPN_TUNNEL_PORT:-51880}:51880/tcp"
+    stop_grace_period: 10s
+    environment:
+      XBT_VPN_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
+      XBT_VPN_REGION: ${LS_VPN_REGION:-}
+      # priced exits are paid through the owner's wallet: its socket, and the dir paid tunnels are streamed through
+      B2_SIGNER_SOCK: /data/run/signer/signer.sock
+      B2_STREAM_DIR: /data/run/signer/streams
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
+      XBT_VPN_TUNNEL_LISTEN: 0.0.0.0:51880
+    volumes:
+      - ${LS_DATA_DIR}/vpn:/data/vpn
+      - ${LS_DATA_DIR}/run/vpn:/data/run/vpn:ro
+      - ${LS_DATA_DIR}/run/vpn-status:/data/run/vpn-status
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/signer/streams:/data/run/signer/streams
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro

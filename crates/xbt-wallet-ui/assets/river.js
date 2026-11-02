@@ -2,16 +2,19 @@
 // ease away from it, and a soft glow follows it; a click sends one pulse along the nearest stream;
 // lsRiver.pulse() runs one down a whole stream. Everything is drawn on the streams' own curve, so
 // it always sits on them. A click is a short electric discharge: an arc from the pointer to the
-// nearest stream, then a jagged, flickering current racing both ways along it (and, weaker, along the
-// next one), with a few forks, fading in well under a second. Drawn in a worker on an OffscreenCanvas where the browser has one (the
-// page's thread only forwards the pointer), else in the page. 30 fps while something moves, 6 at
-// rest, none while hidden or a video plays; half resolution; one still frame for reduced motion.
+// nearest stream, then a jagged, flickering current racing both ways along it (and, when the click
+// lands about midway between two streams, an arc to the other one too), with a few forks, fading in well under a second. Drawn in a worker on an OffscreenCanvas where the browser has one (the
+// page's thread only forwards the pointer), else in the page. 30 fps while something moves, 1.5 at
+// rest (a frame costs the compositor far more than the drawing, and the streams barely move at
+// rest), none while hidden or a video plays; half resolution; one still frame for reduced motion.
 // The streams' shape is a function of the clock, so every page shows the same frame at the same
 // moment: a new page starts where the last one left off, with a first frame drawn before it shows.
 // Colours: --river-* in ui.css.
 (function () {
   "use strict";
-  var STEP = 24, REACH = 140, FAST = 1000 / 30, SLOW = 1000 / 6, IDLE = 8000, FRONT = 0.09, LIFE = 900;
+  var STEP = 24, REACH = 140, FAST = 1000 / 30, SLOW = 1000 / 1.5, IDLE = 8000, FRONT = 0.09, LIFE = 900;
+  // a click arcs to the second-nearest stream too only when it is nearly as close as the nearest
+  var MIDWAY = 0.75;
 
   // the drawing, the same in a worker and in the page; told everything by messages
   function engine(cx, report) {
@@ -184,7 +187,9 @@
       near.sort(function (a, b) { return a[0] - b[0]; });
       if (near[0][0] > REACH * col.reach * 2.5) return;
       discharge(near[0][1], c, now, 1, x, y);
-      if (near[1] && near[1][0] < REACH * col.reach * 3) discharge(near[1][1], c, now + 40, 0.5);
+      // a click about midway between two streams arcs to both; one near a single stream strikes only it
+      if (near[1] && near[1][0] < REACH * col.reach * 2.5 && near[0][0] > near[1][0] * MIDWAY)
+        discharge(near[1][1], c, now + 40, 0.85, x, y);
     }
     function discharge(s, c0, born, k, x, y) {
       var R = Math.random, forks = [];

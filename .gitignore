@@ -10,3 +10,5 @@ __pycache__/
 # run evidence of work_interop.sh and work_nta.sh: local output, not for the repository
 /docs/work-interop-*
 /docs/work-nta-*
+# build output of any crate, not only the workspace's own
+target/

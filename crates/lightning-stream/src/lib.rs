@@ -31,8 +31,8 @@
 //! ```
 //!
 //! and the connector answers its client with that status, `Content-Range` and `Content-Length`
-//! (the body that follows is then framed by its length, so a client sees an answer the wallet
-//! stopped as cut short). A head with `error` is an answer the signer will not read (a 206 for
+//! (the body that follows is then framed by its length, or chunked where the head states none; either
+//! way a client sees an answer the wallet stopped as cut short, [`whole`]). A head with `error` is an answer the signer will not read (a 206 for
 //! another range than was asked): the client gets 502. One socket, one line, no second round trip
 //! to the signer and no second request to the seller.
 
@@ -51,12 +51,51 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Handler, Reply, Request, Response, Streamed};
 
+mod visit;
+pub use visit::Visits;
+
 /// How long a call may wait for the seller's first byte, the payment included.
-const FIRST_BYTE: Duration = Duration::from_secs(60);
-/// The longest one paid answer is followed (a film).
-const LONGEST: Duration = Duration::from_secs(6 * 3600);
+pub(crate) const FIRST_BYTE: Duration = Duration::from_secs(60);
+/// How long a call waits for the signer to begin the answer, or to say why it will not: longer than
+/// the signer's own wait for a call's ordinary payment (`xbt402::ticket::ORDINARY_PAY_S`, 60 s,
+/// whatever the owner's `ln.timeout_s`, and 5 s more, counted from before the payment is sent) and
+/// the lock before it, so that a payment refused at the seller (an invoice that lapsed on a slow
+/// route) is told to the buyer in the signer's words, not as a bare timeout.
+pub(crate) const FIRST_ANSWER: Duration = Duration::from_secs(90);
+// the wallet's own wait for a call's ordinary payment ends first, whatever the owner's policy says
+const _: () = assert!(FIRST_ANSWER.as_secs() > xbt402::ticket::ORDINARY_PAY_S as u64 + 5);
+/// The longest one paid answer is followed (a film): past the most an owner can set
+/// `tickets.max_stream_s` to, so that the wallet ends an answer and says so before this gives up on it.
+pub(crate) const LONGEST: Duration = Duration::from_secs(25 * 3600);
 /// The longest head line the signer writes before the body.
-const HEAD_LINE: u64 = 4096;
+pub(crate) const HEAD_LINE: u64 = 4096;
+/// How long a streamed body's end waits for the signer's account of the call: it takes the session's
+/// order first, then asks the seller for the last receipt (5 s a try, given up after 30 s), on a
+/// slow link or behind other calls of the session.
+pub(crate) const ACCOUNT_WAIT: Duration = Duration::from_secs(120);
+
+/// Whether a streamed answer that has ended was whole (`Ok`). With a length announced its bytes say,
+/// and nothing is waited for; with none it is whole only by the signer's account of the call
+/// (`account`, asked only then). An answer the wallet ended early, for any reason, or with no account
+/// in time, is an error, so that the client sees a body cut short (a `Content-Length` body short of
+/// its length, or a chunked one with no last chunk), never a short file that looks whole.
+pub(crate) fn whole(length: Option<u64>, sent: u64, account: impl FnOnce() -> Option<Result<Value, String>>) -> io::Result<()> {
+    match length {
+        Some(l) if sent >= l => return Ok(()),
+        // short of what was announced: cut, whatever the account says, and it is not waited for
+        Some(l) => return Err(io::Error::other(format!("the answer was cut short after {sent} bytes of {l}"))),
+        None => {}
+    }
+    match account() {
+        Some(Ok(v)) if v.get("complete").and_then(Value::as_bool) == Some(true) => Ok(()),
+        Some(Ok(v)) => {
+            let why = v.get("ended").and_then(Value::as_str).or_else(|| v.get("error").and_then(Value::as_str)).unwrap_or("the wallet stopped reading it");
+            Err(io::Error::other(format!("the answer was cut short after {sent} bytes: {why}")))
+        }
+        Some(Err(e)) => Err(io::Error::other(format!("the answer was cut short after {sent} bytes: {e}"))),
+        None => Err(io::Error::other(format!("the answer ended after {sent} bytes and the wallet did not say it was whole"))),
+    }
+}
 
 pub struct Config {
     /// The signer's socket.
@@ -71,11 +110,12 @@ pub struct Config {
 
 pub struct Connector {
     cfg: Config,
+    visits: Visits,
 }
 
 impl Connector {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg }
+        Self { cfg, visits: Visits::default() }
     }
 
     fn health(&self) -> Response {
@@ -85,7 +125,7 @@ impl Connector {
 
     /// One paid answer, handed on as it arrives: the seller's status and range from the head line,
     /// then the body.
-    fn stream(&self, url: &str, max_sats: i64, range: Option<&str>) -> Reply {
+    fn stream(&self, url: &str, max_sats: i64, range: Option<&str>, if_range: Option<&str>, ceiling: Option<Value>, max_size: Option<u64>) -> Reply {
         let name = format!("ls-{}", random_hex());
         let path = self.cfg.stream_dir.join(&name);
         let listener = match listen_stream(&path) {
@@ -98,6 +138,21 @@ impl Connector {
         let mut params = json!({"url": url, "max_sats": max_sats, "task": self.cfg.task, "stream_to": name, "stream_head": true});
         if let Some(r) = range {
             params["range"] = r.into();
+            // the player's own validator of the copy it has: a changed file comes back whole, and is not spliced on
+            if let Some(v) = if_range {
+                params["if_range"] = v.into();
+            }
+        }
+        // the seller's listed prices, where the caller chose it from a listing: its terms past them are paid nothing
+        if let Some(c) = ceiling {
+            params["price_ceiling"] = c;
+        }
+        // the most bytes the caller was shown the file has: a seller that says it sends more is refused before its body
+        if let Some(n) = max_size {
+            params["max_size"] = n.into();
+        }
+        if let Some(m) = params.as_object_mut() {
+            xbt_wallet_mcp::wallet::with_transport(m);
         }
         let signer = self.cfg.signer.clone();
         std::thread::spawn(move || {
@@ -115,9 +170,9 @@ impl Connector {
                 let _ = std::fs::remove_file(&path);
                 return Reply::Whole(refused(done));
             }
-            if started.elapsed() > FIRST_BYTE {
+            if started.elapsed() > FIRST_ANSWER {
                 let _ = std::fs::remove_file(&path);
-                return Reply::Whole(json_response(504, &json!({"error": "the seller sent nothing within 60 s"})));
+                return Reply::Whole(json_response(504, &json!({"error": format!("the seller sent nothing within {} s", FIRST_ANSWER.as_secs())})));
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -136,6 +191,12 @@ impl Connector {
         let Some(status) = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s)) else {
             return Reply::Whole(json_response(502, &json!({"error": "the signer sent no head for the answer"})));
         };
+        // the seller sent the whole file for a part of it (its copy changed since the player's, or it serves no
+        // ranges): the wallet read none of it, and nothing of another copy is spliced onto what the player has
+        if head.get("range_ignored") == Some(&Value::Bool(true)) {
+            return Reply::Whole(json_response(412, &json!({"error": "ticket_range_ignored: the seller answered the range with the whole file (its copy changed, \
+                                                                     or it serves no ranges); none of it was read. Ask again from the start"})));
+        }
         if let Some(why) = head.get("error").and_then(Value::as_str) {
             return Reply::Whole(json_response(502, &json!({"error": why})));
         }
@@ -150,6 +211,12 @@ impl Connector {
         if let Some(cr) = head.get("content_range").and_then(Value::as_str).filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
             headers.push(("Content-Range".into(), cr.into()));
         }
+        // the copy's validators, which the player names in `If-Range` when it seeks
+        for (k, name) in [("etag", "ETag"), ("last_modified", "Last-Modified")] {
+            if let Some(x) = head.get(k).and_then(Value::as_str).filter(|x| x.len() <= 256 && x.bytes().all(|b| (0x20..0x7f).contains(&b))) {
+                headers.push((name.into(), x.into()));
+            }
+        }
         let length = head.get("content_length").and_then(Value::as_u64);
         let head = first;
         Reply::Stream(Streamed {
@@ -158,6 +225,7 @@ impl Connector {
             length,
             body: Box::new(move |out: &mut dyn BodyWriter| {
                 out.send(&head)?;
+                let mut sent = head.len() as u64;
                 let mut buf = vec![0u8; 64 << 10];
                 loop {
                     let n = src.read(&mut buf)?;
@@ -166,29 +234,44 @@ impl Connector {
                     }
                     // a program that stopped reading: dropping the socket tells the signer to stop paying
                     out.send(&buf[..n])?;
+                    sent += n as u64;
                 }
                 drop(src);
-                // the signer's account of the call, for the log; the body has been handed on already
-                let _ = done_rx.recv_timeout(Duration::from_secs(5));
-                Ok(())
+                // the signer's account of the call: an answer it ended early is cut short for the client too
+                whole(length, sent, || done_rx.recv_timeout(ACCOUNT_WAIT).ok())
             }),
         })
     }
 }
 
 impl Handler for Connector {
-    fn body_limit(&self, _m: &str, _t: &str) -> usize {
-        0
+    /// Stopping a visit goes past the handler slots: requests stuck on a seller hold them, and the stop
+    /// is what frees the buyer of those.
+    fn urgent(&self, req: &Request) -> bool {
+        req.method == "POST" && req.target.starts_with("/visits/") && req.target.ends_with("/stop")
+    }
+
+    fn body_limit(&self, _m: &str, t: &str) -> usize {
+        if t.starts_with("/v/") {
+            visit::MAX_BODY
+        } else if t.starts_with("/visits") {
+            4096
+        } else {
+            0
+        }
     }
 
     fn handle(&self, req: Request) -> Response {
         match self.reply(req) {
             Reply::Whole(r) => r,
-            Reply::Stream(_) => json_response(500, &json!({"error": "a streamed answer where a whole one was asked for"})),
+            Reply::Stream(_) | Reply::Upgrade(_) => json_response(500, &json!({"error": "a streamed answer where a whole one was asked for"})),
         }
     }
 
     fn reply(&self, req: Request) -> Reply {
+        if let Some(r) = self.visits_reply(&req) {
+            return r;
+        }
         if req.method != "GET" {
             return Reply::Whole(json_response(405, &json!({"error": "GET only"})));
         }
@@ -206,7 +289,12 @@ impl Handler for Connector {
         }
         let max_sats = req.header("X-Max-Sats").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n >= 0).unwrap_or(self.cfg.max_sats).min(self.cfg.max_sats);
         let range = req.header("Range").map(str::trim).filter(|r| one_range(r));
-        self.stream(url, max_sats, range)
+        let if_range = req.header("If-Range").map(str::trim).filter(|v| !v.is_empty() && v.len() <= 256);
+        // `X-Price-Ceiling`: the listing's prices as the most this call pays. Only ever stricter than none
+        let ceiling = req.header("X-Price-Ceiling").filter(|v| v.len() <= 1024).and_then(|v| serde_json::from_str::<Value>(v).ok()).filter(Value::is_object);
+        // `X-Max-Size`: the most bytes the caller was shown the resource has (a listed file's size)
+        let max_size = req.header("X-Max-Size").and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+        self.stream(url, max_sats, range, if_range, ceiling, max_size)
     }
 }
 
@@ -280,13 +368,13 @@ pub fn sniff(head: &[u8], url: &str) -> &'static str {
     "application/octet-stream"
 }
 
-fn json_response(status: u16, v: &Value) -> Response {
+pub(crate) fn json_response(status: u16, v: &Value) -> Response {
     Response::text(status, "application/json", v.to_string())
 }
 
 /// Bind `path` and make it group-writable. The signer's user connects to it; a process umask would
 /// leave the socket owner-only, and the directory's group is that user.
-fn listen_stream(path: &Path) -> io::Result<UnixListener> {
+pub(crate) fn listen_stream(path: &Path) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)) {
         let _ = std::fs::remove_file(path);
@@ -295,7 +383,7 @@ fn listen_stream(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-fn random_hex() -> String {
+pub(crate) fn random_hex() -> String {
     let mut b = [0u8; 12];
     getrandom::getrandom(&mut b).expect("the system's random source");
     hex::encode(b)
@@ -308,8 +396,32 @@ pub fn serve(cfg: Config, listener: std::net::TcpListener) -> io::Result<xbt_svc
 
 #[cfg(test)]
 mod tests {
-    use super::listen_stream;
+    use super::{listen_stream, whole};
+    use serde_json::{json, Value};
     use std::os::unix::fs::PermissionsExt;
+
+    /// A call's first answer is waited for longer than the wallet waits for the call's payment, so
+    /// that a payment refused at the seller is told in the wallet's words, not as a timeout.
+    #[test]
+    fn a_call_waits_for_its_first_answer_longer_than_the_wallet_waits_for_its_payment() {
+        assert!(super::FIRST_ANSWER.as_secs() > u64::from(xbt402::ticket::ORDINARY_PAY_S) + 5);
+    }
+
+    #[test]
+    fn an_answer_is_whole_by_its_length_or_the_signers_account_and_otherwise_cut() {
+        let never = || -> Option<Result<Value, String>> { panic!("all of a stated length needs no account") };
+        assert!(whole(Some(10), 10, never).is_ok());
+        let said = |v: Value| move || Some(Ok(v));
+        // no length stated: the account says
+        assert!(whole(None, 10, said(json!({"complete": true}))).is_ok());
+        let cut = whole(None, 10, said(json!({"complete": false, "ended": "max_sats"}))).unwrap_err().to_string();
+        assert!(cut.contains("max_sats") && cut.contains("10 bytes"), "{cut}");
+        // short of a stated length is cut, and no account is waited for
+        assert!(whole(Some(20), 10, never).is_err());
+        // an error from the signer, or no account in time, is not whole
+        assert!(whole(None, 10, || Some(Err("gone".to_string()))).is_err());
+        assert!(whole(None, 10, || None).unwrap_err().to_string().contains("did not say"));
+    }
 
     #[test]
     fn a_stream_socket_is_group_writable() {

@@ -13,7 +13,7 @@
 //!    own Knots node;
 //! 3. the node's decode of the same invoice, field by field;
 //! 4. the channels it may leave through ([`usable_channels`]): active, unified (0x21) signatures,
-//!    **not taproot**, not zero-conf, funded at or above the split height, and (AGP-049) a funding
+//!    **not taproot**, not zero-conf until its funding confirms, funded at or above the split height, and (AGP-049) a funding
 //!    transaction proven on our own node to carry, on every input, only 0x21 signatures that the
 //!    input's script checks ([`crate::ln_funding`], AGP-066), whatever the node's `unified_sigs` flag
 //!    says; the proof is cached per funding block hash, so a reorg proves it again, and kept on disk,
@@ -45,7 +45,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE as B64URL};
 use base64::Engine as _;
@@ -243,7 +243,14 @@ pub struct OfferPayRequest {
     /// Never 0: the node reads 0 as its own default limit.
     pub fee_limit_msat: u64,
     pub timeout_s: i64,
+    /// How much longer than `timeout_s` the node's answer is waited for.
+    pub http_margin_s: i64,
 }
+
+/// How much longer than its `timeout_s` a node is waited for on most payments.
+pub const HTTP_MARGIN_S: i64 = 30;
+/// [`HTTP_MARGIN_S`] for an ordinary payment of a call: the wallet's own wait for it.
+pub const ORDINARY_HTTP_MARGIN_S: i64 = 5;
 
 /// A stream ticket's payment ([`crate::ticket_rail`]): a hold invoice the node locks and does not
 /// see settle until the buyer releases the secret.
@@ -254,6 +261,9 @@ pub struct HeldSend {
     pub fee_limit_msat: u64,
     /// How long the node may look for a route.
     pub timeout_s: i64,
+    /// How much longer than that the node's first word on it is waited for: an ordinary payment of a
+    /// call waits [`ORDINARY_HTTP_MARGIN_S`], as the call's caller is waiting too.
+    pub http_margin_s: i64,
     pub cltv_limit: i64,
     /// The only channels the payment may leave through (never empty).
     pub outgoing_chan_ids: Vec<String>,
@@ -279,6 +289,15 @@ pub trait LnBackend: Send + Sync {
     fn lookup(&self, payment_hash: &str) -> Result<Option<Value>>;
     /// `GET /v1/utxos`: the node's on-chain coins.
     fn utxos(&self) -> Result<Vec<Value>>;
+    /// `GET /v1/graph/routes/{payee}/{amt}` (QueryRoutes, `info:read`): whether the node finds a route of
+    /// `amt_msat` to `payee` out through `outgoing_chan_id`, as its own payment would look for one
+    /// (mission control included). With `route_hints` (the invoice's, as the node's decode gives them), the same
+    /// query by `POST` with them, so that a seller reached through a private channel is found as the payment
+    /// would find it. Nothing is sent. `Ok(false)` only for the node's own "no path"; any other failure to answer
+    /// is an error.
+    fn has_route(&self, _payee: &str, _amt_msat: u64, _outgoing_chan_id: Option<&str>, _final_cltv: u64, _route_hints: &[Value]) -> Result<bool> {
+        Err(err("ln_backend", "this backend does not look for routes"))
+    }
     /// Stream tickets, `POST /v2/router/send` for a hold invoice: the `Payment` as soon as it is
     /// locked (IN_FLIGHT with an HTLC out) or over (FAILED, SUCCEEDED). The payment goes on in the
     /// node after this returns; an error means its fate is not known ([`Self::lookup`] then says).
@@ -567,6 +586,34 @@ impl LnBackend for LndRest {
         Ok(self.get("/v1/channels")?.get("channels").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
+    fn has_route(&self, payee: &str, amt_msat: u64, outgoing_chan_id: Option<&str>, final_cltv: u64, route_hints: &[Value]) -> Result<bool> {
+        if payee.len() != 66 || !payee.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(err("ln_backend", "a route is looked for to a node key only"));
+        }
+        let chan = outgoing_chan_id.filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()));
+        let asked = if route_hints.is_empty() {
+            let mut path = format!("/v1/graph/routes/{payee}/0?amt_msat={amt_msat}&final_cltv_delta={final_cltv}&use_mission_control=true");
+            if let Some(c) = chan {
+                path.push_str(&format!("&outgoing_chan_id={c}"));
+            }
+            self.get(&path)
+        } else {
+            // the query string cannot carry the hints: the node's POST form of the same query takes them in its body
+            let mut body = json!({"amt_msat": amt_msat.to_string(), "final_cltv_delta": final_cltv, "use_mission_control": true, "route_hints": route_hints});
+            if let Some(c) = chan {
+                body["outgoing_chan_id"] = c.into();
+            }
+            // about the GET's 30 s: the request's whole time, as a stalled node's other queries wait
+            self.post(&format!("/v1/graph/routes/{payee}/0"), &body, 1)
+        };
+        match asked {
+            Ok(v) => Ok(v.get("routes").and_then(Value::as_array).is_some_and(|r| !r.is_empty())),
+            // the node's own word that it has no path: no route, and no error
+            Err(e) if e.msg.contains("LN node HTTP") && e.seller.as_deref().is_some_and(|m| m.contains("unable to find a path")) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn send(&self, r: &SendRequest) -> Result<Value> {
         let body = json!({"payment_request": r.invoice, "timeout_seconds": r.timeout_s, "fee_limit_sat": r.fee_limit_sats.to_string(),
                           "cltv_limit": r.cltv_limit, "outgoing_chan_ids": r.outgoing_chan_ids, "no_inflight_updates": true,
@@ -646,7 +693,7 @@ impl LnBackend for LndRest {
         let body = json!({"payment_request": r.invoice, "timeout_seconds": r.timeout_s.max(1), "fee_limit_msat": r.fee_limit_msat.max(1).to_string(),
                           "cltv_limit": r.cltv_limit, "outgoing_chan_ids": r.outgoing_chan_ids, "no_inflight_updates": false,
                           "allow_self_payment": false, "amp": false, "max_parts": 1, "dest_custom_records": records});
-        let resp = self.req("POST", "/v2/router/send").timeout(Duration::from_secs(r.timeout_s.max(1) as u64 + 30))
+        let resp = self.req("POST", "/v2/router/send").timeout(Duration::from_secs((r.timeout_s.max(1) + r.http_margin_s.max(1)) as u64))
             .set("Content-Type", "application/json").send_string(&body.to_string());
         let resp = match Self::sent(resp)? {
             Ok(x) => x,
@@ -684,8 +731,9 @@ impl LnBackend for LndRest {
     }
 
     fn pay_offer(&self, r: &OfferPayRequest) -> Result<Value> {
-        let v = self.post("/v2/offers/pay", &json!({"invoice": r.invoice, "fee_limit_msat": r.fee_limit_msat.max(1).to_string(),
-                                                    "timeout_seconds": r.timeout_s.max(1)}), r.timeout_s)?;
+        let body = json!({"invoice": r.invoice, "fee_limit_msat": r.fee_limit_msat.max(1).to_string(), "timeout_seconds": r.timeout_s.max(1)});
+        let v = Self::answer(Self::sent(self.req("POST", "/v2/offers/pay").timeout(Duration::from_secs((r.timeout_s.max(1) + r.http_margin_s.max(1)) as u64))
+            .set("Content-Type", "application/json").send_string(&body.to_string()))?)?;
         // PayOffer answers only when the payment settled
         Ok(json!({"payment_hash": bytes_hex(v.get("payment_hash")), "status": "SUCCEEDED", "value_msat": u64_of(v.get("amount_msat")).to_string(),
                   "fee_msat": u64_of(v.get("fee_msat")).to_string(), "payment_preimage": bytes_hex(v.get("payment_preimage")), "htlcs": []}))
@@ -784,18 +832,35 @@ pub fn channel_refusal(c: &Value, split_height: i64) -> Option<String> {
     if c.get("unified_sigs") != Some(&Value::Bool(true)) {
         return Some("not unified (option_unified_sigs): its signatures are 0x01 and replayable".into());
     }
-    if c.get("zero_conf") == Some(&Value::Bool(true)) {
+    // lnd's zero_conf says how the channel was opened and stays true once its funding confirms; the
+    // funding is judged by zero_conf_confirmed_scid, which lnd sets at that confirmation (chan_id stays
+    // the channel's alias, which names no block)
+    let confirmed_scid = u64_of(c.get("zero_conf_confirmed_scid"));
+    let zero_conf = c.get("zero_conf") == Some(&Value::Bool(true));
+    if zero_conf && confirmed_scid == 0 {
         return Some("zero-conf: its funding is not confirmed on our chain".into());
     }
     if c.get("active") != Some(&Value::Bool(true)) {
         return Some("inactive".into());
     }
-    let h = (u64_of(c.get("chan_id")) >> 40) as i64;
+    let h = ((if zero_conf { confirmed_scid } else { u64_of(c.get("chan_id")) }) >> 40) as i64;
     if h < split_height {
         return Some(format!("funded at height {h}, below the split {split_height}: the funding exists on both chains"));
     }
     None
 }
+
+/// How long the ticket rail's checks wait for an inactive channel ([`Signer::ln_channels_back`]), and a
+/// payment for a route to its seller: less than the 15 s a seller's answer stands still for a payment as
+/// shipped (`refill_wait`), with room left to pay it.
+pub(crate) const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
+pub(crate) const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
+/// Longer than the wait's polls, and than the moment between one refused payment and the next behind it.
+const CHANNEL_OUT_FORGOTTEN: Duration = Duration::from_secs(1);
+/// A ticket that fails this soon after the wallet saw its channels out failed for the outage: its round is no sign of a
+/// full channel, and the wallet holds no less for it. A minute covers a peer's reconnection and the payments failed
+/// back across it; a full channel after that is counted at the next round.
+pub const OUTAGE_LATELY: Duration = Duration::from_secs(60);
 
 /// Every channel with its verdict: `(usable ids, report)`.
 pub fn usable_channels(chans: &[Value], split_height: i64) -> (Vec<String>, Vec<Value>) {
@@ -1535,6 +1600,66 @@ impl Signer {
     /// payments go on, confined to the proven channels.
     pub(crate) fn ln_route_checks(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool) -> std::result::Result<LnRoutes, Value> {
         let chans = ln.channels().map_err(|e| node_said(self.ln_refuse("ln_backend", &e.msg, dest, hash), &e))?;
+        self.ln_routes_of(ln, pol, dest, hash, every, chans)
+    }
+
+    /// [`Self::ln_route_checks`] for a payment of the ticket rail's session `sid`, whose seller is
+    /// waiting and whose answer ends if it is refused: a channel out for a moment is waited for
+    /// ([`Self::ln_channels_back`]), unless the session is being stopped. The caller holds no lock.
+    pub(crate) fn ln_route_checks_waiting(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool, sid: &str) -> std::result::Result<LnRoutes, Value> {
+        let stopped = || self.ticket_is_stopping(sid) || self.ticket_session(sid).is_some_and(|s| s.state != crate::ticket::SState::Open);
+        let chans = ln.channels().and_then(|c| self.ln_channels_back(ln, pol.split(&self.chain), c, &stopped))
+            .map_err(|e| node_said(self.ln_refuse("ln_backend", &e.msg, dest, hash), &e))?;
+        self.ln_routes_of(ln, pol, dest, hash, every, chans)
+    }
+
+    /// The node's channels, once one that could pay is active again. A channel goes inactive for a
+    /// moment whenever its peer's connection is replaced or drops, and comes back by itself; a payment
+    /// refused in that moment ended a paid answer that a moment would have saved. So where every channel
+    /// that could pay is only inactive, they are read again until [`CHANNEL_BACK_WAIT`] has gone by since
+    /// the wallet first saw them out, for all its payments together: 100 wins queued behind a channel that
+    /// stays down do not wait in turn. An outage nobody has looked at for [`CHANNEL_OUT_FORGOTTEN`] is
+    /// over as far as this goes, and the next one has its own wait. `stopped` ends the wait at once. The
+    /// channels as they stand are returned, and the checks judge them.
+    fn ln_channels_back(&self, ln: &dyn LnBackend, split: i64, mut chans: Vec<Value>, stopped: &dyn Fn() -> bool) -> Result<Vec<Value>> {
+        loop {
+            let now = Instant::now();
+            let up = !usable_channels(&chans, split).0.is_empty();
+            let as_active: Vec<Value> = if up { vec![] } else { chans.iter().map(|c| with(c.clone(), json!({"active": true}))).collect() };
+            if !up && !usable_channels(&as_active, split).0.is_empty() {
+                *self.ln_last_out.lock().unwrap_or_else(|p| p.into_inner()) = Some(now);
+            }
+            let mut out = self.ln_channels_out.lock().unwrap_or_else(|p| p.into_inner());
+            if up || usable_channels(&as_active, split).0.is_empty() {
+                *out = None;
+                return Ok(chans);
+            }
+            let since = out.filter(|(_, seen)| now.duration_since(*seen) <= CHANNEL_OUT_FORGOTTEN).map_or(now, |(since, _)| since);
+            *out = Some((since, now));
+            drop(out);
+            let left = CHANNEL_BACK_WAIT.saturating_sub(now.duration_since(since));
+            if left.is_zero() || stopped() {
+                return Ok(chans);
+            }
+            std::thread::sleep(CHANNEL_BACK_POLL.min(left));
+            chans = ln.channels()?;
+        }
+    }
+
+    /// Whether every channel that could pay is out now (read from the node), or was seen out within [`OUTAGE_LATELY`]:
+    /// a payment that failed meanwhile failed for an outage. A node that cannot be asked says nothing new.
+    pub(crate) fn ln_out_lately(&self, ln: Option<&dyn LnBackend>, split: i64) -> bool {
+        if let Some(chans) = ln.and_then(|ln| ln.channels().ok()) {
+            let up = !usable_channels(&chans, split).0.is_empty();
+            let as_active: Vec<Value> = chans.iter().map(|c| with(c.clone(), json!({"active": true}))).collect();
+            if !up && !usable_channels(&as_active, split).0.is_empty() {
+                *self.ln_last_out.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+            }
+        }
+        self.ln_last_out.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| t.elapsed() <= OUTAGE_LATELY)
+    }
+
+    fn ln_routes_of(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool, chans: Vec<Value>) -> std::result::Result<LnRoutes, Value> {
         // the cap counts channels only, so a payment does not wait on the node's coin list
         let (exposure, over) = self.ln_exposure(pol, &chans, None);
         if let Some(why) = over {
@@ -2065,5 +2190,83 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged, "the records it holds are not replaced");
             assert!(book.halted().is_some_and(|h| h["reason"].as_str().unwrap().contains("ln_payments.json")), "the rail is halted");
         }
+    }
+
+    /// The node's route query: a route found, the node's own "no path", and an error it could not answer, told
+    /// apart; and the question as the node's REST API takes it.
+    #[test]
+    fn a_route_query_tells_no_path_from_no_answer() {
+        use std::io::{BufRead as _, Write as _};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = asked.clone();
+        std::thread::spawn(move || {
+            let answers = [(200, r#"{"routes":[{"total_time_lock":150,"hops":[]}]}"#), (500, r#"{"code":2,"message":"unable to find a path to destination"}"#),
+                           (500, r#"{"code":2,"message":"database is locked"}"#)];
+            for (code, body) in answers {
+                let (mut s, _) = l.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(s.try_clone().unwrap()).read_line(&mut line).unwrap();
+                seen.lock().unwrap().push(line.split_whitespace().nth(1).unwrap_or("").to_string());
+                write!(s, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mac = dir.path().join("m");
+        std::fs::write(&mac, [1u8, 2, 3]).unwrap();
+        let ln = LndRest::new(&url, &mac, None).unwrap();
+        let payee = format!("02{}", "ab".repeat(32));
+        assert!(ln.has_route(&payee, 64_000, Some("123"), 40, &[]).unwrap());
+        assert!(!ln.has_route(&payee, 64_000, None, 40, &[]).unwrap());
+        assert!(ln.has_route(&payee, 64_000, None, 40, &[]).is_err(), "a node that cannot answer is no 'no route'");
+        assert!(ln.has_route("not/a/key", 1, None, 40, &[]).is_err());
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked[0], format!("/v1/graph/routes/{payee}/0?amt_msat=64000&final_cltv_delta=40&use_mission_control=true&outgoing_chan_id=123"));
+        assert_eq!(asked.len(), 3);
+    }
+
+    #[test]
+    fn a_route_query_with_the_invoices_hints_goes_by_post_with_them() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, Value)>));
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            let mut len = 0;
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if h.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            *s2.lock().unwrap() = Some((line.split_whitespace().take(2).collect::<Vec<_>>().join(" "), serde_json::from_slice(&body).unwrap()));
+            let ok = r#"{"routes":[{"total_time_lock":150,"hops":[]}]}"#;
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok}", ok.len()).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mac = dir.path().join("m");
+        std::fs::write(&mac, [1u8, 2, 3]).unwrap();
+        let ln = LndRest::new(&url, &mac, None).unwrap();
+        let payee = format!("02{}", "ab".repeat(32));
+        let hints = vec![json!({"hop_hints": [{"node_id": format!("03{}", "cd".repeat(32)), "chan_id": "1099511693312", "fee_base_msat": 1000,
+                                               "fee_proportional_millionths": 1, "cltv_expiry_delta": 40}]})];
+        assert!(ln.has_route(&payee, 64_000, Some("123"), 40, &hints).unwrap());
+        let (line, body) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(line, format!("POST /v1/graph/routes/{payee}/0"));
+        assert_eq!((body["amt_msat"].as_str(), body["final_cltv_delta"].as_u64(), body["use_mission_control"].as_bool(), body["outgoing_chan_id"].as_str()),
+                   (Some("64000"), Some(40), Some(true), Some("123")));
+        assert_eq!(body["route_hints"], json!(hints));
     }
 }

@@ -5,8 +5,8 @@ nodes you already run yourself. It is the same app as on Umbrel, from the same p
 pinned by digest. The package is in [`packaging/linux`](../packaging/linux).
 
 This guide covers p2p-hash first:
-- **Hashtaker:** you rent other people's miners into your own DATUM Gateway, and pay for each piece of
-  work from your own Lightning node.
+- **Hashtaker:** you rent other people's miners into the Stream Gateway (DATUM-compatible) that comes
+  with the app, and pay for each piece of work from your own Lightning node.
 - **Hashmaker:** you rent your miners out.
 
 The rest of the app (buying and selling services) works the same as on Umbrel. Use real sats in small
@@ -41,8 +41,14 @@ amounts only: the software is tested on mainnet with small amounts.
   network.
   - Its `tls.cert` must be readable by other users. It's a public certificate, so `chmod 644` is fine.
   - You need its `admin.macaroon` once, during installation (see below).
-- **For a hashtaker, your DATUM Gateway:** its Stratum port, `127.0.0.1:23334` by default. The pool your
-  rented work is paid through is set in your DATUM Gateway, not in this app.
+- **For a hashtaker, nothing more:** the app comes with the Stream Gateway (DATUM-compatible), a gateway
+  that masks its jobs, so a hashmaker can't tell which shares would be blocks and keep those back. It
+  works on your XBT node above, over RPC, with no change to the node's config. You choose solo (blocks
+  paid to your own XBT address) or Lazarus Pool on **Services → Hashrate**, under *Your gateway*.
+  - **Your own DATUM Gateway instead:** `install.sh` asks. The app opens each job on your gateway's API
+    (`/xbt/job`) before a miner gets it and refuses the rental if the job isn't masked. A stock DATUM
+    Gateway doesn't mask its jobs and has no `/xbt/job`, so with one every rental is refused (nothing is
+    paid, and the Hashrate page says why).
 - **For a hashmaker:** your miners on the same LAN, and a way for hashtakers to reach you from outside
   (see [Hashmaker](#hashmaker)).
 
@@ -82,7 +88,25 @@ The script is short and readable, so read it first if you like. It:
 7. starts the app.
 
 Use `install.sh --dir DIR` to install somewhere other than `~/lightning-stream`. To change an answer
-later, run `install.sh` again: your current answers are the defaults.
+later, run `install.sh` again: your current answers are the defaults. An update keeps every setting in
+`.env`, including any you added by hand (such as `LS_AI_BIND`). An `LS_*` variable you give the run
+wins over `.env` and is written there, also with `--yes`:
+`LS_UI_PORT=9001 packaging/linux/install.sh --yes`.
+
+The app takes these ports on `127.0.0.1`. Each is a setting in `.env`, so move one if another program
+already uses it:
+
+| setting | default | what it is |
+|---|---|---|
+| `LS_UI_PORT` | 8482 | the app's page |
+| `LS_GW_PORT` | 8402 | your shop, where buyers' apps pay and connect |
+| `LS_FILES_PORT` | 8486 | the folder a Files service shares, served to your shop only |
+| `LS_CONNECTOR_PORT` | 8484 | the connector |
+| `LS_MCP_PORT` | 33511 | the MCP server for agents |
+
+If another program holds `LS_FILES_PORT`, `install.sh` says so when it finishes. The Files service on
+the Sell page also shows "Your shared folder isn't served". To fix it, set a free port in `.env` and
+run `install.sh` again.
 
 ## First run
 
@@ -91,6 +115,9 @@ The page is at **http://127.0.0.1:8482/**. From another machine, open an ssh tun
 `~/lightning-stream/.env` (`grep LS_UI_PASSWORD ~/lightning-stream/.env` shows it). A password you chose
 with spaces or other signs in it is written in single quotes there: type it without them. (Earlier installs
 wrote every password in quotes.)
+To open a seller's own app inside the page (docs/SELLER-APPS.md), forward
+its ports too: `ssh -L 8482:127.0.0.1:8482 -L 33521:127.0.0.1:33521 -L 33522:127.0.0.1:33522
+-L 33523:127.0.0.1:33523 -L 33524:127.0.0.1:33524 you@your-node-machine` (`LS_APP_PORTS`).
 
 1. **Make your approval key.** The app asks for it first. It's the key that signs your spending rules,
    and it stays in your browser. Save its backup.
@@ -148,10 +175,10 @@ then `docker compose up -d`. Every request needs a key either way. docs/INFERENC
 
 ## Hashtaker
 
-You rent hashrate into your own DATUM Gateway and pay for each piece of work:
+You rent hashrate into the Stream Gateway and pay for each piece of work:
 
-1. **Services → Hashrate.** Check that it says *Ready to rent*, meaning your DATUM Gateway answers. If
-   not, set its address under *Your DATUM Gateway*.
+1. **Services → Hashrate.** Under *Your gateway*, choose solo and your XBT payout address, or Lazarus
+   Pool. Then check that it says *Ready to rent*: the gateway answers and its jobs are masked.
 2. **Miners for rent** lists the offers hashmakers publish on Nostr (relay.lazarus-xbt.xyz,
    relay.kilombino.com, relay.damus.io and nos.lol by default). For a hashmaker you haven't paid before, press **Allow this hashmaker to be paid**. The rules
    page shows that hashmaker's address added, tied to the Lightning node its signed listing names, and you
@@ -159,7 +186,7 @@ You rent hashrate into your own DATUM Gateway and pay for each piece of work:
 3. Choose the machines, how long, and the most the rental may cost, then press **Rent**.
 
 **What you pay:**
-- Work is counted only from shares your own DATUM Gateway accepts, weighted by difficulty.
+- Work is counted only from shares your gateway accepts, weighted by difficulty.
 - Each piece of work is paid once it's finished, from a Lightning ticket.
 - The rental ends at its time or its budget, whichever comes first, and **Cut** ends it at once.
 - The hashmaker stops its miners within about one piece of work if payment stops.
@@ -182,20 +209,25 @@ You rent your miners out, and they hash for your own pool whenever nobody rents 
 4. **Sell → Hashrate:**
    - set your own pool (your DATUM Gateway, or your pool, as your miners use it today);
    - set a price per piece of work and a name;
-   - set **the address hashtakers use**: your public address with port **23341**, after you forward TCP
-     23341 to this machine. The link is encrypted end to end, so it needs no certificate, and https
-     tunnels for websites can't carry it.
+   - nothing else: hashtakers reach your miners through the app's direct link, encrypted end to end,
+     with no port forward, address or certificate. It needs outbound internet only; when the two
+     routers don't allow a direct connection it goes through a relay, which sees only encrypted data.
+     Under Advanced you can also give an address with a forwarded TCP port 23341, for hashtakers on apps
+     from before the direct link.
 
-   Then tick *Rent out my miners* and save. With a miner connected and the address set, your offer goes
-   on the Nostr relays within a minute.
+   Then tick *Rent out my miners* and save. With a miner connected, your offer goes on the Nostr relays
+   within a minute.
 
 ## Update, stop, remove
 
 - **Update:** `git pull`, then `packaging/linux/install.sh` again. It keeps your answers, your keys and
   your rules, and pulls the newly pinned images.
+  - **From 0.1:** the update adds the Stream Gateway and moves renting to it, since rentals now need
+    masked jobs. Your own DATUM Gateway's address is kept in `.env` as `LS_DATUM_OWN`; answer **2** to
+    the gateway question to keep using it.
 - **Stop / start:** `docker compose -f ~/lightning-stream/docker-compose.yml down` and `... up -d`. To
   see why something isn't working: `docker compose -f ~/lightning-stream/docker-compose.yml logs ui`
-  (or `signer`, `hashtaker`, `hashmaker`, `gateway`).
+  (or `signer`, `hashtaker`, `hashmaker`, `gateway`, `datum` for the Stream Gateway).
 - **Remove:** `packaging/linux/uninstall.sh`. It stops and removes the containers and images, then,
   after you type `yes`, the data folder (keys, rules, tickets). Move anything left in the app out
   first. `--keep-data` keeps the folder. It also prints the root key ids of the macaroons the app made,
@@ -215,7 +247,9 @@ hand.
 `packaging/linux/test-linux.sh` runs the whole package on regtest:
 1. `install.sh`'s checks in a bare Ubuntu 24.04;
 2. two installs on one machine, a hashmaker and a hashtaker, against a test Lightning network, from
-   `install.sh --yes`;
+   `install.sh --yes`: the hashtaker first installed from the 0.1 package and updated by this one;
 3. each owner's first run on their page;
-4. one rental, paid piece by piece;
-5. `uninstall.sh`, which must leave nothing behind.
+4. the Stream Gateway's jobs shown masked (solo), its API on loopback only, and one rental, paid piece
+   by piece, whose blocks pay the solo address;
+5. the owner's own stock DATUM Gateway chosen instead: rentals refused, in words;
+6. `uninstall.sh`, which must leave nothing behind.

@@ -36,7 +36,12 @@ pub struct Limits {
     /// (AGP-081, review T1: with only the global cap one address held every slot). 0: no cap per
     /// address, for a server whose only peer is its reverse proxy.
     pub per_address: usize,
-    /// One write of a [`Streamed`] body: a client that takes nothing for this long ends the stream.
+    /// Addresses held to [`Limits::connections`] only, not to [`Limits::per_address`]: a reverse
+    /// proxy or tunnel in front of the server, which brings every client over its own address.
+    /// At most [`MAX_PROXIES`]; [`Limits::with_proxies`] fills it.
+    pub proxies: [Option<IpAddr>; MAX_PROXIES],
+    /// One write of a [`Streamed`] body: a client that takes nothing ends the stream after two or three
+    /// of these (a stalled socket may still take a little at the first ones).
     pub stream_write: Duration,
 }
 
@@ -52,12 +57,26 @@ impl Default for Limits {
             body_deadline: Duration::from_secs(30),
             connections: 64,
             per_address: 48,
+            proxies: [None; MAX_PROXIES],
             stream_write: Duration::from_secs(30),
         }
     }
 }
 
+/// How many proxies [`Limits::proxies`] names at most.
+pub const MAX_PROXIES: usize = 8;
+
 impl Limits {
+    /// These limits, with `proxies` (at most [`MAX_PROXIES`] of them, the rest left out) held to the
+    /// total cap only.
+    pub fn with_proxies(mut self, proxies: &[IpAddr]) -> Self {
+        self.proxies = [None; MAX_PROXIES];
+        for (slot, ip) in self.proxies.iter_mut().zip(proxies) {
+            *slot = Some(ip.to_canonical());
+        }
+        self
+    }
+
     /// The default limits with [`PER_ADDRESS_ENV`] applied: a whole number, 0 for no cap per
     /// address. Anything else is an error, not the default.
     pub fn from_env() -> io::Result<Self> {
@@ -167,10 +186,19 @@ pub struct Streamed {
     pub body: Body,
 }
 
+/// An answer that takes the connection over: `101 Switching Protocols` with these headers (and
+/// `Connection: Upgrade`), then `run` gets the connection and any bytes the client sent after its
+/// request, and carries both directions itself (a WebSocket). The server writes nothing more.
+pub struct Upgraded {
+    pub headers: Vec<(String, String)>,
+    pub run: Box<dyn FnOnce(TcpStream, Vec<u8>) + Send>,
+}
+
 /// What a handler answers with.
 pub enum Reply {
     Whole(Response),
     Stream(Streamed),
+    Upgrade(Upgraded),
 }
 
 /// What a server serves.
@@ -178,6 +206,11 @@ pub trait Handler: Send + Sync {
     /// The largest body accepted for this request line. A larger Content-Length is 413 before any
     /// body byte is read.
     fn body_limit(&self, method: &str, target: &str) -> usize;
+    /// A request that takes no handler slot: quick by its nature, and able to end what holds the slots
+    /// (a stop), so that it does not wait behind them.
+    fn urgent(&self, _req: &Request) -> bool {
+        false
+    }
     fn handle(&self, req: Request) -> Response;
     /// [`Handler::handle`] for a handler that streams some of its answers.
     fn reply(&self, req: Request) -> Reply {
@@ -367,13 +400,23 @@ impl PerAddress {
 struct Slot {
     open: Arc<AtomicUsize>,
     per: Arc<PerAddress>,
-    key: Option<AddrKey>,
+    key: SlotKey,
 }
+
+/// Whose share of the cap per address a connection takes: an address's, or none (a named proxy's).
+#[derive(Clone, Copy)]
+enum SlotKey {
+    Counted(Option<AddrKey>),
+    Proxied,
+}
+use SlotKey::{Counted, Proxied};
 
 impl Drop for Slot {
     fn drop(&mut self) {
         self.open.fetch_sub(1, Ordering::SeqCst);
-        self.per.release(self.key);
+        if let Counted(k) = self.key {
+            self.per.release(k);
+        }
     }
 }
 
@@ -498,10 +541,17 @@ fn accept(
             write_error(&mut sock, 503, "too many connections");
             continue;
         }
-        let key = sock.peer_addr().ok().map(|a| AddrKey::of(a.ip()));
-        if !per.admit(key) {
-            write_error(&mut sock, 503, "too many connections from this address");
-            continue;
+        let peer = sock.peer_addr().ok().map(|a| a.ip().to_canonical());
+        // a named proxy's connections are every client's: counted against the total only
+        let key = match peer {
+            Some(ip) if limits.proxies.contains(&Some(ip)) => Proxied,
+            p => Counted(p.map(AddrKey::of)),
+        };
+        if let Counted(k) = key {
+            if !per.admit(k) {
+                write_error(&mut sock, 503, "too many connections from this address");
+                continue;
+            }
         }
         open.fetch_add(1, Ordering::SeqCst);
         let slot = Slot {
@@ -515,7 +565,7 @@ fn accept(
 
 fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &Limits) {
     let peer = sock.peer_addr().ok();
-    let (head, rest) = match read_head(&mut sock, limits) {
+    let (head, mut rest) = match read_head(&mut sock, limits) {
         Ok(h) => h,
         Err(Fail::Large) => return write_error(&mut sock, 431, "header too large"),
         Err(Fail::Timeout) => return write_error(&mut sock, 408, "header timeout"),
@@ -529,6 +579,8 @@ fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &
         Ok(n) => n,
         Err((status, msg)) => return write_error(&mut sock, status, msg),
     };
+    // what a client sends straight after a request with no body: the first bytes of an upgraded connection
+    let early = if n == 0 { std::mem::take(&mut rest) } else { vec![] };
     if n > 0 {
         let expect = req.headers.iter().any(|(k, v)| {
             k.eq_ignore_ascii_case("Expect") && v.eq_ignore_ascii_case("100-continue")
@@ -545,7 +597,7 @@ fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &
     req.peer = peer;
     let head_only = req.method.eq_ignore_ascii_case("HEAD");
     let r = {
-        let _pass = gate.enter();
+        let _pass = (!handler.urgent(&req)).then(|| gate.enter());
         // a panicking handler costs its request, and its slot is given back
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.reply(req)))
             .unwrap_or_else(|_| Reply::Whole(Response::text(500, "text/plain", "handler panicked")))
@@ -554,6 +606,18 @@ fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &
         Reply::Whole(r) => write_response(&mut sock, &r, head_only),
         // outside the handler slot: a slow reader of a long body holds this connection only
         Reply::Stream(s) => write_stream(&mut sock, s, head_only, limits.stream_write),
+        Reply::Upgrade(u) => {
+            let mut head = head_of(101, &u.headers);
+            head.push_str("Connection: Upgrade\r\n\r\n");
+            let _ = sock.set_write_timeout(Some(limits.stream_write));
+            if sock.write_all(head.as_bytes()).is_ok() {
+                let _ = sock.set_read_timeout(None);
+                let _ = sock.set_write_timeout(None);
+                let run = u.run;
+                // a panicking connection ends itself; the server goes on
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || run(sock, early)));
+            }
+        }
     }
 }
 
@@ -704,6 +768,7 @@ fn content_length(headers: &[(String, String)], limit: usize) -> Result<usize, R
 fn reason(status: u16) -> &'static str {
     match status {
         100 => "Continue",
+        101 => "Switching Protocols",
         200 => "OK",
         201 => "Created",
         202 => "Accepted",

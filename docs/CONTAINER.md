@@ -13,8 +13,10 @@ Status: **proposal**, not yet agreed with the xbt-compute project (sent 2026-09-
 takes its Lightning rail from the environment (`B2_LN_REST`, `B2_LN_TLS_CERT`, `B2_LN_MACAROON`: a file).
 `scripts/container_test.sh` runs both on regtest with a paid buy over stream tickets (section 7), and the
 Umbrel and StartOS packages wire them to the box's Lightning Fork node (`packaging/DESIGN.md`). Neither the
-images nor the packages hold an admin macaroon: of the Lightning node's data they mount only its
-`tls.cert`, and the macaroons are narrow ones the owner bakes.
+images nor the packages hold an admin macaroon: of the Lightning node's data the services mount only its
+`tls.cert`, and the macaroons are narrow ones. On Umbrel the one-shot `node-keys-bake` (as Lightning Fork's
+user, its data read-only) has the node bake them once the owner has made the wallet, and keeps nothing of
+the admin macaroon (`packaging/README.md`).
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
 code is in the git history (last at commit 0911cc0). Its image, user and data dir are gone from this
@@ -37,6 +39,9 @@ tmpfs `/tmp`.
   relay/           agp  uid 10006  0700  blobs/ (the xbt-work receipt relay's sealed blobs, one file each), secrets/
   gateway/         agp  uid 10007  0700  the seller gateway's state: receipt.key, sessions, the journal
   hashrate/        agp  uid 10010  0700  p2p-hash: the hasher's link and Nostr keys, the renter's key and its saved DATUM Gateway address
+  stream-relay/    agp  uid 10016  0700  the built-in Stream relay: its Let's Encrypt certificates (certs/) and attempt log
+  vpn/             agp  uid 10018  0700  the VPN service: its keys (WireGuard, the exit's link, Nostr) and category lists (lists/)
+  datum/           agp  uid 10021  0700  the Stream Gateway (DATUM-compatible): submitblocks/, every block it submitted, kept for a resubmit
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
   cmpd/            cmp  uid 10012  0700  device runtime state, secrets/
   cmpd-cache/      cmp  uid 10012  0700  the model span cache: LARGE, its own mount (CMP_CACHE_DIR), safe to prune
@@ -57,6 +62,22 @@ tmpfs `/tmp`.
   run/hashrate/    uid 10005, gid 10010 (xbt-hashrate), 0750: settings.json (0640), written by the UI's Hashrate
                    page, read by the hasher service; control-token (0640), made once by init, owned by the
                    UI, read by both hashrate services (their control pages ask for it)
+  run/rental/      uid 10001, gid 10010 (xbt-hashrate), 0750: signer.sock (0660), the signer's socket for the
+                   hashrate renter alone: a task's rental terms (`tickets.tasks.<task>.rental`) are paid only
+                   through it, and only for a rental's pieces of work. The renter (and the UI) are in the group,
+                   the MCP is not; the signer binds it only where init made the dir (`B2_RENTAL_SOCK`)
+  run/relay/       uid 10005, gid 10016 (xbt-stream-relay), 0750: relay.json (0640), the owner's relay settings
+                   written by the UI's Stream relays page, read by the built-in relay
+  run/relay-status/ uid 10016, gid 10017 (xbt-relay-status), 0750: status.json (0640), written by the relay,
+                   read by the UI; the group has the relay and the UI in it
+  run/vpn/         uid 10005, gid 10018 (xbt-vpn), 0750: devices.json and exit.json (0640), written by the UI's
+                   VPN pages, read by the VPN service
+  run/vpn-status/  uid 10018, gid 10019 (xbt-vpn-status), 0750: endpoint.json, status.json, exit-status.json
+                   (0640), written by the VPN service, read by the UI; the group has the service and the UI in it
+  run/datum/       uid 10005, gid 10021 (xbt-datum), 0750: config.json (0640), the Stream Gateway's config, written by
+                   the UI's Hashrate page (no secret in it); rpc.cookie (0600, uid 10021), the node's RPC user:password
+                   with no newline, written by init from the credentials the signer gets, read by the gateway only.
+                   The gateway's API and Stratum listen on loopback only
   run/ai/          uid 10005, gid 10014 (xbt-ai), 0770: the AI endpoint's files (docs/INFERENCE.md):
                    credentials.json (0660), the store of AI keys and local links, edited by the UI's AI page and
                    booked by the connector; sellers.json (0640), written by the AI page; state.json (0640), the
@@ -70,7 +91,10 @@ Rules:
   connects to. Read-only is enough to connect to a Unix socket.
   - The MCP mounts `mcp/` and `run/signer/` (ro). So does the UI, with `ui/`. With the UI, the MCP also
     mounts `run/ui/` (ro) and the UI mounts it read-write (AGP-042, §8).
-  - The signer mounts `signer/`, `run/signer/` and `run/anchor/` (ro); in a package also `run/ln/` (ro).
+  - The signer mounts `signer/`, `run/signer/` and `run/anchor/` (ro); in a package also `run/ln/` (ro), and
+    `run/rental/` where the hashrate services are installed.
+  - The hashrate renter mounts `hashrate/`, `run/hashrate/` (ro) and `run/rental/` (ro), not `run/signer/`: it
+    pays through the renter's socket alone.
   - The witness mounts `witness/` and `run/anchor/`.
   - The gateway mounts `gateway/` and `run/gateway/` (ro); the UI in its gateway role mounts `ui/`,
     `run/ui/` and `run/gateway/`.
@@ -116,6 +140,11 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10009 | (group xbt-enroll only) | |
 | 10014 | (group xbt-ai only) | the UI and the signer's user, for run/ai |
 | 10010 | xbt-hashrate | xbt-hashlink (the hasher's and the renter's services; in xbt-signer's group for the renter's payments) |
+| 10016 | xbt-stream-relay | xbt-stream-relay (the built-in Stream relay, off until switched on) |
+| 10017 | (group xbt-relay-status only) | |
+| 10018 | xbt-vpn | xbt-vpn (the VPN service: the owner's devices' WireGuard endpoint, and an exit if offered) |
+| 10019 | (group xbt-vpn-status only) | |
+| 10021 | xbt-datum | xbt-datum-gateway (the Stream Gateway, DATUM-compatible: the renter's own masking gateway; the UI is in its group, for run/datum) |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |
@@ -428,4 +457,34 @@ Compared (the lead's options):
 | (a) UI writes a file the MCP only reads | the owner's UI login (uid 10005 owns the file) | no: no endpoint, no write access | a group and a ro mount | **yes** |
 | (b) owner rotation key, HMAC'd request to the MCP | a second key kept only by the UI | no, if the key and replay window are right | a key to provision, an HMAC + nonce store, still an endpoint | no: more crypto and an endpoint to get right, for the same result |
 | (c) a human-signed signer method | the enrolled human key (like AGP-039's signed actions) | no | the signer would then have to own and push the MCP's token | no: the signer holds no MCP secret today; needs a signature for a routine, low-value action |
+
+## The Stream Gateway (xbt-datum-gateway)
+
+The renter's own gateway, bundled so that rented hashrate is never mined unmasked. In product text it is
+**"Stream Gateway (DATUM-compatible)"**. No product text calls it "DATUM Gateway": its MIT licence grants
+no right to the DATUM name. It is CONVOY's `datum_gateway` (commit 971af86, MIT), vendored unmodified in
+`third_party/datum_gateway/`, plus two commits of ours:
+- every job, solo or pool, is masked with a fresh `xor_key` per block template, which the gateway holds,
+  with `clear_bits` = 32 + the share's power of two;
+- each job can be opened, without its key, at `GET /xbt/job` on its loopback API. The renter recomputes
+  the job's commitment from that and holds it to the `coinb1` its miner gets (`crates/xbt-hashlink/src/blind.rs`).
+
+It is C, so `scripts/datum_gateway_build.sh` builds it, static musl through zig for the three platforms, with
+its libraries from pinned, hash-checked sources. Its image layer carries the binary, `xbt-supervise`, and in
+`/usr/share/xbt-datum-gateway/` a NOTICE and the licence of everything linked in. libmicrohttpd and
+argp-standalone are LGPL; the NOTICE says where the source and the build script are, for relinking. Its OCI
+licence label says so: `MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR
+Apache-2.0)`. xbt-vpn's is `(MIT OR Apache-2.0) AND CC-BY-4.0` (DB-IP's country table); every other image is
+`MIT OR Apache-2.0`. `scripts/oci_inspect.py` holds the table and checks each label against it.
+
+It runs as `xbt-datum` in the renter's network namespace (Umbrel `network_mode: service:renter`, a
+StartOS package's shared loopback, the host's loopback on Linux). Its Stratum is on 127.0.0.1:23339 and
+its API on 127.0.0.1:7152 (7153 on Linux), so only the renter can reach `/xbt/job`. It reaches the node
+over RPC alone, and notices new blocks by polling. It starts once the UI writes `run/datum/config.json`.
+
+Pools: solo (the default; the renter's own address is paid), and Lazarus Pool with gateway-held keys (once
+the pool enables them; until then its jobs come back `pool-null` and the renter refuses them). Accepted
+risk, Mike 2026-10-31: on a pool that takes gateway-held keys, the renter's gateway learns of a win before
+the pool does, and could keep it from the pool. That is the same exposure a pool has to any DATUM miner
+today.
 

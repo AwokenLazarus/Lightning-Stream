@@ -1,0 +1,30 @@
+[package]
+name = "xbt-stream-relay"
+description = "A Stream relay built into the package: iroh-relay's server behind a pre-flight check (the domain points here, port 443 is reachable, the certificate budget allows a try), with automatic certificates, hardened defaults, no client addresses logged, a status file for the app, and a metering hook for paid relays"
+version.workspace = true
+edition.workspace = true
+# iroh 1.4 needs 1.91; the rest of the workspace keeps its own floor
+rust-version = "1.91"
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# the same iroh-relay the vendored iroh 1.4.1 uses, with its server
+iroh-relay = { version = "=1.4.1", default-features = false, features = ["server", "metrics"] }
+iroh-base = "=1.4.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+serde_json.workspace = true
+hex.workspace = true
+getrandom = "0.2"
+# logs: warnings and errors, never from inside a client's connection (RUST_LOG=warn,[conn]=off)
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+[dev-dependencies]
+# examples/relay_scale.rs: sellers and buyers reached through a relay, for measuring it
+xbt-iroh-link = { path = "../xbt-iroh-link" }
+
+[[bin]]
+name = "xbt-stream-relay"
+path = "src/main.rs"

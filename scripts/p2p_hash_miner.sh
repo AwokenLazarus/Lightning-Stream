@@ -10,11 +10,19 @@
 # with the hashmaker stopping the miner for non-payment; the miner's saved pool is its fallback in
 # the meantime.
 #
+# Every Stratum line between the miner and the hashmaker is logged (run/.../stratum-lines.log, the pool
+# password left out), and the summary reads from it what a lab can't show: whether this firmware's shares
+# pass the check, the forms its submits take, and how it applies a new difficulty.
+#
+# With GATEWAY_API (the gateway's local API, host:port) every job must be shown blinded, or the rental ends. A
+# gateway without it runs unblinded, and the summary says so. The miner hashes the same 80 bytes and sees the
+# same 39-byte coinb1 either way, which a blinded run on the real firmware confirms.
+#
 # The miner's pools are saved first (run/p2p-hash/miner/<time>/pools-before.json, mode 600: it
 # holds the pool passwords) and restored on every exit, then read back and compared.
 #
 #   MINER=host GATEWAY=host:port LISTEN=this-machine:port DM_USER=... DM_PASS=... scripts/p2p_hash_miner.sh
-#   optional: GW_USER, MINUTES (10), STOP_PAYING_AFTER (4), SHARE_DIFF (4096), SHARES_PER_SLICE (10)
+#   optional: GW_USER, GATEWAY_API, MINUTES (10), STOP_PAYING_AFTER (4), SHARE_DIFF (4096), SHARES_PER_SLICE (10)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${MINER:?}" "${GATEWAY:?}" "${LISTEN:?}" "${DM_USER:?}" "${DM_PASS:?}"
@@ -23,9 +31,10 @@ STOP_PAYING_AFTER=${STOP_PAYING_AFTER:-4}
 SHARE_DIFF=${SHARE_DIFF:-4096}
 SHARES_PER_SLICE=${SHARES_PER_SLICE:-10}
 SLICE_WORK=$((SHARES_PER_SLICE * SHARE_DIFF * 4294967296))
+if [ -n "${GATEWAY_API:-}" ]; then BLIND=(--gateway-api "$GATEWAY_API"); else BLIND=(--allow-unblinded 1); fi
 D=run/p2p-hash/miner/$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$D"
-cargo build -q --release -p xbt-hashlink
+cargo build -q --release -p xbt-hashlink --features test-unblinded
 BIN=target/release/xbt-hashlink
 DM="python3 -I scripts/p2p_hash/dragonmint.py $MINER"
 
@@ -43,14 +52,16 @@ trap restore EXIT
 
 "$BIN" keygen "$D/hasher.key" > "$D/hasher.pub"
 "$BIN" keygen "$D/buyer.key" > /dev/null
-"$BIN" hashmaker --key "$D/hasher.key" --miners "$LISTEN" --link 127.0.0.1:34931 --slice-work $SLICE_WORK \
+"$BIN" hashmaker --key "$D/hasher.key" --miners 127.0.0.1:34932 --link 127.0.0.1:34931 --slice-work $SLICE_WORK \
   --price-msat 10000 --grace-ms 30000 --report "$D/hasher.json" 2> "$D/hasher.log" &
 pids+=($!)
 sleep 0.5
+python3 -I scripts/p2p_hash/stratum_log.py "$LISTEN" 127.0.0.1:34932 "$D/stratum-lines.log" &
+pids+=($!)
 "$BIN" hashtaker --key "$D/buyer.key" --hashmaker 127.0.0.1:34931 --hashmaker-key "$(cat "$D/hasher.pub")" \
   --upstream "$GATEWAY" --user "$GW_USER" --slice-work $SLICE_WORK --price-msat 10000 --grace-ms 30000 \
   --rental "miner-$(date +%s)" --idle-s 180 --duration-s $((MINUTES * 60)) --stop-paying-after "$STOP_PAYING_AFTER" \
-  --report "$D/buyer.json" 2> "$D/buyer.log" &
+  "${BLIND[@]}" --report "$D/buyer.json" 2> "$D/buyer.log" &
 B=$!
 pids+=($B)
 sleep 1

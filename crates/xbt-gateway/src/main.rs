@@ -26,7 +26,7 @@ fn run(args: &[String]) -> Result<(), String> {
         [path] if !path.starts_with('-') => (false, path),
         _ => return Err("usage: xbt-gateway [--check] <config.json>".into()),
     };
-    let cfg = Config::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let mut cfg = Config::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
     // mainnet is asked for twice in the file (`chain` and `mainnet_ack`); a runner who did is told,
     // at every start and every check, what is known to be open there
     for line in cfg.mainnet_notice() {
@@ -140,11 +140,22 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?),
         None => None,
     };
-    let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
-    if let (Some(n), Some(k)) = (nostr, nostr_key) {
-        eprintln!("xbt-gateway: publishing the listing on Nostr to {} relays every {} s, as Nostr key {}", n.relays.len(), n.republish.as_secs(), k.public_hex());
-        xbt_gateway::nostr::spawn(gw.clone(), k, n).map_err(|e| format!("nostr: {e}"))?;
+    // a shop reached by key only is named by its Nostr key (xbt402::shop): that name is its origin
+    let link_keys = match &cfg.link {
+        Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?),
+        None => None,
+    };
+    let nostr_pk = link_keys.as_ref().map(|k| k.public.serialize());
+    // where the link is reached is told on the listing's own relays (xbt_iroh_link::nostr_lookup)
+    let link_relays: Vec<String> = cfg.nostr.as_ref().map(|n| n.relays.clone()).unwrap_or_default();
+    if cfg.public_url == xbt_gateway::config::LINK_ONLY {
+        let pk = nostr_pk.ok_or("a shop reached by key needs its Nostr key")?;
+        cfg.name_shop(xbt402::shop::origin_for(&pk));
+        eprintln!("xbt-gateway: a shop without a web address, named {} ({})", cfg.public_url, xbt402::shop::npub(&pk));
     }
+    let (link_cfg, state_dir) = (cfg.link.clone(), cfg.state_dir.clone());
+    let (link_node, seller, sign_mac) = (node.clone(), cfg.public_url.clone(), cfg.node.macaroon.with_file_name("sign.macaroon"));
+    let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
     let running = gw.serve(listener).map_err(|e| e.to_string())?;
     eprintln!(
         "xbt-gateway: listening on {}; an lnd-family node, {}; receipts signed by {}",
@@ -152,6 +163,17 @@ fn run(args: &[String]) -> Result<(), String> {
         gw.terms().pay_to,
         gw.terms().receipt_key
     );
+    // the link: the same gateway, reached by key (crates/xbt-iroh-link). Its streams come in as
+    // connections to the gateway's own port, so everything else is as for the web
+    let _link = match &link_cfg {
+        Some(l) => Some(start_link(l, &state_dir, running.addr, &link_node, &seller, &sign_mac, &gw, nostr_pk, link_keys.clone(), link_relays.clone())?),
+        None => None,
+    };
+    // after the link, so the first listing sent already names it
+    if let (Some(n), Some(k)) = (nostr, nostr_key) {
+        eprintln!("xbt-gateway: publishing the listing on Nostr to {} relays every {} s, as Nostr key {}", n.relays.len(), n.republish.as_secs(), k.public_hex());
+        xbt_gateway::nostr::spawn(gw.clone(), k, n).map_err(|e| format!("nostr: {e}"))?;
+    }
     let sig = signals.wait();
     xbt_svc::shutdown::say_stopping("xbt-gateway", sig);
     // the listener first, so that nothing new starts; then the requests in flight; then the book.
@@ -173,5 +195,294 @@ fn main() -> ExitCode {
             eprintln!("xbt-gateway: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Starts the gateway's link on `link.endpoints` keys and writes what the app needs to name it
+/// (`link.json` in the state directory: the keys and where they are reached), then has the seller's
+/// node vouch for each, again before the node's word runs out, for as long as the gateway runs.
+/// Every key leads to the same gateway; each keeps its own connection to its relay, so buyers who
+/// reach the shop through a relay do not all share one connection (and one relay's limit for it).
+#[allow(clippy::too_many_arguments)]
+fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, addr: std::net::SocketAddr,
+              node: &Arc<LndRest>, seller: &str, sign_mac: &std::path::Path, gw: &Arc<Gateway>, nostr_pk: Option<[u8; 32]>,
+              keys: Option<xbt_nostr::event::Keys>, nostr_relays: Vec<String>)
+              -> Result<Vec<Arc<xbt_iroh_link::Link>>, String> {
+    let upstream = if addr.ip().is_unspecified() { std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())) } else { addr };
+    let mut links = Vec::new();
+    for i in 0..l.endpoints {
+        // the first key is the one a gateway on one key always had
+        let file = if i == 0 { "link.key".to_string() } else { format!("link-{}.key", i + 1) };
+        let secret = xbt402::provider::load_or_create_secret(&state_dir.join(file)).map_err(|e| e.to_string())?;
+        // no relays named: ours, with iroh's public relays beside it. Relays named: each key has
+        // another of them first, as its home
+        let relays = if l.relays.is_empty() {
+            xbt_iroh_link::Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()])
+        } else {
+            let mut r = l.relays.clone();
+            let k = i % r.len();
+            r.rotate_left(k);
+            xbt_iroh_link::Relays::Ours(r)
+        };
+        let lookup = Some(Arc::new(xbt_iroh_link::nostr_lookup::NostrLookup::new(keys.clone(), nostr_relays.clone())));
+        let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private, lookup })
+            .map_err(|e| format!("link: {e}"))?;
+        link.serve(upstream);
+        links.push(link);
+    }
+    let v = Vouch { links: links.clone(), private: l.private, state_dir: state_dir.to_path_buf(), node: node.clone(), seller: seller.to_string(),
+                    sign_mac: sign_mac.to_path_buf(), gw: gw.clone(), nostr_pk, words: Default::default(), named: Default::default() };
+    // the sign key as it is before the first try: one pasted after it is news to the loop below
+    let mut key = SignKey::read(&v.sign_mac);
+    let mut until = v.once()?;
+    eprintln!(
+        "xbt-gateway: reached by {} over {}{}",
+        match links.as_slice() {
+            [one] => format!("key {}", one.endpoint_id()),
+            many => format!("{} keys, {} first", many.len(), many[0].endpoint_id()),
+        },
+        if l.private { "relays only" } else { "direct links and relays" },
+        if until.is_some() { "; the node vouches for it" } else { "; the node has not vouched for it (see sign_error at /.well-known/lightning-stream-link.json), so buyers cannot check it and nothing names it" }
+    );
+    std::thread::Builder::new().name("link-vouch".into()).spawn(move || {
+        let mut ask_at = next_ask(until, unix_now());
+        loop {
+            // the keys buyers can reach are looked at every REACH_CHECK, and the document made again
+            // when they change; the node is asked again ten days before its word runs out, an hour
+            // after a try that got no word (none yet, or a renewal refused), and at once when its sign
+            // key is given or replaced (pasted on a running shop: the gateway is not restarted for it,
+            // so no session is dropped)
+            std::thread::sleep(REACH_CHECK);
+            if v.gw.stopped() {
+                return;
+            }
+            let new_key = key.changed();
+            if unix_now() >= ask_at || new_key || v.reach_changed() {
+                match v.once() {
+                    Ok(u) => until = u.or(until.filter(|u| *u > unix_now())),
+                    Err(e) => eprintln!("xbt-gateway: link: {e}"),
+                }
+                ask_at = next_ask(until, unix_now());
+            }
+        }
+    }).map_err(|e| format!("link: {e}"))?;
+    Ok(links)
+}
+
+/// The node key the gateway asks the node to sign with (`sign.macaroon`), as last seen: the owner
+/// may give or replace it while the shop runs (StartOS: pasted on the Sell page), and the link is
+/// looked at again at once when it changes, not at the next hourly try. A key given where the node
+/// had not vouched is asked with then; one that replaces a key whose word still holds signs at the
+/// next renewal.
+struct SignKey {
+    path: std::path::PathBuf,
+    seen: Option<Vec<u8>>,
+}
+
+impl SignKey {
+    fn read(path: &std::path::Path) -> Self {
+        SignKey { path: path.to_path_buf(), seen: std::fs::read(path).ok() }
+    }
+
+    /// Whether the key is there now and differs from the one last seen (a key removed is no reason
+    /// to ask the node).
+    fn changed(&mut self) -> bool {
+        let now = std::fs::read(&self.path).ok();
+        let new = now.is_some() && now != self.seen;
+        self.seen = now;
+        new
+    }
+}
+
+/// When the node is next asked for its word, after a try at `now` that left it held until `until`:
+/// ten days before it runs out; or, when there is none or it is due already (the node did not vouch,
+/// or refused to renew), an hour on, so a key the node refuses is not tried every REACH_CHECK.
+fn next_ask(until: Option<u64>, now: u64) -> u64 {
+    match until {
+        Some(u) if u > now + VOUCH_AHEAD => u - VOUCH_AHEAD,
+        _ => now + ASK_AGAIN,
+    }
+}
+
+/// How long after a try that got no word the node is asked again.
+const ASK_AGAIN: u64 = 3600;
+/// How long the node's word for the link holds, and how long before its end it is asked again.
+const VOUCH_FOR: u64 = 30 * 86_400;
+const VOUCH_AHEAD: u64 = 10 * 86_400;
+/// How often the gateway looks at which of its keys buyers can reach.
+const REACH_CHECK: Duration = Duration::from_secs(15);
+
+/// What it takes to have the node vouch for the link and to say so.
+struct Vouch {
+    links: Vec<Arc<xbt_iroh_link::Link>>,
+    private: bool,
+    state_dir: std::path::PathBuf,
+    node: Arc<LndRest>,
+    seller: String,
+    sign_mac: std::path::PathBuf,
+    gw: Arc<Gateway>,
+    nostr_pk: Option<[u8; 32]>,
+    /// The node's word for each key, while it holds: (until, signature), so a key named again is
+    /// not signed again.
+    words: std::sync::Mutex<std::collections::HashMap<String, (u64, String)>>,
+    /// The keys the transport document names now.
+    named: std::sync::Mutex<Vec<String>>,
+}
+
+impl Vouch {
+    /// The keys buyers can reach now: connected to their home relay, or (not private) with a direct
+    /// address. All of them while none is, so that a shop is never left with no key named.
+    fn reachable(&self, hints: &[xbt_iroh_link::Hints]) -> Vec<String> {
+        let up: Vec<String> = self.links.iter().zip(hints)
+            .filter(|(l, h)| l.relay_connected() || (!self.private && !h.direct.is_empty()))
+            .map(|(l, _)| l.endpoint_id())
+            .collect();
+        if up.is_empty() { self.links.iter().map(|l| l.endpoint_id()).collect() } else { up }
+    }
+
+    /// Whether the keys buyers can reach have changed since the document was last made.
+    fn reach_changed(&self) -> bool {
+        let hints: Vec<xbt_iroh_link::Hints> = self.links.iter().map(|l| l.hints(Duration::ZERO)).collect();
+        self.reachable(&hints) != *self.named.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Asks the node to sign the claim for each link key (with a macaroon that allows only
+    /// SignMessage, where the app baked one), checks each signature is the node's own, and publishes
+    /// the result: the transport document, the link's state, `link.json`. `Some(expiry)` when the
+    /// node vouched for at least one key; only the keys it vouched for are named.
+    fn once(&self) -> Result<Option<u64>, String> {
+        let hints: Vec<xbt_iroh_link::Hints> = std::thread::scope(|sc| {
+            let hs: Vec<_> = self.links.iter().map(|l| sc.spawn(move || l.hints(Duration::from_secs(10)))).collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+        let fresh = unix_now() + VOUCH_FOR;
+        let reachable = self.reachable(&hints);
+        let mut sign_error: Option<String> = None;
+        let mac = std::fs::read(&self.sign_mac);
+        let mut each = Vec::new();
+        for (link, h) in self.links.iter().zip(&hints) {
+            let direct: Vec<String> = if self.private { vec![] } else { h.direct.iter().map(|a| a.to_string()).collect() };
+            let kept = self.words.lock().unwrap_or_else(|e| e.into_inner()).get(&link.endpoint_id()).filter(|(u, _)| *u > unix_now() + VOUCH_AHEAD).cloned();
+            let expires = kept.as_ref().map_or(fresh, |(u, _)| *u);
+            let node_sig = match (&kept, &mac) {
+                (Some((_, sig)), _) => Some(sig.clone()),
+                (None, Ok(mac)) => {
+                    let text = xbt402::claim::claim_text(&link.endpoint_id(), &self.seller, expires);
+                    match self.node.sign_message(mac, text.as_bytes()) {
+                        Ok(sig) => match (self.node.info(), xbt402::claim::recover(text.as_bytes(), &sig)) {
+                            // the node's own key, checked before it is published
+                            (Ok(info), Ok(k)) if hex::encode(k.serialize()) == info.pubkey => Some(sig),
+                            _ => {
+                                eprintln!("xbt-gateway: link: the node's signature is not its own key's: not published");
+                                sign_error = Some("the node's signature did not check out against its own key".into());
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("xbt-gateway: link: the node did not sign the link key: {e}");
+                            sign_error = Some(format!("the node did not sign: {e}"));
+                            None
+                        }
+                    }
+                }
+                (None, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    sign_error = Some("no key to ask the node to sign with (sign.macaroon): buyers cannot check this link yet".into());
+                    None
+                }
+                (None, Err(e)) => {
+                    sign_error = Some(format!("cannot read sign.macaroon: {e}: buyers cannot check this link yet"));
+                    None
+                }
+            };
+            if let Some(sig) = &node_sig {
+                self.words.lock().unwrap_or_else(|e| e.into_inner()).insert(link.endpoint_id(), (expires, sig.clone()));
+            }
+            each.push((link.endpoint_id(), h.relays.clone(), direct, node_sig.map(|s| (expires, s))));
+        }
+        let signed = |sig: &Option<(u64, String)>| sig.as_ref().map(|(u, _)| *u);
+        // the first key's fields where a gateway on one key had them; every key under `links`
+        let (id0, relays0, direct0, sig0) = each.first().cloned().ok_or("the link has no key")?;
+        let all: Vec<_> = each.iter().map(|(id, relays, direct, sig)| serde_json::json!({
+            "endpoint_id": id, "relays": relays, "direct": direct, "signed_until": signed(sig), "named": reachable.contains(id),
+        })).collect();
+        let doc = serde_json::json!({
+            "endpoint_id": id0,
+            "relays": relays0,
+            "direct": direct0,
+            "private": self.private,
+            "seller": self.seller,
+            "node_sig": sig0.as_ref().map(|(_, s)| s),
+            "expires": signed(&sig0),
+            "links": all,
+        });
+        std::fs::write(self.state_dir.join("link.json"), format!("{doc}\n")).map_err(|e| format!("link.json: {e}"))?;
+        // only the keys buyers can reach now: a key whose relay connection is not up yet would make
+        // the buyers it is first for wait; it is named once it is up (Vouch::reach_changed)
+        let vouched: Vec<xbt402::transport::Link> = each.iter().filter(|(id, ..)| reachable.contains(id))
+            .filter_map(|(id, relays, direct, sig)| sig.as_ref().map(|(expires, sig)| xbt402::transport::Link {
+                kind: "iroh".into(),
+                endpoint_id: id.clone(),
+                relays: relays.clone(),
+                direct: direct.clone(),
+                expires: *expires,
+                node_sig: sig.clone(),
+            })).collect();
+        *self.named.lock().unwrap_or_else(|e| e.into_inner()) = reachable.clone();
+        self.gw.set_link_status(serde_json::json!({
+            "seller": self.seller,
+            "npub": self.nostr_pk.map(|pk| xbt402::shop::npub(&pk)),
+            "endpoint_id": id0,
+            "relays": relays0,
+            "direct": direct0,
+            "home_relay": relays0.first(),
+            "signed_until": signed(&sig0),
+            "sign_error": sign_error,
+            "private": self.private,
+            "links": all,
+        }));
+        if vouched.is_empty() {
+            return Ok(None);
+        }
+        self.gw.set_link(&vouched, &unix_now().to_string());
+        Ok(vouched.iter().map(|l| l.expires).min())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_ask, SignKey, ASK_AGAIN, VOUCH_AHEAD, VOUCH_FOR};
+
+    /// The node is asked ten days before its word runs out; after a try that got no word, or a
+    /// renewal it refused (the word is due already), an hour on, not at every look at the link.
+    #[test]
+    fn a_refused_renewal_is_tried_again_an_hour_on_not_every_look() {
+        let now = 1_800_000_000;
+        assert_eq!(next_ask(Some(now + VOUCH_FOR), now), now + VOUCH_FOR - VOUCH_AHEAD, "a fresh word: renewed ten days before its end");
+        assert_eq!(next_ask(None, now), now + ASK_AGAIN, "no word: an hour on");
+        assert_eq!(next_ask(Some(now + VOUCH_AHEAD - 60), now), now + ASK_AGAIN, "a renewal refused: an hour on, while the word holds");
+        assert_eq!(next_ask(Some(now + VOUCH_AHEAD), now), now + ASK_AGAIN, "due exactly now and refused: an hour on");
+    }
+
+    /// A sign key pasted on a running shop is noticed at the next look (the node then vouches within
+    /// REACH_CHECK, with no restart); the same key written again, or the key removed, is not news.
+    #[test]
+    fn a_sign_key_given_or_replaced_while_running_is_noticed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sign.macaroon");
+        let mut k = SignKey::read(&p);
+        assert!(!k.changed(), "no key yet: nothing to ask the node");
+        std::fs::write(&p, b"key one").unwrap();
+        assert!(k.changed(), "a key pasted while running");
+        assert!(!k.changed(), "noticed once");
+        std::fs::write(&p, b"key one").unwrap();
+        assert!(!k.changed(), "the same key written again (a form saved twice)");
+        std::fs::write(&p, b"key two").unwrap();
+        assert!(k.changed(), "a key replaced");
+        std::fs::remove_file(&p).unwrap();
+        assert!(!k.changed(), "a key removed");
+        std::fs::write(&p, b"key two").unwrap();
+        assert!(k.changed(), "given back after removal");
+        let mut at_start = SignKey::read(&p);
+        assert!(!at_start.changed(), "a key there at start was already used for the first vouch");
     }
 }

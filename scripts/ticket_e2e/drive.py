@@ -27,6 +27,8 @@ funding proof), lf2->lf3 of 5,000,000 sat. A ticket is 1,000 sat for 40 blocks; 
   latency   a paid request against an unpaid one, both through the wallet
   stream    a 100 MB file whole, stopped half way by max_sats, stopped by the agent; the cancel; the
             four counts of money
+  money     Files and a web app's shape over a realistic amount: usage times the listed price, on both
+            sides (seller's receipts, wallet's account, both nodes, the book)
   liar      seven lies, each at most one ticket and booked exactly
   kill      five things killed at two points of a session each
   slots     the 30-slot channel: with half of the buyer's channel taken by others the wallet holds
@@ -41,12 +43,17 @@ Environment: LAB, RUN, OUT, BIN, TICKET_E2E_PORT_BASE (see the shell script).
 
 from __future__ import annotations
 
+import atexit
 import base64
+import glob
 import hashlib
 import http.client
 import json
 import os
+import re
 import secrets
+import shlex
+import shutil
 import signal
 import socket
 import statistics
@@ -54,6 +61,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -67,14 +76,32 @@ BASE = int(os.environ.get("TICKET_E2E_PORT_BASE", "17961"))
 BUYER, HOP, SELLER = "lf1", "lf2", "lf3"
 NODES = (BUYER, HOP, SELLER)
 GW_PORT, UP_PORT, GW2_PORT, PROXY_PORT = BASE + 4, BASE + 5, BASE + 6, BASE + 7
+# the link check's gateway: BASE + 9 is the offers check's node lf4
+GW_LINK_PORT = BASE + 11
+#: Shops reached by key (`link` checks): the app's shops file, which the MCP reads to hand each one's
+#: transport document to the signer, and the origins the policy allows, each paid through the seller.
+SHOPS_FILE = os.environ.setdefault("XBT_SHOPS_FILE", f"{RUN}/shops.json")
+LINK_ORIGINS: list[str] = []
 ORIGIN = f"http://127.0.0.1:{GW_PORT}"
 LIAR = f"http://127.0.0.1:{PROXY_PORT}"
 SPLIT = 125  # the regtest stand-in for the height the chains split at
 TICKET_MSAT = 1_000_000
+ON_THE_WAY_MSAT = 1_000_000  # what a seller may have charged for bytes still in the sockets as a wallet died (`kill`): 364,222 msat, 1.9 MB, measured; one ticket allowed
 BIG = 100_000_000
 BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
+#: The long_download checks' file: a download that runs well past the wallet's limit for an answer read whole,
+#: at 20 sat a MiB (about 6,100 sat for all of it)
+HUGE, HUGE_BYTE_MSAT = 320_000_000, 20_000
+#: The wallet's limit for an answer read whole while long_download runs, and how fast its client reads (as a player
+#: does: no faster than it plays), so that the download is open several times that limit on any lab host
+LONG_LIMIT_S, LONG_READ_BPS = 2, 40_000_000
+#: What a check sets in the wallet's `tickets` policy over the lab's own, for as long as it runs
+TICKET_OVERRIDES: dict[str, Any] = {}
 REQUEST_MSAT = 2_500
+APP_REQUEST_MSAT, APP_BYTE_MSAT = 2_500, 20_000  # the money check's web app: 2.5 sat a request, 20 sat a MiB
 SOCK = f"{RUN}/signer.sock"
+# the signer's socket for the hashrate renter alone (B2_RENTAL_SOCK): a task's rental terms are paid only through it
+RENTER_SOCK = f"{RUN}/renter.sock"
 WALLET = f"{RUN}/wallet"
 PAGE = "a small page\n" * 20
 REPORT: dict[str, Any] = {"checks": [], "measured": {}}
@@ -124,12 +151,12 @@ def tick(blocks: int = 1) -> int:
 # --- the signer and the MCP server -----------------------------------------------------------------------
 
 
-def signer(method: str, params: dict[str, Any] | None = None, timeout: float = 180) -> dict[str, Any]:
-    """One call on the signer's socket: for looking at the wallet, never for paying."""
+def signer(method: str, params: dict[str, Any] | None = None, timeout: float = 180, sock: str = SOCK) -> dict[str, Any]:
+    """One call on the signer's socket (or `sock`, the renter's): for looking at the wallet, never for paying."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect(SOCK)
+        s.connect(sock)
         s.sendall((json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n").encode())
         buf = b""
         while not buf.endswith(b"\n"):
@@ -152,12 +179,13 @@ class Wallet:
         pk = lab.pubkey(SELLER)
         return {
             # the two origins of the one seller, each tied to its node id
-            "allowlist": [ORIGIN, LIAR],
-            "counterparties": {ORIGIN: {"ln_node": pk}, LIAR: {"ln_node": pk}},
+            "allowlist": [ORIGIN, LIAR, *LINK_ORIGINS],
+            "counterparties": {o: {"ln_node": pk} for o in (ORIGIN, LIAR, *LINK_ORIGINS)},
             "max_per_tx_sats": 50_000,
             "daily_budget_sats": 4_000_000,
             "weekly_budget_sats": 8_000_000,
             "per_counterparty_cap_sats": 4_000_000,
+            "per_counterparty_daily_sats": 4_000_000,
             "velocity_max": 1_000,
             "velocity_window_s": 3600,
             "human_threshold_sats": 40_000,
@@ -168,7 +196,7 @@ class Wallet:
             # as shipped a session is one payment for velocity_max (a 100 MB file is twenty releases), a session holds
             # 2 tickets and the wallet 15 in all: none of that is set here
             "tickets": {"enabled": True, "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
-                        "tasks": {"film": {"budget_sats": 3_000_000}}},
+                        "tasks": {"film": {"budget_sats": 3_000_000}}, **TICKET_OVERRIDES},
         }
 
     def write_policy(self) -> None:
@@ -180,6 +208,7 @@ class Wallet:
         env = dict(
             os.environ,
             B2_SIGNER_SOCK=SOCK,
+            B2_RENTAL_SOCK=RENTER_SOCK,
             B2_RPCHOST="127.0.0.1",
             B2_RPCPORT=str(BASE),
             B2_RPCCOOKIE=f"{RUN}/rpc.cookie",
@@ -187,12 +216,15 @@ class Wallet:
             B2_HOT_KEYFILE=f"{RUN}/keys/wallet.key",
             B2_WATCH_INTERVAL="2",
             B2_BODY_DIR=f"{RUN}/bodies",
+            # the sockets a body is streamed to (the connector's visits): the same directory the connector uses
+            B2_STREAM_DIR=f"{RUN}/stream",
             B2_LN_REST=f"https://127.0.0.1:{lab.PORT[BUYER]}",
             B2_LN_MACAROON=f"{RUN}/rail.macaroon",
             B2_LN_TLS_CERT=f"{RUN}/{BUYER}.tls.cert",
         )
         if os.path.exists(SOCK):
             os.remove(SOCK)
+        os.makedirs(f"{RUN}/stream", exist_ok=True)
         with open(f"{RUN}/signer.log", "ab") as log:
             PROCS["signer"] = subprocess.Popen([f"{BIN}/xbt-signer", "--root", WALLET], env=env, stdout=log, stderr=subprocess.STDOUT)
         lab.wait("the signer's socket", 60, lambda: os.path.exists(SOCK) and signer("health")["ok"])
@@ -364,7 +396,8 @@ def quiet(secs: float = 120) -> float:
         # a buyer's node that was killed in the instant it sent a payment can go on calling that payment in flight with
         # nothing on its channel (docs/LIMITS.md): such a payment holds no money and no slot, and is not waited for
         on_channel = {base64.b64decode(h["hash_lock"]).hex() for c in lab.channels(BUYER) for h in c["pending_htlcs"]}
-        flying = {h for h, p in buyer_payments().items() if p["status"] == "IN_FLIGHT"}
+        # not final, whatever the node calls it (IN_FLIGHT, or INITIATED for one whose sender was killed as it sent)
+        flying = {h for h, p in buyer_payments().items() if p["status"] not in ("SUCCEEDED", "FAILED")}
         if on_channel or held():
             return False
         ORPHANS.update(flying)
@@ -379,18 +412,59 @@ def quiet(secs: float = 120) -> float:
 
 
 ORPHANS: set[str] = set()  # payments the buyer's node calls in flight with nothing on its channel
+FORGOTTEN: set[str] = set()  # sessions whose credit with the seller was given up
 
 
 def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
     """The agent stops every session that is open, and the tickets come back. With `forget` (each
     check starts clean with the seller), the credit a session leaves there is given up as well, so
-    the next session starts with none instead of taking it over."""
-    for s in status().get("sessions", []):
+    the next session starts with none instead of taking it over: a session stopped earlier in a
+    check (by the agent, or its call's max_sats) included, since a stop that ends its answer at once
+    leaves the rest of the last ticket with the seller. Every session the checks have seen, too: the
+    book no longer lists one whose tickets are all final (closed), and its credit is taken over as
+    an open one's is."""
+    listed = status().get("sessions", [])
+    wallet_says: dict[str, str] = {}
+    for s in listed:
         if s["state"] == "open":
-            note_receipts((who or agent()).tool("ticket_stop", {"session": s["session"]}).get("http") or {})
-            if forget:
-                signer("ticket_stop", {"session": s["session"], "forget_credit": True})
+            http = (who or agent()).tool("ticket_stop", {"session": s["session"]}).get("http") or {}
+            note_receipts(http)
+            if http.get("left_with_seller_msat") is not None:
+                wallet_says[s["session"]] = str(http["left_with_seller_msat"])
+    if forget:
+        for sid in [s["session"] for s in listed] + list(RECEIPTS):
+            if sid not in FORGOTTEN:
+                gave_up = signer("ticket_stop", {"session": sid, "forget_credit": True})
+                FORGOTTEN.add(sid)
+                GAVE_UP[sid] = str(gave_up.get("left_with_seller_msat"))
+                SELLER_SPENT[sid] = int(gave_up.get("seller_released_msat") or 0) - int(gave_up.get("left_with_seller_msat") or 0)
+                # the seller's own count for that seller session: what a call that died before its receipt could not note
+                if gave_up.get("seller_released_msat") is not None:
+                    RECEIPTS[sid] = max(RECEIPTS.get(sid, 0), int(gave_up["seller_released_msat"]))
+                    SELLER_OF.setdefault(sid, str(gave_up.get("seller_session")))
+                # what the wallet's stop said it leaves (its signed receipts) and what the seller says it holds
+                if sid in wallet_says:
+                    CREDIT_TOLD.append({"session": sid, "wallet_msat": wallet_says[sid], "seller_msat": gave_up.get("left_with_seller_msat")})
     quiet()
+
+
+CREDIT_TOLD: list[dict[str, Any]] = []  # credit given up, as both sides count it
+GAVE_UP: dict[str, str] = {}  # what the seller said it held of a session, when the session's credit was given up
+SELLER_SPENT: dict[str, int] = {}  # and what it counted as spent there
+
+
+def credit_told_alike() -> list[dict[str, Any]]:
+    """The credit given up since last asked where the wallet and the seller did not name one amount."""
+    told, CREDIT_TOLD[:] = list(CREDIT_TOLD), []
+    return [t for t in told if t["wallet_msat"] != t["seller_msat"]]
+
+
+def credit_left_or_taken_over(session: str, left_msat: str) -> dict[str, Any]:
+    """After a kill of the signer: what `session` left with its seller was logged, to the msat of the
+    last signed receipt, or a later session took that seller session over and uses it."""
+    logged = [e.get("left_msat") for e in events("ticket_left_with_seller", session)]
+    taken = [e for e in events("ticket_resumed") if e.get("seller_session") == SELLER_OF.get(session)]
+    return {"left_msat": left_msat, "logged": logged, "taken_over": len(taken), "ok": left_msat in logged or bool(taken)}
 
 
 def receipts_released() -> int:
@@ -400,6 +474,14 @@ def receipts_released() -> int:
         seller = SELLER_OF.get(wallet, wallet)
         by_seller[seller] = max(by_seller.get(seller, 0), msat)
     return sum(by_seller.values())
+
+
+def booked_for(hashes: set[str]) -> int:
+    """What the book holds booked, unsettled, for these payment hashes."""
+    if not hashes:
+        return 0
+    return sum(int(t.get("booked_sats") or 0) for s in status().get("sessions", []) for t in status(s["session"]).get("session_tickets", [])
+               if t.get("hash") in hashes and t.get("state") != "settled")
 
 
 def money() -> dict[str, Any]:
@@ -418,6 +500,8 @@ def money() -> dict[str, Any]:
         # booked as spent and not settled: after `quiet`, only tickets whose payment the buyer's node still calls in
         # flight with nothing on its channel (a node killed as it sent one). The wallet counts them until the node drops them
         "booked_for_payments_the_node_left_in_flight_sats": int(st.get("booked_sats") or 0),
+        # what the book holds booked for exactly those payments: `left` must be this, not merely "some orphan exists"
+        "booked_for_the_orphans_sats": booked_for(ORPHANS),
         "buyer_node_cost_sats": sum(cost_sats(p) for p in pays),
         "fees_msat": sum(int(p["fee_msat"]) for p in pays),
         "tickets": len(pays),
@@ -429,7 +513,46 @@ def agrees(m: dict[str, Any], receipts: bool = True) -> bool:
     if receipts:
         one.add(m["receipts_released_msat"])
     left = m["booked_for_payments_the_node_left_in_flight_sats"]
-    return len(one) == 1 and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"] + left and (left == 0 or bool(ORPHANS))
+    return len(one) == 1 and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"] + left and left == m["booked_for_the_orphans_sats"]
+
+
+def unsettled_bookings() -> list[dict[str, Any]]:
+    """Each ticket the book counts as spent and not settled, with what the buyer's node and the
+    seller's node say of it: for a check whose counts disagree, the line that says where."""
+    try:
+        return _unsettled_bookings()
+    except Exception as d:  # noqa: BLE001 (a check's own line must not be lost to its dump)
+        return [{"no_list": f"{type(d).__name__}: {d}"}]
+
+
+def _unsettled_bookings() -> list[dict[str, Any]]:
+    pays, invs = buyer_payments(), seller_invoices()
+    out = []
+    for s in status().get("sessions", []):
+        for t in status(s["session"]).get("session_tickets", []):
+            if int(t.get("booked_sats") or 0) > 0 and t.get("state") != "settled":
+                p, i = pays.get(t["hash"], {}), invs.get(t["hash"], {})
+                out.append({"hash": t["hash"][:16], "session": s["session"][:8], "session_state": s.get("state"), "state": t.get("state"),
+                            "booked_sats": t.get("booked_sats"), "released": t.get("released_ts"), "sent": t.get("sent_ts"), "cltv_until": t.get("cltv_until"),
+                            "final_expiry": t.get("final_expiry"), "prepaid": t.get("prepaid"), "note": t.get("note"),
+                            "buyer_node": p.get("status"), "htlcs": [h.get("status") for h in p.get("htlcs", [])], "seller_node": i.get("state")})
+    return out
+
+
+def never_sent_settled(inv: dict[str, Any], m: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], float]:
+    """After a kill of the signer: a ticket it was sending as it died (its write-ahead row written, its payment never
+    on the node) is booked until the book can show the node never had it, ln.timeout_s + 60 s after it was sent
+    (`ticket_reconcile_locked`). Where that booking is the only difference, it is waited for, and then the counts must be
+    exact. Returns the counts then, and the seconds waited (0: nothing to wait for)."""
+    if not m["booked_for_payments_the_node_left_in_flight_sats"] or ORPHANS or inv["not_in_ledger"] or not inv["same_tickets"]:
+        return inv, m, 0.0
+    t0 = time.monotonic()
+    try:
+        lab.wait("the bookings of tickets that never reached the node to go", 200,
+                 lambda: signer("watch_tick") is not None and money()["booked_for_payments_the_node_left_in_flight_sats"] == 0, every=5)
+    except LabError:
+        pass
+    return booked_and_once(), money(), round(time.monotonic() - t0, 1)
 
 
 def booked_and_once() -> dict[str, Any]:
@@ -456,7 +579,7 @@ def send(method: str, target: str, port: int, headers: dict[str, str] | None = N
         conn.close()
 
 
-def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | None = None) -> str:
+def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | None = None, page_msat: int = 0) -> str:
     cfg = {
         "listen": f"127.0.0.1:{port}",
         "public_url": public,
@@ -471,7 +594,10 @@ def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | Non
         "times": {"height_max_age_secs": 5},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
-            {"path": "/small.txt", "price": {"request_msat": REQUEST_MSAT}},
+            {"path": "/huge.bin", "price": {"byte_msat": HUGE_BYTE_MSAT, "per_bytes": PER_BYTES}},
+            # a web app's shape (the money check): a price per request and per byte
+            {"path": "/app/", "price": {"request_msat": APP_REQUEST_MSAT, "byte_msat": APP_BYTE_MSAT, "per_bytes": PER_BYTES}},
+            {"path": "/small.txt", "price": {"request_msat": page_msat or REQUEST_MSAT}},
             {"path": "/free/", "free": True},
         ],
     }
@@ -564,6 +690,7 @@ class Lies:
     kept_receipt: str | None = None
     cut_after = 0
     seen: list[tuple[str, str, bool]] = []  # (method, target, paid)
+    answers: list[tuple[str, bool, int, str]] = []  # (target, paid, status, error code), as the gateway answered
 
 
 def lie_headers(method: str, target: str, paid: bool, headers: dict[str, str]) -> dict[str, str]:
@@ -615,6 +742,13 @@ class Proxy(BaseHTTPRequestHandler):
         try:
             conn.request(method, self.path, body=body or None, headers=fwd)
             r = conn.getresponse()
+            code = ""
+            if r.status == 402 and "payment-required" in {k.lower() for k, _ in r.getheaders()}:
+                try:
+                    code = str(json.loads(base64.b64decode(r.getheader("PAYMENT-REQUIRED") or "")).get("error", ""))
+                except ValueError:
+                    code = "?"
+            Lies.answers.append((self.path, paid, r.status, code))
             headers = lie_headers(method, self.path, paid, {k.lower(): v for k, v in r.getheaders()})
             length = r.getheader("Content-Length")
             if self.path == "/x402/ticket/lock" and Lies.mode == "other_payee" and r.status == 200:
@@ -769,7 +903,7 @@ def page() -> None:
     r = pay(f"{ORIGIN}/small.txt")
     first = time.monotonic() - t0
     ok = (r.get("verdict") == "allow" and r.get("rail") == "ticket" and r.get("status") == 200 and body_of(r) == PAGE and r.get("tickets_released") == 1
-          and r.get("price_msat") == str(REQUEST_MSAT) and r.get("balance_msat") == str(TICKET_MSAT - REQUEST_MSAT) and r["receipt"] == {"signed": True, "body": "as signed"})
+          and r.get("price_msat") == str(REQUEST_MSAT) and r.get("balance_msat") == str(TICKET_MSAT - REQUEST_MSAT) and r.get("receipt") == {"signed": True, "body": "as signed"})
     check("page: one xbt402_pay call fetched a priced page behind the gateway, through the hop: one ticket of the pool released, 2,500 msat used, the seller's receipt signs the body",
           ok, brief(r))
     # the node reports a payment settled a moment before it takes the HTLC off its channel: the book and the channel are
@@ -854,12 +988,12 @@ def stream() -> None:
     r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
     took = time.monotonic() - t0
     ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
-          and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
+          and r.get("tickets_released") == 20 and (r.get("receipt") or {}).get("body") == "as signed" and (r.get("receipt") or {}).get("last", {}).get("charged") == str(price_msat))
     stored = r.get("saved_to", "")
     same_file = bool(stored) and os.path.getsize(stored) == BIG and hashlib.sha256(open(stored, "rb").read()).hexdigest() == r.get("body_digest")
     measured("file_100mb_s", round(took, 2))
     check("stream: a 100 MB file priced per byte came through the wallet whole: 20 tickets released one at a time as it arrived, the stored file is the seller's file, and the last receipt signs its hash and its price",
-          ok and same_file, {**brief(r), "receipt": {"body": r["receipt"].get("body")}, "seconds": round(took, 2), "stored_is_the_file": same_file})
+          ok and same_file, {**brief(r), "receipt": {"body": (r.get("receipt") or {}).get("body")}, "seconds": round(took, 2), "stored_is_the_file": same_file})
     if stored:
         os.remove(stored)
     # half way: the call allows half the price
@@ -873,7 +1007,7 @@ def stream() -> None:
           and half * 1000 - 1_015_000 <= by_count <= half * 1000 + (64 << 10) * BYTE_MSAT // PER_BYTES + 1 and got < BIG * 0.52
           and int(r.get("charged_sats") or 0) <= half)
     check("stream: the same file under a call that allows half its price stops near half way, at the byte the tickets that fit the call's max_sats pay for by the wallet's own count",
-          ok, {**brief(r), "receipt": {"body": r["receipt"].get("body")}, "bytes": got, "max_sats": half, "price_of_bytes_msat": by_count})
+          ok, {**brief(r), "receipt": {"body": (r.get("receipt") or {}).get("body")}, "bytes": got, "max_sats": half, "price_of_bytes_msat": by_count})
     if r.get("saved_to"):
         os.remove(r["saved_to"])
     # stopped by the agent while it arrives
@@ -889,7 +1023,12 @@ def stream() -> None:
     t = threading.Thread(target=run)
     released_before = int((status().get("paying") or [{}])[0].get("released_msat", 0))
     t.start()
-    lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= released_before + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+    try:
+        lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= released_before + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+    except LabError as e:
+        # what the call came to, and the wallet's own view, say why it never got under way
+        t.join(30)
+        raise LabError(f"{e}: the call {json.dumps(brief(result))[:600]}; paying {json.dumps(status().get('paying'))[:600]}") from None
     sid = status()["sessions"][0]["session"]
     t0 = time.monotonic()
     stop = agent().tool("ticket_stop", {"session": sid})
@@ -916,9 +1055,266 @@ def stream() -> None:
           agrees(m) and m["tickets"] > 20, m)
 
 
+class ChannelDrops:
+    """The buyer's connection to its one peer dropped and made again every second, on the real nodes: its channel
+    goes inactive, as it does when a peer's connection drops, under whatever the wallet is paying then."""
+
+    uses = 0
+
+    def __init__(self, every: float = 0.0) -> None:
+        self.every = every or float(os.environ.get("FLAP_EVERY", "5"))
+        self.done = threading.Event()
+        self.drops = 0
+        self.reconnected = 0
+        self.errors: list[str] = []
+        self.back_s: list[float | None] = []
+        self.last_connect: float | None = None
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self) -> None:
+        pk = lab.pubkey(HOP)
+        next_drop = time.monotonic() + self.every
+        while not self.done.wait(max(0.0, next_drop - time.monotonic())):
+            next_drop += self.every
+            try:
+                lab.lncli(BUYER, "disconnect", pk)
+                self.drops += 1
+                lab.lncli(BUYER, "connect", f"{pk}@{HOP}:9735")
+                self.last_connect = time.monotonic()
+            except LabError as e:
+                said = str(e).split("rpc error:")[-1]
+                # the nodes reconnect to a channel's peer by themselves: between this disconnect and connect, or before
+                # the next disconnect. That is what they do, and the drop happened or will; anything else is an error
+                if "already connected to peer" in said or "is not connected" in said:
+                    self.reconnected += 1
+                else:
+                    self.errors.append(said[:160])
+            # how long from the connect until the buyer's node shows the channel active again, within this cycle (the
+            # next drop keeps its time): None, still out when the next drop came
+            t0 = time.monotonic()
+            back = None
+            while time.monotonic() < next_drop and not self.done.is_set():
+                try:
+                    if any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]):
+                        back = time.monotonic() - t0
+                        break
+                except LabError:
+                    pass
+                time.sleep(0.1)
+            self.back_s.append(back)
+
+    def back_summary(self) -> dict[str, Any]:
+        """Connect to channel active, per cycle: how many, the median, 90th percentile and longest of those that came
+        back within their cycle, how many did not, and how many took over the wallet's 8 s wait."""
+        came = sorted(b for b in self.back_s if b is not None)
+        at = lambda q: round(came[min(len(came) - 1, int(q * (len(came) - 1) + 0.5))], 2) if came else None  # noqa: E731
+        return {"cycles": len(self.back_s), "back_in_cycle": len(came), "not_back_in_cycle": len(self.back_s) - len(came),
+                "median_s": at(0.5), "p90_s": at(0.9), "longest_s": round(came[-1], 2) if came else None,
+                "over_8s": sum(1 for b in came if b > 8.0), "every_s": self.every}
+
+    def __enter__(self) -> "ChannelDrops":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.done.set()
+        self.thread.join()
+        ChannelDrops.uses += 1
+        summary = self.back_summary()
+        pk = lab.pubkey(HOP)
+        try:
+            lab.wait("the channel active again", 60, lambda: any(c["active"] and c["remote_pubkey"] == pk for c in lab.lncli(BUYER, "listchannels")["channels"]), every=0.2)
+        except LabError as e:
+            measured(f"flap_channel_back_every_{self.every:g}s_{ChannelDrops.uses}", {**summary, "last_connect_to_active_s": None})
+            raise LabError(f"{e} (what both nodes said then: {self.diagnose()})") from e
+        # the last reconnect, with no drop after it to cut the wait short: how long until the channel was active again
+        summary["last_connect_to_active_s"] = round(time.monotonic() - self.last_connect, 2) if self.last_connect is not None else None
+        measured(f"flap_channel_back_every_{self.every:g}s_{ChannelDrops.uses}", summary)
+
+    def diagnose(self) -> str:
+        """What the buyer and its peer say of each other when the channel does not come back: their peers, their
+        inactive channels, and the last 50 lines of each node's log about the other. Kept in run/flap-channel-diag.log."""
+        out: dict[str, Any] = {"drops": self.drops, "reconnected_by_themselves": self.reconnected, "errors": self.errors}
+        for node, other in ((BUYER, HOP), (HOP, BUYER)):
+            opk = lab.pubkey(other)
+            seen: dict[str, Any] = {}
+            try:
+                seen["peers"] = [{k: p.get(k) for k in ("pub_key", "address", "inbound", "flap_count", "last_flap_ns", "errors")}
+                                 for p in lab.lncli(node, "listpeers").get("peers", []) if p.get("pub_key") == opk]
+            except LabError as e:
+                seen["peers"] = str(e)[:300]
+            try:
+                seen["inactive"] = [{k: c.get(k) for k in ("chan_id", "remote_pubkey", "active", "lifetime", "uptime", "chan_status_flags")}
+                                    for c in lab.lncli(node, "listchannels", "--inactive_only").get("channels", [])]
+            except LabError as e:
+                seen["inactive"] = str(e)[:300]
+            logs = lab.dc("logs", "--no-color", "--tail", "4000", node, check=False).splitlines()
+            seen["log"] = [ln[-400:] for ln in logs if opk[:16] in ln or opk[:10] in ln][-50:]
+            out[node] = seen
+        with open(f"{RUN}/flap-channel-diag.log", "w") as f:
+            json.dump(out, f, indent=1)
+        return json.dumps({n: {"peers": out[n]["peers"], "inactive": out[n]["inactive"]} for n in (BUYER, HOP)})[:1500]
+
+
+# What an answer the wallet does not read may still cost on a route priced by the byte: what the seller's socket took
+# before the wallet closed it, at once on seeing the range ignored. That is bounded by the OS's socket buffers on both
+# ends and what was on its way (docs/LIMITS.md: up to 822 KiB measured on loopback), not by the wallet; the check
+# reports the amount. More than 2 MiB is a finding.
+UNREAD_MOST_MSAT = -(-(2 << 20) * BYTE_MSAT // PER_BYTES)
+
+
+def digest_of_range(start: int) -> str:
+    h = hashlib.sha256()
+    with open(f"{RUN}/www/big.bin", "rb") as f:
+        f.seek(start)
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def flap() -> None:
+    """The gate: a drop every FLAP_EVERY seconds (5 by default) under a 100 MB file paid by tickets, which arrives
+    whole; at a slower rate, files until one has had a drop under it (at most 6). Then an outage: a drop every
+    second, which may end the file; it ends with its reason, the money stays right, and once the channel is back
+    the same file goes on from the byte where it stopped, paying for the rest only."""
+    stop_sessions()
+    files: list[dict[str, Any]] = []
+    with ChannelDrops() as drops:
+        while len(files) < 6:
+            had = drops.drops
+            r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
+            ok = call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG)
+            # why the book stopped the session, where it did
+            why = [s.get("why") for s in status().get("sessions", []) if s.get("session") == r.get("session") and s.get("state") != "open"]
+            files.append({**brief(r), "ok": ok, "drops_under_it": drops.drops - had, "session_stopped_why": why})
+            if r.get("saved_to"):
+                os.remove(r["saved_to"])
+            if not ok or drops.drops > had:
+                break
+    check(f"flap: a 100 MB file paid by tickets comes whole while the channel's peer connection is dropped under it every {drops.every:g} s, on the real nodes",
+          all(f["ok"] for f in files) and drops.drops >= 1 and not drops.errors,
+          {"files": files, "drops": drops.drops, "reconnected_by_themselves": drops.reconnected, "errors": drops.errors})
+    quiet()
+    m = money()
+    check("flap: what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number, to the millisat",
+          agrees(m), m)
+    # an outage: a drop every second, on a file served with ranges (the stock server has none), so that it can go on
+    stop_sessions()
+    range_port, gw_port = BASE + 25, BASE + 26
+    server = ThreadingHTTPServer(("127.0.0.1", range_port), RangeFiles)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    origin = f"http://127.0.0.1:{gw_port}"
+    path = gateway_config("gateway-flap", gw_port, origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["upstream"] = f"http://127.0.0.1:{range_port}"
+    # its own file, priced as big.bin is (the change of copy below rewrites it): a path the gateway has no route for is a 404
+    cfg["routes"].append({"path": "/flap.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}})
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("gateway-flap", gw_port)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    # the owner's policy is read at the signer's start: the new seller is on its allowlist from then on
+    restart_signer()
+    shutil.copyfile(f"{RUN}/www/big.bin", f"{RUN}/www/flap.bin")
+    try:
+        with ChannelDrops(1.0) as drops:
+            r = pay(f"{origin}/flap.bin", max_sats=25_000)
+        got = int(r.get("bytes") or 0)
+        if r.get("saved_to"):
+            os.remove(r["saved_to"])
+        first = {**brief(r), "drops": drops.drops, "errors": drops.errors}
+        if r.get("complete") is True and got == BIG:
+            check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
+                  r.get("body_digest") == digest_of_prefix(BIG) and not drops.errors, {"whole": True, **first})
+        else:
+            ended = str(r.get("ended") or "")
+            clear = ended.startswith("stopped by the wallet: ") or ended.startswith("cut short by the seller")
+            rest = BIG - got
+            again = agent().tool("xbt402_pay", {"url": f"{origin}/flap.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-",
+                                                "if_range": r.get("etag") or ""})
+            note_receipts(again)
+            if again.get("saved_to"):
+                os.remove(again["saved_to"])
+            price = int(again.get("price_msat") or 0)
+            rest_msat = -(-rest * BYTE_MSAT // PER_BYTES)
+            resumed = {"bytes": again.get("bytes"), "complete": again.get("complete"), "status": again.get("status"), "price_msat": price,
+                       "price_of_the_rest_msat": rest_msat, "ended": again.get("ended"), "etag": r.get("etag"),
+                       "verdict": again.get("verdict"), "rule": again.get("rule"), "reason": str(again.get("reason") or again.get("error") or "")[:300],
+                       "session": again.get("session"), "first_session": r.get("session")}
+            check("flap: through a drop every second (an outage), the file either arrives whole or ends with its reason and goes on from that byte once the channel is back",
+                  bool(got) and clear and bool(r.get("etag")) and again.get("status") == 206 and again.get("complete") is True and again.get("bytes") == rest
+                  and again.get("body_digest") == digest_of_range(got) and price <= rest_msat and not drops.errors,
+                  {"first": first, "stopped_at": got, "reason_clear": clear, "resumed": resumed})
+        # every time, whatever the outage did: a file stopped part-way on purpose (the call allows half its price) goes
+        # on from that byte, from the same copy
+        stop_sessions()
+        half = -(-BIG * BYTE_MSAT // PER_BYTES) // 2 // 1000
+        part = pay(f"{origin}/flap.bin", max_sats=half)
+        got = int(part.get("bytes") or 0)
+        if part.get("saved_to"):
+            os.remove(part["saved_to"])
+        on = agent().tool("xbt402_pay", {"url": f"{origin}/flap.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-",
+                                         "if_range": part.get("etag") or ""})
+        note_receipts(on)
+        if on.get("saved_to"):
+            os.remove(on["saved_to"])
+        rest_msat = -(-(BIG - got) * BYTE_MSAT // PER_BYTES)
+        check("flap: a file stopped part-way on purpose goes on from that byte, from the same copy: a 206 of exactly the rest, its bytes the file's, priced as the rest",
+              0 < got < BIG and str(part.get("ended", "")).startswith("stopped by the wallet: max_sats") and on.get("status") == 206 and on.get("complete") is True
+              and on.get("bytes") == BIG - got and on.get("body_digest") == digest_of_range(got) and int(on.get("price_msat") or 0) <= rest_msat,
+              {"stopped_at": got, "first_ended": part.get("ended"), "etag": part.get("etag"),
+               "resumed": {k: on.get(k) for k in ("status", "bytes", "complete", "price_msat", "ended")}, "price_of_the_rest_msat": rest_msat})
+        # the file changed between the two calls: the seller's copy is another, and its rest is not spliced on
+        stop_sessions()
+        r = pay(f"{origin}/flap.bin", max_sats=25_000)
+        etag = r.get("etag") or ""
+        if r.get("saved_to"):
+            os.remove(r["saved_to"])
+        with open(f"{RUN}/www/flap.bin", "r+b") as f:
+            f.seek(BIG // 2)
+            f.write(b"another copy")
+        changed = agent().tool("xbt402_pay", {"url": f"{origin}/flap.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={BIG // 4}-", "if_range": etag})
+        note_receipts(changed)
+        if changed.get("saved_to"):
+            os.remove(changed["saved_to"])
+        check("flap: a range that goes on from a copy the seller no longer has comes back whole, and none of it is read; it costs at most what the seller's socket took",
+              bool(etag) and changed.get("rule") == "ticket_range_ignored" and changed.get("status") == 200 and int(changed.get("bytes") or 0) == 0
+              and int(changed.get("price_msat") or 0) <= UNREAD_MOST_MSAT,
+              {k: changed.get(k) for k in ("status", "rule", "reason", "bytes", "price_msat", "charged_sats", "complete", "ended")} | {"etag": etag})
+    finally:
+        server.shutdown()
+    # the stock server, which has no ranges: the same file stopped part-way on purpose, and its rest asked for, is
+    # answered with the whole body, and none of it is read
+    stop_sessions()
+    part = pay(f"{ORIGIN}/big.bin", max_sats=-(-BIG * BYTE_MSAT // PER_BYTES) // 2 // 1000)
+    got = int(part.get("bytes") or 0)
+    if part.get("saved_to"):
+        os.remove(part["saved_to"])
+    plain = agent().tool("xbt402_pay", {"url": f"{ORIGIN}/big.bin", "max_sats": 25_000, "task": "film", "range": f"bytes={got}-"})
+    note_receipts(plain)
+    if plain.get("saved_to"):
+        os.remove(plain["saved_to"])
+    check("flap: a seller whose server has no ranges answers a range with the whole body, and the wallet reads none of it; it costs at most what the seller's socket took",
+          0 < got < BIG and plain.get("rule") == "ticket_range_ignored" and plain.get("status") == 200 and int(plain.get("bytes") or 0) == 0 and int(plain.get("price_msat") or 0) <= UNREAD_MOST_MSAT,
+          {k: plain.get(k) for k in ("status", "rule", "reason", "bytes", "price_msat", "charged_sats", "complete", "ended")})
+    quiet()
+    m = money()
+    check("flap: after the outage and the resumed file, what the buyer's node paid, what the seller's node received, what the wallet booked and the seller's receipts are one number",
+          agrees(m), m)
+
+
 def lie(name: str, what: str, act: Any, expect: Any, most_tickets: int) -> None:
     """One lie: `act` makes the paid calls with the proxy in mode `name`; `expect` judges the last reply."""
     stop_sessions()
+    # each case starts clean: a seller the last case caught over-charging is blocked, and the owner lifts it (the lab
+    # has no approval key to sign the unblock with, so it clears the signer's block file, as the owner's signed
+    # message would)
+    blocks = f"{WALLET}/.run/blocked_sellers.json"
+    if os.path.exists(blocks):
+        os.remove(blocks)
     before = money()
     paid_before = set(buyer_payments())
     Lies.mode, Lies.kept_receipt = None, None
@@ -979,6 +1375,52 @@ def liar() -> None:
 
     lie("cut", "an answer that stops in the middle (7 MiB of a 100 MB file): what was released for it is paid, less than one ticket of it for nothing, and no ticket after it",
         from_the_start("cut", big_url, 25_000), cut_ok, 2)
+    price_change_in_a_visit(page_url)
+
+
+def page_read(url: str, max_sats: int = CALL_SATS) -> dict[str, Any]:
+    """A page of a web app, as the connector's visit asks for it: paid on the terms the seller stated for its
+    route, without asking the price first (known_terms)."""
+    r = signer("xbt402_pay", {"url": url, "max_sats": max_sats, "task": "film", "known_terms": True})
+    note_receipts(r)
+    return r
+
+
+def price_change_in_a_visit(page_url: str) -> None:
+    """The seller's own gateway changes the page's price in the middle of a web app's visit: the next page, sent
+    on the price the wallet was told, is refused unpaid with a receipt (terms_changed), the price is asked
+    again, and the page is paid at the new price within the owner's rules; the money agrees."""
+    stop_sessions()
+    before = money()
+    start = len(Lies.answers)
+    first, second = page_read(page_url), page_read(page_url)
+    # the first page asks the price; the second, on the terms it was told, does not
+    asked_before = sum(1 for t, paid, _, _ in Lies.answers[start:] if t == "/small.txt" and not paid)
+    # the seller's gateway, stopped and started again on its journal with the page at twice its price
+    PROCS["gateway2"].terminate()
+    PROCS["gateway2"].wait(10)
+    gateway_config("gateway2", GW2_PORT, LIAR, page_msat=2 * REQUEST_MSAT)
+    start_gateway("gateway2", GW2_PORT)
+    mark = len(Lies.answers)
+    third = page_read(page_url)
+    seen = [(paid, status, code) for t, paid, status, code in Lies.answers[mark:] if t == "/small.txt"]
+    # the page at its own price again, for the checks after this one
+    PROCS["gateway2"].terminate()
+    PROCS["gateway2"].wait(10)
+    gateway_config("gateway2", GW2_PORT, LIAR)
+    start_gateway("gateway2", GW2_PORT)
+    stop_sessions()
+    after = money()
+    exact = agrees(after, receipts=False)
+    refused_unpaid = bool(seen) and seen[0] == (True, 402, "terms_changed")
+    asked_again = any(not paid for paid, _, _ in seen[1:])
+    paid_new = call_paid(third) and str(third.get("price_msat")) == str(2 * REQUEST_MSAT)
+    no_fault = not any(r.get("seller_fault") for r in (first, second, third))
+    check("liar: the seller's own price changes in the middle of a web app's visit: the page sent on the old price is refused unpaid with a receipt "
+          "(terms_changed), the price is asked again, the new price is paid within the owner's rules, and the money agrees",
+          call_paid(first) and call_paid(second) and asked_before <= 1 and refused_unpaid and asked_again and paid_new and no_fault and exact,
+          {"first": brief(first), "third": brief(third), "asked_before_the_change": asked_before, "after_the_change": seen,
+           "booked_exactly": exact, "tickets": after["tickets"] - before["tickets"]})
 
 
 def next_call_pays(what: str) -> dict[str, Any]:
@@ -1021,8 +1463,33 @@ def killed(victim: str, at: str) -> None:
     else:
         lab.dc("kill", victim)
         lab.forget_connections()
-        lab.dc("start", victim)
-        lab.wait(f"{victim} back and synced", 180, lambda: lab.synced(victim), every=0.2)
+        # `kill` returns before the container has stopped, and a `start` meanwhile does nothing: the node then stayed
+        # down, refusing connections until the wait below ran out (seen on this lab: "Exited (137)" three minutes after
+        # the start). So: stopped first, started, and running before anything is asked of it
+        state = lambda: lab.dc("ps", "-a", "--format", "{{.State}}", victim, check=False).strip()  # noqa: E731
+        lab.wait(f"{victim} stopped", 60, lambda: state() == "exited", every=0.2)
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for _ in range(3):
+            lab.dc("start", victim)
+            try:
+                lab.wait(f"{victim} running", 20, lambda: state() == "running", every=0.2)
+                break
+            except LabError:
+                continue
+        try:
+            lab.wait(f"{victim} back and synced", 180, lambda: lab.synced(victim), every=0.2)
+        except LabError as e:
+            # what the node said since it was started again, its container's state, and how loaded the machine was: a
+            # node starved of CPU on a busy lab host was slow to listen (seen on this lab at load 16 to 124 on 12 cores)
+            try:
+                # its warnings and errors only, every 64-hex value (a preimage, a hash) cut out
+                said = [re.sub(r"[0-9a-f]{64}", "<64hex>", ln) for ln in lab.dc("logs", "--no-color", "--since", started, victim, check=False).splitlines()
+                        if " [WRN] " in ln or " [ERR] " in ln or " [CRT] " in ln]
+                state = lab.dc("ps", "-a", "--format", "{{.Name}} {{.State}} {{.Status}}", victim, check=False)
+                note = f"; load {os.getloadavg()[0]:.1f}; container: {state}; {victim}'s warnings since its start ({len(said)}): {' | '.join(said[-12:])[:2500]}"
+            except Exception as d:  # noqa: BLE001 (the timeout is the error; what is added to it must not replace it)
+                note = f"; (no more said: {type(d).__name__}: {d})"
+            raise LabError(f"{e}{note}") from None
         peers = {BUYER: 1, SELLER: 1}[victim]
         lab.wait(f"{victim}'s channel active again", 180, partial(active, victim, peers), every=0.5)
         if victim == BUYER:
@@ -1070,13 +1537,38 @@ def kill() -> None:
         try:
             lab.wait("the pool locked and listed", 30, settled_down, every=0.1)
         except LabError as e:
+            try:
+                # where the pool did not come: the call, the session as the book has it, its tickets and its audit trail
+                sid = str(r.get("session"))
+                mine = status(sid).get("session_tickets", [])
+                hashes = {t["hash"] for t in mine}
+                trail = [{k: v for k, v in ev.items() if k not in ("dest",)} for ev in signer("history", {"limit": 5000})["events"]
+                         if ev.get("session") == sid or ev.get("payment_hash") in hashes]
+                diag = {"call": {k: r.get(k) for k in ("tickets_prepaid", "tickets_released", "rule", "ended", "session")},
+                        "session": session_of(r), "tickets": [{k: t.get(k) for k in ("hash", "state", "prepaid", "note")} for t in mine], "trail": trail[-25:]}
+                print(f"     the pool did not lock before the kill of {victim}: {json.dumps(diag)[:6000]}", flush=True)
+            except Exception as d:  # noqa: BLE001 (the wait's error is what counts; the dump must not replace it)
+                print(f"     (no dump of the session: {type(d).__name__}: {d})", flush=True)
             raise LabError(f"{e}; last seen: {json.dumps(saw)[:900]}") from e
         killed(victim, "a pool locked")
+        # the watcher's report comes before the next call here, so that it can be held to the last receipt to the msat
+        credit = None
+        if victim == "signer":
+            signer("watch_tick")
+            credit = credit_left_or_taken_over(str(r.get("session")), str(r.get("balance_msat")))
+            credit["ok"] = credit["left_msat"] in credit["logged"]
         resumed = next_call_pays(f"kill {victim} with a pool locked")
         stop_sessions()
-        inv, m = booked_and_once(), money()
+        inv, m, waited = never_sent_settled(booked_and_once(), money())
+        ok = not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m)
+        # the first call after the signer starts again is paid at once (it takes the credit over), not refused first
+        if victim == "signer":
+            ok = ok and resumed["said_first"] == []
+        differ = credit_told_alike()
+        ok = ok and (credit is None or credit["ok"]) and not differ
         check(f"kill: {victim}, with a pool locked: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
-              not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False), {"next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS)})
+              ok, {"next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS), "credit_left": credit, "credit_told_differently": differ,
+                   "never_sent_booking_waited_s": waited, **({} if ok else {"unsettled": unsettled_bookings()})})
         # in the middle of an answer that is being paid for
         other = Mcp()
         result: dict[str, Any] = {}
@@ -1090,24 +1582,54 @@ def kill() -> None:
         base = int((status().get("paying") or [{}])[0].get("released_msat", 0))
         t = threading.Thread(target=run)
         t.start()
-        lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= base + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+        try:
+            lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= base + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+        except LabError as e:
+            t.join(30)
+            raise LabError(f"{e} ({victim}): the call {json.dumps(brief(result))[:600]}; paying {json.dumps(status().get('paying'))[:600]}") from None
+        under_way = next((p for p in status().get("paying", []) if p.get("answer_open")), {})
         if victim == "mcp":
             other.kill()
         else:
             killed(victim, "an answer open")
         t.join(200)
+        # what the wallet had of the answer as it died: its body file stays, written as the bytes arrived
+        bodies = glob.glob(f"{RUN}/bodies/ticket-*.bin")
+        received = os.path.getsize(max(bodies, key=os.path.getmtime)) if bodies and victim == "signer" else 0
         if victim != "mcp":
             other.close()
         if result.get("saved_to"):
             os.remove(result["saved_to"])
         resumed = next_call_pays(f"kill {victim} with an answer open")
+        # its credit was taken over by that call, or the watcher logged it (once the start's report has run): never forgotten unsaid
+        credit = None
+        if victim == "signer":
+            signer("watch_tick")
+            SELLER_OF.setdefault(str(under_way.get("session")), str(under_way.get("seller_session")))
+            RECEIPTS.setdefault(str(under_way.get("session")), 0)
+            credit = credit_left_or_taken_over(str(under_way.get("session")), "")
+            credit["ok"] = bool(credit["logged"]) or credit["taken_over"] > 0
         stop_sessions()
-        inv, m = booked_and_once(), money()
+        # nothing logged and nothing taken over is right only where the seller itself says that session holds nothing: spent to its last msat
+        if credit is not None:
+            credit["seller_left_msat"] = GAVE_UP.get(str(under_way.get("session")))
+            credit["ok"] = credit["ok"] or credit["seller_left_msat"] == "0"
+            # and whatever it left, what it charged is what the wallet received, within what was still on its way when the
+            # wallet died (the socket's buffers, at the seller's side and the wallet's): a seller that kept the balance does not pass
+            credit["seller_spent_msat"] = SELLER_SPENT.get(str(under_way.get("session")), 0)
+            credit["received_bytes"] = received
+            credit["unexplained_msat"] = credit["seller_spent_msat"] - received * BYTE_MSAT // PER_BYTES
+            credit["ok"] = credit["ok"] and credit["unexplained_msat"] <= ON_THE_WAY_MSAT
+        inv, m, waited = never_sent_settled(booked_and_once(), money())
         how = result.get("error") or result.get("ended") or ("complete" if result.get("complete") else brief(result))
+        ok = not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m)
+        differ = credit_told_alike()
+        ok = ok and (credit is None or credit["ok"]) and not differ
         check(f"kill: {victim}, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
-              not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+              ok,
               {"the_call_ended": str(how)[:160], "bytes": result.get("bytes"), "next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS),
-               "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": len(ORPHANS)})
+               "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": len(ORPHANS), "never_sent_booking_waited_s": waited, "credit_left": credit, "credit_told_differently": differ,
+               **({} if ok else {"unsettled": unsettled_bookings()})})
 
 
 def session_of(r: dict[str, Any]) -> dict[str, Any]:
@@ -1524,12 +2046,1090 @@ def offers() -> None:
     offers_policy(on=True)
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "pruned": pruned}
+
+# --- a shop reached by key, over its iroh link (docs/DIRECT-LINKS.md) --------------------------------
+
+
+# --- money: what the seller charged and what the buyer paid, against usage times the listed price ----------
+
+
+def price_of(n: int, byte_msat: int, per_bytes: int = PER_BYTES) -> int:
+    """The listed price of n bytes, rounded up over the whole count, as the docs (TICKETS.md) state it."""
+    return -(-n * byte_msat // per_bytes)
+
+
+def stop_and_count(sid: str, m0: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The agent stops session `sid`; then, once nothing is locked, what the stop said and the four counts
+    of money since `m0` (this check's own payments only)."""
+    stop = agent().tool("ticket_stop", {"session": sid})
+    note_receipts(stop.get("http") or {})
+    signer("ticket_stop", {"session": sid, "forget_credit": True})
+    quiet()
+    m1 = money()
+    return stop, {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+
+
+def paid_for_usage(name: str, what: str, usage_msat: int, seller_msat: int, stop: dict[str, Any], m: dict[str, Any], slack_msat: int, most_left: int,
+                   saw: dict[str, Any]) -> None:
+    """The money of one service over a realistic amount, on both sides: the seller's own count (signed or
+    on its book) and the wallet's account each within `slack_msat` of usage times the listed price; the
+    buyer's node, the seller's node and the wallet's book one number; every msat the buyer paid either
+    spent or told as left with the seller, and that under `most_left`."""
+    acct = (stop.get("http") or {}).get("account") or {}
+    spent = int(acct.get("spent_msat") or -1)
+    left = int((stop.get("http") or {}).get("left_with_seller_msat") or -1)
+    paid = m["buyer_node_paid_msat"]
+    one = paid == m["seller_node_received_msat"] == m["wallet_book_settled_msat"]
+    # the seller's signed receipts (what they say was released) are a fourth count of the same number
+    ok = (abs(seller_msat - usage_msat) <= slack_msat and abs(spent - usage_msat) <= slack_msat and one and paid == spent + left and 0 <= left < most_left
+          and agrees(m, receipts=True))
+    check(f"{name}: {what}", ok, {"usage_msat": usage_msat, "seller_charged_msat": seller_msat, "wallet_spent_msat": spent, "slack_msat": slack_msat,
+                                  "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
+                                  "wallet_book_settled_msat": m["wallet_book_settled_msat"], "receipts_released_msat": m["receipts_released_msat"],
+                                  "left_with_seller_msat": left, "most_left_msat": most_left,
+                                  "tickets": m["tickets"], **saw})
+    measured(f"{name}_usage_msat", usage_msat)
+
+
+def money_check() -> None:
+    """Every paid service the lab's own gateway sells, over a realistic amount, checked as usage times the
+    listed price on both sides. Files: the 100 MB file whole, priced per byte. A web app's shape: 240
+    requests in one session to a route priced per request and per byte, 200 pages and 40 media segments
+    of 1 to 2.5 MiB (about 70 MiB). Each reply's price is its own bytes' and request's; the seller's
+    signed receipts, the wallet's account and both nodes agree with the sum to the msat: the price of a
+    known body is fixed, so there is no slack. (AI by the token and hashrate slices have no service in
+    this lab: their money over many requests and slices is checked in process, in xbt-signer's
+    tests/ticket_pay.rs and xbt-hashlink's tests/rental.rs. The VPN tunnel's is the vpn check's.)"""
+    # Files: the file whole
+    stop_sessions()
+    m0 = money()
+    r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
+    if r.get("saved_to"):
+        os.remove(r["saved_to"])
+    # usage is what arrived: the file whole, or the check fails
+    whole = r.get("complete") is True and int(r.get("bytes") or -1) == BIG
+    usage = price_of(BIG, BYTE_MSAT) if whole else -1
+    seller = int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or -1)
+    stop, m = stop_and_count(str(r.get("session")), m0)
+    paid_for_usage("money", f"Files: a 100 MB file priced per byte is charged its bytes at the listed price ({price_of(BIG, BYTE_MSAT):,} msat) by the seller's signed "
+                   "receipt and in the wallet's account, to the msat; both nodes and the wallet's book agree, and what was paid is what was spent and what is left "
+                   "with the seller (under one ticket)",
+                   usage, seller, stop, m, 0, TICKET_MSAT, {"bytes": r.get("bytes"), "complete": r.get("complete"), "price_msat": r.get("price_msat")})
+    # a web app: pages and segments
+    stop_sessions()
+    rng = __import__("random").Random(20261031)
+    os.makedirs(f"{RUN}/www/app", exist_ok=True)
+    sizes = [rng.randint(1 << 20, 5 << 19) if i % 6 == 5 else rng.randint(200, 40_000) for i in range(240)]
+    for i, n in enumerate(sizes):
+        with open(f"{RUN}/www/app/{i}.bin", "wb") as f:
+            f.write(os.urandom(n))
+    m0 = money()
+    usage, seller, sid, wrong, bytes_ = 0, 0, "", [], 0
+    for i, n in enumerate(sizes):
+        r = pay(f"{ORIGIN}/app/{i}.bin")
+        if r.get("saved_to"):
+            os.remove(r["saved_to"])
+        want = APP_REQUEST_MSAT + price_of(n, APP_BYTE_MSAT)
+        usage += want
+        bytes_ += n
+        # each reply whole (usage is what arrived), priced at its own request and bytes, in the one session
+        if (not call_paid(r) or r.get("price_msat") != str(want) or (sid and r.get("session") != sid)
+                or r.get("complete") is not True or int(r.get("bytes") or -1) != n):
+            wrong.append({"i": i, "size": n, "want_msat": want, **brief(r)})
+        sid = sid or str(r.get("session"))
+        seller = max(seller, int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or 0))
+    stop, m = stop_and_count(sid, m0)
+    ok_each = not wrong
+    paid_for_usage("money", f"web app: 240 requests in one session (200 pages, 40 segments, {bytes_ / 2**20:.1f} MiB) to a route priced per request and per byte: each reply "
+                   "is charged its own request and bytes, and the seller's signed receipts and the wallet's account come to the sum to the msat; both nodes and the book agree",
+                   usage if ok_each else -1, seller, stop, m, 0, TICKET_MSAT, {"bytes": bytes_, "replies_priced_otherwise": wrong[:3]})
+
+
+# the link keys a gateway serves on by default (xbt-gateway's link.endpoints), each named in its document;
+# TICKET_E2E_LINK_KEYS sets another number for the link and jellyfin_link/_relay checks, to compare
+LINK_KEYS = int(os.environ.get("TICKET_E2E_LINK_KEYS", "4"))
+
+
+def link_check(relay: bool) -> None:
+    """The lab's seller as a shop with no web address: its gateway reached only over its iroh link,
+    found by its transport document (which the MCP hands to the signer from the shops file). The
+    100 MB file is paid as it arrives, ticket after ticket, the same as over http: whole, every
+    byte the seller's, every ticket booked once, the money agreeing. `relay`: both sides relay-only
+    (the gateway's link private, the wallet's XBT_LINK_PRIVATE), through our relay."""
+    mode = "relay" if relay else "direct"
+    stop_sessions()
+    # what earlier checks paid (the offers check pays another seller's node) is left out: this check's own
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    origin, doc = link_gateway(relay)
+    if relay:
+        os.environ["XBT_LINK_PRIVATE"] = "1"
+    try:
+        restart_signer()
+        for m in AGENT:
+            m.close()
+        AGENT.clear()
+        price_msat = -(-BIG * BYTE_MSAT // PER_BYTES)
+        t0 = time.monotonic()
+        r = pay(f"{origin}/big.bin", max_sats=25_000)
+        took = time.monotonic() - t0
+    finally:
+        os.environ.pop("XBT_LINK_PRIVATE", None)
+    link_check_end(relay, mode, m0, paid0, settled0, origin, doc, r, price_msat, took)
+
+
+def link_gateway(relay: bool) -> tuple[str, dict[str, Any]]:
+    """The link gateway started for a shop with no web address (`relay`: relay-only, private), its
+    transport document read, and the shop put in the app's shops file and the wallet's policy:
+    its origin and that document."""
+    # the seller's node vouches for the link key: a macaroon that may only sign
+    with open(f"{RUN}/sign.macaroon", "wb") as f:
+        f.write(bytes.fromhex(lab.bake(SELLER, ("uri:/lnrpc.Lightning/SignMessage",))))
+    os.chmod(f"{RUN}/sign.macaroon", 0o600)
+    path = gateway_config("gateway-link", GW_LINK_PORT, "link")
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if relay else [], "private": relay}
+    cfg["link"]["endpoints"] = LINK_KEYS
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    if "gateway-link" in PROCS and PROCS["gateway-link"].poll() is None:
+        PROCS["gateway-link"].terminate()
+        PROCS["gateway-link"].wait(10)
+    start_gateway("gateway-link", GW_LINK_PORT)
+    doc: dict[str, Any] = {}
+
+    def signed() -> bool:
+        code, _, body = send("GET", "/.well-known/lightning-stream-transport.json", GW_LINK_PORT)
+        if code == 200:
+            doc.update(json.loads(body))
+        # every key named: the gateway names a key once its relay connection is up
+        return code == 200 and len(doc.get("transport") or []) == LINK_KEYS
+
+    lab.wait(f"the link's transport document, signed by the seller's node, naming all {LINK_KEYS} keys", 60, signed, every=0.5)
+    origin = str(doc.get("seller") or "")
+    if not origin.startswith("http"):
+        status_code, _, status_body = send("GET", "/.well-known/lightning-stream-link.json", GW_LINK_PORT)
+        raise LabError(f"the link gateway's transport document names no seller: {json.dumps(doc)[:600]}; link status {status_code}: {status_body[:300]!r}")
+    with open(SHOPS_FILE, "w") as f:
+        json.dump({origin: {"receipt_key": doc["receipt_key"], "transport": doc}}, f)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    return origin, doc
+
+
+def link_check_end(relay: bool, mode: str, m0: dict[str, Any], paid0: set[str], settled0: set[str], origin: str, doc: dict[str, Any],
+                   r: dict[str, Any], price_msat: int, took: float) -> None:
+    """The link check's verdict on the 100 MB file `r` paid through `origin`."""
+    stored = r.get("saved_to", "")
+    same_file = bool(stored) and os.path.getsize(stored) == BIG and hashlib.sha256(open(stored, "rb").read()).hexdigest() == r.get("body_digest")
+    if stored:
+        os.remove(stored)
+    stop_sessions()
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
+    mbit = round(BIG * 8 / took / 1e6, 1) if took else None
+    measured(f"link_{mode}_100mb_s", round(took, 2))
+    measured(f"link_{mode}_mbit_s", mbit)
+    ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
+          and r.get("tickets_released") == 20 and (r.get("receipt") or {}).get("body") == "as signed" and (r.get("receipt") or {}).get("last", {}).get("charged") == str(price_msat))
+    check(f"link ({mode}): a shop with no web address, reached over its iroh link{' through a relay only' if relay else ''}: the 100 MB file came whole, paid as it arrived with 20 tickets released one at a time, the last receipt signs its hash and its exact price, every ticket the seller took is booked once and the money agrees",
+          ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False) and len(doc.get("transport") or []) == LINK_KEYS,
+          {**brief(r), "rails_passed_over": r.get("rails_passed_over"), "origin": origin, "link_keys": len(doc.get("transport") or []), "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
+    PROCS["gateway-link"].terminate()
+    PROCS["gateway-link"].wait(10)
+
+
+def link() -> None:
+    link_check(relay=False)
+
+
+def link_relay() -> None:
+    link_check(relay=True)
+
+
+def huge_file() -> str:
+    """The long_download checks' 320 MB file in the service's directory (made once), and its sha256."""
+    path = f"{RUN}/www/huge.bin"
+    if not os.path.exists(path) or os.path.getsize(path) != HUGE:
+        block = os.urandom(1 << 20)
+        with open(path, "wb") as f:
+            f.writelines((hashlib.sha256(block[:64] + i.to_bytes(8, "big")).digest() + block)[: min(len(block), HUGE - i)] for i in range(0, HUGE, len(block)))
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+#: A TCP socket's states once the other side has closed or reset it (Linux's TCP_INFO, its first byte).
+TCP_ESTABLISHED = 1
+
+
+def connection_open_at(listen_port: int, client_port: int) -> bool:
+    """Whether the side of a local connection that listens on `listen_port` still holds it open. A close there with bytes
+    still queued sends its FIN after them, so a client that takes nothing may not be told: only this side's state shows it."""
+    with open("/proc/net/tcp") as f:
+        for line in f.readlines()[1:]:
+            local, remote, state = line.split()[1:4]
+            if int(local.split(":")[1], 16) == listen_port and int(remote.split(":")[1], 16) == client_port:
+                return int(state, 16) == TCP_ESTABLISHED
+    return False
+
+
+class RangeFiles(BaseHTTPRequestHandler):
+    """The service's files with byte ranges, as a media server gives them (the stock server has none)."""
+
+    def log_message(self, *_: Any) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        path = f"{RUN}/www{self.path.split('?')[0]}"
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        size = os.path.getsize(path)
+        st = os.stat(path)
+        etag = f'"{size:x}-{st.st_mtime_ns:x}"'
+        start, want = 0, self.headers.get("Range", "")
+        # If-Range: a range only of the copy the client names; another copy goes whole (RFC 9110 13.1.5)
+        if want and self.headers.get("If-Range") not in (None, etag):
+            want = ""
+        if want.startswith("bytes=") and want.endswith("-"):
+            start = int(want[6:-1])
+        self.send_response(206 if want else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
+        self.send_header("Content-Length", str(size - start))
+        if want:
+            self.send_header("Content-Range", f"bytes {start}-{size - 1}/{size}")
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(start)
+            try:
+                for chunk in iter(lambda: f.read(1 << 16), b""):
+                    self.wfile.write(chunk)
+            except OSError:
+                pass
+
+
+def paused_player() -> None:
+    """A player paused with its buffer full, past what the app gives a client that takes nothing (60 to
+    90 s, two or three writes of 30 s): its connection ends and the wallet stops paying for that answer. Going on, it asks again from
+    where it was, by `Range`: the file comes whole between the two answers, its sha256 the file's, and
+    the money agrees, the seller paid for the bytes and what was on its way, less than two tickets more."""
+    want = huge_file()
+    range_port, gw_port, conn_port = BASE + 22, BASE + 23, BASE + 24
+    stop_sessions()
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    server = ThreadingHTTPServer(("127.0.0.1", range_port), RangeFiles)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    origin = f"http://127.0.0.1:{gw_port}"
+    path = gateway_config("gateway-range", gw_port, origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["upstream"] = f"http://127.0.0.1:{range_port}"
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("gateway-range", gw_port)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    os.makedirs(f"{RUN}/stream", exist_ok=True)
+    digest, got, first_status, second_status, first_end, second_end, cut_after = hashlib.sha256(), 0, 0, 0, "", "", -1.0
+    try:
+        restart_signer()
+        with open(f"{RUN}/connector-pause.log", "ab") as log:
+            PROCS["connector-pause"] = subprocess.Popen([f"{BIN}/lightning-stream"], env=dict(os.environ, LS_LISTEN=f"127.0.0.1:{conn_port}", B2_SIGNER_SOCK=SOCK,
+                                                        B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="film", LS_MAX_SATS="20000", XBT_SHOPS_FILE=SHOPS_FILE),
+                                                        stdout=log, stderr=log)
+        lab.wait("the connector", 60, lambda: PROCS["connector-pause"].poll() is None and send("GET", "/health", conn_port)[0] == 200, every=0.2)
+        c = http.client.HTTPConnection("127.0.0.1", conn_port, timeout=120)
+        c.request("GET", f"/s/{origin}/huge.bin", headers={"X-Max-Sats": "20000"})
+        resp = c.getresponse()
+        first_status = resp.status
+        paused = False
+        try:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                got += len(chunk)
+                digest.update(chunk)
+                if not paused and got >= 32 << 20:
+                    # the player's buffer is full: it takes nothing until the app has given up on it, with bytes still unread
+                    paused = True
+                    pause_at = time.monotonic()
+                    # (the response holds the socket: an answer with Connection: close leaves the connection object without it)
+                    client_port = resp.fp.raw._sock.getsockname()[1]
+                    while time.monotonic() - pause_at < 150 and connection_open_at(conn_port, client_port):
+                        time.sleep(0.5)
+                    cut_after = round(time.monotonic() - pause_at, 1)
+            if resp.length:
+                first_end = f"short of its length by {resp.length} bytes"
+        except (http.client.IncompleteRead, OSError) as e:
+            # what was read of the cut answer is the player's too
+            part = getattr(e, "partial", b"") or b""
+            got += len(part)
+            digest.update(part)
+            first_end = f"{type(e).__name__}"
+        c.close()
+        whole_at_first = got == HUGE
+        if not whole_at_first:
+            c = http.client.HTTPConnection("127.0.0.1", conn_port, timeout=120)
+            c.request("GET", f"/s/{origin}/huge.bin", headers={"X-Max-Sats": "20000", "Range": f"bytes={got}-"})
+            resp = c.getresponse()
+            second_status = resp.status
+            try:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    digest.update(chunk)
+                if resp.length:
+                    second_end = f"short of its length by {resp.length} bytes"
+            except (http.client.IncompleteRead, OSError) as e:
+                second_end = f"{type(e).__name__}: {e}"[:200]
+            c.close()
+    finally:
+        if "connector-pause" in PROCS:
+            PROCS["connector-pause"].terminate()
+            PROCS["connector-pause"].wait(10)
+    stop_sessions()
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
+    price_msat = -(-HUGE * HUGE_BYTE_MSAT // PER_BYTES)
+    paid_for = price_msat <= m["seller_node_received_msat"] < price_msat + 2 * TICKET_MSAT
+    check("paused_player: a player paused past the 60 to 90 s the app gives a client that takes nothing loses its connection, and asking again by Range from where it was gets the rest: the file whole, its sha256 the file's, the money agreeing, the seller paid for its bytes and less than two tickets more",
+          first_status == 200 and bool(first_end) and 45 <= cut_after <= 120 and second_status == 206 and not second_end and got == HUGE and digest.hexdigest() == want and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {"first": first_status, "first_end": first_end, "cut_after_s": cut_after, "second": second_status, "second_end": second_end, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "price_msat": price_msat, **inv, "money": m})
+    PROCS["gateway-range"].terminate()
+    PROCS["gateway-range"].wait(10)
+    server.shutdown()
+
+
+def long_download(relay: bool) -> None:
+    """A download that takes longer than the wallet's limit for an answer read whole (here 2 s, the
+    default 50 s): the 320 MB file through the connector, which streams it on as it is paid for. It
+    comes whole, its sha256 the file's, and the money agrees, the seller paid for every byte and no
+    more than a ticket past them. `relay`: from a shop with no web address, relay-only, as a Private
+    shop is reached. Before 0.2.0 such a download was cut at max_answer_s and the client kept a
+    short file that looked whole."""
+    mode = "relay" if relay else "direct"
+    want = huge_file()
+    stop_sessions()
+    # what earlier checks paid (the offers check pays another seller's node) is left out: this check's own
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    origin = link_gateway(relay)[0] if relay else ORIGIN
+    TICKET_OVERRIDES["max_answer_s"] = LONG_LIMIT_S
+    WALLET_PROC.write_policy()
+    if relay:
+        os.environ["XBT_LINK_PRIVATE"] = "1"
+    os.makedirs(f"{RUN}/stream", exist_ok=True)
+    conn_port = BASE + 21
+    got, digest, cut, took, status, early = 0, hashlib.sha256(), "", 0.0, 0, b""
+    try:
+        restart_signer()
+        with open(f"{RUN}/connector-dl.log", "ab") as log:
+            PROCS["connector-dl"] = subprocess.Popen([f"{BIN}/lightning-stream"], env=dict(os.environ, LS_LISTEN=f"127.0.0.1:{conn_port}", B2_SIGNER_SOCK=SOCK,
+                                                     B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="film", LS_MAX_SATS="20000", XBT_SHOPS_FILE=SHOPS_FILE),
+                                                     stdout=log, stderr=log)
+        lab.wait("the connector", 60, lambda: PROCS["connector-dl"].poll() is None and send("GET", "/health", conn_port)[0] == 200, every=0.2)
+        t0 = time.monotonic()
+        c = http.client.HTTPConnection("127.0.0.1", conn_port, timeout=120)
+        c.request("GET", f"/s/{origin}/huge.bin", headers={"X-Max-Sats": "20000"})
+        resp = c.getresponse()
+        status = resp.status
+        try:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                if got < 512:
+                    early += chunk[: 512 - got]
+                got += len(chunk)
+                digest.update(chunk)
+                # read as a player does, no faster than it plays: the answer stays open well past the limit
+                ahead = got / LONG_READ_BPS - (time.monotonic() - t0)
+                if ahead > 0:
+                    time.sleep(ahead)
+            # read(n) of a body short of its Content-Length just ends: what is left of the length says so
+            if resp.length:
+                cut = f"short of its length by {resp.length} bytes"
+        except (http.client.IncompleteRead, OSError) as e:
+            cut = f"{type(e).__name__}: {e}"[:200]
+        took = time.monotonic() - t0
+        c.close()
+    finally:
+        os.environ.pop("XBT_LINK_PRIVATE", None)
+        if "connector-dl" in PROCS:
+            PROCS["connector-dl"].terminate()
+            PROCS["connector-dl"].wait(10)
+        TICKET_OVERRIDES.clear()
+        WALLET_PROC.write_policy()
+    stop_sessions()
+    restart_signer()
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
+    price_msat = -(-HUGE * HUGE_BYTE_MSAT // PER_BYTES)
+    mbit = round(got * 8 / took / 1e6, 1) if took else None
+    measured(f"long_download_{mode}_s", round(took, 2))
+    measured(f"long_download_{mode}_mbit_s", mbit)
+    whole = got == HUGE and digest.hexdigest() == want and not cut
+    paid_for = price_msat <= m["seller_node_received_msat"] < price_msat + 2 * TICKET_MSAT
+    check(f"long_download ({mode}): a 320 MB download through the connector{', from a relay-only shop,' if relay else ''} that runs past the wallet's limit for an answer read whole ({LONG_LIMIT_S} s here, read at {LONG_READ_BPS // 1_000_000} MB/s as a player reads) comes whole, its sha256 the file's, every ticket booked once and the money agreeing, the seller paid for its bytes and less than two tickets more",
+          whole and took > 2 * LONG_LIMIT_S and paid_for and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {"status": status, "bytes": got, "of": HUGE, "sha256_ok": digest.hexdigest() == want, "cut": cut,
+           **({"answer": early.decode("utf-8", "replace")} if status != 200 else {}), "seconds": round(took, 2), "mbit_s": mbit, "price_msat": price_msat, **inv, "money": m})
+    if relay:
+        PROCS["gateway-link"].terminate()
+        PROCS["gateway-link"].wait(10)
+
+
+
+# --- a VPN exit, paid as it is used --------------------------------------------------------------------------
+
+VPN_SAT_GB = 500_000  # 500,000 sat a GiB (about 488 sat a MiB): a 10 MiB download is about 4,900 sat, five or six tickets
+VPN_BYTES = 10_485_760
+# The far side of the exit, served by this lab: an exit refuses non-public addresses and its own networks, so
+# a rule in the lab sends this public-looking address to the server below, and no packet for it leaves the machine.
+VPN_FAR = "11.66.0.2"
+VPN_FAR_RULE = "ticket-e2e-far-side"
+# a steady 40 Mbit: what a public download gave. The wallet buys ahead by rate times how long a payment takes
+VPN_FAR_BYTES_PER_S = 5_000_000
+VPN_FILE = f"http://{VPN_FAR}/file?bytes={VPN_BYTES}"
+# a region check's page: it answers, over plain HTTP, with the address the request came from
+VPN_TRACE = f"http://{VPN_FAR}/trace"
+REGION_CHECK_TICKET_SATS = 2_000  # xbt_vpn::holds::REGION_CHECK_TICKET_SATS
+REGION_CHECK_MAX_SATS = 20  # xbt_vpn::buyer::REGION_CHECK_MAX_SATS
+
+
+class FarSide:
+    """The files the VPN checks fetch through the exit, on this machine: their pass or fail hangs on no third
+    party answering a VPN address. `served` is what it has sent, for comparing with what each side counted."""
+
+    def __init__(self) -> None:
+        self.served = 0
+        self.nonce = os.urandom(8).hex()
+        self.block = os.urandom(1 << 20)
+        self.server: ThreadingHTTPServer | None = None
+
+    @staticmethod
+    def iptables(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["sudo", "-n", "iptables", "-w", "-t", "nat", *args], capture_output=True, text=True, timeout=30)
+
+    def clear_rules(self) -> None:
+        listed = self.iptables("-S", "OUTPUT")
+        for line in listed.stdout.splitlines():
+            if VPN_FAR_RULE in line:
+                self.iptables(*shlex.split(line.replace("-A", "-D", 1)))
+
+    def start(self, port: int) -> None:
+        far = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+            def do_GET(self) -> None:
+                if self.path == "/trace":
+                    body = f"{self.client_address[0]}\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("X-Far-Side", far.nonce)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                q = dict(kv.split("=", 1) for kv in self.path.split("?", 1)[-1].split("&") if "=" in kv)
+                want, pace = int(q["bytes"]), int(q.get("rate") or VPN_FAR_BYTES_PER_S)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(want))
+                self.end_headers()
+                sent, t0 = 0, time.monotonic()
+                try:
+                    while sent < want:
+                        n = min(64 << 10, want - sent)
+                        at = sent % ((1 << 20) - n)
+                        self.wfile.write(far.block[at:at + n])
+                        sent += n
+                        far.served += n
+                        time.sleep(max(0.0, t0 + sent / pace - time.monotonic()))
+                except OSError:
+                    pass
+
+        # this machine's address on the way out, which the exit's connection comes from once the rule has rewritten it
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("1.1.1.1", 80))
+        here = probe.getsockname()[0]
+        probe.close()
+        self.server = ThreadingHTTPServer((here, port), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.clear_rules()
+        added = self.iptables("-I", "OUTPUT", "1", "-d", f"{VPN_FAR}/32", "-p", "tcp", "--dport", "80", "-m", "comment", "--comment", VPN_FAR_RULE,
+                              "-j", "DNAT", "--to-destination", f"{here}:{port}")
+        if added.returncode != 0:
+            raise LabError(f"the VPN checks' far side needs a NAT rule, and sudo iptables refused it: {added.stderr.strip()[:300]}")
+        try:
+            with urllib.request.urlopen(VPN_TRACE, timeout=10) as f:
+                ours = f.headers.get("X-Far-Side") == self.nonce
+        except OSError as e:
+            raise LabError(f"the VPN checks' far side does not answer at {VPN_FAR}: {e}") from None
+        if not ours:
+            raise LabError(f"something other than this lab answered at {VPN_FAR}: the NAT rule is not in effect")
+
+    def close(self) -> None:
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+        self.clear_rules()
+
+
+FAR_SIDE = FarSide()
+
+
+def trace_ip(page: str) -> str:
+    """The address the page says the request came from (its body, after any HTTP head)."""
+    return page.split("\r\n\r\n", 1)[-1].strip() if " 200 " in page.split("\r\n", 1)[0] or "\r\n" not in page else ""
+
+
+def vpn_region_check(origin: str) -> None:
+    """A priced exit's region check from NO credit at its shop (docs/VPN-EXITS.md), opened as the
+    buyer's region check opens it (`xbt-vpn fetch --region-check`: no more than one ticket may leave
+    the wallet for it, and it is charged no more than 20 sats). It reads the address page through the
+    exit, which sees the exit's address. The wallet buys one whole ticket; the check is charged only
+    what it carried (its bytes at the exit's price, with the tunnel's framing) and no more than 20 sats;
+    the rest stays as credit with that shop; what the wallet's answer says left it is exactly what the
+    buyer's node paid (what the region checks' daily budget counts); and both sides' books agree."""
+    pays0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    m0 = money()
+    r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", VPN_TRACE, "--once", "--secs", "60", "--region-check"],
+                       env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="40000"),
+                       capture_output=True, text=True, timeout=180)
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+    out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
+    time.sleep(3)
+    stop_sessions()
+    m1 = money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    new = [p for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED" and h not in pays0]
+    paid_sats = sum(cost_sats(p) for p in new)
+    with urllib.request.urlopen(VPN_TRACE, timeout=15) as f:
+        direct = f.read().decode().strip()
+    wallet = out.get("wallet") or {}
+    charged = int(wallet["price_msat"]) / 1000 if wallet.get("price_msat") is not None else None
+    left = out.get("left_sats")
+    got = int(out.get("bytes") or 0)
+    # what the bytes carried come to at the exit's price, both ways, with the tunnel's own framing:
+    # the charge must be about that (at least 1 msat a byte-page rounds to), never more than the cap
+    expect = got * VPN_SAT_GB / (1 << 30)
+    fair = charged is not None and 0 < charged <= max(expect * 1.6, expect + 2)
+    check("vpn_region_check: a priced exit's region check from no credit at its shop buys one ticket (no more than "
+          f"{REGION_CHECK_TICKET_SATS} sats may leave), is charged only what it carried and no more than {REGION_CHECK_MAX_SATS} sats, "
+          "reads the address page through the exit, what the wallet answered left it is what the buyer's node paid, and the money agrees",
+          got > 0 and bool(direct) and trace_ip(out.get("page") or "") == direct
+          and len(new) == 1 and isinstance(left, int) and left == paid_sats and 0 < left <= REGION_CHECK_TICKET_SATS
+          and charged is not None and charged <= REGION_CHECK_MAX_SATS and fair and not wallet.get("seller_fault")
+          and agrees(m, receipts=False),
+          {"fetch": {k: v for k, v in out.items() if k not in ("wallet", "page")}, "page": (out.get("page") or "")[-200:],
+           "wallet": {k: wallet.get(k) for k in ("charged_sats", "price_msat", "tickets_released", "tickets_prepaid", "ended", "seller_fault", "credited_msat")},
+           "tickets": len(new), "node_paid_sats": paid_sats, "expected_sats": round(expect, 3), "charged_sats": charged,
+           "address_direct": direct, "money": m})
+
+
+def vpn() -> None:
+    """A VPN exit sold as a Stream service (docs/VPN-EXITS.md): the exit's VPN service (`xbt-vpn serve`,
+    offering a private exit at a price) behind the seller's gateway, which sells `/vpn/` as WebSockets
+    priced per byte both ways; and a buyer's paid tunnel opened by the wallet (`xbt-vpn fetch --tunnel`,
+    as the buyer's VPN service opens it), carrying a 10 MiB download from the far side of the exit
+    ([`FarSide`]), by the exit's own rules. The download comes whole through the
+    tunnel; the wallet pays as the bytes pass and checks the exit's interim receipts as it runs, with no
+    fault; every ticket the seller took is booked once and the money agrees."""
+    stop_sessions()
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
+    tun_port, wg_port, gw_port = BASE + 17, BASE + 18, BASE + 19
+    origin = f"http://127.0.0.1:{gw_port}"
+    vdir = f"{RUN}/vpn"
+    os.makedirs(vdir, exist_ok=True)
+    FAR_SIDE.start(BASE + 20)
+    atexit.register(FAR_SIDE.close)
+    with open(f"{vdir}/exit.json", "w") as f:
+        json.dump({"offer": True, "kind": "private", "sat_per_gb": VPN_SAT_GB, "country": "XX", "tunnel_url": f"{origin}/vpn/tunnel"}, f)
+    # the secret the gateway and the exit's tunnel endpoint share, as the wallet app writes it with the
+    # route: without it the endpoint lets nobody in
+    tunnel_secret = os.urandom(32).hex()
+    with open(f"{vdir}/tunnel.secret", "w") as f:
+        f.write(tunnel_secret)
+    with open(f"{RUN}/vpn.log", "ab") as log:
+        PROCS["vpn"] = subprocess.Popen([f"{BIN}/xbt-vpn", "serve", "--dir", vdir, "--wg-listen", f"127.0.0.1:{wg_port}", "--tunnel-listen", f"127.0.0.1:{tun_port}"],
+                                        env=dict(os.environ, XBT_VPN_GEO_URL="", XBT_VPN_GEO_BUNDLED="/nonexistent"), stdout=log, stderr=log)
+    lab.wait("the exit's tunnel endpoint", 60, lambda: socket.create_connection(("127.0.0.1", tun_port), timeout=1).close() is None, every=0.2)
+    path = gateway_config("gateway-vpn", gw_port, origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["routes"].append({"path": "/vpn/", "upstream": f"http://127.0.0.1:{tun_port}", "methods": ["GET"], "websocket": True, "service": "vpn-exit",
+                          "upstream_headers": {"X-Stream-Tunnel": tunnel_secret},
+                          "price": {"byte_msat": VPN_SAT_GB * 1000, "per_bytes": 1 << 30}})
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("gateway-vpn", gw_port)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    restart_signer()
+    faults0 = len([e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_interim_fault"])
+    # first, with no credit at this shop yet: a region check of the exit
+    vpn_region_check(origin)
+    url = VPN_FILE
+    t0 = time.monotonic()
+    r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", url, "--once", "--secs", "180"],
+                       env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="40000"),
+                       capture_output=True, text=True, timeout=300)
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+    out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
+    took = time.monotonic() - t0
+    # the tunnel ended as the fetch did: its last receipt closed it
+    time.sleep(3)
+    stop_sessions()
+    faults = len([e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_interim_fault"]) - faults0
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
+    exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
+    mbit = round(VPN_BYTES * 8 / took / 1e6, 1) if took else None
+    measured("vpn_10mib_mbit_s", mbit)
+    # the file and its HTTP head: the fetch counts every byte the tunnel brought back
+    whole = bool(out) and VPN_BYTES <= int(out.get("bytes") or 0) <= VPN_BYTES + 4096
+    check("vpn: a VPN exit sold as a Stream service: a 10 MiB download came whole through a paid tunnel the wallet opened, paid as its bytes passed "
+          "with the exit's interim receipts checked and no fault; every ticket the seller took is booked once and the money agrees",
+          whole and faults == 0 and len(paid) > 0 and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {"fetch": out, "file": url, "seconds": round(took, 1), "mbit_s": mbit, "interim_faults": faults, "exit": {k: exit_status.get(k) for k in ("offered", "paid", "down_bytes", "up_bytes")},
+           "tickets": len(paid), **inv, "money": m})
+    vpn_money(origin, vdir, VPN_SAT_GB)
+
+    def price_route(sat_gb: int) -> None:
+        with open(f"{RUN}/gateway-vpn.json") as f:
+            cfg = json.load(f)
+        for route in cfg["routes"]:
+            if route["path"] == "/vpn/":
+                route["price"]["byte_msat"] = sat_gb * 1000
+        with open(f"{RUN}/gateway-vpn.json", "w") as f:
+            json.dump(cfg, f, indent=1)
+        PROCS["gateway-vpn"].terminate()
+        PROCS["gateway-vpn"].wait(10)
+        start_gateway("gateway-vpn", gw_port)
+
+    # a middle price at 200 Mbit over about 500 MiB: about 25 MiB a second and 50 MiB a ticket, so what the wallet
+    # pays ahead (rate times a payment's time) is a real share of a ticket, and the run is long enough to show it
+    price_route(VPN_MID_SAT_GB)
+    vpn_money(origin, vdir, VPN_MID_SAT_GB, stop_bytes=VPN_MID_STOP_AT_BYTES, pace=VPN_MID_BYTES_PER_S, file_bytes=1 << 30)
+    # the same at 1,000 sat a GiB, where ~60 MiB cost under one ticket: no ticket is released while the
+    # tunnel runs, so nothing but the stop's own count tells what the tunnel drew (the shortfall's regime)
+    price_route(VPN_CHEAP_SAT_GB)
+    vpn_money(origin, vdir, VPN_CHEAP_SAT_GB)
+    for name in ("gateway-vpn", "vpn"):
+        PROCS[name].terminate()
+        PROCS[name].wait(10)
+    FAR_SIDE.close()
+
+
+#: The tunnel is stopped once the far side has sent this much into it.
+VPN_STOP_AT_BYTES = 60 << 20
+VPN_CHEAP_SAT_GB = 1_000
+VPN_MID_SAT_GB = 20_000
+VPN_MID_STOP_AT_BYTES = 500 << 20
+VPN_MID_BYTES_PER_S = 25_000_000
+
+
+def vpn_money(origin: str, vdir: str, sat_gb: int, stop_bytes: int = VPN_STOP_AT_BYTES, pace: int = VPN_FAR_BYTES_PER_S,
+              file_bytes: int = 100 << 20) -> None:
+    """A VPN tunnel's money over a realistic amount, stopped as a VPN that is turned off stops it: a download
+    from the far side of the exit ([`FarSide`]) at `pace` bytes a second, through a tunnel paid at `sat_gb` sat a
+    GiB, and the agent stops the session while the tunnel is still open, once the far side has sent `stop_bytes`
+    (by its own count, which the wallet has no part in: a stop keyed on what the wallet says was spent comes only
+    when the seller has charged every ticket released, the one moment nothing is paid ahead). What the seller charged
+    (its gateway's book) and what the wallet says the
+    session spent are each the tunnel's bytes at the listed price; what was paid is what was spent and what
+    the stop says is left with the seller, and that is under two tickets (the wallet pays at most about 1.5
+    ahead of use); both nodes and the book agree. Usage is the bytes the buyer took
+    out of the tunnel (B): the seller charges for at least those, and for at most B plus 1% and 1 MiB (the
+    tunnel's own framing and requests, 1%, where 0.08 to 0.16% was measured at 40 and 200 Mbit; and bytes on
+    their way when the stop came, which the tunnel's
+    flow window holds to 512 KiB with one flow, plus the paid-ahead chunks). The wallet's account is
+    held to the seller's book within the price of 64 KiB (two 16 KiB chunks each way, paid and not yet
+    counted). The shortfall this pins: the stop counted only the tunnel's opening, so the wallet said every
+    msat the tunnel drew was left with the seller (fixed in 9cc54ac9). It showed only while the tunnel's
+    charge stayed under a ticket, so no ticket released mid-stream refreshed the wallet's count: the
+    cheap run (1,000 sat a GiB) is that regime."""
+    stop_sessions()
+    gw_port = int(origin.rsplit(":", 1)[1])
+    book0 = int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1))
+
+    def exit_down() -> int:
+        try:
+            with open(f"{vdir}/exit-status.json") as f:
+                return int(json.load(f).get("down_bytes") or 0)
+        except (OSError, ValueError):
+            return 0
+
+    down0 = exit_down()
+    m0 = money()
+    out: dict[str, Any] = {}
+    url = f"http://{VPN_FAR}/file?bytes={file_bytes}&rate={pace}"
+    served0 = FAR_SIDE.served
+
+    def fetch() -> None:
+        # not --once: the download starts again as it ends, so the tunnel stays busy and open until the stop ends it
+        r = subprocess.run([f"{BIN}/xbt-vpn", "fetch", "--tunnel", f"{origin}/vpn/tunnel", "--url", url, "--secs", "280"],
+                           env=dict(os.environ, B2_SIGNER_SOCK=SOCK, B2_STREAM_DIR=f"{RUN}/stream", XBT_VPN_TASK="film", XBT_VPN_TUNNEL_MAX_SATS="39000"),
+                           capture_output=True, text=True, timeout=400)
+        line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
+        # the wallet's last word on the tunnel is on stderr: why it ended, if it ended on its own
+        said = next((ln.removeprefix("the wallet:").strip() for ln in r.stderr.splitlines() if ln.startswith("the wallet:")), r.stderr[-400:])
+        try:
+            answer = json.loads(said)
+            said = {k: answer.get(k) for k in ("ended", "rule", "reason", "complete", "seller_fault", "charged_sats", "credited_msat", "balance_msat")}
+        except ValueError:
+            pass
+        out.update(json.loads(line) if line else {"stderr": r.stderr[-800:]})
+        out["wallet_said"] = said
+
+    t = threading.Thread(target=fetch)
+    t.start()
+    def drawn() -> bool:
+        return FAR_SIDE.served - served0 >= stop_bytes and any(p.get("origin") == origin and p.get("answer_open") for p in status().get("paying", []))
+
+    try:
+        lab.wait(f"the tunnel to carry {stop_bytes >> 20} MiB", 300, drawn, every=0.02)
+    except LabError as e:
+        # every count at this one moment; then the tunnel ended, and where the money went
+        paying = status().get("paying", [])
+        at_timeout = {"paying": paying, "exit_down_since": exit_down() - down0, "served_since": FAR_SIDE.served - served0,
+                      "seller_charged_since": int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1)) - book0}
+        stop_sessions()
+        t.join(400)
+        quiet()
+        m1 = money()
+        m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+        check(f"vpn: the money of a tunnel stopped while open at {sat_gb:,} sat a GiB: ran to its end", False,
+              f"{e}: at that moment {json.dumps(at_timeout)[:900]}; once ended, fetch {json.dumps(out)[:700]}, money since the start {json.dumps(m)[:600]}")
+        return
+    sid = next((p["session"] for p in status().get("paying", []) if p.get("origin") == origin), None)
+    if sid is None:
+        raise LabError(f"vpn money at {sat_gb:,} sat a GiB: no wallet session pays {origin}: paying {json.dumps(status().get('paying'))[:400]}")
+    stop = agent().tool("ticket_stop", {"session": sid})
+    # the seller's book at once: the stop ended the tunnel and took its last receipt (its charged total
+    # counts every session there has been, dropped ones included, so its change is this tunnel's charge)
+    book = int(json.loads(send("GET", "/x402/ticket/health", gw_port)[2]).get("chargedMsat", -1))
+    note_receipts(stop.get("http") or {})
+    t.join(400)
+    signer("ticket_stop", {"session": sid, "forget_credit": True})
+    quiet()
+    m1 = money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    took = int(out.get("bytes") or 0)
+    byte_msat = sat_gb * 1000
+    low, high = price_of(took, byte_msat, 1 << 30), price_of(took * 101 // 100 + (1 << 20), byte_msat, 1 << 30)
+    seller = book - book0 if book0 >= 0 and book >= 0 else -1
+    acct = (stop.get("http") or {}).get("account") or {}
+    spent = int(acct.get("spent_msat") or -1)
+    left = int((stop.get("http") or {}).get("left_with_seller_msat") or -1)
+    paid = m["buyer_node_paid_msat"]
+    one = paid == m["seller_node_received_msat"] == m["wallet_book_settled_msat"]
+    # (at least 1 msat: the two may round the same bytes' price apart by one)
+    near = abs(spent - seller) <= max(1, price_of(64 << 10, byte_msat, 1 << 30))
+    exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
+    ok = (took >= stop_bytes * 5 // 6 and low <= seller <= high and near and one and paid == spent + left and 0 <= left < 2 * TICKET_MSAT and agrees(m, receipts=True))
+    measured(f"vpn_money_{sat_gb}_mib", round(took / 2**20, 1))
+    check(f"vpn: a tunnel stopped while open, after {stop_bytes * 5 // 6 >> 20} MiB or more at {pace * 8 // 1_000_000} Mbit: the seller charged its bytes at the listed price ({sat_gb:,} sat a GiB, within 1% and 1 MiB above for "
+          "framing and bytes on their way, never below), the wallet's account says the same within 64 KiB's price, what was paid is what was spent and what is left with the "
+          "seller (under two tickets: what the wallet pays ahead), and both nodes and the book agree",
+          ok, {"bytes_through": took, "served_by_far_side": FAR_SIDE.served - served0, "file": url, "usage_low_msat": low, "usage_high_msat": high, "seller_book_charged_msat": seller, "wallet_spent_msat": spent,
+               "left_with_seller_msat": left, "buyer_node_paid_msat": paid, "seller_node_received_msat": m["seller_node_received_msat"],
+               "receipts_released_msat": m["receipts_released_msat"],
+               "wallet_book_settled_msat": m["wallet_book_settled_msat"], "tickets": m["tickets"],
+               "exit": {k: exit_status.get(k) for k in ("up_bytes", "down_bytes")}, "fetch": out})
+
+
+# --- a seller's whole web app: Jellyfin, through the app port, paid for on these nodes -----------------------
+
+JF_URL = os.environ.get("JELLYFIN_URL", "")
+JF_PRICE_MSAT = 20_000  # 20 sat a MiB
+
+
+def jellyfin_api(method: str, path: str, key: str, body: dict[str, Any] | None = None) -> Any:
+    u = urllib.parse.urlsplit(JF_URL)
+    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+    try:
+        conn.request(method, path, body=json.dumps(body).encode() if body is not None else None,
+                     headers={"X-Emby-Token": key, **({"Content-Type": "application/json"} if body is not None else {})})
+        r = conn.getresponse()
+        text = r.read()
+        if r.status >= 400:
+            raise LabError(f"Jellyfin {method} {path}: {r.status}")
+        return json.loads(text) if text.strip() else None
+    finally:
+        conn.close()
+
+
+JF_MARGIN_S = float(os.environ.get("JF_MARGIN_S", "3"))
+JF_MARGIN_FRAMES = int(os.environ.get("JF_MARGIN_FRAMES", "5"))
+_JF_BASELINES: dict[str, dict[str, Any]] = {}
+
+
+def jellyfin_baseline(item: str) -> dict[str, Any] | None:
+    """The film played straight from Jellyfin by the same driver on this machine, with no Stream in the
+    path, once per run (JF_BASELINE=1; JF_GUEST_USER and JF_GUEST_PW name a user that may watch it).
+    None without JF_BASELINE: the checks keep their fixed limits."""
+    if os.environ.get("JF_BASELINE") != "1":
+        return None
+    if item not in _JF_BASELINES:
+        out = f"{OUT}/jellyfin_baseline"
+        subprocess.run(["node", os.path.join(os.path.dirname(__file__), "jellyfin_drive.mjs"), os.environ["JELLYFIN_URL"], item, out],
+                       env=dict(os.environ, JF_TAP_USER=""), capture_output=True, text=True, timeout=600)
+        with open(f"{out}/log.json") as f:
+            rep = json.load(f)
+        samples = [x for x in rep.get("samples") or [] if x]
+        _JF_BASELINES[item] = {"startup_s": rep.get("startup_s"), "seek_s": rep.get("seek_s"), "after_seek": rep.get("after_seek"),
+                               "width": max((x.get("w", 0) for x in samples), default=0),
+                               "dropped": max((x.get("dropped", 0) or 0 for x in samples), default=0)}
+        measured("jellyfin_baseline", _JF_BASELINES[item])
+    return _JF_BASELINES[item]
+
+
+def jellyfin(link: str = "") -> None:
+    """A seller's whole web app, sold by the byte: the real Jellyfin web client in a browser, through the
+    wallet app's app port, the connector and the signer, to a gateway that gives each buyer an account of
+    their own (docs/SELLER-APPS.md, docs/BUYER-ACCOUNTS.md), paid with tickets on these nodes. Needs a
+    Jellyfin (JELLYFIN_URL), its admin API key (JF_ADMIN_KEY_FILE), a library to sell (JF_LIBRARY), a film
+    in it (JF_ITEM), and Chrome; run by name only: `ticket_e2e_regtest.sh jellyfin`. `link`: "direct" or
+    "relay" sells it as a shop with no web address, over its iroh link (jellyfin_link, jellyfin_relay)."""
+    need = {k: os.environ.get(k, "") for k in ("JELLYFIN_URL", "JF_ADMIN_KEY_FILE", "JF_LIBRARY", "JF_ITEM")}
+    if not all(need.values()):
+        raise LabError(f"set {', '.join(k for k, v in need.items() if not v)}")
+    with open(need["JF_ADMIN_KEY_FILE"]) as f:
+        key = next(ln.strip().rsplit("=", 1)[-1] for ln in f if ln.strip() and not ln.startswith("#"))
+    stop_sessions()
+    gw_port, conn_port, ui_port, app_ports = BASE + 12, BASE + 13, BASE + 14, [BASE + 15, BASE + 16]
+    jf_origin = f"http://127.0.0.1:{gw_port}"
+    if link:
+        with open(f"{RUN}/sign.macaroon", "wb") as f:
+            f.write(bytes.fromhex(lab.bake(SELLER, ("uri:/lnrpc.Lightning/SignMessage",))))
+        os.chmod(f"{RUN}/sign.macaroon", 0o600)
+    # the wallet: this seller allowed, tied to the seller's node, and a task for what its app spends
+    pol = WALLET_PROC.policy()
+    pol["allowlist"].append(jf_origin)
+    pol["counterparties"][jf_origin] = {"ln_node": lab.pubkey(SELLER)}
+    pol["tickets"]["tasks"]["app"] = {"budget_sats": 200_000}
+    with open(f"{WALLET}/policy.json", "w") as f:
+        json.dump(pol, f, indent=1)
+    restart_signer()
+    # the seller: the whole of Jellyfin but its admin, each buyer an account of their own whose progress is kept
+    path = gateway_config("jf", gw_port, "link" if link else jf_origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["times"]["upstream_wait_secs"] = 30
+    if link:
+        cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if link == "relay" else [], "private": link == "relay"}
+        cfg["link"]["endpoints"] = LINK_KEYS
+    cfg["routes"] = [{
+        "path": "/", "upstream": JF_URL, "price": {"byte_msat": JF_PRICE_MSAT, "per_bytes": PER_BYTES},
+        "methods": ["GET", "HEAD", "POST", "DELETE"], "max_body": 1_048_576, "websocket": True, "accept_gzip": True,
+        "forward_headers": ["cookie", "authorization", "x-emby-authorization", "x-mediabrowser-token", "x-emby-token", "x-requested-with"],
+        "accounts": {"kind": "jellyfin", "admin_key_file": os.path.abspath(need["JF_ADMIN_KEY_FILE"]), "libraries": [need["JF_LIBRARY"]]},
+        "allow_paths": ["/", "/users/", "/sessions/playing", "/sessions/capabilities", "/system/info/public", "/system/endpoint",
+                        "/quickconnect/enabled", "/branding/configuration"],
+        "deny_paths": ["/users", "/sessions", "/system/", "/devices", "/quickconnect/", "/auth/", "/startup/", "/plugins/", "/packages/",
+                       "/scheduledtasks/", "/library/", "/environment/", "/branding/"]}]
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    if "jf" in PROCS and PROCS["jf"].poll() is None:
+        PROCS["jf"].terminate()
+        PROCS["jf"].wait(10)
+    start_gateway("jf", gw_port)
+    if link:
+        # the shop's name and link come from its transport document, signed by the seller's node
+        doc: dict[str, Any] = {}
+
+        def signed() -> bool:
+            code, _, body = send("GET", "/.well-known/lightning-stream-transport.json", gw_port)
+            if code == 200:
+                doc.update(json.loads(body))
+            return code == 200 and bool(doc.get("transport")) and str(doc.get("seller", "")).startswith("http")
+
+        lab.wait("the Jellyfin shop's transport document", 60, signed, every=0.5)
+        jf_origin = str(doc["seller"])
+        with open(SHOPS_FILE, "w") as f:
+            json.dump({jf_origin: {"receipt_key": doc["receipt_key"], "transport": doc}}, f)
+        pol = WALLET_PROC.policy()
+        pol["allowlist"].append(jf_origin)
+        pol["counterparties"][jf_origin] = {"ln_node": lab.pubkey(SELLER)}
+        pol["tickets"]["tasks"]["app"] = {"budget_sats": 200_000}
+        with open(f"{WALLET}/policy.json", "w") as f:
+            json.dump(pol, f, indent=1)
+        if link == "relay":
+            os.environ["XBT_LINK_PRIVATE"] = "1"
+        restart_signer()
+    # the buyer's app: the connector on the signer, the wallet app with two app ports, the seller listed in it
+    os.makedirs(f"{RUN}/ui", exist_ok=True)
+    with open(f"{RUN}/ui/services.json", "w") as f:
+        json.dump([{"name": "Films", "kind": "video", "seller": jf_origin, "price_text": "20 sat a MiB", "items": [],
+                    "app": f"{jf_origin}/web/", "app_base": f"{jf_origin}/"}], f)
+    with open(f"{RUN}/connector.log", "ab") as log:
+        PROCS["connector"] = subprocess.Popen([f"{BIN}/lightning-stream"], env=dict(os.environ, LS_LISTEN=f"127.0.0.1:{conn_port}", B2_SIGNER_SOCK=SOCK,
+                                              B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="app", LS_MAX_SATS="30000", XBT_SHOPS_FILE=SHOPS_FILE), stdout=log, stderr=log)
+    password = secrets.token_hex(12)
+    with open(f"{RUN}/ui.log", "ab") as log:
+        PROCS["ui"] = subprocess.Popen([f"{BIN}/xbt-wallet-ui"], env=dict(os.environ, XBT_UI_BIND=f"127.0.0.1:{ui_port}", XBT_UI_SIGNER_SOCK=SOCK,
+                                       XBT_UI_DATA_DIR=f"{RUN}/ui", XBT_UI_PASSWORD=password, XBT_UI_CONNECTOR=f"http://127.0.0.1:{conn_port}",
+                                       XBT_UI_APP_PORTS=",".join(map(str, app_ports))), stdout=log, stderr=log)
+    lab.wait("the connector and the wallet app", 60, lambda: all(p.poll() is None for p in (PROCS["connector"], PROCS["ui"]))
+             and send("GET", "/health", conn_port)[0] == 200 and send("GET", "/login", ui_port)[0] == 200, every=0.2)
+    form = lambda d: urllib.parse.urlencode(d).encode()
+    st, h, _ = send("POST", "/login", ui_port, {"Content-Type": "application/x-www-form-urlencoded"}, form({"password": password}))
+    cookie = h.get("set-cookie", "").split(";")[0]
+    if st != 303 or not cookie:
+        raise LabError(f"the wallet app's login: {st}")
+    q = urllib.parse.urlencode({"u": f"{jf_origin}/web/", "b": f"{jf_origin}/"})
+    page = send("GET", f"/app?{q}", ui_port, {"Cookie": cookie})[2].decode()
+    attr = lambda text, a: text.split(f'{a}="', 1)[1].split('"', 1)[0]
+    st, _, body = send("POST", "/app", ui_port, {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+                       form({"csrf": attr(page, 'name="csrf" value'), "u": f"{jf_origin}/web/", "b": f"{jf_origin}/", "limit": "30000"}))
+    opened = body.decode()
+    if st != 200 or "data-port" not in opened:
+        raise LabError(f"opening the app: {st} {opened[:300]}")
+    port, code = attr(opened, "data-port"), attr(opened, "data-code")
+    if os.environ.get("JF_DIAG"):
+        # the visit fetched by hand: its one-time code for the visit's cookie, then a script Jellyfin
+        # serves gzipped, compared with the same script fetched straight from Jellyfin
+        diag: dict[str, Any] = {}
+        st, h, _ = send("GET", f"/__ls/enter?c={code}", int(port))
+        vc = h.get("set-cookie", "").split(";")[0]
+        diag["enter"] = [st, bool(vc), h.get("location")]
+        for target in ("/web/", "/web/main.jellyfin.bundle.js"):
+            st, h, body = send("GET", target, int(port), {"Cookie": vc, "Accept-Encoding": "gzip, deflate, br"})
+            u = urllib.parse.urlsplit(JF_URL)
+            c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+            c.request("GET", target)
+            direct = c.getresponse().read()
+            c.close()
+            diag[target] = {"status": st, "got": len(body), "direct": len(direct), "same": body == direct,
+                            "headers": {k: v for k, v in h.items() if k in ("content-length", "content-encoding", "transfer-encoding", "content-type")}}
+        measured(f"jellyfin_diag_{link or 'https'}", diag)
+        print(json.dumps(diag, indent=1), flush=True)
+    # the browser, from the visit's one-time code to a minute of the film and a seek
+    before = money()
+    shots = f"{OUT}/jellyfin{'_' + link if link else ''}"
+    t0 = time.monotonic()
+    drove = subprocess.run(["node", os.path.join(os.path.dirname(__file__), "jellyfin_drive.mjs"), f"http://127.0.0.1:{port}/__ls/enter?c={code}",
+                            need["JF_ITEM"], shots], env=dict(os.environ, JF_TAP_USER="^buyer-"), capture_output=True, text=True, timeout=600)
+    took = round(time.monotonic() - t0)
+    with open(f"{RUN}/jellyfin-drive.log", "w") as f:
+        f.write(drove.stdout + drove.stderr)
+    if drove.returncode != 0 or not os.path.exists(f"{shots}/log.json"):
+        raise LabError(f"the browser: rc {drove.returncode} {drove.stderr[-300:]}")
+    with open(f"{shots}/log.json") as f:
+        rep = json.load(f)
+    # the visit stopped: what it locked comes back
+    send("POST", "/app-stop", ui_port, {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+         form({"csrf": attr(opened, 'name="csrf" value'), "visit": attr(opened, "data-visit")}))
+    stop_sessions()
+    lab.wait("the visit's tickets back", 60, lambda: in_flight() == 0 and held() == 0, every=0.2)
+    after = money()
+    # the buyer's account, as Jellyfin keeps it
+    users = [u for u in jellyfin_api("GET", "/Users", key) if u["Name"].startswith("buyer-")]
+    kept = {}
+    for u in users:
+        d = jellyfin_api("GET", f"/Users/{u['Id']}/Items/{need['JF_ITEM']}", key)
+        kept[u["Name"]] = {"position_s": round(int((d.get("UserData") or {}).get("PlaybackPositionTicks") or 0) / 1e7), "admin": u["Policy"]["IsAdministrator"],
+                           "libraries": u["Policy"].get("EnabledFolders"), "all_libraries": u["Policy"].get("EnableAllFolders")}
+    try:
+        with open(f"{RUN}/state-jf/accounts.json") as f:
+            accounts = len(json.load(f))
+    except (OSError, ValueError):
+        accounts = -1
+    samples = [x for x in rep.get("samples") or [] if x]
+    seen = {"after_login": rep.get("after_login"), "home": rep.get("home"), "startup_s": rep.get("startup_s"), "width": max((x.get("w", 0) for x in samples), default=0),
+            "dropped": max((x.get("dropped", 0) or 0 for x in samples), default=None), "after_seek": rep.get("after_seek"), "seek_s": rep.get("seek_s"),
+            "browser_mib": round(rep.get("bytes", 0) / PER_BYTES), "http_errors": len(rep.get("http_errors") or []), "ws": rep.get("ws"), "seconds": took}
+    tag = f"jellyfin_{link}" if link else "jellyfin"
+    measured(tag, seen)
+    check(f"{tag}: the whole web client opens through the app port and logs the buyer in, with one tap, as an account of their own",
+          bool(rep.get("home")) and "/web/" in str(rep.get("after_login")) and len(users) == 1 and accounts == 1
+          and all(not k["admin"] and not k["all_libraries"] and k["libraries"] == [need["JF_LIBRARY"]] for k in kept.values()),
+          {**seen, "accounts": accounts, "users": kept})
+    base = jellyfin_baseline(need["JF_ITEM"])
+    if base is None:
+        check(f"{tag}: the 4K film plays within 5 s, drops no frame, and a seek to 300 s plays again within 5 s",
+              bool(rep.get("started")) and float(rep.get("startup_s") or 99) <= 5 and seen["width"] >= 3840 and seen["dropped"] == 0
+              and bool(rep.get("seek_resumed")) and float(rep.get("seek_s") or 99) <= 5, seen)
+    else:
+        # judged against the same film played straight from Jellyfin on this machine: what Stream adds, not what
+        # Jellyfin's transcode or this machine's CPU cost both runs alike
+        stalls = lambda r: int((r.get("after_seek") or {}).get("stalls") or 0)
+        check(f"{tag}: the 4K film plays, and starts, seeks, drops frames and stalls within a margin of the same film without Stream",
+              bool(rep.get("started")) and seen["width"] >= base["width"]
+              and float(rep.get("startup_s") or 99) <= float(base["startup_s"]) + JF_MARGIN_S
+              and bool(rep.get("seek_resumed")) and float(rep.get("seek_s") or 99) <= float(base["seek_s"]) + JF_MARGIN_S
+              and (seen["dropped"] or 0) <= base["dropped"] + JF_MARGIN_FRAMES and stalls(rep) <= stalls(base) + 1,
+              {**seen, "baseline": base, "margin_s": JF_MARGIN_S})
+    paid = {k: after[k] - before[k] for k in ("buyer_node_paid_msat", "seller_node_received_msat", "wallet_book_settled_msat", "tickets")}
+    # the browser counts what it decoded; the seller charges what it sent, about as much for a film
+    priced = rep.get("bytes", 0) * JF_PRICE_MSAT // PER_BYTES
+    check(f"{tag}: what it loaded was paid for on these nodes: the buyer's node paid, the seller's node received and the wallet booked one sum",
+          paid["tickets"] > 0 and len({paid["buyer_node_paid_msat"], paid["seller_node_received_msat"], paid["wallet_book_settled_msat"]}) == 1
+          and paid["buyer_node_paid_msat"] >= priced // 2, {**paid, "priced_by_the_browser_msat": priced})
+    check(f"{tag}: the buyer's progress is kept in their own account", any(k["position_s"] > 0 for k in kept.values()), kept)
+    check(f"{tag}: tickets were bought again while the film played (a refill mid-stream) and it never stalled",
+          paid["tickets"] >= 2 and seen["dropped"] == 0 and bool(rep.get("started")), {"tickets": paid["tickets"], **seen})
+    os.environ.pop("XBT_LINK_PRIVATE", None)
+    PROCS["jf"].terminate()
+    PROCS["jf"].wait(10)
+    for k in ("connector", "ui"):
+        PROCS[k].terminate()
+        PROCS[k].wait(10)
+    # the next run starts with no buyer: Jellyfin names its users' ids after their names, so one left would come back
+    for u in users:
+        jellyfin_api("DELETE", f"/Users/{u['Id']}", key)
+    # and the gateway's own record of them, kept in its state directory, goes with them
+    try:
+        os.remove(f"{RUN}/state-jf/accounts.json")
+    except OSError:
+        pass
+
+
+CHECKS = {"page": page, "latency": latency, "stream": stream, "money": money_check, "flap": flap, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
+          "vpn": vpn,
+          "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n != "pruned"])
+    # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
+    # (vpn downloads a public file through the exit: run by name only)
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)
@@ -1561,4 +3161,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # a run stopped from outside (stream-lab, the shell's trap) still unwinds, so the far side's NAT rule goes with it
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(129))
     sys.exit(main())

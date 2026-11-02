@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 xbt-primitives.workspace = true
 xbt402 = { workspace = true, features = ["http-client"] }
+# a seller reached by its key (a shop without a web address): crates/xbt-iroh-link
+xbt-iroh-link = { path = "../xbt-iroh-link" }
 sha2.workspace = true
 # stream tickets: a ticket's secret and tag are HMAC-SHA256 of the sealed seed (already in the tree through xbt402)
 hmac.workspace = true
@@ -30,9 +32,17 @@ secp256k1 = { workspace = true, features = ["recovery"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # AGP-066: the LN REST URL's host, parsed as ureq parses it (already in the tree through ureq)
 url = "2.5"
+# the public certificate authorities for a WebSocket to an https seller, as ureq trusts them (already in the tree through ureq)
+webpki-roots = "0.26"
+# an answer's connection, found by its addresses and shut when the answer is stopped (already in the tree)
+socket2 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
 # the ticket payer is tested against the real seller gateway, in process (tests/ticket_pay.rs)
 xbt-gateway = { path = "../xbt-gateway" }
+# and a hashrate rental's payer against this signer's socket, with its own caps (tests/ticket_pay.rs)
+xbt-hashlink = { path = "../xbt-hashlink" }
 xbt402 = { workspace = true, features = ["http-client", "http-server"] }
+# a stand-in web app that serves its page only compressed, as llama.cpp's server does (already in the tree through ureq)
+flate2 = "1"

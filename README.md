@@ -1,11 +1,14 @@
 # Lightning Stream
 
-Buy and sell services over XBT Lightning, paid piece by piece as they arrive: a film by the
-megabyte, an AI model by the token, a miner's hashrate by the slice of work. XBT is Bitcoin on
-BLAKE2b proof of work.
+Buy and sell services over XBT Lightning, paid as you use them: a seller's own web app (Jellyfin
+and the like) or a folder of files by the megabyte, an AI model by the token, a miner's hashrate by
+the slice of work, a VPN exit by the gigabyte. XBT is Bitcoin on BLAKE2b proof of work.
 
-The buyer pays a small ticket ahead (about 900 sats), the seller counts what it delivers to the
-millisatoshi and signs a receipt for every answer, and the buyer can lose no more than one ticket.
+The buyer pays a small ticket ahead (about 900 sats), and the seller counts what it delivers to the
+millisatoshi and signs a receipt for every answer. A shop is paid no more than its listing shows. A
+dishonest shop can keep at most what the buyer's app paid it ahead (about one to two tickets for each
+answer it is sending) plus a small allowance per request; one that charges more is caught and
+blocked, and each shop has a daily cap (the exact bound is in [`docs/TICKETS.md`](docs/TICKETS.md)).
 It runs on ordinary XBT Lightning nodes. Lightning Stream never holds anyone's money: each person
 pays from, and is paid to, their own node.
 
@@ -34,20 +37,30 @@ You need a synced Knots-BLAKE2b node (a first sync takes days, and Lightning For
 - **Linux:** Docker Compose beside your own nodes: [`docs/LINUX.md`](docs/LINUX.md).
 
 Then, in the app: make your approval key, sign the safe starter rules, confirm **Pay with real
-money**, and allow a seller. Our test shop is `https://stream.lazarus-xbt.xyz`. The
+money**, and allow a seller. Our demo shop, **Lightning Stream Genesis**, has the shop key
+`npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a`: paste it under Sellers. The
 [setup page](https://lazarus-xbt.xyz/stream/start/) has each step, and how to get a channel.
 
 ## What it does
 
-- **Buy.** Browse sellers' signed listings (published on Nostr relays), play films as they arrive,
-  ask an AI model, or rent hashrate. Every payment stays within spending rules the owner signs:
+- **Buy.** Browse sellers' signed listings (published on Nostr relays), open a seller's own web app
+  (for example Jellyfin's full interface, up to 4K, with an account of your own), download files or
+  open them in your own player, ask an AI model, rent hashrate, or send your devices out through
+  another box's VPN exit. Every payment stays within spending rules the owner signs:
   budgets, caps per seller, allowed sellers only, and an approval above a threshold.
-- **Sell.** Put a price on the services already on your box (a media server, an AI model, any web
-  service). A gateway answers buyers with HTTP 402 and its terms, meters each answer per request,
-  byte, token or second, and signs a receipt.
+- **Sell.** Put a price on the services already on your box (a web app such as Jellyfin, a folder
+  of files, an AI model, a VPN exit from your own connection). A gateway answers buyers with HTTP 402
+  and its terms, meters each answer per request, byte, token or second, and signs a receipt. Buyers
+  can reach your shop by its key alone, over an encrypted link: no domain, certificate or port
+  forward. Where the two ends can't connect directly a relay carries the traffic without seeing it,
+  and in private mode buyers never learn your box's address. A relay is built in (off by default,
+  free); paid relays come in an update.
 - **Rent hashrate.** A *hashmaker* lists its miners and a *hashtaker* rents them into its own
-  DATUM Gateway, paying for each slice of work after it is delivered. Only shares the hashtaker's
-  own gateway accepted are counted. ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
+  gateway, paid as it uses them, seconds at a time. Both apps check every share's hash
+  themselves, and the renter's gateway hides which shares win. The app comes with its own, the
+  Stream Gateway (DATUM-compatible), set on the Hashrate page to mine solo to your address or
+  through Lazarus Pool, and won't rent into a gateway that doesn't mask its jobs.
+  ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
 - **Agents.** An AI agent pays through the same wallet over MCP and never holds a key.
 - **A local AI address.** The app gives the box an OpenAI-compatible address on the owner's network.
   Any AI app or agent that speaks that API uses the sellers' models through it, paid per token, each
@@ -107,7 +120,8 @@ by Luke Dashjr, who wrote the BLAKE2b proof of work; the signature hash that kee
 being replayed on the SHA-256 chain is Kyle Santiago's. Lightning on XBT is Paul Lamb's Lightning
 Fork, a fork of Lightning Labs' lnd, and PrivKey's Core Lightning fork. Paul also packages
 Knots-BLAKE2b and Lightning Fork for Umbrel and StartOS, and built the access grant the StartOS
-package uses. Hashrate rental is built around OCEAN's DATUM.
+package uses. Hashrate rental is built around OCEAN's DATUM, and the Stream Gateway is CONVOY's
+datum_gateway (MIT) with a masking patch.
 
 Chris Guida's two reviews are why Lightning Stream is built on Lightning, and they narrowed what it
 claims. Kyle Santiago pointed out the slot and dust limits the ticket defaults are built around.

@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 xbt-svc.workspace = true
 xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
+xbt402.workspace = true
 serde_json.workspace = true
 getrandom = "0.2"
 hex.workspace = true

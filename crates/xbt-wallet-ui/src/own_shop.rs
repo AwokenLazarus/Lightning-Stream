@@ -2,7 +2,7 @@
 //!
 //! A box cannot buy from itself: its Lightning node cannot pay its own invoices. So a service whose
 //! seller is this box's own gateway (the origin its config sells under) is shown as "your shop",
-//! and its items play as a free preview straight from the service on the box, through this UI,
+//! and its web app opens as a free preview straight from the service on the box, through this UI,
 //! for the logged-in owner only. Nothing is paid and nothing goes through the gateway. Buyers never
 //! see this: the preview is a page of the owner's own UI, behind its login.
 use serde_json::Value;
@@ -64,7 +64,7 @@ impl App {
         own.is_some() && own == services::http_origin(seller)
     }
 
-    /// Where the free preview of `item_url` (an item of the owner's own shop) comes from.
+    /// Where the free preview of `item_url` (a page of the owner's own shop) comes from.
     pub fn preview_upstream(&self, item_url: &str) -> Result<String, String> {
         upstream_url(&self.own_config().ok_or("this box sells nothing yet")?, item_url)
     }

@@ -1,0 +1,344 @@
+/*
+ *
+ * DATUM Gateway
+ * Decentralized Alternative Templates for Universal Mining
+ *
+ * This file is part of CONVOY's Bitcoin mining decentralization
+ * project, DATUM.
+ *
+ * https://convoy.xyz
+ *
+ * ---
+ *
+ * Copyright (c) 2014-2026 Luke Dashjr and individual contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+#ifndef _DATUM_UTILS_H_
+#define _DATUM_UTILS_H_
+
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#ifdef __has_include
+#	if __has_include(<stdckdint.h>)
+#		include <stdckdint.h>
+#	endif
+#endif
+#include <stdlib.h>
+#include <string.h>
+#include <float.h>
+
+#include "datum_logger.h"
+
+struct buf;
+
+void datum_utils_init(void);
+
+#ifndef ckd_add
+#	define ckd_add(res, a, b) __builtin_add_overflow((a), (b), (res))
+#endif
+
+#ifndef ckd_mul
+#	define ckd_mul(res, a, b) __builtin_mul_overflow((a), (b), (res))
+#endif
+
+extern unsigned int datum_test_failed;
+bool datum_test_fail_(const char *expr, const char *file, unsigned int line, const char *func);
+#define datum_test_(expr, fake_expr, line, fake_func) \
+	((expr) ? true : datum_test_fail_(fake_expr, __FILE__, line, fake_func))
+#define datum_test(expr) \
+	datum_test_(expr, #expr, __LINE__, __func__)
+
+uint64_t monotonic_time_seconds(void);
+uint64_t current_time_millis(void);
+uint64_t current_time_micros(void);
+uint64_t get_process_uptime_seconds(void);
+unsigned char hex2bin_uchar(const char *in);
+void build_hex_lookup(void);
+bool my_sha256(void *digest, const void *buffer, size_t length);
+void nbits_to_target(uint32_t nbits, uint8_t *target);
+int compare_hashes(const uint8_t *hash1, const uint8_t *hash2);
+
+typedef long double bitcoin_difficulty_typ;
+_Static_assert(LDBL_MANT_DIG >= 23, "long double must have at least 23 bits of precision for compact targets");
+#define PRIdiff ".0Lf"
+
+#define DATUM_MAX_PDIFF (UINT64_C(1) << 63)
+
+static inline long double datum_pdiff_to_bdiff(uint64_t n) {
+	return ((long double)n) * 65535.0L / 65536.0L;
+}
+
+static inline bitcoin_difficulty_typ datum_pdiff_to_diff(uint64_t n) {
+	return (bitcoin_difficulty_typ)n * 4294967296.0L;
+}
+
+unsigned long long block_reward(unsigned int block_height);
+int append_bitcoin_varint_hex(uint64_t n, char *s);
+int append_UNum(uint64_t n, uint8_t *s);
+void panic_from_thread(int a);
+
+// The stack size of every thread the gateway starts: glibc's usual default
+// (RLIMIT_STACK), set explicitly because musl starts threads with 128 KiB and
+// macOS with 512 KiB, and some functions keep more than 128 KiB on the stack.
+#define DATUM_THREAD_STACK_SIZE (8 * 1024 * 1024)
+int datum_thread_create(pthread_t *thread, void *(*start_routine)(void *), void *arg);
+bool double_sha256(void *out, const void *in, size_t length);
+void hex_to_bin_le(const char *hex, unsigned char *bin);
+void hex_to_bin(const char *hex, unsigned char *bin);
+void hash2hex(unsigned char *bytes, char *hexString);
+uint64_t roundDownToPowerOfTwo_64(uint64_t x);
+int addr_2_output_script(const char *addr, unsigned char *script, int max_len);
+int output_script_2_addr(const unsigned char *script, const int len, char *addr);
+int base64_decode(const char *in, size_t inLen, unsigned char *out, size_t *outLen);
+void uchar_to_hex(char *s, const unsigned char b);
+
+static inline size_t bytes_to_hex(char * const hex, const uint8_t * const bytes, const size_t len) {
+	for (size_t i = 0; i < len; ++i) {
+		uchar_to_hex(&hex[i << 1], bytes[i]);
+	}
+	return len << 1;
+}
+
+int get_bitcoin_varint_len_bytes(uint64_t n);
+bool strncpy_uachars(char *out, const char *in, size_t maxlen);
+bool strncpy_workerchars(char *out, const char *in, size_t maxlen);
+bitcoin_difficulty_typ calc_network_difficulty_blake2b(uint32_t nbits);
+#define DATUM_FORMAT_DIFFICULTY_OUT_SZ 8
+int datum_format_difficulty(char *out, size_t out_size, bitcoin_difficulty_typ difficulty);
+bool buf_datum_format_difficulty(struct buf *, bitcoin_difficulty_typ diff);
+unsigned char floorPoT(uint64_t x);
+uint64_t datum_siphash(const void *src, uint64_t sz, const unsigned char key[16]);
+uint64_t datum_siphash_mod8(const void *src, uint64_t sz, const unsigned char key[16]);
+unsigned int datum_double_precision(double *inout_dbl);
+uint64_t datum_atoi_strict_u64(const char *s, size_t size);
+int datum_atoi_strict(const char *s, size_t size);
+bool datum_str_to_bool_strict(const char *s, bool *out);
+char **datum_deepcopy_charpp(const char * const *p);
+void datum_reexec();
+bool datum_secure_strequals(const char *secret, const size_t secret_len, const char *guess);
+const char *dynamic_hash_unit(double *inout_hashrate);
+
+
+static inline size_t datum_align_sz(const size_t min_sz, const size_t alignment) {
+	return (min_sz + alignment - 1) / alignment * alignment;
+}
+
+
+static inline
+uint8_t upk_u8(const void * const bufp, const int offset)
+{
+	const uint8_t * const buf = bufp;
+	return buf[offset];
+}
+
+#define upk_u8le(buf, offset)  upk_u8(buf, offset)
+
+static inline
+uint16_t upk_u16le(const void * const bufp, const int offset)
+{
+	const uint8_t * const buf = bufp;
+	return (uint16_t)buf[offset+0]
+	     | (uint16_t)(((uint16_t)buf[offset+1]) << 8);
+}
+
+static inline
+uint32_t upk_u32le(const void * const bufp, const int offset)
+{
+	const uint8_t * const buf = bufp;
+	return (((uint32_t)buf[offset+0]) <<    0)
+	     | (((uint32_t)buf[offset+1]) <<    8)
+	     | (((uint32_t)buf[offset+2]) << 0x10)
+	     | (((uint32_t)buf[offset+3]) << 0x18);
+}
+
+static inline
+uint64_t upk_u64le(const void * const bufp, const int offset)
+{
+	const uint8_t * const buf = bufp;
+	return (((uint64_t)buf[offset+0]) <<    0)
+	     | (((uint64_t)buf[offset+1]) <<    8)
+	     | (((uint64_t)buf[offset+2]) << 0x10)
+	     | (((uint64_t)buf[offset+3]) << 0x18)
+	     | (((uint64_t)buf[offset+4]) << 0x20)
+	     | (((uint64_t)buf[offset+5]) << 0x28)
+	     | (((uint64_t)buf[offset+6]) << 0x30)
+	     | (((uint64_t)buf[offset+7]) << 0x38);
+}
+
+
+static inline
+void pk_u8(void * const bufp, const int offset, const uint8_t nv)
+{
+	uint8_t * const buf = bufp;
+	buf[offset] = nv;
+}
+
+#define pk_u8le(buf, offset, nv)  pk_u8(buf, offset, nv)
+
+static inline
+void pk_u16le(void * const bufp, const int offset, const uint16_t nv)
+{
+	uint8_t * const buf = bufp;
+	buf[offset+0] = (nv >>    0) & 0xff;
+	buf[offset+1] = (nv >>    8) & 0xff;
+}
+
+static inline
+void pk_u32le(void * const bufp, const int offset, const uint32_t nv)
+{
+	uint8_t * const buf = bufp;
+	buf[offset+0] = (nv >>    0) & 0xff;
+	buf[offset+1] = (nv >>    8) & 0xff;
+	buf[offset+2] = (nv >> 0x10) & 0xff;
+	buf[offset+3] = (nv >> 0x18) & 0xff;
+}
+
+static inline
+void pk_u64le(void * const bufp, const int offset, const uint64_t nv)
+{
+	uint8_t * const buf = bufp;
+	buf[offset+0] = (nv >>    0) & 0xff;
+	buf[offset+1] = (nv >>    8) & 0xff;
+	buf[offset+2] = (nv >> 0x10) & 0xff;
+	buf[offset+3] = (nv >> 0x18) & 0xff;
+	buf[offset+4] = (nv >> 0x20) & 0xff;
+	buf[offset+5] = (nv >> 0x28) & 0xff;
+	buf[offset+6] = (nv >> 0x30) & 0xff;
+	buf[offset+7] = (nv >> 0x38) & 0xff;
+}
+
+
+struct buf {
+	char *s;
+	size_t len;
+	size_t allocsz;
+	bool err;
+};
+
+#define BUF_INIT (struct buf){0}
+
+static inline
+void buf_init(struct buf * const buf)
+{
+	*buf = BUF_INIT;
+}
+
+static inline
+bool buf_reserve(struct buf * const buf, const size_t newsz)
+{
+	if (buf->err) return false;
+	if (newsz <= buf->allocsz) return true;
+	
+	void * const n = realloc(buf->s, newsz);
+	if (!n) {
+		buf->err = true;
+		return false;
+	}
+	
+	buf->s = n;
+	buf->allocsz = newsz;
+	return true;
+}
+
+static inline
+bool buf_extend(struct buf * const buf, const size_t min_sz)
+{
+	if (buf->err) return false;
+	if (min_sz <= buf->allocsz) return true;
+	
+	size_t newsz;
+	if (min_sz > SIZE_MAX / 4) {
+		newsz = min_sz;
+	} else {
+		newsz = buf->allocsz ? buf->allocsz : 0x10;
+		do {
+			newsz *= 2;
+		} while (min_sz > newsz);
+	}
+	
+	return buf_reserve(buf, newsz);
+}
+
+[[nodiscard]] static inline
+bool buf_resize(struct buf * const buf, const size_t newlen)
+{
+	if (!buf_extend(buf, newlen)) return false;
+	if (buf->err) return false;
+	buf->len = newlen;
+	return true;
+}
+
+[[nodiscard]] static inline
+void *buf_preappend(struct buf * const buf, const size_t addlen)
+{
+	const size_t origlen = buf->len;
+	if (buf->err) return NULL;
+	if (SIZE_MAX - origlen < addlen) {
+		buf->err = true;
+		return NULL;
+	}
+	if (!buf_extend(buf, origlen + addlen)) return NULL;
+	return &buf->s[origlen];
+}
+
+static inline
+bool buf_append(struct buf * const buf, const void * const add, const size_t addlen)
+{
+	if (!addlen) return !buf->err;
+	void * const appendbuf = buf_preappend(buf, addlen);
+	if (!appendbuf) return false;
+	memcpy(appendbuf, add, addlen);
+	buf->len += addlen;
+	return true;
+}
+
+static inline
+bool buf_strcat(struct buf * const buf, const char * const add)
+{
+	return buf_append(buf, add, strlen(add));
+}
+
+int buf_printf(struct buf *, const char *format, ...) __attribute__((format(printf, 2, 3)));
+
+[[nodiscard]] static inline
+bool buf_nullterminate(struct buf * const buf)
+{
+	char * const appendbuf = buf_preappend(buf, 1);
+	if (!appendbuf) return false;
+	appendbuf[0] = '\0';
+	return true;
+}
+
+static inline
+void buf_destroy(struct buf * const buf)
+{
+	free(buf->s);
+	*buf = BUF_INIT;
+}
+
+
+extern volatile int panic_mode;
+
+#endif

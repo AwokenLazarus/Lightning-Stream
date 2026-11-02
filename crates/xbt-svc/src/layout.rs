@@ -18,6 +18,10 @@
 //!   once and removed. Without the UI, the token stays `mcp/secrets/mcp-http-token`. A secret is
 //!   rewritten only when its value changes; a generated one never is.
 //!
+//! * with the Stream Gateway (`datum`) and the UI: writes the node's RPC credentials to
+//!   `run/datum/rpc.cookie` (`user:password`, no newline, 0600, the gateway's), which its config names as
+//!   `bitcoind.rpccookiefile`, and makes `datum/submitblocks/`. The config the UI writes beside it holds no secret.
+//!
 //! It reports what it did as JSON (names, owners and modes; never a secret's value).
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -41,6 +45,9 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::RELAY, user: "xbt-work-relay", uid: 10006 },
     Component { name: crate::GATEWAY, user: "xbt-gateway", uid: 10007 },
     Component { name: crate::HASHRATE, user: "xbt-hashrate", uid: 10010 },
+    Component { name: crate::STREAM_RELAY, user: "xbt-stream-relay", uid: STREAM_RELAY_UID },
+    Component { name: crate::VPN, user: "xbt-vpn", uid: VPN_UID },
+    Component { name: crate::DATUM, user: "xbt-datum", uid: DATUM_UID },
 ];
 
 /// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
@@ -72,9 +79,53 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     SharedDir { dir: crate::RUN_GATEWAY, writer: crate::UI, reader: crate::GATEWAY, gid: 10007, mode: 0o750 },
     SharedDir { dir: crate::RUN_ENROLL, writer: crate::SIGNER, reader: crate::UI, gid: ENROLL_GID, mode: 0o750 },
     SharedDir { dir: crate::RUN_HASHRATE, writer: crate::UI, reader: crate::HASHRATE, gid: HASHRATE_GID, mode: 0o750 },
+    // the signer's socket for the hashrate renter alone: the one way to a task's rental terms. The hashrate
+    // services' group (the renter, and the UI) reaches it; the MCP, in the signer's group, does not
+    SharedDir { dir: crate::RUN_RENTAL, writer: crate::SIGNER, reader: crate::HASHRATE, gid: HASHRATE_GID, mode: 0o750 },
+    // public data only (receipt keys, signed transport documents): read by the signer's group
+    SharedDir { dir: crate::RUN_SHOPS, writer: crate::UI, reader: crate::SIGNER, gid: SHOPS_GID, mode: 0o750 },
+    // the built-in Stream relay: the owner's settings in, its status out
+    SharedDir { dir: crate::RUN_RELAY, writer: crate::UI, reader: crate::STREAM_RELAY, gid: STREAM_RELAY_UID, mode: 0o750 },
+    SharedDir { dir: crate::RUN_RELAY_STATUS, writer: crate::STREAM_RELAY, reader: crate::UI, gid: RELAY_STATUS_GID, mode: 0o750 },
+    // the VPN service: the devices and exit the owner sets in, its status out
+    SharedDir { dir: crate::RUN_VPN, writer: crate::UI, reader: crate::VPN, gid: VPN_UID, mode: 0o750 },
+    SharedDir { dir: crate::RUN_VPN_STATUS, writer: crate::VPN, reader: crate::UI, gid: VPN_STATUS_GID, mode: 0o750 },
     // both write here: the credential store is booked by the endpoint and edited by the UI's AI page
     SharedDir { dir: crate::RUN_AI, writer: crate::UI, reader: crate::SIGNER, gid: AI_GID, mode: 0o770 },
+    // the stream sockets: the VPN service makes the socket each paid tunnel is streamed to here, and the
+    // signer (whose dir it is) connects to it. Only where the VPN is installed; else the signer's alone (0750)
+    SharedDir { dir: crate::RUN_STREAMS, writer: crate::SIGNER, reader: crate::VPN, gid: STREAMS_GID, mode: 0o770 },
+    // the Stream Gateway: its config the UI's Hashrate page writes (no secret in it), and the node's RPC
+    // cookie init writes there (the gateway's own, 0600)
+    SharedDir { dir: crate::RUN_DATUM, writer: crate::UI, reader: crate::DATUM, gid: DATUM_UID, mode: 0o750 },
 ];
+
+/// A group only: the signer and the VPN service, for the stream sockets' dir (`run/signer/streams`).
+pub const STREAMS_GID: u32 = 10020;
+
+/// Whether `dir` is a shared dir with both its writer and its reader installed (its owners and mode
+/// are then the shared dir's, not a socket dir's).
+fn shared_here(dir: &str, has: &dyn Fn(&str) -> bool) -> bool {
+    SHARED_DIRS.iter().any(|sd| sd.dir == dir && has(sd.writer) && has(sd.reader))
+}
+
+/// The built-in Stream relay's user and group (10011 to 10013 are xbt-compute's, 10014 is the AI
+/// endpoint's group).
+pub const STREAM_RELAY_UID: u32 = 10016;
+/// A group only: the relay and the UI, for the relay's status file.
+pub const RELAY_STATUS_GID: u32 = 10017;
+/// The VPN service's user and group.
+pub const VPN_UID: u32 = 10018;
+/// A group only: the VPN service and the UI, for the service's status files.
+pub const VPN_STATUS_GID: u32 = 10019;
+/// The Stream Gateway's user and group (10020 is reserved for cmp's knots-xbt).
+pub const DATUM_UID: u32 = 10021;
+/// The node RPC cookie's mode: the gateway's alone.
+pub const DATUM_COOKIE_MODE: u32 = 0o600;
+
+/// The group `run/shops/` is read by: the signer's own, whose user the connector runs as and whose
+/// group the MCP is in.
+pub const SHOPS_GID: u32 = 10001;
 
 /// The AI endpoint's group (a group only): the UI and the signer's user, which the connector runs as.
 pub const AI_GID: u32 = 10014;
@@ -105,11 +156,14 @@ pub struct Provision {
     pub node_rpc_auth: Option<String>,
     /// The UI's login password.
     pub ui_password: Option<String>,
+    /// Umbrel: the Lightning app's uid, which owns `run/node-keys/` (the hand-over of the keys its
+    /// node bakes, shared with the UI by group, 0770). `None`: no hand-over folder.
+    pub node_keys_uid: Option<u32>,
 }
 
 impl std::fmt::Debug for Provision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Provision(node_rpc_auth: {}, ui_password: {})", self.node_rpc_auth.is_some(), self.ui_password.is_some())
+        write!(f, "Provision(node_rpc_auth: {}, ui_password: {}, node_keys_uid: {:?})", self.node_rpc_auth.is_some(), self.ui_password.is_some(), self.node_keys_uid)
     }
 }
 
@@ -124,7 +178,8 @@ fn file_or_env(file_var: &str, var: &str) -> Result<Option<String>, String> {
 impl Provision {
     /// `XBT_INIT_NODE_RPC_AUTH_FILE` / `XBT_INIT_NODE_RPC_AUTH` (`user:password`), or
     /// `XBT_INIT_NODE_RPC_USER` + `XBT_INIT_NODE_RPC_PASS` (Umbrel: a dependency's exports);
-    /// `XBT_INIT_UI_PASSWORD_FILE` / `XBT_INIT_UI_PASSWORD` (Umbrel: `${APP_PASSWORD}`).
+    /// `XBT_INIT_UI_PASSWORD_FILE` / `XBT_INIT_UI_PASSWORD` (Umbrel: `${APP_PASSWORD}`);
+    /// `XBT_INIT_NODE_KEYS_UID` (Umbrel: the Lightning app's user, 1000).
     ///
     /// These are plain env values on purpose: `xbt-init` is the installer's step, it exits before any
     /// service starts, and the services themselves still read only files (production mode).
@@ -144,7 +199,11 @@ impl Provision {
         if ui_password.as_deref().is_some_and(|p| p.chars().count() < 8) {
             return Err("the UI password is shorter than 8 characters".into());
         }
-        Ok(Self { node_rpc_auth, ui_password })
+        let node_keys_uid = match crate::env("XBT_INIT_NODE_KEYS_UID") {
+            Some(u) => Some(u.parse::<u32>().ok().filter(|u| *u != 0).ok_or("XBT_INIT_NODE_KEYS_UID must be a uid other than root's")?),
+            None => None,
+        };
+        Ok(Self { node_rpc_auth, ui_password, node_keys_uid })
     }
 }
 
@@ -163,7 +222,7 @@ fn lchown(p: &Path, uid: u32, gid: u32) -> io::Result<()> {
 /// Open `p` itself: O_NOFOLLOW refuses a symlink in its last component (ELOOP), O_NONBLOCK keeps
 /// a FIFO from blocking. AGP-063 K1: owner and mode then change through this fd, never by path.
 #[cfg(unix)]
-fn open_nofollow(p: &Path, dir: bool) -> io::Result<std::fs::File> {
+pub fn open_nofollow(p: &Path, dir: bool) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | if dir { libc::O_DIRECTORY } else { 0 };
     std::fs::OpenOptions::new().read(true).custom_flags(flags).open(p)
@@ -345,6 +404,7 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
     }
     for (dir, server) in RUN_DIRS {
         if let Some(c) = comps.iter().find(|c| c.name == *server) {
+            // made here either way (a socket dir's parent first); a shared one gets its group and mode below
             dirs.push(own_dir(&run.join(dir), uid_of(c), 0o750, true)?);
         }
     }
@@ -354,6 +414,11 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
             let gid = if uid_of(w) == w.uid { sd.gid } else { uid_of(w) };
             dirs.push(own_dir_gid(&run.join(sd.dir), uid_of(w), gid, sd.mode, true)?);
         }
+    }
+    // Umbrel: the hand-over of the keys the Lightning app's user has its node bake: that user writes,
+    // the UI takes them (and removes them) by group
+    if let (Some(u), Some(ui)) = (prov.node_keys_uid, comps.iter().find(|c| c.name == crate::UI)) {
+        dirs.push(own_dir_gid(&run.join(crate::RUN_NODE_KEYS), u, uid_of(ui), 0o770, true)?);
     }
     let mut secrets = vec![];
     let mut put = |comp: &str, name: &str, value: &[u8]| -> Result<(), String> {
@@ -403,6 +468,17 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
         let r = put_secret_gid(&path, &token, ui, gid, MCP_TOKEN_MODE)?;
         secrets.push(json!({"component": crate::UI, "name": format!("run/{}/{HASHRATE_TOKEN}", crate::RUN_HASHRATE), "result": r}));
     }
+    if let Some(d) = comps.iter().find(|c| c.name == crate::DATUM) {
+        // the blocks it submits, kept on the volume for a resubmit if the node's submitblock fails
+        dirs.push(own_dir(&root.join(crate::DATUM).join("submitblocks"), uid_of(d), 0o700, true)?);
+        // the node's RPC credentials as a cookie file (`bitcoind.rpccookiefile`): the gateway's config, which the
+        // UI writes, never holds them. No newline: the gateway takes the file's first line as it is, newline and all
+        if let (Some(a), true) = (&prov.node_rpc_auth, has(crate::UI)) {
+            let path = root.join("run").join(crate::RUN_DATUM).join(crate::DATUM_RPC_COOKIE);
+            let r = put_secret(&path, a.as_bytes(), uid_of(d), DATUM_COOKIE_MODE)?;
+            secrets.push(json!({"component": crate::DATUM, "name": format!("run/{}/{}", crate::RUN_DATUM, crate::DATUM_RPC_COOKIE), "result": r}));
+        }
+    }
     Ok(json!({"ok": true, "root": root.display().to_string(), "dirs": dirs, "secrets": secrets}))
 }
 
@@ -442,12 +518,19 @@ pub fn check(root: &Path, names: &[String]) -> Value {
             }
         }
         for (dir, server) in RUN_DIRS {
-            if *server == c.name {
+            if *server == c.name && !shared_here(dir, &|n: &str| names.iter().any(|x| x == n)) {
                 want(root.join("run").join(dir), c.uid, 0o750);
             }
         }
         if c.name == crate::UI && names.iter().any(|n| n == crate::MCP) {
             want(root.join("run").join(crate::RUN_UI).join(crate::MCP_TOKEN), c.uid, MCP_TOKEN_MODE);
+        }
+        if c.name == crate::DATUM {
+            want(d.join("submitblocks"), c.uid, 0o700);
+            let cookie = root.join("run").join(crate::RUN_DATUM).join(crate::DATUM_RPC_COOKIE);
+            if std::fs::symlink_metadata(&cookie).is_ok() {
+                want(cookie, c.uid, DATUM_COOKIE_MODE);
+            }
         }
     }
     json!({"ok": problems.is_empty(), "problems": problems, "paths": rows})
@@ -465,7 +548,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016), ("vpn", 10018), ("datum", 10021)]);
     }
 
     #[test]
@@ -478,7 +561,13 @@ mod tests {
         assert_eq!(Provision::from_env().unwrap().node_rpc_auth.as_deref(), Some("u:p"));
         std::env::remove_var("XBT_INIT_NODE_RPC_USER");
         std::env::remove_var("XBT_INIT_NODE_RPC_PASS");
-        assert!(!format!("{:?}", Provision { node_rpc_auth: Some("u:secret".into()), ui_password: None }).contains("secret"));
+        // the hand-over's owner: a uid, never root's (in this test: the environment is the process's)
+        std::env::set_var("XBT_INIT_NODE_KEYS_UID", "0");
+        assert!(Provision::from_env().is_err());
+        std::env::set_var("XBT_INIT_NODE_KEYS_UID", "1000");
+        assert_eq!(Provision::from_env().unwrap().node_keys_uid, Some(1000));
+        std::env::remove_var("XBT_INIT_NODE_KEYS_UID");
+        assert!(!format!("{:?}", Provision { node_rpc_auth: Some("u:secret".into()), ui_password: None, node_keys_uid: None }).contains("secret"));
     }
 
     /// As an unprivileged user the chown steps only succeed for our own uid, so run the whole flow as
@@ -494,7 +583,7 @@ mod tests {
         let root = t.path().join("data");
         // stand-in: the code path is the same with every uid = ours
         let names: Vec<String> = ["signer", "mcp", "ui"].iter().map(|s| s.to_string()).collect();
-        let prov = Provision { node_rpc_auth: Some("xbt:pw".into()), ui_password: Some("correct horse".into()) };
+        let prov = Provision { node_rpc_auth: Some("xbt:pw".into()), ui_password: Some("correct horse".into()), node_keys_uid: None };
         let r = init_as(&root, &names, &prov, uid).unwrap();
         assert_eq!(r["ok"], true);
         // AGP-042: with the UI, the token is the UI's run/ui/mcp-http-token (0640, the MCP reads it by group)
@@ -510,6 +599,14 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(root.join("run/signer")).unwrap().mode() & 0o777, 0o750);
         assert_eq!(std::fs::metadata(root.join("run/signer/streams")).unwrap().mode() & 0o777, 0o750, "the stream sockets' dir, the signer's");
+        // with the VPN service installed, it makes its paid tunnels' sockets there too: the dir is the
+        // signer's and the stream group's (the signer and the VPN service only)
+        let with_vpn: Vec<String> = ["signer", "mcp", "ui", "vpn"].iter().map(|s| s.to_string()).collect();
+        let rv = init_as(&root, &with_vpn, &prov, uid).unwrap();
+        assert_eq!(rv["ok"], true, "{rv}");
+        assert_eq!(std::fs::metadata(root.join("run/signer/streams")).unwrap().mode() & 0o777, 0o770);
+        assert_eq!(std::fs::metadata(root.join("run/signer")).unwrap().mode() & 0o777, 0o750, "the signer's socket dir stays its own");
+        init_as(&root, &names, &prov, uid).unwrap();
         // a second run keeps the token and rewrites nothing
         let r2 = init_as(&root, &names, &prov, uid).unwrap();
         assert!(r2["secrets"].as_array().unwrap().iter().all(|s| s["result"] == "unchanged"), "{r2}");
@@ -532,6 +629,28 @@ mod tests {
         std::fs::create_dir_all(&root2).unwrap();
         std::os::unix::fs::symlink(t.path().join("elsewhere"), root2.join("signer")).unwrap();
         assert!(init_as(&root2, &["signer".to_string()], &Provision::default(), uid).is_err());
+    }
+
+    /// Umbrel: the hand-over of the node's baked keys is the Lightning app user's, shared with the UI by
+    /// group (0770); without that user, or without the UI, there is none.
+    #[test]
+    fn the_node_keys_hand_over_is_made_only_with_its_owner_and_the_ui() {
+        let uid = me();
+        if uid == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("data");
+        let names: Vec<String> = ["signer", "ui"].iter().map(|s| s.to_string()).collect();
+        init_as(&root, &names, &Provision::default(), uid).unwrap();
+        assert!(!root.join("run/node-keys").exists(), "no hand-over without its owner");
+        let prov = Provision { node_keys_uid: Some(uid), ..Provision::default() };
+        init_as(&root, &["signer".to_string()], &prov, uid).unwrap();
+        assert!(!root.join("run/node-keys").exists(), "no hand-over without the UI");
+        let r = init_as(&root, &names, &prov, uid).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        let md = std::fs::metadata(root.join("run/node-keys")).unwrap();
+        assert_eq!((md.uid(), md.mode() & 0o7777), (uid, 0o770));
     }
 
     /// An AGP-040 data dir (the token in mcp/secrets and a copy in ui/secrets) upgrades with the same token;
@@ -626,6 +745,52 @@ mod tests {
         init_as(&root3, &names, &Provision::default(), uid).unwrap();
         assert_eq!(std::fs::read(&tok).unwrap(), first, "the token survives a restart");
         assert!(!root.join("run/hashrate").exists(), "no hashrate dir without the hashrate component");
+        // the renter's socket dir: the signer's, reached by the hashrate group alone (here, every component is this uid)
+        let md = std::fs::metadata(root3.join("run/rental")).unwrap();
+        assert_eq!((md.uid(), md.mode() & 0o7777), (uid, 0o750));
+        assert!(!root.join("run/rental").exists() && !root2.join("run/rental").exists(), "no renter's socket without the hashrate component");
+    }
+
+    /// The Stream Gateway: its config dir is the UI's (it writes config.json) and the gateway's by group; the node's
+    /// RPC credentials go to its cookie file alone, 0600, without a newline (the gateway would send the newline as
+    /// part of the password), and only with both the gateway and the UI installed.
+    #[test]
+    fn the_stream_gateways_cookie_is_its_own_and_its_config_dir_is_shared() {
+        let uid = me();
+        if uid == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("data");
+        let names: Vec<String> = ["signer", "ui", "hashrate", "datum"].iter().map(|s| s.to_string()).collect();
+        let prov = Provision { node_rpc_auth: Some("xbt:pw-secret".into()), ..Provision::default() };
+        let r = init_as(&root, &names, &prov, uid).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(!r.to_string().contains("pw-secret"), "the report never holds a secret");
+        let cookie = root.join("run/datum/rpc.cookie");
+        assert_eq!(std::fs::read(&cookie).unwrap(), b"xbt:pw-secret", "user:password, no newline");
+        assert_eq!(std::fs::metadata(&cookie).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::metadata(root.join("run/datum")).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(std::fs::metadata(root.join("datum")).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(std::fs::metadata(root.join("datum/submitblocks")).unwrap().mode() & 0o7777, 0o700);
+        // the node's password changed (StartOS: the node-connection action): rewritten, and so the gateway restarts
+        let prov2 = Provision { node_rpc_auth: Some("xbt:new".into()), ..Provision::default() };
+        let r2 = init_as(&root, &names, &prov2, uid).unwrap();
+        assert!(r2["secrets"].as_array().unwrap().iter().any(|s| s["name"] == "run/datum/rpc.cookie" && s["result"] == "written"), "{r2}");
+        assert_eq!(std::fs::read(&cookie).unwrap(), b"xbt:new");
+        // a cookie whose mode drifted is put back
+        std::fs::set_permissions(&cookie, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        init_as(&root, &names, &prov2, uid).unwrap();
+        assert_eq!(std::fs::metadata(&cookie).unwrap().mode() & 0o7777, 0o600);
+        // no UI, no gateway config dir and no cookie
+        let root2 = t.path().join("no-ui");
+        let names2: Vec<String> = ["signer", "datum"].iter().map(|s| s.to_string()).collect();
+        init_as(&root2, &names2, &prov, uid).unwrap();
+        assert!(!root2.join("run/datum").exists());
+        // no gateway, no cookie
+        let root3 = t.path().join("no-datum");
+        init_as(&root3, &["signer".to_string(), "ui".to_string()], &prov, uid).unwrap();
+        assert!(!root3.join("run/datum").exists());
     }
 
     #[test]

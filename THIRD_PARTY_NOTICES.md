@@ -101,6 +101,34 @@ nodes with the same settings. The lab itself is cloned when a regtest script run
 this tree. At that commit the lab repository carries no licence file, so no licence covers those
 lines. They are a list of lnd options, kept to what the overlay needs, and are credited here.
 
+### CONVOY datum_gateway (vendored, with our changes), and the C libraries it links
+
+`third_party/datum_gateway` is CONVOY's `datum_gateway` (<https://github.com/CONVOYMining/datum_gateway>,
+commit 971af86), MIT licence, Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and individual
+contributors (`third_party/datum_gateway/LICENSE`). Its first commit here is upstream's tree unchanged; our
+changes follow as separate commits (every job masked with a key the gateway holds, `/xbt/job`, gateway-held
+keys on pool jobs, a build name). The licence grants no right to the DATUM name or other marks of their
+owners: the product calls it "Stream Gateway (DATUM-compatible)". `scripts/datum_gateway_build.sh` links it
+statically, in the `xbt-datum-gateway` image only, with libsodium 1.0.20 (ISC), jansson 2.14 (MIT), libcurl
+8.11.1 (curl licence), libmicrohttpd 1.0.1 (GNU LGPL 2.1 or later, or eCos) and argp-standalone 1.5.0 (GNU
+Library GPL 2 or later), each from a pinned source checked by its hash, and with musl (MIT) through zig. The
+image carries each licence text (argp-standalone's as the FSF publishes it, and musl's copyright notice) and a
+NOTICE naming the commit it was built from in `/usr/share/xbt-datum-gateway/`; the workflow that publishes the images keeps the two LGPL
+libraries' exact source tarballs (`scripts/datum_gateway_sources.sh`, checked against the build script's pins),
+and the GitHub release of the version that ships the image (`v0.2.0` for 0.2.0) attaches them with
+`SHA256SUMS-datum-gateway-lgpl`; its OCI licence label is
+`MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)`. The
+LGPL libraries' source is pinned in that script, which with this repository's source lets anyone rebuild the
+gateway or relink it against modified versions of them.
+
+### DB-IP: IP to Country Lite (data, in the VPN image)
+
+The `xbt-vpn` image carries DB-IP's "IP to Country Lite" table (<https://db-ip.com>), licensed under the
+Creative Commons Attribution 4.0 International licence (<https://creativecommons.org/licenses/by/4.0/>),
+unmodified, in `/usr/share/xbt-vpn/` with an ATTRIBUTION file naming its month. The VPN page credits it
+("IP geolocation by DB-IP", linked, with the licence) wherever an exit's checked country is shown. The image's
+OCI licence label is `(MIT OR Apache-2.0) AND CC-BY-4.0`.
+
 ## Rust libraries
 
 The binaries and libraries built from this workspace link the crates below (normal and build

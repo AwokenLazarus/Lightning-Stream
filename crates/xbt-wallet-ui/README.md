@@ -42,11 +42,14 @@ Without a password source, the first start prints a one-time setup code and writ
 | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (e.g. its `/readyz`, CONTRACT §U), shown as a compact tile |
 | `XBT_UI_MCP_URL` | | MCP endpoint(s) shown on the Agents page |
 | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token`, else `<data dir>/secrets/mcp-http-token` | the bearer token shown on Agents. The UI owns it and rotates it there (atomic replace, mode kept, never world-readable); the MCP only reads it (AGP-042) |
-| `XBT_UI_SERVICES` | `<data dir>/services.json` | path of a JSON list of services for Browse and the player. Each service is `{name, kind, seller, price_text, items}`, with an optional `address` (where apps and agents use it), `kind` one of `video`, `files`, `api`, `ai`, and each item `{title, url}` with an optional `year` and `credit`. See `examples/services.example.json` (three Creative Commons films). The Services page writes it: paste a seller's address, and each service its signed listing names is added. |
-| `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (comma-separated) that Sellers and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one. |
+| `XBT_UI_SERVICES` | `<data dir>/services.json` | path of a JSON list of services for Browse. Each service is `{name, kind, seller, price_text, items}`, with an optional `address` (where apps and agents use it), an optional `app` and `app_base` (the service's own web page, docs/SELLER-APPS.md), `kind` one of `video`, `files`, `api`, `ai`, and each item `{title, url}` with an optional `year` and `credit`. See `examples/services.example.json` (three Creative Commons films). The Services page writes it: paste a seller's address, and each service its signed listing names is added. |
+| `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (`https://`) or shop keys (`npub1…`), comma-separated, that Sellers and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one. |
 | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page, which sets up the gateway beside it (the `XBT_UI_GW_*` settings) in plain words: connect the node once, say where buyers find you, and add each service with its address and a price in sats. It keeps the owner's list in `sell.json` in the data dir and writes the gateway's config from it. The one Lightning Stream app sets this. |
-| `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads. A video's source is this URL plus `/s/` plus the item URL. The page's `media-src` allows only that origin. This is the connector's default listen address; the UI's own default bind is the same port, so on one machine set one of the two. |
-| `XBT_UI_RELAY_LINK_S` | 21600 (6 hours) | how long a link for an external player lives. The Player page makes one per item on request (a logged-in POST): `<UI address>/r/<token>`, which VLC or mpv opens without the login and which plays that item only, seeking included. Links can be revoked there, and a restart of the UI revokes them all. |
+| `XBT_UI_RELAY_LINK_S` | 21600 (6 hours) | how long a link for the buyer's own player (VLC, mpv, a TV app) lives. A Files service's page makes one per file on request (a logged-in POST): `<UI address>/r/<token>`, which the player opens without the login and which plays that file only, seeking included. Links can be revoked there, and a restart of the UI revokes them all. |
+| `XBT_UI_FILES_DIR` | `<data dir>/files` | the folder a Files service shares (docs/FILES.md) |
+| `XBT_UI_FILES_BIND` | `127.0.0.1:8486` | where the UI serves that folder to the shop's gateway, with the files key |
+| `XBT_UI_FILES_UPSTREAM` | `http://<XBT_UI_FILES_BIND>` | how the gateway reaches the folder, as its container sees the UI |
+| `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector a seller's web app opens through (`<connector>/visits`, docs/SELLER-APPS.md), and a download or a player's link is relayed to (`<connector>/s/<file URL>`). This is the connector's default listen address; the UI's own default bind is the same port, so on one machine set one of the two. |
 
 `GET /healthz` is always 200. `GET /readyz` is 200 when the signer answers, else 503. Neither needs
 a login, and neither reveals wallet state.
@@ -157,9 +160,12 @@ has five places, each with its pages as tabs: **Services** (Browse, Sellers, Liv
 and **Settings** (setup, your node, spending rules, keys and backup, records). Home says what the
 owner can do: use a service, sell a service, and whether the wallet is ready.
 
-Browse lists services by category: Media, AI, and Data & APIs. Each service has a page of its own.
-A media service's page lists what it plays, and opens the player; any other service's page gives
-the address apps and agents use it at. Live connections shows what is being paid for, what it has
+Browse lists services by category: Web apps, Files, AI, Hashrate, and Data & APIs. Each service has a
+page of its own. A media server (Jellyfin, Plex) is a web app: its page opens the seller's own app
+inside Lightning Stream, paid for what it loads, up to 4K. A Files service lists its files, each to
+download or open in the buyer's own player (VLC, mpv, a TV app), paid as it arrives (docs/FILES.md).
+The app has no player of its own. Any other service's page gives the address apps and agents use it
+at. Live connections shows what is being paid for, what it has
 cost and a Stop button.
 
 Main screens use plain words. The exact terms (keys' permissions, node addresses, raw settings) are
@@ -191,8 +197,9 @@ decoration only: it reads nothing and sends nothing. To stay out of the way:
 
 - it draws in a worker on an `OffscreenCanvas` where the browser has one, so the page's thread only
   forwards pointer positions; elsewhere it draws in the page with the same code;
-- 30 frames a second while the pointer moves, 6 at rest (sleeping between frames, not waking at
-  every display refresh), none while the tab is hidden or a video plays;
+- 30 frames a second while the pointer moves, 1.5 at rest (sleeping between frames, not waking at
+  every display refresh: a frame costs the compositor about 5 ms of CPU without a GPU, and at rest
+  the streams drift only a few pixels a second), none while the tab is hidden or a video plays;
 - half resolution (at most 0.75 backing pixels per CSS pixel; the glow hides it), the stream count
   scaled to the window, one still frame when the system asks for reduced motion;
 - no flash between pages: the streams' shape is a function of the clock, so every page shows the
@@ -214,6 +221,10 @@ river, averaged; 2026-10-26):
 | with the river (worker) | 3.25% (+1.68) | 7.23% (+4.28) |
 | with the river (in the page, the fallback) | 4.03% (+2.46) | 16.97% (+14.02) |
 | page thread busy, without / with (worker) | 0.04% / 0.04% | 0.45% / 0.66% |
+
+Those numbers are from 6 frames a second at rest. At 1.5 (2026-11-01, three runs of the look test
+on the labs) the river at rest adds 0.62, 1.35 and 0.81% of one core (with 0.85, 1.57 and 1.06%,
+without 0.23, 0.22 and 0.25%), down from 3.1-3.5% at 6.
 
 A frame of the river takes 0.14 ms on average and at most 0.9 ms, in the worker, never on the
 page's thread (the first frame of each page is drawn on the page's thread, once). A browser with a

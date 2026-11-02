@@ -20,7 +20,7 @@ them.
 | File | Written by | Checks | What it is |
 |---|---|---|---|
 | `ln_ticket_regtest.json` | `scripts/ln_ticket_regtest.sh` | 31 of 31 passed | Tickets as such, with no wallet and no gateway: lock, settle, cancel, expiry, a seller or a hop that goes away, the on-chain claim. The measurements of `docs/TICKETS.md`, sections 2 to 7 |
-| `gateway_regtest.json` | `scripts/gateway_regtest.sh` | 51 of 51 passed | The seller gateway with a test buyer: latency, a metered download, a flood of lock requests, prepaid tickets, the channels macaroon, restarts |
+| `gateway_regtest.json` | `scripts/gateway_regtest.sh` | 54 of 54 passed | The seller gateway with a test buyer: latency, a metered download, a flood of lock requests, prepaid tickets, the channels macaroon, restarts |
 | `ticket_book_regtest.json` | `scripts/ticket_book_regtest.sh` | 36 of 36 passed | The wallet's ticket book through the signer's socket: one seller, many sellers, the slot rules, a full channel, a lying seller, kills |
 | `ticket_e2e_regtest.json` | `scripts/ticket_e2e_regtest.sh` | **33 of 34 passed, 1 failed** | The wallet paying the gateway through a routing hop with the release binaries. See the note below |
 | `lottery_regtest.json` | `scripts/lottery_regtest.sh` | 30 of 30 passed | The lottery: a file bought by draws, 20 and 100 sellers at once, a buyer that never pays, a seller that lies, kills. The measurements of `docs/TICKETS.md`, section 9.12 |

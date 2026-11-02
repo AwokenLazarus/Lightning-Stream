@@ -3,6 +3,10 @@
 //! shipped binary to the same rules on Lightning Fork nodes.
 mod common;
 
+/// The refill wait for tests that stream a paid body and are not about that wait running out: a slow box (old cores,
+/// a cold cache) took longer than the rig's 300 ms for a buyer's lock and release, and cut the body. Shipped: 15 s.
+const SLOW_BOX_REFILL_MS: u64 = 5_000;
+
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -77,6 +81,8 @@ fn an_unpaid_request_gets_the_terms_and_reaches_nothing() {
         json!({"requestMsat": "0", "byteMsat": "1000", "perBytes": "1048576", "secondMsat": "0"})
     );
     assert_eq!(x["receiptKey"], KEY(&rig));
+    // how long it keeps an answer paused for a release (`times.refill_wait_ms`, 300 in this rig)
+    assert_eq!(x["refillWaitMs"].as_u64(), Some(300));
     assert_eq!(pr["resource"]["url"], "http://gateway.test:8402/files/1000");
     assert_eq!(
         http(&rig.addr, "GET", "/verify/10", &[], b"", None).json()["accepts"][0]["extra"]
@@ -111,7 +117,7 @@ fn an_unpaid_request_gets_the_terms_and_reaches_nothing() {
             s["payTo"].as_str().map(str::len),
             s["routes"].as_array().map(Vec::len)
         ),
-        (Some(false), Some(66), Some(13))
+        (Some(false), Some(66), Some(16))
     );
 }
 
@@ -300,11 +306,13 @@ fn no_ticket_is_settled_inside_24_blocks_of_its_expiry() {
 fn no_ticket_is_settled_without_a_fresh_block_height() {
     // the janitor asks once at the start and then not again within this test
     let (rig, _d) = start(
-        &|v| v["times"] = json!({"height_max_age_secs": 1, "tick_ms": 5000, "upstream_wait_secs": 2, "refill_wait_ms": 300}),
+        // a height 3 s old is stale (shipped: 10 s). 1 s was shorter than one request on a slow box: the fresh height of
+        // a tick had gone stale again by the time the request after it was served
+        &|v| v["times"] = json!({"height_max_age_secs": 3, "tick_ms": 5000, "upstream_wait_secs": 2, "refill_wait_ms": 300}),
     );
     let mut b = Buyer::new(&rig, 1);
     let s = b.lock(&rig, 1);
-    std::thread::sleep(Duration::from_millis(1200));
+    std::thread::sleep(Duration::from_millis(3200));
     assert_eq!(
         rig.gw.stats().height,
         None,
@@ -328,11 +336,42 @@ fn no_ticket_is_settled_without_a_fresh_block_height() {
     // a node that is not there gives no height either
     let t = b.lock(&rig, 1);
     rig.node.set_down(true);
-    std::thread::sleep(Duration::from_millis(1200));
+    std::thread::sleep(Duration::from_millis(3200));
     rig.gw.tick();
     assert_eq!(rig.gw.stats().height, None);
     assert_eq!(b.get("/api", Some(&t[0])).error(), "node_unavailable");
     assert_eq!(rig.node.settles().len(), 1);
+}
+
+/// A paid request that does not authenticate is told why, wherever it is sent: to a path with no
+/// route, to a method the route does not take, or to a free route it names a price for. Not an
+/// unsigned answer as if it had not paid, nor the free body. A paid request for a free route that
+/// names no price (a wallet of before the price header) is served free, as it always was.
+#[test]
+fn a_payment_that_does_not_authenticate_is_refused_as_such_where_nothing_is_sold() {
+    let (rig, _d) = start(&|_| {});
+    let mut a = Buyer::new(&rig, 1);
+    let s = a.lock(&rig, 1);
+    assert_eq!(a.get("/api", Some(&s[0])).status, 200);
+    let price = (xbt402::ticket::PRICE_HEADER, "0 0/1 0/s 0/0/0");
+    for (method, target, extra) in [("GET", "/nowhere", None), ("DELETE", "/api", None), ("GET", "/files/free/100", Some(price))] {
+        // a seq already used
+        let sig = a.sign_at(0, method, target, b"", None, None);
+        let mut headers = vec![("PAYMENT-SIGNATURE", sig.as_str())];
+        headers.extend(extra);
+        let got = http(&rig.addr, method, target, &headers, b"", None);
+        assert_eq!((got.status, got.error().as_str(), got.json()["nextSeq"].as_u64()), (402, "bad_seq", Some(a.seq)), "{method} {target}");
+    }
+    // a seq that is next, on the free route with a price named: refused unpaid, with a receipt
+    let sig = a.sign("GET", "/files/free/100", b"", None, None);
+    let got = http(&rig.addr, "GET", "/files/free/100", &[("PAYMENT-SIGNATURE", &sig), price], b"", None);
+    assert_eq!((got.status, got.error().as_str()), (402, "terms_changed"));
+    assert_eq!(got.receipt(&rig.gw.terms().receipt_key)["charged"], "0");
+    // with no price named: served free
+    let sig = a.sign("GET", "/files/free/100", b"", None, None);
+    let got = http(&rig.addr, "GET", "/files/free/100", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+    a.used(&got);
+    assert_eq!((got.status, got.body.len()), (200, 100));
 }
 
 #[test]
@@ -714,6 +753,9 @@ fn a_body_priced_per_byte_is_paid_as_it_arrives() {
     let (rig, _d) = start(&|v| {
         v["routes"][0]["price"] = json!({"byte_msat": 200_000, "per_bytes": 1_048_576});
         v["tickets"] = json!({"ticket_msat": 2_000_000, "max_tickets": 8});
+        // this test is about paying as the body streams, not about the wait for a refill: the buyer's lock and
+        // release (several node calls) took over the rig's 300 ms on a slow box (shipped: 15 s)
+        v["times"]["refill_wait_ms"] = json!(SLOW_BOX_REFILL_MS);
     });
     let mut b = Buyer::new(&rig, 1);
     let size = 100_000_000usize;
@@ -1485,7 +1527,8 @@ fn shipped(v: &mut Value) {
 
 /// As shipped: a lock for held tickets that nobody authenticated, or of a session that has paid
 /// nothing, is refused `prepaid_first` and asks the node for nothing; a session's first lock is
-/// for a prepaid ticket, whose invoice lapses in 20 s; once that ticket is paid and presented the
+/// for a prepaid ticket, whose invoice lapses in 60 s as any does (20 s before 0.2.0, which shut
+/// out buyers on slow routes); once that ticket is paid and presented the
 /// session is issued hold invoices; and one address has at most 2 unpaid invoices.
 ///
 /// FAILS before: a first lock carried no authentication and was issued hold invoices that lived
@@ -1502,11 +1545,11 @@ fn a_hold_invoice_goes_only_to_a_session_that_has_paid_a_ticket() {
     let got = b.lock_raw(&secrets);
     assert_eq!((got.status, got.error()), (402, "prepaid_first".to_string()), "{}", got.json());
     assert_eq!((rig.node.calls("add_hold"), rig.gw.stats().sessions), (0, 0), "nothing asked of the node, no session made");
-    // the first lock buys a prepaid ticket and makes the session; its invoice lapses sooner than a later one's
+    // the first lock buys a prepaid ticket and makes the session; its invoice lives as long as any
     let got = b.lock_prepaid(1);
     assert_eq!(got.status, 200, "{}", got.json());
     let hash = xbt402::ticket::hex32(got.json()["tickets"][0]["hash"].as_str().unwrap()).unwrap();
-    assert_eq!(rig.node.expiry_of(&hash), Some(20));
+    assert_eq!(rig.node.expiry_of(&hash), Some(60));
     // a held lock of the session before its ticket is paid: refused, in a signed answer
     let one = b.fresh_secrets(1);
     let early = b.lock_raw(&one);
@@ -2071,6 +2114,49 @@ fn a_buyer_may_ask_for_a_smaller_ticket_down_to_the_smallest_the_terms_name() {
     assert!(rig.node.pay(&hash));
     b.release(&[rig.node.paid_preimage(&hash).unwrap()]);
     assert_eq!(b.balance(), 1_350_000);
+}
+
+/// A route's own top ticket: its prepaid entry says so, a prepaid ticket up to it is sold and credited
+/// at its size, and nothing else moves: not the held entry, not another route's terms, not the largest
+/// held ticket, not the held budget.
+#[test]
+fn a_routes_top_ticket_is_for_prepaid_tickets_and_moves_nothing_else() {
+    let plain = {
+        let (rig, _d) = start(&|v| {
+            v["tickets"] = json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000});
+            v["caps"] = json!({"sessions_per_address": 0, "held_after_paid": false});
+        });
+        (rig.gw.stats().max_held, http(&rig.addr, "GET", "/api", &[], b"", None).json())
+    };
+    let (rig, _d) = start(&|v| {
+        v["tickets"] = json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000});
+        v["caps"] = json!({"sessions_per_address": 0, "held_after_paid": false});
+        let mut r = v["routes"].as_array().unwrap().clone();
+        r.push(json!({"path": "/hashrate/", "methods": ["POST"], "price": {"request_msat": 404_250}, "top_ticket_msat": 100_000_000}));
+        v["routes"] = json!(r);
+    });
+    let entry = |pr: &Value, settle: &str| pr["accepts"].as_array().unwrap().iter().find(|a| a["extra"]["settle"] == settle).unwrap()["extra"].clone();
+    let hash = http(&rig.addr, "POST", "/hashrate/r/1", &[], b"", None).json();
+    assert_eq!(entry(&hash, "on-arrival")["topTicketMsat"], "100000000", "{hash}");
+    assert_eq!((entry(&hash, "on-arrival")["ticketMsat"].clone(), entry(&hash, "on-use")["ticketMsat"].clone()), (json!("900000"), json!("900000")));
+    assert!(entry(&hash, "on-use").get("topTicketMsat").is_none(), "{hash}");
+    let other = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert!(entry(&other, "on-arrival").get("topTicketMsat").is_none(), "{other}");
+    for settle in ["on-use", "on-arrival"] {
+        assert_eq!(entry(&other, settle)["ticketMsat"], entry(&plain.1, settle)["ticketMsat"]);
+        assert_eq!(entry(&other, settle)["minTicketMsat"], entry(&plain.1, settle)["minTicketMsat"]);
+    }
+    assert_eq!(rig.gw.stats().max_held, plain.0, "the held budget");
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_with(&s, &json!({"ticketMsat": "900001"})).status, 400, "no held ticket past the shop's own");
+    assert_eq!(b.lock_prepaid_with(1, &json!({"ticketMsat": "100000001"})).status, 400, "past the top");
+    assert_eq!(b.lock_prepaid_with(1, &json!({"ticketMsat": "545999"})).status, 400, "below the first step");
+    let j = b.lock_prepaid_with(1, &json!({"ticketMsat": "34440000"})).json();
+    let hash = xbt402::ticket::hex32(j["tickets"][0]["hash"].as_str().unwrap()).unwrap();
+    assert!(rig.node.pay(&hash));
+    b.release(&[rig.node.paid_preimage(&hash).unwrap()]);
+    assert_eq!(b.balance(), 34_440_000);
 }
 
 #[test]

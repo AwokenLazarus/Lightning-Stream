@@ -1,0 +1,56 @@
+[package]
+name = "xbt-vpn"
+description = "VPN exits over the iroh link: IP packets between a buyer's Stream app and a seller's exit in QUIC datagrams, the exit's packet policy (blocked ports, IPv6), and its byte meter, which never records destinations"
+version.workspace = true
+edition.workspace = true
+# iroh 1.4 needs 1.91, like xbt-iroh-link
+rust-version = "1.91"
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xbt-iroh-link = { path = "../xbt-iroh-link" }
+# a priced exit is reached through the buyer's own wallet (the signer), which pays as the tunnel's bytes pass
+xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
+# exits announce themselves on Nostr, and buyers find them there
+xbt-nostr.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util", "net"] }
+bytes = "1"
+hex.workspace = true
+# the region checks' gate file, read back into its typed shape
+serde.workspace = true
+serde_json.workspace = true
+# a userspace TCP/IP stack: the buyer's app ends its devices' connections on its own side and carries
+# each as a flow
+ipstack = "=1.0.1"
+# WireGuard's protocol in user space: the buyer's app is the WireGuard peer its devices and router add
+boringtun = { version = "=0.7.1", default-features = false }
+# a device's WireGuard config as a QR code to scan
+qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
+base64.workspace = true
+# a private exit's buyer resolves names itself, over DNS-over-TLS through the tunnel (the tree's rustls,
+# with Mozilla's roots)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+# Ed25519 keys for the sealed session between a buyer and an exit (two hops)
+ring = "0.17"
+# fetching category blocklists over HTTPS (the tree's HTTP client)
+ureq.workspace = true
+# DNS-over-HTTPS when an exit's network blocks DNS-over-TLS (resolvers speak HTTP/2)
+h2 = "0.4"
+http = "1"
+# category blocklists kept compact: each list compiled once to a finite-state set (millions of names
+# in a few MiB) and memory-mapped, so a Pi exit holds them without hundreds of MiB of RAM
+fst = "=0.4.7"
+# the offline geo-IP table (DB-IP country lite) arrives gzipped
+flate2 = "1"
+memmap2 = "0.9"
+
+[dev-dependencies]
+# a test DNS-over-TLS server's certificate
+rcgen = "0.14"
+# a client TCP/IP stack, to originate connections inside the tunnel in tests without a TUN device
+# a folder for the tunnel secret tests
+tempfile = "3"
+smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }

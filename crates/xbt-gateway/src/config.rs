@@ -27,7 +27,7 @@ pub const MAINNET_NOTICE: [&str; 9] = [
     "- A held ticket of 1,000 sat can be below a channel's dust limit at mainnet fee rates on a channel without anchors: it then has no output there, and is lost to the miners if that channel is force-closed while it is held. The gateway does not read its channels' dust limits.",
     "- Claiming settled tickets on chain after a force close cost 900 to 1,700 sat for three tickets at 1 sat/vB; at higher fee rates one ticket costs more to claim than it is worth.",
     "- Held tickets take pending-payment slots of every channel on their route for no fee, on your node and on the routing nodes before it. Nothing but this software keeps buyers to half of a channel's slots.",
-    "- A session's first ticket is a prepaid one (caps.held_after_paid), so a hold invoice costs whoever asks for it one paid ticket; but a first lock still costs nothing, and whoever reaches the gateway from enough addresses can take every session place with prepaid invoices it never pays, for 20 s at a time (caps.first_lock_secs).",
+    "- A session's first ticket is a prepaid one (caps.held_after_paid), so a hold invoice costs whoever asks for it one paid ticket; but a first lock still costs nothing, and whoever reaches the gateway from enough addresses can take every session place with prepaid invoices it never pays, two places an address (caps.unpaid_per_address), each for up to 75 s at a time (caps.first_lock_secs, caps.unpaid_secs).",
     "- With a lottery section you serve first, and nothing makes a buyer pay a win.",
     "- The gateway speaks an lnd-family node's REST interface and no other; a Core Lightning seller is not supported.",
     "- The gateway speaks plain HTTP: buyers must reach it through a TLS proxy, with public_url set to the https origin they use.",
@@ -78,6 +78,90 @@ pub struct Route {
     pub upstream: Option<String>,
     /// Pass the target on without this route's path (a route `/ai/` sends `/ai/v1/x` as `/v1/x`).
     pub strip_prefix: bool,
+    /// Ask the service for a gzip body (`accept_gzip`): a web app that serves its pages only
+    /// compressed (llama.cpp's server does). The gateway unpacks it and sends the buyer the plain
+    /// body, which is what it meters and signs.
+    pub accept_gzip: bool,
+    /// Headers the gateway adds to every request of this route (`upstream_headers`), over any the
+    /// buyer sent of the same name: the seller's guest login for a service that needs one. They
+    /// never go to the buyer.
+    pub upstream_headers: Vec<(String, String)>,
+    /// Paths under this route the gateway refuses (`deny_paths`), whatever the method: parts of a
+    /// web app a buyer must not reach (an admin page, other users' sessions). Lower case; matched
+    /// against the decoded path, ignoring case, as a prefix.
+    pub deny_paths: Vec<String>,
+    /// When not empty, the only paths under this route the gateway serves (`allow_paths`), as
+    /// prefixes, ignoring case; everything else is refused.
+    pub allow_paths: Vec<String>,
+    /// The route carries WebSockets (`websocket`): a `GET` asking to upgrade becomes a two-way byte
+    /// stream with the service, every byte of it, either way, paid for as a body's byte is.
+    pub websocket: bool,
+    /// Each buyer gets an account of their own in the service (`accounts`, docs/BUYER-ACCOUNTS.md).
+    pub accounts: Option<Accounts>,
+    /// How many buyers and streams the service takes at once (`capacity`, docs/CAPACITY.md).
+    pub capacity: Capacity,
+    /// The largest prepaid ticket a buyer may ask for on this route (`top_ticket_msat`), above
+    /// `tickets.ticket_msat`: work paid for at a rate a shop's own ticket can't keep up with. Prepaid
+    /// only, so what it raises isn't held: the held budget and every other route's terms stand.
+    pub top_ticket_msat: Option<u64>,
+    /// The service the route is part of (`service`, else its upstream; "" for the config's): the
+    /// routes of one service count a buyer once over all of them (`capacity.max_buyers`).
+    pub service: String,
+}
+
+/// A route's `capacity`: what the seller lets the service carry at once, so that one buyer too many
+/// does not slow every other down. Each limit is off when not set. A buyer turned away is turned
+/// away before paying anything; one already served is never cut off to make room.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capacity {
+    /// Buyers served at once (`max_buyers`): sessions that used the route in the last
+    /// [`BUYER_IDLE_S`] seconds or have an answer of it open.
+    pub max_buyers: Option<u32>,
+    /// Long answers open at once over all buyers (`max_streams`): a film, a WebSocket, an event
+    /// stream, any body too long or too open-ended to be a page's part.
+    pub max_streams: Option<u32>,
+    /// Long answers open at once for one buyer (`max_streams_per_buyer`).
+    pub max_streams_per_buyer: Option<u32>,
+    /// Megabits a second the route's answers may carry together (`max_mbit`): over it, no new
+    /// long answer is started until the rate falls.
+    pub max_mbit: Option<u32>,
+}
+
+impl Capacity {
+    pub fn is_set(&self) -> bool {
+        *self != Capacity::default()
+    }
+}
+
+/// How long a buyer stays counted after its last request of a route, when nothing of it is open.
+pub const BUYER_IDLE_S: u64 = 300;
+
+/// How buyers' accounts are made in a route's service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Accounts {
+    /// Jellyfin, through its API with the seller's key (a file only the gateway reads): a user per
+    /// buyer, seeing only `libraries`.
+    Jellyfin { admin_key_file: PathBuf, libraries: Vec<String> },
+    /// A program of the seller's, given a buyer's handle, that prints the headers to send as them.
+    Hook { command: PathBuf },
+}
+
+impl Route {
+    /// Whether the gateway refuses `path` (decoded) on this route. The longest prefix of the two
+    /// lists that `path` starts with decides: a `deny_paths` entry refuses, an `allow_paths` entry
+    /// serves; one that starts with neither is served when `allow_paths` is empty and refused when
+    /// it is not. So `allow` `/` and `/users/public` with `deny` `/users` serve everything but
+    /// `/users`, and of that only `/users/public`. Case is ignored, as many web servers ignore it.
+    pub fn path_refused(&self, path: &str) -> bool {
+        let p = path.to_ascii_lowercase();
+        let longest = |list: &[String]| list.iter().filter(|x| p.starts_with(x.as_str())).map(String::len).max();
+        match (longest(&self.deny_paths), longest(&self.allow_paths)) {
+            (Some(d), Some(a)) => d > a,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => !self.allow_paths.is_empty(),
+        }
+    }
 }
 
 /// Request headers every route passes on: they select what is returned and carry no authority.
@@ -144,6 +228,10 @@ pub struct Config {
     /// names its own.
     pub upstream: Option<String>,
     pub state_dir: PathBuf,
+    /// A secret the app beside the gateway sends (`X-Xbt402-Health-Token`) to read the operator's view
+    /// (`/x402/ticket/health`) from another container: Umbrel's and StartOS's apps reach the gateway over
+    /// their private network, not its loopback. At least 32 characters; unset, loopback only.
+    pub health_token: Option<String>,
     /// `regtest` unless the file says otherwise. Another test chain's name with `network` given,
     /// or `main`, which also needs `mainnet_ack` ([`MAINNET_ACK`]).
     pub chain: String,
@@ -179,6 +267,72 @@ pub struct Config {
     pub listing: Option<xbt402::listing::Draft>,
     /// Publishing the listing on Nostr (`docs/NOSTR.md`). Absent: nothing is published.
     pub nostr: Option<NostrConfig>,
+    /// Being reached by key over an iroh link (no web address, certificate or forwarded port). Absent:
+    /// web only.
+    pub link: Option<LinkConfig>,
+}
+
+/// The `link` section: the relays the gateway's link uses and whether it is relay-only. The seller's
+/// node vouches for the link key itself, at start (`sign.macaroon` beside `node.macaroon`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkConfig {
+    /// `https://` relay URLs (buyers refuse any other); empty: iroh's public relays.
+    pub relays: Vec<String>,
+    /// Relays only: buyers never learn the seller's address.
+    pub private: bool,
+    /// How many link keys the gateway serves on (1 to [`MAX_LINK_ENDPOINTS`]). Each key keeps its own
+    /// connection to its relay, and a relay limits each connection on its own, so buyers relayed
+    /// to the shop share several instead of one; buyers spread over them and fall back to another.
+    pub endpoints: usize,
+}
+
+/// The link keys a gateway serves on unless its `link.endpoints` says otherwise.
+pub const DEFAULT_LINK_ENDPOINTS: usize = 4;
+/// At most this many (a transport document names at most 8 links).
+pub const MAX_LINK_ENDPOINTS: usize = 8;
+
+/// `public_url` for a shop reached by key only: replaced at start by its shop origin.
+pub const LINK_ONLY: &str = "link";
+
+/// At most this many relays for the link.
+pub const MAX_LINK_RELAYS: usize = 4;
+
+impl LinkConfig {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let m = obj(v, "link", &["relays", "private", "endpoints"])?;
+        let relays = match m.get("relays") {
+            None => Vec::new(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|r| match r.as_str() {
+                    Some(r) if r.starts_with("https://") => Ok(r.trim_end_matches('/').to_string()),
+                    // buyers' wallets reach a seller's relays over https only: a shop with any other
+                    // would be one no buyer can reach
+                    Some(r) if r.starts_with("http://") => Err(format!(
+                        "link.relays: {r} is plain http, which buyers' wallets refuse: give the relay's https:// URL"
+                    )),
+                    _ => Err("link.relays is a list of https:// relay URLs".to_string()),
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            Some(_) => return Err("link.relays is a list of https:// relay URLs".into()),
+        };
+        if relays.len() > MAX_LINK_RELAYS {
+            return Err(format!("link.relays: at most {MAX_LINK_RELAYS}"));
+        }
+        let private = match m.get("private") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("link.private is true or false".into()),
+        };
+        let endpoints = match m.get("endpoints") {
+            None => DEFAULT_LINK_ENDPOINTS,
+            Some(n) => match n.as_u64() {
+                Some(n) if (1..=MAX_LINK_ENDPOINTS as u64).contains(&n) => n as usize,
+                _ => return Err(format!("link.endpoints is a whole number from 1 to {MAX_LINK_ENDPOINTS}")),
+            },
+        };
+        Ok(Self { relays, private, endpoints })
+    }
 }
 
 /// The `nostr` section: the relays the listing goes to, and how often it is sent again.
@@ -272,6 +426,15 @@ pub struct Times {
 }
 
 impl Config {
+    /// Names a shop reached by key by its shop origin (main, at start), and lists the listing's
+    /// own addresses there.
+    pub fn name_shop(&mut self, origin: String) {
+        if let Some(l) = &mut self.listing {
+            l.rebase(xbt402::shop::UNNAMED, &origin);
+        }
+        self.public_url = origin;
+    }
+
     pub fn mainnet(&self) -> bool {
         self.chain == "main"
     }
@@ -334,6 +497,8 @@ impl Config {
                 "times",
                 "listing",
                 "nostr",
+                "link",
+                "health_token",
             ],
         )?;
         // a file that names no chain is a regtest file: mainnet is never what a missing key means
@@ -358,12 +523,24 @@ impl Config {
             },
             (_, None) => return Err(NEEDS_NETWORK.into()),
         };
-        let public_url = req_str(top, "public_url")?
-            .trim_end_matches('/')
-            .to_string();
-        let origin =
-            xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?;
-        if xbt402::wire::request_url(&origin).target != "/" {
+        // a shop reached by key only has no web address: `public_url` absent, or the word "link". Its
+        // origin is its own shop name (xbt402::shop), set at start from its Nostr key
+        let has_link = top.get("link").is_some_and(|l| !l.is_null());
+        let by_key = matches!(top.get("public_url"), None | Some(Value::Null)) || opt_str(top, "public_url")? == Some(LINK_ONLY);
+        if by_key && !has_link {
+            return Err("public_url: a shop without a web address is reached by key: add a link section, or give the https origin buyers use".into());
+        }
+        let public_url = if by_key {
+            LINK_ONLY.to_string()
+        } else {
+            req_str(top, "public_url")?.trim_end_matches('/').to_string()
+        };
+        let origin = if by_key {
+            String::new()
+        } else {
+            xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?
+        };
+        if !by_key && xbt402::wire::request_url(&origin).target != "/" {
             return Err("public_url is an origin (scheme://host[:port]), without a path".into());
         }
         // the gateway speaks plain HTTP. On a loopback address that is the machine's own business;
@@ -373,8 +550,13 @@ impl Config {
         let loopback = listen
             .parse::<std::net::SocketAddr>()
             .is_ok_and(|a| a.ip().is_loopback());
-        if !loopback && !origin.starts_with("https://") {
+        // a shop reached by key is reached over the link (encrypted, into the gateway's own port);
+        // its listen address is the platform's container network
+        if !loopback && !by_key && !origin.starts_with("https://") {
             return Err(format!("listen {listen} is not a loopback address (an address written as one: a name, even localhost, is whatever the resolver says), and public_url is not https. The gateway speaks plain HTTP: listen on 127.0.0.1 or [::1], or put a TLS proxy in front and set public_url to the https origin buyers use"));
+        }
+        if by_key && top.get("public_aliases").is_some_and(|a| !a.is_null()) {
+            return Err("public_aliases: a shop without a web address has no other origins".into());
         }
         let public_aliases = match top.get("public_aliases") {
             None => Vec::new(),
@@ -504,11 +686,13 @@ impl Config {
                     "first_use_secs",
                     "idle_secs",
                     "keep_secs",
+                    "seq_window",
                 ],
             )?,
             None => &empty,
         };
-        let max_sessions = num32(c, "max_sessions", 30)?;
+        // measured: 100 buyers at once used a sixth of one core and 61 MiB (docs/CAPACITY.md)
+        let max_sessions = num32(c, "max_sessions", 100)?;
         if max_sessions == 0 {
             return Err("caps.max_sessions is at least 1".into());
         }
@@ -561,7 +745,10 @@ impl Config {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err("caps.held_after_paid is true or false".into()),
         };
-        let first_lock_secs = num(c, "first_lock_secs", 20)?;
+        // as long as any ticket invoice: a buyer's payment can take tens of seconds to reach the seller over a
+        // slow route, and an invoice that lapsed on the way is refused at the seller with nothing paid. What bounds
+        // a stranger's unpaid places is the caps on them by address, not how soon each lapses
+        let first_lock_secs = num(c, "first_lock_secs", u64::from(xbt402::ticket::INVOICE_EXPIRY_S))?;
         if !(5..=u64::from(xbt402::ticket::INVOICE_EXPIRY_S)).contains(&first_lock_secs) {
             return Err(format!("caps.first_lock_secs is from 5 to {}: how long the invoices of a session's first lock stay payable", xbt402::ticket::INVOICE_EXPIRY_S));
         }
@@ -581,7 +768,11 @@ impl Config {
             first_use_secs: num(c, "first_use_secs", 60)?,
             idle_secs: num(c, "idle_secs", 300)?,
             keep_secs: num(c, "keep_secs", 86_400)?,
+            seq_window: num(c, "seq_window", crate::book::SEQ_WINDOW_MAX)?,
         };
+        if !(1..=crate::book::SEQ_WINDOW_MAX).contains(&caps.seq_window) {
+            return Err(format!("caps.seq_window is from 1 to {}: how many seqs ahead of a session's next one a request may carry", crate::book::SEQ_WINDOW_MAX));
+        }
         if caps.unpaid_secs < u64::from(xbt402::ticket::INVOICE_EXPIRY_S) {
             return Err(format!(
                 "caps.unpaid_secs is at least the invoice's own {} seconds",
@@ -601,7 +792,8 @@ impl Config {
             _ => Err(format!("http.{k} is from {least} to 4096")),
         };
         let http = Http {
-            connections: small("connections", 64, 1)?,
+            // a buyer's film or live connection holds one for as long as it is open
+            connections: small("connections", 512, 1)?,
             per_address: small("per_address", 48, 0)?,
             threads: small("threads", 16, 1)?,
         };
@@ -618,6 +810,9 @@ impl Config {
                 let mut proxies = vec![];
                 for p in f.get("proxies").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or(bad)? {
                     proxies.push(p.as_str().and_then(|a| a.parse::<std::net::IpAddr>().ok()).ok_or(bad)?.to_canonical());
+                }
+                if proxies.len() > xbt_svc::http::MAX_PROXIES {
+                    return Err(format!("http.forwarded_address.proxies: at most {}", xbt_svc::http::MAX_PROXIES));
                 }
                 Some(Forwarded { header, proxies })
             }
@@ -655,6 +850,12 @@ impl Config {
             routes.push(route(r)?);
         }
         for (i, r) in routes.iter().enumerate() {
+            // a service counts its buyers once over its routes: one number of them
+            if let Some(o) = routes[..i].iter().find(|o| o.service == r.service && o.capacity.max_buyers.is_some() && r.capacity.max_buyers.is_some()
+                                                       && o.capacity.max_buyers != r.capacity.max_buyers) {
+                return Err(format!("routes {} and {}: one service counts its buyers once over all its routes, so they take one capacity.max_buyers",
+                                   o.path, r.path));
+            }
             if r.upstream.is_none() && up.is_none() {
                 return Err(format!("route {}: no upstream, and the config names none for every route", r.path));
             }
@@ -671,6 +872,11 @@ impl Config {
             let lottery_path = xbt402::lottery::SESSION_PATH;
             if r.path == lottery_path || r.path.starts_with(&format!("{lottery_path}/")) {
                 return Err(format!("route {}: that path is the gateway's own", r.path));
+            }
+            if let Some(top) = r.top_ticket_msat {
+                if !prepaid || min_ticket_msat.is_none() || !(ticket_msat..=100_000_000_000).contains(&top) {
+                    return Err(format!("route {}: top_ticket_msat is from tickets.ticket_msat ({ticket_msat}) to 100000000000, and needs prepaid tickets and tickets.min_ticket_msat", r.path));
+                }
             }
             if r.release == Release::AfterVerify && r.price.request_msat > ticket_msat {
                 return Err(format!(
@@ -705,21 +911,32 @@ impl Config {
         };
         let listing = match top.get("listing") {
             None | Some(Value::Null) => None,
-            Some(l) => Some(listing_draft(l, &routes)?),
+            Some(l) => Some(listing_draft(l, &routes, if by_key { xbt402::shop::UNNAMED } else { origin.trim_end_matches('/') })?),
         };
         let nostr = match top.get("nostr") {
             None | Some(Value::Null) => None,
             Some(n) => Some(NostrConfig::parse(n)?),
+        };
+        let link = match top.get("link") {
+            None | Some(Value::Null) => None,
+            Some(l) => Some(LinkConfig::parse(l)?),
+        };
+        let health_token = match opt_str(top, "health_token")? {
+            Some(t) if t.len() >= 32 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => Some(t.to_string()),
+            Some(_) => return Err("health_token: at least 32 letters, digits, - or _".into()),
+            None => None,
         };
         if nostr.as_ref().is_some_and(|n| n.publish) && listing.is_none() {
             return Err("nostr.publish publishes the listing: write a listing section, or leave publish out".into());
         }
         Ok(Self {
             listen,
-            public_url: origin.trim_end_matches('/').to_string(),
+            // a shop reached by key keeps the word "link" here: main names it by its Nostr key at start
+            public_url: if by_key { public_url } else { origin.trim_end_matches('/').to_string() },
             public_aliases,
             upstream: up,
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
+            health_token,
             chain,
             network,
             node,
@@ -738,6 +955,7 @@ impl Config {
             times,
             listing,
             nostr,
+            link,
         })
     }
 }
@@ -746,6 +964,12 @@ impl Config {
 pub const SERVICES_PATH: &str = "/services";
 /// The signed listing (`docs/LISTINGS.md`). Free. Absent from the config: 404.
 pub const LISTING_PATH: &str = xbt402::listing::PATH;
+
+/// A plain priced route at `path`, for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn parse_route_for_tests(path: &str) -> Route {
+    route(&serde_json::json!({"path": path, "price": {"request_msat": 1000}})).expect("a test route")
+}
 
 fn route(v: &Value) -> Result<Route, String> {
     let r = obj(
@@ -762,6 +986,15 @@ fn route(v: &Value) -> Result<Route, String> {
             "upstream",
             "strip_prefix",
             "max_output_tokens",
+            "accept_gzip",
+            "upstream_headers",
+            "deny_paths",
+            "allow_paths",
+            "websocket",
+            "accounts",
+            "capacity",
+            "top_ticket_msat",
+            "service",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -877,6 +1110,111 @@ fn route(v: &Value) -> Result<Route, String> {
     if strip_prefix && !path.ends_with('/') {
         return Err(bad("strip_prefix is for a path ending in /, which covers everything under it"));
     }
+    let accept_gzip = match r.get("accept_gzip") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(bad("accept_gzip is true or false")),
+    };
+    let mut upstream_headers = vec![];
+    if let Some(h) = r.get("upstream_headers") {
+        let m = h.as_object().ok_or_else(|| bad("upstream_headers is an object of header names and values"))?;
+        if m.len() > 8 {
+            return Err(bad("upstream_headers has at most 8 headers"));
+        }
+        for (k, v) in m {
+            let name = k.to_ascii_lowercase();
+            if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                return Err(bad("upstream_headers are header names"));
+            }
+            if NEVER_FORWARDED.contains(&name.as_str()) || name.starts_with("payment-") {
+                return Err(bad(&format!("{name} is never sent to the service")));
+            }
+            let v = v.as_str().filter(|v| v.len() <= 4096 && v.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+                .ok_or_else(|| bad("upstream_headers values are plain text"))?;
+            upstream_headers.push((name, v.to_string()));
+        }
+    }
+    let paths = |key: &str| -> Result<Vec<String>, String> {
+        let Some(v) = r.get(key) else { return Ok(vec![]) };
+        let list = v.as_array().ok_or_else(|| bad(&format!("{key} is a list of paths")))?;
+        if list.len() > 64 {
+            return Err(bad(&format!("{key} has at most 64 paths")));
+        }
+        list.iter()
+            .map(|p| {
+                p.as_str()
+                    .filter(|p| p.starts_with('/') && p.len() <= 512 && p.bytes().all(|c| c.is_ascii_graphic()) && !p.contains(['?', '#', '%', '\\']))
+                    .map(str::to_ascii_lowercase)
+                    .ok_or_else(|| bad(&format!("{key} are paths starting with /, without ?, #, % or \\")))
+            })
+            .collect()
+    };
+    let deny_paths = paths("deny_paths")?;
+    let allow_paths = paths("allow_paths")?;
+    let websocket = match r.get("websocket") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(bad("websocket is true or false")),
+    };
+    if websocket && !free && (price.second_msat > 0 || price.tokens.active()) {
+        return Err(bad("a route that carries WebSockets is priced by the request and the byte, or free"));
+    }
+    if websocket && !methods.iter().any(|m| m == "GET") {
+        return Err(bad("a route that carries WebSockets takes GET"));
+    }
+    let accounts = match r.get("accounts") {
+        None => None,
+        Some(a) => {
+            let a = a.as_object().ok_or_else(|| bad("accounts is an object"))?;
+            let file = |k: &str| a.get(k).and_then(Value::as_str).filter(|p| p.starts_with('/')).map(PathBuf::from)
+                .ok_or_else(|| bad(&format!("accounts.{k} is an absolute path")));
+            match a.get("kind").and_then(Value::as_str) {
+                Some("jellyfin") => {
+                    let libraries: Vec<String> = a.get("libraries").and_then(Value::as_array)
+                        .map(|l| l.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+                    if libraries.is_empty() || libraries.iter().any(|l| l.len() > 64 || !l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')) {
+                        return Err(bad("accounts.libraries names the ids of the libraries buyers see"));
+                    }
+                    Some(Accounts::Jellyfin { admin_key_file: file("admin_key_file")?, libraries })
+                }
+                Some("hook") => Some(Accounts::Hook { command: file("command")? }),
+                _ => return Err(bad("accounts.kind is jellyfin or hook")),
+            }
+        }
+    };
+    if accounts.is_some() && free {
+        return Err(bad("a route with accounts is a priced one: a buyer is known only by a paid session"));
+    }
+    let capacity = match r.get("capacity") {
+        None => Capacity::default(),
+        Some(c) => {
+            let c = c.as_object().ok_or_else(|| bad("capacity is an object"))?;
+            if let Some(k) = c.keys().find(|k| !["max_buyers", "max_streams", "max_streams_per_buyer", "max_mbit"].contains(&k.as_str())) {
+                return Err(bad(&format!("capacity has no setting {k:?}")));
+            }
+            let limit = |k: &str| -> Result<Option<u32>, String> {
+                match c.get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(v) => v.as_u64().filter(|n| (1..=1_000_000).contains(n)).map(|n| Some(n as u32))
+                        .ok_or_else(|| bad(&format!("capacity.{k} is a whole number from 1"))),
+                }
+            };
+            Capacity {
+                max_buyers: limit("max_buyers")?,
+                max_streams: limit("max_streams")?,
+                max_streams_per_buyer: limit("max_streams_per_buyer")?,
+                max_mbit: limit("max_mbit")?,
+            }
+        }
+    };
+    if free && capacity.max_buyers.is_some() {
+        return Err(bad("a free route has no buyers to count: capacity.max_buyers is for a priced route"));
+    }
+    let service = match r.get("service") {
+        None | Some(Value::Null) => upstream.clone().unwrap_or_default(),
+        Some(Value::String(s)) if (1..=64).contains(&s.len()) => s.clone(),
+        Some(_) => return Err(bad("service is a name of 1 to 64 characters")),
+    };
     Ok(Route {
         path,
         methods,
@@ -887,13 +1225,37 @@ fn route(v: &Value) -> Result<Route, String> {
         max_body: max_body as usize,
         upstream,
         strip_prefix,
+        accept_gzip,
+        upstream_headers,
+        deny_paths,
+        allow_paths,
+        websocket,
+        accounts,
+        capacity,
+        top_ticket_msat: r.get("top_ticket_msat").map(|_| num(r, "top_ticket_msat", 0)).transpose()?,
+        service,
     })
 }
 
 /// The config's `listing`. A `listing/1` names a route per service: the route must exist, and a
-/// service that names no price is given its route's, so the listing cannot say another price.
-fn listing_draft(l: &Value, routes: &[Route]) -> Result<xbt402::listing::Draft, String> {
+/// service that names no price is given its route's, so the listing cannot say another price. An
+/// item's address from the shop's own root (`/files/a.mkv`) is listed at `origin`: the shop's web
+/// address, or for a shop reached by key [`xbt402::shop::UNNAMED`] until main names it.
+fn listing_draft(l: &Value, routes: &[Route], origin: &str) -> Result<xbt402::listing::Draft, String> {
     let mut l = l.clone();
+    let at_origin = |items: Option<&mut Value>| {
+        for it in items.and_then(Value::as_array_mut).into_iter().flatten() {
+            if let Some(Value::String(u)) = it.get_mut("url") {
+                if u.starts_with('/') && !u.starts_with("//") {
+                    *u = format!("{origin}{u}");
+                }
+            }
+        }
+    };
+    at_origin(l.get_mut("items"));
+    for s in l.get_mut("services").and_then(Value::as_array_mut).into_iter().flatten() {
+        at_origin(s.get_mut("items"));
+    }
     if let Some(list) = l.get_mut("services").and_then(Value::as_array_mut) {
         for (i, s) in list.iter_mut().enumerate() {
             let path = s.get("path").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1018,6 +1380,105 @@ mod tests {
                           {"path": "/api", "methods": ["POST"], "price": {"request_msat": 2500}, "max_body": 4096, "forward_headers": ["X-Trace"]}]})
     }
 
+    /// A seller's web app sold whole, with the parts a buyer must not reach refused: case does not
+    /// help (many web servers ignore it), and an allow list refuses everything it does not name.
+    #[test]
+    fn a_route_refuses_the_paths_it_denies_and_those_its_allow_list_leaves_out() {
+        let mut v = base();
+        v["routes"] = json!([{"path": "/jf/", "price": {"request_msat": 100}, "deny_paths": ["/jf/Sessions", "/jf/system/"]},
+                             {"path": "/app/", "price": {"request_msat": 100}, "allow_paths": ["/app/web/", "/app/Videos/"]}]);
+        let c = Config::from_json(&v).unwrap();
+        let jf = c.route("/jf/web/index.html").unwrap();
+        assert!(!jf.path_refused("/jf/web/index.html"));
+        for p in ["/jf/Sessions", "/jf/sessions/abc/Playing", "/jf/SESSIONS", "/jf/System/Info"] {
+            assert!(jf.path_refused(p), "{p}");
+        }
+        let app = c.route("/app/web/").unwrap();
+        assert!(!app.path_refused("/app/web/main.js") && !app.path_refused("/app/videos/1/stream"));
+        assert!(app.path_refused("/app/Users") && app.path_refused("/app/"));
+        // the longest prefix decides: all of /one/ but /one/users, and of that only /one/users/public
+        let mut w = base();
+        w["routes"] = json!([{"path": "/one/", "price": {"request_msat": 100}, "allow_paths": ["/one/", "/one/users/public", "/one/users/g1/"],
+                              "deny_paths": ["/one/users"]}]);
+        let c = Config::from_json(&w).unwrap();
+        let one = c.route("/one/x").unwrap();
+        for (p, refused) in [("/one/web/a.js", false), ("/one/Users/Public", false), ("/one/users", true), ("/one/USERS/other/items", true),
+                             ("/one/users/g1/items", false), ("/one/usersx", true), ("/two", true)] {
+            assert_eq!(one.path_refused(p), refused, "{p}");
+        }
+        for bad in [json!("Sessions"), json!("/a?b"), json!("/a%2f"), json!(3)] {
+            v["routes"][0]["deny_paths"] = json!([bad.clone()]);
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_shop_without_a_web_address_keeps_the_word_link_for_main_to_name_by_its_key() {
+        for public in [json!("link"), Value::Null] {
+            let mut v = base();
+            v["public_url"] = public;
+            v["link"] = json!({"relays": []});
+            let c = Config::from_json(&v).unwrap();
+            assert_eq!(c.public_url, LINK_ONLY, "a shop by key must keep LINK_ONLY until start names it, else it signs as no seller");
+        }
+        let mut v = base();
+        v["public_url"] = json!("link");
+        assert!(Config::from_json(&v).is_err(), "a shop by key without a link section is refused");
+    }
+
+    /// A buyer's wallet reaches a seller's relays over https only (its transport check refuses any
+    /// other): a plain-http relay here would make the shop one no buyer can reach, so it is refused.
+    #[test]
+    fn a_link_relay_is_https_only_as_buyers_require() {
+        let mut v = base();
+        v["link"] = json!({"relays": ["https://relay.example/"]});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().relays, vec!["https://relay.example".to_string()]);
+        v["link"] = json!({"relays": ["http://127.0.0.1:3340"]});
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("https://") && e.contains("refuse"), "{e}");
+    }
+
+    /// Routes are one service where they name the same `service`, or, naming none, the same
+    /// upstream; such routes take one count of buyers, so they cannot give it two limits.
+    #[test]
+    fn routes_of_one_service_share_its_count_of_buyers() {
+        let mut v = base();
+        v["routes"] = json!([{"path": "/app/", "price": {"request_msat": 100}, "capacity": {"max_buyers": 20}},
+                             {"path": "/api/", "price": {"request_msat": 100}, "capacity": {"max_buyers": 20}},
+                             {"path": "/films/", "upstream": "http://127.0.0.1:8096", "price": {"request_msat": 100}, "capacity": {"max_buyers": 5}},
+                             {"path": "/shows/", "upstream": "http://127.0.0.1:8096", "service": "shows", "price": {"request_msat": 100}, "capacity": {"max_buyers": 3}}]);
+        let c = Config::from_json(&v).unwrap();
+        let svc = |p: &str| c.route(p).unwrap().service.clone();
+        assert_eq!((svc("/app/x"), svc("/api/x")), (String::new(), String::new()));
+        assert_eq!((svc("/films/x").as_str(), svc("/shows/x").as_str()), ("http://127.0.0.1:8096", "shows"));
+        v["routes"][1]["capacity"]["max_buyers"] = json!(10);
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("one service") && e.contains("max_buyers"), "{e}");
+    }
+
+    #[test]
+    fn a_proxy_list_longer_than_the_server_keeps_is_refused() {
+        let mut v = base();
+        let many: Vec<String> = (1..=9).map(|i| format!("10.0.0.{i}")).collect();
+        v["http"] = json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": many}});
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("at most 8"), "{e}");
+    }
+
+    #[test]
+    fn a_link_serves_on_several_keys_by_default_and_as_many_as_it_says() {
+        let mut v = base();
+        v["public_url"] = json!("link");
+        v["link"] = json!({});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().endpoints, DEFAULT_LINK_ENDPOINTS);
+        v["link"] = json!({"endpoints": 1});
+        assert_eq!(Config::from_json(&v).unwrap().link.unwrap().endpoints, 1);
+        for bad in [json!(0), json!(9), json!(2.5), json!("2")] {
+            v["link"] = json!({"endpoints": bad.clone()});
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn the_defaults_are_the_drafts_numbers() {
         let c = Config::from_json(&base()).unwrap();
@@ -1057,7 +1518,7 @@ mod tests {
                 c.caps.max_kept_sessions,
                 c.caps.max_held
             ),
-            (30, 2, 10_000, 15)
+            (100, 2, 10_000, 15)
         );
         assert_eq!(
             (
@@ -1070,7 +1531,7 @@ mod tests {
         );
         assert_eq!(
             (c.http.connections, c.http.per_address, c.http.threads),
-            (64, 48, 16)
+            (512, 48, 16)
         );
         assert!(!c.mainnet());
     }
@@ -1143,7 +1604,7 @@ mod tests {
     #[test]
     fn hold_invoices_go_to_a_session_that_has_paid_by_default_where_prepaid_tickets_are_offered() {
         let c = Config::from_json(&base()).unwrap();
-        assert_eq!((c.caps.held_after_paid, c.caps.first_lock_secs, c.caps.unpaid_per_address), (true, 20, 2));
+        assert_eq!((c.caps.held_after_paid, c.caps.first_lock_secs, c.caps.unpaid_per_address), (true, 60, 2));
         let with = |tickets: Value, caps: Value| {
             let mut v = base();
             v["tickets"] = tickets;
@@ -1160,6 +1621,20 @@ mod tests {
             assert!(with(json!({}), json!({"first_lock_secs": bad})).unwrap_err().to_string().contains("first_lock_secs"), "{bad}");
         }
         assert_eq!(with(json!({}), json!({"first_lock_secs": 15, "unpaid_per_address": 0})).unwrap().caps.unpaid_per_address, 0);
+    }
+
+    #[test]
+    fn a_health_token_is_long_and_plain_or_refused() {
+        let with = |t: Value| {
+            let mut v = base();
+            v["health_token"] = t;
+            Config::from_json(&v)
+        };
+        assert_eq!(Config::from_json(&base()).unwrap().health_token, None);
+        let good = "abcdefghij-ABCDEFGHIJ_0123456789xy";
+        assert_eq!(with(json!(good)).unwrap().health_token.as_deref(), Some(good));
+        assert!(with(json!("short")).unwrap_err().to_string().contains("health_token"));
+        assert!(with(json!("abcdefghij ABCDEFGHIJ 0123456789xy")).unwrap_err().to_string().contains("health_token"));
     }
 
     #[test]
@@ -1351,6 +1826,27 @@ mod tests {
             (
                 "tickets.settle",
                 Box::new(|v| v["tickets"] = json!({"settle": []})),
+            ),
+            (
+                "top_ticket_msat",
+                Box::new(|v| {
+                    v["tickets"] = json!({"ticket_msat": 546_000});
+                    v["routes"][0]["top_ticket_msat"] = json!(1_000_000);
+                }),
+            ),
+            (
+                "top_ticket_msat",
+                Box::new(|v| {
+                    v["tickets"] = json!({"ticket_msat": 546_000, "min_ticket_msat": 546_000, "settle": ["on-use"]});
+                    v["routes"][0]["top_ticket_msat"] = json!(1_000_000);
+                }),
+            ),
+            (
+                "top_ticket_msat",
+                Box::new(|v| {
+                    v["tickets"] = json!({"ticket_msat": 900_000, "min_ticket_msat": 546_000});
+                    v["routes"][0]["top_ticket_msat"] = json!(899_999);
+                }),
             ),
             (
                 "tickets.settle",
@@ -1647,6 +2143,34 @@ mod tests {
         assert_eq!(d.services[1].prices, json!({"request_msat": "2500"}));
         v["listing"]["services"][1]["path"] = json!("/nowhere");
         assert!(Config::from_json(&v).unwrap_err().to_string().contains("not one of the routes"));
+    }
+
+    /// The Sell page writes a service's addresses from the shop's own root (`/files/a.mkv`): a shop
+    /// with a web address lists them there, and a shop reached by key lists them at its shop name,
+    /// which main gives it at start (`name_shop`). A `//host` address is another host's, not relative.
+    #[test]
+    fn a_listing_names_its_relative_addresses_at_the_shops_origin_once_it_is_known() {
+        let mut v = base();
+        v["listing"] = json!({"name": "One box", "updated": "2026-10-30", "services": [
+            {"name": "Files", "kind": "files", "path": "/files/", "items": [{"title": "a.mkv", "url": "/files/a.mkv"}]},
+            {"name": "Model", "kind": "app", "path": "/api", "items": [{"title": "Open", "url": "/api/web/"}]},
+        ]});
+        let d = Config::from_json(&v).unwrap().listing.unwrap();
+        assert_eq!(d.services[0].items[0].url, "http://127.0.0.1:8402/files/a.mkv");
+        assert_eq!(d.services[1].items[0].url, "http://127.0.0.1:8402/api/web/");
+
+        v["public_url"] = json!("link");
+        v["link"] = json!({"relays": []});
+        let mut c = Config::from_json(&v).unwrap();
+        let origin = xbt402::shop::origin_for(&[7; 32]);
+        c.name_shop(origin.clone());
+        assert_eq!(c.public_url, origin);
+        let d = c.listing.unwrap();
+        assert_eq!(d.services[0].items[0].url, format!("{origin}/files/a.mkv"));
+        assert_eq!(d.services[1].items[0].url, format!("{origin}/api/web/"));
+
+        v["listing"]["services"][0]["items"][0]["url"] = json!("//elsewhere.example/a.mkv");
+        assert!(Config::from_json(&v).is_err(), "a scheme-relative address is not the shop's own");
     }
 
     #[test]

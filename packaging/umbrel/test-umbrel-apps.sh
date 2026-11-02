@@ -53,6 +53,8 @@ PY
 if python3 packaging/umbrel/lint.py "$NEG" >>"$OUT/lint.log" 2>&1; then echo "lint missed the broken app" | tee -a "$OUT/lint.log"; rm -rf "$NEG"; echo "RESULT FAIL"; exit 1; fi
 rm -rf "$NEG"
 echo "   refused, as it should be" | tee -a "$OUT/lint.log"
+echo "== lint holds the Lightning node's data to node-keys-bake alone (lint_test.py)" | tee -a "$OUT/lint.log"
+python3 packaging/umbrel/lint_test.py >>"$OUT/lint.log" 2>&1 || { echo "lint_test failed" | tee -a "$OUT/lint.log"; echo "RESULT FAIL"; exit 1; }
 
 rc=0
 TIMES=()

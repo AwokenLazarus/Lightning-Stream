@@ -1,16 +1,15 @@
 //! A stand-in pool and a stand-in miner for the lab.
 //!
-//! They speak ordinary Stratum V1 (subscribe, authorize, set_difficulty, notify, submit), but
-//! the share hash is a toy, not the chain's proof of work: BLAKE2b-256 of
-//! `job|extranonce1|extranonce2|ntime|nonce`, and difficulty 1 is a hash under 2^240 (65536
-//! tries on average), so a CPU finds shares at any difficulty the lab picks. The pool checks
-//! every share (known job, authorized user, no repeat, the hash under the target) and keeps its
-//! own count of accepted work, a third witness beside the hashmaker's and the hashtaker's meters.
+//! They speak ordinary Stratum V1 (subscribe, authorize, set_difficulty, notify, submit) with the
+//! chain's own share format and hash ([`crate::proof`]), at difficulties far below 1 so a CPU finds
+//! shares: 2^-20 is about 4096 tries. The pool checks every share (known job, authorized user, no
+//! repeat, the hash under the target) and keeps its own count of accepted work, a third witness
+//! beside the hashmaker's and the hashtaker's meters. Its jobs aren't real templates, and no block
+//! can come of them.
 
 use crate::meter::share_work;
+use crate::proof;
 use crate::{now_ms, sv1};
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -19,16 +18,39 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub fn toy_hash(job: &str, en1: &str, en2: &str, ntime: &str, nonce: &str) -> [u8; 32] {
-    let mut h = Blake2b::<U32>::new();
-    h.update(format!("{job}|{en1}|{en2}|{ntime}|{nonce}").as_bytes());
-    h.finalize().into()
+/// A `mining.notify` in the form a C DATUM gateway sends: a 39-byte `coinb1`, no `coinb2`, no branches,
+/// so with its 4-byte extranonce1 and 8-byte extranonce2 the leaf comes to 52 bytes. `k` makes the job
+/// its own.
+pub fn notify_line(job: &str, k: u64, ntime: u32, clean: bool) -> Value {
+    let body = format!("{:052x}", k as u128 + (1u128 << 100));
+    let coinb1 = format!("000000{:064x}00000000", k as u128 + (7u128 << 120));
+    json!({"id": null, "method": "mining.notify",
+        "params": [job, format!("000000000000{body}"), coinb1, "", [], "a0000000", "1d00ffff", format!("{ntime:08x}"), clean]})
 }
 
-/// Does the toy hash meet difficulty `d`? (hash < 2^240 / d, read from its top 128 bits)
-pub fn meets(hash: &[u8; 32], d: f64) -> bool {
-    let top = u128::from_be_bytes(hash[..16].try_into().unwrap()) as f64;
-    top * d < 2f64.powi(112)
+/// A nonce (8 hex digits) for this job that proves difficulty `d`, with the first extranonce2 from
+/// `en2` on that gives one; the extranonce2 in hex and the nonce.
+pub fn find_share(notify: &Value, en1: &str, en2_size: usize, d: f64, en2: u64) -> Option<(String, String)> {
+    let job = proof::job_from_notify(notify).ok()?;
+    let en1 = hex::decode(en1).ok()?;
+    let ntime = sv1::params(notify)?.get(7)?.as_str()?;
+    let ntime_num = u32::from_str_radix(ntime, 16).ok()?;
+    let mut time = [0u8; 8];
+    time[..4].copy_from_slice(&ntime_num.to_le_bytes());
+    for e in en2..en2.saturating_add(1000) {
+        let mut e2 = vec![0u8; en2_size];
+        let n = en2_size.min(8);
+        e2[en2_size - n..].copy_from_slice(&e.to_be_bytes()[8 - n..]);
+        let root = proof::leaf_root(&job, &en1, &e2);
+        for nonce in 0u32..4_000_000 {
+            let mut n8 = [0u8; 8];
+            n8[..4].copy_from_slice(&nonce.to_le_bytes());
+            if proof::proven_at(&proof::work_hash(&job.prev, &n8, &time, &root), d) {
+                return Some((hex::encode(&e2), format!("{nonce:08x}")));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -89,9 +111,10 @@ pub fn pool(cfg: PoolConfig) -> Result<(), String> {
 fn pool_session(c: TcpStream, n: u32, st: Arc<Mutex<PoolSt>>, diff: f64, every: Duration) {
     st.lock().unwrap().sessions += 1;
     let en1 = format!("{n:08x}");
+    let session = proof::Session { en1: hex::decode(&en1).unwrap_or_default(), en2_size: 8 };
     let Ok(w) = c.try_clone() else { return };
     let w = Arc::new(Mutex::new(w));
-    let jobs: Arc<Mutex<VecDeque<String>>> = Arc::default();
+    let jobs: Arc<Mutex<VecDeque<(String, Value)>>> = Arc::default();
     let send = |w: &Arc<Mutex<TcpStream>>, v: Value| w.lock().unwrap().write_all(format!("{v}\n").as_bytes()).is_ok();
     let mut user: Option<String> = None;
     let mut seen = HashSet::new();
@@ -108,7 +131,7 @@ fn pool_session(c: TcpStream, n: u32, st: Arc<Mutex<PoolSt>>, diff: f64, every: 
         let id = v.get("id").cloned().unwrap_or(Value::Null);
         match sv1::method(&v) {
             Some("mining.subscribe") => {
-                send(&w, json!({"id": id, "result": [[["mining.set_difficulty", en1], ["mining.notify", en1]], en1, 4], "error": null}));
+                send(&w, json!({"id": id, "result": [[["mining.set_difficulty", en1], ["mining.notify", en1]], en1, 8], "error": null}));
             }
             Some("mining.extranonce.subscribe") => {
                 send(&w, json!({"id": id, "result": true, "error": null}));
@@ -125,15 +148,14 @@ fn pool_session(c: TcpStream, n: u32, st: Arc<Mutex<PoolSt>>, diff: f64, every: 
                         loop {
                             k += 1;
                             let job = format!("{en1}-{k}");
+                            let p = notify_line(&job, ((n as u64) << 32) | k, (now_ms() / 1000) as u32, false);
                             {
                                 let mut j = jobs.lock().unwrap();
-                                j.push_back(job.clone());
+                                j.push_back((job.clone(), p.clone()));
                                 if j.len() > 4 {
                                     j.pop_front();
                                 }
                             }
-                            let p = json!({"id": null, "method": "mining.notify",
-                                "params": [job, format!("{:064x}", k), "", "", [], "00000002", "1d00ffff", format!("{:08x}", now_ms() / 1000), true]});
                             if !send(&w, p) {
                                 return;
                             }
@@ -148,14 +170,21 @@ fn pool_session(c: TcpStream, n: u32, st: Arc<Mutex<PoolSt>>, diff: f64, every: 
                 let (u, job, en2, ntime, nonce) = (s(0), s(1), s(2), s(3), s(4));
                 let why = if user.as_deref() != Some(&u) {
                     Some("unauthorized user")
-                } else if !jobs.lock().unwrap().contains(&job) {
-                    Some("stale job")
                 } else if !seen.insert(format!("{job}|{en2}|{ntime}|{nonce}")) {
                     Some("duplicate")
-                } else if !meets(&toy_hash(&job, &en1, &en2, &ntime, &nonce), diff) {
-                    Some("low difficulty")
                 } else {
-                    None
+                    let notify = jobs.lock().unwrap().iter().find(|(j, _)| *j == job).map(|(_, n)| n.clone());
+                    match notify {
+                        None => Some("stale job"),
+                        Some(n) => {
+                            let hash = proof::job_from_notify(&n).and_then(|j| proof::share_hash(&j, &session, &v));
+                            if hash.is_ok_and(|h| proof::proven_at(&h, diff)) {
+                                None
+                            } else {
+                                Some("low difficulty")
+                            }
+                        }
+                    }
                 };
                 let mut g = st.lock().unwrap();
                 match why {
@@ -195,6 +224,19 @@ pub struct MinerConfig {
     pub reconnect: bool,
     /// Ask for `mining.set_extranonce` (`mining.extranonce.subscribe`), as some firmware does.
     pub extranonce_subscribe: bool,
+    /// Connect from this local address (e.g. one of 127.0.0.0/8), as a miner with its own address
+    /// on a LAN does; `None`: whichever the system picks, shared by every stand-in on this machine.
+    pub bind: Option<std::net::IpAddr>,
+}
+
+/// Connect to `addr`, from `bind` when given.
+fn connect_from(addr: &str, bind: Option<std::net::IpAddr>) -> std::io::Result<TcpStream> {
+    let Some(ip) = bind else { return TcpStream::connect(addr) };
+    let to = std::net::ToSocketAddrs::to_socket_addrs(addr)?.next().ok_or_else(|| std::io::Error::other("no address"))?;
+    let s = socket2::Socket::new(socket2::Domain::for_address(to), socket2::Type::STREAM, None)?;
+    s.bind(&std::net::SocketAddr::new(ip, 0).into())?;
+    s.connect(&to.into())?;
+    Ok(s.into())
 }
 
 /// What a stand-in miner did.
@@ -211,13 +253,25 @@ pub struct MinerResult {
     /// after the miner started).
     pub max_gap_ms: u64,
     pub max_gap_end_ms: u64,
+    /// Each share's round trip, from its submit to the pool's answer, in microseconds.
+    pub share_rtt_us: Vec<u64>,
+}
+
+impl MinerResult {
+    /// The `q` quantile (0..=1) of the shares' round trips, in microseconds.
+    pub fn rtt_quantile_us(&self, q: f64) -> Option<u64> {
+        let mut v = self.share_rtt_us.clone();
+        v.sort_unstable();
+        let i = ((v.len() as f64 - 1.0) * q.clamp(0.0, 1.0)).round() as usize;
+        v.get(i).copied()
+    }
 }
 
 #[derive(Default)]
 struct MinerSt {
     en1: String,
     diff: f64,
-    job: Option<(String, String)>,
+    job: Option<(String, Value)>,
     accepted: u64,
     rejected: u64,
     extranonce_changes: u64,
@@ -227,6 +281,9 @@ struct MinerSt {
     gone: bool,
     /// The connection now in use: a reader of an older one changes nothing.
     gen: u64,
+    /// When each share in flight was submitted, and the round trips of those answered.
+    sent: std::collections::HashMap<u64, Instant>,
+    rtt_us: Vec<u64>,
 }
 
 /// Run the stand-in miner until its time is up (or, without `reconnect`, its connection ends).
@@ -242,7 +299,7 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
         if over(t0) {
             break;
         }
-        let c = match TcpStream::connect(&cfg.pool) {
+        let c = match connect_from(&cfg.pool, cfg.bind) {
             Ok(c) => c,
             Err(e) if res.sessions == 0 => return Err(format!("miner connect {}: {e}", cfg.pool)),
             Err(_) if cfg.reconnect => {
@@ -284,8 +341,7 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
                     if let Some(d) = sv1::set_difficulty(&v) {
                         g.diff = d;
                     } else if let Some(job) = sv1::notify_job(&v) {
-                        let ntime = sv1::params(&v).and_then(|p| p.get(7)).and_then(Value::as_str).unwrap_or("").to_string();
-                        g.job = Some((job, ntime));
+                        g.job = Some((job, v.clone()));
                     } else if sv1::method(&v) == Some("mining.set_extranonce") {
                         if let Some(e) = sv1::params(&v).and_then(|p| p.first()).and_then(Value::as_str) {
                             g.en1 = e.to_string();
@@ -297,7 +353,10 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
                         return;
                     } else if v.get("id") == Some(&json!(1)) {
                         g.en1 = v["result"][1].as_str().unwrap_or("").to_string();
-                    } else if v.get("id").and_then(Value::as_u64).is_some_and(|i| i >= 10) {
+                    } else if let Some(i) = v.get("id").and_then(Value::as_u64).filter(|i| *i >= 10) {
+                        if let Some(at) = g.sent.remove(&i) {
+                            g.rtt_us.push(at.elapsed().as_micros() as u64);
+                        }
                         if sv1::accepted(&v) {
                             g.accepted += 1;
                             let now = Instant::now();
@@ -341,21 +400,13 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
                 }
                 break 'session;
             }
-            let Some((job, ntime)) = job.filter(|_| !en1.is_empty()) else {
+            let Some((job, notify)) = job.filter(|_| !en1.is_empty()) else {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             };
             en2 = en2.wrapping_add(1);
-            let e2 = format!("{en2:08x}");
-            let mut found = None;
-            for nonce in 0u32..2_000_000 {
-                let n = format!("{nonce:08x}");
-                if meets(&toy_hash(&job, &en1, &e2, &ntime, &n), diff) {
-                    found = Some(n);
-                    break;
-                }
-            }
-            let Some(mut nonce) = found else { continue };
+            let Some((e2, mut nonce)) = find_share(&notify, &en1, 8, diff, en2 as u64) else { continue };
+            let ntime = sv1::params(&notify).and_then(|p| p.get(7)).and_then(Value::as_str).unwrap_or("").to_string();
             let gap = Duration::from_secs_f64(1.0 / cfg.max_rate.max(0.001));
             if let Some(wait) = gap.checked_sub(last.elapsed()) {
                 std::thread::sleep(wait);
@@ -365,6 +416,7 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
             if cfg.bad_every > 0 && (id - 10).is_multiple_of(cfg.bad_every) {
                 nonce = "ffffffff".into();
             }
+            st.lock().unwrap().sent.insert(id, Instant::now());
             if say(&mut w, json!({"id": id, "method": "mining.submit", "params": [cfg.user, job, e2, ntime, nonce]})).is_err() {
                 st.lock().unwrap().gone = true;
             }
@@ -379,5 +431,6 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
     res.extranonce_changes = g.extranonce_changes;
     res.max_gap_ms = g.max_gap.as_millis() as u64;
     res.max_gap_end_ms = g.max_gap_end.map(|t| (t - t0).as_millis() as u64).unwrap_or(0);
+    res.share_rtt_us = g.rtt_us.clone();
     Ok(res)
 }

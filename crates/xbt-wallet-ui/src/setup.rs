@@ -24,14 +24,27 @@ pub const MAINNET_ACK_FILE: &str = "mainnet-ack";
 /// What every page says while the owner has yet to confirm paying with real money (mainnet).
 pub const ACK_NEEDED: &str = "One last step: confirm that the app may pay with real money. Until you do, it pays nothing.";
 pub const GW_CONFIG: &str = "config.json";
+
+/// The gateway config's `health_token`, kept if it has one: what lets this app read the gateway's
+/// health from another container ([`crate::config::GatewaySetup::health`]).
+pub fn keep_health_token(c: &mut serde_json::Map<String, Value>, old: Option<&Value>) {
+    let had = c.get("health_token").or_else(|| old.and_then(|o| o.get("health_token"))).and_then(Value::as_str)
+        .filter(|t| t.len() >= 32).map(str::to_string);
+    c.insert("health_token".into(), json!(had.unwrap_or_else(|| hex::encode(crate::random_bytes::<32>()))));
+}
 pub const GW_INVOICES: &str = "invoices.macaroon";
 pub const GW_INFO: &str = "info.macaroon";
+/// The gateway's key for one call only, lnd's SignMessage: its node vouches for its link key with it
+/// (`docs/DIRECT-LINKS.md`).
+pub const GW_SIGN: &str = "sign.macaroon";
 
-/// The caps the gateway page writes on mainnet unless the owner sets others: a few buyers at a time,
-/// and at most 4 held tickets of 1,000 sat on the node's inbound channels.
-pub const MAINNET_CAPS: (u32, u32, u32) = (4, 1, 4);
+/// The caps the gateway page writes on mainnet unless the owner sets others: 25 buyers at a time
+/// (a buyer costs the box little; what is at stake is held tickets), and at most 4 held tickets of 1,000 sat on the node's inbound channels.
+pub const MAINNET_CAPS: (u32, u32, u32) = (25, 1, 4);
 /// The gateway's own defaults on a test chain (`xbt-gateway`'s config).
-pub const TEST_CAPS: (u32, u32, u32) = (30, 2, 15);
+pub const TEST_CAPS: (u32, u32, u32) = (100, 2, 15);
+/// The gateway's own default for connections open at once (`http.connections`).
+pub const GATEWAY_CONNECTIONS: u64 = 512;
 
 /// A macaroon as the node's dashboard shows it: hex, or base64 (standard or URL-safe).
 pub fn decode_macaroon(text: &str) -> Result<Vec<u8>, String> {
@@ -81,7 +94,7 @@ pub fn write_shared(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> 
     res
 }
 
-fn remove_shared(dir: &Path, name: &str) -> Result<bool, String> {
+pub(crate) fn remove_shared(dir: &Path, name: &str) -> Result<bool, String> {
     let p = dir.join(name);
     match std::fs::remove_file(&p) {
         Ok(()) => Ok(true),
@@ -292,7 +305,20 @@ impl App {
                  Grant app access task for Lightning Stream, or paste a key below.".into() }
             else if ln.grant { "Approve Lightning Stream in Lightning Fork: open Lightning Fork's tasks and run Grant app access. \
                  The app connects by itself a few seconds later. Or paste a key below.".into() }
+            // the baker and the taker make nothing the owner disconnected: no automatic reconnect to promise
+            else if ln.auto && crate::node_keys::turned_off(&ln.dir) { "You disconnected the key the app made. Paste a key below, \
+                 or have the app make its key again.".into() }
+            // a key made before, or the owner's own removed: the baker ran at the start and is gone
+            else if ln.auto && (crate::node_keys::made_before(&ln.dir) || crate::node_keys::removed(&ln.dir)) {
+                format!("The app makes its key again when it restarts: {}.", esc(&self.cfg.restart_hint)) }
+            else if ln.auto { "Create your Lightning wallet in Lightning Fork first. Lightning Stream picks it up automatically, \
+                 within a minute and with no restart. Or paste a key below.".into() }
             else { "Make the key in your node's app and paste it below.".into() }));
+        if !have && ln.auto && crate::node_keys::turned_off(&ln.dir) {
+            b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card\">{}<input type=\"hidden\" name=\"action\" value=\"auto_on\">\
+                <h2>Reconnect automatically</h2><p>The app makes a new key through this box's Lightning node when it restarts.</p>\
+                <button class=\"secondary\">Reconnect automatically</button></form>", App::csrf_input(ctx)));
+        }
         // the node holds more than the signed cap: one click to the rules with it raised
         if !ready && txt(status.get("reason")).contains("above ln.exposure_cap_sats") {
             b.push_str("<p><a class=\"button-link\" href=\"./policy?fix=cap\">Raise the limit</a></p>");
@@ -379,7 +405,18 @@ impl App {
                 let _ = remove_shared(dir, MAINNET_ACK_FILE);
                 // a key the app made itself is not made again at the next start
                 let _ = crate::node_keys::turn_off(dir);
-                if had { "Your node is disconnected: its key was removed from this box, and the app pays nothing now.".to_string() } else { "Your node was not connected.".into() }
+                // the owner's own key, on a box that makes one: the next start makes the app's
+                let next = had && self.cfg.ln.auto && !crate::node_keys::made_before(dir);
+                if next {
+                    let _ = crate::node_keys::note_removed(dir);
+                }
+                if next { format!("Your node is disconnected: its key was removed from this box, and the app pays nothing now. \
+                                   The app makes its own key when it restarts: {}.", self.cfg.restart_hint) }
+                else if had { "Your node is disconnected: its key was removed from this box, and the app pays nothing now.".to_string() } else { "Your node was not connected.".into() }
+            }),
+            // undoes a disconnect where the box makes the key (Umbrel's node-keys-bake), at the next start
+            Some("auto_on") if self.cfg.ln.auto => crate::node_keys::turn_on(dir).map(|()| {
+                format!("The app makes its key again when it restarts: {}.", self.cfg.restart_hint)
             }),
             Some("save") => (|| {
                 let chain = self.signer_chain();
@@ -467,6 +504,8 @@ impl App {
         let chain = g("chain");
         let mut c = Map::new();
         c.insert("listen".into(), json!(listen));
+        let old: Option<Value> = std::fs::read_to_string(gw.dir.join(GW_CONFIG)).ok().and_then(|t| serde_json::from_str(&t).ok());
+        keep_health_token(&mut c, old.as_ref());
         c.insert("public_url".into(), json!(public_url));
         c.insert("upstream".into(), json!(g("upstream").trim_end_matches('/')));
         c.insert("state_dir".into(), json!(gw.state_dir));
@@ -494,6 +533,9 @@ impl App {
                                        "max_held_tickets": num("max_held_tickets")?}));
         if !proxies.is_empty() {
             c.insert("http".into(), json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": proxies}}));
+        } else if behind_proxy {
+            // and so is the cap on connections from one address: every buyer comes over the proxy's
+            c.insert("http".into(), json!({"per_address": 0}));
         }
         // the page asks for sats; a form that sends millisats (an older page, a script) still works
         let msat = if g("price").is_empty() { num("price_msat")? } else { crate::app::sell::sats_to_msat(&g("price"))? };
@@ -521,7 +563,7 @@ impl App {
         b.push_str("<p class=\"lead\">Sell a service from this box, paid a little at a time over Lightning. Buyers pay before each piece, \
             and this app passes each paid request on to your service.</p>");
         b.push_str(&pin_card(&App::csrf_input(ctx), gw.node_pin, gw.node_rest.as_deref(), gw.node_tls_cert.as_deref(), "./gateway"));
-        let health = gw.health_url.as_deref().map(crate::app::http_get);
+        let health = gw.health();
         let (class, head, next) = match (&health, saved) {
             (_, false) => ("warn", "Not selling yet", "Fill in the form below and save it."),
             (Some(Ok((200, _))) | None, true) => ("ok", "Selling", "Buyers can pay and use your service."),

@@ -61,8 +61,11 @@ use crate::store::{Store, COMPACT_AT};
 use crate::upstream::{decoded_path, forwarded, returned, Answer, Upstream};
 use crate::Error;
 
+mod accounts;
+pub mod admission;
 mod draws;
 mod offers;
+mod websocket;
 pub use offers::JOURNAL as OFFERS_JOURNAL;
 
 /// A body no larger than this, on a route priced per request only, is read whole so that its
@@ -76,13 +79,18 @@ const SESSION_BODY: usize = 16 << 10;
 const CHUNK: usize = 16 << 10;
 /// How often an answer waiting to be paid for looks whether its buyer is still there.
 const GONE_CHECK: Duration = Duration::from_millis(250);
-/// Final receipts of streamed responses kept per session, for `status`.
-const FINALS_KEPT: usize = 8;
+/// Final receipts of streamed responses kept per session, for `status`: twice as many as a session
+/// may have requests on their way at once ([`crate::book::SEQ_WINDOW_MAX`]), so that the buyer finds
+/// the last receipt of every answer that ran beside the others, however late it asks.
+const FINALS_KEPT: usize = 2 * crate::book::SEQ_WINDOW_MAX as usize;
 
 struct State {
     book: Book,
     store: Store,
     finals: HashMap<String, VecDeque<Value>>,
+    /// The latest interim receipt of each answer still open (a WebSocket, a VPN tunnel), by
+    /// session and seq: listed in `status` until the answer's last receipt replaces it.
+    interim: HashMap<String, HashMap<u64, Value>>,
 }
 
 #[derive(Default)]
@@ -108,6 +116,9 @@ pub struct Stats {
     /// The longest time from a secret's arrival to the node's yes, in microseconds.
     pub settle_max_us: u64,
     pub height: Option<u32>,
+    /// What every session was charged in all, the ones dropped from the book included: the seller's
+    /// earnings ([`crate::book::Book::charged_msat`]).
+    pub charged_msat: u64,
 }
 
 pub struct Gateway {
@@ -130,7 +141,22 @@ pub struct Gateway {
     /// The node's BOLT 12 offer and what was paid to it, where the runner turned payment by offer
     /// on (`docs/TICKETS.md`, section 15).
     offers: Option<offers::Offers>,
+    /// The signed transport document (`transport/1`): the iroh link that reaches this gateway by key,
+    /// with the node's statement vouching for it. `None` until the link has started with one.
+    transport: Mutex<Option<Value>>,
+    /// The link's state for the seller's own app (`LINK_STATUS_PATH`): its key, relays and whether
+    /// the node vouched for it. Public facts only.
+    link_status: Mutex<Option<Value>>,
+    /// The buyer each session proved it is (`identify`, docs/BUYER-ACCOUNTS.md): its key, hex.
+    buyers: Mutex<HashMap<String, String>>,
+    /// Buyers' accounts in the services of routes that give them.
+    accounts: accounts::Store,
+    /// What each route carries at once, against its `capacity`.
+    load: Arc<admission::Load>,
 }
+
+/// Where the gateway says how its link stands, for the seller's app.
+pub const LINK_STATUS_PATH: &str = "/.well-known/lightning-stream-link.json";
 
 /// Wall-clock seconds.
 pub fn unix_now() -> u64 {
@@ -159,6 +185,11 @@ fn same_host(origin: &str, host: &str) -> bool {
     o.host == name && o.port == port
 }
 
+/// A JSON string field, or `""`.
+fn str_of(v: Option<&Value>) -> String {
+    v.and_then(Value::as_str).unwrap_or("").to_string()
+}
+
 fn json_response(status: u16, body: &Value) -> Response {
     Response::new(
         status,
@@ -173,6 +204,50 @@ fn json_response(status: u16, body: &Value) -> Response {
 
 fn error(status: u16, code: &str, detail: &str) -> Response {
     json_response(status, &json!({"error": code, "detail": detail}))
+}
+
+/// A visit or an answer turned away because a route's `capacity` is reached: a 503 with the code
+/// `busy`, the counts, and when to try again. Nothing was sold or charged for it.
+fn busy(b: &admission::Busy) -> Response {
+    let mut r = json_response(503, &b.body());
+    r.headers.push(("Retry-After".into(), admission::RETRY_AFTER_S.to_string()));
+    r
+}
+
+/// Why a body that went past the size the buyer was shown ended there.
+const PASSED_SHOWN: &str = "the answer passed the size the buyer was shown";
+
+/// The most bytes, in all, the buyer was shown the resource has ([`xbt402::ticket::MAX_SIZE_HEADER`]):
+/// the smallest the request names, and only on a GET or HEAD. A request that sends the service work
+/// to do (a body, priced by the token or not) is not judged by it.
+fn shown_size(req: &Request) -> Option<u64> {
+    if !(req.method.eq_ignore_ascii_case("GET") || req.method.eq_ignore_ascii_case("HEAD")) {
+        return None;
+    }
+    req.headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_SIZE_HEADER))
+        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+        .min()
+}
+
+/// The size an answer states in all, where it is more than `most` ([`shown_size`]): `(stated,
+/// most)`. A `206` by the total in its `Content-Range`, any other `2xx` by its `Content-Length` (the
+/// rule the wallet and the app judge by too); an answer that states no size is cut at `most` bytes
+/// as it is sent instead.
+fn larger_than_shown(most: Option<u64>, answer: &Answer) -> Option<(u64, u64)> {
+    let most = most?;
+    let total = match answer.status {
+        206 => answer
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+            .and_then(|(_, v)| v.rsplit_once('/'))
+            .and_then(|(_, t)| t.trim().parse::<u64>().ok()),
+        200..=299 => answer.length,
+        _ => None,
+    }?;
+    (total > most).then_some((total, most))
 }
 
 fn addr_name(client: Option<IpAddr>) -> String {
@@ -220,6 +295,15 @@ struct Metered {
     tokens: Option<TokenCall>,
     /// The most the buyer lets this answer charge, in msat ([`xbt402::ticket::MAX_MSAT_HEADER`]).
     cap_msat: Option<u64>,
+    /// The most bytes the buyer was shown the resource has ([`shown_size`]): a body that states no
+    /// size ends there.
+    max_bytes: Option<u64>,
+}
+
+/// The most the buyer lets an answer to `req` charge, in msat ([`xbt402::ticket::MAX_MSAT_HEADER`]);
+/// None: no limit named, or one that is not a number.
+fn buyers_cap(req: &Request) -> Option<u64> {
+    req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)).and_then(|(_, v)| v.trim().parse::<u64>().ok())
 }
 
 impl Metered {
@@ -269,6 +353,8 @@ impl Gateway {
             ticket_blocks: cfg.ticket_blocks,
             receipt_key: hex::encode(ecdsa::pubkey(&key)),
             session: ticket::SESSION_PATH.into(),
+            seq_window: cfg.caps.seq_window.clamp(1, crate::book::SEQ_WINDOW_MAX),
+            refill_wait_ms: Some(u64::try_from(cfg.times.refill_wait.as_millis()).unwrap_or(u64::MAX)),
         };
         let (mut store, recs) =
             Store::open(&cfg.state_dir).map_err(|e| Error::Journal(e.to_string()))?;
@@ -325,6 +411,7 @@ impl Gateway {
                 book,
                 store,
                 finals: HashMap::new(),
+                interim: HashMap::new(),
             }),
             credited: Condvar::new(),
             height: Mutex::new(Height {
@@ -337,6 +424,11 @@ impl Gateway {
             settle_max_us: AtomicU64::new(0),
             lottery,
             offers,
+            transport: Mutex::new(None),
+            link_status: Mutex::new(None),
+            buyers: Mutex::new(HashMap::new()),
+            accounts: accounts::Store::open(&cfg.state_dir),
+            load: admission::Load::new(),
             cfg,
         });
         for hash in unfinished {
@@ -359,11 +451,15 @@ impl Gateway {
 
     /// Listen on `listener` with the config's limits.
     pub fn serve(self: &Arc<Self>, listener: TcpListener) -> io::Result<Running> {
+        // a reverse proxy the config names brings every buyer over its own address: held to the
+        // total only, while the caps on sessions count each buyer by the address it reports
+        let proxies = self.cfg.forwarded.as_ref().map_or(&[][..], |f| f.proxies.as_slice());
         let limits = Limits {
             connections: self.cfg.http.connections,
             per_address: self.cfg.http.per_address,
             ..Limits::default()
-        };
+        }
+        .with_proxies(proxies);
         xbt_svc::http::serve_with(
             Arc::new(Service(self.clone())),
             listener,
@@ -393,6 +489,24 @@ impl Gateway {
     /// The signed listing, as the well-known URL serves it; `None` without a listing section.
     pub fn listing(&self) -> Option<Value> {
         self.listing_doc()
+    }
+
+    /// Names the iroh links that reach this gateway by key (one per key it serves on), signed by the
+    /// receipt key, for the well-known transport URL and the Nostr listing. Each `node_sig` is the
+    /// seller's node's.
+    pub fn set_link(&self, links: &[xbt402::transport::Link], updated: &str) {
+        let doc = xbt402::transport::document(&self.cfg.public_url, &self.terms.receipt_key, links, updated);
+        *self.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(xbt402::transport::sign(&self.key, &doc));
+    }
+
+    /// Records how the link stands, for [`LINK_STATUS_PATH`].
+    pub fn set_link_status(&self, v: Value) {
+        *self.link_status.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+    }
+
+    /// The signed transport document, if the link has one.
+    pub fn transport(&self) -> Option<Value> {
+        self.transport.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The receipt key's binding of `nostr_pubkey` to this seller (`docs/NOSTR.md`).
@@ -428,6 +542,7 @@ impl Gateway {
             settled: self.settled.load(Ordering::SeqCst),
             settle_max_us: self.settle_max_us.load(Ordering::SeqCst),
             height: self.known_height(),
+            charged_msat: st.book.charged_msat(),
         }
     }
 
@@ -555,6 +670,7 @@ impl Gateway {
             for r in &sweep.recs {
                 if let Rec::Drop { session } = r {
                     st.finals.remove(session);
+                    st.interim.remove(session);
                 }
             }
             self.journal(&mut st, &sweep.recs);
@@ -773,6 +889,16 @@ impl Gateway {
         Some(client.map_or(peer, |a| a.to_canonical()))
     }
 
+    /// Whether a request carries the app's `health_token` (`X-Xbt402-Health-Token`), compared in
+    /// constant time: the operator's view for the app beside the gateway in another container.
+    fn health_token_ok(&self, req: &Request) -> bool {
+        let (Some(want), Some(got)) = (self.cfg.health_token.as_deref(), req.header("x-xbt402-health-token")) else {
+            return false;
+        };
+        let (a, b) = (want.as_bytes(), got.trim().as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+    }
+
     /// The origin a request came in on: an alias its `Host` names (`public_aliases`), else
     /// `public_url`. A payment binds the URL the buyer used, so each origin's terms name it.
     fn origin_of(&self, req: &Request) -> &str {
@@ -824,6 +950,20 @@ impl Gateway {
                     // offering hashes the lock would refuse
                     if *settle == SETTLE_ON_USE && self.cfg.caps.held_after_paid {
                         e["extra"]["heldAfterPaid"] = true.into();
+                    }
+                    // the route these terms are for, and that a paid request repeating another route's terms is
+                    // refused unpaid ([`Refusal::TermsChanged`]): a buyer may then pay its next request on this route
+                    // without asking the price first
+                    e["extra"]["route"] = r.path.clone().into();
+                    e["extra"]["termsChecked"] = true.into();
+                    // a route that gives buyers accounts asks to know who the buyer is (docs/BUYER-ACCOUNTS.md)
+                    if r.accounts.is_some() {
+                        e["extra"]["identify"] = true.into();
+                    }
+                    // the largest prepaid ticket of this route. A word of its own, not its `ticketMsat`: a buyer's session
+                    // goes on across routes on one ticket size
+                    if let Some(top) = r.top_ticket_msat.filter(|_| *settle == SETTLE_ON_ARRIVAL) {
+                        e["extra"]["topTicketMsat"] = top.to_string().into();
                     }
                     // a prepaid ticket can be paid by the node's offer as well as by its invoice
                     if let Some(o) = self.offer_text().filter(|_| *settle == SETTLE_ON_ARRIVAL) {
@@ -988,6 +1128,15 @@ impl Gateway {
     }
 
     /// Steps 2 and 3: authenticate the request, then take the secret it carries.
+    /// The session a visit asking the price names (`PAYMENT-SESSION`), when the book holds it. Not
+    /// authenticated, and needs not be: it only lets a session in that a paid request of the same
+    /// route would let in, and that request is authenticated before it is served or charged.
+    fn session_named(&self, req: &Request) -> Option<String> {
+        let (_, sid) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SESSION"))?;
+        let sid = sid.trim();
+        (sid.len() <= 128 && self.lock().book.session(sid).is_some()).then(|| sid.to_string())
+    }
+
     fn authenticate(
         &self,
         req: &Request,
@@ -1038,6 +1187,15 @@ impl Gateway {
             ticket: pay.ticket,
             head: req.method == "HEAD",
         };
+        // a route that serves as many buyers as it takes turns a new one away here: its request is
+        // authenticated (its sequence number used, so the buyer's count stays in step) but a ticket's
+        // secret it carries is not taken, so nothing is sold or charged for it. A buyer already
+        // served is counted again and goes on.
+        if let Some(route) = route {
+            if let Err(b) = self.load.buyer(route, Some(&a.session), self.now()) {
+                return Err(self.answered(&a, busy(&b), 0));
+            }
+        }
         if let Some(secret) = &pay.secret {
             if let Err(why) = self.take_secret(&a.session, secret) {
                 return Err(self.refused(&a, &self.req_url(req), route, why));
@@ -1072,6 +1230,12 @@ impl Gateway {
         list.iter()
             .map(|h| h.as_str().and_then(hex32).ok_or_else(bad))
             .collect()
+    }
+
+    /// The largest prepaid ticket any route sells: [`Route::top_ticket_msat`], else the gateway's own.
+    /// It holds nothing and is paid before it counts, so a lock names no route for it.
+    pub(crate) fn prepaid_top_msat(&self) -> u64 {
+        self.cfg.routes.iter().filter_map(|r| r.top_ticket_msat).fold(self.cfg.caps.ticket_msat, u64::max)
     }
 
     fn lock_tickets(self: &Arc<Self>, req: &Request) -> Response {
@@ -1121,10 +1285,11 @@ impl Gateway {
                     Value::String(s) => s.parse::<u64>().ok(),
                     v => v.as_u64(),
                 };
-                match asked.filter(|n| (min..=self.cfg.caps.ticket_msat).contains(n)) {
+                let top = if prepaid { self.prepaid_top_msat() } else { self.cfg.caps.ticket_msat };
+                match asked.filter(|n| (min..=top).contains(n)) {
                     Some(n) => n,
                     None => {
-                        return error(400, "bad_request", &format!("ticketMsat is from {min} to {}", self.cfg.caps.ticket_msat))
+                        return error(400, "bad_request", &format!("ticketMsat is from {min} to {top}"))
                     }
                 }
             }
@@ -1222,7 +1387,21 @@ impl Gateway {
             }
             (Err(why), None) => return json_response(402, &json!({"error": why.code()})),
         };
-        // a first lock is nobody's yet: its invoices lapse sooner, so that unpaid ones give their places back
+        // a first lock may name the address the buyer wants (`path`): where that route serves as many
+        // buyers as it takes, nothing is sold to a buyer it would not serve, and the session made for
+        // it is forgotten; where it has room, the new session takes its place there before it pays
+        if authed.is_none() {
+            let route = body.get("path").and_then(Value::as_str).and_then(|p| decoded_path(p).ok()).and_then(|p| self.cfg.route(&p));
+            if let Some(Err(b)) = route.map(|r| self.load.buyer(r, Some(&g.session), self.now())) {
+                let mut st = self.lock();
+                let mut recs: Vec<_> = g.issue.iter().filter_map(|h| st.book.issued(h, false)).collect();
+                recs.extend(st.book.forget_unused(&g.session));
+                self.journal(&mut st, &recs);
+                return busy(&b);
+            }
+        }
+        // a first lock is nobody's yet: its invoices may be set to lapse sooner (caps.first_lock_secs), so that unpaid
+        // ones give their places back; by default they live as long as any, for a payment over a slow route
         let expiry = if g.key.is_some() {
             u32::try_from(self.cfg.caps.first_lock_secs).unwrap_or(INVOICE_EXPIRY_S).min(INVOICE_EXPIRY_S)
         } else {
@@ -1312,6 +1491,8 @@ impl Gateway {
             },
             _ => None,
         };
+        let buyer = str_of(body.get("buyer")).to_ascii_lowercase();
+        let buyer_sig = str_of(body.get("sig")).to_ascii_lowercase();
         let a = match self.authenticate(req, &pay, None) {
             Ok(a) => a,
             Err(r) => return r,
@@ -1326,6 +1507,17 @@ impl Gateway {
                     }
                 }
                 json!({"released": released, "refused": refused})
+            }
+            "identify" => {
+                // the buyer's key for this seller, and its signature over this session (docs/BUYER-ACCOUNTS.md)
+                let msg = ticket::buyer_message(&self.terms.receipt_key, &a.session);
+                let ok = buyer.len() == 66 && hex::decode(&buyer).ok().zip(hex::decode(&buyer_sig).ok())
+                    .is_some_and(|(k, s)| ecdsa::verify(&k, &msg, &s));
+                if !ok {
+                    return self.answered(&a, error(400, "bad_request", "identify: the key's signature over this session does not hold"), 0);
+                }
+                self.buyers.lock().unwrap_or_else(|p| p.into_inner()).insert(a.session.clone(), buyer.clone());
+                json!({"buyer": accounts::handle(&buyer)})
             }
             "cancel" => {
                 let candidates = self.lock().book.cancellable(&a.session, list.as_deref());
@@ -1350,8 +1542,11 @@ impl Gateway {
                     .get(&a.session)
                     .map(|f| f.iter().cloned().collect())
                     .unwrap_or_default();
+                // the answers still open, each with the seller's signed count so far (`interim`): a buyer checks them
+                // while the answer runs. Not among `responses`, which are answers that ended
+                let interim: Vec<Value> = st.interim.get(&a.session).map(|m| m.values().cloned().collect()).unwrap_or_default();
                 drop(st);
-                json!({"tickets": tickets, "height": self.known_height(), "responses": finals})
+                json!({"tickets": tickets, "height": self.known_height(), "responses": finals, "interim": interim})
             }
         };
         let mut out = out;
@@ -1372,8 +1567,20 @@ impl Gateway {
             .cfg
             .routes
             .iter()
-            .map(|r| json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name(),
-                            "lottery": self.lottery_entry(r, false).is_some()}))
+            .map(|r| {
+                let mut v = json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name(),
+                                   "lottery": self.lottery_entry(r, false).is_some()});
+                // a route that gives each buyer an account (docs/BUYER-ACCOUNTS.md): said here, for a buyer's app to tell its owner
+                if r.accounts.is_some() {
+                    v["accounts"] = true.into();
+                }
+                // a route with a `capacity`: what it carries now, and whether it takes a new buyer
+                // (this document is not signed and is read fresh, so it can say so as it changes)
+                if r.capacity.is_set() {
+                    v["capacity"] = self.load.view(r, unix_now());
+                }
+                v
+            })
             .collect();
         let settle: Vec<&str> = [
             (self.cfg.held, SETTLE_ON_USE),
@@ -1400,6 +1607,7 @@ impl Gateway {
             &json!({"height": s.height, "sessions": s.sessions, "activeSessions": s.active_sessions, "heldTickets": s.held_tickets,
                     "maxHeld": s.max_held, "prepaidTickets": s.prepaid_tickets,
                     "heldMsat": (s.held_tickets as u64).saturating_mul(self.cfg.caps.ticket_msat).to_string(), "settled": s.settled, "settleMaxUs": s.settle_max_us,
+                    "chargedMsat": s.charged_msat.to_string(),
                     "lottery": self.lottery_health(), "offer": self.offer_text()}),
         )
     }
@@ -1425,7 +1633,11 @@ impl Gateway {
         let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref());
         // the config refuses a route with neither, and every base has its client
         let up = base.and_then(|b| self.upstreams.get(b)).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
-        up.send(&req.method, &route.upstream_target(&req.target), &forwarded(route, &req.headers), body)
+        let mut headers = forwarded(route, &req.headers);
+        // the seller's own headers for this route (a guest login) win over any of the buyer's of the same name
+        headers.retain(|(k, _)| !route.upstream_headers.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)));
+        headers.extend(route.upstream_headers.iter().cloned());
+        up.send_as(&req.method, &route.upstream_target(&req.target), &headers, body, route.accept_gzip)
     }
 
     /// Read at most `cap` bytes of a body. `Err`: the service stopped in the middle.
@@ -1454,6 +1666,15 @@ impl Gateway {
             }
         };
         let headers = Self::passed_headers(&answer);
+        // a free route's long answers count against its `max_streams` and rate too
+        let slot = if answer.status < 300 && admission::is_long(&answer.headers, answer.length) {
+            match self.load.stream(route, "") {
+                Ok(slot) => Some(slot),
+                Err(b) => return Reply::Whole(busy(&b)),
+            }
+        } else {
+            None
+        };
         let (status, length, mut src) = (answer.status, answer.length, answer.body);
         Reply::Stream(Streamed {
             status,
@@ -1464,7 +1685,12 @@ impl Gateway {
                 loop {
                     match src.read(&mut buf)? {
                         0 => return Ok(()),
-                        n => out.send(&buf[..n])?,
+                        n => {
+                            out.send(&buf[..n])?;
+                            if let Some(slot) = &slot {
+                                slot.sent(n as u64);
+                            }
+                        }
                     }
                 }
             }),
@@ -1476,26 +1702,60 @@ impl Gateway {
             Ok(p) => p,
             Err(why) => return Reply::Whole(error(400, "bad_target", why)),
         };
+        // A request that carries a payment is answered with a receipt whatever happens to it: one
+        // sent without asking the price first (a buyer that knows the route's terms) may be for a
+        // path that is refused, unknown or free, and an answer to a payment nobody signed is the
+        // seller's fault to its buyer. Refused here, it is charged nothing.
+        // A payment that does not authenticate (a seq used already, a session the book does not hold) is
+        // answered with that refusal, as on a path that is sold: the buyer learns what is wrong with it.
+        let signed = |r: Response| -> Reply {
+            if let Ok(Some(pay)) = self.pay_header(&req) {
+                return Reply::Whole(match self.authenticate(&req, &pay, None) {
+                    Ok(a) => self.answered(&a, r, 0),
+                    Err(refused) => refused,
+                });
+            }
+            Reply::Whole(r)
+        };
         let Some(route) = self.cfg.route(&path) else {
-            return Reply::Whole(error(
+            return signed(error(
                 404,
                 "no_route",
                 "nothing is sold or served at this path",
             ));
         };
+        if route.path_refused(&path) {
+            // before payment and before the service: nothing is charged, and the service never sees it
+            return signed(error(403, "path_refused", "the seller does not serve this path to buyers"));
+        }
+        // a paid request for what is free here (a list of models, a free route) that names the price it
+        // took this path to have (a buyer that paid without asking): not served as paid, nothing charged,
+        // and the buyer asks again as anyone does. One that names no price is served free, as it always was
+        let free_here = Self::model_list(&req, &path, route) || route.free;
+        if free_here && req.header(xbt402::ticket::PRICE_HEADER).is_some() {
+            if let Ok(Some(pay)) = self.pay_header(&req) {
+                return Reply::Whole(match self.authenticate(&req, &pay, None) {
+                    Ok(a) => self.refused(&a, &self.req_url(&req), None, Refusal::TermsChanged),
+                    Err(refused) => refused,
+                });
+            }
+        }
         // An AI model's list of models is free to read: a buyer needs it to choose a model before
         // paying, and it costs the service nothing.
         if Self::model_list(&req, &path, route) {
             return self.free(&req, route);
         }
         if !route.methods.iter().any(|m| m == &req.method) {
-            return Reply::Whole(error(
+            return signed(error(
                 405,
                 "method_not_allowed",
                 "this route does not take that method",
             ));
         }
         if route.free {
+            if route.websocket && websocket::asks_upgrade(&req) {
+                return self.free_upgrade(&req, route);
+            }
             return self.free(&req, route);
         }
         if Self::pays_by_lottery(&req) {
@@ -1503,13 +1763,33 @@ impl Gateway {
         }
         let pay = match self.pay_header(&req) {
             Ok(Some(p)) => p,
-            Ok(None) => return Reply::Whole(self.unpaid(&self.req_url(&req), route, req.method == "HEAD")),
+            Ok(None) => {
+                // a visit asking the price: turned away here, before it buys anything, when the route
+                // serves as many buyers as it takes. A buyer's wallet names its session when it asks
+                // the price of a new address; one the book holds is a buyer, counted (or let on, if
+                // the route serves it already) like its paid requests, so that a buyer served is
+                // never turned away at a new address, and one let in has its place before it pays
+                let named = self.session_named(&req);
+                if let Err(b) = self.load.buyer(route, named.as_deref(), self.now()) {
+                    return Reply::Whole(busy(&b));
+                }
+                return Reply::Whole(self.unpaid(&self.req_url(&req), route, req.method == "HEAD"));
+            }
             Err(r) => return Reply::Whole(r),
         };
+        // a new buyer of a full route is turned away inside, before its ticket's secret is taken
         let a = match self.authenticate(&req, &pay, Some(route)) {
             Ok(a) => a,
             Err(r) => return Reply::Whole(r),
         };
+        // a price the buyer took this route to have that is not its own (a buyer that paid without asking
+        // this path's price, from terms of another route): not served, nothing charged, this route's terms stated
+        let p = &route.price;
+        if req.header(xbt402::ticket::PRICE_HEADER)
+            .is_some_and(|h| h.trim() != xbt402::ticket::price_line(p.request_msat, p.byte_msat, p.per_bytes, p.second_msat, &p.tokens))
+        {
+            return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), Refusal::TermsChanged));
+        }
         let on_pledge = route.release == Release::AfterVerify;
         if let Some(hash) = &a.ticket {
             if !on_pledge {
@@ -1573,6 +1853,16 @@ impl Gateway {
             .saturating_add(route.price.second_msat)
             .saturating_add(first_byte)
             .saturating_add(token_bound);
+        // a WebSocket holds the service for as long as it is open: its place among the route's
+        // long answers is taken before anything is charged
+        let socket_slot = if route.websocket && websocket::asks_upgrade(&req) {
+            match self.load.stream(route, &a.session) {
+                Ok(slot) => Some(slot),
+                Err(b) => return Reply::Whole(self.answered(&a, busy(&b), 0)),
+            }
+        } else {
+            None
+        };
         let charged = {
             let mut st = self.lock();
             if st.book.chargeable(&a.session, on_pledge) < needed {
@@ -1584,11 +1874,31 @@ impl Gateway {
         if let Err(why) = charged {
             return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), why));
         }
+        // a WebSocket: from here on a two-way stream, every byte paid for (gateway/websocket.rs)
+        if route.websocket && websocket::asks_upgrade(&req) {
+            return self.paid_upgrade(a, route, &req, reserve, socket_slot);
+        }
         let refund = |msat: u64| self.lock().book.refund(&a.session, msat);
+        // a route that gives accounts: the buyer's request goes as their own account
+        let account = match self.account_for(route, &a.session) {
+            Ok(acc) => acc,
+            Err(r) => {
+                refund(reserve);
+                return Reply::Whole(self.answered(&a, r, 0));
+            }
+        };
         // step 5
-        let sent = match &prepared {
-            Some(p) => self.send_upstream_body(route, &req, &p.body),
-            None => self.send_upstream(route, &req),
+        let sent = match (&account, &prepared) {
+            (Some(acc), _) => match self.send_as_account(route, &req, acc, &a.session) {
+                Ok(Ok(ans)) => Ok(ans),
+                Ok(Err((status, v))) => {
+                    refund(reserve);
+                    return Reply::Whole(self.answered(&a, json_response(status, &v), 0));
+                }
+                Err(e) => Err(e),
+            },
+            (None, Some(p)) => self.send_upstream_body(route, &req, &p.body),
+            (None, None) => self.send_upstream(route, &req),
         };
         let mut answer = match sent {
             // a service behind the gateway does not ask for payment through it
@@ -1620,6 +1930,23 @@ impl Gateway {
                 ),
             };
             return Reply::Whole(self.answered(&a, passed, 0));
+        }
+        // the buyer was shown the resource at no more than this size (a listed file): an answer that
+        // says it is larger is refused before any of its body is sent. The request's price stands, as
+        // for an answer with no body: the service did what was asked, and naming a size is no way to
+        // have that for nothing. The first second is given back
+        let shown = if route.price.tokens.active() { None } else { shown_size(&req) };
+        if let Some((_, most)) = larger_than_shown(shown, &answer) {
+            refund(first_second);
+            return Reply::Whole(self.answered(
+                &a,
+                error(
+                    412,
+                    "larger_than_shown",
+                    &format!("the answer is larger than the {most} bytes the buyer was shown; none of it was sent, and only the request's price was charged"),
+                ),
+                reserve.saturating_sub(first_second),
+            ));
         }
         if head_only || matches!(answer.status, 100..=199 | 204 | 304) {
             // no body: the request's price, and no second of a body that does not exist. The
@@ -1669,12 +1996,26 @@ impl Gateway {
                 }
             };
         }
-        // a body that is metered, long, or of unknown length: sent as it arrives
+        // a body that is metered, long, or of unknown length: sent as it arrives. A long one takes
+        // its place among the route's long answers first; with none left, it is not started, and
+        // nothing is charged for it
+        let slot = if admission::is_long(&answer.headers, answer.length) {
+            match self.load.stream(route, &a.session) {
+                Ok(slot) => Some(slot),
+                Err(b) => {
+                    refund(reserve);
+                    return Reply::Whole(self.answered(&a, busy(&b), 0));
+                }
+            }
+        } else {
+            None
+        };
         self.lock().book.response(&a.session, true, self.now());
         // counted out again when the body ends, or is never started (the buyer hung up first)
         let open = OpenResponse {
             gw: self.clone(),
             session: a.session.clone(),
+            slot,
         };
         self.flush();
         let mut headers = headers;
@@ -1693,8 +2034,8 @@ impl Gateway {
             first_second,
             started: Instant::now(),
             tokens: prepared.as_ref().map(|p| TokenCall { body_len: req.body.len() as u64, max_output: p.max_output }),
-            cap_msat: req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER))
-                .and_then(|(_, v)| v.trim().parse::<u64>().ok()),
+            cap_msat: buyers_cap(&req),
+            max_bytes: shown,
         };
         let event_stream = answer.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().starts_with("text/event-stream"));
         // a body priced by the token has no length known before it is counted
@@ -1806,7 +2147,7 @@ impl Gateway {
         m: Metered,
         mut src: Box<dyn Read + Send>,
         out: &mut dyn BodyWriter,
-        _open: OpenResponse,
+        open: OpenResponse,
     ) -> io::Result<()> {
         let mut meter = Meter::new(m.route.price);
         meter.seconds_charged(1, m.first_second);
@@ -1828,6 +2169,16 @@ impl Gateway {
                 Ok(n) => n,
                 Err(e) => break Err(e),
             };
+            // a body that passes the size the buyer was shown (one that stated no size) ends there: what fits
+            // is sent, and the answer ends cut short, never as a whole one
+            let (n, past) = match m.max_bytes {
+                Some(most) if meter.bytes() >= most => break stopped(PASSED_SHOWN),
+                Some(most) => {
+                    let left = usize::try_from(most - meter.bytes()).unwrap_or(usize::MAX);
+                    (n.min(left), n > left)
+                }
+                None => (n, false),
+            };
             let mut off = 0;
             while off < n {
                 let (take, due) = self.pay_bytes(&m, &meter, (n - off) as u64, &mut || out.gone());
@@ -1839,9 +2190,15 @@ impl Gateway {
                     self.lock().book.refund(&m.session, due);
                     break 'body Err(e);
                 }
+                if let Some(slot) = &open.slot {
+                    slot.sent(take);
+                }
                 hash.update(&buf[off..off + take_n]);
                 meter.sent(take, due);
                 off += take_n;
+            }
+            if past {
+                break stopped(PASSED_SHOWN);
             }
         };
         let charged = m.at_head.saturating_add(meter.charged());
@@ -2019,6 +2376,8 @@ impl Gateway {
 struct OpenResponse {
     gw: Arc<Gateway>,
     session: String,
+    /// The answer's place in its route's `max_streams`, when it is a long one.
+    slot: Option<admission::Slot>,
 }
 
 impl Drop for OpenResponse {
@@ -2062,7 +2421,7 @@ impl Handler for Service {
     fn handle(&self, req: Request) -> Response {
         match self.reply(req) {
             Reply::Whole(r) => r,
-            Reply::Stream(_) => error(
+            Reply::Stream(_) | Reply::Upgrade(_) => error(
                 500,
                 "internal",
                 "a streamed answer where a whole one was asked",
@@ -2075,10 +2434,10 @@ impl Handler for Service {
         let path = req.path().to_string();
         if let Some(call) = self.session_path(&path) {
             // behind a named proxy on this machine every socket is loopback: the address it reports decides
-            let loopback = gw.client_ip(&req).is_some_and(|a| a.is_loopback());
+            let loopback = gw.client_ip(&req).is_some_and(|a| a.is_loopback()) || gw.health_token_ok(&req);
             return Reply::Whole(match (req.method.as_str(), call) {
                 ("POST", "lock") => gw.lock_tickets(&req),
-                ("POST", "release" | "cancel" | "status") => gw.session_call(&req, call),
+                ("POST", "release" | "cancel" | "status" | "identify") => gw.session_call(&req, call),
                 // the operator's view, for the machine the gateway runs on only
                 ("GET", "health") if loopback => gw.health(),
                 _ => error(404, "no_route", "no such session endpoint"),
@@ -2086,12 +2445,24 @@ impl Handler for Service {
         }
         if let Some(call) = self.lottery_path(&path) {
             return Reply::Whole(match (req.method.as_str(), call) {
-                ("POST", "open" | "draw" | "status" | "close") => gw.lottery_call(&req, call),
+                ("POST", "open" | "draw" | "status" | "close" | "cancel") => gw.lottery_call(&req, call),
                 _ => error(404, "no_route", "no such session endpoint"),
             });
         }
         if path == SERVICES_PATH && req.method == "GET" {
             return Reply::Whole(gw.services());
+        }
+        if path == LINK_STATUS_PATH && req.method == "GET" {
+            return Reply::Whole(match gw.link_status.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                Some(body) => json_response(200, &body),
+                None => error(404, "no_route", "this seller has no link"),
+            });
+        }
+        if path == xbt402::transport::PATH && req.method == "GET" {
+            return Reply::Whole(match gw.transport() {
+                Some(body) => json_response(200, &body),
+                None => error(404, "no_route", "this seller is not reached by key"),
+            });
         }
         if path == LISTING_PATH && req.method == "GET" {
             return Reply::Whole(match gw.listing_doc() {
@@ -2106,6 +2477,7 @@ impl Handler for Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use xbt402::lottery::DrawError;
     use xbt402::ticket::PROTOCOL_CODES;
 
@@ -2157,12 +2529,12 @@ mod tests {
         // a compile error here until it is listed
         let tickets = [Refusal::SessionUnknown, Refusal::BadAuth, Refusal::BadSeq(0), Refusal::TicketUnknown, Refusal::TicketNotLocked, Refusal::TicketUsed,
                        Refusal::TicketExpiring, Refusal::BalanceShort, Refusal::TooManyTickets, Refusal::TooManySessions, Refusal::SlotsShort(1),
-                       Refusal::HeightUnknown, Refusal::PledgeOutstanding, Refusal::PrepaidFirst];
+                       Refusal::HeightUnknown, Refusal::PledgeOutstanding, Refusal::PrepaidFirst, Refusal::TermsChanged];
         for r in tickets {
             match r {
                 Refusal::SessionUnknown | Refusal::BadAuth | Refusal::BadSeq(_) | Refusal::TicketUnknown | Refusal::TicketNotLocked | Refusal::TicketUsed
                 | Refusal::TicketExpiring | Refusal::BalanceShort | Refusal::TooManyTickets | Refusal::TooManySessions | Refusal::SlotsShort(_)
-                | Refusal::HeightUnknown | Refusal::PledgeOutstanding | Refusal::PrepaidFirst => codes.push(r.code().into()),
+                | Refusal::HeightUnknown | Refusal::PledgeOutstanding | Refusal::PrepaidFirst | Refusal::TermsChanged => codes.push(r.code().into()),
             }
         }
         // every refusal of the lottery's book, and every refusal of a value the seller's draw can give
@@ -2186,5 +2558,80 @@ mod tests {
             assert!(PROTOCOL_CODES.contains(&c.as_str()), "{c} is answered by the gateway and unknown to the wallet");
             assert_eq!(xbt402::ticket::protocol_code(Some(&json!(c))), c);
         }
+    }
+
+    /// A body that goes past the size the buyer was shown ends cut short, even where the size falls
+    /// inside its last read and nothing comes after: never `Ok`, which would sign fewer bytes as a whole
+    /// answer. One of exactly that size, or less, ends `Ok`.
+    #[test]
+    fn a_body_past_the_size_shown_ends_cut_short_even_inside_its_last_read() {
+        struct Out(Vec<u8>);
+        impl BodyWriter for Out {
+            fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+                self.0.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = json!({"listen": "127.0.0.1:0", "public_url": "http://gateway.test:8402", "upstream": "http://127.0.0.1:1", "state_dir": dir.path(),
+                         "chain": "regtest", "network": "bip122:00000000000000000000000000000001",
+                         "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
+                         "tickets": {"max_tickets": 8},
+                         "caps": {"sessions_per_address": 0, "inbound_slots": 483, "held_after_paid": false, "unpaid_per_address": 0},
+                         "times": {"refill_wait_ms": 300, "upstream_wait_secs": 2, "tick_ms": 50},
+                         "routes": [{"path": "/f/", "price": {"request_msat": 1000}}]});
+        let gw = Gateway::start(Config::from_json(&cfg).unwrap(), Arc::new(crate::standin::StandIn::new(100)), SecretKey::from_slice(&[9u8; 32]).unwrap(), Box::new(|| 1_000_000)).unwrap();
+        let session = gw.lock().book.open_session("v4:127.0.0.1", &[7u8; 48], 1_000_000).ok().unwrap().session;
+        let pump = |len: usize, most: u64| {
+            let m = Metered { session: session.clone(), seq: 1, digest: String::new(), status: 200, route: gw.cfg.routes[0].clone(), at_head: 0, first_second: 0,
+                              started: Instant::now(), tokens: None, cap_msat: None, max_bytes: Some(most) };
+            let open = OpenResponse { gw: gw.clone(), session: session.clone(), slot: None };
+            let mut out = Out(vec![]);
+            // all of it in one read, then the end
+            let r = gw.pump(m, Box::new(io::Cursor::new(vec![7u8; len])), &mut out, open);
+            (r.map_err(|e| e.to_string()), out.0.len())
+        };
+        const _: () = assert!(10_000 < CHUNK, "the body comes in one read");
+        assert_eq!(pump(10_000, 6_000), (Err(PASSED_SHOWN.to_string()), 6_000));
+        assert_eq!(pump(6_000, 6_000), (Ok(()), 6_000), "exactly the size");
+        assert_eq!(pump(5_000, 6_000), (Ok(()), 5_000), "less");
+    }
+
+    /// The size the buyer was shown, against what an answer states: a whole one's length, a
+    /// part's total in its `Content-Range` (not the part's own length), and nothing where the
+    /// request names no size, sends work (not a GET or HEAD), or the answer states none. Several
+    /// sizes named: the smallest.
+    #[test]
+    fn an_answer_is_larger_than_shown_by_its_whole_size() {
+        let req = |method: &str, most: &[&str]| Request {
+            method: method.into(),
+            headers: most.iter().map(|m| (xbt402::ticket::MAX_SIZE_HEADER.to_ascii_lowercase(), m.to_string())).collect(),
+            ..Request::default()
+        };
+        let answer = |status: u16, length: Option<u64>, range: Option<&str>| Answer {
+            status,
+            headers: range.map(|r| ("Content-Range".to_string(), r.to_string())).into_iter().collect(),
+            length,
+            body: Box::new(std::io::empty()),
+        };
+        let shown = shown_size(&req("GET", &["3145728"]));
+        assert_eq!(shown, Some(3_145_728));
+        assert_eq!(larger_than_shown(shown, &answer(200, Some(4_194_304), None)), Some((4_194_304, 3_145_728)));
+        assert_eq!(larger_than_shown(shown, &answer(200, Some(3_145_728), None)), None, "the size shown, exactly");
+        // a part of 1 MiB of a 4 MiB file: larger than shown by the file, though the part is small
+        assert_eq!(larger_than_shown(shown, &answer(206, Some(1_048_576), Some("bytes 0-1048575/4194304"))), Some((4_194_304, 3_145_728)));
+        assert_eq!(larger_than_shown(shown, &answer(206, Some(1_048_576), Some("bytes 0-1048575/3145728"))), None);
+        // any other 2xx by its length; not a 2xx, or an answer of unknown length: not refused here (the
+        // latter is cut as it is sent)
+        assert_eq!(larger_than_shown(shown, &answer(203, Some(4_194_304), None)), Some((4_194_304, 3_145_728)));
+        assert_eq!(larger_than_shown(shown, &answer(304, Some(4_194_304), None)), None);
+        assert_eq!(larger_than_shown(shown, &answer(200, None, None)), None);
+        // no size named, a size that is not a number, or a request that sends work: none
+        assert_eq!(shown_size(&req("GET", &[])), None);
+        assert_eq!(shown_size(&req("GET", &["lots"])), None);
+        assert_eq!(shown_size(&req("POST", &["1"])), None);
+        assert_eq!(shown_size(&req("head", &["1"])), Some(1));
+        // several: the smallest holds
+        assert_eq!(shown_size(&req("GET", &["9000000", "3145728", "x"])), Some(3_145_728));
     }
 }

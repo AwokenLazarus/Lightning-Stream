@@ -25,7 +25,24 @@ pub const SESSION_PATH: &str = "/x402/ticket";
 /// bytes a buyer never reads (in a proxy's or tunnel's buffers) cannot cost more than the buyer's
 /// own limit for the call. A seller that ignores it charges as before.
 pub const MAX_MSAT_HEADER: &str = "X-Xbt402-Max-Msat";
+/// A request's optional header: the most bytes, in all, the buyer was shown the resource has (a
+/// listed file's size). A seller that reads it refuses an answer that states more (the
+/// `Content-Length` of a whole one, the total in a part's `Content-Range`) before any of its body
+/// is sent, and charges nothing for it, so a file that grew after it was listed costs the buyer
+/// nothing. A seller that ignores it sends as before; the buyer reads none of such a body.
+pub const MAX_SIZE_HEADER: &str = "X-Xbt402-Max-Size";
+/// A paid request's optional header: the price the buyer takes this request's route to have, as
+/// [`price_line`] writes it. A seller that states `termsChecked` in its terms refuses a request whose
+/// line is not its route's (`terms_changed`), unpaid, so a buyer may pay a read on a route whose terms
+/// it already knows without asking its price first. A seller that ignores it charges as before.
+pub const PRICE_HEADER: &str = "X-Xbt402-Price";
 pub const RECEIPT_TAG: &str = "xbt402/ticket-receipt/v0";
+
+/// One route's price as one line, the same on both sides ([`PRICE_HEADER`]): msat per request, per
+/// `per_bytes` bytes and per second, and per 1,000 tokens in and out, with the most tokens out.
+pub fn price_line(request_msat: u64, byte_msat: u64, per_bytes: u64, second_msat: u64, tokens: &crate::tokens::TokenRule) -> String {
+    format!("{request_msat} {byte_msat}/{per_bytes} {second_msat}/s {}/{}/{}", tokens.input_per_1k_msat, tokens.output_per_1k_msat, tokens.max_output)
+}
 /// How many blocks before a held invoice's HTLC expires the seller's node cancels it, unless its
 /// runner set otherwise: lnd's `invoices.holdexpirydelta`, which is 18 on the Lightning Fork node
 /// this was built against (upstream lnd's default is 12). A runner's node may differ; the gateway
@@ -42,6 +59,11 @@ pub const SETTLE_MARGIN_BLOCKS: u32 = HOLD_EXPIRY_DELTA + SETTLE_CHAIN_BLOCKS;
 pub const MIN_TICKET_BLOCKS: u32 = 24;
 /// How long an unpaid ticket invoice may wait to be paid, in seconds.
 pub const INVOICE_EXPIRY_S: u32 = 60;
+/// The longest a wallet's node is given for an ordinary payment of a call (a prepaid ticket, a
+/// win), in seconds, whatever its owner's `ln.timeout_s`: as long as the invoice it pays lives.
+/// The wallet waits 5 s more for the node's final word, and a caller of the wallet that waits for
+/// a call's first answer waits longer than both.
+pub const ORDINARY_PAY_S: u32 = INVOICE_EXPIRY_S;
 /// What a seller's config (`mainnet_ack`) and a buyer's policy (`tickets.mainnet_ack`) must say,
 /// word for word, before tickets or draws move funds on mainnet.
 pub const MAINNET_ACK: &str = "real funds, software tested on mainnet with small amounts only";
@@ -119,6 +141,15 @@ pub fn request_auth(key: &[u8; 32], session: &str, seq: u64, secret: &str, ticke
     hex::encode(m.finalize().into_bytes())
 }
 
+/// The label of a buyer's key and of its proof (docs/BUYER-ACCOUNTS.md).
+pub const BUYER_TAG: &str = "xbt402 buyer v1";
+
+/// What a buyer signs to tie its key to one session of one seller (`identify`): the label, the
+/// seller's receipt key and the session id, so that a proof is good for that session alone.
+pub fn buyer_message(receipt_key: &str, session: &str) -> [u8; 32] {
+    Sha256::digest(format!("{BUYER_TAG}\n{}\n{session}", receipt_key.to_ascii_lowercase()).as_bytes()).into()
+}
+
 /// The fields a ticket receipt signs, in order.
 pub const RECEIPT_FIELDS: [&str; 9] = ["scheme", "session", "seq", "releasedMsat", "spentMsat", "charged", "req", "status", "bodyHash"];
 
@@ -130,6 +161,26 @@ pub fn receipt_message(r: &Value) -> [u8; 32] {
         put_field(&mut h, py_str(r.get(k)).as_bytes());
     }
     h.finalize().into()
+}
+
+/// The `bodyHash` of an **interim receipt**: a seller's signed count of an answer that is still
+/// open (a WebSocket, a VPN tunnel), `interim:<part>:<bytesUp>:<bytesDown>`. It is signed like any
+/// receipt's `bodyHash`, and never looks like a finished body's hash (64 hex) or a head's (empty),
+/// so it cannot be taken for either. `part` counts from 1 for each answer; `bytesUp` and
+/// `bytesDown` are the bytes the seller passed each way so far, and `charged` (the receipt's own
+/// field) what they cost with the request's price.
+pub fn interim_body_hash(part: u64, bytes_up: u64, bytes_down: u64) -> String {
+    format!("{INTERIM_PREFIX}{part}:{bytes_up}:{bytes_down}")
+}
+
+const INTERIM_PREFIX: &str = "interim:";
+
+/// `(part, bytesUp, bytesDown)` of an interim receipt's `bodyHash`; `None` for any other.
+pub fn parse_interim(body_hash: &str) -> Option<(u64, u64, u64)> {
+    let mut it = body_hash.strip_prefix(INTERIM_PREFIX)?.split(':');
+    let num = |s: Option<&str>| s.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse().ok());
+    let (part, up, down) = (num(it.next())?, num(it.next())?, num(it.next())?);
+    (it.next().is_none() && part > 0).then_some((part, up, down))
 }
 
 /// The hash a secret names: the ticket's payment hash.
@@ -164,6 +215,14 @@ pub struct Terms {
     pub receipt_key: String,
     /// Path of the session endpoints.
     pub session: String,
+    /// How many seqs from a session's next one the seller takes a request with (`seqWindow`),
+    /// each once: a buyer may send that many side by side. 1 (not stated): the next one only, so
+    /// a buyer sends one request at a time.
+    pub seq_window: u64,
+    /// How long the seller keeps an answer paused for a release before it ends it (`refillWaitMs`): a
+    /// buyer's pause for its next ticket ends before then, since a release that arrives later pays for
+    /// nothing. `None` (not stated, as before 0.2.0): the buyer pauses by its own limit only.
+    pub refill_wait_ms: Option<u64>,
 }
 
 impl Terms {
@@ -186,6 +245,12 @@ impl Terms {
         extra.insert("settle".into(), settle.into());
         extra.insert("receiptKey".into(), self.receipt_key.clone().into());
         extra.insert("session".into(), self.session.clone().into());
+        if self.seq_window > 1 {
+            extra.insert("seqWindow".into(), self.seq_window.into());
+        }
+        if let Some(w) = self.refill_wait_ms {
+            extra.insert("refillWaitMs".into(), w.into());
+        }
         extra.insert("price".into(), price.clone());
         let mut m = Map::new();
         m.insert("scheme".into(), SCHEME.into());
@@ -201,10 +266,10 @@ impl Terms {
 /// The error codes of the ticket scheme and of the lottery beside it ([`crate::lottery`]): what a
 /// gateway answers a payer with. Every code the gateway in this tree can answer with is here (a
 /// test there holds it to that), so that a payer can name each.
-pub const PROTOCOL_CODES: [&str; 35] = [
-    "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "chain_spent",
-    "draw_out_of_order", "draw_used", "hash_refused", "internal", "journal", "method_not_allowed", "no_route", "node_unavailable", "piece_unknown",
-    "pledge_outstanding", "prepaid_first", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
+pub const PROTOCOL_CODES: [&str; 41] = [
+    "accounts_unavailable", "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "busy", "chain_spent",
+    "draw_out_of_order", "draw_used", "hash_refused", "identify_first", "internal", "journal", "larger_than_shown", "method_not_allowed", "no_route", "node_unavailable", "path_refused",
+    "piece_unknown", "pledge_outstanding", "prepaid_first", "session_unknown", "slots_short", "terms_changed", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
     "too_many_sessions", "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused",
     "win_size", "win_unpaid",
 ];
@@ -295,7 +360,7 @@ mod tests {
     #[test]
     fn the_accepts_entry_is_the_one_the_draft_shows() {
         let t = Terms { network: "bip122:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, min_ticket_msat: None, max_tickets: 2, ticket_blocks: 40,
-                        receipt_key: "03".repeat(33), session: SESSION_PATH.into() };
+                        receipt_key: "03".repeat(33), session: SESSION_PATH.into(), seq_window: 64, refill_wait_ms: Some(15_000) };
         let a = t.accepts(2500, "with-request", SETTLE_ON_USE, &json!({"requestMsat": "2500"}));
         assert_eq!(a["scheme"], "ticket");
         assert_eq!(a["amount"], "2500");
@@ -306,6 +371,13 @@ mod tests {
         assert_eq!(a["extra"]["maxTickets"], 2);
         let b = t.accepts(2500, "with-request", SETTLE_ON_ARRIVAL, &json!({"requestMsat": "2500"}));
         assert_eq!(b["extra"]["settle"], "on-arrival");
+        // the seq window is stated where the seller takes more than the next seq
+        assert_eq!(a["extra"]["seqWindow"], 64);
+        // so is how long it keeps a paused answer open, where it says
+        assert_eq!(a["extra"]["refillWaitMs"], 15_000);
+        let one = Terms { seq_window: 1, refill_wait_ms: None, ..t };
+        let quiet = one.accepts(2500, "with-request", SETTLE_ON_USE, &json!({"requestMsat": "2500"}));
+        assert!(quiet["extra"].get("seqWindow").is_none() && quiet["extra"].get("refillWaitMs").is_none(), "{quiet}");
     }
 
     #[test]
@@ -325,5 +397,13 @@ mod tests {
         assert_eq!((held_budget(DEFAULT_CHANNEL_SLOTS), held_budget(MAX_CHANNEL_SLOTS), held_budget(1), held_budget(0)), (15, 241, 0, 0));
         assert_eq!(held_budget(u32::MAX), 241, "no channel has more than the protocol's ceiling");
         assert_eq!(MIN_HELD_TICKET_MSAT, 546_000);
+    }
+
+    #[test]
+    fn an_interim_receipts_body_hash_reads_back_and_nothing_else_does() {
+        assert_eq!(parse_interim(&interim_body_hash(3, 1024, 9_000_000)), Some((3, 1024, 9_000_000)));
+        for bad in ["", &"ab".repeat(32), "interim:0:1:1", "interim:1:2", "interim:1:2:3:4", "interim:1:-2:3", "interim:x:1:1", "Interim:1:1:1"] {
+            assert_eq!(parse_interim(bad), None, "{bad}");
+        }
     }
 }

@@ -312,8 +312,8 @@ involved no node.
   together, in the order they were found, except that a win its seller's answer stands still
   for goes first. On one 30-slot channel that paid the wins of 100
   sellers of one buyer at 14 wins a second, with no payment failed; a buyer whose wins come
-  faster than that keeps its sellers waiting: a seller serves on for its grace of 30 s, and an
-  answer it is sending stands still for a payment for 10 s at the most before it is cut. Before the wallet kept a win inside that limit until it had settled, 24 payments were
+  faster than that keeps its sellers waiting: a seller serves on for its grace of 60 s, and an
+  answer it is sending stands still for a payment for 15 s before it is cut (`refill_wait`, the larger of it and `pay_wait_secs`, 10 s). Before the wallet kept a win inside that limit until it had settled, 24 payments were
   pending on the channel at once and 47 of 313 failed: found on the lab, and what the limit is
   for.
 - What those two waits bound, reasoned from the lab's rate and not run beyond 100 sellers. A
@@ -322,8 +322,8 @@ involved no node.
   past that the seller serves that buyer nothing more until the win is paid. A win an answer
   stands still for (the third unpaid win of a session, or one that 64 pieces were served after)
   goes before those, so its wait is the next of the 8 places to come free, its own payment
-  (0.44 s at the median on the lab), and the other wins of that kind ahead of it: some 140 of
-  them at once would take the 10 s. Before the wallet did this, such a win took its turn with
+  (0.44 s at the median on the lab), and the other wins of that kind ahead of it: some 210 of
+  them at once would take the 15 s. Before the wallet did this, such a win took its turn with
   the rest, and on a busy host the turn passed 10 s: with 16 busy loops beside the lab a file
   was cut short in 12 of 15 runs of the 100-seller check, each time with every win paid
   afterwards, and in none of 5 with the wins in this order (`docs/TICKETS.md`, section 9.12).
@@ -343,10 +343,22 @@ involved no node.
   refused the session.
 - A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
   invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
-  the first has lapsed: a win's invoice lives as long as the grace (30 s), so the next one comes
+  the first has lapsed: a win's invoice lives as long as the grace (60 s), so the next one comes
   with the first request the gateway refuses `win_unpaid`, and the session goes on once it is
-  paid. A slow payment pays less time: an invoice of 30 s that is not paid within it (a win that
-  waited its turn behind many others, section above) fails, and waits for the next one.
+  paid. A slow payment pays less time: an invoice that is not paid within it (a win that waited
+  its turn behind many others, section above, or a payment over a slow route) fails, and waits
+  for the next one. Until 0.2.0 the grace, and so a win's invoice, was 30 s: a buyer whose
+  payment took longer than that to reach the seller (a hop held one 8 to 22 s on a loaded lab
+  node) had every win refused, and was served nothing more. A seller that shortens the grace
+  shortens its invoices with it. From 0.2.0 a wallet says at the open that it asks for a failed
+  win's invoice to be cancelled, and a gateway from 0.2.0 gives it invoices of 180 s
+  (`lottery.invoice_secs_cancel`), the grace being unchanged: a wallet before 0.2.0, or a
+  gateway before it, keeps invoices as long as the grace. After a gateway restarts, a session's
+  invoices are the grace's again (what the buyer said is not journalled).
+- A win is judged against the wallet's send margin when its invoice comes and again just before
+  it is sent, after the waits for a route and for the spend lock: one whose invoice would end on
+  its way is held back unsent and paid on the next invoice. On a loaded lab, before the second
+  look, one win went with 1.1 s left and failed at the seller's node.
 - A wallet that starts again pays no win it found before the start: it cannot tell a start from
   a restore of older records, in which that win may be paid already; the seller has lost the
   wins that were unpaid at that moment (at most the 2 it bears). A gateway that starts again
@@ -544,8 +556,14 @@ wallet) and against a stand-in node in its tests.
   with nothing locked at that moment waits for a place. Since 2026-10-17, with the default caps,
   such locks are for prepaid tickets: an unauthenticated lock for held ones is refused
   `prepaid_first`, so the 15 held places go only to sessions that have paid one ticket each; the
-  invoices of a first lock lapse after 20 s (`caps.first_lock_secs`, and the session's place 15 s
-  after that); and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`).
+  invoices of a first lock lapse after 60 s (`caps.first_lock_secs`), and the gateway gives one up
+  unpaid 15 s after that, at 75 s, with its session's place, whatever `caps.first_use_secs` says;
+  and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`). Until
+  0.2.0 a first lock's invoices lapsed after 20 s: a buyer whose payment took longer than that to
+  reach the seller over a slow route was refused at the seller's node every time, with nothing
+  paid, and could never open a session (measured on the lab route at 8 to 22 s a hop under load).
+  The steady number of places a stranger holds is set by the caps by address, not by how soon each
+  lapses: from A addresses, at most 2A places, 75 s each, asked for again as each is given back.
   Before, 2,000 lock requests from one client took every held place in half a second (measured).
   An unpaid invoice still counts against the cap on held tickets from when it is issued: not
   counting it until paid would let the node hold more than the cap, and with paid-first it is not
@@ -557,8 +575,10 @@ wallet) and against a stand-in node in its tests.
   ticket has neither; the node is asked about it when its preimage is presented and at the sweep.
 - A buyer's balance, the part of its released tickets it has not used, is trusted to the seller:
   it is kept for 24 hours after the session's last paid request and then forgotten.
-- The gateway takes 64 connections in all and 48 from one address, one request per connection,
-  and an answer that is being sent holds its connection: 64 answers at once. A client that takes
+- The gateway takes 512 connections in all and 48 from one address, one request per connection,
+  and an answer that is being sent holds its connection: 512 answers at once. The reverse proxies
+  named in `http.forwarded_address` are held to the total only, since every buyer comes over their
+  address; the Sell page turns the cap per address off behind a proxy it was not told about. A client that takes
   no byte for 30 seconds is cut, and no answer stays open for more than 6 hours.
 - A body priced per byte is charged when the gateway hands the bytes to the operating system,
   not when the buyer has them: a buyer that disappears in the middle paid for what was in the
@@ -732,7 +752,7 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   next ticket is sent after every release, so a node that dies right after a paid request is
   more likely to be caught in that instant than it was with a pool of 8.
 - Such a ticket never arrives at the seller, and it is the oldest of its session. The first
-  release that waits for it (`tickets.ready_wait_ms`, 3 s) finds it on none of the node's
+  release that waits for it (`tickets.ready_wait_ms`, 12 s) finds it on none of the node's
   channels and ends the session (`ticket_session_ended`); the next call opens another. The
   ticket stays locked in the book. A new session's pool is sized inside what the owner's cap on
   tickets locked with one seller (2 as shipped) has left, so after one such ticket the wallet
@@ -898,14 +918,25 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   (`scripts/ticket_e2e_regtest.sh`, `slots`), where a held ticket that is already locked costs
   one request. An answer priced as it goes is slower by that much per
   ticket, and a seller that waits less than that for a refill would cut it.
-- A prepaid payment whose fate the wallet's node cannot tell within the Lightning rail's
-  `timeout_s` and 5 seconds stays booked as spent, and the session is stopped as faulty. The
-  booking goes when the node shows the payment failed, or, for a payment the node never had,
-  60 seconds after the timeout.
-- The wallet keeps a prepaid ticket's preimage in memory until the seller has credited it. A
-  signer killed in between has paid for a ticket whose balance it then gives up with the
-  session, as it gives up any balance at a restart. The gateway credits the session all the
-  same, 75 seconds after it issued the invoice.
+- A prepaid payment (or a win) of a call is given the node for the Lightning rail's
+  `timeout_s`, but never more than 60 s, the life of the invoice it pays. One whose fate the
+  node cannot tell within that and 5 seconds stays booked as spent, and the session is stopped,
+  not as the seller's fault, and the owner's record says so (`ticket_prepay_pending`): once the
+  node shows it paid (a preimage slow on its way back, say) and the seller has credited it, the
+  next call to that seller takes up its credit. Until then, for the invoice's life and 25 s, a
+  call to that seller is refused `ticket_prepaid_pending` with `retry_after_s`, having spent
+  nothing, so that no second ticket leaves the first's credit behind. Past that wait a payment
+  still in flight holds nobody back: a seller that has not credited it is named in the owner's
+  record (`ticket_prepay_overdue`), since a hop on the route, or the seller, holds it. The booking goes when the node shows the
+  payment failed, or, for a payment the node never had, 60 seconds after the timeout. Until
+  0.2.0 the wait was the whole `timeout_s` (up to 600 s), and such a session was stopped as the
+  seller's fault, which left its credit with the seller.
+- A signer killed between a prepaid ticket's payment and the seller's credit has lost nothing: the
+  book marks the ticket as it settles, the watcher shows the seller its preimage from the node's
+  record, and the next call to that seller takes the credit over. Until a shown ticket is
+  credited, for two minutes at the most, that call is refused with `retry_after_s`
+  (`ticket_seller_unanswered`), so that no second ticket is bought beside it. The gateway also
+  credits the session by itself, 75 seconds after it issued the invoice.
 - The slot and dust checks, the wait after a failed lock and the fallback run on the wallet's
   own node and on what the seller says. A seller that always answers `slots_short` is paid with
   prepaid tickets or not at all; it cannot make the wallet hold more, pay more, or pay sooner.
@@ -913,17 +944,108 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   refused or failed. The answer is not read; a seller that does not cancel them holds its own
   places until the invoices lapse.
 - No ticket is released until the seller's signed `status` shows it locked. A seller that never
-  shows it is not paid (`ticket_not_ready` after 3 s), and its tickets stay locked until it
-  cancels them or they expire. The session goes on trying that ticket, its oldest, for as long
-  as the wallet's own node carries it on a channel.
+  shows it is not paid (`ticket_not_ready` after 12 s), and its tickets stay locked until it
+  cancels them or they expire. After three of those running with no byte delivered between them
+  the session ends (`ticket_seller_stalled`), and the next call opens another.
+- A release pauses for 12 s at most, all told, whatever it waits for (`tickets.ready_wait_ms`):
+  under the 15 s a seller as shipped keeps a paused answer open, so that no secret leaves for an
+  answer already over; just before the book the seller's signed `status` is asked whether it is.
+  A seller that says in its terms how long it keeps a paused answer (`refillWaitMs`, from 0.2.0) has
+  the pause end a margin before then, a tenth of it but at least 1 s and at most 3 s (a seller that
+  waits 2 s: a pause of 1 s; one that waits 1 s or less: no pause), if that comes sooner. One that
+  closes a paused answer sooner and does not say so is caught there, not before. For an answer
+  by the byte the 12 s run from its last byte, for a request from when its turn comes, and for an
+  answer by the second from each release, since each second's ticket can wait in its turn.
+- **An answer priced by the second is charged for the pauses.** It is the clock's price: the
+  seconds run while a ticket is late, whether anything arrives or not, and every ticket due meanwhile
+  can be late too. Measured at 400 sat a second: an answer of 3,600 sat came to 4,800 sat with the
+  seller's word held back to 11 s, and to 7,600 sat with its ticket 11 s past due. The wallet does not
+  try to tell this from an answer that is merely slow.
+- **A whole call has one deadline** (`tickets.max_answer_s`, 50 s), and answers plainly within about
+  55 s, before its caller's 60 s. A question to a node or a seller that hangs goes on behind on a
+  thread of its own and the call answers without it, and no secret leaves after the deadline, so a
+  caller that asks again does not pay twice. Three paths can still run past it: a prepaid ticket's
+  payment, which waits as long as `ln.timeout_s` (60 s); the checks of the wallet's nodes that begin
+  a call, each up to its client's 30 s, before there is a session to pay; and the watcher's reconcile
+  on a Lightning node that hangs, which asks after each ticket holding the book and the spend lock.
+- A ticket stuck in `sending` (the node calls it in flight and shows it on no way) for more than
+  `ln.timeout_s` and 30 s, 90 s as shipped, is taken for stranded: the session ends (`ticket_session_ended`). Until then each call
+  waits up to 12 s for it.
+- A ticket held on a channel that is down, or just back and not yet listing its HTLCs again (a
+  link that drops), may still come: it is taken for stranded only once seen on no channel with
+  every channel up for 20 s. A pause for such a ticket is not counted against the seller
+  (`ticket_seller_stalled`), and a refill refused for want of an active channel is asked again
+  inside the pause. A link down for longer than the pause ends the answer with the link's reason.
 - One paid request per seller at a time: a long answer delays every other call to that seller,
   and one session per seller node, so two origins of one node cannot be paid at once.
 - The ticket rail needs https, or http to the wallet's own machine. The wallet does not pin a
   seller's certificate: it trusts the system's roots, as its HTTP client does.
-- An answer priced as it goes is cut by the wallet after 50 s (`tickets.max_answer_s`), because
-  whoever calls the signer's socket waits 60 s by default. An owner who streams longer raises
-  both; if the caller's wait ends first, the caller sees an error while the signer goes on paying
-  for the answer until `max_sats` or `max_answer_s`.
+- An answer priced as it goes that the call reads whole for its caller is cut by the wallet after
+  50 s (`tickets.max_answer_s`), because whoever calls the signer's socket waits 60 s for it by
+  default. So is one at a flat price that the call reads whole, and it still pays its head's price
+  for what arrived. So is one priced by the second, streamed or not: its clock bills whether bytes come or
+  not. Any other answer the wallet streams on to its caller as it arrives (the connector's downloads
+  and films, a visit's pages, the AI address's streams) stays open while it delivers, within the
+  call's limits and `tickets.max_stream_s` (6 hours). A seller that stops sending is ended after
+  `tickets.read_timeout_s` (30 s) without a byte. After its first 10 minutes
+  (`tickets.stream_floor_after_s`) a stream must also bring 16 KiB in each 30 s the wallet waits on
+  its seller, which is far below any film; time the wallet holds it up itself (its reader stalled,
+  a ticket being paid) does not count, and an AI model reasoning behind keep-alives is not cut for
+  those minutes. That floor, 546 bytes a second, does cut a slow CPU model after 10 minutes, and the
+  answer is reported as cut: at 3 or 4 tokens a second where a token's event takes about 150 bytes,
+  and at more or fewer as its seller's format takes fewer or more. An owner who runs such models raises
+  `tickets.stream_floor_after_s`. An answer the wallet ends early, for any reason, reaches the client cut short
+  (short of its `Content-Length`, or a chunked body with no last chunk), never as a whole one.
+- The wallet's wait for a route to the seller (up to 8 s, after a link along the way was replaced) gives the
+  node's route query (QueryRoutes, by its `POST` form) the invoice's route hints, so a seller reached through
+  a private channel is found and waited for like any other. It does not cover blinded paths, which that query
+  is not given: an invoice with them is sent at once, with no route query, and a moment with no route to that
+  seller fails the payment as it did before 0.2.0 (the win is owed again, or the ticket call ends with the
+  node's reason). A gateway marks its invoices private, so most carry hints.
+- A client that takes nothing for 60 to 90 s, such as a player paused with its buffer full, loses its
+  connection, and the wallet stops paying for that answer. (Each write has 30 s, `stream_write`; a
+  stalled socket may still take a little at the first ones, so it is the second or third that fails:
+  measured on Linux loopback, 61 s through the app, and 9 s for a bare socket with a 3 s limit.) What was on its way when it stopped is paid for. A
+  player that can seek resumes by asking again from where it was (`Range`), naming the copy it has
+  (`If-Range`, the `etag` of the answer it goes on from; the app and the wallet's player pass both on).
+  A whole body sent for a range from the first byte is a whole answer: it is read whole, up to the call's
+  `max_sats`, not cut at the range's last byte, so a caller asking `bytes=0-1023` with a large `max_sats` can be
+  charged for the whole body. A seller whose server ignores ranges, or whose file
+  has changed since, answers with the whole body: the wallet reads none of it (`ticket_range_ignored`), and the
+  call costs what the seller's socket took before it was closed. The wallet ends the connection the moment it sees
+  the range was ignored, before reading any of the body; what it still costs is bounded by the operating system's
+  socket buffers on both ends and what was on its way, which the wallet does not set (a smaller receive buffer would
+  also narrow every real download's window). Measured on Linux loopback: up to 822 KiB, 160 sat at the lab route's
+  200 sat a MiB. Before 0.2.0 that whole body was read and paid for, the start of the file bought again.
+- A session of draws takes one answer at a time, and one streamed on may run for hours. Another call
+  to that seller is told `ticket_busy` once that answer has been open 30 s, at once from then on, and
+  otherwise after 50 s at most. A stop ends the open answer at once and gives no new value; wins
+  already drawn are still paid. The stop itself took 60 s against a seller quiet on every session call, and that
+  seller was then not told (`seller_told: false`): it waits for a call already with the seller, then
+  for its own, each up to `tickets.read_timeout_s`. That is as long as a caller of the signer's
+  socket waits by default, so such a caller can give up just as the stop returns.
+- A stream priced by the second on draws, with a client that takes nothing, is not held to the call's
+  charge cap or `tickets.max_answer_s` while the wallet sits in its write to that client: both are
+  checked as it reads. Values stop once the buffers between seller and client fill. Measured with a
+  limit of 3 s, a cap of 20 sat and 4 sat a second: open past 40 s, its price 24 sat, 6 draws. What
+  the wallet pays is its wins, and the luck cap still limits those. The client's connection is given
+  up on after 60 to 90 s. To be fixed.
+- An answer with no length stated (chunked) gets its last chunk only once the wallet says it came
+  whole, which takes the seller's last receipt: up to about 10 s after its last byte, or up to 60 s
+  on draws, where the seller's reveals and the invoices of the wins owed come first.
+  A WebSocket has its own limit, `tickets.max_socket_s` (6 hours, as the gateway's): a web app keeps
+  one open while its page is.
+- A free answer has no cap, floor or stop of its own: a seller can hold one open for as long as
+  its caller waits. Only the caller's time and a thread are at stake, nothing paid or locked. To be fixed.
+- The wallet's disk sets how fast it pays wins. Measured with only the wallet's fsyncs slowed: a
+  win is about 11.5 fsyncs, all under the wallet's spend lock, one win at a time, whatever the
+  gate lets through: 0.60 s of that lock a win at 50 ms an fsync, 1.15 s at 100 ms, so at most about
+  1.7 and 0.87 wins a second. A file of 16 MiB on a route where 1 piece in 4 wins, streamed on to its
+  caller, came in whole in 64 to 73 s at 100 ms and 117 to 148 s at 200 ms. Read whole by the call, it
+  is held to the 50 s above: whole at 50 ms an fsync (39 s), stopped in 5 of 7 runs at 100 ms and 4 of 4
+  at 200 ms. The call says why it stopped, and what it paid is what its node paid. A longer limit
+  would not help, since its caller waits 60 s. Writing a win's rows under fewer fsyncs would, and is
+  not done yet.
 - An answer priced by the second is paid up to a fifth of a second early, and the wallet counts
   its seconds from before it sent the request, so it can pay for one second the seller did not
   charge.
@@ -1152,6 +1274,51 @@ untrusted field.
 - A work payer whose session file holds two sessions for one seller under different spellings of
   its address does not start until its owner removes one; neither is dropped.
 - The pay-with-work rail binds a payment to no host; run it over TLS.
+
+### Hashrate rentals
+
+How each side is protected, and the tests: `docs/P2P-HASH.md`, "How each side is protected".
+
+- A hashtaker can have paid for and not yet received up to a minute of the miner's hashing, or one share, one
+  slice and one ticket (546 sat at least), whichever is more, plus the start fee shown on the offer: the slices
+  paid ahead and the credit left with the seller together. That is what it loses to a hashmaker that takes a payment and
+  vanishes. Its app stops paying a seller after two first steps that delivered little.
+- A hashmaker forwards no share past what's paid. A renter that stops paying gets nothing more, and the miners go
+  home 2 s after the first share that doesn't fit. A renter that walks away still cost the miners their move:
+  that is what the start fee is for, and its right size is not yet measured on real firmware.
+- The renter's protection against a hashmaker dropping winning shares depends on its upstream: a gateway that
+  blinds every job, checked job by job. A miner pointed straight at a pool can't be checked, and is refused.
+- Blinding doesn't stop delay. The checks for it (shares late on a superseded job, shares too old, too few
+  accepted) catch a hashmaker that does it much; a little delay can go unseen.
+- A pool-held key may last across templates. If a pool re-used a key a win had revealed, this check wouldn't see it.
+- These figures assume firmware that hashes what Stratum gives it and honours `mining.set_difficulty`. No real
+  firmware has been run against the check yet.
+- Writes to a miner and to the hashtaker's gateway have no time limit (from reading the code, not measured).
+- After a dropped link, the hashmaker can lose at most the work it forwarded in the 2 s before it last heard from the
+  renter, and never more than in the 4 s before the drop, that the renter's gateway never took (shares sent again
+  the renter couldn't send on or count), at most 8 times an hour; past that the rental ends. After each resume both sides say their count, and the hashmaker's comes
+  down to the renter's by no more than that.
+- A share sent again after a drop whose verdict takes more than 10 s to come from the renter's gateway is counted by
+  neither side: the renter stops waiting for it, and the hashmaker's count comes down to the renter's.
+- A link that stalls without either side noticing for more than 4 s can still end the rental as unpaid: shares
+  forwarded before the last 4 s are not taken as lost when the count comes down, so the hashmaker stays ahead and
+  holds a share the renter thinks is paid.
+- A rental's last ticket can pass its budget by less than a slice, which stays with the seller as credit for about
+  20 hours: a ticket is never smaller than a slice, since the wallet refuses a charge cap under the price.
+- A new price waits until the hashmaker's running rentals end: its gateway restarts to take a new route price, and a
+  restart would fail a running rental's payment. While any rental runs, no new rental starts at the new price.
+  With none running, no new rental starts until the gateway charges the new price (about the time it takes to
+  restart). A market price moving with the chain is put in force at most once every ten minutes; a price the owner
+  saves is taken at once.
+- A renter that keeps reading its link, slowly, can hold up the hashmaker's sends to it for up to 5 s each: the
+  write limit ends only a write that makes no progress (from reading the code, not measured).
+- Each side keeps the hashes of the shares a rental counted to refuse repeats, up to about 4 million, about 100 MB
+  at the most for a long rental at a high share rate (from the code's limits, not measured).
+- The rental terms of the starter rules' hashrate task (outside the wallet's limits for one payment, a day, a week
+  and one seller, up to the task's 200,000 sat) are paid only on the signer's socket for the renter
+  (`run/rental/`), which file permissions keep from every other service. That holds as far as the box's users and
+  groups hold: a process running as the renter's user, or as root, can use them. A setup without `xbt-init`'s
+  layout (a bare `B2_RENTAL_SOCK`) is only as closed as the dir its operator gives it.
 
 ### Signature hash and replay
 

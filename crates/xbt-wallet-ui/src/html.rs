@@ -100,8 +100,8 @@ pub struct Tab {
     pub label: &'static str,
 }
 
-/// A top-level entry of the menu, with its pages as tabs. A page whose title no tab names (the
-/// player, a service's own page) still marks its section through `also`.
+/// A top-level entry of the menu, with its pages as tabs. A page whose title no tab names (a
+/// service's own page) still marks its section through `also`.
 pub struct Section {
     pub label: &'static str,
     pub tabs: &'static [Tab],
@@ -117,10 +117,14 @@ impl Section {
 pub const SERVICES: Section = Section {
     label: "Services",
     tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
-            Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
-    also: &["Service", "Player"],
+            Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    also: &["Service"],
 };
-pub const SELL: Section = Section { label: "Sell", tabs: &[Tab { href: "./sell", title: "Sell", label: "Sell" }], also: &[] };
+pub const SELL: Section = Section {
+    label: "Sell",
+    tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-vpn", title: "VPN exit", label: "VPN exit" }],
+    also: &[],
+};
 pub const WALLET: Section = Section {
     label: "Wallet",
     tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Balance and activity" }, Tab { href: "./approvals", title: "Approvals", label: "Approvals" }],
@@ -135,7 +139,8 @@ pub const SETTINGS: Section = Section {
     label: "Settings",
     tabs: &[Tab { href: "./setup", title: "Setup", label: "Setup" }, Tab { href: "./lightning", title: "Your node", label: "Your node" },
             Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" },
-            Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
+            Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./relays", title: "Stream relays", label: "Stream relays" },
+            Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
     also: &[],
 };
 /// With hashrate (the box runs the hasher's or the renter's service): renting miners is one
@@ -143,12 +148,13 @@ pub const SETTINGS: Section = Section {
 pub const SERVICES_HASH: Section = Section {
     label: "Services",
     tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
-            Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
-    also: &["Service", "Player"],
+            Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" }, Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    also: &["Service"],
 };
 pub const SELL_HASH: Section = Section {
     label: "Sell",
-    tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-hashrate", title: "Sell hashrate", label: "Hashrate" }],
+    tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-hashrate", title: "Sell hashrate", label: "Hashrate" },
+            Tab { href: "./sell-vpn", title: "VPN exit", label: "VPN exit" }],
     also: &[],
 };
 /// The app with Sell (`XBT_UI_SELL=1`): buying and selling.

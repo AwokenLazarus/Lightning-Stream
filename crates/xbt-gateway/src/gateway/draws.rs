@@ -219,7 +219,9 @@ impl Gateway {
     /// session costs nothing to open, and would read the service's headers for nothing.
     pub(super) fn lottery_entry(&self, route: &Route, head: bool) -> Option<Value> {
         let cfg = self.cfg.lottery.as_ref()?;
-        if !cfg.offers(&route.price) || (head && route.price.request_msat == 0) {
+        // a route that gives each buyer an account is paid with tickets only: the draws path serves no buyer as
+        // its account (docs/BUYER-ACCOUNTS.md), and a draw there would be served as nobody
+        if route.accounts.is_some() || !cfg.offers(&route.price) || (head && route.price.request_msat == 0) {
             return None;
         }
         let release = match route.release {
@@ -428,7 +430,7 @@ impl Gateway {
         let (unpaid, win_msat, win_blocks, invoice_secs) = {
             let b = l.lock();
             match b.session(session) {
-                Some(s) if !s.unpaid.is_empty() => (s.unpaid.clone(), s.win_msat, b.cfg().win_blocks, b.cfg().invoice_secs),
+                Some(s) if !s.unpaid.is_empty() => (s.unpaid.clone(), s.win_msat, b.cfg().win_blocks, b.invoice_secs_of(session)),
                 _ => return,
             }
         };
@@ -590,6 +592,15 @@ impl Gateway {
                 Err(why) => return json_response(402, &json!({"error": why.code()})),
             }
         }
+        if call == "cancel" {
+            out["cancelled"] = match self.lottery_cancel(l, &a.session, &body) {
+                Ok(done) => done.into(),
+                Err(why) => {
+                    out["refused"] = why.code().into();
+                    false.into()
+                }
+            };
+        }
         // the wins of this request get their invoices here, and a win paid meanwhile leaves the list
         self.lottery_refresh(l, &a.session);
         let view = self.draw_view(l, &a.session);
@@ -605,6 +616,25 @@ impl Gateway {
             l.lock().close(&a.session, now);
         }
         answer
+    }
+
+    /// The buyer's payment of a win failed, and it asks for that win's invoice to be cancelled, so that the
+    /// next one need not wait for the first to lapse. Only an invoice of this session's unpaid win, and only
+    /// one the seller's own node shows open: the buyer's word moves nothing. Should its payment be
+    /// on its way after all, either the node settled it first and the win is paid by the look that
+    /// follows, or it cancelled first and refuses the payment, which comes back to the buyer. It gives the
+    /// buyer no draw and no money, and costs the node a cancel and an invoice, [`LotteryConfig::max_win_cancels`] times.
+    fn lottery_cancel(&self, l: &Lottery, session: &str, body: &Map<String, Value>) -> Result<bool, Refused> {
+        let draw = body.get("draw").and_then(Value::as_u64);
+        let hash = body.get("hash").and_then(Value::as_str).and_then(xbt402::ticket::hex32);
+        let (Some(draw), Some(hash)) = (draw, hash) else { return Ok(false) };
+        if !l.lock().may_cancel(session, draw, &hash)? {
+            return Ok(false);
+        }
+        match self.node.lookup(&hash) {
+            Ok(Some(inv)) if inv.state == InvoiceState::Open => Ok(self.node.cancel(&hash).is_ok()),
+            _ => Ok(false),
+        }
     }
 
     fn lottery_open(&self, l: &Lottery, req: &Request) -> Response {
@@ -642,6 +672,10 @@ impl Gateway {
         let opened = {
             let mut b = l.lock();
             b.open(&entropy, seed, chain, &addr, win_msat, self.now()).map(|id| {
+                // a buyer that says it asks for a failed win's invoice to be cancelled gets invoices that outlive the grace
+                if body.get("canCancel") == Some(&Value::Bool(true)) {
+                    b.can_cancel(&id);
+                }
                 let anchor = b.anchor(&id).unwrap_or([0; 32]);
                 (id, anchor)
             })
@@ -714,7 +748,8 @@ impl Gateway {
         self.lottery_refresh(l, &a.session);
         let (blocked, win_msat, dearest, offered) = {
             let b = l.lock();
-            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price), b.cfg().offers(&route.price))
+            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price),
+             route.accounts.is_none() && b.cfg().offers(&route.price))
         };
         if let Some(why) = blocked {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), why.code()));
@@ -743,6 +778,18 @@ impl Gateway {
                 Err(_) => error(502, "upstream_unavailable", "the service stopped in the middle of its answer; no piece was served"),
             };
             return Reply::Whole(self.draw_answered(&a, passed, 0));
+        }
+        // the buyer was shown the resource at no more than this size (a listed file): as on the
+        // ticket rail, an answer that says it is larger is refused before any piece of it is sent,
+        // and no draw is owed for it. Only on a route with no price per request: the request's own
+        // piece is a draw the wallet would owe a value for, and the size is no way to have the
+        // service's work for nothing
+        if let Some((_, most)) = larger_than_shown(if route.price.tokens.active() || route.price.request_msat > 0 { None } else { shown_size(&req) }, &answer) {
+            return Reply::Whole(self.draw_answered(
+                &a,
+                error(412, "larger_than_shown", &format!("the answer is larger than the {most} bytes the buyer was shown; no piece of it was sent")),
+                0,
+            ));
         }
         let m = Pieces {
             session: a.session.clone(),

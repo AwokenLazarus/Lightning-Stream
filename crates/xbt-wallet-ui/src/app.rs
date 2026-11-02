@@ -14,12 +14,11 @@ use crate::config::{Config, Role};
 use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, Section, GATEWAY_BRAND, GATEWAY_SECTIONS, STREAM_BRAND, STREAM_SECTIONS,
                   STREAM_SECTIONS_HASH, WALLET_BRAND, WALLET_SECTIONS, WALLET_SECTIONS_HASH};
 use crate::link::SignerLink;
-use crate::relay::RelayLinks;
 use crate::server::{strip_base, Req, Resp};
 use crate::{msg, now};
 
 #[path = "stream_pages.rs"]
-mod stream_pages;
+pub(crate) mod stream_pages;
 #[path = "nwc_pages.rs"]
 mod nwc_pages;
 #[path = "sell.rs"]
@@ -28,10 +27,14 @@ pub(crate) mod sell;
 pub mod services_page;
 #[path = "nostr_pages.rs"]
 mod nostr_pages;
+#[path = "relay_pages.rs"]
+mod relay_pages;
 #[path = "hashrate.rs"]
-pub(crate) mod hashrate;
+pub mod hashrate;
 #[path = "inference_page.rs"]
 pub(crate) mod inference_page;
+#[path = "vpn_page.rs"]
+pub(crate) mod vpn_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -41,14 +44,20 @@ pub struct App {
     pub cfg: Config,
     pub auth: Auth,
     pub signer: SignerLink,
-    /// The links external players play one item through ([`crate::relay`]).
-    pub relays: RelayLinks,
+    /// The links buyers' own players open one file through ([`crate::relay`]).
+    pub relays: crate::relay::RelayLinks,
+    /// Where the shared folder of a Files service is served, once it is ([`crate::files`]).
+    pub files_addr: std::sync::Mutex<Option<std::net::SocketAddr>>,
+    /// Why the shared folder is not served (its address taken by another program, say), for the Sell page.
+    pub files_error: std::sync::Mutex<Option<String>>,
     /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
     pub nostr: crate::nostr::NostrCache,
+    /// Stream relays: the owner's choices, those announced on Nostr, and their probes ([`crate::relaynet`]).
+    pub relay_net: crate::relaynet::RelayNet,
     /// The platform's login proxy, when it does the login ([`crate::auth::PlatformLogin`]).
     pub platform: Option<crate::auth::PlatformLogin>,
-    /// Why the last play of an item failed, by item URL, for the player page to say (a few minutes).
-    pub play_errors: std::sync::Mutex<HashMap<String, (std::time::Instant, u16, Value)>>,
+    /// Sellers' own pages on the app ports ([`crate::seller_app`]).
+    pub apps: crate::seller_app::AppOrigins,
 }
 
 /// What a human who signs on another device needs.
@@ -82,11 +91,12 @@ pub(crate) struct Ctx {
     pub(crate) flash: Option<(bool, String)>,
 }
 
-const INT_KEYS: [(&str, &str, &str); 12] = [
+const INT_KEYS: [(&str, &str, &str); 13] = [
     ("max_per_tx_sats", "Largest single payment (sats)", "budgets"),
     ("daily_budget_sats", "Spending limit for any 24 hours (sats)", "budgets"),
     ("weekly_budget_sats", "Spending limit for any 7 days (sats)", "budgets"),
     ("per_counterparty_cap_sats", "Most to any one seller in 7 days (sats)", "budgets"),
+    ("per_counterparty_daily_sats", "Most to any one seller in 24 hours (sats)", "budgets"),
     ("human_threshold_sats", "Ask me first for a payment of at least (sats)", "human"),
     ("approval_ttl_s", "A request for your approval expires after (seconds)", "human"),
     ("split_window_s", "Smaller payments to one seller within this many seconds count as one (so a large payment can't be split to avoid asking you)", "human"),
@@ -101,13 +111,17 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
 /// coins older than this exists on both chains, and the rail refuses it.
 pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
 
-/// The stream token of a login session whose CSRF token is `csrf`: the player's video URL carries
+/// The stream token of a login session whose CSRF token is `csrf`: a download's URL carries
 /// it (`./s/~<token>/<seller URL>`), and the relay plays nothing without it. Derived, so the URL
 /// (which may be logged) never carries the CSRF token itself.
 pub fn stream_token(csrf: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(&Sha256::digest(format!("xbt-wallet-ui/stream|{csrf}").as_bytes())[..16])
 }
+
+/// What the starter rules let rented hashrate cost on mainnet in any 24 hours: about 70 minutes of a
+/// 4 TH/s miner at market. The owner's limit: a rental's own budget is inside it.
+pub const STARTER_RENTAL_BUDGET_SATS: i64 = 200_000;
 
 /// The least `ln.exposure_cap_sats` the starter rules set on mainnet.
 pub const STARTER_EXPOSURE_CAP_SATS: i64 = 100_000;
@@ -123,7 +137,7 @@ pub fn starter_exposure_cap(held: i64) -> i64 {
 
 /// The money limits the plain form never pre-fills above their mainnet starter value from the
 /// signer's built-in defaults (which are for test chains). For these, a larger number trusts more.
-const MAINNET_CAPPED_KEYS: [&str; 7] = ["max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+const MAINNET_CAPPED_KEYS: [&str; 8] = ["max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats", "per_counterparty_daily_sats",
                                          "human_threshold_sats", "hot_balance_cap_sats", "velocity_max"];
 
 /// Whether paying over Lightning is turned on in `p`.
@@ -144,18 +158,20 @@ pub fn starter_policy(chain: &str) -> Value {
 /// in its channels now ([`starter_exposure_cap`]); `None`: the least cap.
 pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
     let mut p = json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
-           "per_counterparty_cap_sats": 100000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
+           "per_counterparty_cap_sats": 100000, "per_counterparty_daily_sats": 20000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
            "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300,
            "ln": {"enabled": true}, "tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 100000}, "hashrate": {"budget_sats": 100000}}}});
     if chain == "main" {
-        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000),
+        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000), ("per_counterparty_daily_sats", 5000),
                        ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
             p[k] = json!(v);
         }
         p["ln"]["split_height"] = json!(MAINNET_SPLIT_HEIGHT);
         p["ln"]["exposure_cap_sats"] = json!(starter_exposure_cap(held.unwrap_or(0)));
         p["tickets"]["tasks"]["default"]["budget_sats"] = json!(10000);
-        p["tickets"]["tasks"]["hashrate"]["budget_sats"] = json!(5000);
+        // market price for a 4 TH/s miner is about 165,000 sat an hour, which no limit above would let through: the
+        // task pays by its own (`tickets.tasks.*.rental`), and the rest of the wallet stands
+        p["tickets"]["tasks"]["hashrate"] = json!({"budget_sats": STARTER_RENTAL_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}});
     }
     p
 }
@@ -199,13 +215,23 @@ impl App {
     pub fn new(cfg: Config) -> Result<Arc<Self>, String> {
         let auth = Auth::open(&cfg.data_dir, cfg.password.as_deref(), cfg.setup_open, cfg.session_idle, cfg.session_max)?;
         let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90));
-        let relays = RelayLinks::new(cfg.relay_ttl);
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
+        let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
-        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr, platform, play_errors: std::sync::Mutex::new(HashMap::new()) }))
+        let relays = crate::relay::RelayLinks::new(cfg.relay_ttl);
+        // a tunnel secret an older build wrote owner-only is given to the VPN service's group, so an
+        // exit offered before this upgrade isn't left refusing every buyer
+        match vpn_page::migrate_tunnel_secret(&cfg.vpn.dir) {
+            Ok(true) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret is now readable by the VPN service"),
+            Ok(false) => {}
+            Err(e) => eprintln!("xbt-wallet-ui: the VPN exit's tunnel secret was left as it was: {e}"),
+        }
+        Ok(Arc::new(Self { cfg, auth, signer, relays, files_addr: std::sync::Mutex::new(None),
+                         files_error: std::sync::Mutex::new(None), nostr, relay_net, platform,
+                         apps: Default::default() }))
     }
 
-    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+    pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         self.signer.call(method, params)
     }
 
@@ -223,9 +249,9 @@ impl App {
         self.cfg.allow_ips.is_empty() || self.cfg.allow_ips.iter().any(|p| peer == p || (p.ends_with('.') || p.ends_with(':')) && peer.starts_with(p.as_str()))
     }
 
-    /// For `GET /s/<seller URL>` (the player's video), the same checks as a page of the wallet; for
-    /// `GET /r/<token>` (an external player's link), the same checks less the login, and a live
-    /// token for an item still in the services file. `Some(Ok(url))`: relay the seller URL `url`
+    /// For `GET /s/<file URL>` (a download from the page), the same checks as a page of the wallet;
+    /// for `GET /r/<token>` (a link for the buyer's own player), the same checks less the login, and
+    /// a live token for a file still in the services file. `Some(Ok(url))`: relay the seller URL `url`
     /// (for `/s/`, `None`: the caller takes it from the request target); `Some(Err)`: the answer
     /// that refuses it; `None` for anything else.
     pub fn relay_gate(&self, req: &Req) -> Option<Result<Option<String>, Resp>> {
@@ -256,70 +282,47 @@ impl App {
             return Some(Err(Resp::text(401, "text/plain", "login required")));
         };
         // the session's stream token: only a page of the wallet's own knows it (another page of the box sends
-        // the cookie with a <video> it makes, but cannot read the token), so only the wallet's player pays
+        // the cookie with what it asks for, but cannot read the token), so only the wallet's own page pays
         let token = path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).map(|(t, _)| t).unwrap_or("");
+        // `<token>.<service id>`: the service is only which price applies, never what the token proves
+        let token = token.split_once('.').map_or(token, |(t, _)| t);
         if !crate::ct_eq(token.as_bytes(), stream_token(&csrf).as_bytes()) {
             return Some(Err(Resp::text(403, "text/plain", "refused: a stream this page did not ask for")));
         }
         Some(Ok(None))
     }
 
-    /// For `GET /preview?item=<URL>`: the owner's free preview of an item of their own shop, past
-    /// the same checks as every page (login included: there is no link for it). `Some(Ok(url))`:
-    /// stream `url`, the service on this box; `None` for any other request.
-    pub fn preview_gate(&self, req: &Req) -> Option<Result<String, Resp>> {
+    /// The listing's prices of the service the buyer chose for the relayed `item`, as the call's
+    /// `price_ceiling`: from a player's link, the service it was made for; from a Download
+    /// (`/s/~<token>.<service id>/`), the service it names. `None`: that service lists no price.
+    pub fn relay_ceiling(&self, req: &Req, item: &str) -> Option<Value> {
         let path = strip_base(&req.path, &self.cfg.base_path)?;
-        if req.method != "GET" || path != "/preview" || self.cfg.role == Role::Gateway {
-            return None;
-        }
-        if !self.peer_allowed(&req.peer) {
-            return Some(Err(Resp::text(403, "text/plain", "forbidden")));
-        }
-        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
-            return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
-        }
-        let sid = req.cookie(COOKIE).unwrap_or_default();
-        if self.auth.with_session(&sid, |_| ()).is_none() {
-            return Some(Err(Resp::text(401, "text/plain", "login required")));
-        }
-        let item = req.query.get("item").map(String::as_str).unwrap_or("");
-        Some(self.preview_upstream(item).map_err(|e| Resp::json(404, &json!({"error": e}))))
+        let service = match path.strip_prefix("/r/") {
+            Some(token) => self.relays.service_of(token)?,
+            None => path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).and_then(|(t, _)| t.split_once('.')).map(|(_, s)| s.to_string())?,
+        };
+        let all = self.services().ok()?;
+        crate::services::find_item_of(&all, &service, item).and_then(|(s, _)| s.price_ceiling())
     }
 
-    /// What stops any payment before a play is tried, in plain words with the next step: no
-    /// approval key enrolled, so no spending rules can be signed and nothing can be paid.
-    pub fn play_blocker(&self) -> Option<(String, String, String)> {
-        let ks = self.call("keystore_status", json!({})).ok()?;
-        txt(ks.get("human_pubkey")).is_empty()
-            .then(|| ("Your wallet isn't set up yet, so it can't pay for this.".into(), "Finish setup".into(), "./setup".into()))
-    }
-
-    /// A Lightning node that is not ready to pay: said above the player (the play is still tried;
-    /// if it fails, the player says why).
-    pub fn play_warning(&self) -> Option<String> {
-        let ln = self.call("ln_status", json!({})).ok()?;
-        (ln["ready"] != true).then(|| {
-            let why = txt(ln.get("reason").or(ln.get("config_error")));
-            if why.is_empty() { "Your wallet may not be able to pay yet: your Lightning node isn't ready.".into() }
-            else { format!("Your wallet may not be able to pay yet. {}", crate::setup::plain_reason(&why)) }
-        })
-    }
-
-    /// Keep why a play of `item` failed, for [`Self::play_error`].
-    pub fn note_play_error(&self, item: &str, status: u16, body: &[u8]) {
-        let v: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&body[..body.len().min(300)]).to_string()}));
-        let mut g = self.play_errors.lock().unwrap_or_else(|p| p.into_inner());
-        g.retain(|_, (t, _, _)| t.elapsed() < std::time::Duration::from_secs(600));
-        if g.len() < 256 {
-            g.insert(item.to_string(), (std::time::Instant::now(), status, v));
-        }
-    }
-
-    /// Why the last play of `item` failed, in plain words, with the next step: (headline, link text, link).
-    pub fn play_error(&self, item: &str) -> Option<(String, String, String)> {
-        let g = self.play_errors.lock().unwrap_or_else(|p| p.into_inner());
-        let (t, status, v) = g.get(item)?;
-        (t.elapsed() < std::time::Duration::from_secs(600)).then(|| play_error_words(*status, v))
+    /// What one relayed part of a listed file may cost, from its listing: the most bytes its listed
+    /// size can stand for ([`crate::files::size_most`]) and, for a part of `range_len` bytes, the most
+    /// sats at the listed prices with 2% slack. `None`: no listed size or price to hold the seller to.
+    pub fn relay_limit(&self, req: &Req, item: &str, range_len: Option<u64>) -> Option<(u64, i64)> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        let service = match path.strip_prefix("/r/") {
+            Some(token) => self.relays.service_of(token)?,
+            None => path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).and_then(|(t, _)| t.split_once('.')).map(|(_, s)| s.to_string())?,
+        };
+        let all = self.services().ok()?;
+        let (svc, it) = crate::services::find_item_of(&all, &service, item)?;
+        let size = crate::files::size_most(&it.credit)?;
+        let c = svc.price_ceiling()?;
+        let n = |k: &str| c.get(k).and_then(Value::as_u64).unwrap_or(0) as u128;
+        let bytes = range_len.map_or(size, |r| r.min(size)) as u128;
+        let msat = n("request_msat") + (n("gib_msat") * bytes).div_ceil(1 << 30);
+        let sats = (msat * 102 / 100).div_ceil(1000) + 1;
+        Some((size, i64::try_from(sats).unwrap_or(i64::MAX)))
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {
@@ -418,14 +421,18 @@ impl App {
             "/" => self.home(&ctx),
             "/wallet" => self.overview(&ctx),
             "/browse" => self.browse(&ctx, &req.query),
-            "/service" => self.service_page(&ctx, &req.query),
+            "/service" => self.service_page(&ctx, &req),
             "/services" => self.services_page(&ctx),
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
             "/ai" => self.ai_page(&ctx),
+            "/vpn" => self.vpn_page(&ctx),
+            "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
-            "/play" => self.play(&ctx, &req),
+            "/relays" => self.relays_page(&ctx, &req.query),
+            "/app" => self.app_page(&ctx, &req.query),
+            "/api/visit" => self.api_visit(&req.query),
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
@@ -441,13 +448,6 @@ impl App {
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
-            "/api/play-error" => {
-                let item = req.query.get("item").map(String::as_str).unwrap_or("");
-                match self.play_error(item) {
-                    Some((words, link, href)) => Resp::json(200, &json!({"failed": true, "words": words, "link": link, "href": href})),
-                    None => Resp::json(200, &json!({"failed": false})),
-                }
-            }
             _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Home</a></p>")),
         }
     }
@@ -522,7 +522,7 @@ impl App {
             "<label>Setup code<input name=\"code\" autocomplete=\"off\" required></label>\
              <p class=\"hint\">A one-time code that proves this app is yours. It is in the app's log, on the line that says \
              <em>setup code</em>. On Umbrel: right-click the Lightning Stream icon and choose <em>Troubleshoot</em>. \
-             On StartOS: open Lightning Stream and choose <em>Logs</em>.</p>\
+             On StartOS: open Lightning Stream, choose <em>Actions</em>, then <em>Web UI setup code</em>.</p>\
              <details><summary>Running it another way?</summary><p>The code is also in the file <code>setup-code</code> in the app's data folder.</p></details>"
         } else {
             ""
@@ -588,14 +588,21 @@ impl App {
             Resp::redirect(to)
         };
         match req.path.as_str() {
-            "/play" => self.play_stop(ctx, f),
+            "/app" => self.app_open(ctx, f),
+            "/app-stop" => self.app_stop(ctx, f),
+            "/identity" => self.identity(ctx, f),
             "/services" => self.services_post(ctx, f),
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),
             "/hashrate" => self.hashrate_post(ctx, f),
             "/ai" => self.ai_post(ctx, f),
-            "/play-link" => self.play_link(ctx, f),
+            "/file-link" => self.file_link(ctx, f),
+            "/vpn" => self.vpn_post(ctx, f),
+            "/sell-vpn" if self.cfg.sell => self.sell_vpn_post(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
+            "/relays-prefs" => self.relays_prefs(ctx, f),
+            "/relays-publish" => self.relays_publish(ctx, f),
+            "/relay-run" => self.relay_run(ctx, f),
             "/connections" => self.connections_stop(ctx, f),
             "/apps-create" => self.apps_create(ctx, f),
             "/apps-revoke" => self.apps_revoke(ctx, f),
@@ -618,6 +625,8 @@ impl App {
             "/deny" => back("./approvals", self.call("deny_approval", json!({"token": g("token"), "reason": g("reason"), "expiry": i("expiry"), "signature": sig()})),
                             &|_| "Denied.".into()),
             "/policy" => self.policy_preview(ctx, f),
+            "/seller-unblock" => back("./policy", self.call("seller_unblock", json!({"block": g("block"), "expiry": i("expiry"), "signature": sig()})),
+                                      &|_| "Unblocked. The app may buy from this shop again.".into()),
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
             "/policy-apply" => back(if self.ack_needed() { "./lightning#ack" } else { "./policy" }, self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
                                                                               "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
@@ -692,7 +701,7 @@ impl App {
             o.dedup();
             o.len()
         };
-        let mut cats: Vec<String> = services.iter().map(|s| esc(s.kind.category_words())).collect();
+        let mut cats: Vec<String> = services.iter().map(|s| esc(s.category_words())).collect();
         cats.sort();
         cats.dedup();
         b.push_str("<section class=\"grid home\">");
@@ -1011,6 +1020,39 @@ impl App {
         self.page("Spending rules", ctx, b)
     }
 
+    /// Shops the wallet caught charging more than they delivered: blocked until the owner lifts it
+    /// with the approval key. Each shows the three it is blocked by and the evidence.
+    fn blocked_sellers(&self, ctx: &Ctx) -> String {
+        let list = self.call("seller_blocks", json!({})).ok().and_then(|v| v["blocked"].as_array().cloned()).unwrap_or_default();
+        if list.is_empty() {
+            return String::new();
+        }
+        let human = self.human_pub();
+        let mut b = String::from("<section id=\"blocked\"><h2>Shops blocked for overcharging</h2><p>The app caught these shops charging more than \
+            they delivered. It stopped paying them at once and buys nothing more from them, and pays them no lottery win, until you unblock \
+            them with your approval key. A shop is blocked by its Lightning node, its receipt key and its address: changing one of them \
+            does not lift the block.</p>");
+        for e in &list {
+            let id = txt(e.get("id"));
+            let receipt = e["evidence"]["receipt"].clone();
+            let rows = [("Address", esc(&txt(e.get("origin")))), ("Lightning node", format!("<code>{}</code>", esc(&txt(e.get("payee"))))),
+                        ("Receipt key", format!("<code>{}</code>", esc(&txt(e.get("receipt_key"))))), ("What it did", esc(&txt(e.get("reason")))),
+                        ("When", utc(int(e.get("ts"))))];
+            b.push_str("<div class=\"card\">");
+            b.push_str(&kv(&rows));
+            if !receipt.is_null() {
+                b.push_str(&format!("<details><summary>The receipt it signed (evidence)</summary><pre>{}</pre></details>",
+                                    esc(&serde_json::to_string_pretty(&receipt).unwrap_or_default())));
+            }
+            let sexp = now() + SIGN_WINDOW_S;
+            b.push_str(&self.signed_form(ctx, "./seller-unblock", "unblock", &human, &[("block", id.clone()), ("expiry", sexp.to_string())], "",
+                                         "Unblock", Ext::Bytes(msg::unblock(&id, sexp))));
+            b.push_str("</div>");
+        }
+        b.push_str("</section>");
+        b
+    }
+
     fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
@@ -1018,6 +1060,7 @@ impl App {
         };
         let mut b = String::from("<p class=\"lead\">The rules the wallet applies to every payment an app or an agent asks for. A change takes \
             effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
+        b.push_str(&self.blocked_sellers(ctx));
         let pr = cur["pending_restart"].as_array().cloned().unwrap_or_default();
         if !pr.is_empty() {
             let hint = self.cfg.restart_hint.clone();
@@ -1075,7 +1118,7 @@ impl App {
                 p["counterparties"][origin.as_str()] = json!({"ln_node": node});
                 let cap = p.get("per_counterparty_cap_sats").or(cur["effective"].get("per_counterparty_cap_sats")).and_then(Value::as_i64).unwrap_or(0);
                 b.push_str(&format!("<div class=\"flash ok\"><p><strong>Allow {} to be paid.</strong> Sign below with your approval key. \
-                    The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&origin), money(cap)));
+                    The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&xbt402::shop::display(&origin)), money(cap)));
             }
         }
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
@@ -1577,34 +1620,6 @@ impl App {
     }
 }
 
-/// A failed play in plain words and the next step: (what happened, link text, link). From the
-/// connector's answer: the wallet's refusal (`402`, with its `rule` and reason) or an error.
-pub fn play_error_words(status: u16, v: &Value) -> (String, String, String) {
-    let rule = v["rule"].as_str().unwrap_or("").to_ascii_lowercase();
-    let why = v["error"].as_str().unwrap_or("").to_ascii_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| rule.contains(w) || why.contains(w));
-    let (h, l, href) = if why.starts_with("the connector") {
-        ("The app's player part isn't answering. Restart the app from your box's dashboard.", "See live connections", "./connections")
-    } else if has(&["human_key", "enrol", "no policy", "policy is not"]) {
-        ("Your wallet isn't set up yet.", "Finish setup", "./setup")
-    } else if has(&["allowlist", "not named", "unlisted", "listed", "not allowed"]) {
-        ("Payment refused by your spending rules: this seller is not allowed yet.", "Allow this seller", "./services")
-    } else if has(&["budget", "cap", "velocity", "max_sats", "limit", "threshold"]) {
-        ("Payment refused: your spending limit is reached.", "See your spending rules", "./policy")
-    } else if has(&["balance", "liquidity", "insufficient", "no route", "no_route", "unable to find a path", "outbound"]) {
-        ("Not enough balance to pay: your node has no way to send this much.", "See your wallet", "./wallet")
-    } else if has(&["ln_unavailable", "ln_disabled", "ln_config", "ln_halted", "no_rail", "mainnet", "macaroon", "not ready"]) {
-        ("Your wallet can't pay yet: your Lightning node isn't ready.", "Check your node", "./lightning")
-    } else if status == 504 || has(&["sent nothing", "did not answer", "could not reach", "timed out", "unreachable", "connection refused"]) {
-        ("The seller didn't answer. Try again in a moment.", "See your sellers", "./services")
-    } else if status == 401 {
-        ("You were logged out. Log in and press play again.", "Log in", "./login")
-    } else {
-        return (format!("This didn't play: {}.", v["error"].as_str().unwrap_or("the payment did not go through").trim_end_matches('.')),
-                "See live connections".into(), "./connections".into());
-    };
-    (h.into(), l.into(), href.into())
-}
 
 /// `?k=v&...` for a redirect back to the same page (empty when there is no query).
 fn query_string(q: &HashMap<String, String>) -> String {
@@ -1769,6 +1784,11 @@ fn mode_bits(_: &std::fs::Metadata) -> u32 {
 
 /// A plain-HTTP GET with a short timeout (the status page is on the box's own network).
 pub fn http_get(url: &str) -> Result<(u16, String), String> {
+    http_get_with(url, &[])
+}
+
+/// [`http_get`] with extra request headers (the gateway's health token).
+pub fn http_get_with(url: &str, headers: &[(&str, &str)]) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
     let rest = url.strip_prefix("http://").ok_or("only http:// URLs are probed")?;
     let (hostport, path) = match rest.find('/') {
@@ -1780,7 +1800,8 @@ pub fn http_get(url: &str) -> Result<(u16, String), String> {
     let t = std::time::Duration::from_secs(3);
     let mut s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(t)).ok();
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {hostport}\r\nConnection: close\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
+    let extra: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {hostport}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     s.take(64 * 1024).read_to_end(&mut buf).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&buf).to_string();

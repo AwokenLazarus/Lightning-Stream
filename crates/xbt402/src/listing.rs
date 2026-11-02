@@ -23,8 +23,23 @@ const TAG_1: &str = "xbt402/listing/1";
 /// At most this many services in one listing.
 const MAX_SERVICES: usize = 32;
 
-const KINDS: [&str; 5] = ["video", "files", "api", "ai", "hashrate"];
+/// `app`: a service's own web page, which buyers open inside their app (docs/SELLER-APPS.md). Its
+/// path is the app's base and may be the path of the service it belongs to; its one item is where
+/// it opens.
+const KINDS: [&str; 6] = ["video", "files", "api", "ai", "hashrate", "app"];
 const PRICE_KEYS: [&str; 6] = ["request_msat", "byte_msat", "per_bytes", "second_msat", "per_1k_input_msat", "per_1k_output_msat"];
+
+/// The most a buyer who chose from a listing agreed to pay: the listing's `prices` as the wallet's
+/// `price_ceiling` (per request, per GiB, per second, per 1,000 tokens in and out). A seller whose
+/// 402 asks more than its own signed listing showed is paid nothing.
+pub fn price_ceiling(prices: &Value) -> Value {
+    let n = |k: &str| prices.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0);
+    let per_bytes = n("per_bytes").max(1);
+    let gib = (u128::from(n("byte_msat")) << 30).div_ceil(u128::from(per_bytes));
+    serde_json::json!({"request_msat": n("request_msat"), "gib_msat": u64::try_from(gib).unwrap_or(u64::MAX), "second_msat": n("second_msat"),
+                       "input_per_1k_msat": n("per_1k_input_msat"), "output_per_1k_msat": n("per_1k_output_msat")})
+}
+
 /// A fetched document larger than this is refused before it is parsed.
 const MAX_BODY: usize = 256 << 10;
 
@@ -43,6 +58,19 @@ pub struct Draft {
     pub credits: String,
     pub updated: String,
     pub services: Vec<Section>,
+}
+
+impl Draft {
+    /// Moves every item at origin `from` (its paths kept) to origin `to`.
+    pub fn rebase(&mut self, from: &str, to: &str) {
+        let at = |i: &mut Item| {
+            if let Some(rest) = i.url.strip_prefix(from).filter(|r| r.is_empty() || r.starts_with('/')) {
+                i.url = format!("{to}{rest}");
+            }
+        };
+        self.items.iter_mut().for_each(at);
+        self.services.iter_mut().flat_map(|s| s.items.iter_mut()).for_each(at);
+    }
 }
 
 /// One service of a `listing/1`: what it is, the path it is sold under, and its price.
@@ -148,7 +176,7 @@ fn parse_draft_as(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
     }
     let kind = req_str(m, "kind")?;
     if !KINDS.contains(&kind) {
-        return Err("kind is video, files, api, ai or hashrate".into());
+        return Err("kind is video, files, api, ai, hashrate or app".into());
     }
     let prices = price_strings(m.get("prices").ok_or("prices is missing")?)?;
     let items_v = m.get("items").and_then(Value::as_array).ok_or("items is a list")?;
@@ -199,7 +227,7 @@ fn parse_section(v: &Value, n: usize) -> Result<Section, String> {
     }
     let kind = req_str(m, "kind").map_err(|e| format!("{what}: {e}"))?;
     if !KINDS.contains(&kind) {
-        return Err(format!("{what}: kind is video, files, api, ai or hashrate"));
+        return Err(format!("{what}: kind is video, files, api, ai, hashrate or app"));
     }
     let path = req_str(m, "path").map_err(|e| format!("{what}: {e}"))?;
     if !route_path(path) {
@@ -226,7 +254,8 @@ fn parse_draft_1(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
             continue;
         }
         let sec = parse_section(s, i + 1)?;
-        if services.iter().any(|o| o.path == sec.path) {
+        // an app shares the path of the service it is the page of; two of one kind never do
+        if services.iter().any(|o| o.path == sec.path && (o.kind == "app") == (sec.kind == "app")) {
             return Err(format!("service {}: path {} is named twice", i + 1, sec.path));
         }
         services.push(sec);
@@ -235,7 +264,7 @@ fn parse_draft_1(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
     if updated.chars().count() > 64 {
         return Err("updated is at most 64 characters".into());
     }
-    let first = services.first().cloned().ok_or("the listing has no service of a kind this app knows")?;
+    let first = services.iter().find(|s| s.kind != "app").or(services.first()).cloned().ok_or("the listing has no service of a kind this app knows")?;
     Ok(Draft { name: name.to_string(), kind: first.kind, prices: first.prices, items: first.items, licence: opt_text(m, "licence")?,
                credits: opt_text(m, "credits")?, updated: updated.to_string(), services })
 }
@@ -551,6 +580,14 @@ pub fn fetch(seller_url: &str, mut get: impl FnMut(&str) -> Result<Page, String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_listings_prices_are_the_ceiling_its_buyer_pays_within() {
+        let c = super::price_ceiling(&serde_json::json!({"request_msat": "2500", "byte_msat": 200_000, "per_bytes": 1_048_576}));
+        assert_eq!(c, serde_json::json!({"request_msat": 2500, "gib_msat": 204_800_000u64, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0}));
+        let ai = super::price_ceiling(&serde_json::json!({"per_1k_input_msat": "2000", "per_1k_output_msat": "10000"}));
+        assert_eq!((ai["input_per_1k_msat"].as_u64(), ai["output_per_1k_msat"].as_u64(), ai["request_msat"].as_u64()), (Some(2000), Some(10_000), Some(0)));
+    }
+
     use super::*;
     use xbt_primitives::hash::sha256;
 
@@ -634,6 +671,20 @@ mod tests {
         let got = verify(&sign(&sk, &document(&d, "https://seller.example", &pk)), &pk).unwrap();
         assert_eq!(got.services.iter().map(|s| (s.kind.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("ai", "/ai/"), ("hashrate", "/hashrate/")]);
         assert_eq!(got.services[1].prices["request_msat"], "40000");
+    }
+
+    #[test]
+    fn a_services_own_web_page_is_listed_beside_it_at_its_path_and_only_once() {
+        let (sk, pk) = key();
+        let svc = |kind: &str, path: &str| json!({"name": "Local model", "kind": kind, "path": path, "prices": {"per_1k_output_msat": 10000},
+                                                  "items": if kind == "app" { json!([{"title": "Open Local model", "url": "https://seller.example/ai/"}]) } else { json!([]) }});
+        let d = parse_draft(&json!({"name": "One box", "updated": "2026-10-27", "services": [svc("ai", "/ai/"), svc("app", "/ai/")]})).unwrap();
+        let got = verify(&sign(&sk, &document(&d, "https://seller.example", &pk)), &pk).unwrap();
+        assert_eq!(got.services.iter().map(|s| (s.kind.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("ai", "/ai/"), ("app", "/ai/")]);
+        assert_eq!(got.kind, "ai", "the service, not its page, stands for the listing");
+        // two services of one kind, or two pages, never share a path
+        assert!(parse_draft(&json!({"name": "x", "updated": "u", "services": [svc("ai", "/ai/"), svc("ai", "/ai/")]})).is_err());
+        assert!(parse_draft(&json!({"name": "x", "updated": "u", "services": [svc("app", "/ai/"), svc("app", "/ai/")]})).is_err());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // The look of the app in a real headless Chrome: screenshots of the main pages in light, dark and
 // at phone width, the cost of the river background (CPU and frame time, with and without it), and
 // the contrast of text over the brightest point the river reaches.
-//   node look_test.mjs WALLET_BASE SETUP_CODE GATEWAY_BASE GATEWAY_SETUP_CODE OUT PLAY_PATH SECONDS PAGES
+//   node look_test.mjs WALLET_BASE SETUP_CODE GATEWAY_BASE GATEWAY_SETUP_CODE OUT APPS_PATH SECONDS PAGES
 // PAGES: a JSON list of [name, path] for the wallet's pages to shoot.
 // Prints one JSON line starting "LOOK " with the measurements.
 import { spawn } from "node:child_process";
@@ -38,7 +38,12 @@ await new Promise((r, j) => { ws.addEventListener("open", r); ws.addEventListene
   setTimeout(() => j(new Error("the DevTools connection did not open")), CALL_MS); }).catch((e) => fail(e.message));
 ws.addEventListener("close", () => { if (!finishing) fail("Chrome closed the DevTools connection"); });
 let seq = 0; const pending = new Map();
-ws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id && pending.has(d.id)) { pending.get(d.id)(d); pending.delete(d.id); } });
+const listeners = new Map();
+ws.addEventListener("message", (m) => {
+  const d = JSON.parse(m.data);
+  if (d.id && pending.has(d.id)) { pending.get(d.id)(d); pending.delete(d.id); }
+  else if (d.method && listeners.has(d.method)) listeners.get(d.method)(d.params || {});
+});
 function cdp(method, params = {}) {
   const id = ++seq; ws.send(JSON.stringify({ id, method, params }));
   return new Promise((r, j) => {
@@ -106,7 +111,7 @@ try {
   await scheme("light"); await go(BASE + "/"); await shot("setup-first-run-light", 1280); await shot("setup-first-run-phone-light", 390);
   await set("[name=code]", CODE); await set("[name=password]", "look box password"); await set("[name=password2]", "look box password");
   await submitAndWait("document.querySelector('form').submit()");
-  const pages = PAGES ? JSON.parse(PAGES) : [["setup", "/setup"], ["browse", "/browse"], ["player", PLAY], ["connections", "/connections"]];
+  const pages = PAGES ? JSON.parse(PAGES) : [["setup", "/setup"], ["browse", "/browse"], ["browse-apps", PLAY], ["connections", "/connections"]];
   for (const [page, path] of pages) {
     for (const s of ["dark", "light"]) { await scheme(s); await go(BASE + path); await shot(`${page}-${s}`, 1280); await shot(`${page}-phone-${s}`, 390); }
   }
@@ -129,20 +134,32 @@ try {
   // bar, beside the content). A blank or reset canvas shows as a frame with little river in it.
   {
     await scheme("dark"); await size(1280, 900); await go(BASE + "/browse"); await sleep(1500);
-    const grab = async () => (await cdp("Page.captureScreenshot", { format: "png", clip: { x: 0, y: 90, width: 110, height: 780, scale: 1 } })).data;
+    // the margin is cut out of each frame below: x 0, y 90, 110 wide, 780 high
+    const CROP = { x: 0, y: 90, w: 110, h: 780 };
+    const grab = async () => ({ data: (await cdp("Page.captureScreenshot", { format: "png" })).data });
     const steady = [await grab()];
+    // frames during the move come from a screencast, which Chrome pushes as it paints: a screenshot
+    // asked for while a page is being replaced can go unanswered, a pushed frame cannot hang the test
     const early = [];
+    listeners.set("Page.screencastFrame", (p) => {
+      early.push({ data: p.data });
+      cdp("Page.screencastFrameAck", { sessionId: p.sessionId }).catch(() => { /* the page moved on */ });
+    });
+    await cdp("Page.startScreencast", { format: "png", everyNthFrame: 1, maxWidth: 1280, maxHeight: 900 });
     await ev("setTimeout(function(){Array.from(document.querySelectorAll('header nav a')).filter(function(a){return !a.getAttribute('aria-current')})[1].click()},0)");
-    const t0 = Date.now(); while (Date.now() - t0 < 900) early.push(await grab());
+    await sleep(900);
+    await cdp("Page.stopScreencast"); listeners.delete("Page.screencastFrame");
     await loaded(); await sleep(1500); steady.push(await grab());
     // the theme's own ground, so a quiet river counts as well as a bright one
     const ground = await ev("(function(){var m=getComputedStyle(document.body).backgroundColor.match(/[\\d.]+/g).map(Number);return 0.2126*m[0]+0.7152*m[1]+0.0722*m[2]})()");
     await cdp("Page.navigate", { url: "data:text/html,<canvas id=c></canvas>" }); await sleep(300);
     const counts = await ev(`(async function(){
       var c=document.getElementById('c'),x=c.getContext('2d'),out=[];
-      for (const d of ${JSON.stringify([...steady, ...early])}) {
-        var im=new Image(); im.src='data:image/png;base64,'+d; await im.decode();
-        c.width=im.width;c.height=im.height;x.drawImage(im,0,0);var p=x.getImageData(0,0,c.width,c.height).data,n=0;
+      var k=${JSON.stringify(CROP)};
+      for (const f of ${JSON.stringify([...steady, ...early])}) {
+        var im=new Image(); im.src='data:image/png;base64,'+f.data; await im.decode();
+        var s=im.width/1280;
+        c.width=k.w;c.height=k.h;x.drawImage(im,k.x*s,k.y*s,k.w*s,k.h*s,0,0,k.w,k.h);var p=x.getImageData(0,0,c.width,c.height).data,n=0;
         for(var i=0;i<p.length;i+=4){if(Math.abs(0.2126*p[i]+0.7152*p[i+1]+0.0722*p[i+2]-${ground})>3)n++}
         out.push(n);
       }
@@ -209,7 +226,9 @@ try {
   for (const river of [false, true, false, true]) {
     await cdp("Network.setBlockedURLs", { urls: river ? [] : ["*river.js*"] });
     await cdp("Network.setCacheDisabled", { cacheDisabled: true });
-    await go(BASE + "/browse"); await sleep(1000);
+    // "at rest" means after the page has settled: the first seconds after a load (code being
+    // compiled, fonts arriving, the first frames) are not counted against the river
+    await go(BASE + "/browse"); await sleep(6000);
     const still = await cpu(SECONDS, false);
     const moving = await cpu(SECONDS, true);
     const frames = await ev("window.lsRiver ? {frames: lsRiver.stats.frames, avg_ms: +(lsRiver.stats.ms / Math.max(1, lsRiver.stats.frames)).toFixed(3), max_ms: +lsRiver.stats.max.toFixed(3)} : null");

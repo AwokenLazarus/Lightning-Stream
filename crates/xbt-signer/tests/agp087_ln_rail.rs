@@ -754,6 +754,19 @@ fn only_unified_non_taproot_post_split_channels_carry_payments() {
     let why: Vec<String> = r["channels"].as_array().unwrap().iter().map(|c| c["refused"].as_str().unwrap().to_string()).collect();
     assert!(why[0].contains("not unified") && why[1].contains("below the split") && why[2].contains("zero-conf") && why[3].contains("inactive"), "{why:?}");
     assert_eq!(rig.ln.sent(), 0);
+    // a zero-conf channel whose funding has since confirmed (lnd keeps zero_conf true and sets
+    // zero_conf_confirmed_scid) carries payments; its height is the confirmed scid's, not the alias's
+    let mut alias = 17_592_186_044_416_000_000u64;
+    let mut confirmed = chan(&alias.to_string(), "ANCHORS", true);
+    confirmed["zero_conf"] = true.into();
+    confirmed["zero_conf_confirmed_scid"] = scid(6_300, 1).into();
+    alias += 1;
+    let mut early = chan(&alias.to_string(), "ANCHORS", true);
+    early["zero_conf"] = true.into();
+    early["zero_conf_confirmed_scid"] = scid(5_999, 2).into();
+    let (ok, report) = xbt_signer::ln::usable_channels(&[confirmed, early], 6_000);
+    assert_eq!(ok, ["17592186044416000000"], "{report:?}");
+    assert!(report[1]["refused"].as_str().unwrap().contains("below the split"), "{report:?}");
     // node coins below the split are reported, never used to fund a channel (this wallet opens none)
     rig.ln.set(|s| s.utxos = vec![json!({"amount_sat": "5000", "confirmations": "1000", "outpoint": {"txid_str": "aa".repeat(32), "output_index": 0}}),
                                   json!({"amount_sat": "7000", "confirmations": "3", "outpoint": {"txid_str": "bb".repeat(32), "output_index": 1}})]);
@@ -2046,19 +2059,19 @@ fn agp082_the_rest_client_speaks_fetchinvoice_and_pay_as_lightning_fork_does() {
                                                 "fee_msat": "1500"}).to_string().into_boxed_str());
     let (node, asked) = http_stub("200 OK", String::new(), answer);
     let ln = LndRest::new(&node, &mac, None).unwrap();
-    let p = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60 }).unwrap();
+    let p = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60, http_margin_s: 30 }).unwrap();
     assert_eq!(p, json!({"payment_hash": hex::encode(hash), "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "1500",
                          "payment_preimage": hex::encode(pre), "htlcs": []}));
     let head = asked.lock().unwrap()[0].clone();
     assert!(head.starts_with("POST /v2/offers/pay HTTP/1.1"), "{head}");
     assert_eq!(body_of(&head), json!({"invoice": "lni1xyz", "fee_limit_msat": "3000", "timeout_seconds": 60}));
     // a fee limit of 0 would be the node's default limit: never sent
-    let _ = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 0, timeout_s: 0 });
+    let _ = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 0, timeout_s: 0, http_margin_s: 30 });
     assert_eq!(body_of(&asked.lock().unwrap()[1]), json!({"invoice": "lni1xyz", "fee_limit_msat": "1", "timeout_seconds": 1}));
     // a failed payment is an error that carries the node's words, for the caller to look the hash up
     let (node, _) = http_stub("409 Conflict", String::new(), "{\"code\": 10, \"message\": \"payment failed: no route; payment hash 5a5a\"}");
     let ln = LndRest::new(&node, &mac, None).unwrap();
-    let e = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60 }).unwrap_err();
+    let e = ln.pay_offer(&OfferPayRequest { invoice: "lni1xyz".into(), fee_limit_msat: 3_000, timeout_s: 60, http_margin_s: 30 }).unwrap_err();
     assert!(e.msg.contains("HTTP 409") && e.msg.contains("payment failed: no route"), "{}", e.msg);
     assert!(ln.fetch_invoice("lno1abc", 0, 60).is_err());
 }
@@ -2234,7 +2247,7 @@ fn agp087_ln_evidence_no_rest_call_follows_a_redirect() {
         assert!(ln.lookup(&"ab".repeat(32)).is_err());
         assert!(ln.utxos().is_err());
         assert!(ln.fetch_invoice("lno1x", 1, 1).is_err());
-        assert!(ln.pay_offer(&OfferPayRequest { invoice: "lni1x".into(), fee_limit_msat: 1, timeout_s: 1 }).is_err());
+        assert!(ln.pay_offer(&OfferPayRequest { invoice: "lni1x".into(), fee_limit_msat: 1, timeout_s: 1, http_margin_s: 30 }).is_err());
         let t = ln.towers().expect_err(status);
         assert_ne!(t.code, "ln_wtclient_off", "{status}: a redirect is not 'no watchtower client'");
         assert_eq!(asked.lock().unwrap().len(), 10, "{status}");

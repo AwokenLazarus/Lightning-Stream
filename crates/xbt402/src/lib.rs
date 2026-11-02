@@ -25,6 +25,7 @@
 //! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
 //! provider), `rpc` (a bitcoind JSON-RPC client).
 
+pub mod claim;
 pub mod client;
 pub mod error;
 pub mod json;
@@ -35,8 +36,10 @@ pub mod maturity;
 pub mod offer;
 pub mod provider;
 pub mod scheme;
+pub mod shop;
 pub mod ticket;
 pub mod tokens;
+pub mod transport;
 pub mod wire;
 #[cfg(feature = "rpc")]
 pub mod rpc;

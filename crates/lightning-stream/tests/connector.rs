@@ -168,6 +168,28 @@ fn a_head_the_signer_will_not_read_past_is_a_502() {
     assert!(v["error"].as_str().unwrap().contains("not the range asked for"), "{v}");
 }
 
+/// A file's part asked with the listing's prices (`X-Price-Ceiling`, which the app's link sets from
+/// the listing the file was chosen from) carries them to the signer as the call's `price_ceiling`,
+/// so a seller whose terms ask more than it listed is paid nothing; a header that is not a price is
+/// left out.
+///
+/// FAILS before: the connector passed no ceiling, so a file was paid at whatever the seller asked.
+#[test]
+fn a_files_part_carries_the_listings_prices_to_the_signer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, calls) = signer(dir.path(), film(), None, None);
+    let addr = start(sock, dir.path());
+    let ceiling = json!({"request_msat": 0, "gib_msat": 1_000_000, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0});
+    let (status, head, _) = get_with(&addr, "/s/https://seller.example/files/a.mkv", &format!("Range: bytes=0-99\r\nX-Price-Ceiling: {ceiling}\r\n"));
+    assert_eq!(status, 206, "{head}");
+    let (params, _) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(params["price_ceiling"], ceiling, "{params}");
+    let (status, head, _) = get_with(&addr, "/s/https://seller.example/files/a.mkv", "Range: bytes=0-99\r\nX-Price-Ceiling: not json\r\n");
+    assert_eq!(status, 206, "{head}");
+    let (params, _) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(params.get("price_ceiling").is_none(), "{params}");
+}
+
 #[test]
 fn a_call_the_signer_refuses_is_said_plainly_and_streams_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -214,3 +236,85 @@ fn a_web_page_cannot_have_the_connector_pay_and_a_player_still_can() {
     }
     assert_eq!(get(&addr, "/s/https://seller.example/Videos/1/stream?static=true").0, 200);
 }
+
+/// A signer that streams `body` with no length stated (a chunked answer), then answers the call
+/// with `account`: the wallet's word on whether the answer was whole.
+fn unframed_signer(dir: &Path, body: Vec<u8>, account: Value) -> PathBuf {
+    let sock = dir.join("signer-unframed.sock");
+    let l = UnixListener::bind(&sock).unwrap();
+    let stream_dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        for conn in l.incoming() {
+            let mut conn = conn.unwrap();
+            let mut line = String::new();
+            BufReader::new(conn.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let params = req["params"].clone();
+            let mut out = UnixStream::connect(stream_dir.join(params["stream_to"].as_str().unwrap())).unwrap();
+            let _ = writeln!(out, "{}", json!({"status": 200, "content_type": "application/octet-stream"}));
+            let _ = out.write_all(&body);
+            drop(out);
+            let _ = writeln!(conn, "{}", json!({"id": 1, "result": account}));
+        }
+    });
+    sock
+}
+
+fn raw_get(addr: &str, target: &str) -> Vec<u8> {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    write!(s, "GET {target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut all = vec![];
+    let _ = s.read_to_end(&mut all);
+    all
+}
+
+/// A download the wallet ended early (its limit, a seller that stalled) is never handed on as a
+/// whole one: with no length stated, its chunked body has no last chunk, which every HTTP client
+/// reads as cut short. One the wallet says is whole ends with its last chunk.
+#[test]
+fn an_answer_the_wallet_ended_early_is_cut_short_for_the_client_never_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let part: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let sock = unframed_signer(dir.path(), part.clone(), json!({"verdict": "allow", "status": 200, "complete": false, "ended": "read: timed out"}));
+    let addr = start(sock, dir.path());
+    let all = raw_get(&addr, "/s/https://seller.example/files/big.iso");
+    let head = String::from_utf8_lossy(&all[..all.windows(4).position(|w| w == b"\r\n\r\n").unwrap()]).to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200") && head.contains("transfer-encoding: chunked"), "{head}");
+    assert!(!all.ends_with(b"0\r\n\r\n"), "a cut answer ended with its last chunk, as if whole");
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock = unframed_signer(dir.path(), part, json!({"verdict": "allow", "status": 200, "complete": true}));
+    let addr = start(sock, dir.path());
+    let all = raw_get(&addr, "/s/https://seller.example/files/big.iso");
+    assert!(all.ends_with(b"0\r\n\r\n"), "a whole answer did not end with its last chunk");
+}
+
+/// (The head line is the signer's own for such an answer ([`head_to`] in the signer): `range_ignored` with the
+/// reason it was not read under `error`.)
+/// The seller's copy's validators reach the player, and the player's `If-Range` reaches the wallet with its
+/// range. A copy that changed since (the wallet reads none of its whole body, `range_ignored`) is told to the
+/// player as such, never as the rest of the file spliced onto what it has.
+#[test]
+fn a_seek_names_the_players_copy_and_a_changed_file_is_not_spliced_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let film = film();
+    let n = film.len();
+    let (sock, calls) = signer(dir.path(), film.clone(), None, Some(json!({"status": 200, "content_length": n, "etag": "\"v1\"", "last_modified": "Sat, 31 Oct 2026 12:00:00 GMT"})));
+    let addr = start(sock, dir.path());
+    let (status, head, _) = get(&addr, "/s/https://seller.example/v");
+    assert_eq!(status, 200, "{head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(lower.contains("etag: \"v1\"") && lower.contains("last-modified: sat, 31 oct 2026 12:00:00 gmt"), "{head}");
+    calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    let dir2 = tempfile::tempdir().unwrap();
+    let (sock, calls) = signer(dir2.path(), film.clone(), None, Some(json!({"status": 200, "content_length": n, "range_ignored": true,
+                                                                                                 "error": "the seller answered the range asked for (bytes=1000-) with the whole body"})));
+    let addr = start(sock, dir2.path());
+    let (status, head, body) = get_with(&addr, "/s/https://seller.example/v", "Range: bytes=1000-\r\nIf-Range: \"v0\"\r\n");
+    assert_eq!(status, 412, "{head}");
+    assert!(String::from_utf8_lossy(&body).contains("ticket_range_ignored"), "{}", String::from_utf8_lossy(&body));
+    let (params, _) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!((params["range"].as_str(), params["if_range"].as_str()), (Some("bytes=1000-"), Some("\"v0\"")), "{params}");
+}
+

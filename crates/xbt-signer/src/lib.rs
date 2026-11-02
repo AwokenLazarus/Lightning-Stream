@@ -43,12 +43,15 @@ pub mod macaroon;
 pub mod node;
 pub mod policy;
 pub mod pyjson;
+pub mod renter;
 pub mod sanitize;
+pub mod seller_block;
 pub mod server;
 pub mod signer;
 pub mod sigaudit;
 pub mod ticket;
 pub mod ticket_http;
+pub mod ticket_interim;
 pub mod ticket_pay;
 pub mod ticket_rail;
 

@@ -5,6 +5,7 @@
 //!   subscription open on each relay. [`oneshot`]: publish one event, or run one query, and hang up.
 //! * [`market`]: a seller's signed listing (`docs/LISTINGS.md`) as a NIP-99 classified listing,
 //!   bound to the seller's receipt key, and read back and checked.
+//! * [`relays`]: Stream relays (iroh) announced on Nostr, probed, and chosen (`docs/RUN-A-RELAY.md`).
 //! * [`standin`]: an in-process relay, for the tests.
 //!
 //! The NWC wallet service (`xbt-nwc`) is built on these. What goes over Nostr and what does not:
@@ -14,6 +15,7 @@ pub mod market;
 pub mod nip44;
 pub mod oneshot;
 pub mod relay;
+pub mod relays;
 pub mod standin;
 pub mod ws;
 

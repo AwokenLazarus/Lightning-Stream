@@ -1,0 +1,47 @@
+--- a/src/stream/tcp.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/stream/tcp.rs	2026-10-29 22:51:17.909120352 +0000
+@@ -404,6 +404,13 @@
+                     let mut tcb = self.tcb.lock().unwrap();
+                     send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
+                 }
++                // XBT patch: keep the latest waker, so the wake above reaches the task polling now
++                // (unless the session finished meanwhile: then it is ready, not pending)
++                let mut sd = self.shutdown.lock().unwrap();
++                if matches!(*sd, Shutdown::Ready) {
++                    return Poll::Ready(Ok(()));
++                }
++                sd.pending(cx.waker().clone());
+                 Poll::Pending
+             }
+             Shutdown::Ready => Poll::Ready(Ok(())),
+@@ -471,6 +478,7 @@
+             let v = tcp_main_logic_loop(
+                 tcb,
+                 config,
++                shutdown.clone(),
+                 stream_receiver,
+                 up_packet_sender,
+                 exit_notifier,
+@@ -499,6 +507,7 @@
+ async fn tcp_main_logic_loop(
+     tcb: TcbPtr,
+     config: Arc<TcpConfig>,
++    shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
+     mut stream_receiver: PacketReceiver,
+     up_packet_sender: PacketSender,
+     exit_notifier: tokio::sync::mpsc::Sender<()>,
+@@ -670,6 +679,14 @@
+ 
+         tcb.update_inflight_packet_queue(incoming_ack);
+ 
++        // XBT patch: a write half closed while data was in flight is parked in poll_shutdown; the ACK
++        // that empties the flight must wake it, or its FIN is never sent.
++        if tcb.get_inflight_packets_total_len() == 0 {
++            if let Shutdown::Pending(w) = &*shutdown.lock().unwrap() {
++                w.wake_by_ref();
++            }
++        }
++
+         for packet in tcb.collect_timed_out_inflight_packets() {
+             let (seq, count) = (packet.seq, packet.retransmit_count);
+             log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);

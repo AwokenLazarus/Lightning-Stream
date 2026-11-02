@@ -303,7 +303,9 @@ fn check_http(cfg: &HttpConfig) -> Result<(), String> {
 /// returns once it serves.
 pub fn serve_listener(server: Arc<Server>, cfg: HttpConfig, listener: TcpListener) -> Result<xbt_svc::http::Running, String> {
     check_http(&cfg)?;
-    eprintln!("xbt-wallet-mcp: streamable HTTP on http://{}{}{} (health: /healthz, /readyz)", cfg.addr, xbt_svc::proxy::normalize_base(&cfg.base), cfg.path);
+    // the address it was given a port for (`:0`, a port the OS picks: the one it picked)
+    let at = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| cfg.addr.clone());
+    eprintln!("xbt-wallet-mcp: streamable HTTP on http://{at}{}{} (health: /healthz, /readyz)", xbt_svc::proxy::normalize_base(&cfg.base), cfg.path);
     let mcp = Mcp { server, cfg, sessions: Arc::new(Mutex::new(HashMap::new())) };
     xbt_svc::http::serve(Arc::new(mcp), listener, HTTP_WORKERS).map_err(|e| format!("serve: {e}"))
 }

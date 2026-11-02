@@ -6,9 +6,13 @@
 #
 # Lab: the ticket lab's (scripts/ticket_e2e/compose.yml on lightning-fork-lab, three Lightning Fork
 # nodes on one Knots BLAKE2b regtest), in its own compose project (p2phash) and on its own ports:
-# P2P_HASH_PORT_BASE (default 19961) to BASE+9. P2P_HASH_LAB: a lightning-fork-lab checkout with
-# its node binaries built (default run/lightning-fork-lab, cloned and built when missing). The
-# lab's containers and volumes are removed on exit. About 10 minutes.
+# P2P_HASH_PORT_BASE (default 19961) to BASE+36 (BASE+10, +11: two more gateways, shops the wallet has no
+# credit with; BASE+13 to +28: the real gateways' own nodes, on chains of their own; BASE+29 to +36: the reprice
+# check's app, gateway and hashmaker). P2P_HASH_ONLY=reprice runs only the reprice check (a new price while a
+# rental goes on, with the hashmaker's real app and its gateway under xbt-supervise); P2P_HASH_ONLY=real only the
+# real gateways. P2P_HASH_LAB: a lightning-fork-lab checkout with its node binaries built (default
+# run/lightning-fork-lab, cloned and built when missing). The
+# lab's containers and volumes are removed on exit. About 25 minutes, 10 without real gateways.
 # Report: run/p2p_hash_regtest.json and run/p2p_hash_regtest.log.
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -41,12 +45,21 @@ mkdir -p "$ROOT/run"
 R=$(mktemp -d "${TMPDIR:-/tmp}/p2ph-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp \
-  -p xbt-gateway --bin xbt-gateway -p xbt-hashlink --bin xbt-hashlink
+  -p xbt-gateway --bin xbt-gateway -p xbt-hashlink --bin xbt-hashlink --features xbt-hashlink/test-unblinded
+if [ "${P2P_HASH_ONLY:-}" = reprice ]; then
+  nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p xbt-svc --bin xbt-supervise
+fi
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
+# the real gateways' rentals run the Stream Gateway the image ships (static, x86_64), built here once if missing
+# (its pinned sources are cached); P2P_HASH_DATUM_GATEWAY names another binary
+if [ -z "${P2P_HASH_DATUM_GATEWAY:-}" ] && [ ! -x "$ROOT/dist/datum/x86_64-linux-musl/xbt-datum-gateway" ]; then
+  nice -n 19 "$ROOT/scripts/datum_gateway_build.sh" --targets x86_64-linux-musl >"$ROOT/run/datum_gateway_build.log" 2>&1 \
+    || { tail -20 "$ROOT/run/datum_gateway_build.log" >&2; echo "p2p_hash_regtest: the Stream Gateway did not build" >&2; exit 1; }
+fi
 
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
 # shellcheck disable=SC2046 # the port list is meant to split
-python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 9)))
+python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 36)))
 (cd "$LAB" && docker compose build -q lf1 && docker compose up -d fees knots-b2b)
 
 export LAB RUN=$R OUT=$ROOT/run BIN

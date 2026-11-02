@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::pyjson::str_or_empty;
 use crate::ticket::{outside_u64, Refusal, Terms};
+use std::time::Duration;
 use xbt402::tokens::TokenRule;
 
 fn refuse<T>(rule: &'static str, msg: impl Into<String>) -> Result<T, Refusal> {
@@ -134,6 +135,52 @@ impl Price {
     }
 }
 
+// --- the price the buyer was shown --------------------------------------------------------------------
+
+/// The most the buyer agreed to pay, per part of the price, as the listing or announcement it chose
+/// from showed it (`price_ceiling`): a seller whose 402 asks more than it advertised is paid
+/// nothing. A part the caller leaves out must be free in the seller's terms: a listing that showed a
+/// price per GB and nothing per request did not agree to a charge per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PriceCeiling {
+    pub request_msat: u64,
+    /// Per GiB (2^30 bytes) of the answer's body.
+    pub gib_msat: u64,
+    pub second_msat: u64,
+    pub input_per_1k_msat: u64,
+    pub output_per_1k_msat: u64,
+}
+
+impl PriceCeiling {
+    /// From the call's `price_ceiling` object; `Ok(None)` when the caller gave none.
+    pub fn parse(v: Option<&Value>) -> Result<Option<Self>, String> {
+        let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(None) };
+        if !v.is_object() {
+            return Err("price_ceiling is an object of whole msat amounts".into());
+        }
+        let num = |k: &str| match v.get(k).filter(|x| !x.is_null()) {
+            None => Ok(0),
+            Some(x) => outside_u64(Some(x)).ok_or(format!("price_ceiling.{k} is not a whole number of msat")),
+        };
+        Ok(Some(Self { request_msat: num("request_msat")?, gib_msat: num("gib_msat")?, second_msat: num("second_msat")?,
+                       input_per_1k_msat: num("input_per_1k_msat")?, output_per_1k_msat: num("output_per_1k_msat")? }))
+    }
+
+    /// Why an offer's price is above this ceiling, in words; `None` when it is within it.
+    pub fn over(&self, acc: &Value) -> Option<String> {
+        let p = match Price::parse(acc) {
+            Ok(p) => p,
+            Err((_, why)) => return Some(format!("its price could not be read ({why})")),
+        };
+        let gib = p.for_bytes(1 << 30).unwrap_or(u64::MAX);
+        let parts = [("request", p.request_msat, self.request_msat), ("per GiB", gib, self.gib_msat), ("per second", p.second_msat, self.second_msat),
+                     ("per 1,000 input tokens", p.tokens.input_per_1k_msat, self.input_per_1k_msat),
+                     ("per 1,000 output tokens", p.tokens.output_per_1k_msat, self.output_per_1k_msat)];
+        parts.iter().find(|(_, asked, most)| asked > most)
+            .map(|(what, asked, most)| format!("it asks {asked} msat {what}, above the {most} msat the buyer was shown"))
+    }
+}
+
 // --- the terms ---------------------------------------------------------------------------------------
 
 /// A ticket entry of a seller's 402, read whole: what the book needs ([`Terms`]) and what the HTTP
@@ -150,7 +197,27 @@ pub struct PayTerms {
     pub release: String,
     /// The entry as the seller sent it: what `accepted` in PAYMENT-SIGNATURE repeats.
     pub accepted: Value,
+    /// How many seqs from its next one the seller takes a request with (`seqWindow`, at most
+    /// [`SEQ_WINDOW_MAX`] here): that many of the session's requests may be on their way at once.
+    /// 1, a seller that does not state it: one at a time, each sent once the one before is answered.
+    pub seq_window: u64,
+    /// How long the seller keeps an answer paused for a release before it ends it (`refillWaitMs`): the wallet's pause
+    /// for such an answer ends a margin before then ([`seller_pause`]). `None`, a seller that does not state it (one
+    /// before 0.2.0): `tickets.ready_wait_ms` alone.
+    pub refill_wait: Option<Duration>,
 }
+
+/// The most the wallet pauses an answer for a seller that keeps one paused `refill_wait` before it ends it: that less
+/// the way a release takes to reach it (the seller's status asked, the secret delivered), a tenth of it but at least
+/// 1 s, at most 3 s, and never more than the wait itself (15 s, the gateway as shipped: 13.5 s; 2 s: 1 s). A release
+/// that arrives after the seller has ended the answer pays for nothing.
+pub fn seller_pause(refill_wait: Duration) -> Duration {
+    let margin = (refill_wait / 10).clamp(Duration::from_secs(1), Duration::from_secs(3)).min(refill_wait);
+    refill_wait.saturating_sub(margin)
+}
+
+/// The widest seq window the wallet uses, whatever a seller states.
+pub const SEQ_WINDOW_MAX: u64 = 64;
 
 impl PayTerms {
     pub fn parse(acc: &Value, lightning: &str) -> Result<Self, Refusal> {
@@ -163,7 +230,17 @@ impl PayTerms {
             None => xbt402::ticket::SESSION_PATH.to_string(),
             Some(v) => v.as_str().map(str::to_string).ok_or(("ticket_terms", "session is not a path".to_string()))?,
         };
-        Ok(Self { terms, receipt_key, session_path, price: Price::parse(acc)?, release: str_or_empty(x.get("release")), accepted: acc.clone() })
+        let seq_window = match x.get("seqWindow").filter(|v| !v.is_null()) {
+            None => 1,
+            Some(v) => v.as_u64().filter(|&w| w >= 1).ok_or(("ticket_terms", "seqWindow is not a whole number of 1 or more".to_string()))?.min(SEQ_WINDOW_MAX),
+        };
+        // a seller says how long it keeps a paused answer, or leaves it to the wallet's own limit. A seller can only
+        // shorten the wallet's pause by it (a release then gives up sooner, and nothing is released), never lengthen it.
+        // A whole number, or one as a decimal string (as the msat fields are); anything else is taken as not said, and
+        // the wallet pauses by its own limit, as for a seller before 0.2.0
+        let refill_wait = x.get("refillWaitMs").and_then(|v| v.as_u64().or_else(|| v.as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse::<u64>().ok())))
+            .map(Duration::from_millis);
+        Ok(Self { terms, receipt_key, session_path, price: Price::parse(acc)?, release: str_or_empty(x.get("release")), accepted: acc.clone(), seq_window, refill_wait })
     }
 
     /// Whether `other` (the terms of a later 402 from the same origin) is the same seller on the
@@ -196,6 +273,15 @@ impl Offer {
             Offer::Ticket(..) => "ticket",
             Offer::Lottery(_) => "lottery",
             Offer::Lightning(_) => "ln",
+        }
+    }
+
+    /// The `accepts` entries this way of paying would pay by: a ticket entry and, beside it, the
+    /// seller's entry for prepaid tickets if it lists one.
+    pub fn entries(&self) -> Vec<&Value> {
+        match self {
+            Offer::Ticket(a, prepaid) => std::iter::once(a).chain(prepaid.as_ref()).collect(),
+            Offer::Lottery(a) | Offer::Lightning(a) => vec![a],
         }
     }
 }
@@ -379,6 +465,28 @@ mod tests {
     }
 
     #[test]
+    fn a_price_above_what_the_buyer_was_shown_is_named_and_one_within_it_passes() {
+        // 200,000 msat a MiB is 204,800,000 msat a GiB
+        let per_mib = accepts(json!({"requestMsat": "2500", "byteMsat": "200000", "perBytes": "1048576"}));
+        let shown = PriceCeiling::parse(Some(&json!({"request_msat": 2500, "gib_msat": "204800000"}))).unwrap().unwrap();
+        assert_eq!(shown.over(&per_mib), None);
+        let cheaper = PriceCeiling { gib_msat: 204_799_999, ..shown };
+        assert!(cheaper.over(&per_mib).is_some_and(|w| w.contains("per GiB")), "{:?}", cheaper.over(&per_mib));
+        // a part the buyer was not shown must be free: a per-GB listing agreed to no charge per request
+        let per_gb_only = PriceCeiling { request_msat: 0, ..shown };
+        assert!(per_gb_only.over(&per_mib).is_some_and(|w| w.contains("request")));
+        let by_second = accepts(json!({"requestMsat": "2500", "secondMsat": "10"}));
+        assert!(shown.over(&by_second).is_some_and(|w| w.contains("per second")));
+        let by_token = accepts(json!({"requestMsat": "2500", "inputPer1kMsat": "100", "outputPer1kMsat": "300"}));
+        let ai = PriceCeiling { input_per_1k_msat: 100, output_per_1k_msat: 299, ..shown };
+        assert!(ai.over(&by_token).is_some_and(|w| w.contains("output")));
+        assert_eq!(PriceCeiling { output_per_1k_msat: 300, ..ai }.over(&by_token), None);
+        assert_eq!(PriceCeiling::parse(None), Ok(None));
+        assert!(PriceCeiling::parse(Some(&json!({"gib_msat": -1}))).is_err());
+        assert!(PriceCeiling::parse(Some(&json!("cheap"))).is_err());
+    }
+
+    #[test]
     fn a_price_is_read_strictly_and_never_wraps() {
         let p = Price::parse(&accepts(json!({"requestMsat": "2500", "byteMsat": "200000", "perBytes": "1048576", "secondMsat": "0"}))).unwrap();
         assert_eq!(p, Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0, tokens: TokenRule::NONE });
@@ -400,6 +508,49 @@ mod tests {
                     json!({"requestMsat": "2500", "secondMsat": -5}), json!([1]), json!("free")] {
             assert_eq!(Price::parse(&accepts(bad.clone())).map_err(|e| e.0), Err("ticket_terms"), "{bad}");
         }
+    }
+
+    #[test]
+    fn terms_name_the_seq_window_the_wallet_sends_within() {
+        let a = |w: Value| {
+            let mut a = accepts(json!({"requestMsat": "2500"}));
+            a["extra"]["seqWindow"] = w;
+            PayTerms::parse(&a, NET).map(|t| t.seq_window).map_err(|e| e.0)
+        };
+        // not stated: the next seq only, one request at a time
+        assert_eq!(PayTerms::parse(&accepts(json!({"requestMsat": "2500"})), NET).unwrap().seq_window, 1);
+        assert_eq!(a(Value::Null), Ok(1));
+        assert_eq!(a(json!(4)), Ok(4));
+        assert_eq!(a(json!(1000)), Ok(SEQ_WINDOW_MAX), "no wider than the wallet's own");
+        for bad in [json!(0), json!(-1), json!("64"), json!(1.5)] {
+            assert_eq!(a(bad.clone()), Err("ticket_terms"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn terms_say_how_long_the_seller_keeps_a_paused_answer_and_the_pause_ends_before() {
+        let a = |w: Value| {
+            let mut a = accepts(json!({"requestMsat": "2500"}));
+            a["extra"]["refillWaitMs"] = w;
+            PayTerms::parse(&a, NET).map(|t| t.refill_wait).map_err(|e| e.0)
+        };
+        // not stated (a seller before 0.2.0): the wallet's own limit alone
+        assert_eq!(PayTerms::parse(&accepts(json!({"requestMsat": "2500"})), NET).unwrap().refill_wait, None);
+        assert_eq!(a(Value::Null), Ok(None));
+        assert_eq!(a(json!(15_000)), Ok(Some(Duration::from_secs(15))));
+        assert_eq!(a(json!(0)), Ok(Some(Duration::ZERO)));
+        // as a decimal string, as the msat fields are
+        assert_eq!(a(json!("15000")), Ok(Some(Duration::from_secs(15))));
+        // anything else is not said: the wallet's own limit, and the rail goes on
+        for bad in [json!(-1), json!(1.5), json!("15s"), json!(""), json!("-5"), json!("1e4"), json!(true), json!({"ms": 1})] {
+            assert_eq!(a(bad.clone()), Ok(None), "{bad}");
+        }
+        // a tenth of the seller's wait for the way, at least 1 s and at most 3 s, never more than the wait
+        assert_eq!(seller_pause(Duration::from_secs(15)), Duration::from_millis(13_500));
+        assert_eq!(seller_pause(Duration::from_secs(2)), Duration::from_secs(1));
+        assert_eq!(seller_pause(Duration::from_secs(60)), Duration::from_secs(57));
+        assert_eq!(seller_pause(Duration::from_millis(500)), Duration::ZERO);
+        assert_eq!(seller_pause(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

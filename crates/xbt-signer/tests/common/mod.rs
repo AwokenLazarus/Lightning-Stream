@@ -33,11 +33,20 @@ pub struct State {
     pub reject: Option<String>,
     pub mined_by_signer: u64,
     pub down: bool,
+    /// `getblockchaininfo`'s difficulty; None: 6.33e9, as on mainnet when the hashmaker's price was set.
+    pub difficulty: Option<f64>,
+    /// `getblockstats`'s subsidy; None: 3.125 XBT. `Some(None)`: the node does not answer it.
+    pub subsidy: Option<Option<u64>>,
     pub coinbase: std::collections::HashSet<String>,
     /// `getdeploymentinfo`; None: the node does not answer it.
     pub deployments: Option<Value>,
     /// How long `scantxoutset` takes (a scan of the UTXO set can take minutes on mainnet).
     pub scan_ms: u64,
+    /// Every this many `getblockcount`s one fails, as a busy node's does; 0: none.
+    pub height_fails_every: u64,
+    pub height_asked: u64,
+    /// Every call hangs this long and then fails, as a hung node does at its client's timeout.
+    pub hang_ms: u64,
 }
 
 pub struct FakeChain {
@@ -221,16 +230,36 @@ impl Node for FakeChain {
         {
             let mut s = self.st.lock().unwrap();
             s.calls.push(method.into());
+            let hang = s.hang_ms;
+            if hang > 0 {
+                drop(s);
+                std::thread::sleep(std::time::Duration::from_millis(hang));
+                return Err(rpc_err("timed out"));
+            }
             if s.down {
                 return Err(rpc_err("connection refused"));
+            }
+            if method == "getblockcount" && s.height_fails_every > 0 {
+                s.height_asked += 1;
+                if s.height_asked.is_multiple_of(s.height_fails_every) {
+                    return Err(rpc_err("work queue depth exceeded"));
+                }
             }
         }
         let chain = self.st.lock().unwrap().chain.clone();
         Ok(match method {
             "getblockchaininfo" => {
                 let s = self.st.lock().unwrap();
-                json!({"chain": s.chain, "blocks": s.height, "initialblockdownload": false, "pruned": true})
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                json!({"chain": s.chain, "blocks": s.height, "headers": s.height, "initialblockdownload": false, "pruned": true,
+                       "difficulty": s.difficulty.unwrap_or(6.33e9), "time": now})
             }
+            "getblockstats" => match self.st.lock().unwrap().subsidy {
+                // what Knots v29.4.2 answers for a block it pruned: a JSON-RPC error, code -1 (RPC_MISC_ERROR)
+                Some(None) => return Err(refused(r#"{"code":-1,"message":"Block not available (pruned data)"}"#)),
+                Some(Some(sats)) => json!({"subsidy": sats}),
+                None => json!({"subsidy": 312_500_000u64}),
+            },
             "getblockcount" => json!(self.height()),
             "getblockhash" => {
                 let h = p[0].as_u64().unwrap_or(0);

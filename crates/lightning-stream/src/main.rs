@@ -93,7 +93,8 @@ fn main() {
 /// The AI endpoint, when `LS_AI_LISTEN` is set: an OpenAI-compatible address for programs on the
 /// owner's network, each with a key from `LS_CREDENTIALS` (see `inference_server`). It needs
 /// `LS_CREDENTIALS`, `LS_AI_SELLERS` and `LS_AI_STATE`; `LS_AI_HOSTS` (comma-separated) lists the
-/// host names it answers to, `LS_AI_FIRST_BYTE_S` how long a seller has for its first byte.
+/// host names it answers to, `LS_AI_FIRST_BYTE_S` how long a seller has for its first byte, from
+/// when its call is paid for, and `LS_AI_PAY_WAIT_S` how long a call waits for the wallet to pay.
 fn start_ai(base: &(PathBuf, PathBuf, String, i64)) -> Option<xbt_svc::http::Running> {
     let listen = env("LS_AI_LISTEN")?;
     let (Some(credentials), Some(sellers), Some(state)) = (env("LS_CREDENTIALS"), env("LS_AI_SELLERS"), env("LS_AI_STATE")) else {
@@ -104,7 +105,11 @@ fn start_ai(base: &(PathBuf, PathBuf, String, i64)) -> Option<xbt_svc::http::Run
     let allowed_hosts = env("LS_AI_HOSTS").map(|h| h.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
     let (signer, stream_dir, task, max_sats) = base.clone();
     let cfg = lightning_stream::inference_server::Config {
-        signer, stream_dir, task, max_sats, credentials: credentials.into(), sellers: sellers.into(), state: state.into(), first_byte, allowed_hosts,
+        signer, stream_dir, task, max_sats, credentials: credentials.into(), sellers: sellers.into(), state: state.into(), first_byte,
+        pay_wait: env("LS_AI_PAY_WAIT_S").and_then(|v| v.parse().ok())
+            .map_or(lightning_stream::inference_server::PAY_WAIT, |s| Duration::from_secs(s).max(lightning_stream::inference_server::PAY_WAIT_FLOOR)),
+        account_wait: lightning_stream::inference_server::ACCOUNT_WAIT,
+        allowed_hosts,
     };
     let listener = match TcpListener::bind(&listen) {
         Ok(l) => l,
@@ -127,18 +132,27 @@ fn start_ai(base: &(PathBuf, PathBuf, String, i64)) -> Option<xbt_svc::http::Run
 
 /// The stream directory has to be writable by this process: it creates the sockets there. On a
 /// package the directory is inside the signer's socket dir, which init gives to the signer's user,
-/// and this process is that user.
+/// and this process is that user. Where the VPN service is installed, init makes it 0770 for the
+/// xbt-streams group (the VPN service makes its paid tunnels' sockets there): that group write is
+/// kept, never taken away, or every priced VPN exit would fail until init ran again.
 fn prepare_stream_dir(dir: &str) -> i32 {
     let path = PathBuf::from(dir);
     if let Err(e) = std::fs::create_dir_all(&path) {
         eprintln!("lightning-stream: B2_STREAM_DIR {dir}: {e}");
         return 1;
     }
-    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)) {
+    let mode = stream_dir_mode(std::fs::metadata(&path).map(|m| m.permissions().mode()).unwrap_or(0));
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
         eprintln!("lightning-stream: B2_STREAM_DIR {dir} is not owned by this user: {e}");
         return 1;
     }
     0
+}
+
+/// The stream directory's mode: the owner's rwx, the group's r-x, and the group's write if it had it
+/// (init's 0770 for xbt-streams); nothing for others.
+fn stream_dir_mode(current: u32) -> u32 {
+    0o750 | (current & 0o020)
 }
 
 fn healthcheck() -> i32 {
@@ -183,3 +197,23 @@ fn healthcheck() -> i32 {
     eprintln!("lightning-stream healthcheck: {status}");
     1
 }
+
+#[cfg(test)]
+mod stream_dir_tests {
+    use super::*;
+
+    #[test]
+    fn the_stream_dir_keeps_the_vpn_services_group_write() {
+        assert_eq!(stream_dir_mode(0o770), 0o770, "init's mode where the VPN service is installed stays");
+        assert_eq!(stream_dir_mode(0o750), 0o750);
+        assert_eq!(stream_dir_mode(0o755), 0o750, "nothing for others");
+        assert_eq!(stream_dir_mode(0o700), 0o750);
+        let d = std::env::temp_dir().join(format!("ls-streams-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(prepare_stream_dir(d.to_str().unwrap()), 0);
+        assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o770, "a restart of the connector does not undo init");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+

@@ -53,6 +53,16 @@ pub fn sellers_entries(ai: &[Service], old: &Value, mut get: impl FnMut(&str) ->
     let mut problems = vec![];
     for s in ai {
         let route = route_of(s);
+        // a shop reached by key has no web address to fetch its listing from: its listing came from
+        // Nostr, checked against its key when it was added or updated, and its prices are kept with it
+        if xbt402::shop::key_of(&s.seller).is_some() {
+            if s.prices.is_object() {
+                out.push(json!({"name": s.name, "route": route, "prices": s.prices, "max_output": 0}));
+            } else {
+                problems.push(format!("{}: its listing named no prices; press Check for updates on Sellers", s.name));
+            }
+            continue;
+        }
         let prices = match xbt402::listing::fetch(&s.seller, &mut get) {
             Ok(l) => {
                 let path = route.strip_prefix(&services::http_origin(&s.seller).unwrap_or_default()).unwrap_or("/").to_string();
@@ -69,6 +79,14 @@ pub fn sellers_entries(ai: &[Service], old: &Value, mut get: impl FnMut(&str) ->
         out.push(json!({"name": s.name, "route": route, "prices": prices, "max_output": 0}));
     }
     (out, problems)
+}
+
+/// A seller in a few characters: its shop key's start, or its web address's host.
+fn seller_tag(seller: &str) -> String {
+    match xbt402::shop::key_of(seller) {
+        Some(pk) => format!("{}…", xbt402::shop::npub(&pk).chars().take(14).collect::<String>()),
+        None => services::http_origin(seller).map(|o| o.split("://").nth(1).unwrap_or(&o).trim_end_matches('/').to_string()).unwrap_or_else(|| seller.to_string()),
+    }
 }
 
 fn health_html(state: &Value, name: &str) -> String {
@@ -102,8 +120,16 @@ fn key_row(ctx: &Ctx, e: &Entry, today: u64) -> String {
 }
 
 impl App {
+    /// The AI services, each under a name of its own: pins, blocks, health and the `<seller>/<model>`
+    /// route are kept by name, so two shops that call themselves the same are told apart by their key
+    /// (or their address), and only where they clash, so a name the owner pinned stays as it was.
     fn ai_services(&self) -> Vec<Service> {
-        self.file_services().unwrap_or_default().into_iter().filter(|s| s.kind == services::Kind::Ai).collect()
+        let mut ai: Vec<Service> = self.file_services().unwrap_or_default().into_iter().filter(|s| s.kind == services::Kind::Ai).collect();
+        let clash: Vec<String> = ai.iter().map(|s| s.name.clone()).filter(|n| ai.iter().filter(|s| &s.name == n).count() > 1).collect();
+        for s in ai.iter_mut().filter(|s| clash.contains(&s.name)) {
+            s.name = format!("{} ({})", s.name, seller_tag(&s.seller));
+        }
+        ai
     }
 
     /// Writes the sellers file from the AI services and their listings, keeping the owner's pins
@@ -113,6 +139,20 @@ impl App {
         let (sellers, problems) = sellers_entries(&self.ai_services(), &old, crate::app::services_page::get_page);
         write_json(&self.cfg.ai.sellers, &json!({"sellers": sellers, "pinned": names(&old, "pinned"), "blocked": names(&old, "blocked")}))?;
         Ok(problems)
+    }
+
+    /// After the Services page added, updated or removed the seller at `origin`: the sellers file the AI
+    /// address reads follows at once, when that seller sells (or sold) a model. Otherwise a seller allowed
+    /// later would never be offered until the owner pressed "Read the sellers' prices again".
+    pub(crate) fn ai_sellers_follow(&self, origin: &str) {
+        let sold = self.ai_services().iter().any(|s| services::same_origin(&s.seller, origin));
+        let listed = read_sellers(&self.cfg.ai.sellers)["sellers"].as_array().into_iter().flatten()
+            .filter_map(|e| e["route"].as_str()).any(|r| services::same_origin(r, origin));
+        if sold || listed {
+            if let Err(e) = self.ai_write_sellers() {
+                eprintln!("xbt-wallet-ui: the AI sellers file was not written: {e}");
+            }
+        }
     }
 
     pub(crate) fn ai_page(&self, ctx: &Ctx) -> Resp {
@@ -288,8 +328,8 @@ mod tests {
     use crate::services::Item;
 
     fn ai(name: &str, seller: &str, address: &str) -> Service {
-        Service { name: name.into(), kind: services::Kind::Ai, seller: seller.into(), price_text: "10 sat per 1,000 tokens".into(), items: Vec::<Item>::new(),
-                  address: address.into() }
+        Service { name: name.into(), kind: services::Kind::Ai, seller: seller.into(), price_text: "10 sat per 1,000 tokens".into(), prices: Value::Null, items: Vec::<Item>::new(),
+                  address: address.into(), app: String::new(), app_base: String::new() }
     }
 
     #[test]
@@ -306,5 +346,19 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["prices"]["per_1k_output_msat"], 7000);
         assert_eq!(problems.len(), 2);
+    }
+
+    #[test]
+    fn a_shop_reached_by_key_uses_the_prices_of_its_checked_listing_and_is_not_fetched() {
+        let pk = [2u8; 32];
+        let origin = xbt402::shop::origin_for(&pk);
+        let mut s = ai("Model", &origin, &format!("{origin}/laz-mini"));
+        s.prices = json!({"per_1k_output_msat": "10000"});
+        let (out, problems) = sellers_entries(&[s.clone()], &json!({}), |u| panic!("fetched {u}"));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!((out[0]["route"].as_str(), &out[0]["prices"]), (Some(format!("{origin}/laz-mini/").as_str()), &json!({"per_1k_output_msat": "10000"})));
+        s.prices = Value::Null;
+        let (out, problems) = sellers_entries(&[s], &json!({}), |u| panic!("fetched {u}"));
+        assert!(out.is_empty() && problems.len() == 1);
     }
 }

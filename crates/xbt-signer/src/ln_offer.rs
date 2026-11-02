@@ -315,7 +315,7 @@ impl Signer {
             let _ = self.ln_book.update(&hash, json!({"state": "failed", "failure": "ledger"}));
             return deny("ln", e.msg);
         }
-        let req = OfferPayRequest { invoice: lni, fee_limit_msat: (fee_limit as u64).saturating_mul(1000), timeout_s: pol.timeout_s.max(1) };
+        let req = OfferPayRequest { invoice: lni, fee_limit_msat: (fee_limit as u64).saturating_mul(1000), timeout_s: pol.timeout_s.max(1), http_margin_s: 30 };
         // an answer for another payment is no answer: the node's record of this hash decides
         let sent = ln.pay_offer(&req).and_then(|pmt| {
             if str_or_empty(pmt.get("payment_hash")).eq_ignore_ascii_case(&hash) { Ok(pmt) } else { Err(err("ln_backend", "the LN node answered for another payment")) }

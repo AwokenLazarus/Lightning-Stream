@@ -11,10 +11,13 @@ it). Other images (the stand-in XBT node) are left alone. An image with no lock 
 `<image>:0.1.0` (the tag scripts/oci_build.sh --load gives) and any other spelling of it fails --check.
 No digest is invented.
 With --release it also refuses what may not be released: an image the packages name that has no lock
-line (a local tag no box can pull), and a lock built from an older commit than the last change to the
-images' sources (crates/ but its tests, Cargo.toml, Cargo.lock, container/): the pins would run old code. Run it before
-a store or a package is published; it passes only after the images of the commit are published and pinned.
-    python3 packaging/pin_images.py [--check] [--release]
+line (a local tag no box can pull), a lock built from an older commit than the last change to the
+images' sources (crates/ but its tests, Cargo.toml, Cargo.lock, container/): the pins would run old code, and a
+pinned image that doesn't know what its package asks of it (an init without a component the package lists,
+"unknown component datum"; a hashlink without a flag it passes, such as --gateway-api). That last check runs the
+images (docker; --uses runs it alone). Run it before a store or a package is published; it passes only after the
+images of the commit are published and pinned.
+    python3 packaging/pin_images.py [--check] [--release] [--uses]
 """
 from __future__ import annotations
 
@@ -26,9 +29,10 @@ HERE = Path(__file__).resolve().parent
 LOCK = HERE / "images.lock"
 REF = re.compile(r"^(?P<repo>[a-z0-9.-]+(?::\d+)?(?:/[a-z0-9._-]+)+)/(?P<name>xbt-[a-z0-9-]+|lightning-stream):(?P<tag>[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12})"
                  r"@(?P<digest>sha256:[0-9a-f]{64})$")
-# an image reference of an agentpay service, local tag or pinned. lightning-stream and xbt-hashlink are
-# included so that once images.lock has their lines, this rewrites their local tags to those digests.
-ANY = r"(?:[a-z0-9.:/-]+/)?(xbt-(?:init|signer|anchor-witness|wallet-mcp|wallet-ui|gateway|work-relay|hashlink)|lightning-stream)(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?"
+# an image reference of an agentpay service, local tag or pinned. lightning-stream, xbt-hashlink and
+# xbt-datum-gateway are included so that once images.lock has their lines, this rewrites their local tags to
+# those digests.
+ANY = r"(?:[a-z0-9.:/-]+/)?(xbt-(?:init|signer|anchor-witness|wallet-mcp|wallet-ui|gateway|work-relay|hashlink|stream-relay|vpn|datum-gateway)|lightning-stream)(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?"
 
 
 def load_lock(path: Path = LOCK) -> dict[str, str]:
@@ -95,6 +99,102 @@ def stale(pins: dict[str, str]) -> list[str]:
     return out
 
 
+def _docker(*a: str, check: bool = True) -> "subprocess.CompletedProcess[str]":
+    import subprocess
+    return subprocess.run(["docker", *a], capture_output=True, text=True, check=check)
+
+
+def _uses() -> list[tuple[str, str, str, set[str]]]:
+    """What each package asks of its images: (where, image ref, kind, wants), kind "init" (the components its
+    init lists) or "hashlink" (the flags its hashlink commands pass)."""
+    import yaml
+    out = []
+    composes = sorted((HERE / "umbrel").glob("lazarus-*/docker-compose.yml")) + [HERE / "linux" / "docker-compose.yml"]
+    for path in composes:
+        if not path.exists():
+            continue
+        rel = str(path.relative_to(HERE.parent))
+        doc = yaml.safe_load(path.read_text()) or {}
+        for name, svc in (doc.get("services") or {}).items():
+            img = str((svc or {}).get("image", ""))
+            if "/xbt-init:" in img or img.startswith("xbt-init:"):
+                comps = str(((svc.get("environment") or {}) if isinstance(svc.get("environment"), dict) else {}).get("XBT_INIT_COMPONENTS", ""))
+                if comps:
+                    out.append((f"{rel} {name}", img, "init", set(comps.split(","))))
+            if "/xbt-hashlink:" in img or img.startswith("xbt-hashlink:"):
+                cmd = [str(x) for x in (svc.get("command") or [])]
+                flags = {x for x in cmd if x.startswith("--")}
+                if flags:
+                    out.append((f"{rel} {name}", img, "hashlink", flags))
+    for path in sorted((HERE / "startos").glob("*/startos/spec.ts")):
+        rel, text = str(path.relative_to(HERE.parent)), path.read_text()
+        ref = lambda key: (re.search(r"(?m)^  %s: '([^']+)'" % key, text) or [None, ""])[1]  # noqa: E731
+        m = re.search(r"const components = \[([^\]]*)\]", text)
+        if m:
+            out.append((f"{rel} init", ref("init"), "init", set(re.findall(r"'([a-z-]+)'", m.group(1)))))
+        flags = set()
+        for c in re.finditer(r"command: \[\s*'/usr/bin/xbt-hashlink',(.*?)\]", text, re.S):
+            flags |= set(re.findall(r"'(--[a-z0-9-]+)'", c.group(1)))
+        if flags:
+            out.append((f"{rel} hashlink", ref("hashlink"), "hashlink", flags))
+    return out
+
+
+def _init_report(stdout: str) -> dict | None:
+    """xbt-init's report: the last line of its output, a JSON object with "ok"; None when there is none."""
+    import json
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        return v if isinstance(v, dict) and "ok" in v else None
+    return None
+
+
+def unknown_to_pins() -> list[str]:
+    """Each pinned image against what its package asks of it: an init that doesn't know a component the package
+    lists (xbt-init check says \"unknown component\"), a hashlink binary without a flag the package passes. Runs
+    the images (pulled by digest if missing): for --release, before a package or a store is published."""
+    import tempfile
+    bad = []
+    for where, ref, kind, wants in _uses():
+        if not ref:
+            bad.append(f"{where}: no image")
+            continue
+        if kind == "init":
+            r = _docker("run", "--rm", "--network", "none", "--tmpfs", "/x", ref, "check", "--data", "/x", "--components",
+                        ",".join(sorted(wants)), check=False)
+            # xbt-init check prints its report as JSON and exits 1 on any problem (an empty /x has many): the report
+            # is what's read. No report (a pull or run that failed) is a failure, never a pass
+            report = _init_report(r.stdout)
+            if report is None:
+                bad.append(f"{where}: {ref} could not be run to ask it (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+                continue
+            unknown = sorted({m for p in report.get("problems", []) for m in re.findall(r"unknown component ([a-z-]+)", str(p))})
+            if unknown:
+                bad.append(f"{where}: {ref} doesn't know the component{'s' if len(unknown) > 1 else ''} {', '.join(unknown)}")
+        else:
+            made = _docker("create", ref, check=False)
+            c = made.stdout.strip()
+            if made.returncode != 0 or not c:
+                bad.append(f"{where}: {ref} could not be pulled or created (rc {made.returncode}): {made.stderr.strip()[-300:]}")
+                continue
+            try:
+                with tempfile.TemporaryDirectory() as t:
+                    got = _docker("cp", f"{c}:/usr/bin/xbt-hashlink", f"{t}/xbt-hashlink", check=False)
+                    data = open(f"{t}/xbt-hashlink", "rb").read() if got.returncode == 0 else b""
+            finally:
+                _docker("rm", c, check=False)
+            if not data:
+                bad.append(f"{where}: {ref} has no /usr/bin/xbt-hashlink to read")
+                continue
+            missing = sorted(f for f in wants if f.encode() not in data and f[2:].encode() not in data)
+            if missing:
+                bad.append(f"{where}: {ref} doesn't take {', '.join(missing)}")
+    return bad
+
+
 def main() -> int:
     check = "--check" in sys.argv[1:] or "--release" in sys.argv[1:]
     release = "--release" in sys.argv[1:]
@@ -103,6 +203,14 @@ def main() -> int:
     if release:
         for why in stale(pins):
             print(f"pin_images: not releasable: {why}")
+            bad += 1
+        # what the packages ask of the pinned images, asked of the images themselves
+        for why in unknown_to_pins():
+            print(f"pin_images: not releasable: {why}")
+            bad += 1
+    if "--uses" in sys.argv[1:]:
+        for why in unknown_to_pins():
+            print(f"pin_images: {why}")
             bad += 1
     for path, pat, _ in targets():
         text = path.read_text()

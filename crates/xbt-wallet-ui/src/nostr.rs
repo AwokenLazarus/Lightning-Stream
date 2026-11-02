@@ -1,6 +1,6 @@
 //! Sellers found on Nostr (`XBT_UI_NOSTR_RELAYS`, `docs/NOSTR.md`): the listings the owner's relays
 //! hold, each checked by [`xbt_nostr::market`] (the event, the listing and the binding all verify),
-//! kept for a while, and turned into services the player can open.
+//! kept for a while, and turned into services a service page can open.
 //!
 //! The relays are asked only when the owner opens the Nostr page, never in the background, and
 //! never with no relays set (the default). A seller found here is unvetted: its listing is signed
@@ -59,11 +59,31 @@ impl NostrCache {
         s
     }
 
-    /// The services found the last time the page asked, without asking again: what the player and
-    /// the links for external players may open.
+    /// The services found the last time the page asked, without asking again: what a service page
+    /// may open.
     pub fn services(&self) -> Vec<Service> {
         self.snap.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|s| s.listings.iter().flat_map(to_services).collect()).unwrap_or_default()
     }
+
+    /// The shop with Nostr key `pk` (a shop without a web address, `docs/DIRECT-LINKS.md`): its
+    /// newest listing on the owner's relays. The relays are asked for that key's listings only.
+    pub fn find_shop(&self, pk: &[u8; 32]) -> Result<NostrListing, String> {
+        if !self.enabled() {
+            return Err("The app has no Nostr relays to look the shop up on. Set them in the app's settings, or paste the seller's web address.".into());
+        }
+        let filter = serde_json::json!({"kinds": [market::KIND_CLASSIFIED], "authors": [hex::encode(pk)], "#t": [market::TOPIC], "limit": 20});
+        let (events, _) = oneshot::query(&self.relays, &filter, QUERY_WAIT);
+        shop_listing(&events, pk, xbt_nostr::now()).ok_or_else(|| "None of the app's Nostr relays has a listing from that shop. Check the key, or ask the seller which relays it publishes to.".into())
+    }
+}
+
+/// The newest good listing among `events` that the shop with Nostr key `pk` published for itself.
+pub fn shop_listing(events: &[xbt_nostr::event::Event], pk: &[u8; 32], now: u64) -> Option<NostrListing> {
+    let origin = xbt402::shop::origin_for(pk);
+    let author = hex::encode(pk);
+    events.iter().filter_map(|e| market::read_event(e, now).ok())
+        .filter(|n| n.author == author && n.listing.seller == origin)
+        .max_by_key(|n| n.created_at)
 }
 
 /// A checked listing as services of Browse: one for a `listing/0`, one per service for a

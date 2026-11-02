@@ -35,9 +35,12 @@ fn empty() -> Value {
 /// [`spec`] for a wallet whose operator turned stream tickets on (`tickets`): `xbt402_pay` then
 /// also takes `task`, the owner's task the call is paid under. With tickets off it is B2's.
 pub fn spec_for(tool: &str, tickets: bool) -> Option<&'static [Arg]> {
-    // `range`: one byte range of a GET (bytes=N- or bytes=N-M), as a player that seeks asks; empty: the whole body
-    static XBT402_PAY_TICKETS: [Arg; 6] = [req("url", Ty::Str), opt("method", Ty::Str, || Value::from("GET")), opt("body", Ty::Str, empty),
-                                           opt("max_sats", Ty::Int, || Value::from(2000)), opt("task", Ty::Str, empty), opt("range", Ty::Str, empty)];
+    // `range`: one byte range of a GET (bytes=N- or bytes=N-M), as a player that seeks asks; empty: the whole body.
+    // `if_range`: with a range that goes on from an earlier answer, that answer's `etag` (or `last_modified`): a file
+    // that changed since comes back whole and is not read, rather than its rest spliced onto the old bytes
+    static XBT402_PAY_TICKETS: [Arg; 7] = [req("url", Ty::Str), opt("method", Ty::Str, || Value::from("GET")), opt("body", Ty::Str, empty),
+                                           opt("max_sats", Ty::Int, || Value::from(2000)), opt("task", Ty::Str, empty), opt("range", Ty::Str, empty),
+                                           opt("if_range", Ty::Str, empty)];
     match tool {
         "xbt402_pay" if tickets => Some(&XBT402_PAY_TICKETS),
         _ => spec(tool),
@@ -254,7 +257,7 @@ mod tests {
         // `task` exists only for a wallet with tickets on; without them it is an extra key, ignored as pydantic ignores one
         assert_eq!(v("xbt402_pay", json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 1000}));
         let with = |a: Value| validate_for("xbt402_pay", a.as_object().unwrap(), true).map(Value::Object);
-        assert_eq!(with(json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 2000, "task": "film", "range": ""}));
+        assert_eq!(with(json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 2000, "task": "film", "range": "", "if_range": ""}));
         assert_eq!(with(json!({"url": "u", "range": "bytes=0-1048575"})).unwrap()["range"], "bytes=0-1048575");
         assert_eq!(with(json!({"url": "u"})).unwrap()["task"], "");
         assert!(with(json!({"url": "u", "task": 7})).unwrap_err().contains("task"));

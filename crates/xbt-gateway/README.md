@@ -32,7 +32,9 @@ section 8). Pointed at a node that answers `getinfo` in Core Lightning's names, 
    full on arrival), and hold invoices are issued only to a session that has paid one: a lock
    for held tickets before that is `402 prepaid_first`, and asks your node for nothing
    (`caps.held_after_paid`, on wherever you offer both kinds; `false` turns it off). A first
-   lock's invoice lapses after 20 s (`caps.first_lock_secs`), and one client address has at most
+   lock's invoice lapses after 60 s, as any ticket invoice does (`caps.first_lock_secs`, from 5 to
+   60: a buyer's payment over a slow route can take tens of seconds to reach you, and one that
+   arrives after the invoice lapsed is refused with nothing paid), and one client address has at most
    2 unpaid invoices at once (`caps.unpaid_per_address`, 0 for no cap: the address is the
    socket's unless `http.forwarded_address` names your proxy).
 3. The buyer releases a ticket by sending its secret: in `POST /x402/ticket/release`, which is
@@ -223,7 +225,7 @@ draws (`docs/TICKETS.md`, section 9). It is off unless you write the section: wi
 first.
 
 ```json
-"lottery": {"win_msat": 64000, "min_win_msat": 16000, "window": 8, "grace_seconds": 30,
+"lottery": {"win_msat": 64000, "min_win_msat": 16000, "window": 8, "grace_seconds": 60,
             "grace_pieces": 64, "max_unpaid_wins": 2, "piece_bytes": 262144}
 ```
 
@@ -236,6 +238,13 @@ the buyer pays it at once. The odds are the piece's price over the win, so what 
 be paid is your price: a piece of a tenth of a sat wins a 64-sat payment one time in 640. What
 you are actually paid comes near that only over many wins: within 20% takes about 68 wins
 (4,350 sat at this win size), nine times in ten.
+
+A win's invoice lives `invoice_secs` (as long as `grace_seconds`, and never longer) for a buyer
+that says nothing more. A buyer that says at the open that it asks for a failed win's invoice to
+be cancelled (`canCancel`, every wallet from 0.2.0) gets invoices of `invoice_secs_cancel`, 180 s
+as shipped: its next invoice comes at once when a payment fails, so a long invoice holds it up
+for nothing, and a win that waits its turn behind many others' does not see its invoice lapse.
+The grace is the same for both: a win unpaid past it stops the answer either way.
 
 A route is offered this way only if its dearest piece (its request, one second, or `piece_bytes`
 of its body) costs a quarter of `win_msat` or less (`max_odds_den`, 4: no piece wins more often

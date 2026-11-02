@@ -20,6 +20,11 @@
 #            max_sats; again and stopped by the agent; the unused tickets cancelled within 5 s; what
 #            the buyer's node paid, what the seller's node received, what the wallet booked and what
 #            the receipts say, to the millisat
+#   money    every paid service of this lab's gateway over a realistic amount, as usage times the
+#            listed price on both sides: the 100 MB file (Files), and 240 requests of a web app's shape
+#            (pages and 40 media segments, about 70 MiB) to a route priced per request and per byte;
+#            each reply must arrive whole; the seller's signed receipts and the wallet's account each
+#            come to it to the msat, and both nodes, the wallet's book and the receipts agree
 #   slots    half of the buyer's channel taken by payments of others: the wallet holds nothing and
 #            pays with prepaid tickets, one at a time; a seller at its cap of 15 says slots_short and
 #            is paid with a prepaid ticket; a lock that finds no slot on the way: the session holds
@@ -36,6 +41,36 @@
 #            killed with a pool locked and again in the middle of an answer, then started again:
 #            nothing the seller took that the wallet has not booked, nothing paid twice, and the
 #            next call pays or says why not
+#   long_download  a 320 MB download through the connector, which streams it on as it is paid
+#            for, with the wallet's limit for an answer read whole set to 2 s: it comes whole, its
+#            sha256 the file's, the money agreeing. long_download_relay (by name only): the same
+#            from a relay-only shop, through our relay
+#   paused_player  a player paused past what the app gives a client that takes nothing: it loses its
+#            connection after 60 to 90 s (measured), and asks again by Range from where it was. The file
+#            whole, the money agreeing
+#   jellyfin (by name only) a seller's whole web app: the real Jellyfin web client in Chrome,
+#            through the wallet app's app port, the connector and the signer, to a gateway that
+#            gives each buyer a Jellyfin account of their own, sold by the byte on these nodes: one
+#            tap logs the buyer in as themselves, a 4K film plays and seeks, every byte is paid,
+#            and the progress is the buyer's. Needs JELLYFIN_URL, JF_ADMIN_KEY_FILE, JF_LIBRARY,
+#            JF_ITEM, node and google-chrome. jellyfin_link and jellyfin_relay: the same, the shop
+#            reached only over its iroh link, directly or through our relay. JF_BASELINE=1 plays the
+#            film straight from Jellyfin first and judges playback against that, within JF_MARGIN_S
+#            (3 s) and JF_MARGIN_FRAMES (5); JF_GUEST_USER and JF_GUEST_PW name the Jellyfin user
+#            that plays it there
+#   vpn      (by name only) a VPN exit sold as a Stream service: the exit's VPN service behind the
+#            seller's gateway (/vpn/, WebSockets priced per byte), and a buyer's paid tunnel opened by
+#            the wallet carrying a 10 MiB download from the far side of the exit (a server in this
+#            check, reached by a NAT rule, so sudo iptables is needed): whole, interim receipts checked
+#            with no fault, the money agreeing. First, from no credit at that shop, a region check of the
+#            exit (vpn_region_check): one ticket bought, charged at most 20 sats, the trace page read
+#            through the exit, and what the wallet says left it equal to what its node paid. Then
+#            tunnels the agent stops while they are open, once the far side has sent 60 MiB at
+#            40 Mbit (500,000 sat a GiB, and 1,000: under one ticket) and 500 MiB at 200 Mbit (20,000
+#            sat a GiB, where what is paid ahead is a real share of a ticket): the seller's book and
+#            the wallet's account each charge the tunnel's bytes at the listed price, never below it
+#            and at most 1% and 1 MiB above (framing, and bytes on their way at the stop: one flow's
+#            512 KiB window), and under two tickets are left with the seller. Ports BASE+17 to BASE+20
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab
@@ -44,7 +79,8 @@
 # Ports (loopback, below the kernel's ephemeral range): TICKET_E2E_PORT_BASE (default 17961) to
 # BASE+7: the chain node's RPC, the three nodes' REST, the gateway (BASE+4), the file server
 # (BASE+5), the second gateway (BASE+6) and the lying proxy in front of it (BASE+7); the offers
-# check's node lf4 (BASE+9) and its gateway (BASE+10). Its own compose
+# check's node lf4 (BASE+9) and its gateway (BASE+10); the link check's gateway (BASE+11); the jellyfin check's gateway (BASE+12),
+# connector (BASE+13), wallet app (BASE+14) and its two app ports (BASE+15, BASE+16). Its own compose
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit
 # (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 25 minutes.
@@ -81,6 +117,10 @@ R=
 
 cleanup() {
   if [ -n "$R" ]; then pkill -f "$R/" 2>/dev/null || true; fi
+  # the vpn checks' NAT rule to their far side (drive.py's FarSide), even where the driver was killed outright. Never
+  # failing: under set -e a failed command in this trap would become the run's exit status
+  sudo -n iptables -w -t nat -S OUTPUT 2>/dev/null | grep -- 'ticket-e2e-far-side' | sed 's/^-A /-D /' |
+    while read -r rule; do eval "sudo -n iptables -w -t nat $rule" 2>/dev/null || true; done || true
   if [ "${TICKET_E2E_KEEP:-0}" != 1 ]; then
     if [ -d "$LAB" ]; then
       # unchecked: on the way out there is nobody to tell, and the next run removes what is left
@@ -101,6 +141,14 @@ mkdir -p "${TICKET_E2E_SCRATCH:-$ROOT/run}"
 R=$(mktemp -d "${TICKET_E2E_SCRATCH:-$ROOT/run}/ticket-e2e-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
+# a seller's whole web app (the jellyfin check, run by name only) also needs the wallet app and the connector, and
+# the long_download and paused_player checks (in the default run) the connector
+case " $* " in *" jellyfin"*)
+  nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p lightning-stream --bin lightning-stream ;;
+esac
+case " $* " in *" long_download"*|*" paused_player"*|"  ") nice -n 19 cargo build -q -j4 --release --locked -p lightning-stream --bin lightning-stream ;; esac
+# a VPN exit sold as a service (the vpn check, run by name only) needs the VPN service
+case " $* " in *" vpn "*|*" vpn") nice -n 19 cargo build -q -j4 --release --locked -p xbt-vpn --bin xbt-vpn ;; esac
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 # the lab and the node binaries: cloned and built when missing

@@ -145,21 +145,51 @@ pub fn parse_py(s: &str) -> serde_json::Result<Value> {
 /// B2's `SignerClient.call`: one request per connection, `{"id": 1, "method", "params"}` + newline,
 /// one line back. Big integers survive both ways (`xbt402::json::parse`).
 pub fn signer_call(sock: &Path, timeout: Duration, method: &str, params: &Value) -> Result<Value, String> {
+    signer_call_sent(sock, timeout, method, params).map_err(|(_, e)| e)
+}
+
+/// [`signer_call`], saying with an error whether the request may have reached the signer: `false`
+/// only where the socket could not be reached, so that nothing was sent.
+pub fn signer_call_sent(sock: &Path, timeout: Duration, method: &str, params: &Value) -> Result<Value, (bool, String)> {
+    signer_call_waiting(sock, timeout, Some(timeout), method, params)
+}
+
+/// [`signer_call_sent`] with the wait for the answer apart from the rest: `answer_wait` `None` waits
+/// as long as the signer takes. Connecting and sending keep `timeout`.
+pub fn signer_call_waiting(sock: &Path, timeout: Duration, answer_wait: Option<Duration>, method: &str, params: &Value)
+                           -> Result<Value, (bool, String)> {
+    let mut s = Stream::connect(sock).map_err(|e| (false, format!("signer socket {}: {e}", sock.display())))?;
+    signer_exchange(&mut s, sock, timeout, answer_wait, method, params).map_err(|e| (true, e))
+}
+
+fn signer_exchange(s: &mut Stream, sock: &Path, timeout: Duration, answer_wait: Option<Duration>, method: &str, params: &Value)
+                   -> Result<Value, String> {
     let io = |e: std::io::Error| format!("signer socket {}: {e}", sock.display());
-    let mut s = Stream::connect(sock).map_err(io)?;
     s.set_timeouts(Some(timeout));
     let mut req = Map::new();
     req.insert("id".into(), 1.into());
     req.insert("method".into(), method.into());
     req.insert("params".into(), params.clone());
     s.write_all(format!("{}\n", dumps(&Value::Object(req))).as_bytes()).map_err(io)?;
+    s.set_read_timeout(answer_wait);
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).map_err(io)?;
+    if line.trim().is_empty() {
+        return Err(format!("signer socket {}: closed without an answer", sock.display()));
+    }
     let resp = parse_py(line.trim()).map_err(|e| format!("signer answer: {e}"))?;
     if let Some(e) = resp.get("error").filter(|e| !e.is_null()) {
         return Err(format!("signer error: {}", e.get("message").and_then(Value::as_str).unwrap_or("error")));
     }
     Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// The answer to a paying call whose own answer was lost after it was sent.
+fn no_answer(method: &str) -> Value {
+    let see = if method == "ln_pay" { "ln_status and the wallet's payments" } else { "ticket_status (or the wallet's history)" };
+    json!({"verdict": "unknown", "rule": "signer_no_answer", "request_sent": true,
+           "reason": format!("the wallet's signer took the call and its answer was lost (the signer stopped or its socket failed): \
+                              the call may have paid, in part or in full; {see} shows what it did. Do not repeat it before looking")})
 }
 
 /// Where B2 looks for the socket: `B2_SIGNER_SOCK`, else `$B2_ROOT/.run/signer.sock`.
@@ -186,15 +216,25 @@ pub struct Wallet {
     pub ln_tools: bool,
     /// `XBT_MCP_TICKETS=1`: offer `ticket_status` and `ticket_stop` (the signer's policy must turn tickets on).
     pub ticket_tools: bool,
+    /// The longest a paying call waits for the signer's answer (`XBT_MCP_PAY_CEILING_S`): past it the answer counts as
+    /// lost (`signer_no_answer`), so that a signer that never answers (stuck, or stopped with its socket open) holds no
+    /// worker for ever. As shipped, the longest the signer keeps any answer open whatever its owner sets (each open
+    /// limit, `tickets.max_socket_s` among them, is held to 24 h) and 5 minutes more: no call the signer works on is
+    /// cut by it, not even with `max_socket_s` raised past its 6 h.
+    pub pay_ceiling: Duration,
 }
+
+/// [`Wallet::pay_ceiling`] as shipped, in seconds.
+pub const PAY_CEILING_S: u64 = 86_400 + 300;
 
 impl Wallet {
     pub fn new(sock: PathBuf) -> Self {
         let wait = std::env::var("XBT_MCP_APPROVAL_WAIT_S").ok().and_then(|v| v.parse::<f64>().ok()).filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0);
         let ln_tools = std::env::var("XBT_MCP_LN").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
         let ticket_tools = std::env::var("XBT_MCP_TICKETS").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        let ceiling = std::env::var("XBT_MCP_PAY_CEILING_S").ok().and_then(|v| v.parse::<u64>().ok()).filter(|s| *s > 0).unwrap_or(PAY_CEILING_S);
         Self { sock, timeout: default_timeout(), approval_wait: Duration::from_secs_f64(wait.min(86_400.0)), ln_tools,
-               ticket_tools }
+               ticket_tools, pay_ceiling: Duration::from_secs(ceiling) }
     }
 
     /// B2's environment: `B2_SIGNER_SOCK` / `B2_ROOT`, `B2_SIGNER_TIMEOUT`. `XBT_MCP_PAYER=local` was
@@ -212,14 +252,34 @@ impl Wallet {
         signer_call(&self.sock, self.timeout, method, params)
     }
 
+    /// A paying call: the signer answers when the payment, or the paid answer, is done, which can take
+    /// far longer than any other call, so its answer is waited for as long as the signer works
+    /// (the signer bounds the call itself: its stalls, deadlines and stops). An answer lost after the
+    /// call was sent (the signer stopped, the socket failed) is said as such, not as an error that
+    /// reads as if nothing happened: the call may have paid, in part or in full.
+    fn signer_pay(&self, method: &str, params: &Value) -> Result<Value, String> {
+        match signer_call_waiting(&self.sock, self.timeout, Some(self.pay_ceiling), method, params) {
+            Ok(v) => Ok(v),
+            Err((true, e)) if !e.starts_with("signer error:") => {
+                eprintln!("xbt-wallet-mcp: {method}: the answer was lost after the call was sent: {e}");
+                Ok(no_answer(method))
+            }
+            Err((_, e)) => Err(e),
+        }
+    }
+
     /// The signer's `xbt402_pay` (or, AGP-048, `ln_pay`); an over-threshold call waits up to
     /// `approval_wait` for the human. Once the human approved in the UI the signer holds a one-time
     /// grant for exactly this call (url, method, max_sats; or the invoice), and the same call again
     /// pays under it. A deny or expiry answers the original `needs_human` with `approval_state`. The
     /// model never sees or needs a signature.
     fn pay_waiting(&self, method: &str, params: &Map<String, Value>) -> Result<Value, String> {
+        let mut params = params.clone();
+        if method == "xbt402_pay" {
+            with_transport(&mut params);
+        }
         let args = Value::Object(params.clone());
-        let first = self.signer(method, &args)?;
+        let first = self.signer_pay(method, &args)?;
         if self.approval_wait.is_zero() || first.get("verdict").and_then(Value::as_str) != Some("needs_human") {
             return Ok(first);
         }
@@ -230,12 +290,12 @@ impl Wallet {
             std::thread::sleep(Duration::from_millis(500));
             state = self.signer("approval_status", &json!({"token": token}))?.get("state").and_then(Value::as_str).unwrap_or("unknown").to_string();
             if state == "approved" {
-                let mut paid = self.signer(method, &args)?;
+                let mut paid = self.signer_pay(method, &args)?;
                 // a payment the node has not settled yet answers "pending": the grant stays until
                 // it is used, so keep calling while the wait lasts
                 while paid.get("verdict").and_then(Value::as_str) == Some("pending") && std::time::Instant::now() < until {
                     std::thread::sleep(Duration::from_secs(1));
-                    paid = self.signer(method, &args)?;
+                    paid = self.signer_pay(method, &args)?;
                 }
                 if let Value::Object(m) = &mut paid {
                     m.insert("waited_for_human".into(), Value::Bool(true));
@@ -257,8 +317,10 @@ impl Wallet {
     /// stays in this process's log; the model gets B2's generic "Error executing tool" line.
     pub fn call_tool(&self, name: &str, mut params: Map<String, Value>) -> Result<String, String> {
         // no byte range asked for: the whole body, and the signer is not sent an empty one
-        if params.get("range").and_then(Value::as_str).is_some_and(|r| r.trim().is_empty()) {
-            params.remove("range");
+        for k in ["range", "if_range"] {
+            if params.get(k).and_then(Value::as_str).is_some_and(|r| r.trim().is_empty()) {
+                params.remove(k);
+            }
         }
         let result = match name {
             "xbt402_pay" | "ln_pay" => self.pay_waiting(name, &params)?,
@@ -268,8 +330,51 @@ impl Wallet {
     }
 }
 
+/// A pay call to a shop without a web address, with its receipt key and transport document from
+/// the app's shops file (`XBT_SHOPS_FILE`, which the app writes when the owner adds such a shop),
+/// unless the call names them itself. The signer checks the document before a byte goes; reading it
+/// here keeps the app's files out of the signer's sandbox. Any other call is left as it is.
+pub fn with_transport(params: &mut Map<String, Value>) {
+    let Some(url) = params.get("url").and_then(Value::as_str) else { return };
+    let u = xbt402::wire::request_url(url);
+    let origin = format!("{}://{}", u.scheme.to_ascii_lowercase(), u.host.to_ascii_lowercase());
+    if !xbt402::shop::is_shop(&origin) || params.get("transport").is_some_and(|v| !v.is_null()) {
+        return;
+    }
+    let Some(path) = std::env::var_os("XBT_SHOPS_FILE") else { return };
+    let Some(all) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return };
+    let Some(e) = all.get(&origin) else { return };
+    if let (Some(rk), Some(doc)) = (e.get("receipt_key").and_then(Value::as_str), e.get("transport")) {
+        params.insert("receipt_key".into(), rk.into());
+        params.insert("transport".into(), doc.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_shop_by_key_gets_its_document_from_the_shops_file_and_nothing_else_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = xbt402::shop::origin_for(&[7u8; 32]);
+        let file = dir.path().join("shops.json");
+        std::fs::write(&file, serde_json::json!({origin.clone(): {"receipt_key": "02ab", "transport": {"version": "transport/1"}}}).to_string()).unwrap();
+        std::env::set_var("XBT_SHOPS_FILE", &file);
+        let call = |url: &str| {
+            let mut m = serde_json::json!({"url": url}).as_object().unwrap().clone();
+            with_transport(&mut m);
+            m
+        };
+        let shop = call(&format!("{origin}/film"));
+        assert_eq!(shop["receipt_key"], "02ab");
+        assert_eq!(shop["transport"]["version"], "transport/1");
+        assert!(call("https://shop.example/film").get("transport").is_none());
+        // a document the call names itself is kept
+        let mut own = serde_json::json!({"url": format!("{origin}/film"), "transport": {"mine": true}}).as_object().unwrap().clone();
+        with_transport(&mut own);
+        assert_eq!(own["transport"]["mine"], true);
+        std::env::remove_var("XBT_SHOPS_FILE");
+    }
+
     use super::*;
     use xbt_signer::sanitize::UNTRUSTED_KEY;
 

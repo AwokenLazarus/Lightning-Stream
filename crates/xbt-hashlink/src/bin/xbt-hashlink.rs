@@ -14,12 +14,15 @@
 //!                         from F as they change; without --fallback and --config: one rental, then exit
 //! xbt-hashlink hashtaker --key F --control ADDR [--control-token-file F] --upstream ADDR|auto --user U --relays URL,URL
 //!                     [--signer SOCK --task T] [--expect-node HEX] [--datum-candidates ADDR,ADDR] [--state DIR]
-//!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum
+//!                     [--gateway-api ADDR] [--bundled-gateway ADDR|off]
+//!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum.
+//!                         The app's own Stream Gateway is 127.0.0.1:23339 when the candidates list it
 //! xbt-hashlink hashtaker  --key F --upstream ADDR --user U [--idle-s S] [--duration-s S] [--stop-paying-after N]
 //!                     [--rental ID] [--report F] [--miners N] [--budget-sats N]
 //!                     ( --hashmaker ADDR --hashmaker-key HEX --slice-work W --price-msat P [--grace-ms G]
 //!                     | --find URL,URL [--expect-node HEX] [--max-price-msat P] [--found-out F] )
 //!                     [--signer SOCK --task T --max-sats N [--pay-url URL]]   pay through the wallet
+//!                         (tickets are the step the rental has earned: order::Standing; --max-sats is the most one payment may move)
 //! xbt-hashlink relay  --listen ADDR                 a stand-in Nostr relay (in memory, for a lab or a rehearsal)
 //! xbt-hashlink healthcheck [ADDR ...]              the image's HEALTHCHECK (it has no shell or curl): exit 0
 //!                                                  when a control page answers on one of ADDR (default
@@ -73,6 +76,21 @@ pub(crate) fn num<T: std::str::FromStr>(f: &HashMap<String, String>, k: &str, de
     }
 }
 
+/// --allow-unblinded: rent without holding each job to a gateway's API. Never in a release build (Mike: no rental
+/// runs unmasked): only a build with the test-unblinded feature takes it, for stand-in pools that have no gateway to
+/// open their jobs, and its value is read (1 or true, 0 or false), not just its presence.
+pub(crate) fn allow_unblinded(f: &HashMap<String, String>) -> Result<bool, String> {
+    let Some(v) = f.get("allow-unblinded") else { return Ok(false) };
+    if !cfg!(feature = "test-unblinded") {
+        return Err("--allow-unblinded is for test builds only: a rental never runs on jobs it can't show masked".into());
+    }
+    match v.as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(format!("--allow-unblinded takes 1 or 0, not {v:?}")),
+    }
+}
+
 pub(crate) fn read_key(path: &str) -> Result<SecretKey, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("key {path}: {e}"))?;
     let b = hex::decode(s.trim()).map_err(|_| format!("key {path}: not hex"))?;
@@ -88,6 +106,7 @@ fn terms(f: &HashMap<String, String>) -> Result<Terms, String> {
         slice_work: num(f, "slice-work", None)?,
         price_msat: num(f, "price-msat", None)?,
         grace_ms: num(f, "grace-ms", Some(3000))?,
+        start_slices: num(f, "start-slices", Some(0))?,
     })
 }
 
@@ -182,6 +201,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 duration: f.get("duration-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--duration-s")?,
                 reconnect: num(&f, "reconnect", Some(0u8))? == 1,
                 extranonce_subscribe: num(&f, "extranonce-subscribe", Some(0u8))? == 1,
+                bind: None,
             })?;
             eprintln!(
                 "miner: submitted {}, accepted {}, rejected {}, sessions {}, extranonce changes {}, longest gap {} ms",
@@ -213,6 +233,7 @@ fn hashmaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         slices: f.get("slices").cloned(),
         fallback: None,
         rentable: None,
+        min_slice_time: f.get("min-slice-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--min-slice-s")?.unwrap_or(hashmaker::MIN_SLICE_TIME),
     };
     let r = hashmaker::run(cfg, Box::<LabSeller>::default())?;
     eprintln!("hashmaker: done: {}", r["stopped"]);
@@ -224,11 +245,22 @@ pub(crate) fn listing_of(f: &HashMap<String, String>, key: &SecretKey, t: &Terms
         name: need(f, "name")?.into(),
         algorithm: "blake2b".into(),
         hashrate_hs: num(f, "hashrate-hs", Some(capacity.free_hs))?,
-        link_addr: need(f, "link-public")?.into(),
+        // over iroh only, a listing names no TCP address: hashtakers reach the link by its iroh key
+        link_addr: match (f.get("link-public"), f.get("iroh-id")) {
+            (Some(a), _) => a.clone(),
+            (None, Some(_)) => String::new(),
+            (None, None) => need(f, "link-public")?.into(),
+        },
         link_key: pubkey(key),
+        iroh: f.get("iroh-id").map(|id| listing::IrohLink {
+            id: id.clone(),
+            relays: f.get("iroh-relays").map(|r| relays(r)).unwrap_or_default(),
+            direct: Vec::new(),
+        }),
         pay_url: need(f, "pay-url")?.into(),
         pay_node: need(f, "pay-node")?.into(),
         terms: t.clone(),
+        proof: Some(xbt_hashlink::msg::PROOF.into()),
         capacity,
     })
 }
@@ -263,20 +295,30 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
             (need(f, "hashmaker")?.to_string(), PublicKey::from_slice(&hk).map_err(|_| "--hashmaker-key: not a public key")?, terms(f)?, None)
         }
     };
+    let budget_sats = f.get("budget-sats").map(|v| v.parse::<u64>()).transpose().map_err(|_| "--budget-sats")?;
     let payer = match f.get("signer") {
-        Some(sock) => Some(SignerPayer {
-            sock: PathBuf::from(sock),
-            url: f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
-            task: need(f, "task")?.into(),
-            max_sats: num(f, "max-sats", None)?,
-            session: None,
-            wait_for_signer: std::time::Duration::from_secs(num(f, "wait-for-signer-s", Some(15))?),
-        }),
+        Some(sock) => {
+            // tickets are the step the rental has earned (order::Standing), inside a budget if there is one;
+            // --max-sats is the most any one payment may move, however large the step
+            let most_sats = match (f.get("max-sats"), budget_sats) {
+                (None, Some(_)) => None,
+                _ => Some(num(f, "max-sats", None)?),
+            };
+            Some(SignerPayer::new(
+                PathBuf::from(sock),
+                f.get("pay-url").cloned().or(found_pay_url).ok_or("--pay-url is required with --signer")?,
+                need(f, "task")?.into(),
+                t.price_msat,
+                budget_sats,
+                most_sats,
+                std::time::Duration::from_secs(num(f, "wait-for-signer-s", Some(15))?),
+            ))
+        }
         None => None,
     };
     let cfg = hashtaker::Config {
         miners: num(f, "miners", Some(0))?,
-        budget_msat: f.get("budget-sats").map(|v| v.parse::<u64>().map(|s| s * 1000)).transpose().map_err(|_| "--budget-sats")?,
+        budget_msat: budget_sats.map(|s| s.checked_mul(1000).ok_or("--budget-sats: too large")).transpose()?,
         cut: None,
         live: None,
         hashmaker,
@@ -291,7 +333,9 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         idle: Duration::from_secs(num(f, "idle-s", Some(60))?),
         duration: f.get("duration-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--duration-s")?,
         report: f.get("report").map(PathBuf::from),
-        payer,
+        payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
+        gateway_api: f.get("gateway-api").cloned(),
+        allow_unblinded: allow_unblinded(f)?,
     };
     let r = hashtaker::run(cfg, Box::<LabHashtaker>::default())?;
     eprintln!("hashtaker: done: released {} slices, {}", r["released"], r["closed"]);
@@ -308,4 +352,30 @@ pub(crate) fn write_secret(path: &str, s: &str) -> Result<(), String> {
     o.mode(0o600);
     let mut f = o.open(path).map_err(|e| format!("{path}: {e}"))?;
     f.write_all(s.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod allow_unblinded_tests {
+    use super::allow_unblinded;
+    use std::collections::HashMap;
+
+    fn f(v: Option<&str>) -> HashMap<String, String> {
+        v.map(|v| HashMap::from([("allow-unblinded".to_string(), v.to_string())])).unwrap_or_default()
+    }
+
+    /// Mike: no rental runs unmasked. A release build refuses the flag whatever its value; a test build reads it.
+    #[test]
+    fn allow_unblinded_is_a_test_build_flag_and_its_value_is_read() {
+        assert_eq!(allow_unblinded(&f(None)), Ok(false));
+        if cfg!(feature = "test-unblinded") {
+            assert_eq!(allow_unblinded(&f(Some("1"))), Ok(true));
+            assert_eq!(allow_unblinded(&f(Some("true"))), Ok(true));
+            assert_eq!(allow_unblinded(&f(Some("0"))), Ok(false), "0 means no, not the flag's presence");
+            assert!(allow_unblinded(&f(Some("yes please"))).is_err());
+        } else {
+            for v in ["1", "0", "true", ""] {
+                assert!(allow_unblinded(&f(Some(v))).unwrap_err().contains("test builds only"), "{v}");
+            }
+        }
+    }
 }

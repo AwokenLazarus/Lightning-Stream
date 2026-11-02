@@ -84,6 +84,9 @@ pub const RUN_UI: &str = "ui";
 pub const RUN_LN: &str = "ln";
 /// The gateway's config and macaroons, written by the UI's gateway page, read by the gateway.
 pub const RUN_GATEWAY: &str = "gateway";
+/// Umbrel: the hand-over folder of the keys the one-shot `node-keys-bake` (the Lightning app's user)
+/// has the node bake; `node-keys` (the UI) moves them into `run/ln` and `run/gateway` (`node_keys`).
+pub const RUN_NODE_KEYS: &str = "node-keys";
 /// A copy of the signer's one-time enrolment code for the UI's setup page (`B2_ENROLL_CODE_COPY`):
 /// the signer writes it, the UI reads it by group, the MCP is in neither the group nor the mount.
 pub const RUN_ENROLL: &str = "enroll";
@@ -91,9 +94,38 @@ pub const RUN_ENROLL: &str = "enroll";
 pub const HASHRATE: &str = "hashrate";
 /// Their settings, written by the UI's Hashrate page, and their control token.
 pub const RUN_HASHRATE: &str = "hashrate";
+/// The signer's socket for the hashrate renter alone (`signer.sock`): a task's rental terms
+/// (`tickets.tasks.<task>.rental`) are paid only through it. The signer owns the dir; its group is the
+/// hashrate services' (the renter, and the UI, which writes their settings), never the MCP's, so no
+/// other caller of the wallet reaches it.
+pub const RUN_RENTAL: &str = "rental";
+/// The shops without a web address the owner added (`shops.json`: their receipt keys and transport
+/// documents), written by the UI and read, by the signer's group, by the connector and the MCP, which
+/// hand them to the signer in each call to such a shop. The signer itself never mounts it.
+pub const RUN_SHOPS: &str = "shops";
+/// The Stream relay built into the package (`docs/RUN-A-RELAY.md`): its certificates and attempt log.
+pub const STREAM_RELAY: &str = "stream-relay";
+/// The owner's relay settings (`relay.json`), written by the UI and read by the relay.
+pub const RUN_RELAY: &str = "relay";
+/// The relay's status file, written by the relay and read by the UI.
+pub const RUN_RELAY_STATUS: &str = "relay-status";
+/// The VPN service (`docs/VPN-EXITS.md`): its keys (WireGuard, the exit's link, Nostr) and category lists.
+pub const VPN: &str = "vpn";
+/// The VPN settings (`devices.json`, `exit.json`), written by the UI's VPN pages and read by the service.
+pub const RUN_VPN: &str = "vpn";
+/// The VPN service's status (`endpoint.json`, `status.json`, `exit-status.json`), read by the UI.
+pub const RUN_VPN_STATUS: &str = "vpn-status";
 /// The AI endpoint's files, which the UI and the connector (as the signer's user) both write: the
 /// credential store, the AI sellers the UI writes, and the sellers' health the endpoint writes.
 pub const RUN_AI: &str = "ai";
+/// The Stream Gateway (DATUM-compatible) that masks the renter's jobs: its blocks kept for a resubmit
+/// (`submitblocks/`).
+pub const DATUM: &str = "datum";
+/// Its config (`config.json`), written by the UI's Hashrate page, and the node's RPC cookie
+/// (`rpc.cookie`), written by init; the gateway reads both.
+pub const RUN_DATUM: &str = "datum";
+/// The node RPC cookie's name in `run/datum/`: `user:password`, no newline.
+pub const DATUM_RPC_COOKIE: &str = "rpc.cookie";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 
@@ -133,6 +165,11 @@ impl DataDir {
     /// The signer's socket.
     pub fn signer_sock(&self) -> PathBuf {
         self.run(RUN_SIGNER).join("signer.sock")
+    }
+
+    /// The signer's socket for the hashrate renter ([`RUN_RENTAL`]).
+    pub fn rental_sock(&self) -> PathBuf {
+        self.run(RUN_RENTAL).join("signer.sock")
     }
 
     /// The signer's readiness file.

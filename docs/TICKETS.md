@@ -56,7 +56,8 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
  "extra": {"version": "ticket/0", "layer": "lightning", "features": [512],
            "ticketMsat": "1000000", "maxTickets": 2, "ticketBlocks": 40,
            "release": "with-request", "settle": "on-use",
-           "receiptKey": "<33-byte public key>", "session": "/x402/ticket",
+           "receiptKey": "<33-byte public key>", "session": "/x402/ticket", "seqWindow": 64,
+           "refillWaitMs": 15000,
            "price": {"requestMsat": "2500", "byteMsat": "0", "perBytes": "1", "secondMsat": "0"}}}
 ```
 
@@ -75,6 +76,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 | `settle` | `on-use`: tickets are held until used. `on-arrival`: section 5. | Whether a ticket can be had back. |
 | `receiptKey` | The key that signs the seller's receipts. | With tickets the payment preimage proves nothing: the buyer always knew it. The signed receipt is the proof of what was paid for. |
 | `session` | Path of the session endpoints on the seller's origin. | |
+| `refillWaitMs` | Optional (from 0.2.0). How long, in milliseconds, the seller keeps an answer paused for a release before it ends it (the gateway's `times.refill_wait_ms`, 15000 as shipped). A whole number, or one as a decimal string as the msat fields are. Absent: not stated, as by a seller before 0.2.0; a buyer takes any other value as not stated. | A secret released after the seller has ended the answer pays for nothing. A buyer ends its pause for such an answer a margin before then (this wallet: a tenth of it for the way, at least 1 s and at most 3 s), or at its own limit if that comes first; without the field it pauses by its own limit alone. The field can only shorten a buyer's pause, never lengthen it: a seller that states too little gives up its own sales, and a relay that strips it leaves the buyer as before. Like every other term it is as sure as the TLS the 402 came over: nothing signs the terms, and a relay that could rewrite this could rewrite `payTo`. |
 | `heldAfterPaid` | Optional, on an `on-use` entry: `true` when the seller issues held tickets only to a session that has paid a prepaid ticket (section 2, `prepaid_first`). Absent: no such rule is stated. | A buyer that knows the rule buys its prepaid ticket first, instead of offering hashes the seller would refuse. A buyer that does not read it is still told `prepaid_first` and recovers. |
 | `offer` | Optional, on an `on-arrival` entry: a BOLT 12 offer of the seller's node, with no amount, by which its prepaid tickets can be paid (section 15). Never on an `on-use` entry. | A buyer that pays by offer asks for no invoice over HTTP. One that does not read the field buys its prepaid tickets with `lock` as before. |
 
@@ -115,6 +117,11 @@ lock for tickets settled on arrival may instead say `"by": "offer"` and name no 
 no invoice, and makes the session of a buyer that pays its prepaid tickets by the seller's offer
 (section 15).
 
+A first lock MAY name the address the buyer opens the session for, `"path": "<path and query>"`.
+A seller whose route there serves as many buyers as it takes (docs/CAPACITY.md) then answers
+`503 busy` and makes no invoice and no session; one with room counts the new buyer there before
+it pays. A seller that does not know the field ignores it.
+
 The first lock of a session carries no authentication and makes the session. Every later lock is
 a request of that session and carries `PAYMENT-SIGNATURE` as any paid request does (section 3):
 without it, anyone who learns a session id can fill that session's ticket places. A seller MAY
@@ -125,8 +132,10 @@ kinds (`caps.held_after_paid`). Without such a rule a hold invoice costs whoever
 HTTP request, and the seller's held places can be taken by anyone who reaches it from enough
 addresses. Such a seller says so in its terms (`heldAfterPaid`, section 1), and a buyer that reads
 them buys one prepaid ticket first. A buyer told `prepaid_first` buys one prepaid ticket, and holds after it is credited.
-The invoices of a first lock lapse sooner than others (20 s in the gateway, `caps.first_lock_secs`,
-against 60), and one client address has at most 2 unpaid invoices (`caps.unpaid_per_address`). A request names
+The invoices of a first lock lapse after 60 s in the gateway, as others do (`caps.first_lock_secs`
+may set them sooner, down to 5 s: a payment that reaches the seller after its invoice lapsed is
+refused there, with nothing paid, so a short one shuts out buyers on slow routes), and one client
+address has at most 2 unpaid invoices (`caps.unpaid_per_address`). A request names
 at most `maxTickets` hashes. A hash the seller's node will not issue (it has had an invoice for
 that hash before, in any session) comes back under `refused`; a first lock that issues nothing
 makes no session.
@@ -143,7 +152,9 @@ the buyer, which knows that from the terms, does not ask. The same field in a lo
 settled on arrival (section 5) sizes those tickets, and a prepaid ticket paid by offer (section 15)
 is credited at the amount its note names, inside the same bounds. A size outside them is answered
 `400 bad_request`. The gateway built here offers smaller sizes only where its runner sets
-`tickets.min_ticket_msat`; it records each ticket's size and credits it for that size. A buyer drops a hash it got no invoice
+`tickets.min_ticket_msat`; it records each ticket's size and credits it for that size. A route's
+`top_ticket_msat` lets a buyer ask for a prepaid ticket larger than `ticketMsat`, up to the
+`topTicketMsat` its prepaid entry states; a held ticket stays at `ticketMsat` or below. A buyer drops a hash it got no invoice
 for after two minutes: an invoice that arrives later is not paid.
 
 Before paying each invoice the buyer MUST check all of these. They are the whole of the buyer's
@@ -187,7 +198,7 @@ the lab), and cannot see `ACCEPTED` at all. A buyer that releases a ticket in th
 secret again. On the lab a buyer that paid as soon as its own node showed 8 tickets in flight was
 answered so and served on the retry. A buyer SHOULD wait for the seller's own word instead: the
 session's signed `status` (section 4) lists each ticket's state, and the wallet built here releases
-a ticket only after `status` has shown it `ACCEPTED`, for a bounded time (3 s by default), so that
+a ticket only after `status` has shown it `ACCEPTED`, for a bounded time (12 s by default), so that
 no secret leaves for a ticket the seller cannot yet use. Locked funds
 are not spent. They count against a cap on locked funds, not against a budget.
 
@@ -231,12 +242,17 @@ its ticket**, since its hash is the ticket's payment hash.
 
 Every request of a session is authenticated this way: a paid request for a resource, and the
 session's own `lock`, `release`, `cancel` and `status` (section 4), whose JSON bodies the digest
-covers. A `seq` is used up by a request whose `auth` was good and whose `seq` was the next one,
-whether it was then served or refused; its answer carries a receipt. A request that was not
-authenticated uses up nothing and gets no receipt: `401 bad_auth`, or `402 bad_seq` with the
-`nextSeq` the seller expects, which a buyer adopts (a seller can lose its last half second of
-counters in a power cut). The buyer sends the requests of one session one after another, the next
-when the head of the last answer has arrived: two sent together can arrive out of order.
+covers. A `seq` is used up by a request whose `auth` was good and whose `seq` the seller takes, whether
+it was then served or refused; its answer carries a receipt. A seller takes each `seq` once: the
+next one, or, where its terms state `seqWindow` (`extra.seqWindow`, a whole number from 2 to 64),
+any one not taken yet from the next one up to `seqWindow - 1` past it; its next `seq` then moves
+past every one taken from it on. A request that was not authenticated uses up nothing and gets no
+receipt: `401 bad_auth`, or `402 bad_seq` with the `nextSeq` the seller expects (for a `seq` below
+it, taken already, or past the window), which a buyer adopts (a seller can lose its last half
+second of counters in a power cut). Requests sent together can arrive out of order. With a window,
+the buyer sends up to `seqWindow` requests of one session at once, each `seq` within the window of
+the lowest one still on its way; without one, one after another, the next when the head of the
+last answer has arrived.
 
 The session has a balance in msat. Each secret released adds `ticketMsat`; each request served
 subtracts its price.
@@ -257,8 +273,10 @@ covers both; no field of the terms says which a seller takes.
 In both places the seller does steps 2 and 3 below with the secret. The seller, for each
 request, in this order:
 
-1. Checks `auth` and that `seq` is the next one. Without `auth` anyone who sees a session id spends
-   its balance. Without `seq` a replayed request is served twice.
+1. Checks `auth` and that it takes `seq`: the next one, or one not taken yet within its window.
+   Without `auth` anyone who sees a session id spends its balance. Without `seq` a replayed
+   request is served twice. The seqs taken past the next one are kept with the session's other
+   counters, so a seller that starts again takes none of them again.
 2. If there is a secret: hashes it and finds that ticket in this session. The ticket MUST be
    `ACCEPTED` on the seller's own node for the full `ticketMsat` (by a lookup, or from the node's
    invoice subscription), not used before, and MUST have more than 24 blocks left before its HTLC
@@ -281,7 +299,10 @@ request, in this order:
    signature is ECDSA on secp256k1, strict DER, low S (`xbt402::ticket::receipt_message`). `releasedMsat` is the sum of the
    tickets settled in this session and `spentMsat` the running total of what was served.
    `releasedMsat` only rises. `spentMsat` rises as pieces are served, and falls only by what the
-   seller charged ahead of sending and then did not send (an answer the buyer stopped reading).
+   seller charged ahead of sending and then did not send (an answer the buyer stopped reading), or
+   charged past what an answer came to (a model's reply settled on its counts). A buyer orders
+   receipts by its own requests, not by their figures: a receipt for a request sent after the buyer
+   took a receipt is the newer of the two, though its `spentMsat` is lower (section 17).
 
 The step-2 height is the seller's node's, and the seller's macaroon of section 7 cannot read it:
 with `invoices:read` and `invoices:write` the node answers `permission denied` to `GetInfo` and to
@@ -378,17 +399,26 @@ a new session is no new start (section 14).
 **An answer priced as it goes.** A body priced per byte or per second (section 1, `price`) is paid
 for while it is sent: the seller takes the price of each piece of the body from the balance before
 it sends that piece, and of each second as it starts. When the balance runs out it stops sending
-and waits a few seconds for more; then it ends the answer, cut short where the buyer can see it
+and waits for more (15 s by default); then it ends the answer, cut short where the buyer can see it
 (a body shorter than its `Content-Length`, or a chunked body with no last chunk). The buyer keeps
 such an answer going with `POST <session>/release {"secrets": ["<s1>", ...]}`: each secret is
 taken as in section 3, steps 2 and 3, and the answer names the hashes `released` and those
 `refused`, each with its code. A buyer that releases one ticket when the last is used up is never
 more than one ticket ahead of what it has received; what it has not used stays its balance.
+This wallet releases the next ticket a little before the last is used up, so that a payment that
+takes a moment does not hold the body up: when what has arrived comes within a lead of what is
+paid for. The lead is twice what arrived while the last ticket's release took, at most half of
+what one ticket pays for; before the answer's first release is timed, 3 s of the body at the
+rate it came, at most half of what is paid for. So right after a release the seller holds up to
+about 1.5 tickets of unspent credit for the answer, falling to nothing as the body arrives
+(answers side by side each draw on the same balance, and each releases only as it needs). The
+seller's wait for a release before it ends an answer is `times.refill_wait_ms`.
 
 The head of such an answer carries a receipt for what was charged before the body (`bodyHash`
 empty, and `"stream": true` beside the receipt). The receipt for the whole answer, with the bytes
 sent, their hash and their price, is in the answer to `POST <session>/status {}`, under
-`responses`, signed for the request's own `seq`; `status` also lists the session's tickets with
+`responses`, signed for the request's own `seq` (the last 128 such receipts of the session: twice
+the widest window, so that every answer of a window that ran at once is found); `status` also lists the session's tickets with
 their state and expiry height. On the lab a 100 MB file at 200,000 msat per MiB, fetched through
 a hop with one ticket released each time the last was used up, stopped after the tenth ticket at
 52,428,800 bytes: what ten tickets pay for, to the byte (`scripts/gateway_regtest.sh fetch`).
@@ -418,7 +448,8 @@ a ticket is free when its payment shows `FAILED` there. The seller SHOULD also c
 of a session that has been idle for some minutes, and SHOULD cancel a ticket that has reached its
 margin, which it can no longer use. Held tickets cost it inbound capacity, and they are what
 closes its channel if its node goes down (section 6). The gateway cancels after 5 minutes without
-a paid request, after 1 minute for a session that has never released a secret, and at the margin.
+a paid request, after 1 minute for a session that has never released a secret (but not an
+invoice of it that is still payable: that is kept for its life and 15 s more), and at the margin.
 
 Cancelling needs the seller. A seller that does nothing leaves the buyer's tickets locked until
 they end by block height.
@@ -694,7 +725,8 @@ cancelled, and with a hold fee more the longer it is held. Then:
 
 **Strangers (built 2026-10-17).** A session with a seller the owner has not named starts with one
 prepaid ticket, paid and settled on arrival, and holds tickets only after the wallet's node shows
-it paid (the session's `paid_first`, cleared in the same write that books the payment). The
+it paid (the session's `paid_first`, cleared in the same write that books the payment, or when the
+session takes over a seller session this wallet paid: see "A balance left with the seller"). The
 wallet holds 1 ticket at a time with such a seller and 2 with a named one: a task's
 `unlisted_max_tickets` is 1 by default, whatever `pool_many` says, and the pool follows it. A
 seller the owner has not named whose terms offer no prepaid tickets is not held with at all
@@ -715,7 +747,7 @@ too, and holds after it.
 | Held tickets on one channel, all sessions together | Half of the channel's slots: 15 of 30 | The other half is for ordinary payments, for settles on their way and for everyone else (section 11). |
 | Ticket life (`ticketBlocks`) | 40 blocks | The node takes no less than 24. The seller's node cancels at 18 before expiry, the seller stops accepting at 24 before, and the payer's node adds 3: so 19 usable blocks, and at most 25 blocks locked behind a silent seller. |
 | Seller's margin | 24 blocks before expiry | 18, when its node cancels the ticket itself, and 6 more for a settle that has to go on chain (the node starts that 16 blocks before expiry). The 18 is the node's `invoices.holdexpirydelta`, a setting of the node's runner: 18 on the Lightning Fork node at its default, 12 on upstream lnd. The node does not tell it, so the gateway takes it from its config (`node.hold_expiry_delta`, 18 unless the runner says otherwise) and refuses to start when it is above 18: the margin is one number for both sides (a buyer stops releasing a ticket at 25 blocks), so it is not moved to fit a node. |
-| Invoice time expiry | 60 s; 20 s for the invoices of a first lock | Long enough to pay through a few hops (0.5 s through two), short enough that unpaid invoices do not pile up. A first lock is nobody's yet: its invoices give their places back sooner. |
+| Invoice time expiry | 60 s, a first lock's included | Long enough to pay through a few hops on a slow route (a hop held a payment 8 to 22 s on a loaded lab node, and a first lock's 20 s, before 0.2.0, refused such buyers every time), short enough that unpaid invoices do not pile up. What bounds a stranger's unpaid places is the caps by address. |
 | Tickets in flight per channel | 30 on a Core Lightning channel, 483 at most | 483 is the protocol's limit and Lightning Fork's default; 30 is Core Lightning's default, each way, set when the channel opens. Between Lightning Fork nodes, of 520 offered at once 483 locked in 8 s and 37 failed on the buyer's node (`INSUFFICIENT_BALANCE`) with nothing held; to a Core Lightning node, of 40 offered 30 locked and 10 failed the same way. 483 tickets take a commitment transaction from 1,116 to 84,200 weight units. |
 | Macaroons | Buyer: `info:read`, `offchain:read`, `offchain:write`, `onchain:read`. Seller: one with `invoices:read`, `invoices:write`, and one with `info:read`. | The buyer's was enough for its side. The seller's invoice macaroon makes, follows, settles and cancels tickets and cannot read the block height; the second one reads it. Neither could send coins, pay, open a channel, read the wallet or bake another. |
 | Seller's caps (the gateway's defaults in this tree) | 15 held tickets for all sessions together, 2 a session, 30 sessions, 2 from one address, 2 unpaid invoices from one address; hold invoices only to a session that has paid a ticket | What buyers can hold of the seller's inbound capacity at no cost to them: 15,000 sat and half of one 30-slot channel. A runner whose inbound channels all carry more says so (`caps.inbound_slots`), and one with several channels may raise the cap past half of one (`caps.held_over_half`). Until 2026-10-13 the defaults were 8 a session and 240 in all. |
@@ -860,7 +892,7 @@ knows only tickets skips an entry it cannot read.
  "extra": {"version": "lottery/0", "layer": "lightning", "features": [512],
            "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40,
            "pay": "on-win", "release": "after-answer",
-           "window": 8, "graceSeconds": 30, "gracePieces": 64, "maxUnpaidWins": 2,
+           "window": 8, "graceSeconds": 60, "gracePieces": 64, "maxUnpaidWins": 2,
            "chainDraws": 65536, "pieceBytes": "262144",
            "receiptKey": "<33-byte public key>", "session": "/x402/lottery",
            "price": {"requestMsat": "0", "byteMsat": "100", "perBytes": "262144", "secondMsat": "0"}}}
@@ -1087,8 +1119,35 @@ when the node shows the first cancelled (it lapsed unpaid).
 
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed. A win's invoice lives as long as the seller's grace
-(`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer, and is never
+gateway does when the first has lapsed, or at once where the wallet asks it to cancel the first:
+`POST .../cancel` with `{"draw", "hash"}`, signed as every call of the session. The wallet asks only
+when its node shows the payment failed with nothing in flight, at most 4 times for a win and 32 for a
+session. The gateway cancels only the current invoice of that session's unpaid win, only where its own
+node shows it open (`cancelled` says whether it did), and at most `max_win_cancels` times a session, 32
+by default, past which it says `too_many_cancels`; the win's grace still runs from its draw, so a
+cancel buys the buyer no time, no draw and no money. A seller without the call answers 404, and the
+win waits for the lapse. The wallet asks the same where it held a win back for lack of time on its
+invoice (below), which it never sent. Before any payment of the rail the wallet waits for an
+inactive channel, at most 8 s from when it first saw it out, and before a win or a prepaid ticket is
+sent it asks its node for a route to the seller (QueryRoutes, which needs `info:read`; nothing is
+sent) and waits for one up to 8 s, counted from after its node's checks of the channel and the invoice. The query
+is given the invoice's route hints (as the node's decode shows them), so a seller behind a private channel is found
+as the payment finds it; an invoice with blinded paths, which the query is not given, is not asked about and is sent at once. One payment to a seller waits at a
+time, in one window for all of them: the others are refused at once (`ln_no_route`, and not counted), and
+a win whose wait ran the whole window three times ends the call with that reason, the win owed for a
+later call. A node that cannot answer the
+question is not waited for. A win whose invoice would end before
+the payment could arrive (by twice the longest of the latest payments' time on the way, at least 5 s
+and at most half its life) is not sent, and one that ran out while the win waited at the gate does
+not count against the seller, up to 4 for a win and 32 for a session; past that the session ends
+(`lottery_invoices_lapse`). One that came with less than 5 s left counts as a bad invoice. The
+win's next invoice goes before the wins no seller waits for, and a call waits for it where it is due
+within 10 s, or within what the wallet's margin holds back and 5 s more. A wallet from 0.2.0 says at the open that it
+asks for a failed win's invoice to be cancelled (`canCancel: true`), and a gateway from 0.2.0 gives such a session
+invoices of `invoice_secs_cancel` (180 s as shipped), longer than the grace: a win waiting its turn behind many others'
+does not see its invoice lapse, and a failed one's next invoice comes at once on the cancel. For a buyer that says
+nothing, a win's invoice lives as long as the seller's grace
+(`graceSeconds`, 60 s at the gateway, 30 s before 0.2.0; `invoice_secs`, which may not be longer, and is never
 below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`
 carries it, the wallet pays it and asks again. (Until 2026-10-14 an invoice lived 60 s against a
@@ -1130,8 +1189,8 @@ The seller goes first, and these are what bound it:
 - **The grace.** While a win is unpaid the seller serves on: for `graceSeconds`, for
   `gracePieces` pieces after that win, and with at most `maxUnpaidWins` wins unpaid. Beyond any
   of the three a request is refused `win_unpaid`, with the unpaid wins and their invoices, and
-  an answer that is being sent stands still for the payment (10 s at the gateway, and never
-  beyond the grace) and is then cut short. Service goes on when the seller's node shows the wins
+  an answer that is being sent stands still for the payment (15 s at the gateway as shipped: the larger of `refill_wait`, 15 s, and what is left of the
+  win's grace up to `pay_wait_secs`, 10 s; so past the grace when little of it is left) and is then cut short. Service goes on when the seller's node shows the wins
   paid. A file of 64 pieces at one win expected draws three or more wins 8 times in 100,
   and its answer then stands still at the third until the first is paid: what that takes is the
   buyer's to keep short (section 9.5).
@@ -1151,8 +1210,8 @@ One function in the wallet decides, when a seller's 402 has a ticket entry and a
 | A session with this seller is open | what that session pays by |
 | The seller offers one of the two, the owner turned the lottery off (`tickets.lottery.enabled`), or the task says (`meter`: `tickets` or `draws`) | that one |
 | A piece of the route costs one ticket or more | tickets |
-| The call expects fewer wins than the owner's `min_expected_wins` (4): what it may use (`max_sats`) is less than that many wins of the size a session would be opened with, and the seller's ticket entry has prepaid tickets beside it | tickets: a held one where the seller is named and one fits; a prepaid one first for a seller the owner has not named (section 6.4) |
-| The call may use four tickets' worth or more with this seller (`max_sats`), and a held ticket fits (the slot budget of section 11 and the owner's caps have room) | tickets |
+| The call expects fewer wins than the owner's `min_expected_wins` (4): what it may be charged (`max_charge_sats`, else `max_sats`) is less than that many wins of the size a session would be opened with, and the seller's ticket entry has prepaid tickets beside it | tickets: a held one where the seller is named and one fits; a prepaid one first for a seller the owner has not named (section 6.4) |
+| The call may be charged four tickets' worth or more with this seller (`max_charge_sats`, else `max_sats`), and a held ticket fits (the slot budget of section 11 and the owner's caps have room) | tickets |
 | Anything smaller, and whenever no held ticket fits | draws |
 | Draws were chosen and no win size fits the owner's bounds | tickets, and with them the prepaid ticket of section 5 where none can be held |
 
@@ -1197,11 +1256,13 @@ budgets, `max_sellers`, `max_new_sellers_per_min`, `max_sends_per_hour`.
 
 - **Spend is what the node paid.** A win and its routing fee, booked before the payment leaves.
   Never an expected value.
-- **`max_sats` bounds what a call uses**, by the wallet's own count of the pieces it gave values
-  for. What the call pays is uneven: nothing, or several wins. The wallet asks for no more pieces
-  when the wins of a call come to more than `max_sats`, plus 3.1 times the square root of
-  `max_sats` times the win, plus one win. For a call of 1,000 sat on 64-sat wins that is 1,848
-  sat. The task's budget is the bound that holds whatever the draws do.
+- **The call's charge cap bounds what it uses** (`max_charge_sats`, else `max_sats`), by the
+  wallet's own count of the pieces it gave values for. What the call pays is uneven: nothing, or
+  several wins. The wallet asks for no more pieces when the wins of a call come to more than the
+  charge cap, plus 3.1 times the square root of the cap times the win, plus one win (the luck cap).
+  For a call of 1,000 sat on 64-sat wins that is 1,848 sat. `max_sats` does not bound the wins:
+  where the charge cap is `max_sats`, they may come to the luck cap, above it. The task's budget is
+  the bound that holds whatever the draws do.
 - **A budget below one win and its fee pays nothing at all.** The wallet says so when the session
   would open, before it asks the seller for anything.
 - **A session counts once** for `velocity_max` (`tickets.velocity: "session"`, the default),
@@ -1262,7 +1323,7 @@ this tree (the wallet's signer, its MCP server, the gateway), a stock file serve
 Lightning Fork nodes (buyer, one routing hop, seller) on one host over loopback, the buyer's
 channel and the seller's inbound channel opened with 30 slots. The lottery's own rules are the
 shipped ones on both sides (wins of 64 sat through a hop, odds of 1 in 4 at the most, 8 values
-ahead; a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid wins), with pieces of
+ahead; a window of 8 pieces, a grace of 60 s and 64 pieces, 2 unpaid wins), with pieces of
 64 KiB. Other settings of the lab are not the shipped ones. Its wallet policy has
 `velocity_max` 1,000 (shipped: 8), `max_sellers` 108 and `max_new_sellers_per_min` 400 for the
 100 sellers (15 and 30), `max_sends_per_hour` 100,000 (1,200), `max_answer_s` 120 (50) and a lab
@@ -1298,7 +1359,7 @@ wins differ from run to run. The report of the latest run is `reports/lottery_re
   item).
 - The gateway's grace of 10 s was sized for wins that are not paced. Paced 8 at a time, the last
   of 100 sellers' wins waited 13 s. The default is 30 s, and an answer that is being sent stands
-  still for a payment for 10 s at the most.
+  still for a payment for 15 s (`refill_wait`, the larger of it and `pay_wait_secs`, 10 s).
 - A wallet killed between the two writes that book a win kept a ledger row for a payment that
   was never sent. The book's row is now written first. The same was true of a prepaid ticket.
 - A wallet that stopped reading an answer left pieces open with the seller, and the session's
@@ -1427,7 +1488,8 @@ reads the smaller of the two numbers, sees 30 in both cases.
 
 ## 12. The wallet's side: `xbt402_pay`
 
-An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)`. Everything else
+An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)`, with an optional
+`max_charge_sats` beside `max_sats` (below: two limits, not one). Everything else
 is the wallet's signer's (`crates/xbt-signer/src/ticket_pay.rs`): it sends the request once without
 paying, reads the 402 itself, and chooses the rail. Who the seller is therefore comes from what
 the signer fetched from the URL's own origin, never from its caller.
@@ -1511,9 +1573,12 @@ entry for an origin off the allowlist, which is never used, is warned of the sam
    answer priced as it goes is read as it arrives; the next ticket is released when everything
    the released ones pay for has arrived (by the second: in the last fifth of the second before
    the unpaid one), and the wallet stops reading when the book refuses a release, when the call's
-   `max_sats` is used up by its own count of bytes and seconds, or when the answer has been open
-   for `tickets.max_answer_s` (50 s by default). It then asks `status` for the last receipt and
-   checks it against what arrived.
+   charge cap (`max_charge_sats`, else `max_sats`) is used up by its own count of bytes and
+   seconds, when nothing has arrived for `tickets.read_timeout_s` (30 s), or when the answer has
+   been open for `tickets.max_answer_s` (50 s by default). An answer streamed on to the caller as it
+   arrives, unless priced by the second, has `tickets.max_stream_s` instead (6 hours) and, after 10
+   minutes, must bring 16 KiB in each `read_timeout_s`; a WebSocket has `tickets.max_socket_s` (6 hours). It
+   then asks `status` for the last receipt and checks it against what arrived.
 6. The pool is refilled behind the call when half of it or fewer are left: with the default of
    2, when 1 is left.
 
@@ -1522,10 +1587,18 @@ prepaid ticket instead: a lock with `settle: "on-arrival"` and a count of 1, the
 the invoice and every rule of a release, the ledger row, the payment, and then the preimage in
 `release`. One at a time, and none ahead of need.
 
-`max_sats` bounds what the call books, and so what it uses. Money moves a ticket at a time, and a
+`max_sats` bounds what the call books, whole tickets and their fee limits included; its charge cap
+(`max_charge_sats`, else `max_sats`) bounds what it uses. Money moves a ticket at a time, and a
 ticket is released or bought for a call only when it fits what is left of the call's `max_sats`,
-its fee limit included. Where the seller's own size does not fit and its terms let the wallet ask
-for a smaller one (`minTicketMsat`), the wallet asks for the largest that fits, in whole sats: a
+its fee limit included, and, for an answer priced as it goes, only while the credit it can draw
+(the session's balance at its head with what its call released, less what answers beside it drew)
+does not already cover its charge cap: the call could never be charged for one more. Where the seller's own size
+does not fit and its terms let the wallet ask for a smaller one (`minTicketMsat`), the wallet asks
+for the largest that fits, in whole sats, and no larger than the call's charge cap needs: a ticket
+of that cap with its fee limit, or, where that is larger, the seller's smallest for a prepaid
+ticket, and for a held one the larger of the seller's smallest and the smallest the wallet holds
+(the largest of 546 sat, the owner's `tickets.floor_ticket_sats` and the channels' dust limit:
+section 11). A
 prepaid ticket is sized for each purchase, a session's held tickets once, to the call that opens
 it, and a held ticket that does not fit a later call gives way to a smaller prepaid one where the
 seller sells those. Where nothing fits, nothing is paid and the call is refused (`max_sats`, with
@@ -1536,6 +1609,69 @@ wallet's count of that balance, and only where it stands inside the wallet's own
 released total never above what the wallet released, a charge never above the price by the terms
 of what was asked for and received). The ledger holds the wallet's own tickets and the fees its
 node reports, and nothing else.
+
+**Two limits: what may leave the wallet, and what the call may be charged.** A call names
+`max_sats`, and may name `max_charge_sats` beside it. They bound different things:
+
+| | `max_sats` | `max_charge_sats` (default: `max_sats`; never above it) |
+|---|---|---|
+| Bounds | What may leave the wallet for the call on the ticket rail: the tickets it releases or buys, whole, with their routing fees. Not a call paid by draws: its wins are bounded by the charge cap's luck cap and the task's budget (section 9.8) | What the call's answer may be charged by the seller |
+| Told to the seller | No | Yes, as `X-Xbt402-Max-Msat` on each paid request; the gateway ends the answer there, a body or a paid WebSocket (gateways before 0.2.0 did not stop a WebSocket at it: bytes in flight past it were charged, and the wallet takes such a receipt as the seller's fault) |
+| Checked by the wallet | Before a ticket is released or bought: it must fit what is left of `max_sats` | A quoted price above it is refused before anything is paid (`max_sats`); a metered answer is cut there; a receipt that charges more is a seller fault (`ticket_over_cap`) |
+| Where the difference goes | — | It stays as credit with that seller. A later session with it takes it over within 20 hours of the stop (the newest stopped sessions first, and only where the seller's signed count agrees); after that it is lost |
+
+They differ where a use is smaller than the seller's ticket. Tickets run to some 500 to 1,000 sat
+or more, so a call whose `max_sats` is its own small price fits no ticket and, with no credit at
+that seller, is refused before anything is paid. Such a call names a `max_sats` that a whole
+ticket fits, and its own price as `max_charge_sats`. With no credit, a ticket leaves the wallet:
+of about the charge cap where the seller lets the wallet choose the size (its smallest at the
+least), else the seller's own, and never more than `max_sats`. The call is charged at most
+`max_charge_sats` of it; the rest is credit with that seller, which only a later session with that
+seller within 20 hours can use: past that it is lost. More leaves the wallet than the call costs,
+and a page that starts such a call says so: "may buy a ticket of up to N sats; unused credit stays
+with this seller for about 20 hours". The callers in this repository:
+
+- **A VPN exit's region check** (`docs/VPN-EXITS.md`): charged at most 20 sat, and may buy the
+  exit's ticket.
+- **A hashrate rental** (`crates/xbt-hashlink/src/rail.rs`, `caps_at`, and `order.rs`). This covers a
+  trial and every other rental. A ticket is a whole payment that cannot be recalled, so a renter
+  buys only the step it has earned: `max_charge_sats`, which sizes the ticket, is
+  `order::Standing::ticket_msat`, inside what is left of its budget, and `max_sats` is that and its
+  fee limit. A shop sells such a ticket through `tickets.min_ticket_msat`, and a larger one on the
+  hashrate route through `top_ticket_msat`; one whose smallest does not fit is refused with
+  nothing paid, and the rental's card says why. Under the starter rules the task is a rental
+  task: see below.
+
+**A rental task** (`tickets.tasks.<task>.rental`: `max_ticket_sats`, `max_sends_per_hour`). Market
+price for a 4 TH/s miner is about 165,000 sat an hour, which no wallet-wide limit of the starter
+rules lets through. So a task the owner signs this for pays by prepaid tickets only, locking nothing;
+each is at most its `max_ticket_sats`, clamped there where the seller's size is above it and its
+smallest is not; its sends count against its own `max_sends_per_hour`; and the task's `budget_sats` is
+what bounds it. The wallet's limits for one payment, a day, a week and one seller, its velocity and
+its approval threshold don't apply to it, and its payments don't count against them, so every other
+use of the wallet stands as it did. This is the one exception to "a budget is one budget". A wallet
+whose rules don't say so pays a rental like any other task. On mainnet the starter rules sign this for the
+hashrate task: a budget of 200,000 sat, tickets of at most 10,000 sat, and 600 sends an hour. A 4 TH/s
+miner at market price runs well inside them (its step is about 1,400 sat); a miner fast enough that its
+step would pass 10,000 sat pays in tickets of 10,000, about 414 an hour at 100 TH/s.
+
+A task's name is any caller's to give (`task` in `xbt402_pay`, a free string in the MCP tool), so the
+name grants nothing (`crates/xbt-signer/src/renter.rs`). A rental task's terms are paid only on the
+signer's socket for the hashrate renter (`B2_RENTAL_SOCK`, `run/rental/signer.sock`), whose dir the
+renter's group reaches and the MCP's does not, and only for a rental's pieces of work (`POST <pay
+url>/hashrate/<rental>/<slice>`). On the wallet's socket a call that names a rental task is refused
+(`ticket_rental_payer`) before anything is asked of the seller, as are `ticket_open`, `ticket_offer`,
+`ticket_lock` and `ticket_release` on such a task's session; the renter's socket answers only
+`xbt402_pay`, `ticket_stop` and `health`, and refuses any other route (`ticket_rental_route`). The
+route check is a shape check, not a payee check: it holds the renter to a rental's request shape, and
+which seller is paid, at what price, is still the seller's terms against the offer's price ceiling and
+the task's own limits. The
+socket grants nothing by itself: under a task without rental terms (an older wallet's) a rental's
+pieces of work are paid there under the wallet's own limits, as on the wallet's socket.
+
+The owner's limits are never raised by either one. The task's budget, the cap per seller and the
+caps on locked funds count what leaves the wallet, so a ticket bought for a small call counts in
+full.
 
 **A seller that ignores the call's limit.** Each paid request names the call's limit to the seller
 (`X-Xbt402-Max-Msat`), and a seller that reads it never charges the answer more. One that does not
@@ -1549,12 +1685,118 @@ left from earlier calls) and the tickets this call released, the last of them re
 call was still under its limit. So past the limit it can take at most one ticket of this call, plus
 the balance it held before (under one ticket), and nothing after.
 
+**A file larger than it was listed.** A call may name the most bytes, in all, the buyer was shown
+the resource has (`max_size`; the app passes a listed file's size). It goes to the seller as
+`X-Xbt402-Max-Size`; a caller's own `x-xbt402-*` headers are refused. The seller, the wallet and the
+app judge an answer by one rule: a `206` by the total in its `Content-Range`, any other `2xx` by its
+`Content-Length`. A 0.2.0 seller judges a GET or HEAD of a route not priced by the token by it,
+taking the smallest size named, and refuses an answer that states more before any of its body is
+sent: `412` `larger_than_shown`. It charges the request's price, as for an answer with no body: on a
+route priced only by the byte or the second (a file) that is nothing; on one priced by the request
+the size is no way to have the service's work for nothing. The wallet takes up to the request's
+price for a `412` to a GET or HEAD that named a size, by its status alone (a HEAD has no body to
+carry the code), and nothing for any other error; a seller's charge is never above that price. A
+HEAD's receipt may sign the body its GET would have had: with no body to compare, that is no fault.
+
+On the lottery rail a route with no price per request sends no piece of such an answer (`412`, no
+draw owed, nothing charged). A route priced by the request is not judged by the seller there, since
+its request is a piece of its own: the answer is served, the wallet reads none of a body larger than
+the size, and it draws for the request's piece all the same, as the ticket rail charges its price.
+
+An answer that states no size is cut at the size named as it is sent: the 0.2.0 seller ends it
+there cut short (on the ticket rail; the lottery rail does not yet), and the wallet reads no more
+than that on either rail. A seller that ignores the header (gateways before 0.2.0) sends as before;
+the wallet reads none of a body whose head states more, or no more than the size of one that
+states none, and stops the call. That seller then charges only what it had pushed into the buffers
+between the wallet and itself before the stop (a socket's, a proxy's, a relay's: up to a few MiB),
+never more than the call's limit, and both books agree on it. Why: a file that grew after it was
+listed was refused by the app only once its head arrived, and the 1 MB the signer had already read
+by then was charged for nothing delivered. Tests (crates/xbt-signer/tests/ticket_pay.rs):
+`a_file_larger_than_the_buyer_was_shown_is_refused_before_its_body_and_costs_nothing`,
+`a_file_larger_than_the_buyer_was_shown_sends_no_piece_by_draws`,
+`a_page_by_draws_refused_for_its_size_still_draws_for_its_request`; and
+`an_answer_is_larger_than_shown_by_its_whole_size` (crates/xbt-gateway).
+
 **Stop.** `ticket_stop`, a session idle for `tickets.http_idle_s` (120 s by default), a seller
 fault and changed terms all end a session the same way: the book locks and releases nothing more,
-the wallet sends `cancel` for all the session's tickets, and its own node shows them back. A
-wallet that starts again has stopped every session (section 3); it asks each seller on record,
-once, to cancel what it left locked. Stopping gives up the session's balance: the unused part of
+the wallet sends `cancel` naming the session's tickets (never `"all"`: another session of the wallet
+may have taken that seller session over), and its own node shows them back. A wallet that starts
+again has stopped every session (section 3); it asks each seller on record, once, to cancel what it
+may still hold of that session: tickets locked or on their way, and any held ticket booked as
+released whose secret may not have arrived. Stopping gives up the session's balance: the unused part of
 the last ticket.
+
+From the moment a session starts to stop, no ticket is released in it, no new call is made in it,
+and its open answers end: a body read as it comes is read no further, an answer priced by the
+second stops at the second it has paid for, and a WebSocket (a VPN tunnel) is closed both ways.
+Each takes its last receipt as it ends. The owner's own `ticket_stop` waits for those last
+receipts, up to 15 s, before it says what the session spent and what it leaves with the seller,
+so a tunnel open at the stop is counted with every byte it carried. A stop the wallet makes itself
+(a seller fault, changed terms, an idle session) does not wait: one made at a fault is made inside
+the faulty answer, which is among the open ones. A stream that has not ended when the wait is up
+is counted at the wallet's own count of it.
+
+**The most a dishonest seller can take, in one place.** In short: **a cheating shop can take what
+your app has paid it ahead (about one to two tickets for each answer it is sending you at the
+time; a ticket is 1,000 sat by default), and a small allowance for each request: 16 MiB of data
+at its own price, an AI reply's quoted price, or, for a request priced by the second, that
+request's limit. A shop that over-charges past that is caught and blocked. One that cheats inside
+it is not caught: it takes that much, once per request.** Requests whose connection failed before
+their answer arrived add at most one ticket in all in a session (an AI reply's keeps its quote, and
+one the app stopped waiting for keeps what it was being paid ahead, outside that ticket); a shop
+that charges for them at three points in the same session is blocked. In detail:
+
+A seller is never paid more than the tickets the wallet released to it: its receipts may not say it
+spent more than that, and nothing else moves money. So the most a seller can take without
+delivering is **the credit the app has with that seller right then** (what it released and the
+seller has not yet earned), and on top of it, for each request, **at most what that request may add
+past what the wallet has counted of it** (`uncounted_most` in `ticket_pay.rs`):
+
+- **Priced by size (web pages, files, films, VPN):** its request, 16 MiB of bytes on their way,
+  priced, and while it is answered and priced by the byte, two tickets (what the wallet pays ahead
+  of what it has read). About 1.5 tickets of credit sit with the seller for each answer right after
+  a release, falling as the body arrives, so N answers running side by side (a page's parallel
+  reads, several films) can have about N times that with the seller at once. A seller that cuts
+  answers short is believed for at most that credit, with 16 MiB of slack, priced, for each answer
+  it cuts: answers cut side by side are judged together, so cutting many at once does not multiply
+  the credit.
+- **Priced by the token (AI replies):** at most its quote (its request and the price of its most
+  output tokens), from the moment it is sent. A reply cut short before its final counts is believed
+  up to that quote and stays counted as drawn, so no other answer is believed for the same credit;
+  one cut after its final counts, or that arrives whole, is believed only for what its counts come to.
+- **Priced by the second:** the seconds a seller counts are not the wallet's to know, so such a
+  request may add up to its call's charge cap (`max_charge_sats`, else `max_sats`). Keep it near
+  what it should cost.
+- **A request whose answer is lost** (the connection fails after the request left, which a seller
+  can cause) is held, until a quiet point after `LOST_GRACE` (two minutes), to what could have
+  arrived of it: by size, its request and 16 MiB priced; by the token, its quote; by the second, the
+  seconds since it was sent and 16 MiB priced. One the wallet stopped waiting for (its own timeout,
+  an error of its own kind, `timeout`, where an honest seller on a slow path may still serve it) is
+  held as one being answered, with the two tickets paid ahead. Lost requests whose connection failed
+  and that are not priced by the token share one ticket over the session (`LOST_CAP_TICKETS`); a
+  reply by the token keeps its quote, and one the wallet timed out keeps its own bound, outside that
+  ticket. A seller whose spend rises by lost requests whose connection failed at three quiet points
+  of one session (`LOST_CHARGED_MOST`) is over-charging; ones the wallet timed out are not counted. A seller whose connection drops before its answer reaches
+  the wallet is paid only for what could have arrived: honest sellers lose that request's charge
+  past it, which is the trade for not trusting a seller's word for a request nobody saw answered.
+- **Never past a call's own charge cap** (`max_charge_sats`, else `max_sats`), whatever it is.
+- **What cheating inside these bounds costs:** the seller takes them and is not caught, once per
+  request: the wallet cannot tell such a charge from an honest one. Over a day, the owner's
+  spending rules cap what any one seller is paid (`per_counterparty_daily_sats`: 20,000 sat on a
+  new install, 5,000 on mainnet, beside the weekly `per_counterparty_cap_sats`).
+
+**A seller caught over-charging is blocked.** Over-charging is a charge past an answer's cost or
+quote or past the call's limit, a spend past what the wallet can account for, or charging lost
+requests again and again. The session stops at once, nothing more is released or bought for it (one
+release already leaving the book at that moment, at most, still goes), and the seller is blocked by
+its Lightning node, its receipt key and its origin: a match on any one of the three opens no new
+session, releases no ticket and pays no lottery win, so a new node or a new address alone does not
+shake it off. The block keeps the receipt that over-charged as its evidence, with the session's
+count (also in the audit log, `ticket_seller_fault`), shown on the Spending rules page. Only the
+owner lifts it, with a message signed by the approval key (`seller_unblock`, like a policy change).
+A fault of another kind (a receipt that signs another body or does not verify, a released total
+that contradicts the wallet's, a node with no final answer, a seller that forgot the session) stops
+the session and blocks nothing.
 
 **What goes wrong, and what the wallet then does.**
 
@@ -1562,17 +1804,20 @@ the last ticket.
 |---|---|---|
 | The answer to a `release` is lost. | It asks `status`. Credited: it goes on. Not credited: the same secret again, never another. | Nothing more: the ticket was booked when its secret left. |
 | The seller says a released ticket is `ticket_not_locked`. | The same secret again, five times within about a second; then the call is refused and the next call sends it first. | The ticket, if the seller never takes it and never cancels it: booked until the wallet's node shows it failed. |
-| The answer to a paid request is lost. | The call says so. No secret travels with a request. | What the seller charged the balance for it. |
+| The answer to a paid request is lost. | The call says so. No secret travels with a request. | What the seller charged the balance for it: up to the call's whole limit, once (see above). |
 | An answer carries a receipt for another request (a replay), a receipt signed by another key, or none. | It is not believed. A 5xx without a receipt is reported and the session kept; any other answer nobody signed stops the session. | The session's balance. |
 | A refusal that is not signed (a forged `balance_short`, or `session_unknown` from a seller that lost its records). | Nothing is released on its word. The session is stopped; the next call opens a new one. | The session's balance. |
 | `session_unknown`, unsigned, to a `lock` or a `status` (the seller forgot a session that held nothing and was quiet for its `idle_secs`). | The session is stopped (`ticket_session_ended`); the next call opens a new one. | Nothing: the seller forgets only a session with no balance, or with one that was not used for a day. |
 | An unsigned `bad_seq` with `nextSeq`. | Adopted, twice at most: a `seq` only orders requests. | Nothing. |
-| A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use. |
+| A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty, and the seller blocked until the owner unblocks it. | At most the credit in use and, for each request, what it may add past what is counted of it: by size, its request, 16 MiB priced and two tickets; by the token, its quote; by the second, its call's limit (see above). |
 | The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
-| The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | The part of the last released ticket that paid for nothing. |
-| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its 3 s wait for a refill), then releases. | Up to 3 s of waiting. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
+| The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | By its size: what it could still draw when it stopped (the credit the session had for it when it started, the tickets its own call released and holds freed beside it), and no more than the session's credit left for it as it is closed, with 16 MiB priced on top; answers cut side by side share that credit, each with its own 16 MiB. By the token: what its counts come to and 64 tokens more where its final counts or its end were read, else up to what its terms quote for it (a charge past that is a seller fault). Never more than the credit the app has with the seller (see above), and the answers show cut short. |
+| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its wait for a refill, 15 s by default), then releases. | Up to that wait. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
+| The wallet's chain node gives no tip, and none it gave in the last 5 minutes. | `ticket_chain` after up to `tickets.ready_wait_ms`, 12 s as shipped, all a release's waits together. | Nothing: no secret was released. |
+| The seller ended the answer a ticket is for while the ticket was awaited (its signed `status` lists it). | `ticket_answer_closed`. | Nothing: no secret was released. |
+| The seller shows no ticket three times running, with no byte delivered between them. | `ticket_seller_stalled`: the session is stopped. | Nothing more. |
 | The seller never shows a ticket `ACCEPTED`, and the wallet's own node calls its payment in flight and carries it on no channel (a node killed as it sent it). | The session is stopped (`ticket_session_ended`); the next call opens a new one, with a pool inside what the owner's cap for that seller has left. | Nothing: no secret was released. The ticket counts as locked until the node gives it up. |
 | Tickets failed on the wallet's node after their lock round was over. | The seller is asked to cancel their invoices before the next lock, once for each. | Nothing. Without it the seller refused the lock (`too_many_tickets`) until the invoices lapsed. |
 | The wallet's signer is killed. | On its next start every locked ticket is booked as if released and never released, and the sellers on record are asked to cancel. | The balance; and the pool's worst case held against the budgets until the node shows the tickets failed. |
@@ -1829,7 +2074,8 @@ Found buying from a mainnet seller behind a web tunnel, with the starter rules a
 
 **A limit for each answer** (`X-Xbt402-Max-Msat`). A paid request may name the most, in msat, its
 answer may charge the session's balance. A seller that reads it charges the answer no more and ends
-the body there; one that ignores it charges as before. The wallet sends the call's `max_sats`. Why: a
+the body there; one that ignores it charges as before. The wallet sends the call's charge cap
+(`max_charge_sats`, else `max_sats`). Why: a
 seller that meters what it writes counts bytes that sit in a proxy's or tunnel's buffers once the
 buyer stops reading. A buyer that stopped at its 200-sat limit was charged 345 sat that way, out of
 credit it had prepaid. The header fixes the bound before anything is sent, so it gives the buyer no
@@ -1846,10 +2092,208 @@ fit, and says which limit and by how much.
 **A balance left with the seller is used again.** A session the wallet stops (an idle stop, or the
 signer starting again) may leave prepaid credit at the seller, which keeps a session with a balance
 for a day (section 4). Credit is the seller's, not its address's: when the next call opens a session
-with the same seller (its node), under any address, the wallet first looks for the newest such
-session it stopped in the last 20 hours. One it still holds open under another address (an alias of
-the shop, or the address it moved from) is stopped first, unless a call is using it right now. If the seller's
-`status` for it, signed with the receipt key of the seller's terms now, credits exactly what the wallet's own book says left the wallet in that
-seller session, and shows a balance, the new session takes over its seller side; otherwise it starts
-fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
-counts as paid.
+with the same seller (its node), under any address, the wallet first looks through the seller
+sessions it stopped in the last 20 hours, those opened at this address first and the oldest first
+within that, since the oldest lapses first, asking four at most. A session the seller has forgotten (`session_unknown`, from the address it was opened at) is
+given up and not asked about again. One it still holds open under
+another address (an alias of the shop, or the address it moved from) is stopped first, unless a call
+is using it right now. If the seller's `status` for one, signed with the receipt key of the seller's terms now,
+credits exactly what the wallet's own book says left the wallet in that seller session, and shows
+a balance, the new session takes over its seller side; one that does not is passed over for the next, and with none the
+session starts fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
+counts as paid. Only a seller with the same receipt key is taken over: another shop on the same node
+is another seller, even though its payments reach the same node. A key is public, so naming it proves nothing:
+a session's key goes on record at its first signed receipt, and one with another key on record is not asked about at all.
+One with no key on record (killed before its first signed receipt, or from before 0.2.0) is taken over only at the address it was opened at.
+A `session_unknown` from any other address cannot be signed and says nothing of that session: it counts as no answer.
+
+A `status` that does not answer is asked again, three times in all, a few seconds each. Still none, or
+a signed count short of what the book sent while a ticket the node settled has not been taken from its
+preimage, and the call is refused (`ticket_seller_unanswered`, with `retry_after_s`), with no new seller
+session and nothing bought beside a credit that may be there. Calls queued behind that wait, and any in the
+next few seconds, have the same refusal at once, none counts against `max_new_sellers_per_min`, and the watcher does not wait for them. Past 2
+minutes of that the buyer is not held to it: the call starts fresh, and the audit names the session asked
+and left behind (`ticket_left_with_seller`, `left_msat` null, with what the book sent). The next call that
+opens a session asks that one first, so its credit is used as soon as the seller answers, and it holds no one up again.
+
+Only after that signed `status` does a takeover show the seller the preimages of prepaid tickets its
+earlier sessions never delivered (below), and only signed answers count; it asks `status` again where those
+changed the count. It then cancels by hash what they may still hold
+there, so that the seller's places are free. It then holds tickets at once where it would otherwise
+have bought a prepaid ticket first (a seller the owner has not named, or one that holds only after a
+paid ticket), if the wallet's own node settled a ticket of that seller session with its preimage: a
+payment proved, not said. On the seller's count alone the credit is used but the first-ticket rule
+stays. A first lock that fails after a takeover does not refuse the call: it goes on, on the credit,
+and the pool is filled again behind it.
+
+**A prepaid ticket no call delivered.** A prepaid ticket can settle on the wallet's node with no call
+left to show the seller its preimage: the call ended first, or the signer stopped before the seller
+answered. Until the seller is seen to have it the book marks the ticket, in the same write as its
+settle. The watcher presents the preimage at the address on record (and never to a session this
+process still has open, which delivers its own). The seller's answer decides: taken, now or before,
+and it is done; refused for good, or the session forgotten, and it is given up; refused for the
+moment, or no answer, and it is tried again after 60 s, doubling to an hour, for as long as the credit
+could be taken over (20 hours). Without this the seller credits such a ticket by its own sweep, a
+minute or more later. A preimage moves no money; it only proves a payment already made.
+
+**What a stopped session left.** A stop says what it leaves with the seller (`left_with_seller_msat`,
+and `ticket_left_with_seller` in the audit log). A session a start stopped could not: its process had
+died. So the watcher asks each of those sellers once, after any late preimage, and logs the same line,
+with `left_msat` null where the seller did not say. Giving up a stopped session's credit
+(`forget_credit`) answers the amount, as the seller counts it, and what it credited in that seller session.
+
+A stop or a takeover cancels by hash: every ticket that may hold a place at the seller, including a hash offered and not
+yet paid, whose invoice still counts against the session's cap. A seller session that a session of this process
+still holds, whatever the book says of it, or that one on the book has open, is not taken over, and so never has its tickets named.
+The book does not call a session idle while it has a call or an answer open. A call under another address on other terms, beside
+a session that stays open, is refused `ticket_session_exists` with `retry_after_s`: asking again is worth it then, though that session may be a long answer.
+
+## 17. Requests side by side in one session (2026-10-29)
+
+A seller's web app asks for many things at once: a page's scripts and pictures together, a film
+that plays for an hour, a WebSocket that stays open as long as the page does. Until 0.2.0 the
+wallet sent one paid request at a time in a session, so a film or a socket held up every other
+request to that seller until the read timeout. Now requests in one session run side by side.
+
+- **Order at the seller.** A request holds the session's link only to take its `seq`; it is sent
+  and its head read with nothing held, so a request slow to be answered (a long poll, a model slow
+  to its first word) holds up nothing. The requests go out on their own connections and arrive in
+  another order than they left, so this needs a seller that states `seqWindow` (section 3): it takes
+  each seq where it falls in its window. The wallet takes a seq only within the window of the
+  lowest one still on its way. A seq the seller refuses as taken goes again as a fresh one; one
+  past the window goes again once the seqs before it have arrived, or takes over a seq that no
+  request holds any more (one given up when its connection failed). With a seller that states no
+  window, which takes only the next seq, a request holds the session's `order` from its seq to its
+  head: one at a time, as before 0.2.0. Without a window, requests side by side arrived out of
+  order and went again, a round trip each: over a relay a web app's page loaded in ten seconds.
+- **Receipts out of order.** Receipts come back in another order than the seller signed them. The
+  wallet orders them by its own steps: a request it sent after it last took the seller's totals is
+  answered by a receipt the seller signed after those totals, so that receipt is newer, whatever its
+  figures say. Its spend is taken even where it is lower: the seller gives back a charge that bought
+  nothing (a page the browser dropped, a model's reply that came to fewer tokens than it ran up), and
+  the given-back credit is credit again, and the tickets it names ready are ready. A newer receipt
+  that says less was released than before is a seller fault. A receipt for a request sent before the
+  totals held were taken may be older: one with less than the wallet holds, released or spent, is
+  passed over (its own charge is still checked against its price), and what it says was released
+  still confirms the releases it names. A head signed while a released ticket is on its way
+  rightly says less was released than the wallet sent.
+- **What the seller may have spent.** Every request may be charged from the moment it leaves until
+  its answer's last receipt is read, and at most its call's limit. Each is held by an id of its own,
+  not by its seq (a seq can pass from one request to another). A request whose connection failed
+  after it left may still be served and charged from the seller's queue: it is held at its call's
+  limit, and no quiet point is taken, for two minutes.
+- **One rule for every way an answer closes.** What the wallet believes of a seller's charge for one
+  answer is the same whether its last receipt is read as the answer ends, listed later in `status`,
+  or never listed (the wallet closes it after 30 s):
+  - **arrived whole:** up to what it cost by the wallet's own count. Its receipt must sign the body
+    that arrived and charge no more than that, or it is a seller fault;
+  - **priced by the token and cut short:** where its final counts (`usage` on the last event, with
+    no choices) or its end (`[DONE]`) were read, up to what they come to and 64 tokens more (the
+    seller settles the reply before it sends the event with its counts); before them, up to what its
+    terms quote for it at most (its request and its tokens' bound: what an honest gateway charges at
+    most), and a charge past that quote is a seller fault. Such a reply keeps all it held back as
+    drawn, so the answers beside it do not count on that credit. Counts on every chunk (vLLM's
+    `continuous_usage_stats`) are not asked for: both sides take that option out of the request;
+  - **priced by its size and cut short:** up to what it read and what could have been on its way when
+    it stopped (16 MiB and a proxy's slack, priced), or up to the credit it could have drawn where that
+    is more: what the session had for it when it started and the tickets its own call released, with
+    the same 16 MiB priced on top, and the holds of replies beside it that ended undrawn. A seller
+    pushes ahead as far as the credit goes, and a proxy between them can hold all of it. And as it is
+    closed, under the same lock as its close, no more than the credit the session has left for it
+    then (what was released, less what the other answers drew since it started), 16 MiB priced on
+    top: each answer closed adds what its seller was believed past the wallet's count to the count,
+    so answers cut side by side share one credit rather than each being believed up to it;
+  - **never past the call's limit;** a charge past that is a seller fault.
+
+  The trade-off in the last case: not the session's whole credit at the stop. A seller that held the
+  other answers back and cut this one would otherwise have it charged all their credit too, and then
+  be paid again as they released more. The cost is a possible false fault on an honest seller that,
+  behind a buffering proxy, pushed this answer more than 16 MiB ahead on credit that came to the
+  session while it ran from somewhere the wallet does not count for it: another answer's ticket, or a
+  charge the seller gave back (a refund lowers the seller's spend, which the wallet's count of what
+  is left does not read). A reply's hold that ends undrawn is counted, where its cost is known (it
+  arrived whole, or its final counts were read). Possible only where the credit in question buys
+  more than 16 MiB.
+
+  A seller fault found as an answer closes is the session's under the same lock, and every release
+  asks for it just before the book, and every prepaid ticket before it is bought and again just before
+  it is paid, so no answer beside it releases or buys another ticket for that seller from then on;
+  one whose secret is already leaving the book (at most one) still goes. The wallet waits for an
+  answer's last receipt at most 2 s (10 s for one that arrived whole) and a second more: each
+  `status` call, head and body, is cut to what is left of that wait. Every call to a session
+  endpoint, the first `lock` included, is held to the read timeout as a whole (its resends after a
+  `bad_seq` too), not only for each read, so a seller that answers
+  a byte at a time cannot hold the session's order or payment lock past it.
+- **What an ended answer may still add.** Once an answer has ended, what its request may still add
+  to the seller's spend is no more than the wallet believes of any charge for it, past what it
+  counted: nothing for one that arrived whole or a reply held at its quote, the rest of its bound for
+  one cut short. A request whose answer was lost keeps, until a quiet point, only what could have
+  arrived of it. Before it ends, a request may add no more than its price allows past what is counted
+  of it (`uncounted_most`): by size, its request, 16 MiB priced and two tickets; by the token, its
+  quote; by the second, its call's limit.
+- **A seller caught over-charging is blocked** (`blocked_sellers.json` in the signer's run folder),
+  by node, receipt key and origin, with the over-charging receipt as evidence: no new session, no
+  release and no draw paid to it until the owner unblocks it with a signed message. Only an
+  over-charge blocks (`Money::overcharged`, set by `Money::overcharge` and `Bound::overcharges`, or a
+  charge past the call's limit); a body-hash mismatch, a receipt that does not verify or a released
+  total that contradicts the wallet's only stops the session.
+- **What the seller may have spent.** A receipt's spend is taken only
+  inside the spend at the last quiet point (nothing open, nothing unclosed), plus what the wallet
+  counted since, plus what the requests still open may add. Where nothing is open, it is taken only
+  inside what the seller's own receipts charged the answers closed since. A seller that marks the
+  balance spent while a WebSocket of the page stays open is a seller fault: the socket may add at
+  most its own call's limit, and every answer at most its own.
+- **One balance.** Every answer counts what it draws into one count for the session: its head, its
+  body as it arrives, its seconds as they start. An answer priced by the token holds back the most it
+  may cost until it ends, apart from that count, and draws what it cost at its end: what was drawn
+  never falls, so an answer that started beside it never counts on credit the reply gave back
+  before it was drawn. An answer finds a ticket due on what is left for it after what the others
+  drew since it started. One that closes with a charge above the wallet's count (bytes the seller
+  sent of an answer the wallet stopped reading) adds the difference to the count, so the answers
+  beside it do not count on credit the seller has spent.
+- **One release for one need.** Two answers can find a ticket due at the same moment. Releases
+  stay one at a time, and each asks again whether it is still due once it holds the session's
+  release lock, against the credit it found the ticket due on: the second finds the first's ticket
+  covers it, and releases nothing.
+- **An answer the seller has not closed.** No ticket is released into a session while an answer the
+  wallet stopped reading is unclosed, as before, but only for the answers that open after it was
+  left, and the wait is not inside the release lock: the answers already open beside it (a page's
+  WebSocket while the viewer leaves a video) go on paying within their own calls' limits. An answer
+  that arrived whole waits longer for its last receipt before it is counted unclosed. The seller
+  keeps the last receipts of twice as many answers as its window lets run at once. One the wallet
+  never finds closed in 30 s is closed by the wallet itself, as charged the most the rule above
+  believes of it, judged then (audited as `ticket_answer_given_up`); the session goes on.
+- **Why one session and not one per request.** A session per request would lock a ticket for each
+  request in flight, spread the credit thin across them, and use up the per-seller caps on a page
+  with a dozen pictures. One session lets one ticket's credit serve the whole page.
+- **A visit's limit.** In the app, each request of a seller's page holds a share of the visit's
+  limit while it runs (at most 1,000 sat, as a WebSocket does), and may buy within it, before its
+  head or as its body arrives; the shares running at once never add up to more than the limit. A
+  range is asked for in parts of at most 4 MiB, so that a film segment is never cut for want of a
+  ticket mid-body. A call that ends before its answer starts (no head within a minute, or the
+  stream failed) keeps its share spent until the signer says what it charged; none said, all of it,
+  but for a call that never reached the signer (its socket refused the connection), which charged
+  nothing and gives its share back. The share is waited for as long as the signer may still be
+  working after the stop (its read timeout of at most an hour, a ticket being paid, the last
+  receipt): about 75 minutes, past which it stays spent and only the visit's budget is held.
+  A request refused because a ticket does not fit in its share asks again with a share that has
+  room for the ticket the refusal named, and only then waits to run alone with all that is left;
+  while it waits, no new share is handed out, so a busy page cannot starve it.
+
+Tests (crates/xbt-signer/tests/ticket_pay.rs): `requests_side_by_side_in_one_session_are_each_charged_exactly`,
+`a_websocket_open_does_not_hold_up_other_requests_to_the_seller`,
+`films_side_by_side_share_one_balance_and_each_pays_its_own_bytes`,
+`side_by_side_each_answer_stops_at_its_own_limit`, `a_stop_ends_every_answer_open_in_the_session`,
+`many_rounds_side_by_side_keep_the_counts_exact`, `a_request_slow_to_answer_does_not_hold_up_the_others`,
+`an_older_receipt_read_after_a_newer_one_is_passed_over`,
+`a_seller_that_drains_the_balance_while_a_websocket_is_open_is_caught`,
+`a_websocket_open_before_a_video_is_left_keeps_paying`,
+`a_spend_lowered_by_a_refund_is_taken_and_the_next_tickets_still_release`,
+`many_answers_cut_short_side_by_side_do_not_stop_the_session`,
+`a_cut_answer_never_listed_closed_is_given_up_without_stopping_the_session`,
+`an_answer_beside_a_reply_priced_by_the_token_is_paid_in_time`,
+`a_cut_answer_charged_past_what_could_have_arrived_is_a_seller_fault`,
+`a_seller_charging_a_request_whose_answer_was_lost_is_no_fault`; the unit tests of `Money` in
+crates/xbt-signer/src/ticket_pay.rs; and `a_range_goes_in_parts_each_within_a_share_of_the_limit`,
+`a_call_that_ends_before_its_head_keeps_its_share_until_the_signer_says_what_it_charged`,
+`a_request_that_must_run_alone_gets_its_turn_on_a_busy_page` (crates/lightning-stream/tests/visits.rs).

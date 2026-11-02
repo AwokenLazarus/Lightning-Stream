@@ -657,6 +657,27 @@ fn locked_rig(n: usize) -> (Rig, String, Vec<String>) {
     (r, sid, locked)
 }
 
+/// A release that names its ticket takes that one while it is locked, whichever of the session's
+/// locked tickets sorts first. The wallet's payer names the ticket it chose and waits for the seller
+/// to show it locked; a refill can lock another meanwhile that sorts before it (offered in the same
+/// second, the lower hash), and that was refused as `ticket_none`, which ends a rental.
+#[test]
+fn a_release_that_names_a_locked_ticket_takes_it_whatever_sorts_first() {
+    let _g = env_lock();
+    let (r, sid, locked) = locked_rig(2);
+    let mut sorted = locked;
+    sorted.sort();
+    // one lock round: the same second, so the lower hash is the one a release without a name takes
+    let (first, second) = (sorted[0].clone(), sorted[1].clone());
+    let v = r.call("ticket_release", json!({"session": sid, "hash": second}));
+    assert_eq!((v["verdict"].as_str(), v["hash"].as_str()), (Some("allow"), Some(second.as_str())), "{v}");
+    assert_eq!((r.state_of(&sid, &second), r.state_of(&sid, &first)), ("released".to_string(), "locked".to_string()));
+    // released once: named again, it is refused, and the other is still there for a release that names none
+    let again = r.call("ticket_release", json!({"session": sid, "hash": second}));
+    assert_eq!(again["rule"].as_str(), Some("ticket_none"), "{again}");
+    assert_eq!(r.release(&sid)["hash"].as_str(), Some(first.as_str()));
+}
+
 #[test]
 fn a_kill_at_every_write_point_of_a_release_never_undercounts_and_never_releases_twice() {
     let _g = env_lock();
@@ -1170,7 +1191,7 @@ fn only_this_wallets_tag_makes_a_node_payment_a_ticket_and_the_list_is_read_befo
     let their_hash = foreign.hash(&nonce);
     for (hash, tag) in [(their_hash, foreign.tag(&nonce, &their_hash).to_vec()), ([0x21; 32], vec![]), ([0x22; 32], vec![1, 2, 3])] {
         let inv = r.seller.invoice(r.now(), &hex::encode(hash), &Inv::default());
-        r.ln.record(&HeldSend { invoice: inv, fee_limit_msat: 1, timeout_s: 1, cltv_limit: 500, outgoing_chan_ids: vec![], tag }, "IN_FLIGHT").unwrap();
+        r.ln.record(&HeldSend { invoice: inv, fee_limit_msat: 1, timeout_s: 1, http_margin_s: 30, cltv_limit: 500, outgoing_chan_ids: vec![], tag }, "IN_FLIGHT").unwrap();
     }
     r.call("watch_tick", json!({}));
     let st = r.status();
@@ -1617,7 +1638,7 @@ fn restore(r: &mut Rig, b: &tempfile::TempDir) {
 }
 
 fn held(r: &Rig, hash: &str) -> HeldSend {
-    HeldSend { invoice: r.seller.invoice(r.now(), hash, &Inv::default()), fee_limit_msat: 1, timeout_s: 1, cltv_limit: 500, outgoing_chan_ids: vec![], tag: vec![] }
+    HeldSend { invoice: r.seller.invoice(r.now(), hash, &Inv::default()), fee_limit_msat: 1, timeout_s: 1, http_margin_s: 30, cltv_limit: 500, outgoing_chan_ids: vec![], tag: vec![] }
 }
 
 #[test]
@@ -1673,6 +1694,24 @@ fn a_ticket_given_up_that_reaches_the_node_late_is_booked_again() {
     r.call("watch_tick", json!({}));
     assert_eq!(r.booked_for(&late), BOOKING, "money that left is counted again");
     assert_eq!(r.state_of(&sid, &late), "retired");
+}
+
+/// A chain node that gives no answer says nothing about a ticket's expiry: the last tip it gave holds for a while,
+/// and after that the release says what is wrong, and calls no ticket stale.
+#[test]
+fn a_release_on_a_tip_nobody_knows_says_so_and_calls_no_ticket_stale() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let sid = r.open();
+    r.fill(&sid);
+    assert_eq!(r.release(&sid)["verdict"], "allow");
+    r.chain.st.lock().unwrap().down = true;
+    assert_eq!(r.release(&sid)["verdict"], "allow", "the tip the node gave a moment ago");
+    r.clock.fetch_add(301, Ordering::SeqCst);
+    let d = r.release(&sid);
+    assert_eq!((d["rule"].as_str(), d.get("stale").is_none(), d["charged_sats"].as_i64()), (Some("ticket_chain"), true, Some(0)), "{d}");
+    r.chain.st.lock().unwrap().down = false;
+    assert_eq!(r.release(&sid)["verdict"], "allow");
 }
 
 #[test]

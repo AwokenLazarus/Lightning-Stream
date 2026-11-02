@@ -58,6 +58,9 @@ pub fn mode_of(path: &Path) -> u32 {
 /// made the last thing the process does. Every state file and log of the signer writes through these.
 pub mod probe {
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SLOW_SYNC_MS: AtomicU64 = AtomicU64::new(0);
 
     /// What [`crash_at`] unwinds with: the process "died" at a durable step. A test catches it
     /// (`std::panic::catch_unwind`), drops every object and opens the wallet again from its files.
@@ -96,8 +99,20 @@ pub mod probe {
         CRASH_AT.with(|c| c.set(Some((steps, torn))));
     }
 
+    /// Every fsync of this process, from now on, takes `ms` longer: a wallet on an SD card or a USB
+    /// disk. Zero: as the disk gives it. Nothing in the signer calls this: it exists for the tests.
+    pub fn slow_syncs(ms: u64) {
+        SLOW_SYNC_MS.store(ms, Ordering::SeqCst);
+    }
+
     /// Count one step; `Some(torn)` when this step is where the armed crash happens.
     pub(super) fn step(kind: &'static str) -> Option<bool> {
+        if kind == "sync" {
+            let ms = SLOW_SYNC_MS.load(Ordering::Relaxed);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
         let n = COUNTS.with(|c| {
             let mut v = c.get();
             v.steps += 1;

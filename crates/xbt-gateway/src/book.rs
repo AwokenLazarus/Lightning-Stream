@@ -64,13 +64,21 @@ pub struct Caps {
     pub unpaid_per_address: u32,
     /// Hold invoices only to a session that has paid something.
     pub held_after_paid: bool,
-    /// A session that has never released a secret is closed after this many seconds.
+    /// A session that has never released a secret is closed after this many seconds, once none of
+    /// its invoices is still payable: an unpaid one is kept for its life and 15 s more.
     pub first_use_secs: u64,
     /// A session's tickets are cancelled after this many seconds without a paid request.
     pub idle_secs: u64,
     /// A session with nothing locked is forgotten, its unused balance with it, after this long.
     pub keep_secs: u64,
+    /// How many seqs from a session's next one a request may carry, 1 to [`SEQ_WINDOW_MAX`]: a
+    /// buyer's requests side by side reach the gateway in another order than they left, and each
+    /// is taken once, whatever its place in the window. 1 takes the next seq only.
+    pub seq_window: u64,
 }
+
+/// The widest seq window: the seqs taken ahead of a session's next one are one 64-bit word.
+pub const SEQ_WINDOW_MAX: u64 = 64;
 
 /// Why a request is not served. The wire names are the draft's (`docs/TICKETS.md`, section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +102,10 @@ pub enum Refusal {
     PledgeOutstanding,
     /// Held tickets are issued only to a session that has paid something: buy a prepaid one first.
     PrepaidFirst,
+    /// The request repeats terms (`accepted`) that are not its route's: a buyer that paid without
+    /// asking the price first, from terms it saw for another route. Nothing is charged; the 402
+    /// states the route's terms.
+    TermsChanged,
 }
 
 impl Refusal {
@@ -113,6 +125,7 @@ impl Refusal {
             Self::HeightUnknown => "node_unavailable",
             Self::PledgeOutstanding => "pledge_outstanding",
             Self::PrepaidFirst => "prepaid_first",
+            Self::TermsChanged => "terms_changed",
         }
     }
 }
@@ -165,7 +178,11 @@ const USED_KEPT: usize = 64;
 pub struct Session {
     pub key: [u8; 32],
     pub addr: String,
+    /// The lowest seq not taken yet. Seqs below it are taken.
     pub next_seq: u64,
+    /// The seqs taken above `next_seq`, within the window: bit `i` is `next_seq + i` (bit 0 is
+    /// always clear, as `next_seq` is not taken).
+    pub seqs_ahead: u64,
     /// The sum of this session's settled tickets. Only rises.
     pub released_msat: u64,
     /// The running total of what was served. Refunds of a charge that bought nothing aside, only rises.
@@ -225,6 +242,8 @@ pub enum Rec {
     Mark {
         session: String,
         next_seq: u64,
+        /// [`Session::seqs_ahead`]: absent (0) in a journal written before the window.
+        seqs_ahead: u64,
         spent_msat: u64,
         pledge: Option<Hash>,
     },
@@ -261,10 +280,15 @@ impl crate::store::Record for Rec {
             Self::Mark {
                 session,
                 next_seq,
+                seqs_ahead,
                 spent_msat,
                 pledge,
             } => {
-                json!({"t": "mark", "session": session, "seq": next_seq, "spent": spent_msat, "pledge": pledge.map(hex::encode)})
+                let mut v = json!({"t": "mark", "session": session, "seq": next_seq, "spent": spent_msat, "pledge": pledge.map(hex::encode)});
+                if *seqs_ahead != 0 {
+                    v["ahead"] = (*seqs_ahead).into();
+                }
+                v
             }
             Self::Drop { session } => json!({"t": "drop", "session": session}),
         }
@@ -301,6 +325,10 @@ impl crate::store::Record for Rec {
             "mark" => Self::Mark {
                 session: s("session")?.to_string(),
                 next_seq: n("seq")?,
+                seqs_ahead: match v.get("ahead") {
+                    None => 0,
+                    Some(a) => a.as_u64().filter(|a| a & 1 == 0)?,
+                },
                 spent_msat: n("spent")?,
                 pledge: match v.get("pledge")? {
                     Value::Null => None,
@@ -346,6 +374,11 @@ pub struct Book {
     /// The latest time the book was told (a lock, a charge, a sweep): when a credit with no clock
     /// of its own happened, within one sweep.
     seen_now: u64,
+    /// What the sessions dropped from the book had been charged: with the sessions on it, what the
+    /// seller earned in all ([`Book::charged_msat`]). A compacted journal no longer holds the drops,
+    /// so its snapshot carries their sum as a session of its own, charged it and dropped
+    /// ([`DROPPED_CARRY`]): the sum and the book are written in one file, at once.
+    dropped_charged_msat: u64,
 }
 
 impl Book {
@@ -356,7 +389,13 @@ impl Book {
             tickets: HashMap::new(),
             dirty: HashSet::new(),
             seen_now: 0,
+            dropped_charged_msat: 0,
         }
+    }
+
+    /// The seq window the terms name ([`Caps::seq_window`]).
+    pub fn seq_window(&self) -> u64 {
+        self.caps.seq_window.clamp(1, SEQ_WINDOW_MAX)
     }
 
     pub fn caps(&self) -> &Caps {
@@ -373,6 +412,25 @@ impl Book {
 
     pub fn sessions(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// What every session was charged in all, the ones dropped from the book included: the seller's
+    /// earnings. It only rises, but for a refund of a charge that bought nothing.
+    pub fn charged_msat(&self) -> u64 {
+        self.sessions.values().fold(self.dropped_charged_msat, |a, s| a.saturating_add(s.spent_msat))
+    }
+
+    /// What the dropped sessions had been charged ([`Book::charged_msat`]).
+    pub fn dropped_charged_msat(&self) -> u64 {
+        self.dropped_charged_msat
+    }
+
+    /// A session leaves the book: what it was charged stays counted.
+    fn drop_session(&mut self, id: &str) {
+        if let Some(s) = self.sessions.remove(id) {
+            self.dropped_charged_msat = self.dropped_charged_msat.saturating_add(s.spent_msat);
+        }
+        self.dirty.remove(id);
     }
 
     /// Sessions that hold a ticket or have a response open: the ones the cap counts.
@@ -514,6 +572,7 @@ impl Book {
                     key,
                     addr: addr.to_string(),
                     next_seq: 0,
+                    seqs_ahead: 0,
                     released_msat: 0,
                     spent_msat: 0,
                     pledge: None,
@@ -640,6 +699,7 @@ impl Book {
                 key,
                 addr: addr.to_string(),
                 next_seq: 0,
+                seqs_ahead: 0,
                 released_msat: 0,
                 spent_msat: 0,
                 pledge: None,
@@ -710,11 +770,10 @@ impl Book {
     /// told to nobody who could use it.
     pub fn forget_unused(&mut self, session: &str) -> Option<Rec> {
         let s = self.sessions.get(session)?;
-        if s.live > 0 || s.released_msat > 0 || s.next_seq > 0 {
+        if s.live > 0 || s.released_msat > 0 || s.next_seq > 0 || s.seqs_ahead != 0 {
             return None;
         }
-        self.sessions.remove(session);
-        self.dirty.remove(session);
+        self.drop_session(session);
         Some(Rec::Drop {
             session: session.to_string(),
         })
@@ -737,13 +796,17 @@ impl Book {
         if !verify(&s.key) {
             return Err(Refusal::BadAuth);
         }
-        if seq != s.next_seq {
+        // a seq below the next one, past the window, or taken already: refused, the next one named
+        let off = seq.wrapping_sub(s.next_seq);
+        if seq < s.next_seq || off >= self.caps.seq_window.clamp(1, SEQ_WINDOW_MAX) || s.seqs_ahead >> off & 1 == 1 {
             return Err(Refusal::BadSeq(s.next_seq));
         }
-        s.next_seq = s
-            .next_seq
-            .checked_add(1)
-            .ok_or(Refusal::BadSeq(s.next_seq))?;
+        s.seqs_ahead |= 1 << off;
+        // the next seq moves past every one taken from it on
+        let taken = s.seqs_ahead.trailing_ones();
+        let Some(next) = s.next_seq.checked_add(u64::from(taken)) else { return Err(Refusal::BadSeq(s.next_seq)) };
+        s.next_seq = next;
+        s.seqs_ahead = s.seqs_ahead.checked_shr(taken).unwrap_or(0);
         self.dirty.insert(session.to_string());
         Ok(())
     }
@@ -1036,7 +1099,13 @@ impl Book {
             let expiring = t.state == TicketState::Accepted
                 && height.is_some()
                 && Self::outside_margin(&caps, t, height).is_err();
-            let idle = self.sessions.get(&t.session).is_none_or(quiet);
+            // an unpaid invoice lives its whole life and the 15 s after, however soon its session is called idle
+            // (`first_use_secs`): a payment over a slow route can arrive near its end, and the seller's node would refuse
+            // one for an invoice cancelled under it. Its life: a first lock's `first_lock_secs`, any other's 60 s (a
+            // ticket read back after a restart is not known to be a first lock's, and has the longer)
+            let invoice_life = if t.first { caps.first_lock_secs } else { u64::from(xbt402::ticket::INVOICE_EXPIRY_S) };
+            let paying = t.state == TicketState::Open && !unpaid && now.saturating_sub(t.issued_at) <= invoice_life.saturating_add(15);
+            let idle = !paying && self.sessions.get(&t.session).is_none_or(quiet);
             if unpaid || expiring || idle {
                 out.cancel.push(*h);
             }
@@ -1053,8 +1122,7 @@ impl Book {
             .map(|(id, _)| id.clone())
             .collect();
         for id in gone {
-            self.sessions.remove(&id);
-            self.dirty.remove(&id);
+            self.drop_session(&id);
             out.recs.push(Rec::Drop { session: id });
         }
         out
@@ -1074,6 +1142,7 @@ impl Book {
         Some(Rec::Mark {
             session: id.to_string(),
             next_seq: s.next_seq,
+            seqs_ahead: s.seqs_ahead,
             spent_msat: s.spent_msat,
             pledge: s.pledge,
         })
@@ -1082,6 +1151,25 @@ impl Book {
     /// The whole book as records: what a compacted journal holds.
     pub fn snapshot(&self) -> Vec<Rec> {
         let mut out = vec![];
+        // what the dropped sessions were charged, as one session charged that sum and dropped: a
+        // replay adds it back, as it does any dropped session's (a gateway from before, too)
+        if self.dropped_charged_msat > 0 {
+            out.push(Rec::Session {
+                id: DROPPED_CARRY.into(),
+                key: [0; 32],
+                addr: String::new(),
+            });
+            out.push(Rec::Mark {
+                session: DROPPED_CARRY.into(),
+                next_seq: 0,
+                seqs_ahead: 0,
+                spent_msat: self.dropped_charged_msat,
+                pledge: None,
+            });
+            out.push(Rec::Drop {
+                session: DROPPED_CARRY.into(),
+            });
+        }
         for (id, s) in &self.sessions {
             out.push(Rec::Session {
                 id: id.clone(),
@@ -1138,6 +1226,7 @@ impl Book {
                             key: *key,
                             addr: addr.clone(),
                             next_seq: 0,
+                            seqs_ahead: 0,
                             released_msat: 0,
                             spent_msat: 0,
                             pledge: None,
@@ -1197,18 +1286,20 @@ impl Book {
                 Rec::Mark {
                     session,
                     next_seq,
+                    seqs_ahead,
                     spent_msat,
                     pledge,
                 } => {
                     if let Some(s) = b.sessions.get_mut(session) {
                         s.next_seq = *next_seq;
+                        s.seqs_ahead = *seqs_ahead;
                         s.spent_msat = *spent_msat;
                         s.pledge = pledge
                             .filter(|p| b.tickets.get(p).is_some_and(|t| &t.session == session));
                     }
                 }
                 Rec::Drop { session } => {
-                    b.sessions.remove(session);
+                    b.drop_session(session);
                     b.tickets.retain(|_, t| &t.session != session);
                 }
             }
@@ -1221,6 +1312,10 @@ impl Book {
     }
 }
 
+/// The session under which a snapshot carries what the dropped sessions were charged: not hex, so
+/// never the id of a session the gateway made (those are 32 hex digits).
+pub const DROPPED_CARRY: &str = "dropped";
+
 /// The name under which a snapshot carries a session's released sum: not a payment hash anyone can
 /// lock (it would need a preimage of a value fixed by the session id), and never sent to the node.
 fn carry_hash(session: &str) -> Hash {
@@ -1228,12 +1323,13 @@ fn carry_hash(session: &str) -> Hash {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::Record;
 
     pub(crate) fn caps() -> Caps {
         Caps {
+            seq_window: SEQ_WINDOW_MAX,
             ticket_msat: 1_000_000,
             max_tickets: 8,
             max_sessions: 4,
@@ -1564,7 +1660,8 @@ mod tests {
 
     #[test]
     fn requests_are_authenticated_and_in_order() {
-        let mut b = Book::new(caps());
+        // a gateway that takes the next seq only, as before the window
+        let mut b = Book::new(Caps { seq_window: 1, ..caps() });
         let s = open(&mut b, 1, &[1]);
         assert_eq!(
             b.authenticate("nobody", 0, |_| true),
@@ -1579,6 +1676,62 @@ mod tests {
         // a bad MAC uses up nothing
         assert_eq!(b.authenticate(&s, 2, |_| false), Err(Refusal::BadAuth));
         assert_eq!(b.session(&s).unwrap().next_seq, 2);
+    }
+
+    #[test]
+    fn a_seq_is_taken_once_anywhere_in_the_window() {
+        let mut b = Book::new(caps());
+        let s = open(&mut b, 1, &[1]);
+        // requests side by side arrive out of order: each is taken where it falls in the window
+        for seq in [3, 1, 0] {
+            assert_eq!(b.authenticate(&s, seq, |_| true), Ok(()), "seq {seq}");
+        }
+        assert_eq!((b.session(&s).unwrap().next_seq, b.session(&s).unwrap().seqs_ahead), (2, 0b10));
+        // a seq taken already, above the next one or below it, is refused, the next one named
+        assert_eq!(b.authenticate(&s, 3, |_| true), Err(Refusal::BadSeq(2)));
+        assert_eq!(b.authenticate(&s, 0, |_| true), Err(Refusal::BadSeq(2)));
+        assert_eq!(b.authenticate(&s, 2, |_| true), Ok(()));
+        assert_eq!((b.session(&s).unwrap().next_seq, b.session(&s).unwrap().seqs_ahead), (4, 0));
+        // the window is 64 seqs from the next one: past it, refused
+        assert_eq!(b.authenticate(&s, 4 + SEQ_WINDOW_MAX, |_| true), Err(Refusal::BadSeq(4)));
+        assert_eq!(b.authenticate(&s, 3 + SEQ_WINDOW_MAX, |_| true), Ok(()));
+        assert_eq!(b.authenticate(&s, 3 + SEQ_WINDOW_MAX, |_| true), Err(Refusal::BadSeq(4)), "taken at the window's last place");
+        // a bad MAC uses up nothing in the window either
+        assert_eq!(b.authenticate(&s, 5, |_| false), Err(Refusal::BadAuth));
+        assert_eq!(b.authenticate(&s, 5, |_| true), Ok(()));
+        let sess = b.session(&s).unwrap();
+        assert_eq!((sess.next_seq, sess.seqs_ahead), (4, 1 << 1 | 1 << 63));
+    }
+
+    #[test]
+    fn the_seqs_taken_in_the_window_are_kept_across_a_restart() {
+        let mut b = Book::new(caps());
+        let s = open(&mut b, 1, &[1]);
+        for seq in [0, 2, 5] {
+            assert_eq!(b.authenticate(&s, seq, |_| true), Ok(()));
+        }
+        // the journal: the session, then its counters; and a compacted one
+        let mut journal = vec![Rec::Session { id: s.clone(), key: [1u8; 32], addr: "a".into() }];
+        journal.extend(b.take_marks());
+        let journal: Vec<Rec> = journal.iter().map(|r| Rec::from_json(&r.to_json()).unwrap()).collect();
+        for (label, recs) in [("journal", journal), ("snapshot", b.snapshot())] {
+            let mut r = Book::restore(caps(), &recs, 1000).unwrap();
+            assert_eq!((r.session(&s).unwrap().next_seq, r.session(&s).unwrap().seqs_ahead), (1, 0b10010), "{label}");
+            // what was taken before the restart is not taken again
+            for seq in [0, 2, 5] {
+                assert_eq!(r.authenticate(&s, seq, |_| true), Err(Refusal::BadSeq(1)), "{label}: seq {seq} replayed");
+            }
+            for seq in [1, 3, 4, 6] {
+                assert_eq!(r.authenticate(&s, seq, |_| true), Ok(()), "{label}: seq {seq}");
+            }
+            assert_eq!(r.session(&s).unwrap().next_seq, 7, "{label}");
+        }
+        // a journal written before the window has no `ahead`: nothing above the next seq was taken
+        let old = json!({"t": "mark", "session": s, "seq": 3, "spent": 0, "pledge": null});
+        assert!(matches!(Rec::from_json(&old), Some(Rec::Mark { next_seq: 3, seqs_ahead: 0, .. })));
+        // one that names the next seq itself as taken is not this gateway's
+        let bad = json!({"t": "mark", "session": s, "seq": 3, "spent": 0, "pledge": null, "ahead": 1});
+        assert_eq!(Rec::from_json(&bad), None);
     }
 
     #[test]
@@ -1839,6 +1992,37 @@ mod tests {
         );
     }
 
+    /// What the seller earned counts the sessions dropped from the book: through a sweep, a restart
+    /// from the journal, and a compaction (whose snapshot no longer holds them; the gateway keeps
+    /// their sum beside it and adds it back).
+    #[test]
+    fn what_was_charged_outlives_the_sessions_dropped_from_the_book() {
+        let mark = |id: &str, spent| Rec::Mark { session: id.into(), next_seq: 3, seqs_ahead: 0, spent_msat: spent, pledge: None };
+        let journal = vec![
+            Rec::Session { id: "a".into(), key: [1u8; 32], addr: "x".into() },
+            Rec::Session { id: "b".into(), key: [2u8; 32], addr: "y".into() },
+            mark("a", 294_967),
+            mark("b", 1_000),
+            Rec::Drop { session: "a".into() },
+        ];
+        let b = Book::restore(caps(), &journal, 0).unwrap();
+        assert_eq!((b.sessions(), b.dropped_charged_msat(), b.charged_msat()), (1, 294_967, 295_967));
+        // compacted: the snapshot holds b, and a's charge as the carry, in the same file
+        let mut again = Book::restore(caps(), &b.snapshot(), 0).unwrap();
+        assert_eq!((again.sessions(), again.dropped_charged_msat(), again.charged_msat()), (1, 294_967, 295_967));
+        assert!(again.session(DROPPED_CARRY).is_none(), "the carry is no session on the book");
+        // compacted again, and drops after it: counted once each
+        let mut journal = again.snapshot();
+        journal.push(Rec::Drop { session: "b".into() });
+        let twice = Book::restore(caps(), &journal, 0).unwrap();
+        assert_eq!((twice.sessions(), twice.charged_msat()), (0, 295_967));
+        assert_eq!(Book::restore(caps(), &twice.snapshot(), 0).unwrap().charged_msat(), 295_967);
+        // and a sweep that drops b keeps its charge counted
+        let sw = again.sweep(10_000_000, Some(100));
+        assert_eq!(sw.recs, vec![Rec::Drop { session: "b".into() }]);
+        assert_eq!((again.sessions(), again.charged_msat()), (0, 295_967));
+    }
+
     #[test]
     fn a_restart_keeps_sessions_counters_and_tickets_and_trusts_only_the_node_for_locked() {
         let mut b = Book::new(caps());
@@ -2050,6 +2234,26 @@ mod tests {
         assert_eq!(b.lock("a", None, &[hash(5), hash(6)], false, &ent(4), 0).unwrap().issue.len(), 2);
         // a lock asks for as many as are left to the address
         assert_eq!(b.lock("a", None, &[hash(7)], false, &ent(5), 0), Err(Refusal::TooManyTickets));
+    }
+
+    /// As shipped (a first lock's invoices live 60 s): an unpaid one is kept for its whole life and
+    /// the 15 s after, whatever `first_use_secs` says, and given up then. A first lock set to lapse
+    /// sooner (`first_lock_secs` 5) is given up at 20 s, however long `unpaid_secs` is.
+    ///
+    /// FAILS before: the first-use sweep gave it up at `first_use_secs` (61 s as shipped, 16 s with
+    /// the lab's 15), before its invoice lapsed, so a payment over a slow route met a cancelled one.
+    #[test]
+    fn an_unpaid_first_lock_lives_its_whole_life_however_soon_a_session_is_called_idle() {
+        for first_use in [15, 60] {
+            let mut b = Book::new(Caps { max_tickets: 2, first_lock_secs: 60, first_use_secs: first_use, ..caps() });
+            b.lock("a", None, &[hash(1)], true, &ent(1), 100).unwrap();
+            assert!(b.sweep(175, None).cancel.is_empty(), "first_use_secs {first_use}");
+            assert_eq!(b.sweep(176, None).cancel, vec![hash(1)], "first_use_secs {first_use}");
+        }
+        let mut b = Book::new(Caps { max_tickets: 2, first_lock_secs: 5, first_use_secs: 15, unpaid_secs: 600, ..caps() });
+        b.lock("a", None, &[hash(1)], true, &ent(1), 100).unwrap();
+        assert!(b.sweep(120, None).cancel.is_empty());
+        assert_eq!(b.sweep(121, None).cancel, vec![hash(1)], "5 s and 15 s: given up by the first-use sweep from 21 s");
     }
 
     /// The invoices of a first lock lapse sooner than those of an authenticated one.

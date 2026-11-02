@@ -162,7 +162,8 @@ fn outcome(state: &str, extra: Value) -> Value {
 /// The values in force, defaults included (the UI shows them for keys policy.json leaves out).
 pub fn effective(c: &PolicyConfig) -> Value {
     json!({"max_per_tx_sats": c.max_per_tx_sats, "daily_budget_sats": c.daily_budget_sats, "weekly_budget_sats": c.weekly_budget_sats,
-           "per_counterparty_cap_sats": c.per_counterparty_cap_sats, "velocity_max": c.velocity_max, "velocity_window_s": c.velocity_window_s,
+           "per_counterparty_cap_sats": c.per_counterparty_cap_sats,
+           "per_counterparty_daily_sats": if c.per_counterparty_daily_sats == i64::MAX { Value::Null } else { json!(c.per_counterparty_daily_sats) }, "velocity_max": c.velocity_max, "velocity_window_s": c.velocity_window_s,
            "human_threshold_sats": c.human_threshold_sats, "split_window_s": c.split_window_s, "approval_ttl_s": c.approval_ttl_s,
            "treasury_csv": c.treasury_csv, "hot_balance_cap_sats": c.hot_balance_cap_sats, "anchor_interval_s": c.anchor_interval_s,
            "anchor_required": c.anchor_required,
@@ -270,6 +271,8 @@ impl Signer {
             }
             "policy_prepare" => self.policy_prepare(p),
             "policy_set" => self.policy_set(p),
+            // lifting a block on a seller caught over-charging: signed by the human, like a policy change
+            "seller_unblock" => self.seller_unblock(p),
             "human_key_enroll" => self.human_key_enroll(p),
             "human_key_rotate" => self.human_key_rotate(p),
             "rotate_hot_key" | "rotate_hot_key_signed" => self.rotate_signed(p),
@@ -314,6 +317,21 @@ impl Signer {
                                         "reason": reason, "ts": ts_value(self.engine.now())}));
         self.remember(&token, outcome("denied", json!({"token": token, "reason": reason})));
         Ok(json!({"ok": true, "token": token, "state": "denied"}))
+    }
+
+    /// Lift the block on a seller the wallet caught over-charging ([`crate::seller_block`]): signed by
+    /// the human (`unblock_message`), since it lets the wallet pay that seller again.
+    fn seller_unblock(&self, p: &Value) -> Result<Value> {
+        let block = str_or_empty(p.get("block"));
+        let expiry = py_int(p.get("expiry")).unwrap_or(0);
+        if let Some(d) = self.check_sig(&crate::approval::unblock_message(&block, expiry), p, expiry) {
+            return Ok(d);
+        }
+        if !self.seller_blocks.unblock(&block) {
+            return Ok(deny("seller_unblock", "no such block: it may have been lifted already"));
+        }
+        self.engine.audit.append(json!({"type": "seller_unblock", "block": block, "ts": ts_value(self.engine.now())}));
+        Ok(json!({"ok": true, "block": block}))
     }
 
     fn policy_get(&self) -> Result<Value> {

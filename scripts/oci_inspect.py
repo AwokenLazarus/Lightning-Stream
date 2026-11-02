@@ -5,11 +5,14 @@ For every image and platform it reads the index, the manifest, the config and th
   * the platforms are linux/amd64, linux/arm64 and linux/arm/v7;
   * the image runs as a non-root user, has an ENTRYPOINT and a HEALTHCHECK, and sets XBT_DATA_DIR and XBT_MODE=production
     (xbt-init, the one-shot that fixes a bind mount's owners, is the exception: root, and no HEALTHCHECK);
-  * the binary layer holds exactly /usr/bin/<image> (and, for the signer and the gateway, /usr/bin/xbt-supervise),
+  * the binary layer holds exactly /usr/bin/<image> (and, for the signer, the gateway and the Stream Gateway
+    (xbt-datum-gateway), /usr/bin/xbt-supervise), plus any read-only data an image ships (DATA),
     each a static ELF (no PT_INTERP) for that architecture;
-  * the base layer is the same blob in every image and on every platform (it is stored once).
+  * the base layer is the same blob in every image and on every platform (it is stored once);
+  * the licence label is the image's own (LICENSES: the Stream Gateway's names the C libraries it links).
 It prints a JSON report, writes a markdown table of sizes (--md), and exits 1 if any check fails.
     python3 scripts/oci_inspect.py dist/oci IMAGE... [--md OUT.md] [--rev REV]
+    python3 scripts/oci_inspect.py --license IMAGE     the image's licence (SPDX), for oci_build.sh
 """
 import gzip
 import io
@@ -21,8 +24,26 @@ import tarfile
 WANT = {("amd64", ""): 0x3E, ("arm64", ""): 0xB7, ("arm", "v7"): 0x28}
 ROOT_ONESHOTS = {"xbt-init"}
 # binaries an image carries beside its own, in the same layer
-COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"]}
+COMPANIONS = {"xbt-signer": ["xbt-supervise"], "xbt-gateway": ["xbt-supervise"], "xbt-datum-gateway": ["xbt-supervise"]}
+# data an image's binary layer carries beside its binaries, each read-only and not a program
+DATA = {"xbt-vpn": ["usr/share/xbt-vpn/ATTRIBUTION", "usr/share/xbt-vpn/dbip-country-lite.csv.gz"],
+        # the Stream Gateway's notice and the licences of what it links statically (two are LGPL)
+        "xbt-datum-gateway": [f"usr/share/xbt-datum-gateway/{n}" for n in ("NOTICE", "datum_gateway.LICENSE", "libsodium.LICENSE",
+                              "jansson.LICENSE", "curl.COPYING", "libmicrohttpd.COPYING", "argp-standalone.NOTICE",
+                              "argp-standalone.COPYING", "musl.COPYRIGHT")]}
 ELF_CLASS = {0x3E: 2, 0xB7: 2, 0x28: 1}
+# each image's licence (SPDX), as its OCI label and index annotation state it (oci_build.sh reads this with
+# --license IMAGE). Ours is MIT OR Apache-2.0 (Cargo.toml). The Stream Gateway links C code of other licences:
+# datum_gateway MIT, libsodium ISC, jansson MIT, libcurl curl, libmicrohttpd LGPL-2.1-or-later (or eCos-2.0, its
+# dual licence), argp-standalone LGPL-2.0-or-later (GNU Library GPL 2 or later), musl MIT, and xbt-supervise ours
+OURS = "MIT OR Apache-2.0"
+# xbt-vpn ships DB-IP's country table, under CC BY 4.0 (its ATTRIBUTION file is in the image, and the VPN page credits it)
+LICENSES = {"xbt-datum-gateway": "MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)",
+            "xbt-vpn": "(MIT OR Apache-2.0) AND CC-BY-4.0"}
+
+
+def license_of(image):
+    return LICENSES.get(image, OURS)
 
 
 def blob(tar, digest):
@@ -87,11 +108,21 @@ def inspect(path, image):
                     probs.append("no ENTRYPOINT or HEALTHCHECK")
             if "XBT_DATA_DIR=/data" not in (p["env"] or []) or "XBT_MODE=production" not in (p["env"] or []):
                 probs.append("XBT_DATA_DIR/XBT_MODE not set")
+            lic = (c.get("Labels") or {}).get("org.opencontainers.image.licenses")
+            if lic != license_of(image):
+                probs.append(f"licence label {lic!r}, want {license_of(image)!r}")
             if len(layers) != 2:
                 probs.append(f"{len(layers)} layers (want base + binary)")
             else:
                 files = layer_files(blob(tar, layers[1]["digest"]))
-                bins = {k: v for k, v in files.items() if v[1] is not None}
+                data = DATA.get(image, [])
+                for name in data:
+                    member, body = files.get(name, (None, None))
+                    if body is None:
+                        probs.append(f"binary layer lacks {name}")
+                    elif member.mode & 0o7777 != 0o444 or body[:4] == b"\x7fELF":
+                        probs.append(f"{name} is not read-only data ({oct(member.mode)})")
+                bins = {k: v for k, v in files.items() if v[1] is not None and k not in data}
                 want = f"usr/bin/{image}"
                 expected = sorted([want] + [f"usr/bin/{c}" for c in COMPANIONS.get(image, [])])
                 if sorted(bins) != expected:
@@ -120,6 +151,9 @@ def inspect(path, image):
 
 def main():
     args = sys.argv[1:]
+    if args[:1] == ["--license"]:
+        print(license_of(args[1]))
+        return 0
     md = args[args.index("--md") + 1] if "--md" in args else None
     rev = args[args.index("--rev") + 1] if "--rev" in args else ""
     pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--md", "--rev"))]

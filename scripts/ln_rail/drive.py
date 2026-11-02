@@ -194,7 +194,7 @@ def start_signer(root, sock, extra_env, log):
 
 def policy(human_pub, allow):
     return {"allowlist": allow, "max_per_tx_sats": 50_000, "daily_budget_sats": 30_000, "weekly_budget_sats": 100_000,
-            "per_counterparty_cap_sats": 100_000, "velocity_max": 20, "velocity_window_s": 3600, "human_threshold_sats": 20_000,
+            "per_counterparty_cap_sats": 100_000, "per_counterparty_daily_sats": 100_000, "velocity_max": 20, "velocity_window_s": 3600, "human_threshold_sats": 20_000,
             "split_window_s": 0, "human_pubkey": human_pub, "regtest_mine": False, "anchor_interval_s": 3600,
             "ln": {"enabled": True, "split_height": SPLIT, "max_fee_base_sats": 10, "max_fee_ppm": 5000, "timeout_s": 60}}
 

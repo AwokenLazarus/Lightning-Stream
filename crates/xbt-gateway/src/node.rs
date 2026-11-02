@@ -542,6 +542,16 @@ impl LndRest {
         }
     }
 
+    /// The node's signature over `msg` (lnd `SignMessage`, z-base32), asked with a macaroon that
+    /// allows exactly that: how the seller's node vouches for the gateway's link key.
+    pub fn sign_message(&self, macaroon: &[u8], msg: &[u8]) -> Result<String, NodeError> {
+        use base64::Engine as _;
+        let body = serde_json::json!({ "msg": base64::engine::general_purpose::STANDARD.encode(msg) });
+        let v = self.unary(&hex::encode(macaroon), "POST", "/v1/signmessage", Some(&body))?;
+        v.get("signature").and_then(Value::as_str).map(str::to_string)
+            .ok_or_else(|| NodeError::Unreachable("signmessage answered without a signature".into()))
+    }
+
     fn unary(
         &self,
         macaroon: &str,

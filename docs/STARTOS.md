@@ -52,8 +52,9 @@ buying, selling, hashrate, and the wallet your agents pay with.
   only ask for payments: make them in Lightning Fork's dashboard (the Sell page lists the
   permissions) and paste them there.
 - **Rent your miners out** (Sell → Hashrate): point your miners at the *Miners* interface. Renters
-  outside your network reach TCP port 23341 (the *Hashrate link*): forward it on your router, or use
-  a tunnel, and enter the public address on the page.
+  reach your miners through the app's direct link, encrypted end to end: no port forward or address
+  is needed. Only hashtakers on apps from before the direct link need a forwarded TCP port 23341 (the *Hashrate
+  link*), which you can enter under Advanced on the page.
 - **Rent others' miners** (Services → Hashrate): the work goes to your own DATUM Gateway.
 - **AI for your programs** (Services → AI): programs on your LAN that work with OpenAI's API use the
   AI sellers you allowed through the *AI address for programs* interface, each with a key you make

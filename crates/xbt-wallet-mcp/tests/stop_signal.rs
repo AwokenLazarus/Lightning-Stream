@@ -1,7 +1,10 @@
 //! The shipped binary stops on SIGTERM over HTTP, as a container stop sends it: exit 0 at once,
 //! not after Docker's grace period (as PID 1 it used to ignore SIGTERM, having no handler).
 #![cfg(unix)]
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+mod common;
+use common::spawn_on_own_port;
 
 fn term_and_wait(child: &mut std::process::Child) -> (std::process::ExitStatus, std::time::Duration) {
     assert!(std::process::Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap().success());
@@ -32,14 +35,17 @@ fn wait_200(addr: &str, path: &str) {
 
 #[test]
 fn the_mcp_over_http_exits_0_on_sigterm() {
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let addr = format!("127.0.0.1:{port}");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_xbt-wallet-mcp")).env_clear().env("B2_SIGNER_SOCK", "/nonexistent/signer.sock")
-        .env("XBT_MCP_HTTP_TOKEN", "t0ken").args(["--http", &addr]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
-    wait_200(&addr, "/healthz");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_xbt-wallet-mcp"));
+    cmd.env_clear().env("B2_SIGNER_SOCK", "/nonexistent/signer.sock").env("XBT_MCP_HTTP_TOKEN", "t0ken").args(["--http", "127.0.0.1:0"]);
+    let (mut child, port, said) = spawn_on_own_port(cmd);
+    wait_200(&format!("127.0.0.1:{port}"), "/healthz");
     let (st, took) = term_and_wait(&mut child);
-    let mut said = String::new();
-    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
+    // the rest of what it said, read to its end
+    let t0 = std::time::Instant::now();
+    while !said.lock().unwrap().contains("xbt-wallet-mcp: stopped") && t0.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let said = said.lock().unwrap().clone();
     assert!(st.success() && took < std::time::Duration::from_secs(2), "exit {st:?} after {took:?}: {said}");
     assert!(said.contains("SIGTERM received") && said.contains("xbt-wallet-mcp: stopped"), "{said}");
 }

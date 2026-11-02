@@ -1,14 +1,12 @@
-//! Browse, a service's own page, the player and the live connections page.
+//! Browse, a service's own page and the live connections page.
 //!
-//! Browse reads the services file and lists services by category (media, AI, data and APIs), each
-//! with its own page: a media service's page lists what it has to play, and any other service's
-//! page gives the address apps and agents use it at. The player points a `<video>` at the connector
-//! (`XBT_UI_CONNECTOR` + `/s/` + the item URL), relayed by this process; for VLC, mpv and other
-//! players it makes links of their own for one item ([`crate::relay`], `POST /play-link`), shown
-//! with the exact address to paste. Stopping is a POST: this process asks the signer
-//! to `ticket_stop` the open session whose origin is that seller. Connections lists every session
-//! `ticket_status` still has open and reloads itself every 4 seconds (a meta refresh: the page's
-//! script policy does not allow an inline script).
+//! Browse reads the services file and lists services by category (web apps, AI, hashrate, data and
+//! APIs). A seller's media server (Jellyfin, Plex) is a web app: its page opens the seller's own app
+//! inside Lightning Stream ([`crate::seller_app`]), paid as it loads. Any other service's page gives
+//! the address apps and agents use it at. Stopping is a POST: this process asks the signer to
+//! `ticket_stop` the open session. Connections lists every session `ticket_status` still has open
+//! and reloads itself every 4 seconds (a meta refresh: the page's script policy does not allow an
+//! inline script).
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
@@ -39,62 +37,41 @@ impl App {
     /// One-click forms for the suggested sellers not added yet.
     pub(crate) fn suggested(&self, ctx: &Ctx, have: &[Service]) -> String {
         let mut b = String::new();
-        for url in self.cfg.suggested_sellers.iter().filter(|u| !have.iter().any(|s| services::same_origin(&s.seller, u))) {
+        // a suggestion is a web address or a shop key: matched against the sellers added by the address it names
+        for url in self.cfg.suggested_sellers.iter().filter(|u| {
+            let origin = xbt402::shop::parse(u).unwrap_or_else(|| u.to_string());
+            !have.iter().any(|s| services::same_origin(&s.seller, &origin))
+        }) {
+            let shown = if url.starts_with("npub1") && url.len() > 16 {
+                format!("shop key {}…{}", &url[..10], &url[url.len() - 6..])
+            } else {
+                url.trim_start_matches("https://").to_string()
+            };
             b.push_str(&format!("<form method=\"post\" action=\"./services\" class=\"row suggested\">{}<input type=\"hidden\" name=\"action\" value=\"add\">\
                 <input type=\"hidden\" name=\"url\" value=\"{}\"><span>Suggested: <strong>{}</strong></span><button class=\"secondary\">Add this seller</button></form>",
-                App::csrf_input(ctx), esc(url), esc(url.trim_start_matches("https://"))));
+                App::csrf_input(ctx), esc(url), esc(&shown)));
         }
         b
     }
 
     /// `GET /service?seller=…&name=…`: one service, as its category needs.
-    pub(crate) fn service_page(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
+    pub(crate) fn service_page(&self, ctx: &Ctx, req: &Req) -> Resp {
+        let q = &req.query;
         let seller = q.get("seller").map(String::as_str).unwrap_or("");
         let name = q.get("name").map(String::as_str).unwrap_or("");
         let found = self.services().ok().and_then(|all| all.into_iter().find(|s| services::same_origin(&s.seller, seller) && s.name == name));
         match found {
             Some(svc) => {
-                let body = service_html(&svc, self.is_own_shop(&svc.seller));
+                let own = self.is_own_shop(&svc.seller);
+                let mut body = service_html(&svc, own);
+                if svc.has_files() {
+                    body.push_str(&files_html(ctx, &svc, own, &self.link_base(req), &|item| self.relays.of_item(item)));
+                }
                 self.html_page("Service", &svc.name, ctx, &body, "")
             }
             None => self.html_page("Service", "Service", ctx, &format!("{}<p><a href=\"./browse\">Back to Browse</a></p>",
                                                                      Self::error_box("That service is not in your list. A seller may have removed it.")), ""),
         }
-    }
-
-    pub(crate) fn play(&self, ctx: &Ctx, req: &Req) -> Resp {
-        let item_url = req.query.get("item").map(String::as_str).unwrap_or("");
-        let mut title = "Player".to_string();
-        let body = match self.services() {
-            Ok(all) => match services::find_item(&all, item_url) {
-                Some((service, item)) => {
-                    title = item.title.clone();
-                    if self.is_own_shop(&service.seller) {
-                        own_player_html(service, item)
-                    } else if let Some((words, link, href)) = self.play_blocker() {
-                        format!("<p class=\"small\"><a href=\"{}\">← {}</a></p><section class=\"status bad\"><p class=\"status-head\">{}</p>\
-                                 <p><a class=\"button-link primary\" href=\"{}\">{}</a></p></section>",
-                                service_href(service), esc(&service.name), esc(&words), esc(&href), esc(&link))
-                    } else {
-                        let links = self.relays.of_item(&item.url);
-                        let warn = self.play_warning().map(|w| {
-                            let (href, link) = if w.contains("spending rules") { ("./policy?template=starter", "Open the starter rules") } else { ("./lightning", "Check your node") };
-                            format!("<div class=\"flash warn\">{} <a href=\"{href}\">{link}</a></div>", esc(&w))
-                        })
-                            .unwrap_or_default();
-                        // opened from the wallet's own page, or by the owner: a page opened from elsewhere is the home page
-                        // ([`crate::server`]), and one whose browser says nothing of where it came from waits for Play
-                        let autoplay = matches!(req.header("sec-fetch-site"), "same-origin" | "none") || !req.header("referer").is_empty();
-                        format!("{warn}{}{}", player_html(ctx, &self.cfg.connector, service, item, autoplay),
-                                if service.kind == Kind::Video { links_html(ctx, &self.link_base(req), &item.url, &links) } else { String::new() })
-                    }
-                }
-                None if item_url.is_empty() => "<p>Choose something to play from a media service on <a href=\"./browse?cat=media\">Browse</a>.</p>".into(),
-                None => format!("{}<p><a href=\"./browse\">Back to Browse</a></p>", Self::error_box("That item is not in your list of services.")),
-            },
-            Err(e) => format!("{}{}", Self::error_box(&e), empty_how("")),
-        };
-        self.html_page("Player", &title, ctx, &body, "")
     }
 
     pub(crate) fn connections(&self, ctx: &Ctx) -> Resp {
@@ -109,34 +86,6 @@ impl App {
             body.push_str(&format!("<h2>Rented hashrate</h2><div class=\"stack\" data-spent=\"{spent}\">{cards}</div>"));
         }
         self.html_page("Live connections", "Live connections", ctx, &body, REFRESH)
-    }
-
-    pub(crate) fn play_stop(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
-        let item_url = f.get("item").map(|s| s.trim().to_string()).unwrap_or_default();
-        let back = format!("./play?item={}", services::urlenc(&item_url));
-        let origins = match self.services() {
-            Ok(all) => match services::find_item(&all, &item_url) {
-                Some((service, item)) => services::pay_origins(service, item),
-                None => {
-                    self.flash(ctx, false, "That item is not in your list of services.");
-                    return Resp::redirect("./browse");
-                }
-            },
-            Err(e) => {
-                self.flash(ctx, false, e);
-                return Resp::redirect("./browse");
-            }
-        };
-        let st = match self.call("ticket_status", json!({})) {
-            Ok(v) => v,
-            Err(e) => {
-                self.flash(ctx, false, e);
-                return Resp::redirect(&back);
-            }
-        };
-        let ids = open_ids(&st, Some(&origins));
-        self.flash_stops(ctx, &ids, &origins.join(", "));
-        Resp::redirect(&back)
     }
 
     pub(crate) fn connections_stop(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
@@ -162,21 +111,24 @@ impl App {
         Resp::redirect("./connections")
     }
 
-    /// `POST /play-link`: make a link for an external player for one video item of the services
-    /// file (`action=create`), or revoke one (`action=revoke`, `token`). The CSRF token was checked
-    /// with every POST.
-    pub(crate) fn play_link(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+    /// `POST /file-link`: a link for the buyer's own player for one file of the services file
+    /// (`action=create`), or revoke one (`action=revoke`, `token`). The CSRF token was checked with
+    /// every POST. Back to the file's service page.
+    pub(crate) fn file_link(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let item_url = f.get("item").map(|s| s.trim().to_string()).unwrap_or_default();
-        let back = format!("./play?item={}", services::urlenc(&item_url));
+        let all = self.services().unwrap_or_default();
+        // the service the buyer chose, where several list the file; else the first that does
+        let chosen = f.get("service").map(|s| s.trim().to_string()).unwrap_or_default();
+        let found = services::find_item_of(&all, &chosen, &item_url).or_else(|| services::find_item(&all, &item_url));
+        let Some((svc, _)) = found.filter(|(s, _)| s.has_files()) else {
+            self.flash(ctx, false, "That file is not in your list of services.");
+            return Resp::redirect("./browse?cat=files");
+        };
+        let back = format!("./service?seller={}&name={}", services::urlenc(&svc.seller), services::urlenc(&svc.name));
         match f.get("action").map(String::as_str) {
             Some("create") => {
-                let video = self.services().ok().is_some_and(|all| services::find_item(&all, &item_url).is_some_and(|(s, _)| s.kind == Kind::Video));
-                if !video {
-                    self.flash(ctx, false, "That item is not a video in your list of services.");
-                    return Resp::redirect("./browse");
-                }
-                self.relays.create(&item_url);
-                self.flash(ctx, true, format!("Link made. It plays this film only, and stops working in {}.", lasts(self.cfg.relay_ttl)));
+                self.relays.create_for(&item_url, &svc.id());
+                self.flash(ctx, true, format!("Link made: copy it into your player. It plays this file only, and stops working in {}.", lasts(self.cfg.relay_ttl)));
             }
             Some("revoke") => {
                 let token = f.get("token").map(|s| s.trim().to_string()).unwrap_or_default();
@@ -200,8 +152,8 @@ impl App {
         format!("{}://{host}{base}", if https { "https" } else { "http" })
     }
 
-    /// What the player and the links for external players may open: the services file, and the
-    /// sellers the Nostr page last found (unvetted, shown on that page only).
+    /// What a service page and a seller's app may open: the services file, and the sellers the
+    /// Nostr page last found (unvetted, shown on that page only).
     pub(crate) fn services(&self) -> Result<Vec<Service>, String> {
         let mut all = self.file_services()?;
         all.extend(self.nostr.services());
@@ -253,22 +205,23 @@ impl App {
 
 fn empty_how(suggested: &str) -> String {
     format!("<section class=\"card empty-card\"><p class=\"empty\">No services yet.</p>\
-     <p>Add a seller to see what they offer: media to watch, AI models to ask, data and other services, each paid a little at a time.</p>\
+     <p>Add a seller to see what they offer: web apps such as a media server, AI models to ask, hashrate, data and other services, each paid a little at a time.</p>\
      <p><a class=\"button-link primary\" href=\"./services\">Add a seller</a></p>{suggested}</section>")
 }
 
 fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dyn Fn(&str) -> bool) -> String {
     let cat = cat.trim().to_ascii_lowercase();
-    // a kind (`video`, from an older link) names its category
+    // a kind or an older category names its category: films (`video`) are files, a media server (`media`) a web app
     let cat = match cat.as_str() {
-        "video" => "media".to_string(),
-        "files" | "api" => "data".to_string(),
+        "video" => "files".to_string(),
+        "media" => "apps".to_string(),
+        "api" => "data".to_string(),
         c if services::CATEGORIES.iter().any(|(id, _)| *id == c) => cat,
         _ => String::new(),
     };
     let sort_q = if sort == Sort::Price { "&amp;sort=price" } else { "" };
     let mut b = String::from("<nav class=\"chips\" aria-label=\"Categories\">");
-    let count = |id: &str| all.iter().filter(|s| id.is_empty() || s.kind.category() == id).count();
+    let count = |id: &str| all.iter().filter(|s| id.is_empty() || s.category() == id).count();
     for (id, words) in std::iter::once(("", "All")).chain(services::CATEGORIES.iter().copied()) {
         let cur = if id == cat { " aria-current=\"page\"" } else { "" };
         b.push_str(&format!("<a href=\"./browse?cat={id}{sort_q}\"{cur}>{} <span class=\"count\">{}</span></a>", esc(words), count(id)));
@@ -288,19 +241,20 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     }
     b.push_str("<div class=\"grid services\">");
     for s in &shown {
+        let n = s.items.len();
         let what = match s.kind {
-            Kind::Video if !s.items.is_empty() => format!("{} to play", s.items.len()),
-            Kind::Video => "Media".into(),
+            _ if s.category() == "apps" => "A web app: open it inside Lightning Stream".into(),
+            _ if s.has_files() => format!("{n} file{}: download, or open in your player", if n == 1 { "" } else { "s" }),
+            Kind::Video | Kind::Files => "No files listed yet".into(),
             Kind::Ai => "Ask it from your apps and agents".into(),
             Kind::Api => "Use it from your apps and agents".into(),
-            Kind::Files if !s.items.is_empty() => format!("{} file{}", s.items.len(), if s.items.len() == 1 { "" } else { "s" }),
-            Kind::Files => "Files".into(),
             Kind::Hashrate => "Rent miners by the piece of work".into(),
         };
         let mine = own(&s.seller);
+        let what = if s.app.is_empty() || s.category() == "apps" { what } else { format!("{what} · has its own app") };
         b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}</span>{}<h2>{}</h2>\
                              <p class=\"price\">{}</p><p class=\"small\">{} · {}</p></a>",
-                            service_href(s), s.kind.category(), esc(s.kind.category_words()),
+                            service_href(s), s.category(), esc(s.category_words()),
                             if mine { " <span class=\"pill good\">Your shop</span>" } else { "" },
                             esc(&s.name), esc(&s.price_text), esc(&what), esc(&host(&s.seller))));
     }
@@ -308,7 +262,13 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     b
 }
 
-fn host(url: &str) -> String {
+/// A seller as the pages show it: its web address's host, or for a shop reached by its key, that key
+/// shortened (its made-up `<key>.shop.invalid` name means nothing to a person, and is too long for a line).
+pub(crate) fn host(url: &str) -> String {
+    if let Some(pk) = xbt402::shop::key_of(url) {
+        let npub = xbt402::shop::npub(&pk);
+        return format!("{}…{}", &npub[..13], &npub[npub.len() - 4..]);
+    }
     services::http_origin(url).unwrap_or_else(|| url.to_string()).trim_start_matches("https://").trim_start_matches("http://").to_string()
 }
 
@@ -321,31 +281,43 @@ fn service_href(s: &Service) -> String {
 }
 
 /// A service's own page: its price and seller, then what its category needs. `own`: the seller is
-/// this box's own shop, which this box cannot buy from: its items play as a free preview instead.
+/// this box's own shop, which this box cannot buy from: its app opens as a free preview instead.
 fn service_html(s: &Service, own: bool) -> String {
     let mut b = format!("<p class=\"small\"><a href=\"./browse?cat={}\">← {}</a></p>\
         <section class=\"card\"><div class=\"offer-head\"><span class=\"pill cat-{}\">{}</span><span class=\"price\">{}</span></div>\
         <p class=\"small\">Sold by {}</p></section>",
-        s.kind.category(), esc(s.kind.category_words()), s.kind.category(), esc(s.kind.category_words()), esc(&s.price_text), esc(&host(&s.seller)));
+        s.category(), esc(s.category_words()), s.category(), esc(s.category_words()), esc(&s.price_text), esc(&host(&s.seller)));
     if own {
-        b.push_str("<section class=\"status ok\"><p class=\"status-head\">This is your shop</p><p>Buyers pay for this. You can preview it \
-            here for free: it plays straight from your service on this box, and nothing is paid.</p></section>");
+        b.push_str(if s.app.is_empty() {
+            "<section class=\"status ok\"><p class=\"status-head\">This is your shop</p><p>Buyers pay for this. Your box can't buy from \
+            its own shop.</p></section>"
+        } else {
+            "<section class=\"status ok\"><p class=\"status-head\">This is your shop</p><p>Buyers pay for this. You can preview it \
+            here for free: it opens straight from your service on this box, and nothing is paid.</p></section>"
+        });
     }
-    let play = if own { "Preview (free)" } else { "Play" };
+    if !s.app.is_empty() {
+        let seller = host(&s.seller);
+        b.push_str(&if own {
+            format!("<section class=\"card\"><h2>Its own app</h2><p>Buyers can open this service's own web page inside their app, \
+                and pay your price for what it loads. You can try it here for free.</p>\
+                <div class=\"row\"><a class=\"button-link\" href=\"./app?u={}&amp;b={}\">Preview the app (free)</a></div></section>",
+                services::urlenc(&s.app), services::urlenc(&s.app_base))
+        } else {
+            format!("<section class=\"card primary\"><h2>Its own app</h2><p>Use {}'s own page for this service, inside Lightning Stream. \
+                What it loads is paid at the price above, up to a limit you set.</p>\
+                <div class=\"row\"><a class=\"button-link primary\" href=\"./app?u={}&amp;b={}\">Open {}'s app</a></div></section>",
+                esc(&seller), services::urlenc(&s.app), services::urlenc(&s.app_base), esc(&seller))
+        });
+    }
     match s.kind {
-        Kind::Video => {
-            if s.items.is_empty() {
-                b.push_str("<p class=\"empty\">This seller lists nothing to play yet.</p>");
-            } else {
-                b.push_str("<div class=\"grid\">");
-                for item in &s.items {
-                    b.push_str(&format!("<article class=\"card item\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>\
-                                         <p><a class=\"button-link\" href=\"./play?item={}\">{play}</a></p></article>",
-                                        esc(&item.title), esc(&item.year), esc(&item.credit), services::urlenc(&item.url)));
-                }
-                b.push_str("</div>");
-            }
-        }
+        // a media server is the seller's own web app, opened above; an older listing names films for a
+        // player this app no longer has
+        Kind::Video | Kind::Files if s.has_files() || !s.app.is_empty() => {}
+        Kind::Files => b.push_str("<p class=\"empty\">This seller lists no files yet.</p>"),
+        Kind::Video => b.push_str("<section class=\"status warn\"><p class=\"status-head\">This shop uses an older media listing</p>\
+            <p>It names nothing to download or open. Ask the seller to share their media server as a web app: Lightning Stream opens \
+            a seller's own app (Jellyfin, Plex) and pays for what it loads.</p></section>"),
         Kind::Hashrate => b.push_str("<section class=\"card primary\"><h2>Rent miners</h2>\
             <p>This seller rents out its miners: they hash for your own pool, and you pay for each piece of work as it is done.</p>\
             <div class=\"row\"><a class=\"button-link primary\" href=\"./hashrate\">Rent hashrate</a></div></section>"),
@@ -371,40 +343,48 @@ fn service_html(s: &Service, own: bool) -> String {
     b
 }
 
-/// `autoplay`: the page was opened from the wallet's own page or by the owner (a typed address, a
-/// bookmark), so the video starts by itself; otherwise it waits for the owner's Play.
-fn player_html(ctx: &Ctx, connector: &str, service: &Service, item: &services::Item, autoplay: bool) -> String {
-    if service.kind != Kind::Video {
-        return format!("<p>{} is not something to play. Its service's page says how to use it: <a href=\"{}\">{}</a>.</p>",
-                       esc(&item.title), service_href(service), esc(&service.name));
-    }
-    let src = match services::player_src(connector, &crate::app::stream_token(&ctx.csrf), &item.url) {
-        Ok(s) => s,
-        Err(e) => return format!("{}<p><a href=\"./browse\">Back to Browse</a></p>", App::error_box(&e)),
+/// A size as a Files listing words it (`850 KB`, `1.4 GB`, `850 bytes`): bytes.
+fn size_of(words: &str) -> Option<f64> {
+    let (n, unit) = words.trim().split_once(' ')?;
+    let n: f64 = n.parse().ok()?;
+    let mult = match unit {
+        "bytes" => 1.0,
+        "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        _ => return None,
     };
-    format!("<p class=\"small\"><a href=\"{}\">← {}</a> · {} · <span class=\"price\">{}</span></p>\
-             <div class=\"player\" data-player data-item=\"{}\"><video controls{} src=\"{}\"></video>\
-             <p class=\"player-msg\" role=\"status\" aria-live=\"polite\" hidden></p></div>\
-             <p class=\"small\">{}</p>\
-             <form method=\"post\" action=\"./play\" data-stop-player>\
-             {}<input type=\"hidden\" name=\"item\" value=\"{}\">\
-             <button class=\"danger\" type=\"submit\">Stop and cut the connection</button></form>\
-             <p class=\"hint\">You pay as it plays. Stopping ends the payments at once; <a href=\"./connections\">Live connections</a> shows what is open.</p>",
-            service_href(service), esc(&service.name), esc(&item.year), esc(&service.price_text), esc(&item.url),
-            if autoplay { " autoplay" } else { "" }, esc(&src), esc(&item.credit),
-            App::csrf_input(ctx), esc(&item.url))
+    Some(n * mult)
 }
 
-/// The owner's own shop: a free preview, straight from the service on this box (`/preview`), never
-/// through the gateway and never paid. Only the owner, logged in, gets this page.
-fn own_player_html(service: &Service, item: &services::Item) -> String {
-    format!("<p class=\"small\"><a href=\"{}\">← {}</a> · {}</p>\
-             <section class=\"status ok\"><p class=\"status-head\">Preview of your shop (free)</p><p>This plays straight from your service on \
-             this box. Nothing is paid: a box cannot buy from its own shop. Buyers pay {}.</p></section>\
-             <div class=\"player\" data-player data-item=\"{}\" data-preview><video controls autoplay src=\"./preview?item={}\"></video>\
-             <p class=\"player-msg\" role=\"status\" aria-live=\"polite\" hidden></p></div>\
-             <p class=\"small\">{}</p>",
-            service_href(service), esc(&service.name), esc(&item.year), esc(&service.price_text), esc(&item.url), services::urlenc(&item.url), esc(&item.credit))
+/// The sats a byte costs, from a price as Browse words it (`1000 sat a GB`, `20 sat a MiB`).
+fn sat_a_byte(price: &str) -> Option<f64> {
+    let (n, rest) = price.trim().split_once(" sat a ")?;
+    let n: f64 = n.replace(',', "").parse().ok()?;
+    match rest {
+        "GB" => Some(n / 1e9),
+        "MiB" => Some(n / 1_048_576.0),
+        _ => None,
+    }
+}
+
+/// About what a file costs: `about 1,400 sat`, `under 1 sat`.
+fn about_sats(bytes: f64, per_byte: f64) -> String {
+    let sats = bytes * per_byte;
+    if sats < 1.0 {
+        return "under 1 sat".into();
+    }
+    let n = sats.round() as u64;
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("about {out} sat")
 }
 
 /// `6 hours`, `90 minutes`, `45 seconds`.
@@ -414,27 +394,64 @@ fn lasts(d: std::time::Duration) -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
-/// The Player page's section for VLC, mpv and other players: the item's live links, each with the
-/// exact address to paste and a button that revokes it, and a button that makes one.
-fn links_html(ctx: &Ctx, base: &str, item_url: &str, links: &[crate::relay::Shown]) -> String {
+/// A Files service's list: each file's name, size and price, a Download (paid as it arrives, from
+/// this page's own address: [`crate::server`]), and Open in your player: a link VLC, mpv or a TV app
+/// opens on any device that reaches this app ([`crate::relay`]). `own`: this box's own shop, which it
+/// cannot buy from.
+fn files_html(ctx: &Ctx, s: &Service, own: bool, base: &str, links: &dyn Fn(&str) -> Vec<crate::relay::Shown>) -> String {
+    let per_byte = sat_a_byte(&s.price_text);
+    let token = crate::app::stream_token(&ctx.csrf);
     let csrf = App::csrf_input(ctx);
-    let mut b = format!("<details class=\"card\"{}><summary>", if links.is_empty() { "" } else { " open" });
-    b.push_str("Play in VLC, mpv or another player</summary>\
-        <p class=\"small\">A link plays this item through this app on any device that can reach it, without logging in: paste it into \
-        VLC (Media, Open Network Stream) or run <code>mpv '&lt;link&gt;'</code>. Seeking works, and each part is paid as it plays, \
-        within your spending rules. Anyone who has the link can play this item, and nothing else, until it expires or you revoke it.</p>");
-    for l in links {
-        let url = format!("{base}r/{}", l.token);
-        b.push_str(&format!("<div class=\"row\"><input readonly class=\"relay-link\" aria-label=\"Link for an external player\" value=\"{}\">\
-                             <span class=\"small\">{} left</span>\
-                             <form method=\"post\" action=\"./play-link\" class=\"inline\">{csrf}<input type=\"hidden\" name=\"action\" value=\"revoke\">\
-                             <input type=\"hidden\" name=\"item\" value=\"{}\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
-                             <button class=\"danger\" type=\"submit\">Revoke</button></form></div>",
-                            esc(&url), lasts(l.left), esc(item_url), esc(&l.token)));
+    let mut b = String::from("<section class=\"card\"><h2>Files</h2>");
+    b.push_str(if own {
+        "<p class=\"hint\">Your box can't buy from its own shop: buyers see this list, and the files are in your shared folder.</p>"
+    } else {
+        "<p class=\"hint\">Download a file, or open it in your own player (VLC, mpv, a TV app). Either way you pay as it arrives, \
+          within your spending rules, and stop paying when it stops.</p>"
+    });
+    b.push_str("<table class=\"files\"><thead><tr><th>Name</th><th>Size</th><th>Price</th><th></th></tr></thead><tbody>");
+    for (i, item) in s.items.iter().enumerate() {
+        let bytes = size_of(&item.credit);
+        let size = if bytes.is_some() { esc(&item.credit) } else { String::new() };
+        let note = if bytes.is_none() && !item.credit.is_empty() { format!("<br><span class=\"small\">{}</span>", esc(&item.credit)) } else { String::new() };
+        let price = match (bytes, per_byte) {
+            (Some(n), Some(p)) => about_sats(n, p),
+            _ => esc(&s.price_text),
+        };
+        // a service not chosen from a listing has no price the app can hold the seller to: said, not hidden
+        let price = if s.prices.is_object() { price } else { format!("{price}<br><span class=\"small\">no listed price</span>") };
+        let actions = if own {
+            String::new()
+        } else {
+            let dl = match services::download_src(&token, &s.id(), &item.url) {
+                Ok(src) => format!("<a class=\"button-link\" href=\"{}\" download>Download</a>", esc(&src)),
+                Err(_) => String::new(),
+            };
+            let shown = links(&item.url);
+            let mut l = String::new();
+            for (j, x) in shown.iter().enumerate() {
+                let id = format!("link-{i}-{j}");
+                l.push_str(&format!("<div class=\"row\"><input id=\"{id}\" readonly class=\"mono relay-link\" aria-label=\"Link for your player\" value=\"{}\">\
+                    <button type=\"button\" class=\"secondary\" data-copy=\"{id}\">Copy</button><span class=\"small\">{} left</span>\
+                    <form method=\"post\" action=\"./file-link\" class=\"inline\">{csrf}<input type=\"hidden\" name=\"action\" value=\"revoke\">\
+                    <input type=\"hidden\" name=\"item\" value=\"{}\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
+                    <button class=\"link\" type=\"submit\">Revoke</button></form></div>",
+                    esc(&format!("{base}r/{}", x.token)), lasts(x.left), esc(&item.url), esc(&x.token)));
+            }
+            format!("<div class=\"row\">{dl}<form method=\"post\" action=\"./file-link\" class=\"inline\">{csrf}\
+                <input type=\"hidden\" name=\"action\" value=\"create\"><input type=\"hidden\" name=\"item\" value=\"{}\">\
+                <input type=\"hidden\" name=\"service\" value=\"{}\">\
+                <button class=\"secondary\" type=\"submit\">Open in your player</button></form></div>{l}", esc(&item.url), esc(&s.id()))
+        };
+        b.push_str(&format!("<tr><td><strong>{}</strong>{note}</td><td>{size}</td><td>{price}</td><td>{actions}</td></tr>", esc(&item.title)));
     }
-    b.push_str(&format!("<form method=\"post\" action=\"./play-link\">{csrf}<input type=\"hidden\" name=\"action\" value=\"create\">\
-                         <input type=\"hidden\" name=\"item\" value=\"{}\"><button type=\"submit\" class=\"secondary\">{}</button></form></details>",
-                        esc(item_url), if links.is_empty() { "Make a link" } else { "Make another link" }));
+    b.push_str("</tbody></table>");
+    if !own {
+        b.push_str("<p class=\"hint\">Open in your player makes a link: paste it into VLC (Media, Open Network Stream), run \
+            <code>mpv '&lt;link&gt;'</code>, or add it in a TV app. It plays this one file, seeking included, from any device that reaches this app, \
+            until it expires or you revoke it.</p>");
+    }
+    b.push_str("</section>");
     b
 }
 
@@ -610,7 +627,7 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
     let streaming = row.and_then(|p| p.get("answer_open")).and_then(Value::as_bool).unwrap_or(false);
     let pill = match state {
         "open" if streaming => "<span class=\"pill good\">Streaming</span>",
-        "open" => "<span class=\"pill\">Open, nothing playing</span>",
+        "open" => "<span class=\"pill\">Open, idle</span>",
         "stopping" | "stopped" => "<span class=\"pill warn\">Stopping</span>",
         _ => "<span class=\"pill\">Closed</span>",
     };
@@ -712,21 +729,53 @@ mod tests {
         assert!(service_html(&all[0], false).contains("href=\"./hashrate\""));
     }
 
+    /// Two services list the same file at different prices: the Download and the player's link carry
+    /// the service the buyer chose, and the relay takes that one's prices; a service with no listed
+    /// price says so.
+    ///
+    /// FAILS before: the file was found as the first service that lists it, whatever the buyer chose.
     #[test]
-    fn the_player_src_is_the_connector_plus_the_item_and_the_credit_is_escaped() {
-        let svc = Service { name: "Films".into(), kind: Kind::Video, seller: "https://stream.lazarus-xbt.xyz".into(),
-                            price_text: "20 sat a MiB".into(),
-                            items: vec![services::Item { title: "<b>".into(), year: "2008".into(),
-                                url: "https://stream.lazarus-xbt.xyz/v?static=true&x=1".into(), credit: "CC <BY>".into() }],
-                            address: String::new() };
-        let ctx = Ctx { sid: "s".into(), csrf: "tok&1".into(), flash: None };
-        let html = player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0], true);
-        let token = crate::app::stream_token("tok&1");
-        assert!(html.contains(&format!("src=\"./s/~{token}/https://stream.lazarus-xbt.xyz/v?static=true&amp;x=1\"")) && html.contains(" autoplay "), "{html}");
-        assert!(!player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0], false).contains("autoplay"));
-        assert!(html.contains("Stop and cut the connection"));
-        assert!(html.contains("value=\"tok&amp;1\""));
-        // the item's title is the page's heading (escaped by the layout); the credit is in the body
-        assert!(html.contains("CC &lt;BY&gt;") && !html.contains("<BY>"));
+    fn a_file_is_paid_at_the_price_of_the_service_the_buyer_chose() {
+        let url = "https://box.example/files/a.mkv";
+        let item = services::Item { title: "A".into(), year: String::new(), url: url.into(), credit: "1 GiB".into() };
+        let svc = |name: &str, byte_msat: u64| Service { name: name.into(), kind: Kind::Files, seller: "https://box.example".into(),
+            price_text: "1 sat a MiB".into(), prices: json!({"byte_msat": byte_msat, "per_bytes": 1_048_576}), items: vec![item.clone()],
+            address: String::new(), app: String::new(), app_base: String::new() };
+        let (cheap, dear) = (svc("Cheap", 1_000), svc("Dear", 9_000));
+        let all = vec![cheap.clone(), dear.clone()];
+        assert_ne!(cheap.id(), dear.id());
+        let (chosen, _) = services::find_item_of(&all, &dear.id(), url).unwrap();
+        assert_eq!(chosen.price_ceiling(), dear.price_ceiling(), "the chosen one, not the first that lists the file");
+        assert!(services::download_src("tok", &dear.id(), url).unwrap().starts_with(&format!("./s/~tok.{}/", dear.id())));
+        let links = crate::relay::RelayLinks::new(std::time::Duration::from_secs(60));
+        let t = links.create_for(url, &dear.id());
+        assert_eq!(links.service_of(&t).as_deref(), Some(dear.id().as_str()));
+        // with no listed price, the page says so
+        let ctx = crate::app::Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let mut plain = cheap.clone();
+        plain.prices = serde_json::Value::Null;
+        assert!(files_html(&ctx, &plain, false, "http://x/", &|_| vec![]).contains("no listed price"));
+        assert!(!files_html(&ctx, &cheap, false, "http://x/", &|_| vec![]).contains("no listed price"));
+    }
+
+    /// A service chosen from a listing keeps the listing's prices, through the services file, as
+    /// the ceiling the app pays it at; one not from a listing has none.
+    #[test]
+    fn a_service_keeps_its_listings_prices_as_its_price_ceiling() {
+        let section = xbt402::listing::Section { name: "Films".into(), kind: "files".into(), path: "/files/".into(),
+            prices: json!({"request_msat": "0", "byte_msat": 1000, "per_bytes": 1_048_576}), items: vec![], licence: String::new(), credits: String::new() };
+        let l = xbt402::listing::Listing { name: "Box".into(), kind: "files".into(), seller: "https://box.example".into(), receipt_key: String::new(),
+            prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
+        let all = services::from_listing(&l);
+        let want = xbt402::listing::price_ceiling(&l.prices);
+        assert_eq!(all[0].price_ceiling(), Some(want.clone()));
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("services.json");
+        services::save(&p, &all).unwrap();
+        let back = services::load(&p).unwrap();
+        assert_eq!(back[0].price_ceiling(), Some(want), "kept through the file");
+        let mut plain = back[0].clone();
+        plain.prices = serde_json::Value::Null;
+        assert_eq!(plain.price_ceiling(), None);
     }
 }
