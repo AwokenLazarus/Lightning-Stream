@@ -162,7 +162,6 @@ impl App {
         if self.app_ports().is_empty() {
             return self.page("Open the app", ctx, "<p class=\"empty\">This box does not open sellers' apps.</p>".into());
         }
-        let host = crate::app::stream_pages::host(&svc.seller);
         if self.is_own_shop(&svc.seller) {
             let b = format!("<section class=\"card primary\"><h2>Preview your own app</h2>\
                 <p>This is your shop: buyers open <strong>{}</strong> here and pay {} for what it loads. You can try it for free: it comes \
@@ -176,13 +175,15 @@ impl App {
         let warn = crate::pay_feedback::cant_send_card(self.spendable_sats(), MIN_CALL_SATS, "this shop");
         // a limit the owner entered under the smallest ticket comes back raised to it (see [`visit_limit`])
         let suggested = q.get("limit").and_then(|v| v.parse::<i64>().ok()).filter(|n| (MIN_CALL_SATS..=MAX_VISIT_SATS).contains(n)).unwrap_or(SUGGESTED_LIMIT);
+        // the shop by its listed name ("Lightning Stream Genesis"), never its key or made-up address
+        let shop = self.seller_name(&svc.seller);
         let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
             <p>You use <strong>{}</strong> as it is on {}'s own network, inside this page. What it loads is paid at {}, \
             and stops at the limit you set here.</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
             {}<div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
             <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
-            esc(&host), esc(&svc.name), esc(&host), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
+            esc(&shop), esc(&svc.name), esc(&shop), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
             self.identity_card(ctx, &svc.seller, &base, &entry));
         self.page("Open the app", ctx, b)
     }
@@ -292,7 +293,8 @@ impl App {
             s.codes.retain(|_, (t, _, _)| t.elapsed() < CODE_TTL);
             s.codes.insert(code.clone(), (Instant::now(), grant, other));
         }
-        let host = crate::app::stream_pages::host(&svc.seller);
+        // the shop by its listed name, never its key or made-up address
+        let host = self.seller_name(&svc.seller);
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
             <div class=\"card primary refusal\" data-visit-refusal hidden></div>\

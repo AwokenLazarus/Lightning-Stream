@@ -27,6 +27,7 @@ pub enum Kind {
     Visit,
     /// The shop is busy: nothing was charged.
     Busy,
+    NodeCap,
     Other,
 }
 
@@ -40,6 +41,7 @@ pub fn kind_of(rule: &str, words: &str) -> Kind {
         "daily_budget" | "weekly_budget" | "per_counterparty_daily" | "per_counterparty" => Kind::Cap,
         "visit" => Kind::Visit,
         "seller_busy" => Kind::Busy,
+        _ if w.contains("exposure_cap_sats") => Kind::NodeCap,
         _ if w.contains("pays only named sellers") || w.contains("not on allowlist") => Kind::Admission,
         _ if w.contains("no route") => Kind::NoRoute,
         _ if w.contains("exceeds budget") || w.contains("daily cap") => Kind::Cap,
@@ -113,6 +115,17 @@ pub fn explain(body: &str, spendable: Option<i64>, file: bool) -> Explained {
             let when = if rule == "weekly_budget" { "this week's" } else { "today's" };
             ("Spending cap reached", format!("You've reached {when} spending cap in your rules. Nothing was paid."),
              format!("Raise the cap in Spending rules, or wait until {}.", if rule == "weekly_budget" { "next week" } else { "tomorrow" }), rules())
+        }
+        Kind::NodeCap => {
+            // "the LN node holds N sats in its channels (…), above ln.exposure_cap_sats C: …"
+            let num = |key: &str| raw.split(key).nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())).and_then(|s| s.parse::<i64>().ok());
+            let (held, cap) = (num("holds "), num("exposure_cap_sats "));
+            let words = match (held, cap) {
+                (Some(h), Some(c)) => format!("Your Lightning node holds {} in its channels, more than your spending rules let the app pay through ({}). Nothing was paid.", sat(h), sat(c)),
+                _ => "Your Lightning node holds more in its channels than your spending rules let the app pay through. Nothing was paid.".into(),
+            };
+            ("Your node holds more than your rules allow", words,
+             "Raise \"The most your Lightning node may hold\" in Spending rules and sign, or move funds off the node.".into(), rules())
         }
         Kind::Visit => ("This visit has ended", if raw.is_empty() { "This visit has ended.".into() } else { raw.clone() },
                         "Open the app again with a new limit. What you don't use stays as credit with the shop.".into(), vec![("browse".into(), "Browse".into())]),
@@ -247,6 +260,11 @@ mod tests {
     fn limits_and_caps_are_told_apart() {
         assert_eq!(explain(r#"{"error": "daily spend 5000 exceeds budget 4000", "rule": "daily_budget"}"#, None, false).title, "Spending cap reached");
         assert!(explain(r#"{"error": "x", "rule": "daily_budget"}"#, None, false).words.contains("today's spending cap"));
+        // Mike's 0.2.1 refusal, word for word: the node limit in plain words, with the amounts and the fix
+        let e = explain(r#"{"error": "the LN node holds 287070 sats in its channels (local 287070, HTLCs 0), above ln.exposure_cap_sats 100000: move funds off it before paying through it"}"#, None, false);
+        assert_eq!(e.kind, Kind::NodeCap);
+        assert!(e.words.contains("287,070") && e.words.contains("100,000"), "{}", e.words);
+        assert!(e.fix.contains("The most your Lightning node may hold"), "{}", e.fix);
         assert!(explain(r#"{"error": "x", "rule": "max_sats"}"#, None, true).fix.contains("at most 2,000 sat for its first ticket"));
         assert!(explain(r#"{"error": "x", "rule": "max_per_tx"}"#, None, false).fix.contains("most per payment"));
         assert_eq!(explain("not json", None, true).words, "The wallet did not pay for this file.");
