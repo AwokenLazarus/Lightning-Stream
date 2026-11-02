@@ -856,7 +856,10 @@ impl App {
         // a seller by its name where the list of sellers has it, never by a made-up `…shop.invalid` address
         let known = self.services().unwrap_or_default();
         // a payment to `ln:<node>` by the name of the seller paid through that node: on file in the rules, or vouched for by its shop
-        let nodes: Vec<(String, String)> = {
+        // (read only where a row names a node: the page's reads stay few)
+        let named_nodes = recent.as_ref().ok().and_then(|h| h["events"].as_array())
+            .is_some_and(|a| a.iter().any(|e| e["dest"].as_str().is_some_and(|d| d.starts_with("ln:"))));
+        let nodes: Vec<(String, String)> = if !named_nodes { Vec::new() } else {
             let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
             let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
             let mut v: Vec<(String, String)> = rule_sellers(&pol).into_iter().filter_map(|r| Some((r.node?.to_ascii_lowercase(), r.origin?))).collect();
