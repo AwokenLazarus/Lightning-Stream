@@ -860,7 +860,8 @@ impl App {
                     Some(t) => { let t = t.replace('_', " "); let mut c = t.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }
                     None => String::new(),
                 };
-                let amt = e.get("amount_sats").map(|a| money(int(Some(a)))).unwrap_or_default();
+                // a ticket's row has its amount too: what it cost, else what was booked for it (0.2.1 showed none)
+                let amt = ["amount_sats", "spent_sats", "booked_sats"].iter().find_map(|k| e.get(*k)).map(|a| money(int(Some(a)))).unwrap_or_default();
                 b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{}</td></tr>", utc(int(e.get("ts"))), esc(&what),
                                     esc(&who(&txt(e.get("dest").or(e.get("origin"))))), esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))));
             }
