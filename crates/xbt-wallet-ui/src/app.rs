@@ -726,8 +726,9 @@ impl App {
         let bought = allowed && self.call("history", json!({"limit": 500})).ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter()
             .any(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_open" | "ticket_paid_first")));
         let demo = self.first_suggestion();
-        // mainnet, without another read of the signer: it asks for the confirmation, or the confirmation is on file
-        let main = ack || self.cfg.ln.dir.join(crate::setup::MAINNET_ACK_FILE).is_file();
+        // mainnet: the signer asks for the confirmation, or the confirmation is on file; before the rules
+        // are signed the signer asks nothing yet, so the chain is read then (once, until they are)
+        let main = ack || self.cfg.ln.dir.join(crate::setup::MAINNET_ACK_FILE).is_file() || (!paying && connected && self.signer_chain() == "main");
         // (done, title, what it is, where to go, its button)
         let mut steps: Vec<(bool, &str, &str, String, &str)> = vec![
             (human, "Make your approval key", "It is how you say yes to a rule change or a large payment. It stays in this browser.",

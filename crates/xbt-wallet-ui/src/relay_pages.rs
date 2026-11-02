@@ -99,7 +99,7 @@ impl App {
             <p class=\"small\">The announcement is signed with a key this app keeps for it, and lasts 30 days; announce again to keep it listed. \
             Apps check every relay themselves before using it.</p></details></section>",
             esc(&ctx.csrf), esc(&prefill), relays::MAX_REGION, relays::MAX_CONTACT));
-        self.html_page("Settings", "Stream relays", ctx, &b, "")
+        self.html_page("Stream relays", "Stream relays", ctx, &b, "")
     }
 
     /// `POST /relays-prefs`: prefer, block, add as yours, only own.
