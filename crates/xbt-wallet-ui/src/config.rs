@@ -93,6 +93,10 @@ pub struct Config {
     pub mcp_urls: Vec<String>,
     pub mcp_token_file: PathBuf,
     pub threads: usize,
+    /// `XBT_UI_CACHE_S` (default 3, 0 to turn it off): how long the signer's slow-changing reads
+    /// (the node's state, balances, the rules) serve later pages ([`crate::link::SignerLink::keep`]).
+    /// Zero also asks the renter for its offers on each Hashrate page instead of keeping them.
+    pub read_cache: Duration,
     pub role: Role,
     pub ln: LnSetup,
     pub gw: GatewaySetup,
@@ -399,6 +403,7 @@ impl Config {
                 .unwrap_or_else(|| data_dir.join("secrets").join("mcp-http-token")),
             data_dir,
             threads: secs("XBT_UI_THREADS", 4) as usize,
+            read_cache: Duration::from_secs(env("XBT_UI_CACHE_S").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(3).min(60)),
             role,
             ln,
             gw,
@@ -491,7 +496,8 @@ impl Config {
         let files_choice = data_dir.join("files-folder");
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),
                session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, cmp_url: None,
-               cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
+               cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4,
+               read_cache: Duration::ZERO, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), app_ports: vec![],
                relay_ttl: Duration::from_secs(6 * 3600),

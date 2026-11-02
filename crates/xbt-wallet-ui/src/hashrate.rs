@@ -254,8 +254,38 @@ fn route_may_follow(s: &Value, st: &Value) -> Option<u64> {
     (taken && !going_on).then_some(price)
 }
 
+/// How long the renter's offers serve the Hashrate page before they are asked again behind it.
+pub const OFFERS_FRESH: Duration = Duration::from_secs(30);
+
+/// The renter's offers as last asked, by the renter's address.
+type Offers = crate::perf::Swr<Result<Value, String>>;
+
+fn offers_kept(base: &str) -> Offers {
+    static KEPT: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Offers>>> = std::sync::LazyLock::new(Default::default);
+    KEPT.lock().unwrap_or_else(|p| p.into_inner()).entry(base.to_string()).or_default().clone()
+}
+
+/// The renter's `GET /offers`: the last answer at once, asked again behind it once older than
+/// [`OFFERS_FRESH`] (the renter gathers them from Nostr, which took it seconds). With none yet, or
+/// an error last time, it is asked now. Not `keep` (`XBT_UI_CACHE_S=0`): asked each time.
+fn rent_offers(base: &str, token: &Option<PathBuf>, keep: bool) -> Result<Value, String> {
+    if !keep {
+        return call(base, token, "GET", "/offers", None);
+    }
+    let kept = offers_kept(base);
+    let (b, t) = (base.to_string(), token.clone());
+    match kept.peek() {
+        Some((_, Ok(_))) => kept.get(OFFERS_FRESH, WAIT, move || call(&b, &t, "GET", "/offers", None)).unwrap_or_else(|| Err("The hashrate service does not answer.".into())),
+        _ => kept.refresh(|| call(base, token, "GET", "/offers", None)),
+    }
+}
+
 /// One call to a service's control page.
 fn call(base: &str, token: &Option<PathBuf>, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+    crate::perf::timed(|| call_once(base, token, method, path, body))
+}
+
+fn call_once(base: &str, token: &Option<PathBuf>, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new().timeout_connect(WAIT).timeout_read(WAIT).timeout_write(WAIT).redirects(0).build();
     let mut req = agent.request(method, &format!("{}{path}", base.trim_end_matches('/')));
     if let Some(t) = token {
@@ -780,7 +810,9 @@ impl App {
                 "<p class=\"empty\">Renting miners is off in this install. The Lightning Stream app on Umbrel and on Linux has it.</p>", "");
         };
         let token = self.cfg.hash.renter_token.clone();
-        let st = call(&base, &token, "GET", "/status", None);
+        // the rentals going on, and the offers (kept a little: they come from Nostr), asked at once
+        let keep = !self.cfg.read_cache.is_zero();
+        let (st, offers) = crate::perf::both(|| call(&base, &token, "GET", "/status", None), || rent_offers(&base, &token, keep));
         let csrf = App::csrf_input(ctx);
         let mut b = String::from("<p class=\"lead\">Rent miners from other people, by the piece of work they do, into your own gateway. \
             Paid as you use it, seconds at a time: you never have more paid for and not yet received than a minute of the miner's hashing, or one share, one slice and one ticket (546 sat at least), whichever is more, plus any start fee shown on the offer. You can cut a rental at any moment.</p>\
@@ -835,7 +867,7 @@ impl App {
 
         // the offers: the main action
         b.push_str("<h2>Miners for rent</h2>");
-        match call(&base, &token, "GET", "/offers", None) {
+        match offers {
             Err(e) => b.push_str(&App::error_box(&e)),
             Ok(o) => {
                 let offers: Vec<Value> = o["offers"].as_array().cloned().unwrap_or_default();
@@ -922,6 +954,8 @@ impl App {
             return Resp::redirect(back);
         };
         let token = self.cfg.hash.renter_token.clone();
+        // a rental or a cut changes which miners are free: the page asks for the offers afresh
+        offers_kept(&base).forget();
         let g = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
         let n = |k: &str| g(k).parse::<u64>().unwrap_or(0);
         let r: Result<String, String> = match g("action").as_str() {
