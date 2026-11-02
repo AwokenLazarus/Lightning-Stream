@@ -12,12 +12,18 @@ blocked, and each shop has a daily cap (the exact bound is in [`docs/TICKETS.md`
 It runs on ordinary XBT Lightning nodes. Lightning Stream never holds anyone's money: each person
 pays from, and is paid to, their own node.
 
-- **Website and setup:** <https://lazarus-xbt.xyz/stream/start/>
-- **Whitepaper:** <https://lazarus-xbt.xyz/stream/>
+- **Website:** <https://lightning-stream.com>: [download](https://lightning-stream.com/download/),
+  [guide](https://lightning-stream.com/guide/), [how it works](https://lightning-stream.com/how-it-works/),
+  [live shops](https://lightning-stream.com/shops/) and the [network map](https://lightning-stream.com/map/)
+- **Whitepaper:** <https://lightning-stream.com/whitepaper/>
 - **What changed in each version:** [`CHANGELOG.md`](CHANGELOG.md), also at
-  <https://lazarus-xbt.xyz/stream/changelog/>
+  <https://lightning-stream.com/changelog/>
 - **Bugs and confusing screens:** [issues](https://github.com/AwokenLazarus/Lightning-Stream/issues)
 
+> **0.2.0** (a public test release) adds hashrate rental with masked jobs through the bundled Stream
+> Gateway, solo or on Lazarus Pool. A seller must run 0.2.0 before 0.2.0 buyers can rent from it.
+> [Release notes](https://github.com/AwokenLazarus/Lightning-Stream/releases/tag/v0.2.0).
+>
 > **Status.** Released for Umbrel, StartOS and Linux, and tested on XBT mainnet between our own
 > nodes with small amounts. It has had design and code reviews, not an independent audit. Use
 > amounts you can afford to lose. [`docs/LIMITS.md`](docs/LIMITS.md) lists every stated limit and
@@ -39,7 +45,8 @@ You need a synced Knots-BLAKE2b node (a first sync takes days, and Lightning For
 Then, in the app: make your approval key, sign the safe starter rules, confirm **Pay with real
 money**, and allow a seller. Our demo shop, **Lightning Stream Genesis**, has the shop key
 `npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a`: paste it under Sellers. The
-[setup page](https://lazarus-xbt.xyz/stream/start/) has each step, and how to get a channel.
+[guide](https://lightning-stream.com/guide/) has each step, and how to get a channel: any
+well-connected XBT Lightning node works, and a small channel to Genesis lets you try buying at once.
 
 ## What it does
 

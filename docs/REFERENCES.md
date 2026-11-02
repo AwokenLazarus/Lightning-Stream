@@ -1,7 +1,7 @@
 # References
 
 What Lightning Stream takes from other people, with a reference a reader can follow. The
-whitepaper (<https://lazarus-xbt.xyz/stream/>) carries the same list under the same numbers.
+whitepaper (<https://lightning-stream.com/whitepaper/>) carries the same list under the same numbers.
 Each entry was opened and read against what these texts say of it on 2026-10-12; where only an
 archived copy or only part of a source was read, the entry says so. Libraries the code links,
 and code and data copied into this tree, are in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
