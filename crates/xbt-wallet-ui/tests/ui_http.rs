@@ -532,9 +532,9 @@ fn the_mainnet_starter_rules_set_the_node_s_exposure_cap_from_what_it_holds() {
     assert!(xbt_signer::policy::validate_policy(&m).0.is_empty(), "{m}");
 }
 
-/// On mainnet the app pays nothing until the owner confirms paying with real money: setup lists that
-/// step straight after the rules, the rules page says so with a link to it, and neither calls the
-/// wallet ready. Once the confirmation is on file, both are gone.
+/// On mainnet the app pays nothing until the owner confirms paying with real money: setup's rules step
+/// asks for it (a box beside the rules' Sign, no step of its own), the rules page says so with a link
+/// to it, and neither calls the wallet ready. Once the confirmation is on file, both are gone.
 #[test]
 fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -546,9 +546,11 @@ fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     let mut br = logged_in(&b);
     assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], true);
     let setup = unescape(&br.get("/setup").body);
-    let (rules, ack_step) = (setup.find("Your spending rules").unwrap(), setup.find("Pay with real money").expect("the step is listed"));
-    assert!(rules < ack_step && ack_step < setup.find("Your Lightning node").unwrap(), "straight after the rules");
-    assert!(setup.contains("./lightning#ack") && !setup.contains("Connected and ready to pay"), "{setup}");
+    assert!(!setup.contains("<h2>Pay with real money</h2>"), "no step of its own: {setup}");
+    let (rules, node) = (setup.find("<h2>Your spending rules</h2>").unwrap(), setup.find("<h2>Your Lightning node</h2>").unwrap());
+    let ask = setup.find("holds real money").expect("the rules step asks for it");
+    assert!(rules < ask && ask < node, "in the rules step: {setup}");
+    assert!(!setup.contains("Connected and ready to pay") && setup.contains("of 5 done"), "{setup}");
     let page = unescape(&br.get("/policy").body);
     assert!(page.contains("pays nothing until you confirm") && page.contains("./lightning#ack"), "{page}");
     // a refused buy says what to do, in words
@@ -557,8 +559,74 @@ fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     // confirmed: the step and the warning are gone
     std::fs::write(&ack_file, format!("{}\n", xbt402::ticket::MAINNET_ACK)).unwrap();
     assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], false);
-    assert!(!unescape(&br.get("/setup").body).contains("Pay with real money"));
+    assert!(!unescape(&br.get("/setup").body).contains("holds real money"));
     assert!(!unescape(&br.get("/policy").body).contains("pays nothing until you confirm"));
+    std::env::remove_var(xbt_signer::ticket::MAINNET_ACK_ENV);
+}
+
+/// Mainnet: the rules' sign step carries the one box "I understand the app pays with real money, within
+/// these rules". Ticked, signing writes the very confirmation Your node's Start paying writes (the file the
+/// signer checks), and the signer stops asking; unticked, nothing is written and Your node still asks.
+/// Home and Setup show one rules step, not a real-money step beside it. Your node turns it off again.
+#[test]
+fn on_mainnet_signing_the_starter_rules_with_the_box_ticked_confirms_paying_with_real_money() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let ack_file = ln.path().join("mainnet-ack");
+    std::env::set_var(xbt_signer::ticket::MAINNET_ACK_ENV, &ack_file);
+    // the node connected: the app holds its key
+    std::fs::write(ln.path().join("rail.macaroon"), b"key").unwrap();
+    let lnd = ln.path().to_path_buf();
+    let b = start_on(Rig::build(json!({}), false, "main"), move |c| c.ln.dir = lnd);
+    let mut br = logged_in(&b);
+    let home = unescape(&br.get("/").body);
+    assert!(home.contains("Sign the starter rules") && home.contains("your yes to paying with real money"), "{home}");
+    assert!(!home.contains("<strong>Pay with real money</strong>"), "no step of its own: {home}");
+
+    // unticked: the rules are signed, nothing is confirmed, Your node asks next
+    let page = br.get("/policy?template=starter").body;
+    let form = policy_form_fields(&page);
+    let prev = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    assert!(prev.contains("name=\"ack\" value=\"1\"") && unescape(&prev).contains("I understand the app pays with real money, within these rules"),
+            "the box beside Sign: {prev}");
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &form[0].1), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
+    assert_eq!(r.location(), "./lightning#ack");
+    assert!(!ack_file.exists());
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], true);
+    let home = unescape(&br.get("/").body);
+    assert!(home.contains("Your rules are signed. Confirm that the app may pay with real money") && home.contains("./lightning#ack"), "{home}");
+
+    // ticked: signed and confirmed in one press, with the file Your node writes
+    let page = br.get("/policy").body;
+    let mut form = policy_form_fields(&page);
+    form.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "4000".into();
+    let prev = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &form[0].1), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text))), ("ack", "1")]);
+    let flash = br.flash_after(&r);
+    assert!(flash.contains("the app may now pay with real money"), "{flash}");
+    assert_eq!(std::fs::read_to_string(&ack_file).unwrap(), format!("{}\n", xbt402::ticket::MAINNET_ACK), "the file Your node writes");
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], false, "the signer's check passes");
+    assert_eq!(b.rig.call("policy_get", json!({}))["policy"]["human_threshold_sats"], 4000);
+    let setup = unescape(&br.get("/setup").body);
+    assert!(!setup.contains("holds real money"), "{setup}");
+    // the box is not offered again once confirmed
+    let prev = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    assert!(!prev.contains("name=\"ack\""), "{prev}");
+
+    // Your node: off, then on again by its own box
+    let node = unescape(&br.get("/lightning").body);
+    assert!(node.contains("Stop paying with real money"), "{node}");
+    let r = br.act("/lightning", "/lightning", &[("action", "ack_off")]);
+    assert!(br.flash_after(&r).contains("no longer pays with real money"));
+    assert!(!ack_file.exists());
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], true);
+    let r = br.act("/lightning", "/lightning", &[("action", "ack"), ("ack", "1")]);
+    assert!(br.flash_after(&r).starts_with("Done."));
+    assert_eq!(std::fs::read_to_string(&ack_file).unwrap(), format!("{}\n", xbt402::ticket::MAINNET_ACK));
     std::env::remove_var(xbt_signer::ticket::MAINNET_ACK_ENV);
 }
 

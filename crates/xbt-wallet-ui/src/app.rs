@@ -628,15 +628,7 @@ impl App {
             "/seller-unblock" => back("./policy", self.call("seller_unblock", json!({"block": g("block"), "expiry": i("expiry"), "signature": sig()})),
                                       &|_| "Unblocked. The app may buy from this shop again.".into()),
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
-            "/policy-apply" => back(if self.ack_needed() { "./lightning#ack" } else { "./policy" }, self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
-                                                                              "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
-                let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-                if pr.is_empty() && self.ack_needed() {
-                    "Policy applied. One last step before the app pays: confirm below that it may pay with real money.".into()
-                } else if pr.is_empty() { "Policy applied; it is in force now.".into() } else {
-                    format!("Policy applied. One part waits for the app to restart ({pr}): {}.", self.cfg.restart_hint)
-                }
-            }),
+            "/policy-apply" => self.policy_apply(ctx, f),
             "/human-key-enroll" => back("./setup", self.call("human_key_enroll", json!({"pubkey": g("pubkey"), "code": g("code")})), &|_| "Approval key enrolled.".into()),
             "/human-key-rotate" => back("./keys", self.call("human_key_rotate", json!({"pubkey": g("pubkey"), "expiry": i("expiry"), "signature": sig()})),
                                         &|_| "The new approval key is enrolled; the old one no longer approves anything.".into()),
@@ -724,7 +716,7 @@ impl App {
     }
 
     /// Home's "Get started" list, until every step is done: the approval key, the node, the starter
-    /// rules, paying with real money (mainnet), a shop allowed (the demo shop in one press where the box
+    /// rules (with, on mainnet, the yes to paying with real money ticked as they are signed), a shop allowed (the demo shop in one press where the box
     /// suggests one) and a first purchase. Each step says what it is; the next one to do has its button.
     fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool) -> String {
         let pol = self.call("policy_get", json!({})).map(|v| v["policy"].clone()).unwrap_or(Value::Null);
@@ -743,10 +735,18 @@ impl App {
         if !connected {
             steps.push((false, "Connect your Lightning node", "The app pays through your own node.", "./lightning".into(), "Connect it"));
         }
-        steps.push((paying, "Sign the starter rules", "Low limits on what the app may spend. You can change them any time.",
-                    "./policy?template=starter".into(), "Open the starter rules"));
-        if main {
-            steps.push((connected && !ack, "Pay with real money", "Confirm once that the app may pay from your node.", "./lightning#ack".into(), "Start paying"));
+        // on mainnet the yes to real money is a box on the same page as the rules' Sign: one step, done with both
+        if !main {
+            steps.push((paying, "Sign the starter rules", "Low limits on what the app may spend. You can change them any time.",
+                        "./policy?template=starter".into(), "Open the starter rules"));
+        } else if paying && ack {
+            // signed without the box ticked: the confirmation alone is left, on Your node
+            steps.push((false, "Sign the starter rules", "Your rules are signed. Confirm that the app may pay with real money within them.",
+                        "./lightning#ack".into(), "Start paying"));
+        } else {
+            steps.push((paying && connected && !ack, "Sign the starter rules",
+                        "Low limits on what the app may spend, and your yes to paying with real money within them. You can change them any time.",
+                        "./policy?template=starter".into(), "Open the starter rules"));
         }
         steps.push((allowed, if demo.is_some() { "Try the demo shop" } else { "Allow a shop" },
                     if demo.is_some() { "Add Lightning Stream Genesis and allow it to be paid, with one signature." }
@@ -1342,6 +1342,43 @@ impl App {
         Value::Object(p)
     }
 
+    /// The signed rules, applied; with the real-money box ticked (`ack=1`), the confirmation is written
+    /// next, by the same code as Your node's Start paying. Unticked, or refused, the page that asks for it
+    /// is next.
+    fn policy_apply(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        let sig = { let s = g("signature"); if s.is_empty() { g("signature_ext") } else { s } };
+        // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
+        let r = self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
+                                                "prev_sha256": g("prev_sha256"), "expiry": g("expiry").parse::<i64>().unwrap_or(0), "signature": sig}));
+        let v = match r {
+            Ok(v) if ok_of(&v) => v,
+            Ok(v) => { self.flash(ctx, false, reason_of(&v)); return Resp::redirect("./policy"); }
+            Err(e) => { self.flash(ctx, false, e); return Resp::redirect("./policy"); }
+        };
+        let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        // ticked: the same confirmation Your node writes
+        let confirmed = if f.get("ack").map(String::as_str) == Some("1") { Some(self.confirm_real_money(f)) } else { None };
+        if let Some(Err(e)) = &confirmed {
+            self.flash(ctx, false, format!("Policy applied, but paying with real money is not confirmed yet: {e}"));
+            return Resp::redirect("./lightning#ack");
+        }
+        let real = matches!(confirmed, Some(Ok(true)));
+        let ack_needed = !real && self.ack_needed();
+        let m = if !pr.is_empty() {
+            format!("Policy applied{}. One part waits for the app to restart ({pr}): {}.", if real { ", and the app may pay with real money within it" } else { "" },
+                    self.cfg.restart_hint)
+        } else if real {
+            "Policy applied, and the app may now pay with real money within it. It is in force now.".into()
+        } else if ack_needed {
+            "Policy applied. One last step before the app pays: confirm below that it may pay with real money.".into()
+        } else {
+            "Policy applied; it is in force now.".into()
+        };
+        self.flash(ctx, true, m);
+        Resp::redirect(if ack_needed { "./lightning#ack" } else { "./policy" })
+    }
+
     fn policy_preview(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
@@ -1411,7 +1448,14 @@ impl App {
         let text = txt(prep.get("text"));
         let prev = txt(prep.get("prev_sha256"));
         let exp = int(prep.get("expiry"));
-        let visible = format!("<details><summary>Advanced: the exact text you sign</summary><pre class=\"signed-text\">{}</pre></details>", esc(&text));
+        let mut visible = format!("<details><summary>Advanced: the exact text you sign</summary><pre class=\"signed-text\">{}</pre></details>", esc(&text));
+        // mainnet, paying not yet confirmed: the yes to real money is one box beside Sign, not a page of its own
+        if paying_on(&proposed) && self.real_money_to_confirm() {
+            visible.push_str(&format!("<div class=\"flash warn\" id=\"real-money\"><p><strong>This is real money.</strong> Keep your rules low while you try the app.</p>\
+                <details><summary>Read before you start</summary>{}</details>\
+                <label class=\"check\"><input type=\"checkbox\" name=\"ack\" value=\"1\"> I understand the app pays with real money, within these rules</label></div>",
+                crate::setup::notice_html(&crate::setup::WALLET_MAINNET_NOTICE)));
+        }
         b.push_str(&self.signed_form(ctx, "./policy-apply", "policy", &self.human_pub(),
                                      &[("text", text.clone()), ("prev_sha256", prev.clone()), ("expiry", exp.to_string())], &visible,
                                      "Sign and apply", Ext::Bytes(msg::policy(&prev, exp, &text))));
@@ -1733,10 +1777,10 @@ impl App {
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
         let enc = ks["encrypted"] == true;
         let ack_needed = ln["real_money_ack_needed"] == true;
-        let done = [true, !human.is_empty(), seen("policy_change"), ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
-        // the count is of the steps shown: the real-money step, while it is listed, is one of them (0.2.1 said "4 of 5" beside other steps)
+        // on mainnet the rules step takes the yes to real money too (a box beside its Sign): done with both
+        let done = [true, !human.is_empty(), seen("policy_change") && !ack_needed, ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
         let n = done.iter().filter(|d| **d).count();
-        let total = done.len() + usize::from(ack_needed);
+        let total = done.len();
         let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">");
         b.push_str(&step(true, "Password", if self.platform.is_some() {
             "<p>Not needed: you opened the app from your box's dashboard, which already asked who you are.</p>".into()
@@ -1754,18 +1798,22 @@ impl App {
         };
         b.push_str(&step(done[1], "Your approval key", key_body));
         b.push_str(&step(done[2], "Your spending rules",
-            format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>\
-                     <p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>", allow_n, if allow_n == 1 { "" } else { "s" })));
-        // on mainnet: straight after the rules, the confirmation that the app may pay with real money
-        if ack_needed {
-            b.push_str(&step(false, "Pay with real money",
-                "<p>This box's Lightning node holds real money. Until you confirm that the app may pay with it, the app pays nothing, \
-                 even with your rules signed.</p><p><a href=\"./lightning#ack\">Start paying →</a></p>".into()));
-        }
+            format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>{}",
+                    allow_n, if allow_n == 1 { "" } else { "s" },
+                    // mainnet: the yes to real money is a box beside the rules' Sign; signed without it, Your node takes it alone
+                    if ack_needed && seen("policy_change") {
+                        "<p>This box's Lightning node holds real money. Your rules are signed, but until you confirm that the app may pay \
+                         with it, the app pays nothing.</p><p><a href=\"./lightning#ack\">Start paying →</a></p>"
+                    } else if ack_needed {
+                        "<p>This box's Lightning node holds real money: when you sign, tick the box that says the app pays with real money \
+                         within these rules.</p><p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>"
+                    } else {
+                        "<p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>"
+                    })));
         b.push_str(&step(done[3], "Your Lightning node",
             format!("<p>{}</p><p><a href=\"./lightning\">Your node →</a></p>",
                     if done[3] { "Connected and ready to pay.".to_string() }
-                    else if ack_needed && ln["ready"] == true { "Connected. Confirm paying with real money (above) and it is ready.".to_string() }
+                    else if ack_needed && ln["ready"] == true { "Connected. Confirm paying with real money with your rules (above) and it is ready.".to_string() }
                     else {
                         let (_, connected, why) = self.node_state();
                         esc(&format!("{} {why}", if connected { "Connected, not ready yet." } else { "Not connected yet." }))

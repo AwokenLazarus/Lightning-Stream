@@ -123,7 +123,7 @@ fn cert_line(path: Option<&Path>) -> String {
     }
 }
 
-fn notice_html(lines: &[&str]) -> String {
+pub(crate) fn notice_html(lines: &[&str]) -> String {
     let mut b = String::from("<div class=\"flash warn\"><ul>");
     for l in lines {
         b.push_str(&format!("<li>{}</li>", esc(l.trim_start_matches("- "))));
@@ -274,6 +274,35 @@ impl App {
         self.signer.call("ln_status", json!({})).is_ok_and(|s| s["real_money_ack_needed"] == true)
     }
 
+    /// Whether paying with real money is still to be confirmed and can be now: mainnet, the node
+    /// connected, and the confirmation not on file (or the signer still asks for it). The rules page
+    /// then offers the box beside its Sign, as Your node does.
+    pub(crate) fn real_money_to_confirm(&self) -> bool {
+        let dir = &self.cfg.ln.dir;
+        dir.join(RAIL_MACAROON).is_file() && self.signer_chain() == "main" && (!dir.join(MAINNET_ACK_FILE).is_file() || self.ack_needed())
+    }
+
+    /// The owner's yes to paying with real money (`ack=1` in `f`): the confirmation file the signer
+    /// checks, written once the box is ticked, on mainnet, with the node connected. The one way it is
+    /// written from a confirmation: Your node's Start paying and the rules page's Sign both come here.
+    /// `Ok(false)`: a test network, nothing to confirm.
+    pub(crate) fn confirm_real_money(&self, f: &HashMap<String, String>) -> Result<bool, String> {
+        let dir = &self.cfg.ln.dir;
+        // the chain is the signer's word: while it restarts there is none, and nothing is said about the network
+        match self.signer_chain().as_str() {
+            "" => return Err("The wallet is starting. Try again in a moment.".into()),
+            "main" => {}
+            _ => return Ok(false),
+        }
+        if f.get("ack").map(String::as_str) != Some("1") {
+            return Err("Tick the box to confirm that the app pays with real money.".into());
+        }
+        if !dir.join(RAIL_MACAROON).is_file() {
+            return Err("Your node is not connected yet.".into());
+        }
+        write_shared(dir, MAINNET_ACK_FILE, format!("{MAINNET_ACK}\n").as_bytes()).map(|()| true)
+    }
+
     pub(crate) fn lightning_page(&self, ctx: &Ctx) -> Resp {
         let ln = &self.cfg.ln;
         let chain = self.signer_chain();
@@ -330,6 +359,13 @@ impl App {
                 <label class=\"check\"><input type=\"checkbox\" name=\"ack\" value=\"1\" required> I understand that the app pays with real money, within my spending rules</label>\
                 <button>Start paying</button></form>", App::csrf_input(ctx), notice_html(&WALLET_MAINNET_NOTICE)));
         }
+        // on: a way to turn it off again (and back on, above, by the same confirmation)
+        if have && main && acked && !needs_ack {
+            b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card\" id=\"ack\">{}<input type=\"hidden\" name=\"action\" value=\"ack_off\">\
+                <h2>Pay with real money</h2><p><span class=\"pill good\">On</span> The app pays from your node, within your spending rules. \
+                Turn it off and the app pays nothing until you confirm again.</p>\
+                <button class=\"secondary\">Stop paying with real money</button></form>", App::csrf_input(ctx)));
+        }
         b.push_str(&pin_card(&App::csrf_input(ctx), ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), "./lightning"));
         if main && !auto {
             b.push_str(&format!("<div class=\"flash warn\"><p><strong>This is real money.</strong> Keep your spending rules low while you try the app.</p>\
@@ -385,22 +421,13 @@ impl App {
         let ln = &self.cfg.ln;
         let result = match f.get("action").map(String::as_str) {
             Some("pin_cert") => pin_cert(ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), f.get("fingerprint").map(String::as_str).unwrap_or("")),
-            Some("ack") => (|| {
-                // the chain is the signer's word: while it restarts there is none, and nothing is said about the network
-                match self.signer_chain().as_str() {
-                    "" => return Err("The wallet is starting. Try again in a moment.".into()),
-                    "main" => {}
-                    _ => return Ok("Nothing to confirm on a test network.".to_string()),
-                }
-                if f.get("ack").map(String::as_str) != Some("1") {
-                    return Err("Tick the box to confirm that the app pays with real money.".into());
-                }
-                if !dir.join(RAIL_MACAROON).is_file() {
-                    return Err("Your node is not connected yet.".into());
-                }
-                write_shared(dir, MAINNET_ACK_FILE, format!("{MAINNET_ACK}\n").as_bytes())?;
-                Ok("Done. The app can now pay within your spending rules; the status above follows in a few seconds.".into())
-            })(),
+            Some("ack") => self.confirm_real_money(f).map(|written| if written {
+                "Done. The app can now pay within your spending rules; the status above follows in a few seconds.".to_string()
+            } else { "Nothing to confirm on a test network.".to_string() }),
+            // paying with real money off again: the confirmation leaves the box, and the signer pays nothing
+            Some("ack_off") => remove_shared(dir, MAINNET_ACK_FILE).map(|had| if had {
+                "The app no longer pays with real money: it pays nothing until you confirm again.".to_string()
+            } else { "Paying with real money was not on.".to_string() }),
             Some("remove") => remove_shared(dir, RAIL_MACAROON).map(|had| {
                 let _ = remove_shared(dir, MAINNET_ACK_FILE);
                 // a key the app made itself is not made again at the next start
