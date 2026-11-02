@@ -28,6 +28,9 @@ wallet UI change; payments and the signer are unchanged.
 - **Get started counts a shop allowed through its node.** Home's Get started now counts a shop allowed through
   its Lightning node's line in your rules, as the wallet pays it. Before, it kept saying "Allow a shop" and
   left "Buy something" unticked.
+- **An AI seller's page points to your AI address.** It sends programs to the AI page, for this box's AI
+  address and a key of their own, instead of showing the seller's own address (for a shop reached by its key,
+  a made-up one only this wallet's agents can reach). That address is still under Technical details.
 
 ## 0.2.3 (2026-11-02)
 

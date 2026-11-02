@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.3:0',
+  version: '0.2.4:0',
   releaseNotes: {
     en_US:
-      'A usability release. The menu says Buy and Sell; rarely used settings sit under Advanced. Signing the starter rules on mainnet includes the yes to paying with real money, and Your node can stop paying. The demo shop can be added and allowed in one click. Each payment shows one cost: what left your node, with the routing fee beside it. Credit with a shop is shown and used first. The VPN page lists exits found on Nostr with Add this exit. Pages open faster. The app has a new look, dark by default, with a light/dark toggle.',
+      'A fix release for web apps. A web app such as Jellyfin now loads many requests at once, so it opens in seconds instead of after a long white page, and its sign-in no longer hangs. Free parts of a shop are asked for directly. On Hashrate, a disabled Rent says why, and your own offer is marked as yours. Home counts a shop allowed through its node. An AI seller\'s page points to your AI address.',
   },
   migrations: {
     up: async () => {},
