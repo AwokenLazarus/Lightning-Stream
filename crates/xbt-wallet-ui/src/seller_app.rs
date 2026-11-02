@@ -327,15 +327,27 @@ impl App {
                     used = visit_numbers(&v).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
                 }
             }
-            let others = {
+            let origin = base.as_deref().and_then(crate::services::http_origin);
+            let others: Vec<String> = {
                 let mut s = self.apps.lock();
                 s.grants.retain(|_, g| g.visit != visit);
                 s.refusals.remove(&visit);
-                let origin = base.as_deref().and_then(crate::services::http_origin);
-                origin.filter(|o| !s.grants.values().any(|g| crate::services::http_origin(&g.base).as_deref() == Some(o.as_str())))
+                let mut v: Vec<String> = s.grants.values().filter(|g| g.direct.is_none() && crate::services::http_origin(&g.base) == origin)
+                    .map(|g| g.visit.clone()).collect();
+                v.sort();
+                v.dedup();
+                v
             };
-            // one Stop ends it all: the connection the visit paid through closes too, unless another visit to that shop still uses it
-            if let Some(o) = others {
+            // another visit to the shop counts only while the connector holds it open: a grant outlives a visit that ended
+            // without a Stop (its page closed, its limit reached, its idle time out), and such a grant kept the connection open
+            let ended: Vec<String> = others.into_iter().filter(|id| !self.visit_open(id)).collect();
+            let still_used = {
+                let mut s = self.apps.lock();
+                s.grants.retain(|_, g| !ended.contains(&g.visit));
+                s.grants.values().any(|g| g.direct.is_none() && crate::services::http_origin(&g.base) == origin)
+            };
+            // one Stop ends it all: the connection the visit paid through closes too, unless another open visit to that shop still uses it
+            if let Some(o) = origin.filter(|_| !still_used) {
                 if self.stop_seller_sessions(&o) > 0 {
                     ended = format!(" Its connection with {} is closed.", self.seller_name(&o));
                 }
@@ -343,6 +355,16 @@ impl App {
         }
         self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{ended}{used}"));
         Resp::redirect("./browse")
+    }
+
+    /// Whether the connector holds visit `id` open (not ended, not gone). A connector that cannot be
+    /// asked is taken to hold it, so that a Stop never closes a connection another visit may use.
+    fn visit_open(&self, id: &str) -> bool {
+        match connector_json("GET", &format!("{}/visits/{id}", self.cfg.connector.trim_end_matches('/')), None) {
+            Ok((200, v)) => v.get("ended").is_none_or(Value::is_null),
+            Ok((404, _)) => false,
+            _ => true,
+        }
     }
 
     /// `GET /api/visit?v=<id>`: what the visit has spent.
