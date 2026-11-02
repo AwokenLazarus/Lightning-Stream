@@ -149,7 +149,7 @@ its subscribe before it authorizes, so a miner is placed as soon as it connects 
 authorizes; the stand-in miner now does the same.
 
 The app (Umbrel) has a page for each side: Sell → Hashrate (the fallback, the price, how many
-miners to rent out, each miner and each rental, a Stop button) and Services → Hashrate (the offers,
+miners to rent out, each miner and each rental, a Stop button) and Buy → Hashrate (the offers,
 a budget and a duration, each rental with a Cut button, and *Your gateway*). Rentals also
 show on Live connections.
 
@@ -158,7 +158,7 @@ show on Live connections.
 A hashtaker has two ways to judge a hashmaker before committing a budget
 (`crates/xbt-hashlink/src/trust.rs`).
 
-**A test slice.** Services → Hashrate → *Try one slice first* rents one machine for one slice:
+**A test slice.** Buy → Hashrate → *Try one slice first* rents one machine for one slice:
 its budget is one slice's price, and its time limit is three slices' worth at the advertised speed,
 between 5 and 60 minutes. It is an ordinary rental, paid the ordinary way, and the hashtaker's own
 gateway checks every share. When it ends, the rental shows what it delivered: the speed
@@ -192,7 +192,7 @@ it. It is signed by the Nostr key the hashmaker's listing is bound to; a summary
 ignored. The list behind it, rental by rental, stays on the hashmaker's box in `hash-summary.json` beside
 its settings, so it survives a restart.
 
-**What the offer shows.** Each offer on Services → Hashrate carries the delivery records about its
+**What the offer shows.** Each offer on Buy → Hashrate carries the delivery records about its
 hashmaker on the app's relays: how many, and from how many keys, under the words "Anyone can publish
 these", and the newest, one for each key, each with its own speed delivered against advertised. It
 makes no score of them, and calls none confirmed. The app asks each relay for each hashmaker's records

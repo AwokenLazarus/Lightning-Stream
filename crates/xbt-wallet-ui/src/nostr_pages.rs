@@ -20,7 +20,10 @@ impl App {
         }
         let snap = self.nostr.get(q.get("refresh").is_some_and(|v| v == "1"));
         let have = self.file_services().unwrap_or_default();
-        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have), "")
+        // this box's own shop, by its web address or its shop key: marked, never offered to add (a box can't buy from itself)
+        let own_key = self.own_shop_key_origin();
+        let own = |seller: &str| self.is_own_shop(seller) || own_key.as_deref().is_some_and(|k| services::same_origin(k, seller));
+        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have, &own), "")
     }
 
     /// `POST /nostr-check`: ask the seller whether the listing found on Nostr is its own.
@@ -41,12 +44,12 @@ impl App {
 }
 
 /// `have`: the sellers on the owner's list, marked "On your list".
-fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service]) -> String {
-    let mut b = String::from("<p class=\"small\"><a href=\"./browse\">← Your services</a> · <a href=\"./nostr?refresh=1\">Look again</a></p>\
+fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -> bool) -> String {
+    let mut b = String::from("<p class=\"small\"><a href=\"./browse\">← Browse</a> · <a href=\"./nostr?refresh=1\">Look again</a></p>\
         <div class=\"flash warn\"><strong>Unvetted.</strong> These sellers published their lists on Nostr, each signed by the \
         seller's own key, but nobody has checked who runs them. A shop reached by its key: its address is that key, so the list is its own. \
         A seller with a web address: press Check with the seller, and the app asks that address whether the list is theirs. \
-        Payments still keep to your spending rules.</div>");
+        Who runs a shop is not checked by anyone. Payments still keep to your spending rules.</div>");
     let up = snap.relays.iter().filter(|r| r.result.is_ok()).count();
     b.push_str(&format!("<p class=\"small\">{up} of {} relays answered", snap.relays.len()));
     if snap.refused > 0 {
@@ -61,6 +64,12 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service]) -> String {
         return b;
     }
     for n in &snap.listings {
+        if own(&n.listing.seller) {
+            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill good\">Your shop</span></div>\
+                                 <p class=\"small\">This is the listing your box publishes. See it on <a href=\"./sell\">Sell</a>.</p></section>",
+                                esc(&n.listing.name)));
+            continue;
+        }
         let added = have.iter().any(|s| services::same_origin(&s.seller, &n.listing.seller));
         let mine = if added { "<span class=\"pill good\">On your list</span>" } else { "" };
         let (add_label, add_class) = if added { ("Check for updates", " class=\"secondary\"") } else { ("Add this shop", "") };
@@ -68,8 +77,7 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service]) -> String {
             // a shop without a web address: its address is its key, and the listing is signed by that key, so
             // there is no other address to ask. It is added as a shop key on Sellers ([`App::add_seller`])
             b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill\">reached by its key</span>{mine}</div>\
-                                 <p class=\"small\">Shop key <code class=\"key\">{}</code>. This list is signed by that key, so it is the shop's own; \
-                                 who runs the shop is not checked by anyone.</p>\
+                                 <p class=\"small\">Shop key <code class=\"key\">{}</code></p>\
                                  <form method=\"post\" action=\"./services\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
                                  <input type=\"hidden\" name=\"action\" value=\"add\"><input type=\"hidden\" name=\"url\" value=\"{}\">\
                                  <button type=\"submit\"{add_class}>{add_label}</button></form>",
@@ -89,7 +97,10 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service]) -> String {
             if !s.items.is_empty() {
                 b.push_str("<div class=\"grid\">");
                 for item in &s.items {
-                    let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&item.url));
+                    // the file's path at the shop, not its made-up `…shop.invalid` address
+                    let path = services::http_origin(&item.url).filter(|o| xbt402::shop::is_shop(o))
+                        .and_then(|o| item.url.strip_prefix(&o).map(str::to_string)).unwrap_or_else(|| item.url.clone());
+                    let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&path));
                     b.push_str(&format!("<article class=\"card\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>{open}</article>",
                                         esc(&item.title), esc(&item.year), esc(&item.credit)));
                 }

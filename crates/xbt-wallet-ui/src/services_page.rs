@@ -90,6 +90,7 @@ impl App {
             Ok(all) if all.is_empty() => b.push_str("<p class=\"empty\">No sellers yet. Add one above.</p>"),
             Ok(all) => {
                 b.push_str("<h2>Your sellers</h2>");
+                let credits = self.credits();
                 for (origin, list) in by_seller(&all) {
                     let shown = if xbt402::shop::is_shop(&origin) {
                         format!("Shop key <code class=\"key\">{}</code> <span class=\"pill\">Direct link</span>", esc(&xbt402::shop::display(&origin)))
@@ -107,9 +108,20 @@ impl App {
                                             if n > 0 { format!(" <span class=\"small\">{n} to choose from</span>") } else { String::new() }));
                     }
                     b.push_str("</ul>");
+                    // what is left with the shop from earlier connections, drawn first next time
+                    if let Some(m) = credits.get(&origin) {
+                        b.push_str(&crate::app::credit_line(&services::seller_name(&all, &origin), *m));
+                    }
                     let allowed = self.seller_allowed(&origin);
                     b.push_str(&if allowed {
                         "<p><span class=\"pill good\">Allowed to be paid</span> within your spending rules.</p>".to_string()
+                    } else if self.in_rules(&origin) && self.vouched_node(&origin).is_some() {
+                        // on the list with no node on file (or another): the fix in place, reviewed and signed on the rules page
+                        format!("<p><span class=\"pill warn\">No Lightning node on file</span> Your rules list this shop, but not the node it is paid \
+                                 through, so the app would refuse to pay it.</p>\
+                                 <form method=\"post\" action=\"./services\">{}<input type=\"hidden\" name=\"action\" value=\"allow\">\
+                                 <input type=\"hidden\" name=\"url\" value=\"{}\"><button>Use the node the shop vouches for</button></form>",
+                                App::csrf_input(ctx), esc(&origin))
                     } else {
                         format!("<p><span class=\"pill warn\">Not allowed to be paid yet</span> Your spending rules list the sellers the app may pay.</p>\
                                  <form method=\"post\" action=\"./services\">{}<input type=\"hidden\" name=\"action\" value=\"allow\">\
@@ -143,6 +155,15 @@ impl App {
             } else {
                 m
             }),
+            // "Try the demo shop": add the seller, then straight to the rules with it allowed, ready to sign once
+            Some("try") => match self.add_seller(&url, get_page) {
+                Ok(_) if self.seller_allowed(&url) => Ok(format!("{} is on Browse and allowed to be paid.", self.seller_name(&url))),
+                Ok(_) => match self.allow_link(&url, get_page) {
+                    Ok(link) => return Resp::redirect(&link),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
             Some("allow") => match self.allow_link(&url, get_page) {
                 Ok(link) => return Resp::redirect(&link),
                 Err(e) => Err(e),
@@ -204,7 +225,8 @@ impl App {
     /// ([`services::seller_name`]). For the pages that name a seller by its origin alone (a visit, an
     /// activity line).
     pub fn seller_name(&self, origin: &str) -> String {
-        services::seller_name(&self.file_services().unwrap_or_default(), origin)
+        // the sellers on the owner's list, then the ones Found on Nostr last saw (0.2.2 showed a key for a shop known only there)
+        services::seller_name(&self.services().unwrap_or_default(), origin)
     }
 
     /// Whether the spending rules name the seller at `origin` at all: on the list that may be paid,
@@ -237,11 +259,21 @@ impl App {
     /// tied to a Lightning node.
     pub(crate) fn seller_allowed(&self, origin: &str) -> bool {
         let Ok(p) = self.signer.call("policy_get", serde_json::json!({})) else { return false };
-        let pol = &p["policy"];
-        let o = services::http_origin(origin).unwrap_or_default();
-        let listed = pol["allowlist"].as_array().is_some_and(|a| a.iter().filter_map(|x| x.as_str()).any(|x| services::http_origin(x).as_deref() == Some(o.as_str())));
-        listed && pol["counterparties"].as_object().is_some_and(|m| m.iter().any(|(k, v)|
-            services::http_origin(k).as_deref() == Some(o.as_str()) && v["ln_node"].as_str().is_some_and(|n| !n.is_empty())))
+        crate::app::rules_allow(&p["policy"], origin, self.vouched_node(origin).as_deref())
+    }
+
+    /// The credit left with each shop ([`crate::app::credit_left`]), from the wallet's history.
+    pub(crate) fn credits(&self) -> HashMap<String, u64> {
+        let events = self.signer.call("history", serde_json::json!({"limit": 1000})).ok()
+            .and_then(|h| h["events"].as_array().cloned()).unwrap_or_default();
+        crate::app::credit_left(&events)
+    }
+
+    /// The Lightning node the shop at `origin` (one reached by its key) vouches for now, from its entry.
+    pub(crate) fn vouched_node(&self, origin: &str) -> Option<String> {
+        let o = services::http_origin(origin)?;
+        let shops = crate::shops::load(&self.cfg.shops_path()).ok()?;
+        shops.get(&o).and_then(|s| crate::shops::node(s, &o, xbt_nostr::now()))
     }
 
     /// The spending rules page with this seller added, ready to sign: the seller's node is read from

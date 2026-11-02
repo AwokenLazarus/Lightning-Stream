@@ -90,7 +90,7 @@ decides which pieces are paid, so the price is exact on average. The wire is wri
 | `xbt-primitives` | XBT transactions, scripts, addresses, UnifiedSighash, strict ECDSA, BLAKE2b headers and proof of work |
 | `xbt402` | the paid-HTTP wires: x402 v2 headers and request binding, stream tickets and the lottery |
 | `xbt-signer` | the wallet's signer: keys, the owner's signed spending rules, a tamper-evident signature log, the Lightning rail (BOLT 11 and 12), the ticket book and the payer |
-| `xbt-wallet-ui` | the app: Services, Sell, Wallet, Apps & agents and Settings |
+| `xbt-wallet-ui` | the app: Buy, Sell, Wallet, Apps & agents and Settings |
 | `xbt-wallet-mcp` | the wallet's MCP server, so an AI agent can quote and pay without holding a key |
 | `lightning-stream` | the connector: hands a paid answer to a local player as it is paid for, and serves the local AI address, holding no keys |
 | `xbt-gateway` | the seller's gateway beside a Lightning node, in front of any HTTP service |

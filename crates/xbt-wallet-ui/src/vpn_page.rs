@@ -4,7 +4,9 @@
 //! The pages write settings files the VPN service reads, in `XBT_UI_VPN_DIR`:
 //! - `devices.json`: each device's name, WireGuard public key, tunnel address, limit and policy.
 //!   A device's private key is made here, shown once in its config and QR code (in the answer to
-//!   the form, `Cache-Control: no-store`), and never kept.
+//!   the form, `Cache-Control: no-store`), and never kept. Its `exits`: the exits the owner added
+//!   from Found on Nostr (*Add this exit*), each its signed announcement, which the service checks
+//!   as it checks the ones its relays give, and every device prefers.
 //! - `exit.json`: this box's exit, if offered: its kind, what it blocks, its protections, its price.
 //!
 //! And they read what the service writes, in `XBT_UI_VPN_STATUS_DIR` (the same dir unless set): `endpoint.json` (the WireGuard key devices pair with),
@@ -50,6 +52,15 @@ fn key32(s: &str) -> Option<[u8; 32]> {
 fn next_ip(devices: &[Value]) -> Option<Ipv4Addr> {
     let used: Vec<&str> = devices.iter().filter_map(|d| d["tunnel_ip"].as_str()).collect();
     (2..=250u8).map(|n| Ipv4Addr::new(10, 66, 0, n)).find(|ip| !used.contains(&ip.to_string().as_str()))
+}
+
+/// An exit's price by the GB, in sats (`msat` as the announcement says it).
+fn price_words(msat: Option<u64>) -> String {
+    match msat {
+        None => String::new(),
+        Some(0) => "free".into(),
+        Some(m) => format!("{} sat/GB", crate::html::group3(m.div_ceil(1000))),
+    }
 }
 
 /// A device's policy in plain words.
@@ -128,12 +139,64 @@ impl App {
         read(&self.cfg.vpn.status_dir.join("endpoint.json"))["public_key"].as_str().and_then(key32)
     }
 
-    pub(crate) fn vpn_page(&self, ctx: &Ctx) -> Resp {
-        let body = self.vpn_html(ctx, None);
+    pub(crate) fn vpn_page(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
+        let body = self.vpn_html(ctx, None, q.get("refresh").is_some_and(|v| v == "1"));
         self.page("VPN", ctx, body)
     }
 
-    fn vpn_html(&self, ctx: &Ctx, made: Option<(&str, &str)>) -> String {
+    /// The exits the owner added (`exits` of `devices.json`): their exit keys.
+    fn vpn_added(&self) -> Vec<String> {
+        read(&self.cfg.vpn.dir.join("devices.json"))["exits"].as_array().map(|a| a.iter()
+            .filter_map(|e| xbt_nostr::event::Event::from_value(e).and_then(|e| e.tag("exit").map(str::to_string))).collect()).unwrap_or_default()
+    }
+
+    /// Found on Nostr: the exits the owner's relays carry, each checked, with *Add this exit* for one the
+    /// owner wants: the service then reads it with the ones it finds, and every device prefers it.
+    fn vpn_found_on_nostr(&self, ctx: &Ctx, in_use: &[&Value], refresh: bool) -> String {
+        if !self.vpn_exits.enabled() {
+            return String::new();
+        }
+        let own = read(&self.cfg.vpn.status_dir.join("exit-status.json"))["exit"].as_str().map(str::to_string);
+        let added = self.vpn_added();
+        let look = "<p class=\"small\"><a href=\"./vpn?refresh=1#found-exits\">Look again</a></p>";
+        let Some(snap) = self.vpn_exits.get(refresh) else {
+            return format!("<section class=\"card\" id=\"found-exits\"><h2>Found on Nostr</h2><p class=\"empty\">The relays are still being asked: \
+                reload this page in a few seconds.</p>{look}</section>");
+        };
+        let mut known = self.file_services().unwrap_or_default();
+        known.extend(self.nostr.services());
+        let rows: String = snap.exits.iter().map(|f| {
+            let e = &f.exit.exit;
+            // the shop it is paid through, by its name where a listing names it (the services file, or Found on Nostr)
+            let shop = f.exit.tunnel.as_deref().and_then(crate::services::http_origin).map(|o| crate::services::seller_name(&known, &o)).unwrap_or_default();
+            let action = if own.as_deref() == Some(e.id.as_str()) {
+                "<span class=\"tag\">this box's exit</span>".to_string()
+            } else if added.contains(&e.id) {
+                format!("<span class=\"tag ok\">added</span> <form method=\"post\" action=\"./vpn\" class=\"inline\">{}<input type=\"hidden\" name=\"do\" value=\"remove_exit\">\
+                         <input type=\"hidden\" name=\"exit\" value=\"{}\"><button class=\"link\" type=\"submit\">Remove</button></form>", App::csrf_input(ctx), esc(&e.id))
+            } else if e.price_msat_per_gb > 0 && f.exit.tunnel.is_none() {
+                "<span class=\"small\">names no place to pay it: not usable</span>".to_string()
+            } else {
+                format!("<form method=\"post\" action=\"./vpn\" class=\"inline\">{}<input type=\"hidden\" name=\"do\" value=\"add_exit\">\
+                         <input type=\"hidden\" name=\"exit\" value=\"{}\"><button class=\"secondary\" type=\"submit\">Add this exit</button></form>", App::csrf_input(ctx), esc(&e.id))
+            };
+            let seen = if in_use.iter().any(|x| x["exit"].as_str() == Some(e.id.as_str())) { " <span class=\"tag ok\">found by the VPN service</span>" } else { "" };
+            format!("<tr><td><code>{}…</code>{seen}<div class=\"small\">{}{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{action}</td></tr>",
+                    esc(&e.id.chars().take(12).collect::<String>()), if e.filtered { "filtered" } else { "private" },
+                    if shop.is_empty() { String::new() } else { format!(" · paid through {}", esc(&shop)) },
+                    esc(&e.region), price_words(Some(e.price_msat_per_gb)), if e.logs { "says it keeps logs" } else { "says no logs" })
+        }).collect();
+        let table = if snap.exits.is_empty() {
+            "<p class=\"empty\">None of your Nostr relays carries an exit right now.</p>".to_string()
+        } else {
+            format!("<div class=\"scroll\"><table><thead><tr><th>Exit</th><th>Says</th><th>Price</th><th>Logs</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+        };
+        format!("<section class=\"card\" id=\"found-exits\"><h2>Found on Nostr</h2><p class=\"small\">Exits your Nostr relays carry, each signed by its own key. \
+            The VPN service looks for them by itself; <strong>Add this exit</strong> hands it one by hand, and your devices then use it first \
+            whenever it meets their rules. Their rules still decide: country, price and the rest.</p>{table}{look}</section>")
+    }
+
+    fn vpn_html(&self, ctx: &Ctx, made: Option<(&str, &str)>, refresh: bool) -> String {
         let mut b = String::from("<p class=\"lead\">Send a phone's, a laptop's or your whole home's traffic out through someone else's connection, \
             in the country you choose. Paid as you use it, by the GB, within your spending rules. If no exit meets a device's rules, its \
             traffic stops: it never goes out your own connection by mistake.</p>");
@@ -181,20 +244,34 @@ impl App {
         };
         b.push_str(&format!("<section class=\"card\"><h2>Devices</h2>{list}</section>"));
         // each exit's country, checked against where its traffic really comes out
+        // every exit the service found (0.2.3: also the ones whose country is not checked yet), with its check
         let exits: Vec<&Value> = status["exits"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
         if !exits.is_empty() {
             let rows: String = exits.iter().map(|e| {
                 let id = e["exit"].as_str().unwrap_or("");
-                let tag = if e["verified"] == true { "<span class=\"tag ok\">checked</span>" } else { "<span class=\"tag\">not used for its country</span>" };
-                format!("<tr><td><code>{}…</code></td><td>{}</td><td>{tag} <span class=\"small\">{}</span></td></tr>",
-                        esc(&id.chars().take(12).collect::<String>()), esc(e["region"].as_str().unwrap_or("")), esc(e["region_check"].as_str().unwrap_or("")))
+                let tag = if e["verified"] == true { "<span class=\"tag ok\">checked</span>" }
+                          else if e["checked_at"].as_u64().unwrap_or(0) == 0 && e.get("checked_at").is_some() { "<span class=\"tag\">not checked</span>" }
+                          else { "<span class=\"tag\">not used for its country</span>" };
+                let added = if e["added"] == true { " <span class=\"tag ok\">added</span>" } else { "" };
+                format!("<tr><td><code>{}…</code>{added}</td><td>{}</td><td>{}</td><td>{tag} <span class=\"small\">{}</span></td></tr>",
+                        esc(&id.chars().take(12).collect::<String>()), esc(e["region"].as_str().unwrap_or("")), price_words(e["price_msat_gb"].as_u64()),
+                        esc(e["region_check"].as_str().unwrap_or("")))
             }).collect();
-            b.push_str(&format!("<section class=\"card\"><h2>Exits found</h2><p class=\"small\">An exit's country is checked, not taken on its word: \
+            b.push_str(&format!("<section class=\"card\" id=\"exits\"><h2>Exits found</h2><p class=\"small\">The exits this box's VPN service can use. \
+                An exit's country is checked, not taken on its word: \
                 its traffic's address is read through it from several independent sites and looked up in a country table that comes with the app. \
                 The check is best-effort: an exit could route those sites differently from your traffic.</p>\
-                <div class=\"scroll\"><table><thead><tr><th>Exit</th><th>Says</th><th>Check</th></tr></thead><tbody>{rows}</tbody></table></div>\
+                <div class=\"scroll\"><table><thead><tr><th>Exit</th><th>Says</th><th>Price</th><th>Check</th></tr></thead><tbody>{rows}</tbody></table></div>\
                 <p class=\"small\"><a href=\"https://db-ip.com\" rel=\"noopener\">IP geolocation by DB-IP</a> (CC BY 4.0).</p></section>"));
         }
+        if exits.is_empty() {
+            // where exits come from, said where there are none (0.2.1 listed nothing and said nothing)
+            b.push_str("<section class=\"card\" id=\"no-exits\"><h2>Exits</h2><p class=\"empty\">No exit found yet.</p>\
+                <p class=\"small\">Exits are boxes that sell their internet connection. Their owners publish them on Nostr, and this box's VPN \
+                service looks for them there by itself and checks each one's country. If none shows up after a few minutes, the relays it \
+                reads may carry none yet; an exit listed under Found on Nostr can be added by hand.</p></section>");
+        }
+        b.push_str(&self.vpn_found_on_nostr(ctx, &exits, refresh));
         if ready {
             b.push_str(&format!(
                 "<section class=\"card\"><h2>Add a device</h2><form method=\"post\" action=\"./vpn\" class=\"stack\">{}\
@@ -212,6 +289,18 @@ impl App {
         let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
         let path = self.cfg.vpn.dir.join("devices.json");
         let mut devices = self.vpn_devices();
+        // the file whole: what is not changed here (the exits added by hand, the devices) stays
+        let doc = |devices: &[Value], exits: Option<Vec<Value>>| -> Value {
+            let mut d = read(&path);
+            if !d.is_object() {
+                d = json!({});
+            }
+            d["devices"] = json!(devices);
+            if let Some(x) = exits {
+                d["exits"] = json!(x);
+            }
+            d
+        };
         let r: Result<String, String> = match g("do").as_str() {
             "add" => {
                 let name: String = g("name").chars().take(64).collect();
@@ -234,10 +323,10 @@ impl App {
                     "limit_sats": g("limit_sats").parse::<u64>().ok().filter(|n| *n > 0), "policy": policy,
                     "added": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                 }));
-                match write(&path, &json!({ "devices": devices })) {
+                match write(&path, &doc(&devices, None)) {
                     Ok(()) => {
                         let config = xbt_vpn::wg::device_config(private, ip, endpoint_key, &endpoint, "10.66.0.1");
-                        let body = self.vpn_html(ctx, Some((&name, &config)));
+                        let body = self.vpn_html(ctx, Some((&name, &config)), false);
                         return self.page("VPN", ctx, body).header("Cache-Control", "no-store");
                     }
                     Err(e) => Err(format!("The devices file cannot be written: {e}")),
@@ -248,7 +337,31 @@ impl App {
                 for d in devices.iter_mut().filter(|d| d["id"].as_str() == Some(id.as_str())) {
                     d["revoked"] = json!(true);
                 }
-                write(&path, &json!({ "devices": devices })).map(|_| "Removed: that device's traffic stops now.".into())
+                write(&path, &doc(&devices, None)).map(|_| "Removed: that device's traffic stops now.".into())
+                    .map_err(|e| format!("The devices file cannot be written: {e}"))
+            }
+            // an exit from Found on Nostr: its signed announcement as the relays gave it (never the form's
+            // word), kept for the service, which checks it again
+            "add_exit" => {
+                let id = g("exit");
+                let mut exits: Vec<Value> = read(&path)["exits"].as_array().cloned().unwrap_or_default();
+                exits.retain(|e| xbt_nostr::event::Event::from_value(e).and_then(|e| e.tag("exit").map(str::to_string)).as_deref() != Some(id.as_str()));
+                match self.vpn_exits.find(&id) {
+                    None => Err("That exit is no longer on your Nostr relays. Look again.".into()),
+                    Some(_) if exits.len() >= xbt_vpn::service::MAX_ADDED_EXITS => Err(format!("At most {} exits can be added. Remove one first.", xbt_vpn::service::MAX_ADDED_EXITS)),
+                    Some(f) => {
+                        exits.push(f.event.to_value());
+                        write(&path, &doc(&devices, Some(exits))).map(|_| format!("Added the exit in {}. The VPN service starts again with it in a few seconds; \
+                            your devices use it first whenever it meets their rules.", f.exit.exit.region))
+                            .map_err(|e| format!("The devices file cannot be written: {e}"))
+                    }
+                }
+            }
+            "remove_exit" => {
+                let id = g("exit");
+                let mut exits: Vec<Value> = read(&path)["exits"].as_array().cloned().unwrap_or_default();
+                exits.retain(|e| xbt_nostr::event::Event::from_value(e).and_then(|e| e.tag("exit").map(str::to_string)).as_deref() != Some(id.as_str()));
+                write(&path, &doc(&devices, Some(exits))).map(|_| "Removed the exit from your list. The VPN service may still find it on Nostr by itself.".into())
                     .map_err(|e| format!("The devices file cannot be written: {e}"))
             }
             _ => Err("Unknown action.".into()),

@@ -10,9 +10,9 @@ http://<your box>:33540/v1      (Umbrel and StartOS; on Linux, 127.0.0.1 unless 
 
 ## Set it up
 
-1. **Add an AI seller** on Services → Sellers, and press **Allow this seller to be paid**. The
+1. **Add an AI seller** on Buy → Sellers, and press **Allow this seller to be paid**. The
    spending rules page opens with that seller added; sign the change.
-2. **Services → AI.** The page shows your AI address and the sellers of AI on your list.
+2. **Buy → AI.** The page shows your AI address and the sellers of AI on your list.
 3. **Make a key** for each program, with a limit in sats (and, under Advanced, one per day). The
    key is shown once: copy it into the program now. Nobody can show it again.
 4. In the program's settings, put the address where it asks for the OpenAI **base URL** (or "API

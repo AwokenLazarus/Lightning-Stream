@@ -178,12 +178,12 @@ impl App {
         // the shop by its listed name ("Lightning Stream Genesis"), never its key or made-up address
         let shop = self.seller_name(&svc.seller);
         let b = format!("{warn}<section class=\"card primary\"><h2>Open {}'s app</h2>\
-            <p>You use <strong>{}</strong> as it is on {}'s own network, inside this page. What it loads is paid at {}, \
-            and stops at the limit you set here.</p>\
+            <p>You use <strong>{}</strong> inside this page. What it loads is paid at {}, and stops at the limit you set here.</p>\
+            <p class=\"small\">Shop address: {}</p>\
             <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
             {}<div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
             <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
-            esc(&shop), esc(&svc.name), esc(&crate::app::stream_pages::host(&svc.seller)), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
+            esc(&shop), esc(&svc.name), esc(&svc.price_text), esc(&crate::app::stream_pages::host(&svc.seller)), App::csrf_input(ctx), esc(&entry), esc(&base), limit_field(suggested),
             self.identity_card(ctx, &svc.seller, &base, &entry));
         self.page("Open the app", ctx, b)
     }
@@ -293,7 +293,8 @@ impl App {
             s.codes.retain(|_, (t, _, _)| t.elapsed() < CODE_TTL);
             s.codes.insert(code.clone(), (Instant::now(), grant, other));
         }
-        let host = crate::app::stream_pages::host(&svc.seller);
+        // the shop by its name in the visit's words (its key only in small detail text)
+        let host = self.seller_name(&svc.seller);
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>Your visit</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
             <div class=\"card primary refusal\" data-visit-refusal hidden></div>\
@@ -317,18 +318,30 @@ impl App {
     pub(crate) fn app_stop(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let visit = f.get("visit").cloned().unwrap_or_default();
         let mut used = String::new();
+        let mut ended = String::new();
         if visit.bytes().all(|b| b.is_ascii_hexdigit()) && !visit.is_empty() {
+            let base = self.apps.lock().grants.values().find(|g| g.visit == visit).map(|g| g.base.clone());
             if !self.apps.lock().previews.remove(&visit) {
                 let said = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
                 if let Ok((200, v)) = said {
                     used = visit_numbers(&v).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
                 }
             }
-            let mut s = self.apps.lock();
-            s.grants.retain(|_, g| g.visit != visit);
-            s.refusals.remove(&visit);
+            let others = {
+                let mut s = self.apps.lock();
+                s.grants.retain(|_, g| g.visit != visit);
+                s.refusals.remove(&visit);
+                let origin = base.as_deref().and_then(crate::services::http_origin);
+                origin.filter(|o| !s.grants.values().any(|g| crate::services::http_origin(&g.base).as_deref() == Some(o.as_str())))
+            };
+            // one Stop ends it all: the connection the visit paid through closes too, unless another visit to that shop still uses it
+            if let Some(o) = others {
+                if self.stop_seller_sessions(&o) > 0 {
+                    ended = format!(" Its connection with {} is closed.", self.seller_name(&o));
+                }
+            }
         }
-        self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{used}"));
+        self.flash(ctx, true, format!("Stopped. The app is closed and nothing more is paid for it.{ended}{used}"));
         Resp::redirect("./browse")
     }
 
@@ -355,10 +368,24 @@ impl App {
             Ok((200, v)) => {
                 let mut out = visit_numbers(&v);
                 out["refusal"] = refusal.unwrap_or(Value::Null);
+                // a visit that runs on earlier credit pays nothing new: the bar says what is left of that credit
+                if out["prepaid_sats"].as_i64() == Some(0) && out["used_sats"].as_i64().unwrap_or(0) > 0 {
+                    let origin = self.apps.lock().grants.values().find(|g| g.visit == visit).and_then(|g| crate::services::http_origin(&g.base));
+                    if let Some(m) = origin.and_then(|o| self.live_credit_msat(&o)) {
+                        out["credit_left_sats"] = json!(m / 1000);
+                    }
+                }
                 Resp::json(200, &out)
             }
             _ => Resp::json(200, &json!({"ended": "This visit has ended."})),
         }
+    }
+
+    /// The credit the open connection with the shop at `origin` holds now (msat), by the wallet's count.
+    fn live_credit_msat(&self, origin: &str) -> Option<u64> {
+        let st = self.call("ticket_status", json!({})).ok()?;
+        st["paying"].as_array()?.iter().filter(|p| p["origin"].as_str().and_then(crate::services::http_origin).as_deref() == Some(origin))
+            .filter_map(|p| p["balance_msat"].as_str().and_then(|s| s.parse::<u64>().ok())).max()
     }
 
     /// What the node can send now, about ([`crate::pay_feedback::spendable_sats`]); `None` where the
@@ -379,9 +406,11 @@ pub(crate) fn visit_numbers(v: &Value) -> Value {
     let used = i64::try_from(used_msat.div_ceil(1000)).unwrap_or(i64::MAX);
     let paid = v.get("paid_sats").and_then(Value::as_i64).unwrap_or(0).max(0);
     let credit = i64::try_from((paid.unsigned_abs() * 1000).saturating_sub(used_msat) / 1000).unwrap_or(0);
+    // the three figures every page names (crate::html::paid_html): used, paid (what left the node, as the
+    // signer charged it), credit left
     let mut said = format!("This visit used {used} sat");
     if paid > 0 {
-        said.push_str(&format!("; {paid} sat was prepaid, and {credit} sat of it stays as credit with the shop."));
+        said.push_str(&format!(". Paid: {paid} sat; credit left with the shop: {credit} sat."));
     } else if used > 0 {
         said.push_str(" from your credit with the shop; nothing new was paid.");
     } else {
@@ -392,10 +421,10 @@ pub(crate) fn visit_numbers(v: &Value) -> Value {
 
 /// The visit limit's field, with the least a visit needs up front, set to `suggested`.
 fn limit_field(suggested: i64) -> String {
-    format!("<label>Spend at most, on this visit, in sats: at least {MIN_CALL_SATS} sat for this shop\
+    format!("<label>Spend at most on this visit: at least {MIN_CALL_SATS} sat\
              <input name=\"limit\" value=\"{suggested}\" required inputmode=\"numeric\" pattern=\"[0-9,]+\"></label>\
-             <p class=\"hint\">A shop sells in tickets of at least {MIN_TICKET_SATS} sat; with routing fees a visit needs {MIN_CALL_SATS} sat. \
-             What you don't use stays as credit with the shop. Your spending rules apply as well.</p>")
+             <p class=\"hint\">The shop is paid ahead in steps of {MIN_TICKET_SATS} sat or more, plus routing fees. \
+             What you don't use stays with the shop as credit for next time.</p>")
 }
 
 /// One app port: a seller's own page, for the visit whose cookie the browser holds.
@@ -829,7 +858,7 @@ mod tests {
     #[test]
     fn the_visit_limit_field_says_the_least_up_front_and_starts_at_1000() {
         let f = limit_field(SUGGESTED_LIMIT);
-        assert!(f.starts_with("<label>Spend at most, on this visit, in sats: at least 559 sat for this shop<input"), "{f}");
+        assert!(f.starts_with("<label>Spend at most on this visit: at least 559 sat<input"), "{f}");
         assert!(f.contains("value=\"1000\""));
     }
 
@@ -850,7 +879,7 @@ mod tests {
         // a ticket bought in the visit: prepaid, and the rest left as credit
         let bought = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 559, "held_sats": 0, "used_msat": 64_870, "paid_sats": 559, "ended": null}));
         assert_eq!((bought["used_sats"].as_i64(), bought["prepaid_sats"].as_i64(), bought["credit_sats"].as_i64()), (Some(65), Some(559), Some(494)));
-        assert_eq!(bought["said"], "This visit used 65 sat; 559 sat was prepaid, and 494 sat of it stays as credit with the shop.");
+        assert_eq!(bought["said"], "This visit used 65 sat. Paid: 559 sat; credit left with the shop: 494 sat.");
         // an older connector: as before
         assert_eq!(visit_numbers(&json!({"limit_sats": 559, "spent_sats": 12}))["spent_sats"].as_i64(), Some(12));
     }

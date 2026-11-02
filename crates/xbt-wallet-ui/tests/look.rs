@@ -72,7 +72,8 @@ fn the_river_and_the_stylesheet_are_local_cached_by_hash_and_the_csp_stays_self_
     assert!(h["content-type"].starts_with("text/css"));
     assert_eq!(h["cache-control"], "public, max-age=31536000, immutable");
     assert!(!css.contains("url(http") && !css.contains("@import"), "the stylesheet loads nothing from elsewhere");
-    for token in ["--river-a", "--river-b", "--river-spark", "--river-blend", "prefers-color-scheme: dark"] {
+    // dark by default, light as the owner's choice (the bar's theme button)
+    for token in ["--river-a", "--river-b", "--river-spark", "--river-blend", "color-scheme: dark", ":root[data-theme=\"light\"]"] {
         assert!(css.contains(token), "{token}");
     }
 }
@@ -182,7 +183,7 @@ fn the_look_in_headless_chrome() {
         ["browse-apps", apps.clone()], ["browse-files", "/browse?cat=files"],
         ["service-files", format!("/service?seller={}&name={}", enc("https://files.example"), enc("Open films and books"))], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
         ["sell", "/sell"], ["sell-files", "/sell#service-form"], ["sell-reach", "/sell#shop-reach"], ["sell-capacity", "/sell#capacity"], ["wallet", "/wallet"],
-        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"], ["ai", "/ai"], ["vpn", "/vpn"], ["sell-vpn", "/sell-vpn"]]).to_string();
+        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["records", "/signatures"], ["relays", "/relays"], ["ai", "/ai"], ["vpn", "/vpn"], ["sell-vpn", "/sell-vpn"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
         .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),
@@ -198,6 +199,10 @@ fn the_look_in_headless_chrome() {
         assert!(r["contrast"][s]["text"].as_f64().unwrap() >= 7.0, "body text over the brightest river point: {r}");
         assert!(r["contrast"][s]["muted"].as_f64().unwrap() >= 4.5, "secondary text over the brightest river point: {r}");
     }
+    let t = &r["theme"];
+    assert!(t["default"] == "dark" && t["after_click"] == "light" && t["pressed"] == "true" && t["next_page"] == "light" && t["back"] == "dark",
+            "dark by default; the bar's button turns it light, and the choice is kept from page to page: {r}");
+    assert_ne!(t["dark_bg"], t["light_bg"], "{r}");
     assert!(r["flicker"]["frames"].as_u64().unwrap() >= 5, "{r}");
     assert!(r["flicker"]["min_ratio"].as_f64().unwrap() >= 0.5, "no blank or reset river while moving between pages: {r}");
     for k in ["desktop", "phone-menu"] {
@@ -214,7 +219,7 @@ fn the_look_in_headless_chrome() {
 
 /// The Hashrate pages against running hashrate services (`XBT_UI_HASH_SHOTS=1`, with
 /// `XBT_UI_HASH_HASHER` and `XBT_UI_HASH_RENTER` their control pages, `XBT_UI_HASH_TOKEN` the
-/// token file): screenshots of Sell → Hashrate, Services → Hashrate and Live connections, in light,
+/// token file): screenshots of Sell → Hashrate, Buy → Hashrate and Live connections, in light,
 /// dark and at phone width, into `$XBT_UI_LOOK_DIR`.
 #[test]
 fn the_hashrate_pages_in_headless_chrome() {

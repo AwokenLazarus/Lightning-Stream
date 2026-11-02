@@ -21,6 +21,31 @@ use crate::html::{esc, sats};
 use crate::server::Resp;
 use crate::services::{self, Service};
 
+/// The AI address by the box's IP, for devices that can't resolve its name (`umbrel.local`): the IP the
+/// browser reached this page at, where it did by IP; else how to find it.
+pub(crate) fn by_ip(endpoint: &str, page_host: &str) -> String {
+    let rest = endpoint.split_once("://").map(|(_, r)| r).unwrap_or(endpoint);
+    if rest.starts_with('[') {
+        return String::new();
+    }
+    let cut = rest.find([':', '/']).unwrap_or(rest.len());
+    let (ep_host, tail) = (&rest[..cut], rest[cut..].to_string());
+    if ep_host.parse::<std::net::IpAddr>().is_ok() {
+        return String::new();
+    }
+    let ip = page_host.rsplit_once(':').map(|(h, _)| h).unwrap_or(page_host).trim_matches(['[', ']']);
+    let scheme = endpoint.split_once("://").map(|(s, _)| s).unwrap_or("http");
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => {
+            let alt = format!("{scheme}://{a}{tail}");
+            format!("<label>Or by this box's IP address, for devices that can't find {}<input id=\"ai-endpoint-ip\" class=\"mono\" readonly value=\"{}\"></label>\
+                     <div class=\"row\"><button type=\"button\" data-copy=\"ai-endpoint-ip\">Copy</button></div>", crate::html::esc(ep_host), crate::html::esc(&alt))
+        }
+        _ => format!("<p class=\"small\">A device that can't find <code>{}</code>: use this box's IP address in its place (your router, or the box's \
+                      own settings, show it), as in <code>{scheme}://192.168.1.20{}</code>.</p>", crate::html::esc(ep_host), crate::html::esc(&tail)),
+    }
+}
+
 /// The sellers file as the endpoint reads it: each AI service's name, route and prices, and the
 /// owner's pins and blocks.
 fn read_sellers(path: &Path) -> Value {
@@ -115,7 +140,9 @@ fn key_row(ctx: &Ctx, e: &Entry, today: u64) -> String {
          <button type=\"submit\">Save the limit</button></form></details>\
          <form method=\"post\" action=\"./ai\" class=\"inline\">{}<input type=\"hidden\" name=\"do\" value=\"revoke\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
          <button class=\"danger\" type=\"submit\">Revoke</button></form></td></tr>",
-        esc(&e.name), crate::html::utc(e.created as i64), sats((e.spent_msat / 1000) as i64), sats(e.limit_sats as i64),
+        esc(&e.name), crate::html::utc(e.created as i64),
+        // a key that spent less than a sat is not shown as unused (0.2.1 said "0 sats" after paid answers)
+        if e.spent_msat > 0 && e.spent_msat < 1000 { "under 1 sat".to_string() } else { sats((e.spent_msat / 1000) as i64) }, sats(e.limit_sats as i64),
         App::csrf_input(ctx), esc(&e.id), e.limit_sats, e.per_day_sats.map(|d| d.to_string()).unwrap_or_default(), App::csrf_input(ctx), esc(&e.id))
 }
 
@@ -155,16 +182,17 @@ impl App {
         }
     }
 
-    pub(crate) fn ai_page(&self, ctx: &Ctx) -> Resp {
+    pub(crate) fn ai_page(&self, ctx: &Ctx, host: &str) -> Resp {
         // the first visit writes the sellers file, so the endpoint has sellers without a click
         if !self.cfg.ai.sellers.exists() && !self.ai_services().is_empty() {
             let _ = self.ai_write_sellers();
         }
-        let body = self.ai_html(ctx, None);
+        let body = self.ai_html(ctx, None, host);
         self.page("AI", ctx, body)
     }
 
-    fn ai_html(&self, ctx: &Ctx, made: Option<(&str, &str)>) -> String {
+    /// `host`: how the browser reached this page (`Host`), for the address by IP where it was an IP.
+    fn ai_html(&self, ctx: &Ctx, made: Option<(&str, &str)>, host: &str) -> String {
         let mut b = String::from("<p class=\"lead\">Use AI models from the sellers you allowed, in any program on your network that works with \
             OpenAI's API: Open WebUI, coding agents, your own scripts. Each request goes to the cheapest seller that answers, and is paid by the \
             word as it arrives, within your spending rules.</p>");
@@ -176,9 +204,9 @@ impl App {
             Some(ep) => b.push_str(&format!(
                 "<section class=\"card\"><h2>Your AI address</h2>\
                  <label>Address<input id=\"ai-endpoint\" class=\"mono\" readonly value=\"{}\"></label>\
-                 <div class=\"row\"><button type=\"button\" data-copy=\"ai-endpoint\">Copy</button></div>\
+                 <div class=\"row\"><button type=\"button\" data-copy=\"ai-endpoint\">Copy</button></div>{}\
                  <p class=\"hint\">In the program's settings, put this address where it asks for the OpenAI \"base URL\" or \"API base\", and a key \
-                 from below where it asks for an \"API key\". Then pick a model from the list it shows.</p></section>", esc(ep))),
+                 from below where it asks for an \"API key\". Then pick a model from the list it shows.</p></section>", esc(ep), by_ip(ep, host))),
         }
         if let Some((name, key)) = made {
             b.push_str(&format!(
@@ -293,7 +321,7 @@ impl App {
                 match store(&|s| { *made.borrow_mut() = s.make(Kind::AiKey, &name, limit, n("per_day_sats").filter(|d| *d > 0), None).1; Ok(String::new()) }) {
                     Ok(_) => {
                         let key = made.into_inner();
-                        let body = self.ai_html(ctx, Some((&name, &key)));
+                        let body = self.ai_html(ctx, Some((&name, &key)), "");
                         return self.page("AI", ctx, body).header("Cache-Control", "no-store");
                     }
                     Err(e) => Err(e),
@@ -325,6 +353,17 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.2.2 showed only `http://umbrel.local:33540/v1`, which other devices may not resolve.
+    #[test]
+    fn the_ai_address_is_also_given_by_ip() {
+        let ep = "http://umbrel.local:33540/v1";
+        let h = by_ip(ep, "192.168.1.20:2100");
+        assert!(h.contains("value=\"http://192.168.1.20:33540/v1\"") && h.contains("can't find umbrel.local"), "{h}");
+        let h = by_ip(ep, "umbrel.local:2100");
+        assert!(h.contains("use this box's IP address") && h.contains("http://192.168.1.20:33540/v1"), "{h}");
+        assert!(by_ip("http://10.0.0.5:33540/v1", "umbrel.local").is_empty(), "already an IP");
+    }
     use crate::services::Item;
 
     fn ai(name: &str, seller: &str, address: &str) -> Service {

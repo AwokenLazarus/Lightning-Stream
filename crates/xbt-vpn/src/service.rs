@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use crate::content::{ContentFilter, DomainSet, LiveLists};
 use crate::exit::{ExitConfig, ExitKind};
 use crate::filter::Policy;
-use crate::router::{Requirements, Want};
+use crate::region::RegionCheck;
+use crate::router::{ExitInfo, Requirements, Want};
 
 /// A device from `devices.json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,10 +52,29 @@ pub fn requirements_from(p: &Value) -> Requirements {
     }
 }
 
+/// The most exits the owner may add by hand.
+pub const MAX_ADDED_EXITS: usize = 16;
+
+/// The exits the owner added by hand (`exits` in `devices.json`): each one's signed announcement, as
+/// the app found it on Nostr. The service reads them with the ones its own relays give, through the same
+/// checks ([`crate::announce::collect`]): an event that does not hold is not used, and a newer
+/// announcement of the same exit replaces it.
+pub fn added_exits(v: &Value) -> Vec<xbt_nostr::event::Event> {
+    v["exits"].as_array().map(|a| a.iter().take(MAX_ADDED_EXITS).filter_map(xbt_nostr::event::Event::from_value).collect()).unwrap_or_default()
+}
+
+/// The exit keys of the exits the owner added: every device prefers them among the exits that meet its
+/// rules (a preference, never a way around a rule).
+pub fn added_exit_ids(v: &Value) -> Vec<String> {
+    added_exits(v).iter().filter_map(|e| e.tag("exit").map(str::to_string)).collect()
+}
+
 /// The devices of `devices.json`, without the removed ones and any entry that does not hold
-/// together (a bad key or address is skipped, never guessed at).
+/// together (a bad key or address is skipped, never guessed at). Each prefers the exits the owner
+/// added ([`added_exit_ids`]).
 pub fn devices_from(v: &Value) -> Vec<DeviceEntry> {
     let Some(list) = v["devices"].as_array() else { return Vec::new() };
+    let prefer = added_exit_ids(v);
     list.iter()
         .filter(|d| !d["revoked"].as_bool().unwrap_or(false))
         .filter_map(|d| {
@@ -66,10 +86,35 @@ pub fn devices_from(v: &Value) -> Vec<DeviceEntry> {
                 public,
                 tunnel_ip,
                 limit_sats: d["limit_sats"].as_u64(),
-                requirements: requirements_from(&d["policy"]),
+                requirements: Requirements { prefer: prefer.clone(), ..requirements_from(&d["policy"]) },
             })
         })
         .collect()
+}
+
+/// The exits for the page (`exits` of `status.json`): every exit the service found and may use, each
+/// with its country check where one was made. Before 0.2.3 only exits whose country had been checked
+/// were listed, and a priced exit is checked only once a device asks for its country, so a priced exit
+/// in use or at hand never showed (Mike's Umbrel: the Pi Demo exit, SV, 1,000 sat/GB).
+pub fn exits_status(known: &[ExitInfo], checks: &[(String, String, RegionCheck, std::time::SystemTime)], added: &[String]) -> Vec<Value> {
+    let mut rows: Vec<Value> = known.iter().map(|e| {
+        let check = checks.iter().find(|c| c.0 == e.id);
+        let region = &e.region;
+        let words = match check.map(|c| &c.2) {
+            Some(RegionCheck::Verified) => format!("Checked: its traffic comes out in {region}."),
+            Some(RegionCheck::Elsewhere(cc)) => format!("Its traffic comes out in {cc}, not {region}: not used for {region}."),
+            Some(RegionCheck::TooFast) => format!("It answers faster than {region} is from here: not used for {region}."),
+            Some(RegionCheck::Unknown) => "Not checked yet: no country table, or the address checks didn't agree.".to_string(),
+            None if e.price_msat_per_gb > 0 => format!("Not checked: a paid exit's country is checked once a device asks for {region}."),
+            None => "Not checked yet.".to_string(),
+        };
+        let at = check.and_then(|c| c.3.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+        json!({"exit": e.id, "operator": e.operator, "region": region, "verified": check.is_some_and(|c| c.2 == RegionCheck::Verified),
+               "region_check": words, "checked_at": at, "price_msat_gb": e.price_msat_per_gb, "kind": if e.filtered { "filtered" } else { "private" },
+               "added": added.contains(&e.id)})
+    }).collect();
+    rows.sort_by(|a, b| a["exit"].as_str().cmp(&b["exit"].as_str()));
+    rows
 }
 
 /// This box's exit, as `exit.json` sets it.
@@ -208,6 +253,58 @@ impl Mode600 for std::fs::OpenOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Pi Demo exit as the relays carried it on 2026-11-02 (SV, 1,000 sat/GB, paid through its shop).
+    const PI_DEMO: &str = include_str!("../tests/data/pi-demo-exit.json");
+    const PI_DEMO_EXIT: &str = "81b90e5d31777fc0a405dc83d5219e9007ee5b80775ab99850db77247155340d";
+
+    /// Mike's Umbrel: the VPN page listed no exit while the relays carried the Pi Demo exit. Its
+    /// announcement reads (relays, filter and parse were right); the page's list held only exits whose
+    /// country had been checked, which a paid exit no device asks a country of never is.
+    #[test]
+    fn the_pi_demo_exit_reads_and_every_exit_found_is_listed_checked_or_not() {
+        let ev = xbt_nostr::event::Event::from_value(&serde_json::from_str(PI_DEMO).unwrap()).unwrap();
+        let now = 1_793_597_749;
+        let a = crate::announce::read_event(&ev, now).expect("the announcement holds");
+        assert_eq!((a.exit.id.as_str(), a.exit.region.as_str(), a.exit.price_msat_per_gb), (PI_DEMO_EXIT, "SV", 1_000_000));
+        assert!(a.tunnel.as_deref().is_some_and(|t| t.ends_with(".shop.invalid/vpn/tunnel")), "a paid exit, with where to pay it");
+        assert!(crate::announce::filter(500)["#t"][0] == crate::announce::TOPIC && crate::announce::filter(500)["kinds"][0] == 30078);
+
+        let free = ExitInfo { id: "aa".repeat(32), region: "DE".into(), healthy: true, ..ExitInfo::default() };
+        let checked = vec![(free.id.clone(), "DE".to_string(), RegionCheck::Verified, std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000))];
+        let rows = exits_status(&[a.exit.clone(), free.clone()], &checked, &[PI_DEMO_EXIT.to_string()]);
+        assert_eq!(rows.len(), 2, "the paid exit is listed with no check made: {rows:?}");
+        let pi = rows.iter().find(|r| r["exit"] == PI_DEMO_EXIT).unwrap();
+        assert_eq!((pi["region"].as_str(), pi["verified"].as_bool(), pi["price_msat_gb"].as_u64(), pi["added"].as_bool()), (Some("SV"), Some(false), Some(1_000_000), Some(true)));
+        assert!(pi["region_check"].as_str().unwrap().contains("once a device asks for SV"), "{pi}");
+        let de = rows.iter().find(|r| r["exit"] == free.id).unwrap();
+        assert_eq!((de["verified"].as_bool(), de["checked_at"].as_u64(), de["added"].as_bool()), (Some(true), Some(1000), Some(false)));
+        assert_eq!(de["region_check"], "Checked: its traffic comes out in DE.");
+    }
+
+    /// An exit added by hand on the VPN page: its signed announcement in devices.json, read with the ones
+    /// the relays give and preferred by every device; a broken one is left out.
+    #[test]
+    fn exits_added_by_hand_are_read_from_devices_json_and_preferred() {
+        let key = base64::engine::general_purpose::STANDARD.encode([3u8; 32]);
+        let pi: Value = serde_json::from_str(PI_DEMO).unwrap();
+        let v = json!({"devices": [{"id": "a", "name": "tv", "public_key": key, "tunnel_ip": "10.66.0.2", "policy": {"country": "DE"}}],
+                       "exits": [pi, {"not": "an event"}]});
+        let added = added_exits(&v);
+        assert_eq!(added.len(), 1);
+        let (found, refused) = crate::announce::collect(&added, 1_793_597_749);
+        assert_eq!((found.len(), refused), (1, 0), "checked like any announcement");
+        assert_eq!(added_exit_ids(&v), vec![PI_DEMO_EXIT.to_string()]);
+        let d = devices_from(&v);
+        assert_eq!(d[0].requirements.prefer, vec![PI_DEMO_EXIT.to_string()]);
+        assert_eq!(d[0].requirements.region.as_deref(), Some("DE"), "the device's own rules stay");
+        // a tampered copy does not hold
+        let mut bad = pi.clone();
+        bad["tags"][4][1] = json!("DE");
+        let (found, refused) = crate::announce::collect(&added_exits(&json!({"exits": [bad]})), 1_793_597_749);
+        assert_eq!((found.len(), refused), (0, 1));
+        assert!(devices_from(&json!({"devices": []})).is_empty() && added_exits(&json!({})).is_empty());
+    }
 
     #[test]
     fn a_device_policy_reads_as_the_routers_requirements() {

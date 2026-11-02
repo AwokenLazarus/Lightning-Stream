@@ -576,7 +576,9 @@ fn a_visit_to_a_shop_reached_by_key_is_headed_by_the_shops_name() {
         .send_string(&format!("csrf={csrf}&{q}&limit=600")).unwrap().into_string().unwrap();
     assert!(page.contains("data-visit=\""), "the visit opened: {page}");
     assert_eq!(heading(&page), "Home films", "headed by the shop's name");
-    assert!(!shown(&page).contains(".shop.invalid") && shown(&page).contains(&short), "during the visit: {}", shown(&page));
+    // the shop by its name in the visit's words too (0.2.2: "npub1…'s own page")
+    assert!(!shown(&page).contains(".shop.invalid") && !shown(&page).contains(&short) && shown(&page).contains("Home films's own page"),
+            "during the visit: {}", shown(&page));
 }
 
 /// One seller, two apps (a media server and a podcast player), opened by one buyer at once: each is

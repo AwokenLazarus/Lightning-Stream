@@ -6,7 +6,7 @@
 //! rental. Renters pay each piece of work through this box's shop, which sells it under
 //! `/hashrate/` (the route [`App::hash_route`] adds).
 //!
-//! Services → Hashrate (`XBT_UI_HASHRENT`): the owner rents other people's miners into their own
+//! Buy → Hashrate (`XBT_UI_HASHRENT`): the owner rents other people's miners into their own
 //! DATUM Gateway (the pool is chosen there, not here), with a budget, and can cut a rental at any
 //! time. Rentals also show on Live connections.
 //!
@@ -366,6 +366,17 @@ fn blinding_card(b: &Value) -> String {
     format!("<section class=\"card\"><p><span class=\"pill {class}\">{head}</span></p><p>{}</p></section>", esc(words))
 }
 
+/// What a rental says when the hashmaker's pay address doesn't answer.
+const PAY_ADDRESS_GONE: &str = "This hashmaker's offer points at an address that doesn't answer (it may have moved). Ask the seller to update, or try again later.";
+
+/// Whether the wallet's reason for not paying a piece of work is that the hashmaker's pay address
+/// doesn't answer: no resume answer from it, not found, refused or not reached.
+fn pay_address_gone(why: &str) -> bool {
+    let w = why.to_ascii_lowercase();
+    ["the seller has not said what an earlier session left", "404", "not found", "connection refused", "could not reach", "can't reach",
+     "cannot reach", "no such host", "failed to lookup", "dns"].iter().any(|m| w.contains(m))
+}
+
 /// A closed rental's reason, in words.
 fn ended_words(why: &str) -> String {
     // the earlier role names too: a hashlink from before the rename words its reasons with them
@@ -543,6 +554,11 @@ impl App {
             return self.html_page("Sell hashrate", "Sell hashrate", ctx,
                 "<p class=\"empty\">Renting out miners is off in this install. On Umbrel it is part of the app; on Linux, run install.sh again and turn the hashmaker on.</p>", "");
         };
+        // a pay address left behind by a change of reach (a shop gone Private under 0.2.2) is put right here,
+        // and the hashmaker republishes its offer
+        if self.hash_settings()["enabled"] == true {
+            let _ = self.follow_reach(&self.shop(), self.own_shop_key_origin().as_deref());
+        }
         let st = call(&base, &self.cfg.hash.hasher_token, "GET", "/status", None);
         let saved = self.hash_settings();
         let csrf = App::csrf_input(ctx);
@@ -760,8 +776,9 @@ impl App {
                 }
                 // empty clears it: no listing on public relays until it is set
                 v["linkPublic"] = json!(link);
-                if !shop.public_url.is_empty() {
-                    v["payUrl"] = json!(format!("{}/hashrate", shop.public_url.trim_end_matches('/')));
+                // paid at the shop's web address, or at its key address when it is reached by its key (Private)
+                if let Some(pay) = crate::app::sell::pay_url_for(&shop, self.own_shop_key_origin().as_deref()) {
+                    v["payUrl"] = json!(pay);
                 }
                 write_settings(&self.cfg.hash.settings, &v)?;
                 // priced now, unless rentals are going on: the price they pay stays till they end
@@ -789,7 +806,7 @@ impl App {
         Resp::redirect("./sell-hashrate")
     }
 
-    // --- Services → Hashrate ---------------------------------------------------------------------
+    // --- Buy → Hashrate ------------------------------------------------------------------------
 
     /// Rentals going on (for Live connections): cards with a Cut button, and what they spent.
     pub(crate) fn hash_live_cards(&self, ctx: &Ctx) -> (String, i64) {
@@ -802,6 +819,13 @@ impl App {
             cards.push_str(&rental_card(ctx, r, "./connections-hashrate"));
         }
         (cards, spent)
+    }
+
+    /// The renter's offers asked once, kept for the first Hashrate page ([`App::prefetch`]).
+    pub(crate) fn hashrate_prefetch(&self) {
+        if let (Some(base), false) = (self.cfg.hash.renter.clone(), self.cfg.read_cache.is_zero()) {
+            let _ = rent_offers(&base, &self.cfg.hash.renter_token, true);
+        }
     }
 
     pub(crate) fn hashrate_page(&self, ctx: &Ctx) -> Resp {
@@ -899,7 +923,17 @@ impl App {
                             crate::services::urlenc(&o), esc(n)),
                         _ => String::new(),
                     };
-                    let can = ready && allowed && !old && (free > 0 || total == 0);
+                    // this box's own offer: marked, and not rented (a box can't pay itself)
+                    let mine = self.is_own_shop(pay_url);
+                    let can = ready && allowed && !old && !mine && (free > 0 || total == 0);
+                    // the seller by name: an offer called just "Hashrate" says whose it is
+                    let seller = crate::services::http_origin(pay_url).map(|o| self.seller_name(&o)).unwrap_or_default();
+                    let title = match (x["name"].as_str().unwrap_or("Miners"), seller.is_empty()) {
+                        (n, false) if n.eq_ignore_ascii_case("hashrate") || n.eq_ignore_ascii_case("miners") => format!("Miners from {seller}"),
+                        (n, _) => n.to_string(),
+                    };
+                    let whose = if mine { "<span class=\"pill good\">Your offer</span><p class=\"hint\">This is your own box's offer: buyers rent it. You can't rent it from here.</p>".to_string() }
+                                else if seller.is_empty() { String::new() } else { format!("<p class=\"small\">Sold by {}</p>", esc(&seller)) };
                     let old = if old {
                         "<p class=\"hint\"><span class=\"pill warn\">Needs updating</span> This hashmaker's app doesn't prove the work it sells, so it can't be rented.</p>"
                     } else {
@@ -920,7 +954,7 @@ impl App {
                         <button class=\"secondary\"{}>Try one slice first</button></form>",
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
-                    b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
+                    b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
                         <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
@@ -929,7 +963,7 @@ impl App {
                         <p class=\"hint\">About an hour of one machine{}. The rental ends when this much is spent, but however small it is, your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <button{}>Rent</button></form></section>",
-                        esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
+                        esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
                         if can { "" } else { " disabled" }));
@@ -1227,7 +1261,11 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     } else {
         "<span class=\"pill good\">Hashing</span>".to_string()
     };
-    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}{}</p>", esc(&ended_words(w)),
+    // the hashmaker's pay address that doesn't answer (a shop that moved or turned Private): said as that, not as a
+    // wallet that "could not pay" (0.2.2, Mike's Umbrel: the reason was only in the API)
+    let unreachable = live["pays"].as_array().into_iter().flatten().filter_map(|p| p["why"].as_str()).any(pay_address_gone);
+    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}{}</p>",
+                                                     esc(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { ended_words(w) }),
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
     // a payment the wallet refused: the hashmaker will only say a piece went unpaid, and the reason is this wallet's,
     // in words where it has them (xbt_hashlink::rail::BIG_TICKETS_ONLY and those beside it)
@@ -1329,8 +1367,9 @@ fn price_words(w: &Result<Want, String>, tip: Option<&Tip>, hs: Option<f64>, mar
         Ok(w) => w,
         Err(why) => {
             let fixed = if market { " A fixed price works without it." } else { "" };
-            return format!("<p class=\"hint\"><span class=\"pill warn\">No live price</span> This app can't read today's difficulty: {}. \
-                            Following the market needs it, so no new rental starts until it can. Rentals going on keep their price.{fixed}</p>", esc(why));
+            return format!("<p class=\"hint\"><span class=\"pill warn\">No live price</span> A live price follows what a piece of work earns today, \
+                            which comes from the XBT chain's difficulty, read from your XBT node. This app can't read it now ({}): \
+                            check that your XBT node is running and synced. Until then no new rental starts; rentals going on keep their price.{fixed}</p>", esc(why));
         }
     };
     let (miner, at) = match hs {
@@ -1758,6 +1797,10 @@ mod tests {
         assert_eq!(sats_n(4093.4), "4,093 sats");
         assert_eq!(sats_n(1.0), "1 sat");
         assert_eq!(ended_words("hasher closed: unpaid"), "A piece of work was not paid in time.");
+        // the hashmaker's pay address gone (a shop that turned Private under 0.2.2): told as that
+        assert!(pay_address_gone("the seller has not said what an earlier session left with it (origin https://stream.lazarus-xbt.xyz)"));
+        assert!(pay_address_gone("the seller answered 404 Not Found"));
+        assert!(!pay_address_gone("Your wallet's rules stopped this payment: over the daily budget"));
         assert_eq!(ended_words("cut by the buyer"), "You cut it.");
         assert_eq!(ended_words("hashtaker closed: cut by the hashtaker"), "You cut it.");
         assert_eq!(ended_words("hashmaker closed: stopped by the hashmaker"), "The hashmaker stopped it.");

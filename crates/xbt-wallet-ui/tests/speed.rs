@@ -116,7 +116,8 @@ fn a_page_asks_the_signer_each_read_once_and_says_what_it_waited_for() {
     let bx = start(Duration::ZERO);
     let mut br = B::login(&bx);
     let mut over = vec![];
-    for (path, most) in [("/", 3), ("/wallet", 5), ("/policy", 5), ("/lightning", 3), ("/setup", 5), ("/connections", 2), ("/browse", 1)] {
+    // Home reads the rules for its Get started list, and Wallet the node for its Lightning card (0.2.3): one read each
+    for (path, most) in [("/", 4), ("/wallet", 6), ("/policy", 5), ("/lightning", 3), ("/setup", 5), ("/connections", 2), ("/browse", 1)] {
         let p = br.get(path);
         assert_eq!(p.status, 200, "{path}");
         eprintln!("{path}: {}", p.timing);
@@ -249,4 +250,44 @@ fn the_hashrate_page_asks_status_and_offers_at_once_and_keeps_the_offers() {
     let (third, _) = timed(&mut br);
     assert!(third >= Duration::from_millis(600), "{third:?}");
     assert_eq!(offers(), 2);
+}
+
+/// The signer's slow-changing reads serve pages opened seconds apart (0.2.2 kept them 3 s: "2 calls, 0
+/// cached" on every page of Mike's Umbrel), and a read-only call a page makes keeps them.
+#[test]
+fn kept_reads_serve_a_page_opened_seconds_later() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    const { assert!(xbt_wallet_ui::config::DEFAULT_CACHE_S >= 15) };
+    assert!(xbt_wallet_ui::link::READS.contains(&"settled_amounts"), "the Wallet page's read of what each payment cost forgets nothing");
+    let bx = start(Duration::from_secs(xbt_wallet_ui::config::DEFAULT_CACHE_S));
+    let mut br = B::login(&bx);
+    let first = br.get("/policy");
+    std::thread::sleep(Duration::from_secs(4));
+    let later = br.get("/policy");
+    assert!(later.signer.1 > 0 && later.signer.0 < first.signer.0, "kept across pages: {:?} then {:?}", first.signer, later.signer);
+}
+
+/// The renter's offers are asked once at start, in the background (0.2.2: the first Hashrate page after a
+/// start waited 3.7 s for them on Mike's Umbrel): the first visit shows them without that wait.
+#[test]
+fn the_first_hashrate_page_after_a_start_does_not_wait_for_the_offers() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, seen) = slow_renter(|p| match p { "/status" => 100, "/offers" => 1500, _ => 0 });
+    let bx = start_with(Duration::from_secs(20), |c| {
+        c.hash.renter = Some(renter.clone());
+        c.prefetch = true;
+    });
+    let mut br = B::login(&bx);
+    let offers = || seen.lock().unwrap().iter().filter(|r| *r == "GET /offers").count();
+    let t0 = std::time::Instant::now();
+    while offers() == 0 && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(offers(), 1, "asked at start");
+    std::thread::sleep(Duration::from_millis(1700));
+    let t = std::time::Instant::now();
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Garage miners"), "the offers are shown");
+    assert!(t.elapsed() < Duration::from_millis(900), "the first visit after a start: {:?}", t.elapsed());
+    assert_eq!(offers(), 1, "not asked again");
 }

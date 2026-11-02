@@ -479,7 +479,8 @@
       fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
         if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
         if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
-          ? " · " + v.prepaid_sats.toLocaleString() + " sat prepaid, " + (v.credit_sats || 0).toLocaleString() + " sat of it left as credit with the shop" : "";
+          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat · credit left " + (v.credit_sats || 0).toLocaleString() + " sat"
+          : typeof v.credit_left_sats === "number" ? " · from your credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat left" : "";
         if (refusal) showRefusal(v.refusal);
         if (v.ended) ended(String(v.ended));
       }).catch(function () {});
@@ -523,6 +524,22 @@
       toggle.addEventListener("click", function () {
         var open = header.classList.toggle("open");
         toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+    }
+    // The theme: dark by default, light when the owner picks it here; kept in this browser
+    // (vt.js applies it before the next page's first paint).
+    var theme = $(".theme-toggle"), html = doc.documentElement;
+    if (theme) {
+      var show = function () {
+        var light = html.getAttribute("data-theme") === "light";
+        theme.setAttribute("aria-pressed", light ? "true" : "false");
+      };
+      show();
+      theme.addEventListener("click", function () {
+        var light = html.getAttribute("data-theme") !== "light";
+        if (light) html.setAttribute("data-theme", "light"); else html.removeAttribute("data-theme");
+        try { root.localStorage.setItem("ls-theme", light ? "light" : "dark"); } catch (e) { /* no storage: this page only */ }
+        show();
       });
     }
   }

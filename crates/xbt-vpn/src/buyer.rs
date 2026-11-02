@@ -525,6 +525,11 @@ impl Buyer {
     }
 
     /// What is known about an exit (a listing, a measurement, a health change), for every policy.
+    /// Every exit the buyer knows, as its router holds it.
+    pub async fn exits(&self) -> Vec<ExitInfo> {
+        self.router.lock().await.exits().to_vec()
+    }
+
     pub async fn upsert_exit(&self, e: ExitInfo) {
         self.router.lock().await.upsert(e.clone());
         for r in self.device_routers.values() {

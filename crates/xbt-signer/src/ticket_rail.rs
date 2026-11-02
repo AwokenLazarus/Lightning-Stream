@@ -53,6 +53,9 @@ use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invo
                     TAG_RECORD};
 use crate::{err, Result};
 
+/// The most payment hashes one `settled_amounts` read answers for.
+pub const SETTLED_AMOUNTS_MAX: usize = 100;
+
 /// The longest the wallet waits for the seller's invoice for its offer, in seconds, before it
 /// pays the ticket or win by the seller's BOLT 11 invoice instead: a win's invoice lives 60 s by
 /// default (the gateway's `lottery.invoice_secs`, its grace), and a busy issuer can leave a request
@@ -592,6 +595,41 @@ impl Signer {
             Ok(g) => g.as_ref().map(|s| s.book.tickets.keys().cloned().collect()).unwrap_or_default(),
             Err(_) => HashSet::new(),
         }
+    }
+
+    /// `settled_amounts`: read-only, for the app's pages. For each payment hash asked (at most
+    /// [`SETTLED_AMOUNTS_MAX`]), what its settled record says left the node: the amount the payee
+    /// got (`value_msat`), the routing fee (`fee_msat`) and the whole sats it is booked at
+    /// (`paid_sats`: their sum rounded up, as the budgets count it). A ticket from the ticket book, a
+    /// Lightning payment from the payments book; a hash not settled (or not proven) is left out.
+    pub(crate) fn settled_amounts(&self, p: &Value) -> Value {
+        let hashes: Vec<String> = p.get("hashes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str)
+            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).take(SETTLED_AMOUNTS_MAX).map(str::to_string).collect()).unwrap_or_default();
+        let mut out = serde_json::Map::new();
+        if hashes.is_empty() {
+            return json!({"ok": true, "settled": out});
+        }
+        if self.ticket_path().exists() {
+            if let Ok(g) = self.ticket_store() {
+                if let Some(st) = g.as_ref() {
+                    for h in &hashes {
+                        if let Some(t) = st.book.tickets.get(h).filter(|t| t.state == TState::Settled && t.note != SETTLED_UNPROVEN) {
+                            out.insert(h.clone(), json!({"rail": "ticket", "value_msat": t.msat.to_string(), "fee_msat": t.fee_msat.to_string(), "paid_sats": t.booked_sats}));
+                        }
+                    }
+                }
+            }
+        }
+        let ln = self.ln_book.all();
+        for h in &hashes {
+            let Some(r) = ln.get(h).filter(|_| !out.contains_key(h)) else { continue };
+            if r.get("state").and_then(Value::as_str) != Some("settled") || r.get("preimage_ok") == Some(&Value::Bool(false)) {
+                continue;
+            }
+            out.insert(h.clone(), json!({"rail": "ln", "value_msat": u64_of(r.get("value_msat")).to_string(), "fee_msat": u64_of(r.get("fee_msat")).to_string(),
+                                         "paid_sats": py_int(r.get("spent_sats")).unwrap_or(0)}));
+        }
+        json!({"ok": true, "settled": out})
     }
 
     /// This wallet's key for the seller whose receipt key is `receipt_key` ([`Seed::buyer_key`]).

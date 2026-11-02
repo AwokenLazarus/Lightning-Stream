@@ -101,6 +101,78 @@ impl NostrCache {
     }
 }
 
+/// VPN exits found on Nostr: each a checked announcement ([`xbt_vpn::announce::read_event`]) and the
+/// signed event itself, which the VPN page's *Add this exit* writes for the VPN service to read again.
+#[derive(Debug, Clone)]
+pub struct FoundExit {
+    pub exit: xbt_vpn::announce::Announced,
+    pub event: xbt_nostr::event::Event,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExitSnapshot {
+    pub at: Instant,
+    pub exits: Vec<FoundExit>,
+    pub refused: usize,
+    pub relays: Vec<Outcome>,
+}
+
+/// The newest good announcement of each exit among `events`, and how many were refused.
+pub fn found_exits(events: &[xbt_nostr::event::Event], now: u64) -> (Vec<FoundExit>, usize) {
+    let mut best: std::collections::HashMap<String, FoundExit> = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut refused = 0;
+    for ev in events.iter().filter(|e| seen.insert(e.id.clone())) {
+        match xbt_vpn::announce::read_event(ev, now) {
+            Ok(a) if best.get(&a.exit.id).is_none_or(|o| a.created_at > o.exit.created_at) => {
+                best.insert(a.exit.id.clone(), FoundExit { exit: a, event: ev.clone() });
+            }
+            Ok(_) => {}
+            Err(_) => refused += 1,
+        }
+    }
+    let mut out: Vec<FoundExit> = best.into_values().collect();
+    out.sort_by(|a, b| (a.exit.exit.region.as_str(), a.exit.exit.price_msat_per_gb, a.exit.exit.id.as_str())
+        .cmp(&(b.exit.exit.region.as_str(), b.exit.exit.price_msat_per_gb, b.exit.exit.id.as_str())));
+    (out, refused)
+}
+
+/// The VPN exits on the owner's relays, asked as Found on Nostr asks for listings: the last answer at
+/// once, asked again behind it when older than [`FRESH`].
+pub struct ExitCache {
+    relays: Vec<String>,
+    snap: crate::perf::Swr<ExitSnapshot>,
+}
+
+impl ExitCache {
+    pub fn new(relays: Vec<String>) -> Self {
+        Self { relays, snap: crate::perf::Swr::new() }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.relays.is_empty()
+    }
+
+    /// `None`: the relays are still being asked (the first visit waits [`FIRST_WAIT`] at most).
+    pub fn get(&self, refresh: bool) -> Option<ExitSnapshot> {
+        let relays = self.relays.clone();
+        let make = move || {
+            let (events, outcomes) = crate::perf::timed(|| oneshot::query(&relays, &xbt_vpn::announce::filter(QUERY_LIMIT), QUERY_WAIT));
+            let (exits, refused) = found_exits(&events, xbt_nostr::now());
+            ExitSnapshot { at: Instant::now(), exits, refused, relays: outcomes }
+        };
+        if refresh {
+            return Some(self.snap.refresh(make));
+        }
+        self.snap.get(FRESH, FIRST_WAIT, make)
+    }
+
+    /// The exit `id` as last found, without asking again.
+    pub fn find(&self, id: &str) -> Option<FoundExit> {
+        self.snap.peek().and_then(|(_, s)| s.exits.into_iter().find(|e| e.exit.exit.id == id))
+    }
+}
+
 /// The newest good listing among `events` that the shop with Nostr key `pk` published for itself.
 pub fn shop_listing(events: &[xbt_nostr::event::Event], pk: &[u8; 32], now: u64) -> Option<NostrListing> {
     let origin = xbt402::shop::origin_for(pk);

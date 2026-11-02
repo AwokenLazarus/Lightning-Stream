@@ -57,6 +57,23 @@ pub fn sats(n: i64) -> String {
     format!("{sign}{} sats <span class=\"xbt\">({sign}{}.{:08} XBT)</span>", group3(a), a / 100_000_000, a % 100_000_000)
 }
 
+/// Millisats as sats, without a unit, with the fraction where there is one: `900`, `2.009`, `1,250.5`.
+pub fn msat_num(m: u64) -> String {
+    let whole = group3(m / 1000);
+    if m.is_multiple_of(1000) { whole } else { format!("{whole}.{}", format!("{:03}", m % 1000).trim_end_matches('0')) }
+}
+
+/// What a payment cost, said one way on every page (0.2.3: Wallet, Live connections and the visit
+/// showed three figures for one payment). **Paid** is what left the node: the amount the payee got
+/// plus the routing fee, from the signer's settled record, in the whole sats the signer books (that
+/// sum rounded up); its two parts follow where the record has them. The other two figures a page
+/// names are **used** (what the seller drew) and **credit left** (paid and not used yet); a
+/// reservation before a payment settles is **reserved**, never paid.
+pub fn paid_html(paid_sats: i64, parts_msat: Option<(u64, u64)>) -> String {
+    let parts = parts_msat.map(|(v, f)| format!(" <span class=\"small\">({} + {} fee)</span>", msat_num(v), msat_num(f))).unwrap_or_default();
+    format!("<span class=\"money\">{} sats</span>{parts}", group3(paid_sats.max(0).unsigned_abs()))
+}
+
 /// UTC `YYYY-MM-DD HH:MM:SS` from Unix seconds.
 pub fn utc(t: i64) -> String {
     if t <= 0 {
@@ -101,61 +118,77 @@ pub struct Tab {
 }
 
 /// A top-level entry of the menu, with its pages as tabs. A page whose title no tab names (a
-/// service's own page) still marks its section through `also`.
+/// service's own page) still marks its section through `also`. `advanced`: pages most owners never
+/// need, behind one Advanced tab, with their own row of tabs once there.
 pub struct Section {
     pub label: &'static str,
     pub tabs: &'static [Tab],
     pub also: &'static [&'static str],
+    pub advanced: &'static [Tab],
 }
 
 impl Section {
     fn has(&self, title: &str) -> bool {
-        self.tabs.iter().any(|t| t.title == title) || self.also.contains(&title)
+        self.tabs.iter().any(|t| t.title == title) || self.also.contains(&title) || self.in_advanced(title)
+    }
+
+    fn in_advanced(&self, title: &str) -> bool {
+        self.advanced.iter().any(|t| t.title == title)
     }
 }
 
+/// The tab that leads to a section's advanced pages.
+pub const ADVANCED: &str = "Advanced";
+
+/// Buying: paired with Sell.
 pub const SERVICES: Section = Section {
-    label: "Services",
+    label: "Buy",
     tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
             Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
     also: &["Service"],
+    advanced: &[],
 };
 pub const SELL: Section = Section {
     label: "Sell",
     tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-vpn", title: "VPN exit", label: "VPN exit" }],
     also: &[],
+    advanced: &[],
 };
 pub const WALLET: Section = Section {
     label: "Wallet",
     tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Balance and activity" }, Tab { href: "./approvals", title: "Approvals", label: "Approvals" }],
     also: &[],
+    advanced: &[],
 };
 pub const APPS: Section = Section {
     label: "Apps & agents",
     tabs: &[Tab { href: "./apps", title: "Apps", label: "Apps" }, Tab { href: "./agents", title: "AI agents", label: "AI agents" }],
     also: &[],
+    advanced: &[],
 };
 pub const SETTINGS: Section = Section {
     label: "Settings",
     tabs: &[Tab { href: "./setup", title: "Setup", label: "Setup" }, Tab { href: "./lightning", title: "Your node", label: "Your node" },
-            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" },
-            Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./relays", title: "Stream relays", label: "Stream relays" },
-            Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
+            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" }],
     also: &[],
+    advanced: &[Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./relays", title: "Stream relays", label: "Stream relays" },
+                Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
 };
 /// With hashrate (the box runs the hasher's or the renter's service): renting miners is one
 /// more kind of service, beside the others.
 pub const SERVICES_HASH: Section = Section {
-    label: "Services",
+    label: "Buy",
     tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
             Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" }, Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
     also: &["Service"],
+    advanced: &[],
 };
 pub const SELL_HASH: Section = Section {
     label: "Sell",
     tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-hashrate", title: "Sell hashrate", label: "Hashrate" },
             Tab { href: "./sell-vpn", title: "VPN exit", label: "VPN exit" }],
     also: &[],
+    advanced: &[],
 };
 /// The app with Sell (`XBT_UI_SELL=1`): buying and selling.
 pub const STREAM_SECTIONS: [&Section; 5] = [&SERVICES, &SELL, &WALLET, &APPS, &SETTINGS];
@@ -189,13 +222,26 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
                 String::new()
             };
             links.push_str(&format!("<a href=\"{}\"{cur}>{}{badge}</a>", sec.tabs[0].href, esc(sec.label)));
-            if here && sec.tabs.len() > 1 {
+            if here && sec.tabs.len() + sec.advanced.len() > 1 {
                 tabs.push_str(&format!("<nav class=\"tabs\" aria-label=\"{}\">", esc(sec.label)));
                 for t in sec.tabs {
                     let cur = if t.title == nav.active { " aria-current=\"page\"" } else { "" };
                     tabs.push_str(&format!("<a href=\"{}\"{cur}>{}</a>", t.href, esc(t.label)));
                 }
+                let in_adv = sec.in_advanced(nav.active);
+                if let Some(first) = sec.advanced.first() {
+                    let cur = if in_adv { " aria-current=\"page\"" } else { "" };
+                    tabs.push_str(&format!("<a href=\"{}\"{cur}>{ADVANCED}</a>", first.href));
+                }
                 tabs.push_str("</nav>");
+                if in_adv {
+                    tabs.push_str(&format!("<nav class=\"tabs sub\" aria-label=\"{ADVANCED}\">"));
+                    for t in sec.advanced {
+                        let cur = if t.title == nav.active { " aria-current=\"page\"" } else { "" };
+                        tabs.push_str(&format!("<a href=\"{}\"{cur}>{}</a>", t.href, esc(t.label)));
+                    }
+                    tabs.push_str("</nav>");
+                }
             }
         }
         links.push_str(&format!("<form method=\"post\" action=\"./logout\" class=\"inline\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
@@ -221,7 +267,7 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
              <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" type=\"image/svg+xml\" href=\"./mark.svg?v={}\"><title>{} · {}</title>\
              <link rel=\"stylesheet\" href=\"./ui.css?v={}\"><script src=\"./vt.js?v={}\"></script></head><body>\
              <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
-             <header>{brand}{menu}</header>\
+             <header>{brand}{menu}{THEME_TOGGLE}</header>\
              <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>\
              <footer>Your money stays on your own Lightning node. Nobody else holds it. <span class=\"version\">Lightning Stream {}</span></footer>\
              <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
@@ -229,8 +275,15 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
             esc(crate::release_version()), asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
 
-/// The app's mark in the header and as the page icon: assets/mark.svg, one theme's logo.
+/// The app's mark in the header and as the page icon: assets/mark.svg, the website's mark.
 const MARK: &str = crate::MARK_SVG;
+
+/// The bar's theme button: dark is the default, light is the owner's choice, kept in this browser
+/// (ui.js switches it, vt.js applies it before the first paint). Shown only with scripts on.
+const THEME_TOGGLE: &str = "<button type=\"button\" class=\"theme-toggle\" aria-label=\"Light theme\" aria-pressed=\"false\" title=\"Light or dark\">\
+    <svg class=\"sun\" viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><circle cx=\"12\" cy=\"12\" r=\"4\"/>\
+    <path d=\"M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6\"/></svg>\
+    <svg class=\"moon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z\"/></svg></button>";
 
 /// A short content hash for cache busting.
 pub fn asset_version(s: &str) -> String {

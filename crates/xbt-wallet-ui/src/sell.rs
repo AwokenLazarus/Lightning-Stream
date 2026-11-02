@@ -276,6 +276,12 @@ const APP_HEADERS: [&str; 7] = ["cookie", "authorization", "x-emby-authorization
 
 /// The gateway's settings as the Sell page shows them: every `upstream_headers` value (an app's
 /// login, the files key) is replaced, so a screenshot of the page gives none of them away.
+/// Whether a setting named `k` holds a secret: a token, a password, a key's secret part.
+fn secret_key(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    ["token", "secret", "password", "passwd", "macaroon", "private", "nsec"].iter().any(|w| k.contains(w))
+}
+
 fn hide_header_values(mut c: Value) -> Value {
     fn walk(v: &mut Value) {
         match v {
@@ -287,6 +293,9 @@ fn hide_header_values(mut c: Value) -> Value {
                                 *val = Value::String("(hidden)".into());
                             }
                         }
+                    } else if secret_key(k) && !x.is_null() && !x.is_object() && !x.is_array() {
+                        // the gateway's health token and any other secret: never in the page (0.2.1 showed health_token whole)
+                        *x = Value::String("(hidden)".into());
                     } else {
                         walk(x);
                     }
@@ -392,6 +401,15 @@ impl Offer {
 pub const DEFAULT_LINK_RELAYS: [&str; 1] = ["https://iroh.lazarus-xbt.xyz"];
 /// Where the gateway says how its direct link is doing.
 pub const LINK_STATUS_PATH: &str = "/.well-known/lightning-stream-link.json";
+
+/// Where renters pay for this box's hashrate: under the shop's web address while buyers reach it
+/// there, under its key address (`<key>.shop.invalid/hashrate`) when it is reached by its key (direct,
+/// Private). `None` where neither is known.
+pub(crate) fn pay_url_for(shop: &Shop, key: Option<&str>) -> Option<String> {
+    let web = shop.public_url.trim_end_matches('/');
+    let base = if !shop.direct && !web.is_empty() { web.to_string() } else { key?.trim_end_matches('/').to_string() };
+    Some(format!("{base}/hashrate"))
+}
 
 /// The shop and its offers: `sell.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1009,19 +1027,35 @@ impl App {
         Ok(v)
     }
 
-    /// Hashrate is paid at the shop's address: a shop that moves takes its hashrate payments along.
-    fn follow_public_url(&self, shop: &Shop) -> Result<(), String> {
+    /// This box's shop key as an address (`<key>.shop.invalid`), from the gateway's link status: how
+    /// buyers reach a shop that has no web address (direct or Private). `None` while the gateway does not
+    /// answer, or sells over its web address only.
+    pub(crate) fn own_shop_key_origin(&self) -> Option<String> {
+        if !self.cfg.sell {
+            return None;
+        }
+        self.link_status().and_then(|v| v.get("npub").and_then(Value::as_str).and_then(xbt402::shop::parse))
+    }
+
+    /// Hashrate is paid at the shop's address: a shop that moves, or turns Private, takes its hashrate
+    /// payments along. The hashmaker reads its settings again by itself and republishes its offer with
+    /// the new address. `key`: the shop's key address ([`App::own_shop_key_origin`]), for a shop reached
+    /// by its key. Settings with no `payUrl` yet (renting never set up) are left as they are.
+    ///
+    /// 0.2.2 left a shop gone Private paid at its old web address, which no longer answered: every
+    /// rental of its miners failed at the first piece of work.
+    pub(crate) fn follow_reach(&self, shop: &Shop, key: Option<&str>) -> Result<bool, String> {
         let mut v = self.hash_settings();
-        let base = shop.public_url.trim_end_matches('/');
-        if v.get("payUrl").and_then(Value::as_str).is_none() || base.is_empty() {
-            return Ok(());
+        if v.get("payUrl").and_then(Value::as_str).is_none() {
+            return Ok(false);
         }
-        let pay = format!("{base}/hashrate");
-        if v["payUrl"] != pay {
-            v["payUrl"] = json!(pay);
-            crate::app::hashrate::write_settings(&self.cfg.hash.settings, &v)?;
+        let Some(pay) = pay_url_for(shop, key) else { return Ok(false) };
+        if v["payUrl"] == pay {
+            return Ok(false);
         }
-        Ok(())
+        v["payUrl"] = json!(pay);
+        crate::app::hashrate::write_settings(&self.cfg.hash.settings, &v)?;
+        Ok(true)
     }
 
     /// Save the shop, and the gateway's config when the shop is complete and the config changes.
@@ -1485,7 +1519,7 @@ impl App {
             <form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"advanced\">\
             <label>Buyers at once<input name=\"max_sessions\" value=\"{ms}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             <label>Buyers at once from one address<input name=\"sessions_per_address\" value=\"{spa}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
-            <label>Payments held open at once (1,000 sat each, on your inbound channels)<input name=\"max_held_tickets\" value=\"{mh}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
+            <label>Payments held open at once (each up to 900 sat, on your inbound channels)<input name=\"max_held_tickets\" value=\"{mh}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             <label>Your proxy's addresses, whose word on the buyer's address the shop believes (comma-separated)<input name=\"proxies\" value=\"{}\" class=\"mono\"></label>\
             <label>Test chain only: its network id<input name=\"network\" value=\"{}\" class=\"mono\" placeholder=\"bip122:…\"></label>\
             <button>Save advanced settings</button></form>\
@@ -1574,7 +1608,13 @@ impl App {
                     && !shop.public_url.starts_with("http://localhost") && !shop.public_url.starts_with("http://[::1]") {
                     Err("Buyers reach you at an https:// address, like https://films.example.com.".into())
                 } else {
-                    self.commit(&shop, "Saved.").and_then(|words| self.follow_public_url(&shop).map(|()| words))
+                    // the shop's key is read before the commit: the gateway restarts on a new config, and its
+                    // key (the same in every reach) may not answer for a few seconds after
+                    let key = self.own_shop_key_origin();
+                    self.commit(&shop, "Saved.").and_then(|words| {
+                        let key = key.or_else(|| self.own_shop_key_origin());
+                        self.follow_reach(&shop, key.as_deref()).map(|_| words)
+                    })
                 }
             }
             "check_public" => self.check_public(&shop),
@@ -1857,10 +1897,29 @@ mod tests {
     fn the_settings_shown_hide_every_header_value() {
         let c = json!({"routes": [{"path": "/files/", "upstream_headers": {"x-stream-files-key": "secret1"}},
                                   {"path": "/app/", "upstream_headers": {"x-emby-authorization": "secret2"}, "free": false}],
-                       "nostr": {"publish": true}});
+                       "nostr": {"publish": true}, "health_token": "secret3", "gw": {"api_token_file": "/data/t", "admin_password": "secret4"}});
         let shown = hide_header_values(c).to_string();
-        assert!(!shown.contains("secret1") && !shown.contains("secret2"), "{shown}");
+        assert!(!shown.contains("secret1") && !shown.contains("secret2") && !shown.contains("secret3") && !shown.contains("secret4"), "{shown}");
+        assert!(shown.contains("\"health_token\":\"(hidden)\""), "{shown}");
         assert!(shown.contains("x-stream-files-key") && shown.contains("(hidden)") && shown.contains("\"publish\":true"), "{shown}");
+    }
+
+    /// Hashrate is paid at the web address while buyers reach the shop there, at its key address when
+    /// they reach it by its key (direct or Private), and nowhere new while the key is not known.
+    ///
+    /// FAILS before: a Private shop kept its old web address (pay_url_for did not exist; payUrl was set
+    /// only from a non-empty public_url).
+    #[test]
+    fn hashrate_is_paid_where_buyers_reach_the_shop() {
+        let key = "1234.shop.invalid";
+        let web = Shop { public_url: "https://stream.example/".into(), ..Default::default() };
+        assert_eq!(pay_url_for(&web, Some(key)).as_deref(), Some("https://stream.example/hashrate"));
+        let private = Shop { direct: true, private: true, ..Default::default() };
+        assert_eq!(pay_url_for(&private, Some(key)).as_deref(), Some("1234.shop.invalid/hashrate"));
+        // direct, with a web address still in the file from before: the key, not the old address
+        let direct = Shop { direct: true, public_url: "https://stream.example".into(), ..Default::default() };
+        assert_eq!(pay_url_for(&direct, Some(key)).as_deref(), Some("1234.shop.invalid/hashrate"));
+        assert_eq!(pay_url_for(&private, None), None);
     }
 
     #[test]

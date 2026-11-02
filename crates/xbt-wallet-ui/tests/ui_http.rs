@@ -497,7 +497,7 @@ fn with_paying_off_the_rules_page_opens_on_the_starter_rules_and_signing_them_tu
     assert!(page.contains("Paying is not turned on yet, so the safe starter rules are filled in below"), "{page}");
     assert!(page.contains("name=\"f_max_per_tx_sats\" value=\"100000\""), "the starter value, not the rule in force");
     // the node's limit: shown in words, empty off mainnet (not required there)
-    assert!(page.contains("The most your Lightning node may hold that this app trusts it with (sats)"), "{page}");
+    assert!(page.contains("Most your Lightning node may hold (sats)"), "{page}");
     assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"\""), "{page}");
     // what is posted: the starter's Lightning and ticket sections come along, and a cap typed in lands in ln
     let mut f = policy_form_fields(&page);
@@ -516,23 +516,25 @@ fn with_paying_off_the_rules_page_opens_on_the_starter_rules_and_signing_them_tu
 #[test]
 fn the_mainnet_starter_rules_set_the_node_s_exposure_cap_from_what_it_holds() {
     use xbt_wallet_ui::app::{starter_exposure_cap, starter_policy, starter_policy_for, STARTER_EXPOSURE_CAP_SATS};
-    assert_eq!(STARTER_EXPOSURE_CAP_SATS, 100_000);
+    // 0.2.3: a node of ordinary size (287,070 sats in 0.2.1's hands-on run) is not refused at the first payment
+    assert_eq!(STARTER_EXPOSURE_CAP_SATS, 1_000_000);
     // twice what the channels hold, rounded up to 10,000, never below the least cap
-    for (held, cap) in [(0, 100_000), (29_692, 100_000), (50_000, 100_000), (50_001, 110_000), (70_000, 140_000), (-5, 100_000), (i64::MAX, i64::MAX / 10_000 * 10_000)] {
+    for (held, cap) in [(0, 1_000_000), (287_070, 1_000_000), (500_000, 1_000_000), (500_001, 1_010_000), (700_000, 1_400_000), (-5, 1_000_000),
+                        (i64::MAX, i64::MAX / 10_000 * 10_000)] {
         assert_eq!(starter_exposure_cap(held), cap, "held {held}");
     }
     let m = starter_policy("main");
-    // exactly the Lightning section the signer's mainnet readiness test signs (xbt-signer tests/ln_rail.rs)
-    assert_eq!(m["ln"], json!({"enabled": true, "split_height": xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT, "exposure_cap_sats": 100_000}));
-    assert_eq!(starter_policy_for("main", Some(70_000))["ln"]["exposure_cap_sats"], json!(140_000));
+    // the Lightning section the signer's mainnet readiness test signs (xbt-signer tests/ln_rail.rs), with the starter's least cap
+    assert_eq!(m["ln"], json!({"enabled": true, "split_height": xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT, "exposure_cap_sats": 1_000_000}));
+    assert_eq!(starter_policy_for("main", Some(700_000))["ln"]["exposure_cap_sats"], json!(1_400_000));
     // off mainnet the signer needs no cap: none is set
     assert!(starter_policy_for("regtest", Some(70_000))["ln"].get("exposure_cap_sats").is_none());
     assert!(xbt_signer::policy::validate_policy(&m).0.is_empty(), "{m}");
 }
 
-/// On mainnet the app pays nothing until the owner confirms paying with real money: setup lists that
-/// step straight after the rules, the rules page says so with a link to it, and neither calls the
-/// wallet ready. Once the confirmation is on file, both are gone.
+/// On mainnet the app pays nothing until the owner confirms paying with real money: setup's rules step
+/// asks for it (a box beside the rules' Sign, no step of its own), the rules page says so with a link
+/// to it, and neither calls the wallet ready. Once the confirmation is on file, both are gone.
 #[test]
 fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -544,9 +546,11 @@ fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     let mut br = logged_in(&b);
     assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], true);
     let setup = unescape(&br.get("/setup").body);
-    let (rules, ack_step) = (setup.find("Your spending rules").unwrap(), setup.find("Pay with real money").expect("the step is listed"));
-    assert!(rules < ack_step && ack_step < setup.find("Your Lightning node").unwrap(), "straight after the rules");
-    assert!(setup.contains("./lightning#ack") && !setup.contains("Connected and ready to pay"), "{setup}");
+    assert!(!setup.contains("<h2>Pay with real money</h2>"), "no step of its own: {setup}");
+    let (rules, node) = (setup.find("<h2>Your spending rules</h2>").unwrap(), setup.find("<h2>Your Lightning node</h2>").unwrap());
+    let ask = setup.find("holds real money").expect("the rules step asks for it");
+    assert!(rules < ask && ask < node, "in the rules step: {setup}");
+    assert!(!setup.contains("Connected and ready to pay") && setup.contains("of 5 done"), "{setup}");
     let page = unescape(&br.get("/policy").body);
     assert!(page.contains("pays nothing until you confirm") && page.contains("./lightning#ack"), "{page}");
     // a refused buy says what to do, in words
@@ -555,8 +559,74 @@ fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     // confirmed: the step and the warning are gone
     std::fs::write(&ack_file, format!("{}\n", xbt402::ticket::MAINNET_ACK)).unwrap();
     assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], false);
-    assert!(!unescape(&br.get("/setup").body).contains("Pay with real money"));
+    assert!(!unescape(&br.get("/setup").body).contains("holds real money"));
     assert!(!unescape(&br.get("/policy").body).contains("pays nothing until you confirm"));
+    std::env::remove_var(xbt_signer::ticket::MAINNET_ACK_ENV);
+}
+
+/// Mainnet: the rules' sign step carries the one box "I understand the app pays with real money, within
+/// these rules". Ticked, signing writes the very confirmation Your node's Start paying writes (the file the
+/// signer checks), and the signer stops asking; unticked, nothing is written and Your node still asks.
+/// Home and Setup show one rules step, not a real-money step beside it. Your node turns it off again.
+#[test]
+fn on_mainnet_signing_the_starter_rules_with_the_box_ticked_confirms_paying_with_real_money() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let ack_file = ln.path().join("mainnet-ack");
+    std::env::set_var(xbt_signer::ticket::MAINNET_ACK_ENV, &ack_file);
+    // the node connected: the app holds its key
+    std::fs::write(ln.path().join("rail.macaroon"), b"key").unwrap();
+    let lnd = ln.path().to_path_buf();
+    let b = start_on(Rig::build(json!({}), false, "main"), move |c| c.ln.dir = lnd);
+    let mut br = logged_in(&b);
+    let home = unescape(&br.get("/").body);
+    assert!(home.contains("Sign the starter rules") && home.contains("your yes to paying with real money"), "{home}");
+    assert!(!home.contains("<strong>Pay with real money</strong>"), "no step of its own: {home}");
+
+    // unticked: the rules are signed, nothing is confirmed, Your node asks next
+    let page = br.get("/policy?template=starter").body;
+    let form = policy_form_fields(&page);
+    let prev = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    assert!(prev.contains("name=\"ack\" value=\"1\"") && unescape(&prev).contains("I understand the app pays with real money, within these rules"),
+            "the box beside Sign: {prev}");
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &form[0].1), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
+    assert_eq!(r.location(), "./lightning#ack");
+    assert!(!ack_file.exists());
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], true);
+    let home = unescape(&br.get("/").body);
+    assert!(home.contains("Your rules are signed. Confirm that the app may pay with real money") && home.contains("./lightning#ack"), "{home}");
+
+    // ticked: signed and confirmed in one press, with the file Your node writes
+    let page = br.get("/policy").body;
+    let mut form = policy_form_fields(&page);
+    form.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "4000".into();
+    let prev = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &form[0].1), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text))), ("ack", "1")]);
+    let flash = br.flash_after(&r);
+    assert!(flash.contains("the app may now pay with real money"), "{flash}");
+    assert_eq!(std::fs::read_to_string(&ack_file).unwrap(), format!("{}\n", xbt402::ticket::MAINNET_ACK), "the file Your node writes");
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], false, "the signer's check passes");
+    assert_eq!(b.rig.call("policy_get", json!({}))["policy"]["human_threshold_sats"], 4000);
+    let setup = unescape(&br.get("/setup").body);
+    assert!(!setup.contains("holds real money"), "{setup}");
+    // the box is not offered again once confirmed
+    let prev = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    assert!(!prev.contains("name=\"ack\""), "{prev}");
+
+    // Your node: off, then on again by its own box
+    let node = unescape(&br.get("/lightning").body);
+    assert!(node.contains("Stop paying with real money"), "{node}");
+    let r = br.act("/lightning", "/lightning", &[("action", "ack_off")]);
+    assert!(br.flash_after(&r).contains("no longer pays with real money"));
+    assert!(!ack_file.exists());
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], true);
+    let r = br.act("/lightning", "/lightning", &[("action", "ack"), ("ack", "1")]);
+    assert!(br.flash_after(&r).starts_with("Done."));
+    assert_eq!(std::fs::read_to_string(&ack_file).unwrap(), format!("{}\n", xbt402::ticket::MAINNET_ACK));
     std::env::remove_var(xbt_signer::ticket::MAINNET_ACK_ENV);
 }
 
@@ -631,7 +701,9 @@ fn enrol_and_replace_the_human_key_then_sweep_rotate_backup_and_anchor() {
     let setup = br.get("/setup").body;
     assert!(setup.contains("id=\"keygen\"") && setup.contains("./human-key-enroll"));
     assert!(br.get("/wallet").body.contains("No approval key yet"));
-    assert!(br.get("/").body.contains("Finish setting up"), "home says what is left to do");
+    let home = br.get("/").body;
+    assert!(home.contains("Get started") && home.contains("Make your approval key") && home.contains("aria-current=\"step\""),
+            "home says what is left to do, the next step first: {home}");
     let pubhex = hex::encode(human().verifying_key().to_bytes());
     let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex), ("code", "0000-0000-0000")]);
     assert!(br.flash_after(&r).contains("enrolment code"), "AGP-063 W4: the code from the signer's log, not trust on first use");
@@ -750,8 +822,12 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     // as xbt-init leaves it on a box: 0640, the MCP reads it by group
     xbt_svc::replace_secret_file(&tok, format!("{}\n", "ab".repeat(32)).as_bytes(), 0o640).unwrap();
     let page = br.get("/agents").body;
-    assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
+    // the key is not in the page as it opens: only on "Show the access key", a POST with the CSRF token
+    assert!(!page.contains(&"ab".repeat(32)) && !page.contains("Bearer ") && page.contains("action=\"./agents-key\""), "{page}");
     assert!(page.contains("aria-current=\"page\">AI agents") && page.contains("Rotate the token"), "{page}");
+    assert!(!br.post("/agents-key", &[]).body.contains(&"ab".repeat(32)), "not without the CSRF token");
+    let page = br.act("/agents", "/agents-key", &[]).body;
+    assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer "), "{page}");
     // AGP-042: the real MCP HTTP transport, reading the same file (the UI never calls it to rotate)
     let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock")));
     // a port of its own (0: the system picks a free one), bound before the server starts, so a request
@@ -783,7 +859,7 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     assert!(flash.contains("Agent token rotated"), "{flash}");
     // the old token is refused on the next request; the new one (shown only on this page) works
     assert_eq!(mcp_init(&"ab".repeat(32)), 401);
-    let page = br.get("/agents").body;
+    let page = br.act("/agents", "/agents-key", &[]).body;
     let new = regex_token(&page);
     assert!(new.len() == 64 && new != "ab".repeat(32));
     assert_eq!(std::fs::read_to_string(&tok).unwrap().trim(), new);
@@ -966,6 +1042,45 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     xbt_gateway::config::Config::from_json(&c).unwrap();
 }
 
+/// The menu: Buy beside Sell (no "Services"); Records, Stream relays and Old channels sit behind one
+/// Advanced tab in Settings, with their own row of tabs once there.
+#[test]
+fn the_menu_says_buy_and_sell_and_settings_keeps_the_rare_pages_under_advanced() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |c| c.sell = true);
+    let mut br = logged_in(&bx);
+    let browse = br.get("/browse").body;
+    let menu = &browse[browse.find("id=\"site-nav\"").unwrap()..browse.find("</header>").unwrap()];
+    assert!(!menu.contains(">Services<"), "{menu}");
+    let (buy, sell) = (menu.find(">Buy<").expect("Buy in the menu"), menu.find(">Sell<").expect("Sell in the menu"));
+    assert!(buy < sell, "Buy comes first, then Sell: {menu}");
+    assert!(menu.contains("<a href=\"./browse\" aria-current=\"page\">Buy<"), "Browse is under Buy: {menu}");
+
+    let setup = br.get("/setup").body;
+    let tabs = &setup[setup.find("<nav class=\"tabs\" aria-label=\"Settings\">").unwrap()..];
+    let tabs = &tabs[..tabs.find("</nav>").unwrap()];
+    for t in ["Setup", "Your node", "Spending rules", "Keys and backup"] {
+        assert!(tabs.contains(&format!(">{t}</a>")), "{t}: {tabs}");
+    }
+    for t in ["Records", "Stream relays", "Old channels"] {
+        assert!(!tabs.contains(&format!(">{t}</a>")), "{t} is under Advanced, not a tab of its own: {tabs}");
+        assert!(!setup.contains(&format!(">{t}</a>")), "{t}");
+    }
+    assert!(tabs.contains("<a href=\"./signatures\">Advanced</a>"), "{tabs}");
+
+    for (path, here) in [("/signatures", "Records"), ("/relays", "Stream relays"), ("/channels", "Old channels")] {
+        let p = br.get(path).body;
+        assert!(p.contains("aria-current=\"page\">Settings<"), "{path} is in Settings");
+        assert!(p.contains("<a href=\"./signatures\" aria-current=\"page\">Advanced</a>"), "{path}: Advanced is the current tab");
+        let sub = &p[p.find("<nav class=\"tabs sub\" aria-label=\"Advanced\">").expect("the Advanced row")..];
+        let sub = &sub[..sub.find("</nav>").unwrap()];
+        assert!(sub.contains(&format!("aria-current=\"page\">{here}</a>")), "{path}: {sub}");
+        for t in ["Records", "Stream relays", "Old channels"] {
+            assert!(sub.contains(&format!(">{t}</a>")), "{t}: {sub}");
+        }
+    }
+}
+
 const FILM: &str = "https://stream.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true";
 const NOTES: &str = "https://files.example/notes?a=1&b=2";
 
@@ -988,7 +1103,7 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
 
     let page = br.get("/browse");
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("aria-current=\"page\">Browse") && page.body.contains("aria-current=\"page\">Services"));
+    assert!(page.body.contains("aria-current=\"page\">Browse") && page.body.contains("aria-current=\"page\">Buy"));
     assert!(page.body.contains("href=\"./services\"") && page.body.contains("href=\"./connections\""));
     assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
     assert!(page.body.contains(">Web apps <") && page.body.contains(">Files <") && page.body.contains(">Data &amp; APIs <"), "the categories");
@@ -2069,6 +2184,49 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!(n.relays, ["wss://relay.one.example", "wss://relay.two.example", "wss://relay.own.example"]);
 }
 
+/// A shop that turns Private (reached by its key, no web address) takes its hashrate payments along:
+/// the hashmaker's pay address becomes the shop's key address, and turning back to the web address
+/// moves it back.
+///
+/// FAILS before: payUrl kept the old web address (Mike's Umbrel, 0.2.2), which no longer answered,
+/// and every rental failed at its first piece of work.
+#[test]
+fn a_shop_gone_private_is_paid_for_hashrate_at_its_key_address() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    const NPUB: &str = "npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a";
+    // the gateway's link status names the shop's key, as the real one does
+    let gateway = mock_http(|path| if path == "/.well-known/lightning-stream-link.json" {
+        (200, r#"{"npub": "npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a", "private": true}"#)
+    } else { (200, "{}") });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.gw.health_url = Some(format!("http://{gateway}/x402/ticket/health"));
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = dir.join("hashrate-settings.json");
+    });
+    let mut br = logged_in(&bx);
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    assert_eq!(r.status, 303);
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("reach", "web"), ("public_url", "https://stream.example")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    // renting set up while the shop sold at its web address
+    std::fs::write(dir.join("hashrate-settings.json"), json!({"enabled": true, "payUrl": "https://stream.example/hashrate"}).to_string()).unwrap();
+    let pay = || serde_json::from_str::<Value>(&std::fs::read_to_string(dir.join("hashrate-settings.json")).unwrap()).unwrap()["payUrl"].clone();
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("reach", "direct"), ("private", "1")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    let key = xbt402::shop::parse(NPUB).unwrap();
+    assert_eq!(pay(), json!(format!("{key}/hashrate")), "paid at the shop's key address once it is Private");
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("reach", "web"), ("public_url", "https://stream.example")]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert_eq!(pay(), json!("https://stream.example/hashrate"), "and back at the web address");
+}
+
 #[test]
 fn without_sell_the_wallet_has_no_sell_page() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2907,11 +3065,12 @@ fn allowing_a_seller_fills_in_the_spending_rules_for_one_signature() {
     let b = start(json!({}), false, |_| {});
     let mut br = logged_in(&b);
     let page = br.get(&format!("/policy?allow={}&node={node}", enc("https://seller.example"))).body;
-    assert!(page.contains("Allow https://seller.example to be paid") && page.contains("in any 7 days"), "{page}");
+    // by its name where the list of sellers has one, else its short address
+    assert!(page.contains("Allow seller.example to be paid") && page.contains("in any 7 days"), "{page}");
     assert!(page.contains("https://seller.example") && page.contains(&node), "{page}");
     // a bad node is ignored: nothing filled in
     let page = br.get(&format!("/policy?allow={}&node=zz", enc("https://seller.example"))).body;
-    assert!(!page.contains("Allow https://seller.example to be paid"));
+    assert!(!page.contains("Allow seller.example to be paid"));
 }
 
 /// The Sell page offers the services it finds on the box, in one click.
@@ -2954,8 +3113,8 @@ fn on_mainnet_the_rules_page_suggests_the_node_s_limit_and_never_prefills_the_si
     let mut br = logged_in(&bx);
     let page = br.get("/policy").body;
     assert!(!page.contains("Paying is not turned on yet"), "paying is on: the rules in force are edited");
-    assert!(page.contains("Your Lightning node needs a limit before the app can pay through it: <span class=\"money\">100,000 sats"), "{page}");
-    assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"100000\""), "{page}");
+    assert!(page.contains("Your Lightning node needs a limit before the app can pay through it: <span class=\"money\">1,000,000 sats"), "{page}");
+    assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"1000000\""), "{page}");
     assert!(page.contains("the safe starter values are filled in below instead of the signer&#39;s built-in ones")
             || page.contains("the safe starter values are filled in below instead of the signer's built-in ones"), "{page}");
     let starter = xbt_wallet_ui::app::starter_policy("main");
@@ -2970,7 +3129,7 @@ fn on_mainnet_the_rules_page_suggests_the_node_s_limit_and_never_prefills_the_si
     let prev = br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
     let signed: Value = serde_json::from_str(&field(&prev, "text")).unwrap();
     assert_eq!((signed["ln"]["enabled"].clone(), signed["ln"]["exposure_cap_sats"].clone(), signed["max_per_tx_sats"].clone()),
-               (json!(true), json!(100000), starter["max_per_tx_sats"].clone()), "{signed}");
+               (json!(true), json!(1000000), starter["max_per_tx_sats"].clone()), "{signed}");
 }
 
 /// A seller that charged a call past its limit is said at the top of the wallet page, with the
@@ -3093,7 +3252,7 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
     assert_eq!(r.status, 303, "{}", r.body);
     assert!(r.location().contains(&format!("node={node_hex}")) && r.location().contains("shop.invalid"), "{}", r.location());
     let rules = br.get(r.location().trim_start_matches('.')).body;
-    assert!(rules.contains(&format!("Allow {npub} to be paid")), "the rules page names the shop by its key");
+    assert!(rules.contains("Allow Home films to be paid"), "the rules page names the shop by its listing's name (0.2.3)");
     // and in the list of who may be paid, by its listing's name, with its key under it (#37 items 7, 11)
     assert!(rules.contains("<strong>Home films</strong><br><code class=\"key small\">") && rules.contains(&format!("title=\"{node_hex}\"")), "{rules}");
     // Found on Nostr knows it is on the list (#37 items 6, 15). FAILS before: "Add this shop" still, no mark
@@ -3987,7 +4146,7 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     }
     assert_eq!((terms(&read()).0, read()["priceSeenMs"].clone()), (Some(366), seen_at));
     let p = br.get("/sell-hashrate");
-    assert!(p.body.contains("No live price") && p.body.contains("no new rental starts until it can"), "{}", p.body);
+    assert!(p.body.contains("No live price") && p.body.contains("Until then no new rental starts"), "{}", p.body);
     // a pruned node, whose getblockstats fails: the block reward is the chain's schedule at the tip (regtest's
     // halves every 150 blocks: 3.125 at 700), and the price is the one a full node gives
     let height = {
@@ -4605,4 +4764,119 @@ fn sellers_are_named_by_their_shop_and_a_removed_seller_still_in_the_rules_is_of
     assert_eq!(p["allowlist"], json!([ADDR]), "{p}");
     assert_eq!(p["counterparties"], json!({}), "{p}");
     assert!(!br.get("/services").body.contains("Still allowed to be paid"));
+}
+
+/// The VPN page lists the exits the owner's Nostr relays carry, and *Add this exit* hands one to the VPN
+/// service: its signed announcement as the relays gave it goes into devices.json (the devices stay), the
+/// service reads it back through the same checks and every device prefers it. An exit the relays don't
+/// carry can't be added by naming it. Every exit the service found is listed, a paid one not yet checked
+/// as "not checked" (Mike's Umbrel: the Pi Demo exit was found but never shown).
+#[test]
+fn the_vpn_page_lists_exits_found_on_nostr_and_adds_one_for_the_vpn_service() {
+    use xbt_nostr::{event::Keys, oneshot, standin::StandinRelay};
+    use xbt_vpn::announce::{self, ExitOffer};
+    use base64::Engine;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let nostr = vec![relay.url.clone()];
+    let (secret, shop) = ([9u8; 32], xbt402::shop::origin_for(&[0x5a; 32]));
+    let exit = hex::encode(xbt_vpn::sealed::public_of(&secret));
+    let offer = ExitOffer { exit: exit.clone(), region: "SV".into(), price_msat_per_gb: 1_000_000, tunnel: Some(format!("{shop}/vpn/tunnel")),
+                            ttl_s: 86_400, ..ExitOffer::default() };
+    let ev = announce::announcement_event(&Keys::generate(), &secret, &offer, xbt_nostr::now()).unwrap();
+    assert_eq!(oneshot::publish(&nostr, &ev, Duration::from_secs(5))[0].result, Ok(()));
+    let vpn = tempfile::tempdir().unwrap();
+    let vdir = vpn.path().to_path_buf();
+    let key = base64::engine::general_purpose::STANDARD.encode([3u8; 32]);
+    std::fs::write(vdir.join("devices.json"), json!({"devices": [{"id": "a1", "name": "Phone", "public_key": key, "tunnel_ip": "10.66.0.2",
+                                                                    "policy": {"kind": "private"}}]}).to_string()).unwrap();
+    // the service's status: it found the exit and could not check its country (a paid exit no device asks SV of)
+    std::fs::write(vdir.join("status.json"), json!({"devices": [], "exits": [{"exit": exit, "region": "SV", "verified": false, "checked_at": 0,
+        "region_check": "Not checked: a paid exit's country is checked once a device asks for SV.", "price_msat_gb": 1_000_000, "added": false}]}).to_string()).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.nostr_relays = nostr.clone();
+        c.vpn = xbt_wallet_ui::config::VpnSetup { status_dir: vdir.clone(), dir: vdir.clone(), endpoint: None, tunnel_upstream: None };
+    });
+    let mut br = logged_in(&bx);
+    let page = unescape(&br.get("/vpn?refresh=1").body);
+    let found = &page[page.find("id=\"exits\"").expect("the exits the service found")..];
+    assert!(found.contains(&format!("{}…", &exit[..12])) && found.contains(">not checked<") && found.contains("1,000 sat/GB"), "{found}");
+    let nostr_part = &page[page.find("id=\"found-exits\"").expect("Found on Nostr")..];
+    assert!(nostr_part.contains(">Add this exit</button>") && nostr_part.contains(">SV<") && nostr_part.contains("found by the VPN service"), "{nostr_part}");
+
+    // an exit the relays don't carry: refused, nothing written
+    let r = br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &"ab".repeat(32))]);
+    assert!(br.flash_after(&r).contains("no longer on your Nostr relays"));
+    assert!(read_json(&vdir.join("devices.json")).get("exits").is_none());
+
+    let r = br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &exit)]);
+    assert!(br.flash_after(&r).starts_with("Added the exit in SV."));
+    let file = read_json(&vdir.join("devices.json"));
+    assert_eq!(file["devices"][0]["name"], "Phone", "the devices stay: {file}");
+    assert_eq!(file["exits"], json!([ev.to_value()]), "the signed announcement as the relays gave it");
+    // as the VPN service reads it
+    let (got, refused) = announce::collect(&xbt_vpn::service::added_exits(&file), xbt_nostr::now());
+    assert_eq!((got.len(), refused, got[0].exit.id.as_str()), (1, 0, exit.as_str()));
+    assert_eq!(xbt_vpn::service::devices_from(&file)[0].requirements.prefer, vec![exit.clone()]);
+    let page = unescape(&br.get("/vpn").body);
+    let nostr_part = &page[page.find("id=\"found-exits\"").unwrap()..];
+    assert!(nostr_part.contains(">added<") && !nostr_part.contains("value=\"add_exit\""), "{nostr_part}");
+    // adding it again keeps one copy; removing it leaves the devices
+    br.act("/vpn", "/vpn", &[("do", "add_exit"), ("exit", &exit)]);
+    assert_eq!(read_json(&vdir.join("devices.json"))["exits"].as_array().unwrap().len(), 1);
+    let r = br.act("/vpn", "/vpn", &[("do", "remove_exit"), ("exit", &exit)]);
+    assert!(br.flash_after(&r).starts_with("Removed the exit"));
+    let file = read_json(&vdir.join("devices.json"));
+    assert_eq!((file["exits"].as_array().unwrap().len(), file["devices"][0]["name"].as_str()), (0, Some("Phone")));
+}
+
+fn read_json(p: &std::path::Path) -> Value {
+    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+}
+
+/// The 0.2.2 hands-on run on Mike's Umbrel, on the Wallet and the rules pages: a payment to `ln:<node>`
+/// named by its shop; a settled payment "Paid" with its two parts from the signer's settled record and
+/// its booking "Reserved"; the credit a closed connection left, with its amount, on the Wallet, Sellers and
+/// the service's page; a refusal in plain words; and the `ln:` line of the rules a Lightning node, by
+/// its seller's name, never "a coin address".
+#[test]
+fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let node = format!("03bb{}", "0".repeat(62));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, json!([{"name": "Alpha films", "kind": "files", "seller": "https://a.example", "price_text": "5 sat a file",
+        "items": [{"title": "A", "url": "https://a.example/a.mkv", "credit": "1 GB"}]}]).to_string()).unwrap();
+    let policy = json!({"allowlist": ["https://a.example", format!("ln:{node}")], "counterparties": {"https://a.example": {"ln_node": node}}});
+    let bx = start(policy, false, |c| c.services_file = Some(path.clone()));
+    let hash = "ab".repeat(32);
+    bx.rig.s.ln_book.put(&hash, json!({"state": "settled", "value_msat": 900_000, "fee_msat": 2_009, "spent_sats": 903})).unwrap();
+    let a = &bx.rig.s.engine.audit;
+    a.append(json!({"type": "commit", "dest": format!("ln:{node}"), "amount_sats": 915, "txid": format!("ln:{hash}"), "ts": 1_793_000_000}));
+    a.append(json!({"type": "ln_amend", "txid": format!("ln:{hash}"), "booked_sats": 915, "amount_sats": 903, "ts": 1_793_000_001}));
+    a.append(json!({"type": "ln_settled", "dest": format!("ln:{node}"), "payment_hash": hash, "spent_sats": 903, "fee_msat": 2009, "ts": 1_793_000_002}));
+    a.append(json!({"type": "ticket_left_with_seller", "session": "s1", "dest": format!("ln:{node}"), "origin": "https://a.example", "left_msat": "475900",
+                    "why": "stopped", "ts": 1_793_000_003}));
+    a.append(json!({"type": "ln_refused", "dest": format!("ln:{node}"), "reason": "the LN node holds 287070 sats in its channels, above ln.exposure_cap_sats 100000",
+                    "ts": 1_793_000_004}));
+    let mut br = logged_in(&bx);
+    let w = unescape(&br.get("/wallet").body);
+    let act = &w[w.find("Recent activity").unwrap()..];
+    assert!(!act.contains(&format!("ln:{}", &node[..8])), "a node by its shop's name: {act}");
+    assert!(act.contains("<td>Alpha films</td>"), "{act}");
+    assert!(act.contains("<td>Paid</td>") && act.contains("903 sats</span> <span class=\"small\">(900 + 2.009 fee)</span>"), "paid, with its parts: {act}");
+    assert!(act.contains("<td>Reserved</td>") && act.contains("reserved</span>") && !act.contains("<td>Commit</td>"), "{act}");
+    assert!(!act.contains("Ln amend"), "the booking's correction is no row of its own: {act}");
+    assert!(act.contains("<td>Credit left with the shop</td>") && act.contains("475.9 sats</span> <span class=\"small\">credit left"), "{act}");
+    assert!(!act.contains("<td>Ln refused</td>"), "a refusal in plain words: {act}");
+    assert!(act.contains("more than the 100000 sats") || act.contains("node holds"), "{act}");
+    // the credit on Sellers and on the service's page
+    let sellers = unescape(&br.get("/services").body);
+    assert!(sellers.contains("You have about 476 sat of credit with Alpha films; it's used first next time."), "{sellers}");
+    let svc = unescape(&br.get("/service?seller=https%3A%2F%2Fa.example&name=Alpha%20films").body);
+    assert!(svc.contains("about 476 sat of credit with Alpha films"), "{svc}");
+    // the rules: the `ln:` line is the seller's Lightning node
+    let rules = unescape(&br.get("/policy").body);
+    let who = &rules[rules.find("id=\"sellers\"").unwrap()..];
+    assert!(who.contains("Lightning node of Alpha films") && !who.contains("A coin address"), "{who}");
 }
