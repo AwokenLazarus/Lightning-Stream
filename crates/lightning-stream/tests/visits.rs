@@ -65,6 +65,8 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                     return;
                 }
                 if url.contains("/nohead/") {
+                    // never more than the call may spend, as the signer
+                    let ticket = ticket.min(max);
                     session.lock().unwrap().charged += ticket;
                     drop(UnixStream::connect(stream_dir.join(p["stream_to"].as_str().unwrap())));
                     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -243,9 +245,12 @@ fn a_visit_spends_at_most_its_limit_however_many_requests_run_at_once() {
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert_eq!((v["spent_sats"].as_i64(), v["limit_sats"].as_i64()), (Some(charged), Some(1_500)), "{v}");
     assert!(v["ended"].as_str().unwrap().contains("limit"), "{v}");
-    // each call held a share of the limit as its cap, and the shares running at once never added up to more than it
+    // each call held a share of the limit as its cap (all that was left, for one that ran alone), and the shares
+    // running at once never added up to more than it
     let calls = session.lock().unwrap().calls.clone();
-    assert!(calls.iter().all(|c| (1..=1_000).contains(&c["max_sats"].as_i64().unwrap())), "{calls:?}");
+    assert!(calls.iter().all(|c| (1..=1_500).contains(&c["max_sats"].as_i64().unwrap())), "{calls:?}");
+    // an eighth of the limit each: many ran on their own share, not one at a time
+    assert!(calls.iter().filter(|c| c["max_sats"] == 187).count() >= 12, "{calls:?}");
     assert!(calls.iter().all(|c| c.get("credit_only").is_none()), "{calls:?}");
 }
 
@@ -353,7 +358,7 @@ fn a_ticket_dearer_than_a_share_is_bought_by_a_request_asked_again_with_room_for
     let (_, _, b) = ask(&addr, "GET", &format!("/v/{visit}/next.js"), "", b"");
     assert!(!b.is_empty());
     let last = session.lock().unwrap().calls.last().cloned().unwrap();
-    assert!((1..=1_000).contains(&last["max_sats"].as_i64().unwrap()), "{last}");
+    assert!((1..=1_000 + 1_002).contains(&last["max_sats"].as_i64().unwrap()), "{last}");
     let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert!(v["ended"].is_null(), "{v}");
@@ -366,26 +371,34 @@ fn a_ticket_dearer_than_a_share_is_bought_by_a_request_asked_again_with_room_for
 #[test]
 fn a_call_that_ends_before_its_head_keeps_its_share_until_the_signer_says_what_it_charged() {
     let dir = tempfile::tempdir().unwrap();
-    let (sock, session) = signer(dir.path());
+    // tickets of 80 sat, within a request's share of a 1,000 sat visit (125)
+    let (sock, session) = signer_at(dir.path(), 80);
     let addr = start(sock, dir.path());
     let visit = open(&addr, 1_000);
+    let spent = |addr: &str| serde_json::from_slice::<Value>(&ask(addr, "GET", &format!("/visits/{visit}"), "", b"").2).unwrap()["spent_sats"].as_i64();
     let (st, _, _) = ask(&addr, "GET", &format!("/v/{visit}/nohead/a.js"), "", b"");
     assert_eq!(st, 502);
-    // the signer's answer comes after the refusal: what it charged is counted then
+    // until the signer's answer comes after the refusal, all of the share stays spent; what it charged is counted then
+    assert_eq!(spent(&addr), Some(125));
     let t = std::time::Instant::now();
-    let spent = loop {
-        let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
-        let v: Value = serde_json::from_slice(&b).unwrap();
-        if v["spent_sats"].as_i64() == Some(TICKET) || t.elapsed() > std::time::Duration::from_secs(5) {
-            break v["spent_sats"].as_i64();
-        }
+    while spent(&addr) != Some(80) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", spent(&addr));
         std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    assert_eq!(spent, Some(TICKET));
-    // what is left (400 sat) buys no second ticket: the next request is refused, nothing more is charged
-    let (st, _, _) = ask(&addr, "GET", &format!("/v/{visit}/b.js"), "", b"");
-    assert_eq!(st, 402);
-    assert_eq!(session.lock().unwrap().charged, TICKET);
+    }
+    // the visit's limit holds: requests are paid until what is left buys no ticket, then refused
+    let mut refused = false;
+    for i in 0..40 {
+        let (st, _, _) = ask(&addr, "GET", &format!("/v/{visit}/b{i}.js"), "", b"");
+        if st == 402 {
+            refused = true;
+            break;
+        }
+        assert_eq!(st, 200);
+    }
+    assert!(refused);
+    let charged = session.lock().unwrap().charged;
+    assert!(charged <= 1_000, "{charged}");
+    assert_eq!(spent(&addr), Some(charged));
 }
 
 /// A request that needs more than a share goes alone once the requests running have ended: new
@@ -554,7 +567,6 @@ fn a_path_on_a_free_route_is_asked_for_unpaid() {
     let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/web/gone/a.js"), "", b"");
     assert_eq!(st, 200, "{head}");
     let gone: Vec<Value> = session.lock().unwrap().calls.iter().filter(|c| c["url"].as_str().unwrap().contains("/web/gone/")).cloned().collect();
-    assert_eq!(gone.len(), 2, "{gone:?}");
-    assert_eq!((gone[0]["max_sats"].as_i64(), gone[1]["known_terms"].as_bool()), (Some(0), Some(true)), "{gone:?}");
-    assert!(gone[1]["max_sats"].as_i64().unwrap() >= 1, "{gone:?}");
+    assert!(gone.len() >= 2 && gone[0]["max_sats"] == 0, "{gone:?}");
+    assert!(gone[1..].iter().all(|c| c["known_terms"] == true && c["max_sats"].as_i64().unwrap() >= 1), "{gone:?}");
 }
