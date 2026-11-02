@@ -5,6 +5,53 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.6 (2026-11-02)
+
+Spending limits that say what they are, from a hands-on run of 0.2.5 with the demo shop's Jellyfin. A film
+froze near its end and the buyer was shown "the seller refused the lock: HTTP 402 too_many_sessions". The
+real cause was the buyer's own rule: at most 5,000 sat a day to one seller, about what one film costs at
+20 sat a MiB. The signer, the connector, the wallet UI and the seller's Sell page change.
+
+- **A ticket your own rules refuse is never asked for.** The signer checked a prepaid ticket against the
+  owner's spending rules only after the seller had issued its invoice. A refused ticket's invoice stayed
+  unpaid for 75 seconds and held one of the places the seller gives a session and an address. The next
+  ticket was then refused `too_many_tickets`, the wallet opened new sessions, and those were refused
+  `too_many_sessions`, again and again. Now each prepaid ticket is checked against the owner's caps and
+  rules before the seller is asked for anything. The check writes nothing and stores no approval. If a
+  refusal still comes after an invoice was issued (the rules changed in between), the wallet asks the
+  seller to cancel that invoice. A session your own rules stopped is never replaced by a new one.
+- **The reason reaches you.** A refusal by one of your spending rules now carries the limit that refused it
+  (`limit_sats`). A top-up your rules refuse is reported in the call's answer (`top_up_refused`, with the rule
+  and the limit) instead of being dropped. A visit that meets such a refusal ends with it, and logs it. Its
+  later requests are refused with your rule at once instead of asking the seller again.
+- **Plain words for every spending rule.** The visit bar and the "Not paid" page name the rule as the
+  Spending rules page shows it, with your limit and where to raise it. For example: "You've reached today's
+  limit for Demo Films (5,000 sat)", then "Raise it: "Most to any one seller in 24 hours" in Settings →
+  Spending rules (under More rules)", with a link. The seller's internal errors are no longer shown there.
+  This covers the daily and weekly budgets, both per-seller caps, the largest single payment, the approval
+  threshold, the payment rate and the stream tickets' budget.
+- **The AI endpoint says when your limit is reached.** When your spending rules refuse a call, the
+  OpenAI-compatible endpoint now answers 402 (429 for the payment-rate rule). It uses OpenAI's error shape
+  with `type` and `code` `spending_limit_reached`, the rule and the limit. The message names the seller,
+  the limit in sats and where to raise it. A seller's internal refusal is no longer passed on in the error,
+  and is logged instead. A limit for one seller lets the next seller offering the model answer; a limit for
+  the whole wallet stops at once. `/v1/models` says in each entry's description that a model's short name
+  and its seller-qualified name are the same model. The short name goes to the cheapest seller that offers
+  it, and the qualified name goes to that one seller.
+- **Starter limits that fit a film.** New mainnet wallets start with 20,000 sat a day to any one seller
+  (was 5,000), 50,000 sat in 7 days to one seller (was 10,000), a 25,000 sat daily limit (was 10,000), a
+  60,000 sat weekly limit (was 30,000), and a 25,000 sat daily budget for stream tickets (was 10,000). The
+  largest single payment stays 2,000 sat, and payments of 1,000 sat or more still ask you first. An existing
+  wallet keeps its rules; raise them on the Spending rules page.
+- **Shops: free paths for a web app.** The Sell page has a "Free paths" field for a web app. It suggests
+  `/web/` for Jellyfin and other media servers, and the seller can edit it. Each path is served free (GET
+  and HEAD, compressed) under the app's own listing. Everything else under the app stays paid. Before, a
+  free route added to the gateway's config by hand was dropped each time the app started or the Sell page
+  was saved.
+- **Shops: two sessions from one address on mainnet.** The Sell page's mainnet default is now 2 sessions
+  per buyer address (was 1), which is the gateway's own default. With 1, a buyer's own stale session could
+  shut that buyer out. Unpaid invoices from one address are still capped at 2.
+
 ## 0.2.5 (2026-11-02)
 
 Web apps in visits, faster and whole, from a hands-on run of 0.2.4 with the demo shop's Jellyfin over a
