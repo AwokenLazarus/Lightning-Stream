@@ -86,12 +86,20 @@ def pinned(text: str, pat: re.Pattern, pins: dict[str, str], release: bool = Fal
 IMAGE_SOURCES = ["crates", "Cargo.toml", "Cargo.lock", "container", ":(glob,exclude)crates/*/tests/**"]
 
 
+# sources only one image is built from (no other crate depends on them): a change there makes only that image's
+# pin stale, so a fix release may rebuild that image alone and keep the others' pins (0.2.1 rebuilt xbt-wallet-ui)
+OWN_SOURCES = {"xbt-wallet-ui": ["crates/xbt-wallet-ui"]}
+
+
 def stale(pins: dict[str, str]) -> list[str]:
     """The lock's commits whose images are older than the sources at HEAD (the reasons, one per commit)."""
     import subprocess
     out = []
     for commit in sorted({REF.match(r)["tag"].rsplit("-", 1)[1] for r in pins.values()}):
-        r = subprocess.run(["git", "-C", str(HERE.parent), "diff", "--quiet", commit, "HEAD", "--", *IMAGE_SOURCES])
+        at = {img for img, r in pins.items() if REF.match(r)["tag"].rsplit("-", 1)[1] == commit}
+        # what only images built from another commit are made of does not make these stale
+        others = [f":(exclude){p}" for img, paths in OWN_SOURCES.items() if img not in at for p in paths]
+        r = subprocess.run(["git", "-C", str(HERE.parent), "diff", "--quiet", commit, "HEAD", "--", *IMAGE_SOURCES, *others])
         if r.returncode == 1:
             out.append(f"images.lock pins images built from {commit}; their sources changed since (git diff {commit} HEAD -- {' '.join(IMAGE_SOURCES)})")
         elif r.returncode != 0:
