@@ -3102,7 +3102,7 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
     assert_eq!(r.status, 303, "{}", r.body);
     assert!(r.location().contains(&format!("node={node_hex}")) && r.location().contains("shop.invalid"), "{}", r.location());
     let rules = br.get(r.location().trim_start_matches('.')).body;
-    assert!(rules.contains(&format!("Allow {npub} to be paid")), "the rules page names the shop by its key");
+    assert!(rules.contains("Allow Home films to be paid"), "the rules page names the shop by its listing's name (0.2.3)");
     // and in the list of who may be paid, by its listing's name, with its key under it (#37 items 7, 11)
     assert!(rules.contains("<strong>Home films</strong><br><code class=\"key small\">") && rules.contains(&format!("title=\"{node_hex}\"")), "{rules}");
     // Found on Nostr knows it is on the list (#37 items 6, 15). FAILS before: "Add this shop" still, no mark
@@ -3996,7 +3996,7 @@ fn the_hashmakers_price_follows_the_difficulty_and_waits_for_the_rentals_going_o
     }
     assert_eq!((terms(&read()).0, read()["priceSeenMs"].clone()), (Some(366), seen_at));
     let p = br.get("/sell-hashrate");
-    assert!(p.body.contains("No live price") && p.body.contains("no new rental starts until it can"), "{}", p.body);
+    assert!(p.body.contains("No live price") && p.body.contains("Until then no new rental starts"), "{}", p.body);
     // a pruned node, whose getblockstats fails: the block reward is the chain's schedule at the tip (regtest's
     // halves every 150 blocks: 3.125 at 700), and the price is the one a full node gives
     let height = {
