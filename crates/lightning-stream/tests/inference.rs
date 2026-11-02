@@ -64,6 +64,9 @@ enum Plan {
     Policy(&'static str, u64),
     /// The seller refused the wallet's lock with its own internal code (`too_many_tickets`).
     LockRefused,
+    /// Paid for and sent; the model writes the whole answer (not a stream) for `.1` ms before its head is sent, and
+    /// is paid `.0`.
+    SlowWhole(u64, u64),
 }
 
 /// The caller's socket is still there (as the signer checks before it sends).
@@ -75,6 +78,8 @@ fn there(s: &UnixStream) -> bool {
 }
 
 const EMBEDDING: &str = "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}";
+
+const WHOLE: &str = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Hello there\"}}]}";
 
 const ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: [DONE]\n\n";
 
@@ -261,6 +266,15 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                             drop(s);
                             // the call to the signer ends with no answer
                             return;
+                        }
+                        Plan::SlowWhole(msat, ms) => {
+                            let Some(mut s) = opened() else { return_gone(&conn, &gone); return };
+                            serve();
+                            std::thread::sleep(Duration::from_millis(ms));
+                            let _ = writeln!(s, "{}", head(200, "application/json"));
+                            let _ = s.write_all(WHOLE.as_bytes());
+                            json!({"verdict": "allow", "rail": "ticket", "status": 200, "complete": true, "price_msat": msat.to_string(), "charged_sats": 900,
+                                   "request_sent": true})
                         }
                         Plan::CutWhole(msat) => {
                             let Some(mut s) = opened() else { return_gone(&conn, &gone); return };
@@ -933,4 +947,19 @@ fn a_model_and_its_seller_qualified_name_say_what_they_are_and_route_the_same() 
     let calls = r.sellers.lock().unwrap().calls.clone();
     assert_eq!(calls.len(), 2);
     assert_eq!((calls[0].0.as_str(), calls[0].1["model"].as_str()), (calls[1].0.as_str(), calls[1].1["model"].as_str()), "both names reach the same seller and model");
+}
+
+/// A whole answer (no `stream`) is sent by the seller only once its model has written all of it, a
+/// minute or more for a few thousand tokens: the seller's time for it is not a stream's wait for its
+/// first byte (`first_byte`, 1 s here, 20 s as shipped).
+///
+/// FAILS before: the call was given up as "the seller sent nothing within 1 s of being paid" (504).
+#[test]
+fn a_whole_answer_slower_than_a_streams_first_byte_is_waited_for() {
+    let r = rig(Plan::SlowWhole(777, 2500), Plan::Answer(999), 100);
+    let body = json!({"model": "llama", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}).to_string();
+    let (status, _, body) = call(&r.addr, "POST", "/v1/chat/completions", Some(&r.key), "", &body);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("Hello there"), "{body}");
+    assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
 }

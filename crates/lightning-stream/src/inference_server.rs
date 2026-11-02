@@ -65,6 +65,12 @@ pub const PAY_WAIT: Duration = Duration::from_secs(90);
 /// Past it the answer is not called whole.
 pub const ACCOUNT_WAIT: Duration = Duration::from_secs(120);
 
+/// How long a seller has for the head of a whole answer (a request that does not ask for a stream),
+/// from when its call is paid for, where [`Config::first_byte`] is less: the model writes all of it
+/// before anything is sent, a minute or more for a few thousand tokens on a seller's own box. As
+/// the seller's gateway and the wallet wait for it ([`xbt402::tokens::WHOLE_ANSWER_S`]).
+pub const WHOLE_ANSWER_WAIT: Duration = Duration::from_secs(xbt402::tokens::WHOLE_ANSWER_S);
+
 /// The shortest `LS_AI_PAY_WAIT_S` taken: a wait shorter than a payment over an ordinary route
 /// gives every paid call up before it is paid.
 pub const PAY_WAIT_FLOOR: Duration = Duration::from_secs(30);
@@ -691,8 +697,10 @@ impl AiServer {
             body["model"] = Value::String(offer.model.clone());
             let sent = body.to_string().into_bytes();
             let url = format!("{}{}", offer.route, path.trim_start_matches('/'));
+            // a whole answer starts only once the model has written all of it: the seller's time for it is longer
+            let first_byte = if body.get("stream") == Some(&Value::Bool(true)) { self.cfg.first_byte } else { self.cfg.first_byte.max(WHOLE_ANSWER_WAIT) };
             // the seller's own listed prices are the most it is paid: a 402 asking more is refused
-            match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, self.cfg.first_byte, Some(&offer.ceiling)) {
+            match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, first_byte, Some(&offer.ceiling)) {
                 Ok(b) => return self.relay(b, offer.seller.clone(), key_id.to_string(), today, bound),
                 Err(Failed { status, message, final_answer, paid, paying, account, spending: refused_by }) => {
                     // whatever the call cost this seller is booked to the key, now or when the wallet says; where it

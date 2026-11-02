@@ -480,12 +480,31 @@ pub struct Times {
     pub refill_wait: Duration,
     /// The service must start its answer, and then keep sending, within this.
     pub upstream_wait: Duration,
+    /// [`Times::upstream_wait`] for a route priced by the token (an AI model), where it is longer: a
+    /// whole answer (not a stream) starts only once the model has written all of it.
+    pub ai_upstream_wait: Duration,
     /// A block height older than this is not a height.
     pub height_max_age: Duration,
     /// The longest one response may stay open.
     pub max_response: Duration,
     /// How often the janitor runs: the height, the sweep, the journal's sync.
     pub tick: Duration,
+}
+
+/// The default of `times.ai_upstream_wait_secs`: a model's whole answer is sent only at its end,
+/// a minute or more for a few thousand tokens ([`xbt402::tokens::WHOLE_ANSWER_S`]). A stream's
+/// next token is held to it too, under `max_response_secs`.
+pub const AI_UPSTREAM_WAIT_S: u64 = xbt402::tokens::WHOLE_ANSWER_S;
+
+impl Times {
+    /// How long `route`'s service may take to start its answer, and between two reads of it.
+    pub fn upstream_wait_for(&self, route: &Route) -> Duration {
+        if route.price.tokens.active() {
+            self.upstream_wait.max(self.ai_upstream_wait)
+        } else {
+            self.upstream_wait
+        }
+    }
 }
 
 impl Config {
@@ -887,6 +906,7 @@ impl Config {
                 &[
                     "refill_wait_ms",
                     "upstream_wait_secs",
+                    "ai_upstream_wait_secs",
                     "height_max_age_secs",
                     "max_response_secs",
                     "tick_ms",
@@ -899,6 +919,7 @@ impl Config {
             // and the buyer pays for the next ticket only once it has read nearly all it paid for
             refill_wait: Duration::from_millis(num(tm, "refill_wait_ms", 15_000)?),
             upstream_wait: Duration::from_secs(num(tm, "upstream_wait_secs", 10)?.max(1)),
+            ai_upstream_wait: Duration::from_secs(num(tm, "ai_upstream_wait_secs", AI_UPSTREAM_WAIT_S)?.max(1)),
             height_max_age: Duration::from_secs(num(tm, "height_max_age_secs", 10)?.max(1)),
             max_response: Duration::from_secs(num(tm, "max_response_secs", 21_600)?.max(1)),
             tick: Duration::from_millis(num(tm, "tick_ms", 500)?.clamp(10, 5000)),
