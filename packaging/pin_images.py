@@ -90,7 +90,14 @@ IMAGE_SOURCES = ["crates", "Cargo.toml", "Cargo.lock", "container", ":(glob,excl
 # images' pins stale, so a fix release may rebuild them alone and keep the others' pins (0.2.1: xbt-wallet-ui;
 # 0.2.2: xbt-wallet-ui and lightning-stream)
 # path -> the images built from it (no other image's crates depend on it)
-OWN_SOURCES = {"crates/xbt-wallet-ui": {"xbt-wallet-ui"}, "crates/lightning-stream": {"lightning-stream", "xbt-wallet-ui"}}
+OWN_SOURCES = {
+    "crates/xbt-wallet-ui": {"xbt-wallet-ui"},
+    "crates/lightning-stream": {"lightning-stream", "xbt-wallet-ui"},
+    # 0.2.3: the VPN service is also linked into the wallet UI; the signer crate into the wallet UI, the
+    # wallet MCP (and its xbt-nwc) and the anchor witness, which builds from the same package
+    "crates/xbt-vpn": {"xbt-vpn", "xbt-wallet-ui"},
+    "crates/xbt-signer": {"xbt-signer", "xbt-anchor-witness", "xbt-wallet-mcp", "xbt-wallet-ui"},
+}
 
 
 def stale(pins: dict[str, str]) -> list[str]:

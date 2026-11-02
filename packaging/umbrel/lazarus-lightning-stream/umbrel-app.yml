@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.2.2"
+version: "0.2.3"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -53,6 +53,9 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.2.3: the menu says Buy; signing the starter rules includes paying with real money; the demo shop
+  is added and allowed in one click; each payment shows one cost with its fee; credit with a shop is
+  shown; the VPN page can add exits found on Nostr; faster pages; a new look, dark by default.
   0.2.2: sellers by name everywhere; editing who may be paid can no longer drop a seller's node; plain
   words instead of blank pages when a payment can't happen, and a warning when your node can't send; a
   visit shows what it used; the version shows; slow pages open at once.
