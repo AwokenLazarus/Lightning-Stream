@@ -15957,10 +15957,12 @@ fn a_prepaid_ticket_the_buyers_own_rules_refuse_is_never_locked_and_opens_no_ses
     let _g = env_lock();
     // two tickets of 1,003 sat booked fit; a third does not
     let r = prepaid_shop_with_daily_cap(2_100);
+    // refused for the call's request, or as its answer went on (then it ends "stopped by the wallet")
+    let by_the_cap = |v: &Value| v["rule"] == "per_counterparty_daily" || v["ended"].as_str().is_some_and(|e| e.contains("per_counterparty_daily"));
     let mut refused = None;
     for i in 0..6 {
         let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
-        if v["rule"] == "per_counterparty_daily" {
+        if by_the_cap(&v) {
             refused = Some(v);
             break;
         }
@@ -15972,13 +15974,15 @@ fn a_prepaid_ticket_the_buyers_own_rules_refuse_is_never_locked_and_opens_no_ses
     let locks = r.tap.seen("/x402/ticket/lock").len();
     assert_eq!(locks, paid, "a lock was made for a ticket the buyer's rules refused: {locks} locks, {paid} tickets paid: {v}");
     assert_eq!(r.shop.standin.count(InvoiceState::Open), 0, "an unpaid invoice was left at the seller: {v}");
-    assert_eq!(v["limit_sats"].as_i64(), Some(2_100), "the refusal names the owner's limit: {v}");
-    assert!(v["reason"].as_str().is_some_and(|w| w.contains("daily cap")), "{v}");
+    // the rule and the owner's limit, whether the call was refused or its answer stopped
+    let said = if v["rule"] == "per_counterparty_daily" { v.clone() } else { v["policy_refused"].clone() };
+    assert_eq!((said["rule"].as_str(), said["limit_sats"].as_i64()), (Some("per_counterparty_daily"), Some(2_100)), "the refusal names the rule and the owner's limit: {v}");
+    assert!(said["reason"].as_str().is_some_and(|w| w.contains("daily cap")), "{v}");
     // the calls after it: the same rule, at once, and still nothing asked of the seller and no session opened
     for i in 0..3 {
         let t = Instant::now();
         let v = r.pay(&format!("/files/{}", 4 * MIB), 5_000);
-        assert_eq!(v["rule"].as_str(), Some("per_counterparty_daily"), "call {i} after: {v}");
+        assert!(by_the_cap(&v) || v["policy_refused"]["rule"] == "per_counterparty_daily", "call {i} after: {v}");
         assert!(!v.to_string().contains("too_many"), "call {i} after: the seller's refusal reached the buyer: {v}");
         assert!(t.elapsed() < Duration::from_secs(5), "call {i} after waited {:?}: {v}", t.elapsed());
     }

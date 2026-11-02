@@ -340,7 +340,8 @@ impl Visit {
         let used = price.max(signed.unwrap_or(0).min(price.saturating_add(share.max(0).unsigned_abs().saturating_mul(1000))));
         let charged = num("charged_sats").unwrap_or(0);
         // a top-up the buyer's own rules refused: the request went on, and the visit ends with that rule's words
-        if let Some(t) = v.get("top_up_refused").filter(|t| t.is_object()) {
+        // (or a ticket for the answer, which stopped where the credit ended: `policy_refused`)
+        if let Some(t) = v.get("top_up_refused").or(v.get("policy_refused")).filter(|t| t.is_object()) {
             self.policy_stop(t);
         }
         let mut s = self.lock();

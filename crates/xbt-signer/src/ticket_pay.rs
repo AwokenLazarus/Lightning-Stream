@@ -1898,6 +1898,10 @@ struct Spent {
     /// The caller's top-up (`top_up_sats`) was refused by the owner's own caps or spending rules: the rule, why, and the
     /// limit (`top_up_refused` in the answer). The request went on with the credit it had.
     top_up_refused: Option<Value>,
+    /// The owner's own caps or spending rules refused a prepaid ticket for the call (for its request, its answer as it
+    /// went on, or its top-up): the rule, why, and the limit (`policy_refused` in the answer). An answer stopped for it
+    /// says only "stopped by the wallet" in `ended`; this says which of the owner's rules it was.
+    policy_refused: Option<Value>,
 }
 
 impl Spent {
@@ -3699,7 +3703,7 @@ impl Signer {
         // locked, so it holds none of the places the seller gives the session and this address
         if let Some((m, _, _)) = size {
             if let Err(d) = self.ticket_prepay_precheck(&hs.sid, m) {
-                return Err(self.ticket_policy_refused(hs, d, None));
+                return Err(self.ticket_policy_refused(hs, spent, d, None));
             }
         }
         // a rental task's sizes aren't its seller's own (`topTicketMsat`): each is asked for by name
@@ -3739,7 +3743,7 @@ impl Signer {
                 // that it does not hold a place until it lapses
                 if r["verdict"] == "deny" && is_owner_limit(&r) {
                     let hash = str_or_empty(first.get("hash"));
-                    return Err(self.ticket_policy_refused(hs, r, Some(hash)));
+                    return Err(self.ticket_policy_refused(hs, spent, r, Some(hash)));
                 }
                 r
             }
@@ -3767,7 +3771,7 @@ impl Signer {
         }
         if r["verdict"] != "allow" {
             if is_owner_limit(&r) {
-                return Err(self.ticket_policy_refused(hs, r, None));
+                return Err(self.ticket_policy_refused(hs, spent, r, None));
             }
             return Err(r);
         }
@@ -3790,7 +3794,7 @@ impl Signer {
     /// A prepaid ticket of the session refused by the owner's own caps or spending rules (`d`): noted on the session
     /// ([`HttpSession::policy_refused`]) and in the owner's audit, and, where the seller had already issued an invoice for
     /// it (`invoiced`, its hash), the seller asked to cancel that invoice. Returns the refusal the caller is told.
-    fn ticket_policy_refused(&self, hs: &HttpSession, d: Value, invoiced: Option<String>) -> Value {
+    fn ticket_policy_refused(&self, hs: &HttpSession, spent: &mut Spent, d: Value, invoiced: Option<String>) -> Value {
         let mut cancel_asked = false;
         if let Some(hash) = invoiced.filter(|h| xbt402::ticket::hex32(h).is_some()) {
             // unchecked, as every cancel of an invoice the wallet will not pay: one the seller does not cancel lapses
@@ -3801,6 +3805,7 @@ impl Signer {
                                                                      "reason": d.get("reason"), "limit_sats": d.get("limit_sats"),
                                                                      "before_lock": d.get("before_lock").is_some(), "cancel_asked": cancel_asked}));
         *lock(&hs.policy_refused) = Some(d.clone());
+        spent.policy_refused = Some(json!({"rule": d.get("rule"), "reason": d.get("reason"), "limit_sats": d.get("limit_sats")}));
         d
     }
 
@@ -4916,6 +4921,9 @@ impl Signer {
                                "balance_msat": hs.balance().to_string(), "credited_msat": hs.credited().to_string(), "tickets": self.ticket_session_counts(&hs.sid)});
             if let Some(t) = &spent.top_up_refused {
                 v["top_up_refused"] = t.clone();
+            }
+            if let Some(t) = &spent.policy_refused {
+                v["policy_refused"] = t.clone();
             }
             v
         };
