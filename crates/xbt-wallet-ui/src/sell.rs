@@ -276,6 +276,12 @@ const APP_HEADERS: [&str; 7] = ["cookie", "authorization", "x-emby-authorization
 
 /// The gateway's settings as the Sell page shows them: every `upstream_headers` value (an app's
 /// login, the files key) is replaced, so a screenshot of the page gives none of them away.
+/// Whether a setting named `k` holds a secret: a token, a password, a key's secret part.
+fn secret_key(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    ["token", "secret", "password", "passwd", "macaroon", "private", "nsec"].iter().any(|w| k.contains(w))
+}
+
 fn hide_header_values(mut c: Value) -> Value {
     fn walk(v: &mut Value) {
         match v {
@@ -287,6 +293,9 @@ fn hide_header_values(mut c: Value) -> Value {
                                 *val = Value::String("(hidden)".into());
                             }
                         }
+                    } else if secret_key(k) && !x.is_null() && !x.is_object() && !x.is_array() {
+                        // the gateway's health token and any other secret: never in the page (0.2.1 showed health_token whole)
+                        *x = Value::String("(hidden)".into());
                     } else {
                         walk(x);
                     }
@@ -1857,9 +1866,10 @@ mod tests {
     fn the_settings_shown_hide_every_header_value() {
         let c = json!({"routes": [{"path": "/files/", "upstream_headers": {"x-stream-files-key": "secret1"}},
                                   {"path": "/app/", "upstream_headers": {"x-emby-authorization": "secret2"}, "free": false}],
-                       "nostr": {"publish": true}});
+                       "nostr": {"publish": true}, "health_token": "secret3", "gw": {"api_token_file": "/data/t", "admin_password": "secret4"}});
         let shown = hide_header_values(c).to_string();
-        assert!(!shown.contains("secret1") && !shown.contains("secret2"), "{shown}");
+        assert!(!shown.contains("secret1") && !shown.contains("secret2") && !shown.contains("secret3") && !shown.contains("secret4"), "{shown}");
+        assert!(shown.contains("\"health_token\":\"(hidden)\""), "{shown}");
         assert!(shown.contains("x-stream-files-key") && shown.contains("(hidden)") && shown.contains("\"publish\":true"), "{shown}");
     }
 
