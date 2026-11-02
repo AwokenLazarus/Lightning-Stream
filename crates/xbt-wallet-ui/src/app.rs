@@ -254,6 +254,8 @@ impl App {
         if app.cfg.prefetch {
             app.prefetch();
         }
+        // the agents' catalog, for a box whose services file predates it (or was edited by hand)
+        app.write_catalog();
         Ok(app)
     }
 
@@ -2461,6 +2463,25 @@ mod handson_0202_tests {
         assert!(!rules_allow(&json!({"allowlist": ["https://a.example"]}), "https://a.example", None));
         assert_eq!(ln_line_node(&format!("ln:{node}")), Some(node.as_str()));
         assert_eq!(ln_line_node("bc1qcoin"), None);
+    }
+
+    /// The wallet's MCP server (`list_services`) marks a seller allowed as Browse does: the same answer for each case.
+    #[test]
+    fn the_agents_catalog_marks_a_seller_allowed_as_browse_does() {
+        let node = format!("035d867908cd{}0b7d", "0".repeat(50));
+        let shop = xbt402::shop::origin_for(&[0x5a; 32]);
+        let other = "02".repeat(33);
+        let rules = [json!({"allowlist": [shop.clone(), format!("ln:{node}")], "counterparties": {}}),
+                     json!({"allowlist": ["https://a.example"], "counterparties": {"https://a.example": {"ln_node": node}}}),
+                     json!({"allowlist": [format!("ln:{node}")], "counterparties": {"https://a.example": {"ln_node": node}}}),
+                     json!({"allowlist": ["https://a.example"]}), json!({}), json!({"allowlist": ["https://A.example:443/"], "counterparties": {"https://a.example": {"ln_node": node}}})];
+        for p in &rules {
+            for origin in [shop.as_str(), "https://a.example", "https://a.example/", "https://b.example"] {
+                for known in [None, Some(node.as_str()), Some(other.as_str())] {
+                    assert_eq!(xbt_wallet_mcp::catalog::allowed(p, origin, known), rules_allow(p, origin, known), "{p} {origin} {known:?}");
+                }
+            }
+        }
     }
 
     /// Home's Get started counts a shop allowed as the signer allows it: also one allowed only

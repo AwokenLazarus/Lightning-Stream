@@ -301,7 +301,7 @@ POLICY_BASE = {"max_per_tx_sats": 1000, "daily_budget_sats": 20000, "weekly_budg
                "regtest_mine": False, "anchor_required": True, "anchor_interval_s": 5}
 
 # what the wallet's MCP lists with no rail's own tools turned on
-BASE_TOOLS = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"]
+BASE_TOOLS = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "list_services"]
 # the packages turn the Lightning rail's and the tickets' own tools on (XBT_MCP_LN, XBT_MCP_TICKETS)
 PACKAGE_TOOLS = BASE_TOOLS + ["ln_pay", "ln_status", "ticket_status", "ticket_stop"]
 
@@ -320,7 +320,7 @@ def agent_and_custody(group, agent, ui, sign_bin, key_file, chain, sc, tools="ba
     code, listed = agent.post({"jsonrpc": "2.0", "id": 9000, "method": "tools/list"})
     names = [t.get("name") for t in listed.get("result", {}).get("tools", [])] if isinstance(listed, dict) else listed
     want = PACKAGE_TOOLS if tools == "package" else BASE_TOOLS
-    check(group, f"the agent's tools: the six every wallet has{', the rail and ticket tools' if tools == 'package' else ''}, and none of the "
+    check(group, f"the agent's tools: the seven every wallet has{', the rail and ticket tools' if tools == 'package' else ''}, and none of the "
                  "removed on-chain channel", names == want, names)
     bal = agent.tool("balance")
     check(group, "the agent reads the balance: the hot key's coins, no channel", bal.get("hot", {}).get("hot_sats") == 50000 and bal.get("channels") == []

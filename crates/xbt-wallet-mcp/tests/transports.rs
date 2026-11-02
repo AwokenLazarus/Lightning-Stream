@@ -181,7 +181,7 @@ fn streamable_http_sessions_and_guards() {
     assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", "nope")]).0, 404);
     let (st, _, body) = req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid), ("MCP-Protocol-Version", "2025-06-18")]);
     assert_eq!(st, 200);
-    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["result"]["tools"].as_array().unwrap().len(), 7);
     let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
     assert_eq!(req("POST", &h.base, Some(&note), &[a, ("Mcp-Session-Id", &sid)]).0, 202);
     let call = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "balance", "arguments": {}}});

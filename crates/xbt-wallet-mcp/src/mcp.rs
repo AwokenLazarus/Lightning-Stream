@@ -18,7 +18,8 @@ pub const LATEST: &str = "2025-11-25";
 /// The tools every wallet has. They are six of the ten of the Python wallet (B2 `MCP_TOOL_NAMES`):
 /// `close_channel`, `xbt402_refund`, `forward_status` and `forward_recover` were tools of the
 /// on-chain channel and of a rail that rode on its closes, and went with the channel.
-pub const TOOL_NAMES: [&str; 6] = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"];
+/// `list_services` (not B2's) is read-only: the services the wallet may buy, from the catalog the wallet UI writes.
+pub const TOOL_NAMES: [&str; 7] = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "list_services"];
 /// AGP-048 `rail=ln`: listed and callable only when the operator turns the rail on (`XBT_MCP_LN=1`),
 /// so a wallet without a Lightning node is not offered them.
 pub const LN_TOOL_NAMES: [&str; 2] = ["ln_pay", "ln_status"];
@@ -232,16 +233,16 @@ mod tests {
     fn ticket_tools_only_when_on_and_none_of_them_locks_or_releases() {
         let names = |v: Value| v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(names(tools_with(false, false)), TOOL_NAMES);
-        assert_eq!(names(tools_with(true, false)).len(), 8, "the Lightning tools alone are as before");
+        assert_eq!(names(tools_with(true, false)).len(), 9, "the Lightning tools alone are as before");
         let on = names(tools_with(true, true));
-        assert_eq!((on.len(), &on[8..]), (10, &TICKET_TOOL_NAMES.map(String::from)[..]));
-        assert_eq!(names(tools_with(false, true))[6..], TICKET_TOOL_NAMES);
+        assert_eq!((on.len(), &on[9..]), (11, &TICKET_TOOL_NAMES.map(String::from)[..]));
+        assert_eq!(names(tools_with(false, true))[7..], TICKET_TOOL_NAMES);
         for forbidden in ["ticket_open", "ticket_offer", "ticket_lock", "ticket_release"] {
             assert!(!on.iter().any(|n| n == forbidden) && crate::args::spec(forbidden).is_none(), "{forbidden} is a socket method, not a tool");
         }
         // the published schema of each ticket tool, and of each tool tickets describe anew, names exactly the arguments the server takes
         let listed = tools_with(false, true);
-        assert_eq!(names(listed.clone())[..6], TOOL_NAMES, "a redescribed tool keeps its place and its name");
+        assert_eq!(names(listed.clone())[..7], TOOL_NAMES, "a redescribed tool keeps its place and its name");
         for t in listed["tools"].as_array().unwrap().iter().filter(|t| TICKET_TOOL_NAMES.contains(&t["name"].as_str().unwrap()) || TICKET_REDESCRIBED.contains(&t["name"].as_str().unwrap())) {
             let spec = crate::args::spec_for(t["name"].as_str().unwrap(), true).unwrap();
             let mut props: Vec<&str> = t["inputSchema"]["properties"].as_object().unwrap().keys().map(String::as_str).collect();
@@ -267,13 +268,31 @@ mod tests {
         }
     }
 
+    /// `list_services` is listed on every wallet, takes only `kind`, says it is read-only, and the pay tool points to it.
+    ///
+    /// FAILS before: there was no tool that says what the wallet may buy, and a shop reached by its key could not be found.
+    #[test]
+    fn list_services_is_offered_and_the_pay_tool_points_to_it() {
+        for (ln, tickets) in [(false, false), (true, true)] {
+            let t = tools_with(ln, tickets);
+            let all = t["tools"].as_array().unwrap();
+            let ls = all.iter().find(|x| x["name"] == "list_services").expect("list_services is listed");
+            let props: Vec<&String> = ls["inputSchema"]["properties"].as_object().unwrap().keys().collect();
+            assert_eq!(props, ["kind"]);
+            assert_eq!(crate::args::spec("list_services").unwrap().iter().map(|a| a.name).collect::<Vec<_>>(), ["kind"]);
+            assert!(ls["description"].as_str().unwrap().contains("Read-only") && ls["description"].as_str().unwrap().contains("pay_address"));
+            let pay = all.iter().find(|x| x["name"] == "xbt402_pay").unwrap();
+            assert!(pay["description"].as_str().unwrap().contains("Use an address from list_services"), "{ln} {tickets}");
+        }
+    }
+
     #[test]
     fn ln_tools_only_when_on() {
         let names = |v: Value| v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(names(tools_for(false)), TOOL_NAMES);
         let on = names(tools_for(true));
-        assert_eq!(on.len(), 8);
-        assert_eq!(on[6..], LN_TOOL_NAMES);
+        assert_eq!(on.len(), 9);
+        assert_eq!(on[7..], LN_TOOL_NAMES);
         for n in LN_TOOL_NAMES {
             assert!(crate::args::spec(n).is_some() && !FORBIDDEN.contains(&n));
         }
@@ -290,7 +309,7 @@ mod tests {
             let listed: Vec<&str> = t["inputSchema"].get("required").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
             assert_eq!(required, listed, "{}", t["name"]);
         }
-        let ln_pay = &listed["tools"][6];
+        let ln_pay = &listed["tools"][7];
         assert!(ln_pay["description"].as_str().unwrap().contains("ln-offer:<offer id>"));
         assert_eq!(ln_pay["inputSchema"]["properties"]["amount_sats"]["default"], 0);
     }

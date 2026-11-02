@@ -313,6 +313,25 @@ impl Wallet {
         Ok(out)
     }
 
+    /// `list_services`: the catalog the wallet UI wrote ([`crate::catalog`]), each seller marked by the
+    /// owner's rules as the signer has them now. Read-only. No catalog yet: an empty list that says why.
+    fn list_services(&self, kind: &str) -> Result<Value, String> {
+        let policy = self.signer("policy_get", &json!({}))?.get("policy").cloned().unwrap_or(Value::Null);
+        let catalog = match crate::catalog::catalog_path() {
+            None => Err("this server has no XBT_SHOPS_FILE or XBT_MCP_CATALOG set, so it cannot find the wallet's catalog".to_string()),
+            Some(p) if !p.exists() => Err("the wallet has no catalog yet: the owner adds sellers on the wallet app's Services page".to_string()),
+            Some(p) => crate::catalog::read_catalog(&p),
+        };
+        Ok(match catalog {
+            Ok(c) => crate::catalog::list(&c, &policy, kind),
+            Err(why) => {
+                let mut v = crate::catalog::list(&json!({}), &policy, kind);
+                v["note"] = why.into();
+                v
+            }
+        })
+    }
+
     /// Run a tool whose arguments passed validation. Ok: the packed text. Err: the reason, which
     /// stays in this process's log; the model gets B2's generic "Error executing tool" line.
     pub fn call_tool(&self, name: &str, mut params: Map<String, Value>) -> Result<String, String> {
@@ -324,6 +343,7 @@ impl Wallet {
         }
         let result = match name {
             "xbt402_pay" | "ln_pay" => self.pay_waiting(name, &params)?,
+            "list_services" => self.list_services(params.get("kind").and_then(Value::as_str).unwrap_or(""))?,
             _ => self.signer(name, &Value::Object(params))?,
         };
         pack(result)
