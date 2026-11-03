@@ -5533,8 +5533,9 @@ impl Signer {
         let up_writer_absent = up_writer.is_none();
         // the caller's side of an answer streamed on (never a WebSocket, whose caller writes on it): a ticket is not released
         // for an answer whose reader has gone (a visit stopped while the seller waited for the next ticket)
-        let watch = if up_writer_absent { sink.out.as_ref().and_then(|o| o.try_clone().ok()) } else { None };
-        let reader_left = || watch.as_ref().is_some_and(reader_closed);
+        // (let go with the sink's own end, so that the reader sees the body end then: [`Sink::out`] is dropped below)
+        let watch = Mutex::new(if up_writer_absent { sink.out.as_ref().and_then(|o| o.try_clone().ok()) } else { None });
+        let reader_left = || lock(&watch).as_ref().is_some_and(reader_closed);
         // `due`: the caller's own test of whether one is due, on the credit left for this answer
         let pay = |bytes: u64, due: &dyn Fn(u64) -> bool| -> Option<String> {
             if let Some(why) = st.over(bytes) {
@@ -5935,6 +5936,7 @@ impl Signer {
         // and the reader's socket too: its client has the whole body now, not after the seller's last receipt is
         // fetched below, a round trip or more on a slow link (the call's reply still says what the answer cost)
         sink.out = None;
+        lock(&watch).take();
         *spent = std::mem::take(&mut lock(&spent_cell));
         let stopped = lock(&state).1.clone();
         let complete = stopped.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);
