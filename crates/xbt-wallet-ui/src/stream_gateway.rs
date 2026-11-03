@@ -66,12 +66,22 @@ pub struct Settings {
     pub pool_pubkey: String,
     /// `mining.coinbase_unique_id`: one per install, kept.
     pub unique_id: u16,
+    /// The owner's own coinbase tag (`mining.coinbase_tag_secondary`, the miner's short name in DATUM's words), in every
+    /// block it finds; empty: [`TAG_SECONDARY`]. The primary tag is [`TAG_PRIMARY`] solo, and the pool's own with a pool.
+    pub tag: String,
 }
+
+/// The coinbase tags the gateway writes by default.
+pub const TAG_PRIMARY: &str = "Lightning Stream";
+pub const TAG_SECONDARY: &str = "Stream Gateway";
+/// DATUM's limits on the tags (`datum_conf.c`): 60 bytes each, 88 both together.
+const TAG_MAX: usize = 60;
+const TAGS_MAX: usize = 88;
 
 impl Settings {
     pub fn new(mode: Mode, payout: &str) -> Self {
         Self { mode, payout: payout.trim().to_string(), pool_host: LAZARUS_HOST.into(), pool_port: LAZARUS_PORT, pool_pubkey: LAZARUS_PUBKEY.into(),
-               unique_id: fresh_unique_id() }
+               unique_id: fresh_unique_id(), tag: String::new() }
     }
 }
 
@@ -160,9 +170,21 @@ fn check_pubkey(k: &str) -> Result<(), String> {
     }
 }
 
+/// The owner's coinbase tag: plain printable ASCII, within DATUM's limits beside the primary tag. Empty is the default.
+pub fn check_tag(tag: &str) -> Result<(), String> {
+    if !tag.bytes().all(|c| (0x20..=0x7e).contains(&c)) {
+        return Err("The coinbase tag takes plain letters, digits, spaces and punctuation (ASCII) only.".into());
+    }
+    if tag.len() > TAG_MAX || TAG_PRIMARY.len() + tag.len() > TAGS_MAX {
+        return Err(format!("The coinbase tag is {TAG_MAX} characters at the most."));
+    }
+    Ok(())
+}
+
 /// Check the owner's settings before they are written.
 pub fn check(s: &Settings, chain: &str) -> Result<(), String> {
     check_address(&s.payout, chain)?;
+    check_tag(&s.tag)?;
     if s.mode == Mode::PoolKey {
         if s.pool_host.is_empty() || !s.pool_host.bytes().all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c)) {
             return Err("The pool's address is a host name, like datum.lazarus-xbt.xyz.".into());
@@ -199,8 +221,8 @@ pub fn config_json(s: &Settings, setup: &StreamGwSetup) -> Value {
         "stratum": {"listen_addr": "127.0.0.1", "listen_port": setup.stratum_port},
         "mining": {
             "pool_address": s.payout,
-            "coinbase_tag_primary": "Lightning Stream",
-            "coinbase_tag_secondary": "Stream Gateway",
+            "coinbase_tag_primary": TAG_PRIMARY,
+            "coinbase_tag_secondary": if s.tag.is_empty() { TAG_SECONDARY } else { s.tag.as_str() },
             "coinbase_unique_id": s.unique_id,
             // a block it found stays on the volume even if the node's submitblock fails
             "save_submitblocks_dir": format!("{state}/submitblocks"),
@@ -225,6 +247,7 @@ pub fn read(dir: &Path) -> Option<Settings> {
     let mode = Mode::from_name(v["xbt"]["mode"].as_str()?)?;
     let mut s = Settings::new(mode, v["mining"]["pool_address"].as_str().unwrap_or(""));
     s.unique_id = v["mining"]["coinbase_unique_id"].as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0).unwrap_or(s.unique_id);
+    s.tag = v["mining"]["coinbase_tag_secondary"].as_str().filter(|t| *t != TAG_SECONDARY).unwrap_or("").to_string();
     if mode == Mode::PoolKey {
         let d = &v["datum"];
         s.pool_host = d["pool_host"].as_str().unwrap_or(LAZARUS_HOST).to_string();
@@ -382,6 +405,30 @@ mod tests {
                             || ["127.0.0.1", "Lightning Stream", "Stream Gateway", "solo", "pool-key", "lazarus"].contains(&s.as_str()), "{s}");
             }
         }
+    }
+
+    /// The owner's own coinbase tag goes in the secondary tag (DATUM's: the primary is the pool's with a pool), read back,
+    /// and refused past DATUM's limits or outside printable ASCII. Empty is today's tag.
+    #[test]
+    fn the_owners_coinbase_tag_is_written_checked_and_read_back() {
+        let t = tempfile::tempdir().unwrap();
+        let st = setup(t.path());
+        let mut s = Settings::new(Mode::Solo, P2PKH);
+        assert_eq!(config_json(&s, &st)["mining"]["coinbase_tag_secondary"], "Stream Gateway");
+        s.tag = "Kilombino /solo/".into();
+        let c = config_json(&s, &st);
+        assert_eq!((c["mining"]["coinbase_tag_primary"].clone(), c["mining"]["coinbase_tag_secondary"].clone()), (json!("Lightning Stream"), json!("Kilombino /solo/")));
+        write(&st, &s, "main").unwrap();
+        assert_eq!(read(t.path()).unwrap().tag, "Kilombino /solo/");
+        write(&st, &Settings::new(Mode::Solo, P2PKH), "main").unwrap();
+        assert_eq!(read(t.path()).unwrap().tag, "", "the default reads back as none of the owner's");
+        assert_eq!(check_tag(&"x".repeat(60)), Ok(()));
+        assert!(check_tag(&"x".repeat(61)).unwrap_err().contains("60 characters"));
+        assert!(check_tag("bloque ñ").unwrap_err().contains("ASCII"));
+        assert!(check_tag("a\nb").is_err(), "no control characters");
+        let bad = Settings { tag: "x".repeat(61), ..Settings::new(Mode::Solo, P2PKH) };
+        assert!(write(&st, &bad, "main").is_err());
+        assert_eq!(read(t.path()).unwrap().tag, "", "refused: nothing written");
     }
 
     #[test]

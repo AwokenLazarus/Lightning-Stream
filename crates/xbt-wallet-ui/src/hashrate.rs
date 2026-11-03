@@ -1242,23 +1242,28 @@ impl App {
                 <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>\
                 <p class=\"small\">Built on <a href=\"https://github.com/FlyTheElephant1/datum_gateway\" target=\"_blank\" rel=\"noopener noreferrer\">FlyTheElephant's \
                 datum_gateway</a>, with Lightning Stream's job masking.</p>"));
+            // in order: its state, where its blocks pay, what goes in its blocks, then what most owners never change
             if b["inUse"] == true {
                 let node = b["node"].as_bool();
-                o.push_str("<ul class=\"plain\">");
+                o.push_str("<h3>Status</h3><ul class=\"plain\">");
                 o.push_str(&state_row(Some(b["running"] == true), "Running"));
                 // what it measures: a job was fetched from the gateway and checked (it comes from your node)
                 o.push_str(&jobs_row(if b["running"] == true { node } else { None }));
                 o.push_str(&state_row(if node == Some(true) { Some(b["masking"] == true) } else { None }, "Masking its jobs"));
                 o.push_str("</ul>");
             } else if !b.is_null() {
-                o.push_str(&format!("<p class=\"hint\">Rented work goes to another gateway now, at <code>{}</code>.</p>\
+                o.push_str(&format!("<h3>Status</h3><p class=\"hint\">Rented work goes to another gateway now, at <code>{}</code>.</p>\
                     <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"use-bundled\">\
                     <button class=\"secondary\">Use the {NAME}</button></form>", esc(datum)));
             }
             let solo = s.mode == Mode::Solo;
             let ck = |on: bool| if on { " checked" } else { "" };
+            // the node its block templates come from, by host (the node's credentials are never in its address)
+            let node = self.cfg.hash.stream_gw.rpcurl.as_deref().map(|u| u.split("://").last().unwrap_or(u).rsplit('@').next().unwrap_or("").trim_end_matches('/'))
+                .map(|h| format!(", at <code>{}</code>", esc(h))).unwrap_or_default();
             o.push_str(&format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"gateway\">\
-                <fieldset><legend>Where its blocks pay</legend>\
+                <h3>Where its blocks pay</h3>\
+                <fieldset><legend>Solo or a pool</legend>\
                 <label><input type=\"radio\" name=\"mode\" value=\"solo\"{}> Solo: every block it finds pays your address, whole</label>\
                 <label><input type=\"radio\" name=\"mode\" value=\"pool-key\"{}> Lazarus Pool: blocks are shared through the pool, and you are paid for your share of its work</label>\
                 </fieldset>\
@@ -1267,13 +1272,19 @@ impl App {
                 <p class=\"hint\">With Lazarus Pool, this gateway holds the key that masks its jobs, and hands it to the pool with a block. So it could hide \
                 a block it finds from the pool, the same as any DATUM miner can today. Lazarus Pool masks these jobs once it takes gateway keys; until then \
                 renting stays off in this mode, and solo works.</p>\
-                <details><summary>The pool's server</summary>\
+                <h3>Your blocks</h3>\
+                <p class=\"hint\">Its block templates come from your own XBT node{node}: the transactions in a block it finds are your node's choice.</p>\
+                <label>Coinbase tag <small>(optional)</small><input name=\"coinbase_tag\" value=\"{}\" maxlength=\"60\" pattern=\"[ -~]*\" spellcheck=\"false\" placeholder=\"{}\"></label>\
+                <p class=\"hint\">Your own words in every block it finds, after &quot;{}&quot; solo, or after the pool's own with a pool. Up to 60 characters, \
+                plain letters, digits and punctuation. Empty: &quot;{}&quot;.</p>\
+                <details><summary>Advanced: the pool's server</summary>\
                 <label>Host<input name=\"pool_host\" value=\"{}\" class=\"mono\"></label>\
                 <label>Port<input name=\"pool_port\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
                 <label>Its key<input name=\"pool_pubkey\" value=\"{}\" class=\"mono\" spellcheck=\"false\"></label>\
                 <p class=\"hint\">Lazarus Pool's own, as it publishes them. Change them only if the pool says so.</p></details>\
                 <button>Save</button></form>",
-                ck(solo), ck(!solo), esc(&s.payout),
+                ck(solo), ck(!solo), esc(&s.payout), esc(&s.tag), crate::stream_gateway::TAG_SECONDARY, crate::stream_gateway::TAG_PRIMARY,
+                crate::stream_gateway::TAG_SECONDARY,
                 esc(if solo { LAZARUS_HOST } else { &s.pool_host }), if solo { LAZARUS_PORT } else { s.pool_port },
                 esc(if solo { LAZARUS_PUBKEY } else { &s.pool_pubkey })));
         }
@@ -1295,7 +1306,7 @@ impl App {
                 && datum.rsplit_once(':').is_none_or(|(h, _)| *a != format!("{h}:7152"))).unwrap_or("")),
             esc(&self.cfg.hash.datum_guide));
         if self.stream_gw_here() {
-            o.push_str(&format!("<details><summary>Use another gateway</summary>{other}</details>"));
+            o.push_str(&format!("<details><summary>Advanced: use another gateway</summary>{other}</details>"));
         } else {
             o.push_str(&other);
         }
@@ -1312,6 +1323,7 @@ impl App {
         let g = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
         let mode = Mode::from_name(&g("mode")).unwrap_or(Mode::Solo);
         let mut s = Settings::new(mode, &g("payout"));
+        s.tag = g("coinbase_tag");
         if mode == Mode::PoolKey {
             if !g("pool_host").is_empty() {
                 s.pool_host = g("pool_host");
