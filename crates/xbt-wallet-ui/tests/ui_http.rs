@@ -4847,6 +4847,119 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     assert!(!text.contains(&"r".repeat(64)) && !text.contains("rpcpassword") && !text.contains("rpcuser"));
 }
 
+/// A page as the bundled gateway serves it with no admin password: absolute links, its own inline style.
+const GW_THREADS: &str = "<!DOCTYPE html><html><head><title>DATUM Gateway Status</title><link rel=\"icon\" href=\"/assets/icons/favicon.ico\">\
+    <link rel=\"stylesheet\" href=\"./assets/style.css\"><style>td { word-break: break-all; }</style></head><body>\
+    <img src=\"/assets/icons/datum_logo.svg\"><a href=\"/\">Status</a><a href=\"/config\">Config</a><a href=\"/clients\">Clients</a>\
+    <a href=\"/threads\">Threads</a><a href=\"/coinbaser\">Coinbaser</a><h2>Thread Stats</h2><button disabled>Disconnect All</button></body></html>";
+
+/// The renter's control page with the bundled gateway up, and its status pages as `GET /gateway-page` passes them on.
+fn gateway_pages(m: &str, p: &str) -> Value {
+    use base64::Engine;
+    let b64 = |b: &str| base64::engine::general_purpose::STANDARD.encode(b);
+    match (m, p) {
+        ("GET", "/status") => bundled_status(true, Some(true), true, None),
+        ("GET", "/offers") => offers_one(),
+        ("GET", "/gateway-page?p=threads") => json!({"status": 401, "contentType": "text/html", "body": b64(GW_THREADS)}),
+        ("GET", "/gateway-page?p=assets/style.css") => json!({"status": 200, "contentType": "text/html", "body": b64("body { color: #fff }")}),
+        ("GET", "/gateway-page?p=coinbaser") => json!({"status": 500, "contentType": "text/html", "body": b64("<H1>oops</H1>")}),
+        ("GET", "/gateway-page?p=") => json!({"error": "the gateway's API at 127.0.0.1:7152: Connection refused"}),
+        _ => json!({"error": "no"}),
+    }
+}
+
+/// "Your gateway" leads to the bundled gateway's own status pages, shown as the gateway shows them under the app's login:
+/// their links kept on this page, their style and nothing else of their own (no script, no form goes anywhere), through the
+/// renter's control page with its token. Only those pages: never the job API, nothing that acts, nothing but a GET.
+#[test]
+fn the_bundled_gateways_own_status_pages_show_read_only_from_your_gateway() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, seen) = control_standin(gateway_pages);
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://xbt-knots_bitcoind_1:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+    });
+    // not logged in: the login, and the renter is never asked
+    let mut anon = B::new(&bx.base);
+    let _ = anon.get("/");
+    let r = anon.get("/hashrate/gateway/threads");
+    assert!(r.status == 303 && !seen.lock().unwrap().iter().any(|(_, p, ..)| p.starts_with("/gateway-page")), "{} {}", r.status, r.location());
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    let card = &p.body[p.body.find("id=\"gateway\"").unwrap()..];
+    assert!(card[..card.find("</section>").unwrap()].contains("<a href=\"./hashrate/gateway/\">Gateway status</a>"), "{}", p.body);
+    assert_eq!((br.get("/hashrate/gateway").status, br.get("/hashrate/gateway").location()), (303, "./gateway/"));
+    // its page, as it shows it (the 401 a gateway with no admin password answers /threads with is its page all the same)
+    let r = br.get("/hashrate/gateway/threads");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.headers["content-type"], "text/html; charset=utf-8");
+    assert!(r.body.contains("<h2>Thread Stats</h2>") && r.body.contains("<button disabled>Disconnect All</button>"));
+    for link in ["href=\"./\">Status", "href=\"./config\"", "href=\"./clients\"", "href=\"./threads\"", "href=\"./coinbaser\"",
+                 "src=\"./assets/icons/datum_logo.svg\"", "href=\"./assets/icons/favicon.ico\"", "href=\"./assets/style.css\""] {
+        assert!(r.body.contains(link), "{link}: {}", r.body);
+    }
+    assert!(!r.body.contains("href=\"/") && !r.body.contains("src=\"/"), "no link leaves the app: {}", r.body);
+    assert!(r.body.contains("<a href=\"../../hashrate#gateway\"") && r.body.contains("Back to Hashrate"), "{}", r.body);
+    let csp = &r.headers["content-security-policy"];
+    for d in ["default-src 'none'", "style-src 'self' 'unsafe-inline'", "form-action 'none'", "frame-ancestors 'none'"] {
+        assert!(csp.contains(d), "{d}: {csp}");
+    }
+    assert!(!csp.contains("script-src"), "no script runs on it: {csp}");
+    assert_eq!(r.headers["x-frame-options"], "DENY");
+    assert!(!r.headers.contains_key("www-authenticate"), "no login prompt for the gateway's admin");
+    // its style, as the type this page serves it as (not the one the gateway says)
+    let r = br.get("/hashrate/gateway/assets/style.css");
+    assert_eq!((r.status, r.headers["content-type"].as_str(), r.body.as_str()), (200, "text/css; charset=utf-8", "body { color: #fff }"));
+    // asked of the renter with its token, by name, and nothing else
+    {
+        let s = seen.lock().unwrap();
+        let asked: Vec<&(String, String, String, String)> = s.iter().filter(|(_, p, ..)| p.starts_with("/gateway-page")).collect();
+        assert_eq!(asked.iter().map(|(m, p, ..)| format!("{m} {p}")).collect::<Vec<_>>(),
+                   ["GET /gateway-page?p=threads", "GET /gateway-page?p=assets/style.css"]);
+        assert!(asked.iter().all(|(_, _, auth, _)| *auth == format!("Bearer {}", "r".repeat(64))));
+    }
+    // a gateway that isn't up, or answers with an error: said on the Hashrate page
+    for page in ["/hashrate/gateway/", "/hashrate/gateway/coinbaser"] {
+        let r = br.get(page);
+        assert_eq!((r.status, r.location()), (303, "../../hashrate#gateway"), "{page}");
+        let after = br.get("/hashrate").body;
+        assert!(after.contains("The Stream Gateway&#39;s status page isn&#39;t there now") || after.contains("The Stream Gateway's status page isn't there now"), "{page}");
+    }
+    // nothing but those pages, and nothing but a GET: the job API, a GET that acts, the admin's commands, a POST
+    let before = seen.lock().unwrap().iter().filter(|(_, p, ..)| p.starts_with("/gateway-page")).count();
+    for bad in ["/hashrate/gateway/xbt/job", "/hashrate/gateway/xbt/job?id=1&pot=0", "/hashrate/gateway/NOTIFY", "/hashrate/gateway/testnet_fastforward",
+                "/hashrate/gateway/cmd", "/hashrate/gateway/umbrel-api", "/hashrate/gateway//threads", "/hashrate/gateway/../xbt/job",
+                "/hashrate/gateway/threads%3Fx"] {
+        let r = br.get(bad);
+        assert_eq!(r.status, 404, "{bad}: {}", r.body);
+    }
+    let csrf = field(&br.get("/hashrate").body, "csrf");
+    assert_eq!(br.post("/hashrate/gateway/config", &[("csrf", csrf.as_str()), ("pool_host", "evil")]).status, 404);
+    assert_eq!(br.send("PUT", "/hashrate/gateway/config", Some("x"), &[]).status, 405);
+    assert_eq!(seen.lock().unwrap().iter().filter(|(_, p, ..)| p.starts_with("/gateway-page")).count(), before, "none of those reached the renter");
+    assert!(!seen.lock().unwrap().iter().any(|(m, p, ..)| m != "GET" && p.contains("gateway")));
+}
+
+/// An install without the bundled gateway has no link to its pages, and the pages aren't there.
+#[test]
+fn without_the_bundled_gateway_there_are_no_gateway_status_pages() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, seen) = control_standin(gateway_pages);
+    let bx = start(miners_allowed(), false, |c| c.hash.renter = Some(renter.clone()));
+    let mut br = logged_in(&bx);
+    assert!(!br.get("/hashrate").body.contains("hashrate/gateway/"));
+    let r = br.get("/hashrate/gateway/threads");
+    assert_eq!((r.status, r.location()), (303, "../../hashrate#gateway"));
+    assert!(!seen.lock().unwrap().iter().any(|(_, p, ..)| p.starts_with("/gateway-page")));
+}
+
 /// The bundled gateway's state on the rent page: running, connected to the node, masking, each said plainly, and
 /// Rent opens only once all three are so.
 #[test]
