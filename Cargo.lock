@@ -5733,6 +5733,7 @@ dependencies = [
  "xbt-iroh-link",
  "xbt-nostr",
  "xbt-primitives",
+ "xbt402",
 ]
 
 [[package]]
