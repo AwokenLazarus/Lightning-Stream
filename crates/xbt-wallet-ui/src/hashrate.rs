@@ -1291,6 +1291,12 @@ impl App {
                 } else {
                     Err(v["error"].as_str().map(|e| format!("Not published: {e}.")).unwrap_or_else(|| "Not published: no relay took it.".into()))
                 }),
+            "topup" if n("add_sats") == 0 && n("add_minutes") == 0 => Err("Enter the sats to add to its budget, the minutes to add, or both.".into()),
+            "topup" => call(&base, &token, "POST", "/topup", Some(&json!({"rental": g("rental"), "addSats": n("add_sats"), "addMinutes": n("add_minutes")})))
+                .and_then(|v| match v["budgetSats"].as_u64() {
+                    Some(b) => Ok(format!("Added. This rental may now cost up to {}, for {} minutes in all.", sats_n(b as f64), v["minutes"].as_u64().unwrap_or(0))),
+                    None => Err(v["error"].as_str().map(|e| format!("Not added: {e}.")).unwrap_or_else(|| "Not added.".into())),
+                }),
             "cut" => call(&base, &token, "POST", "/cut", Some(&json!({"rental": g("rental")})))
                 .and_then(|v| if v["ok"] == true { Ok("Cut. The miners stop working for you and payments stop.".into()) } else { Err("That rental had ended already.".into()) }),
             "datum" | "use-previous" | "use-bundled" => {
@@ -1851,6 +1857,16 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
                 App::csrf_input(ctx), esc(id), if _action.contains("connections") { "connections" } else { "hashrate" })
     };
     let trial = r["trial"] == true;
+    // a rental going on takes more budget and time here, so it carries on instead of ending and waiting for its own
+    // machine to be free for a new one
+    let more = if ended || trial {
+        String::new()
+    } else {
+        format!("<form method=\"post\" action=\"./hashrate\">{}<input type=\"hidden\" name=\"action\" value=\"topup\"><input type=\"hidden\" name=\"rental\" value=\"{}\">\
+                 <input type=\"hidden\" name=\"back\" value=\"{}\"><div class=\"price-row\"><label>Add to its budget, in sats<input name=\"add_sats\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label>\
+                 <label>Add minutes<input name=\"add_minutes\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label></div><button class=\"secondary\">Add to this rental</button></form>",
+                App::csrf_input(ctx), esc(id), if _action.contains("connections") { "connections" } else { "hashrate" })
+    };
     let result = if ended && paid > 0 { result_box(&r["result"], trial) } else { String::new() };
     let attest = match (&r["attested"], ended && paid > 0) {
         (a, _) if a["ok"] == true => "<p class=\"hint\">Its delivery record is published.</p>".to_string(),
@@ -1874,7 +1890,7 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
         String::new()
     };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
-             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
+             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}{more}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
 }

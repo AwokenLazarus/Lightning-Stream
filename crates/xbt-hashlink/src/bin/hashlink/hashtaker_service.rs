@@ -78,6 +78,8 @@ struct Rental {
     live: Arc<Mutex<Value>>,
     cut: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    /// What the hashtaker added to its budget and time while it went on ([`top_up`]).
+    added: Arc<hashtaker::Added>,
 }
 
 struct R {
@@ -770,7 +772,8 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             }
         }
         ("POST", "/rent") => rent_once(r, &b),
-        _ => (404, json!({"error": "GET /status, GET /offers, GET /gateway-page, POST /rent, POST /cut, POST /datum, POST /attest"})),
+        ("POST", "/topup") => top_up(r, &b),
+        _ => (404, json!({"error": "GET /status, GET /offers, GET /gateway-page, POST /rent, POST /cut, POST /topup, POST /datum, POST /attest"})),
     }
 }
 
@@ -894,8 +897,13 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     };
     // the first ticket, the first step's: later ones grow as they are earned, inside the budget
     let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(ticket_budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
+    let added = Arc::new(hashtaker::Added::default());
     let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(ticket_budget_sats), None,
-                                                   std::time::Duration::from_millis(h.terms.grace_ms / 2)));
+                                                   std::time::Duration::from_millis(h.terms.grace_ms / 2)))
+        .map(|mut p| {
+            p.added = Some(added.clone());
+            p
+        });
     let cfg = hashtaker::Config {
         hashmaker: addr,
         hashmaker_key: h.link_key,
@@ -913,6 +921,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         miners,
         budget_msat: Some(budget_sats * 1000),
         cut: Some(cut.clone()),
+        added: Some(added.clone()),
         live: Some(live.clone()),
         gateway_api: gateway_api.clone(),
         allow_unblinded,
@@ -938,6 +947,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             live: live.clone(),
             cut,
             done: done.clone(),
+            added,
         });
     }
     let hashmaker_key: PublicKey = h.link_key;
@@ -957,6 +967,37 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     });
     // the rental may buy the shop's ticket: what of it the slices do not use stays with that shop as credit
     (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes, "mayBuyTicketUpToSats": first_ticket}))
+}
+
+/// Add budget (`addSats`) and time (`addMinutes`) to a rental going on, so it carries on instead of a new one being
+/// rented (which waits for a machine the rental itself holds). A rental's limits stay those of a new one: a week at
+/// the most. Its payments are the wallet's as before, each under the owner's rules (the hashrate task's budget).
+fn top_up(r: &Mutex<R>, b: &Value) -> (u16, Value) {
+    let id = b["rental"].as_str().unwrap_or("");
+    let (sats, minutes) = (b["addSats"].as_u64().unwrap_or(0), b["addMinutes"].as_u64().unwrap_or(0));
+    let mut g = lock(r);
+    let Some(x) = g.rentals.get_mut(id) else { return (404, json!({"error": "no such rental"})) };
+    if x.done.load(Ordering::Relaxed) || x.cut.load(Ordering::Relaxed) || !x.live.lock().unwrap_or_else(|p| p.into_inner())["closed"].is_null() {
+        return (409, json!({"error": "that rental has ended: rent again"}));
+    }
+    if x.trial {
+        return (400, json!({"error": "a test slice is one piece of work: rent this hashmaker to go on"}));
+    }
+    if sats == 0 && minutes == 0 {
+        return (400, json!({"error": "add sats to its budget, minutes to its time, or both"}));
+    }
+    let most = 7 * 24 * 60;
+    if x.minutes.saturating_add(minutes) > most {
+        return (400, json!({"error": format!("a rental lasts a week at the most: it may have {} minutes more", most - x.minutes.min(most))}));
+    }
+    if sats > 21_000_000 * 100_000_000 {
+        return (400, json!({"error": "that budget is too large"}));
+    }
+    x.added.msat.fetch_add(sats * 1000, Ordering::Relaxed);
+    x.added.secs.fetch_add(minutes * 60, Ordering::Relaxed);
+    x.budget_sats = x.budget_sats.saturating_add(sats);
+    x.minutes += minutes;
+    (200, json!({"ok": true, "rental": id, "budgetSats": x.budget_sats, "minutes": x.minutes}))
 }
 
 /// Publish the signed delivery record of a rental that ended (the hashtaker's choice, per rental).
@@ -1371,6 +1412,49 @@ mod tests {
         assert_eq!(report["paidSlices"].as_u64(), Some(paid), "both sides count the same slices paid: {report}");
     }
 
+    /// Budget added to a rental going on is paid on: it carries on past the pieces its first budget had, instead of
+    /// ending and waiting for its own machine to be free for a new one. Not to a rental that ended, nor to a test slice.
+    #[test]
+    fn a_rental_going_on_takes_more_budget_and_time() {
+        let (h, listing) = hashmaker_with_two_miners();
+        let terms = listing.terms.clone();
+        let key = hex::encode(listing.link_key.serialize());
+        let r = renter(listing);
+        // the start fee and two slices
+        let first = 3 * terms.price_msat / 1000;
+        let (code, v) = handle(&r, &[], "POST", "/rent", json!({"linkKey": key, "miners": 1, "budgetSats": first, "minutes": 1}).to_string().as_bytes());
+        assert_eq!(code, 200, "{v}");
+        let id = v["rental"].as_str().unwrap().to_string();
+        let topup = |b: Value| handle(&r, &[], "POST", "/topup", b.to_string().as_bytes());
+        assert_eq!(topup(json!({"rental": id})).0, 400, "nothing to add");
+        assert_eq!(topup(json!({"rental": id, "addMinutes": 7 * 24 * 60})).0, 400, "past a week");
+        assert_eq!(topup(json!({"rental": "nope", "addSats": 1})).0, 404);
+        let (code, v) = topup(json!({"rental": id, "addSats": first, "addMinutes": 2}));
+        assert_eq!(code, 200, "{v}");
+        assert_eq!((v["budgetSats"].clone(), v["minutes"].clone()), (json!(2 * first), json!(3)));
+        // paid on past the first budget's three pieces
+        let t0 = Instant::now();
+        while !h.status()["rentals"].as_array().is_some_and(|a| a.iter().any(|x| x["paid"].as_u64().unwrap_or(0) > 3)) {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the rental never went past its first budget: {} {}", h.status(), lock(&r).rentals[&id].live.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(lock(&r).rentals[&id].live.lock().unwrap()["budgetMsat"], json!(2 * first * 1000), "the rental's own budget grew");
+        handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
+        assert_eq!(topup(json!({"rental": id, "addSats": 100})).0, 409, "cut: rent again");
+        let t0 = Instant::now();
+        while h.finished().is_empty() {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the rental never ended: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(h.finished()[0]["paid"].as_u64().unwrap() <= 6, "and never past what was added: {}", h.finished()[0]);
+        // a test slice is one piece: nothing is added to it
+        lock(&r).rentals.get_mut(&id).unwrap().trial = true;
+        lock(&r).rentals.get_mut(&id).unwrap().done.store(false, Ordering::Relaxed);
+        lock(&r).rentals.get_mut(&id).unwrap().cut.store(false, Ordering::Relaxed);
+        *lock(&r).rentals[&id].live.lock().unwrap() = json!({"closed": null});
+        assert_eq!(topup(json!({"rental": id, "addSats": 100})).0, 400);
+    }
+
     fn record(taker: &SecretKey, maker: &PublicKey, rental: &str, ended: u64) -> xbt_nostr::event::Event {
         let t = PublicKey::from_secret_key(secp256k1::SECP256K1, taker);
         trust::Attestation {
@@ -1464,6 +1548,7 @@ mod tests {
             miners: 1,
             budget_msat: None,
             cut: None,
+            added: None,
             live: None,
             gateway_api: None,
             allow_unblinded: true,

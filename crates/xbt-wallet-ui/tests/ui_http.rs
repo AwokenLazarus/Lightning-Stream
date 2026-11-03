@@ -2982,6 +2982,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
                                                   "payUrl": "https://miners.example/hashrate", "payNode": format!("03{}", "c".repeat(64))}]}),
         ("POST", "/rent") => json!({"ok": true, "rental": "r10", "budgetSats": 40, "mayBuyTicketUpToSats": 2000}),
         ("POST", "/cut") => json!({"ok": true}),
+        ("POST", "/topup") => json!({"ok": true, "rental": "r9", "budgetSats": 5000, "minutes": 90}),
         ("POST", "/datum") => json!({"ok": true, "datum": "datum-gateway:23334", "reachable": true}),
         _ => json!({"error": "no"}),
     });
@@ -3116,11 +3117,21 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert!(said.starts_with("Trying one slice, at most 40 sats. Your wallet may buy a ticket of up to 2,000 sats from this shop for it; unused credit stays \
                               with this seller for about 20 hours, for a later rental there."),
             "{said}");
+    // a rental going on takes more budget and time from its card, instead of a new rental waiting for its machine
+    assert!(card.contains("value=\"topup\"") && card.contains("name=\"add_sats\"") && card.contains("Add to this rental"), "{card}");
+    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9"), ("add_sats", "1000"), ("add_minutes", "30")]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("Added. This rental may now cost up to 5,000 sats, for 90 minutes in all."), "{said}");
+    let sent = rseen.lock().unwrap().iter().rev().find(|(m, p, _, _)| m == "POST" && p == "/topup").cloned().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&sent.3).unwrap(), json!({"rental": "r9", "addSats": 1000, "addMinutes": 30}));
+    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9")]);
+    assert!(br.flash_after(&r).starts_with("Enter the sats"));
     // Live connections shows the rental, with its Cut button
     let p = br.get("/connections");
     assert!(p.body.contains("Rented hashrate") && p.body.contains("data-spent=\"200\""), "{}", p.body);
     assert!(p.body.find("<h2>Rented hashrate</h2>").unwrap() < p.body.find("Every service you are paying for right now").unwrap(),
             "the rental going on first, the connections under it: {}", p.body);
+    assert!(p.body.contains("Add to this rental") && p.body.contains("name=\"back\" value=\"connections\""), "and there too: {}", p.body);
     plain("/connections", &p.body);
     let r = br.act("/connections", "/hashrate", &[("action", "cut"), ("rental", "r9"), ("back", "connections")]);
     assert_eq!(r.location(), "./connections");

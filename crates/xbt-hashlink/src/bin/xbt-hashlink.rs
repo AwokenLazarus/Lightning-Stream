@@ -320,6 +320,7 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         miners: num(f, "miners", Some(0))?,
         budget_msat: budget_sats.map(|s| s.checked_mul(1000).ok_or("--budget-sats: too large")).transpose()?,
         cut: None,
+        added: None,
         live: None,
         hashmaker,
         hashmaker_key,
