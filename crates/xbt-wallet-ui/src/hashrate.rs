@@ -275,8 +275,24 @@ fn rent_offers(base: &str, token: &Option<PathBuf>, keep: bool) -> Result<Value,
     let kept = offers_kept(base);
     let (b, t) = (base.to_string(), token.clone());
     match kept.peek() {
-        Some((_, Ok(_))) => kept.get(OFFERS_FRESH, WAIT, move || call(&b, &t, "GET", "/offers", None)).unwrap_or_else(|| Err("The hashrate service does not answer.".into())),
+        // an answer that was still looking is not kept: the renter answers at once, with what it has found since
+        Some((_, Ok(v))) if v["looking"] != true => kept.get(OFFERS_FRESH, WAIT, move || call(&b, &t, "GET", "/offers", None)).unwrap_or_else(|| Err("The hashrate service does not answer.".into())),
         _ => kept.refresh(|| call(base, token, "GET", "/offers", None)),
+    }
+}
+
+/// What the Hashrate page says with no offer to show, from the renter's answer. Just started, the renter is still
+/// looking on Nostr (it answers at once, and looks behind it): said, and the page looks again by itself in a few
+/// seconds. 0.2.9 waited on that look and said "The hashrate service does not answer" when it took longer than 6 s.
+fn no_offers_words(o: &Value) -> String {
+    if o["looking"] == true {
+        "<p class=\"empty\" data-reload-after=\"5\">Looking for offers on Nostr… This page looks again by itself in a few seconds \
+         (or <a href=\"./hashrate\">look again</a>).</p>".into()
+    } else if o["relaysAnswered"] == false {
+        "<p class=\"empty\">No Nostr relay answered the last look for offers. The app looks again every minute; \
+         <a href=\"./hashrate\">look again</a> in a while.</p>".into()
+    } else {
+        "<p class=\"empty\">No miners for rent found right now. Hashmakers publish their offers on Nostr; look again in a while.</p>".into()
     }
 }
 
@@ -980,7 +996,7 @@ impl App {
             Ok(o) => {
                 let offers: Vec<Value> = o["offers"].as_array().cloned().unwrap_or_default();
                 if offers.is_empty() {
-                    b.push_str("<p class=\"empty\">No miners for rent found right now. Hashmakers publish their offers on Nostr; look again in a while.</p>");
+                    b.push_str(&no_offers_words(&o));
                 }
                 b.push_str("<div class=\"grid services\">");
                 // this box's own hashmaker's pay address: its offer is ours even when the shop is reached by its key (Private),
@@ -2188,6 +2204,16 @@ mod tests {
                        "live": {"closed": "the first slice could not be paid", "pays": [{"slice": 1, "ok": false, "why": transport.to_string()}]}});
         let card = rental_card(&ctx, &r, "./hashrate");
         assert!(card.contains("Your wallet could not pay for the first piece of work") && card.contains("add the shop on"), "{card}");
+    }
+
+    /// With no offer to show: still looking (and the page looks again), no relay answering, or none found.
+    #[test]
+    fn no_offers_says_whether_the_renter_is_still_looking() {
+        let looking = no_offers_words(&json!({"offers": [], "looking": true, "relaysAnswered": true}));
+        assert!(looking.contains("Looking for offers on Nostr") && looking.contains("data-reload-after=\"5\"") && !looking.contains("does not answer"), "{looking}");
+        let quiet = no_offers_words(&json!({"offers": [], "looking": false, "relaysAnswered": false}));
+        assert!(quiet.contains("No Nostr relay answered") && !quiet.contains("data-reload-after"), "{quiet}");
+        assert!(no_offers_words(&json!({"offers": []})).contains("No miners for rent found right now"), "an older renter's answer");
     }
 
     /// The Rent form's budget, in whole tickets, and what a budget really buys (#50's follow-up): the wallet pays a shop

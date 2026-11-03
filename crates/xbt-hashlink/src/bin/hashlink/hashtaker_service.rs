@@ -36,7 +36,17 @@ use xbt_hashlink::over_iroh::{self, Dialer};
 use xbt_hashlink::rail::{LabHashtaker, SignerPayer};
 use xbt_hashlink::trust;
 
+/// Kept offers older than this are looked up again, in the background: the page is never kept waiting on the relays.
 const OFFERS_FRESH: Duration = Duration::from_secs(20);
+/// How often the offers are looked up in the background whatever asks, so the page finds them kept.
+const OFFERS_EVERY: Duration = Duration::from_secs(60);
+/// The oldest kept offers a rent takes without looking them up again: twice the background's round, so one late
+/// look-up doesn't make a rent wait. Older, or the hashmaker not among them, a rent looks them up itself.
+const OFFERS_RENT_FRESH: Duration = Duration::from_secs(120);
+/// The oldest kept offers a rent falls back on when no relay answers its own look-up. A listing's terms are checked
+/// again at the link: the hashmaker's welcome carries their hash, and terms it no longer offers are refused there,
+/// before anything is paid.
+const OFFERS_FALLBACK: Duration = Duration::from_secs(600);
 /// How long the delivery records read from the relays are kept before they are read again.
 const HISTORY_FRESH: Duration = Duration::from_secs(60);
 /// A test slice's time limit: a few times what one slice should take at the advertised speed,
@@ -93,6 +103,10 @@ struct R {
     expect_node: Option<String>,
     state: Option<PathBuf>,
     offers: Option<(Instant, Vec<(Hashrate, String)>)>,
+    /// A look-up of the offers is running in the background (one at a time).
+    offers_looking: bool,
+    /// The last look-up had no relay answering: nothing is known of the offers since.
+    offers_unanswered: bool,
     /// Each listing's Nostr author, by link key (a hashmaker's summary counts only from it).
     authors: HashMap<String, String>,
     /// The delivery records and summaries on the relays, as last read.
@@ -301,6 +315,8 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         expect_node: f.get("expect-node").cloned(),
         state,
         offers: None,
+        offers_looking: false,
+        offers_unanswered: false,
         authors: HashMap::new(),
         history: None,
         rentals: BTreeMap::new(),
@@ -317,6 +333,14 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         std::thread::spawn(move || loop {
             let shown = look_at_upstream(&r);
             std::thread::sleep(look_interval(shown.as_ref()));
+        });
+    }
+    {
+        // the offers looked up now and every minute, so the page finds them kept and never waits on the relays
+        let r = r.clone();
+        std::thread::spawn(move || loop {
+            look_up_in_background(&r);
+            std::thread::sleep(OFFERS_EVERY);
         });
     }
     http::serve(&addr, token, Arc::new(move |method, path, body| handle(&r, &candidates, method, path, body)))?;
@@ -357,28 +381,96 @@ fn offer_json(h: &Hashrate, event: &str) -> Value {
     })
 }
 
-fn offers(r: &Mutex<R>, fresh: bool) -> Vec<(Hashrate, String)> {
-    {
-        let g = lock(r);
-        if let Some((t, o)) = &g.offers {
-            if !fresh && t.elapsed() < OFFERS_FRESH {
-                return o.clone();
-            }
-        }
-    }
+/// Look the offers up on the relays now and keep them, with their delivery records when those are older than
+/// [`HISTORY_FRESH`]. `None`: no relay answered, and the kept offers stay as they were.
+fn look_up_offers(r: &Mutex<R>) -> Option<Vec<(Hashrate, String)>> {
     let (relays, node) = {
         let g = lock(r);
         (g.relays.clone(), g.expect_node.clone())
     };
-    let (found, _) = listing::find(&relays, xbt_nostr::now());
-    let found: Vec<_> = found.into_iter().filter(|(h, _)| h.algorithm == "blake2b" && node.as_ref().is_none_or(|n| *n == h.pay_node)).collect();
-    let mut g = lock(r);
-    for (h, e) in &found {
-        g.authors.insert(hex::encode(h.link_key.serialize()), e.pubkey.clone());
+    let (found, _, answered) = listing::find_answered(&relays, xbt_nostr::now());
+    let unanswered = answered == 0 && !relays.is_empty();
+    lock(r).offers_unanswered = unanswered;
+    if unanswered {
+        return None;
     }
-    let o: Vec<(Hashrate, String)> = found.into_iter().map(|(h, e)| (h, e.id)).collect();
-    g.offers = Some((Instant::now(), o.clone()));
-    o
+    let found: Vec<_> = found.into_iter().filter(|(h, _)| h.algorithm == "blake2b" && node.as_ref().is_none_or(|n| *n == h.pay_node)).collect();
+    let o: Vec<(Hashrate, String)> = {
+        let mut g = lock(r);
+        for (h, e) in &found {
+            g.authors.insert(hex::encode(h.link_key.serialize()), e.pubkey.clone());
+        }
+        let o: Vec<(Hashrate, String)> = found.into_iter().map(|(h, e)| (h, e.id)).collect();
+        g.offers = Some((Instant::now(), o.clone()));
+        o
+    };
+    if lock(r).history.as_ref().is_none_or(|(t, _)| t.elapsed() >= HISTORY_FRESH) {
+        let _ = history_events(r, &o);
+    }
+    Some(o)
+}
+
+/// Clears the look-up's mark when it ends, however it ends.
+struct Looking<'a>(&'a Mutex<R>);
+
+impl Drop for Looking<'_> {
+    fn drop(&mut self) {
+        lock(self.0).offers_looking = false;
+    }
+}
+
+/// Start a look-up of the offers in the background, unless one is running.
+fn look_up_in_background(r: &Arc<Mutex<R>>) {
+    {
+        let mut g = lock(r);
+        if g.offers_looking {
+            return;
+        }
+        g.offers_looking = true;
+    }
+    let r = r.clone();
+    std::thread::spawn(move || {
+        let _looking = Looking(&r);
+        let _ = look_up_offers(&r);
+    });
+}
+
+/// The offers as kept, for the page: never waits on the relays. Kept offers past [`OFFERS_FRESH`] are given as they
+/// are while a look-up runs in the background. With none kept yet (just started): none, and `true`, still looking
+/// (`false` once a look-up found no relay answering).
+/// 0.2.9 looked them up inside the request once they were 20 s old, and a cold look-up took longer than the app
+/// waits (20 s measured, against 6 s): the page said the hashrate service did not answer.
+fn offers_kept(r: &Arc<Mutex<R>>) -> (Vec<(Hashrate, String)>, bool) {
+    let (kept, stale, unanswered) = {
+        let g = lock(r);
+        (g.offers.as_ref().map(|(_, o)| o.clone()), g.offers.as_ref().is_none_or(|(t, _)| t.elapsed() >= OFFERS_FRESH), g.offers_unanswered)
+    };
+    if stale {
+        look_up_in_background(r);
+    }
+    match kept {
+        Some(o) => (o, false),
+        // none kept: still looking, unless the last look-up found no relay answering (said as that)
+        None => (vec![], !unanswered),
+    }
+}
+
+/// The offers kept, if no older than `age`.
+fn kept_within(r: &Mutex<R>, age: Duration) -> Option<Vec<(Hashrate, String)>> {
+    lock(r).offers.as_ref().filter(|(t, _)| t.elapsed() < age).map(|(_, o)| o.clone())
+}
+
+/// A hashmaker's offer for a rent, by its link key: from the offers kept within [`OFFERS_RENT_FRESH`], else looked up
+/// now; and when no relay answers that, from those kept within [`OFFERS_FALLBACK`] (the link checks its terms).
+fn offer_for_rent(r: &Mutex<R>, key_hex: &str) -> Result<(Hashrate, String), &'static str> {
+    let pick = |o: Vec<(Hashrate, String)>| o.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key_hex);
+    if let Some(found) = kept_within(r, OFFERS_RENT_FRESH).and_then(pick) {
+        return Ok(found);
+    }
+    match look_up_offers(r) {
+        Some(o) => pick(o).ok_or("that hashmaker's listing is no longer on the relays"),
+        None => kept_within(r, OFFERS_FALLBACK).and_then(pick).ok_or("no Nostr relay answered just now, so that hashmaker's listing can't be checked: try again in a minute"),
+    }
 }
 
 /// The delivery records and summaries on the relays for the hashmakers on show (read at most once a minute).
@@ -406,7 +498,7 @@ fn history_events(r: &Mutex<R>, offers: &[(Hashrate, String)]) -> Vec<xbt_nostr:
 fn records_for(relays: &[String], hashmakers: &[(PublicKey, String)]) -> Vec<xbt_nostr::event::Event> {
     let mut seen = std::collections::BTreeSet::new();
     std::thread::scope(|s| {
-        let asks: Vec<_> = trust::filters(hashmakers).into_iter().map(|f| s.spawn(move || xbt_nostr::oneshot::query(relays, &f, Duration::from_secs(10)).0)).collect();
+        let asks: Vec<_> = trust::filters(hashmakers).into_iter().map(|f| s.spawn(move || listing::query_bounded(relays, &f, listing::RELAY_WAIT).0)).collect();
         asks.into_iter().flat_map(|a| a.join().unwrap_or_default()).filter(|e| seen.insert(e.id.clone())).collect()
     })
 }
@@ -545,8 +637,17 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             }))
         }
         ("GET", "/offers") => {
-            let o = offers(r, path.contains("fresh=1"));
-            let events = history_events(r, &o);
+            // never kept waiting on the relays, unless asked for them fresh (`fresh=1`)
+            let (o, looking) = if path.contains("fresh=1") {
+                match look_up_offers(r) {
+                    Some(o) => (o, false),
+                    None => offers_kept(r),
+                }
+            } else {
+                offers_kept(r)
+            };
+            // the delivery records as kept: the look-up keeps them current
+            let events = lock(r).history.as_ref().map(|(_, e)| e.clone()).unwrap_or_default();
             let authors = lock(r).authors.clone();
             let list: Vec<Value> = o
                 .iter()
@@ -558,7 +659,8 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                     v
                 })
                 .collect();
-            (200, json!({"offers": list}))
+            let relays_answered = !lock(r).offers_unanswered;
+            (200, json!({"offers": list, "looking": looking, "relaysAnswered": relays_answered}))
         }
         ("POST", "/attest") => attest(r, &b),
         ("POST", "/datum") => {
@@ -681,9 +783,9 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             _ => {}
         }
     }
-    let pick = |o: Vec<(Hashrate, String)>| o.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key_hex);
-    let Some((h, event)) = pick(offers(r, false)).or_else(|| pick(offers(r, true))) else {
-        return (404, json!({"error": "that hashmaker's listing is no longer on the relays"}));
+    let (h, event) = match offer_for_rent(r, key_hex) {
+        Ok(found) => found,
+        Err(e) => return (404, json!({"error": e})),
     };
     if !h.proves() {
         return (400, json!({"error": "this hashmaker's app doesn't prove the work it sells: it needs updating"}));
@@ -856,6 +958,91 @@ mod tests {
         assert_eq!(trial_minutes(1 << 47, 0), TRIAL_MAX_MINUTES);
     }
 
+    fn offer_listing() -> Hashrate {
+        Hashrate {
+            name: "Laz Hash".into(),
+            algorithm: "blake2b".into(),
+            hashrate_hs: 4_000_000_000_000,
+            link_addr: "127.0.0.1:9".into(),
+            link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, &noise::fresh_key()),
+            iroh: None,
+            pay_url: String::new(),
+            pay_node: String::new(),
+            terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000, start_slices: 0 },
+            proof: Some(PROOF.into()),
+            capacity: Capacity { miners: 1, free_miners: 1, free_hs: 4_000_000_000_000 },
+        }
+    }
+
+    /// A relay that takes the connection and never says a word: a look-up waits its whole time on it.
+    fn silent_relay() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = vec![];
+            for c in l.incoming().flatten() {
+                held.push(c);
+            }
+        });
+        url
+    }
+
+    /// A relay address nothing listens at: refused at once.
+    fn gone_relay() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", l.local_addr().unwrap());
+        drop(l);
+        url
+    }
+
+    /// The offers page never waits on the relays: just started, it answers at once with none and "looking"; with offers
+    /// kept past their 20 s it answers with those at once and looks them up again behind. 0.2.9 looked them up inside
+    /// the request, and a cold look-up (20 s on VM 118) outlasted the app's 6 s wait: "the hashrate service does not answer".
+    #[test]
+    fn the_offers_page_answers_at_once_while_the_relays_are_asked_behind_it() {
+        let r = bare();
+        lock(&r).relays = vec![silent_relay()];
+        let t = Instant::now();
+        let (code, v) = handle(&r, &[], "GET", "/offers", b"");
+        assert!(t.elapsed() < Duration::from_secs(2), "answered at once: {:?}", t.elapsed());
+        assert_eq!((code, v["offers"].clone(), v["looking"].clone()), (200, json!([]), json!(true)), "{v}");
+        assert!(lock(&r).offers_looking, "a look-up runs behind it");
+        // asked again while it runs: still at once, and still one look-up
+        let (_, v) = handle(&r, &[], "GET", "/offers", b"");
+        assert_eq!(v["looking"], true);
+        // offers kept, past their 20 s: given at once, not "looking"
+        let listing = offer_listing();
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(300), vec![(listing.clone(), "ev".into())]));
+        let t = Instant::now();
+        let (code, v) = handle(&r, &[], "GET", "/offers", b"");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!((code, v["offers"].as_array().map(Vec::len), v["looking"].clone()), (200, Some(1), json!(false)), "{v}");
+        // the look-up behind it ends at the relay's deadline, and with no relay answering, the kept offers stay
+        let until = Instant::now() + listing::RELAY_WAIT + Duration::from_secs(5);
+        while lock(&r).offers_looking && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!lock(&r).offers_looking, "it ended by the relay's deadline");
+        assert_eq!(lock(&r).offers.as_ref().map(|(_, o)| o.len()), Some(1), "nothing answered: what was kept stays");
+    }
+
+    /// A rent takes the offer kept within two minutes; older, it looks the offers up itself, and when no relay answers it
+    /// falls back on those kept within ten minutes (the link checks the terms again), else says no relay answered.
+    #[test]
+    fn a_rent_falls_back_on_the_kept_offer_only_when_no_relay_answers() {
+        let r = bare();
+        lock(&r).relays = vec![gone_relay()];
+        let listing = offer_listing();
+        let key = hex::encode(listing.link_key.serialize());
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(300), vec![(listing.clone(), "ev".into())]));
+        assert!(offer_for_rent(&r, &key).is_ok(), "kept five minutes ago, no relay answering: the kept offer");
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(900), vec![(listing.clone(), "ev".into())]));
+        assert!(offer_for_rent(&r, &key).unwrap_err().contains("no Nostr relay answered"), "kept too long ago");
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(60), vec![(listing, "ev".into())]));
+        assert!(offer_for_rent(&r, &key).is_ok(), "kept a minute ago: taken as it is");
+        assert!(offer_for_rent(&r, &"02".repeat(33)).unwrap_err().contains("no Nostr relay answered"), "a hashmaker not kept, nothing answering");
+    }
+
     /// A test slice of a few sats can pay a shop whose smallest ticket is 546 sat: its slices stop at one, and the wallet
     /// may buy that ticket, as the offer says. 0.2.9 gave the wallet the slice's 40 sats to buy it with, and every trial
     /// ended with "What is left of this rental's budget (40 sats) is less than this hashmaker's smallest ticket (546 sats)".
@@ -1021,6 +1208,8 @@ mod tests {
             expect_node: None,
             state: None,
             offers: None,
+            offers_looking: false,
+        offers_unanswered: false,
             authors: HashMap::new(),
             history: None,
             rentals: BTreeMap::new(),
@@ -1421,6 +1610,8 @@ mod tests {
             expect_node: None,
             state: None,
             offers: None,
+            offers_looking: false,
+        offers_unanswered: false,
             authors: HashMap::new(),
             history: None,
             rentals: BTreeMap::new(),

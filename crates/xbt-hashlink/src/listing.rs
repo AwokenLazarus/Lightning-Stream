@@ -229,9 +229,48 @@ pub fn publish(relays: &[String], ev: &Event) -> Vec<Value> {
         .collect()
 }
 
+/// How long each relay is given to answer a look-up. The relays are asked at once, and one that is down or slow is
+/// left behind at this deadline, not waited for: a relay's connect alone could take the whole wait for each address
+/// its host has, one after another (a renter's offers took 20 s to come back with one relay answering 503).
+pub const RELAY_WAIT: Duration = Duration::from_secs(8);
+
+/// Ask each relay at once for `filter`, each given `wait`, and stop waiting at that deadline (half a second over):
+/// what came back by then, and how many relays answered (ended their stored events, or sent some).
+pub fn query_bounded(relays: &[String], filter: &Value, wait: Duration) -> (Vec<Event>, usize) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for relay in relays {
+        let (tx, relay, filter) = (tx.clone(), relay.clone(), filter.clone());
+        // a relay still connecting at the deadline finishes on its own thread, and what it sends then is dropped
+        std::thread::spawn(move || {
+            let (events, outcomes) = xbt_nostr::oneshot::query(std::slice::from_ref(&relay), &filter, wait);
+            let answered = !events.is_empty() || outcomes.iter().any(|o| o.result.is_ok());
+            let _ = tx.send((events, answered));
+        });
+    }
+    drop(tx);
+    let until = std::time::Instant::now() + wait + Duration::from_millis(500);
+    let (mut events, mut answered) = (Vec::new(), 0);
+    for _ in relays {
+        match rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+            Ok((e, ok)) => {
+                events.extend(e);
+                answered += usize::from(ok);
+            }
+            Err(_) => break,
+        }
+    }
+    (events, answered)
+}
+
 /// Every good listing on the relays, newest per link key; and how many events were refused.
 pub fn find(relays: &[String], now: u64) -> (Vec<(Hashrate, Event)>, usize) {
-    let (events, _) = xbt_nostr::oneshot::query(relays, &filter(100, now.saturating_sub(MAX_AGE_S)), Duration::from_secs(10));
+    let (found, refused, _) = find_answered(relays, now);
+    (found, refused)
+}
+
+/// [`find`], and how many relays answered: none means nothing is known, not that there is no listing.
+pub fn find_answered(relays: &[String], now: u64) -> (Vec<(Hashrate, Event)>, usize, usize) {
+    let (events, answered) = query_bounded(relays, &filter(100, now.saturating_sub(MAX_AGE_S)), RELAY_WAIT);
     let mut best: Vec<(Hashrate, Event)> = Vec::new();
     let mut refused = 0;
     for ev in events {
@@ -244,7 +283,7 @@ pub fn find(relays: &[String], now: u64) -> (Vec<(Hashrate, Event)>, usize) {
             Err(_) => refused += 1,
         }
     }
-    (best, refused)
+    (best, refused, answered)
 }
 
 #[cfg(test)]
@@ -265,6 +304,28 @@ mod tests {
             proof: Some(PROOF.into()),
             capacity: Capacity { miners: 4, free_miners: 1, free_hs: 4_100_000_000_000 },
         }
+    }
+
+    /// The relays are asked at once and none is waited for past the deadline: one that takes the connection and never
+    /// answers, and one that refuses it, together take the wait once (not each in turn), and count as not answering.
+    #[test]
+    fn a_look_up_stops_at_its_deadline_whatever_the_relays_do() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_url = format!("ws://{}", silent.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = vec![];
+            for c in silent.incoming().flatten() {
+                held.push(c);
+            }
+        });
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gone_url = format!("ws://{}", gone.local_addr().unwrap());
+        drop(gone);
+        let t = std::time::Instant::now();
+        let (events, answered) = query_bounded(&[silent_url.clone(), gone_url, silent_url], &filter(10, 0), Duration::from_secs(1));
+        assert!(t.elapsed() < Duration::from_millis(2500), "{:?}", t.elapsed());
+        assert_eq!((events.len(), answered), (0, 0));
+        assert_eq!(query_bounded(&[], &filter(10, 0), Duration::from_secs(1)).1, 0, "no relay: nothing to wait for");
     }
 
     #[test]

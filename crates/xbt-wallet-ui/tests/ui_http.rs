@@ -4884,6 +4884,38 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
     }
 }
 
+/// Just started, the renter is still looking for offers on Nostr: the page says so and looks again by itself, and the
+/// next look shows what it found, not the kept "looking" answer. On VM 118 (0.2.9) the renter's first look took 20 s and
+/// the page said "The hashrate service does not answer. It may still be starting".
+#[test]
+fn the_hashrate_page_says_it_is_looking_for_offers_while_the_renter_looks() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    static LOOKING: AtomicBool = AtomicBool::new(true);
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
+        ("GET", "/offers") if LOOKING.load(SeqCst) => json!({"offers": [], "looking": true, "relaysAnswered": true}),
+        ("GET", "/offers") => json!({"offers": [{"name": "Found miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(),
+                                                 "proves": true, "miners": 1, "freeMiners": 1, "freeHs": "4000000000000"}], "looking": false, "relaysAnswered": true}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Looking for offers on Nostr") && p.body.contains("data-reload-after=\"5\""), "{}", p.body);
+    assert!(!p.body.contains("does not answer") && !p.body.contains("No miners for rent found"), "{}", p.body);
+    LOOKING.store(false, SeqCst);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("<h3>Found miners</h3>") && !p.body.contains("Looking for offers"), "found since: shown at once, {}", p.body);
+}
+
 /// The renter's offer card says the start fee, in sats and seconds, and a trial and a budget include it.
 #[test]
 fn an_offer_shows_its_start_fee() {

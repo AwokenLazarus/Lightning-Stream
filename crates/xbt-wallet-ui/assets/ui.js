@@ -628,6 +628,18 @@
     }, 5000);
   }
 
+  // Buy → Hashrate while the renter is still looking for offers on Nostr: the page is loaded again in a few seconds,
+  // and not while the owner is in one of its forms.
+  var again = $("[data-reload-after]");
+  if (again) {
+    var reloadSoon = function () {
+      var a = document.activeElement;
+      if (a && a.form) { setTimeout(reloadSoon, 3000); return; }
+      root.location.reload();
+    };
+    setTimeout(reloadSoon, (Number(again.getAttribute("data-reload-after")) || 5) * 1000);
+  }
+
   // The pending-approvals badge.
   var badge = $("#pending-badge");
   if (badge && root.fetch) {
