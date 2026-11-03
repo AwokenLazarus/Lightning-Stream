@@ -128,7 +128,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4e9c9f4132c4@sha256:fff8aff3d5250a9a3208f46ca06d6817f2559dadc6f931eef35d607123943431
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-abcd6238a790@sha256:b2bf2bb9c2f1a1fdc7a7ca37312cdf3e8cfc4c8d4a4e57a403c4bf74f8ab0dbd
     stop_grace_period: 15s
     environment:
       # loopback only: from another machine, use an ssh tunnel (docs/LINUX.md)
@@ -205,7 +205,7 @@ services:
   # macaroon on standard input, and exits. It is not started by `up` (profile "setup").
   node-keys:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4e9c9f4132c4@sha256:fff8aff3d5250a9a3208f46ca06d6817f2559dadc6f931eef35d607123943431
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-abcd6238a790@sha256:b2bf2bb9c2f1a1fdc7a7ca37312cdf3e8cfc4c8d4a4e57a403c4bf74f8ab0dbd
     profiles: ["setup"]
     command: ["node-keys"]
     restart: "no"
