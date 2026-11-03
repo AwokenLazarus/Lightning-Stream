@@ -123,17 +123,16 @@ fn link(flags: &Flags) -> Result<(), String> {
     let mut chain = Machines::default();
     let mut ports = BTreeMap::new();
     if let (Some(peers_path), Some(ports_path)) = (peers_path, ports_path) {
+        // a writer that does not write the file whole is waited for, not misread
         let deadline = Instant::now() + Duration::from_secs(600);
-        let text = loop {
-            if let Ok(text) = std::fs::read_to_string(&peers_path) {
-                break text;
+        chain = loop {
+            match std::fs::read_to_string(&peers_path).map(|t| serde_json::from_str::<Machines>(&t)) {
+                Ok(Ok(chain)) => break chain,
+                Ok(Err(e)) if Instant::now() >= deadline => return Err(format!("{peers_path}: {e}")),
+                _ if Instant::now() >= deadline => return Err(format!("{peers_path} did not appear in 10 minutes")),
+                _ => std::thread::sleep(Duration::from_millis(100)),
             }
-            if Instant::now() >= deadline {
-                return Err(format!("{peers_path} did not appear in 10 minutes"));
-            }
-            std::thread::sleep(Duration::from_millis(100));
         };
-        chain = serde_json::from_str(&text).map_err(|e| format!("{peers_path}: {e}"))?;
         if let Ok(mut a) = allowed.write() {
             a.extend(chain.machines.values().map(|c| c.peer.id.clone()));
         }
