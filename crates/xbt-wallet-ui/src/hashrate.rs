@@ -833,17 +833,22 @@ impl App {
 
     // --- Buy → Hashrate ------------------------------------------------------------------------
 
-    /// Rentals going on (for Live connections): cards with a Cut button, and what they spent.
-    pub(crate) fn hash_live_cards(&self, ctx: &Ctx) -> (String, i64) {
-        let Some(base) = &self.cfg.hash.renter else { return (String::new(), 0) };
-        let Ok(st) = call(base, &self.cfg.hash.renter_token, "GET", "/status", None) else { return (String::new(), 0) };
+    /// Rentals going on (for Live connections): cards with a Cut button, what they spent, and each one's pay address and
+    /// name, for the shop connection that pays it.
+    pub(crate) fn hash_live_cards(&self, ctx: &Ctx) -> (String, i64, Vec<(String, String)>) {
+        let Some(base) = &self.cfg.hash.renter else { return (String::new(), 0, vec![]) };
+        let Ok(st) = call(base, &self.cfg.hash.renter_token, "GET", "/status", None) else { return (String::new(), 0, vec![]) };
         let mut spent = 0i64;
         let mut cards = String::new();
+        let mut renting = vec![];
         for r in st["rentals"].as_array().into_iter().flatten().filter(|r| r["ended"] != true) {
             spent += (num(&r["live"]["spentMsat"]) / 1000.0) as i64;
             cards.push_str(&rental_card(ctx, r, "./connections-hashrate"));
+            if let Some(pay) = r["payUrl"].as_str().filter(|p| !p.is_empty()) {
+                renting.push((pay.to_string(), r["hasher"].as_str().unwrap_or("a hashmaker").to_string()));
+            }
         }
-        (cards, spent)
+        (cards, spent, renting)
     }
 
     /// The renter's offers asked once, kept for the first Hashrate page ([`App::prefetch`]).

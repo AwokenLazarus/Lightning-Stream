@@ -50,6 +50,9 @@ const ONCE_WAIT: Duration = Duration::from_secs(60);
 
 struct Rental {
     hashmaker: String,
+    /// Where its slices are paid (the hashmaker's shop): the app's Live connections shows that shop's connection as
+    /// paying this rental.
+    pay_url: String,
     hashmaker_key: PublicKey,
     /// The speed the listing advertised for the machines rented.
     advertised_hs: u64,
@@ -492,7 +495,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                     let live = x.live.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     let result = if live.get("meter").is_some() { trust::trial_result(&live, x.started_ms, xbt_hashlink::now_ms(), x.advertised_hs) } else { Value::Null };
                     json!({
-                        "rental": id, "hasher": x.hashmaker, "startedMs": x.started_ms, "miners": x.miners, "budgetSats": x.budget_sats,
+                        "rental": id, "hasher": x.hashmaker, "payUrl": x.pay_url, "startedMs": x.started_ms, "miners": x.miners, "budgetSats": x.budget_sats,
                         "minutes": x.minutes, "ended": x.done.load(Ordering::Relaxed), "live": live,
                         "trial": x.trial, "advertisedHs": x.advertised_hs.to_string(), "result": result, "attested": x.attested,
                     })
@@ -742,6 +745,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         }
         g.rentals.insert(id.clone(), Rental {
             hashmaker: h.name.clone(),
+            pay_url: h.pay_url.clone(),
             hashmaker_key: h.link_key,
             advertised_hs,
             trial,

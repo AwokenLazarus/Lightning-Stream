@@ -3071,6 +3071,8 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     // Live connections shows the rental, with its Cut button
     let p = br.get("/connections");
     assert!(p.body.contains("Rented hashrate") && p.body.contains("data-spent=\"200\""), "{}", p.body);
+    assert!(p.body.find("<h2>Rented hashrate</h2>").unwrap() < p.body.find("Every service you are paying for right now").unwrap(),
+            "the rental going on first, the connections under it: {}", p.body);
     plain("/connections", &p.body);
     let r = br.act("/connections", "/hashrate", &[("action", "cut"), ("rental", "r9"), ("back", "connections")]);
     assert_eq!(r.location(), "./connections");

@@ -116,14 +116,17 @@ impl App {
     pub(crate) fn connections(&self, ctx: &Ctx) -> Resp {
         let names = self.services().unwrap_or_default();
         // rented hashrate is one more kind of connection: a pulse for each piece of work paid
-        let (cards, spent) = self.hash_live_cards(ctx);
-        let mut body = match self.call("ticket_status", json!({})) {
-            Ok(st) => connections_html(ctx, &st, &|id| self.call("ticket_status", json!({"session": id})), &names, crate::now(), !cards.is_empty()),
+        let (cards, spent, renting) = self.hash_live_cards(ctx);
+        let conns = match self.call("ticket_status", json!({})) {
+            Ok(st) => connections_html(ctx, &st, &|id| self.call("ticket_status", json!({"session": id})), &names, crate::now(), !cards.is_empty(), &renting),
             Err(e) => Self::error_box(&e),
         };
-        if !cards.is_empty() {
-            body.push_str(&format!("<h2>Rented hashrate</h2><div class=\"stack\" data-spent=\"{spent}\">{cards}</div>"));
-        }
+        // a rental going on first: the shop's connection that pays it is the means, said as that below it
+        let body = if cards.is_empty() {
+            conns
+        } else {
+            format!("<h2>Rented hashrate</h2><div class=\"stack\" data-spent=\"{spent}\">{cards}</div><h2>Connections</h2>{conns}")
+        };
         self.html_page("Live connections", "Live connections", ctx, &body, REFRESH)
     }
 
@@ -702,7 +705,10 @@ fn balance_cell(paying: &Value, sid: &str, booked_sats: i64) -> String {
 }
 
 /// `more`: other connections (rented hashrate) follow, so an empty list here is not "nothing open".
-fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value, String>, names: &[Service], now: i64, more: bool) -> String {
+/// `renting`: the rentals going on, by the address they are paid at and their name, whose shop connection pays them.
+#[allow(clippy::too_many_arguments)]
+fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value, String>, names: &[Service], now: i64, more: bool,
+                    renting: &[(String, String)]) -> String {
     let csrf = App::csrf_input(ctx);
     let mut b = String::from("<p class=\"lead\">Every service you are paying for right now. Stop one and its payments end at once. \
                               Money paid ahead and not used stays with that shop as credit, and is spent first next time. \
@@ -737,7 +743,8 @@ fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value
         let origin = &xbt402::shop::display(origin);
         let opened = num(s.get("opened_ts"));
         let minutes = if opened > 0.0 { ((now as f64 - opened) / 60.0).max(0.0) } else { 0.0 };
-        cards.push_str(&session_card(ctx, id, &name, origin, state, &counts, &paying, paid, minutes, err.as_deref()));
+        let pays_rental = renting.iter().find(|(pay, _)| services::same_origin(pay, s.get("origin").and_then(Value::as_str).unwrap_or(""))).map(|(_, h)| h.as_str());
+        cards.push_str(&session_card(ctx, id, &name, origin, state, &counts, &paying, paid, minutes, err.as_deref(), pays_rental));
     }
     if open > 1 {
         b.push_str(&format!("<form method=\"post\" action=\"./connections\" class=\"row\">{csrf}\
@@ -748,8 +755,9 @@ fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `rental`: the rental going on that this connection pays, by name: it is not idle between its payments.
 fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &Counts, paying: &Value, paid: (i64, Option<(u64, u64)>), minutes: f64,
-                err: Option<&str>) -> String {
+                err: Option<&str>, rental: Option<&str>) -> String {
     let spent = paid.0;
     let open = state == "open";
     let stop = if open && !id.is_empty() {
@@ -762,6 +770,7 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
     let streaming = row.and_then(|p| p.get("answer_open")).and_then(Value::as_bool).unwrap_or(false);
     let pill = match state {
         "open" if streaming => "<span class=\"pill good\">Streaming</span>",
+        "open" if rental.is_some() => "<span class=\"pill good\">Paying a rental</span>",
         "open" => "<span class=\"pill\">Open, idle</span>",
         "stopping" | "stopped" => "<span class=\"pill warn\">Stopping</span>",
         _ => "<span class=\"pill\">Closed</span>",
@@ -787,6 +796,10 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
     let failed = format!("{} never sent · {} canceled at Stop · {} failed", c.never_sent, c.cancelled_at_stop, c.payment_failed);
     let err = err.map(|e| format!("<p class=\"hint bad\">{}</p>", esc(e))).unwrap_or_default();
     let used = usage_line(row);
+    let used = match rental.filter(|_| open) {
+        Some(h) => format!("<p class=\"hint\">This connection pays the rental Hashrate from {}, under Rented hashrate above.</p>{used}", esc(h)),
+        None => used,
+    };
     // booked for tickets whose secret left and that have not settled: reserved, not paid yet
     let reserved = if c.reserved_sats > 0 { format!(" · <span class=\"small\">{} reserved</span>", sats_short(c.reserved_sats)) } else { String::new() };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
@@ -901,13 +914,26 @@ mod tests {
         assert_eq!(msat_text(40_000), sats_short(40));
     }
 
+    /// The shop connection that pays a rental going on says so, not "Open, idle" between the rental's payments.
+    #[test]
+    fn a_connection_paying_a_rental_says_so() {
+        let ctx = crate::app::Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let shop = xbt402::shop::origin_for(&[7u8; 32]);
+        let st = json!({"sessions": [{"session": "s1", "origin": shop, "state": "open"}, {"session": "s2", "origin": "https://films.example", "state": "open"}], "paying": []});
+        let html = connections_html(&ctx, &st, &|_| Ok(json!({})), &[], 0, true, &[(format!("{shop}/hashrate"), "Laz Hash".into())]);
+        let cards: Vec<&str> = html.split("<section class=\"card live\">").skip(1).collect();
+        assert_eq!(cards.len(), 2, "{html}");
+        assert!(cards[0].contains("Paying a rental") && cards[0].contains("This connection pays the rental Hashrate from Laz Hash") && !cards[0].contains("Open, idle"), "{html}");
+        assert!(cards[1].contains("Open, idle") && !cards[1].contains("rental"), "another shop's stays as it is: {html}");
+    }
+
     /// A connection that runs on credit paid on an earlier one says so, not "Paid so far: 0" beside what it
     /// used; and its rate shows only while the seller's count grows, not as an old average while it is idle.
     #[test]
     fn a_connection_on_earlier_credit_and_its_rate_only_while_bytes_flow() {
         let ctx = crate::app::Ctx { sid: String::new(), csrf: "c".into(), flash: None };
         let paying = |spent: &str| json!([{"session": "on-credit", "spent_msat": spent, "balance_msat": "500000", "answer_open": true}]);
-        let card = |spent: &str| session_card(&ctx, "on-credit", "Demo Films", "https://films.example", "open", &Counts::default(), &paying(spent), (0, None), 10.0, None);
+        let card = |spent: &str| session_card(&ctx, "on-credit", "Demo Films", "https://films.example", "open", &Counts::default(), &paying(spent), (0, None), 10.0, None, None);
         let first = card("499000");
         assert!(first.contains("Paid from earlier credit") && !first.contains("Paid so far"), "{first}");
         assert!(!first.contains("a minute"), "first look: not known to be moving: {first}");
@@ -916,7 +942,7 @@ mod tests {
         assert!(!use_moving("idle", 5, t) && use_moving("idle", 9, t) && use_moving("idle", 9, t + std::time::Duration::from_secs(5)));
         assert!(!use_moving("idle", 9, t + MOVING_FOR + std::time::Duration::from_secs(1)), "idle since: no rate");
         // nothing used yet: the paid line as before
-        let fresh = session_card(&ctx, "fresh", "Demo Films", "https://films.example", "open", &Counts::default(), &json!([]), (0, None), 0.0, None);
+        let fresh = session_card(&ctx, "fresh", "Demo Films", "https://films.example", "open", &Counts::default(), &json!([]), (0, None), 0.0, None, None);
         assert!(fresh.contains("Paid so far"), "{fresh}");
     }
 
