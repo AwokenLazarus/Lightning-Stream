@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.2.9"
+version: "0.2.10"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -53,6 +53,8 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.2.10: hashrate fixes: works with Knots 29.4.3, the offers page answers at once, test slices can be
+  paid, budgets in whole tickets, renting turned back on brings the shop back, your own coinbase tag.
   0.2.9: renting hashrate works with the published images (a build fix).
   0.2.8: Stop says credit is shared; limits say a payment would pass them; player links give their
   size to players; the publish-anyway box only where it applies.

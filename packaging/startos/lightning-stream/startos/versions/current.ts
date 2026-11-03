@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.9:0',
+  version: '0.2.10:0',
   releaseNotes: {
     en_US:
-      'A fix release: renting hashrate works with the published images. The rental component was built without a library feature it needs, which made a rental fail to start; it now declares it, and a release check builds every component the way publishing does.',
+      'Hashrate fixes, most sent by a hashmaker who runs the app. The market price works with Knots 29.4.3. The Hashrate page under Buy answers at once and says when it is still looking for offers on Nostr. A test slice can be paid. The Rent form suggests budgets in whole tickets and says what a budget buys. Renting turned back on brings the shop back without a Save. Add a service under Sell has a Hashrate choice. Rentals update by themselves, a refused payment says why, prices are said per TH/s for an hour, and your gateway takes your own coinbase tag.',
   },
   migrations: {
     up: async () => {},
