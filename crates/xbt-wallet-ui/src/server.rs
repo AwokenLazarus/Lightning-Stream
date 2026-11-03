@@ -711,7 +711,7 @@ fn files_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String
     let key = crate::files::key(&app.cfg.data_dir.join("secrets"))?;
     let l = std::net::TcpListener::bind(&app.cfg.files.bind).map_err(|e| format!("bind {}: {e}", app.cfg.files.bind))?;
     *app.files_addr.lock().unwrap_or_else(|p| p.into_inner()) = l.local_addr().ok();
-    let server = crate::files::Server { setup: app.cfg.files.clone(), key };
+    let server = crate::files::Server::new(app.cfg.files.clone(), key);
     xbt_svc::http::serve(Arc::new(server), l, 4).map(Some).map_err(|e| format!("serve: {e}"))
 }
 

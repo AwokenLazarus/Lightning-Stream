@@ -259,6 +259,19 @@ pub struct Server {
     /// Where the shared folder is: read for every request, so a new choice applies at once.
     pub setup: crate::config::FilesSetup,
     pub key: String,
+    /// Blossom by hash (`XBT_UI_FILES_BLOSSOM=1`, [`crate::blossom`]): `None`, off.
+    pub blossom: Option<std::sync::Arc<crate::blossom::Index>>,
+}
+
+impl Server {
+    /// The server, with its Blossom index started when [`crate::config::FilesSetup::blossom`] is on.
+    pub fn new(setup: crate::config::FilesSetup, key: String) -> Self {
+        let blossom = setup.blossom.then(|| std::sync::Arc::new(crate::blossom::Index::default()));
+        if let (Some(ix), Some(dir)) = (&blossom, shared_dir(&setup)) {
+            ix.refresh_soon(dir, true);
+        }
+        Self { setup, key, blossom }
+    }
 }
 
 impl xbt_svc::http::Handler for Server {
@@ -282,14 +295,38 @@ impl xbt_svc::http::Handler for Server {
         if self.key.is_empty() || !crate::ct_eq(given.as_bytes(), self.key.as_bytes()) {
             return Reply::Whole(Response::text(403, "text/plain", "forbidden"));
         }
-        let Some(path) = shared_dir(&self.setup).and_then(|dir| resolve(&dir, req.path())) else {
+        let Some(dir) = shared_dir(&self.setup) else {
             return Reply::Whole(Response::text(404, "text/plain", "no such file"));
+        };
+        // a file by its name first, as before; then, with Blossom on, by the hash of its content
+        let mut by_hash = None;
+        let path = match resolve(&dir, req.path()) {
+            Some(p) => p,
+            None => match (&self.blossom, crate::blossom::hash_of_path(req.path())) {
+                (Some(ix), Some(h)) => match ix.lookup(&dir, &h) {
+                    Some(p) => {
+                        by_hash = Some((ix.clone(), h));
+                        p
+                    }
+                    None => {
+                        ix.refresh_soon(dir.clone(), false);
+                        return Reply::Whole(Response::new(404, vec![("Access-Control-Allow-Origin".into(), "*".into()),
+                                                                    ("X-Reason".into(), "no blob with that hash here".into())],
+                                                          b"no such blob".to_vec()));
+                    }
+                },
+                _ => return Reply::Whole(Response::text(404, "text/plain", "no such file")),
+            },
         };
         let Ok(mut f) = std::fs::File::open(&path) else {
             return Reply::Whole(Response::text(404, "text/plain", "no such file"));
         };
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         let mut headers = vec![("Content-Type".to_string(), content_type(&path).to_string()), ("Accept-Ranges".into(), "bytes".into())];
+        if by_hash.is_some() {
+            // BUD-01: every answer may be read from any origin
+            headers.push(("Access-Control-Allow-Origin".into(), "*".into()));
+        }
         let (status, start, end) = match range_of(req.header("range"), len) {
             Some(Ok((s, e))) => {
                 headers.push(("Content-Range".into(), format!("bytes {s}-{e}/{len}")));
@@ -304,6 +341,8 @@ impl xbt_svc::http::Handler for Server {
         if f.seek(SeekFrom::Start(start)).is_err() {
             return Reply::Whole(Response::text(500, "text/plain", "could not read the file"));
         }
+        // a whole file sent by hash is hashed again as it goes: bytes that are not the hash's end short
+        let mut check = by_hash.filter(|_| status == 200 && method == "GET").map(|(ix, h)| (ix, crate::blossom::Check::new(&h), dir, path.clone()));
         Reply::Stream(Streamed {
             status,
             headers,
@@ -316,6 +355,18 @@ impl xbt_svc::http::Handler for Server {
                     let n = f.read(&mut buf[..want])?;
                     if n == 0 {
                         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the file got shorter"));
+                    }
+                    if let Some((_, c, _, _)) = check.as_mut() {
+                        sha2::Digest::update(&mut c.hasher, &buf[..n]);
+                    }
+                    if left == n as u64 {
+                        if let Some((ix, c, dir, path)) = check.take() {
+                            if !c.ok() {
+                                ix.forget(&dir, &path);
+                                // the last bytes are held back: the client sees a cut answer, not a wrong whole one
+                                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the file no longer has the hash it was asked by"));
+                            }
+                        }
                     }
                     out.send(&buf[..n])?;
                     left -= n as u64;
@@ -451,5 +502,73 @@ mod tests {
         assert_eq!(size_most("1.4 GB"), Some(1_450_000_000));
         assert_eq!(size_most("276 MB"), Some(276_500_000));
         assert_eq!(size_most("plenty"), None);
+    }
+
+    /// Blossom on: a file is served by the SHA-256 of its content as well as by its name, with the
+    /// same key; a hash it does not have is a 404 with a reason; a file changed in place behind the
+    /// index's back is cut short, never sent whole under a hash that is not its. Off: no hash path.
+    #[test]
+    fn with_blossom_on_a_file_is_served_by_its_hash_and_never_whole_under_a_wrong_one() {
+        use sha2::Digest;
+        use xbt_svc::http::Handler;
+        struct Out(Vec<u8>);
+        impl xbt_svc::http::BodyWriter for Out {
+            fn send(&mut self, b: &[u8]) -> std::io::Result<()> {
+                self.0.extend_from_slice(b);
+                Ok(())
+            }
+        }
+        let get = |s: &Server, method: &str, target: &str, key: &str, range: Option<&str>| {
+            let mut headers = vec![(KEY_HEADER.to_string(), key.to_string())];
+            if let Some(r) = range {
+                headers.push(("Range".into(), r.into()));
+            }
+            match s.reply(Request { method: method.into(), target: target.into(), headers, body: vec![], peer: None }) {
+                Reply::Whole(r) => (r.status, r.headers, Ok(r.body)),
+                Reply::Stream(st) => {
+                    let mut out = Out(vec![]);
+                    let r = (st.body)(&mut out);
+                    (st.status, st.headers, r.map(|_| out.0))
+                }
+            }
+        };
+        let hdr = |h: &[(String, String)], k: &str| h.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone());
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Sintel.mkv"), b"0123456789").unwrap();
+        let h = hex::encode(sha2::Sha256::digest(b"0123456789"));
+        let setup = crate::config::FilesSetup { dir: d.path().to_path_buf(), blossom: true, ..Default::default() };
+        let s = Server { setup: setup.clone(), key: "k".repeat(32), blossom: Some(std::sync::Arc::new(crate::blossom::Index::default())) };
+        s.blossom.as_ref().unwrap().refresh(d.path());
+        let key = "k".repeat(32);
+
+        let (st, hs, body) = get(&s, "GET", &format!("/{h}.mkv"), &key, None);
+        assert_eq!((st, body.unwrap()), (200, b"0123456789".to_vec()));
+        assert_eq!(hdr(&hs, "content-type").as_deref(), Some("video/x-matroska"), "the type is the file's");
+        assert_eq!(hdr(&hs, "access-control-allow-origin").as_deref(), Some("*"));
+        let (st, _, body) = get(&s, "GET", &format!("/{h}"), &key, Some("bytes=2-4"));
+        assert_eq!((st, body.unwrap()), (206, b"234".to_vec()), "ranges as by name");
+        assert_eq!(get(&s, "HEAD", &format!("/{h}"), &key, None).0, 200);
+        assert_eq!(get(&s, "GET", "/Sintel.mkv", &key, None).0, 200, "by name as before");
+        assert_eq!(get(&s, "GET", &format!("/{h}"), "wrong", None).0, 403, "the files key is still needed");
+        let (st, hs, _) = get(&s, "GET", &format!("/{}", "0".repeat(64)), &key, None);
+        assert_eq!(st, 404);
+        assert!(hdr(&hs, "x-reason").is_some());
+
+        // changed in place, keeping its size and time: the index still names it, the bytes are not the hash's
+        let mtime = std::fs::metadata(d.path().join("Sintel.mkv")).unwrap().modified().unwrap();
+        std::fs::write(d.path().join("Sintel.mkv"), b"9876543210").unwrap();
+        std::fs::File::options().write(true).open(d.path().join("Sintel.mkv")).unwrap().set_modified(mtime).unwrap();
+        let (st, _, body) = get(&s, "GET", &format!("/{h}"), &key, None);
+        assert_eq!(st, 200);
+        assert!(body.is_err(), "cut short, not a whole wrong file");
+        assert_eq!(get(&s, "GET", &format!("/{h}"), &key, None).0, 404, "and the hash is forgotten");
+
+        // off (the default): a hash path is just a name no file has
+        let off = Server::new(crate::config::FilesSetup { blossom: false, ..setup }, key.clone());
+        assert!(off.blossom.is_none());
+        let h2 = hex::encode(sha2::Sha256::digest(b"9876543210"));
+        let (st, hs, _) = get(&off, "GET", &format!("/{h2}"), &key, None);
+        assert_eq!(st, 404);
+        assert!(hdr(&hs, "x-reason").is_none());
     }
 }

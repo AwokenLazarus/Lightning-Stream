@@ -17,6 +17,7 @@
 pub mod app;
 pub mod services;
 pub mod auth;
+pub mod blossom;
 pub mod config;
 pub mod files;
 pub mod html;

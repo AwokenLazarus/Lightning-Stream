@@ -62,6 +62,7 @@
 //! | `XBT_UI_FILES_ROOT_WORDS` | "the folder this box shares with the app" | what the Sell page calls `XBT_UI_FILES_ROOT` ("the Downloads folder in Umbrel's Files app") |
 //! | `XBT_UI_FILES_ROOT` | unset | a folder the box shares with the app (Umbrel's Downloads, read-only): the owner chooses the shared folder under it on the Sell page, instead of `XBT_UI_FILES_DIR` |
 //! | `XBT_UI_FILES_BIND` | `127.0.0.1:8486` | where the UI serves that folder; on a platform whose gateway runs in another container, the app's private network |
+//! | `XBT_UI_FILES_BLOSSOM` | unset (off) | `1`: the shared folder also answers a file by the SHA-256 of its content, `/files/<sha256>[.ext]` through the gateway, as a Blossom server does (BUD-01; `docs/NWC-BLOSSOM.md`). Sold by the same route and price |
 //! | `XBT_UI_FILES_UPSTREAM` | `http://<XBT_UI_FILES_BIND>` | how the gateway reaches the folder, as its container sees the UI |
 //! | `XBT_UI_DATUM_GUIDE` | the project's guide | where a renter without a gateway is sent to set one up |
 //! | `XBT_UI_DATUM_RPCURL` | | the XBT node's RPC address (`http://host:port`) as the bundled Stream Gateway reaches it. Set: the Hashrate page has the gateway's settings ("Your gateway") and writes its config. Unset: this install has no bundled gateway |
@@ -230,6 +231,9 @@ pub struct FilesSetup {
     pub bind: String,
     /// `XBT_UI_FILES_UPSTREAM`: how the gateway reaches it. Empty: the address the UI bound.
     pub upstream: String,
+    /// `XBT_UI_FILES_BLOSSOM=1`: the folder also answers a file by its SHA-256 (Blossom BUD-01,
+    /// [`crate::blossom`]). Off by default.
+    pub blossom: bool,
 }
 
 /// The AI endpoint the connector serves (`LS_AI_LISTEN`), as the AI page sees it.
@@ -437,7 +441,8 @@ impl Config {
                              choice: files_choice,
                              root_words: env("XBT_UI_FILES_ROOT_WORDS").filter(|s| !s.trim().is_empty())
                                  .unwrap_or_else(|| "the folder this box shares with the app".into()),
-                             upstream: env("XBT_UI_FILES_UPSTREAM").unwrap_or_else(|| format!("http://{bind}")), bind }
+                             upstream: env("XBT_UI_FILES_UPSTREAM").unwrap_or_else(|| format!("http://{bind}")), bind,
+                             blossom: env("XBT_UI_FILES_BLOSSOM").as_deref() == Some("1") }
             },
             nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
             nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
