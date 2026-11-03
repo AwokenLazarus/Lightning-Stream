@@ -181,7 +181,7 @@ impl Catalogue {
 /// by its shop alone (0.2.6 said "laz-mini from Lightning Stream Genesis: laz-mini only").
 pub fn one_seller_words(seller: &str, model: &str) -> String {
     let shop = seller.strip_suffix(&format!(": {model}")).filter(|s| !s.trim().is_empty()).unwrap_or(seller);
-    format!("{model}, always from {shop}. To let the cheapest seller you allow answer, ask for {model}.")
+    format!("{model}, always from {shop}: the same model as {model}, from this seller. To let the cheapest seller you allow answer, ask for {model}.")
 }
 
 /// One seller's recent record.
@@ -312,13 +312,13 @@ mod tests {
     #[test]
     fn a_one_seller_model_is_described_in_plain_words() {
         assert_eq!(super::one_seller_words("Lightning Stream Genesis: laz-mini", "laz-mini"),
-                   "laz-mini, always from Lightning Stream Genesis. To let the cheapest seller you allow answer, ask for laz-mini.");
-        assert_eq!(super::one_seller_words("by-token", "llama"), "llama, always from by-token. To let the cheapest seller you allow answer, ask for llama.");
+                   "laz-mini, always from Lightning Stream Genesis: the same model as laz-mini, from this seller. To let the cheapest seller you allow answer, ask for laz-mini.");
+        assert_eq!(super::one_seller_words("by-token", "llama"), "llama, always from by-token: the same model as llama, from this seller. To let the cheapest seller you allow answer, ask for llama.");
         let mut c = super::Catalogue::default();
         c.add_seller("Shop: m", "https://a.example/ai/", &serde_json::json!({"per_1k_output_msat": "1000"}), 1024, &serde_json::json!({"data": [{"id": "m"}]}));
         let shown = c.models_json();
         let one = shown["data"].as_array().unwrap().iter().find(|d| d["id"] == "Shop: m/m").unwrap();
-        assert_eq!(one["description"], "m, always from Shop. To let the cheapest seller you allow answer, ask for m.");
+        assert_eq!(one["description"], "m, always from Shop: the same model as m, from this seller. To let the cheapest seller you allow answer, ask for m.");
     }
 
     /// A seller's price for each request counts in its rank and is shown beside its token prices:

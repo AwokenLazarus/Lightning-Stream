@@ -993,7 +993,8 @@ struct Sink {
     file: Option<(std::fs::File, PathBuf)>,
     file_error: Option<String>,
     /// Where the body goes as it arrives, for a caller that streams it on (a player): the socket
-    /// the call named in `stream_to`.
+    /// the call named in `stream_to`. Its reader never writes on it (a WebSocket's excepted) and never half-closes
+    /// it: a reader that shuts its writing side is taken for one that has gone, and no more is paid for the answer.
     out: Option<std::os::unix::net::UnixStream>,
     /// The reader at `out` went away: the call reads no further.
     gone: bool,
@@ -2206,7 +2207,12 @@ fn reader_closed(watch: &std::os::unix::net::UnixStream) -> bool {
     if watch.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
         return false;
     }
-    matches!((&*watch).read(&mut [0u8; 1]), Ok(0))
+    match (&*watch).read(&mut [0u8; 1]) {
+        Ok(n) => n == 0,
+        // nothing to read within the moment: still there. Any other error (a reset, which Linux reports before the end of
+        // the stream) is a reader gone
+        Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted),
+    }
 }
 /// Why the wallet read no further of a body that went past the size the buyer was shown (`max_size`).
 const PASSED_SHOWN: &str = "stopped by the wallet: the answer passed the size the buyer was shown";
@@ -5141,6 +5147,13 @@ impl Signer {
                         return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
                     }
                 }
+                // a caller that streams its answer to a socket and has not been told yet: gone (its socket with it) while
+                // this call waited for its turn, or before a send again, it is sent nothing, though the balance covered it
+                if early.is_none() && c.stream_to.as_deref().is_some_and(|p| !p.exists()) {
+                    self.seq_done(hs, seq);
+                    lock_money(hs).close(rid, 0, 0);
+                    return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
+                }
                 spent.sent = true;
                 sent_epoch = lock_money(hs).epoch;
                 let sent = if c.upgrade {
@@ -5359,7 +5372,7 @@ impl Signer {
         } else {
             let tokens = Some(c.body).filter(|b| price.tokens.active() && !b.is_empty())
                 .and_then(|b| xbt402::tokens::prepare(b, price.tokens.max_output).ok().map(|p| (b.len() as u64, p.max_output)));
-            let (m, note, last) = self.ticket_stream(hs, price, &head, &mark, rid, seq, &digest, ans, started, c.by, max_msat, &mut sink, &mut spent, not_read, tokens, reserve, up_writer);
+            let (m, note, last) = self.ticket_stream(hs, price, &head, &mark, rid, seq, &digest, ans, started, c.by, max_msat, &mut sink, &mut spent, not_read, tokens, reserve, up_writer, c.upgrade);
             drop(streaming);
             seller_last = last;
             out = with(out, m);
@@ -5456,8 +5469,8 @@ impl Signer {
     /// stopped at its head, for that reason.
     #[allow(clippy::too_many_arguments)]
     fn ticket_stream(&self, hs: &Arc<HttpSession>, price: &Price, head: &Receipt, mark: &Mark, rid: u64, seq: u64, digest: &str, ans: WireAnswer, started: Instant, call_by: Instant, max_msat: u64,
-                     sink: &mut Sink, spent: &mut Spent, stop: Option<String>, tokens: Option<(u64, u64)>, reserve: u64, up_writer: Option<Box<dyn Write + Send>>)
-                     -> (Value, Value, Value) {
+                     sink: &mut Sink, spent: &mut Spent, stop: Option<String>, tokens: Option<(u64, u64)>, reserve: u64, up_writer: Option<Box<dyn Write + Send>>,
+                     upgrade: bool) -> (Value, Value, Value) {
         // by the token: the answer counted here as the seller counts it, to check its last receipt
         let event_stream = ans.header("content-type").is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"));
         let mut sse = xbt402::tokens::Sse::default();
@@ -5531,10 +5544,10 @@ impl Signer {
         let freed_before = lock_money(hs).freed;
         // one more ticket for this answer, or the reason there is none
         let up_writer_absent = up_writer.is_none();
-        // the caller's side of an answer streamed on (never a WebSocket, whose caller writes on it): a ticket is not released
-        // for an answer whose reader has gone (a visit stopped while the seller waited for the next ticket)
-        // (let go with the sink's own end, so that the reader sees the body end then: [`Sink::out`] is dropped below)
-        let watch = Mutex::new(if up_writer_absent { sink.out.as_ref().and_then(|o| o.try_clone().ok()) } else { None });
+        // the caller's side of an answer streamed on (never a call that asked for a WebSocket, whose caller may write on it): a
+        // ticket is not released for an answer whose reader has gone (a visit stopped while the seller waited for the next
+        // ticket). Let go with the sink's own end, so that the reader sees the body end then ([`Sink::out`] is dropped below)
+        let watch = Mutex::new(if upgrade { None } else { sink.out.as_ref().and_then(|o| o.try_clone().ok()) });
         let reader_left = || lock(&watch).as_ref().is_some_and(reader_closed);
         // `due`: the caller's own test of whether one is due, on the credit left for this answer
         let pay = |bytes: u64, due: &dyn Fn(u64) -> bool| -> Option<String> {
@@ -6837,6 +6850,25 @@ mod tests {
         assert!(Refilling::take(&*f).is_some(), "the flag went with the thread");
     }
     use super::*;
+
+    /// The watch on an answer's reader ([`reader_closed`]): a reader still there with nothing to say is there; one that
+    /// closed its socket, or whose socket was reset, is gone. Nothing it might have written is waited for.
+    ///
+    /// FAILS before: there was no watch, and a ticket was released for the next bytes of an answer whose reader had gone
+    /// while the seller waited for that ticket (a visit stopped mid-film).
+    #[test]
+    fn the_watch_on_an_answers_reader_tells_a_reader_gone_from_one_that_is_quiet() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let watch = ours.try_clone().unwrap();
+        let t = Instant::now();
+        assert!(!reader_closed(&watch), "a quiet reader is there");
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+        drop(theirs);
+        assert!(reader_closed(&watch), "a reader that closed is gone");
+        // the answer's own end is untouched by the watch: still a blocking socket, its writes refused only by the close
+        use std::io::Write as _;
+        assert!((&ours).write_all(b"x").is_err());
+    }
 
     /// Once the credit released for a request covers its charge cap, no ticket more is due for it,
     /// however far its body goes or however long it runs: it could never be charged for one.
