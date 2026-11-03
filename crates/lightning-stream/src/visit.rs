@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Reply, Request, Response, Streamed};
 
-use crate::{flight, in_flight_besides, origin_of, listen_stream, one_range, random_hex, whole, Config, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
+use crate::{close_if_alone, flight, origin_of, listen_stream, one_range, random_hex, whole, Config, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
 
 /// The largest limit a visit may have, in sats.
 const MAX_LIMIT: i64 = 10_000_000;
@@ -1264,19 +1264,26 @@ fn finish_stop(cfg: &Config, visits: &Visits, visit: &Visit) {
     // decided now, just before it is closed: another open visit to the shop, or a call of the connector's to it besides
     // this visit's own (a visit opened since the stop, the AI endpoint's answer, a player link's film), uses the same
     // connection, and keeps it. Only this visit's own session is closed, never the shop's sessions of other tasks
+    // (decided and marked at once: a call of anyone else's to the shop that starts meanwhile waits for the close, and goes
+    // on a new connection)
     let origin = visit.origin();
-    let others = visits.other_open(&origin, &visit.id) || in_flight_besides(&cfg.signer, &origin, &visit.id);
-    let closed = !others && !sessions.is_empty() && sessions.iter().all(|sid| {
-        let r = xbt_wallet_mcp::wallet::signer_call(&cfg.signer, Duration::from_secs(90), "ticket_stop",
-                                                    &json!({"session": sid, "why": "the buyer stopped the visit"}));
-        match r {
-            Ok(v) => v.get("verdict").and_then(Value::as_str).is_some_and(|d| d == "allow" || d == "partial"),
-            Err(e) => {
-                eprintln!("lightning-stream: a stopped visit's connection with the shop could not be closed: {e}");
-                false
+    let closing = if sessions.is_empty() { None } else { close_if_alone(&cfg.signer, &origin, &visit.id, || visits.other_open(&origin, &visit.id)) };
+    let closed = closing.is_some() && {
+        // every session is stopped, whatever became of the one before
+        let each: Vec<bool> = sessions.iter().map(|sid| {
+            let r = xbt_wallet_mcp::wallet::signer_call(&cfg.signer, Duration::from_secs(90), "ticket_stop",
+                                                        &json!({"session": sid, "why": "the buyer stopped the visit"}));
+            match r {
+                Ok(v) => v.get("verdict").and_then(Value::as_str).is_some_and(|d| d == "allow" || d == "partial"),
+                Err(e) => {
+                    eprintln!("lightning-stream: a stopped visit's connection with the shop could not be closed: {e}");
+                    false
+                }
             }
-        }
-    });
+        }).collect();
+        each.iter().all(|ok| *ok)
+    };
+    drop(closing);
     let until = Instant::now() + STOP_SETTLE_WAIT;
     let mut s = visit.lock();
     s.connection_closed = Some(closed);
