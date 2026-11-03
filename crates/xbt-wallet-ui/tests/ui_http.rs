@@ -3012,6 +3012,10 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     let s: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!((s["enabled"].clone(), s["fallback"].clone(), s["priceSat"].clone(), s["rentable"].clone()),
                (json!(true), json!("192.168.1.20:23334"), json!(40), json!(1)));
+    // the price per 1 TH/s for an hour, beside the other offers seen (this box rents too)
+    let p = br.get("/sell-hashrate").body;
+    assert!(p.contains("Per 1 TH/s of speed, your price comes to about <strong>") && p.contains("The 2 other offers seen now ask from about 1,023 sats an hour \
+                                                                                                for 1 TH/s (the cheapest), 1,023 sats in the middle."), "{p}");
     let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "no port"), ("price", "40")]);
     assert!(br.flash_after(&r).contains("with its port"));
 
