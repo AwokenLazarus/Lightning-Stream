@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(hash_of_path(&format!("/{h}")), Some(h.clone()));
         assert_eq!(hash_of_path(&format!("/{h}.mkv")), Some(h.clone()));
         assert_eq!(hash_of_path(&format!("/{}.PDF", h.to_uppercase())), Some(h.clone()));
-        for bad in [format!("{h}"), format!("/{h}."), format!("/{h}.tar.gz"), format!("/{h}.m/v"), format!("/{}", &h[1..]),
+        for bad in [h.clone(), format!("/{h}."), format!("/{h}.tar.gz"), format!("/{h}.m/v"), format!("/{}", &h[1..]),
                     format!("/{h}0"), format!("/x{}", &h[1..]), "/Sintel.mkv".into(), format!("/a/{h}"), format!("/{h}.%2e")] {
             assert_eq!(hash_of_path(&bad), None, "{bad}");
         }
