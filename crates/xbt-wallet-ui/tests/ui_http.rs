@@ -4584,6 +4584,70 @@ fn add_a_service_has_a_hashrate_choice_that_leads_to_sell_hashrate() {
     assert!(br.get("/sell-hashrate").body.contains("Renting out, you are the <strong>hashmaker</strong>"), "and it leads there");
 }
 
+/// The shop's route for pieces of work follows renting on or off however it changed, not only at Save: on VM 118 (0.2.9)
+/// renting turned back on after an upgrade restart left the shop without its /hashrate/ route, and the hashmaker
+/// paused with "your shop is not selling yet" till the UI restarted. The minute's reprice puts it back, and takes it out.
+#[cfg(unix)]
+#[test]
+fn the_hashrate_route_follows_renting_on_or_off_without_a_save() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"open": true, "settings": {}, "minersAddress": "umbrel.local:23340", "terms": {"priceMsat": 404000},
+                                     "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}],
+                                     "rentals": [], "paused": null}),
+        _ => json!({"error": "no"}),
+    });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let htok = dir.join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.join("hashrate-settings.json");
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example/")]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price_mode", "fixed"),
+                                                          ("price_pct", "100"), ("price", "404"), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved. Renting is on."), "{}", br.flash_after(&r));
+    let route = || {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        c["routes"].as_array().unwrap().iter().any(|r| r["path"] == "/hashrate/")
+    };
+    assert!(route(), "saved on: the shop sells pieces of work");
+    let set_enabled = |on: bool| {
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        v["enabled"] = json!(on);
+        std::fs::write(&settings, v.to_string()).unwrap();
+    };
+    // off by the settings file: the route goes at the minute's reprice, with no Save
+    set_enabled(false);
+    bx._app.hash_reprice(false);
+    assert!(!route(), "renting off: no route");
+    // on again by the file (as after an upgrade restart): the route comes back by itself
+    set_enabled(true);
+    bx._app.hash_reprice(false);
+    assert!(route(), "renting on again: the route is back without a Save");
+    // the config written without it by something else (a shop saved while off, an older version): put back too
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    c["routes"].as_array_mut().unwrap().retain(|r| r["path"] != "/hashrate/");
+    std::fs::write(dir.join("config.json"), serde_json::to_string_pretty(&c).unwrap()).unwrap();
+    assert!(bx._app.hash_route_follows(), "written again");
+    assert!(route());
+    assert!(!bx._app.hash_route_follows(), "and nothing more to do: the shop is not restarted again");
+}
+
 /// The hashmaker's price follows the chain: by default what a piece of work is worth when mined, read through the
 /// signer from the XBT node, written for the hasher and into the shop's route alike. A new price waits for the
 /// rentals going on to end, no live price is no new rental, and a typed price is kept.

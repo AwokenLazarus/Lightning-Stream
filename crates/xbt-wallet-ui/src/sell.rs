@@ -757,7 +757,7 @@ impl App {
         self.cfg.data_dir.join(SELL_FILE)
     }
 
-    fn gateway_now(&self) -> Option<Value> {
+    pub(crate) fn gateway_now(&self) -> Option<Value> {
         std::fs::read_to_string(self.cfg.gw.dir.join(GW_CONFIG)).ok().and_then(|t| serde_json::from_str(&t).ok())
     }
 

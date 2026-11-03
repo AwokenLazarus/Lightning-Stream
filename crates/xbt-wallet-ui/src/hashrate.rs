@@ -505,6 +505,35 @@ impl App {
     /// moment before it read them keeps a shop that charges those till its rental ends. A live price moving with the
     /// chain comes no sooner than [`REPRICE_DWELL_MS`] after the last, so the shop isn't kept restarting.
     pub fn hash_reprice(&self, saving: bool) -> Repriced {
+        let r = self.hash_reprice_inner(saving);
+        self.hash_route_follows();
+        r
+    }
+
+    /// The shop's route for pieces of work follows the `enabled` setting, however it changed: written into the
+    /// gateway's config when renting is on and the config lacks it, taken out when renting is off and the config
+    /// has it. 0.2.9 did this only at the Save on Sell → Hashrate: renting turned back on by the settings file
+    /// changing or the app restarting left the shop without its route, and the hashmaker paused with "your shop is
+    /// not selling yet" till the UI restarted. `true`: the shop was written again.
+    pub fn hash_route_follows(&self) -> bool {
+        if self.cfg.hash.slices.is_none() {
+            return false;
+        }
+        let Some(now) = self.gateway_now() else { return false };
+        let has = now["routes"].as_array().is_some_and(|rs| rs.iter().any(|r| r["path"] == "/hashrate/"));
+        if has == self.hash_route().is_some() {
+            return false;
+        }
+        match self.commit(&self.shop(), "") {
+            Ok(_) => self.gateway_now().is_some_and(|c| c != now),
+            Err(e) => {
+                eprintln!("xbt-wallet-ui: the shop's hashrate route: {e}");
+                false
+            }
+        }
+    }
+
+    fn hash_reprice_inner(&self, saving: bool) -> Repriced {
         let mut s = self.hash_settings();
         if s["enabled"] != true {
             return Repriced::Off;
