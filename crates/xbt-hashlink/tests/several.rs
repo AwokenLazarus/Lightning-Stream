@@ -196,6 +196,7 @@ fn hashtaker_idle(rig: &Rig, name: &str, miners: u32, secs: u64, stop_paying_aft
         miners,
         budget_msat: None,
         cut: None,
+        added: None,
         live: None,
         gateway_api: None,
         allow_unblinded: true,

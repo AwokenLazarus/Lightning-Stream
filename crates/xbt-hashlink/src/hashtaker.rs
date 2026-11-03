@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,8 @@ pub struct Config {
     pub budget_msat: Option<u64>,
     /// Set to end the rental now (the app's Cut button).
     pub cut: Option<Arc<AtomicBool>>,
+    /// Budget and time added while it goes on (the app's Add to this rental), on top of `budget_msat` and `duration`.
+    pub added: Option<Arc<Added>>,
     /// The report, kept current (twice a second) for the app's pages.
     pub live: Option<Arc<Mutex<Value>>>,
     /// The local API of the hashtaker's gateway, where each job is opened and checked for its blinding.
@@ -62,6 +64,24 @@ pub struct Config {
     /// Rent onto jobs that aren't blinded, where a hashmaker could drop the shares that win (a lab's own
     /// pool). Off, a rental refuses any job it can't show is blinded.
     pub allow_unblinded: bool,
+}
+
+/// Budget and time the hashtaker added to a rental going on: the rental reads them twice a second, and the wallet's
+/// payer before each payment ([`crate::rail::SignerPayer::added`]). They only grow.
+#[derive(Debug, Default)]
+pub struct Added {
+    pub msat: AtomicU64,
+    pub secs: AtomicU64,
+}
+
+impl Added {
+    pub fn msat(&self) -> u64 {
+        self.msat.load(Ordering::Relaxed)
+    }
+
+    pub fn secs(&self) -> u64 {
+        self.secs.load(Ordering::Relaxed)
+    }
 }
 
 /// Tickets kept locked ahead of the work.
@@ -593,7 +613,8 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
         let st = st.clone();
         let tx = tx.clone();
         let report = cfg.report.clone();
-        let (idle, duration, cut, live) = (cfg.idle, cfg.duration, cfg.cut.clone(), cfg.live.clone());
+        let (idle, cut, live, budget, added) = (cfg.idle, cfg.cut.clone(), cfg.live.clone(), cfg.budget_msat, cfg.added.clone());
+        let mut duration = cfg.duration;
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(500));
             let mut g = lock(&st);
@@ -602,6 +623,15 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             }
             if g.closed.is_some() {
                 return;
+            }
+            // budget and time the hashtaker added: a slice held back by the budget is paid now, if it is due
+            if let Some(a) = &added {
+                duration = cfg.duration.map(|d| d + Duration::from_secs(a.secs()));
+                let more = budget.map(|b| b.saturating_add(a.msat()));
+                if more != g.budget_msat {
+                    g.budget_msat = more;
+                    g.settle_up(&tx);
+                }
             }
             g.tick(&tx);
             let (s, largest) = (g.terms.slice_work, g.largest_share());

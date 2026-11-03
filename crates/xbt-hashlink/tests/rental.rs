@@ -222,6 +222,7 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
             miners: 0,
             budget_msat: None,
             cut: None,
+            added: None,
             live: None,
             gateway_api: None,
             allow_unblinded: true,
@@ -772,6 +773,7 @@ impl WalletRental {
             miners: 0,
             budget_msat: None,
             cut: Some(end.clone()),
+            added: None,
             live: Some(live.clone()),
             gateway_api: None,
             allow_unblinded: true,
@@ -1133,7 +1135,7 @@ impl TicketShop {
         let cfg = hashtaker::Config { hashmaker: self.link.clone(), hashmaker_key: self.hpub, key: noise::fresh_key(), upstream: self.pool.clone(),
                                       user: "hashtaker.rented".into(), terms: terms(), rental: id.into(), listing: "lab".into(), stop_paying_after: None,
                                       idle: Duration::from_secs(3), duration: Some(Duration::from_secs(40)), report: None, payer: Some(Box::new(payer)), miners: 0,
-                                      budget_msat: Some(budget_sats * 1000), cut: None, live: None, gateway_api: None, allow_unblinded: true };
+                                      budget_msat: Some(budget_sats * 1000), cut: None, added: None, live: None, gateway_api: None, allow_unblinded: true };
         hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap()
     }
 
