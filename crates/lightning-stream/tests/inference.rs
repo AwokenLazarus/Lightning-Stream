@@ -963,3 +963,77 @@ fn a_whole_answer_slower_than_a_streams_first_byte_is_waited_for() {
     assert!(body.contains("Hello there"), "{body}");
     assert_eq!(sellers_called(&r), ["cheap.example"], "no other seller is called");
 }
+
+/// One more AI key in the rig's store, of 100 sats.
+fn another_key(r: &Rig) -> String {
+    let mut store = Store::open(&r.creds).unwrap();
+    let (_, key) = store.make(Kind::AiKey, "another client", 100, None, None);
+    store.save().unwrap();
+    key
+}
+
+/// A whole answer (no `stream`) of the cheap seller, asked with `key`.
+fn whole_answer(addr: &str, key: &str) -> (u16, String, String) {
+    call(addr, "POST", "/v1/chat/completions", Some(key), "", &json!({"model": "cheap/llama", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}).to_string())
+}
+
+/// Eight whole answers that their seller takes seconds to write (four from each of two keys), all
+/// paid for, do not hold the places for calls waiting on a payment: a quick call beside them is
+/// served, and so are they.
+///
+/// FAILS before: each held its place for the whole of its seller's time (up to 300 s as shipped),
+/// and the quick call was answered 503 `busy`.
+#[test]
+fn whole_answers_being_written_do_not_hold_the_places_for_payments() {
+    let r = rig(Plan::SlowWhole(10, 3000), Plan::Answer(10), 100);
+    model_ids(&r);
+    let keys = [r.key.clone(), another_key(&r)];
+    let calls: Vec<_> = (0..8).map(|i| {
+        let (addr, key) = (r.addr.clone(), keys[i % 2].clone());
+        std::thread::spawn(move || whole_answer(&addr, &key))
+    }).collect();
+    wait_until("all 8 paid for and at the seller", || served(&r).len() == 8);
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, _, body) = chat(&r, "dear/llama");
+    assert_eq!((status, body.as_str()), (200, ANSWER), "a quick call beside 8 whole answers being written");
+    for c in calls {
+        let (status, _, body) = c.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("Hello there"), "{body}");
+    }
+}
+
+/// A key waits for at most `MAX_WHOLE_PER_KEY` (4) whole answers at once: its next is told 429 at
+/// once, in OpenAI's shape, and nothing is sent or paid for it. Another key's whole answer, and the
+/// same key's stream, are served meanwhile; once its answers came, the key may ask again.
+///
+/// FAILS before: no cap a key: the fifth was taken (and could hold a thread for 300 s as shipped).
+#[test]
+fn a_key_waits_for_a_few_whole_answers_at_once_and_another_key_is_not_held_up() {
+    use lightning_stream::inference_server::MAX_WHOLE_PER_KEY;
+    let r = rig(Plan::SlowWhole(10, 3000), Plan::Answer(10), 100);
+    model_ids(&r);
+    let other = another_key(&r);
+    let calls: Vec<_> = (0..MAX_WHOLE_PER_KEY).map(|_| {
+        let (addr, key) = (r.addr.clone(), r.key.clone());
+        std::thread::spawn(move || whole_answer(&addr, &key))
+    }).collect();
+    wait_until("the key's whole answers at the seller", || served(&r).len() == MAX_WHOLE_PER_KEY);
+    let t = std::time::Instant::now();
+    let (status, _, body) = whole_answer(&r.addr, &r.key);
+    assert_eq!(status, 429, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "rate_limit_exceeded", "{body}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("stream"), "{body}");
+    assert!(t.elapsed() < Duration::from_secs(1), "told at once: {:?}", t.elapsed());
+    assert_eq!(r.sellers.lock().unwrap().calls.len(), MAX_WHOLE_PER_KEY, "nothing sent for the call refused");
+    let (status, _, body) = chat(&r, "dear/llama");
+    assert_eq!((status, body.as_str()), (200, ANSWER), "the same key's stream is not held to the cap");
+    let (status, _, body) = whole_answer(&r.addr, &other);
+    assert_eq!(status, 200, "another key: {body}");
+    for c in calls {
+        assert_eq!(c.join().unwrap().0, 200);
+    }
+    let (status, _, body) = whole_answer(&r.addr, &r.key);
+    assert_eq!(status, 200, "the key's answers came: {body}");
+}

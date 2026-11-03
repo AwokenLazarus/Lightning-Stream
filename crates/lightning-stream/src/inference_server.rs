@@ -21,6 +21,7 @@
 //! Not for web pages: the endpoint sends no CORS headers, so a page in a browser cannot read its
 //! answers, and a request carrying a page's `Origin` or `Sec-Fetch-Site: cross-site` is refused.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -76,15 +77,22 @@ pub const WHOLE_ANSWER_WAIT: Duration = Duration::from_secs(xbt402::tokens::WHOL
 pub const PAY_WAIT_FLOOR: Duration = Duration::from_secs(30);
 
 /// The most calls that wait on a payment at once ([`serve`] answers on 16 threads), so that a slow
-/// route never holds every thread and the endpoint's health and list of models still answer.
+/// route never holds every thread and the endpoint's health and list of models still answer. A
+/// call gives its place back once the wallet says it is paid for: a seller writing a whole answer
+/// for minutes ([`WHOLE_ANSWER_WAIT`]) holds no place, and is bounded by [`MAX_WHOLE_PER_KEY`].
 pub const MAX_PAYING: usize = 8;
+
+/// The most whole answers (requests that do not ask for a stream) one key waits for at once: each
+/// may wait [`WHOLE_ANSWER_WAIT`] for its seller, on one of the endpoint's threads. Past it the
+/// key's next one is answered 429 at once.
+pub const MAX_WHOLE_PER_KEY: usize = 4;
 
 /// The most calls that wait for one of those places. Past that a call is answered 503 at once: with
 /// [`MAX_PAYING`] it leaves 4 of the 16 threads for the endpoint's health and list of models.
 pub const MAX_WAITING: usize = 4;
 
 /// How long a call waits for a place at most (a quarter of `first_byte` where that is less). A place
-/// is held for the whole of a call's start, not only a slow payment, so that more than
+/// is held for the whole of a call's start up to its payment, not only a slow payment, so that more than
 /// [`MAX_PAYING`] quick calls at once are a moment's queue, not a refusal; and the wait stays well
 /// under the time a seller is given, so that a client is told soon when a slow route has them all.
 pub const SLOT_WAIT: Duration = Duration::from_secs(5);
@@ -143,6 +151,8 @@ pub struct AiServer {
     paying: AtomicUsize,
     /// Calls waiting for a place among them ([`MAX_WAITING`]).
     waiting: AtomicUsize,
+    /// Whole answers waited for now, by key ([`MAX_WHOLE_PER_KEY`]).
+    whole: Mutex<HashMap<String, usize>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -348,7 +358,11 @@ fn given_up(cfg: &Config, stage: Stage, rx: mpsc::Receiver<Result<Value, String>
 /// signer's `paying` line). A call is given up for another seller only while the request cannot
 /// have reached this one ([`Failed::paid`]).
 /// `ceiling`: the seller's listed prices, the most the wallet pays it (none for a free read).
-fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration, ceiling: Option<&Value>) -> Result<Begun, Failed> {
+/// `place`: the call's place among those waiting on a payment ([`MAX_PAYING`]), given back on the
+/// signer's `paid` line: from there the seller's time is bounded by `first_byte`, not the places.
+#[allow(clippy::too_many_arguments)]
+fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration, ceiling: Option<&Value>,
+         place: &mut Option<Slot<'_>>) -> Result<Begun, Failed> {
     let fail = |status: u16, message: String| Failed { status, message, final_answer: None, paid: false, paying: false, account: Account::Unknown, spending: None };
     let name = format!("ai-{}", random_hex());
     let path = cfg.stream_dir.join(&name);
@@ -368,7 +382,10 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
         params["stream_paid"] = true.into();
     }
     let signer = cfg.signer.clone();
+    // counted among the connector's calls to the shop while the signer has it: a visit's Stop leaves the connection to it
+    let flight = crate::flight(&signer, params["url"].as_str().unwrap_or(""), "ai");
     std::thread::spawn(move || {
+        let _flight = flight;
         let _ = tx.send(xbt_wallet_mcp::wallet::signer_call(&signer, LONGEST, "xbt402_pay", &params));
     });
     let started = Instant::now();
@@ -436,6 +453,8 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
             Ok(_) if line.ends_with('\n') => {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 if v.get("paid").and_then(Value::as_bool) == Some(true) {
+                    // paid for: the place is the next payment's
+                    *place = None;
                     since = Instant::now();
                     (until, stage) = (since + first_byte, Stage::Paid);
                     continue;
@@ -521,7 +540,7 @@ fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs, bool) {
         // the seller's own list, asked for with nothing to spend; a seller that asks to be paid even for
         // its list (a gateway that serves nothing outside a paid session) is listed with the models the
         // sellers file names for it, if any
-        let asked = begin(cfg, "GET", &format!("{route}v1/models"), &[], 0, cfg.first_byte, None).ok().and_then(|mut b| {
+        let asked = begin(cfg, "GET", &format!("{route}v1/models"), &[], 0, cfg.first_byte, None, &mut None).ok().and_then(|mut b| {
             let mut body = std::mem::take(&mut b.first);
             let _ = (&mut b.rest).take(1 << 20).read_to_end(&mut body);
             serde_json::from_slice::<Value>(&body).ok().filter(|m| m.get("data").is_some_and(Value::is_array))
@@ -546,7 +565,7 @@ impl AiServer {
             Err(e) => return Err(e),
         }
         let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, keep: CATALOGUE_TTL, fetches: 0, fetching: false, sellers_changed: None })),
-                        paying: AtomicUsize::new(0), waiting: AtomicUsize::new(0) };
+                        paying: AtomicUsize::new(0), waiting: AtomicUsize::new(0), whole: Mutex::new(HashMap::new()) };
         // the sellers' model lists are asked for at once, in the background: the first request does not wait for all of them
         me.fetch_in_background();
         Ok(me)
@@ -660,11 +679,25 @@ impl AiServer {
         let Some(model) = body.get("model").and_then(Value::as_str).map(str::to_string) else {
             return Reply::Whole(json_response(400, &error_body("model_missing", "invalid_request_error", "The request names no model.")));
         };
-        // a cap on the calls waiting on a payment at once (a fetch of the catalogue included): the endpoint's other
-        // requests (its health, its list of models) keep threads to answer on while a slow route holds the rest
-        let Some(_slot) = self.paying_place() else {
-            return Reply::Whole(json_response(503, &error_body("busy", "api_error", "Too many requests are waiting for their payment to go through; try again shortly.")));
+        // a whole answer may wait minutes for its seller, on one of the endpoint's threads: a cap on them a key
+        let whole = body.get("stream") != Some(&Value::Bool(true));
+        let _whole = if whole {
+            let Some(w) = KeyWhole::take(&self.whole, key_id, MAX_WHOLE_PER_KEY) else {
+                return Reply::Whole(json_response(429, &error_body("rate_limit_exceeded", "requests", &format!(
+                    "This key is already waiting for {MAX_WHOLE_PER_KEY} answers that are not streamed, the most at once; \
+                     try again once one has come, or ask with \"stream\": true."))));
+            };
+            Some(w)
+        } else {
+            None
         };
+        // a cap on the calls waiting on a payment at once (a fetch of the catalogue included): the endpoint's other
+        // requests (its health, its list of models) keep threads to answer on while a slow route holds the rest. The
+        // place is given back once the call is paid for
+        let mut place = self.paying_place();
+        if place.is_none() {
+            return Reply::Whole(json_response(503, &error_body("busy", "api_error", BUSY)));
+        }
         self.refresh();
         let (input, max_tokens) = request_bounds(&body, raw.len(), DEFAULT_MAX_TOKENS);
         let now = credentials::now();
@@ -698,9 +731,17 @@ impl AiServer {
             let sent = body.to_string().into_bytes();
             let url = format!("{}{}", offer.route, path.trim_start_matches('/'));
             // a whole answer starts only once the model has written all of it: the seller's time for it is longer
-            let first_byte = if body.get("stream") == Some(&Value::Bool(true)) { self.cfg.first_byte } else { self.cfg.first_byte.max(WHOLE_ANSWER_WAIT) };
+            let first_byte = if whole { self.cfg.first_byte.max(WHOLE_ANSWER_WAIT) } else { self.cfg.first_byte };
+            // the next seller after one paid for: a place again for its payment
+            if place.is_none() {
+                place = self.paying_place();
+                if place.is_none() {
+                    last = Some((503, BUSY.into()));
+                    break;
+                }
+            }
             // the seller's own listed prices are the most it is paid: a 402 asking more is refused
-            match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, first_byte, Some(&offer.ceiling)) {
+            match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, first_byte, Some(&offer.ceiling), &mut place) {
                 Ok(b) => return self.relay(b, offer.seller.clone(), key_id.to_string(), today, bound),
                 Err(Failed { status, message, final_answer, paid, paying, account, spending: refused_by }) => {
                     // whatever the call cost this seller is booked to the key, now or when the wallet says; where it
@@ -923,6 +964,39 @@ impl<'a> Slot<'a> {
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What a call is told when it found no place among the calls waiting on a payment.
+const BUSY: &str = "Too many requests are waiting for their payment to go through; try again shortly.";
+
+/// One of a key's whole answers waited for ([`MAX_WHOLE_PER_KEY`]), given back when dropped.
+struct KeyWhole<'a> {
+    map: &'a Mutex<HashMap<String, usize>>,
+    key: String,
+}
+
+impl<'a> KeyWhole<'a> {
+    fn take(map: &'a Mutex<HashMap<String, usize>>, key: &str, most: usize) -> Option<Self> {
+        let mut g = lock(map);
+        let n = g.entry(key.to_string()).or_insert(0);
+        if *n >= most {
+            return None;
+        }
+        *n += 1;
+        Some(KeyWhole { map, key: key.to_string() })
+    }
+}
+
+impl Drop for KeyWhole<'_> {
+    fn drop(&mut self) {
+        let mut g = lock(self.map);
+        if let Some(n) = g.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(&self.key);
+            }
+        }
     }
 }
 
