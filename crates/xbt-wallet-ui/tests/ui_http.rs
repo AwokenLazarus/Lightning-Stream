@@ -4794,9 +4794,9 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     let mut br = logged_in(&bx);
     let p = br.get("/hashrate");
     assert!(p.body.contains("Set up your gateway") && p.body.contains("Stream Gateway (DATUM-compatible)"), "{}", p.body);
-    // the product name only where the page says Umbrel's DATUM Gateway app is for Bitcoin and won't work here
-    let warned = "Umbrel&#39;s own DATUM Gateway app is for Bitcoin, and won&#39;t work here.";
-    let warned_raw = "Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.";
+    // the product name only where the page says Umbrel's DATUM Gateway app is for Spamcoin and won't work here
+    let warned = "Umbrel&#39;s own DATUM Gateway app is for Spamcoin, and won&#39;t work here.";
+    let warned_raw = "Umbrel's own DATUM Gateway app is for Spamcoin, and won't work here.";
     assert!(p.body.contains(warned) || p.body.contains(warned_raw), "{}", p.body);
     // and the credit to the gateway it is built on, by its repository's name (never the DATUM Gateway product name)
     let credit = "FlyTheElephant&#39;s datum_gateway</a>, with Lightning Stream&#39;s job masking.";
