@@ -5,6 +5,28 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.8 (2026-11-03)
+
+Four small fixes to the wallet UI, from a hands-on run of 0.2.7. Only the wallet UI changes.
+
+- **The Stop says the credit is shared.** A visit's Stop said "This visit used 680 sat of your credit with the shop",
+  while the visit bar says that credit is shared with your other uses of the shop. Now the Stop says so too: "This
+  visit used 680 sat of your credit with the shop (shared with your other uses of it)". Where it also says the
+  credit left, it says it once.
+- **A limit refusal says the payment would pass the limit.** A payment refused by one of your spending rules' limits
+  said the limit "is reached", though spending was often still under it: about 9,703 of 10,000 sat used, and a
+  625 sat ticket would have made 10,328. Now the page says, for example, "Today's limit for paid services would be
+  passed" and "This payment would pass the most your spending rules let the app pay shops in 24 hours (10,000 sat)".
+  This covers the limits for one shop (24 hours and 7 days), for paid services, and the daily and weekly spending
+  caps. Each still names its field on the Spending rules page and links there.
+- **A player link's `HEAD` gives the file's size.** Some players ask `HEAD` first to learn a file's size, and a
+  player link's `HEAD` sent no `Content-Length`. Now it sends the size where it is known: from the link's service,
+  where its listing gives the size in exact bytes, or else from the shop's answer to an earlier request through the
+  link. It still asks the shop nothing and pays nothing. Where the size is not known yet, it answers as before.
+- **"Publish without buyer accounts anyway" shows only where it applies.** On the Sell page the box showed on every
+  service's form, even with buyer accounts on or a guest login set. Now it shows only for a media server that has
+  neither, and it shows or hides as you fill in the form.
+
 ## 0.2.7 (2026-11-03)
 
 Visits that stop when you press Stop, top-ups only when they are needed, and an AI endpoint and player links

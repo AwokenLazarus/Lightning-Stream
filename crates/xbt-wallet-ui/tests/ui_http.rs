@@ -1620,6 +1620,10 @@ fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
 
     // the link plays there with no cookie, seeking included
     let link = format!("{own}{token}");
+    // a HEAD's length: the file's size where it is known, else none (its listing gives no size in bytes, and nothing
+    // went through the link yet)
+    let head_length = |url: &str| ureq::AgentBuilder::new().redirects(0).build().head(url).call().ok().and_then(|r| r.header("Content-Length").map(str::to_string));
+    assert_eq!(head_length(&link), None, "not known yet: no Content-Length, as before");
     let (status, body) = plain_get(&link, &[("Range", "bytes=5000-")]);
     assert_eq!((status, body.as_slice()), (206, &film[5000..]));
     let (status, body) = plain_get(&link, &[]);
@@ -1640,6 +1644,11 @@ fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
     assert_eq!(head(&link), (200, Some("bytes".into()), Some("application/octet-stream".into()), 0));
     assert_eq!(head(&format!("{}/r/{token}", b.base)).0, 200, "the UI's own port answers it alike");
     assert_eq!(seen.lock().unwrap().len(), n, "a HEAD asks the connector nothing, so nothing is paid");
+    // once the shop's answer through the link said the file's size, a HEAD gives it, for a player that learns the size so
+    // (FAILS before: no Content-Length, whatever had been played)
+    assert_eq!(head_length(&link), Some(film.len().to_string()), "the size the shop's answer gave");
+    assert_eq!(head_length(&format!("{}/r/{token}", b.base)), Some(film.len().to_string()));
+    assert_eq!(seen.lock().unwrap().len(), n, "still nothing asked of the connector");
 
     // nothing else of the UI is there, the login and the setup included; an unknown token is nothing
     let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
@@ -1884,6 +1893,7 @@ fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller
     // editing it: the box is ticked already, and a save without it (an edit of something else) is not refused
     let page = br.get(&format!("/sell?edit={id}")).body;
     assert!(page.contains("name=\"app_no_accounts\" value=\"1\" checked"), "{page}");
+    assert!(page.contains("<label class=\"check\" data-no-accounts><input type=\"checkbox\" name=\"app_no_accounts\""), "shown where it applies: {page}");
     let mut f = form(&[("price", "21")]);
     f.retain(|(k, v)| k != "price" || v == "21");
     f.push(("id".into(), id.clone()));
@@ -1904,6 +1914,21 @@ fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     assert_eq!(saved(), 2);
     assert!(!unescape(&br.get("/sell").body).contains("can't get in"));
+    // "Publish without buyer accounts anyway" shows only where its warning applies: on a new media server's form, not on
+    // one with a guest login (or buyers' accounts), nor on a web app that is no media server
+    // (FAILS before, 0.2.7's hands-on retest: it showed on every form)
+    let shown = |page: &str| {
+        assert!(page.contains("name=\"app_no_accounts\""), "{page}");
+        page.contains("data-no-accounts><input")
+    };
+    assert!(shown(&br.get("/sell").body), "a new media server's form: it applies");
+    for o in sell()["offers"].as_array().unwrap().clone() {
+        let page = br.get(&format!("/sell?edit={}", o["id"].as_str().unwrap())).body;
+        assert!(!shown(&page) && page.contains("data-no-accounts hidden><input"), "{}: {page}", o["name"]);
+    }
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Other Jellyfin"),
+                                       ("app", "1"), ("app_accounts", "1")]);
+    assert!(!shown(&r.body), "a form sent back with buyers' accounts on: it does not apply");
 }
 
 #[cfg(unix)]

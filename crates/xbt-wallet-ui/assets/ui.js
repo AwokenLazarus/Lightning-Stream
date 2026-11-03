@@ -332,6 +332,25 @@
   openCapacity();
   if (root.addEventListener) root.addEventListener("hashchange", openCapacity);
 
+  // The Sell form's "Publish without buyer accounts anyway": shown only where its warning applies, as the save
+  // checks it: a media server's web app (Media, or Jellyfin, Emby or Plex by its name or address) with neither
+  // buyers' own accounts nor a guest login
+  $$("[data-no-accounts]").forEach(function (box) {
+    var form = box.closest("form");
+    if (!form) return;
+    function field(n) { return form.querySelector("[name='" + n + "']"); }
+    function update() {
+      var k = form.querySelector("[name='kind']:checked"), kind = k ? k.value : "media";
+      var app = field("app"), acc = field("app_accounts"), login = field("app_login"), name = field("name"), addr = field("address");
+      var media = kind === "media" || /jellyfin|emby|plex/i.test((name ? name.value : "") + " " + (addr ? addr.value : ""));
+      var appOn = kind !== "files" && (kind === "media" || !!(app && app.checked));
+      box.hidden = !(appOn && media && !(acc && acc.checked) && !(login && login.value.trim()));
+    }
+    form.addEventListener("input", update);
+    form.addEventListener("change", update);
+    update();
+  });
+
   // A rotation of the human key finished: promote the pending key.
   var hk = $("#human-key-state");
   if (hk) {
