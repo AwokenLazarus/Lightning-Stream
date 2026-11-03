@@ -1819,6 +1819,8 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
                                ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
     br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
     assert!(br.get("/sell").body.contains("How many buyers at once"));
+    // no hashmaker on this box: Add a service has no Hashrate choice (#46)
+    assert!(!br.get("/sell").body.contains("href=\"./sell-hashrate\"><span><strong>Hashrate"));
     let addr = format!("http://{media}");
     // a number that is not one: refused, in words
     let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"),
@@ -4539,6 +4541,47 @@ fn the_relay_passes_if_range_and_the_copys_validators() {
     assert_eq!(call("\"v0\"").0, 412);
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen, vec![Some("\"v1\"".to_string()), Some("\"v0\"".to_string())]);
+}
+
+/// Sell → Add a service: Hashrate is among what it is, and leads to Sell → Hashrate (#46: a hashmaker looked for it
+/// among the types and took a while to find its page).
+#[cfg(unix)]
+#[test]
+fn add_a_service_has_a_hashrate_choice_that_leads_to_sell_hashrate() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"open": true, "settings": {}, "minersAddress": "umbrel.local:23340", "terms": {"priceMsat": 404000},
+                                     "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}],
+                                     "rentals": [], "paused": null}),
+        _ => json!({"error": "no"}),
+    });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let htok = dir.join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.join("hashrate-settings.json");
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example/")]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    // Add a service: among what it is, Hashrate, a page of its own that it leads to (#46: it was looked for here)
+    let p = br.get("/sell");
+    let kinds = &p.body[p.body.find("<legend>What is it?</legend>").unwrap()..];
+    let kinds = &kinds[..kinds.find("</fieldset>").unwrap()];
+    assert!(kinds.contains("<a class=\"choice\" href=\"./sell-hashrate\"><span><strong>Hashrate</strong>") && kinds.contains("Sell → Hashrate"), "{kinds}");
+    assert!(br.get("/sell-hashrate").body.contains("Renting out, you are the <strong>hashmaker</strong>"), "and it leads there");
 }
 
 /// The hashmaker's price follows the chain: by default what a piece of work is worth when mined, read through the

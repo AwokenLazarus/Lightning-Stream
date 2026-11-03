@@ -1593,7 +1593,12 @@ impl App {
             };
             format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>{what}suggested {} sat {}</small></span></label>",
                     k.id(), if *k == kind { " checked" } else { "" }, k.words(), p, u.short())
-        }).collect();
+        }).collect::<String>()
+            // renting out miners has a page of its own: a choice here that goes there (#46: it was looked for among these)
+            + if self.cfg.hash.hasher.is_some() {
+                "<a class=\"choice\" href=\"./sell-hashrate\"><span><strong>Hashrate</strong><small>your miners, rented out by the piece of work \
+                 · set up on Sell → Hashrate</small></span></a>"
+            } else { "" };
         // Files: where the folder is. With a folder the box shares with the app (Umbrel's Downloads,
         // read-only), the owner picks one under it; otherwise it is the app's own folder.
         let files_where = match &self.cfg.files.root {
