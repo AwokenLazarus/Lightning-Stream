@@ -3040,6 +3040,14 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert!(card.contains("Left your wallet: <span class=\"money\">1,002 sats</span>, a ticket bought whole from this shop; 800 sats of it stays \
                            with this seller as credit for about 20 hours"), "{card}");
     assert!(basement.contains("about 40 sats") && basement.contains("charged at most that"), "{basement}");
+    // a rental going on: the page shows its rentals again by itself (ui.js asks ./api/hashrate-rentals), F5 not needed
+    assert!(p.body.contains("<div id=\"rentals\" data-live=\"1\"><h2>Your rentals</h2>"), "{}", p.body);
+    let a = br.get("/api/hashrate-rentals");
+    assert_eq!(a.status, 200, "{}", a.body);
+    let v: Value = serde_json::from_str(&a.body).unwrap();
+    assert_eq!(v["live"], true);
+    assert!(v["html"].as_str().unwrap().contains("Hashrate from Basement miners") && v["html"].as_str().unwrap().contains("Spent so far"), "{v}");
+    assert_eq!(B::new(&bx.base).get("/api/hashrate-rentals").status, 401, "behind the login");
     let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);
     assert!(br.flash_after(&r).starts_with("Renting."));
     let rent = rseen.lock().unwrap().iter().find(|(m, p, _, _)| m == "POST" && p == "/rent").cloned().unwrap();
