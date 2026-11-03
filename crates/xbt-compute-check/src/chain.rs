@@ -131,12 +131,14 @@ async fn join(tcp: TcpStream, mut send: LinkSendStream, mut recv: LinkRecvStream
     tokio::join!(up, down);
 }
 
-/// Opens a loopback port for every machine of `chain` that serves, other than `me`: each TCP
-/// connection to it becomes one stream on one link to that machine. Returns the ports by name.
-pub fn forward_all(link: &Arc<Link>, me: &str, chain: &Machines) -> std::io::Result<BTreeMap<String, SocketAddr>> {
+/// Opens a loopback port for every machine of `chain` that serves, other than `me`, or only for
+/// those named in `to`: each TCP connection to it becomes one stream on one link to that machine.
+/// A user's machine names only the relay, so that nothing on it can open a link to a shard, which
+/// would show the shard its address. Returns the ports by name.
+pub fn forward_all(link: &Arc<Link>, me: &str, chain: &Machines, to: Option<&HashSet<String>>) -> std::io::Result<BTreeMap<String, SocketAddr>> {
     let mut ports = BTreeMap::new();
     for (name, card) in &chain.machines {
-        if card.peer.id == me || !card.serves {
+        if card.peer.id == me || !card.serves || to.is_some_and(|t| !t.contains(name)) {
             continue;
         }
         link.learn(&card.peer.id, Hints { relays: card.peer.relays.clone(), direct: card.peer.direct.clone() })?;

@@ -30,11 +30,13 @@ stream-compute-check: what this machine has and how well testers reach each othe
       Prints a made-up group of testers, in a collector's format. An illustration only.
   sweep [--seeds 5]
       What the plan says of made-up groups of 10 to 500 testers. An illustration only.
-  link --card FILE [--serve IP:PORT] [--peers FILE --ports FILE] [--report FILE] [--key FILE]
+  link --card FILE [--serve IP:PORT] [--peers FILE --ports FILE [--to NAME,...]] [--report FILE]
+       [--key FILE]
       Carries a compute chain over iroh. Serves IP:PORT, this machine's chain port, to the chain's
       other machines, and writes this machine's card. Once the chain's cards are gathered in
-      --peers, opens a loopback port for each other machine that serves and writes them to
-      --ports. Only the chain's keys are let in. Runs until stopped. Without --key, a new key.
+      --peers, opens a loopback port for each other machine that serves, or only for those named
+      in --to (a user's machine: the relay), and writes them to --ports. Only the chain's keys are
+      let in. Runs until stopped. Without --key, a new key.
 
 Lab flags: --no-relay, and --collector-addr IP:PORT with check.";
 
@@ -136,7 +138,11 @@ fn link(flags: &Flags) -> Result<(), String> {
         if let Ok(mut a) = allowed.write() {
             a.extend(chain.machines.values().map(|c| c.peer.id.clone()));
         }
-        ports = chain::forward_all(&link, &me, &chain).map_err(|e| e.to_string())?;
+        let to: Option<HashSet<String>> = flags.value("--to").map(|t| t.split(',').filter(|n| !n.is_empty()).map(String::from).collect());
+        if let Some(missing) = to.iter().flatten().find(|n| !chain.machines.contains_key(*n)) {
+            return Err(format!("--to {missing}: no such machine in {peers_path}"));
+        }
+        ports = chain::forward_all(&link, &me, &chain, to.as_ref()).map_err(|e| e.to_string())?;
         let shown: BTreeMap<&String, String> = ports.iter().map(|(n, a)| (n, a.to_string())).collect();
         write_whole(&ports_path, &serde_json::to_vec_pretty(&shown).map_err(|e| e.to_string())?)?;
     }

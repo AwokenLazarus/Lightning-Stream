@@ -66,7 +66,9 @@ fn a_chain_port_answers_over_iroh_and_only_to_the_chain() {
     machines.machines.insert("client0".into(), card(&user, false));
     allowed.write().unwrap().extend(machines.machines.values().map(|c| c.peer.id.clone()));
 
-    let ports = chain::forward_all(&user, &user.endpoint_id(), &machines).unwrap();
+    let only_relay: HashSet<String> = ["relay".to_string()].into();
+    assert!(chain::forward_all(&user, &user.endpoint_id(), &machines, Some(&only_relay)).unwrap().is_empty(), "no relay here, so no port");
+    let ports = chain::forward_all(&user, &user.endpoint_id(), &machines, None).unwrap();
     assert_eq!(ports.keys().collect::<Vec<_>>(), vec!["shard0"], "a user's machine serves nothing, so only the shard gets a port");
     let msg: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     assert_eq!(round_trip(ports["shard0"], &msg).unwrap(), msg);
@@ -77,7 +79,7 @@ fn a_chain_port_answers_over_iroh_and_only_to_the_chain() {
     assert_eq!(r.peers["shard0"].path.as_deref(), Some("direct"));
 
     // a key outside the chain reaches the link but not the port
-    let stranger = chain::forward_all(&outsider, &outsider.endpoint_id(), &machines).unwrap();
+    let stranger = chain::forward_all(&outsider, &outsider.endpoint_id(), &machines, None).unwrap();
     assert!(round_trip(stranger["shard0"], b"let me in").is_err());
     assert_eq!(counters.refused.load(Ordering::Relaxed), 1);
     assert_eq!(counters.streams_in.load(Ordering::Relaxed), 2);
