@@ -1265,7 +1265,7 @@ fn finish_stop(cfg: &Config, visits: &Visits, visit: &Visit) {
     // this visit's own (a visit opened since the stop, the AI endpoint's answer, a player link's film), uses the same
     // connection, and keeps it. Only this visit's own session is closed, never the shop's sessions of other tasks
     let origin = visit.origin();
-    let others = visits.other_open(&origin, &visit.id) || in_flight_besides(&origin, &visit.id);
+    let others = visits.other_open(&origin, &visit.id) || in_flight_besides(&cfg.signer, &origin, &visit.id);
     let closed = !others && !sessions.is_empty() && sessions.iter().all(|sid| {
         let r = xbt_wallet_mcp::wallet::signer_call(&cfg.signer, Duration::from_secs(90), "ticket_stop",
                                                     &json!({"session": sid, "why": "the buyer stopped the visit"}));
@@ -1353,7 +1353,7 @@ fn start_call_until(cfg: &Config, mut params: Value, owner: Option<&str>, stoppe
     // the signer could not be reached: nothing was sent, and nothing charged
     let unsent = Arc::new(AtomicBool::new(false));
     let u = unsent.clone();
-    let flight = owner.map(|o| flight(params["url"].as_str().unwrap_or(""), o));
+    let flight = owner.map(|o| flight(&cfg.signer, params["url"].as_str().unwrap_or(""), o));
     std::thread::spawn(move || {
         let _flight = flight;
         let r = xbt_wallet_mcp::wallet::signer_call_sent(&signer, LONGEST, "xbt402_pay", &params).map_err(|(sent, e)| {

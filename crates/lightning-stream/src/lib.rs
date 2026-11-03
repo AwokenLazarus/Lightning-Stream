@@ -100,7 +100,8 @@ pub(crate) fn whole(length: Option<u64>, sent: u64, account: impl FnOnce() -> Op
 /// The connector's paid calls the signer has now, by shop (its origin) and by who made them (a visit's id, `stream` for a
 /// program's or a player link's, `ai` for the AI endpoint's). They share one connection with each shop (the signer keeps
 /// one session for a shop and the connector's task), which a visit's Stop closes only where no other of them uses it.
-static FLIGHTS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+/// Kept by the signer they go to (its socket), the shop and the caller.
+static FLIGHTS: std::sync::Mutex<Vec<(PathBuf, String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// The origin of an absolute URL (`https://host:port`): its scheme and authority, without the path.
 pub(crate) fn origin_of(url: &str) -> String {
@@ -111,11 +112,11 @@ pub(crate) fn origin_of(url: &str) -> String {
 }
 
 /// One paid call of the connector's, counted while it lives ([`FLIGHTS`]).
-pub(crate) struct Flight(Option<(String, String)>);
+pub(crate) struct Flight(Option<(PathBuf, String, String)>);
 
-/// A paid call to `url`'s shop by `owner`, counted until the returned guard is dropped.
-pub(crate) fn flight(url: &str, owner: &str) -> Flight {
-    let key = (origin_of(url), owner.to_string());
+/// A paid call to `url`'s shop by `owner`, through the signer at `signer`, counted until the returned guard is dropped.
+pub(crate) fn flight(signer: &Path, url: &str, owner: &str) -> Flight {
+    let key = (signer.to_path_buf(), origin_of(url), owner.to_string());
     FLIGHTS.lock().unwrap_or_else(|p| p.into_inner()).push(key.clone());
     Flight(Some(key))
 }
@@ -131,10 +132,10 @@ impl Drop for Flight {
     }
 }
 
-/// Whether a paid call to the shop at `origin` by anyone but `owner` is with the signer now.
-pub(crate) fn in_flight_besides(origin: &str, owner: &str) -> bool {
+/// Whether a paid call to the shop at `origin` by anyone but `owner` is with the signer at `signer` now.
+pub(crate) fn in_flight_besides(signer: &Path, origin: &str, owner: &str) -> bool {
     let origin = origin.to_ascii_lowercase();
-    FLIGHTS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|(o, w)| *o == origin && w != owner)
+    FLIGHTS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|(s, o, w)| s == signer && *o == origin && w != owner)
 }
 
 #[derive(Clone)]
@@ -197,7 +198,7 @@ impl Connector {
         }
         let signer = self.cfg.signer.clone();
         // counted among the connector's calls to the shop while the signer has it ([`in_flight_besides`])
-        let flight = flight(url, "stream");
+        let flight = flight(&self.cfg.signer, url, "stream");
         std::thread::spawn(move || {
             let _flight = flight;
             let _ = done_tx.send(xbt_wallet_mcp::wallet::signer_call(&signer, LONGEST, "xbt402_pay", &params));
