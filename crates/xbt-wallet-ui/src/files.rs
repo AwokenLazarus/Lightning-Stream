@@ -530,6 +530,7 @@ mod tests {
                     let r = (st.body)(&mut out);
                     (st.status, st.headers, r.map(|_| out.0))
                 }
+                Reply::Upgrade(_) => panic!("the folder never upgrades"),
             }
         };
         let hdr = |h: &[(String, String)], k: &str| h.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone());
