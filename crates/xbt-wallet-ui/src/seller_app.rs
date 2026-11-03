@@ -347,6 +347,9 @@ impl App {
         if visit.bytes().all(|b| b.is_ascii_hexdigit()) && !visit.is_empty() {
             let base = self.apps.lock().grants.values().find(|g| g.visit == visit).map(|g| g.base.clone());
             let mut closed_by_connector = false;
+            // the connector decided on the connection (it closes the visit's own session where nothing else of its uses it):
+            // its word stands, and the wallet closes nothing more
+            let mut connector_decided = false;
             if !self.apps.lock().previews.remove(&visit) {
                 let said = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
                 if let Ok((200, v)) = said {
@@ -355,6 +358,7 @@ impl App {
                     // still on its way, and a figure read at once said "nothing new was paid" after tickets were bought)
                     let v = self.visit_settled(&visit).unwrap_or(v);
                     closed_by_connector = v.get("connection_closed") == Some(&Value::Bool(true));
+                    connector_decided = v.get("connection_closed").is_some_and(Value::is_boolean);
                     // the credit the connection still holds, where it is open; a closed one leaves it with the shop
                     let credit = if closed_by_connector { None } else { self.visit_credit_msat(&visit) };
                     used = visit_numbers(&v, credit).get("said").and_then(Value::as_str).map(|s| format!(" {s}")).unwrap_or_default();
@@ -388,7 +392,7 @@ impl App {
                 if let Some(o) = &origin {
                     ended = format!(" Its connection with {} is closed.", self.seller_name(o));
                 }
-            } else if let Some(o) = origin.filter(|_| !still_used) {
+            } else if let Some(o) = origin.filter(|_| !still_used && !connector_decided) {
                 if self.stop_seller_sessions(&o) > 0 {
                     ended = format!(" Its connection with {} is closed.", self.seller_name(&o));
                 }
@@ -561,7 +565,8 @@ pub(crate) fn visit_numbers(v: &Value, credit_msat: Option<u64>) -> Value {
         said.push_str(". Nothing new was paid during it");
     }
     if let Some(c) = credit {
-        said.push_str(&format!(". Credit left with the shop: {} sat", g(c)));
+        // the connection's, which every use of this shop draws on (other visits, AI calls, links), not this visit's own
+        said.push_str(&format!(". Credit left with the shop (shared with your other uses of it): {} sat", g(c)));
     }
     if !settled {
         said.push_str(". Its last requests are still being counted");
@@ -1065,7 +1070,7 @@ mod tests {
         let bought = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 559, "held_sats": 0, "used_msat": 64_870, "paid_sats": 559, "ended": null}), Some(493_130));
         assert_eq!((bought["used_sats"].as_i64(), bought["prepaid_sats"].as_i64(), bought["credit_sats"].as_i64()), (Some(65), Some(559), Some(493)));
         assert_eq!(bought["said"], "This visit used 65 sat of your credit with the shop. New payments during it: 559 sat, routing fees included. \
-                                    Credit left with the shop: 493 sat.");
+                                    Credit left with the shop (shared with your other uses of it): 493 sat.");
         // an older connector: as before
         assert_eq!(visit_numbers(&json!({"limit_sats": 559, "spent_sats": 12}), None)["spent_sats"].as_i64(), Some(12));
     }
@@ -1080,7 +1085,7 @@ mod tests {
         let v = visit_numbers(&json!({"limit_sats": 2000, "spent_sats": 600, "held_sats": 0, "used_msat": 12_000, "paid_sats": 600, "ended": null}), Some(542_324));
         assert_eq!((v["credit_sats"].as_i64(), v["credit_msat"].as_str()), (Some(542), Some("542324")), "{v}");
         assert_eq!(v["said"], "This visit used 12 sat of your credit with the shop. New payments during it: 600 sat, routing fees included. \
-                               Credit left with the shop: 542 sat.");
+                               Credit left with the shop (shared with your other uses of it): 542 sat.");
         // not known: not said, never guessed
         let v = visit_numbers(&json!({"limit_sats": 2000, "spent_sats": 600, "held_sats": 0, "used_msat": 12_000, "paid_sats": 600, "ended": null}), None);
         assert!(v["credit_sats"].is_null(), "{v}");
@@ -1090,15 +1095,18 @@ mod tests {
     /// The Stop's words say what was newly paid during the visit (the tickets bought, as the signer booked them) and what
     /// the visit used, once the connector's word on every request is in; before that, never "nothing new was paid".
     ///
-    /// FAILS before: read at once after the Stop, a visit that had bought three tickets (2,706 sat) said "This visit used
-    /// 520 sat from your credit with the shop; nothing new was paid."
+    /// The credit is the connection's, shared with every other use of that shop (other visits, AI calls, links), so it is
+    /// said so.
+    ///
+    /// FAILS before: read at once after the Stop, before the word on its last requests, a visit said "This visit used 520
+    /// sat from your credit with the shop; nothing new was paid", whatever those requests had cost or bought.
     #[test]
     fn the_stop_says_the_new_payments_and_what_was_used_once_settled() {
-        let v = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 0, "held_sats": 0, "used_msat": 1_546_830, "paid_sats": 2_709, "tickets_bought": 3,
-                                      "settled": true, "ended": "Stopped."}), Some(2_462_787));
-        assert_eq!(v["said"], "This visit used 1,547 sat of your credit with the shop. New payments during it: 2,709 sat for 3 tickets, routing fees \
-                               included. Credit left with the shop: 2,462 sat.");
-        assert_eq!((v["tickets_bought"].as_u64(), v["settled"].as_bool()), (Some(3), Some(true)));
+        let v = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 614, "held_sats": 0, "used_msat": 560_900, "paid_sats": 614, "tickets_bought": 1,
+                                      "settled": true, "ended": "Stopped."}), Some(578_902));
+        assert_eq!(v["said"], "This visit used 561 sat of your credit with the shop. New payments during it: 614 sat for 1 ticket, routing fees \
+                               included. Credit left with the shop (shared with your other uses of it): 578 sat.");
+        assert_eq!((v["tickets_bought"].as_u64(), v["settled"].as_bool()), (Some(1), Some(true)));
         // not settled yet: what is known so far, and that more is coming; never "nothing new was paid"
         let v = visit_numbers(&json!({"limit_sats": 1000, "spent_sats": 900, "held_sats": 900, "used_msat": 520_000, "paid_sats": 0, "tickets_bought": 0,
                                       "settled": false, "ended": "Stopped."}), None);

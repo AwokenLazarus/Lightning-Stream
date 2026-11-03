@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Reply, Request, Response, Streamed};
 
-use crate::{listen_stream, one_range, random_hex, whole, Config, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
+use crate::{flight, in_flight_besides, origin_of, listen_stream, one_range, random_hex, whole, Config, Connector, FIRST_ANSWER, FIRST_BYTE, HEAD_LINE, LONGEST};
 
 /// The largest limit a visit may have, in sats.
 const MAX_LIMIT: i64 = 10_000_000;
@@ -198,6 +198,9 @@ struct State {
     closing: bool,
     /// Whether that stop closed the shop's connection (`None`: not decided yet, or no stop).
     connection_closed: Option<bool>,
+    /// The signer's sessions with the shop this visit's calls were paid in, as their answers named them (`session`): the
+    /// one connection a Stop closes, where nothing else uses it.
+    sessions: Vec<String>,
 }
 
 /// A route of the seller, as its `/services` names it.
@@ -236,6 +239,8 @@ enum Kind {
 }
 
 pub struct Visit {
+    /// Its id, as its requests' calls are counted among the connector's ([`crate::flight`]).
+    id: String,
     base: String,
     /// The visit's limit: raised by the buyer while it is open ([`Visit::raise`]), never lowered.
     limit: std::sync::atomic::AtomicI64,
@@ -418,7 +423,18 @@ impl Visit {
 
     /// The signer's final word on one call that held `share`: what the seller charged for its answer and what was
     /// paid for tickets for it, counted for the visit's report.
+    /// The signer's session a call's answer `v` names, kept for the visit's Stop ([`State::sessions`]).
+    fn note_session(&self, v: &Value) {
+        if let Some(sid) = v.get("session").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128) {
+            let mut s = self.lock();
+            if !s.sessions.iter().any(|x| x == sid) && s.sessions.len() < 8 {
+                s.sessions.push(sid.to_string());
+            }
+        }
+    }
+
     fn account(&self, v: &Value, share: i64) {
+        self.note_session(v);
         let num = |k: &str| v.get(k).and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok())));
         // what the answer took from the credit: the seller's signed charge where it is more than the wallet's own count (an
         // answer cut short or left by the page, whose bytes on their way were charged), so that what the visit says it used
@@ -624,6 +640,7 @@ impl Visit {
     /// spent, and what a ticket of the seller's books, where the reply names it, is kept.
     fn refused(self: &Arc<Self>, share: i64, f: Failed) {
         let Failed { v, done, unknown } = f;
+        self.note_session(&v);
         self.policy_stop(&v);
         if let Some(t) = v.get("ticket_booking_sats").and_then(Value::as_i64) {
             let mut s = self.lock();
@@ -784,18 +801,11 @@ impl Visits {
             return Err("too many visits open".into());
         }
         let id = random_hex();
-        m.insert(id.clone(), Arc::new(Visit { base, limit: limit.into(), ceiling, state: Mutex::new(State { last: Some(Instant::now()), ..State::default() }), turn: Condvar::new() }));
+        m.insert(id.clone(), Arc::new(Visit { id: id.clone(), base, limit: limit.into(), ceiling, state: Mutex::new(State { last: Some(Instant::now()), ..State::default() }), turn: Condvar::new() }));
         Ok(id)
     }
 }
 
-/// The origin of an absolute URL: its scheme and authority, without the path.
-fn origin_of(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => format!("{scheme}://{}", rest.split(['/', '?', '#']).next().unwrap_or(rest)),
-        None => url.to_string(),
-    }
-}
 
 /// The base of a visit: an absolute http(s) URL ending in `/`, of visible characters.
 fn base_ok(b: &str) -> bool {
@@ -862,12 +872,9 @@ impl Connector {
                 let first = !v.is_stopped();
                 v.stop();
                 if first {
-                    // decided now, before the shop's connection is closed behind the stop's grace: another visit opened
-                    // after this stop starts its own requests on a new connection
-                    let others = self.visits.other_open(&v.origin(), id);
                     v.lock().closing = true;
-                    let (cfg, visit) = (self.cfg.clone(), v.clone());
-                    std::thread::spawn(move || finish_stop(&cfg, &visit, others));
+                    let (cfg, visits, visit) = (self.cfg.clone(), self.visits.clone(), v.clone());
+                    std::thread::spawn(move || finish_stop(&cfg, &visits, &visit));
                 }
             }
             return Some(Reply::Whole(json_response(200, &v.report())));
@@ -1208,7 +1215,7 @@ impl Connector {
     /// [`Connector::start`] for a request of `visit`: given up while it waits to begin, where the visit is stopped (unless it
     /// is let through in the grace after the stop, `grace`).
     fn start_in(&self, visit: &Visit, params: Value, grace: bool) -> Result<Started, Failed> {
-        start_call_until(&self.cfg, params, &|| !grace && visit.is_stopped())
+        start_call_until(&self.cfg, params, Some(&visit.id), &|| !grace && visit.is_stopped())
     }
 }
 
@@ -1246,16 +1253,22 @@ impl Drop for SocketHold {
 /// (and charges) the bytes on their way, a call still paying for a ticket before its head, a top-up, a WebSocket held
 /// open. Their shares are then settled by the signer's word on each, waited for up to [`STOP_SETTLE_WAIT`], so that the
 /// visit's report (`settled`) says what it used and what was paid in it.
-fn finish_stop(cfg: &Config, visit: &Visit, others: bool) {
+fn finish_stop(cfg: &Config, visits: &Visits, visit: &Visit) {
     let until = Instant::now() + GRACE_WAIT;
     let mut s = visit.lock();
     while (s.stopped_at.is_some_and(|t| t.elapsed() < STOP_GRACE) || s.grace_open > 0) && Instant::now() < until {
         s = visit.turn.wait_timeout(s, Duration::from_millis(100)).unwrap_or_else(|p| p.into_inner()).0;
     }
+    let sessions = s.sessions.clone();
     drop(s);
-    let closed = !others && {
+    // decided now, just before it is closed: another open visit to the shop, or a call of the connector's to it besides
+    // this visit's own (a visit opened since the stop, the AI endpoint's answer, a player link's film), uses the same
+    // connection, and keeps it. Only this visit's own session is closed, never the shop's sessions of other tasks
+    let origin = visit.origin();
+    let others = visits.other_open(&origin, &visit.id) || in_flight_besides(&origin, &visit.id);
+    let closed = !others && !sessions.is_empty() && sessions.iter().all(|sid| {
         let r = xbt_wallet_mcp::wallet::signer_call(&cfg.signer, Duration::from_secs(90), "ticket_stop",
-                                                    &json!({"seller": visit.origin(), "why": "the buyer stopped the visit"}));
+                                                    &json!({"session": sid, "why": "the buyer stopped the visit"}));
         match r {
             Ok(v) => v.get("verdict").and_then(Value::as_str).is_some_and(|d| d == "allow" || d == "partial"),
             Err(e) => {
@@ -1263,7 +1276,7 @@ fn finish_stop(cfg: &Config, visit: &Visit, others: bool) {
                 false
             }
         }
-    };
+    });
     let until = Instant::now() + STOP_SETTLE_WAIT;
     let mut s = visit.lock();
     s.connection_closed = Some(closed);
@@ -1321,13 +1334,14 @@ fn read_routes(cfg: &Config, visit: &Visit, gen: u64) -> bool {
 
 /// [`Connector::start`].
 fn start_call(cfg: &Config, params: Value) -> Result<Started, Failed> {
-    start_call_until(cfg, params, &|| false)
+    start_call_until(cfg, params, None, &|| false)
 }
 
 /// [`start_call`], given up where `stopped` says so while it waits for the signer to begin the answer (the visit was
 /// stopped): the stream socket goes, so the answer has no reader, and the signer's word on the call is still waited for
 /// ([`Visit::settle`]), the share held until it comes.
-fn start_call_until(cfg: &Config, mut params: Value, stopped: &dyn Fn() -> bool) -> Result<Started, Failed> {
+/// `owner`: the visit whose call it is, counted among the connector's calls to the shop while the signer has it.
+fn start_call_until(cfg: &Config, mut params: Value, owner: Option<&str>, stopped: &dyn Fn() -> bool) -> Result<Started, Failed> {
     let name = format!("ls-{}", random_hex());
     let path = cfg.stream_dir.join(&name);
     let listener = listen_stream(&path).map_err(|e| Failed { v: json!({"error": format!("stream socket: {e}")}), done: None, unknown: false })?;
@@ -1339,7 +1353,9 @@ fn start_call_until(cfg: &Config, mut params: Value, stopped: &dyn Fn() -> bool)
     // the signer could not be reached: nothing was sent, and nothing charged
     let unsent = Arc::new(AtomicBool::new(false));
     let u = unsent.clone();
+    let flight = owner.map(|o| flight(params["url"].as_str().unwrap_or(""), o));
     std::thread::spawn(move || {
+        let _flight = flight;
         let r = xbt_wallet_mcp::wallet::signer_call_sent(&signer, LONGEST, "xbt402_pay", &params).map_err(|(sent, e)| {
             u.store(!sent, Ordering::SeqCst);
             e
@@ -1510,7 +1526,7 @@ mod tests {
     use super::*;
 
     fn visit(limit: i64) -> Arc<Visit> {
-        Arc::new(Visit { base: String::new(), limit: limit.into(), ceiling: None, state: Mutex::new(State::default()), turn: Condvar::new() })
+        Arc::new(Visit { id: String::new(), base: String::new(), limit: limit.into(), ceiling: None, state: Mutex::new(State::default()), turn: Condvar::new() })
     }
 
     /// The buyer's own spending rules refuse a payment of the visit (here the cap on a day's spend with one shop): the
