@@ -5071,9 +5071,20 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
         assert!(!conf.exists(), "{bad}");
     }
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", ADDR)]);
+    // the card in order: where its blocks pay, what goes in them (the node they come from, the owner's tag), then the advanced parts
+    let at = |s: &str| p.body.find(s).unwrap_or_else(|| panic!("{s} missing: {}", p.body));
+    assert!(at("<h3>Where its blocks pay</h3>") < at("<h3>Your blocks</h3>") && at("<h3>Your blocks</h3>") < at("name=\"coinbase_tag\"")
+            && at("name=\"coinbase_tag\"") < at("Advanced: the pool") && at("Advanced: the pool") < at("Advanced: use another gateway"));
+    assert!(p.body.contains("from your own XBT node, at <code>xbt-knots_bitcoind_1:18443</code>"), "{}", p.body);
+    // a tag outside DATUM's limits is refused, nothing written
+    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", ADDR), ("coinbase_tag", &"x".repeat(61))]);
+    assert!(br.flash_after(&r).contains("60 characters"));
+    assert!(!conf.exists());
+    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", ADDR), ("coinbase_tag", "Kilombino solo")]);
     assert!(br.flash_after(&r).starts_with("Saved."));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(&conf).unwrap()).unwrap();
+    assert_eq!(c["mining"]["coinbase_tag_secondary"], "Kilombino solo", "the owner's tag in the blocks it finds");
+    assert!(br.get("/hashrate").body.contains("name=\"coinbase_tag\" value=\"Kilombino solo\""), "and shown again");
     assert_eq!(c["datum"], json!({"pool_host": "", "pooled_mining_only": false}));
     assert_eq!(c["mining"]["pool_address"], ADDR);
     assert_eq!(c["bitcoind"]["rpcurl"], "http://xbt-knots_bitcoind_1:18443");
