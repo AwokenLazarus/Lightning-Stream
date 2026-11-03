@@ -78,7 +78,7 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                     session.lock().unwrap().charged += ticket;
                     drop(UnixStream::connect(stream_dir.join(p["stream_to"].as_str().unwrap())));
                     std::thread::sleep(std::time::Duration::from_millis(200));
-                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 502, "charged_sats": ticket, "complete": false}}));
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "session": "s-shop", "status": 502, "charged_sats": ticket, "complete": false}}));
                     return;
                 }
                 // the seller's routes, read unpaid as a visit opens (not counted among the page's calls): its web client is free
@@ -145,7 +145,7 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                     session.lock().unwrap().reader_gone = true;
-                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 200, "charged_sats": charged, "complete": false, "ended": "stopped by the buyer"}}));
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "session": "s-shop", "status": 200, "charged_sats": charged, "complete": false, "ended": "stopped by the buyer"}}));
                     return;
                 }
                 // a film's range that the wallet ends half-way (its limit, a seller gone quiet): `/cut/` with the part's length
@@ -160,7 +160,7 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                     let _ = writeln!(out, "{head}");
                     let _ = out.write_all(&part[..part.len() / 2]);
                     drop(out);
-                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 206, "charged_sats": charged, "complete": false,
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "session": "s-shop", "status": 206, "charged_sats": charged, "complete": false,
                                                                             "ended": "max_answer_s: the answer has been open for 50 s"}}));
                     return;
                 }
@@ -172,7 +172,7 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                 let _ = writeln!(out, "{head}");
                 let _ = out.write_all(echo.as_bytes());
                 drop(out);
-                let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 200, "charged_sats": charged, "complete": true}}));
+                let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "session": "s-shop", "status": 200, "charged_sats": charged, "complete": true}}));
             });
         }
     });
@@ -642,7 +642,7 @@ fn signer_with_credit(dir: &Path, credit: i64) -> (PathBuf, Arc<Mutex<Session>>)
                 if slow {
                     std::thread::sleep(std::time::Duration::from_millis(1_500));
                 }
-                let mut r = json!({"verdict": "allow", "status": 200, "charged_sats": charged, "tickets_released": charged / TICKET, "complete": whole,
+                let mut r = json!({"verdict": "allow", "session": "s-shop", "status": 200, "charged_sats": charged, "tickets_released": charged / TICKET, "complete": whole,
                                    "price_msat": (used * 1000).to_string(), "balance_msat": (balance * 1000).to_string()});
                 if !whole {
                     r["ended"] = "stopped by the wallet: max_sats: the next ticket of this seller is over this call's limit".into();
@@ -755,7 +755,8 @@ fn stopping_a_visit_mid_film_ends_what_runs_in_it_and_closes_the_shops_connectio
     assert_eq!((r["settled"].as_bool(), r["connection_closed"].as_bool(), r["held_sats"].as_i64()), (Some(true), Some(true), Some(0)), "{r}");
     let stops = session.lock().unwrap().stops.clone();
     assert_eq!(stops.len(), 1, "{stops:?}");
-    assert_eq!(stops[0]["seller"], "https://seller.example", "{stops:?}");
+    // the visit's own session, by its id: never every session with the shop, whatever its task
+    assert_eq!((stops[0]["session"].as_str(), stops[0].get("seller")), (Some("s-shop"), None), "{stops:?}");
     assert!(session.lock().unwrap().reader_gone, "the film's answer was still being written");
     assert_ne!(paying.join().unwrap(), 200, "the request waiting for its answer went on after the stop");
     let (_, body) = film.join().unwrap();
@@ -828,4 +829,47 @@ fn what_a_stopped_visit_used_and_paid_is_said_once_every_request_is_settled() {
     assert_eq!(charged, TICKET);
     assert_eq!((r["settled"].as_bool(), r["used_msat"].as_u64(), r["paid_sats"].as_i64(), r["tickets_bought"].as_u64()),
                (Some(true), Some(2 * COST as u64 * 1000), Some(charged), Some(1)), "{r}");
+}
+
+/// A Stop leaves the connection with the shop open where something else of the connector uses it when it comes to close
+/// it, a moment after the Stop: a visit opened since, or a program's film streaming from that shop. It closes only this
+/// visit's own session, and only once nothing else uses it.
+///
+/// FAILS before: whether other visits used it was decided at the Stop, by visits only, and every session with the shop
+/// was closed (`seller`, whatever its task) a few seconds later: a new visit's first requests, an AI answer or a player
+/// link's film were cut.
+#[test]
+fn a_stop_leaves_the_connection_to_what_else_uses_it_when_it_comes_to_close_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    // a visit opened just after the Stop
+    let one = open(&addr, 5_000);
+    assert_eq!(ask(&addr, "GET", &format!("/v/{one}/page"), "", b"").0, 200);
+    assert_eq!(ask(&addr, "POST", &format!("/visits/{one}/stop"), "", b"").0, 200);
+    let _two = open(&addr, 5_000);
+    let r = report_until(&addr, &one, std::time::Duration::from_secs(10), |r| r["settled"] == true);
+    assert_eq!((r["settled"].as_bool(), r["connection_closed"].as_bool()), (Some(true), Some(false)), "{r}");
+    assert!(session.lock().unwrap().stops.is_empty(), "{:?}", session.lock().unwrap().stops);
+    // a program's film from the shop, still with the signer
+    let dir2 = tempfile::tempdir().unwrap();
+    let (sock2, session2) = signer(dir2.path());
+    let addr2 = start(sock2, dir2.path());
+    let three = open(&addr2, 5_000);
+    assert_eq!(ask(&addr2, "GET", &format!("/v/{three}/page"), "", b"").0, 200);
+    let a2 = addr2.clone();
+    std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect(&a2).unwrap();
+        write!(s, "GET /s/https://seller.example/hang/film.mp4 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+        let _ = s.read_to_end(&mut vec![]);
+    });
+    let t = std::time::Instant::now();
+    while !session2.lock().unwrap().calls.iter().any(|c| c["url"].as_str().is_some_and(|u| u.contains("/hang/film"))) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the film never reached the signer");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(ask(&addr2, "POST", &format!("/visits/{three}/stop"), "", b"").0, 200);
+    let r = report_until(&addr2, &three, std::time::Duration::from_secs(10), |r| r["settled"] == true);
+    assert_eq!((r["settled"].as_bool(), r["connection_closed"].as_bool()), (Some(true), Some(false)), "{r}");
+    assert!(session2.lock().unwrap().stops.is_empty(), "{:?}", session2.lock().unwrap().stops);
 }

@@ -497,6 +497,8 @@
           .catch(function () { add.disabled = false; });
       });
     }
+    // the credit is the signer's with the shop: every visit, AI call and player link using that shop draws on it
+    var sharedNote = " (shared with your other uses of this shop)";
     function ask() {
       fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
         if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
@@ -515,8 +517,8 @@
         if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
           ? " · paid " + v.prepaid_sats.toLocaleString() + " sat"
             + (typeof v.tickets_bought === "number" && v.tickets_bought > 0 ? " for " + v.tickets_bought + (v.tickets_bought === 1 ? " ticket" : " tickets") : "")
-            + (typeof v.credit_sats === "number" ? " · credit left " + v.credit_sats.toLocaleString() + " sat" : "")
-          : typeof v.credit_left_sats === "number" ? " · from your credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat left" : "";
+            + (typeof v.credit_sats === "number" ? " · credit left with the shop: " + v.credit_sats.toLocaleString() + " sat" + sharedNote : "")
+          : typeof v.credit_left_sats === "number" ? " · credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat" + sharedNote : "";
         if (refusal) showRefusal(v.refusal);
         if (v.ended) ended(String(v.ended));
       }).catch(function () {});

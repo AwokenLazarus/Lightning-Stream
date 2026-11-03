@@ -345,6 +345,30 @@ fn lock_order(hs: &HttpSession) -> Option<OrderGuard<'_>> {
     Some(OrderGuard(g))
 }
 
+/// [`lock_order`], waited for no later than `by`: `Err` where another request held it all that while (a model's whole
+/// answer can hold it for minutes, [`whole_model_answer`]).
+fn lock_order_by(hs: &HttpSession, by: Instant) -> std::result::Result<Option<OrderGuard<'_>>, ()> {
+    if hs.terms.seq_window > 1 {
+        return Ok(None);
+    }
+    debug_assert_eq!(LINK_HELD.with(std::cell::Cell::get), 0, "lock order: a session's order is taken before its link, never with it held");
+    debug_assert_eq!(MONEY_HELD.with(std::cell::Cell::get), 0, "lock order: a session's order is taken before its money, never with it held");
+    loop {
+        match hs.order.try_lock() {
+            Ok(g) => {
+                ORDER_HELD.with(|n| n.set(n.get() + 1));
+                return Ok(Some(OrderGuard(g)));
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                ORDER_HELD.with(|n| n.set(n.get() + 1));
+                return Ok(Some(OrderGuard(p.into_inner())));
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() >= by => return Err(()),
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
 /// How long a seq is taken to be on its way to the seller. One sent longer ago that has no answer
 /// yet has arrived, its answer slow to come (a long poll, a model slow to its first word), or was
 /// lost: it no longer holds the window of the seqs sent after it ([`Signer::seq_take`]).
@@ -2163,6 +2187,27 @@ const FIRST_PAY_S: f64 = 3.0;
 
 /// Why a call stopped reading when the program it streams to stopped reading first.
 const READER_GONE: &str = "stopped by the buyer: the reader the body was streamed to went away";
+
+/// Whether the caller of `c`, which streams its answer to a socket (`stream_to`), has left before the answer began: its
+/// socket is gone (a visit stopped while this call was paying for its head, say). Nothing more is bought for it. A caller
+/// told already (`stream_paid`, `early`) is asked on that socket instead.
+fn caller_left_before_head(c: &Call, early: Option<&mut Sink>) -> bool {
+    match early {
+        Some(s) => !c.upgrade && !s.reader_there(),
+        None => c.stream_to.as_deref().is_some_and(|p| !p.exists()),
+    }
+}
+
+/// Whether the reader at the other end of `watch` (a clone of an answer's stream socket, on which the caller never writes)
+/// has closed it: a ticket is not released for an answer nobody reads any more. Read with a moment's timeout on the clone
+/// (a socket option for reads only: the answer's writes are not touched).
+fn reader_closed(watch: &std::os::unix::net::UnixStream) -> bool {
+    use std::io::Read;
+    if watch.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
+        return false;
+    }
+    matches!((&*watch).read(&mut [0u8; 1]), Ok(0))
+}
 /// Why the wallet read no further of a body that went past the size the buyer was shown (`max_size`).
 const PASSED_SHOWN: &str = "stopped by the wallet: the answer passed the size the buyer was shown";
 
@@ -5003,6 +5048,10 @@ impl Signer {
                     s.head(&json!({"paying": true}));
                     paying_told = true;
                 }
+                // a caller gone while this call paid for its head (a visit stopped): nothing more is bought for it, nor sent
+                if caller_left_before_head(c, early.as_mut()) {
+                    return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
+                }
                 let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &short_now, answer: None, best_effort: false };
                 if let Err(d) = self.ticket_release_one(hs, &mut spent, &due) {
                     return fail(hs, &spent, d);
@@ -5016,6 +5065,9 @@ impl Signer {
             };
             let mut topped = 0;
             while !c.credit_only && c.top_up_msat > 0 && topped < 4 && low() {
+                if caller_left_before_head(c, early.as_mut()) {
+                    return fail(hs, &spent, with(caller_gone(), json!({"status": null})));
+                }
                 topped += 1;
                 let due = Due { opened: started, waiting_since: None, call_by: c.by, still_due: &low, answer: None, best_effort: true };
                 if let Err(d) = self.ticket_release_one(hs, &mut spent, &due) {
@@ -5036,7 +5088,12 @@ impl Signer {
                 return fail(hs, &spent, refusal("ticket_session", "the session with this seller was stopped while this call waited: call again"));
             }
             let digest = request_digest_v2(c.method, c.url, c.body);
-            let order = lock_order(hs);
+            // in turn behind a request of the session still waiting for its head, no later than this call's deadline: a model's
+            // whole answer may hold the turn for minutes, and a call behind it is told to call again rather than wait as long
+            let Ok(order) = lock_order_by(hs, c.by.max(Instant::now() + Duration::from_secs(1))) else {
+                return fail(hs, &spent, with(refusal("ticket_busy", "another request to this seller is waiting for its answer, and this seller takes one at a \
+                                                                     time: nothing was sent; call again"), json!({"retry_after_s": 5})));
+            };
             let (mut seq, sid, key) = match self.seq_take(hs) {
                 Ok(x) => x,
                 Err(e) => return fail(hs, &spent, refusal("ticket_session", e.msg)),
@@ -5474,14 +5531,22 @@ impl Signer {
         let freed_before = lock_money(hs).freed;
         // one more ticket for this answer, or the reason there is none
         let up_writer_absent = up_writer.is_none();
+        // the caller's side of an answer streamed on (never a WebSocket, whose caller writes on it): a ticket is not released
+        // for an answer whose reader has gone (a visit stopped while the seller waited for the next ticket)
+        // (let go with the sink's own end, so that the reader sees the body end then: [`Sink::out`] is dropped below)
+        let watch = Mutex::new(if up_writer_absent { sink.out.as_ref().and_then(|o| o.try_clone().ok()) } else { None });
+        let reader_left = || lock(&watch).as_ref().is_some_and(reader_closed);
         // `due`: the caller's own test of whether one is due, on the credit left for this answer
         let pay = |bytes: u64, due: &dyn Fn(u64) -> bool| -> Option<String> {
             if let Some(why) = st.over(bytes) {
                 return Some(why);
             }
+            if reader_left() {
+                return Some(READER_GONE.into());
+            }
             // released only if still due once the session's `paying` is held, asked again of the credit left then:
             // another answer may have released one meanwhile, or drawn on or held back what this one found
-            let still = || due(credited());
+            let still = || !reader_left() && due(credited());
             // an answer by the byte stops at the edge of its credit, and its seller waits from there. One by the second, or
             // a socket, may be quiet for as long as it likes with its seller waiting for nothing
             let waiting_since = Some(if price.second_msat == 0 && up_writer_absent { *lock(&last_byte) } else { Instant::now() });
@@ -5871,6 +5936,7 @@ impl Signer {
         // and the reader's socket too: its client has the whole body now, not after the seller's last receipt is
         // fetched below, a round trip or more on a slow link (the call's reply still says what the answer cost)
         sink.out = None;
+        lock(&watch).take();
         *spent = std::mem::take(&mut lock(&spent_cell));
         let stopped = lock(&state).1.clone();
         let complete = stopped.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);

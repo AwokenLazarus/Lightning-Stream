@@ -125,8 +125,10 @@ pub struct Gateway {
     cfg: Config,
     terms: Terms,
     node: Arc<dyn Node>,
-    /// One client per service: the config's `upstream` and each route's own, by base URL.
-    upstreams: HashMap<String, Upstream>,
+    /// One client per service and wait: the config's `upstream` and each route's own, by base URL and
+    /// the route's wait ([`crate::config::Times::upstream_wait_for`]), so that an AI route's long wait
+    /// is not lent to the other routes of its service ([`Gateway::upstream_for`]).
+    upstreams: HashMap<(String, Duration), Upstream>,
     key: SecretKey,
     state: Mutex<State>,
     /// Signalled whenever a session is credited: metered responses out of balance wait on it.
@@ -415,15 +417,13 @@ impl Gateway {
             Some(l) => Some(draws::Lottery::open(l, &cfg.state_dir, clock())?),
             None => None,
         };
-        // one client a service, with the longest wait of the routes that reach it (an AI model's whole answer is long to start)
-        let mut waits: HashMap<&String, Duration> = cfg.upstream.iter().map(|b| (b, cfg.times.upstream_wait)).collect();
-        for r in &cfg.routes {
-            if let Some(base) = r.upstream.as_ref().or(cfg.upstream.as_ref()) {
-                let w = waits.entry(base).or_insert(cfg.times.upstream_wait);
-                *w = (*w).max(cfg.times.upstream_wait_for(r));
-            }
+        // one client a service and wait: an AI model's whole answer is long to start, and only its routes wait that long
+        let mut upstreams: HashMap<(String, Duration), Upstream> = HashMap::new();
+        let waits = cfg.upstream.iter().map(|b| (b, cfg.times.upstream_wait))
+            .chain(cfg.routes.iter().filter_map(|r| r.upstream.as_ref().or(cfg.upstream.as_ref()).map(|b| (b, cfg.times.upstream_wait_for(r)))));
+        for (base, wait) in waits {
+            upstreams.entry((base.clone(), wait)).or_insert_with(|| Upstream::new(base, wait));
         }
-        let upstreams: HashMap<String, Upstream> = waits.into_iter().map(|(base, wait)| (base.clone(), Upstream::new(base, wait))).collect();
         // the node's offer, made (or found again) before anything is served: terms that name it are
         // terms the node can be paid on
         let offers = Self::make_offer(&*node, &cfg, clock())?;
@@ -1648,6 +1648,12 @@ impl Gateway {
             .collect()
     }
 
+    /// The client for `route`'s service, with the route's own wait.
+    pub(crate) fn upstream_for(&self, route: &Route) -> Option<&Upstream> {
+        let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref())?;
+        self.upstreams.get(&(base.clone(), self.cfg.times.upstream_wait_for(route)))
+    }
+
     /// Pass the request on to its route's service.
     pub(crate) fn send_upstream(&self, route: &Route, req: &Request) -> Result<Answer, crate::Error> {
         self.send_upstream_body(route, req, &req.body)
@@ -1655,9 +1661,8 @@ impl Gateway {
 
     /// Pass the request on with another body (a request to a route priced by the token, bounded).
     fn send_upstream_body(&self, route: &Route, req: &Request, body: &[u8]) -> Result<Answer, crate::Error> {
-        let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref());
-        // the config refuses a route with neither, and every base has its client
-        let up = base.and_then(|b| self.upstreams.get(b)).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
+        // the config refuses a route with neither a base nor the config's, and every route has its client
+        let up = self.upstream_for(route).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
         let mut headers = forwarded(route, &req.headers);
         // the seller's own headers for this route (a guest login) win over any of the buyer's of the same name
         headers.retain(|(k, _)| !route.upstream_headers.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)));

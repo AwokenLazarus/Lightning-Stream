@@ -2743,10 +2743,11 @@ fn a_call_that_asks_is_told_on_its_socket_when_it_is_paid_for_before_the_head() 
     r.assert_booked();
 }
 
-/// A caller that asked to be told (`stream_paid`, the AI address) and is gone by the time its
-/// request is paid for (its socket not there) is sent nothing: the request does not leave, the
-/// answer says so (`request_sent` false, no status), and the ticket bought for it stays with the
-/// seller as credit, which the next call spends without buying another.
+/// A caller that asked to be told (`stream_paid`, the AI address) and is gone before its request is
+/// paid for (its socket not there) is sent nothing and bought nothing: the request does not leave,
+/// the answer says so (`request_sent` false, no status), and no ticket is bought for it (since
+/// 0.2.7: before, one was, and stayed with the seller as credit). The next call, to a caller that is
+/// there, buys the one ticket.
 ///
 /// FAILS before: the request left for the seller whatever became of the caller, so the AI address,
 /// which had gone on to another seller, had one answer paid to two.
@@ -2763,9 +2764,9 @@ fn a_call_whose_caller_is_gone_once_it_is_paid_for_is_not_sent() {
                                         "stream_paid": true}));
     assert_eq!((v["rule"].as_str(), v["request_sent"].as_bool()), (Some("ticket_caller_gone"), Some(false)), "{v}");
     assert!(v["status"].is_null(), "{v}");
-    assert_eq!(v["tickets_prepaid"].as_u64(), Some(1), "the ticket was bought before the request would have left: {v}");
+    assert_eq!((v["tickets_prepaid"].as_u64(), v["charged_sats"].as_i64()), (Some(0), Some(0)), "a ticket was bought for a caller that had gone: {v}");
     assert!(r.tap.seen("/page/11").iter().all(|s| !s.paid), "the seller got no paid request");
-    // the next call, to a caller that is there, spends that credit: no second ticket
+    // the next call, to a caller that is there, buys the one ticket
     let l = UnixListener::bind(dir.path().join("here")).unwrap();
     let reader = std::thread::spawn(move || {
         let (s, _) = l.accept().unwrap();
@@ -2776,7 +2777,7 @@ fn a_call_whose_caller_is_gone_once_it_is_paid_for_is_not_sent() {
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/11"), "max_sats": CALL, "task": "film", "stream_to": "here", "stream_head": true,
                                         "stream_paid": true}));
     let got = reader.join().unwrap();
-    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(0), Some(true)), "{v}");
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(1), Some(true)), "{v}");
     assert!(got.starts_with("{\"paid\":true}\n"), "{got}");
     assert_eq!(r.tap.seen("/page/11").iter().filter(|s| s.paid).count(), 1, "one paid request reached the seller");
     std::env::remove_var("B2_STREAM_DIR");
@@ -4561,6 +4562,27 @@ fn a_whole_model_answer_slower_than_the_read_timeout_and_the_calls_deadline_is_w
     let answer: Value = serde_json::from_slice(&rest).unwrap();
     assert_eq!(answer["usage"]["completion_tokens"], 12);
     std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A caller that streams its answer to a socket (`stream_to`) and leaves before the answer begins (a visit stopped while
+/// its request was being paid for) is bought nothing more: the call ends without releasing a ticket for the head, and the
+/// request is not sent.
+///
+/// FAILS before: the wallet went on paying for the head of an answer nobody would read, released a ticket for it and
+/// sent the request, and only then found the caller's socket gone.
+#[test]
+fn a_caller_gone_before_its_answer_begins_is_bought_nothing() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // no one listens at "gone-1": the caller has left
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "gone-1", "stream_head": true}));
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_caller_gone")), "{v}");
+    assert_eq!((v["charged_sats"].as_i64(), v["request_sent"].as_bool()), (Some(0), Some(false)), "{v}");
+    assert_eq!(r.tap.secrets().len(), 0, "a ticket was released for an answer nobody would read: {v}");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
 }
 
 // --- the owner's policy through the HTTP path -------------------------------------------------------

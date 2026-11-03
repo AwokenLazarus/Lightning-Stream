@@ -10,8 +10,8 @@
 //! * At most [`MAX_LINKS`] are live; a new one past that replaces the oldest.
 //!
 //! * Where the platform's own login sits in front of the UI's port (umbrelOS's app login), the links
-//!   are served on a port of their own (`XBT_UI_LINKS_BIND`), which answers `GET /r/<token>` and
-//!   nothing else, through the same checks ([`crate::server::spawn`]); the page gives that address.
+//!   are served on a port of their own (`XBT_UI_LINKS_BIND`), which answers `GET /r/<token>` (and
+//!   its `HEAD`, with no call to the connector) and nothing else, through the same checks ([`crate::server::spawn`]); the page gives that address.
 //!
 //! What a link can spend is what the connector spends for that one file: each request through it
 //! is one paid call under the connector's task and per-call cap, within the owner's budgets. It

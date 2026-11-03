@@ -63,8 +63,7 @@ impl Gateway {
     /// Ask the service to upgrade, with the route's headers and the opening's own. `Err`: the
     /// answer for the buyer (the service said no, or gave none).
     fn upgrade_upstream(&self, route: &Route, req: &Request, account: Option<&super::accounts::Account>) -> Result<Opened, Response> {
-        let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref());
-        let up = base.and_then(|b| self.upstreams.get(b)).ok_or_else(|| error(502, "upstream_unavailable", "no service for this route"))?;
+        let up = self.upstream_for(route).ok_or_else(|| error(502, "upstream_unavailable", "no service for this route"))?;
         let mut headers = forwarded(route, &req.headers);
         headers.retain(|(k, _)| !route.upstream_headers.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)));
         headers.extend(route.upstream_headers.iter().cloned());
