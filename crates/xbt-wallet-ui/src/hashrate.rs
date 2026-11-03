@@ -1619,21 +1619,22 @@ fn whole_tickets(budget: u64, ticket: u64) -> u64 {
 /// of the budget under one ticket can't be spent. For the owner only: the budget still bounds the payments as before.
 fn budget_buys(budget: u64, price_sat: f64, ticket: u64) -> String {
     let ticket = ticket.max(1);
+    let n = |x: u64| sats_n(x as f64);
     if budget < ticket {
-        return format!("{} sats is less than this shop's smallest ticket ({} sats): it buys no work. Set at least {} sats.",
-                       sats_n(budget as f64), sats_n(ticket as f64), sats_n(ticket as f64));
+        return format!("{} is less than this shop's smallest ticket ({}): it buys no work. Set at least {}.", n(budget), n(ticket), n(ticket));
     }
     let spent = budget / ticket * ticket;
     let left = budget - spent;
-    let pieces = if price_sat > 0.0 { (spent as f64 / price_sat).floor() } else { 0.0 };
-    let pieces = if pieces >= 1.0 { format!(" (about {} piece{} of work)", sats_n(pieces), if pieces == 1.0 { "" } else { "s" }) } else { String::new() };
+    let pieces = if price_sat > 0.0 { (spent as f64 / price_sat).floor() as u64 } else { 0 };
+    // a count, grouped as sats are: "about 1,365 pieces of work"
+    let count = sats_n(pieces as f64).trim_end_matches(" sats").trim_end_matches(" sat").to_string();
+    let pieces = if pieces >= 1 { format!(" (about {count} piece{} of work)", if pieces == 1 { "" } else { "s" }) } else { String::new() };
     if left == 0 {
-        format!("Your wallet pays this shop in tickets of at least {} sats: {} sats buys pieces of work worth about {} sats{pieces}.",
-                sats_n(ticket as f64), sats_n(budget as f64), sats_n(spent as f64))
+        format!("Your wallet pays this shop in tickets of at least {}: {} buys pieces of work worth about {}{pieces}.", n(ticket), n(budget), n(spent))
     } else {
-        format!("Your wallet pays this shop in tickets of at least {} sats: {} sats buys pieces of work worth about {} sats{pieces}. \
-                 The {} sats left under one ticket can't be spent; {} sats would use it all.",
-                sats_n(ticket as f64), sats_n(budget as f64), sats_n(spent as f64), sats_n(left as f64), sats_n(whole_tickets(budget, ticket) as f64))
+        format!("Your wallet pays this shop in tickets of at least {}: {} buys pieces of work worth about {}{pieces}. \
+                 The {} left under one ticket can't be spent; {} would use it all.",
+                n(ticket), n(budget), n(spent), n(left), n(whole_tickets(budget, ticket)))
     }
 }
 
