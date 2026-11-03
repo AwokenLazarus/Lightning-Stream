@@ -149,6 +149,28 @@ try {
     const back = await ev("document.documentElement.getAttribute('data-theme') || 'dark'");
     result.theme = { default: before, after_click: after, pressed, next_page: next, back, dark_bg: bg0, light_bg: bg1 };
   }
+  // the Sell form's "Publish without buyer accounts anyway": shown only while its warning applies (a media server's web
+  // app with neither buyers' accounts nor a guest login), as the form changes
+  {
+    await go(BASE + "/sell");
+    await ev(`window.__na = function (step) {
+      var f = document.querySelector("[data-no-accounts]").closest("form"), q = function (n) { return f.querySelector("[name='" + n + "']"); };
+      var put = function (n, v) { var e = q(n); e.value = v; e.dispatchEvent(new Event("input", { bubbles: true })); };
+      var kind = function (k) { f.querySelector("[name='kind'][value='" + k + "']").click(); };
+      var tick = function (n, on) { if (q(n).checked !== on) q(n).click(); };
+      if (step === "accounts") tick("app_accounts", true);
+      if (step === "no-accounts") tick("app_accounts", false);
+      if (step === "login") put("app_login", "X-Emby-Token: guest");
+      if (step === "no-login") put("app_login", "");
+      if (step === "files") kind("files");
+      if (step === "web") { kind("web"); tick("app", false); put("name", "Wiki"); }
+      if (step === "web-jellyfin") { tick("app", true); put("name", "My Jellyfin"); }
+      return !document.querySelector("[data-no-accounts]").hidden;
+    }; true`);
+    const steps = ["start", "accounts", "no-accounts", "login", "no-login", "files", "web", "web-jellyfin"];
+    result.no_accounts = {};
+    for (const st of steps) result.no_accounts[st] = await ev(`window.__na(${JSON.stringify(st)})`);
+  }
   // the phone's menu, opened
   await scheme("light"); await size(390, 844); await go(BASE + "/browse"); await ev("document.querySelector('.menu-toggle').click()"); await sleep(200);
   { const png = await cdp("Page.captureScreenshot", { format: "png" }); const f = join(OUT, "menu-phone-light.png"); writeFileSync(f, Buffer.from(png.data, "base64")); shots.push(f); }

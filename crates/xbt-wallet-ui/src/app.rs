@@ -2705,7 +2705,7 @@ mod handson_0202_tests {
         let e = json!({"type": "ticket_prepay_refused_by_policy", "rule": "ticket_task_budget", "dest": "ln:aa",
                        "reason": "with this ticket's 915 sats, 10618 would be above the task's budget_sats (10000)"});
         let (what, words) = refusal_words(&e).unwrap();
-        assert!(what == "Today's limit for paid services is reached" && words.contains("Most for paid services"), "{what}: {words}");
+        assert!(what == "Today's limit for paid services would be passed" && words.contains("Most for paid services"), "{what}: {words}");
     }
 
     /// Recent activity names what happened in plain words: no `ticket:<hash>`, no "all policy rules passed", no signer

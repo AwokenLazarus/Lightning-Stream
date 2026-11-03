@@ -203,6 +203,10 @@ fn the_look_in_headless_chrome() {
     assert!(t["default"] == "dark" && t["after_click"] == "light" && t["pressed"] == "true" && t["next_page"] == "light" && t["back"] == "dark",
             "dark by default; the bar's button turns it light, and the choice is kept from page to page: {r}");
     assert_ne!(t["dark_bg"], t["light_bg"], "{r}");
+    // FAILS before (0.2.7's hands-on retest): the box showed whatever the form said
+    assert_eq!(r["no_accounts"], json!({"start": true, "accounts": false, "no-accounts": true, "login": false, "no-login": true, "files": false,
+                                        "web": false, "web-jellyfin": true}),
+               "\"Publish without buyer accounts anyway\" only while a media server has neither buyers' accounts nor a guest login: {r}");
     assert!(r["flicker"]["frames"].as_u64().unwrap() >= 5, "{r}");
     assert!(r["flicker"]["min_ratio"].as_f64().unwrap() >= 0.5, "no blank or reset river while moving between pages: {r}");
     for k in ["desktop", "phone-menu"] {

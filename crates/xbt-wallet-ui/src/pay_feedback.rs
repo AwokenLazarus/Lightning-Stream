@@ -21,7 +21,7 @@ pub enum Kind {
     NoRoute,
     /// The call's own limit, or the rules' most per payment.
     Limit,
-    /// A daily (or weekly) cap of the rules.
+    /// A daily (or weekly) cap of the rules, which the refused payment would have passed.
     Cap,
     /// The visit's limit is reached, or it was stopped.
     Visit,
@@ -155,20 +155,20 @@ pub fn explain_at(body: &str, spendable: Option<i64>, file: bool, shop: Option<&
         Kind::Limit => ("Over your limit", format!("This payment is larger than your spending rules allow for one payment{limit}. Nothing was paid."),
                         format!("Raise the most per payment, if you want to allow it: \"Largest single payment\" in {RULES_AT}."), rules()),
         Kind::Cap => match rule {
-            "per_counterparty_daily" => ("Today's limit for this shop is reached",
-                format!("You've reached today's limit for {shop}{limit}. Nothing more was paid."),
+            "per_counterparty_daily" => ("Today's limit for this shop would be passed",
+                format!("This payment would pass today's limit for {shop}{limit}. Nothing more was paid."),
                 format!("{} Or wait: the limit counts the last 24 hours.", raise_words(rule, "Raise it:")), rules()),
-            "per_counterparty" | "ticket_seller_cap" => ("This week's limit for this shop is reached",
-                format!("You've reached this week's limit for {shop}{limit}. Nothing more was paid."),
+            "per_counterparty" | "ticket_seller_cap" => ("This week's limit for this shop would be passed",
+                format!("This payment would pass this week's limit for {shop}{limit}. Nothing more was paid."),
                 format!("{} Or wait: the limit counts the last 7 days.", raise_words(rule, "Raise it:")), rules()),
-            "ticket_task_budget" => ("Today's limit for paid services is reached",
-                format!("You've reached the most your spending rules let the app pay shops in 24 hours{limit}. Nothing more was paid."),
+            "ticket_task_budget" => ("Today's limit for paid services would be passed",
+                format!("This payment would pass the most your spending rules let the app pay shops in 24 hours{limit}. Nothing more was paid."),
                 format!("{} Or wait: the limit counts the last 24 hours.", raise_words(rule, "Raise it:")), rules()),
             "velocity" => ("Too many payments at once", format!("Your spending rules allow only so many payments in a while, and {shop} asked for more. Nothing more was paid."),
                 format!("{} Or wait a while.", raise_words(rule, "Raise")), rules()),
             _ => {
                 let when = if rule == "weekly_budget" { "this week's" } else { "today's" };
-                ("Spending cap reached", format!("You've reached {when} spending cap in your rules{limit}. Nothing was paid."),
+                ("Spending cap would be passed", format!("This payment would pass {when} spending cap in your rules{limit}. Nothing was paid."),
                  format!("{} Or wait until {}.", raise_words(if rule == "weekly_budget" { rule } else { "daily_budget" }, "Raise the cap:"),
                          if rule == "weekly_budget" { "next week" } else { "tomorrow" }), rules())
             }
@@ -312,8 +312,8 @@ mod tests {
         assert_eq!(explain(r#"{"error": "the wallet's node has found no route to the seller for 8.0 s: nothing was sent"}"#, None, true).kind, Kind::NoRoute);
     }
 
-    /// The buyer's own daily cap with one shop: the page says, in plain words, that today's limit for that shop is
-    /// reached, with the limit, the field to raise on the Spending rules page and where it is, and a link there. The
+    /// The buyer's own daily cap with one shop: the page says, in plain words, that the payment would pass today's limit for
+    /// that shop, with the limit, the field to raise on the Spending rules page and where it is, and a link there. The
     /// seller's words never appear.
     ///
     /// FAILS before: "Spending cap reached ... today's spending cap", with no shop, no limit and no field.
@@ -322,13 +322,13 @@ mod tests {
         let body = r#"{"error": "today's spend with this seller 5203 exceeds its daily cap 5000", "rule": "per_counterparty_daily", "limit_sats": 5000}"#;
         let e = explain_at(body, None, false, Some("Demo Films"));
         assert_eq!(e.kind, Kind::Cap);
-        assert!(e.words.starts_with("You've reached today's limit for Demo Films (5,000 sat)."), "{e:?}");
+        assert!(e.words.starts_with("This payment would pass today's limit for Demo Films (5,000 sat)."), "{e:?}");
         assert!(e.fix.contains("\"Most to any one seller in 24 hours\" in Settings → Spending rules (under More rules)"), "{e:?}");
         assert_eq!(e.links, vec![("policy".to_string(), "Spending rules".to_string())]);
         assert!(!format!("{e:?}").contains("too_many"), "{e:?}");
         // without the shop's name or the limit: still the rule, in words
         let e = explain(r#"{"error": "x", "rule": "per_counterparty_daily"}"#, None, false);
-        assert!(e.words.starts_with("You've reached today's limit for this shop."), "{e:?}");
+        assert!(e.words.starts_with("This payment would pass today's limit for this shop."), "{e:?}");
     }
 
     /// Every one of the owner's spending rules that can refuse a payment is named on the "Not paid" page: the field
@@ -367,15 +367,32 @@ mod tests {
     fn the_stream_tickets_budget_is_named_by_its_field() {
         let e = explain_at(&json!({"error": "with this ticket's 915 sats, 10618 would be above the task's budget_sats (10000)", "rule": "ticket_task_budget",
                                    "limit_sats": 10_000}).to_string(), None, false, Some("Demo"));
-        assert_eq!(e.title, "Today's limit for paid services is reached");
+        assert_eq!(e.title, "Today's limit for paid services would be passed");
         assert!(e.words.contains("10,000 sat") && !e.words.contains("budget_sats"), "{e:?}");
         assert_eq!(e.fix, "Raise it: \"Most for paid services (stream tickets) in 24 hours\" in Settings → Spending rules. Or wait: the limit counts the last 24 hours.");
         assert!(e.links.iter().any(|(to, _)| to == "policy"), "{e:?}");
     }
 
+    /// A limit refusal says the refused payment would have passed the owner's limit, not that the limit "is reached": the
+    /// spending so far may be under it (about 9,703 of 10,000 sat, and a 625 sat ticket makes 10,328). Every owner-limit
+    /// rule keeps its field and its link to raise it.
+    ///
+    /// FAILS before (0.2.7's hands-on retest): "Today's limit for paid services is reached", "You've reached ...".
+    #[test]
+    fn a_limit_refusal_says_the_payment_would_pass_it() {
+        for rule in ["per_counterparty_daily", "per_counterparty", "ticket_seller_cap", "ticket_task_budget", "daily_budget", "weekly_budget"] {
+            let e = explain_at(&json!({"error": "with this ticket's 625 sats, 10328 would be above the task's budget_sats (10000)", "rule": rule,
+                                       "limit_sats": 10_000}).to_string(), None, false, Some("Demo"));
+            assert_eq!(e.kind, Kind::Cap, "{rule}");
+            assert!(e.title.ends_with("would be passed") && !e.title.contains("reached"), "{rule}: {e:?}");
+            assert!(e.words.starts_with("This payment would pass ") && e.words.contains("10,000 sat") && !e.words.contains("reached"), "{rule}: {e:?}");
+            assert!(e.fix.contains(rule_field(rule).unwrap().0) && e.links.iter().any(|(to, _)| to == "policy"), "{rule}: {e:?}");
+        }
+    }
+
     #[test]
     fn limits_and_caps_are_told_apart() {
-        assert_eq!(explain(r#"{"error": "daily spend 5000 exceeds budget 4000", "rule": "daily_budget"}"#, None, false).title, "Spending cap reached");
+        assert_eq!(explain(r#"{"error": "daily spend 5000 exceeds budget 4000", "rule": "daily_budget"}"#, None, false).title, "Spending cap would be passed");
         assert!(explain(r#"{"error": "x", "rule": "daily_budget"}"#, None, false).words.contains("today's spending cap"));
         // Mike's 0.2.1 refusal, word for word: the node limit in plain words, with the amounts and the fix
         let e = explain(r#"{"error": "the LN node holds 287070 sats in its channels (local 287070, HTLCs 0), above ln.exposure_cap_sats 100000: move funds off it before paying through it"}"#, None, false);
