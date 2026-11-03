@@ -4563,6 +4563,27 @@ fn a_whole_model_answer_slower_than_the_read_timeout_and_the_calls_deadline_is_w
     std::env::remove_var("B2_STREAM_DIR");
 }
 
+/// A caller that streams its answer to a socket (`stream_to`) and leaves before the answer begins (a visit stopped while
+/// its request was being paid for) is bought nothing more: the call ends without releasing a ticket for the head, and the
+/// request is not sent.
+///
+/// FAILS before: the wallet went on paying for the head of an answer nobody would read, released a ticket for it and
+/// sent the request, and only then found the caller's socket gone.
+#[test]
+fn a_caller_gone_before_its_answer_begins_is_bought_nothing() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // no one listens at "gone-1": the caller has left
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "gone-1", "stream_head": true}));
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_caller_gone")), "{v}");
+    assert_eq!((v["charged_sats"].as_i64(), v["request_sent"].as_bool()), (Some(0), Some(false)), "{v}");
+    assert_eq!(r.tap.secrets().len(), 0, "a ticket was released for an answer nobody would read: {v}");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
 // --- the owner's policy through the HTTP path -------------------------------------------------------
 
 /// A task that pays any seller is what an agent has when it is told to go and find sellers: a URL
