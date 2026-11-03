@@ -934,6 +934,8 @@ impl App {
                 }
                 // the shops the app knows, read once for every offer's seller
                 let known = self.services().unwrap_or_default();
+                // and the shops reached by their key that it keeps how to reach (the Sellers page's add)
+                let kept = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
                 for x in &offers {
                     let price = num(&x["priceMsat"]) / 1000.0;
                     let slice = num(&x["sliceWork"]);
@@ -950,8 +952,18 @@ impl App {
                     // the spending rules list who the app may pay: a hashmaker not on them is allowed first, with the
                     // node its signed listing names (the rules page shows the change to sign)
                     let pay_url = x["payUrl"].as_str().unwrap_or("");
-                    let allowed = self.seller_allowed(pay_url);
+                    // a hashmaker whose shop has no web address is paid through the transport document the app keeps for it:
+                    // allowed in the rules but not kept, the wallet refuses every payment (rule "transport"), so it is
+                    // allowed here the Sellers page's way, which keeps the shop and then opens the rules
+                    let by_key = crate::services::http_origin(pay_url).filter(|o| xbt402::shop::is_shop(o));
+                    let allowed = by_key.as_ref().is_none_or(|o| kept.contains_key(o)) && self.seller_allowed(pay_url);
                     let allow = match (allowed, crate::services::http_origin(pay_url), x["payNode"].as_str()) {
+                        (false, Some(o), _) if by_key.is_some() => format!(
+                            "<p class=\"hint\">Your spending rules list who this app may pay. Allow this hashmaker first: its shop is added to your sellers, \
+                             so your wallet knows how to reach it, and you sign the change with your approval key.</p>\
+                             <form method=\"post\" action=\"./services\">{csrf}<input type=\"hidden\" name=\"action\" value=\"try\">\
+                             <input type=\"hidden\" name=\"url\" value=\"{}\"><button>Allow this hashmaker to be paid</button></form>",
+                            esc(&o)),
                         (false, Some(o), Some(n)) if !n.is_empty() => format!(
                             "<p class=\"hint\">Your spending rules list who this app may pay. Allow this hashmaker first: you sign the change with your approval key.</p>\
                              <p><a class=\"button\" href=\"./policy?allow={}&amp;node={}\">Allow this hashmaker to be paid</a></p>",

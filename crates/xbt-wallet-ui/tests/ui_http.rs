@@ -3077,6 +3077,85 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert!(rseen.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/cut" && b.contains("r9")));
 }
 
+/// A hashmaker whose shop has no web address (reached by its key) is paid through the transport document the app
+/// keeps for it. Allowing it from its offer adds the shop, as the Sellers page does, before the rules: 0.2.9 only
+/// opened the rules, and every payment was refused ("a shop without a web address is reached through its transport
+/// document"). One the rules allow but the app doesn't keep is offered the same, with Rent off until it is kept.
+#[test]
+fn allowing_a_hashmaker_reached_by_its_key_adds_its_shop() {
+    use std::sync::OnceLock;
+    use xbt_nostr::{event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    // the hashmaker's shop, by its key, with a link its node vouches for
+    let keys = Keys::generate();
+    let shop = xbt402::shop::origin_for(&keys.public.serialize());
+    let (sk, pk) = receipt_key(b"laz hash");
+    let d = xbt402::listing::parse_draft(&json!({
+        "name": "Lazarus Stream", "services": [{"name": "Laz Hash", "kind": "hashrate", "path": "/hashrate/", "prices": {"request_msat": 40000}, "items": []}],
+        "updated": "2026-11-03",
+    })).unwrap();
+    let doc = xbt402::listing::sign(&sk, &xbt402::listing::document(&d, &shop, &pk));
+    let node = Sk::from_slice(&[9u8; 32]).unwrap();
+    let node_hex = hex::encode(xbt_primitives::ecdsa::pubkey(&node));
+    let expires = xbt_nostr::now() + 30 * 86_400;
+    let ep = "ab".repeat(32);
+    let link = xbt402::transport::Link { kind: "iroh".into(), endpoint_id: ep.clone(), relays: vec!["https://relay.example".into()], direct: vec![], expires,
+                                         node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) };
+    let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &[link], "2026-11-03"));
+    let bind = xbt402::listing::bind(&sk, &keys.public.serialize(), &shop);
+    let ev = market::listing_event_with(&keys, &doc, &bind, Some(&t), xbt_nostr::now()).unwrap();
+    assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+    // its hashrate offer, paid at that shop
+    static PAY: OnceLock<(String, String)> = OnceLock::new();
+    PAY.set((format!("{shop}/hashrate"), node_hex.clone())).unwrap();
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
+                                     "blinding": {"state": "blinded", "why": "pool", "words": "Blinded."}, "rentals": []}),
+        ("GET", "/offers") => json!({"offers": [{"name": "Laz Hash", "linkKey": "02ee", "priceMsat": 40000, "sliceWork": "140737488355328",
+                                                  "miners": 1, "freeMiners": 1, "freeHs": "4000000000000",
+                                                  "payUrl": PAY.get().unwrap().0, "payNode": PAY.get().unwrap().1}]}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let tweak = |c: &mut Config| {
+        c.nostr_relays = relays.clone();
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    };
+    let offer = |page: &str| {
+        let o = &page[page.find("<h3>Laz Hash</h3>").expect(page)..];
+        o[..o.find("</section>").unwrap()].to_string()
+    };
+
+    // not allowed yet: Allow adds the shop, then opens the rules with the node its link names
+    let bx = start(json!({}), false, tweak);
+    let mut br = logged_in(&bx);
+    let o = offer(&br.get("/hashrate").body);
+    assert!(o.contains("value=\"try\"") && o.contains(&format!("name=\"url\" value=\"{shop}\"")) && o.contains("Allow this hashmaker to be paid"), "{o}");
+    assert!(!o.contains("./policy?allow="), "not the rules alone: {o}");
+    assert!(o.contains("<button disabled>Rent</button>"), "{o}");
+    let r = br.act("/hashrate", "/services", &[("action", "try"), ("url", &shop)]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert!(r.location().starts_with("./policy?allow=") && r.location().contains(&format!("node={node_hex}")), "{}", r.location());
+    let kept = xbt_wallet_ui::shops::load(&bx.data.path().join("ui/shops.json")).unwrap();
+    assert_eq!(kept[&shop].transport, Some(t.clone()), "the shop is kept, with how to reach it");
+
+    // allowed in the rules (as 0.2.9's link left it), the shop not kept: FAILS before, Rent was on and every payment refused
+    let rules = json!({"allowlist": [shop.clone()], "counterparties": {shop.clone(): {"ln_node": node_hex}}});
+    let bx = start(rules, false, tweak);
+    let mut br = logged_in(&bx);
+    let o = offer(&br.get("/hashrate").body);
+    assert!(o.contains("value=\"try\"") && o.contains("<button disabled>Rent</button>"), "{o}");
+    let r = br.act("/hashrate", "/services", &[("action", "try"), ("url", &shop)]);
+    assert!(br.flash_after(&r).contains("Lazarus Stream is on Browse and allowed to be paid"));
+    let o = offer(&br.get("/hashrate").body);
+    assert!(!o.contains("Allow this hashmaker to be paid") && o.contains("<button>Rent</button>"), "kept and allowed: {o}");
+}
+
 /// Without an address renters outside can reach, the offer stays off public listings and the page
 /// An owner who has never saved the form finds "Rent out my miners" not ticked, with what a renter's word
 /// means beside it, and one who has saved keeps their choice, either way.
