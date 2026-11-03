@@ -332,6 +332,14 @@ fn first_payment_msat(t: &xbt_hashlink::msg::Terms) -> u64 {
     t.price_msat.saturating_mul(t.start_slices.saturating_add(1))
 }
 
+/// What a test slice may spend on the shop's ticket: its first payment, and never less than the smallest ticket a shop
+/// sells (546 sat, [`xbt_hashlink::order::FIRST_STEP_MSAT`]), which a slice of a few sats is under: a budget below it
+/// buys no ticket, and the trial could never pay. Its slices still stop at the first payment (the rental's own budget);
+/// what the ticket's slices don't use stays with the shop as credit.
+fn trial_ticket_msat(t: &xbt_hashlink::msg::Terms) -> u64 {
+    first_payment_msat(t).max(xbt_hashlink::order::FIRST_STEP_MSAT)
+}
+
 fn offer_json(h: &Hashrate, event: &str) -> Value {
     json!({
         "name": h.name, "algorithm": h.algorithm, "linkKey": hex::encode(h.link_key.serialize()), "linkAddr": h.link_addr,
@@ -342,7 +350,7 @@ fn offer_json(h: &Hashrate, event: &str) -> Value {
         "miners": h.capacity.miners, "freeMiners": h.capacity.free_miners, "freeHs": h.capacity.free_hs.to_string(), "event": event,
         // what a trial may leave the wallet for: a ticket of the first step and its fee limit.
         // A longer rental's tickets grow as they are earned, so no figure stands for them
-        "trialMayBuyTicketUpToSats": xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(h.terms.price_msat.saturating_mul(h.terms.start_slices + 1)), None).0,
+        "trialMayBuyTicketUpToSats": xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(trial_ticket_msat(&h.terms)), None).0,
     })
 }
 
@@ -683,6 +691,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         budget_sats = first_payment_msat(&h.terms).div_ceil(1000);
         minutes = trial_minutes(h.terms.slice_work, per_miner_hs(&h));
     }
+    // what the wallet may spend on tickets: the budget, and for a trial at least the shop's smallest ticket
+    let ticket_budget_sats = if trial { trial_ticket_msat(&h.terms).div_ceil(1000) } else { budget_sats };
     let advertised_hs = per_miner_hs(&h).saturating_mul(miners as u64);
     if first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
         return (400, json!({"error": if h.terms.start_slices > 0 { "the budget is less than the start fee and one slice" } else { "the budget is less than one slice" }}));
@@ -709,8 +719,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         (g.key, g.user.clone(), g.signer.clone(), g.task.clone(), g.api(), g.allow_unblinded)
     };
     // the first ticket, the first step's: later ones grow as they are earned, inside the budget
-    let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
-    let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(budget_sats), None,
+    let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(ticket_budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
+    let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(ticket_budget_sats), None,
                                                    std::time::Duration::from_millis(h.terms.grace_ms / 2)));
     let cfg = hashtaker::Config {
         hashmaker: addr,
@@ -840,6 +850,37 @@ mod tests {
         assert_eq!(trial_minutes(1 << 47, 100_000_000_000), TRIAL_MAX_MINUTES);
         assert_eq!(trial_minutes(1 << 47, 1_000_000_000_000), 8);
         assert_eq!(trial_minutes(1 << 47, 0), TRIAL_MAX_MINUTES);
+    }
+
+    /// A test slice of a few sats can pay a shop whose smallest ticket is 546 sat: its slices stop at one, and the wallet
+    /// may buy that ticket, as the offer says. 0.2.9 gave the wallet the slice's 40 sats to buy it with, and every trial
+    /// ended with "What is left of this rental's budget (40 sats) is less than this hashmaker's smallest ticket (546 sats)".
+    #[test]
+    fn a_test_slice_may_buy_the_shops_smallest_ticket() {
+        let terms = Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000, start_slices: 0 };
+        assert_eq!(trial_ticket_msat(&terms), 546_000);
+        assert_eq!(trial_ticket_msat(&Terms { price_msat: 300_000, start_slices: 1, ..terms.clone() }), 600_000, "a first payment above it is its own");
+        // nothing answers at the hashmaker's address: the rental starts and then can't, which is all this needs
+        let listing = Hashrate {
+            name: "Laz Hash".into(),
+            algorithm: "blake2b".into(),
+            hashrate_hs: 4_000_000_000_000,
+            link_addr: "127.0.0.1:9".into(),
+            link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, &noise::fresh_key()),
+            iroh: None,
+            pay_url: String::new(),
+            pay_node: String::new(),
+            terms,
+            proof: Some(PROOF.into()),
+            capacity: Capacity { miners: 1, free_miners: 1, free_hs: 4_000_000_000_000 },
+        };
+        // the offer's words: up to the 546 sat ticket and its routing fee limit, not the slice's 40 sats and theirs (51)
+        assert_eq!(offer_json(&listing, "ev")["trialMayBuyTicketUpToSats"], 559);
+        let key = hex::encode(listing.link_key.serialize());
+        let r = renter(listing);
+        let (code, v) = handle(&r, &[], "POST", "/rent", json!({"linkKey": key, "trial": true}).to_string().as_bytes());
+        assert_eq!(code, 200, "{v}");
+        assert_eq!((v["budgetSats"].clone(), v["mayBuyTicketUpToSats"].clone()), (json!(40), json!(546)), "charged at most one slice, a ticket of 546 sat: {v}");
     }
 
     use std::net::TcpListener;
