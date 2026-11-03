@@ -662,7 +662,11 @@ impl App {
             Pricing::Market(p) => (p, String::new()),
             Pricing::Fixed { sat, .. } => (MARKET_PCT, sat.to_string()),
         };
-        let price_block = price_words(&wanted, tip.as_ref().ok(), seen.hs, matches!(mode, Pricing::Market(_)));
+        let mut price_block = price_words(&wanted, tip.as_ref().ok(), seen.hs, matches!(mode, Pricing::Market(_)));
+        // the price per TH/s for an hour, the figure offers compare by, beside the mining value and the other offers seen
+        if let Ok(w) = &wanted {
+            price_block.push_str(&th_hour_words(w, tip.as_ref().ok(), &self.other_offers_th_hour()));
+        }
         let paused = st.as_ref().ok().and_then(|s| s["paused"].as_str()).map(paused_words).unwrap_or_default();
         let slice_typed = saved["sliceFixed"] == true;
         let slice_now = wanted.as_ref().map(|w| w.slice_work).unwrap_or_else(|_| slice_for(seen.hs.unwrap_or(EXAMPLE_HS), None)) as f64;
@@ -1029,6 +1033,19 @@ impl App {
         // your gateway: the bundled one's settings and state, and the way to another
         b.push_str(&self.gateway_card(&csrf, &st));
         self.html_page("Hashrate", "Hashrate", ctx, &b, "")
+    }
+
+    /// What the other hashmakers' offers seen on Nostr ask for 1 TH/s for an hour, in sats: the renter's offers (kept for
+    /// its page, asked again behind it), this box's own left out. None where this box doesn't rent.
+    fn other_offers_th_hour(&self) -> Vec<f64> {
+        let Some(base) = self.cfg.hash.renter.clone() else { return vec![] };
+        let Ok(o) = rent_offers(&base, &self.cfg.hash.renter_token, !self.cfg.read_cache.is_zero()) else { return vec![] };
+        let own_pay = self.hash_settings()["payUrl"].as_str().and_then(crate::services::http_origin);
+        o["offers"].as_array().into_iter().flatten()
+            .filter(|x| { let pay = x["payUrl"].as_str().unwrap_or(""); !own_offer(self.is_own_shop(pay), &own_pay, pay) })
+            .map(|x| per_hour(num(&x["priceMsat"]) / 1000.0, num(&x["sliceWork"]), 1e12))
+            .filter(|p| *p > 0.0)
+            .collect()
     }
 
     pub(crate) fn hashrate_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
@@ -1487,6 +1504,29 @@ fn price_words(w: &Result<Want, String>, tip: Option<&Tip>, hs: Option<f64>, mar
     b
 }
 
+/// The price `w` per 1 TH/s for an hour, beside what that hour is worth when mined at `tip` and what `others` (the other
+/// offers seen, per TH/s for an hour) ask: a price a piece of work says little by itself, since pieces differ in size.
+fn th_hour_words(w: &Want, tip: Option<&Tip>, others: &[f64]) -> String {
+    let slice = w.slice_work as f64;
+    let mine = per_hour(w.price_sat as f64, slice, 1e12);
+    let mut b = format!("<p class=\"hint\">Per 1 TH/s of speed, your price comes to about <strong>{}</strong> an hour.", sats_n(mine));
+    if let Some(t) = tip {
+        b.push_str(&format!(" Mined at today's difficulty, 1 TH/s for an hour is worth about {}.", sats_n(per_hour(worth_sat(w.slice_work, t), slice, 1e12))));
+    }
+    let mut o: Vec<f64> = others.to_vec();
+    o.sort_by(f64::total_cmp);
+    match o.len() {
+        0 => {}
+        1 => b.push_str(&format!(" The other offer seen now asks about {} an hour for 1 TH/s.", sats_n(o[0]))),
+        n => {
+            let median = if n % 2 == 1 { o[n / 2] } else { (o[n / 2 - 1] + o[n / 2]) / 2.0 };
+            b.push_str(&format!(" The {n} other offers seen now ask from about {} an hour for 1 TH/s (the cheapest), {} in the middle.", sats_n(o[0]), sats_n(median)));
+        }
+    }
+    b.push_str("</p>");
+    b
+}
+
 /// Why the hasher takes no new rental, in the owner's words.
 fn paused_words(why: &str) -> String {
     let w = match why {
@@ -1940,5 +1980,21 @@ mod tests {
         assert_eq!(ended_words("hashmaker closed: no first payment"), "The first piece of work was not paid in time.");
         assert_eq!(ended_words("the gateway's jobs aren't blinded"), "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.");
         assert_eq!(ended_words("hashmaker closed: a difficulty too high for the slice"), "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.");
+    }
+
+    /// A fixed price is said per 1 TH/s for an hour, beside the mining value and the other offers: 1,700 sats a piece was
+    /// set without seeing it came to about 40 times the other offer's.
+    #[test]
+    fn a_price_is_said_per_th_hour_beside_the_market_and_the_other_offers() {
+        let tip = Tip { difficulty: 1e6, subsidy_sats: 312_500_000, height: 1 };
+        let w = Want { price_sat: 1700, slice_work: 1 << 45, start_slices: 1 };
+        let worth = per_hour(worth_sat(1 << 45, &tip), (1u64 << 45) as f64, 1e12);
+        let words = th_hour_words(&w, Some(&tip), &[1_500.0, 100.0, 300.0]);
+        assert!(words.contains(&format!("your price comes to about <strong>{}</strong> an hour", sats_n(per_hour(1700.0, (1u64 << 45) as f64, 1e12)))), "{words}");
+        assert!(words.contains(&format!("1 TH/s for an hour is worth about {}", sats_n(worth))), "{words}");
+        assert!(words.contains("The 3 other offers seen now ask from about 100 sats an hour for 1 TH/s (the cheapest), 300 sats in the middle."), "{words}");
+        let one = th_hour_words(&w, None, &[4_400.0]);
+        assert!(one.contains("The other offer seen now asks about 4,400 sats") && !one.contains("worth"), "{one}");
+        assert!(!th_hour_words(&w, None, &[]).contains("other offer"));
     }
 }
