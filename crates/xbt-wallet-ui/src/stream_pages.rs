@@ -34,11 +34,9 @@ impl App {
             }
             Err(e) => format!("{}{}", Self::error_box(&e), empty_how(&self.suggested(ctx, &[]))),
         };
-        let more = if self.nostr.enabled() {
-            "<p class=\"small\">More sellers, not checked by anyone: <a href=\"./nostr\">found on Nostr</a>.</p>"
-        } else {
-            ""
-        };
+        // the sellers on the owner's list (adding a shop, allowing it to be paid, the credit with each): once a tab of Buy
+        let more = format!("<p class=\"small\">Your <a href=\"./services\">sellers</a>: add a shop, allow it to be paid, see the credit left with each.{}</p>",
+                           if self.nostr.enabled() { " More sellers, not checked by anyone: <a href=\"./nostr\">found on Nostr</a>." } else { "" });
         self.html_page("Browse", "Browse", ctx, &format!("{body}{more}"), "")
     }
 
@@ -279,14 +277,15 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     let sort_q = if sort == Sort::Price { "&amp;sort=price" } else { "" };
     let mut b = String::from("<nav class=\"chips\" aria-label=\"Categories\">");
     let count = |id: &str| all.iter().filter(|s| id.is_empty() || s.category() == id).count();
-    for (id, words) in std::iter::once(("", "All")).chain(services::CATEGORIES.iter().copied()) {
-        let cur = if id == cat { " aria-current=\"page\"" } else { "" };
-        // hashrate is offered on Rent hashrate, from listings the shops publish, not from the list of sellers: with
-        // none on that list the chip leads there, with no count (0.2.1 said "Hashrate 0" beside an offer)
-        if id == "hashrate" && count(id) == 0 {
-            b.push_str(&format!("<a href=\"./hashrate\">{}</a>", esc(words)));
+    // every kind of service, one row: AI and VPN lead to their own pages (once tabs of Buy beside Browse, so AI was there
+    // twice), the others filter the list. Hashrate is offered on its page, from the listings shops publish, not from the
+    // list of sellers: with none on that list its chip leads there, with no count (0.2.1 said "Hashrate 0" beside an offer)
+    for (id, words) in [("", "All"), ("ai", "AI"), ("hashrate", "Hashrate"), ("vpn", "VPN"), ("files", "Files"), ("data", "Data & APIs"), ("apps", "Web apps")] {
+        if matches!(id, "ai" | "vpn") || (id == "hashrate" && count(id) == 0) {
+            b.push_str(&format!("<a href=\"./{id}\">{}</a>", esc(words)));
             continue;
         }
+        let cur = if id == cat { " aria-current=\"page\"" } else { "" };
         b.push_str(&format!("<a href=\"./browse?cat={id}{sort_q}\"{cur}>{} <span class=\"count\">{}</span></a>", esc(words), count(id)));
     }
     b.push_str("</nav>");

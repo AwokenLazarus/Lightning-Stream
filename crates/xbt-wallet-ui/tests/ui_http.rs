@@ -1144,6 +1144,20 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
     assert!(page.body.contains(">Web apps <") && page.body.contains(">Files <") && page.body.contains(">Data &amp; APIs <"), "the categories");
     assert!(!page.body.contains(">Media <"), "no media category of its own");
+    // Buy has two tabs; every kind of service is a chip of Browse, once each (AI was a tab and a chip), and Sellers is linked below
+    let tabs = &page.body[page.body.find("aria-current=\"page\">Browse").unwrap()..];
+    let tabs = &tabs[..tabs.find("</nav>").unwrap()];
+    assert!(!tabs.contains("./ai\"") && !tabs.contains("./vpn\"") && !tabs.contains("./services\"") && tabs.contains("./connections"), "{tabs}");
+    let chips = &page.body[page.body.find("<nav class=\"chips\"").unwrap()..];
+    let chips = &chips[..chips.find("</nav>").unwrap()];
+    let order: Vec<usize> = [">All <", "./ai\">AI<", ">Hashrate<", "./vpn\">VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
+        .map(|c| chips.find(c).unwrap_or_else(|| panic!("{c}: {chips}"))).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{chips}");
+    assert!(page.body.contains("Your <a href=\"./services\">sellers</a>"), "Sellers, from Browse");
+    // the pages that were tabs still open, as part of Buy
+    for path in ["/ai", "/vpn", "/services"] {
+        assert!(br.get(path).body.contains("aria-current=\"page\">Buy"), "{path} is in Buy");
+    }
     assert!(!page.body.contains("Big Buck Bunny"), "Browse lists services, not what a media service has inside");
     assert!(page.headers.get("content-security-policy").is_some_and(|v| v.contains("media-src 'self'")));
     // an older film listing (no web app) is files: each to download or open in the buyer's own player, no player here

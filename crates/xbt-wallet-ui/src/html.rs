@@ -145,11 +145,12 @@ impl Section {
 pub const ADVANCED: &str = "Advanced";
 
 /// Buying: paired with Sell.
+/// Two tabs: what there is to buy, and what is being paid for now. AI, Hashrate and VPN are chips of Browse, beside the
+/// other kinds of service, and the Sellers page is linked from Browse and Wallet.
 pub const SERVICES: Section = Section {
     label: "Buy",
-    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
-            Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
-    also: &["Service"],
+    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    also: &["Service", "AI", "VPN", "Sellers"],
     advanced: &[],
 };
 pub const SELL: Section = Section {
@@ -182,9 +183,8 @@ pub const SETTINGS: Section = Section {
 /// more kind of service, beside the others.
 pub const SERVICES_HASH: Section = Section {
     label: "Buy",
-    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
-            Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" }, Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
-    also: &["Service"],
+    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    also: &["Service", "AI", "Hashrate", "VPN", "Sellers"],
     advanced: &[],
 };
 pub const SELL_HASH: Section = Section {
