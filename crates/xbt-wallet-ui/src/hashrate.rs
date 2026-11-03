@@ -900,15 +900,9 @@ impl App {
                 esc(was), esc(was), esc(was)));
         }
 
-        // the rentals going on and the last ones
+        // the rentals going on, and the ended ones under History
         let rentals: Vec<Value> = st["rentals"].as_array().cloned().unwrap_or_default();
-        if !rentals.is_empty() {
-            b.push_str("<h2>Your rentals</h2><div class=\"stack\">");
-            for r in rentals.iter().take(10) {
-                b.push_str(&rental_card(ctx, r, "./hashrate"));
-            }
-            b.push_str("</div>");
-        }
+        b.push_str(&rentals_sections(ctx, &rentals));
 
         // a solo renter's odds of a block come from its own node's difficulty, asked only when its jobs show solo
         let solo = st["blinding"]["state"] == "blinded" && st["blinding"]["why"] == "solo";
@@ -1333,10 +1327,51 @@ impl App {
     }
 }
 
+/// The most ended rentals History shows; the count says them all.
+const HISTORY_SHOWN: usize = 20;
+
+/// Whether a rental is over (or closing): as its card says it, "Ended" or "Could not start".
+fn rental_ended(r: &Value) -> bool {
+    r["ended"] == true || !r["live"]["closed"].is_null()
+}
+
+/// The Hashrate page's rentals: those going on (connecting, hashing, paying) under Your rentals, and the ended
+/// ones, newest first, under History, folded with their count. Before, ended test slices piled up above the
+/// rentals going on (0.2.9, a page with six ended test slices on top).
+fn rentals_sections(ctx: &Ctx, rentals: &[Value]) -> String {
+    if rentals.is_empty() {
+        return String::new();
+    }
+    let (mut ended, live): (Vec<&Value>, Vec<&Value>) = rentals.iter().partition(|r| rental_ended(r));
+    // newest first; the service lists them by id
+    ended.sort_by_key(|r| std::cmp::Reverse(r["startedMs"].as_u64().unwrap_or(0)));
+    let mut b = String::from("<h2>Your rentals</h2>");
+    if live.is_empty() {
+        b.push_str("<p class=\"empty\">No rental going on. The ones that ended are under History.</p>");
+    } else {
+        b.push_str("<div class=\"stack\">");
+        for r in live {
+            b.push_str(&rental_card(ctx, r, "./hashrate"));
+        }
+        b.push_str("</div>");
+    }
+    if !ended.is_empty() {
+        let n = ended.len();
+        let more = if n > HISTORY_SHOWN { format!("<p class=\"hint\">The last {HISTORY_SHOWN} are shown.</p>") } else { String::new() };
+        b.push_str(&format!("<details class=\"card rentals-history\" id=\"rentals-history\"><summary>History: {n} ended rental{}</summary>{more}<div class=\"stack\">",
+                            if n == 1 { "" } else { "s" }));
+        for r in ended.into_iter().take(HISTORY_SHOWN) {
+            b.push_str(&rental_card(ctx, r, "./hashrate"));
+        }
+        b.push_str("</div></details>");
+    }
+    b
+}
+
 /// One rental, as the renter sees it.
 fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let live = &r["live"];
-    let ended = r["ended"] == true || !live["closed"].is_null();
+    let ended = rental_ended(r);
     let id = r["rental"].as_str().unwrap_or("");
     let hs = num(&live["lastRate"]["hs"]);
     let paid = live["paidSlices"].as_u64().unwrap_or(0);
@@ -1940,5 +1975,45 @@ mod tests {
         assert_eq!(ended_words("hashmaker closed: no first payment"), "The first piece of work was not paid in time.");
         assert_eq!(ended_words("the gateway's jobs aren't blinded"), "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.");
         assert_eq!(ended_words("hashmaker closed: a difficulty too high for the slice"), "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.");
+    }
+
+    /// Rentals going on are listed under Your rentals; the ended ones (and one closing) only under History,
+    /// newest first, with their count; with none going on the page says so and History stays.
+    #[test]
+    fn ended_rentals_go_under_history() {
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let going = json!({"rental": "r5", "hasher": "Laz Hash", "budgetSats": 4696, "startedMs": 500, "ended": false,
+                           "live": {"closed": null, "role": "hashtaker", "paidSlices": 3, "spentMsat": 120000, "miners": 1}});
+        let connecting = json!({"rental": "r6", "hasher": "Garage", "budgetSats": 1000, "startedMs": 600, "ended": false, "live": {"closed": null}});
+        let old = json!({"rental": "r1", "hasher": "Old Shop", "trial": true, "budgetSats": 40, "startedMs": 100, "ended": true,
+                         "live": {"closed": "hashmaker closed: no first payment"}});
+        let newer = json!({"rental": "r2", "hasher": "New Shop", "trial": true, "budgetSats": 40, "startedMs": 300, "ended": true,
+                           "live": {"closed": "hashmaker closed: no first payment"}});
+        let closing = json!({"rental": "r3", "hasher": "Closing Shop", "budgetSats": 1000, "startedMs": 200, "ended": false,
+                             "live": {"closed": "cut by the hashtaker"}});
+        let html = rentals_sections(&ctx, &[old.clone(), going.clone(), newer.clone(), connecting.clone(), closing.clone()]);
+        let (yours, history) = html.split_at(html.find("<details").expect("a History section"));
+        assert!(yours.contains("<h2>Your rentals</h2>") && yours.contains("Hashrate from Laz Hash") && yours.contains("Hashing")
+                && yours.contains("Hashrate from Garage") && yours.contains("Connecting"), "{yours}");
+        assert!(!yours.contains("Ended") && !yours.contains("Shop"), "no ended rental under Your rentals: {yours}");
+        assert!(history.contains("<summary>History: 3 ended rentals</summary>"), "{history}");
+        let at = |s: &str| history.find(s).unwrap_or_else(|| panic!("{s} not in History: {history}"));
+        assert!(at("Test slice from New Shop") < at("Hashrate from Closing Shop") && at("Hashrate from Closing Shop") < at("Test slice from Old Shop"),
+                "newest first: {history}");
+        assert!(!history.contains("Laz Hash") && !history.contains("Garage"), "{history}");
+        assert_eq!(history.matches("<section class=\"card live\">").count(), 3);
+        // none going on: said, and History is still there
+        let html = rentals_sections(&ctx, &[old.clone()]);
+        assert!(html.contains("No rental going on.") && html.contains("<summary>History: 1 ended rental</summary>"), "{html}");
+        // none ended: no History
+        let html = rentals_sections(&ctx, &[going]);
+        assert!(!html.contains("History") && !html.contains("No rental going on"), "{html}");
+        assert_eq!(rentals_sections(&ctx, &[]), "");
+        // a long history shows its last ones, and counts them all
+        let many: Vec<Value> = (0..25u64).map(|i| json!({"rental": format!("t{i}"), "hasher": format!("Shop {i}"), "budgetSats": 40,
+                                                         "startedMs": i, "ended": true, "live": {"closed": "budget used up"}})).collect();
+        let html = rentals_sections(&ctx, &many);
+        assert!(html.contains("History: 25 ended rentals") && html.contains("The last 20 are shown.") && html.contains("Shop 24<")
+                && !html.contains("Shop 4<"), "{html}");
     }
 }
