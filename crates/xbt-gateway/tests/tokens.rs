@@ -229,6 +229,30 @@ fn a_whole_answer_slower_than_an_ordinary_service_start_is_waited_for() {
     assert_eq!(b.balance(), 1_000_000 - 250);
 }
 
+/// The AI route's long wait is its own: another route to the same service (here a free one) still
+/// gives up at the ordinary `times.upstream_wait_secs` (the rig's 2 s), while the AI route on that
+/// service waits for its whole answer.
+///
+/// FAILS before: one client a service, with the longest wait of its routes: the other route waited
+/// as long as a model's whole answer (300 s) and served a 4 s answer.
+#[test]
+fn a_route_beside_an_ai_route_on_its_service_keeps_the_ordinary_wait() {
+    let (rig, _dir, _model, _m) = rig_with(0, 10_000, 500, &|v| {
+        let up = v["routes"].as_array().unwrap().last().unwrap()["upstream"].clone();
+        v["routes"].as_array_mut().unwrap().push(json!({"path": "/plain/", "methods": ["POST"], "free": true, "upstream": up, "max_body": 65536}));
+    });
+    let t = std::time::Instant::now();
+    let body = json!({"x_n": 1, "x_wait_ms": 4000}).to_string();
+    let got = http(&rig.addr, "POST", "/plain/x", &[("Content-Type", "application/json")], body.as_bytes(), None);
+    assert_ne!(got.status, 200, "a 4 s answer on a route with a 2 s wait: {}", String::from_utf8_lossy(&got.body));
+    assert!(t.elapsed() < Duration::from_millis(3500), "given up at the ordinary wait: {:?}", t.elapsed());
+    // the AI route on the same service still waits past the ordinary wait
+    let mut b = Buyer::new(&rig, 9);
+    let s = b.lock(&rig, 1);
+    let got = post(&mut b, "/v1/chat/completions", &json!({"x_n": 5, "x_wait_ms": 3000}), Some(&s[0]));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+}
+
 #[test]
 fn a_request_the_balance_cannot_bound_is_refused_before_the_model_is_asked() {
     // 10,000 msat a token: one ticket of 1,000,000 covers 100 tokens of output
