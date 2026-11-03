@@ -612,6 +612,22 @@
     }
   }
 
+  // Buy → Hashrate: the rentals, shown again every 5 s while one is live (money spent, pieces paid, its state), and no
+  // more once none is. Not while the owner is in one of their forms (a Cut on its way).
+  var rentals = $("#rentals[data-live]");
+  if (rentals && root.fetch) {
+    var rentalsTimer = setInterval(function () {
+      root.fetch("./api/hashrate-rentals", { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || typeof d.html !== "string" || rentals.contains(document.activeElement)) return;
+          rentals.innerHTML = d.html;
+          if (!d.live) { rentals.removeAttribute("data-live"); clearInterval(rentalsTimer); }
+        })
+        .catch(function () {});
+    }, 5000);
+  }
+
   // The pending-approvals badge.
   var badge = $("#pending-badge");
   if (badge && root.fetch) {

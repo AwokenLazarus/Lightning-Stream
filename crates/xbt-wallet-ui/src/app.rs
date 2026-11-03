@@ -481,6 +481,7 @@ impl App {
             "/relays" => self.relays_page(&ctx, &req.query),
             "/app" => self.app_page(&ctx, &req.query),
             "/api/visit" => self.api_visit(&req.query),
+            "/api/hashrate-rentals" => self.api_hashrate_rentals(&ctx),
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),

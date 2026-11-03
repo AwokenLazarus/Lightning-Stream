@@ -903,11 +903,9 @@ impl App {
         // the rentals going on and the last ones
         let rentals: Vec<Value> = st["rentals"].as_array().cloned().unwrap_or_default();
         if !rentals.is_empty() {
-            b.push_str("<h2>Your rentals</h2><div class=\"stack\">");
-            for r in rentals.iter().take(10) {
-                b.push_str(&rental_card(ctx, r, "./hashrate"));
-            }
-            b.push_str("</div>");
+            // looked at again by the page (ui.js, ./api/hashrate-rentals) while one of them is live
+            let (cards, live) = rentals_cards(ctx, &rentals);
+            b.push_str(&format!("<div id=\"rentals\"{}>{cards}</div>", if live { " data-live=\"1\"" } else { "" }));
         }
 
         // a solo renter's odds of a block come from its own node's difficulty, asked only when its jobs show solo
@@ -1029,6 +1027,19 @@ impl App {
         // your gateway: the bundled one's settings and state, and the way to another
         b.push_str(&self.gateway_card(&csrf, &st));
         self.html_page("Hashrate", "Hashrate", ctx, &b, "")
+    }
+
+    /// The Hashrate page's rentals, for the page to show again while one is live: their cards, and whether one still is.
+    /// Without it the money spent, the pieces paid and a rental's end showed only on a reload.
+    pub(crate) fn api_hashrate_rentals(&self, ctx: &Ctx) -> Resp {
+        let Some(base) = self.cfg.hash.renter.clone() else { return Resp::json(404, &json!({"error": "this box does not rent miners"})) };
+        match call(&base, &self.cfg.hash.renter_token, "GET", "/status", None) {
+            Ok(st) => {
+                let (html, live) = rentals_cards(ctx, st["rentals"].as_array().map(Vec::as_slice).unwrap_or_default());
+                Resp::json(200, &json!({"html": html, "live": live}))
+            }
+            Err(e) => Resp::json(502, &json!({"error": e})),
+        }
     }
 
     pub(crate) fn hashrate_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
@@ -1334,6 +1345,16 @@ impl App {
 }
 
 /// One rental, as the renter sees it.
+/// The Hashrate page's rentals (the last ten), and whether one of them is still going on.
+fn rentals_cards(ctx: &Ctx, rentals: &[Value]) -> (String, bool) {
+    let mut b = String::from("<h2>Your rentals</h2><div class=\"stack\">");
+    for r in rentals.iter().take(10) {
+        b.push_str(&rental_card(ctx, r, "./hashrate"));
+    }
+    b.push_str("</div>");
+    (b, rentals.iter().take(10).any(|r| r["ended"] != true && r["live"]["closed"].is_null()))
+}
+
 fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let live = &r["live"];
     let ended = r["ended"] == true || !live["closed"].is_null();
@@ -1940,5 +1961,20 @@ mod tests {
         assert_eq!(ended_words("hashmaker closed: no first payment"), "The first piece of work was not paid in time.");
         assert_eq!(ended_words("the gateway's jobs aren't blinded"), "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.");
         assert_eq!(ended_words("hashmaker closed: a difficulty too high for the slice"), "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.");
+    }
+
+    /// The rentals the page shows again: live while one hashes or connects, not once every one ended (its last look
+    /// shows the end, then the page stops asking).
+    #[test]
+    fn the_rentals_are_live_while_one_goes_on() {
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let going = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 1000, "ended": false,
+                           "live": {"closed": null, "role": "hashtaker", "paidSlices": 3, "spentMsat": 120000, "miners": 1}});
+        let ended = json!({"rental": "r0", "hasher": "Laz Hash", "budgetSats": 1000, "ended": true, "live": {"closed": "budget used up"}});
+        let closing = json!({"rental": "r2", "hasher": "Laz Hash", "budgetSats": 1000, "ended": false, "live": {"closed": "cut by the hashtaker"}});
+        let (html, live) = rentals_cards(&ctx, &[going.clone(), ended.clone()]);
+        assert!(live && html.contains("Your rentals") && html.contains("Spent so far: <span class=\"money\">120 sats</span>") && html.contains("Hashing"), "{html}");
+        assert!(!rentals_cards(&ctx, &[ended.clone(), closing]).1, "every one ended or closing");
+        assert!(!rentals_cards(&ctx, &[]).1);
     }
 }
