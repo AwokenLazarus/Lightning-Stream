@@ -4585,6 +4585,28 @@ fn a_caller_gone_before_its_answer_begins_is_bought_nothing() {
     r.assert_booked();
 }
 
+/// The same, where the session's credit already covers the head, so that nothing is bought for it: a caller gone (its
+/// socket with it) by the time its request would leave is sent nothing, and nothing is charged.
+///
+/// FAILS before: the caller was looked for only while the head was being paid for; with credit enough the request left,
+/// and its head was charged to an answer nobody would read.
+#[test]
+fn a_caller_gone_before_its_request_leaves_is_sent_nothing_though_the_credit_covers_it() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // a first call opens the session and leaves credit for the next page
+    assert_eq!(r.pay("/page/10", CALL)["status"], 200);
+    let before = r.tap.secrets().len();
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/12"), "max_sats": CALL, "task": "film", "stream_to": "gone-2", "stream_head": true}));
+    assert_eq!((v["rule"].as_str(), v["request_sent"].as_bool(), v["charged_sats"].as_i64()), (Some("ticket_caller_gone"), Some(false), Some(0)), "{v}");
+    assert!(r.tap.seen("/page/12").iter().all(|s| !s.paid), "the seller got a paid request for a caller that had gone: {v}");
+    assert_eq!(r.tap.secrets().len(), before, "{v}");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
 // --- the owner's policy through the HTTP path -------------------------------------------------------
 
 /// A task that pays any seller is what an agent has when it is told to go and find sellers: a URL

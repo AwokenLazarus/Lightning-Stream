@@ -100,8 +100,19 @@ pub(crate) fn whole(length: Option<u64>, sent: u64, account: impl FnOnce() -> Op
 /// The connector's paid calls the signer has now, by shop (its origin) and by who made them (a visit's id, `stream` for a
 /// program's or a player link's, `ai` for the AI endpoint's). They share one connection with each shop (the signer keeps
 /// one session for a shop and the connector's task), which a visit's Stop closes only where no other of them uses it.
-/// Kept by the signer they go to (its socket), the shop and the caller.
-static FLIGHTS: std::sync::Mutex<Vec<(PathBuf, String, String)>> = std::sync::Mutex::new(Vec::new());
+/// Kept by the signer they go to (its socket), the shop and the caller; and the shops whose connection a Stop is closing
+/// now, by whom ([`close_if_alone`]): a new call to one waits until that is done, and goes on a new connection.
+#[derive(Default)]
+struct Flights {
+    calls: Vec<(PathBuf, String, String)>,
+    closing: Vec<(PathBuf, String, String)>,
+}
+
+static FLIGHTS: std::sync::Mutex<Flights> = std::sync::Mutex::new(Flights { calls: Vec::new(), closing: Vec::new() });
+static FLIGHTS_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The longest a new call to a shop waits for a Stop to close that shop's connection: past it, it goes on.
+const CLOSING_WAIT: Duration = Duration::from_secs(30);
 
 /// The origin of an absolute URL (`https://host:port`): its scheme and authority, without the path.
 pub(crate) fn origin_of(url: &str) -> String {
@@ -111,31 +122,70 @@ pub(crate) fn origin_of(url: &str) -> String {
     }
 }
 
+fn flights() -> std::sync::MutexGuard<'static, Flights> {
+    FLIGHTS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// One paid call of the connector's, counted while it lives ([`FLIGHTS`]).
 pub(crate) struct Flight(Option<(PathBuf, String, String)>);
 
 /// A paid call to `url`'s shop by `owner`, through the signer at `signer`, counted until the returned guard is dropped.
+/// Where a Stop of someone else's is closing that shop's connection now, it waits until that is done (at most
+/// [`CLOSING_WAIT`]), so that it does not go on the connection being closed.
 pub(crate) fn flight(signer: &Path, url: &str, owner: &str) -> Flight {
     let key = (signer.to_path_buf(), origin_of(url), owner.to_string());
-    FLIGHTS.lock().unwrap_or_else(|p| p.into_inner()).push(key.clone());
+    let until = Instant::now() + CLOSING_WAIT;
+    let mut f = flights();
+    while f.closing.iter().any(|(s, o, w)| *s == key.0 && *o == key.1 && *w != key.2) && Instant::now() < until {
+        let left = until.saturating_duration_since(Instant::now());
+        f = FLIGHTS_CHANGED.wait_timeout(f, left).unwrap_or_else(|p| p.into_inner()).0;
+    }
+    f.calls.push(key.clone());
     Flight(Some(key))
 }
 
 impl Drop for Flight {
     fn drop(&mut self) {
         if let Some(key) = self.0.take() {
-            let mut all = FLIGHTS.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(i) = all.iter().position(|k| *k == key) {
-                all.swap_remove(i);
+            let mut f = flights();
+            if let Some(i) = f.calls.iter().position(|k| *k == key) {
+                f.calls.swap_remove(i);
             }
+            drop(f);
+            FLIGHTS_CHANGED.notify_all();
         }
     }
 }
 
-/// Whether a paid call to the shop at `origin` by anyone but `owner` is with the signer at `signer` now.
-pub(crate) fn in_flight_besides(signer: &Path, origin: &str, owner: &str) -> bool {
+/// A Stop closing a shop's connection ([`close_if_alone`]): new calls to the shop wait while it lives.
+pub(crate) struct Closing(Option<(PathBuf, String, String)>);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            let mut f = flights();
+            if let Some(i) = f.closing.iter().position(|k| *k == key) {
+                f.closing.swap_remove(i);
+            }
+            drop(f);
+            FLIGHTS_CHANGED.notify_all();
+        }
+    }
+}
+
+/// `owner`'s Stop may close its connection with the shop at `origin` (through the signer at `signer`): no paid call of
+/// anyone else's to that shop is with the signer now, nor is `busy` (another open visit to it, say). Decided and marked
+/// at once, so that no call of anyone else's starts on the connection until the returned guard is dropped ([`flight`]).
+/// `None`: it is used, and stays open.
+pub(crate) fn close_if_alone(signer: &Path, origin: &str, owner: &str, busy: impl FnOnce() -> bool) -> Option<Closing> {
     let origin = origin.to_ascii_lowercase();
-    FLIGHTS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|(s, o, w)| s == signer && *o == origin && w != owner)
+    let mut f = flights();
+    if f.calls.iter().any(|(s, o, w)| s == signer && *o == origin && w != owner) || busy() {
+        return None;
+    }
+    let key = (signer.to_path_buf(), origin, owner.to_string());
+    f.closing.push(key.clone());
+    Some(Closing(Some(key)))
 }
 
 #[derive(Clone)]
@@ -197,7 +247,7 @@ impl Connector {
             xbt_wallet_mcp::wallet::with_transport(m);
         }
         let signer = self.cfg.signer.clone();
-        // counted among the connector's calls to the shop while the signer has it ([`in_flight_besides`])
+        // counted among the connector's calls to the shop while the signer has it ([`close_if_alone`])
         let flight = flight(&self.cfg.signer, url, "stream");
         std::thread::spawn(move || {
             let _flight = flight;
