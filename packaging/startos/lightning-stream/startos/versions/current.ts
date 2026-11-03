@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.7:0',
+  version: '0.2.8:0',
   releaseNotes: {
     en_US:
-      'Fixes from a hands-on run of 0.2.6. Stop ends a visit completely, closing only what that visit used. A visit buys a ticket only when it needs one, and its report says exactly what it used and what was newly paid. Long AI answers no longer fail. Player links have their own address, so VLC and other players can open them on Umbrel. The Sell page warns when a media server has no way in for buyers. Plain names for the stream tickets budget and the wallet\'s records. The Stream Gateway that powers mining rental is now built on FlyTheElephant\'s datum_gateway.',
+      'Small fixes from a hands-on run of 0.2.7. A visit\'s Stop says the credit with the shop is shared with your other uses of it. A spending limit that stops a payment says the payment would pass it. A player link answers a player\'s size check once the file is known. The Sell page shows its publish-anyway box only where it applies.',
   },
   migrations: {
     up: async () => {},
