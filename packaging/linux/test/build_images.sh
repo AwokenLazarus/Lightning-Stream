@@ -21,9 +21,15 @@ lock() { awk -v n="$1" '$1 == n {print $2}' packaging/images.lock; }
 
 echo "== this tree's xbt-init, xbt-wallet-ui, xbt-hashlink and xbt-gateway (x86_64 musl)"
 TGT=${CARGO_TARGET_DIR:-target}
-cargo build -q -j "${CARGO_BUILD_JOBS:-6}" --release --locked --target x86_64-unknown-linux-musl \
-  -p xbt-wallet-ui -p xbt-hashlink -p xbt-svc -p xbt-gateway -p xbt-signer --bin xbt-wallet-ui --bin xbt-hashlink --bin xbt-init \
-  --bin xbt-gateway --bin xbt-signer --bin xbt-supervise
+# One cargo run per image, as scripts/oci_build.sh builds them for publishing, not one run for all: cargo turns
+# on, for the dependencies the crates of one run share, every feature any of them asks for, and a binary built
+# with the others got features its published build lacks (0.2.9: xbt-hashlink without xbt402's http-client
+# passed here and failed to start a rental from the published image).
+for b in "-p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init" "-p xbt-hashlink --bin xbt-hashlink" \
+         "-p xbt-gateway --bin xbt-gateway" "-p xbt-signer --bin xbt-signer" "-p xbt-svc --bin xbt-supervise"; do
+  # shellcheck disable=SC2086 # $b is the list of cargo arguments
+  cargo build -q -j "${CARGO_BUILD_JOBS:-6}" --release --locked --target x86_64-unknown-linux-musl $b
+done
 # and this tree's users and groups (container/mkbase.py): the pinned images' /etc/group predates the Stream
 # Gateway's (xbt-datum, 10021, with the UI in it, so the UI can give run/datum/config.json the gateway's group)
 python3 container/mkbase.py "$T/base.tar"

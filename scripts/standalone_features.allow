@@ -1,0 +1,107 @@
+# Features the tests' workspace build turns on and a published build (scripts/oci_build.sh, one cargo run per
+# image) does not, each read and found to change nothing the binary does: scripts/check_standalone_features.sh
+# fails on any difference not listed here. One line each: the published build (its packages joined by "+", as
+# the check prints them, or * for every build) and crate/feature. A feature a binary needs is not listed: it is
+# declared in that crate's Cargo.toml. `scripts/check_standalone_features.sh --print` lists every difference.
+#
+# Read for 0.2.9 (Rust 1.98, Cargo.lock of 2026-11-03).
+
+# Only API: trait impls (std::error::Error, Debug/Eq, io::Write, From), types and constructors no published
+# binary calls; a binary that called one would not compile without the feature.
+* aead/alloc
+* aead/default
+* aead/getrandom
+* aead/rand_core
+* aes-gcm/alloc
+* aes-gcm/default
+* aes-gcm/getrandom
+* aes-gcm/rand_core
+* arrayvec/std
+* chacha20poly1305/default
+* chacha20poly1305/getrandom
+* chacha20poly1305/rand_core
+* crypto-common/getrandom
+* crypto-common/std
+* derive_more/from_str
+* derive_more/into_iterator
+* derive_more-impl/from_str
+* derive_more-impl/into_iterator
+* digest/block-buffer
+* digest/core-api
+* digest/mac
+* digest/oid
+* digest/std
+* digest/subtle
+* displaydoc/default
+* displaydoc/std
+* ed25519/alloc
+* ed25519/pem
+* ed25519/pkcs8
+* ed25519/std
+* ed25519-dalek/alloc
+* ed25519-dalek/pem
+* ed25519-dalek/pkcs8
+* ed25519-dalek/std
+* getrandom/std
+* getrandom/sys_rng
+* hashbrown/default-hasher
+* hashbrown/raw
+* iroh-base/default
+* libc/extra_traits
+* rand_core/getrandom
+* reqwest/json
+* reqwest/stream
+* ring/std
+* serde_core/alloc
+* serde_core/rc
+* serde_core/result
+* sha2/default
+* sha2/std
+* signature/alloc
+* signature/std
+* time/formatting
+* time/macros
+* time/parsing
+* toml_datetime/serde
+* zerocopy/simd
+
+# The relay server and its metrics service (iroh-relay/server, iroh-metrics/service), which only the built-in
+# Stream relay runs and xbt-stream-relay declares; the other builds use iroh-relay's client. tokio/signal comes
+# with the server. noq's platform-verifier adds a verifier iroh uses only when asked (CaTlsConfig::system),
+# which no crate here does: iroh keeps its embedded roots either way. HTTP/2 in hyper comes from igd-next (UPnP
+# port mapping), which the relay's build does not use.
+* iroh-relay/server
+* iroh-metrics/service
+* tokio/signal
+* tokio/signal-hook-registry
+* noq/platform-verifier
+* noq-proto/platform-verifier
+* hyper/http2
+* hyper-util/http2
+
+# Counters only: without them iroh's metrics are not counted (nothing here reads them, except the relay, which
+# declares them).
+* iroh-relay/metrics
+* iroh-metrics/metrics
+
+# Speed only, the same results: inlining (hashbrown), run-time CPU detection for SIMD (memchr, simdutf8).
+* hashbrown/inline-more
+* memchr/default
+* simdutf8/default
+
+# Logging only: tracing-core's std (per-thread dispatch; the binaries set one global subscriber or none),
+# tracing's log bridge, noq-udp's log output.
+* tracing-core/default
+* tracing/log
+* noq-udp/default
+* noq-udp/tracing-log
+
+# Wiping the stream cipher's state when it is dropped (chacha20, cipher). Hygiene, not function: a binary works
+# the same without it. Kept as a difference for now; declare it on the crates that hold long-lived keys if wanted.
+* chacha20/zeroize
+* cipher/zeroize
+
+# xbt402's HTTP client for the seller gateway: an API it does not call. The 0.2.7 gateway image, built without it,
+# passed every gateway check of packaging/linux/test-linux.sh on the published images. (xbt-hashlink, which also
+# lacked it, now declares it: see crates/xbt-hashlink/Cargo.toml.)
+xbt-gateway xbt402/http-client

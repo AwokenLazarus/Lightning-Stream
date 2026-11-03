@@ -5,6 +5,19 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.9 (2026-11-03)
+
+Renting hashrate works with the published images. Only the hashrate image changes.
+
+- **A rental starts.** The rental component was built without features it needs: the published image was built
+  on its own, while every test built it together with the other components, and that joint build turned on
+  features the image lacked. With the published image a rental closed as soon as it started ("could not start:
+  link i/o: failed to fill whole buffer"), and the hashrate seller never saw it. The component now declares the
+  feature itself, so the image is built as the tests build it, and the Linux package's test passes with it.
+- **The release checks each image's build.** Before images are published, a check now compares the features each
+  image's own build gets with those the tests get, and stops on a difference nobody has looked at. The Linux
+  package's test also builds each component the way the published image is built.
+
 ## 0.2.8 (2026-11-03)
 
 Four small fixes to the wallet UI, from a hands-on run of 0.2.7. Only the wallet UI changes.

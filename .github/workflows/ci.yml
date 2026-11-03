@@ -49,6 +49,10 @@ jobs:
       # ureq, which is the patched copy under vendor/ureq
       - name: Fetch the dependencies Cargo.lock names
         run: cargo fetch --locked
+      # the published images build each crate alone (scripts/oci_build.sh), these steps build the workspace
+      # together: a feature only the joint build turns on would pass here and be missing from an image
+      - name: Each published build has the features the tests had
+        run: scripts/check_standalone_features.sh
       - name: Build
         run: cargo build --workspace --locked
       # a test binary that hangs is ended by its watchdog (crates/xbt-signer/tests/common/mod.rs,
