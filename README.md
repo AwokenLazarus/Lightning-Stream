@@ -127,8 +127,9 @@ by Luke Dashjr, who wrote the BLAKE2b proof of work; the signature hash that kee
 being replayed on the SHA-256 chain is Kyle Santiago's. Lightning on XBT is Paul Lamb's Lightning
 Fork, a fork of Lightning Labs' lnd, and PrivKey's Core Lightning fork. Paul also packages
 Knots-BLAKE2b and Lightning Fork for Umbrel and StartOS, and built the access grant the StartOS
-package uses. Hashrate rental is built around OCEAN's DATUM, and the Stream Gateway is CONVOY's
-datum_gateway (MIT) with a masking patch.
+package uses. Hashrate rental is built around OCEAN's DATUM. The Stream Gateway, which powers mining
+(hashrate) rental, is built on FlyTheElephant's datum_gateway (<https://github.com/FlyTheElephant1/datum_gateway>),
+itself built on CONVOY's datum_gateway (both MIT), with Lightning Stream's job masking added.
 
 Chris Guida's two reviews are why Lightning Stream is built on Lightning, and they narrowed what it
 claims. Kyle Santiago pointed out the slot and dust limits the ticket defaults are built around.

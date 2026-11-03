@@ -319,13 +319,19 @@ so it waits for that plumbing.
 
 ## The Stream Gateway that comes with the app
 
-The app runs its own gateway beside the renter: the **Stream Gateway (DATUM-compatible)**. It is CONVOY's
-`datum_gateway` (MIT, commit 971af86) with a patch that masks every job with a key of the gateway's own, a new
-key for each block template, and opens each job to the renter on `GET /xbt/job` (never the key). It runs as
+The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's datum_gateway
+(<https://github.com/FlyTheElephant1/datum_gateway>), with Lightning Stream's job masking added. The app's
+Hashrate page says so under **Your gateway**.
+
+The app runs its own gateway beside the renter: the **Stream Gateway (DATUM-compatible)**. It is FlyTheElephant's
+`datum_gateway` (MIT, master 280cf54, merged with CONVOY's 971af86, the fork it comes from) with a patch that
+masks every job with a key of the gateway's own, a new key for each block template, and opens each job to the
+renter on `GET /xbt/job` (never the key). In Lazarus Pool mode it never hands a miner a job whose coinbase pays
+the pool alone while the pool's split is late: the miner keeps its work until the split is in. It runs as
 `xbt-datum-gateway` in its own container: on Umbrel a `datum` service in the renter's network namespace, on
 StartOS a `datum` daemon in the package, on Linux a `datum` compose service. Its license and notice ship in
 the image (`/usr/share/xbt-datum-gateway/LICENSE`). "DATUM" names the protocol it speaks; the gateway is not
-OCEAN's or CONVOY's product.
+OCEAN's, CONVOY's or FlyTheElephant's product.
 
 **Your gateway** (Hashrate page) sets where its blocks pay:
 

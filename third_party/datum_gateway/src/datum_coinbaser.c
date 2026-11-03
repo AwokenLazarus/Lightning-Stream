@@ -911,7 +911,14 @@ void *datum_coinbaser_thread(void *ptr) {
 				s->available_coinbase_outputs_count = 0;
 				i = 0;
 			}
-			if (i>=0) {
+			// A pool's reply always carries at least one output (its own), so 0 while pooled
+			// means no reply: the fetch timed out or the reply was for another value. Publishing
+			// then would build every coinbase class without the split and mark the job ready,
+			// so a found block pays the pool alone. Ask again instead; miners keep their current
+			// work (or a new height's subsidy-only job) until the split is in.
+			if (i < 1 && datum_protocol_is_active()) {
+				DLOG_DEBUG("No coinbaser for job %d yet; asking again", sjob);
+			} else if (i>=0) {
 				DLOG_DEBUG("Generating coinbases for up to %d outputs", i);
 				generate_coinbase_txns_for_stratum_job(s, false);
 				if (need_coinbaser_rwlocks_init_done) {

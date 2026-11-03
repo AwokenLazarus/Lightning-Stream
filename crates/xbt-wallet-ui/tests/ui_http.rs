@@ -4738,6 +4738,11 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     let warned = "Umbrel&#39;s own DATUM Gateway app is for Bitcoin, and won&#39;t work here.";
     let warned_raw = "Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.";
     assert!(p.body.contains(warned) || p.body.contains(warned_raw), "{}", p.body);
+    // and the credit to the gateway it is built on, by its repository's name (never the DATUM Gateway product name)
+    let credit = "FlyTheElephant&#39;s datum_gateway</a>, with Lightning Stream&#39;s job masking.";
+    let credit_raw = "FlyTheElephant's datum_gateway</a>, with Lightning Stream's job masking.";
+    assert!(p.body.contains(credit) || p.body.contains(credit_raw), "the credit to FlyTheElephant: {}", p.body);
+    assert!(p.body.contains("https://github.com/FlyTheElephant1/datum_gateway"), "{}", p.body);
     assert!(!p.body.replace(warned, "").replace(warned_raw, "").contains("DATUM Gateway"), "never the product name otherwise: {}", p.body);
     assert!(p.body.contains("name=\"mode\" value=\"solo\" checked"), "solo is the default");
     assert!(p.body.contains("could hide a block it finds from the pool, the same as any DATUM miner can today"));
