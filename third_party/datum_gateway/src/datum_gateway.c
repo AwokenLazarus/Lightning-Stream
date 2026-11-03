@@ -200,6 +200,13 @@ int main(const int argc, const char * const * const argv) {
 		DLOG_FATAL("Error initializing the logger!");
 		exit(1);
 	}
+	if (datum_config.mining_save_submitblocks_dir[0]) {
+		char gitshort[8];
+		memset(gitshort, 0, sizeof(gitshort));
+		memcpy(gitshort, GIT_COMMIT_HASH, 7);
+		DLOG_INFO("submitblock save dir: %s (datum_submitblock_<height>_%s.json + datum_submitblock_last.json)",
+			datum_config.mining_save_submitblocks_dir, gitshort[0] ? gitshort : "unknown");
+	}
 	
 	if (datum_protocol_init()) {
 		DLOG_FATAL("Error initializing the DATUM protocol!");

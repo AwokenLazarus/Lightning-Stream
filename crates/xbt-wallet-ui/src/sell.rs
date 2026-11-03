@@ -215,6 +215,9 @@ pub struct OfferApp {
     /// service, before its paid route ([`free_routes`]). `None`: never chosen (the form offers
     /// [`DEFAULT_FREE_PATHS`] for a media server); `Some` of none: the seller chose none.
     pub free: Option<Vec<String>>,
+    /// The seller said to publish this media server's page with no way in for buyers (neither
+    /// accounts nor a guest login: [`no_buyer_login`]), so Save no longer asks. False by default.
+    pub no_login_ok: bool,
 }
 
 /// What a media server's page is offered as free paths: Jellyfin's and Plex's web client.
@@ -233,9 +236,33 @@ impl OfferApp {
 /// A service that looks like a media server's web app (Jellyfin, Plex, Emby): its web client is
 /// under `/web/`.
 fn looks_like_media_app(o: &Offer) -> bool {
-    let words = format!("{} {}", o.name, o.address).to_ascii_lowercase();
-    o.app.is_some() && (o.kind == Kind::Media || ["jellyfin", "plex", "emby"].iter().any(|w| words.contains(w))
-                        || o.app.as_ref().is_some_and(|a| a.entry.ends_with("/web/") || a.entry.contains("/web/index.html")))
+    o.app.as_ref().is_some_and(|a| media_server(o.kind, &o.name, &o.address).is_some() || a.entry.ends_with("/web/") || a.entry.contains("/web/index.html"))
+}
+
+/// The media server a service is, as the Sell page names it: Jellyfin, Emby or Plex when its name or address says so,
+/// "media server" when only its kind does. `None`: not a media server (a page at `/web/` alone is not one).
+fn media_server(kind: Kind, name: &str, address: &str) -> Option<&'static str> {
+    let words = format!("{name} {address}").to_ascii_lowercase();
+    [("jellyfin", "Jellyfin"), ("emby", "Emby"), ("plex", "Plex")].iter().find(|(w, _)| words.contains(w)).map(|(_, n)| *n)
+        .or((kind == Kind::Media).then_some("media server"))
+}
+
+/// What the Sell page says of a media server's web app shared with no way in for buyers: neither an account of their own
+/// nor a guest login, so they pay and land on the server's own sign-in page. Buyers' own accounts are Jellyfin's (and
+/// Emby's); a Plex is told of the guest login only.
+fn no_buyer_login(server: &str) -> String {
+    let fix = match server {
+        "Plex" => "Set a shared guest login.".to_string(),
+        "media server" => "Set a shared guest login, or, for Jellyfin or Emby, turn on \"Each buyer gets their own Jellyfin account\" (and paste an API key).".to_string(),
+        _ => "Turn on \"Each buyer gets their own Jellyfin account\" (and paste an API key), or set a shared guest login.".to_string(),
+    };
+    format!("Buyers will see your {server}'s sign-in page and can't get in. {fix}")
+}
+
+/// The media server `o` is ([`media_server`]) when its web app has no way in for buyers ([`no_buyer_login`]).
+fn media_without_buyer_login(o: &Offer) -> Option<&'static str> {
+    o.app.as_ref().filter(|a| a.accounts.as_ref().is_none_or(Vec::is_empty) && a.login.trim().is_empty())
+        .and(media_server(o.kind, &o.name, &o.address))
 }
 
 /// The paths a seller lists for an app, one per line or comma-separated: each starts with `/`.
@@ -563,6 +590,9 @@ fn offer_json(o: &Offer) -> Value {
         if let Some(f) = &a.free {
             v["app"]["free"] = json!(f);
         }
+        if a.no_login_ok {
+            v["app"]["no_login_ok"] = json!(true);
+        }
     }
     v
 }
@@ -589,7 +619,8 @@ fn offer_of(v: &Value) -> Option<Offer> {
             // an app saved before live connections were carried has them on
             OfferApp { base: t("base"), entry: t("entry"), login: t("login"), deny: list("deny"), allow: list("allow"), live: a.get("live").and_then(Value::as_bool).unwrap_or(true),
                        accounts: a.get("accounts").filter(|l| l.is_array()).map(|_| list("accounts")),
-                       free: a.get("free").filter(|l| l.is_array()).map(|_| list("free")) }
+                       free: a.get("free").filter(|l| l.is_array()).map(|_| list("free")),
+                       no_login_ok: a.get("no_login_ok").and_then(Value::as_bool).unwrap_or(false) }
         }).filter(|a| a.base.starts_with('/') && a.base.ends_with('/')),
         capacity: {
             let c = v.get("capacity");
@@ -1459,6 +1490,9 @@ impl App {
                 next_hint.push_str("<p class=\"hint warn\">Buyers' apps no longer have a player of their own: they use your media server's own web app. \
                     Edit this service and save it to share it that way. A list of films is no longer needed.</p>");
             }
+            if let Some(server) = media_without_buyer_login(o) {
+                next_hint.push_str(&format!("<p class=\"hint warn\">{}</p>", esc(&no_buyer_login(server))));
+            }
             next_hint.push_str(&now);
             let btn = |action: &str, label: &str, class: &str| format!("<form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                 <input type=\"hidden\" name=\"id\" value=\"{}\"><button{class}>{label}</button></form>", esc(&o.id));
@@ -1519,10 +1553,17 @@ impl App {
             <details{}><summary>Buyers' accounts</summary>\
             <label>Your Jellyfin API key <small>({})</small><input name=\"app_key\" type=\"password\" autocomplete=\"off\" class=\"mono\"></label>\
             <p class=\"hint\">Make one in Jellyfin under Dashboard, API Keys. The shop makes each buyer's account with it. It stays on this box, \
-            beside the shop's own keys, and is never shown again. Buyers who stay anonymous use the guest login below, if you give one.</p>{libraries}</details>",
+            beside the shop's own keys, and is never shown again. Buyers who stay anonymous use the guest login below, if you give one.</p>{libraries}</details>\
+            <label class=\"check\"><input type=\"checkbox\" name=\"app_no_accounts\" value=\"1\"{}> Publish without buyer accounts anyway \
+            <small>(a media server with neither accounts for buyers nor a guest login shows them its sign-in page)</small></label>",
             if fv("app_accounts", if saved_libs.is_some() { "1".into() } else { String::new() }) == "1" { " checked" } else { "" },
             if saved_libs.is_some() && saved_key.is_none() { " open" } else { "" },
-            if saved_key.is_some() { "saved: leave empty to keep it" } else { "Dashboard, API Keys" });
+            if saved_key.is_some() { "saved: leave empty to keep it" } else { "Dashboard, API Keys" },
+            if fv("app_no_accounts", if editing.and_then(|o| o.app.as_ref()).is_some_and(|a| a.no_login_ok) { "1".into() } else { String::new() }) == "1" {
+                " checked"
+            } else {
+                ""
+            });
         let kind = Kind::parse(&fv("kind", editing.map(|o| o.kind.id().to_string()).unwrap_or_else(|| "media".into()))).unwrap_or(Kind::Media);
         // what was chosen; where nothing was, /web/ for what looks like Jellyfin or Plex
         let free_default = match editing.and_then(|o| o.app.as_ref()).and_then(|a| a.free.as_ref()) {
@@ -1797,7 +1838,7 @@ impl App {
                 let mut accounts_key: Option<String> = None;
                 // a media server is sold as its own web app: buyers use it as they would at home, with no player of
                 // the app's own
-                let app = if kind == Kind::Files {
+                let mut app = if kind == Kind::Files {
                     None
                 } else if g("app") == "1" || kind == Kind::Media {
                     // a media server's page uses paths all over the service (Jellyfin: /web/, /Users/, /Items/…); an AI model's or a web app's, its own path
@@ -1848,7 +1889,7 @@ impl App {
                         Some(t) => Some(free_paths(t)?),
                         None => shop.offers.iter().find(|o| o.id == new_id).and_then(|o| o.app.as_ref()).and_then(|a| a.free.clone()),
                     };
-                    Some(OfferApp { base, entry, login, deny, allow, live: g("app_live") == "1", accounts, free })
+                    Some(OfferApp { base, entry, login, deny, allow, live: g("app_live") == "1", accounts, free, no_login_ok: false })
                 } else {
                     None
                 };
@@ -1867,6 +1908,17 @@ impl App {
                     max_streams_per_buyer: limit("cap_streams_buyer", "Most streams for one buyer")?,
                     max_mbit: limit("cap_mbit", "Most Mbit/s together")?,
                 };
+                // a media server shared with no way in for buyers: they would pay and land on its sign-in page. Saved only
+                // once the seller says so, which is kept with the offer: a later edit does not ask again
+                if let Some(a) = app.as_mut().filter(|a| a.accounts.as_ref().is_none_or(Vec::is_empty) && a.login.trim().is_empty()) {
+                    if let Some(server) = media_server(kind, &name, &address) {
+                        let said = shop.offers.iter().find(|o| o.id == new_id).and_then(|o| o.app.as_ref()).is_some_and(|a| a.no_login_ok);
+                        if g("app_no_accounts") != "1" && !said {
+                            return Err(format!("{} To publish it as it is, tick \"Publish without buyer accounts anyway\" and save again.", no_buyer_login(server)));
+                        }
+                        a.no_login_ok = true;
+                    }
+                }
                 let strip = g("strip") == "1" || kind == Kind::Files;
                 let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip, titles, app, capacity };
                 match shop.offers.iter_mut().find(|o| o.id == new_id) {
@@ -2162,9 +2214,24 @@ mod tests {
         assert_eq!(s.free_path("x402", Kind::Web, "c"), "/x402-2/");
         // a web app whose page sees the root holds it as well
         s.offers.push(Offer { id: "w".into(), paths: vec!["/w/".into()],
-                              app: Some(OfferApp { base: "/".into(), entry: "/".into(), login: String::new(), deny: vec![], allow: vec![], live: false, accounts: None, free: None }),
+                              app: Some(OfferApp { base: "/".into(), entry: "/".into(), login: String::new(), deny: vec![], allow: vec![], live: false, accounts: None, free: None, no_login_ok: false }),
                               ..s.offers[0].clone() });
         s.offers.retain(|o| o.id != "a");
         assert_eq!(s.free_path("Films", Kind::Media, "a"), "/films/");
+    }
+
+    #[test]
+    fn a_media_server_without_a_way_in_for_buyers_is_named_and_told_its_own_fix() {
+        assert_eq!(media_server(Kind::Web, "Laz Flix", "http://jellyfin.lan:8096"), Some("Jellyfin"));
+        assert_eq!(media_server(Kind::Other, "Emby", "http://10.0.0.2:8096"), Some("Emby"));
+        assert_eq!(media_server(Kind::Media, "Films", "http://plex.lan:32400"), Some("Plex"));
+        assert_eq!(media_server(Kind::Media, "Films", "http://10.0.0.2:8096"), Some("media server"));
+        assert_eq!(media_server(Kind::Web, "Wiki", "http://10.0.0.2:80"), None, "a page at /web/ alone is no media server");
+        let jf = no_buyer_login("Jellyfin");
+        assert!(jf.starts_with("Buyers will see your Jellyfin's sign-in page and can't get in.") && jf.contains("Each buyer gets their own Jellyfin account"), "{jf}");
+        assert!(no_buyer_login("Emby").contains("Each buyer gets their own Jellyfin account"));
+        let plex = no_buyer_login("Plex");
+        assert!(plex.contains("your Plex's sign-in page") && plex.contains("Set a shared guest login") && !plex.contains("account"), "{plex}");
+        assert!(no_buyer_login("media server").contains("your media server's sign-in page"));
     }
 }

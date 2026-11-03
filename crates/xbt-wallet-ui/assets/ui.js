@@ -497,12 +497,17 @@
           .catch(function () { add.disabled = false; });
       });
     }
+    // the credit is the signer's with the shop: every visit, AI call and player link using that shop draws on it
+    var sharedNote = " (shared with your other uses of this shop)";
     function ask() {
       fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
         if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
         if (limitEl && typeof v.limit_sats === "number") limitEl.textContent = v.limit_sats.toLocaleString();
-        var near = typeof v.spent_sats === "number" && typeof v.limit_sats === "number" && v.spent_sats >= 0.8 * v.limit_sats;
-        if (add) add.hidden = !(near || v.limit_reached);
+        // Add shows once 80% of the limit is used, or at the limit: never at the start of a visit. What was used, not what
+        // was paid ahead (an older connector's spent_sats counts the first ticket, most of a small limit)
+        var used = typeof v.used_sats === "number" ? v.used_sats : v.spent_sats;
+        var near = typeof used === "number" && typeof v.limit_sats === "number" && v.limit_sats > 0 && used > 0 && used >= 0.8 * v.limit_sats;
+        if (add) add.hidden = v.ended && !v.limit_reached ? true : !(near || v.limit_reached === true);
         if (state) {
           if (v.limit_reached) { state.textContent = "Limit reached"; state.className = "pill warn"; }
           else if (!v.ended) { state.textContent = "Open"; state.className = "pill good"; }
@@ -510,8 +515,10 @@
         // at its limit the visit waits for the owner: the page stays as it is, and Add lets it go on
         if (v.limit_reached) return;
         if (paid) paid.textContent = typeof v.prepaid_sats === "number" && v.prepaid_sats > 0
-          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat" + (typeof v.credit_sats === "number" ? " · credit left " + v.credit_sats.toLocaleString() + " sat" : "")
-          : typeof v.credit_left_sats === "number" ? " · from your credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat left" : "";
+          ? " · paid " + v.prepaid_sats.toLocaleString() + " sat"
+            + (typeof v.tickets_bought === "number" && v.tickets_bought > 0 ? " for " + v.tickets_bought + (v.tickets_bought === 1 ? " ticket" : " tickets") : "")
+            + (typeof v.credit_sats === "number" ? " · credit left with the shop: " + v.credit_sats.toLocaleString() + " sat" + sharedNote : "")
+          : typeof v.credit_left_sats === "number" ? " · credit with the shop: " + v.credit_left_sats.toLocaleString() + " sat" + sharedNote : "";
         if (refusal) showRefusal(v.refusal);
         if (v.ended) ended(String(v.ended));
       }).catch(function () {});

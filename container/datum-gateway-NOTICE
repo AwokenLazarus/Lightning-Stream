@@ -2,11 +2,19 @@ Stream Gateway (DATUM-compatible), as shipped in Lightning Stream's xbt-datum-ga
 This binary: @BUILD@, built from Lightning Stream commit @COMMIT@@LOCAL@
 (https://github.com/AwokenLazarus/Lightning-Stream/tree/@COMMIT@).
 
-It is CONVOY's datum_gateway (https://github.com/CONVOYMining/datum_gateway, commit
-971af86b93de088e217a9e74d1ac70188565dbb7), MIT licensed (datum_gateway.LICENSE), with Lightning Stream's
+The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's datum_gateway
+(https://github.com/FlyTheElephant1/datum_gateway), with Lightning Stream's job masking added.
+
+It is FlyTheElephant's datum_gateway (https://github.com/FlyTheElephant1/datum_gateway, master at commit
+@UPSTREAM_FTE@), merged with CONVOY's datum_gateway
+(https://github.com/CONVOYMining/datum_gateway, commit @UPSTREAM_CONVOY@), from which FlyTheElephant's
+fork descends: OCEAN's datum_gateway as CONVOY maintains it, with FlyTheElephant's performance and logging
+changes. MIT licensed (datum_gateway.LICENSE: Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and
+individual contributors, FlyTheElephant and CONVOY's contributors among them). With Lightning Stream's
 changes: every job is masked with a fresh key the gateway holds, so a hasher cannot tell which share is a
 block, and each job can be opened (without its key) on the gateway's loopback API at /xbt/job for the
-renter's check. The licence grants no right to the DATUM name or other marks of their owners: "DATUM" is
+renter's check; and a pooled miner is never handed a full template whose coinbase pays the pool alone
+(the late-coinbaser fix). The licence grants no right to the DATUM name or other marks of their owners: "DATUM" is
 used here only to say which protocol it speaks.
 
 SPDX-License-Identifier: MIT AND ISC AND curl AND (LGPL-2.1-or-later OR eCos-2.0) AND LGPL-2.0-or-later AND (MIT OR Apache-2.0)

@@ -183,8 +183,13 @@ impl App {
     }
 
     /// The address of this UI as the browser reached it, for a link another device opens:
-    /// `http(s)://<Host><base path>`. The Host was checked against the allowed names already.
+    /// `http(s)://<Host><base path>`. The Host was checked against the allowed names already. Where the
+    /// links have a port of their own (`XBT_UI_LINKS_BIND`), that port's address instead.
     fn link_base(&self, req: &Req) -> String {
+        // the links' own port (a platform's login is in front of this page's): its address, by IP where this page was
+        if let Some(base) = self.relays.served_at().and_then(|a| crate::relay::links_base(self.cfg.links_url.as_deref(), a.port(), req.header("host"))) {
+            return base;
+        }
         let https = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
         let host = req.header("host").trim();
         let base = if self.cfg.base_path.ends_with('/') { self.cfg.base_path.clone() } else { format!("{}/", self.cfg.base_path) };
@@ -291,7 +296,12 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
         if sort == Sort::Name { "<strong aria-current=\"true\">name</strong>".to_string() } else { format!("<a href=\"./browse?cat={cat}\">name</a>") },
         if sort == Sort::Price { "<strong aria-current=\"true\">price</strong>".to_string() } else { format!("<a href=\"./browse?cat={cat}&amp;sort=price\">price</a>") }));
     if shown.is_empty() {
-        b.push_str("<p class=\"empty\">No services in this category yet. <a href=\"./browse\">Show all</a></p>");
+        // miners for rent are listed on the Hashrate page, from the offers shops publish, not on the list of sellers
+        b.push_str(if cat == "hashrate" {
+            "<p class=\"empty\">Miners for rent are listed on the <a href=\"./hashrate\">Hashrate</a> page. <a href=\"./browse\">Show all</a></p>"
+        } else {
+            "<p class=\"empty\">No services in this category yet. <a href=\"./browse\">Show all</a></p>"
+        });
         return b;
     }
     b.push_str("<div class=\"grid services\">");
@@ -490,9 +500,11 @@ fn bytes_words(n: u64) -> String {
 }
 
 /// `6 hours`, `90 minutes`, `45 seconds`.
+/// How long a link lasts, or has left, rounded to the nearest hour or minute: a link made for 6 hours says
+/// "6 hours left" just after, as its flash said (0.2.6 cut it down to "5 hours left" a second later).
 fn lasts(d: std::time::Duration) -> String {
     let s = d.as_secs();
-    let (n, unit) = if s >= 7200 { (s / 3600, "hour") } else if s >= 120 { (s / 60, "minute") } else { (s, "second") };
+    let (n, unit) = if s >= 7200 { ((s + 1800) / 3600, "hour") } else if s >= 120 { ((s + 30) / 60, "minute") } else { (s, "second") };
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
@@ -920,6 +932,40 @@ mod tests {
         let after = link_use(1_400_000_000, false, false, per);
         assert!(after.contains("Carried 1.40 GB, about 1,400 sat") && !after.contains("Playing"), "{after}");
         assert_eq!(bytes_words(800), "800 bytes");
+    }
+
+    /// A new player link's flash and its row say the same time left.
+    ///
+    /// FAILS before (0.2.6): "stops working in 6 hours", then "5 hours left" a second later.
+    #[test]
+    fn a_new_links_time_left_matches_its_flash() {
+        use std::time::Duration;
+        assert_eq!(lasts(Duration::from_secs(6 * 3600)), "6 hours");
+        assert_eq!(lasts(Duration::from_secs(6 * 3600 - 2)), "6 hours");
+        assert_eq!(lasts(Duration::from_secs(5 * 3600 + 1700)), "5 hours");
+        assert_eq!(lasts(Duration::from_secs(10 * 60 - 1)), "10 minutes");
+        assert_eq!(lasts(Duration::from_secs(45)), "45 seconds");
+    }
+
+    /// Each category's count is what its list shows, the box's own shop included; Hashrate with nothing listed leads to
+    /// the Hashrate page, where miners for rent are.
+    #[test]
+    fn a_categorys_count_matches_its_list() {
+        let section = xbt402::listing::Section { name: "Laz Hash".into(), kind: "hashrate".into(), path: "/hashrate/".into(),
+            prices: json!({"request_msat": "40000"}), items: vec![], licence: String::new(), credits: String::new() };
+        let l = xbt402::listing::Listing { name: "Box".into(), kind: "hashrate".into(), seller: "https://box.example".into(), receipt_key: String::new(),
+            prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
+        let all = services::from_listing(&l);
+        for own in [false, true] {
+            let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| own);
+            assert!(html.contains("Hashrate <span class=\"count\">1</span>"), "{html}");
+            assert_eq!(html.matches("class=\"card service-card\"").count(), 1, "{html}");
+        }
+        let html = browse_html(&all, "data", Sort::Name, "", &|_| false);
+        assert!(html.contains("No services in this category yet"), "{html}");
+        let none: Vec<Service> = vec![Service { kind: Kind::Ai, ..all[0].clone() }];
+        let html = browse_html(&none, "hashrate", Sort::Name, "", &|_| false);
+        assert!(html.contains("Miners for rent are listed on the <a href=\"./hashrate\">Hashrate</a> page") && !html.contains("No services in this category"), "{html}");
     }
 
     #[test]

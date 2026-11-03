@@ -316,7 +316,7 @@ impl Gateway {
     /// service. A refused login (an expired or revoked token) is made again once.
     pub(super) fn send_as_account(&self, route: &Route, req: &Request, acc: &Account, session: &str) -> Result<Result<Answer, (u16, Value)>, crate::Error> {
         let base = self.service_base(route);
-        let up = self.upstreams.get(&base).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
+        let up = self.upstream_for(route).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
         let target = route.upstream_target(&req.target);
         let send = |a: &Account| -> Result<Result<Answer, (u16, Value)>, crate::Error> {
             match self.as_account(route, a, &req.method, &target, &forwarded(route, &req.headers)) {

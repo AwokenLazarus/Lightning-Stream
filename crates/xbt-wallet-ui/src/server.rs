@@ -217,6 +217,10 @@ impl xbt_svc::http::Handler for Ui {
     /// relayed from the connector as it streams, with the reader's `Range`. Everything else is
     /// [`Self::handle`]. A seller's media server is a web app ([`crate::seller_app`]): this UI has no
     /// player of its own.
+    ///
+    /// A player's `HEAD /r/<token>` (some ask that first) passes the same gate as its `GET` (token,
+    /// expiry, revocation, the file still listed) and is answered here, with no body ([`link_head`]):
+    /// the connector is not called, so nothing is paid, and the link's use is not counted.
     fn reply(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Reply {
         if let Some(mut r) = foreign_refused(&rq.method.to_uppercase(), &rq.target, &self.0.cfg.base_path, &rq.headers) {
             security_headers(&mut r);
@@ -225,13 +229,17 @@ impl xbt_svc::http::Handler for Ui {
         let peer = rq.peer.map(|a| a.ip().to_string()).unwrap_or_default();
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
-        let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: vec![], peer };
+        let method = rq.method.to_uppercase();
+        let head = method == "HEAD" && strip_base(raw_path, &self.0.cfg.base_path).is_some_and(|p| p.starts_with("/r/"));
+        // a link's HEAD is gated as its GET
+        let req = Req { method: if head { "GET".into() } else { method }, path: raw_path.to_string(), query: parse_qs(q), headers, body: vec![], peer };
         match self.0.relay_gate(&req) {
             None => xbt_svc::http::Reply::Whole(self.handle(rq)),
             Some(Err(mut resp)) => {
                 security_headers(&mut resp);
                 xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(resp.status, resp.headers, resp.body))
             }
+            Some(Ok(Some(item))) if head => link_head(&self.0, &item),
             Some(Ok(item)) => {
                 // for /s/~<stream token>/, the seller URL is everything after the token, its own query included
                 let item = item.unwrap_or_else(|| {
@@ -268,6 +276,82 @@ impl xbt_svc::http::Handler for Ui {
                 }
             }
         }
+    }
+}
+
+/// The answer to a player's `HEAD` of a live link for `item`: what its `GET` answers when the file is
+/// sent whole (`200`, the type its URL names, ranges taken, its length where its listing gives it in
+/// bytes), and no body. The connector is not asked: any request of it is a paid call. A `Range` is
+/// ignored, as HTTP has it for `HEAD`.
+fn link_head(app: &App, item: &str) -> xbt_svc::http::Reply {
+    let size = app.services().ok().and_then(|all| crate::services::find_item(&all, item).and_then(|(_, it)| exact_bytes(&it.credit)));
+    let headers = vec![("Content-Type".to_string(), media_type_of(item).to_string()), ("Accept-Ranges".into(), "bytes".into()),
+                       ("Cache-Control".into(), "no-store".into()), ("X-Content-Type-Options".into(), "nosniff".into()),
+                       ("Cross-Origin-Resource-Policy".into(), "same-origin".into())];
+    xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed { status: 200, headers, length: size, body: Box::new(|_| Ok(())) })
+}
+
+/// A listing's size when it is exact (`N bytes`); a rounded one (`1.2 GB`) is no `Content-Length`.
+fn exact_bytes(words: &str) -> Option<u64> {
+    words.trim().strip_suffix(" bytes").and_then(|n| n.trim().parse().ok())
+}
+
+/// A file's media type from its URL's extension, for a `HEAD` the seller is not asked about.
+fn media_type_of(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let ext = path.rsplit_once('/').map_or(path.as_str(), |(_, f)| f).rsplit_once('.').map_or("", |(_, e)| e);
+    match ext {
+        "mp4" | "m4v" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "ts" => "video/mp2t",
+        "m3u8" => "application/vnd.apple.mpegurl",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The player links' own listener (`XBT_UI_LINKS_BIND`): `GET /r/<token>` (and its `HEAD`), through the UI's own
+/// relay ([`Ui::reply`]: the same checks, limits, counting and revocation), and nothing else: no page,
+/// no action, no download, no API. It is for a platform whose login sits in front of the UI's port
+/// (umbrelOS's app login), which a player on another device cannot pass.
+struct Links(Arc<App>);
+
+impl Links {
+    /// Whether this listener answers the request: a `GET` or `HEAD` of `/r/<something>` (the token is checked by the relay).
+    fn serves(&self, rq: &xbt_svc::http::Request) -> bool {
+        let path = rq.target.split('?').next().unwrap_or("");
+        (rq.method.eq_ignore_ascii_case("GET") || rq.method.eq_ignore_ascii_case("HEAD")) && self.0.cfg.role != crate::config::Role::Gateway
+            && strip_base(path, &self.0.cfg.base_path).is_some_and(|p| p.strip_prefix("/r/").is_some_and(|t| !t.is_empty()))
+    }
+
+    fn not_found() -> xbt_svc::http::Response {
+        let mut r = Resp::text(404, "text/plain", "not found: this port serves only links for your player");
+        security_headers(&mut r);
+        xbt_svc::http::Response::new(r.status, r.headers, r.body)
+    }
+}
+
+impl xbt_svc::http::Handler for Links {
+    fn body_limit(&self, _method: &str, _target: &str) -> usize {
+        0
+    }
+
+    fn handle(&self, _rq: xbt_svc::http::Request) -> xbt_svc::http::Response {
+        Self::not_found()
+    }
+
+    fn reply(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Reply {
+        if !self.serves(&rq) {
+            return xbt_svc::http::Reply::Whole(Self::not_found());
+        }
+        xbt_svc::http::Handler::reply(&Ui(self.0.clone()), rq)
     }
 }
 
@@ -530,6 +614,8 @@ pub struct Running {
     apps: Vec<xbt_svc::http::Stop>,
     /// Where the shared folder is served ([`crate::files`]), when the box sells.
     pub files_addr: Option<std::net::SocketAddr>,
+    /// Where the player links' own listener answers (`XBT_UI_LINKS_BIND`), when it is set.
+    pub links_addr: Option<std::net::SocketAddr>,
 }
 
 impl Drop for Running {
@@ -571,7 +657,26 @@ pub fn spawn(app: Arc<App>) -> Result<Running, String> {
             None
         }
     };
-    Ok(Running { addr: run.addr, stop: run.stopper(), app_ports, apps, files_addr })
+    // the player links' own port, where the platform's login is in front of this one
+    let links_addr = match links_server(&app) {
+        Ok(Some(l)) => {
+            apps.push(l.stopper());
+            app.relays.set_served_at(l.addr);
+            Some(l.addr)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("xbt-wallet-ui: player links are not served on their own port (the page gives this one's address): {e}");
+            None
+        }
+    };
+    Ok(Running { addr: run.addr, stop: run.stopper(), app_ports, apps, files_addr, links_addr })
+}
+
+fn links_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String> {
+    let Some(bind) = app.cfg.links_bind.as_deref().filter(|_| app.cfg.role != crate::config::Role::Gateway) else { return Ok(None) };
+    let l = std::net::TcpListener::bind(bind).map_err(|e| format!("bind {bind}: {e}"))?;
+    xbt_svc::http::serve(Arc::new(Links(app.clone())), l, app.cfg.threads).map(Some).map_err(|e| format!("serve: {e}"))
 }
 
 fn files_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String> {

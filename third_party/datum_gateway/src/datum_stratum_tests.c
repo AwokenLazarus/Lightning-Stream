@@ -401,9 +401,11 @@ static void datum_blake2b_coinbase_selection_tests(void) {
 	sdata->full_coinbase_ready = true;
 	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 0);
 	job.job_state = JOB_STATE_FULL_PRIORITY_WAIT_COINBASER;
-	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 3);
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == COINBASE_TYPE_YUGE);
 	miner.coinbase_selection = MAX_COINBASE_TYPES;
-	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 0);
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == COINBASE_TYPE_YUGE);
+	miner.coinbase_selection = 2;
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == COINBASE_TYPE_YUGE);
 	free(sdata);
 }
 

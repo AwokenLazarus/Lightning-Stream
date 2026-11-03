@@ -286,6 +286,16 @@ fn rent_offers(base: &str, token: &Option<PathBuf>, keep: bool) -> Result<Value,
 /// Nothing is fetched for it: anyone can publish an offer with any address, and asking that address would
 /// tell its publisher this box's IP, and reach whatever it names. 0.2.5 said "stream.example" for a shop
 /// with a name.
+/// Under an offer's name: whose it is, with its address. This box's own offer is marked, and says it is not rented here.
+pub(crate) fn own_offer_note(mine: bool, seller: &str) -> String {
+    let at = if seller.is_empty() { String::new() } else { format!("<p class=\"small\">Sold by {}</p>", esc(seller)) };
+    if mine {
+        format!("<span class=\"pill good\">Your offer</span>{at}<p class=\"hint\">This is your own box's offer: buyers rent it. You can't rent it from here.</p>")
+    } else {
+        at
+    }
+}
+
 pub(crate) fn offer_seller(known: &[crate::services::Service], pay_url: &str) -> String {
     let Some(origin) = crate::services::http_origin(pay_url) else { return String::new() };
     let host = crate::services::short_address(&origin);
@@ -964,8 +974,8 @@ impl App {
                         (n, false) if n.eq_ignore_ascii_case("hashrate") || n.eq_ignore_ascii_case("miners") => format!("Miners from {seller}"),
                         (n, _) => n.to_string(),
                     };
-                    let whose = if mine { "<span class=\"pill good\">Your offer</span><p class=\"hint\">This is your own box's offer: buyers rent it. You can't rent it from here.</p>".to_string() }
-                                else if seller.is_empty() { String::new() } else { format!("<p class=\"small\">Sold by {}</p>", esc(&seller)) };
+                    // the offer's address beside its name, your own too (0.2.6 named the shop only on other people's offers)
+                    let whose = own_offer_note(mine, &seller);
                     let old = if old {
                         "<p class=\"hint\"><span class=\"pill warn\">Needs updating</span> This hashmaker's app doesn't prove the work it sells, so it can't be rented.</p>"
                     } else {
@@ -986,6 +996,14 @@ impl App {
                         <span class=\"btn-why\"{off_tip}><button class=\"secondary\"{}>Try one slice first</button></span></form>",
                         esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { " and its start fee" } else { "" }, sats_n((price + fee).ceil()),
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
+                    // your own offer: what it is and what it costs, with nothing to allow, try or rent (a box can't pay itself)
+                    if mine {
+                        b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
+                            <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}</section>",
+                            esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
+                            if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() }));
+                        continue;
+                    }
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
                         <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
@@ -1221,7 +1239,9 @@ impl App {
             let s = saved.clone().unwrap_or_else(|| Settings::new(Mode::Solo, ""));
             o.push_str(&format!("<p>The {NAME} comes with this app and runs beside it. It masks every job it hands out, so a hashmaker can't tell \
                 which shares win, and it takes its work from your own XBT node.</p>\
-                <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>"));
+                <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>\
+                <p class=\"small\">Built on <a href=\"https://github.com/FlyTheElephant1/datum_gateway\" target=\"_blank\" rel=\"noopener noreferrer\">FlyTheElephant's \
+                datum_gateway</a>, with Lightning Stream's job masking.</p>"));
             if b["inUse"] == true {
                 let node = b["node"].as_bool();
                 o.push_str("<ul class=\"plain\">");

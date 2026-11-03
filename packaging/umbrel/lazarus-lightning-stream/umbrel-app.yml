@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.2.6"
+version: "0.2.7"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -53,6 +53,9 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.2.7: Stop ends a visit completely; a visit buys tickets only as needed and says exactly what it
+  paid; long AI answers work; player links open in VLC and other players; plain names for limits; the
+  Stream Gateway is built on FlyTheElephant's datum_gateway.
   0.2.6, the public testing release: your rules are checked before a ticket and a limit says plainly
   where to raise it; starter rules fit a film; selling Jellyfin 10.11+ works; free page files for web
   apps; exact paid amounts; agents can list what they may buy; plain words throughout.

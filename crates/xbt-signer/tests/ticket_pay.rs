@@ -260,13 +260,14 @@ impl Handler for Service {
         if (path.starts_with("/v1/") || path.starts_with("/dear/v1/")) && req.method == "POST" {
             // a stand-in model: `x_n` tokens of output (at most max_tokens), 7 of input, streamed when asked; its
             // usage says `x_usage` where given (a model whose chunks are not one token each); `x_pause_ms` between chunks,
-            // `x_chunk` the text of each
+            // `x_chunk` the text of each; `x_wait_ms` before a whole answer (the model writing all of it first)
             let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             let n = v["x_n"].as_u64().unwrap_or(10).min(v["max_tokens"].as_u64().unwrap_or(u64::MAX));
             let said = v["x_usage"].as_u64().unwrap_or(n);
             let pause = Duration::from_millis(v["x_pause_ms"].as_u64().unwrap_or(0));
             let chunk = v["x_chunk"].as_str().unwrap_or("tok").to_string();
             if v["stream"] != true {
+                std::thread::sleep(Duration::from_millis(v["x_wait_ms"].as_u64().unwrap_or(0)));
                 let body = json!({"choices": [{"message": {"content": "abcd".repeat(n as usize)}}], "usage": {"prompt_tokens": 7, "completion_tokens": n}});
                 return Reply::Whole(Response::text(200, "application/json", body.to_string()));
             }
@@ -2742,10 +2743,11 @@ fn a_call_that_asks_is_told_on_its_socket_when_it_is_paid_for_before_the_head() 
     r.assert_booked();
 }
 
-/// A caller that asked to be told (`stream_paid`, the AI address) and is gone by the time its
-/// request is paid for (its socket not there) is sent nothing: the request does not leave, the
-/// answer says so (`request_sent` false, no status), and the ticket bought for it stays with the
-/// seller as credit, which the next call spends without buying another.
+/// A caller that asked to be told (`stream_paid`, the AI address) and is gone before its request is
+/// paid for (its socket not there) is sent nothing and bought nothing: the request does not leave,
+/// the answer says so (`request_sent` false, no status), and no ticket is bought for it (since
+/// 0.2.7: before, one was, and stayed with the seller as credit). The next call, to a caller that is
+/// there, buys the one ticket.
 ///
 /// FAILS before: the request left for the seller whatever became of the caller, so the AI address,
 /// which had gone on to another seller, had one answer paid to two.
@@ -2762,9 +2764,9 @@ fn a_call_whose_caller_is_gone_once_it_is_paid_for_is_not_sent() {
                                         "stream_paid": true}));
     assert_eq!((v["rule"].as_str(), v["request_sent"].as_bool()), (Some("ticket_caller_gone"), Some(false)), "{v}");
     assert!(v["status"].is_null(), "{v}");
-    assert_eq!(v["tickets_prepaid"].as_u64(), Some(1), "the ticket was bought before the request would have left: {v}");
+    assert_eq!((v["tickets_prepaid"].as_u64(), v["charged_sats"].as_i64()), (Some(0), Some(0)), "a ticket was bought for a caller that had gone: {v}");
     assert!(r.tap.seen("/page/11").iter().all(|s| !s.paid), "the seller got no paid request");
-    // the next call, to a caller that is there, spends that credit: no second ticket
+    // the next call, to a caller that is there, buys the one ticket
     let l = UnixListener::bind(dir.path().join("here")).unwrap();
     let reader = std::thread::spawn(move || {
         let (s, _) = l.accept().unwrap();
@@ -2775,7 +2777,7 @@ fn a_call_whose_caller_is_gone_once_it_is_paid_for_is_not_sent() {
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/11"), "max_sats": CALL, "task": "film", "stream_to": "here", "stream_head": true,
                                         "stream_paid": true}));
     let got = reader.join().unwrap();
-    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(0), Some(true)), "{v}");
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), v["request_sent"].as_bool()), (Some(200), Some(1), Some(true)), "{v}");
     assert!(got.starts_with("{\"paid\":true}\n"), "{got}");
     assert_eq!(r.tap.seen("/page/11").iter().filter(|s| s.paid).count(), 1, "one paid request reached the seller");
     std::env::remove_var("B2_STREAM_DIR");
@@ -4511,6 +4513,76 @@ fn a_model_priced_by_the_token_is_paid_for_its_tokens_and_its_receipt_checked() 
     // a smaller max_tokens is a smaller bound
     let v = call(json!({"messages": [], "x_n": 3, "max_tokens": 100}), 5);
     assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+}
+
+/// A model's whole answer (no `stream`), streamed on to its caller as the AI endpoint asks for it (`stream_to`,
+/// `stream_paid`): its head comes only once the model has written all of it, a minute or more for a few thousand
+/// tokens. The wallet waits for it as long as the seller's gateway waits for its model
+/// (`xbt402::tokens::WHOLE_ANSWER_S`), past `tickets.read_timeout_s` and the call's deadline (`max_answer_s`), and
+/// it is charged its tokens exactly. Here those two are 3 s and 6 s and the model takes 8 s: the same wait as a
+/// model taking 35 s or 60 s against the shipped 30 s and 50 s, in a fraction of the time.
+///
+/// FAILS before: the head was waited for at most `read_timeout_s` (30 s as shipped) within the call's deadline
+/// (50 s), and the answer was "the seller gave no answer to the paid request".
+#[test]
+fn a_whole_model_answer_slower_than_the_read_timeout_and_the_calls_deadline_is_waited_for() {
+    use std::io::{BufRead as _, BufReader, Read as _};
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    // the seller waits for its model past the 8 s whatever its own default for a model's route
+    UPSTREAM_WAIT_SECS.store(40, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"read_timeout_s": 3, "max_answer_s": 6}}));
+    UPSTREAM_WAIT_SECS.store(UPSTREAM_WAIT_DEFAULT_SECS, Ordering::SeqCst);
+    let l = std::os::unix::net::UnixListener::bind(dir.path().join("ai-slow")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut b = BufReader::new(s);
+        let mut lines = vec![];
+        for _ in 0..2 {
+            let mut line = String::new();
+            b.read_line(&mut line).unwrap();
+            lines.push(serde_json::from_str::<Value>(&line).unwrap_or(Value::Null));
+        }
+        let mut rest = vec![];
+        let _ = b.read_to_end(&mut rest);
+        (lines, rest)
+    });
+    let t = Instant::now();
+    let body = json!({"messages": [{"role": "user", "content": "hello"}], "x_n": 12, "max_tokens": 50, "x_wait_ms": 8_000});
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/v1/chat/completions"), "method": "POST", "body": body.to_string(), "max_sats": CALL,
+                                       "task": "film", "stream_to": "ai-slow", "stream_head": true, "stream_paid": true}));
+    assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "an answer whose head took 8 s: {v}");
+    assert!(t.elapsed() >= Duration::from_secs(8), "{:?}", t.elapsed());
+    // 7 tokens in at 4 sat the 1,000 (28 msat), 12 out at 20 (240 msat)
+    assert_eq!((v["price_msat"].as_str(), v["complete"].as_bool()), (Some("268"), Some(true)), "{v}");
+    assert!(v.get("seller_fault").is_none(), "{v}");
+    let (lines, rest) = reader.join().unwrap();
+    assert_eq!((lines[0].clone(), lines[1]["status"].as_u64()), (json!({"paid": true}), Some(200)), "{lines:?}");
+    let answer: Value = serde_json::from_slice(&rest).unwrap();
+    assert_eq!(answer["usage"]["completion_tokens"], 12);
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A caller that streams its answer to a socket (`stream_to`) and leaves before the answer begins (a visit stopped while
+/// its request was being paid for) is bought nothing more: the call ends without releasing a ticket for the head, and the
+/// request is not sent.
+///
+/// FAILS before: the wallet went on paying for the head of an answer nobody would read, released a ticket for it and
+/// sent the request, and only then found the caller's socket gone.
+#[test]
+fn a_caller_gone_before_its_answer_begins_is_bought_nothing() {
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // no one listens at "gone-1": the caller has left
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "gone-1", "stream_head": true}));
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_caller_gone")), "{v}");
+    assert_eq!((v["charged_sats"].as_i64(), v["request_sent"].as_bool()), (Some(0), Some(false)), "{v}");
+    assert_eq!(r.tap.secrets().len(), 0, "a ticket was released for an answer nobody would read: {v}");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
 }
 
 // --- the owner's policy through the HTTP path -------------------------------------------------------

@@ -52,9 +52,12 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <errno.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 
 #include "datum_logger.h"
 #include "datum_utils.h"
+#include "datum_conf.h"
 
 const char *level_text[] = { "  ALL", "DEBUG", " INFO", " WARN", "ERROR", "FATAL" };
 
@@ -70,6 +73,126 @@ bool log_calling_function = true;
 bool log_to_stderr = false;
 bool log_rotate_daily = true;
 char log_file[1024] = { 0 };
+
+static int console_collapse_kind = 0;
+static int console_collapse_count = 0;
+static int console_collapse_open = 0;
+
+static int datum_console_job_kind(const char *msg)
+{
+	if (!msg) return 0;
+	if (!strncmp(msg, "Updating standard stratum job for block", 39)) return 1;
+	if (!strncmp(msg, "Updating priority stratum job for block", 39)) return 2;
+	if (!strcmp(msg, "NEW NETWORK BLOCK NOTIFICATION RECEIVED")) return 3;
+	if (!strncmp(msg, "NEW NETWORK BLOCK:", 18)) return 4;
+	return 0;
+}
+
+static int datum_console_is_tty(FILE *out)
+{
+	int fd;
+	if (!out) return 0;
+	fd = fileno(out);
+	if (fd < 0) return 0;
+	return isatty(fd);
+}
+
+static int datum_console_cols(FILE *out)
+{
+	struct winsize ws;
+	if (ioctl(fileno(out), TIOCGWINSZ, &ws) != 0) return 0;
+	return (int)ws.ws_col;
+}
+
+static void datum_console_put_inplace(FILE *out, const char *line, int cols)
+{
+	size_t n;
+	char buf[1200];
+	if (!line) return;
+	snprintf(buf, sizeof(buf), "%s", line);
+	n = strlen(buf);
+	if (n && buf[n - 1] == '\n') buf[--n] = 0;
+	/* Stay on one visual row so \\r overwrites in tmux. CUU (1A) is wrong
+	 * once the previous line wrapped. */
+	if (cols > 8 && (int)n >= cols) {
+		buf[cols - 1] = 0;
+		n = (size_t)(cols - 1);
+	}
+	if (console_collapse_open) {
+		fputc('\r', out);
+	}
+	fputs(buf, out);
+	fputs("\033[K", out);
+	fflush(out);
+	console_collapse_open = 1;
+}
+
+static void datum_console_write(FILE *out, const char *line_with_nl, const char *msg)
+{
+	int kind = datum_console_job_kind(msg);
+	int tty = datum_console_is_tty(out);
+	int cols = tty ? datum_console_cols(out) : 0;
+	char rebuilt[1200];
+	int can_collapse = datum_config.clog_console_collapse_jobs && tty && kind;
+
+	if (can_collapse && cols <= 0) cols = 80;
+
+	if (!can_collapse) {
+		if (console_collapse_open) {
+			fputc('\n', out);
+			console_collapse_open = 0;
+		}
+		console_collapse_kind = 0;
+		console_collapse_count = 0;
+		fputs(line_with_nl, out);
+		return;
+	}
+
+	if (kind == 4 && console_collapse_kind == 3 && console_collapse_count > 0) {
+		char base[1200];
+		size_t n;
+		snprintf(base, sizeof(base), "%s", line_with_nl);
+		n = strlen(base);
+		if (n && base[n-1] == '\n') base[--n] = 0;
+		{
+			const char *colon = strstr(base, ": ");
+			if (colon) {
+				size_t pre = (size_t)(colon + 2 - base);
+				snprintf(rebuilt, sizeof(rebuilt), "%.*sx%d NOTIFICATION + %s", (int)pre, base, console_collapse_count, colon + 2);
+			} else {
+				snprintf(rebuilt, sizeof(rebuilt), "x%d NOTIFICATION + %s", console_collapse_count, base);
+			}
+		}
+		datum_console_put_inplace(out, rebuilt, cols);
+		console_collapse_kind = 4;
+		console_collapse_count = 1;
+		return;
+	}
+
+	if (console_collapse_kind == kind && console_collapse_count > 0 && kind != 4) {
+		const char *colon;
+		console_collapse_count++;
+		colon = strstr(line_with_nl, ": ");
+		if (colon) {
+			size_t pre = (size_t)(colon + 2 - line_with_nl);
+			snprintf(rebuilt, sizeof(rebuilt), "%.*sx%d %s", (int)pre, line_with_nl, console_collapse_count, colon + 2);
+		} else {
+			snprintf(rebuilt, sizeof(rebuilt), "%s", line_with_nl);
+		}
+		datum_console_put_inplace(out, rebuilt, cols);
+		return;
+	}
+
+	if (console_collapse_open) {
+		fputc('\n', out);
+		console_collapse_open = 0;
+	}
+	console_collapse_kind = kind;
+	console_collapse_count = 1;
+	/* First line of a kind is also in-place (no trailing newline) so a
+	 * wrapped job-update cannot sit under a later \\r. */
+	datum_console_put_inplace(out, line_with_nl, cols);
+}
 
 int dlog_queue_max_entries = 0;
 int msg_buf_maxsz = DLOG_MSG_BUF_SIZE;
@@ -336,7 +459,7 @@ void * datum_logger_thread(void *ptr) {
 				log_line[1199] = 0;
 				
 				if ((log_to_console) && (msg->level >= log_level_console)) {
-					fprintf(log_to_stderr?stderr:stdout, "%s", log_line);
+					datum_console_write(log_to_stderr?stderr:stdout, log_line, msg->msg);
 				}
 				
 				if ((log_to_file) && (msg->level >= log_level_file)) {
@@ -410,16 +533,9 @@ void * datum_logger_thread(void *ptr) {
 			ets = 0;
 		}
 		
-		if (ets < 56999) {
-			j = (57000 - ets) / 1000;
-			j++;
-			for(i=0;i<j;i++) {
-				if (panic_mode) {
-					i = j;
-				} else {
-					usleep(1000);
-				}
-			}
+		if (ets < 57000 && !panic_mode) {
+		    struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)(57000 - ets) * 1000L };
+		    nanosleep(&ts, NULL);
 		}
 	}
 	return NULL;
