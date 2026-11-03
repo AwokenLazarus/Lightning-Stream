@@ -1009,7 +1009,10 @@ impl App {
                     let per_miner = if free > 0 && free_hs > 0.0 { free_hs / free as f64 } else { EXAMPLE_HS };
                     let start = x["startSlices"].as_u64().unwrap_or(0);
                     let fee = price * start as f64;
-                    let budget = (per_hour(price, slice, per_miner) + fee).ceil().max(price + fee) as u64;
+                    // about an hour of one machine, in whole tickets: what is under one ticket couldn't be spent
+                    let ticket_sat = smallest_ticket_sat(price);
+                    let budget = whole_tickets((per_hour(price, slice, per_miner) + fee).ceil().max(price + fee) as u64, ticket_sat);
+                    let buys = budget_buys(budget, price, ticket_sat);
                     let fee_words = start_fee_words(price, start, slice, per_miner);
                     // a hashmaker whose app doesn't prove its work is refused when renting: said, and Rent waits
                     let old = x["proves"] == false;
@@ -1086,15 +1089,16 @@ impl App {
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
                         <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
+                        <input type=\"hidden\" name=\"piece_sat\" value=\"{price}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
-                        <p class=\"hint\">About an hour of one machine{}. The rental ends when this much is spent, but however small it is, your wallet {}; \
-                        unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
+                        <p class=\"hint\">About an hour of one machine{}, in whole tickets. The rental ends when this much is spent, but however small it is, your wallet {}; \
+                        unused credit stays with this seller for about 20 hours, for a later rental there.</p><p class=\"hint\">{}</p>\
                         <span class=\"btn-why\"{off_tip}><button{}>Rent</button></span>{off_note}</form></section>",
                         esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
-                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
+                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"), esc(&buys),
                         if can { "" } else { " disabled" }));
                 }
                 b.push_str("</div>");
@@ -1158,7 +1162,12 @@ impl App {
                     call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1),
                                                                      "once": g("once")})))
                         .and_then(|v| match v["rental"].as_str() {
-                            Some(_) => Ok(format!("Renting. The miners start on your gateway in a few seconds; you pay as their work is accepted.{}", may_buy(&v))),
+                            Some(_) => {
+                                // what the budget typed really buys, said: it bounds the payments as it always did
+                                let piece = g("piece_sat").parse::<f64>().ok().filter(|p| p.is_finite() && *p >= 0.0);
+                                let buys = piece.map(|p| format!(" {}", budget_buys(n("budget"), p, smallest_ticket_sat(p)))).unwrap_or_default();
+                                Ok(format!("Renting. The miners start on your gateway in a few seconds; you pay as their work is accepted.{buys}{}", may_buy(&v)))
+                            }
                             None => Err(v["error"].as_str().map(|e| format!("Not rented: {e}.")).unwrap_or_else(|| "Not rented.".into())),
                         })
                 }
@@ -1576,6 +1585,42 @@ fn pct(x: f64) -> String {
 
 /// What a rental may take from the wallet beyond its budget, as the hashtaker answered it: a ticket
 /// bought whole, its unused part staying with that seller as credit.
+/// The smallest ticket a shop sells (`xbt_hashlink::order::FIRST_STEP_MSAT`, the dust limit), in sats.
+const SMALLEST_TICKET_SAT: u64 = 546;
+
+/// The smallest ticket a rental pays with: the shop's smallest, never under one piece of work.
+fn smallest_ticket_sat(price_sat: f64) -> u64 {
+    SMALLEST_TICKET_SAT.max(price_sat.max(0.0).ceil() as u64)
+}
+
+/// A budget suggested in whole tickets: rounded up to the next whole number of the smallest ticket, so none of it is
+/// left under a ticket that can't be spent.
+fn whole_tickets(budget: u64, ticket: u64) -> u64 {
+    budget.div_ceil(ticket.max(1)).max(1) * ticket.max(1)
+}
+
+/// What a budget really buys, in words: the wallet pays a shop in tickets of at least `ticket` sats, so what is left
+/// of the budget under one ticket can't be spent. For the owner only: the budget still bounds the payments as before.
+fn budget_buys(budget: u64, price_sat: f64, ticket: u64) -> String {
+    let ticket = ticket.max(1);
+    if budget < ticket {
+        return format!("{} sats is less than this shop's smallest ticket ({} sats): it buys no work. Set at least {} sats.",
+                       sats_n(budget as f64), sats_n(ticket as f64), sats_n(ticket as f64));
+    }
+    let spent = budget / ticket * ticket;
+    let left = budget - spent;
+    let pieces = if price_sat > 0.0 { (spent as f64 / price_sat).floor() } else { 0.0 };
+    let pieces = if pieces >= 1.0 { format!(" (about {} piece{} of work)", sats_n(pieces), if pieces == 1.0 { "" } else { "s" }) } else { String::new() };
+    if left == 0 {
+        format!("Your wallet pays this shop in tickets of at least {} sats: {} sats buys pieces of work worth about {} sats{pieces}.",
+                sats_n(ticket as f64), sats_n(budget as f64), sats_n(spent as f64))
+    } else {
+        format!("Your wallet pays this shop in tickets of at least {} sats: {} sats buys pieces of work worth about {} sats{pieces}. \
+                 The {} sats left under one ticket can't be spent; {} sats would use it all.",
+                sats_n(ticket as f64), sats_n(budget as f64), sats_n(spent as f64), sats_n(left as f64), sats_n(whole_tickets(budget, ticket) as f64))
+    }
+}
+
 fn may_buy(v: &Value) -> String {
     match v["mayBuyTicketUpToSats"].as_u64() {
         Some(n) if n > v["budgetSats"].as_u64().unwrap_or(0) => {
@@ -2143,6 +2188,21 @@ mod tests {
                        "live": {"closed": "the first slice could not be paid", "pays": [{"slice": 1, "ok": false, "why": transport.to_string()}]}});
         let card = rental_card(&ctx, &r, "./hashrate");
         assert!(card.contains("Your wallet could not pay for the first piece of work") && card.contains("add the shop on"), "{card}");
+    }
+
+    /// The Rent form's budget, in whole tickets, and what a budget really buys (#50's follow-up): the wallet pays a shop
+    /// in tickets of at least 546 sats, so 1,000 sats buys about 546 sats of work and the 454 under a ticket can't be spent.
+    #[test]
+    fn a_budget_is_suggested_in_whole_tickets_and_says_what_it_buys() {
+        assert_eq!((smallest_ticket_sat(40.0), smallest_ticket_sat(3235.0), smallest_ticket_sat(546.4)), (546, 3235, 547));
+        assert_eq!((whole_tickets(1000, 546), whole_tickets(1092, 546), whole_tickets(1, 546), whole_tickets(0, 546)), (1092, 1092, 546, 546));
+        let w = budget_buys(1000, 40.0, 546);
+        assert!(w.contains("tickets of at least 546 sats: 1,000 sats buys pieces of work worth about 546 sats (about 13 pieces of work)")
+                && w.contains("The 454 sats left under one ticket can't be spent; 1,092 sats would use it all."), "{w}");
+        let whole = budget_buys(1092, 40.0, 546);
+        assert!(whole.contains("worth about 1,092 sats (about 27 pieces of work).") && !whole.contains("left under"), "{whole}");
+        assert!(budget_buys(500, 40.0, 546).contains("less than this shop's smallest ticket (546 sats): it buys no work"));
+        assert!(budget_buys(546, 1000.0, 546).ends_with("worth about 546 sats."), "no piece in it: no count");
     }
 
     /// A fixed price is said per 1 TH/s for an hour, beside the mining value and the other offers: 1,700 sats a piece was

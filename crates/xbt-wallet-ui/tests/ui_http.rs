@@ -3068,8 +3068,12 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert_eq!(v["live"], true);
     assert!(v["html"].as_str().unwrap().contains("Hashrate from Basement miners") && v["html"].as_str().unwrap().contains("Spent so far"), "{v}");
     assert_eq!(B::new(&bx.base).get("/api/hashrate-rentals").status, 401, "behind the login");
-    let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);
-    assert!(br.flash_after(&r).starts_with("Renting."));
+    let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60"), ("piece_sat", "40")]);
+    let f = br.flash_after(&r);
+    assert!(f.starts_with("Renting."), "{f}");
+    // what the budget really buys, said (#50's follow-up): tickets of at least 546 sats, what is under one can't be spent
+    assert!(f.contains("tickets of at least 546 sats: 4,000 sats buys pieces of work worth about 3,822 sats (about 95 pieces of work)")
+            && f.contains("The 178 sats left under one ticket") && f.contains("4,368 sats would use it all"), "{f}");
     let rent = rseen.lock().unwrap().iter().find(|(m, p, _, _)| m == "POST" && p == "/rent").cloned().unwrap();
     let body: Value = serde_json::from_str(&rent.3).unwrap();
     assert_eq!((body["linkKey"].clone(), body["miners"].clone(), body["budgetSats"].clone()), (json!("02bb"), json!(1), json!(4000)));
@@ -4910,7 +4914,12 @@ fn an_offer_shows_its_start_fee() {
     let big = card("Big miners");
     assert!(big.contains("Start fee: <strong>6,470 sats</strong>, about 14 seconds of a machine") && big.contains("paid first"), "{big}");
     assert!(big.contains("one piece of work and its start fee, about 9,705 sats"), "the trial pays the fee too: {big}");
-    assert!(big.contains("About an hour of one machine, with its start fee"), "{big}");
+    assert!(big.contains("About an hour of one machine, with its start fee, in whole tickets"), "{big}");
+    // the budget suggested in whole tickets: a piece of 3,235 sats is its own smallest ticket; 546 sats for a 40 sat piece
+    let budget = |c: &str| field(c, "budget").parse::<u64>().unwrap();
+    assert!(budget(&big) % 3235 == 0 && big.contains("in tickets of at least 3,235 sats"), "{big}");
+    let small = card("Old miners");
+    assert!(budget(&small) % 546 == 0 && small.contains("in tickets of at least 546 sats") && !small.contains("left under one ticket"), "{small}");
     let old = card("Old miners");
     assert!(old.contains("Needs updating") && old.contains("<button disabled>Rent</button>"), "{old}");
     assert!(!old.contains("Start fee"), "{old}");
