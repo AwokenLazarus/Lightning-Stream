@@ -309,6 +309,64 @@ pub struct Config {
     /// Being reached by key over an iroh link (no web address, certificate or forwarded port). Absent:
     /// web only.
     pub link: Option<LinkConfig>,
+    /// Paying the paid relays the link uses (`docs/PAID-RELAYS.md`). Absent: none is paid, and a
+    /// paid relay carries the shop only within its free allowance.
+    pub relay_pay: Option<RelayPayConfig>,
+}
+
+/// The `relay_pay` section: the paid relays among `link.relays`, and the bounds the shop pays them
+/// within. Payment goes through the wallet's signer (`xbt402_pay`), under the owner's ticket task
+/// `task`, whose budget is the most for relays per day: the signer refuses past it whatever this says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPayConfig {
+    /// The wallet signer's socket.
+    pub signer: PathBuf,
+    pub task: String,
+    pub relays: Vec<xbt_iroh_link::relay_pay::PaidRelay>,
+    pub max_msat_per_gb: u64,
+    pub max_credit_msat: u64,
+    pub max_sats: u64,
+    pub low_water_bytes: u64,
+    /// How often each key's balance is looked at.
+    pub check: Duration,
+}
+
+impl RelayPayConfig {
+    fn parse(v: &Value, link: Option<&LinkConfig>) -> Result<Self, String> {
+        let m = obj(v, "relay_pay", &["signer", "task", "relays", "max_msat_per_gb", "max_credit_msat", "max_sats", "low_water_mb", "check_s"])?;
+        let d = xbt_iroh_link::relay_pay::Bounds::default();
+        let link = link.ok_or("relay_pay pays the relays of the link: write a link section")?;
+        let mut relays = Vec::new();
+        for r in m.get("relays").and_then(Value::as_array).ok_or("relay_pay.relays is a list of the paid relays")? {
+            let r = obj(r, "relay_pay.relays[]", &["relay", "credit", "msat_per_gb"])?;
+            let relay = req_str(r, "relay")?.trim_end_matches('/').to_string();
+            if !link.relays.contains(&relay) {
+                return Err(format!("relay_pay: {relay} is not one of link.relays"));
+            }
+            let credit = req_str(r, "credit")?.trim_end_matches('/').to_string();
+            if !credit.starts_with("https://") {
+                return Err(format!("relay_pay: {relay}'s credit URL is not https"));
+            }
+            relays.push(xbt_iroh_link::relay_pay::PaidRelay { relay, credit, msat_per_gb: num(r, "msat_per_gb", 0)? });
+        }
+        let task = opt_str(m, "task")?.unwrap_or(xbt_iroh_link::relay_pay::DEFAULT_TASK).to_string();
+        Ok(Self {
+            signer: PathBuf::from(req_str(m, "signer")?),
+            task,
+            relays,
+            max_msat_per_gb: num(m, "max_msat_per_gb", d.max_msat_per_gb)?,
+            max_credit_msat: num(m, "max_credit_msat", d.max_credit_msat)?,
+            max_sats: num(m, "max_sats", d.max_sats)?,
+            low_water_bytes: num(m, "low_water_mb", d.low_water_bytes / 1_000_000)?.saturating_mul(1_000_000),
+            check: Duration::from_secs(num(m, "check_s", 60)?.clamp(10, 3_600)),
+        })
+    }
+
+    /// The payer's bounds.
+    pub fn bounds(&self) -> xbt_iroh_link::relay_pay::Bounds {
+        xbt_iroh_link::relay_pay::Bounds { task: self.task.clone(), max_msat_per_gb: self.max_msat_per_gb, max_credit_msat: self.max_credit_msat,
+                                           max_sats: self.max_sats, low_water_bytes: self.low_water_bytes }
+    }
 }
 
 /// The `link` section: the relays the gateway's link uses and whether it is relay-only. The seller's
@@ -580,6 +638,7 @@ impl Config {
                 "listing",
                 "nostr",
                 "link",
+                "relay_pay",
                 "health_token",
             ],
         )?;
@@ -1005,6 +1064,10 @@ impl Config {
             None | Some(Value::Null) => None,
             Some(l) => Some(LinkConfig::parse(l)?),
         };
+        let relay_pay = match top.get("relay_pay") {
+            None | Some(Value::Null) => None,
+            Some(r) => Some(RelayPayConfig::parse(r, link.as_ref())?),
+        };
         let health_token = match opt_str(top, "health_token")? {
             Some(t) if t.len() >= 32 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => Some(t.to_string()),
             Some(_) => return Err("health_token: at least 32 letters, digits, - or _".into()),
@@ -1040,6 +1103,7 @@ impl Config {
             listing,
             nostr,
             link,
+            relay_pay,
         })
     }
 }
@@ -1529,6 +1593,26 @@ mod tests {
         v["link"] = json!({"relays": ["http://127.0.0.1:3340"]});
         let e = Config::from_json(&v).unwrap_err().to_string();
         assert!(e.contains("https://") && e.contains("refuse"), "{e}");
+    }
+
+    /// Paying relays is off unless written, names only relays the link uses, and keeps the owner's
+    /// bounds (docs/PAID-RELAYS.md).
+    #[test]
+    fn relay_pay_is_opt_in_and_bounded() {
+        let mut v = base();
+        assert!(Config::from_json(&v).unwrap().relay_pay.is_none(), "off by default");
+        v["relay_pay"] = json!({"signer": "/run/signer.sock", "relays": [{"relay": "https://paid.example", "credit": "https://ops.example/r"}]});
+        assert!(Config::from_json(&v).unwrap_err().to_string().contains("link section"));
+        v["link"] = json!({"relays": ["https://paid.example/", "https://free.example"]});
+        let rp = Config::from_json(&v).unwrap().relay_pay.unwrap();
+        assert_eq!((rp.task.as_str(), rp.relays[0].relay.as_str(), rp.relays[0].credit.as_str()), ("relays", "https://paid.example", "https://ops.example/r"));
+        assert_eq!(rp.bounds().max_msat_per_gb, 4_000);
+        v["relay_pay"]["relays"] = json!([{"relay": "https://elsewhere.example", "credit": "https://ops.example/r"}]);
+        assert!(Config::from_json(&v).unwrap_err().to_string().contains("not one of link.relays"));
+        v["relay_pay"]["relays"] = json!([{"relay": "https://paid.example", "credit": "http://ops.example/r"}]);
+        assert!(Config::from_json(&v).is_err());
+        v["relay_pay"] = json!({"signer": "/s", "relays": [], "typo": 1});
+        assert!(Config::from_json(&v).is_err());
     }
 
     /// Routes are one service where they name the same `service`, or, naming none, the same

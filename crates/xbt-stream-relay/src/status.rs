@@ -44,18 +44,20 @@ pub struct Status {
     pub bytes_recv: u64,
     pub clients: usize,
     pub udp: bool,
+    /// A paid relay's terms and totals (`null` for a free one).
+    pub paid: Value,
 }
 
 impl Status {
     pub fn new(state: State, domain: &str, message: impl Into<String>) -> Self {
         Self { state, domain: domain.into(), since: now(), message: message.into(), preflight: Value::Null, bytes_sent: 0, bytes_recv: 0,
-               clients: 0, udp: false }
+               clients: 0, udp: false, paid: Value::Null }
     }
 
     pub fn to_value(&self) -> Value {
         json!({"state": self.state.word(), "domain": self.domain, "since": self.since, "message": self.message,
                "preflight": self.preflight, "bytes_sent": self.bytes_sent, "bytes_recv": self.bytes_recv, "clients": self.clients,
-               "udp": self.udp, "written": now()})
+               "udp": self.udp, "paid": self.paid, "written": now()})
     }
 
     pub fn write(&self, path: &Path) -> std::io::Result<()> {

@@ -10,6 +10,7 @@
 //! | `XBT_RELAY_QUIC_LISTEN` | `0.0.0.0:7842` | where QUIC address discovery listens, when chosen |
 //! | `XBT_RELAY_STUN` | Cloudflare's and Google's | STUN servers asked for the public address, comma-separated |
 //! | `XBT_RELAY_ACME_STAGING` | unset | `1`: Let's Encrypt's staging server (for tests) |
+//! | `XBT_RELAY_CREDIT_LISTEN` | `127.0.0.1:3341` | a paid relay's credit API, for the operator's own gateway only (`docs/PAID-RELAYS.md`) |
 //!
 //! Logs: warnings and errors only, and never from inside a client's connection, whose lines carry
 //! the client's address.
@@ -22,6 +23,7 @@ use std::time::Duration;
 use iroh_relay::server::{self as relay, AcmeConfig, CertConfig, ClientRateLimit, QuicConfig, RelayConfig, ServerConfig};
 use xbt_stream_relay::config::{self, Settings};
 use xbt_stream_relay::meter::{Free, Gate, Meter};
+use xbt_stream_relay::paid::Paid;
 use xbt_stream_relay::preflight;
 use xbt_stream_relay::status::{self, State, Status};
 
@@ -50,6 +52,18 @@ impl Paths {
     fn attempts(&self) -> PathBuf {
         self.state.join("attempts.json")
     }
+    /// A paid relay's accounts: what shops have bought and used.
+    fn accounts(&self) -> PathBuf {
+        self.state.join("accounts.json")
+    }
+}
+
+fn save_accounts(p: &Paths, paid: &Paid) {
+    let _ = std::fs::create_dir_all(&p.state);
+    let tmp = p.accounts().with_extension("json.tmp");
+    if std::fs::write(&tmp, paid.saved().to_string()).and_then(|_| std::fs::rename(&tmp, p.accounts())).is_err() {
+        eprintln!("xbt-stream-relay: {}: could not keep the accounts", p.accounts().display());
+    }
 }
 
 fn read_settings(p: &Paths) -> Settings {
@@ -76,7 +90,7 @@ fn write(p: &Paths, s: &Status) {
     }
 }
 
-fn server_config(s: &Settings, p: &Paths, meter: Arc<Free>) -> ServerConfig {
+fn server_config(s: &Settings, p: &Paths, meter: Arc<dyn Meter>) -> ServerConfig {
     let tls_builder = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .expect("protocols supported by ring")
@@ -160,7 +174,13 @@ async fn main() {
     };
     let listen = env_addr("XBT_RELAY_LISTEN", "0.0.0.0:443");
     let stun: Vec<String> = std::env::var("XBT_RELAY_STUN").ok().map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
-    let mut running: Option<(relay::Server, Settings, Arc<Free>, Status)> = None;
+    let mut running: Option<(relay::Server, Settings, Arc<dyn Meter>, Status)> = None;
+    // a paid relay's meter outlives restarts of the server, and its accounts restarts of the service
+    let paid = Arc::new(Paid::new(Default::default()));
+    if let Some(v) = std::fs::read_to_string(p.accounts()).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+        paid.restore(&v);
+    }
+    let mut credit_api: Option<SocketAddr> = None;
     // the settings an attempt was last made with: a failed attempt is not repeated until they change
     let mut tried: Option<Settings> = None;
     loop {
@@ -169,6 +189,7 @@ async fn main() {
         if running.as_ref().is_some_and(|(_, was, ..)| !s.enabled || *was != s) {
             let (srv, ..) = running.take().expect("running");
             let _ = srv.shutdown().await;
+            save_accounts(&p, &paid);
         }
         if !s.enabled {
             tried = None;
@@ -179,6 +200,14 @@ async fn main() {
             st.bytes_recv = recv;
             st.clients = meter.connected();
             st.udp = was.udp;
+            if was.paid.enabled {
+                let mut v = was.paid.terms();
+                v["totals"] = paid.totals();
+                v["credit_api"] = credit_api.map(|a| a.to_string()).into();
+                st.paid = v;
+                paid.prune();
+                save_accounts(&p, &paid);
+            }
             write(&p, st);
         } else if !s.problems().is_empty() {
             write(&p, &Status::new(State::Invalid, &s.domain, s.problems().join(" ")));
@@ -194,7 +223,21 @@ async fn main() {
                 write(&p, &st);
             } else {
                 log_attempt(&p);
-                let meter = Arc::new(Free::default());
+                let meter: Arc<dyn Meter> = if s.paid.enabled {
+                    paid.set_settings(s.paid.clone());
+                    if credit_api.is_none() {
+                        let at = env_addr("XBT_RELAY_CREDIT_LISTEN", "127.0.0.1:3341");
+                        match xbt_stream_relay::credit::spawn(paid.clone(), at) {
+                            Ok(a) => credit_api = Some(a),
+                            Err(e) => eprintln!("xbt-stream-relay: the credit API could not listen on {at}: {e}"),
+                        }
+                    }
+                    paid.clone()
+                } else {
+                    // a credit API already listening answers that this relay is free
+                    paid.set_settings(Default::default());
+                    Arc::new(Free::default())
+                };
                 match relay::Server::spawn(server_config(&s, &p, meter.clone())).await {
                     Err(e) => {
                         let mut st = Status::new(State::Failed, &s.domain, format!("The relay couldn't start: {e}"));
@@ -241,4 +284,5 @@ async fn main() {
     if let Some((srv, ..)) = running {
         let _ = srv.shutdown().await;
     }
+    save_accounts(&p, &paid);
 }

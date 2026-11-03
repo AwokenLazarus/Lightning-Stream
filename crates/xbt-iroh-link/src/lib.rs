@@ -19,6 +19,7 @@
 /// How the seller's node vouches for the link key: one implementation, in xbt402.
 pub use xbt402::claim;
 pub mod nostr_lookup;
+pub mod relay_pay;
 
 use std::collections::HashMap;
 use std::io;

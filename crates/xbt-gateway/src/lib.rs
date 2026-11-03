@@ -40,6 +40,7 @@ pub mod lottery;
 pub mod node;
 pub mod nostr;
 pub mod price;
+pub mod relay_pay;
 pub mod standin;
 pub mod store;
 pub mod upstream;

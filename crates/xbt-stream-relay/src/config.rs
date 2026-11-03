@@ -33,6 +33,8 @@ pub struct Settings {
     pub port_forwarded: bool,
     /// Bumped by the app's Try again button: a new attempt after a failed one.
     pub attempt: u64,
+    /// A paid relay's terms (`paid`, `docs/PAID-RELAYS.md`); off unless switched on.
+    pub paid: crate::paid::PaidSettings,
 }
 
 impl Settings {
@@ -40,12 +42,18 @@ impl Settings {
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
         let b = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
         Self { enabled: b("enabled"), domain: s("domain").to_ascii_lowercase(), contact: s("contact"), udp: b("udp"),
-               port_forwarded: b("port_forwarded"), attempt: v.get("attempt").and_then(Value::as_u64).unwrap_or(0) }
+               port_forwarded: b("port_forwarded"), attempt: v.get("attempt").and_then(Value::as_u64).unwrap_or(0),
+               paid: crate::paid::PaidSettings::from_value(v.get("paid").unwrap_or(&Value::Null)) }
     }
 
     pub fn to_value(&self) -> Value {
-        serde_json::json!({"enabled": self.enabled, "domain": self.domain, "contact": self.contact, "udp": self.udp,
-                           "port_forwarded": self.port_forwarded, "attempt": self.attempt})
+        let mut v = serde_json::json!({"enabled": self.enabled, "domain": self.domain, "contact": self.contact, "udp": self.udp,
+                                       "port_forwarded": self.port_forwarded, "attempt": self.attempt});
+        // a free relay's file stays as it was
+        if self.paid != crate::paid::PaidSettings::default() {
+            v["paid"] = self.paid.to_value();
+        }
+        v
     }
 
     /// The reasons these settings cannot run, in words; empty when they can.
@@ -56,6 +64,9 @@ impl Settings {
         }
         if let Err(e) = check_contact(&self.contact) {
             v.push(e);
+        }
+        if self.paid.enabled {
+            v.extend(self.paid.problems());
         }
         v
     }
@@ -122,5 +133,13 @@ mod tests {
         assert!(s.problems().is_empty());
         assert_eq!(Settings::from_value(&s.to_value()), s);
         assert_eq!(Settings::from_value(&serde_json::json!({})).problems().len(), 2);
+        assert!(s.to_value().get("paid").is_none(), "a free relay's settings have no paid part");
+        let paid = serde_json::json!({"domain": "relay.example.com", "contact": "ops@example.com",
+                                      "paid": {"enabled": true, "msat_per_gb": 3000, "credit_token": "k".repeat(32)}});
+        let p = Settings::from_value(&paid);
+        assert!(p.paid.enabled && p.paid.msat_per_gb == 3000 && p.problems().is_empty(), "{:?}", p.problems());
+        assert_eq!(Settings::from_value(&p.to_value()), p);
+        let short = serde_json::json!({"domain": "relay.example.com", "contact": "ops@example.com", "paid": {"enabled": true}});
+        assert_eq!(Settings::from_value(&short).problems().len(), 1, "no credit token");
     }
 }

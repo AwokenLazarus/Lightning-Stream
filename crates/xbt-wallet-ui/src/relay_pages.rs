@@ -156,7 +156,7 @@ impl App {
             },
         };
         let offer = Offer { relay: g("relay"), region: g("region"), capacity_mbit: capacity, udp: g("udp") == "1", contact: g("contact"),
-                            note: String::new(), ttl_s: relays::MAX_TTL_S };
+                            note: String::new(), ttl_s: relays::MAX_TTL_S, price: None };
         match self.relay_net.publish(&offer) {
             Ok((ok, all)) if ok > 0 => self.flash(ctx, true, format!("Announced on {ok} of {} Nostr relays. It is listed as yours here.", all.len())),
             Ok((_, all)) => self.flash(ctx, false, format!("No Nostr relay accepted the announcement: {}",

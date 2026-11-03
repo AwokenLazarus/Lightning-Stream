@@ -3535,7 +3535,7 @@ fn the_stream_relays_page_lists_announced_relays_and_keeps_the_owner_s_choices()
     // two announced relays: neither answers a probe here (port 9 on this machine), so neither is used
     for (host, region) in [("relay-a.example", "eu-central"), ("relay-b.example", "us-west")] {
         let offer = relays::Offer { relay: format!("https://{host}"), region: region.into(), capacity_mbit: Some(200), udp: false,
-                                    contact: String::new(), note: String::new(), ttl_s: 86_400 };
+                                    contact: String::new(), note: String::new(), ttl_s: 86_400, price: None };
         let ev = relays::announcement_event(&Keys::generate(), &offer, xbt_nostr::now()).unwrap();
         assert_eq!(oneshot::publish(&nostr, &ev, Duration::from_secs(5))[0].result, Ok(()));
     }

@@ -8,10 +8,13 @@
 //!    in a cache;
 //! 3. writes what it is doing to a status file the app shows ([`status`]).
 //!
-//! Who may use the relay is decided by a [`meter::Meter`]: free for everyone in this version, the
-//! place where paid relays check a client's credit later.
+//! Who may use the relay, and what it carries, is decided by a [`meter::Meter`]: [`meter::Free`]
+//! for a free relay, [`paid::Paid`] for a paid one (`docs/PAID-RELAYS.md`), whose shops buy credit
+//! through the credit API ([`credit`]).
 pub mod config;
+pub mod credit;
 pub mod meter;
+pub mod paid;
 pub mod preflight;
 pub mod status;
 pub mod stun;

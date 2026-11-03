@@ -15,6 +15,18 @@
 //! * `expiration` (NIP-40): when the announcement lapses, at most [`MAX_TTL_S`] after it was made;
 //!   an operator refreshes it, so a relay nobody tends drops out by itself.
 //!
+//! A **paid** relay (`docs/PAID-RELAYS.md`) is announced with `t` = [`TOPIC_PAID`] instead of
+//! [`TOPIC`], so apps that predate paid relays never see it and never make it their home relay,
+//! and with two more tags:
+//!
+//! * `price_msat_per_gb`: what it charges a shop per GB it carries for it, in msat.
+//! * `credit`: the https URL of the priced route on its operator's shop where credit is bought
+//!   with Stream tickets (`<credit>/credit`; `<credit>/balance` and `<credit>/terms` are free).
+//!
+//! An app uses a paid relay only when its owner allows paid relays and the price is within the
+//! owner's most per GB ([`Prefs::paid`], [`Prefs::max_msat_per_gb`]); otherwise it is left out
+//! like a relay that does not answer, and the free relays (the default last) are the fallback.
+//!
 //! What an announcement does not prove: that its author runs the relay. Anyone can announce any
 //! relay URL. That is acceptable because a relay never sees what it carries (the link is encrypted
 //! end to end) and the app ranks relays by what it measures itself, not by what an announcement
@@ -29,6 +41,8 @@ use crate::event::{tag, Event, Keys};
 pub const KIND_APP_DATA: u64 = 30078;
 /// The `t` tag every relay announcement carries, and the one readers ask for.
 pub const TOPIC: &str = "lightning-stream-relay";
+/// The `t` tag of a paid relay's announcement, in place of [`TOPIC`].
+pub const TOPIC_PAID: &str = "lightning-stream-relay-paid";
 /// The `d` tag's prefix; the relay URL follows it.
 pub const D_PREFIX: &str = "lightning-stream-relay:";
 /// The longest an announcement lives before its operator must refresh it.
@@ -56,6 +70,33 @@ pub struct Announcement {
     pub event_id: String,
     pub created_at: u64,
     pub expires: u64,
+    /// A paid relay's price; `None` for a free one.
+    pub price: Option<RelayPrice>,
+}
+
+/// What a paid relay charges, and where credit is bought.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPrice {
+    pub msat_per_gb: u64,
+    /// The https URL of the seller route (no query, no trailing `/`).
+    pub credit: String,
+}
+
+/// The most a price per GB may be announced at: 1,000 sats.
+pub const MAX_MSAT_PER_GB: u64 = 1_000_000;
+
+impl RelayPrice {
+    fn check(&self) -> Result<Self, String> {
+        if self.msat_per_gb == 0 || self.msat_per_gb > MAX_MSAT_PER_GB {
+            return Err(format!("a paid relay's price is 1 to {MAX_MSAT_PER_GB} msat per GB"));
+        }
+        let c = self.credit.trim().trim_end_matches('/');
+        let rest = c.strip_prefix("https://").ok_or("the credit URL starts with https://")?;
+        if rest.is_empty() || c.len() > 256 || c.contains(['?', '#', '@']) || c.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return Err("the credit URL is an https URL with no query, at most 256 characters".into());
+        }
+        Ok(Self { msat_per_gb: self.msat_per_gb, credit: c.to_string() })
+    }
 }
 
 /// `https://host[:port][/]` in one form: lower-case host, port only when not 443, a single `/`
@@ -93,6 +134,8 @@ pub struct Offer {
     pub note: String,
     /// How long the announcement lives, capped at [`MAX_TTL_S`].
     pub ttl_s: u64,
+    /// A paid relay's price (announced under [`TOPIC_PAID`]); `None` for a free relay.
+    pub price: Option<RelayPrice>,
 }
 
 /// The announcement event for `offer`, signed by the operator's Nostr key.
@@ -109,9 +152,10 @@ pub fn announcement_event(keys: &Keys, offer: &Offer, now: u64) -> Result<Event,
         return Err(format!("the note is at most {MAX_NOTE} characters"));
     }
     let ttl = offer.ttl_s.clamp(3600, MAX_TTL_S);
+    let price = offer.price.as_ref().map(RelayPrice::check).transpose()?;
     let mut tags = vec![
         tag("d", &format!("{D_PREFIX}{relay}")),
-        tag("t", TOPIC),
+        tag("t", if price.is_some() { TOPIC_PAID } else { TOPIC }),
         tag("relay", &relay),
         tag("region", region),
         tag("udp", if offer.udp { "1" } else { "0" }),
@@ -123,12 +167,16 @@ pub fn announcement_event(keys: &Keys, offer: &Offer, now: u64) -> Result<Event,
     if !offer.contact.trim().is_empty() {
         tags.push(tag("contact", offer.contact.trim()));
     }
+    if let Some(p) = price {
+        tags.push(tag("price_msat_per_gb", &p.msat_per_gb.to_string()));
+        tags.push(tag("credit", &p.credit));
+    }
     Ok(Event::sign(keys, now, KIND_APP_DATA, tags, offer.note.trim().to_string()))
 }
 
 /// The filter that asks a Nostr relay for relay announcements.
 pub fn filter(limit: usize) -> Value {
-    json!({"kinds": [KIND_APP_DATA], "#t": [TOPIC], "limit": limit})
+    json!({"kinds": [KIND_APP_DATA], "#t": [TOPIC, TOPIC_PAID], "limit": limit})
 }
 
 /// Check one announcement. `now` is the reader's clock.
@@ -145,9 +193,21 @@ pub fn read_event(ev: &Event, now: u64) -> Result<Announcement, String> {
     if ev.created_at > now.saturating_add(MAX_AHEAD_S) {
         return Err("the event is dated in the future".into());
     }
-    if !ev.tags.iter().any(|t| t.len() >= 2 && t[0] == "t" && t[1] == TOPIC) {
+    let topic = |w: &str| ev.tags.iter().any(|t| t.len() >= 2 && t[0] == "t" && t[1] == w);
+    let paid = topic(TOPIC_PAID);
+    if !paid && !topic(TOPIC) {
         return Err("not a Stream relay announcement".into());
     }
+    // a paid relay is never also announced as a free one: an app that predates paid relays would use it
+    if paid && topic(TOPIC) {
+        return Err("a paid relay's announcement carries the free relays' topic".into());
+    }
+    let price = if paid {
+        let msat_per_gb = ev.tag("price_msat_per_gb").and_then(|s| s.parse::<u64>().ok()).ok_or("a paid relay without a price")?;
+        Some(RelayPrice { msat_per_gb, credit: ev.tag("credit").ok_or("a paid relay without a credit URL")?.to_string() }.check()?)
+    } else {
+        None
+    };
     let relay = canonical_relay(ev.tag("relay").ok_or("no relay URL")?)?;
     if ev.tag("d") != Some(format!("{D_PREFIX}{relay}").as_str()) {
         return Err("the event's d tag is not its relay URL".into());
@@ -174,7 +234,7 @@ pub fn read_event(ev: &Event, now: u64) -> Result<Announcement, String> {
     let note: String = ev.content.chars().take(MAX_NOTE).collect();
     Ok(Announcement {
         relay, region, capacity_mbit, udp: ev.tag("udp") == Some("1"), contact, note,
-        author: ev.pubkey.clone(), event_id: ev.id.clone(), created_at: ev.created_at, expires,
+        author: ev.pubkey.clone(), event_id: ev.id.clone(), created_at: ev.created_at, expires, price,
     })
 }
 
@@ -252,6 +312,10 @@ pub struct Prefs {
     pub own: Vec<String>,
     /// Use only the owner's own relays.
     pub only_own: bool,
+    /// Paid relays may be used (the shop pays them, `docs/PAID-RELAYS.md`). Off: they are left out.
+    pub paid: bool,
+    /// The most per GB a paid relay may charge to be used, in msat.
+    pub max_msat_per_gb: u64,
 }
 
 /// The relays to use, best first: the first one is the home relay (what iroh's `preferred_relay`
@@ -279,14 +343,24 @@ pub fn select_for(announced: &[Announcement], probes: &HashMap<String, Probe>, p
     let max = max.max(1);
     let claimed: HashMap<&str, u32> = announced.iter().filter_map(|a| a.capacity_mbit.map(|c| (a.relay.as_str(), c))).collect();
     let canon = |u: &str| canonical_relay(u).ok();
-    let blocked: HashSet<String> = prefs.blocked.iter().filter_map(|u| canon(u)).collect();
+    let mut blocked: HashSet<String> = prefs.blocked.iter().filter_map(|u| canon(u)).collect();
+    // a paid relay the owner doesn't pay for, or not at its price, is as good as blocked; the owner's
+    // own relays are never left out for a price (any announcement of them is someone else's word)
+    let own_set: HashSet<String> = prefs.own.iter().filter_map(|u| canon(u)).collect();
+    let price: HashMap<&str, u64> = announced.iter().filter_map(|a| a.price.as_ref().map(|p| (a.relay.as_str(), p.msat_per_gb))).collect();
+    for (u, p) in &price {
+        if !own_set.contains(*u) && (!prefs.paid || *p > prefs.max_msat_per_gb) {
+            blocked.insert(u.to_string());
+        }
+    }
+    let cost = |u: &str| price.get(u).copied().unwrap_or(0);
     let probe = |u: &str| probes.get(u).copied().unwrap_or_default();
     let by_rtt = |v: &mut Vec<String>| match purpose {
-        Purpose::Latency => v.sort_by_key(|u| (probe(u).rtt_ms.unwrap_or(u32::MAX), u.clone())),
+        Purpose::Latency => v.sort_by_key(|u| (probe(u).rtt_ms.unwrap_or(u32::MAX), cost(u), u.clone())),
         // most measured first, then most claimed, then quickest
         Purpose::Throughput => v.sort_by_key(|u| {
             let p = probe(u);
-            (std::cmp::Reverse(p.mbit.unwrap_or(0)), std::cmp::Reverse(claimed.get(u.as_str()).copied().unwrap_or(0)), p.rtt_ms.unwrap_or(u32::MAX), u.clone())
+            (std::cmp::Reverse(p.mbit.unwrap_or(0)), std::cmp::Reverse(claimed.get(u.as_str()).copied().unwrap_or(0)), p.rtt_ms.unwrap_or(u32::MAX), cost(u), u.clone())
         }),
     };
     let mut out: Vec<String> = Vec::new();
@@ -358,7 +432,56 @@ mod tests {
 
     fn offer(relay: &str) -> Offer {
         Offer { relay: relay.into(), region: "us-west".into(), capacity_mbit: Some(500), udp: true, contact: "ops@example.com".into(),
-                note: "A relay for Stream.".into(), ttl_s: 7 * 86_400 }
+                note: "A relay for Stream.".into(), ttl_s: 7 * 86_400, price: None }
+    }
+
+    fn paid_ann(relay: &str, msat_per_gb: u64) -> Announcement {
+        let k = Keys::generate();
+        let o = Offer { price: Some(RelayPrice { msat_per_gb, credit: "https://ops.example.com/stream-relay/".into() }), ..offer(relay) };
+        read_event(&announcement_event(&k, &o, NOW).unwrap(), NOW).unwrap()
+    }
+
+    #[test]
+    fn a_paid_relay_is_announced_apart() {
+        let k = Keys::generate();
+        let o = Offer { price: Some(RelayPrice { msat_per_gb: 2_000, credit: "https://ops.example.com/stream-relay/".into() }), ..offer("https://paid.example.com") };
+        let ev = announcement_event(&k, &o, NOW).unwrap();
+        // not under the free topic: an app that predates paid relays never reads it
+        assert_eq!(ev.tag("t"), Some(TOPIC_PAID));
+        let a = read_event(&ev, NOW).unwrap();
+        assert_eq!(a.price, Some(RelayPrice { msat_per_gb: 2_000, credit: "https://ops.example.com/stream-relay".into() }));
+        assert_eq!(ann("https://free.example.com").price, None);
+        // a paid announcement without a price, or also under the free topic, is refused
+        let no_price: Vec<_> = ev.tags.iter().filter(|t| t[0] != "price_msat_per_gb").cloned().collect();
+        assert!(read_event(&Event::sign(&k, NOW, KIND_APP_DATA, no_price, String::new()), NOW).unwrap_err().contains("price"));
+        let mut both = ev.tags.clone();
+        both.push(tag("t", TOPIC));
+        assert!(read_event(&Event::sign(&k, NOW, KIND_APP_DATA, both, String::new()), NOW).is_err());
+        // bad prices and credit URLs are refused when made
+        for p in [RelayPrice { msat_per_gb: 0, credit: "https://a.example.com".into() }, RelayPrice { msat_per_gb: 1, credit: "http://a.example.com".into() },
+                  RelayPrice { msat_per_gb: MAX_MSAT_PER_GB + 1, credit: "https://a.example.com".into() }] {
+            assert!(announcement_event(&k, &Offer { price: Some(p), ..offer("https://a.example.com") }, NOW).is_err());
+        }
+        assert_eq!(filter(5)["#t"], json!([TOPIC, TOPIC_PAID]));
+    }
+
+    #[test]
+    fn paid_relays_are_used_only_when_the_owner_pays_and_the_price_is_right() {
+        let a = [paid_ann("https://cheap.example.com", 1_000), paid_ann("https://dear.example.com", 9_000), ann("https://free.example.com")];
+        let p = probes(&[("https://cheap.example.com", Some(10), 0), ("https://dear.example.com", Some(5), 0), ("https://free.example.com", Some(50), 0)]);
+        // by default: no paid relay, the free ones as before
+        assert_eq!(select(&a, &p, &Prefs::default(), OURS, 4), vec!["https://free.example.com/", "https://iroh.lazarus-xbt.xyz/"]);
+        // paying up to 2 sats a GB: the cheap one, the free ones and ours still behind it as the fallback
+        let prefs = Prefs { paid: true, max_msat_per_gb: 2_000, ..Prefs::default() };
+        assert_eq!(select(&a, &p, &prefs, OURS, 4), vec!["https://cheap.example.com/", "https://free.example.com/", "https://iroh.lazarus-xbt.xyz/"]);
+        // the owner's own relay is never left out for its price
+        let prefs = Prefs { own: vec!["https://dear.example.com".into()], ..Prefs::default() };
+        assert_eq!(select(&a, &p, &prefs, OURS, 4)[0], "https://dear.example.com/");
+        // at the same round trip, the cheaper first
+        let b = [paid_ann("https://b.example.com", 1_500), paid_ann("https://a.example.com", 1_800)];
+        let p = probes(&[("https://a.example.com", Some(10), 0), ("https://b.example.com", Some(10), 0)]);
+        let prefs = Prefs { paid: true, max_msat_per_gb: 2_000, ..Prefs::default() };
+        assert_eq!(select(&b, &p, &prefs, OURS, 4)[0], "https://b.example.com/");
     }
 
     fn ann(relay: &str) -> Announcement {

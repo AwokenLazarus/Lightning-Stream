@@ -5,6 +5,24 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.3.0 (unreleased)
+
+Draft. Paid relays (`docs/PAID-RELAYS.md`): a relay operator can charge for what a Stream relay
+carries, by the GB, and a shop pays the relays it uses with Stream tickets, within a new spending
+rule for relays. Everything is off by default: free relays and shops that don't opt in work as in
+0.2.
+
+- The Stream relay meters each shop's link key, bytes in and out, and carries a paying shop while
+  its prepaid credit lasts (with a grace), then stops until it pays again. Buyers can't make a
+  shop pay by flooding it. A small patch to iroh-relay 1.4.1 adds the per-packet hook this needs
+  (`vendor/iroh-relay/XBT-PATCH.md`).
+- The relay's credit API, sold as a priced route on the operator's own shop.
+- Paid relays are announced on Nostr under their own topic, with a price per GB; apps use one only
+  when the owner allows paid relays, up to a price.
+- The shop's gateway pays its paid home relays through the wallet's signer (`relay_pay`).
+- Still to come in 0.3.0: the pages for sellers and relay operators, packaging, and a regtest run
+  across a real relay.
+
 ## 0.2.7 (2026-11-03)
 
 Visits that stop when you press Stop, top-ups only when they are needed, and an AI endpoint and player links

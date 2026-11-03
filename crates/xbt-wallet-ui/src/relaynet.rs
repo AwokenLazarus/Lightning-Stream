@@ -91,7 +91,10 @@ impl RelayNet {
     pub fn prefs(&self) -> Prefs {
         let v: Value = std::fs::read_to_string(&self.file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
         Prefs { pinned: list(&v, "pinned"), blocked: list(&v, "blocked"), own: list(&v, "own"),
-                only_own: v.get("only_own").and_then(Value::as_bool).unwrap_or(false) }
+                only_own: v.get("only_own").and_then(Value::as_bool).unwrap_or(false),
+                // paid relays (docs/PAID-RELAYS.md): off unless the owner allows them, up to a price per GB
+                paid: v.get("paid").and_then(Value::as_bool).unwrap_or(false),
+                max_msat_per_gb: v.get("max_msat_per_gb").and_then(Value::as_u64).unwrap_or(0) }
     }
 
     /// The relays to use now for AI, hashrate and pages, from the last snapshot (none yet:
@@ -125,8 +128,13 @@ impl RelayNet {
         let selected = self.selected(prefs);
         let throughput = self.selected_for(prefs, Purpose::Throughput);
         let observed: serde_json::Map<String, Value> = self.observed().into_iter().map(|(k, v)| (k, json!(v))).collect();
-        let v = json!({"pinned": prefs.pinned, "blocked": prefs.blocked, "own": prefs.own, "only_own": prefs.only_own,
-                       "selected": selected, "selected_throughput": throughput, "observed": observed});
+        let mut v = json!({"pinned": prefs.pinned, "blocked": prefs.blocked, "own": prefs.own, "only_own": prefs.only_own,
+                           "selected": selected, "selected_throughput": throughput, "observed": observed});
+        // paid relays, when the owner has allowed them: kept, never written for one who hasn't
+        if prefs.paid || prefs.max_msat_per_gb > 0 {
+            v["paid"] = json!(prefs.paid);
+            v["max_msat_per_gb"] = json!(prefs.max_msat_per_gb);
+        }
         let tmp = self.file.with_extension("json.tmp");
         std::fs::write(&tmp, format!("{v:#}\n")).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, &self.file).map_err(|e| format!("{}: {e}", self.file.display()))
@@ -240,7 +248,7 @@ mod tests {
         let n = RelayNet::new(Vec::new(), &d);
         assert_eq!(n.prefs(), Prefs::default());
         let p = Prefs { pinned: vec!["https://a.example.com/".into()], blocked: vec!["https://b.example.com/".into()],
-                        own: vec!["https://mine.example.com/".into()], only_own: false };
+                        own: vec!["https://mine.example.com/".into()], only_own: false, ..Prefs::default() };
         n.save(&p).unwrap();
         assert_eq!(n.prefs(), p);
         let v: Value = serde_json::from_str(&std::fs::read_to_string(d.join("relays.json")).unwrap()).unwrap();
@@ -254,7 +262,7 @@ mod tests {
             assert_eq!(std::fs::metadata(d.join("secrets/relay-operator.key")).unwrap().permissions().mode() & 0o777, 0o600);
         }
         assert!(n.publish(&Offer { relay: "https://mine.example.com".into(), region: "eu".into(), capacity_mbit: None, udp: false,
-                                   contact: String::new(), note: String::new(), ttl_s: 86_400 }).unwrap_err().contains("no Nostr relays"));
+                                   contact: String::new(), note: String::new(), ttl_s: 86_400, price: None }).unwrap_err().contains("no Nostr relays"));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

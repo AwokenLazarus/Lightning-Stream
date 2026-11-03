@@ -2,11 +2,11 @@
 //! client's iroh key, and says when the connection ends; [`Gate`] puts a [`Meter`] behind those
 //! two calls.
 //!
-//! In this version the relay is free: [`Free`] admits everyone and counts the clients connected
-//! now, for the status page. Paid relays (`docs/RUN-A-RELAY.md`, "Paid relays") replace it with a
-//! meter that admits a client while it has credit and stops carrying when the credit runs out.
-//! Metering by bytes needs a per-client byte count, which iroh-relay 1.4.1 does not expose: that
-//! part is a change to iroh-relay, planned with paid relays.
+//! A free relay uses [`Free`]: it admits everyone, carries everything and counts the clients
+//! connected now, for the status page. A paid relay (`docs/PAID-RELAYS.md`) uses
+//! [`crate::paid::Paid`], which meters every relayed packet by the keys it is from and to through
+//! [`Meter::forward`] (iroh-relay's `on_forward`, a hook our vendored copy adds:
+//! `vendor/iroh-relay/XBT-PATCH.md`), and stops carrying for a shop whose credit has run out.
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -20,6 +20,12 @@ pub trait Meter: std::fmt::Debug + Send + Sync + 'static {
     fn ended(&self, key: &[u8; 32]);
     /// How many clients are connected now.
     fn connected(&self) -> usize;
+    /// Carry `len` bytes of datagrams from `src` to `dst`? Called for every relayed packet; it must
+    /// not block. Everything is carried unless a meter says otherwise.
+    fn forward(&self, src: &[u8; 32], dst: &[u8; 32], len: usize) -> bool {
+        let _ = (src, dst, len);
+        true
+    }
 }
 
 /// Everyone is admitted; clients are counted.
@@ -51,9 +57,9 @@ impl Meter for Free {
 
 /// iroh-relay's access control, deciding through a [`Meter`].
 #[derive(Debug)]
-pub struct Gate<M: Meter>(pub std::sync::Arc<M>);
+pub struct Gate<M: Meter + ?Sized>(pub std::sync::Arc<M>);
 
-impl<M: Meter> AccessControl for Gate<M> {
+impl<M: Meter + ?Sized> AccessControl for Gate<M> {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
         match self.0.admit(request.endpoint_id().as_bytes()) {
             Ok(()) => Access::Allow,
@@ -63,6 +69,10 @@ impl<M: Meter> AccessControl for Gate<M> {
 
     fn on_disconnect(&self, endpoint_id: iroh_base::EndpointId, _connection_id: iroh_relay::server::ConnectionId) {
         self.0.ended(endpoint_id.as_bytes());
+    }
+
+    fn on_forward(&self, src: iroh_base::EndpointId, dst: iroh_base::EndpointId, len: usize) -> bool {
+        self.0.forward(src.as_bytes(), dst.as_bytes(), len)
     }
 }
 
@@ -85,5 +95,11 @@ mod tests {
         assert_eq!(m.connected(), 0);
         m.ended(&b);
         assert_eq!(m.connected(), 0);
+    }
+
+    #[test]
+    fn free_carries_everything() {
+        let m = Free::default();
+        assert!((0..1_000).all(|_| m.forward(&[1; 32], &[2; 32], 1 << 20)));
     }
 }

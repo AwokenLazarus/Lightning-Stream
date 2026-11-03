@@ -368,6 +368,10 @@ more than 10 minutes ahead, or that has lapsed.
 
 ## Paid relays (planned for a later version)
 
+*0.3.0 builds this: `docs/PAID-RELAYS.md` is the design as built so far, and supersedes what
+follows where they differ (a paid relay is announced under its own topic, and the shop pays only
+its own traffic).*
+
 A relay costs its operator bandwidth. Paid relays let an operator charge for what the relay
 carries, through Stream itself, like any other service. The built-in relay in 0.2.0 is free; the
 design below is what that version adds.

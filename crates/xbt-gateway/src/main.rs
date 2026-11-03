@@ -153,7 +153,7 @@ fn run(args: &[String]) -> Result<(), String> {
         cfg.name_shop(xbt402::shop::origin_for(&pk));
         eprintln!("xbt-gateway: a shop without a web address, named {} ({})", cfg.public_url, xbt402::shop::npub(&pk));
     }
-    let (link_cfg, state_dir) = (cfg.link.clone(), cfg.state_dir.clone());
+    let (link_cfg, state_dir, relay_pay) = (cfg.link.clone(), cfg.state_dir.clone(), cfg.relay_pay.clone());
     let (link_node, seller, sign_mac) = (node.clone(), cfg.public_url.clone(), cfg.node.macaroon.with_file_name("sign.macaroon"));
     let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
     let running = gw.serve(listener).map_err(|e| e.to_string())?;
@@ -169,6 +169,14 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(l) => Some(start_link(l, &state_dir, running.addr, &link_node, &seller, &sign_mac, &gw, nostr_pk, link_keys.clone(), link_relays.clone())?),
         None => None,
     };
+    // paying the paid relays the link's keys are homed on (docs/PAID-RELAYS.md): off unless relay_pay is written
+    if let (Some(l), Some(rp)) = (&link_cfg, relay_pay) {
+        let secrets = (0..l.endpoints)
+            .map(|i| xbt402::provider::load_or_create_secret(&state_dir.join(link_key_file(i))).map(|s| s.secret_bytes()).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, String>>()?;
+        eprintln!("xbt-gateway: relay_pay: paying {} paid relay(s) under the wallet task {:?}", rp.relays.len(), rp.task);
+        xbt_gateway::relay_pay::spawn(rp, l.relays.clone(), secrets);
+    }
     // after the link, so the first listing sent already names it
     if let (Some(n), Some(k)) = (nostr, nostr_key) {
         eprintln!("xbt-gateway: publishing the listing on Nostr to {} relays every {} s, as Nostr key {}", n.relays.len(), n.republish.as_secs(), k.public_hex());
@@ -198,6 +206,11 @@ fn main() -> ExitCode {
     }
 }
 
+/// The file of link key `i`: the first key is the one a gateway on one key always had.
+fn link_key_file(i: usize) -> String {
+    if i == 0 { "link.key".to_string() } else { format!("link-{}.key", i + 1) }
+}
+
 /// Starts the gateway's link on `link.endpoints` keys and writes what the app needs to name it
 /// (`link.json` in the state directory: the keys and where they are reached), then has the seller's
 /// node vouch for each, again before the node's word runs out, for as long as the gateway runs.
@@ -211,9 +224,7 @@ fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, 
     let upstream = if addr.ip().is_unspecified() { std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())) } else { addr };
     let mut links = Vec::new();
     for i in 0..l.endpoints {
-        // the first key is the one a gateway on one key always had
-        let file = if i == 0 { "link.key".to_string() } else { format!("link-{}.key", i + 1) };
-        let secret = xbt402::provider::load_or_create_secret(&state_dir.join(file)).map_err(|e| e.to_string())?;
+        let secret = xbt402::provider::load_or_create_secret(&state_dir.join(link_key_file(i))).map_err(|e| e.to_string())?;
         // no relays named: ours, with iroh's public relays beside it. Relays named: each key has
         // another of them first, as its home
         let relays = if l.relays.is_empty() {
