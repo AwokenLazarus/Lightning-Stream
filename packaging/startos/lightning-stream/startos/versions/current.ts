@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.6:0',
+  version: '0.2.7:0',
   releaseNotes: {
     en_US:
-      'The public testing release. Your spending rules are checked before a shop is asked for a ticket, and a limit that stops a payment says so in plain words, naming the shop, the limit and where to raise it, also at the AI address. The starter rules fit a film and some AI at one shop. Selling Jellyfin 10.11 and newer works, and a web app\'s page files can be free. Paid amounts are exact. AI agents can list what they may buy. A shop that changes its address withdraws its old listing. Plain words throughout.',
+      'Fixes from a hands-on run of 0.2.6. Stop ends a visit completely, closing only what that visit used. A visit buys a ticket only when it needs one, and its report says exactly what it used and what was newly paid. Long AI answers no longer fail. Player links have their own address, so VLC and other players can open them on Umbrel. The Sell page warns when a media server has no way in for buyers. Plain names for the stream tickets budget and the wallet\'s records. The Stream Gateway that powers mining rental is now built on FlyTheElephant\'s datum_gateway.',
   },
   migrations: {
     up: async () => {},
