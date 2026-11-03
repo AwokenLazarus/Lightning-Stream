@@ -961,6 +961,11 @@ impl App {
                 let known = self.services().unwrap_or_default();
                 // and the shops reached by their key that it keeps how to reach (the Sellers page's add)
                 let kept = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
+                // what the other offers ask for 1 TH/s for an hour: your own offer is compared with them
+                let th_hour = |x: &Value| per_hour(num(&x["priceMsat"]) / 1000.0, num(&x["sliceWork"]), 1e12);
+                let others: Vec<f64> = offers.iter()
+                    .filter(|x| { let pay = x["payUrl"].as_str().unwrap_or(""); !own_offer(self.is_own_shop(pay), &own_pay, pay) })
+                    .map(th_hour).filter(|p| *p > 0.0).collect();
                 for x in &offers {
                     let price = num(&x["priceMsat"]) / 1000.0;
                     let slice = num(&x["sliceWork"]);
@@ -1035,8 +1040,11 @@ impl App {
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     // your own offer: what it is and what it costs, with nothing to allow, try or rent (a box can't pay itself)
                     if mine {
+                        // far above the other offers or the mining value: said, as a hint only
+                        let market = tip.or_else(|| self.mining_tip().ok()).map(|t| per_hour(worth_sat(1 << 32, &t), 4_294_967_296.0, 1e12));
+                        let high = priced_high(th_hour(x), &others, market);
                         b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
-                            <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}</section>",
+                            <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{high}</section>",
                             esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                             if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() }));
                         continue;
@@ -1183,6 +1191,31 @@ impl App {
 /// hashmaker is paid.
 fn own_offer(own_shop: bool, own_pay: &Option<String>, pay_url: &str) -> bool {
     own_shop || own_pay.as_ref().is_some_and(|o| crate::services::http_origin(pay_url).as_ref() == Some(o))
+}
+
+/// How many times the other offers' middle price, or the mining value, a hashmaker's own price may be before its offer
+/// card says it is priced high.
+const PRICED_HIGH: f64 = 2.0;
+
+/// A hint on the hashmaker's own offer when its price per 1 TH/s for an hour (`mine`) is over [`PRICED_HIGH`] times what
+/// the other offers ask in the middle (`others`) or what that hour is worth when mined (`market`). Empty otherwise.
+fn priced_high(mine: f64, others: &[f64], market: Option<f64>) -> String {
+    let mut o: Vec<f64> = others.iter().copied().filter(|p| *p > 0.0).collect();
+    o.sort_by(f64::total_cmp);
+    let median = (!o.is_empty()).then(|| if o.len() % 2 == 1 { o[o.len() / 2] } else { (o[o.len() / 2 - 1] + o[o.len() / 2]) / 2.0 });
+    let mut over: Vec<String> = vec![];
+    if let Some(m) = median.filter(|m| mine > PRICED_HIGH * m) {
+        over.push(format!("about {:.0} times what the other offers ask ({} in the middle)", mine / m, sats_n(m)));
+    }
+    if let Some(m) = market.filter(|m| *m > 0.0 && mine > PRICED_HIGH * m) {
+        over.push(format!("about {:.0} times what that hour is worth when mined at today's difficulty ({})", mine / m, sats_n(m)));
+    }
+    if over.is_empty() {
+        return String::new();
+    }
+    format!("<p class=\"hint warn\"><span class=\"pill warn\">Priced high</span> Your offer comes to about {} an hour for 1 TH/s: {}. \
+             Renters see the offers side by side, so it may not be rented. Only a hint: the price is yours to set on \
+             <a href=\"./sell-hashrate\">Sell → Hashrate</a>.</p>", sats_n(mine), over.join(", and "))
 }
 
 /// Why an offer's Rent (and Try one slice first) is off, in the order a renter fixes them; empty when it is on.
@@ -2092,5 +2125,18 @@ mod tests {
         let one = th_hour_words(&w, None, &[4_400.0]);
         assert!(one.contains("The other offer seen now asks about 4,400 sats") && !one.contains("worth"), "{one}");
         assert!(!th_hour_words(&w, None, &[]).contains("other offer"));
+    }
+
+    /// The hashmaker's own offer says when it is priced far above the other offers or the mining value, as a hint:
+    /// 1,700 sats a piece was set at about 40 times the other offer's price for 1 TH/s for an hour.
+    #[test]
+    fn an_own_offer_far_above_the_others_says_so() {
+        let w = priced_high(44_000.0, &[1_100.0], None);
+        assert!(w.contains("Priced high") && w.contains("about 44,000 sats an hour for 1 TH/s") && w.contains("about 40 times what the other offers ask (1,100 sats in the middle)")
+                && w.contains("Only a hint"), "{w}");
+        let m = priced_high(3_000.0, &[], Some(1_000.0));
+        assert!(m.contains("about 3 times what that hour is worth when mined") && !m.contains("other offers"), "{m}");
+        assert_eq!(priced_high(2_000.0, &[1_000.0, 900.0, 5_000.0], Some(1_000.0)), "", "twice the middle price and the mining value: not yet");
+        assert_eq!(priced_high(5_000.0, &[], None), "", "nothing to compare with");
     }
 }
