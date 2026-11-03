@@ -1551,7 +1551,9 @@ fn link_on(page: &str, prefix: &str) -> String {
 /// umbrelOS puts its own login in front of the app's port (8482), which a player on another device
 /// can't pass, so the links have a port of their own (`XBT_UI_LINKS_BIND`, 33541 there): it plays a
 /// live link with no cookie, refuses an unknown, revoked or expired one as the UI's port does, and
-/// serves nothing else (no page, no action, no download, no API). The Files page gives that port's
+/// serves nothing else (no page, no action, no download, no API). A player's HEAD of a live link
+/// (some ask that first) is answered as its GET, with no body and no call to the connector (which
+/// pays); of an unknown or revoked one, 404. The Files page gives that port's
 /// address: the page's host on it, by IP where the page was opened by IP, or the configured address
 /// (`XBT_UI_LINKS_URL`), by IP likewise.
 #[test]
@@ -1595,6 +1597,20 @@ fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
     assert_eq!((status, body.len()), (200, film.len()));
     let n = seen.lock().unwrap().len();
     assert_eq!(n, 2);
+    // a HEAD first: the GET's answer with no body, paid for nothing (the connector is not asked), on either port
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let head = |url: &str| match agent.head(url).set("Range", "bytes=0-").call() {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => {
+            let (status, ranges, kind) = (r.status(), r.header("Accept-Ranges").map(str::to_string), r.header("Content-Type").map(str::to_string));
+            let mut body = vec![];
+            r.into_reader().read_to_end(&mut body).unwrap();
+            (status, ranges, kind, body.len())
+        }
+        Err(e) => panic!("HEAD {url}: {e}"),
+    };
+    assert_eq!(head(&link), (200, Some("bytes".into()), Some("application/octet-stream".into()), 0));
+    assert_eq!(head(&format!("{}/r/{token}", b.base)).0, 200, "the UI's own port answers it alike");
+    assert_eq!(seen.lock().unwrap().len(), n, "a HEAD asks the connector nothing, so nothing is paid");
 
     // nothing else of the UI is there, the login and the setup included; an unknown token is nothing
     let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
@@ -1606,9 +1622,8 @@ fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
         let (status, _) = plain_get(&format!("{base}{p}"), &[("Cookie", &br.cookie)]);
         assert_eq!(status, 404, "{p}");
     }
-    // nor any other method, the link's own path included
-    let agent = ureq::AgentBuilder::new().redirects(0).build();
-    for (m, p) in [("HEAD", format!("/r/{token}")), ("POST", format!("/r/{token}")), ("POST", "/file-link".to_string()), ("POST", "/login".into())] {
+    // nor any other method, the link's own path included, nor a HEAD of anything but a live link
+    for (m, p) in [("HEAD", format!("/r/{other}")), ("HEAD", "/".into()), ("HEAD", format!("/s/{FILM}")), ("POST", format!("/r/{token}")), ("POST", "/file-link".to_string()), ("POST", "/login".into())] {
         let status = match agent.request(m, &format!("{base}{p}")).set("Cookie", &br.cookie).call() {
             Ok(r) => r.status(),
             Err(ureq::Error::Status(s, _)) => s,
@@ -1622,6 +1637,7 @@ fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
     let r = br.act(&play, "/file-link", &[("action", "revoke"), ("item", FILM), ("token", &token)]);
     assert!(br.flash_after(&r).contains("revoked"));
     assert_eq!(plain_get(&link, &[]).0, 404);
+    assert_eq!(head(&link).0, 404, "nor answers a HEAD");
     // and a new one expires on its own
     let r = br.act(&play, "/file-link", &[("action", "create"), ("item", FILM)]);
     assert!(br.flash_after(&r).contains("Link made"));
@@ -1786,10 +1802,12 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
 }
 
 /// A media server shared with neither accounts for buyers nor a guest login shows buyers its own sign-in page: they pay
-/// and cannot get in. The Sell page says so on the offer, and Save asks the seller to say they mean it.
+/// and cannot get in. The Sell page says so on the offer, naming the server, and Save asks the seller to say they mean
+/// it, once: what they said is kept with the offer, so a later edit saves without asking. A web app that only opens at
+/// /web/ is no media server and is not asked.
 ///
 /// FAILS before: it was saved without a word (a hands-on run's buyers paid a ticket for Laz Flix and landed on the
-/// owner's Jellyfin sign-in page).
+/// owner's Jellyfin sign-in page); then every later edit asked again, and any page at /web/ was refused.
 #[cfg(unix)]
 #[test]
 fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller_says_so() {
@@ -1812,13 +1830,13 @@ fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller
     br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
     let addr = format!("http://{media}");
     let form = |extra: &[(&'static str, &'static str)]| {
-        let mut f: Vec<(&str, &str)> = vec![("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Laz Flix"),
-                                             ("app", "1"), ("app_entry", "/web/"), ("app_free", "/web/")];
+        let mut f: Vec<(&str, &str)> = vec![("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+                                             ("name", "Laz Flix Jellyfin"), ("app", "1"), ("app_entry", "/web/"), ("app_free", "/web/")];
         f.extend_from_slice(extra);
         f.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>()
     };
-    let saved = || std::fs::read_to_string(bx.data.path().join("ui/sell.json")).ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok()).map_or(0, |v| v["offers"].as_array().map_or(0, Vec::len));
+    let sell = || std::fs::read_to_string(bx.data.path().join("ui/sell.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or(Value::Null);
+    let saved = || sell()["offers"].as_array().map_or(0, Vec::len);
     // neither accounts nor a guest login: the form comes back with why, and nothing is saved
     let f = form(&[]);
     let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
@@ -1832,13 +1850,30 @@ fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     assert_eq!(saved(), 1);
     assert!(unescape(&br.get("/sell").body).contains("Buyers will see your Jellyfin's sign-in page and can't get in"));
+    assert_eq!(sell()["offers"][0]["app"]["no_login_ok"], json!(true), "what the seller said is kept with the offer");
+    let id = sell()["offers"][0]["id"].as_str().unwrap().to_string();
+    // editing it: the box is ticked already, and a save without it (an edit of something else) is not refused
+    let page = br.get(&format!("/sell?edit={id}")).body;
+    assert!(page.contains("name=\"app_no_accounts\" value=\"1\" checked"), "{page}");
+    let mut f = form(&[("price", "21")]);
+    f.retain(|(k, v)| k != "price" || v == "21");
+    f.push(("id".into(), id.clone()));
+    let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert_eq!((saved(), &sell()["offers"][0]["price_msat"], &sell()["offers"][0]["app"]["no_login_ok"]), (1, &json!(21_000), &json!(true)));
+    assert!(unescape(&br.get("/sell").body).contains("Buyers will see your Jellyfin's sign-in page and can't get in"), "the offer still says so");
     // with a shared guest login it is saved at once, and no warning is shown
-    let id = serde_json::from_str::<Value>(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap()["offers"][0]["id"]
-        .as_str().unwrap().to_string();
     let mut f = form(&[("app_login", "X-Emby-Token: guest-1")]);
     f.push(("id".into(), id));
     let r = br.act("/sell", "/sell", &f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert!(!unescape(&br.get("/sell").body).contains("can't get in"));
+    assert_eq!(sell()["offers"][0]["app"].get("no_login_ok"), None, "a way in for buyers: nothing to say");
+    // a web app (no media server) whose page opens at /web/: saved as it is
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", &addr), ("price", "1"), ("unit", "request"), ("name", "Wiki"),
+                                       ("paths", "/wiki/"), ("app", "1"), ("app_base", "/wiki/"), ("app_entry", "/wiki/web/")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert_eq!(saved(), 2);
     assert!(!unescape(&br.get("/sell").body).contains("can't get in"));
 }
 
