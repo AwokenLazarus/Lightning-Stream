@@ -5695,6 +5695,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xbt-compute-check"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "xbt-iroh-link",
+]
+
+[[package]]
 name = "xbt-gateway"
 version = "0.1.0"
 dependencies = [

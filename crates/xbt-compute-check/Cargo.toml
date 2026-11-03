@@ -1,0 +1,26 @@
+[package]
+name = "xbt-compute-check"
+description = "The first step of the compute alpha: what testers' machines have and how well they reach each other, and which mixture-of-experts models that group could run together"
+version.workspace = true
+edition.workspace = true
+# iroh 1.4 needs 1.91, like xbt-iroh-link
+rust-version = "1.91"
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "xbt_compute_check"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stream-compute-check"
+path = "src/main.rs"
+
+[dependencies]
+xbt-iroh-link = { path = "../xbt-iroh-link" }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util", "fs"] }
+serde = { workspace = true }
+serde_json.workspace = true
+hex.workspace = true
+getrandom = "0.2"
+libc = "0.2"
