@@ -1223,7 +1223,7 @@ impl App {
                 which shares win, and it takes its work from your own XBT node.</p>\
                 <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>\
                 <p class=\"small\">Built on <a href=\"https://github.com/FlyTheElephant1/datum_gateway\" target=\"_blank\" rel=\"noopener noreferrer\">FlyTheElephant's \
-                DATUM Gateway</a>, with Lightning Stream's job masking.</p>"));
+                datum_gateway</a>, with Lightning Stream's job masking.</p>"));
             if b["inUse"] == true {
                 let node = b["node"].as_bool();
                 o.push_str("<ul class=\"plain\">");

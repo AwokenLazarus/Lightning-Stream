@@ -103,13 +103,13 @@ lines. They are a list of lnd options, kept to what the overlay needs, and are c
 
 ### FlyTheElephant's and CONVOY's datum_gateway (vendored, with our changes), and the C libraries it links
 
-The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's DATUM Gateway
+The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's datum_gateway
 (<https://github.com/FlyTheElephant1/datum_gateway>), with Lightning Stream's job masking added. CONVOY's
 `datum_gateway`, which FlyTheElephant's builds on, is credited below and in the image's NOTICE.
 
 `third_party/datum_gateway` is FlyTheElephant's `datum_gateway` (<https://github.com/FlyTheElephant1/datum_gateway>,
 master at commit 280cf54), merged with CONVOY's `datum_gateway` (<https://github.com/CONVOYMining/datum_gateway>,
-commit 971af86), the fork it descends from: OCEAN's DATUM Gateway as CONVOY maintains it, with FlyTheElephant's
+commit 971af86), the fork it descends from: OCEAN's datum_gateway as CONVOY maintains it, with FlyTheElephant's
 performance and logging changes. MIT licence, Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and
 individual contributors (`third_party/datum_gateway/LICENSE`, the same text in both). Until 0.2.6 it was
 CONVOY's 971af86 alone; that tree's first commit here is upstream's unchanged. The move to FlyTheElephant's

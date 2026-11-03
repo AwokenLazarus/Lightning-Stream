@@ -2,13 +2,13 @@ Stream Gateway (DATUM-compatible), as shipped in Lightning Stream's xbt-datum-ga
 This binary: @BUILD@, built from Lightning Stream commit @COMMIT@@LOCAL@
 (https://github.com/AwokenLazarus/Lightning-Stream/tree/@COMMIT@).
 
-The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's DATUM Gateway
+The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's datum_gateway
 (https://github.com/FlyTheElephant1/datum_gateway), with Lightning Stream's job masking added.
 
 It is FlyTheElephant's datum_gateway (https://github.com/FlyTheElephant1/datum_gateway, master at commit
 @UPSTREAM_FTE@), merged with CONVOY's datum_gateway
 (https://github.com/CONVOYMining/datum_gateway, commit @UPSTREAM_CONVOY@), from which FlyTheElephant's
-fork descends: OCEAN's DATUM Gateway as CONVOY maintains it, with FlyTheElephant's performance and logging
+fork descends: OCEAN's datum_gateway as CONVOY maintains it, with FlyTheElephant's performance and logging
 changes. MIT licensed (datum_gateway.LICENSE: Copyright (c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and
 individual contributors, FlyTheElephant and CONVOY's contributors among them). With Lightning Stream's
 changes: every job is masked with a fresh key the gateway holds, so a hasher cannot tell which share is a

@@ -319,7 +319,7 @@ so it waits for that plumbing.
 
 ## The Stream Gateway that comes with the app
 
-The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's DATUM Gateway
+The Stream Gateway, which powers mining (hashrate) rental, is built on FlyTheElephant's datum_gateway
 (<https://github.com/FlyTheElephant1/datum_gateway>), with Lightning Stream's job masking added. The app's
 Hashrate page says so under **Your gateway**.
 
