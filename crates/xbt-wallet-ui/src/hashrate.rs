@@ -402,6 +402,29 @@ fn pay_address_gone(why: &str) -> bool {
      "cannot reach", "no such host", "failed to lookup", "dns"].iter().any(|m| w.contains(m))
 }
 
+/// A payment the wallet refused (its answer as the renter kept it: `{"verdict":"deny","rule":…,"reason":…}`), in words,
+/// with what to do for the rules an owner meets most. None: not a refusal of the wallet's.
+fn wallet_refusal(why: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(why).ok()?;
+    if v["verdict"] != "deny" {
+        return None;
+    }
+    let rule = v["rule"].as_str().unwrap_or("");
+    // one with no reason in words is left unsaid, as before: the end of the rental says the rest
+    let reason = v["reason"].as_str().map(|r| r.trim().trim_end_matches('.')).filter(|r| !r.is_empty())?;
+    let todo = match rule {
+        "transport" => " This hashmaker's shop has no web address, so your wallet reaches it by its key: add the shop on \
+            <a href=\"./services\">Sellers</a> (paste its shop key), then rent again.",
+        "allowlist" | "seller_blocked" => " Allow this hashmaker to be paid (the button on its offer), and sign the change in your \
+            <a href=\"./policy\">spending rules</a>.",
+        "ticket_disabled" | "ticket_mainnet" | "ln_disabled" | "ticket_task" => " Paying is off in your spending rules: turn it on and sign them \
+            (<a href=\"./policy\">Settings → Spending rules</a>).",
+        _ => "",
+    };
+    Some(format!("<p class=\"hint\">Your wallet refused to pay this hashmaker: {}.{todo} <span class=\"small\">(rule: <code>{}</code>)</span></p>",
+                 esc(reason), esc(if rule.is_empty() { "none given" } else { rule })))
+}
+
 /// A closed rental's reason, in words.
 fn ended_words(why: &str) -> String {
     // the earlier role names too: a hashlink from before the rename words its reasons with them
@@ -1365,8 +1388,10 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     const WORDS: [&str; 5] = ["This hashmaker's smallest ticket is", "What is left of this rental's budget", "Your wallet's rules stopped this payment",
                               "The wallet pays a rental only through the renter's own connection",
                               "The renter asked to pay something that isn't a piece of work of its rental"];
-    let refused = live["pays"].as_array().into_iter().flatten().rev().find_map(|p| p["why"].as_str().filter(|w| WORDS.iter().any(|s| w.starts_with(s))))
-        .map(|w| format!("<p class=\"hint\">{}</p>", esc(w))).unwrap_or_default();
+    let whys = || live["pays"].as_array().into_iter().flatten().rev().filter_map(|p| p["why"].as_str());
+    let refused = whys().find(|w| WORDS.iter().any(|s| w.starts_with(s))).map(|w| format!("<p class=\"hint\">{}</p>", esc(w)))
+        // any other refusal of the wallet's is its own answer, as it gave it: said with what to do, not left in the API
+        .or_else(|| whys().find_map(wallet_refusal)).unwrap_or_default();
     let cut = if ended {
         String::new()
     } else {
@@ -1940,5 +1965,28 @@ mod tests {
         assert_eq!(ended_words("hashmaker closed: no first payment"), "The first piece of work was not paid in time.");
         assert_eq!(ended_words("the gateway's jobs aren't blinded"), "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.");
         assert_eq!(ended_words("hashmaker closed: a difficulty too high for the slice"), "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.");
+    }
+
+    /// A payment the wallet refused is said on the rental's card with its reason and what to do: 0.2.9 said only "Your
+    /// wallet could not pay for the first piece of work", and the reason was in the renter's API.
+    #[test]
+    fn a_payment_the_wallet_refused_is_said_with_what_to_do() {
+        let transport = json!({"verdict": "deny", "rule": "transport", "reason": "a shop without a web address is reached through its transport document: pass `transport` and `receipt_key` from its listing, or add the shop in the app (XBT_SHOPS_FILE)"});
+        let w = wallet_refusal(&transport.to_string()).unwrap();
+        assert!(w.contains("Your wallet refused to pay this hashmaker: a shop without a web address") && w.contains("<a href=\"./services\">Sellers</a>")
+                && w.contains("<code>transport</code>"), "{w}");
+        let off = wallet_refusal(&json!({"verdict": "deny", "rule": "ticket_disabled", "reason": "stream tickets are off in this policy (tickets.enabled)"}).to_string()).unwrap();
+        assert!(off.contains("Paying is off in your spending rules") && off.contains("./policy"), "{off}");
+        let other = wallet_refusal(&json!({"verdict": "deny", "rule": "price_ceiling", "reason": "the price is above the ceiling."}).to_string()).unwrap();
+        assert!(other.contains("the price is above the ceiling. <span") && !other.contains("<a "), "said as it is, nothing to point at: {other}");
+        assert_eq!(wallet_refusal("signer socket run/signer.sock: No such file"), None, "not the wallet's answer");
+        assert_eq!(wallet_refusal(&json!({"verdict": "allow"}).to_string()), None);
+        assert_eq!(wallet_refusal(&json!({"verdict": "deny", "rule": "price_ceiling"}).to_string()), None, "no words to say");
+        // on the card, beside the end in words
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let r = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 40, "ended": true,
+                       "live": {"closed": "the first slice could not be paid", "pays": [{"slice": 1, "ok": false, "why": transport.to_string()}]}});
+        let card = rental_card(&ctx, &r, "./hashrate");
+        assert!(card.contains("Your wallet could not pay for the first piece of work") && card.contains("add the shop on"), "{card}");
     }
 }
