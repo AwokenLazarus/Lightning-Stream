@@ -1561,17 +1561,37 @@ impl App {
         self.stream_gw_here().then(|| crate::stream_gateway::read(&self.cfg.hash.stream_gw.dir)).flatten()
     }
 
-    /// "Your gateway": the bundled Stream Gateway's state and settings, when this install has it, and another gateway's
-    /// address, for an owner who runs one that masks its jobs.
-    fn gateway_card(&self, csrf: &str, st: &Value) -> String {
-        use crate::stream_gateway::{Mode, Settings, LAZARUS_HOST, LAZARUS_PORT, LAZARUS_PUBKEY, NAME};
+    /// `GET /your-gateway`, Settings → Your gateway: the gateway rented work goes to, as the Hashrate page says it (its
+    /// state, the bundled Stream Gateway's rows and the way to its status pages); its settings stay on the Hashrate page.
+    pub(crate) fn your_gateway_page(&self, ctx: &Ctx) -> Resp {
+        let Some(base) = self.cfg.hash.renter.as_deref() else {
+            return self.page("Your gateway", ctx,
+                "<p class=\"empty\">Renting miners is off in this install. The Lightning Stream app on Umbrel and on Linux has it.</p>".into());
+        };
+        let st = match call(base, &self.cfg.hash.renter_token, "GET", "/status", None) {
+            Ok(s) => s,
+            Err(e) => return self.page("Your gateway", ctx, App::error_box(&e)),
+        };
+        // the Hashrate page's own heading for it (its words after say "below", for the settings there); renting itself
+        // waits on the spending rules too, said on that page
+        let (class, head, _) = rent_status(&st, self.stream_gw_here(), self.stream_gw_settings().is_some());
+        let head = if class == "good" { "Your gateway is ready" } else { head };
+        let mut b = format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{head}</p></section>");
+        b.push_str(&format!("<section class=\"card\" id=\"gateway\">{}\
+            <p><a href=\"./hashrate#gateway\">Its settings</a> <span class=\"small\">on the Hashrate page: where its blocks pay, \
+            and another gateway.</span></p></section>", self.gateway_state(&App::csrf_input(ctx), &st)));
+        self.page("Your gateway", ctx, b)
+    }
+
+    /// "Your gateway"'s state: what the bundled Stream Gateway is, and whether it runs, has jobs from the node and masks
+    /// them (or the other gateway rented work goes to instead), with the way to its status pages. On the Hashrate page's
+    /// card and on Settings → Your gateway. Nothing for an install without it.
+    fn gateway_state(&self, csrf: &str, st: &Value) -> String {
+        use crate::stream_gateway::NAME;
         let datum = st["datum"]["addr"].as_str().unwrap_or("");
-        let found: Vec<String> = st["datum"]["found"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
         let b = &st["bundled"];
-        let mut o = String::from("<section class=\"card\" id=\"gateway\"><h2>Your gateway</h2>");
+        let mut o = String::new();
         if self.stream_gw_here() {
-            let saved = self.stream_gw_settings();
-            let s = saved.clone().unwrap_or_else(|| Settings::new(Mode::Solo, ""));
             o.push_str(&format!("<p>The {NAME} comes with this app and runs beside it. It masks every job it hands out, so a hashmaker can't tell \
                 which shares win, and it takes its work from your own XBT node.</p>\
                 <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app mines the SHA-256 fork, and won't work here.</p>\
@@ -1593,6 +1613,22 @@ impl App {
                     <button class=\"secondary\">Use the {NAME}</button></form>", esc(datum)));
                 o.push_str(GATEWAY_STATUS_LINK);
             }
+        }
+        o
+    }
+
+    /// "Your gateway": the bundled Stream Gateway's state and settings, when this install has it, and another gateway's
+    /// address, for an owner who runs one that masks its jobs.
+    fn gateway_card(&self, csrf: &str, st: &Value) -> String {
+        use crate::stream_gateway::{Mode, Settings, LAZARUS_HOST, LAZARUS_PORT, LAZARUS_PUBKEY, NAME};
+        let datum = st["datum"]["addr"].as_str().unwrap_or("");
+        let found: Vec<String> = st["datum"]["found"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+        let b = &st["bundled"];
+        let mut o = String::from("<section class=\"card\" id=\"gateway\"><h2>Your gateway</h2>");
+        o.push_str(&self.gateway_state(csrf, st));
+        if self.stream_gw_here() {
+            let saved = self.stream_gw_settings();
+            let s = saved.clone().unwrap_or_else(|| Settings::new(Mode::Solo, ""));
             let solo = s.mode == Mode::Solo;
             let ck = |on: bool| if on { " checked" } else { "" };
             // the node its block templates come from, by host (the node's credentials are never in its address)
