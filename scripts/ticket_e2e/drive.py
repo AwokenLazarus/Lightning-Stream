@@ -196,7 +196,7 @@ class Wallet:
             # as shipped a session is one payment for velocity_max (a 100 MB file is twenty releases), a session holds
             # 2 tickets and the wallet 15 in all: none of that is set here
             "tickets": {"enabled": True, "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
-                        "tasks": {"film": {"budget_sats": 3_000_000}}, **TICKET_OVERRIDES},
+                        "tasks": {"film": {"budget_sats": 3_000_000}, "chat": {"budget_sats": 100_000}}, **TICKET_OVERRIDES},
         }
 
     def write_policy(self) -> None:
@@ -2931,20 +2931,32 @@ def mesh() -> None:
         return json.dumps(b)
 
     code, headers, _ = send("POST", path, GW_PORT, {"Content-Type": "application/json"}, question(0, False).encode())
-    required = next((v for k, v in headers.items() if k.lower() == "payment-required"), "")
     try:
-        terms = base64.b64decode(required).decode()
+        terms = json.loads(base64.b64decode(headers.get("payment-required", "")))
     except ValueError:
-        terms = ""
-    rates = f"{AI_IN_MSAT}/{AI_OUT_MSAT}/{AI_MAX_OUT}"
+        terms = {}
+    found: list[dict[str, Any]] = []
+
+    def prices(v: Any) -> None:  # every price in the terms, wherever it sits
+        if isinstance(v, dict):
+            if "outputPer1kMsat" in v:
+                found.append({k: v.get(k) for k in ("inputPer1kMsat", "outputPer1kMsat", "maxOutputTokens")})
+            for x in v.values():
+                prices(x)
+        elif isinstance(v, list):
+            for x in v:
+                prices(x)
+    prices(terms)
+    rates = {"inputPer1kMsat": str(AI_IN_MSAT), "outputPer1kMsat": str(AI_OUT_MSAT), "maxOutputTokens": str(AI_MAX_OUT)}
     check(f"mesh: unpaid, the model's route answers 402 and names its rates per 1,000 tokens in and out and its most tokens out ({rates})",
-          code == 402 and rates in terms, {"status": code, "rates_in_terms": rates in terms})
+          code == 402 and rates in found, {"status": code, "prices_in_terms": found})
     stop_sessions()
     m0 = money()
     usage, seller, sid, wrong, tin, tout = 0, 0, "", [], 0, 0
     for i in range(20):
         streamed = i % 2 == 1
         body = question(i, streamed)
+        # the owner's task for this lab's chat questions: a budget of its own beside the films'
         r = agent().tool("xbt402_pay", {"url": f"{ORIGIN}{path}", "method": "POST", "body": body, "max_sats": CALL_SATS, "task": "chat"})
         note_receipts(r)
         u = ai_usage(body_of(r), streamed)
@@ -2955,7 +2967,7 @@ def mesh() -> None:
             tout += min(int(u["completion_tokens"]), AI_MAX_OUT)
         # each answer the model's, priced on its own counts, in the one session
         if not call_paid(r) or r.get("rail") != "ticket" or r.get("price_msat") != str(want) or (sid and r.get("session") != sid):
-            wrong.append({"i": i, "streamed": streamed, "usage": u, "want_msat": want, **brief(r)})
+            wrong.append({"i": i, "streamed": streamed, "usage": u, "want_msat": want, "rails_passed_over": r.get("rails_passed_over"), **brief(r)})
         sid = sid or str(r.get("session"))
         seller = max(seller, int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or 0))
     stop, m = stop_and_count(sid, m0)
