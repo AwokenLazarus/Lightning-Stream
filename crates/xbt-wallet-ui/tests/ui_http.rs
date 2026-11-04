@@ -4938,7 +4938,7 @@ fn rules_without_the_hashrate_task_say_so_and_add_only_that_task_to_sign() {
 
     // the line and the button, and Rent off with why
     let p = br.get("/hashrate").body;
-    assert!(p.contains("Your spending rules don't allow renting hashrate yet") && !p.contains("Ready to rent"), "{p}");
+    assert!(p.contains("id=\"rent-rules\"") && p.contains("Your spending rules don't allow renting hashrate yet") && !p.contains("Ready to rent"), "{p}");
     assert!(p.contains("href=\"./policy?task=hashrate\">Allow renting hashrate in your spending rules</a>"), "{p}");
     let card = big(&p);
     assert!(card.contains("<button disabled>Rent</button>") && card.contains("Try one slice first</button>") && !card.contains("<button class=\"secondary\">Try"), "{card}");
@@ -4989,7 +4989,7 @@ fn rules_without_the_hashrate_task_say_so_and_add_only_that_task_to_sign() {
 
     // Rent is on, and the rules page shows the task read-only
     let p = br.get("/hashrate").body;
-    assert!(p.contains("Ready to rent") && !p.contains("Your spending rules don't allow renting hashrate yet"), "{p}");
+    assert!(p.contains("Ready to rent") && !p.contains("id=\"rent-rules\""), "{p}");
     assert!(big(&p).contains("<button>Rent</button>"), "{}", big(&p));
     let pol = br.get("/policy").body;
     let task = &pol[pol.find("id=\"renting-hashrate\"").expect(&pol)..];
