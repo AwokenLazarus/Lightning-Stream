@@ -763,6 +763,10 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             Err(e) => *live.lock().unwrap_or_else(|p| p.into_inner()) = json!({"closed": format!("could not start: {e}")}),
             Ok(report) => lock(&service).note_rental_end(&hex::encode(hashmaker_key.serialize()), &report),
         }
+        // when it ended, for the renter's page to say beside its start
+        if let Some(o) = live.lock().unwrap_or_else(|p| p.into_inner()).as_object_mut() {
+            o.insert("endedMs".into(), json!(xbt_hashlink::now_ms()));
+        }
         done.store(true, Ordering::Relaxed);
         eprintln!("hashtaker: rental with {} ended", hex::encode(hashmaker_key.serialize()));
     });

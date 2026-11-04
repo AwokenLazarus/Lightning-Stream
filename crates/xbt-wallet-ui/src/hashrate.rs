@@ -1368,6 +1368,47 @@ fn rentals_sections(ctx: &Ctx, rentals: &[Value]) -> String {
     b
 }
 
+/// A rental's end reason after "Ended:": [`ended_words`]' sentence with a small first letter.
+fn ended_line(words: &str) -> String {
+    let w = words.trim_start_matches("Ended: ");
+    let mut c = w.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// A span of time as people say it: "40 s", "5 min", "11 h 2 min", "2 d 3 h".
+fn duration_words(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} min", s / 60),
+        3600..86_400 => match s % 3600 / 60 {
+            0 => format!("{} h", s / 3600),
+            m => format!("{} h {m} min", s / 3600),
+        },
+        _ => match s % 86_400 / 3600 {
+            0 => format!("{} d", s / 86_400),
+            h => format!("{} d {h} h", s / 86_400),
+        },
+    }
+}
+
+/// When a rental started, and when it ended and after how long (the renter's service says `live.endedMs` once its
+/// rental is over), or how long it has been going on. The start is `startedMs`, or the time in its id (`r<ms>`).
+fn rental_times(r: &Value, ended: bool, now_ms: u64) -> String {
+    let started = r["startedMs"].as_u64().or_else(|| r["rental"].as_str().and_then(|i| i.strip_prefix('r')).and_then(|t| t.parse().ok()).filter(|t: &u64| *t > 1_000_000_000_000));
+    let Some(started) = started.filter(|t| *t > 0) else { return String::new() };
+    let at = |ms: u64| crate::html::utc((ms / 1000) as i64);
+    let end = match (ended, r["live"]["endedMs"].as_u64()) {
+        (true, Some(e)) => format!(" · ended {}, after {}", at(e), duration_words(e.saturating_sub(started))),
+        (true, None) => String::new(),
+        (false, _) => format!(" · going on for {}", duration_words(now_ms.saturating_sub(started))),
+    };
+    format!("<p class=\"small\">Started {}{end}</p>", at(started))
+}
+
 /// One rental, as the renter sees it.
 fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let live = &r["live"];
@@ -1392,9 +1433,10 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     // the hashmaker's pay address that doesn't answer (a shop that moved or turned Private): said as that, not as a
     // wallet that "could not pay" (0.2.2, Mike's Umbrel: the reason was only in the API)
     let unreachable = live["pays"].as_array().into_iter().flatten().filter_map(|p| p["why"].as_str()).any(pay_address_gone);
-    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\">{}{}</p>",
-                                                     esc(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { ended_words(w) }),
+    let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\"><strong>Ended:</strong> {}{}</p>",
+                                                     esc(&ended_line(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { ended_words(w) })),
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
+    let times = rental_times(r, ended, crate::now() as u64 * 1000);
     // a payment the wallet refused: the hashmaker will only say a piece went unpaid, and the reason is this wallet's,
     // in words where it has them (xbt_hashlink::rail::BIG_TICKETS_ONLY and those beside it)
     const WORDS: [&str; 5] = ["This hashmaker's smallest ticket is", "What is left of this rental's budget", "Your wallet's rules stopped this payment",
@@ -1433,7 +1475,7 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
         String::new()
     };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
-             <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
+             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
 }
@@ -1735,7 +1777,7 @@ mod tests {
         let c = card(json!({"role": "buyer", "meter": {"accepted": 3}, "closed": null}), false);
         assert!(c.contains("Hashing"), "{c}");
         let c = card(json!({"closed": "could not start: link i/o: Operation timed out (os error 110)"}), true);
-        assert!(c.contains("Could not start") && c.contains("It could not start: link i/o: Operation timed out") && c.contains("Nothing was paid."), "{c}");
+        assert!(c.contains("Could not start") && c.contains("<strong>Ended:</strong> it could not start: link i/o: Operation timed out") && c.contains("Nothing was paid."), "{c}");
         assert!(!c.contains("Hashing") && !c.contains(">Cut<"), "{c}");
     }
 
@@ -2003,7 +2045,7 @@ mod tests {
         assert!(!history.contains("Laz Hash") && !history.contains("Garage"), "{history}");
         assert_eq!(history.matches("<section class=\"card live\">").count(), 3);
         // none going on: said, and History is still there
-        let html = rentals_sections(&ctx, &[old.clone()]);
+        let html = rentals_sections(&ctx, std::slice::from_ref(&old));
         assert!(html.contains("No rental going on.") && html.contains("<summary>History: 1 ended rental</summary>"), "{html}");
         // none ended: no History
         let html = rentals_sections(&ctx, &[going]);
@@ -2015,5 +2057,30 @@ mod tests {
         let html = rentals_sections(&ctx, &many);
         assert!(html.contains("History: 25 ended rentals") && html.contains("The last 20 are shown.") && html.contains("Shop 24<")
                 && !html.contains("Shop 4<"), "{html}");
+    }
+
+    /// A card says when its rental started, when it ended and after how long (or how long it has gone on),
+    /// and why it ended on a line of its own.
+    #[test]
+    fn a_rental_card_says_its_times_and_why_it_ended() {
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        assert_eq!((duration_words(40_000), duration_words(300_000), duration_words(39_720_000), duration_words(36_000_000), duration_words(183_600_000)),
+                   ("40 s".into(), "5 min".into(), "11 h 2 min".into(), "10 h".into(), "2 d 3 h".into()));
+        // 2026-11-03 10:00:00 UTC, ended 11 h 2 min later
+        let start = 1_793_700_000_000u64;
+        let ended = json!({"rental": format!("r{start}"), "hasher": "Laz Hash", "budgetSats": 95700, "startedMs": start, "ended": true,
+                           "live": {"closed": "hashmaker closed: unpaid", "paidSlices": 1078, "spentMsat": 43_120_000, "endedMs": start + 39_720_000}});
+        let c = rental_card(&ctx, &ended, "hashrate");
+        assert!(c.contains("Started 2026-11-03 10:00:00 UTC · ended 2026-11-03 21:02:00 UTC, after 11 h 2 min"), "{c}");
+        assert!(c.contains("<strong>Ended:</strong> a piece of work was not paid in time."), "{c}");
+        let going = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 1000, "startedMs": start, "ended": false,
+                           "live": {"closed": null, "role": "hashtaker"}});
+        assert_eq!(rental_times(&going, false, start + 125_000), "<p class=\"small\">Started 2026-11-03 10:00:00 UTC · going on for 2 min</p>");
+        assert!(!rental_card(&ctx, &going, "hashrate").contains("Ended:"));
+        // no startedMs: the time in the rental's id; no end time from an older service: the start alone
+        let old = json!({"rental": format!("r{start}"), "ended": true, "live": {"closed": "budget used up"}});
+        assert_eq!(rental_times(&old, true, 0), "<p class=\"small\">Started 2026-11-03 10:00:00 UTC</p>");
+        assert!(rental_card(&ctx, &old, "hashrate").contains("<strong>Ended:</strong> its budget is used up."));
+        assert_eq!(rental_times(&json!({"rental": "x"}), true, 0), "");
     }
 }
