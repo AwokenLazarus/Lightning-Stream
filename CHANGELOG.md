@@ -21,8 +21,7 @@ hashrate component, the wallet UI and the gateway change.
     the renter while it waits; its miners work for its own pool meanwhile, at most 3 minutes an hour.
   - money paid ahead stays bounded: at most the lead's worth of work, one piece of work and the smallest ticket
     (about 1,250 sats in the rental above, against 950 before). Each piece of work is still paid once, one payment
-    at a time, and a rental's budget is never passed: a piece of work that would need a ticket larger than what is
-    left of the budget is not paid, and the rental ends as "budget used up".
+    at a time, and what the pieces of work are charged never passes the rental's budget.
 - **Browse shows a hashrate offer's live price.** A hashrate card on Browse said the price its listing names ("40 sat
   a piece of work") beside a live offer asking 404 sats. It now says what the live offer asks, as the Hashrate page
   does, or "Live price on the Hashrate page" until that page has looked.

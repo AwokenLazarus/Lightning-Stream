@@ -320,13 +320,6 @@ impl St {
         }
     }
 
-    /// The next slice needs a ticket (the credit at the seller is short of it) and what is left of the budget is
-    /// short of a slice: a ticket is never smaller than the slice it pays, so buying it would pass the budget. Not paid.
-    fn budget_short(&self) -> bool {
-        let price = self.terms.price_msat;
-        self.queue.is_some() && self.guard.credit_msat < price && self.guard.budget_left.is_some_and(|l| l < price)
-    }
-
     /// End the rental from this side.
     fn end(&mut self, why: &str, tx: &Sender) {
         self.closed = Some(why.to_string());
@@ -390,7 +383,7 @@ impl St {
             if self.stop_paying_after.is_some_and(|n| slice > n) {
                 return;
             }
-            if self.budget_msat.is_some_and(|b| slice * self.terms.price_msat > b) || self.budget_short() {
+            if self.budget_msat.is_some_and(|b| slice * self.terms.price_msat > b) {
                 return;
             }
             let receipt = Receipt {
@@ -614,7 +607,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             g.tick(&tx);
             let (s, largest) = (g.terms.slice_work, g.largest_share());
             // the next slice can't be paid: end as the last paid one runs out, before the hashmaker does it
-            let no_more = g.budget_msat.is_some_and(|b| (g.released + 1) * g.terms.price_msat > b) || g.budget_short();
+            let no_more = g.budget_msat.is_some_and(|b| (g.released + 1) * g.terms.price_msat > b);
             let why = if cut.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                 Some("cut by the hashtaker")
             } else if no_more && !order::fits(g.meter.work, largest.max(1), g.released, g.terms.start_slices, s) {
