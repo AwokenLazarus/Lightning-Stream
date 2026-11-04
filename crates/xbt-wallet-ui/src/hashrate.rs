@@ -2377,7 +2377,7 @@ mod tests {
         let r = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 40, "ended": true,
                        "live": {"closed": "the first slice could not be paid", "pays": [{"slice": 1, "ok": false, "why": transport.to_string()}]}});
         let card = rental_card(&ctx, &r, "./hashrate");
-        assert!(card.contains("Your wallet could not pay for the first piece of work") && card.contains("add the shop on"), "{card}");
+        assert!(card.contains("<strong>Ended:</strong> your wallet could not pay for the first piece of work") && card.contains("add the shop on"), "{card}");
     }
 
     /// With no offer to show: still looking (and the page looks again), no relay answering, or none found.
