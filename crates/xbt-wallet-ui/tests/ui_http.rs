@@ -2967,8 +2967,13 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
             "datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
             "blinding": {"state": "blinded", "why": "solo", "words": "Blinded: a hashmaker can't tell which shares win, so it can't drop those."},
             "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
+                         "startedMs": (xbt_wallet_ui::now() as u64 - 300) * 1000,
                          "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12},
-                                  "walletMovedSats": 1002, "leftWithSellerMsat": 800000}}]}),
+                                  "walletMovedSats": 1002, "leftWithSellerMsat": 800000}},
+                        {"rental": "r7", "hasher": "Laz Hash", "trial": true, "miners": 1, "budgetSats": 40, "startedMs": 1000, "ended": true,
+                         "live": {"closed": "hashmaker closed: no first payment", "paidSlices": 0, "spentMsat": 0, "miners": 0}},
+                        {"rental": "r8", "hasher": "Laz Hash", "miners": 1, "budgetSats": 4696, "startedMs": 2000, "ended": true,
+                         "live": {"closed": "hashmaker closed: unpaid", "paidSlices": 0, "spentMsat": 0, "miners": 0, "endedMs": 39_722_000}}]}),
         ("GET", "/offers") => json!({"offers": [{"name": "Basement miners", "linkKey": "02bb", "priceMsat": 40000, "sliceWork": "140737488355328",
                                                   "miners": 2, "freeMiners": 1, "freeHs": "4000000000000",
                                                   "trialMayBuyTicketUpToSats": 2000, "mayBuyTicketUpToSats": 2000},
@@ -3042,6 +3047,17 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
         assert!(p.body.contains(s), "{s} missing from Hashrate");
     }
     plain("/hashrate", &p.body);
+    // the rental going on is under Your rentals; the ended ones only under History, newest first, with their count
+    let (yours, history) = p.body.split_at(p.body.find("<details class=\"card rentals-history\"").expect("History"));
+    let yours = &yours[yours.find("<h2>Your rentals</h2>").unwrap()..];
+    let history = &history[..history.find("</details>").unwrap()];
+    assert!(yours.contains("Hashrate from Basement miners") && !yours.contains("Laz Hash"), "{yours}");
+    assert!(history.contains("<summary>History: 2 ended rentals</summary>") && !history.contains("Basement miners"), "{history}");
+    assert!(history.find("Hashrate from Laz Hash").unwrap() < history.find("Test slice from Laz Hash").unwrap(), "newest first: {history}");
+    // each card says when it started, when it ended and after how long, and why
+    assert!(history.contains("Started 1970-01-01 00:00:02 UTC · ended 1970-01-01 11:02:02 UTC, after 11 h 2 min")
+            && history.contains("<strong>Ended:</strong> a piece of work was not paid in time."), "{history}");
+    assert!(yours.contains("Started ") && yours.contains("going on for 5 min"), "{yours}");
     // a hashmaker the spending rules do not list yet: allowed first (the rules page, with its node), Rent waits
     let garage = &p.body[p.body.find("Garage miners").unwrap()..];
     let garage = &garage[..garage.find("</section>").unwrap()];
