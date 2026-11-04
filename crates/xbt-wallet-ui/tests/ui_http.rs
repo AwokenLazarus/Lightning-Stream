@@ -4946,7 +4946,7 @@ fn rules_without_the_hashrate_task_say_so_and_add_only_that_task_to_sign() {
     // the refused rental's card says why, in words, with the same button
     let hist = &p[p.find("Test slice from Kilohash").expect(&p)..];
     let hist = &hist[..hist.find("</section>").unwrap()];
-    assert!(hist.contains("Your spending rules don&#39;t allow renting hashrate yet. Nothing was paid.") && hist.contains("./policy?task=hashrate"), "{hist}");
+    assert!(hist.contains("Your spending rules don't allow renting hashrate yet. Nothing was paid.") && hist.contains("./policy?task=hashrate"), "{hist}");
     assert!(!hist.contains("verdict") && !hist.contains("rails_passed_over"), "never the raw answer: {hist}");
     // the rules page says it is missing
     let pol = br.get("/policy").body;
