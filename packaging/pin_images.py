@@ -101,6 +101,8 @@ OWN_SOURCES = {
     # crate into the connector, the VPN service and the wallet UI
     "crates/xbt-gateway": {"xbt-gateway", "xbt-signer", "xbt-anchor-witness", "xbt-wallet-ui"},
     "crates/xbt-wallet-mcp": {"xbt-wallet-mcp", "lightning-stream", "xbt-vpn", "xbt-wallet-ui"},
+    # 0.2.10: the hashrate crate is only the hashlink image's (the signer takes it as a dev-dependency, for its tests)
+    "crates/xbt-hashlink": {"xbt-hashlink"},
 }
 
 
