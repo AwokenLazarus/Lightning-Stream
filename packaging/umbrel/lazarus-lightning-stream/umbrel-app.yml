@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.2.12"
+version: "0.2.13"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -53,6 +53,8 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.2.13: long hashrate rentals keep paying on a slow wallet (tickets bought ahead, a 30 s wait for a
+  payment on its way), live offer prices on Browse, one wallet row a payment, a Your gateway tab.
   0.2.12: rules signed before renting hashrate existed get a button that adds it, for you to sign,
   and a refused rental says why.
   0.2.11: a payment the wallet's socket could not take for a moment is made again, ended rentals fold

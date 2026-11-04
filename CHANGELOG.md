@@ -5,6 +5,38 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.13 (2026-11-04)
+
+A fix for long hashrate rentals on a slow wallet, and display fixes sent by a hashmaker who runs the app. The
+hashrate component, the wallet UI and the gateway change.
+
+- **Long rentals keep paying when tickets are slow to buy.** A rental ended after 2 minutes, and two 24 h rentals
+  after a few hours, as "hashmaker closed: unpaid". Buying a ticket took 11 to 15 seconds over several Lightning hops,
+  but the renter bought the next one only when less than about 9 seconds of work was paid ahead, and the hashmaker
+  waited 10 seconds for a payment on its way. Now:
+  - the renter times its ticket buys and starts the next one while what is paid still lasts that long and half
+    again (at least 3 seconds more, at most 30 seconds of the miners' work), so the piece of work after it is paid
+    from the credit it bought. With buys of 12 seconds, the next buy starts about 19 seconds ahead.
+  - a hashmaker waits up to 30 seconds for a payment the renter says is on its way, instead of 10. No work goes to
+    the renter while it waits; its miners work for its own pool meanwhile, at most 3 minutes an hour.
+  - money paid ahead stays bounded: at most the lead's worth of work, one piece of work and the smallest ticket
+    (about 1,250 sats in the rental above, against 950 before). Each piece of work is still paid once, one payment
+    at a time, and a rental's budget is never passed: a piece of work that would need a ticket larger than what is
+    left of the budget is not paid, and the rental ends as "budget used up".
+- **Browse shows a hashrate offer's live price.** A hashrate card on Browse said the price its listing names ("40 sat
+  a piece of work") beside a live offer asking 404 sats. It now says what the live offer asks, as the Hashrate page
+  does, or "Live price on the Hashrate page" until that page has looked.
+- **The Hashrate page's offers fill the row** on wide screens, instead of narrow cards beside empty space.
+- **The wallet shows one row a payment.** Each payment was three rows on the wallet page ("Allowed", "Reserved",
+  "Paid"). Its allowed and reserved steps now fold into its outcome, behind "Allowed and reserved first".
+- **Settings has a Your gateway tab,** beside Your node: the gateway rented work goes to, its state and the way to its
+  status pages. Its settings stay on the Hashrate page.
+- **A token-priced request with no Content-Type reaches the model as JSON** at the gateway, so a model server that
+  needs it answers.
+
+Thanks to Kilombino, who reported the rentals that ended unpaid with the numbers that showed why, and sent the live
+offer price on Browse, the offer cards, one row a payment and the Your gateway tab.
+
 ## 0.2.12 (2026-11-04)
 
 A fix for renting hashrate on spending rules signed before renting hashrate existed. The wallet UI changes.
