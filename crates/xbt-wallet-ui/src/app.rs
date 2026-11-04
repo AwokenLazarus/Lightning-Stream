@@ -579,6 +579,7 @@ impl App {
             "/agents" => self.agents(&ctx, false),
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),
+            "/your-gateway" => self.your_gateway_page(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
             _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Home</a></p>")),
         }
