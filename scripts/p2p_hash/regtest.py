@@ -497,7 +497,9 @@ def slow_check() -> None:
     inv0, pay0 = d.seller_invoices(), d.buyer_payments()
     t0 = time.time()
     r = rental("slow", None, SLOW_SECS, SLOW_RATE, origin=ORIGIN4, price_msat=SLOW_PRICE_MSAT, task="hashrate-slow",
-               caps=("--budget-sats", str(SLOW_BUDGET_SATS)), idle_s=60)
+               caps=("--budget-sats", str(SLOW_BUDGET_SATS)), idle_s=60,
+               # a share every 5 s from each miner: a new job every second would leave most of them stale
+               job_ms=60_000)
     hz, bz = r["hasher"], r["buyer"]
     for who in ("hasher", "buyer"):
         try:
