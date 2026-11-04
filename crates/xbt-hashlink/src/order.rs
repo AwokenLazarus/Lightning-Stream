@@ -160,7 +160,7 @@ impl Standing {
     /// ([`Standing::buy_secs`]) and a margin of half of it, at least [`BUY_MARGIN_SECS`], up to
     /// [`BUY_AHEAD_MOST_SECS`]. 0 (none started ahead) for buys under [`BUY_AHEAD_FROM_SECS`], or none measured.
     pub fn buy_lead_secs(&self) -> f64 {
-        if !(self.buy_secs >= BUY_AHEAD_FROM_SECS) || !self.buy_secs.is_finite() {
+        if !self.buy_secs.is_finite() || self.buy_secs < BUY_AHEAD_FROM_SECS {
             return 0.0;
         }
         (self.buy_secs + (self.buy_secs / 2.0).max(BUY_MARGIN_SECS)).min(BUY_AHEAD_MOST_SECS)
@@ -169,7 +169,7 @@ impl Standing {
     /// [`Standing::buy_lead_secs`] of output at the measured rate, in msat: 0 till a rate is measured.
     pub fn buy_lead_msat(&self) -> u64 {
         let lead = self.buy_lead_secs();
-        if lead <= 0.0 || !(self.msat_a_second > 0.0) || !self.msat_a_second.is_finite() {
+        if lead <= 0.0 || !self.msat_a_second.is_finite() || self.msat_a_second <= 0.0 {
             return 0;
         }
         (self.msat_a_second * lead) as u64
@@ -602,7 +602,7 @@ mod tests {
     /// turn, one payment at a time; what's gone and unworked within its bound at every buy; the budget never passed.
     #[test]
     fn issue_64_slow_buys_run_a_day_long_rental_to_its_end() {
-        let buys = |n: u64| if n == 0 { 3.7 } else if n % 5 == 0 { 15.4 } else { 12.4 };
+        let buys = |n: u64| if n == 0 { 3.7 } else if n.is_multiple_of(5) { 15.4 } else { 12.4 };
         let before = wallet_timeline(404_000, 16_000.0, &buys, 1.0, false, u64::MAX, 1.0);
         eprintln!("MEASURED before: longest hold {:.1} s at {:.0} s, {} waits, {} buys of {} payments", before.longest_hold.0, before.longest_hold.1,
                   before.waits, before.bought, before.paid);
