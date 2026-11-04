@@ -190,6 +190,12 @@ pub fn signer_unreached(why: &str) -> bool {
 /// How long any signer call but a paying one waits for its answer.
 pub const SIGNER_WAIT: std::time::Duration = std::time::Duration::from_secs(200);
 
+/// How long writing a call to the signer may block. A call is a few hundred bytes and a working signer reads it at
+/// once; a socket that takes none of it for this long is busy, and a payment asks again on a new connection
+/// ([`SignerPayer::pay`]) well within its `wait_for_signer`. Waited for as long as [`SIGNER_WAIT`], the one `EAGAIN`
+/// would come only after the hashmaker's grace was gone, too late to ask again.
+pub const SIGNER_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One call on the signer's socket.
 pub fn signer_call(sock: &std::path::Path, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     signer_call_waiting(sock, method, params, Some(SIGNER_WAIT)).map_err(|(_, e)| e)
@@ -201,7 +207,7 @@ pub fn signer_call_waiting(sock: &std::path::Path, method: &str, params: &serde_
                            -> Result<serde_json::Value, (bool, String)> {
     use std::io::{BufRead, BufReader};
     let mut s = std::os::unix::net::UnixStream::connect(sock).map_err(|e| (false, format!("signer socket {}: {e}", sock.display())))?;
-    s.set_write_timeout(Some(SIGNER_WAIT)).map_err(|e| (false, e.to_string()))?;
+    s.set_write_timeout(Some(SIGNER_WRITE_WAIT)).map_err(|e| (false, e.to_string()))?;
     let req = serde_json::json!({"id": 1, "method": method, "params": params});
     send_request(&mut s, format!("{req}\n").as_bytes())?;
     s.set_read_timeout(answer_wait).map_err(|e| (true, e.to_string()))?;
@@ -717,6 +723,49 @@ mod signer_wait_tests {
         assert_eq!(e, (false, "Resource temporarily unavailable (os error 11)".to_string()));
         assert!(send_request(&mut Busy { ok: 2, interrupted: false }, b"{}\n").unwrap_err().0, "part of it out: sent");
         assert!(send_request(&mut Busy { ok: 3, interrupted: true }, b"{}\n").is_ok());
+    }
+
+    /// A real socket that takes part of a call and then no more (a signer that accepted it and stopped reading): the
+    /// write gives up after [`SIGNER_WRITE_WAIT`] with some of it out, so the call counts as sent. Its payment is an
+    /// answer lost (`verdict: "unknown"`), never made again, though the wait for the signer has time left.
+    #[test]
+    fn a_call_written_in_part_is_never_made_again() {
+        let dir = scratch("part");
+        let sock = dir.join("signer.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let conns = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c2 = conns.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                c2.lock().unwrap().push(c); // held open, never read
+            }
+        });
+        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 5_000, None, None, Duration::from_secs(60));
+        // a body far past any socket buffer, so the write stops part way
+        let big = serde_json::json!({"pad": "x".repeat(16 << 20)});
+        let t0 = Instant::now();
+        let v = p.pay("r1", 1, &big).unwrap();
+        assert_eq!(v["verdict"], "unknown", "{v}");
+        assert_eq!(v["request_sent"], true, "{v}");
+        assert!(t0.elapsed() < SIGNER_WRITE_WAIT * 2 + Duration::from_secs(5), "{:?}", t0.elapsed());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(conns.lock().unwrap().len(), 1, "the signer was asked once");
+    }
+
+    /// A stand-in whose call got out in part and then failed as a busy socket does: sent, so never made again.
+    #[test]
+    fn a_pay_whose_call_got_out_in_part_is_an_answer_lost_and_asked_once() {
+        static TRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn part_out(_: &std::path::Path, _: &str, _: &serde_json::Value, _: Option<Duration>) -> Result<serde_json::Value, (bool, String)> {
+            TRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err((true, std::io::Error::from_raw_os_error(11).to_string()))
+        }
+        let dir = scratch("partstand");
+        let mut p = SignerPayer::new(dir.join("signer.sock"), "https://x/hashrate".into(), "hashrate".into(), 5_000, None, None, Duration::from_secs(5));
+        p.call = part_out;
+        let v = p.pay("r1", 1, &serde_json::json!({})).unwrap();
+        assert_eq!((v["verdict"].as_str(), v["request_sent"].as_bool()), (Some("unknown"), Some(true)), "{v}");
+        assert_eq!(TRIES.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// The `xbt402_pay`s a stand-in socket fails before any of the call is out (as `EAGAIN` does), by number from 1:
