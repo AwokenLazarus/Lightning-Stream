@@ -13,6 +13,8 @@ use xbt_iroh_link::relay_pay::{Fetch, PaidRelay, RelayPayer, Step, Wallet};
 
 use crate::config::RelayPayConfig;
 
+/// The payers' status, beside the gateway's config: what the app's relay page reads.
+pub const STATUS_FILE: &str = "relay_pay.json";
 /// How long a payment waits for the signer: it bounds the call itself.
 const PAY_WAIT: Duration = Duration::from_secs(300);
 const GET_WAIT: Duration = Duration::from_secs(15);
@@ -74,8 +76,21 @@ pub fn homes(cfg: &RelayPayConfig, link_relays: &[String], keys: usize) -> Vec<O
         .collect()
 }
 
-/// Run the payers for `secrets` (the link keys, in order) until the process ends.
-pub fn spawn(cfg: RelayPayConfig, link_relays: Vec<String>, secrets: Vec<[u8; 32]>) {
+/// What the payers found at their last round, for the owner's relay page: written to `status`
+/// (`relay_pay.json` beside the gateway's config, which the app reads).
+pub fn status_value(payers: &[([u8; 32], RelayPayer<Signer, Http>)], last: &[String], now: u64) -> Value {
+    let keys: Vec<Value> = payers.iter().zip(last).map(|((s, p), last)| {
+        let key = xbt_iroh_link::relay_pay::link_key_hex(s);
+        let a = p.accounts.get(&key).cloned().unwrap_or_default();
+        serde_json::json!({"relay": p.relay.relay, "key": key, "balance_bytes": a.balance, "waiting": a.waiting, "dropped_bytes": a.dropped_bytes,
+                           "charged_in": a.charged_in, "charged_out": a.charged_out, "home": a.home, "paid_msat": p.paid_msat, "last": last})
+    }).collect();
+    serde_json::json!({"at": now, "keys": keys})
+}
+
+/// Run the payers for `secrets` (the link keys, in order) until the process ends; after each
+/// round their accounts are written to `status`.
+pub fn spawn(cfg: RelayPayConfig, link_relays: Vec<String>, secrets: Vec<[u8; 32]>, status: Option<PathBuf>) {
     let homes = homes(&cfg, &link_relays, secrets.len());
     let mut payers: Vec<([u8; 32], RelayPayer<Signer, Http>)> = secrets
         .into_iter()
@@ -87,14 +102,30 @@ pub fn spawn(cfg: RelayPayConfig, link_relays: Vec<String>, secrets: Vec<[u8; 32
         return;
     }
     let every = cfg.check;
+    let mut last = vec![String::new(); payers.len()];
     let _ = std::thread::Builder::new().name("relay-pay".into()).spawn(move || loop {
-        for (secret, p) in payers.iter_mut() {
+        for (i, (secret, p)) in payers.iter_mut().enumerate() {
             match p.step(secret, now()) {
                 Step::Paid { balance, price_msat } => {
                     eprintln!("xbt-gateway: relay_pay: paid {price_msat} msat to {}; balance {balance} bytes", p.relay.relay);
+                    last[i] = format!("paid {price_msat} msat");
                 }
-                Step::Refused(why) => eprintln!("xbt-gateway: relay_pay: {} not paid: {why}", p.relay.relay),
-                Step::Enough { .. } | Step::Waiting { .. } => {}
+                Step::Refused(why) => {
+                    eprintln!("xbt-gateway: relay_pay: {} not paid: {why}", p.relay.relay);
+                    last[i] = format!("not paid: {why}");
+                }
+                Step::Enough { .. } => last[i] = "enough credit".into(),
+                Step::Waiting { .. } => {}
+            }
+            if p.accounts.values().any(|a| a.dropped_bytes > 0 && a.waiting) {
+                eprintln!("xbt-gateway: relay_pay: {} is dropping this shop's traffic for want of credit", p.relay.relay);
+            }
+        }
+        if let Some(path) = &status {
+            let tmp = path.with_extension("json.tmp");
+            let v = status_value(&payers, &last, now());
+            if std::fs::write(&tmp, format!("{v}\n")).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+                eprintln!("xbt-gateway: relay_pay: could not write {}", path.display());
             }
         }
         std::thread::sleep(every);

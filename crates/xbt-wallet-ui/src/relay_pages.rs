@@ -126,6 +126,23 @@ impl App {
         if let Some((text, at)) = &home.notice {
             b.push_str(&format!("<p class=\"flash ok\">{} <span class=\"small\">({})</span></p>", esc(text), esc(&ago(*at))));
         }
+        // what the shop's gateway last found at its home relay (relay_pay.json, beside its config)
+        if self.cfg.sell {
+            let st: serde_json::Value = std::fs::read_to_string(self.cfg.gw.dir.join("relay_pay.json")).ok()
+                .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            for k in st.get("keys").and_then(serde_json::Value::as_array).into_iter().flatten() {
+                let n = |f: &str| k.get(f).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let bal = k.get("balance_bytes").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let mut line = format!("Your shop at <code>{}</code>: {} of credit left, {} received and {} sent there paid, {} paid so far; {}.",
+                    esc(k.get("relay").and_then(serde_json::Value::as_str).unwrap_or("")), esc(&gb(bal.max(0) as u64)), esc(&gb(n("charged_in"))),
+                    esc(&gb(n("charged_out"))), esc(&sats(n("paid_msat"))), esc(k.get("last").and_then(serde_json::Value::as_str).unwrap_or("")));
+                if k.get("waiting").and_then(serde_json::Value::as_bool) == Some(true) {
+                    line.push_str(&format!(" <strong>Its traffic is waiting for credit</strong>{}.",
+                        if n("dropped_bytes") > 0 { format!(", and {} was dropped after waiting", esc(&gb(n("dropped_bytes")))) } else { String::new() }));
+                }
+                b.push_str(&format!("<p class=\"small\">{line}</p>"));
+            }
+        }
         if home.price.is_some() && self.cfg.gw.signer_sock.is_none() && self.cfg.sell {
             b.push_str("<p class=\"flash warn\">This box's gateway can't reach the wallet to pay a relay, so your shop stays on Genesis's relay \
                         (free) until it can.</p><details><summary>Technical details</summary><p class=\"small\">Set <code>XBT_UI_GW_SIGNER_SOCK</code> \

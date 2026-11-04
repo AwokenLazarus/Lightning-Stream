@@ -175,7 +175,8 @@ fn run(args: &[String]) -> Result<(), String> {
             .map(|i| xbt402::provider::load_or_create_secret(&state_dir.join(link_key_file(i))).map(|s| s.secret_bytes()).map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, String>>()?;
         eprintln!("xbt-gateway: relay_pay: paying {} paid relay(s) under the wallet task {:?}", rp.relays.len(), rp.task);
-        xbt_gateway::relay_pay::spawn(rp, l.relays.clone(), secrets);
+        let status = std::path::Path::new(path).parent().map(|d| d.join(xbt_gateway::relay_pay::STATUS_FILE));
+        xbt_gateway::relay_pay::spawn(rp, l.relays.clone(), secrets, status);
     }
     // after the link, so the first listing sent already names it
     if let (Some(n), Some(k)) = (nostr, nostr_key) {

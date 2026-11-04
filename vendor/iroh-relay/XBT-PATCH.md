@@ -8,22 +8,26 @@ members.
 
 ## The patch: a per-packet access hook (paid relays)
 
-A paid Stream relay (`docs/PAID-RELAYS.md`) charges a shop by the bytes it carries for it and stops
-carrying for a shop whose credit has run out. iroh-relay's access control decides only when a
-client connects and sees when it leaves; it has no per-client byte count and no way to stop one
-client's traffic short of disconnecting it. The patch adds one hook:
+A paid Stream relay (`docs/PAID-RELAYS.md`) charges an app by the bytes it carries for it, and holds
+the traffic of an app whose credit has run out until it pays. iroh-relay's access control decides
+only when a client connects and sees when it leaves; it has no per-client byte count and no way to
+stop or slow one client's traffic short of disconnecting it. The patch adds one hook:
 
-- `AccessControl::on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> bool`, with a
-  default body that returns `true` (so every existing implementation is unchanged), and the same
-  method on `DynAccessControl` and its blanket impl.
-- `OnDisconnectGuard::forward(&self, dst, len) -> bool`: calls it, `true` for a guard without access
-  control.
-- In the client actor (`server/client.rs`, `handle_frame`), a `Datagrams` frame is forwarded only when
-  `guard.forward(dst, len)` says so; otherwise it is dropped and counted in `send_packets_dropped`.
-  `bytes_recv` still counts it. `len` is the datagrams' contents, without the relay's framing.
-
+- `AccessControl::on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> Forward`, with
+  a default body that returns `Forward::Yes` (so every existing implementation is unchanged), and
+  the same method on `DynAccessControl` and its blanket impl. `Forward` is `#[non_exhaustive]`:
+  `Yes`, `Drop`, `Hold`.
+- `OnDisconnectGuard::forward(&self, dst, len) -> Forward`: calls it, `Yes` for a guard without
+  access control.
+- In the client actor (`server/client.rs`), a `Datagrams` frame is forwarded on `Yes`, dropped and
+  counted in `send_packets_dropped` on `Drop`, and on `Hold` kept while the actor reads nothing
+  more from that client and asks again every `FORWARD_HOLD_RETRY` (50 ms), for up to
+  `FORWARD_HOLD_MAX` (10 s), then dropped. Writes to the client and pings go on meanwhile.
+  `bytes_recv` counts every packet read. `len` is the datagrams' contents, without the relay's
+  framing.
 - A test, `test_relay_access_control_on_forward` in `server.rs`: a per-sender byte budget; packets
-  past it are not forwarded, the connection stays up, and forwarding resumes when it is raised.
+  past it are dropped while the connection stays up, held packets are forwarded in order once
+  there is budget, and packets to the held client still arrive.
 
 Everything else is as published. The same change is kept as a clean commit on iroh's own tag
 `v1.4.1`, to be carried as a fork pinned by commit and offered upstream (`docs/IROH-UPSTREAM.md`);
