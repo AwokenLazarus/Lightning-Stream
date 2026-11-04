@@ -13,6 +13,12 @@
 //! the app keeps it and ranks by it. Both lists are written when the owner changes a choice and
 //! each time the page probes.
 //!
+//! The home relay (`docs/PAID-RELAYS.md`, choosing): `home` is `{"relay", "better": [relay, looks],
+//! "price", "notice": {"text", "at"}}`, the box's home relay as [`xbt_nostr::relays::choose_home`]
+//! keeps it after each look, and the last time it moved by itself, in words for the owner.
+//! `home_pin` is the relay the owner pinned; `paid` and `max_msat_per_gb` whether paid relays may be
+//! home, and at what most per GB. Every app starts on Genesis's relay.
+//!
 //! The Nostr relays are asked, and the relays probed, only when the owner opens the page. The page
 //! shows the last snapshot at once, and when it is older than [`FRESH`] makes a new one behind it
 //! for the next visit; only the first visit waits for one, at most [`crate::nostr::FIRST_WAIT`].
@@ -29,7 +35,22 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_nostr::event::Keys;
 use xbt_nostr::oneshot::{self, Outcome};
-use xbt_nostr::relays::{self, Announcement, Offer, Prefs, Probe, Purpose};
+use xbt_nostr::relays::{self, Announcement, HomeState, HomeWhy, Offer, Prefs, Probe, Purpose, RelayPrice};
+
+/// The box's home relay, as the page and the shop's config read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Home {
+    pub relay: String,
+    /// Its price, when it is a paid relay (from its announcement).
+    pub price: Option<RelayPrice>,
+    pub pinned: bool,
+    /// The last time it moved by itself, in words, and when (Unix seconds).
+    pub notice: Option<(String, u64)>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
 
 /// Genesis's relay: every app's home relay to begin with, and the last resort unless the owner
 /// blocks it. Its 0.2 name, `iroh.lazarus-xbt.xyz`, is the same relay
@@ -96,7 +117,65 @@ impl RelayNet {
                 only_own: v.get("only_own").and_then(Value::as_bool).unwrap_or(false),
                 // paid relays (docs/PAID-RELAYS.md): off unless the owner allows them, up to a price per GB
                 paid: v.get("paid").and_then(Value::as_bool).unwrap_or(false),
-                max_msat_per_gb: v.get("max_msat_per_gb").and_then(Value::as_u64).unwrap_or(0) }
+                max_msat_per_gb: v.get("max_msat_per_gb").and_then(Value::as_u64).unwrap_or(0),
+                home_pin: v.get("home_pin").and_then(Value::as_str).and_then(|s| relays::same_relay(s).ok()) }
+    }
+
+    fn file_value(&self) -> Value {
+        std::fs::read_to_string(&self.file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
+    }
+
+    fn home_state(&self) -> Option<HomeState> {
+        let h = self.file_value().get("home").cloned()?;
+        let relay = h.get("relay").and_then(Value::as_str)?.to_string();
+        let better = h.get("better").and_then(Value::as_array).and_then(|a| Some((a.first()?.as_str()?.to_string(), a.get(1)?.as_u64()? as u32)));
+        Some(HomeState { relay, better })
+    }
+
+    /// The box's home relay now: the one kept after the last look, the default before any.
+    pub fn home(&self) -> Home {
+        let v = self.file_value();
+        let prefs = self.prefs();
+        let relay = self.home_state().map(|s| s.relay).and_then(|r| relays::same_relay(&r).ok()).unwrap_or_else(|| self.default_relay.clone());
+        let price = self.snap.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+            .and_then(|s| s.announced.iter().find(|a| relays::same_relay(&a.relay).ok().as_deref() == Some(relay.as_str())).and_then(|a| a.price.clone()))
+            .or_else(|| v.pointer("/home/price").and_then(|p| Some(RelayPrice { free_bytes_per_day: p.get("free_bytes_per_day")?.as_u64()?,
+                                                                                  ..RelayPrice::new(p.get("msat_per_gb")?.as_u64()?, p.get("credit")?.as_str()?) })));
+        let notice = v.pointer("/home/notice").and_then(|n| Some((n.get("text")?.as_str()?.to_string(), n.get("at")?.as_u64()?)));
+        Home { pinned: prefs.home_pin.as_deref() == Some(relay.as_str()), relay, price, notice }
+    }
+
+    /// One look at the home relay, on what the last snapshot measured: kept, moved to a clearly
+    /// better one (with a notice for the owner), or to the owner's pin. Written to `relays.json`.
+    pub fn look_home(&self, prefs: &Prefs) -> (Home, HomeWhy) {
+        let (ann, probes) = self.snap.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|s| (s.announced.clone(), s.probes.clone())).unwrap_or_default();
+        let before = self.home_state();
+        let (state, why) = relays::choose_home(before.as_ref(), &ann, &probes, prefs, &self.default_relay, prefs.home_pin.as_deref());
+        let mut v = self.file_value();
+        if !v.is_object() {
+            v = json!({});
+        }
+        let mut home = json!({"relay": state.relay, "better": state.better.as_ref().map(|(r, n)| json!([r, n]))});
+        if let Some(p) = ann.iter().find(|a| relays::same_relay(&a.relay).ok().as_deref() == Some(state.relay.as_str())).and_then(|a| a.price.as_ref()) {
+            home["price"] = json!({"msat_per_gb": p.msat_per_gb, "credit": p.credit, "free_bytes_per_day": p.free_bytes_per_day});
+        }
+        let moved = before.as_ref().is_none_or(|b| relays::same_relay(&b.relay).ok().as_deref() != Some(state.relay.as_str()));
+        let text = match &why {
+            HomeWhy::Better { from, from_ms, to_ms } => Some(format!("Moved to {} by itself: it answered in {to_ms} ms, where {from} took {from_ms} ms.", state.relay)),
+            HomeWhy::Replaced { from } => Some(format!("Moved to {} by itself: {from} stopped answering or is no longer allowed.", state.relay)),
+            HomeWhy::Pinned if moved => Some(format!("Moved to {}: you pinned it.", state.relay)),
+            _ => None,
+        };
+        home["notice"] = match text {
+            Some(t) => json!({"text": t, "at": unix_now()}),
+            None => v.pointer("/home/notice").cloned().unwrap_or(Value::Null),
+        };
+        v["home"] = home;
+        let tmp = self.file.with_extension("json.tmp");
+        if std::fs::write(&tmp, format!("{v:#}\n")).and_then(|_| std::fs::rename(&tmp, &self.file)).is_err() {
+            eprintln!("xbt-wallet-ui: could not write the home relay to {}", self.file.display());
+        }
+        (self.home(), why)
     }
 
     /// The relays to use now for AI, hashrate and pages, from the last snapshot (none yet:
@@ -132,6 +211,13 @@ impl RelayNet {
         let observed: serde_json::Map<String, Value> = self.observed().into_iter().map(|(k, v)| (k, json!(v))).collect();
         let mut v = json!({"pinned": prefs.pinned, "blocked": prefs.blocked, "own": prefs.own, "only_own": prefs.only_own,
                            "selected": selected, "selected_throughput": throughput, "observed": observed});
+        // the home relay is kept by its looks (`look_home`)
+        if let Some(h) = self.file_value().get("home").filter(|h| h.is_object()) {
+            v["home"] = h.clone();
+        }
+        if let Some(pin) = &prefs.home_pin {
+            v["home_pin"] = json!(pin);
+        }
         // paid relays, when the owner has allowed them: kept, never written for one who hasn't
         if prefs.paid || prefs.max_msat_per_gb > 0 {
             v["paid"] = json!(prefs.paid);
@@ -195,6 +281,8 @@ impl RelayNet {
         let s = Snapshot { at: Instant::now(), announced, refused, probes, errors, nostr };
         *self.snap.lock().unwrap_or_else(|p| p.into_inner()) = Some(s.clone());
         let _ = self.save(&prefs);
+        // each look at the relays is a look at the home relay
+        let _ = self.look_home(&prefs);
         s
     }
 
@@ -242,6 +330,32 @@ impl RelayNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_home_relay_starts_on_genesis_and_a_pin_is_kept() {
+        let d = std::env::temp_dir().join(format!("relaynet-home-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let n = RelayNet::new(Vec::new(), &d);
+        let h = n.home();
+        assert_eq!((h.relay.as_str(), h.price.is_none(), h.pinned, h.notice.is_none()), (DEFAULT_RELAY, true, false, true));
+        assert_eq!(n.look_home(&n.prefs()).1, HomeWhy::Default);
+        // a pin is kept with the other choices; a pinned relay that doesn't answer is not home
+        let p = Prefs { home_pin: Some("https://mine.example.com/".into()), paid: true, max_msat_per_gb: 2_500, ..Prefs::default() };
+        n.save(&p).unwrap();
+        assert_eq!(n.prefs(), p);
+        let (h, why) = n.look_home(&p);
+        assert_eq!((h.relay.as_str(), why), (DEFAULT_RELAY, HomeWhy::Kept));
+        // the home survives the other choices being saved
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(d.join("relays.json")).unwrap()).unwrap();
+        assert_eq!(v["home"]["relay"], DEFAULT_RELAY);
+        n.save(&Prefs { blocked: vec!["https://b.example.com/".into()], ..p }).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(d.join("relays.json")).unwrap()).unwrap();
+        assert_eq!(v["home"]["relay"], DEFAULT_RELAY);
+        // the 0.2 name of Genesis's relay is the same relay
+        std::fs::write(d.join("relays.json"), json!({"home": {"relay": "https://iroh.lazarus-xbt.xyz/"}}).to_string()).unwrap();
+        assert_eq!(n.home().relay, DEFAULT_RELAY);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn prefs_round_trip_and_selected_is_written() {

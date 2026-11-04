@@ -30,6 +30,7 @@ impl App {
             format!("{in_use}<p class=\"small\">For video, files and VPN exits, where what a relay can carry matters more than how quickly \
                      it answers: {}</p>", for_video.iter().map(|u| format!("<code>{}</code>", esc(u))).collect::<Vec<_>>().join(", "))
         } else { in_use };
+        b.push_str(&self.home_relay_card(ctx, &prefs, &snap));
         b.push_str(&format!("<section class=\"card\"><h2>In use now</h2>{in_use}\
             <p class=\"small\"><a href=\"./relays?refresh=1\">Check the relays again</a></p></section>"));
         // known relays
@@ -85,8 +86,8 @@ impl App {
         let prefill = self.builtin_relay_settings().filter(|r| r.enabled && !r.domain.is_empty()).map(|r| format!("https://{}", r.domain)).unwrap_or_default();
         b.push_str(&format!("<section class=\"card\"><h2>Run a relay for the Stream network</h2>\
             <p>A relay adds capacity for everyone whose router blocks direct connections. It needs a public address and port 443, \
-            so it suits a small rented server (VPS) better than a box at home. Running one is free for now; paying relays for what \
-            they carry is planned.</p>{own}<p><a href=\"{GUIDE}\">The setup guide</a> covers both ways: switching it on here, or \
+            so it suits a small rented server (VPS) better than a box at home. A relay can be free, or charge the apps that make it their \
+            home by the GB (paid relays, in the guide).</p>{own}<p><a href=\"{GUIDE}\">The setup guide</a> covers both ways: switching it on here, or \
             running the relay on its own.</p>\
             <details><summary>Announce a relay</summary><form method=\"post\" action=\"./relays-publish\" class=\"stack\">\
             <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
@@ -102,12 +103,100 @@ impl App {
         self.html_page("Stream relays", "Stream relays", ctx, &b, "")
     }
 
-    /// `POST /relays-prefs`: prefer, block, add as yours, only own.
+    /// Settings → Stream relays, Home relay (`docs/PAID-RELAYS.md`): the box's home relay, why, the
+    /// owner's pin, the most per GB a paid home relay may charge, and the relays' budget in the rules.
+    fn home_relay_card(&self, ctx: &Ctx, prefs: &xbt_nostr::relays::Prefs, snap: &crate::relaynet::Snapshot) -> String {
+        let net = &self.relay_net;
+        let home = net.home();
+        let csrf = esc(&ctx.csrf);
+        let policy = self.call("policy_get", serde_json::json!({})).map(|v| v["policy"].clone()).unwrap_or_default();
+        let (budget, per_relay) = crate::app::relays_budget(&policy);
+        let price = match &home.price {
+            Some(p) => format!("It charges {} per GB, in credits of 10 GB ({} each); the first {} it brings this box each day are free.",
+                               sats_per_gb(p.msat_per_gb), sats(p.credit_msat()), mb(p.free_bytes_per_day)),
+            None => "It is free.".to_string(),
+        };
+        let how = if home.pinned { "You pinned it." } else if home.relay == net.default_relay() && home.notice.is_none() {
+            "Every app starts on Genesis's relay, and keeps it while it answers."
+        } else { "Chosen by this app." };
+        let mut b = format!("<section class=\"card\"><h2>Home relay</h2><p>This box's home relay is <code>{}</code>. {how} {price}</p>\
+            <p class=\"small\">Each app pays only its own home relay, and only for what it receives there: a buyer's requests reach your \
+            shop through your home relay, and your answers reach the buyer through the relay the buyer chose (or back through yours, \
+            when the buyer's app doesn't say which). Nobody pays a relay they didn't choose.</p>", esc(&home.relay));
+        if let Some((text, at)) = &home.notice {
+            b.push_str(&format!("<p class=\"flash ok\">{} <span class=\"small\">({})</span></p>", esc(text), esc(&ago(*at))));
+        }
+        if home.price.is_some() && self.cfg.gw.signer_sock.is_none() && self.cfg.sell {
+            b.push_str("<p class=\"flash warn\">This box's gateway can't reach the wallet to pay a relay, so your shop stays on Genesis's relay \
+                        (free) until it can.</p><details><summary>Technical details</summary><p class=\"small\">Set <code>XBT_UI_GW_SIGNER_SOCK</code> \
+                        to the signer's socket as the gateway's container sees it.</p></details>");
+        }
+        // the pin: any relay this app knows, or let it choose
+        let mut known: Vec<String> = vec![net.default_relay().to_string()];
+        for u in prefs.own.iter().cloned().chain(snap.announced.iter().filter_map(|a| xbt_nostr::relays::same_relay(&a.relay).ok())) {
+            if !known.contains(&u) {
+                known.push(u);
+            }
+        }
+        let options: String = known.iter().map(|u| format!("<option value=\"{0}\"{1}>{0}</option>", esc(u),
+            if prefs.home_pin.as_deref() == Some(u.as_str()) { " selected" } else { "" })).collect();
+        b.push_str(&format!("<form method=\"post\" action=\"./relays-prefs\" class=\"stack\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+            <input type=\"hidden\" name=\"action\" value=\"home\">\
+            <label>Home relay <select name=\"relay\"><option value=\"\"{}>Choose by itself</option>{options}</select></label>\
+            <p class=\"hint\">By itself, the app moves to a relay that answers clearly faster (in a quarter less time, and 20 ms less, twice in a row), \
+            at or below your most per GB, and says so here. A relay you pin is home whenever it answers.</p>\
+            <label>Most a home relay may charge, in sats per GB <input name=\"max_sats_per_gb\" inputmode=\"decimal\" value=\"{}\"></label>\
+            <p class=\"hint\">0 keeps this box on free relays. Relays set their own price; 2 sats per GB is the suggested one.</p>\
+            <button type=\"submit\" class=\"secondary\">Save</button></form>",
+            if prefs.home_pin.is_none() { " selected" } else { "" },
+            if prefs.paid { trim_sats(prefs.max_msat_per_gb) } else { "0".into() }));
+        b.push_str(&format!("<p class=\"small\">Your rules allow {} for relays in 24 hours, at most {} to any one relay. \
+            <a href=\"./policy\">Change them in the spending rules</a>: past that budget, what your home relay carries for this box waits \
+            for the next credit, and what waits too long is dropped and counted here.</p>", sats_i(budget), sats_i(per_relay)));
+        if budget == 0 && prefs.paid {
+            b.push_str("<p class=\"flash warn\">Your rules allow nothing for relays, so a paid relay is never your home.</p>");
+        }
+        b.push_str("</section>");
+        b
+    }
+
+    /// `POST /relays-prefs`: prefer, block, add as yours, only own; the home relay and the most per GB.
     pub(crate) fn relays_prefs(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let net = &self.relay_net;
         let mut p = net.prefs();
         let action = f.get("action").map(String::as_str).unwrap_or("");
         let relay = f.get("relay").map(|s| s.trim()).unwrap_or("");
+        if action == "home" {
+            p.home_pin = if relay.is_empty() { None } else {
+                match relays::same_relay(relay) {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        self.flash(ctx, false, e);
+                        return Resp::redirect("./relays");
+                    }
+                }
+            };
+            match parse_sats_per_gb(f.get("max_sats_per_gb").map(String::as_str).unwrap_or("0")) {
+                Some(m) => {
+                    p.paid = m > 0;
+                    p.max_msat_per_gb = m;
+                }
+                None => {
+                    self.flash(ctx, false, "The most per GB is a number of sats, such as 2 or 2.5.");
+                    return Resp::redirect("./relays");
+                }
+            }
+            if let Err(e) = net.save(&p) {
+                self.flash(ctx, false, e);
+                return Resp::redirect("./relays");
+            }
+            let (home, _) = net.look_home(&p);
+            // the shop follows its home relay (its gateway restarts when it changes)
+            let shop = if self.cfg.sell { self.refresh_shop_config() } else { None };
+            let more = if shop == Some("written") { " Your shop restarts on it in a few seconds." } else { "" };
+            self.flash(ctx, true, format!("Saved. The home relay is {}.{more}", home.relay));
+            return Resp::redirect("./relays");
+        }
         let url = if matches!(action, "only-own-on" | "only-own-off") { String::new() } else {
             match relays::canonical_relay(relay) {
                 Ok(u) => u,
@@ -181,6 +270,52 @@ pub struct BuiltinRelay {
 
 fn gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / 1e9)
+}
+
+/// How long ago `at` (Unix seconds) was, in words.
+fn ago(at: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match now.saturating_sub(at) {
+        s if s < 120 => "just now".to_string(),
+        s if s < 7_200 => format!("{} minutes ago", s / 60),
+        s if s < 172_800 => format!("{} hours ago", s / 3_600),
+        s => format!("{} days ago", s / 86_400),
+    }
+}
+
+fn mb(bytes: u64) -> String {
+    format!("{} MB", bytes >> 20)
+}
+
+/// msat as sats, without a trailing `.000`.
+fn trim_sats(msat: u64) -> String {
+    let s = format!("{}.{:03}", msat / 1000, msat % 1000);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn sats_per_gb(msat: u64) -> String {
+    format!("{} sats", trim_sats(msat))
+}
+
+fn sats(msat: u64) -> String {
+    format!("{} sats", trim_sats(msat))
+}
+
+fn sats_i(s: i64) -> String {
+    format!("{s} sats")
+}
+
+/// "2", "2.5", "0.001": sats per GB, as msat. `None` for anything else, or more than 1,000 sats.
+pub fn parse_sats_per_gb(s: &str) -> Option<u64> {
+    let s = s.trim().replace(',', "");
+    let (whole, frac) = s.split_once('.').unwrap_or((&s, ""));
+    if whole.is_empty() && frac.is_empty() || frac.len() > 3 || !whole.chars().chain(frac.chars()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let w: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let f: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<3}").parse().ok()? };
+    let m = w.checked_mul(1000)?.checked_add(f)?;
+    (m <= xbt_nostr::relays::MAX_MSAT_PER_GB).then_some(m)
 }
 
 impl App {
@@ -312,4 +447,22 @@ pub fn check_domain(d: &str) -> Result<(), String> {
 pub fn check_contact(c: &str) -> Result<(), String> {
     let ok = c.len() <= 128 && c.split_once('@').is_some_and(|(u, h)| !u.is_empty() && h.contains('.') && !h.starts_with('.')) && !c.chars().any(char::is_whitespace);
     if ok { Ok(()) } else { Err("Enter an e-mail address Let's Encrypt can write to about the certificate.".into()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sats_per_gb() {
+        assert_eq!(parse_sats_per_gb("2"), Some(2_000));
+        assert_eq!(parse_sats_per_gb(" 2.5 "), Some(2_500));
+        assert_eq!(parse_sats_per_gb("0.001"), Some(1));
+        assert_eq!(parse_sats_per_gb("0"), Some(0));
+        assert_eq!(parse_sats_per_gb("1000"), Some(1_000_000));
+        for bad in ["", ".", "1001", "2.0001", "-1", "two", "1e3"] {
+            assert_eq!(parse_sats_per_gb(bad), None, "{bad}");
+        }
+        assert_eq!((trim_sats(2_000), trim_sats(2_500), trim_sats(20_000), trim_sats(1)), ("2".into(), "2.5".into(), "20".into(), "0.001".into()));
+    }
 }

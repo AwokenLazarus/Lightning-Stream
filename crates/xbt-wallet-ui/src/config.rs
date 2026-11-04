@@ -25,6 +25,7 @@
 //! | `XBT_UI_GW_STATE_DIR` | `/data/gateway` | the gateway's state dir, written into its config |
 //! | `XBT_UI_GW_PORT` | `8402` | the port the gateway listens on |
 //! | `XBT_UI_GW_HEALTH_URL` | | the gateway's `/x402/ticket/health`, read server-side for the page (plain http on the box network) |
+//! | `XBT_UI_GW_SIGNER_SOCK` | | the wallet signer's socket as the gateway's container sees it: set, the shop may make a paid relay its home and its gateway pays it (`docs/PAID-RELAYS.md`); unset, the shop's home relay is a free one |
 //! | `XBT_UI_GW_PROXIES` | | the addresses of the box's own proxy in front of the gateway (StartOS), offered as the default for the forwarded-address setting |
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
 //! | `XBT_UI_SERVICES` | `<data dir>/services.json` | path of the services JSON Browse reads (a list of `{name, kind, seller, price_text, items}`); the Services page writes it |
@@ -196,6 +197,9 @@ pub struct GatewaySetup {
     pub port: u16,
     pub health_url: Option<String>,
     pub proxies: Vec<String>,
+    /// The wallet signer's socket as the gateway's container sees it (`XBT_UI_GW_SIGNER_SOCK`): set,
+    /// the shop may be homed on a paid relay, which its gateway pays through it (`docs/PAID-RELAYS.md`).
+    pub signer_sock: Option<String>,
 }
 
 impl GatewaySetup {
@@ -379,6 +383,7 @@ impl Config {
             port: env("XBT_UI_GW_PORT").and_then(|p| p.parse().ok()).filter(|p| *p > 0).unwrap_or(8402),
             health_url: env("XBT_UI_GW_HEALTH_URL").filter(|u| u.starts_with("http://")),
             proxies: env("XBT_UI_GW_PROXIES").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
+            signer_sock: env("XBT_UI_GW_SIGNER_SOCK").filter(|s| s.starts_with('/')),
         };
         let ai = AiSetup {
             endpoint: env("XBT_UI_AI_ENDPOINT").filter(|u| u.starts_with("http://") || u.starts_with("https://")),

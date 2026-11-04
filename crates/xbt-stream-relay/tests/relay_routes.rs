@@ -1,7 +1,10 @@
 //! Which relay carries which direction of a relayed session (`docs/PAID-RELAYS.md`, "Who pays"):
-//! a shop homed on one relay, a buyer homed on another, both private (relays only), and a
-//! recording meter behind each relay. It prints what each relay carried, from whom to whom, and
-//! checks that each relay carried the bytes for the client it is home to.
+//! a shop homed on one relay, a buyer homed on another, both private (relays only, no address
+//! lookup), and a recording meter behind each relay. It prints what each relay carried, from whom
+//! to whom. As run on 2026-11-04 the shop's answers went back through the shop's own home relay,
+//! the one the buyer's requests came in on: iroh answers on the relay it heard from a peer on when
+//! it knows no other relay for it. That is the case the paid meter charges to the sender
+//! (`crate::paid`): the receiver didn't choose that relay, the sender did.
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -104,7 +107,7 @@ fn key_of(l: &Link) -> [u8; 32] {
 }
 
 #[test]
-fn each_relay_carries_the_bytes_for_the_client_it_is_home_to() {
+fn which_relay_carries_each_direction() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     let (shop_rec, buyer_rec) = (Arc::new(Recorder::default()), Arc::new(Recorder::default()));
     let (_s1, shop_relay) = rt.block_on(start_relay(shop_rec.clone()));

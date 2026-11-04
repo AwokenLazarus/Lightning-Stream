@@ -374,10 +374,13 @@ pub struct Prefs {
     pub own: Vec<String>,
     /// Use only the owner's own relays.
     pub only_own: bool,
-    /// Paid relays may be used (the shop pays them, `docs/PAID-RELAYS.md`). Off: they are left out.
+    /// Paid relays may be used (an app pays its own home relay, `docs/PAID-RELAYS.md`). Off: they are left out.
     pub paid: bool,
     /// The most per GB a paid relay may charge to be used, in msat.
     pub max_msat_per_gb: u64,
+    /// The home relay the owner pinned: home whenever it answers ([`choose_home`]). `None`: the app
+    /// chooses by itself.
+    pub home_pin: Option<String>,
 }
 
 /// The relays to use, best first: the first one is the home relay (what iroh's `preferred_relay`

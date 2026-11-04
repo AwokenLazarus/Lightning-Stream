@@ -892,12 +892,27 @@ impl App {
             if link.get("relays").and_then(Value::as_array).is_none_or(|a| a.is_empty()) || link["relays"] == json!(OLD_DEFAULT_LINK_RELAYS) {
                 link["relays"] = json!(DEFAULT_LINK_RELAYS);
             }
+            // the shop's home relay is the box's (docs/PAID-RELAYS.md), Genesis's behind it as the fallback; a list the
+            // owner wrote by hand is kept
+            let (relays, pay) = self.shop_link_relays(link.get("relays"));
+            if let Some(r) = relays {
+                link["relays"] = json!(r);
+            }
             link["private"] = json!(shop.private);
             c.insert("link".into(), link);
+            match pay {
+                Some(p) => {
+                    c.insert("relay_pay".into(), p);
+                }
+                None => {
+                    c.remove("relay_pay");
+                }
+            }
         } else {
             // a shop sold at a web address has no link: one kept from when it was reached directly
-            // would still be served, and vouched for by its node
+            // would still be served, and vouched for by its node; nor does it pay a link's relay
             c.remove("link");
+            c.remove("relay_pay");
             c.insert("public_url".into(), json!(public_url));
         }
         // every route names its own service
@@ -1196,6 +1211,30 @@ impl App {
                 Some(false)
             }
         }
+    }
+
+    /// The shop link's relays for the box's home relay, and the gateway's `relay_pay` section when that
+    /// home charges (`docs/PAID-RELAYS.md`): `(None, _)` keeps the relays the config has, a list the owner
+    /// wrote by hand. A paid home is used only when the gateway can reach the wallet to pay it
+    /// (`XBT_UI_GW_SIGNER_SOCK`); otherwise the shop stays on Genesis's relay.
+    pub(crate) fn shop_link_relays(&self, now: Option<&Value>) -> (Option<Vec<String>>, Option<Value>) {
+        let bare = |u: &str| u.trim_end_matches('/').to_string();
+        let default = bare(DEFAULT_LINK_RELAYS[0]);
+        let current: Vec<String> = now.and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(bare).collect();
+        let ours = current.is_empty() || current == [bare(OLD_DEFAULT_LINK_RELAYS[0])] || current.first() == Some(&default)
+            || (current.len() == 2 && current[1] == default);
+        if !ours {
+            return (None, None);
+        }
+        let home = self.relay_net.home();
+        let prefs = self.relay_net.prefs();
+        let sock = self.cfg.gw.signer_sock.clone();
+        let paid = home.price.clone().filter(|_| sock.is_some() && prefs.paid);
+        let first = if home.price.is_some() && paid.is_none() { default.clone() } else { bare(&home.relay) };
+        let relays = if first == default { vec![default] } else { vec![first.clone(), default] };
+        let pay = paid.map(|p| json!({"signer": sock, "relays": [{"relay": first, "credit": p.credit, "msat_per_gb": p.msat_per_gb}],
+                                      "max_msat_per_gb": prefs.max_msat_per_gb}));
+        (Some(relays), pay)
     }
 
     /// Save the shop, and the gateway's config when the shop is complete and the config changes.

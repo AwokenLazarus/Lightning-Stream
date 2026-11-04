@@ -113,6 +113,20 @@ pub(crate) const INT_KEYS: [(&str, &str, &str); 13] = [
 /// 0.2.6 showed it only in the rules file, by its raw name, and its refusal sent the owner there.
 pub(crate) const TICKETS_BUDGET_LABEL: &str = "Most for paid services (stream tickets) in 24 hours (sats)";
 
+/// The relays' own limits (`tickets.tasks.relays`, `docs/PAID-RELAYS.md`): what this box may pay its home
+/// relay in 24 hours, and the most to any one relay. Both 0, the default: no paid home relay.
+/// The ticket task relays are paid under: the gateway's `relay_pay` pays under it (`xbt_iroh_link::relay_pay::DEFAULT_TASK`).
+pub(crate) const RELAYS_TASK: &str = "relays";
+pub(crate) const RELAYS_BUDGET_LABEL: &str = "Most for relays in 24 hours (sats)";
+pub(crate) const RELAYS_PER_RELAY_LABEL: &str = "Most to any one relay in 24 hours (sats)";
+
+/// The relays' budget and per-relay cap the rules `p` set, in sats: `(0, 0)` without a relays task.
+pub(crate) fn relays_budget(p: &Value) -> (i64, i64) {
+    let Some(t) = p.get("tickets").and_then(|t| t.get("tasks")).and_then(|t| t.get(RELAYS_TASK)) else { return (0, 0) };
+    let budget = t.get("budget_sats").and_then(Value::as_i64).unwrap_or(0).max(0);
+    (budget, t.get("unlisted_max_spend_sats").and_then(Value::as_i64).unwrap_or(budget).clamp(0, budget))
+}
+
 /// The stream tickets' budget the rules `p` set, where they have a tickets section.
 fn tickets_budget(p: &Value) -> Option<&Value> {
     p.get("tickets")?.get("tasks")?.get("default")?.get("budget_sats")
@@ -1139,6 +1153,12 @@ impl App {
                 fields.push_str(&format!("<label>{}<input name=\"f_tickets_budget_sats\" value=\"{}\" inputmode=\"numeric\"></label>\
                     <p class=\"hint\">What the app may pay shops for web apps, files and AI, a little at a time, in any 24 hours. \
                     It counts within the spending limit above.</p>", esc(TICKETS_BUDGET_LABEL), esc(&value)));
+                let (rb, rc) = relays_budget(p);
+                fields.push_str(&format!("<label>{}<input name=\"f_relays_budget_sats\" value=\"{rb}\" inputmode=\"numeric\"></label>\
+                    <label>{}<input name=\"f_relays_per_relay_sats\" value=\"{rc}\" inputmode=\"numeric\"></label>\
+                    <p class=\"hint\">What this box may pay its home relay for what it receives there, if that relay charges (most are free, \
+                    and Genesis's is). 0, the default, keeps the box on free relays. Settings → Stream relays sets the most per GB.</p>",
+                    esc(RELAYS_BUDGET_LABEL), esc(RELAYS_PER_RELAY_LABEL)));
             }
             if g == "anchor" {
                 fields.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the separate record keeper (after a restart)</label>",
@@ -1462,6 +1482,24 @@ impl App {
                     let d = tasks.entry("default").or_insert_with(|| json!({}));
                     if let Some(d) = d.as_object_mut() {
                         d.insert("budget_sats".into(), num(&v));
+                    }
+                }
+            }
+        }
+        // the relays' budget (`docs/PAID-RELAYS.md`): a task of its own that pays any relay announced on Nostr,
+        // within the budget and the cap for one relay; 0 takes it out, so no relay is paid
+        if let Some(v) = f.get("f_relays_budget_sats").map(|v| v.trim().replace(',', "")) {
+            if let Some(t) = p.get_mut("tickets").and_then(Value::as_object_mut) {
+                let budget = v.parse::<i64>().unwrap_or(0).max(0);
+                let per = f.get("f_relays_per_relay_sats").map(|v| v.trim().replace(',', "")).and_then(|v| v.parse::<i64>().ok())
+                    .filter(|n| *n > 0).unwrap_or(budget).min(budget);
+                let tasks = t.entry("tasks").or_insert_with(|| json!({}));
+                if let Some(tasks) = tasks.as_object_mut() {
+                    if budget == 0 {
+                        tasks.remove(RELAYS_TASK);
+                    } else {
+                        tasks.insert(RELAYS_TASK.into(),
+                                     json!({"budget_sats": budget, "window_s": 86_400, "admit": "any", "unlisted_max_spend_sats": per}));
                     }
                 }
             }
@@ -2538,6 +2576,28 @@ mod file_call_tests {
 #[cfg(test)]
 mod change_tests {
     use super::*;
+
+    /// The relays' budget (docs/PAID-RELAYS.md): its own task, paying any relay within the budget and the cap
+    /// for one; 0, the default, takes it out, so no relay is paid.
+    #[test]
+    fn the_rules_form_sets_the_relays_budget() {
+        let cur = json!({"tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 1000}}}});
+        assert_eq!(relays_budget(&cur), (0, 0), "off by default");
+        let f = |b: &str, c: &str| -> HashMap<String, String> {
+            [("f_relays_budget_sats", b), ("f_relays_per_relay_sats", c)].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let p = App::proposed_from_form(&cur, &f("200", "50"));
+        assert_eq!(p["tickets"]["tasks"]["relays"], json!({"budget_sats": 200, "window_s": 86_400, "admit": "any", "unlisted_max_spend_sats": 50}));
+        assert_eq!(relays_budget(&p), (200, 50));
+        assert_eq!(p["tickets"]["tasks"]["default"]["budget_sats"], 1000, "the other tasks as they were");
+        // no cap for one relay: the whole budget; a cap above it: the budget
+        assert_eq!(relays_budget(&App::proposed_from_form(&cur, &f("200", ""))), (200, 200));
+        assert_eq!(relays_budget(&App::proposed_from_form(&cur, &f("200", "900"))), (200, 200));
+        let off = App::proposed_from_form(&p, &f("0", "50"));
+        assert!(off["tickets"]["tasks"].get("relays").is_none(), "0 takes the task out");
+        // rules without a tickets section get none
+        assert!(App::proposed_from_form(&json!({}), &f("200", "50")).get("tickets").is_none());
+    }
 
     /// Records and the Wallet say who authorized a signature, what it was and where it went in words:
     /// not `policy:ok`, `xbt402_pay` or `ln:035d…`.

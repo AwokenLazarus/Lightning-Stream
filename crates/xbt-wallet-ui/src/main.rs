@@ -259,6 +259,23 @@ fn serve() -> i32 {
             }
         });
     }
+    if app.relay_net.nostr_enabled() {
+        let app = app.clone();
+        // the home relay (docs/PAID-RELAYS.md): a look every half hour, which may move it to a clearly better relay;
+        // the shop follows it
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1_800));
+            let before = app.relay_net.home().relay;
+            let _ = app.relay_net.get(true);
+            let after = app.relay_net.home().relay;
+            if after != before {
+                eprintln!("xbt-wallet-ui: the home relay is now {after} (was {before})");
+                if app.cfg.sell && app.refresh_shop_config() == Some("written") {
+                    eprintln!("xbt-wallet-ui: the shop's gateway restarts on its new home relay");
+                }
+            }
+        });
+    }
     if app.cfg.hash.hasher.is_some() {
         let app = app.clone();
         // the hashmaker's price follows the difficulty and its miners' speed (Sell → Hashrate)
