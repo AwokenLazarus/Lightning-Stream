@@ -492,8 +492,10 @@ impl Offer {
     }
 }
 
-/// The relays a direct link names unless the owner chose others: the project's own first.
-pub const DEFAULT_LINK_RELAYS: [&str; 1] = ["https://iroh.lazarus-xbt.xyz"];
+/// The relays a direct link names unless the owner chose others: Genesis's relay.
+pub const DEFAULT_LINK_RELAYS: [&str; 1] = ["https://relay.lightning-stream.com"];
+/// What 0.2 wrote for [`DEFAULT_LINK_RELAYS`]: the same relay by its old name, written again by the new one.
+pub const OLD_DEFAULT_LINK_RELAYS: [&str; 1] = ["https://iroh.lazarus-xbt.xyz"];
 /// Where the gateway says how its direct link is doing.
 pub const LINK_STATUS_PATH: &str = "/.well-known/lightning-stream-link.json";
 
@@ -887,7 +889,7 @@ impl App {
             c.remove("public_url");
             c.remove("public_aliases");
             let mut link = c.get("link").cloned().filter(Value::is_object).unwrap_or(json!({}));
-            if link.get("relays").and_then(Value::as_array).is_none_or(|a| a.is_empty()) {
+            if link.get("relays").and_then(Value::as_array).is_none_or(|a| a.is_empty()) || link["relays"] == json!(OLD_DEFAULT_LINK_RELAYS) {
                 link["relays"] = json!(DEFAULT_LINK_RELAYS);
             }
             link["private"] = json!(shop.private);

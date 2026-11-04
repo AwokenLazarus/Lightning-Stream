@@ -147,6 +147,37 @@ pub fn canonical_relay(url: &str) -> Result<String, String> {
     Ok(if port == 443 { format!("https://{host}/") } else { format!("https://{host}:{port}/") })
 }
 
+/// Genesis's link relay: the default home relay of every app.
+pub const DEFAULT_RELAY: &str = "https://relay.lightning-stream.com/";
+/// Other names of the same relays, and the name each is known by: 0.2 apps and their listings name
+/// Genesis's relay `iroh.lazarus-xbt.xyz`, which the same box still serves.
+pub const RELAY_ALIASES: [(&str, &str); 1] = [("https://relay.lightning-stream.com/", DEFAULT_RELAY)];
+
+/// A relay URL in [`canonical_relay`]'s form, by the name the relay is known by (an alias in
+/// [`RELAY_ALIASES`] is the same relay). `Err` as [`canonical_relay`].
+pub fn same_relay(url: &str) -> Result<String, String> {
+    let c = canonical_relay(url)?;
+    Ok(RELAY_ALIASES.iter().find(|(a, _)| *a == c).map_or(c, |(_, to)| to.to_string()))
+}
+
+/// The announcements and probes with every relay by the name it is known by ([`same_relay`]); of
+/// two probes of one relay, the one that answered quicker.
+fn by_known_name(announced: &[Announcement], probes: &HashMap<String, Probe>) -> (Vec<Announcement>, HashMap<String, Probe>) {
+    let ann = announced.iter().cloned().map(|mut a| {
+        a.relay = same_relay(&a.relay).unwrap_or(a.relay);
+        a
+    }).collect();
+    let mut pr: HashMap<String, Probe> = HashMap::new();
+    for (u, p) in probes {
+        let k = same_relay(u).unwrap_or_else(|_| u.clone());
+        let better = |o: &Probe| (!o.healthy() && p.healthy()) || (o.healthy() == p.healthy() && p.rtt_ms.unwrap_or(u32::MAX) < o.rtt_ms.unwrap_or(u32::MAX));
+        if pr.get(&k).is_none_or(better) {
+            pr.insert(k, *p);
+        }
+    }
+    (ann, pr)
+}
+
 /// What an operator announces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
@@ -372,8 +403,10 @@ pub fn select(announced: &[Announcement], probes: &HashMap<String, Probe>, prefs
 /// and pins, blocks, only own and the default relay's place work as in [`select`].
 pub fn select_for(announced: &[Announcement], probes: &HashMap<String, Probe>, prefs: &Prefs, default_relay: &str, max: usize, purpose: Purpose) -> Vec<String> {
     let max = max.max(1);
+    let (announced, probes) = by_known_name(announced, probes);
+    let (announced, probes) = (announced.as_slice(), &probes);
     let claimed: HashMap<&str, u32> = announced.iter().filter_map(|a| a.capacity_mbit.map(|c| (a.relay.as_str(), c))).collect();
-    let canon = |u: &str| canonical_relay(u).ok();
+    let canon = |u: &str| same_relay(u).ok();
     let mut blocked: HashSet<String> = prefs.blocked.iter().filter_map(|u| canon(u)).collect();
     // a paid relay the owner doesn't pay for, or not at its price, is as good as blocked; the owner's
     // own relays are never left out for a price (any announcement of them is someone else's word)
@@ -486,7 +519,9 @@ fn home_candidates(announced: &[Announcement], probes: &HashMap<String, Probe>, 
 /// that stops answering, or is no longer allowed, is replaced by the quickest that is.
 pub fn choose_home(state: Option<&HomeState>, announced: &[Announcement], probes: &HashMap<String, Probe>, prefs: &Prefs,
                    default_relay: &str, pin: Option<&str>) -> (HomeState, HomeWhy) {
-    let canon = |u: &str| canonical_relay(u).ok();
+    let (announced, probes) = by_known_name(announced, probes);
+    let (announced, probes) = (announced.as_slice(), &probes);
+    let canon = |u: &str| same_relay(u).ok();
     let default = canon(default_relay).unwrap_or_else(|| default_relay.to_string());
     let ok = home_candidates(announced, probes, prefs, &default);
     let rtt = |u: &str| probes.get(u).and_then(|p| p.rtt_ms);
@@ -584,10 +619,10 @@ mod tests {
         let a = [paid_ann("https://cheap.example.com", 1_000), paid_ann("https://dear.example.com", 9_000), ann("https://free.example.com")];
         let p = probes(&[("https://cheap.example.com", Some(10), 0), ("https://dear.example.com", Some(5), 0), ("https://free.example.com", Some(50), 0)]);
         // by default: no paid relay, the free ones as before
-        assert_eq!(select(&a, &p, &Prefs::default(), OURS, 4), vec!["https://free.example.com/", "https://iroh.lazarus-xbt.xyz/"]);
+        assert_eq!(select(&a, &p, &Prefs::default(), OURS, 4), vec!["https://free.example.com/", "https://relay.lightning-stream.com/"]);
         // paying up to 2 sats a GB: the cheap one, the free ones and ours still behind it as the fallback
         let prefs = Prefs { paid: true, max_msat_per_gb: 2_000, ..Prefs::default() };
-        assert_eq!(select(&a, &p, &prefs, OURS, 4), vec!["https://cheap.example.com/", "https://free.example.com/", "https://iroh.lazarus-xbt.xyz/"]);
+        assert_eq!(select(&a, &p, &prefs, OURS, 4), vec!["https://cheap.example.com/", "https://free.example.com/", "https://relay.lightning-stream.com/"]);
         // the owner's own relay is never left out for its price
         let prefs = Prefs { own: vec!["https://dear.example.com".into()], ..Prefs::default() };
         assert_eq!(select(&a, &p, &prefs, OURS, 4)[0], "https://dear.example.com/");
@@ -596,6 +631,22 @@ mod tests {
         let p = probes(&[("https://a.example.com", Some(10), 0), ("https://b.example.com", Some(10), 0)]);
         let prefs = Prefs { paid: true, max_msat_per_gb: 2_000, ..Prefs::default() };
         assert_eq!(select(&b, &p, &prefs, OURS, 4)[0], "https://b.example.com/");
+    }
+
+    #[test]
+    fn genesiss_old_relay_name_is_the_same_relay() {
+        assert_eq!(same_relay("https://iroh.lazarus-xbt.xyz").unwrap(), DEFAULT_RELAY);
+        assert_eq!(same_relay("https://Relay.Lightning-Stream.com/").unwrap(), DEFAULT_RELAY);
+        assert_eq!(same_relay("https://a.example.com").unwrap(), "https://a.example.com/");
+        // a 0.2 announcement of the old name is read as before, and selected as the default relay, once
+        let old = ann("https://iroh.lazarus-xbt.xyz");
+        assert_eq!(old.relay, "https://iroh.lazarus-xbt.xyz/", "parsing is unchanged");
+        let p = probes(&[("https://iroh.lazarus-xbt.xyz", Some(30), 0), (OURS, None, 5)]);
+        assert_eq!(select(&[old.clone()], &p, &Prefs::default(), OURS, 4), vec![DEFAULT_RELAY]);
+        // a home kept under the old name, or pinned by it, is the default relay
+        let s = HomeState { relay: "https://iroh.lazarus-xbt.xyz/".into(), better: None };
+        assert_eq!(choose_home(Some(&s), &[old.clone()], &p, &Prefs::default(), OURS, None), (HomeState { relay: DEFAULT_RELAY.into(), better: None }, HomeWhy::Kept));
+        assert_eq!(choose_home(None, &[old], &p, &Prefs::default(), OURS, Some("https://iroh.lazarus-xbt.xyz")).1, HomeWhy::Pinned);
     }
 
     #[test]
@@ -620,13 +671,13 @@ mod tests {
                              ("https://paid.example.com", Some(10), 0)]);
         let prefs = Prefs::default();
         let (s, why) = choose_home(None, &a, &p, &prefs, OURS, None);
-        assert_eq!((s.relay.as_str(), why), ("https://iroh.lazarus-xbt.xyz/", HomeWhy::Default));
+        assert_eq!((s.relay.as_str(), why), ("https://relay.lightning-stream.com/", HomeWhy::Default));
         // a clearly better one: seen once, not yet; twice in a row, home
         let (s, why) = choose_home(Some(&s), &a, &p, &prefs, OURS, None);
-        assert_eq!((s.relay.as_str(), &why, s.better.clone()), ("https://iroh.lazarus-xbt.xyz/", &HomeWhy::Kept, Some(("https://near.example.com/".into(), 1))));
+        assert_eq!((s.relay.as_str(), &why, s.better.clone()), ("https://relay.lightning-stream.com/", &HomeWhy::Kept, Some(("https://near.example.com/".into(), 1))));
         let (s, why) = choose_home(Some(&s), &a, &p, &prefs, OURS, None);
         assert_eq!(s.relay, "https://near.example.com/");
-        assert_eq!(why, HomeWhy::Better { from: "https://iroh.lazarus-xbt.xyz/".into(), from_ms: 100, to_ms: 40 });
+        assert_eq!(why, HomeWhy::Better { from: "https://relay.lightning-stream.com/".into(), from_ms: 100, to_ms: 40 });
         // a little quicker is not clearly better
         let s = HomeState { relay: "https://same.example.com/".into(), better: None };
         p.insert("https://near.example.com/".into(), Probe { rtt_ms: Some(80), fail_streak: 0, mbit: None });
@@ -644,8 +695,8 @@ mod tests {
         let (s2, why) = choose_home(Some(&s), &a, &p, &prefs, OURS, None);
         assert_eq!((s2.relay.as_str(), why), ("https://same.example.com/", HomeWhy::Replaced { from: "https://near.example.com/".into() }));
         // the owner's pin wins whenever it answers
-        let (s3, why) = choose_home(Some(&s2), &a, &p, &prefs, OURS, Some("https://iroh.lazarus-xbt.xyz"));
-        assert_eq!((s3.relay.as_str(), why), ("https://iroh.lazarus-xbt.xyz/", HomeWhy::Pinned));
+        let (s3, why) = choose_home(Some(&s2), &a, &p, &prefs, OURS, Some("https://relay.lightning-stream.com"));
+        assert_eq!((s3.relay.as_str(), why), ("https://relay.lightning-stream.com/", HomeWhy::Pinned));
         // a pinned relay that doesn't answer leaves the choice as it would be
         assert_eq!(choose_home(Some(&s2), &a, &p, &prefs, OURS, Some("https://near.example.com")).1, HomeWhy::Kept);
     }
@@ -731,7 +782,7 @@ mod tests {
         list.iter().map(|(u, rtt, f)| (canonical_relay(u).unwrap(), Probe { rtt_ms: *rtt, fail_streak: *f, mbit: None })).collect()
     }
 
-    const OURS: &str = "https://iroh.lazarus-xbt.xyz";
+    const OURS: &str = "https://relay.lightning-stream.com";
 
     #[test]
     fn nearest_healthy_first_then_the_default() {
@@ -740,7 +791,7 @@ mod tests {
                          ("https://dead.example.com", None, 5), (OURS, Some(60), 0)]);
         let v = select(&a, &p, &Prefs::default(), OURS, 5);
         // the default goes last, even when it answers faster than an announced relay; a dead relay is left out
-        assert_eq!(v, vec!["https://near.example.com/", "https://far.example.com/", "https://iroh.lazarus-xbt.xyz/"]);
+        assert_eq!(v, vec!["https://near.example.com/", "https://far.example.com/", "https://relay.lightning-stream.com/"]);
     }
 
     #[test]
@@ -750,16 +801,16 @@ mod tests {
         let prefs = Prefs { pinned: vec!["https://c.example.com".into()], blocked: vec!["https://a.example.com/".into()], ..Prefs::default() };
         let v = select(&a, &p, &prefs, OURS, 2);
         // pinned first; a is blocked; the default keeps its place within max
-        assert_eq!(v, vec!["https://c.example.com/", "https://iroh.lazarus-xbt.xyz/"]);
+        assert_eq!(v, vec!["https://c.example.com/", "https://relay.lightning-stream.com/"]);
         // blocking the default removes it
         let prefs = Prefs { blocked: vec![OURS.into()], ..Prefs::default() };
-        assert!(!select(&a, &p, &prefs, OURS, 5).contains(&"https://iroh.lazarus-xbt.xyz/".to_string()));
+        assert!(!select(&a, &p, &prefs, OURS, 5).contains(&"https://relay.lightning-stream.com/".to_string()));
         // a pinned relay that does not answer is left out
         let prefs = Prefs { pinned: vec!["https://gone.example.com".into()], ..Prefs::default() };
         let v = select(&a, &p, &prefs, OURS, 10);
         assert!(!v.contains(&"https://gone.example.com/".to_string()));
         assert_eq!(v[0], "https://a.example.com/");
-        assert_eq!(v.last().unwrap(), "https://iroh.lazarus-xbt.xyz/");
+        assert_eq!(v.last().unwrap(), "https://relay.lightning-stream.com/");
     }
 
     #[test]
@@ -806,6 +857,6 @@ mod tests {
 
     #[test]
     fn nothing_known_is_the_default_alone() {
-        assert_eq!(select(&[], &HashMap::new(), &Prefs::default(), OURS, 3), vec!["https://iroh.lazarus-xbt.xyz/"]);
+        assert_eq!(select(&[], &HashMap::new(), &Prefs::default(), OURS, 3), vec!["https://relay.lightning-stream.com/"]);
     }
 }

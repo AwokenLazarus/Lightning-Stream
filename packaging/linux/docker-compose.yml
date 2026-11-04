@@ -153,7 +153,7 @@ services:
       XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_GW_HEALTH_URL: http://127.0.0.1:${LS_GW_PORT:-8402}/x402/ticket/health
       XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-npub1kqdrfmfg6mg52sy3ehu4vv7m3fjpa0830rhjdmvqrf09u3t3724q8cwr6a}
-      XBT_UI_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
+      XBT_UI_NOSTR_RELAYS: ${LS_RELAYS:-wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
       # the hashmaker's pages: set by install.sh only when LS_HASHMAKER=1
       XBT_UI_HASHER: ${LS_UI_HASHMAKER:-}
       XBT_UI_HASHER_SETTINGS: /data/run/hashrate/settings.json
@@ -278,7 +278,7 @@ services:
     command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
               "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "127.0.0.1:23344",
               "--control", "127.0.0.1:23342", "--control-token-file", "/data/run/hashrate/control-token",
-              "--config", "/data/run/hashrate/settings.json", "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
+              "--config", "/data/run/hashrate/settings.json", "--relays", "${LS_RELAYS:-wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
               "--gateway", "http://127.0.0.1:${LS_GW_PORT:-8402}",
               "--miners-public", "${LS_LAN_HOST:-127.0.0.1}:23340", "--link-lan", "${LS_LAN_HOST:-127.0.0.1}:23341",
               "--report", "/data/hashrate/hasher.json"]
@@ -334,7 +334,7 @@ services:
               "--upstream", "${LS_DATUM:-127.0.0.1:23339}", "--gateway-api", "${LS_GATEWAY_API:-127.0.0.1:7153}",
               "--datum-candidates", "127.0.0.1:23339", "--bundled-gateway", "${LS_BUNDLED_GATEWAY:-127.0.0.1:23339}",
               "--user", "${LS_DATUM_USER:-rented}",
-              "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
+              "--relays", "${LS_RELAYS:-wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
               "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate
@@ -382,7 +382,7 @@ services:
       - "127.0.0.1:${LS_VPN_TUNNEL_PORT:-51880}:51880/tcp"
     stop_grace_period: 10s
     environment:
-      XBT_VPN_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
+      XBT_VPN_NOSTR_RELAYS: ${LS_RELAYS:-wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
       XBT_VPN_REGION: ${LS_VPN_REGION:-}
       # priced exits are paid through the owner's wallet: its socket, and the dir paid tunnels are streamed through
       B2_SIGNER_SOCK: /data/run/signer/signer.sock

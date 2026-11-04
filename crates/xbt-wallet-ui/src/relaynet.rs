@@ -31,8 +31,10 @@ use xbt_nostr::event::Keys;
 use xbt_nostr::oneshot::{self, Outcome};
 use xbt_nostr::relays::{self, Announcement, Offer, Prefs, Probe, Purpose};
 
-/// Our relay: the last resort unless the owner blocks it.
-pub const DEFAULT_RELAY: &str = "https://iroh.lazarus-xbt.xyz/";
+/// Genesis's relay: every app's home relay to begin with, and the last resort unless the owner
+/// blocks it. Its 0.2 name, `iroh.lazarus-xbt.xyz`, is the same relay
+/// ([`xbt_nostr::relays::same_relay`]).
+pub const DEFAULT_RELAY: &str = xbt_nostr::relays::DEFAULT_RELAY;
 /// A snapshot older than this is made again when the page opens.
 pub const FRESH: Duration = Duration::from_secs(120);
 pub const QUERY_WAIT: Duration = Duration::from_secs(8);

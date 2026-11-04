@@ -182,7 +182,7 @@ export const DATUM = {
 export const DATUM_CANDIDATES = [DATUM.stratum, 'datum-blake2b.startos:23336', 'datum.startos:23334']
 
 /** The Nostr relays listings are published on and found at. */
-export const RELAYS = ['wss://relay.lazarus-xbt.xyz', 'wss://relay.kilombino.com', 'wss://relay.damus.io', 'wss://nos.lol']
+export const RELAYS = ['wss://nostr.lazarus-xbt.xyz', 'wss://relay.lazarus-xbt.xyz', 'wss://relay.kilombino.com', 'wss://relay.damus.io', 'wss://nos.lol']
 
 /**
  * The published images, pinned by digest (packaging/images.lock; packaging/pin_images.py writes them);

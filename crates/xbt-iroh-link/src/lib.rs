@@ -79,8 +79,11 @@ pub enum Relays {
     OursThenPublic(Vec<String>),
 }
 
-/// Our relay: the default.
-pub const DEFAULT_RELAY: &str = "https://iroh.lazarus-xbt.xyz";
+/// Genesis's link relay: the default. The same relay also answers as `https://iroh.lazarus-xbt.xyz`,
+/// the name 0.2 apps and listings use ([`OLD_DEFAULT_RELAY`]).
+pub const DEFAULT_RELAY: &str = "https://relay.lightning-stream.com";
+/// The name Genesis's relay had in 0.2, still served by the same box.
+pub const OLD_DEFAULT_RELAY: &str = "https://iroh.lazarus-xbt.xyz";
 
 /// Where a seller can be found, besides its key: relays and direct addresses it last reported.
 #[derive(Clone, Debug, Default)]

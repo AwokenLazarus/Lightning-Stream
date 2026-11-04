@@ -212,7 +212,7 @@ esac
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-lightning-stream}
 LS_UI_PORT=${LS_UI_PORT:-8482} LS_MCP_PORT=${LS_MCP_PORT:-33511} LS_CONNECTOR_PORT=${LS_CONNECTOR_PORT:-8484} LS_APP_PORTS=${LS_APP_PORTS:-33521,33522,33523,33524}
 LS_GW_PORT=${LS_GW_PORT:-8402} LS_HASHTAKER_CONTROL_PORT=${LS_HASHTAKER_CONTROL_PORT:-23343} LS_FILES_PORT=${LS_FILES_PORT:-8486}
-LS_RELAYS=${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol} LS_LAN_HOST=${LS_LAN_HOST:-}
+LS_RELAYS=${LS_RELAYS:-wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol} LS_LAN_HOST=${LS_LAN_HOST:-}
 
 # --- 3. the files -------------------------------------------------------------------------------------
 say "writing $DIR/docker-compose.yml and $DIR/.env"

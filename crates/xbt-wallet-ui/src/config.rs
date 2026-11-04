@@ -31,7 +31,7 @@
 //! | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page (`/sell`), which sets up the gateway beside it (the `XBT_UI_GW_*` settings); the app is then branded Lightning Stream |
 //! | `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (`https://`) or shop keys (`npub1…`), comma-separated, the Sellers page and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one |
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
-//! | `XBT_UI_STREAM_RELAY` | our relay, `https://iroh.lazarus-xbt.xyz/` | the Stream relay a direct link falls back to last; the Stream relays page (Settings) keeps the owner's other choices in `<data dir>/relays.json` (`docs/RUN-A-RELAY.md`) |
+//! | `XBT_UI_STREAM_RELAY` | Genesis's relay, `https://relay.lightning-stream.com/` | the Stream relay a direct link falls back to last; the Stream relays page (Settings) keeps the owner's other choices in `<data dir>/relays.json` (`docs/RUN-A-RELAY.md`) |
 //! | `XBT_UI_RELAY_DIR`, `XBT_UI_RELAY_STATUS` | | the package's own relay service: the folder it reads the owner's `relay.json` from, and its status file. Unset: the page offers no built-in relay |
 //! | `XBT_UI_RELAY_UNAVAILABLE` | | why this platform can't run the built-in relay, shown instead of the switch |
 //! | `XBT_UI_VPN_DIR` | `<data dir>/run/vpn` | the folder the VPN pages write `devices.json` and `exit.json` to, for the VPN service |

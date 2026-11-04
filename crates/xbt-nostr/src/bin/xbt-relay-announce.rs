@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! xbt-relay-announce --relay https://relay.example.com --region eu-central \
-//!     --nostr wss://relay.lazarus-xbt.xyz --nostr wss://nos.lol \
+//!     --nostr wss://nostr.lazarus-xbt.xyz --nostr wss://nos.lol \
 //!     [--capacity-mbit 500] [--udp] [--contact ops@example.com] [--note "…"] \
 //!     [--ttl-days 30] [--key-file ~/.config/stream-relay/nostr.key] [--dry-run] \
 //!     [--price-msat-per-gb 2000 --credit https://shop.example.com/stream-relay [--free-mb-per-day 64]]

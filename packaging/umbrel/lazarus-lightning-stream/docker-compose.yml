@@ -218,7 +218,7 @@ services:
       XBT_UI_RELAY_UNAVAILABLE: "an Umbrel app can't take this box's port 443, which a relay needs. Run one with the Linux package on a server with a public address (see the setup guide)."
       XBT_UI_RESTART_HINT: restart Lightning Stream from your Umbrel (right-click its icon, then Restart)
       # Nostr relays the Services page reads sellers' signed listings from (opt-in Nostr page)
-      XBT_UI_NOSTR_RELAYS: wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol
+      XBT_UI_NOSTR_RELAYS: wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol
       # Hashrate: renting this box's miners out (Sell) and other people's in (Services)
       XBT_UI_HASHER: http://lazarus-lightning-stream_hasher_1:23342
       XBT_UI_HASHER_SETTINGS: /data/run/hashrate/settings.json
@@ -400,7 +400,7 @@ services:
     command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
               "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "0.0.0.0:23344",
               "--control", "0.0.0.0:23342", "--control-token-file", "/data/run/hashrate/control-token",
-              "--config", "/data/run/hashrate/settings.json", "--relays", "wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
+              "--config", "/data/run/hashrate/settings.json", "--relays", "wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
               "--gateway", "http://lazarus-lightning-stream_gateway_1:8402",
               "--miners-public", "${DEVICE_DOMAIN_NAME}:23340", "--link-lan", "${DEVICE_DOMAIN_NAME}:23341",
               "--report", "/data/hashrate/hasher.json"]
@@ -428,7 +428,7 @@ services:
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "0.0.0.0:23343",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
               "--upstream", "auto", "--datum-candidates", "127.0.0.1:23339,datum-gateway_web_1:23334",
-              "--user", "rented", "--relays", "wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
+              "--user", "rented", "--relays", "wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
               "--signer", "/data/run/rental/signer.sock", "--task", "hashrate"]
     volumes:
       - ${APP_DATA_DIR}/data/hashrate:/data/hashrate
@@ -477,7 +477,7 @@ services:
     image: ghcr.io/awokenlazarus/xbt-vpn:0.1.0-8c844bcb5c6f@sha256:f8a5e837c822f8d5a9472b8ae7322959e2d479cd18f5a895e2697aedb212723e
     stop_grace_period: 10s
     environment:
-      XBT_VPN_NOSTR_RELAYS: wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol
+      XBT_VPN_NOSTR_RELAYS: wss://nostr.lazarus-xbt.xyz,wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol
       # priced exits are paid through the owner's wallet: its socket, and the dir paid tunnels are streamed through
       B2_SIGNER_SOCK: /data/run/signer/signer.sock
       B2_STREAM_DIR: /data/run/signer/streams

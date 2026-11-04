@@ -1,7 +1,7 @@
 #!/bin/bash
 # Add a fixed delay to traffic leaving this machine for a relay, to see how a shop and its buyers
 # behave over a slow path (lab only; needs sudo and tc).
-#   scripts/relay_delay.sh on <ms> [relay host]   # default host: iroh.lazarus-xbt.xyz
+#   scripts/relay_delay.sh on <ms> [relay host]   # default host: relay.lightning-stream.com
 #   scripts/relay_delay.sh off
 # Both ends of a lab run sit on this machine and reach the relay from here, so a request and its answer
 # each cross the delay once: the link's round trip grows by about twice <ms>.
@@ -10,7 +10,7 @@ dev=$(ip route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "dev") pri
 case "${1:-}" in
 on)
     ms=${2:?delay in ms}
-    host=${3:-iroh.lazarus-xbt.xyz}
+    host=${3:-relay.lightning-stream.com}
     sudo tc qdisc del dev "$dev" root 2>/dev/null || true
     # a fourth band of its own for the delayed traffic: the three default bands carry the rest unchanged
     sudo tc qdisc add dev "$dev" root handle 1: prio bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1

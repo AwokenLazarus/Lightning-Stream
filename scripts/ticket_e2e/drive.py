@@ -2190,7 +2190,7 @@ def link_gateway(relay: bool) -> tuple[str, dict[str, Any]]:
     path = gateway_config("gateway-link", GW_LINK_PORT, "link")
     with open(path) as f:
         cfg = json.load(f)
-    cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if relay else [], "private": relay}
+    cfg["link"] = {"relays": ["https://relay.lightning-stream.com"] if relay else [], "private": relay}
     cfg["link"]["endpoints"] = LINK_KEYS
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
@@ -2954,7 +2954,7 @@ def jellyfin(link: str = "") -> None:
         cfg = json.load(f)
     cfg["times"]["upstream_wait_secs"] = 30
     if link:
-        cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if link == "relay" else [], "private": link == "relay"}
+        cfg["link"] = {"relays": ["https://relay.lightning-stream.com"] if link == "relay" else [], "private": link == "relay"}
         cfg["link"]["endpoints"] = LINK_KEYS
     cfg["routes"] = [{
         "path": "/", "upstream": JF_URL, "price": {"byte_msat": JF_PRICE_MSAT, "per_bytes": PER_BYTES},

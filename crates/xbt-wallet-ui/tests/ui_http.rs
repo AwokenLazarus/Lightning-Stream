@@ -3961,7 +3961,7 @@ fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     assert!(f.contains("restarts"), "{f}");
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     assert!(c.get("public_url").is_none(), "{c}");
-    assert_eq!(c["link"], json!({"relays": ["https://iroh.lazarus-xbt.xyz"], "private": true}));
+    assert_eq!(c["link"], json!({"relays": ["https://relay.lightning-stream.com"], "private": true}));
     assert_eq!(c["nostr"]["publish"], true, "a direct shop is found on Nostr");
     assert!(c["listen"].as_str().unwrap().starts_with("127.0.0.1:"), "with the app beside it (no health address), only on loopback");
     // the page keeps the choice; the https address went with "web"

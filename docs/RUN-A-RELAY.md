@@ -287,7 +287,7 @@ lasts at most 30 days; announce again to stay listed (a monthly timer is fine).
   cargo build --release -p xbt-nostr --bin xbt-relay-announce
   ./target/release/xbt-relay-announce --relay https://relay.example.com --region eu-central \
       --capacity-mbit 500 --udp --contact you@example.com \
-      --nostr wss://relay.lazarus-xbt.xyz --nostr wss://nos.lol
+      --nostr wss://nostr.lazarus-xbt.xyz --nostr wss://nos.lol
   ```
 
   It keeps its signing key in `~/.config/stream-relay/nostr.key` (mode 600), made the first time.
