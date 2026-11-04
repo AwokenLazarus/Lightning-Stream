@@ -5,12 +5,24 @@
 //! A free relay uses [`Free`]: it admits everyone, carries everything and counts the clients
 //! connected now, for the status page. A paid relay (`docs/PAID-RELAYS.md`) uses
 //! [`crate::paid::Paid`], which meters every relayed packet by the keys it is from and to through
-//! [`Meter::forward`] (iroh-relay's `on_forward`, a hook our vendored copy adds:
-//! `vendor/iroh-relay/XBT-PATCH.md`), and stops carrying for a shop whose credit has run out.
+//! [`Meter::forward`] (iroh-relay's `on_forward`, a hook our patch adds: `docs/IROH-UPSTREAM.md`),
+//! and holds the traffic of an app whose credit has run out until it pays.
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use iroh_relay::server::{Access, AccessControl, ClientRequest};
+
+/// What happens to one relayed packet ([`Meter::forward`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forward {
+    /// Carry it.
+    Yes,
+    /// Keep it and ask again shortly: the relay reads nothing more from its sender meanwhile, and
+    /// drops it if it is still held after iroh-relay's `FORWARD_HOLD_MAX` (10 s).
+    Hold,
+    /// Don't carry it.
+    Drop,
+}
 
 /// A decision about one client, by its iroh key.
 pub trait Meter: std::fmt::Debug + Send + Sync + 'static {
@@ -20,11 +32,12 @@ pub trait Meter: std::fmt::Debug + Send + Sync + 'static {
     fn ended(&self, key: &[u8; 32]);
     /// How many clients are connected now.
     fn connected(&self) -> usize;
-    /// Carry `len` bytes of datagrams from `src` to `dst`? Called for every relayed packet; it must
-    /// not block. Everything is carried unless a meter says otherwise.
-    fn forward(&self, src: &[u8; 32], dst: &[u8; 32], len: usize) -> bool {
+    /// What to do with `len` bytes of datagrams from `src` to `dst`. Called for every relayed
+    /// packet, and again for a held one every 50 ms; it must not block. Everything is carried
+    /// unless a meter says otherwise.
+    fn forward(&self, src: &[u8; 32], dst: &[u8; 32], len: usize) -> Forward {
         let _ = (src, dst, len);
-        true
+        Forward::Yes
     }
 }
 
@@ -71,8 +84,12 @@ impl<M: Meter + ?Sized> AccessControl for Gate<M> {
         self.0.ended(endpoint_id.as_bytes());
     }
 
-    fn on_forward(&self, src: iroh_base::EndpointId, dst: iroh_base::EndpointId, len: usize) -> bool {
-        self.0.forward(src.as_bytes(), dst.as_bytes(), len)
+    fn on_forward(&self, src: iroh_base::EndpointId, dst: iroh_base::EndpointId, len: usize) -> iroh_relay::server::Forward {
+        match self.0.forward(src.as_bytes(), dst.as_bytes(), len) {
+            Forward::Yes => iroh_relay::server::Forward::Yes,
+            Forward::Hold => iroh_relay::server::Forward::Hold,
+            Forward::Drop => iroh_relay::server::Forward::Drop,
+        }
     }
 }
 
@@ -100,6 +117,6 @@ mod tests {
     #[test]
     fn free_carries_everything() {
         let m = Free::default();
-        assert!((0..1_000).all(|_| m.forward(&[1; 32], &[2; 32], 1 << 20)));
+        assert!((0..1_000).all(|_| m.forward(&[1; 32], &[2; 32], 1 << 20) == Forward::Yes));
     }
 }

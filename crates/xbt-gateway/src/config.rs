@@ -309,13 +309,14 @@ pub struct Config {
     /// Being reached by key over an iroh link (no web address, certificate or forwarded port). Absent:
     /// web only.
     pub link: Option<LinkConfig>,
-    /// Paying the paid relays the link uses (`docs/PAID-RELAYS.md`). Absent: none is paid, and a
-    /// paid relay carries the shop only within its free allowance.
+    /// Paying the link's paid home relays (`docs/PAID-RELAYS.md`): each key pays its own home relay
+    /// for what it receives there. Absent: none is paid, and a paid home relay carries the shop only
+    /// within its free allowance.
     pub relay_pay: Option<RelayPayConfig>,
 }
 
-/// The `relay_pay` section: the paid relays among `link.relays`, and the bounds the shop pays them
-/// within. Payment goes through the wallet's signer (`xbt402_pay`), under the owner's ticket task
+/// The `relay_pay` section: the paid relays among `link.relays` (a key whose home one is pays it),
+/// and the bounds the shop pays them within. Payment goes through the wallet's signer (`xbt402_pay`), under the owner's ticket task
 /// `task`, whose budget is the most for relays per day: the signer refuses past it whatever this says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPayConfig {
@@ -350,12 +351,14 @@ impl RelayPayConfig {
             relays.push(xbt_iroh_link::relay_pay::PaidRelay { relay, credit, msat_per_gb: num(r, "msat_per_gb", 0)? });
         }
         let task = opt_str(m, "task")?.unwrap_or(xbt_iroh_link::relay_pay::DEFAULT_TASK).to_string();
+        let max_msat_per_gb = num(m, "max_msat_per_gb", d.max_msat_per_gb)?;
         Ok(Self {
             signer: PathBuf::from(req_str(m, "signer")?),
             task,
             relays,
-            max_msat_per_gb: num(m, "max_msat_per_gb", d.max_msat_per_gb)?,
-            max_credit_msat: num(m, "max_credit_msat", d.max_credit_msat)?,
+            max_msat_per_gb,
+            // a 10 GB credit at the most per GB, unless written
+            max_credit_msat: num(m, "max_credit_msat", xbt_iroh_link::relay_pay::Bounds::at_most(max_msat_per_gb).max_credit_msat)?,
             max_sats: num(m, "max_sats", d.max_sats)?,
             low_water_bytes: num(m, "low_water_mb", d.low_water_bytes / 1_000_000)?.saturating_mul(1_000_000),
             check: Duration::from_secs(num(m, "check_s", 60)?.clamp(10, 3_600)),

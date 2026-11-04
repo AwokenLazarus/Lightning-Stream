@@ -6,12 +6,15 @@
 //! | Request | |
 //! | --- | --- |
 //! | `POST /credit` `{"key": "<link key, 64 hex>"}` with `x-relay-credit-token` | one credit for that key (the gateway calls it once per paid request); answers the account |
-//! | `GET /balance?key=&ts=&sig=` | the account of `key`, for the shop that holds it: `sig` is the key's ed25519 signature of [`balance_message`] |
+//! | `GET /balance?key=&ts=&sig=` | the account of `key`, for the app that holds it: `sig` is the key's ed25519 signature of [`balance_message`] |
+//! | `GET /balance?key=&ts=&sig=&home=1` | the same, and this relay is the key's home for the next [`crate::paid::HOME_TTL_S`]: `sig` signs [`home_message`] |
 //! | `GET /terms` | the price and the rest of the terms |
 //!
 //! Crediting a key is a gift to it, so a credit needs no proof that the payer holds the key; only
-//! the gateway may credit (the token), since only it was paid. A balance tells how much a shop
-//! sells, so only the key's holder may read it.
+//! the gateway may credit (the token), since only it was paid. A gift declares nothing: a key is
+//! charged only after its holder has said this relay is its home, with its own signature, so nobody
+//! pays a relay it didn't choose. A balance tells how much an app receives, so only the key's
+//! holder may read it.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -25,6 +28,8 @@ use crate::paid::{key_from_hex, Paid};
 pub const TOKEN_HEADER: &str = "x-relay-credit-token";
 /// Signed balance queries: what the key signs.
 pub const BALANCE_DOMAIN: &str = "xbt-stream-relay/balance/v1";
+/// Signed home declarations: what the key signs.
+pub const HOME_DOMAIN: &str = "xbt-stream-relay/home/v1";
 /// How far a balance query's time may be from the relay's.
 pub const BALANCE_SKEW_S: u64 = 300;
 const MAX_HEAD: usize = 8 * 1024;
@@ -36,15 +41,26 @@ pub fn balance_message(key_hex: &str, ts: u64) -> String {
     format!("{BALANCE_DOMAIN}|{}|{ts}", key_hex.to_ascii_lowercase())
 }
 
-/// Check a balance query: the key's signature of [`balance_message`], within [`BALANCE_SKEW_S`].
+/// What a link key signs to declare this relay its home at `ts`, and read its balance.
+pub fn home_message(key_hex: &str, ts: u64) -> String {
+    format!("{HOME_DOMAIN}|{}|{ts}", key_hex.to_ascii_lowercase())
+}
+
+/// Check a balance query: the key's signature of [`balance_message`] (or of [`home_message`] when
+/// `home`), within [`BALANCE_SKEW_S`].
 pub fn check_balance_query(key_hex: &str, ts: u64, sig_hex: &str, now: u64) -> Result<[u8; 32], String> {
+    check_signed(key_hex, ts, sig_hex, now, false)
+}
+
+fn check_signed(key_hex: &str, ts: u64, sig_hex: &str, now: u64, home: bool) -> Result<[u8; 32], String> {
     let key = key_from_hex(key_hex).ok_or("key is 64 hex characters")?;
     if ts.abs_diff(now) > BALANCE_SKEW_S {
         return Err("ts is too far from the relay's clock".into());
     }
     let sig: [u8; 64] = hex::decode(sig_hex.trim()).ok().and_then(|b| b.try_into().ok()).ok_or("sig is 128 hex characters")?;
     let pk = iroh_base::PublicKey::from_bytes(&key).map_err(|_| "key is not a link key")?;
-    pk.verify(balance_message(key_hex, ts).as_bytes(), &iroh_base::Signature::from_bytes(&sig)).map_err(|_| "the signature does not hold")?;
+    let msg = if home { home_message(key_hex, ts) } else { balance_message(key_hex, ts) };
+    pk.verify(msg.as_bytes(), &iroh_base::Signature::from_bytes(&sig)).map_err(|_| "the signature does not hold")?;
     Ok(key)
 }
 
@@ -127,8 +143,14 @@ fn handle(meter: &Paid, req: &Req, now: u64) -> (u16, Value) {
         }
         ("GET", "/balance") => {
             let (key, ts, sig) = (req.q("key").unwrap_or(""), req.q("ts").and_then(|t| t.parse().ok()).unwrap_or(0), req.q("sig").unwrap_or(""));
-            match check_balance_query(key, ts, sig, now) {
-                Ok(k) => (200, meter.account(&k).unwrap_or_else(|| json!({"key": hex::encode(k), "balance_bytes": 0, "carrying": false}))),
+            let home = req.q("home") == Some("1");
+            match check_signed(key, ts, sig, now, home) {
+                Ok(k) => {
+                    if home {
+                        meter.declare_home(&k);
+                    }
+                    (200, meter.account(&k).unwrap_or_else(|| json!({"key": hex::encode(k), "balance_bytes": 0, "home": false, "carrying": false})))
+                }
                 Err(e) => (403, json!({"error": "bad_query", "message": e})),
             }
         }
@@ -176,7 +198,7 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
     fn paid() -> Paid {
-        Paid::new(PaidSettings { enabled: true, msat_per_gb: 2_000, credit_msat: 20_000, credit_token: TOKEN.into(), ..PaidSettings::default() })
+        Paid::new(PaidSettings { enabled: true, msat_per_gb: 2_000, credit_token: TOKEN.into(), ..PaidSettings::default() })
     }
 
     fn req(method: &str, path: &str, query: &[(&str, &str)], headers: &[(&str, &str)], body: &str) -> Req {
@@ -191,6 +213,30 @@ mod tests {
         (key, sig)
     }
 
+    fn signed_home(secret: [u8; 32], ts: u64) -> (String, String) {
+        let sk = iroh_base::SecretKey::from_bytes(&secret);
+        let key = hex::encode(sk.public().as_bytes());
+        let sig = hex::encode(sk.sign(home_message(&key, ts).as_bytes()).to_bytes());
+        (key, sig)
+    }
+
+    #[test]
+    fn only_the_keys_holder_declares_a_home() {
+        let m = paid();
+        let now = crate::status::now();
+        let ts = now.to_string();
+        let (key, home_sig) = signed_home([9; 32], now);
+        let (_, read_sig) = signed([9; 32], now);
+        let q = |sig: &str, home: &str| req("GET", "/balance", &[("key", &key), ("ts", &ts), ("sig", sig), ("home", home)], &[], "");
+        // a read's signature does not declare a home, nor the other way round
+        assert_eq!(handle(&m, &q(&read_sig, "1"), now).0, 403);
+        assert_eq!(handle(&m, &q(&home_sig, "0"), now).0, 403);
+        let (code, v) = handle(&m, &q(&read_sig, "0"), now);
+        assert_eq!((code, &v["home"]), (200, &json!(false)));
+        let (code, v) = handle(&m, &q(&home_sig, "1"), now);
+        assert_eq!((code, &v["home"]), (200, &json!(true)), "{v}");
+    }
+
     #[test]
     fn credit_needs_the_token_and_a_key() {
         let m = paid();
@@ -200,7 +246,8 @@ mod tests {
         assert_eq!(handle(&m, &req("POST", "/credit", &[], &[(TOKEN_HEADER, "x")], &body), 0).0, 403);
         assert_eq!(handle(&m, &req("POST", "/credit", &[], &[(TOKEN_HEADER, TOKEN)], "{}"), 0).0, 400);
         let (code, v) = handle(&m, &req("POST", "/credit", &[], &[(TOKEN_HEADER, TOKEN)], &body), 0);
-        assert_eq!((code, v["balance_bytes"].as_i64()), (200, Some(10_000_000_000)));
+        assert_eq!((code, v["balance_bytes"].as_i64(), v["credited_msat"].as_u64()), (200, Some(10_000_000_000), Some(20_000)));
+        assert_eq!(v["home"], false, "a credit declares no home");
     }
 
     #[test]
@@ -223,6 +270,7 @@ mod tests {
         let m = paid();
         let (code, v) = handle(&m, &req("GET", "/terms", &[], &[], ""), 0);
         assert_eq!((code, v["msat_per_gb"].as_u64(), v.get("credit_token")), (200, Some(2_000), None));
+        assert_eq!((v["credit_bytes"].as_u64(), v["credit_msat"].as_u64()), (Some(10_000_000_000), Some(20_000)));
         m.set_settings(PaidSettings::default());
         assert_eq!(handle(&m, &req("GET", "/terms", &[], &[], ""), 0).0, 503);
     }

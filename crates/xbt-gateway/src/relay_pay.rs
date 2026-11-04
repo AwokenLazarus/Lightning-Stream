@@ -1,5 +1,6 @@
-//! The shop paying its paid relays (`docs/PAID-RELAYS.md`, the `relay_pay` section): for each link
-//! key whose home relay is a paid one, a [`RelayPayer`] keeps a small prepaid balance there, paid
+//! The shop paying its own home relays (`docs/PAID-RELAYS.md`, the `relay_pay` section): each app
+//! pays the relay it chose as home for what it receives there. For each link key whose home relay
+//! is a paid one, a [`RelayPayer`] declares that home and keeps a small prepaid balance there, paid
 //! through the wallet's signer (`xbt402_pay`) under the owner's spending rule for relays.
 //! The gateway holds no wallet key: what it can spend is what the signer's policy lets the task
 //! spend.
@@ -93,7 +94,7 @@ pub fn spawn(cfg: RelayPayConfig, link_relays: Vec<String>, secrets: Vec<[u8; 32
                     eprintln!("xbt-gateway: relay_pay: paid {price_msat} msat to {}; balance {balance} bytes", p.relay.relay);
                 }
                 Step::Refused(why) => eprintln!("xbt-gateway: relay_pay: {} not paid: {why}", p.relay.relay),
-                Step::Enough { .. } | Step::Waiting => {}
+                Step::Enough { .. } | Step::Waiting { .. } => {}
             }
         }
         std::thread::sleep(every);

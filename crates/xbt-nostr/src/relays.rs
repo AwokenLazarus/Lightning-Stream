@@ -19,9 +19,12 @@
 //! [`TOPIC`], so apps that predate paid relays never see it and never make it their home relay,
 //! and with two more tags:
 //!
-//! * `price_msat_per_gb`: what it charges a shop per GB it carries for it, in msat.
+//! * `price_msat_per_gb`: what it charges per GB, in msat. An app homed on it pays it for what it
+//!   receives there, in credits of 10 GB.
 //! * `credit`: the https URL of the priced route on its operator's shop where credit is bought
 //!   with Stream tickets (`<credit>/credit`; `<credit>/balance` and `<credit>/terms` are free).
+//! * `free_bytes_per_day`: what each key may receive there free each day, optional:
+//!   [`DEFAULT_FREE_BYTES_PER_DAY`] (64 MB) when it is left out.
 //!
 //! An app uses a paid relay only when its owner allows paid relays and the price is within the
 //! owner's most per GB ([`Prefs::paid`], [`Prefs::max_msat_per_gb`]); otherwise it is left out
@@ -80,13 +83,34 @@ pub struct RelayPrice {
     pub msat_per_gb: u64,
     /// The https URL of the seller route (no query, no trailing `/`).
     pub credit: String,
+    /// What each key may receive there free each day.
+    pub free_bytes_per_day: u64,
 }
 
 /// The most a price per GB may be announced at: 1,000 sats.
 pub const MAX_MSAT_PER_GB: u64 = 1_000_000;
+/// A paid relay's free allowance when its announcement doesn't say: 64 MB a day.
+pub const DEFAULT_FREE_BYTES_PER_DAY: u64 = 64 << 20;
+/// The most free allowance an announcement may claim: 100 GB a day.
+pub const MAX_FREE_BYTES_PER_DAY: u64 = 100_000_000_000;
+/// A credit's size: what one paid request to a relay's seller route buys.
+pub const CREDIT_BYTES: u64 = 10_000_000_000;
 
 impl RelayPrice {
+    /// A price with the default free allowance.
+    pub fn new(msat_per_gb: u64, credit: &str) -> Self {
+        Self { msat_per_gb, credit: credit.to_string(), free_bytes_per_day: DEFAULT_FREE_BYTES_PER_DAY }
+    }
+
+    /// What one 10 GB credit costs at this price, in msat.
+    pub fn credit_msat(&self) -> u64 {
+        u64::try_from((u128::from(CREDIT_BYTES) * u128::from(self.msat_per_gb)).div_ceil(1_000_000_000)).unwrap_or(u64::MAX)
+    }
+
     fn check(&self) -> Result<Self, String> {
+        if self.free_bytes_per_day > MAX_FREE_BYTES_PER_DAY {
+            return Err("a paid relay's free allowance is at most 100 GB a day".into());
+        }
         if self.msat_per_gb == 0 || self.msat_per_gb > MAX_MSAT_PER_GB {
             return Err(format!("a paid relay's price is 1 to {MAX_MSAT_PER_GB} msat per GB"));
         }
@@ -95,7 +119,7 @@ impl RelayPrice {
         if rest.is_empty() || c.len() > 256 || c.contains(['?', '#', '@']) || c.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
             return Err("the credit URL is an https URL with no query, at most 256 characters".into());
         }
-        Ok(Self { msat_per_gb: self.msat_per_gb, credit: c.to_string() })
+        Ok(Self { msat_per_gb: self.msat_per_gb, credit: c.to_string(), free_bytes_per_day: self.free_bytes_per_day })
     }
 }
 
@@ -170,6 +194,9 @@ pub fn announcement_event(keys: &Keys, offer: &Offer, now: u64) -> Result<Event,
     if let Some(p) = price {
         tags.push(tag("price_msat_per_gb", &p.msat_per_gb.to_string()));
         tags.push(tag("credit", &p.credit));
+        if p.free_bytes_per_day != DEFAULT_FREE_BYTES_PER_DAY {
+            tags.push(tag("free_bytes_per_day", &p.free_bytes_per_day.to_string()));
+        }
     }
     Ok(Event::sign(keys, now, KIND_APP_DATA, tags, offer.note.trim().to_string()))
 }
@@ -204,7 +231,11 @@ pub fn read_event(ev: &Event, now: u64) -> Result<Announcement, String> {
     }
     let price = if paid {
         let msat_per_gb = ev.tag("price_msat_per_gb").and_then(|s| s.parse::<u64>().ok()).ok_or("a paid relay without a price")?;
-        Some(RelayPrice { msat_per_gb, credit: ev.tag("credit").ok_or("a paid relay without a credit URL")?.to_string() }.check()?)
+        let free_bytes_per_day = match ev.tag("free_bytes_per_day") {
+            None => DEFAULT_FREE_BYTES_PER_DAY,
+            Some(s) => s.parse::<u64>().map_err(|_| "the free allowance is not a number")?,
+        };
+        Some(RelayPrice { msat_per_gb, credit: ev.tag("credit").ok_or("a paid relay without a credit URL")?.to_string(), free_bytes_per_day }.check()?)
     } else {
         None
     };
@@ -408,6 +439,89 @@ pub fn select_for(announced: &[Announcement], probes: &HashMap<String, Probe>, p
     out
 }
 
+/// How much quicker another relay must answer to be a clearly better home: at most three quarters
+/// of the home's round trip, and at least [`HOME_BETTER_MS`] less.
+pub const HOME_BETTER_PCT: u32 = 75;
+pub const HOME_BETTER_MS: u32 = 20;
+/// A better relay becomes home only after it was better in this many looks in a row.
+pub const HOME_BETTER_LOOKS: u32 = 2;
+
+/// Where an app's home relay stands: the relay, and a relay seen to be clearly better, with how
+/// many looks in a row it has been (kept in `relays.json` as `home`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HomeState {
+    pub relay: String,
+    pub better: Option<(String, u32)>,
+}
+
+/// Why the home relay is what it is after a look ([`choose_home`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeWhy {
+    /// The first look: the default relay.
+    Default,
+    /// The owner pinned it.
+    Pinned,
+    /// Unchanged.
+    Kept,
+    /// It changed by itself to a clearly better relay: measured round trips, before and after.
+    Better { from: String, from_ms: u32, to_ms: u32 },
+    /// The home didn't answer, or is no longer allowed (blocked, paid past the owner's price): the
+    /// best answering relay instead.
+    Replaced { from: String },
+}
+
+/// The relays an app may make its home now, answering: what [`select_for`] keeps, the default
+/// relay included when it answers.
+fn home_candidates(announced: &[Announcement], probes: &HashMap<String, Probe>, prefs: &Prefs, default_relay: &str) -> Vec<String> {
+    let mut v = select_for(announced, probes, prefs, default_relay, usize::MAX, Purpose::Latency);
+    v.retain(|u| probes.get(u).is_some_and(Probe::healthy));
+    v
+}
+
+/// The app's home relay after one look (`docs/PAID-RELAYS.md`, choosing): every app starts on the
+/// default relay and keeps its home while it answers, unless the owner pinned another (which is
+/// home whenever it answers) or another allowed relay is clearly quicker ([`HOME_BETTER_PCT`],
+/// [`HOME_BETTER_MS`]) in [`HOME_BETTER_LOOKS`] looks in a row. Paid relays are allowed only as
+/// [`select_for`] allows them: when the owner pays for relays, at or below the most per GB. A home
+/// that stops answering, or is no longer allowed, is replaced by the quickest that is.
+pub fn choose_home(state: Option<&HomeState>, announced: &[Announcement], probes: &HashMap<String, Probe>, prefs: &Prefs,
+                   default_relay: &str, pin: Option<&str>) -> (HomeState, HomeWhy) {
+    let canon = |u: &str| canonical_relay(u).ok();
+    let default = canon(default_relay).unwrap_or_else(|| default_relay.to_string());
+    let ok = home_candidates(announced, probes, prefs, &default);
+    let rtt = |u: &str| probes.get(u).and_then(|p| p.rtt_ms);
+    if let Some(p) = pin.and_then(canon) {
+        if ok.contains(&p) {
+            return (HomeState { relay: p, better: None }, HomeWhy::Pinned);
+        }
+    }
+    let Some(cur) = state.filter(|s| !s.relay.is_empty()).map(|s| canon(&s.relay).unwrap_or_else(|| s.relay.clone())) else {
+        return (HomeState { relay: default, better: None }, HomeWhy::Default);
+    };
+    let quickest = ok.iter().min_by_key(|u| (rtt(u).unwrap_or(u32::MAX), u.as_str())).cloned();
+    if !ok.contains(&cur) {
+        return match quickest {
+            Some(q) => (HomeState { relay: q, better: None }, HomeWhy::Replaced { from: cur }),
+            // nothing answers now: keep it, and look again
+            None => (HomeState { relay: cur, better: None }, HomeWhy::Kept),
+        };
+    }
+    let cur_ms = rtt(&cur).unwrap_or(u32::MAX);
+    let better = quickest.filter(|q| *q != cur).and_then(|q| {
+        let ms = rtt(&q)?;
+        (u64::from(ms) * 100 <= u64::from(cur_ms) * u64::from(HOME_BETTER_PCT) && cur_ms.saturating_sub(ms) >= HOME_BETTER_MS).then_some((q, ms))
+    });
+    let Some((q, ms)) = better else {
+        return (HomeState { relay: cur, better: None }, HomeWhy::Kept);
+    };
+    let looks = state.and_then(|s| s.better.as_ref()).filter(|(r, _)| *r == q).map_or(1, |(_, n)| n + 1);
+    if looks >= HOME_BETTER_LOOKS {
+        (HomeState { relay: q, better: None }, HomeWhy::Better { from: cur, from_ms: cur_ms, to_ms: ms })
+    } else {
+        (HomeState { relay: cur, better: Some((q, looks)) }, HomeWhy::Kept)
+    }
+}
+
 /// Probe a relay the way an iroh endpoint first reaches it: a WebSocket upgrade on `/relay` with
 /// the `iroh-relay-v1` sub-protocol, over TLS. `Ok` with the time to the `101` answer, in
 /// milliseconds; the connection is closed right after, so nothing is relayed.
@@ -437,19 +551,19 @@ mod tests {
 
     fn paid_ann(relay: &str, msat_per_gb: u64) -> Announcement {
         let k = Keys::generate();
-        let o = Offer { price: Some(RelayPrice { msat_per_gb, credit: "https://ops.example.com/stream-relay/".into() }), ..offer(relay) };
+        let o = Offer { price: Some(RelayPrice::new(msat_per_gb, "https://ops.example.com/stream-relay/")), ..offer(relay) };
         read_event(&announcement_event(&k, &o, NOW).unwrap(), NOW).unwrap()
     }
 
     #[test]
     fn a_paid_relay_is_announced_apart() {
         let k = Keys::generate();
-        let o = Offer { price: Some(RelayPrice { msat_per_gb: 2_000, credit: "https://ops.example.com/stream-relay/".into() }), ..offer("https://paid.example.com") };
+        let o = Offer { price: Some(RelayPrice::new(2_000, "https://ops.example.com/stream-relay/")), ..offer("https://paid.example.com") };
         let ev = announcement_event(&k, &o, NOW).unwrap();
         // not under the free topic: an app that predates paid relays never reads it
         assert_eq!(ev.tag("t"), Some(TOPIC_PAID));
         let a = read_event(&ev, NOW).unwrap();
-        assert_eq!(a.price, Some(RelayPrice { msat_per_gb: 2_000, credit: "https://ops.example.com/stream-relay".into() }));
+        assert_eq!(a.price, Some(RelayPrice::new(2_000, "https://ops.example.com/stream-relay")));
         assert_eq!(ann("https://free.example.com").price, None);
         // a paid announcement without a price, or also under the free topic, is refused
         let no_price: Vec<_> = ev.tags.iter().filter(|t| t[0] != "price_msat_per_gb").cloned().collect();
@@ -458,8 +572,8 @@ mod tests {
         both.push(tag("t", TOPIC));
         assert!(read_event(&Event::sign(&k, NOW, KIND_APP_DATA, both, String::new()), NOW).is_err());
         // bad prices and credit URLs are refused when made
-        for p in [RelayPrice { msat_per_gb: 0, credit: "https://a.example.com".into() }, RelayPrice { msat_per_gb: 1, credit: "http://a.example.com".into() },
-                  RelayPrice { msat_per_gb: MAX_MSAT_PER_GB + 1, credit: "https://a.example.com".into() }] {
+        for p in [RelayPrice::new(0, "https://a.example.com"), RelayPrice::new(1, "http://a.example.com"),
+                  RelayPrice::new(MAX_MSAT_PER_GB + 1, "https://a.example.com")] {
             assert!(announcement_event(&k, &Offer { price: Some(p), ..offer("https://a.example.com") }, NOW).is_err());
         }
         assert_eq!(filter(5)["#t"], json!([TOPIC, TOPIC_PAID]));
@@ -482,6 +596,58 @@ mod tests {
         let p = probes(&[("https://a.example.com", Some(10), 0), ("https://b.example.com", Some(10), 0)]);
         let prefs = Prefs { paid: true, max_msat_per_gb: 2_000, ..Prefs::default() };
         assert_eq!(select(&b, &p, &prefs, OURS, 4)[0], "https://b.example.com/");
+    }
+
+    #[test]
+    fn a_paid_relay_announces_its_free_allowance() {
+        let k = Keys::generate();
+        let p = RelayPrice { free_bytes_per_day: 1 << 30, ..RelayPrice::new(3_000, "https://ops.example.com/r") };
+        let ev = announcement_event(&k, &Offer { price: Some(p.clone()), ..offer("https://paid.example.com") }, NOW).unwrap();
+        assert_eq!(read_event(&ev, NOW).unwrap().price, Some(p));
+        // left out: 64 MB a day
+        let a = paid_ann("https://paid.example.com", 3_000);
+        assert_eq!(a.price.as_ref().unwrap().free_bytes_per_day, 64 << 20);
+        // 10 GB credits at the relay's own price
+        assert_eq!(a.price.unwrap().credit_msat(), 30_000);
+        let huge = RelayPrice { free_bytes_per_day: MAX_FREE_BYTES_PER_DAY + 1, ..RelayPrice::new(3_000, "https://ops.example.com/r") };
+        assert!(announcement_event(&k, &Offer { price: Some(huge), ..offer("https://paid.example.com") }, NOW).is_err());
+    }
+
+    #[test]
+    fn every_app_starts_on_the_default_and_moves_only_to_a_clearly_better_home() {
+        let a = [ann("https://near.example.com"), ann("https://same.example.com"), paid_ann("https://paid.example.com", 3_000)];
+        let mut p = probes(&[(OURS, Some(100), 0), ("https://near.example.com", Some(40), 0), ("https://same.example.com", Some(90), 0),
+                             ("https://paid.example.com", Some(10), 0)]);
+        let prefs = Prefs::default();
+        let (s, why) = choose_home(None, &a, &p, &prefs, OURS, None);
+        assert_eq!((s.relay.as_str(), why), ("https://iroh.lazarus-xbt.xyz/", HomeWhy::Default));
+        // a clearly better one: seen once, not yet; twice in a row, home
+        let (s, why) = choose_home(Some(&s), &a, &p, &prefs, OURS, None);
+        assert_eq!((s.relay.as_str(), &why, s.better.clone()), ("https://iroh.lazarus-xbt.xyz/", &HomeWhy::Kept, Some(("https://near.example.com/".into(), 1))));
+        let (s, why) = choose_home(Some(&s), &a, &p, &prefs, OURS, None);
+        assert_eq!(s.relay, "https://near.example.com/");
+        assert_eq!(why, HomeWhy::Better { from: "https://iroh.lazarus-xbt.xyz/".into(), from_ms: 100, to_ms: 40 });
+        // a little quicker is not clearly better
+        let s = HomeState { relay: "https://same.example.com/".into(), better: None };
+        p.insert("https://near.example.com/".into(), Probe { rtt_ms: Some(80), fail_streak: 0, mbit: None });
+        assert_eq!(choose_home(Some(&s), &a, &p, &prefs, OURS, None).1, HomeWhy::Kept);
+        // the paid one, quickest of all, only when the owner pays for relays at its price or more
+        let s = HomeState { relay: OURS.into(), better: Some(("https://paid.example.com/".into(), 1)) };
+        assert_ne!(choose_home(Some(&s), &a, &p, &prefs, OURS, None).0.relay, "https://paid.example.com/");
+        let low = Prefs { paid: true, max_msat_per_gb: 2_000, ..Prefs::default() };
+        assert_ne!(choose_home(Some(&s), &a, &p, &low, OURS, None).0.relay, "https://paid.example.com/");
+        let pays = Prefs { paid: true, max_msat_per_gb: 3_000, ..Prefs::default() };
+        assert_eq!(choose_home(Some(&s), &a, &p, &pays, OURS, None).0.relay, "https://paid.example.com/");
+        // a home that stops answering is replaced by the quickest that does
+        let s = HomeState { relay: "https://near.example.com/".into(), better: None };
+        p.insert("https://near.example.com/".into(), Probe { rtt_ms: None, fail_streak: DOWN_AFTER, mbit: None });
+        let (s2, why) = choose_home(Some(&s), &a, &p, &prefs, OURS, None);
+        assert_eq!((s2.relay.as_str(), why), ("https://same.example.com/", HomeWhy::Replaced { from: "https://near.example.com/".into() }));
+        // the owner's pin wins whenever it answers
+        let (s3, why) = choose_home(Some(&s2), &a, &p, &prefs, OURS, Some("https://iroh.lazarus-xbt.xyz"));
+        assert_eq!((s3.relay.as_str(), why), ("https://iroh.lazarus-xbt.xyz/", HomeWhy::Pinned));
+        // a pinned relay that doesn't answer leaves the choice as it would be
+        assert_eq!(choose_home(Some(&s2), &a, &p, &prefs, OURS, Some("https://near.example.com")).1, HomeWhy::Kept);
     }
 
     fn ann(relay: &str) -> Announcement {

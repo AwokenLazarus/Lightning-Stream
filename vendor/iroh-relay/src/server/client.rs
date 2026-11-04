@@ -29,7 +29,7 @@ use crate::{
         streams::BytesStreamSink,
     },
     server::{
-        ConnectionId, OnDisconnectGuard,
+        ConnectionId, FORWARD_HOLD_MAX, FORWARD_HOLD_RETRY, Forward, OnDisconnectGuard,
         clients::Clients,
         metrics::Metrics,
         streams::{RecvError as RelayRecvError, RelayedStream, SendError as RelaySendError},
@@ -152,6 +152,7 @@ impl Client {
             protocol_version,
             rate_limited,
             metrics,
+            held: None,
         };
 
         // start io loop
@@ -337,6 +338,17 @@ struct Actor<S> {
     /// Optional signal counting how often the connection has been rate-limited.
     rate_limited: Option<watch::Receiver<u64>>,
     metrics: Arc<Metrics>,
+    /// A packet the access control holds ([`Forward::Hold`]): nothing more is read from the
+    /// client until it is forwarded or dropped.
+    held: Option<Held>,
+}
+
+/// A packet held by [`Forward::Hold`], and since when.
+#[derive(Debug)]
+struct Held {
+    dst: EndpointId,
+    datagrams: Datagrams,
+    since: tokio::time::Instant,
 }
 
 impl<S> Actor<S>
@@ -399,12 +411,16 @@ where
                             .map_err(|err| e!(RunError::WriteFrame, err))?;
                     }
                 }
-                maybe_frame = self.stream.next() => {
+                maybe_frame = self.stream.next(), if self.held.is_none() => {
                     self
                         .handle_frame(maybe_frame)
                         .await?;
                     // reset the ping interval, we just received a message
                     ping_interval.reset();
+                }
+                // a held packet: ask the access control again
+                _ = tokio::time::sleep(FORWARD_HOLD_RETRY), if self.held.is_some() => {
+                    self.retry_held();
                 }
                 // Second priority, sending regular packets
                 packet = self.packet_send_queue.recv() => {
@@ -501,15 +517,18 @@ where
                 datagrams,
             } => {
                 let packet_len = datagrams.contents.len();
-                // the access control may stop carrying a packet
-                if !self.guard.forward(dst_key, packet_len) {
-                    self.metrics.send_packets_dropped.inc();
-                } else if let Err(err @ ForwardPacketError { .. }) =
-                    self.handle_frame_send_packet(dst_key, datagrams)
-                {
-                    warn!("failed to handle send packet frame: {err:#}");
-                }
                 self.metrics.bytes_recv.inc_by(packet_len as u64);
+                // the access control may drop or hold a packet
+                match self.guard.forward(dst_key, packet_len) {
+                    Forward::Hold => {
+                        self.held = Some(Held {
+                            dst: dst_key,
+                            datagrams,
+                            since: tokio::time::Instant::now(),
+                        });
+                    }
+                    decision => self.forward_or_drop(decision, dst_key, datagrams),
+                }
             }
             ClientToRelayMsg::Ping(data) => {
                 self.metrics.got_ping.inc();
@@ -522,6 +541,35 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Forwards a packet the access control let through, or drops it.
+    fn forward_or_drop(&self, decision: Forward, dst: EndpointId, datagrams: Datagrams) {
+        if decision == Forward::Yes {
+            if let Err(err @ ForwardPacketError { .. }) =
+                self.handle_frame_send_packet(dst, datagrams)
+            {
+                warn!("failed to handle send packet frame: {err:#}");
+            }
+        } else {
+            self.metrics.send_packets_dropped.inc();
+        }
+    }
+
+    /// Asks the access control again about the held packet: forwarded, dropped, or held on, until
+    /// [`FORWARD_HOLD_MAX`] has passed.
+    fn retry_held(&mut self) {
+        let Some(h) = self.held.take() else {
+            return;
+        };
+        match self.guard.forward(h.dst, h.datagrams.contents.len()) {
+            Forward::Hold if h.since.elapsed() < FORWARD_HOLD_MAX => self.held = Some(h),
+            Forward::Hold => {
+                debug!("held packet dropped after {FORWARD_HOLD_MAX:?}");
+                self.forward_or_drop(Forward::Drop, h.dst, h.datagrams);
+            }
+            decision => self.forward_or_drop(decision, h.dst, h.datagrams),
+        }
     }
 
     fn handle_frame_send_packet(
@@ -653,6 +701,7 @@ mod tests {
             protocol_version: ProtocolVersion::V2,
             rate_limited: None,
             metrics,
+            held: None,
         };
 
         let done = CancellationToken::new();

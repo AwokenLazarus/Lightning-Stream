@@ -5,11 +5,12 @@
 //!     --nostr wss://relay.lazarus-xbt.xyz --nostr wss://nos.lol \
 //!     [--capacity-mbit 500] [--udp] [--contact ops@example.com] [--note "…"] \
 //!     [--ttl-days 30] [--key-file ~/.config/stream-relay/nostr.key] [--dry-run] \
-//!     [--price-msat-per-gb 2000 --credit https://shop.example.com/stream-relay]
+//!     [--price-msat-per-gb 2000 --credit https://shop.example.com/stream-relay [--free-mb-per-day 64]]
 //! ```
 //!
 //! `--price-msat-per-gb` and `--credit` announce a paid relay (`docs/PAID-RELAYS.md`): its price per
 //! GB in msat, and the priced route on the operator's shop where credit is bought. Both or neither.
+//! `--free-mb-per-day` is what each key may receive there free each day (64 MB when left out).
 //!
 //! The announcement is signed with the key in `--key-file` (64 hex characters), made there with
 //! mode 600 the first time. It lives `--ttl-days` (at most 30): run this again, by hand or from a
@@ -23,7 +24,7 @@ use xbt_nostr::relays::{self, Offer};
 fn usage() -> ! {
     eprintln!("usage: xbt-relay-announce --relay https://HOST --region REGION --nostr wss://… [--nostr …] \
                [--capacity-mbit N] [--udp] [--contact TEXT] [--note TEXT] [--ttl-days N] [--key-file PATH] [--dry-run] \
-               [--price-msat-per-gb N --credit https://…]");
+               [--price-msat-per-gb N --credit https://… [--free-mb-per-day N]]");
     std::process::exit(2)
 }
 
@@ -53,7 +54,7 @@ fn main() {
     let (mut relay, mut region, mut contact, mut note) = (None, None, String::new(), String::new());
     let (mut capacity, mut udp, mut ttl_days, mut dry) = (None, false, 30u64, false);
     let mut nostr = Vec::new();
-    let (mut price, mut credit): (Option<u64>, Option<String>) = (None, None);
+    let (mut price, mut credit, mut free_mb): (Option<u64>, Option<String>, Option<u64>) = (None, None, None);
     let mut key_file = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/stream-relay/nostr.key")).unwrap_or_else(|| "nostr.key".into());
     while let Some(arg) = a.next() {
         let mut val = || a.next().unwrap_or_else(|| usage());
@@ -70,13 +71,17 @@ fn main() {
             "--dry-run" => dry = true,
             "--price-msat-per-gb" => price = Some(val().parse::<u64>().unwrap_or_else(|_| usage())),
             "--credit" => credit = Some(val()),
+            "--free-mb-per-day" => free_mb = Some(val().parse::<u64>().unwrap_or_else(|_| usage())),
             "-h" | "--help" => usage(),
             _ => usage(),
         }
     }
     let (Some(relay), Some(region)) = (relay, region) else { usage() };
     let price = match (price, credit) {
-        (Some(msat_per_gb), Some(credit)) => Some(relays::RelayPrice { msat_per_gb, credit }),
+        (Some(msat_per_gb), Some(credit)) => Some(relays::RelayPrice {
+            free_bytes_per_day: free_mb.map_or(relays::DEFAULT_FREE_BYTES_PER_DAY, |m| m.saturating_mul(1 << 20)),
+            ..relays::RelayPrice::new(msat_per_gb, &credit)
+        }),
         (None, None) => None,
         _ => usage(),
     };

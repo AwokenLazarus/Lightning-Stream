@@ -304,18 +304,42 @@ pub trait AccessControl: std::fmt::Debug + Send + Sync + 'static {
         let _ = (endpoint_id, connection_id);
     }
 
-    /// Decides whether one relayed packet is forwarded: `len` bytes of datagrams from the
-    /// admitted client `src` to the endpoint `dst`. Returns `false` to drop it.
+    /// Decides what happens to one relayed packet: `len` bytes of datagrams from the admitted
+    /// client `src` to the endpoint `dst`.
     ///
     /// Called for every packet a client sends through the relay, before it is forwarded, so an
-    /// implementation can count the bytes it carries for each endpoint and stop carrying for one.
+    /// implementation can count the bytes it carries for each endpoint and stop carrying for one
+    /// without disconnecting it. [`Forward::Hold`] keeps the packet and asks again (see there).
     /// The default forwards everything. A sync method called in an async context: it must not
     /// block.
-    fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> bool {
+    fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> Forward {
         let _ = (src, dst, len);
-        true
+        Forward::Yes
     }
 }
+
+/// What [`AccessControl::on_forward`] decided about one relayed packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Forward {
+    /// Forward it.
+    Yes,
+    /// Drop it. It is counted in the `send_packets_dropped` metric.
+    Drop,
+    /// Not yet: the relay keeps the packet and reads nothing more from its sender (which slows
+    /// the sender down, as a full connection would) while it asks again every
+    /// [`FORWARD_HOLD_RETRY`]. It is forwarded or dropped as soon as the answer is [`Forward::Yes`]
+    /// or [`Forward::Drop`], and dropped if it is still held after [`FORWARD_HOLD_MAX`]. Everything
+    /// else on the connection (packets to the client, pings) goes on meanwhile.
+    Hold,
+}
+
+/// How often a held packet is asked about again ([`Forward::Hold`]).
+pub const FORWARD_HOLD_RETRY: Duration = Duration::from_millis(50);
+/// The longest a packet is held ([`Forward::Hold`]): shorter than the time the relay waits, after
+/// the last frame it read from a client, before it pings it, so a held connection is not taken
+/// for a dead one.
+pub const FORWARD_HOLD_MAX: Duration = Duration::from_secs(10);
 
 /// A dyn-compatible version of [`AccessControl`] that returns boxed futures.
 ///
@@ -333,7 +357,7 @@ pub trait DynAccessControl: std::fmt::Debug + Send + Sync + 'static {
     fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId);
 
     /// See [`AccessControl::on_forward`].
-    fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> bool;
+    fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> Forward;
 }
 
 impl<T: AccessControl> DynAccessControl for T {
@@ -348,7 +372,7 @@ impl<T: AccessControl> DynAccessControl for T {
         <Self as AccessControl>::on_disconnect(self, endpoint_id, connection_id)
     }
 
-    fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> bool {
+    fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> Forward {
         <Self as AccessControl>::on_forward(self, src, dst, len)
     }
 }
@@ -435,12 +459,12 @@ impl OnDisconnectGuard {
         self.connection_id
     }
 
-    /// Whether a packet of `len` bytes from the guarded endpoint to `dst` is forwarded:
-    /// [`AccessControl::on_forward`] of the access control, `true` without one.
-    pub fn forward(&self, dst: EndpointId, len: usize) -> bool {
+    /// What happens to a packet of `len` bytes from the guarded endpoint to `dst`:
+    /// [`AccessControl::on_forward`] of the access control, [`Forward::Yes`] without one.
+    pub fn forward(&self, dst: EndpointId, len: usize) -> Forward {
         self.access
             .as_ref()
-            .is_none_or(|a| a.on_forward(self.endpoint_id, dst, len))
+            .map_or(Forward::Yes, |a| a.on_forward(self.endpoint_id, dst, len))
     }
 }
 
@@ -1229,7 +1253,7 @@ mod tests {
     use url::Url;
 
     use super::{
-        Access, AccessControl, ClientRequest, NO_CONTENT_CHALLENGE_HEADER,
+        Access, AccessControl, ClientRequest, Forward, NO_CONTENT_CHALLENGE_HEADER,
         NO_CONTENT_RESPONSE_HEADER, RelayConfig, Server, ServerConfig, SpawnError,
     };
     use crate::{
@@ -1522,11 +1546,13 @@ mod tests {
     }
 
     /// An [`AccessControl`] that forwards a packet only while its sender has bytes left, and
-    /// counts what it forwarded, for [`test_relay_access_control_on_forward`].
-    #[derive(Debug)]
+    /// counts what it forwarded, for [`test_relay_access_control_on_forward`]. Past the budget it
+    /// drops, or holds when `hold` is set.
+    #[derive(Debug, Default)]
     struct Budget {
         left: std::sync::Mutex<std::collections::HashMap<EndpointId, usize>>,
         forwarded: std::sync::atomic::AtomicUsize,
+        hold: std::sync::atomic::AtomicBool,
     }
 
     impl AccessControl for Budget {
@@ -1534,21 +1560,26 @@ mod tests {
             Access::Allow
         }
 
-        fn on_forward(&self, src: EndpointId, _dst: EndpointId, len: usize) -> bool {
+        fn on_forward(&self, src: EndpointId, _dst: EndpointId, len: usize) -> Forward {
             let mut left = self.left.lock().unwrap();
             let left = left.entry(src).or_insert(0);
             if *left < len {
-                return false;
+                return if self.hold.load(std::sync::atomic::Ordering::Relaxed) {
+                    Forward::Hold
+                } else {
+                    Forward::Drop
+                };
             }
             *left -= len;
             self.forwarded
                 .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
-            true
+            Forward::Yes
         }
     }
 
-    /// [`AccessControl::on_forward`] sees each relayed packet's sender, receiver and length, and
-    /// a packet it refuses is not forwarded while the connection stays up.
+    /// [`AccessControl::on_forward`] sees each relayed packet's sender, receiver and length; a
+    /// packet it drops is not forwarded while the connection stays up, and one it holds is
+    /// forwarded, in order, once it lets it through.
     #[tokio::test]
     #[traced_test]
     async fn test_relay_access_control_on_forward() -> Result<()> {
@@ -1564,7 +1595,7 @@ mod tests {
         // a may send 8 bytes, b nothing
         let budget = Arc::new(Budget {
             left: std::sync::Mutex::new([(a_key, 8)].into_iter().collect()),
-            forwarded: Default::default(),
+            ..Default::default()
         });
         let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
         relay.key_cache_capacity = Some(1024);
@@ -1638,6 +1669,43 @@ mod tests {
         assert!(
             matches!(res, RelayToClientMsg::Datagrams { remote_endpoint_id, datagrams } if remote_endpoint_id == a_key && datagrams == msg)
         );
+
+        // held: a's next packets past its budget wait at the relay, in order, and are forwarded
+        // once it has budget again, while packets to a still arrive
+        budget.left.lock().unwrap().insert(a_key, 0);
+        budget
+            .hold
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for m in ["held 1", "held 2"] {
+            client_a
+                .send(ClientToRelayMsg::Datagrams {
+                    dst_endpoint_id: b_key,
+                    datagrams: Datagrams::from(m),
+                })
+                .await?;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client_b.next())
+                .await
+                .is_err(),
+            "held, not forwarded"
+        );
+        budget.left.lock().unwrap().insert(b_key, 100);
+        let msg = Datagrams::from("while a is held");
+        let res = try_send_recv(&mut client_b, &mut client_a, a_key, msg.clone()).await?;
+        assert!(
+            matches!(res, RelayToClientMsg::Datagrams { remote_endpoint_id, datagrams } if remote_endpoint_id == b_key && datagrams == msg)
+        );
+        budget.left.lock().unwrap().insert(a_key, 100);
+        for m in ["held 1", "held 2"] {
+            let res = tokio::time::timeout(Duration::from_secs(2), client_b.next())
+                .await
+                .expect("a held packet is forwarded once there is budget")
+                .expect("stream finished")?;
+            assert!(
+                matches!(res, RelayToClientMsg::Datagrams { remote_endpoint_id, datagrams } if remote_endpoint_id == a_key && datagrams == Datagrams::from(m))
+            );
+        }
 
         Ok(())
     }
