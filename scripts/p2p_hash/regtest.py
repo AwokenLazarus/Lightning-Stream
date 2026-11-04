@@ -192,9 +192,9 @@ def setup() -> None:
         subprocess.run([f"{BIN}/xbt-hashlink", "keygen", f"{RUN}/keys/{who}.key"], check=True, stdout=subprocess.DEVNULL)
 
 
-def spawn(name: str, args: list[str]) -> subprocess.Popen[bytes]:
+def spawn(name: str, args: list[str], env: dict[str, str] | None = None) -> subprocess.Popen[bytes]:
     log = open(f"{RUN}/{name}.log", "ab")
-    p = subprocess.Popen([f"{BIN}/xbt-hashlink", *args], stdout=log, stderr=log)
+    p = subprocess.Popen([f"{BIN}/xbt-hashlink", *args], stdout=log, stderr=log, env=env)
     PROCS.append(p)
     return p
 
@@ -774,6 +774,94 @@ def real_gateway(mode: str) -> None:
                     pass
 
 
+# the bundled gateway's own pages the app passes on read-only (xbt-hashlink hashtaker_service GATEWAY_PAGES)
+GATEWAY_PAGES = ["", "threads", "coinbaser", "clients", "config", "assets/style.css", "assets/icons/datum_logo.svg", "assets/icons/favicon.ico"]
+
+
+def gateway_pages_check(mode: str, api: int, rpc: int, home: str) -> None:
+    """Every page the app passes on from the gateway, asked as the renter asks it (GET, no login): with the admin
+    password empty, none shows the node's RPC address, its cookie or a credential, and Clients and Config say they
+    need admin access."""
+    import http.client
+    cookie = open(f"{home}/node/regtest/.cookie").read().strip()
+    secrets = {"cookie": cookie, "cookie password": cookie.split(":", 1)[-1], "rpc url": f"127.0.0.1:{rpc}", "rpc port": f":{rpc}",
+               "cookie path": ".cookie", "lab dir": home, "rpcuser": "rpcuser", "rpcpassword": "rpcpassword", "rpcurl": "rpcurl"}
+    pages, leaks = {}, {}
+    for page in GATEWAY_PAGES:
+        c = http.client.HTTPConnection("127.0.0.1", api, timeout=5)
+        c.request("GET", f"/{page}", headers={"Connection": "close"})
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        text = body.decode("utf-8", "replace")
+        pages[page or "/"] = {"status": r.status, "type": r.getheader("Content-Type"), "bytes": len(body), "chunked": r.getheader("Transfer-Encoding"),
+                              "admin": "requires admin" in text.lower() or "admin access" in text.lower()}
+        found = [k for k, v in secrets.items() if v and v in text]
+        if found:
+            leaks[page or "/"] = found
+        with open(f"{RUN}/{mode}-gateway-page-{(page or 'status').replace('/', '_')}", "wb") as f:
+            f.write(body)
+    REPORT[f"{mode}_gateway_pages"] = {"pages": pages, "leaks": leaks}
+    check(f"{mode}: the gateway's status pages the app shows, as the renter asks them: each answers, none shows the node's RPC address, cookie or a credential, "
+          "and Clients and Config need admin access",
+          not leaks and all(v["status"] in (200, 401, 403) and v["bytes"] <= 1 << 20 and not v["chunked"] for v in pages.values())
+          and pages["clients"]["admin"] and pages["config"]["admin"],
+          {"pages": pages, "leaks": leaks})
+
+
+# P2P_HASH_BUSY_SIGNER=1: the renter's writes to the wallet's signer socket fail now and then as a busy socket's do
+# (EAGAIN, nothing sent), from an LD_PRELOAD shim: each failure counted down from the number in its file
+BUSY_SHIM_C = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+static ssize_t (*real_write)(int, const void *, size_t);
+ssize_t write(int fd, const void *buf, size_t n) {
+    if (!real_write) real_write = (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write");
+    const char *f = getenv("BUSY_SHIM_FILE");
+    int dom = 0;
+    socklen_t l = sizeof dom;
+    if (f && getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) == 0 && dom == AF_UNIX) {
+        int h = open(f, O_RDWR);
+        if (h >= 0) {
+            char b[32] = {0};
+            long left = pread(h, b, sizeof b - 1, 0) > 0 ? strtol(b, 0, 10) : 0;
+            if (left > 0) {
+                char o[32];
+                int k = snprintf(o, sizeof o, "%ld\n", left - 1);
+                if (ftruncate(h, 0) == 0 && pwrite(h, o, k, 0) == k) {
+                    close(h);
+                    errno = EAGAIN;
+                    return -1;
+                }
+            }
+            close(h);
+        }
+    }
+    return real_write(fd, buf, n);
+}
+"""
+
+
+def busy_shim() -> tuple[dict[str, str], str] | None:
+    """The renter's environment with the busy-socket shim, and its countdown file; None when it can't be built."""
+    so, src, count = f"{RUN}/busy_shim.so", f"{RUN}/busy_shim.c", f"{RUN}/busy_shim.count"
+    with open(src, "w") as f:
+        f.write(BUSY_SHIM_C)
+    built = subprocess.run(["cc", "-shared", "-fPIC", "-O2", "-o", so, src, "-ldl"], capture_output=True, text=True)
+    if built.returncode != 0:
+        REPORT.setdefault("skipped", []).append({"check": "busy signer socket", "missing": built.stderr[-400:]})
+        return None
+    with open(count, "w") as f:
+        f.write("0\n")
+    return {**os.environ, "LD_PRELOAD": so, "BUSY_SHIM_FILE": count}, count
+
+
 def real_gateway_run(mode: str) -> None:
     """A rental paid with real money through the wallet, of real work for a real gateway on a chain of its own."""
     keys = mode == "solo" or os.environ.get("P2P_HASH_PRIMED_KEYS") == "1"
@@ -866,13 +954,30 @@ def real_gateway_run(mode: str) -> None:
         # Mike's rule: no rental runs unmasked, pool or solo. Every rental holds each job to the gateway's API, so a
         # pool that doesn't take gateway keys gives jobs the renter must refuse
         check_flags = ["--gateway-api", f"127.0.0.1:{api}"]
+        busy = busy_shim() if os.environ.get("P2P_HASH_BUSY_SIGNER") == "1" and keys else None
         hashtaker = spawn(f"{mode}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER), "--found-out", f"{RUN}/{mode}-found.json",
                                                  "--upstream", f"127.0.0.1:{st}", "--user", address, "--signer", d.RENTER_SOCK, "--task", "hashrate", "--max-sats", "1500", "--rental", f"rt-{mode}",
-                                                 "--idle-s", str(REAL_SECS), "--duration-s", str(REAL_SECS), "--report", f"{RUN}/{mode}-buyer.json", *check_flags])
+                                                 "--idle-s", str(REAL_SECS), "--duration-s", str(REAL_SECS), "--report", f"{RUN}/{mode}-buyer.json", *check_flags],
+                          env=busy[0] if busy else None)
         time.sleep(2)
         log = open(f"{RUN}/{mode}-miner.log", "ab")
         grind = subprocess.Popen(["nice", "-n", "15", f"{HG}/stratum-grind", "--host", "127.0.0.1", "--port", str(MINERS), "--user", "hasher.m1"], stdout=log, stderr=log, env=env)
         PROCS.append(grind)
+        injected: list[dict[str, Any]] = []
+        if busy:
+            # mid-rental, a few bursts of busy-socket failures on the renter's payments (each burst: that many writes
+            # in a row fail with nothing sent); each payment hit is asked again within the grace
+            def bursts() -> None:
+                for at, n in ((0.3, 1), (0.5, 3), (0.7, 2)):
+                    time.sleep(max(0.0, t_rent + at * REAL_SECS - time.time()))
+                    with open(busy[1], "w") as f:
+                        f.write(f"{n}\n")
+                    injected.append({"atS": round(time.time() - t_rent), "writes": n})
+            t_rent = time.time()
+            threading.Thread(target=bursts, daemon=True).start()
+        if mode == "solo":
+            time.sleep(30)
+            gateway_pages_check(mode, api, rpc, home)
         # the rental's time counts from its first accepted share, which can come minutes in on a loaded box
         hashtaker.wait(REAL_SECS + 300)
         if not keys:
@@ -983,6 +1088,14 @@ def real_gateway_run(mode: str) -> None:
               and int(hz["meter"]["work"]) <= hz["paid"] * slice_work,
               {"hashmaker": hz["meter"], "hashtaker": bz["meter"], "paid": hz["paid"], "blocks found": len(blocks)})
         oks = [p for p in bz["pays"] if p.get("ok")]
+        if busy:
+            left = open(busy[1]).read().strip()
+            check(f"{mode}: the wallet's socket busy {sum(i['writes'] for i in injected)} times mid-rental (EAGAIN, nothing sent): each payment asked again "
+                  "and paid once, none failed or left unknown, and the rental ran to its end",
+                  len(injected) == 3 and left == "0" and not bz["payFailed"] and all(p.get("ok") is True for p in bz["pays"]) and bz["closed"] == "rental time over"
+                  and len(oks) == hz["paid"],
+                  {"injected": injected, "left": left, "pays": len(bz["pays"]), "ok": len(oks), "hashmaker paid": hz["paid"], "closed": bz["closed"],
+                   "slowest pay ms": max([p.get("ms", 0) for p in bz["pays"]] or [0])})
         priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
         check(f"{mode}: the wallet's real payments = what the hashmaker earned", priced == hz["earnedMsat"] == hz["paid"] * PRICE_MSAT and hz["paid"] == len(oks) and not bz["payFailed"],
               {"priced": priced, "earned": hz["earnedMsat"], "paid": hz["paid"], "wallet ok": len(oks)})
