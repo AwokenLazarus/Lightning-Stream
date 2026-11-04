@@ -820,30 +820,41 @@ BUSY_SHIM_C = r"""
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
-static ssize_t (*real_write)(int, const void *, size_t);
-ssize_t write(int fd, const void *buf, size_t n) {
-    if (!real_write) real_write = (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write");
+/* whether this write to fd fails as a busy socket's: an AF_UNIX socket while the count in BUSY_SHIM_FILE is above 0 */
+static int busy(int fd) {
     const char *f = getenv("BUSY_SHIM_FILE");
-    int dom = 0;
+    int dom = 0, hit = 0;
     socklen_t l = sizeof dom;
-    if (f && getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) == 0 && dom == AF_UNIX) {
-        int h = open(f, O_RDWR);
-        if (h >= 0) {
-            char b[32] = {0};
-            long left = pread(h, b, sizeof b - 1, 0) > 0 ? strtol(b, 0, 10) : 0;
-            if (left > 0) {
-                char o[32];
-                int k = snprintf(o, sizeof o, "%ld\n", left - 1);
-                if (ftruncate(h, 0) == 0 && pwrite(h, o, k, 0) == k) {
-                    close(h);
-                    errno = EAGAIN;
-                    return -1;
-                }
-            }
-            close(h);
-        }
+    if (!f || getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) != 0 || dom != AF_UNIX) return 0;
+    int h = open(f, O_RDWR);
+    if (h < 0) return 0;
+    char b[32] = {0};
+    long left = pread(h, b, sizeof b - 1, 0) > 0 ? strtol(b, 0, 10) : 0;
+    if (left > 0) {
+        char o[32];
+        int k = snprintf(o, sizeof o, "%ld\n", left - 1);
+        hit = ftruncate(h, 0) == 0 && pwrite(h, o, k, 0) == k;
     }
-    return real_write(fd, buf, n);
+    close(h);
+    return hit;
+}
+ssize_t write(int fd, const void *buf, size_t n) {
+    static ssize_t (*real)(int, const void *, size_t);
+    if (!real) real = (ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write");
+    if (busy(fd)) { errno = EAGAIN; return -1; }
+    return real(fd, buf, n);
+}
+ssize_t send(int fd, const void *buf, size_t n, int flags) {
+    static ssize_t (*real)(int, const void *, size_t, int);
+    if (!real) real = (ssize_t (*)(int, const void *, size_t, int))dlsym(RTLD_NEXT, "send");
+    if (busy(fd)) { errno = EAGAIN; return -1; }
+    return real(fd, buf, n, flags);
+}
+ssize_t sendto(int fd, const void *buf, size_t n, int flags, const struct sockaddr *a, socklen_t al) {
+    static ssize_t (*real)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+    if (!real) real = (ssize_t (*)(int, const void *, size_t, int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "sendto");
+    if (busy(fd)) { errno = EAGAIN; return -1; }
+    return real(fd, buf, n, flags, a, al);
 }
 """
 

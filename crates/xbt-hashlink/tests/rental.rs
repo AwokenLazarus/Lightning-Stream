@@ -119,6 +119,8 @@ struct Run {
     miners_done_ms: u64,
     miners: Vec<standin::MinerResult>,
     wallet_calls: Vec<Value>,
+    /// The renter's `xbt402_pay` tries ([`BUSY_PAYS`]), read before the next rental may start and count its own.
+    pay_tries: usize,
 }
 
 fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run {
@@ -287,7 +289,8 @@ fn rental_with(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cu
         })
         .expect("the stand-in pool wrote its report within 10 s");
     let wallet_calls = calls.lock().unwrap().clone();
-    Run { hashmaker, hashtaker, pool, miners_done_ms, miners, wallet_calls }
+    let pay_tries = BUSY_PAYS.lock().unwrap_or_else(|p| p.into_inner()).0;
+    Run { hashmaker, hashtaker, pool, miners_done_ms, miners, wallet_calls, pay_tries }
 }
 
 fn w(v: &Value) -> u128 {
@@ -424,7 +427,7 @@ fn unpaid_by_the_wallet_stops_the_hash() {
 #[test]
 fn a_payment_the_wallets_socket_could_not_take_for_a_moment_is_made_again_and_the_rental_goes_on() {
     let r = rental_with(None, 10, true, None, &[1]);
-    assert_eq!(BUSY_PAYS.lock().unwrap().0 as u64, r.hashmaker["paid"].as_u64().unwrap() + 1, "one try more than the slices paid");
+    assert_eq!(r.pay_tries as u64, r.hashmaker["paid"].as_u64().unwrap() + 1, "one try more than the slices paid");
     assert_eq!(r.hashtaker["payFailed"], false, "{}", r.hashtaker);
     check_paid_then_stopped(r, true);
 }
@@ -441,7 +444,7 @@ fn a_wallets_socket_that_stays_busy_still_ends_the_rental_unpaid() {
     assert_eq!(r.hashtaker["payFailed"], true, "{}", r.hashtaker);
     let last = r.hashtaker["pays"].as_array().unwrap().last().unwrap().clone();
     assert_eq!((last["slice"].as_u64(), last["ok"].as_bool(), last["why"].as_str()), (Some(3), Some(false), Some("Resource temporarily unavailable (os error 11)")), "{last}");
-    assert!(BUSY_PAYS.lock().unwrap().0 > 3, "slice 3 was tried again within the wait");
+    assert!(r.pay_tries > 3, "slice 3 was tried again within the wait");
     assert_eq!(r.wallet_calls.iter().filter(|c| c["method"] == "xbt402_pay").count(), 2, "the wallet was asked only for the slices paid");
     eprintln!("ended: hashmaker {:?}, hashtaker {:?}", r.hashmaker["stopped"]["reason"], r.hashtaker["closed"]);
 }
