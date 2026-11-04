@@ -332,6 +332,25 @@
   openCapacity();
   if (root.addEventListener) root.addEventListener("hashchange", openCapacity);
 
+  // The Sell form's "Publish without buyer accounts anyway": shown only where its warning applies, as the save
+  // checks it: a media server's web app (Media, or Jellyfin, Emby or Plex by its name or address) with neither
+  // buyers' own accounts nor a guest login
+  $$("[data-no-accounts]").forEach(function (box) {
+    var form = box.closest("form");
+    if (!form) return;
+    function field(n) { return form.querySelector("[name='" + n + "']"); }
+    function update() {
+      var k = form.querySelector("[name='kind']:checked"), kind = k ? k.value : "media";
+      var app = field("app"), acc = field("app_accounts"), login = field("app_login"), name = field("name"), addr = field("address");
+      var media = kind === "media" || /jellyfin|emby|plex/i.test((name ? name.value : "") + " " + (addr ? addr.value : ""));
+      var appOn = kind !== "files" && (kind === "media" || !!(app && app.checked));
+      box.hidden = !(appOn && media && !(acc && acc.checked) && !(login && login.value.trim()));
+    }
+    form.addEventListener("input", update);
+    form.addEventListener("change", update);
+    update();
+  });
+
   // A rotation of the human key finished: promote the pending key.
   var hk = $("#human-key-state");
   if (hk) {
@@ -591,6 +610,38 @@
     if (before !== null && now > before) {
       root.addEventListener("load", function () { if (root.lsRiver) root.lsRiver.pulse(); });
     }
+  }
+
+  // Buy → Hashrate: the rentals, shown again every 5 s while one is live (money spent, pieces paid, its state), and no
+  // more once none is. Not while the owner is in one of their forms (a Cut on its way).
+  var rentals = $("#rentals[data-live]");
+  if (rentals && root.fetch) {
+    var rentalsTimer = setInterval(function () {
+      root.fetch("./api/hashrate-rentals", { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || typeof d.html !== "string" || rentals.contains(document.activeElement)) return;
+          // History stays open or folded as the owner left it
+          var hist = $("#rentals-history"), wasOpen = hist && hist.open;
+          rentals.innerHTML = d.html;
+          hist = $("#rentals-history");
+          if (hist && wasOpen) hist.open = true;
+          if (!d.live) { rentals.removeAttribute("data-live"); clearInterval(rentalsTimer); }
+        })
+        .catch(function () {});
+    }, 5000);
+  }
+
+  // Buy → Hashrate while the renter is still looking for offers on Nostr: the page is loaded again in a few seconds,
+  // and not while the owner is in one of its forms.
+  var again = $("[data-reload-after]");
+  if (again) {
+    var reloadSoon = function () {
+      var a = document.activeElement;
+      if (a && a.form) { setTimeout(reloadSoon, 3000); return; }
+      root.location.reload();
+    };
+    setTimeout(reloadSoon, (Number(again.getAttribute("data-reload-after")) || 5) * 1000);
   }
 
   // The pending-approvals badge.

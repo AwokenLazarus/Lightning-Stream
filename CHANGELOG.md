@@ -23,6 +23,114 @@ rule for relays. Everything is off by default: free relays and shops that don't 
 - Still to come in 0.3.0: the pages for sellers and relay operators, packaging, and a regtest run
   across a real relay.
 
+## 0.2.11 (2026-11-04)
+
+Hashrate fixes sent by a hashmaker who runs the app. The wallet UI and the hashrate component change.
+
+- **A payment the wallet's socket can't take for a moment is made again.** A 24 h rental ended after about 11 hours
+  as "a piece of work was not paid in time": one payment's call to the wallet's signer failed with "Resource
+  temporarily unavailable" before any of it was sent, and the renter stopped paying. A call that never reached the
+  signer is now made again within the hashmaker's grace. A call that got out even in part is never made again, so a
+  slice is never paid twice. Writing a call to the signer now gives up after 5 seconds instead of 200, so there is
+  time to ask again.
+- **Ended rentals move under History.** Buy → Hashrate lists only the rentals going on under Your rentals. The ended
+  ones are folded under "History: N ended rentals", newest first. Each rental's card says when it started, when it
+  ended and after how long, and why it ended.
+- **Your gateway's own status pages.** "Your gateway" on Buy → Hashrate has a Gateway status link to the Stream
+  Gateway's own pages (status, threads, coinbaser, clients, config), read-only, under the app's login. Only those
+  pages are shown, with GET only, and no script runs on them. The gateway has no admin password, so its clients and
+  config pages say they need admin access and show nothing else.
+- **A link that can't be made again says why** in the hashrate component's log, instead of only "failed to fill
+  whole buffer".
+
+Thanks to Kilombino, who found and fixed the payment the wallet's socket couldn't take, and sent History for ended
+rentals, the rental times and the gateway status pages.
+
+## 0.2.10 (2026-11-03)
+
+Hashrate fixes and clearer hashrate pages, most of them sent by a hashmaker who runs the app. The wallet UI, the
+signer and the hashrate component change.
+
+- **The market price works with Knots 29.4.3.** That node reports the difficulty only as `difficulty_blake2b`, so the
+  hashmaker's price that follows the market said "your XBT node did not say the difficulty" and no rental started.
+  The signer now reads the difficulty from either.
+- **Buy → Hashrate answers at once.** The page said "The hashrate service does not answer. It may still be starting"
+  whenever the offers had not been looked up on Nostr for a while: the look-up ran inside the page's request and
+  could take 20 seconds. Now the offers are looked up in the background every minute, the page shows the last ones
+  at once, and just after a start it says "Looking for offers on Nostr…" and looks again by itself. Each Nostr relay
+  gets a few seconds; one that is down no longer holds up the others.
+- **A test slice can be paid.** "Try one slice first" let the wallet spend only the slice's price on a ticket, under
+  the shop's smallest ticket (546 sats), so every trial ended unpaid. The wallet may now buy that ticket; the trial
+  still pays for one slice, and the rest stays with the seller as credit.
+- **The Rent form budgets in whole tickets.** It suggests a budget that is a whole number of the shop's smallest
+  ticket and says what a budget really buys: with 546 sat tickets, 1,000 sats buys about 546 sats of work, and the
+  454 sats left under one ticket can't be spent. Rent says the same for the budget you typed. The budget still
+  limits payments as before.
+- **Renting turned back on brings the shop back.** Turning renting off removes the shop's hashrate route. Turned on
+  again any way but the Save on Sell → Hashrate (the settings file changing, or the app restarting after an
+  upgrade), the route stayed off, and the hashmaker waited with "your shop is not selling yet" until the app was
+  restarted. Now the route follows the setting within a minute.
+- **Sell → Add a service has Hashrate.** Among the kinds of service there is now a Hashrate choice that leads to
+  Sell → Hashrate, where miners are rented out.
+- **Allowing a hashmaker reached by its key adds its shop.** "Allow this hashmaker to be paid" only opened the
+  spending rules, so the wallet still couldn't reach a shop with no web address and refused every payment. It now
+  adds the shop first, as the Sellers page does.
+- **Your rentals update by themselves** while one is going on: money spent, pieces paid and the rental's end show
+  without a reload.
+- **A refused payment says why on the rental's card**, with what to do for the common cases (add the shop on
+  Sellers, allow the hashmaker, turn paying on in your spending rules).
+- **Prices per TH/s for an hour.** Sell → Hashrate says what your price comes to for 1 TH/s for an hour, what that
+  hour is worth when mined, and what the other offers ask. On Buy → Hashrate your own offer says "Priced high" when
+  it asks far more than the others or the mining value.
+- **Live connections shows a rental first**, and the shop connection that pays it says "Paying a rental".
+- **Buy has two tabs**, Browse and Live connections. Every kind of service is a chip of Browse: AI, Hashrate, VPN,
+  Files, Data & APIs and Web apps.
+- **Your own coinbase tag.** Your gateway's settings take an optional coinbase tag, up to 60 plain characters, put
+  in every block the Stream Gateway finds after "Lightning Stream" (or after the pool's tag with a pool). The card
+  now reads in order: status, where its blocks pay, your blocks, then the advanced settings. A regtest run checked
+  that blocks with a 60-character tag are accepted by the node.
+- **Plain words about Umbrel's DATUM Gateway app:** the hint says it mines the SHA-256 fork, and won't work here.
+
+Thanks to Kilombino, who sent the fixes for the market price with Knots 29.4.3, test slices, allowing a hashmaker
+reached by its key, the rentals that update by themselves, refusal reasons, prices per TH/s, "Priced high", Live
+connections, Buy's tabs, the coinbase tag and the DATUM hint, and who suggested the Hashrate choice in Add a
+service.
+
+## 0.2.9 (2026-11-03)
+
+Renting hashrate works with the published images. Only the hashrate image changes.
+
+- **A rental starts.** The rental component was built without features it needs: the published image was built
+  on its own, while every test built it together with the other components, and that joint build turned on
+  features the image lacked. With the published image a rental closed as soon as it started ("could not start:
+  link i/o: failed to fill whole buffer"), and the hashrate seller never saw it. The component now declares the
+  feature itself, so the image is built as the tests build it, and the Linux package's test passes with it.
+- **The release checks each image's build.** Before images are published, a check now compares the features each
+  image's own build gets with those the tests get, and stops on a difference nobody has looked at. The Linux
+  package's test also builds each component the way the published image is built.
+
+## 0.2.8 (2026-11-03)
+
+Four small fixes to the wallet UI, from a hands-on run of 0.2.7. Only the wallet UI changes.
+
+- **The Stop says the credit is shared.** A visit's Stop said "This visit used 680 sat of your credit with the shop",
+  while the visit bar says that credit is shared with your other uses of the shop. Now the Stop says so too: "This
+  visit used 680 sat of your credit with the shop (shared with your other uses of it)". Where it also says the
+  credit left, it says it once.
+- **A limit refusal says the payment would pass the limit.** A payment refused by one of your spending rules' limits
+  said the limit "is reached", though spending was often still under it: about 9,703 of 10,000 sat used, and a
+  625 sat ticket would have made 10,328. Now the page says, for example, "Today's limit for paid services would be
+  passed" and "This payment would pass the most your spending rules let the app pay shops in 24 hours (10,000 sat)".
+  This covers the limits for one shop (24 hours and 7 days), for paid services, and the daily and weekly spending
+  caps. Each still names its field on the Spending rules page and links there.
+- **A player link's `HEAD` gives the file's size.** Some players ask `HEAD` first to learn a file's size, and a
+  player link's `HEAD` sent no `Content-Length`. Now it sends the size where it is known: from the link's service,
+  where its listing gives the size in exact bytes, or else from the shop's answer to an earlier request through the
+  link. It still asks the shop nothing and pays nothing. Where the size is not known yet, it answers as before.
+- **"Publish without buyer accounts anyway" shows only where it applies.** On the Sell page the box showed on every
+  service's form, even with buyer accounts on or a guest login set. Now it shows only for a media server that has
+  neither, and it shows or hides as you fill in the form.
+
 ## 0.2.7 (2026-11-03)
 
 Visits that stop when you press Stop, top-ups only when they are needed, and an AI endpoint and player links

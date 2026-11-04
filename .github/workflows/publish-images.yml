@@ -69,6 +69,10 @@ jobs:
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
       - name: Fetch the dependencies Cargo.lock names
         run: cargo fetch --locked
+      # oci_build.sh builds each image's crates alone; the tests build the workspace together. Stop before
+      # publishing a binary that lacks a feature only the tests' joint build turned on (0.2.9)
+      - name: Each published build has the features the tests had
+        run: scripts/check_standalone_features.sh --target x86_64-unknown-linux-musl && scripts/check_standalone_features.sh --target aarch64-unknown-linux-musl && scripts/check_standalone_features.sh --target armv7-unknown-linux-musleabihf
       - name: Build and publish
         env:
           OWNER: ${{ github.repository_owner }}

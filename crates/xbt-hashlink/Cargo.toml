@@ -24,6 +24,14 @@ getrandom = "0.2"
 base64.workspace = true
 # the hashrate listing on Nostr (NIP-99), and the stand-in relay for the lab
 xbt-nostr.workspace = true
+# Declared, not left to feature unification (0.2.9). The tests and the Linux test's images built this crate with
+# the wallet UI, signer and gateway, which turn xbt402's http-client on; scripts/oci_build.sh builds it alone,
+# without it, and the hashtaker of that build closed every rental at its start ("link i/o: failed to fill whole
+# buffer", the hashmaker never saw the link), five runs of five. With http-client declared the build alone passes
+# packaging/linux/test-linux.sh. Nothing here calls the HTTP client, and another feature change in the build
+# alone (arrayvec, libc, zerocopy) also passed once, so the fault itself is not understood yet: this keeps the
+# published build the one the tests ran. scripts/check_standalone_features.sh keeps them in step.
+xbt402 = { workspace = true, features = ["http-client"] }
 # the hashrate link over iroh: no port forward, through our relay or directly (the link's own Noise
 # handshake runs inside it, unchanged)
 xbt-iroh-link = { path = "../xbt-iroh-link" }

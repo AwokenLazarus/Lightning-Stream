@@ -239,7 +239,10 @@ impl xbt_svc::http::Handler for Ui {
                 security_headers(&mut resp);
                 xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(resp.status, resp.headers, resp.body))
             }
-            Some(Ok(Some(item))) if head => link_head(&self.0, &item),
+            Some(Ok(Some(item))) if head => {
+                let token = strip_base(raw_path, &self.0.cfg.base_path).and_then(|p| p.strip_prefix("/r/").map(str::to_string)).unwrap_or_default();
+                link_head(&self.0, &item, &token)
+            }
             Some(Ok(item)) => {
                 // for /s/~<stream token>/, the seller URL is everything after the token, its own query included
                 let item = item.unwrap_or_else(|| {
@@ -265,6 +268,10 @@ impl xbt_svc::http::Handler for Ui {
                 let reply = relay(&url, range.as_deref(), req.headers.get("if-range").map(String::as_str), ceiling.as_ref(), limit, &page);
                 match (used, reply) {
                     (Some(used), xbt_svc::http::Reply::Stream(mut s)) => {
+                        // the file's whole size, for the link's HEAD (a player may ask it for the size)
+                        if let Some(n) = whole_size(s.status, s.length, &s.headers) {
+                            used.learn_size(n);
+                        }
                         let body = s.body;
                         s.body = Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| {
                             let _open = used.start();
@@ -279,16 +286,34 @@ impl xbt_svc::http::Handler for Ui {
     }
 }
 
-/// The answer to a player's `HEAD` of a live link for `item`: what its `GET` answers when the file is
-/// sent whole (`200`, the type its URL names, ranges taken, its length where its listing gives it in
-/// bytes), and no body. The connector is not asked: any request of it is a paid call. A `Range` is
-/// ignored, as HTTP has it for `HEAD`.
-fn link_head(app: &App, item: &str) -> xbt_svc::http::Reply {
-    let size = app.services().ok().and_then(|all| crate::services::find_item(&all, item).and_then(|(_, it)| exact_bytes(&it.credit)));
+/// The answer to a player's `HEAD` of the live link `token` for `item`: what its `GET` answers when the
+/// file is sent whole (`200`, the type its URL names, ranges taken, its length where it is known), and
+/// no body. The length is the listing's, where the link's service lists the file in exact bytes, or else
+/// the one the shop's answer to an earlier request through the link gave ([`whole_size`]); not known, no
+/// `Content-Length`. The connector is not asked: any request of it is a paid call. A `Range` is ignored,
+/// as HTTP has it for `HEAD`.
+fn link_head(app: &App, item: &str, token: &str) -> xbt_svc::http::Reply {
+    let service = app.relays.service_of(token).unwrap_or_default();
+    let listed = app.services().ok().and_then(|all| {
+        let found = if service.is_empty() { None } else { crate::services::find_item_of(&all, &service, item) };
+        found.or_else(|| crate::services::find_item(&all, item)).and_then(|(_, it)| exact_bytes(&it.credit))
+    });
+    let size = listed.or_else(|| app.relays.usage(token).and_then(|u| u.size()));
     let headers = vec![("Content-Type".to_string(), media_type_of(item).to_string()), ("Accept-Ranges".into(), "bytes".into()),
                        ("Cache-Control".into(), "no-store".into()), ("X-Content-Type-Options".into(), "nosniff".into()),
                        ("Cross-Origin-Resource-Policy".into(), "same-origin".into())];
     xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed { status: 200, headers, length: size, body: Box::new(|_| Ok(())) })
+}
+
+/// A file's whole size from a relayed answer: a `200`'s length, or the total of a `206`'s
+/// `Content-Range` (`bytes 0-99/1234`; `*` is not known).
+fn whole_size(status: u16, length: Option<u64>, headers: &[(String, String)]) -> Option<u64> {
+    match status {
+        200 => length,
+        206 => headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Content-Range"))
+            .and_then(|(_, v)| v.trim().strip_prefix("bytes ")?.rsplit_once('/')?.1.trim().parse().ok()),
+        _ => None,
+    }
 }
 
 /// A listing's size when it is exact (`N bytes`); a rounded one (`1.2 GB`) is no `Content-Length`.
@@ -693,6 +718,20 @@ fn files_server(app: &Arc<App>) -> Result<Option<xbt_svc::http::Running>, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link's HEAD gives the file's size the shop's answer said: a whole file's length, or a part's total.
+    #[test]
+    fn a_relayed_answer_says_the_files_whole_size() {
+        let cr = |v: &str| vec![("Content-Range".to_string(), v.to_string())];
+        assert_eq!(whole_size(200, Some(1234), &[]), Some(1234));
+        assert_eq!(whole_size(206, Some(100), &cr("bytes 0-99/1234")), Some(1234));
+        assert_eq!(whole_size(206, Some(100), &cr("bytes 0-99/*")), None, "not known");
+        assert_eq!(whole_size(206, Some(100), &[]), None);
+        assert_eq!(whole_size(200, None, &[]), None, "chunked: not known");
+        assert_eq!(whole_size(416, Some(0), &cr("bytes */1234")), None);
+        assert_eq!(exact_bytes("1234 bytes"), Some(1234));
+        assert_eq!(exact_bytes("1.4 GB"), None, "a rounded size is no Content-Length");
+    }
 
     #[test]
     fn a_seller_saying_it_sends_more_than_listed_is_refused() {

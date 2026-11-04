@@ -1,8 +1,9 @@
 # Lightning Stream
 
-Buy and sell services over XBT Lightning, paid as you use them: a seller's own web app (Jellyfin
-and the like) or a folder of files by the megabyte, an AI model by the token, a miner's hashrate by
-the slice of work, a VPN exit by the gigabyte. XBT is Bitcoin on BLAKE2b proof of work.
+Peer-to-peer streaming and payments for services, on Lightning, on top of Bitcoin. Buy and sell a
+seller's own web app (Jellyfin and the like) or a folder of files by the megabyte, an AI model by the
+token, a miner's hashrate by the slice of work (P2P hash), a VPN exit by the gigabyte, paid as you use
+them. Bitcoin is secured by BLAKE2b proof of work, and its ticker is XBT.
 
 The buyer pays a small ticket ahead (about 900 sats), and the seller counts what it delivers to the
 millisatoshi and signs a receipt for every answer. A shop is paid no more than its listing shows. A
@@ -18,11 +19,14 @@ pays from, and is paid to, their own node.
 - **Whitepaper:** <https://lightning-stream.com/whitepaper/>
 - **What changed in each version:** [`CHANGELOG.md`](CHANGELOG.md), also at
   <https://lightning-stream.com/changelog/>
+- **P2P hash (hashrate rental):** [`docs/P2P-HASH.md`](docs/P2P-HASH.md)
 - **Bugs and confusing screens:** [issues](https://github.com/AwokenLazarus/Lightning-Stream/issues)
 
-> **0.2.0** (a public test release) adds hashrate rental with masked jobs through the bundled Stream
-> Gateway, solo or on Lazarus Pool. A seller must run 0.2.0 before 0.2.0 buyers can rent from it.
-> [Release notes](https://github.com/AwokenLazarus/Lightning-Stream/releases/tag/v0.2.0).
+> **0.2.8** is the current public testing release: web apps (Jellyfin 10.11+ included), files and
+> player links, an OpenAI-compatible AI endpoint, VPN exits, and P2P hashrate rental with masked jobs
+> through the bundled Stream Gateway, solo or on Lazarus Pool. Spending limits say plainly where to
+> raise them. [What changed](CHANGELOG.md) ·
+> [releases](https://github.com/AwokenLazarus/Lightning-Stream/releases).
 >
 > **Status.** Released for Umbrel, StartOS and Linux, and tested on XBT mainnet between our own
 > nodes with small amounts. It has had design and code reviews, not an independent audit. Use
@@ -124,7 +128,7 @@ the scripts that need more are described in [`docs/ENGINEERING.md`](docs/ENGINEE
 
 Lightning Stream is a small addition to other people's work. XBT runs on Bitcoin Knots, maintained
 by Luke Dashjr, who wrote the BLAKE2b proof of work; the signature hash that keeps a payment from
-being replayed on the SHA-256 chain is Kyle Santiago's. Lightning on XBT is Paul Lamb's Lightning
+being replayed on the SHA-256 fork is Kyle Santiago's. Lightning on XBT is Paul Lamb's Lightning
 Fork, a fork of Lightning Labs' lnd, and PrivKey's Core Lightning fork. Paul also packages
 Knots-BLAKE2b and Lightning Fork for Umbrel and StartOS, and built the access grant the StartOS
 package uses. Hashrate rental is built around OCEAN's DATUM. The Stream Gateway, which powers mining

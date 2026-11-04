@@ -757,7 +757,7 @@ impl App {
         self.cfg.data_dir.join(SELL_FILE)
     }
 
-    fn gateway_now(&self) -> Option<Value> {
+    pub(crate) fn gateway_now(&self) -> Option<Value> {
         std::fs::read_to_string(self.cfg.gw.dir.join(GW_CONFIG)).ok().and_then(|t| serde_json::from_str(&t).ok())
     }
 
@@ -1548,23 +1548,33 @@ impl App {
             if cap.is_set() { " open" } else { "" },
             cap_val("cap_buyers", cap.max_buyers), cap_val("cap_streams", cap.max_streams),
             cap_val("cap_streams_buyer", cap.max_streams_per_buyer), cap_val("cap_mbit", cap.max_mbit), shop_limits);
+        let kind = Kind::parse(&fv("kind", editing.map(|o| o.kind.id().to_string()).unwrap_or_else(|| "media".into()))).unwrap_or(Kind::Media);
+        // "Publish without buyer accounts anyway" only where its warning applies (as the save checks it): a media server's
+        // web app with neither buyers' own accounts nor a guest login. Shown or hidden as the form changes (ui.js)
+        let accounts_on = fv("app_accounts", if saved_libs.is_some() { "1".into() } else { String::new() }) == "1";
+        let login_on = !fv("app_login", editing.and_then(|o| o.app.as_ref()).map(|a| a.login.clone()).unwrap_or_default()).trim().is_empty();
+        let app_on = kind != Kind::Files
+            && (kind == Kind::Media || fv("app", editing.map(|o| if o.app.is_some() { "1" } else { "" }.to_string()).unwrap_or_default()) == "1");
+        let no_accounts_applies = app_on && !accounts_on && !login_on
+            && media_server(kind, &fv("name", editing.map(|o| o.name.clone()).unwrap_or_default()),
+                            &fv("address", editing.map(|o| o.address.clone()).unwrap_or_default())).is_some();
         let accounts_html = format!("<label class=\"check\"><input type=\"checkbox\" name=\"app_accounts\" value=\"1\"{}> Each buyer gets their own Jellyfin account: \
             their own watch history, and where they stopped</label>\
             <details{}><summary>Buyers' accounts</summary>\
             <label>Your Jellyfin API key <small>({})</small><input name=\"app_key\" type=\"password\" autocomplete=\"off\" class=\"mono\"></label>\
             <p class=\"hint\">Make one in Jellyfin under Dashboard, API Keys. The shop makes each buyer's account with it. It stays on this box, \
             beside the shop's own keys, and is never shown again. Buyers who stay anonymous use the guest login below, if you give one.</p>{libraries}</details>\
-            <label class=\"check\"><input type=\"checkbox\" name=\"app_no_accounts\" value=\"1\"{}> Publish without buyer accounts anyway \
+            <label class=\"check\" data-no-accounts{}><input type=\"checkbox\" name=\"app_no_accounts\" value=\"1\"{}> Publish without buyer accounts anyway \
             <small>(a media server with neither accounts for buyers nor a guest login shows them its sign-in page)</small></label>",
             if fv("app_accounts", if saved_libs.is_some() { "1".into() } else { String::new() }) == "1" { " checked" } else { "" },
             if saved_libs.is_some() && saved_key.is_none() { " open" } else { "" },
             if saved_key.is_some() { "saved: leave empty to keep it" } else { "Dashboard, API Keys" },
+            if no_accounts_applies { "" } else { " hidden" },
             if fv("app_no_accounts", if editing.and_then(|o| o.app.as_ref()).is_some_and(|a| a.no_login_ok) { "1".into() } else { String::new() }) == "1" {
                 " checked"
             } else {
                 ""
             });
-        let kind = Kind::parse(&fv("kind", editing.map(|o| o.kind.id().to_string()).unwrap_or_else(|| "media".into()))).unwrap_or(Kind::Media);
         // what was chosen; where nothing was, /web/ for what looks like Jellyfin or Plex
         let free_default = match editing.and_then(|o| o.app.as_ref()).and_then(|a| a.free.as_ref()) {
             Some(f) => f.join("\n"),
@@ -1583,7 +1593,12 @@ impl App {
             };
             format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>{what}suggested {} sat {}</small></span></label>",
                     k.id(), if *k == kind { " checked" } else { "" }, k.words(), p, u.short())
-        }).collect();
+        }).collect::<String>()
+            // renting out miners has a page of its own: a choice here that goes there (#46: it was looked for among these)
+            + if self.cfg.hash.hasher.is_some() {
+                "<a class=\"choice\" href=\"./sell-hashrate\"><span><strong>Hashrate</strong><small>your miners, rented out by the piece of work \
+                 · set up on Sell → Hashrate</small></span></a>"
+            } else { "" };
         // Files: where the folder is. With a folder the box shares with the app (Umbrel's Downloads,
         // read-only), the owner picks one under it; otherwise it is the app's own folder.
         let files_where = match &self.cfg.files.root {

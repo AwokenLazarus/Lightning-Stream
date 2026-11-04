@@ -42,6 +42,9 @@ pub struct LinkUse {
     open: AtomicUsize,
     /// When bytes last went to the player, in ms since [`epoch`].
     last_ms: AtomicU64,
+    /// The file's whole size, as the shop's answer to a request through the link said it (a whole file's
+    /// `Content-Length`, or a part's `Content-Range` total); 0: not said yet.
+    size: AtomicU64,
 }
 
 /// How recently bytes must have moved for a link to read as playing.
@@ -58,6 +61,18 @@ impl LinkUse {
     pub fn sent(&self, n: u64) {
         self.bytes.fetch_add(n, Ordering::Relaxed);
         self.last_ms.store(u64::try_from(epoch().elapsed().as_millis()).unwrap_or(u64::MAX).max(1), Ordering::Relaxed);
+    }
+
+    /// The file's whole size, as an answer through the link said it.
+    pub fn learn_size(&self, n: u64) {
+        if n > 0 {
+            self.size.store(n, Ordering::Relaxed);
+        }
+    }
+
+    /// The file's whole size, once an answer through the link has said it.
+    pub fn size(&self) -> Option<u64> {
+        Some(self.size.load(Ordering::Relaxed)).filter(|n| *n > 0)
     }
 
     /// A request is open and bytes moved within [`PLAYING_WITHIN`].

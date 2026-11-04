@@ -10,7 +10,8 @@
 //! "minutes", "once"}` (or `{"linkKey", "trial": true, "once"}`: one slice, to try a hashmaker first; a request
 //! sent again with the same `once` starts nothing and answers what the first did), `POST /cut
 //! {"rental"}`, `POST /datum {"addr", "api"?}`, `POST /attest {"rental"}` (publish a signed delivery record
-//! of a rental that ended, if the hashtaker chooses to).
+//! of a rental that ended, if the hashtaker chooses to), `GET /gateway-page?p=PAGE` (one of the bundled gateway's own
+//! status pages, read-only: [`GATEWAY_PAGES`]).
 //!
 //! The app comes with its own gateway, the Stream Gateway (DATUM-compatible), on `127.0.0.1:23339` beside
 //! this service (`--bundled-gateway`, else that address when `--datum-candidates` lists it). Its API is
@@ -36,7 +37,17 @@ use xbt_hashlink::over_iroh::{self, Dialer};
 use xbt_hashlink::rail::{LabHashtaker, SignerPayer};
 use xbt_hashlink::trust;
 
+/// Kept offers older than this are looked up again, in the background: the page is never kept waiting on the relays.
 const OFFERS_FRESH: Duration = Duration::from_secs(20);
+/// How often the offers are looked up in the background whatever asks, so the page finds them kept.
+const OFFERS_EVERY: Duration = Duration::from_secs(60);
+/// The oldest kept offers a rent takes without looking them up again: twice the background's round, so one late
+/// look-up doesn't make a rent wait. Older, or the hashmaker not among them, a rent looks them up itself.
+const OFFERS_RENT_FRESH: Duration = Duration::from_secs(120);
+/// The oldest kept offers a rent falls back on when no relay answers its own look-up. A listing's terms are checked
+/// again at the link: the hashmaker's welcome carries their hash, and terms it no longer offers are refused there,
+/// before anything is paid.
+const OFFERS_FALLBACK: Duration = Duration::from_secs(600);
 /// How long the delivery records read from the relays are kept before they are read again.
 const HISTORY_FRESH: Duration = Duration::from_secs(60);
 /// A test slice's time limit: a few times what one slice should take at the advertised speed,
@@ -50,6 +61,9 @@ const ONCE_WAIT: Duration = Duration::from_secs(60);
 
 struct Rental {
     hashmaker: String,
+    /// Where its slices are paid (the hashmaker's shop): the app's Live connections shows that shop's connection as
+    /// paying this rental.
+    pay_url: String,
     hashmaker_key: PublicKey,
     /// The speed the listing advertised for the machines rented.
     advertised_hs: u64,
@@ -90,6 +104,10 @@ struct R {
     expect_node: Option<String>,
     state: Option<PathBuf>,
     offers: Option<(Instant, Vec<(Hashrate, String)>)>,
+    /// A look-up of the offers is running in the background (one at a time).
+    offers_looking: bool,
+    /// The last look-up had no relay answering: nothing is known of the offers since.
+    offers_unanswered: bool,
     /// Each listing's Nostr author, by link key (a hashmaker's summary counts only from it).
     authors: HashMap<String, String>,
     /// The delivery records and summaries on the relays, as last read.
@@ -298,6 +316,8 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         expect_node: f.get("expect-node").cloned(),
         state,
         offers: None,
+        offers_looking: false,
+        offers_unanswered: false,
         authors: HashMap::new(),
         history: None,
         rentals: BTreeMap::new(),
@@ -316,6 +336,14 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
             std::thread::sleep(look_interval(shown.as_ref()));
         });
     }
+    {
+        // the offers looked up now and every minute, so the page finds them kept and never waits on the relays
+        let r = r.clone();
+        std::thread::spawn(move || loop {
+            look_up_in_background(&r);
+            std::thread::sleep(OFFERS_EVERY);
+        });
+    }
     http::serve(&addr, token, Arc::new(move |method, path, body| handle(&r, &candidates, method, path, body)))?;
     eprintln!("hashtaker: control page on {addr}");
     loop {
@@ -332,6 +360,14 @@ fn first_payment_msat(t: &xbt_hashlink::msg::Terms) -> u64 {
     t.price_msat.saturating_mul(t.start_slices.saturating_add(1))
 }
 
+/// What a test slice may spend on the shop's ticket: its first payment, and never less than the smallest ticket a shop
+/// sells (546 sat, [`xbt_hashlink::order::FIRST_STEP_MSAT`]), which a slice of a few sats is under: a budget below it
+/// buys no ticket, and the trial could never pay. Its slices still stop at the first payment (the rental's own budget);
+/// what the ticket's slices don't use stays with the shop as credit.
+fn trial_ticket_msat(t: &xbt_hashlink::msg::Terms) -> u64 {
+    first_payment_msat(t).max(xbt_hashlink::order::FIRST_STEP_MSAT)
+}
+
 fn offer_json(h: &Hashrate, event: &str) -> Value {
     json!({
         "name": h.name, "algorithm": h.algorithm, "linkKey": hex::encode(h.link_key.serialize()), "linkAddr": h.link_addr,
@@ -342,32 +378,100 @@ fn offer_json(h: &Hashrate, event: &str) -> Value {
         "miners": h.capacity.miners, "freeMiners": h.capacity.free_miners, "freeHs": h.capacity.free_hs.to_string(), "event": event,
         // what a trial may leave the wallet for: a ticket of the first step and its fee limit.
         // A longer rental's tickets grow as they are earned, so no figure stands for them
-        "trialMayBuyTicketUpToSats": xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(h.terms.price_msat.saturating_mul(h.terms.start_slices + 1)), None).0,
+        "trialMayBuyTicketUpToSats": xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(trial_ticket_msat(&h.terms)), None).0,
     })
 }
 
-fn offers(r: &Mutex<R>, fresh: bool) -> Vec<(Hashrate, String)> {
-    {
-        let g = lock(r);
-        if let Some((t, o)) = &g.offers {
-            if !fresh && t.elapsed() < OFFERS_FRESH {
-                return o.clone();
-            }
-        }
-    }
+/// Look the offers up on the relays now and keep them, with their delivery records when those are older than
+/// [`HISTORY_FRESH`]. `None`: no relay answered, and the kept offers stay as they were.
+fn look_up_offers(r: &Mutex<R>) -> Option<Vec<(Hashrate, String)>> {
     let (relays, node) = {
         let g = lock(r);
         (g.relays.clone(), g.expect_node.clone())
     };
-    let (found, _) = listing::find(&relays, xbt_nostr::now());
-    let found: Vec<_> = found.into_iter().filter(|(h, _)| h.algorithm == "blake2b" && node.as_ref().is_none_or(|n| *n == h.pay_node)).collect();
-    let mut g = lock(r);
-    for (h, e) in &found {
-        g.authors.insert(hex::encode(h.link_key.serialize()), e.pubkey.clone());
+    let (found, _, answered) = listing::find_answered(&relays, xbt_nostr::now());
+    let unanswered = answered == 0 && !relays.is_empty();
+    lock(r).offers_unanswered = unanswered;
+    if unanswered {
+        return None;
     }
-    let o: Vec<(Hashrate, String)> = found.into_iter().map(|(h, e)| (h, e.id)).collect();
-    g.offers = Some((Instant::now(), o.clone()));
-    o
+    let found: Vec<_> = found.into_iter().filter(|(h, _)| h.algorithm == "blake2b" && node.as_ref().is_none_or(|n| *n == h.pay_node)).collect();
+    let o: Vec<(Hashrate, String)> = {
+        let mut g = lock(r);
+        for (h, e) in &found {
+            g.authors.insert(hex::encode(h.link_key.serialize()), e.pubkey.clone());
+        }
+        let o: Vec<(Hashrate, String)> = found.into_iter().map(|(h, e)| (h, e.id)).collect();
+        g.offers = Some((Instant::now(), o.clone()));
+        o
+    };
+    if lock(r).history.as_ref().is_none_or(|(t, _)| t.elapsed() >= HISTORY_FRESH) {
+        let _ = history_events(r, &o);
+    }
+    Some(o)
+}
+
+/// Clears the look-up's mark when it ends, however it ends.
+struct Looking<'a>(&'a Mutex<R>);
+
+impl Drop for Looking<'_> {
+    fn drop(&mut self) {
+        lock(self.0).offers_looking = false;
+    }
+}
+
+/// Start a look-up of the offers in the background, unless one is running.
+fn look_up_in_background(r: &Arc<Mutex<R>>) {
+    {
+        let mut g = lock(r);
+        if g.offers_looking {
+            return;
+        }
+        g.offers_looking = true;
+    }
+    let r = r.clone();
+    std::thread::spawn(move || {
+        let _looking = Looking(&r);
+        let _ = look_up_offers(&r);
+    });
+}
+
+/// The offers as kept, for the page: never waits on the relays. Kept offers past [`OFFERS_FRESH`] are given as they
+/// are while a look-up runs in the background. With none kept yet (just started): none, and `true`, still looking
+/// (`false` once a look-up found no relay answering).
+/// 0.2.9 looked them up inside the request once they were 20 s old, and a cold look-up took longer than the app
+/// waits (20 s measured, against 6 s): the page said the hashrate service did not answer.
+fn offers_kept(r: &Arc<Mutex<R>>) -> (Vec<(Hashrate, String)>, bool) {
+    let (kept, stale, unanswered) = {
+        let g = lock(r);
+        (g.offers.as_ref().map(|(_, o)| o.clone()), g.offers.as_ref().is_none_or(|(t, _)| t.elapsed() >= OFFERS_FRESH), g.offers_unanswered)
+    };
+    if stale {
+        look_up_in_background(r);
+    }
+    match kept {
+        Some(o) => (o, false),
+        // none kept: still looking, unless the last look-up found no relay answering (said as that)
+        None => (vec![], !unanswered),
+    }
+}
+
+/// The offers kept, if no older than `age`.
+fn kept_within(r: &Mutex<R>, age: Duration) -> Option<Vec<(Hashrate, String)>> {
+    lock(r).offers.as_ref().filter(|(t, _)| t.elapsed() < age).map(|(_, o)| o.clone())
+}
+
+/// A hashmaker's offer for a rent, by its link key: from the offers kept within [`OFFERS_RENT_FRESH`], else looked up
+/// now; and when no relay answers that, from those kept within [`OFFERS_FALLBACK`] (the link checks its terms).
+fn offer_for_rent(r: &Mutex<R>, key_hex: &str) -> Result<(Hashrate, String), &'static str> {
+    let pick = |o: Vec<(Hashrate, String)>| o.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key_hex);
+    if let Some(found) = kept_within(r, OFFERS_RENT_FRESH).and_then(pick) {
+        return Ok(found);
+    }
+    match look_up_offers(r) {
+        Some(o) => pick(o).ok_or("that hashmaker's listing is no longer on the relays"),
+        None => kept_within(r, OFFERS_FALLBACK).and_then(pick).ok_or("no Nostr relay answered just now, so that hashmaker's listing can't be checked: try again in a minute"),
+    }
 }
 
 /// The delivery records and summaries on the relays for the hashmakers on show (read at most once a minute).
@@ -395,7 +499,7 @@ fn history_events(r: &Mutex<R>, offers: &[(Hashrate, String)]) -> Vec<xbt_nostr:
 fn records_for(relays: &[String], hashmakers: &[(PublicKey, String)]) -> Vec<xbt_nostr::event::Event> {
     let mut seen = std::collections::BTreeSet::new();
     std::thread::scope(|s| {
-        let asks: Vec<_> = trust::filters(hashmakers).into_iter().map(|f| s.spawn(move || xbt_nostr::oneshot::query(relays, &f, Duration::from_secs(10)).0)).collect();
+        let asks: Vec<_> = trust::filters(hashmakers).into_iter().map(|f| s.spawn(move || listing::query_bounded(relays, &f, listing::RELAY_WAIT).0)).collect();
         asks.into_iter().flat_map(|a| a.join().unwrap_or_default()).filter(|e| seen.insert(e.id.clone())).collect()
     })
 }
@@ -463,6 +567,57 @@ fn bundled_words(state: &str) -> Option<&'static str> {
     }
 }
 
+/// The bundled gateway's own web pages the app may show its owner, by name (`p=`), and nothing else: its status, threads,
+/// coinbaser, clients and config pages and their style and icons, each read with a GET and no login. The gateway's admin
+/// password is empty, so its clients and config pages say they need admin access, and no page carries a button that does
+/// anything. Never `/xbt/job` (the consensus target, for this service alone), `/NOTIFY` or `/testnet_fastforward` (a GET
+/// that acts), `/cmd` or a POST to `/config`.
+pub const GATEWAY_PAGES: &[&str] =
+    &["", "threads", "coinbaser", "clients", "config", "assets/style.css", "assets/icons/datum_logo.svg", "assets/icons/favicon.ico"];
+/// The most of a gateway page that is passed on.
+const GATEWAY_PAGE_MAX: u64 = 1 << 20;
+
+/// The bundled gateway's API: `--gateway-api` only while `--upstream` doesn't name another gateway (that flag is then
+/// that gateway's API), else its stratum's host on [`GATEWAY_API_PORT`].
+fn bundled_api(bundled: &str, upstream_flag: Option<&str>, flag_api: Option<&str>) -> Option<String> {
+    let flag_api = flag_api.filter(|_| upstream_flag.is_none_or(|u| u == bundled));
+    api_of(bundled, None, Some(bundled), None, flag_api)
+}
+
+/// One of the bundled gateway's [`GATEWAY_PAGES`], from its API on this service's own network: its HTTP status, its
+/// content type and its body (base64). The request carries no login and no query, and goes only to a loopback
+/// address: the bundled gateway listens there on every platform, and no setting sends it anywhere else.
+fn gateway_page(api: &str, page: &str) -> Result<Value, String> {
+    use base64::Engine;
+    use std::io::{Read, Write};
+    let addr = api.to_socket_addrs().ok().and_then(|mut a| a.next()).ok_or_else(|| format!("no such address: {api}"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!("the gateway's API at {api} is not on this box's loopback: its pages are not passed on"));
+    }
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| format!("the gateway's API at {api}: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    s.write_all(format!("GET /{page} HTTP/1.1\r\nHost: {api}\r\nConnection: close\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    (&mut s).take(GATEWAY_PAGE_MAX + 16 * 1024).read_to_end(&mut out).map_err(|e| format!("the gateway's API: {e}"))?;
+    let at = out.windows(4).position(|w| w == b"\r\n\r\n").ok_or("the gateway's API sent no HTTP answer")?;
+    let head = String::from_utf8_lossy(&out[..at]).to_string();
+    let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or("the gateway's API sent no status")?;
+    let header = |name: &str| head.lines().skip(1).filter_map(|l| l.split_once(':')).find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string());
+    if header("transfer-encoding").is_some_and(|t| t.eq_ignore_ascii_case("chunked")) {
+        return Err("the gateway's API sent a chunked answer".into());
+    }
+    let mut body = out[at + 4..].to_vec();
+    if let Some(n) = header("content-length").and_then(|n| n.parse::<usize>().ok()) {
+        body.truncate(n);
+    }
+    if body.len() as u64 > GATEWAY_PAGE_MAX {
+        return Err("the gateway's page is too big".into());
+    }
+    Ok(json!({"status": code, "contentType": header("content-type").unwrap_or_default(),
+              "body": base64::engine::general_purpose::STANDARD.encode(&body)}))
+}
+
 /// Look at what the upstream's jobs show, with no lock held for it.
 fn look_at_upstream(r: &Mutex<R>) -> Option<xbt_hashlink::blind::Shown> {
     let (datum, api, user) = {
@@ -492,7 +647,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                     let live = x.live.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     let result = if live.get("meter").is_some() { trust::trial_result(&live, x.started_ms, xbt_hashlink::now_ms(), x.advertised_hs) } else { Value::Null };
                     json!({
-                        "rental": id, "hasher": x.hashmaker, "startedMs": x.started_ms, "miners": x.miners, "budgetSats": x.budget_sats,
+                        "rental": id, "hasher": x.hashmaker, "payUrl": x.pay_url, "startedMs": x.started_ms, "miners": x.miners, "budgetSats": x.budget_sats,
                         "minutes": x.minutes, "ended": x.done.load(Ordering::Relaxed), "live": live,
                         "trial": x.trial, "advertisedHs": x.advertised_hs.to_string(), "result": result, "attested": x.attested,
                     })
@@ -534,8 +689,17 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             }))
         }
         ("GET", "/offers") => {
-            let o = offers(r, path.contains("fresh=1"));
-            let events = history_events(r, &o);
+            // never kept waiting on the relays, unless asked for them fresh (`fresh=1`)
+            let (o, looking) = if path.contains("fresh=1") {
+                match look_up_offers(r) {
+                    Some(o) => (o, false),
+                    None => offers_kept(r),
+                }
+            } else {
+                offers_kept(r)
+            };
+            // the delivery records as kept: the look-up keeps them current
+            let events = lock(r).history.as_ref().map(|(_, e)| e.clone()).unwrap_or_default();
             let authors = lock(r).authors.clone();
             let list: Vec<Value> = o
                 .iter()
@@ -547,7 +711,25 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                     v
                 })
                 .collect();
-            (200, json!({"offers": list}))
+            let relays_answered = !lock(r).offers_unanswered;
+            (200, json!({"offers": list, "looking": looking, "relaysAnswered": relays_answered}))
+        }
+        ("GET", "/gateway-page") => {
+            // exactly one of the pages named, as named: nothing else of the gateway is reached from here
+            let p = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let Some(page) = p.strip_prefix("p=").filter(|x| GATEWAY_PAGES.contains(x)) else {
+                return (404, json!({"error": "not one of the gateway's status pages"}));
+            };
+            // the gateway that comes with the app, on its own API: never another gateway's address
+            let api = {
+                let g = lock(r);
+                g.bundled.as_deref().and_then(|b| bundled_api(b, g.upstream_flag.as_deref(), g.gateway_api.as_deref()))
+            };
+            let Some(api) = api else { return (404, json!({"error": "this box has no Stream Gateway"})) };
+            match gateway_page(&api, page) {
+                Ok(v) => (200, v),
+                Err(e) => (502, json!({"error": e})),
+            }
         }
         ("POST", "/attest") => attest(r, &b),
         ("POST", "/datum") => {
@@ -588,7 +770,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             }
         }
         ("POST", "/rent") => rent_once(r, &b),
-        _ => (404, json!({"error": "GET /status, GET /offers, POST /rent, POST /cut, POST /datum, POST /attest"})),
+        _ => (404, json!({"error": "GET /status, GET /offers, GET /gateway-page, POST /rent, POST /cut, POST /datum, POST /attest"})),
     }
 }
 
@@ -670,9 +852,9 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             _ => {}
         }
     }
-    let pick = |o: Vec<(Hashrate, String)>| o.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key_hex);
-    let Some((h, event)) = pick(offers(r, false)).or_else(|| pick(offers(r, true))) else {
-        return (404, json!({"error": "that hashmaker's listing is no longer on the relays"}));
+    let (h, event) = match offer_for_rent(r, key_hex) {
+        Ok(found) => found,
+        Err(e) => return (404, json!({"error": e})),
     };
     if !h.proves() {
         return (400, json!({"error": "this hashmaker's app doesn't prove the work it sells: it needs updating"}));
@@ -683,6 +865,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         budget_sats = first_payment_msat(&h.terms).div_ceil(1000);
         minutes = trial_minutes(h.terms.slice_work, per_miner_hs(&h));
     }
+    // what the wallet may spend on tickets: the budget, and for a trial at least the shop's smallest ticket
+    let ticket_budget_sats = if trial { trial_ticket_msat(&h.terms).div_ceil(1000) } else { budget_sats };
     let advertised_hs = per_miner_hs(&h).saturating_mul(miners as u64);
     if first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
         return (400, json!({"error": if h.terms.start_slices > 0 { "the budget is less than the start fee and one slice" } else { "the budget is less than one slice" }}));
@@ -709,8 +893,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         (g.key, g.user.clone(), g.signer.clone(), g.task.clone(), g.api(), g.allow_unblinded)
     };
     // the first ticket, the first step's: later ones grow as they are earned, inside the budget
-    let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
-    let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(budget_sats), None,
+    let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(ticket_budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
+    let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(ticket_budget_sats), None,
                                                    std::time::Duration::from_millis(h.terms.grace_ms / 2)));
     let cfg = hashtaker::Config {
         hashmaker: addr,
@@ -742,6 +926,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         }
         g.rentals.insert(id.clone(), Rental {
             hashmaker: h.name.clone(),
+            pay_url: h.pay_url.clone(),
             hashmaker_key: h.link_key,
             advertised_hs,
             trial,
@@ -762,6 +947,10 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         match res {
             Err(e) => *live.lock().unwrap_or_else(|p| p.into_inner()) = json!({"closed": format!("could not start: {e}")}),
             Ok(report) => lock(&service).note_rental_end(&hex::encode(hashmaker_key.serialize()), &report),
+        }
+        // when it ended, for the renter's page to say beside its start
+        if let Some(o) = live.lock().unwrap_or_else(|p| p.into_inner()).as_object_mut() {
+            o.insert("endedMs".into(), json!(xbt_hashlink::now_ms()));
         }
         done.store(true, Ordering::Relaxed);
         eprintln!("hashtaker: rental with {} ended", hex::encode(hashmaker_key.serialize()));
@@ -840,6 +1029,122 @@ mod tests {
         assert_eq!(trial_minutes(1 << 47, 100_000_000_000), TRIAL_MAX_MINUTES);
         assert_eq!(trial_minutes(1 << 47, 1_000_000_000_000), 8);
         assert_eq!(trial_minutes(1 << 47, 0), TRIAL_MAX_MINUTES);
+    }
+
+    fn offer_listing() -> Hashrate {
+        Hashrate {
+            name: "Laz Hash".into(),
+            algorithm: "blake2b".into(),
+            hashrate_hs: 4_000_000_000_000,
+            link_addr: "127.0.0.1:9".into(),
+            link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, &noise::fresh_key()),
+            iroh: None,
+            pay_url: String::new(),
+            pay_node: String::new(),
+            terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000, start_slices: 0 },
+            proof: Some(PROOF.into()),
+            capacity: Capacity { miners: 1, free_miners: 1, free_hs: 4_000_000_000_000 },
+        }
+    }
+
+    /// A relay that takes the connection and never says a word: a look-up waits its whole time on it.
+    fn silent_relay() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = vec![];
+            for c in l.incoming().flatten() {
+                held.push(c);
+            }
+        });
+        url
+    }
+
+    /// A relay address nothing listens at: refused at once.
+    fn gone_relay() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", l.local_addr().unwrap());
+        drop(l);
+        url
+    }
+
+    /// The offers page never waits on the relays: just started, it answers at once with none and "looking"; with offers
+    /// kept past their 20 s it answers with those at once and looks them up again behind. 0.2.9 looked them up inside
+    /// the request, and a cold look-up (20 s on VM 118) outlasted the app's 6 s wait: "the hashrate service does not answer".
+    #[test]
+    fn the_offers_page_answers_at_once_while_the_relays_are_asked_behind_it() {
+        let r = bare();
+        lock(&r).relays = vec![silent_relay()];
+        let t = Instant::now();
+        let (code, v) = handle(&r, &[], "GET", "/offers", b"");
+        assert!(t.elapsed() < Duration::from_secs(2), "answered at once: {:?}", t.elapsed());
+        assert_eq!((code, v["offers"].clone(), v["looking"].clone()), (200, json!([]), json!(true)), "{v}");
+        assert!(lock(&r).offers_looking, "a look-up runs behind it");
+        // asked again while it runs: still at once, and still one look-up
+        let (_, v) = handle(&r, &[], "GET", "/offers", b"");
+        assert_eq!(v["looking"], true);
+        // offers kept, past their 20 s: given at once, not "looking"
+        let listing = offer_listing();
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(300), vec![(listing.clone(), "ev".into())]));
+        let t = Instant::now();
+        let (code, v) = handle(&r, &[], "GET", "/offers", b"");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!((code, v["offers"].as_array().map(Vec::len), v["looking"].clone()), (200, Some(1), json!(false)), "{v}");
+        // the look-up behind it ends at the relay's deadline, and with no relay answering, the kept offers stay
+        let until = Instant::now() + listing::RELAY_WAIT + Duration::from_secs(5);
+        while lock(&r).offers_looking && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!lock(&r).offers_looking, "it ended by the relay's deadline");
+        assert_eq!(lock(&r).offers.as_ref().map(|(_, o)| o.len()), Some(1), "nothing answered: what was kept stays");
+    }
+
+    /// A rent takes the offer kept within two minutes; older, it looks the offers up itself, and when no relay answers it
+    /// falls back on those kept within ten minutes (the link checks the terms again), else says no relay answered.
+    #[test]
+    fn a_rent_falls_back_on_the_kept_offer_only_when_no_relay_answers() {
+        let r = bare();
+        lock(&r).relays = vec![gone_relay()];
+        let listing = offer_listing();
+        let key = hex::encode(listing.link_key.serialize());
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(300), vec![(listing.clone(), "ev".into())]));
+        assert!(offer_for_rent(&r, &key).is_ok(), "kept five minutes ago, no relay answering: the kept offer");
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(900), vec![(listing.clone(), "ev".into())]));
+        assert!(offer_for_rent(&r, &key).unwrap_err().contains("no Nostr relay answered"), "kept too long ago");
+        lock(&r).offers = Some((Instant::now() - Duration::from_secs(60), vec![(listing, "ev".into())]));
+        assert!(offer_for_rent(&r, &key).is_ok(), "kept a minute ago: taken as it is");
+        assert!(offer_for_rent(&r, &"02".repeat(33)).unwrap_err().contains("no Nostr relay answered"), "a hashmaker not kept, nothing answering");
+    }
+
+    /// A test slice of a few sats can pay a shop whose smallest ticket is 546 sat: its slices stop at one, and the wallet
+    /// may buy that ticket, as the offer says. 0.2.9 gave the wallet the slice's 40 sats to buy it with, and every trial
+    /// ended with "What is left of this rental's budget (40 sats) is less than this hashmaker's smallest ticket (546 sats)".
+    #[test]
+    fn a_test_slice_may_buy_the_shops_smallest_ticket() {
+        let terms = Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000, start_slices: 0 };
+        assert_eq!(trial_ticket_msat(&terms), 546_000);
+        assert_eq!(trial_ticket_msat(&Terms { price_msat: 300_000, start_slices: 1, ..terms.clone() }), 600_000, "a first payment above it is its own");
+        // nothing answers at the hashmaker's address: the rental starts and then can't, which is all this needs
+        let listing = Hashrate {
+            name: "Laz Hash".into(),
+            algorithm: "blake2b".into(),
+            hashrate_hs: 4_000_000_000_000,
+            link_addr: "127.0.0.1:9".into(),
+            link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, &noise::fresh_key()),
+            iroh: None,
+            pay_url: String::new(),
+            pay_node: String::new(),
+            terms,
+            proof: Some(PROOF.into()),
+            capacity: Capacity { miners: 1, free_miners: 1, free_hs: 4_000_000_000_000 },
+        };
+        // the offer's words: up to the 546 sat ticket and its routing fee limit, not the slice's 40 sats and theirs (51)
+        assert_eq!(offer_json(&listing, "ev")["trialMayBuyTicketUpToSats"], 559);
+        let key = hex::encode(listing.link_key.serialize());
+        let r = renter(listing);
+        let (code, v) = handle(&r, &[], "POST", "/rent", json!({"linkKey": key, "trial": true}).to_string().as_bytes());
+        assert_eq!(code, 200, "{v}");
+        assert_eq!((v["budgetSats"].clone(), v["mayBuyTicketUpToSats"].clone()), (json!(40), json!(546)), "charged at most one slice, a ticket of 546 sat: {v}");
     }
 
     use std::net::TcpListener;
@@ -976,6 +1281,8 @@ mod tests {
             expect_node: None,
             state: None,
             offers: None,
+            offers_looking: false,
+        offers_unanswered: false,
             authors: HashMap::new(),
             history: None,
             rentals: BTreeMap::new(),
@@ -1356,6 +1663,63 @@ mod tests {
         assert!(st["blinding"].is_null() || st["blinding"]["bundled"].is_null(), "{st}");
     }
 
+    /// The bundled gateway's own status pages, read-only: a page named is fetched from its API with a plain GET, and
+    /// anything not named (`/xbt/job`, `/NOTIFY`, `/cmd`, another path or a query) never reaches the gateway.
+    #[test]
+    fn only_the_gateways_status_pages_are_passed_on() {
+        use base64::Engine;
+        use std::io::{BufRead, BufReader, Write};
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_addr = api.local_addr().unwrap().to_string();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let a2 = asked.clone();
+        std::thread::spawn(move || {
+            for c in api.incoming() {
+                let Ok(mut c) = c else { continue };
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                let mut head = line.clone();
+                loop {
+                    let mut h = String::new();
+                    r.read_line(&mut h).unwrap();
+                    if h.trim_end().is_empty() {
+                        break;
+                    }
+                    head.push_str(&h);
+                }
+                a2.lock().unwrap().push(head);
+                let body = "<h2>Thread Stats</h2>";
+                // as the gateway answers /threads with no admin password: its page, with a 401 and a login challenge
+                let _ = write!(c, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"DATUM Gateway\"\r\nContent-Type: text/html\r\n\
+                                   Content-Length: {}\r\n\r\n{body}", body.len());
+            }
+        });
+        let r = test_r(BUNDLED_STRATUM, Some(api_addr));
+        let (code, v) = handle(&r, &[], "GET", "/gateway-page?p=threads", b"");
+        assert_eq!((code, v["status"].as_u64(), v["contentType"].as_str()), (200, Some(401), Some("text/html")), "{v}");
+        let body = base64::engine::general_purpose::STANDARD.decode(v["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body, b"<h2>Thread Stats</h2>");
+        let seen = asked.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].starts_with("GET /threads HTTP/1.1\r\n") && !seen[0].to_ascii_lowercase().contains("authorization"), "{}", seen[0]);
+        for bad in ["/gateway-page?p=xbt/job", "/gateway-page?p=xbt/job?id=x&pot=0", "/gateway-page?p=NOTIFY", "/gateway-page?p=testnet_fastforward",
+                    "/gateway-page?p=cmd", "/gateway-page?p=/threads", "/gateway-page?p=threads&x=1", "/gateway-page?p=threads%2F", "/gateway-page?p=../xbt/job",
+                    "/gateway-page?p=umbrel-api", "/gateway-page"] {
+            assert_eq!(handle(&r, &[], "GET", bad, b"").0, 404, "{bad}");
+        }
+        assert_eq!(handle(&r, &[], "POST", "/gateway-page?p=config", b"{}").0, 404, "a POST is no page");
+        assert_eq!(asked.lock().unwrap().len(), 1, "none of those reached the gateway");
+        // only the bundled gateway's own API, on loopback: never another gateway's that --upstream and --gateway-api name
+        assert_eq!(bundled_api(BUNDLED_STRATUM, Some("10.0.0.9:23334"), Some("10.0.0.9:7152")).as_deref(), Some("127.0.0.1:7152"));
+        assert_eq!(bundled_api(BUNDLED_STRATUM, Some(BUNDLED_STRATUM), Some("127.0.0.1:7153")).as_deref(), Some("127.0.0.1:7153"));
+        assert_eq!(bundled_api(BUNDLED_STRATUM, None, Some("127.0.0.1:7153")).as_deref(), Some("127.0.0.1:7153"));
+        assert!(gateway_page("10.255.255.1:7152", "").unwrap_err().contains("not on this box's loopback"));
+        // a box without the bundled gateway shows none
+        lock(&r).bundled = None;
+        assert_eq!(handle(&r, &[], "GET", "/gateway-page?p=", b"").0, 404);
+    }
+
     fn test_r(bundled: &str, api: Option<String>) -> Arc<Mutex<R>> {
         Arc::new(Mutex::new(R {
             onces: HashMap::new(),
@@ -1376,6 +1740,8 @@ mod tests {
             expect_node: None,
             state: None,
             offers: None,
+            offers_looking: false,
+        offers_unanswered: false,
             authors: HashMap::new(),
             history: None,
             rentals: BTreeMap::new(),

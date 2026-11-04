@@ -112,13 +112,19 @@ pub struct SignerPayer {
     /// The most the hashmaker's signed offer said a slice costs, as the wallet's `price_ceiling`: a
     /// shop whose terms ask more than the offer it was rented from is paid nothing.
     pub ceiling: Option<serde_json::Value>,
-    /// How long a slice's payment waits for a signer whose socket is not there (a wallet that
-    /// starts again): within the hashmaker's grace, so the slice is still paid in time.
+    /// How long a slice's payment keeps asking a signer it could not send the call to (a wallet that
+    /// starts again, a socket busy for a moment): within the hashmaker's grace, so the slice is still
+    /// paid in time.
     pub wait_for_signer: std::time::Duration,
     /// How long a slice's payment waits for the signer's answer once sent ([`PAY_WAIT`]): the signer bounds the
     /// call itself, and past this one that's stuck is taken as an answer lost.
     pub pay_wait: std::time::Duration,
+    /// The call on the signer's socket: [`signer_call_waiting`], or a test's stand-in.
+    pub call: SignerCall,
 }
+
+/// A call on the signer's socket, as [`signer_call_waiting`] makes it.
+pub type SignerCall = fn(&std::path::Path, &str, &serde_json::Value, Option<std::time::Duration>) -> Result<serde_json::Value, (bool, String)>;
 
 /// How long a slice's payment waits for the signer's answer: far past any payment the signer bounds itself, short of
 /// a rental hung for good on a signer that's stuck.
@@ -184,6 +190,12 @@ pub fn signer_unreached(why: &str) -> bool {
 /// How long any signer call but a paying one waits for its answer.
 pub const SIGNER_WAIT: std::time::Duration = std::time::Duration::from_secs(200);
 
+/// How long writing a call to the signer may block. A call is a few hundred bytes and a working signer reads it at
+/// once; a socket that takes none of it for this long is busy, and a payment asks again on a new connection
+/// ([`SignerPayer::pay`]) well within its `wait_for_signer`. Waited for as long as [`SIGNER_WAIT`], the one `EAGAIN`
+/// would come only after the hashmaker's grace was gone, too late to ask again.
+pub const SIGNER_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One call on the signer's socket.
 pub fn signer_call(sock: &std::path::Path, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     signer_call_waiting(sock, method, params, Some(SIGNER_WAIT)).map_err(|(_, e)| e)
@@ -193,11 +205,11 @@ pub fn signer_call(sock: &std::path::Path, method: &str, params: &serde_json::Va
 /// the call had been sent: an answer lost after that leaves the call's effect unknown.
 pub fn signer_call_waiting(sock: &std::path::Path, method: &str, params: &serde_json::Value, answer_wait: Option<std::time::Duration>)
                            -> Result<serde_json::Value, (bool, String)> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader};
     let mut s = std::os::unix::net::UnixStream::connect(sock).map_err(|e| (false, format!("signer socket {}: {e}", sock.display())))?;
-    s.set_write_timeout(Some(SIGNER_WAIT)).map_err(|e| (false, e.to_string()))?;
+    s.set_write_timeout(Some(SIGNER_WRITE_WAIT)).map_err(|e| (false, e.to_string()))?;
     let req = serde_json::json!({"id": 1, "method": method, "params": params});
-    s.write_all(format!("{req}\n").as_bytes()).map_err(|e| (false, e.to_string()))?;
+    send_request(&mut s, format!("{req}\n").as_bytes())?;
     s.set_read_timeout(answer_wait).map_err(|e| (true, e.to_string()))?;
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).map_err(|e| (true, format!("signer: {e}")))?;
@@ -211,6 +223,21 @@ pub fn signer_call_waiting(sock: &std::path::Path, method: &str, params: &serde_
     }
 }
 
+/// Write a call to the signer. It was sent once any of it is out: the signer may have read it whole. A write that
+/// fails before that (the socket busy for a moment, `EAGAIN`, or gone) asked nothing, and may be made again.
+fn send_request(w: &mut impl std::io::Write, buf: &[u8]) -> Result<(), (bool, String)> {
+    let mut out = 0;
+    while out < buf.len() {
+        match w.write(&buf[out..]) {
+            Ok(0) => return Err((out > 0, "signer: closed before the call was written".into())),
+            Ok(n) => out += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err((out > 0, e.to_string())),
+        }
+    }
+    Ok(())
+}
+
 impl SignerPayer {
     /// A payer for a rental at `price_msat` a slice, its caps those of the first step until
     /// [`SignerPayer::caps_for`] says otherwise. The offer's price is its ceiling. `budget_sats`,
@@ -218,7 +245,7 @@ impl SignerPayer {
     pub fn new(sock: std::path::PathBuf, url: String, task: String, price_msat: u64, budget_sats: Option<u64>, most_sats: Option<u64>,
                wait_for_signer: std::time::Duration) -> Self {
         let mut p = Self { sock, url, task, price_msat, max_sats: 0, max_charge_sats: None, budget_sats, most_sats, charged_msat: 0, credit_msat: 0, session: None,
-                           ceiling: Some(slice_ceiling(price_msat)), wait_for_signer, pay_wait: PAY_WAIT };
+                           ceiling: Some(slice_ceiling(price_msat)), wait_for_signer, pay_wait: PAY_WAIT, call: signer_call_waiting };
         p.caps_for(crate::order::FIRST_STEP_MSAT);
         p
     }
@@ -247,27 +274,27 @@ impl SignerPayer {
         if let Some(c) = self.max_charge_sats {
             params["max_charge_sats"] = c.into();
         }
-        // a signer that is starting again is waited for, with growing pauses, as long as the call never
-        // reached it: a call that reached it is never made a second time
+        // a signer that is starting again, or whose socket could not take the call for a moment, is asked again, with
+        // growing pauses, as long as the call never reached it: a call that reached it is never made a second time
         let start = std::time::Instant::now();
         let mut pause = std::time::Duration::from_millis(250);
         let mut asked_again = false;
         let mut r = loop {
             // the signer answers once the slice is paid, and bounds the call itself: its answer is waited for as long as
             // it takes. One lost after the call was sent leaves the payment unknown: never paid again, never said unpaid
-            let called = match signer_call_waiting(&self.sock, "xbt402_pay", &params, Some(self.pay_wait)) {
+            let called = match (self.call)(&self.sock, "xbt402_pay", &params, Some(self.pay_wait)) {
                 Err((true, why)) if !why.starts_with("signer error:") => return Ok(self.lost_answer(&why)),
-                other => other.map_err(|(_, e)| e),
+                other => other,
             };
             match called {
-                Err(why) if signer_unreached(&why) && start.elapsed() + pause < self.wait_for_signer => {
+                Err((false, _)) if start.elapsed() + pause < self.wait_for_signer => {
                     std::thread::sleep(pause);
                     pause = (pause * 2).min(std::time::Duration::from_secs(4));
                 }
                 // the seller forgot a session with nothing in it (a slice longer than its idle limit, with the wallet's
                 // watcher away): nothing was released or booked, and the next call opens another
                 Ok(v) if !asked_again && v.get("rule").and_then(serde_json::Value::as_str) == Some("ticket_session_ended") && moved_nothing(&v) => asked_again = true,
-                other => break other?,
+                other => break other.map_err(|(_, e)| e)?,
             }
         };
         if let Some(o) = r.as_object_mut() {
@@ -661,5 +688,121 @@ mod signer_wait_tests {
         let r = p.pay("r1", 0, &serde_json::json!({}));
         assert!(r.as_ref().is_err_and(|e| signer_unreached(e)), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A writer that fails as a socket does when it can't take a write for a moment, after letting `ok` bytes out.
+    struct Busy {
+        ok: usize,
+        interrupted: bool,
+    }
+
+    impl Write for Busy {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if std::mem::take(&mut self.interrupted) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            match self.ok.min(b.len()) {
+                0 => Err(std::io::Error::from_raw_os_error(11)),
+                n => {
+                    self.ok -= n;
+                    Ok(n)
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A call the socket took none of was not sent, and may be made again; one it took any of may have been read
+    /// whole, so it was sent. An interrupted write is written again.
+    #[test]
+    fn a_call_is_sent_once_any_of_it_is_out() {
+        let e = send_request(&mut Busy { ok: 0, interrupted: false }, b"{}\n").unwrap_err();
+        assert_eq!(e, (false, "Resource temporarily unavailable (os error 11)".to_string()));
+        assert!(send_request(&mut Busy { ok: 2, interrupted: false }, b"{}\n").unwrap_err().0, "part of it out: sent");
+        assert!(send_request(&mut Busy { ok: 3, interrupted: true }, b"{}\n").is_ok());
+    }
+
+    /// A real socket that takes part of a call and then no more (a signer that accepted it and stopped reading): the
+    /// write gives up after [`SIGNER_WRITE_WAIT`] with some of it out, so the call counts as sent. Its payment is an
+    /// answer lost (`verdict: "unknown"`), never made again, though the wait for the signer has time left.
+    #[test]
+    fn a_call_written_in_part_is_never_made_again() {
+        let dir = scratch("part");
+        let sock = dir.join("signer.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let conns = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c2 = conns.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                c2.lock().unwrap().push(c); // held open, never read
+            }
+        });
+        let mut p = SignerPayer::new(sock, "https://x/hashrate".into(), "hashrate".into(), 5_000, None, None, Duration::from_secs(60));
+        // a body far past any socket buffer, so the write stops part way
+        let big = serde_json::json!({"pad": "x".repeat(16 << 20)});
+        let t0 = Instant::now();
+        let v = p.pay("r1", 1, &big).unwrap();
+        assert_eq!(v["verdict"], "unknown", "{v}");
+        assert_eq!(v["request_sent"], true, "{v}");
+        assert!(t0.elapsed() < SIGNER_WRITE_WAIT * 2 + Duration::from_secs(5), "{:?}", t0.elapsed());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(conns.lock().unwrap().len(), 1, "the signer was asked once");
+    }
+
+    /// A stand-in whose call got out in part and then failed as a busy socket does: sent, so never made again.
+    #[test]
+    fn a_pay_whose_call_got_out_in_part_is_an_answer_lost_and_asked_once() {
+        static TRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn part_out(_: &std::path::Path, _: &str, _: &serde_json::Value, _: Option<Duration>) -> Result<serde_json::Value, (bool, String)> {
+            TRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err((true, std::io::Error::from_raw_os_error(11).to_string()))
+        }
+        let dir = scratch("partstand");
+        let mut p = SignerPayer::new(dir.join("signer.sock"), "https://x/hashrate".into(), "hashrate".into(), 5_000, None, None, Duration::from_secs(5));
+        p.call = part_out;
+        let v = p.pay("r1", 1, &serde_json::json!({})).unwrap();
+        assert_eq!((v["verdict"].as_str(), v["request_sent"].as_bool()), (Some("unknown"), Some(true)), "{v}");
+        assert_eq!(TRIES.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The `xbt402_pay`s a stand-in socket fails before any of the call is out (as `EAGAIN` does), by number from 1:
+    /// one test's at a time.
+    static BUSY_PAYS: std::sync::Mutex<(usize, Vec<usize>)> = std::sync::Mutex::new((0, Vec::new()));
+
+    fn busy_now_and_then(sock: &std::path::Path, method: &str, params: &serde_json::Value, wait: Option<Duration>) -> Result<serde_json::Value, (bool, String)> {
+        let mut g = BUSY_PAYS.lock().unwrap_or_else(|p| p.into_inner());
+        g.0 += 1;
+        if g.1.contains(&g.0) {
+            return Err((false, std::io::Error::from_raw_os_error(11).to_string()));
+        }
+        drop(g);
+        signer_call_waiting(sock, method, params, wait)
+    }
+
+    /// A socket that could not take the call for a moment (the renter's `EAGAIN`): nothing was asked, so the call is
+    /// made again within the wait and the slice is paid, asked of the signer once. One that stays so fails plainly
+    /// at the end of the wait, and the signer is never asked.
+    #[test]
+    fn a_call_the_socket_could_not_take_is_made_again_and_paid_once() {
+        let dir = scratch("busy");
+        let sock = dir.join("signer.sock");
+        let seen = scripted(&sock, Duration::ZERO, vec![("xbt402_pay", Some(serde_json::json!({"verdict": "allow", "status": 200, "session": "s1"})))]);
+        let mut p = SignerPayer::new(sock.clone(), "https://x/hashrate".into(), "hashrate".into(), 5_000, None, None, Duration::from_secs(5));
+        p.call = busy_now_and_then;
+        *BUSY_PAYS.lock().unwrap() = (0, vec![1, 2]);
+        let v = p.pay("r1", 1, &serde_json::json!({})).unwrap();
+        assert_eq!(v["verdict"], "allow", "{v}");
+        assert_eq!((BUSY_PAYS.lock().unwrap().0, seen.lock().unwrap().len()), (3, 1), "tried three times, asked once");
+        // busy for good: not past the wait, and nothing asked
+        *BUSY_PAYS.lock().unwrap() = (0, (1..1000).collect());
+        p.wait_for_signer = Duration::from_millis(800);
+        let t0 = Instant::now();
+        let why = p.pay("r1", 2, &serde_json::json!({})).unwrap_err();
+        assert_eq!(why, "Resource temporarily unavailable (os error 11)");
+        assert!(t0.elapsed() < Duration::from_secs(2) && BUSY_PAYS.lock().unwrap().0 > 1, "asked again within the wait, and no longer");
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

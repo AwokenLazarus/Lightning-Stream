@@ -1144,6 +1144,20 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
     assert!(page.body.contains(">Web apps <") && page.body.contains(">Files <") && page.body.contains(">Data &amp; APIs <"), "the categories");
     assert!(!page.body.contains(">Media <"), "no media category of its own");
+    // Buy has two tabs; every kind of service is a chip of Browse, once each (AI was a tab and a chip), and Sellers is linked below
+    let tabs = &page.body[page.body.find("aria-current=\"page\">Browse").unwrap()..];
+    let tabs = &tabs[..tabs.find("</nav>").unwrap()];
+    assert!(!tabs.contains("./ai\"") && !tabs.contains("./vpn\"") && !tabs.contains("./services\"") && tabs.contains("./connections"), "{tabs}");
+    let chips = &page.body[page.body.find("<nav class=\"chips\"").unwrap()..];
+    let chips = &chips[..chips.find("</nav>").unwrap()];
+    let order: Vec<usize> = [">All <", "./ai\">AI<", ">Hashrate<", "./vpn\">VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
+        .map(|c| chips.find(c).unwrap_or_else(|| panic!("{c}: {chips}"))).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{chips}");
+    assert!(page.body.contains("Your <a href=\"./services\">sellers</a>"), "Sellers, from Browse");
+    // the pages that were tabs still open, as part of Buy
+    for path in ["/ai", "/vpn", "/services"] {
+        assert!(br.get(path).body.contains("aria-current=\"page\">Buy"), "{path} is in Buy");
+    }
     assert!(!page.body.contains("Big Buck Bunny"), "Browse lists services, not what a media service has inside");
     assert!(page.headers.get("content-security-policy").is_some_and(|v| v.contains("media-src 'self'")));
     // an older film listing (no web app) is files: each to download or open in the buyer's own player, no player here
@@ -1620,6 +1634,10 @@ fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
 
     // the link plays there with no cookie, seeking included
     let link = format!("{own}{token}");
+    // a HEAD's length: the file's size where it is known, else none (its listing gives no size in bytes, and nothing
+    // went through the link yet)
+    let head_length = |url: &str| ureq::AgentBuilder::new().redirects(0).build().head(url).call().ok().and_then(|r| r.header("Content-Length").map(str::to_string));
+    assert_eq!(head_length(&link), None, "not known yet: no Content-Length, as before");
     let (status, body) = plain_get(&link, &[("Range", "bytes=5000-")]);
     assert_eq!((status, body.as_slice()), (206, &film[5000..]));
     let (status, body) = plain_get(&link, &[]);
@@ -1640,6 +1658,11 @@ fn player_links_have_a_port_of_their_own_that_serves_nothing_else() {
     assert_eq!(head(&link), (200, Some("bytes".into()), Some("application/octet-stream".into()), 0));
     assert_eq!(head(&format!("{}/r/{token}", b.base)).0, 200, "the UI's own port answers it alike");
     assert_eq!(seen.lock().unwrap().len(), n, "a HEAD asks the connector nothing, so nothing is paid");
+    // once the shop's answer through the link said the file's size, a HEAD gives it, for a player that learns the size so
+    // (FAILS before: no Content-Length, whatever had been played)
+    assert_eq!(head_length(&link), Some(film.len().to_string()), "the size the shop's answer gave");
+    assert_eq!(head_length(&format!("{}/r/{token}", b.base)), Some(film.len().to_string()));
+    assert_eq!(seen.lock().unwrap().len(), n, "still nothing asked of the connector");
 
     // nothing else of the UI is there, the login and the setup included; an unknown token is nothing
     let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
@@ -1796,6 +1819,8 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
                                ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
     br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
     assert!(br.get("/sell").body.contains("How many buyers at once"));
+    // no hashmaker on this box: Add a service has no Hashrate choice (#46)
+    assert!(!br.get("/sell").body.contains("href=\"./sell-hashrate\"><span><strong>Hashrate"));
     let addr = format!("http://{media}");
     // a number that is not one: refused, in words
     let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("app_no_accounts", "1"), ("address", &addr), ("price", "20"), ("unit", "mib"),
@@ -1884,6 +1909,7 @@ fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller
     // editing it: the box is ticked already, and a save without it (an edit of something else) is not refused
     let page = br.get(&format!("/sell?edit={id}")).body;
     assert!(page.contains("name=\"app_no_accounts\" value=\"1\" checked"), "{page}");
+    assert!(page.contains("<label class=\"check\" data-no-accounts><input type=\"checkbox\" name=\"app_no_accounts\""), "shown where it applies: {page}");
     let mut f = form(&[("price", "21")]);
     f.retain(|(k, v)| k != "price" || v == "21");
     f.push(("id".into(), id.clone()));
@@ -1904,6 +1930,21 @@ fn a_media_server_shared_with_no_way_in_for_buyers_is_saved_only_once_the_seller
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     assert_eq!(saved(), 2);
     assert!(!unescape(&br.get("/sell").body).contains("can't get in"));
+    // "Publish without buyer accounts anyway" shows only where its warning applies: on a new media server's form, not on
+    // one with a guest login (or buyers' accounts), nor on a web app that is no media server
+    // (FAILS before, 0.2.7's hands-on retest: it showed on every form)
+    let shown = |page: &str| {
+        assert!(page.contains("name=\"app_no_accounts\""), "{page}");
+        page.contains("data-no-accounts><input")
+    };
+    assert!(shown(&br.get("/sell").body), "a new media server's form: it applies");
+    for o in sell()["offers"].as_array().unwrap().clone() {
+        let page = br.get(&format!("/sell?edit={}", o["id"].as_str().unwrap())).body;
+        assert!(!shown(&page) && page.contains("data-no-accounts hidden><input"), "{}: {page}", o["name"]);
+    }
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("name", "Other Jellyfin"),
+                                       ("app", "1"), ("app_accounts", "1")]);
+    assert!(!shown(&r.body), "a form sent back with buyers' accounts on: it does not apply");
 }
 
 #[cfg(unix)]
@@ -2926,8 +2967,13 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
             "datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
             "blinding": {"state": "blinded", "why": "solo", "words": "Blinded: a hashmaker can't tell which shares win, so it can't drop those."},
             "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
+                         "startedMs": (xbt_wallet_ui::now() as u64 - 300) * 1000,
                          "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12},
-                                  "walletMovedSats": 1002, "leftWithSellerMsat": 800000}}]}),
+                                  "walletMovedSats": 1002, "leftWithSellerMsat": 800000}},
+                        {"rental": "r7", "hasher": "Laz Hash", "trial": true, "miners": 1, "budgetSats": 40, "startedMs": 1000, "ended": true,
+                         "live": {"closed": "hashmaker closed: no first payment", "paidSlices": 0, "spentMsat": 0, "miners": 0}},
+                        {"rental": "r8", "hasher": "Laz Hash", "miners": 1, "budgetSats": 4696, "startedMs": 2000, "ended": true,
+                         "live": {"closed": "hashmaker closed: unpaid", "paidSlices": 0, "spentMsat": 0, "miners": 0, "endedMs": 39_722_000}}]}),
         ("GET", "/offers") => json!({"offers": [{"name": "Basement miners", "linkKey": "02bb", "priceMsat": 40000, "sliceWork": "140737488355328",
                                                   "miners": 2, "freeMiners": 1, "freeHs": "4000000000000",
                                                   "trialMayBuyTicketUpToSats": 2000, "mayBuyTicketUpToSats": 2000},
@@ -2987,6 +3033,10 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     let s: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!((s["enabled"].clone(), s["fallback"].clone(), s["priceSat"].clone(), s["rentable"].clone()),
                (json!(true), json!("192.168.1.20:23334"), json!(40), json!(1)));
+    // the price per 1 TH/s for an hour, beside the other offers seen (this box rents too)
+    let p = br.get("/sell-hashrate").body;
+    assert!(p.contains("Per 1 TH/s of speed, your price comes to about <strong>") && p.contains("The 2 other offers seen now ask from about 1,023 sats an hour \
+                                                                                                for 1 TH/s (the cheapest), 1,023 sats in the middle."), "{p}");
     let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "no port"), ("price", "40")]);
     assert!(br.flash_after(&r).contains("with its port"));
 
@@ -2997,6 +3047,17 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
         assert!(p.body.contains(s), "{s} missing from Hashrate");
     }
     plain("/hashrate", &p.body);
+    // the rental going on is under Your rentals; the ended ones only under History, newest first, with their count
+    let (yours, history) = p.body.split_at(p.body.find("<details class=\"card rentals-history\"").expect("History"));
+    let yours = &yours[yours.find("<h2>Your rentals</h2>").unwrap()..];
+    let history = &history[..history.find("</details>").unwrap()];
+    assert!(yours.contains("Hashrate from Basement miners") && !yours.contains("Laz Hash"), "{yours}");
+    assert!(history.contains("<summary>History: 2 ended rentals</summary>") && !history.contains("Basement miners"), "{history}");
+    assert!(history.find("Hashrate from Laz Hash").unwrap() < history.find("Test slice from Laz Hash").unwrap(), "newest first: {history}");
+    // each card says when it started, when it ended and after how long, and why
+    assert!(history.contains("Started 1970-01-01 00:00:02 UTC · ended 1970-01-01 11:02:02 UTC, after 11 h 2 min")
+            && history.contains("<strong>Ended:</strong> a piece of work was not paid in time."), "{history}");
+    assert!(yours.contains("Started ") && yours.contains("going on for 5 min"), "{yours}");
     // a hashmaker the spending rules do not list yet: allowed first (the rules page, with its node), Rent waits
     let garage = &p.body[p.body.find("Garage miners").unwrap()..];
     let garage = &garage[..garage.find("</section>").unwrap()];
@@ -3015,8 +3076,20 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert!(card.contains("Left your wallet: <span class=\"money\">1,002 sats</span>, a ticket bought whole from this shop; 800 sats of it stays \
                            with this seller as credit for about 20 hours"), "{card}");
     assert!(basement.contains("about 40 sats") && basement.contains("charged at most that"), "{basement}");
-    let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);
-    assert!(br.flash_after(&r).starts_with("Renting."));
+    // a rental going on: the page shows its rentals again by itself (ui.js asks ./api/hashrate-rentals), F5 not needed
+    assert!(p.body.contains("<div id=\"rentals\" data-live=\"1\"><h2>Your rentals</h2>"), "{}", p.body);
+    let a = br.get("/api/hashrate-rentals");
+    assert_eq!(a.status, 200, "{}", a.body);
+    let v: Value = serde_json::from_str(&a.body).unwrap();
+    assert_eq!(v["live"], true);
+    assert!(v["html"].as_str().unwrap().contains("Hashrate from Basement miners") && v["html"].as_str().unwrap().contains("Spent so far"), "{v}");
+    assert_eq!(B::new(&bx.base).get("/api/hashrate-rentals").status, 401, "behind the login");
+    let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60"), ("piece_sat", "40")]);
+    let f = br.flash_after(&r);
+    assert!(f.starts_with("Renting."), "{f}");
+    // what the budget really buys, said (#50's follow-up): tickets of at least 546 sats, what is under one can't be spent
+    assert!(f.contains("tickets of at least 546 sats: 4,000 sats buys pieces of work worth about 3,822 sats (about 95 pieces of work)")
+            && f.contains("The 178 sats left under one ticket") && f.contains("4,368 sats would use it all"), "{f}");
     let rent = rseen.lock().unwrap().iter().find(|(m, p, _, _)| m == "POST" && p == "/rent").cloned().unwrap();
     let body: Value = serde_json::from_str(&rent.3).unwrap();
     assert_eq!((body["linkKey"].clone(), body["miners"].clone(), body["budgetSats"].clone()), (json!("02bb"), json!(1), json!(4000)));
@@ -3046,10 +3119,91 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     // Live connections shows the rental, with its Cut button
     let p = br.get("/connections");
     assert!(p.body.contains("Rented hashrate") && p.body.contains("data-spent=\"200\""), "{}", p.body);
+    assert!(p.body.find("<h2>Rented hashrate</h2>").unwrap() < p.body.find("Every service you are paying for right now").unwrap(),
+            "the rental going on first, the connections under it: {}", p.body);
     plain("/connections", &p.body);
     let r = br.act("/connections", "/hashrate", &[("action", "cut"), ("rental", "r9"), ("back", "connections")]);
     assert_eq!(r.location(), "./connections");
     assert!(rseen.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/cut" && b.contains("r9")));
+}
+
+/// A hashmaker whose shop has no web address (reached by its key) is paid through the transport document the app
+/// keeps for it. Allowing it from its offer adds the shop, as the Sellers page does, before the rules: 0.2.9 only
+/// opened the rules, and every payment was refused ("a shop without a web address is reached through its transport
+/// document"). One the rules allow but the app doesn't keep is offered the same, with Rent off until it is kept.
+#[test]
+fn allowing_a_hashmaker_reached_by_its_key_adds_its_shop() {
+    use std::sync::OnceLock;
+    use xbt_nostr::{event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    // the hashmaker's shop, by its key, with a link its node vouches for
+    let keys = Keys::generate();
+    let shop = xbt402::shop::origin_for(&keys.public.serialize());
+    let (sk, pk) = receipt_key(b"laz hash");
+    let d = xbt402::listing::parse_draft(&json!({
+        "name": "Lazarus Stream", "services": [{"name": "Laz Hash", "kind": "hashrate", "path": "/hashrate/", "prices": {"request_msat": 40000}, "items": []}],
+        "updated": "2026-11-03",
+    })).unwrap();
+    let doc = xbt402::listing::sign(&sk, &xbt402::listing::document(&d, &shop, &pk));
+    let node = Sk::from_slice(&[9u8; 32]).unwrap();
+    let node_hex = hex::encode(xbt_primitives::ecdsa::pubkey(&node));
+    let expires = xbt_nostr::now() + 30 * 86_400;
+    let ep = "ab".repeat(32);
+    let link = xbt402::transport::Link { kind: "iroh".into(), endpoint_id: ep.clone(), relays: vec!["https://relay.example".into()], direct: vec![], expires,
+                                         node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) };
+    let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &[link], "2026-11-03"));
+    let bind = xbt402::listing::bind(&sk, &keys.public.serialize(), &shop);
+    let ev = market::listing_event_with(&keys, &doc, &bind, Some(&t), xbt_nostr::now()).unwrap();
+    assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+    // its hashrate offer, paid at that shop
+    static PAY: OnceLock<(String, String)> = OnceLock::new();
+    PAY.set((format!("{shop}/hashrate"), node_hex.clone())).unwrap();
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
+                                     "blinding": {"state": "blinded", "why": "pool", "words": "Blinded."}, "rentals": []}),
+        ("GET", "/offers") => json!({"offers": [{"name": "Laz Hash", "linkKey": "02ee", "priceMsat": 40000, "sliceWork": "140737488355328",
+                                                  "miners": 1, "freeMiners": 1, "freeHs": "4000000000000",
+                                                  "payUrl": PAY.get().unwrap().0, "payNode": PAY.get().unwrap().1}]}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let tweak = |c: &mut Config| {
+        c.nostr_relays = relays.clone();
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    };
+    let offer = |page: &str| {
+        let o = &page[page.find("<h3>Laz Hash</h3>").expect(page)..];
+        o[..o.find("</section>").unwrap()].to_string()
+    };
+
+    // not allowed yet: Allow adds the shop, then opens the rules with the node its link names
+    let bx = start(json!({}), false, tweak);
+    let mut br = logged_in(&bx);
+    let o = offer(&br.get("/hashrate").body);
+    assert!(o.contains("value=\"try\"") && o.contains(&format!("name=\"url\" value=\"{shop}\"")) && o.contains("Allow this hashmaker to be paid"), "{o}");
+    assert!(!o.contains("./policy?allow="), "not the rules alone: {o}");
+    assert!(o.contains("<button disabled>Rent</button>"), "{o}");
+    let r = br.act("/hashrate", "/services", &[("action", "try"), ("url", &shop)]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert!(r.location().starts_with("./policy?allow=") && r.location().contains(&format!("node={node_hex}")), "{}", r.location());
+    let kept = xbt_wallet_ui::shops::load(&bx.data.path().join("ui/shops.json")).unwrap();
+    assert_eq!(kept[&shop].transport, Some(t.clone()), "the shop is kept, with how to reach it");
+
+    // allowed in the rules (as 0.2.9's link left it), the shop not kept: FAILS before, Rent was on and every payment refused
+    let rules = json!({"allowlist": [shop.clone()], "counterparties": {shop.clone(): {"ln_node": node_hex}}});
+    let bx = start(rules, false, tweak);
+    let mut br = logged_in(&bx);
+    let o = offer(&br.get("/hashrate").body);
+    assert!(o.contains("value=\"try\"") && o.contains("<button disabled>Rent</button>"), "{o}");
+    let r = br.act("/hashrate", "/services", &[("action", "try"), ("url", &shop)]);
+    assert!(br.flash_after(&r).contains("Lazarus Stream is on Browse and allowed to be paid"));
+    let o = offer(&br.get("/hashrate").body);
+    assert!(!o.contains("Allow this hashmaker to be paid") && o.contains("<button>Rent</button>"), "kept and allowed: {o}");
 }
 
 /// Without an address renters outside can reach, the offer stays off public listings and the page
@@ -4409,6 +4563,111 @@ fn the_relay_passes_if_range_and_the_copys_validators() {
     assert_eq!(seen, vec![Some("\"v1\"".to_string()), Some("\"v0\"".to_string())]);
 }
 
+/// Sell → Add a service: Hashrate is among what it is, and leads to Sell → Hashrate (#46: a hashmaker looked for it
+/// among the types and took a while to find its page).
+#[cfg(unix)]
+#[test]
+fn add_a_service_has_a_hashrate_choice_that_leads_to_sell_hashrate() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"open": true, "settings": {}, "minersAddress": "umbrel.local:23340", "terms": {"priceMsat": 404000},
+                                     "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}],
+                                     "rentals": [], "paused": null}),
+        _ => json!({"error": "no"}),
+    });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let htok = dir.join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.join("hashrate-settings.json");
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example/")]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    // Add a service: among what it is, Hashrate, a page of its own that it leads to (#46: it was looked for here)
+    let p = br.get("/sell");
+    let kinds = &p.body[p.body.find("<legend>What is it?</legend>").unwrap()..];
+    let kinds = &kinds[..kinds.find("</fieldset>").unwrap()];
+    assert!(kinds.contains("<a class=\"choice\" href=\"./sell-hashrate\"><span><strong>Hashrate</strong>") && kinds.contains("Sell → Hashrate"), "{kinds}");
+    assert!(br.get("/sell-hashrate").body.contains("Renting out, you are the <strong>hashmaker</strong>"), "and it leads there");
+}
+
+/// The shop's route for pieces of work follows renting on or off however it changed, not only at Save: on VM 118 (0.2.9)
+/// renting turned back on after an upgrade restart left the shop without its /hashrate/ route, and the hashmaker
+/// paused with "your shop is not selling yet" till the UI restarted. The minute's reprice puts it back, and takes it out.
+#[cfg(unix)]
+#[test]
+fn the_hashrate_route_follows_renting_on_or_off_without_a_save() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"open": true, "settings": {}, "minersAddress": "umbrel.local:23340", "terms": {"priceMsat": 404000},
+                                     "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}],
+                                     "rentals": [], "paused": null}),
+        _ => json!({"error": "no"}),
+    });
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let htok = dir.join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.join("hashrate-settings.json");
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let (inv, info) = (mac(&[("invoices", &["read", "write"])]), mac(&[("info", &["read"])]));
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example/")]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price_mode", "fixed"),
+                                                          ("price_pct", "100"), ("price", "404"), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved. Renting is on."), "{}", br.flash_after(&r));
+    let route = || {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        c["routes"].as_array().unwrap().iter().any(|r| r["path"] == "/hashrate/")
+    };
+    assert!(route(), "saved on: the shop sells pieces of work");
+    let set_enabled = |on: bool| {
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        v["enabled"] = json!(on);
+        std::fs::write(&settings, v.to_string()).unwrap();
+    };
+    // off by the settings file: the route goes at the minute's reprice, with no Save
+    set_enabled(false);
+    bx._app.hash_reprice(false);
+    assert!(!route(), "renting off: no route");
+    // on again by the file (as after an upgrade restart): the route comes back by itself
+    set_enabled(true);
+    bx._app.hash_reprice(false);
+    assert!(route(), "renting on again: the route is back without a Save");
+    // the config written without it by something else (a shop saved while off, an older version): put back too
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    c["routes"].as_array_mut().unwrap().retain(|r| r["path"] != "/hashrate/");
+    std::fs::write(dir.join("config.json"), serde_json::to_string_pretty(&c).unwrap()).unwrap();
+    assert!(bx._app.hash_route_follows(), "written again");
+    assert!(route());
+    assert!(!bx._app.hash_route_follows(), "and nothing more to do: the shop is not restarted again");
+}
+
 /// The hashmaker's price follows the chain: by default what a piece of work is worth when mined, read through the
 /// signer from the XBT node, written for the hasher and into the shop's route alike. A new price waits for the
 /// rentals going on to end, no live price is no new rental, and a typed price is kept.
@@ -4641,6 +4900,38 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
     }
 }
 
+/// Just started, the renter is still looking for offers on Nostr: the page says so and looks again by itself, and the
+/// next look shows what it found, not the kept "looking" answer. On VM 118 (0.2.9) the renter's first look took 20 s and
+/// the page said "The hashrate service does not answer. It may still be starting".
+#[test]
+fn the_hashrate_page_says_it_is_looking_for_offers_while_the_renter_looks() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    static LOOKING: AtomicBool = AtomicBool::new(true);
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
+        ("GET", "/offers") if LOOKING.load(SeqCst) => json!({"offers": [], "looking": true, "relaysAnswered": true}),
+        ("GET", "/offers") => json!({"offers": [{"name": "Found miners", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(),
+                                                 "proves": true, "miners": 1, "freeMiners": 1, "freeHs": "4000000000000"}], "looking": false, "relaysAnswered": true}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("Looking for offers on Nostr") && p.body.contains("data-reload-after=\"5\""), "{}", p.body);
+    assert!(!p.body.contains("does not answer") && !p.body.contains("No miners for rent found"), "{}", p.body);
+    LOOKING.store(false, SeqCst);
+    let p = br.get("/hashrate");
+    assert!(p.body.contains("<h3>Found miners</h3>") && !p.body.contains("Looking for offers"), "found since: shown at once, {}", p.body);
+}
+
 /// The renter's offer card says the start fee, in sats and seconds, and a trial and a budget include it.
 #[test]
 fn an_offer_shows_its_start_fee() {
@@ -4671,7 +4962,12 @@ fn an_offer_shows_its_start_fee() {
     let big = card("Big miners");
     assert!(big.contains("Start fee: <strong>6,470 sats</strong>, about 14 seconds of a machine") && big.contains("paid first"), "{big}");
     assert!(big.contains("one piece of work and its start fee, about 9,705 sats"), "the trial pays the fee too: {big}");
-    assert!(big.contains("About an hour of one machine, with its start fee"), "{big}");
+    assert!(big.contains("About an hour of one machine, with its start fee, in whole tickets"), "{big}");
+    // the budget suggested in whole tickets: a piece of 3,235 sats is its own smallest ticket; 546 sats for a 40 sat piece
+    let budget = |c: &str| field(c, "budget").parse::<u64>().unwrap();
+    assert!(budget(&big) % 3235 == 0 && big.contains("in tickets of at least 3,235 sats"), "{big}");
+    let small = card("Old miners");
+    assert!(budget(&small) % 546 == 0 && small.contains("in tickets of at least 546 sats") && !small.contains("left under one ticket"), "{small}");
     let old = card("Old miners");
     assert!(old.contains("Needs updating") && old.contains("<button disabled>Rent</button>"), "{old}");
     assert!(!old.contains("Start fee"), "{old}");
@@ -4769,9 +5065,9 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     let mut br = logged_in(&bx);
     let p = br.get("/hashrate");
     assert!(p.body.contains("Set up your gateway") && p.body.contains("Stream Gateway (DATUM-compatible)"), "{}", p.body);
-    // the product name only where the page says Umbrel's DATUM Gateway app is for Bitcoin and won't work here
-    let warned = "Umbrel&#39;s own DATUM Gateway app is for Bitcoin, and won&#39;t work here.";
-    let warned_raw = "Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.";
+    // the product name only where the page says Umbrel's DATUM Gateway app mines the SHA-256 fork and won't work here
+    let warned = "Umbrel&#39;s own DATUM Gateway app mines the SHA-256 fork, and won&#39;t work here.";
+    let warned_raw = "Umbrel's own DATUM Gateway app mines the SHA-256 fork, and won't work here.";
     assert!(p.body.contains(warned) || p.body.contains(warned_raw), "{}", p.body);
     // and the credit to the gateway it is built on, by its repository's name (never the DATUM Gateway product name)
     let credit = "FlyTheElephant&#39;s datum_gateway</a>, with Lightning Stream&#39;s job masking.";
@@ -4791,9 +5087,20 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
         assert!(!conf.exists(), "{bad}");
     }
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", ADDR)]);
+    // the card in order: where its blocks pay, what goes in them (the node they come from, the owner's tag), then the advanced parts
+    let at = |s: &str| p.body.find(s).unwrap_or_else(|| panic!("{s} missing: {}", p.body));
+    assert!(at("<h3>Where its blocks pay</h3>") < at("<h3>Your blocks</h3>") && at("<h3>Your blocks</h3>") < at("name=\"coinbase_tag\"")
+            && at("name=\"coinbase_tag\"") < at("Advanced: the pool") && at("Advanced: the pool") < at("Advanced: use another gateway"));
+    assert!(p.body.contains("from your own XBT node, at <code>xbt-knots_bitcoind_1:18443</code>"), "{}", p.body);
+    // a tag outside DATUM's limits is refused, nothing written
+    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", ADDR), ("coinbase_tag", &"x".repeat(61))]);
+    assert!(br.flash_after(&r).contains("60 characters"));
+    assert!(!conf.exists());
+    let r = br.act("/hashrate", "/hashrate", &[("action", "gateway"), ("mode", "solo"), ("payout", ADDR), ("coinbase_tag", "Kilombino solo")]);
     assert!(br.flash_after(&r).starts_with("Saved."));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(&conf).unwrap()).unwrap();
+    assert_eq!(c["mining"]["coinbase_tag_secondary"], "Kilombino solo", "the owner's tag in the blocks it finds");
+    assert!(br.get("/hashrate").body.contains("name=\"coinbase_tag\" value=\"Kilombino solo\""), "and shown again");
     assert_eq!(c["datum"], json!({"pool_host": "", "pooled_mining_only": false}));
     assert_eq!(c["mining"]["pool_address"], ADDR);
     assert_eq!(c["bitcoind"]["rpcurl"], "http://xbt-knots_bitcoind_1:18443");
@@ -4820,6 +5127,120 @@ fn the_stream_gateways_settings_are_written_for_each_mode_with_the_address_check
     // no secret of the box's in it: not the renter's token, not the UI's password
     let text = std::fs::read_to_string(&conf).unwrap();
     assert!(!text.contains(&"r".repeat(64)) && !text.contains("rpcpassword") && !text.contains("rpcuser"));
+}
+
+/// A page as the bundled gateway serves it with no admin password: absolute links, its own inline style.
+const GW_THREADS: &str = "<!DOCTYPE html><html><head><title>DATUM Gateway Status</title><link rel=\"icon\" href=\"/assets/icons/favicon.ico\">\
+    <link rel=\"stylesheet\" href=\"./assets/style.css\"><style>td { word-break: break-all; }</style></head><body>\
+    <img src=\"/assets/icons/datum_logo.svg\"><a href=\"/\">Status</a><a href=\"/config\">Config</a><a href=\"/clients\">Clients</a>\
+    <a href=\"/threads\">Threads</a><a href=\"/coinbaser\">Coinbaser</a><h2>Thread Stats</h2><button disabled>Disconnect All</button></body></html>";
+
+/// The renter's control page with the bundled gateway up, and its status pages as `GET /gateway-page` passes them on.
+fn gateway_pages(m: &str, p: &str) -> Value {
+    use base64::Engine;
+    let b64 = |b: &str| base64::engine::general_purpose::STANDARD.encode(b);
+    match (m, p) {
+        ("GET", "/status") => bundled_status(true, Some(true), true, None),
+        ("GET", "/offers") => offers_one(),
+        ("GET", "/gateway-page?p=threads") => json!({"status": 401, "contentType": "text/html", "body": b64(GW_THREADS)}),
+        ("GET", "/gateway-page?p=assets/style.css") => json!({"status": 200, "contentType": "text/html", "body": b64("body { color: #fff }")}),
+        ("GET", "/gateway-page?p=coinbaser") => json!({"status": 500, "contentType": "text/html", "body": b64("<H1>oops</H1>")}),
+        ("GET", "/gateway-page?p=") => json!({"error": "the gateway's API at 127.0.0.1:7152: Connection refused"}),
+        _ => json!({"error": "no"}),
+    }
+}
+
+/// "Your gateway" leads to the bundled gateway's own status pages, shown as the gateway shows them under the app's login:
+/// their links kept on this page, their style and nothing else of their own (no script, no form goes anywhere), through the
+/// renter's control page with its token. Only those pages: never the job API, nothing that acts, nothing but a GET.
+#[test]
+fn the_bundled_gateways_own_status_pages_show_read_only_from_your_gateway() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, seen) = control_standin(gateway_pages);
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.stream_gw.rpcurl = Some("http://xbt-knots_bitcoind_1:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+    });
+    // not logged in: the login, and the renter is never asked
+    let mut anon = B::new(&bx.base);
+    let _ = anon.get("/");
+    let r = anon.get("/hashrate/gateway/threads");
+    assert!(r.status == 303 && !seen.lock().unwrap().iter().any(|(_, p, ..)| p.starts_with("/gateway-page")), "{} {}", r.status, r.location());
+    assert!(matches!(r.location(), "../../login" | "../../setup-password"), "the app's own login, not one under the gateway's pages (a redirect loop): {}", r.location());
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    let card = &p.body[p.body.find("id=\"gateway\"").unwrap()..];
+    assert!(card[..card.find("</section>").unwrap()].contains("<a href=\"./hashrate/gateway/\">Gateway status</a>"), "{}", p.body);
+    assert_eq!((br.get("/hashrate/gateway").status, br.get("/hashrate/gateway").location()), (303, "./gateway/"));
+    // its page, as it shows it (the 401 a gateway with no admin password answers /threads with is its page all the same)
+    let r = br.get("/hashrate/gateway/threads");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.headers["content-type"], "text/html; charset=utf-8");
+    assert!(r.body.contains("<h2>Thread Stats</h2>") && r.body.contains("<button disabled>Disconnect All</button>"));
+    for link in ["href=\"./\">Status", "href=\"./config\"", "href=\"./clients\"", "href=\"./threads\"", "href=\"./coinbaser\"",
+                 "src=\"./assets/icons/datum_logo.svg\"", "href=\"./assets/icons/favicon.ico\"", "href=\"./assets/style.css\""] {
+        assert!(r.body.contains(link), "{link}: {}", r.body);
+    }
+    assert!(!r.body.contains("href=\"/") && !r.body.contains("src=\"/"), "no link leaves the app: {}", r.body);
+    assert!(r.body.contains("<a href=\"../../hashrate#gateway\"") && r.body.contains("Back to Hashrate"), "{}", r.body);
+    let csp = &r.headers["content-security-policy"];
+    for d in ["default-src 'none'", "style-src 'self' 'unsafe-inline'", "form-action 'none'", "frame-ancestors 'none'"] {
+        assert!(csp.contains(d), "{d}: {csp}");
+    }
+    assert!(!csp.contains("script-src"), "no script runs on it: {csp}");
+    assert_eq!(r.headers["x-frame-options"], "DENY");
+    assert!(!r.headers.contains_key("www-authenticate"), "no login prompt for the gateway's admin");
+    // its style, as the type this page serves it as (not the one the gateway says)
+    let r = br.get("/hashrate/gateway/assets/style.css");
+    assert_eq!((r.status, r.headers["content-type"].as_str(), r.body.as_str()), (200, "text/css; charset=utf-8", "body { color: #fff }"));
+    // asked of the renter with its token, by name, and nothing else
+    {
+        let s = seen.lock().unwrap();
+        let asked: Vec<&(String, String, String, String)> = s.iter().filter(|(_, p, ..)| p.starts_with("/gateway-page")).collect();
+        assert_eq!(asked.iter().map(|(m, p, ..)| format!("{m} {p}")).collect::<Vec<_>>(),
+                   ["GET /gateway-page?p=threads", "GET /gateway-page?p=assets/style.css"]);
+        assert!(asked.iter().all(|(_, _, auth, _)| *auth == format!("Bearer {}", "r".repeat(64))));
+    }
+    // a gateway that isn't up, or answers with an error: said on the Hashrate page
+    for page in ["/hashrate/gateway/", "/hashrate/gateway/coinbaser"] {
+        let r = br.get(page);
+        assert_eq!((r.status, r.location()), (303, "../../hashrate#gateway"), "{page}");
+        let after = br.get("/hashrate").body;
+        assert!(after.contains("The Stream Gateway&#39;s status page isn&#39;t there now") || after.contains("The Stream Gateway's status page isn't there now"), "{page}");
+    }
+    // nothing but those pages, and nothing but a GET: the job API, a GET that acts, the admin's commands, a POST
+    let before = seen.lock().unwrap().iter().filter(|(_, p, ..)| p.starts_with("/gateway-page")).count();
+    for bad in ["/hashrate/gateway/xbt/job", "/hashrate/gateway/xbt/job?id=1&pot=0", "/hashrate/gateway/NOTIFY", "/hashrate/gateway/testnet_fastforward",
+                "/hashrate/gateway/cmd", "/hashrate/gateway/umbrel-api", "/hashrate/gateway//threads", "/hashrate/gateway/../xbt/job",
+                "/hashrate/gateway/threads%3Fx"] {
+        let r = br.get(bad);
+        assert_eq!(r.status, 404, "{bad}: {}", r.body);
+    }
+    let csrf = field(&br.get("/hashrate").body, "csrf");
+    assert_eq!(br.post("/hashrate/gateway/config", &[("csrf", csrf.as_str()), ("pool_host", "evil")]).status, 404);
+    assert_eq!(br.send("PUT", "/hashrate/gateway/config", Some("x"), &[]).status, 405);
+    assert_eq!(seen.lock().unwrap().iter().filter(|(_, p, ..)| p.starts_with("/gateway-page")).count(), before, "none of those reached the renter");
+    assert!(!seen.lock().unwrap().iter().any(|(m, p, ..)| m != "GET" && p.contains("gateway")));
+}
+
+/// An install without the bundled gateway has no link to its pages, and the pages aren't there.
+#[test]
+fn without_the_bundled_gateway_there_are_no_gateway_status_pages() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, seen) = control_standin(gateway_pages);
+    let bx = start(miners_allowed(), false, |c| c.hash.renter = Some(renter.clone()));
+    let mut br = logged_in(&bx);
+    assert!(!br.get("/hashrate").body.contains("hashrate/gateway/"));
+    let r = br.get("/hashrate/gateway/threads");
+    assert_eq!((r.status, r.location()), (303, "../../hashrate#gateway"));
+    assert!(!seen.lock().unwrap().iter().any(|(_, p, ..)| p.starts_with("/gateway-page")));
 }
 
 /// The bundled gateway's state on the rent page: running, connected to the node, masking, each said plainly, and

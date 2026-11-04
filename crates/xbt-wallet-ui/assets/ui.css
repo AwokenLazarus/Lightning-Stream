@@ -296,12 +296,15 @@ ol.steps { list-style: none; padding: 0; margin: 0; counter-reset: step; }
 .card.refusal h2 { color: var(--fg); }
 fieldset.choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px; border: none; padding: 0; margin: 0 0 8px; }
 fieldset.choices legend { padding: 0 0 6px; }
-label.choice { display: flex; gap: 10px; align-items: flex-start; margin: 0; padding: 14px 16px; background: var(--input); border: 1px solid var(--line-2);
+label.choice, a.choice { display: flex; gap: 10px; align-items: flex-start; margin: 0; padding: 14px 16px; background: var(--input); border: 1px solid var(--line-2);
                border-radius: var(--radius); color: var(--fg); cursor: pointer; transition: border-color 0.2s, box-shadow 0.2s, background 0.2s; }
-label.choice:hover { border-color: color-mix(in srgb, var(--fg) 28%, transparent); }
+label.choice:hover, a.choice:hover { border-color: color-mix(in srgb, var(--fg) 28%, transparent); }
 label.choice input { margin: 2px 0 0; }
-label.choice span { display: flex; flex-direction: column; gap: 2px; }
-label.choice small { color: var(--muted); }
+label.choice span, a.choice span { display: flex; flex-direction: column; gap: 2px; }
+label.choice small, a.choice small { color: var(--muted); }
+/* a choice that is a page of its own (Sell's Hashrate): a link dressed as the others, with no radio */
+a.choice { text-decoration: none; }
+a.choice strong::after { content: " \2192"; }
 label.choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 3px var(--accent-soft); }
 .price-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 12px; }
 @media (max-width: 520px) { .price-row { grid-template-columns: 1fr; } }

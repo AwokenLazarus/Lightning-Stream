@@ -426,7 +426,7 @@ impl App {
                 let sid = self.auth.new_session();
                 let page = match req.path.as_str() {
                     "/login" | "/setup-password" => "./".to_string(),
-                    p => format!(".{p}{}", query_string(&req.query)),
+                    p => format!("{}{}{}", to_root(p), &p[1..], query_string(&req.query)),
                 };
                 return Resp::redirect(&page).header("Set-Cookie", &self.cookie(&req, &sid, self.cfg.session_max.as_secs() as i64));
             }
@@ -446,7 +446,7 @@ impl App {
             if req.path.starts_with("/api/") {
                 return Resp::json(401, &json!({"error": "login required"}));
             }
-            return Resp::redirect("./login");
+            return Resp::redirect(&format!("{}login", to_root(&req.path)));
         };
         let ctx = Ctx { sid, csrf, flash };
         if post {
@@ -474,6 +474,8 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
+            "/hashrate/gateway" => Resp::redirect("./gateway/"),
+            p if p.starts_with("/hashrate/gateway/") => self.gateway_status_page(&ctx, &p["/hashrate/gateway/".len()..]),
             "/ai" => self.ai_page(&ctx, inference_page::page_host(&req)),
             "/vpn" => self.vpn_page(&ctx, &req.query),
             "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),
@@ -481,6 +483,7 @@ impl App {
             "/relays" => self.relays_page(&ctx, &req.query),
             "/app" => self.app_page(&ctx, &req.query),
             "/api/visit" => self.api_visit(&req.query),
+            "/api/hashrate-rentals" => self.api_hashrate_rentals(&ctx),
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
@@ -588,7 +591,7 @@ impl App {
         };
         if req.method != "POST" || req.path != "/setup-password" {
             if req.path != "/setup-password" && req.path != "/" {
-                return Resp::redirect("./setup-password");
+                return Resp::redirect(&format!("{}setup-password", to_root(&req.path)));
             }
             return form(None);
         }
@@ -2247,6 +2250,15 @@ fn capital(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
 
+/// The relative way from `path` to the app's root, as a link on its page: `./` for a page at the top (`/hashrate`), one
+/// `../` for each level below it (`/hashrate/gateway/threads`: `../../`), so a redirect lands at the top under any base path.
+fn to_root(path: &str) -> String {
+    match path.matches('/').count().saturating_sub(1) {
+        0 => "./".to_string(),
+        n => "../".repeat(n),
+    }
+}
+
 /// `?k=v&...` for a redirect back to the same page (empty when there is no query).
 fn query_string(q: &HashMap<String, String>) -> String {
     if q.is_empty() {
@@ -2705,7 +2717,7 @@ mod handson_0202_tests {
         let e = json!({"type": "ticket_prepay_refused_by_policy", "rule": "ticket_task_budget", "dest": "ln:aa",
                        "reason": "with this ticket's 915 sats, 10618 would be above the task's budget_sats (10000)"});
         let (what, words) = refusal_words(&e).unwrap();
-        assert!(what == "Today's limit for paid services is reached" && words.contains("Most for paid services"), "{what}: {words}");
+        assert!(what == "Today's limit for paid services would be passed" && words.contains("Most for paid services"), "{what}: {words}");
     }
 
     /// Recent activity names what happened in plain words: no `ticket:<hash>`, no "all policy rules passed", no signer

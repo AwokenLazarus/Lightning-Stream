@@ -119,6 +119,8 @@ struct Run {
     miners_done_ms: u64,
     miners: Vec<standin::MinerResult>,
     wallet_calls: Vec<Value>,
+    /// The renter's `xbt402_pay` tries ([`BUSY_PAYS`]), read before the next rental may start and count its own.
+    pay_tries: usize,
 }
 
 fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run {
@@ -158,7 +160,28 @@ fn cut(open: &Arc<Mutex<Vec<TcpStream>>>) {
 }
 
 fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut_after: Option<Duration>) -> Run {
+    rental_with(stop_paying_after, miner_secs, wallet, cut_after, &[])
+}
+
+/// The renter's `xbt402_pay`s that the signer's socket can't take, by number from 1, counted over each try: each
+/// fails as the write of a call does on a socket busy for a moment (`EAGAIN`), with none of it sent.
+static BUSY_PAYS: Mutex<(usize, Vec<usize>)> = Mutex::new((0, Vec::new()));
+
+fn busy_now_and_then(sock: &std::path::Path, method: &str, params: &Value, wait: Option<Duration>) -> Result<Value, (bool, String)> {
+    if method == "xbt402_pay" {
+        let mut g = BUSY_PAYS.lock().unwrap_or_else(|p| p.into_inner());
+        g.0 += 1;
+        if g.1.contains(&g.0) {
+            return Err((false, std::io::Error::from_raw_os_error(11).to_string()));
+        }
+    }
+    xbt_hashlink::rail::signer_call_waiting(sock, method, params, wait)
+}
+
+/// [`rental_cut`], the wallet's socket busy for the payments `busy` numbers ([`BUSY_PAYS`]).
+fn rental_with(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut_after: Option<Duration>, busy: &[usize]) -> Run {
     let _serial = serial();
+    *BUSY_PAYS.lock().unwrap_or_else(|p| p.into_inner()) = (0, busy.to_vec());
     let [pool_a, link_a, miners_a, slices_a, relay_a] = ports::<5>();
     let dir = tempdir();
     let pool_report = dir.join("pool.json");
@@ -199,8 +222,10 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
     };
     let calls: Arc<Mutex<Vec<Value>>> = Arc::default();
     let payer = wallet.then(|| {
-        SignerPayer::new(fake_wallet(&dir, slices_a.clone(), calls.clone()), "https://hashmaker.example/hashrate".into(), "hashrate".into(), terms().price_msat, None,
-                         Some(600), std::time::Duration::from_secs(5))
+        let mut p = SignerPayer::new(fake_wallet(&dir, slices_a.clone(), calls.clone()), "https://hashmaker.example/hashrate".into(), "hashrate".into(), terms().price_msat, None,
+                                     Some(600), std::time::Duration::from_secs(5));
+        p.call = busy_now_and_then;
+        p
     });
     let b = {
         let cfg = hashtaker::Config {
@@ -264,7 +289,8 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
         })
         .expect("the stand-in pool wrote its report within 10 s");
     let wallet_calls = calls.lock().unwrap().clone();
-    Run { hashmaker, hashtaker, pool, miners_done_ms, miners, wallet_calls }
+    let pay_tries = BUSY_PAYS.lock().unwrap_or_else(|p| p.into_inner()).0;
+    Run { hashmaker, hashtaker, pool, miners_done_ms, miners, wallet_calls, pay_tries }
 }
 
 fn w(v: &Value) -> u128 {
@@ -288,7 +314,10 @@ fn each_payment_was_due(b: &Value, terms: &Terms, sw: u128) {
 }
 
 fn paid_then_stopped(wallet: bool) {
-    let r = rental(None, 10, wallet);
+    check_paid_then_stopped(rental(None, 10, wallet), wallet);
+}
+
+fn check_paid_then_stopped(r: Run, wallet: bool) {
     let (s, sw) = (terms().slice_work, share_work(DIFF));
     let paid = r.hashmaker["paid"].as_u64().unwrap();
     assert!(paid >= 3, "only {paid} slices: {}", r.hashmaker);
@@ -390,6 +419,34 @@ fn paid_by_the_wallet_then_the_hash_stops() {
 #[test]
 fn unpaid_by_the_wallet_stops_the_hash() {
     unpaid_stops(true);
+}
+
+/// The renter's first payment finds the wallet's socket unable to take it for a moment (`EAGAIN`, as a real 24 h
+/// rental's did after 11 h): nothing was sent, so it is made again within the hashmaker's grace, the slice is paid
+/// once, and the rental goes on to its end as one that was never caught short.
+#[test]
+fn a_payment_the_wallets_socket_could_not_take_for_a_moment_is_made_again_and_the_rental_goes_on() {
+    let r = rental_with(None, 10, true, None, &[1]);
+    assert_eq!(r.pay_tries as u64, r.hashmaker["paid"].as_u64().unwrap() + 1, "one try more than the slices paid");
+    assert_eq!(r.hashtaker["payFailed"], false, "{}", r.hashtaker);
+    check_paid_then_stopped(r, true);
+}
+
+/// A socket that stays that way past the wait still fails the payment, as any failed payment does: no later slice is
+/// paid, the hashmaker stops at what was paid with no work past it, and the wallet was asked only for the slices paid.
+#[test]
+fn a_wallets_socket_that_stays_busy_still_ends_the_rental_unpaid() {
+    let r = rental_with(None, 20, true, None, &(3..10_000).collect::<Vec<_>>());
+    let paid = r.hashmaker["paid"].as_u64().unwrap();
+    assert_eq!(paid, 2, "{}", r.hashmaker);
+    assert_eq!(r.hashmaker["stopped"]["unpaidWork"], "0", "{}", r.hashmaker);
+    assert!(w(&r.hashmaker["stopped"]["work"]) <= order::paid_work(2, 0, terms().slice_work), "{}", r.hashmaker);
+    assert_eq!(r.hashtaker["payFailed"], true, "{}", r.hashtaker);
+    let last = r.hashtaker["pays"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!((last["slice"].as_u64(), last["ok"].as_bool(), last["why"].as_str()), (Some(3), Some(false), Some("Resource temporarily unavailable (os error 11)")), "{last}");
+    assert!(r.pay_tries > 3, "slice 3 was tried again within the wait");
+    assert_eq!(r.wallet_calls.iter().filter(|c| c["method"] == "xbt402_pay").count(), 2, "the wallet was asked only for the slices paid");
+    eprintln!("ended: hashmaker {:?}, hashtaker {:?}", r.hashmaker["stopped"]["reason"], r.hashtaker["closed"]);
 }
 
 /// The most a renter may have paid ahead of the work it has proven, in msat, just after paying a slice, by the
@@ -616,6 +673,25 @@ fn a_rental_survives_a_moment_without_its_link() {
     assert_eq!(r.hashmaker["meter"]["proven"], r.hashtaker["meter"]["proven"]);
     assert!(!r.hashmaker["stopped"]["reason"].as_str().unwrap_or("").starts_with("link lost"), "{}", r.hashmaker);
     assert_eq!(r.hashtaker["closed"], "no proven work", "it ended when the miners stopped, not when the link dropped");
+}
+
+/// The link drops for a moment while the wallet's socket can't take some payments for a moment, as in a real rental
+/// that ended after 11 h on both at once: the link is made again, each payment the socket could not take is made
+/// again, and the rental goes on to its end with every slice paid once.
+#[test]
+fn a_rental_paid_by_the_wallet_survives_a_dropped_link_and_a_busy_socket() {
+    let r = rental_with(None, 22, true, Some(Duration::from_secs(4)), &[2, 5, 9, 14, 20]);
+    let taker = r.hashtaker["events"].as_array().cloned().unwrap_or_default();
+    assert!(taker.iter().any(|e| e["ev"] == "link lost, dialling again"), "{}", r.hashtaker);
+    assert!(taker.iter().any(|e| e["ev"] == "rental resumed"), "{}", r.hashtaker);
+    let paid = r.hashmaker["paid"].as_u64().unwrap();
+    assert!(paid >= 6, "only {paid} slices: {}", r.hashmaker);
+    assert_eq!(r.hashtaker["payFailed"], false, "{}", r.hashtaker);
+    assert!(r.hashtaker["pays"].as_array().unwrap().iter().all(|p| p["ok"] == true), "{}", r.hashtaker);
+    assert_eq!(r.hashtaker["released"].as_u64().unwrap(), paid, "each slice paid once");
+    assert_eq!(r.wallet_calls.iter().filter(|c| c["method"] == "xbt402_pay").count() as u64, paid, "the wallet asked once a slice");
+    assert_eq!(r.hashmaker["meter"]["work"], r.hashtaker["meter"]["work"], "{} / {}", r.hashmaker, r.hashtaker);
+    assert_eq!(r.hashtaker["closed"], "no proven work", "it ended when the miners stopped");
 }
 
 /// A relay between the hashtaker and the hashmaker: it can lose what either side sends with the
