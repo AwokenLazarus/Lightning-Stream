@@ -684,9 +684,24 @@ async fn open(ep: &Endpoint, addr: &EndpointAddr, conn: &tokio::sync::Mutex<Opti
             return Some(s);
         }
     }
-    let fresh = ep.connect(addr.clone(), alpn).await.ok()?;
+    // why a link could not be made is said, not dropped: a stream that fails is all its caller sees ("failed to fill
+    // whole buffer" on a link that dropped). Only the error's own line, no source chain, so no address goes with it
+    let peer_short = &hex::encode(addr.id.as_bytes())[..12];
+    let fresh = match ep.connect(addr.clone(), alpn).await {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("link: {peer_short} connect failed: {e}");
+            return None;
+        }
+    };
     watch(fresh.clone(), paths.clone(), detail);
-    let s = fresh.open_bi().await.ok()?;
+    let s = match fresh.open_bi().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("link: {peer_short} stream on a new connection failed: {e}");
+            return None;
+        }
+    };
     *c = Some(fresh);
     Some(s)
 }
