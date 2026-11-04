@@ -202,6 +202,85 @@ pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
     p
 }
 
+/// The ticket task a rented miner's pieces of work are paid under (the renter names it on every payment).
+pub const HASHRATE_TASK: &str = "hashrate";
+
+/// What the signed rules say of renting hashrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RentRules {
+    /// Stream tickets are on and the rules have a `hashrate` task.
+    Allowed,
+    /// Stream tickets are on, but no `hashrate` task: the wallet refuses every rental's payment
+    /// (0.2.11 on rules signed before the task: `no_rail`, "names no task \"hashrate\"").
+    NoTask,
+    /// Stream tickets are off, and rentals are paid with them.
+    TicketsOff,
+}
+
+/// What the rules `p` (policy.json as signed) say of renting hashrate. Tickets are on as the signer reads
+/// `tickets.enabled` (any value that is not false, 0, empty or missing), and a task is there when it is an object.
+pub fn rent_rules(p: &Value) -> RentRules {
+    let t = &p["tickets"];
+    let on = match t.get("enabled") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_none_or(|f| f != 0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+    };
+    if !on {
+        RentRules::TicketsOff
+    } else if t["tasks"][HASHRATE_TASK].is_object() {
+        RentRules::Allowed
+    } else {
+        RentRules::NoTask
+    }
+}
+
+/// The `hashrate` task as the starter rules for `chain` set it ([`starter_policy_for`]).
+pub fn starter_hashrate_task(chain: &str) -> Value {
+    starter_policy(chain)["tickets"]["tasks"][HASHRATE_TASK].clone()
+}
+
+/// The rules `p` with only the `hashrate` task added, at the starter values for `chain`: every other
+/// key is as it was. None where tickets are off or the task is there already.
+pub fn with_hashrate_task(p: &Value, chain: &str) -> Option<Value> {
+    if rent_rules(p) != RentRules::NoTask {
+        return None;
+    }
+    let mut q = p.clone();
+    let t = q.get_mut("tickets")?.as_object_mut()?;
+    let tasks = t.entry("tasks").or_insert_with(|| json!({}));
+    // tasks that are not an object are no tasks at all to the signer
+    if !tasks.is_object() {
+        *tasks = json!({});
+    }
+    tasks.as_object_mut()?.insert(HASHRATE_TASK.into(), starter_hashrate_task(chain));
+    Some(q)
+}
+
+/// The `hashrate` task `task`, read-only, in words: its budget and window, and a rental's own caps.
+pub(crate) fn hashrate_task_rows(task: &Value) -> String {
+    let n = |v: &Value| v.as_i64();
+    let mut rows: Vec<(&str, String)> = vec![];
+    let window = n(&task["window_s"]).unwrap_or(86_400);
+    let span = if window == 86_400 { "any 24 hours".to_string() } else if window % 3600 == 0 { format!("any {} hours", window / 3600) } else { format!("any {window} seconds") };
+    rows.push(("Most for rented hashrate", match n(&task["budget_sats"]) {
+        Some(b) => format!("{} in {span}", money(b)),
+        None => "no budget set: nothing is paid".into(),
+    }));
+    if let Some(r) = task["rental"].as_object() {
+        if let Some(t) = r.get("max_ticket_sats").and_then(Value::as_i64) {
+            rows.push(("Largest ticket for a rental", money(t)));
+        }
+        if let Some(s) = r.get("max_sends_per_hour").and_then(Value::as_i64) {
+            rows.push(("Most payments an hour for a rental", crate::html::group3(s.unsigned_abs())));
+        }
+    }
+    kv(&rows)
+}
+
 /// The rows of Recent activity on the Wallet page, and with Show more.
 const RECENT_ROWS: usize = 15;
 const RECENT_MORE: usize = 200;
@@ -491,7 +570,8 @@ impl App {
                 Some("cap") => self.policy_fix_cap(&ctx),
                 _ => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false),
                                       req.query.get("allow").zip(req.query.get("node")).map(|(a, n)| (a.as_str(), n.as_str())),
-                                      &req.query.get("drop").and_then(|d| crate::services::http_origin(d)).into_iter().collect::<Vec<_>>()),
+                                      &req.query.get("drop").and_then(|d| crate::services::http_origin(d)).into_iter().collect::<Vec<_>>(),
+                                      req.query.get("task").map(String::as_str)),
             },
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
@@ -1139,6 +1219,16 @@ impl App {
                 fields.push_str(&format!("<label>{}<input name=\"f_tickets_budget_sats\" value=\"{}\" inputmode=\"numeric\"></label>\
                     <p class=\"hint\">What the app may pay shops for web apps, files and AI, a little at a time, in any 24 hours. \
                     It counts within the spending limit above.</p>", esc(TICKETS_BUDGET_LABEL), esc(&value)));
+                // renting hashrate: its own task, shown read-only (changed in Advanced, or added from Buy → Hashrate)
+                match rent_rules(p) {
+                    RentRules::Allowed => fields.push_str(&format!("<div id=\"renting-hashrate\"><p><strong>Renting hashrate</strong></p>{}\
+                        <p class=\"hint\">What rented miners' work may cost, apart from the limits above. To change it, edit the rules as a file under \
+                        Advanced below.</p></div>", hashrate_task_rows(&p["tickets"]["tasks"][HASHRATE_TASK]))),
+                    RentRules::NoTask => fields.push_str("<div id=\"renting-hashrate\"><p><strong>Renting hashrate</strong></p>\
+                        <p class=\"hint\">Not allowed: your rules have no budget for renting hashrate, so the wallet pays no rental. \
+                        <a href=\"./policy?task=hashrate\">Allow renting hashrate in your spending rules</a></p></div>"),
+                    RentRules::TicketsOff => {}
+                }
             }
             if g == "anchor" {
                 fields.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the separate record keeper (after a restart)</label>",
@@ -1327,13 +1417,24 @@ impl App {
         b
     }
 
-    fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>, drop: &[String]) -> Resp {
+    fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>, drop: &[String], task: Option<&str>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
             Err(e) => return self.page("Spending rules", ctx, Self::error_box(&e)),
         };
+        // `?task=hashrate`, from Buy → Hashrate: the signed rules with only the hashrate task added, to sign
+        let task_note = match (task, rent_rules(&cur["policy"])) {
+            (Some(HASHRATE_TASK), RentRules::NoTask) => return self.hashrate_task_page(ctx, &cur["policy"]),
+            (Some(HASHRATE_TASK), RentRules::Allowed) => "<div class=\"flash ok\"><p>Renting hashrate is already allowed in your spending rules: \
+                see Renting hashrate below.</p></div>",
+            (Some(HASHRATE_TASK), RentRules::TicketsOff) => "<div class=\"flash warn\"><p>Stream tickets are off in your spending rules, and rented \
+                hashrate is paid with them. The safe starter rules turn them on, with renting hashrate; or turn <code>tickets.enabled</code> on under \
+                Advanced and sign.</p></div>",
+            _ => "",
+        };
         let mut b = String::from("<p class=\"lead\">The rules the wallet applies to every payment an app or an agent asks for. A change takes \
             effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
+        b.push_str(task_note);
         b.push_str(&self.blocked_sellers(ctx));
         let pr = cur["pending_restart"].as_array().cloned().unwrap_or_default();
         if !pr.is_empty() {
@@ -1406,6 +1507,34 @@ impl App {
         b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns, drop));
         b.push_str(&format!("<details><summary>Advanced: the rules file's fingerprint</summary><p class=\"small\">policy.json SHA-256 <code>{}</code></p></details>",
                             escv(cur.get("sha256"))));
+        self.page("Spending rules", ctx, b)
+    }
+
+    /// The signed rules `p` with only the hashrate task added at the starter values for this chain, for the owner
+    /// to review and sign: the exact rules go as the rules file (the form's JSON mode), so no other field changes,
+    /// not even one the plain form would fill with its starter value. Nothing is signed here.
+    fn hashrate_task_page(&self, ctx: &Ctx, p: &Value) -> Resp {
+        let chain = self.signer_chain();
+        let Some(q) = with_hashrate_task(p, &chain) else { return Resp::redirect("./policy") };
+        let mut b = String::from("<p class=\"lead\">The rules the wallet applies to every payment an app or an agent asks for. A change takes \
+            effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
+        b.push_str("<section class=\"card\" id=\"add-hashrate-task\"><h2>Allow renting hashrate</h2>\
+            <p>Your spending rules have stream tickets on, but nothing for renting hashrate, so your wallet refuses to pay for rented \
+            miners' work. This adds only that, at the starter values. Everything else in your rules stays exactly as you signed it.</p>");
+        b.push_str(&hashrate_task_rows(&q["tickets"]["tasks"][HASHRATE_TASK]));
+        // one task not named "default" takes the payments that name none; with a second, those are refused
+        let others: Vec<String> = p["tickets"]["tasks"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        if let [only] = others.as_slice() {
+            if only != "default" {
+                b.push_str(&format!("<p class=\"hint warn\">Your rules have one other ticket task, <code>{}</code>, which now takes every payment that \
+                    names no task. With two tasks, such a payment is refused unless one of them is named <code>default</code>.</p>", esc(only)));
+            }
+        }
+        b.push_str(&format!("<form method=\"post\" action=\"./policy\">{}<input type=\"hidden\" name=\"mode\" value=\"json\">\
+            <input type=\"hidden\" name=\"json\" value=\"{}\"><div class=\"row\"><button>Review the change</button> \
+            <a href=\"./hashrate\">Cancel</a></div></form><p class=\"small\">You sign the change with your approval key on the next page. \
+            To change other rules, open <a href=\"./policy\">all your spending rules</a>.</p></section>",
+            Self::csrf_input(ctx), esc(&serde_json::to_string_pretty(&q).unwrap_or_default())));
         self.page("Spending rules", ctx, b)
     }
 
@@ -2327,6 +2456,13 @@ fn change_words(k: &str, old: Option<&Value>, new: Option<&Value>) -> (String, V
                     if let Some(rest) = d.strip_prefix("tasks › default › budget_sats:") {
                         *d = format!("{label}:{rest}");
                     }
+                    for (raw, words) in [("tasks › hashrate › budget_sats:", "Renting hashrate, most in its window:"),
+                                         ("tasks › hashrate › rental › max_ticket_sats:", "Renting hashrate, largest ticket for a rental:"),
+                                         ("tasks › hashrate › rental › max_sends_per_hour:", "Renting hashrate, most payments an hour for a rental:")] {
+                        if let Some(rest) = d.strip_prefix(raw) {
+                            *d = format!("{words}{rest}");
+                        }
+                    }
                 }
             }
             match old {
@@ -2558,6 +2694,52 @@ mod change_tests {
     /// (0.2.1: a node wrapped in a free-text box and was saved without it), and a form with no list of
     /// sellers (an older page) keeps them as they are.
     ///
+    /// Rules signed before the hashrate task (VM 118): only that task is added, at the starter values for the chain,
+    /// and every other field is as signed, compared field by field.
+    #[test]
+    fn the_hashrate_task_is_added_alone_at_the_starter_values() {
+        let signed = json!({"allowlist": ["https://a.example"], "counterparties": {"https://a.example": {"ln_node": "02".repeat(33)}},
+                            "max_per_tx_sats": 1234, "daily_budget_sats": 5678, "human_pubkey": "ab".repeat(32), "anchor_required": true,
+                            "ln": {"enabled": true, "exposure_cap_sats": 3_000_000, "split_height": MAINNET_SPLIT_HEIGHT},
+                            "tickets": {"enabled": true, "mainnet_ack": "yes", "max_ticket_sats": 5000, "tasks": {"default": {"budget_sats": 7777, "window_s": 3600}}},
+                            "some_future_key": [1, 2]});
+        assert_eq!(rent_rules(&signed), RentRules::NoTask);
+        for chain in ["main", "regtest"] {
+            let q = with_hashrate_task(&signed, chain).unwrap();
+            assert_eq!(rent_rules(&q), RentRules::Allowed);
+            assert_eq!(q["tickets"]["tasks"][HASHRATE_TASK], starter_policy(chain)["tickets"]["tasks"]["hashrate"], "{chain}");
+            let (a, b) = (signed.as_object().unwrap(), q.as_object().unwrap());
+            assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+            for (k, v) in a {
+                if k == "tickets" {
+                    let (ta, tb) = (v.as_object().unwrap(), b[k].as_object().unwrap());
+                    assert_eq!(ta.keys().collect::<Vec<_>>(), tb.keys().collect::<Vec<_>>());
+                    for (tk, tv) in ta {
+                        if tk == "tasks" {
+                            let mut want = tv.as_object().unwrap().clone();
+                            want.insert(HASHRATE_TASK.into(), starter_hashrate_task(chain));
+                            assert_eq!(tb[tk], Value::Object(want), "{chain}");
+                        } else {
+                            assert_eq!(&tb[tk], tv, "{chain} tickets.{tk}");
+                        }
+                    }
+                } else {
+                    assert_eq!(&b[k], v, "{chain} {k}");
+                }
+            }
+        }
+        assert_eq!(starter_hashrate_task("main"), json!({"budget_sats": STARTER_RENTAL_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}));
+        assert_eq!(starter_hashrate_task("regtest"), json!({"budget_sats": 100000}));
+        // already there, or tickets off: nothing to add
+        assert_eq!(with_hashrate_task(&starter_policy("main"), "main"), None);
+        assert_eq!(rent_rules(&json!({"tickets": {"enabled": false, "tasks": {}}})), RentRules::TicketsOff);
+        assert_eq!(rent_rules(&json!({})), RentRules::TicketsOff);
+        assert_eq!(with_hashrate_task(&json!({"tickets": {"enabled": false}}), "main"), None);
+        // a tickets section with no tasks gets one
+        let q = with_hashrate_task(&json!({"tickets": {"enabled": true}}), "regtest").unwrap();
+        assert_eq!(q, json!({"tickets": {"enabled": true, "tasks": {"hashrate": {"budget_sats": 100000}}}}));
+    }
+
     /// FAILS before: the parse read free text, and a line with no node dropped `ln_node`.
     #[test]
     fn the_rules_form_takes_whole_sellers_out_and_never_a_node() {

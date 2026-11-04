@@ -5,6 +5,25 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.12 (2026-11-04)
+
+A fix for renting hashrate on spending rules signed before renting hashrate existed. The wallet UI changes.
+
+- **Rules signed before renting hashrate get a way to add it.** Spending rules signed before the app could rent
+  hashrate have stream tickets on but no budget for it, so the wallet refused every rental's first payment, while Buy →
+  Hashrate said "Ready to rent". The page now says "Your spending rules don't allow renting hashrate yet", with a
+  button, "Allow renting hashrate in your spending rules". It opens your signed rules with only that added, at the
+  starter values (on mainnet 200,000 sats in any 24 hours, tickets of up to 10,000 sats, at most 600 payments an
+  hour). Everything else stays exactly as you signed it, and you sign the change with your approval key as usual.
+  Rent stays off, and says why, until the rules have it.
+- **Stream tickets off is said too.** When the rules have stream tickets off, the Hashrate page says so and points
+  to the spending rules, and Rent stays off.
+- **A rental refused for it says why.** A rental card whose payment was refused because the rules have no task for
+  it says "Your spending rules don't allow renting hashrate yet. Nothing was paid.", with the same button. A refusal
+  with no way to pay lists why each way was passed over, in words.
+- **The rules page shows the budget for renting hashrate,** read-only, under "Renting hashrate", or says it is
+  missing, with the link to add it.
+
 ## 0.2.11 (2026-11-04)
 
 Hashrate fixes sent by a hashmaker who runs the app. The wallet UI and the hashrate component change.

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{App, Ctx};
+use super::{rent_rules, App, Ctx, RentRules};
 use crate::html::{esc, short};
 use crate::server::Resp;
 
@@ -418,14 +418,62 @@ fn pay_address_gone(why: &str) -> bool {
      "cannot reach", "no such host", "failed to lookup", "dns"].iter().any(|m| w.contains(m))
 }
 
+/// The button that opens the spending rules with only the hashrate task added, for the owner to sign.
+const ALLOW_TASK_BUTTON: &str = "<p><a class=\"button\" href=\"./policy?task=hashrate\">Allow renting hashrate in your spending rules</a></p>";
+
+/// What Buy → Hashrate says when the signed rules don't let a rental be paid: a heading, and what to do. None: they do.
+fn rules_notice(r: RentRules) -> Option<(&'static str, String)> {
+    match r {
+        RentRules::Allowed => None,
+        RentRules::NoTask => Some(("Your spending rules don't allow renting hashrate yet", format!(
+            "<p>Your wallet would refuse to pay for the miners' work, so Rent stays off and nothing is paid. The button adds renting hashrate \
+             to your spending rules at the starter values, for you to sign. Everything else in them stays as you signed it.</p>{ALLOW_TASK_BUTTON}"))),
+        RentRules::TicketsOff => Some(("Stream tickets are off in your spending rules",
+            "<p>Rented hashrate is paid with stream tickets, so Rent stays off and nothing is paid. Turn them on in your \
+             <a href=\"./policy\">spending rules</a> (the safe starter rules turn them on, with renting hashrate), and sign.</p>".to_string())),
+    }
+}
+
+/// The ticket task a refusal says the owner's rules don't name (`the owner's policy names no task "hashrate" (tickets.tasks)`):
+/// in its reason, or, for a refusal with no way to pay (`no_rail`), in why each way was passed over.
+fn missing_task(v: &Value) -> Option<String> {
+    std::iter::once(v["reason"].as_str())
+        .chain(v["rails_passed_over"].as_array().into_iter().flatten().map(|r| r["why"].as_str()))
+        .flatten()
+        .find_map(|w| {
+            const AT: &str = "names no task \"";
+            let rest = &w[w.find(AT)? + AT.len()..];
+            Some(rest[..rest.find('"')?].to_string()).filter(|t| !t.is_empty())
+        })
+}
+
 /// A payment the wallet refused (its answer as the renter kept it: `{"verdict":"deny","rule":…,"reason":…}`), in words,
-/// with what to do for the rules an owner meets most. None: not a refusal of the wallet's.
+/// with what to do for the rules an owner meets most. None: not a refusal of the wallet's. Never the answer itself.
 fn wallet_refusal(why: &str) -> Option<String> {
     let v: Value = serde_json::from_str(why).ok()?;
     if v["verdict"] != "deny" {
         return None;
     }
     let rule = v["rule"].as_str().unwrap_or("");
+    let code = format!(" <span class=\"small\">(rule: <code>{}</code>)</span>", esc(if rule.is_empty() { "none given" } else { rule }));
+    // rules signed before the hashrate task (0.2.11, VM 118): a ticket task the owner's rules don't have, said as that, with the way to add it
+    if let Some(task) = missing_task(&v) {
+        return Some(if task == crate::app::HASHRATE_TASK {
+            format!("<p class=\"hint\">Your spending rules don't allow renting hashrate yet. Nothing was paid.{code}</p>{ALLOW_TASK_BUTTON}")
+        } else {
+            format!("<p class=\"hint\">Your spending rules have no ticket task named <code>{}</code>, which this payment is made under. Nothing was paid. \
+                     Add it in your <a href=\"./policy\">spending rules</a> and sign them.{code}</p>", esc(&task))
+        });
+    }
+    let passed: Vec<&str> = v["rails_passed_over"].as_array().into_iter().flatten().filter_map(|r| r["why"].as_str()).collect();
+    if rule == "no_rail" && passed.iter().any(|w| w.contains("(tickets.enabled)")) {
+        return Some(format!("<p class=\"hint\">Stream tickets are off in your spending rules, and rented hashrate is paid with them. Nothing was paid. \
+            Turn them on in your <a href=\"./policy\">spending rules</a> and sign them.{code}</p>"));
+    }
+    if passed.iter().any(|w| w.starts_with("mainnet_ack:")) {
+        return Some(format!("<p class=\"hint\">Your wallet hasn't been told yet that it may pay with real money. Nothing was paid. \
+            Press Start paying on <a href=\"./lightning#ack\">Your node</a>.{code}</p>"));
+    }
     // one with no reason in words is left unsaid, as before: the end of the rental says the rest
     let reason = v["reason"].as_str().map(|r| r.trim().trim_end_matches('.')).filter(|r| !r.is_empty())?;
     let todo = match rule {
@@ -437,8 +485,13 @@ fn wallet_refusal(why: &str) -> Option<String> {
             (<a href=\"./policy\">Settings → Spending rules</a>).",
         _ => "",
     };
-    Some(format!("<p class=\"hint\">Your wallet refused to pay this hashmaker: {}.{todo} <span class=\"small\">(rule: <code>{}</code>)</span></p>",
-                 esc(reason), esc(if rule.is_empty() { "none given" } else { rule })))
+    // no way to pay: why each was passed over, in the wallet's words
+    let over = if rule == "no_rail" && !passed.is_empty() {
+        format!("<ul class=\"small\">{}</ul>", passed.iter().map(|w| format!("<li>{}</li>", esc(w.trim_end_matches('.')))).collect::<String>())
+    } else {
+        String::new()
+    };
+    Some(format!("<p class=\"hint\">Your wallet refused to pay this hashmaker: {}.{todo}{code}</p>{over}", esc(reason)))
 }
 
 /// A closed rental's reason, in words.
@@ -956,8 +1009,21 @@ impl App {
         let masked = st["blinding"]["state"] == "blinded";
         let ready = reachable && masked;
         let (class, head, next) = rent_status(&st, self.stream_gw_here(), self.stream_gw_settings().is_some());
-        b.push_str(&format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{head}</p>{}</section>",
-                            if next.is_empty() { String::new() } else { format!("<p>{}</p>", esc(&next)) }));
+        // the signed spending rules: a rental is paid with stream tickets, under their hashrate task (0.2.11 said "Ready to rent"
+        // on rules signed before that task, and every rental's first payment was refused). Unread, nothing is said here.
+        let rules = self.call("policy_get", json!({})).map(|v| rent_rules(&v["policy"])).unwrap_or(RentRules::Allowed);
+        match rules_notice(rules) {
+            // the gateway is ready: the rules are what renting waits for
+            Some((rhead, rbody)) if class == "good" => b.push_str(&format!(
+                "<section class=\"status warn\" id=\"rent-rules\" aria-live=\"polite\"><p class=\"status-head\">{rhead}</p>{rbody}</section>")),
+            notice => {
+                b.push_str(&format!("<section class=\"status {class}\" aria-live=\"polite\"><p class=\"status-head\">{head}</p>{}</section>",
+                                    if next.is_empty() { String::new() } else { format!("<p>{}</p>", esc(&next)) }));
+                if let Some((rhead, rbody)) = notice {
+                    b.push_str(&format!("<section class=\"card\" id=\"rent-rules\"><p><strong>{rhead}</strong></p>{rbody}</section>"));
+                }
+            }
+        }
         // moved to the bundled gateway at the upgrade: said once it happened, with the way back
         if let Some(from) = st["datum"]["movedFrom"].as_str().filter(|_| st["bundled"]["inUse"] == true) {
             b.push_str(&format!("<section class=\"card\"><p>Rented work now goes to the {} that comes with this app. It went to <code>{}</code> before, \
@@ -1055,13 +1121,14 @@ impl App {
                     };
                     // this box's own offer: marked, and not rented (a box can't pay itself)
                     let mine = own_offer(self.is_own_shop(pay_url), &own_pay, pay_url);
-                    let can = ready && allowed && !old && !mine && (free > 0 || total == 0);
+                    let can = ready && rules == RentRules::Allowed && allowed && !old && !mine && (free > 0 || total == 0);
                     // why Rent is off, said beside the buttons (and as their tooltip), so nobody is left guessing
-                    let why_off = rent_off_reasons(ready, head, allowed, old, mine, free, total);
+                    let why_off = rent_off_reasons(ready, head, rules, allowed, old, mine, free, total);
                     let (off_tip, off_note) = if can || why_off.is_empty() { (String::new(), String::new()) } else {
                         (format!(" title=\"Rent is off: {}\"", esc(&why_off.join("; "))),
-                         format!("<div class=\"hint rent-off\"><strong>Rent is off because:</strong><ul>{}</ul></div>",
-                                 why_off.iter().map(|w| format!("<li>{}</li>", esc(w))).collect::<String>()))
+                         format!("<div class=\"hint rent-off\"><strong>Rent is off because:</strong><ul>{}</ul>{}</div>",
+                                 why_off.iter().map(|w| format!("<li>{}</li>", esc(w))).collect::<String>(),
+                                 if rules == RentRules::NoTask { ALLOW_TASK_BUTTON } else { "" }))
                     };
                     // the seller by name: an offer called just "Hashrate" says whose it is
                     let seller = offer_seller(&known, pay_url);
@@ -1279,7 +1346,9 @@ fn priced_high(mine: f64, others: &[f64], market: Option<f64>) -> String {
 
 /// Why an offer's Rent (and Try one slice first) is off, in the order a renter fixes them; empty when it is on.
 /// `gateway` is the heading `rent_status` gives the gateway's state, so the reason matches the notice on the page.
-fn rent_off_reasons(ready: bool, gateway: &str, allowed: bool, old: bool, mine: bool, free: u64, total: u64) -> Vec<String> {
+/// `rules`: what the signed spending rules say of renting.
+#[allow(clippy::too_many_arguments)]
+fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool, old: bool, mine: bool, free: u64, total: u64) -> Vec<String> {
     let mut why = Vec::new();
     if mine {
         why.push("This is your own box's offer: buyers rent it from their apps".to_string());
@@ -1287,6 +1356,12 @@ fn rent_off_reasons(ready: bool, gateway: &str, allowed: bool, old: bool, mine: 
     }
     if !ready {
         why.push(format!("{} (see Your gateway below)", gateway.trim_end_matches('.')));
+    }
+    match rules {
+        RentRules::NoTask => why.push("Your spending rules don't allow renting hashrate yet: press Allow renting hashrate in your spending rules, \
+                                       and sign the change".to_string()),
+        RentRules::TicketsOff => why.push("Stream tickets are off in your spending rules: turn them on, and sign the change".to_string()),
+        RentRules::Allowed => {}
     }
     if !allowed {
         why.push("This hashmaker isn't allowed to be paid yet: press Allow this hashmaker to be paid above, and sign the change".to_string());
@@ -2007,16 +2082,16 @@ mod tests {
 
     #[test]
     fn a_disabled_rent_says_why() {
-        let r = super::rent_off_reasons(false, "Your gateway isn't running", false, false, false, 1, 1);
+        let r = super::rent_off_reasons(false, "Your gateway isn't running", RentRules::Allowed, false, false, false, 1, 1);
         assert_eq!(r.len(), 2, "{r:?}");
         assert!(r[0].starts_with("Your gateway isn't running"), "{r:?}");
         assert!(r[1].contains("Allow this hashmaker to be paid"), "{r:?}");
-        let r = super::rent_off_reasons(true, "", true, true, false, 0, 3);
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, true, false, 0, 3);
         assert!(r[0].contains("needs updating") && r[1].contains("rented right now"), "{r:?}");
-        let r = super::rent_off_reasons(false, "Set up your gateway", false, true, true, 0, 1);
+        let r = super::rent_off_reasons(false, "Set up your gateway", RentRules::Allowed, false, true, true, 0, 1);
         assert_eq!(r, vec!["This is your own box's offer: buyers rent it from their apps".to_string()]);
-        assert!(super::rent_off_reasons(true, "", true, false, false, 1, 1).is_empty());
-        assert!(super::rent_off_reasons(true, "", true, false, false, 0, 0).is_empty(), "no machine count given is not 'all rented'");
+        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 1, 1).is_empty());
+        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 0, 0).is_empty(), "no machine count given is not 'all rented'");
     }
 
     /// A price saved with no rental going on is in force at once and holds no new rental: the first price, a
@@ -2378,6 +2453,58 @@ mod tests {
                        "live": {"closed": "the first slice could not be paid", "pays": [{"slice": 1, "ok": false, "why": transport.to_string()}]}});
         let card = rental_card(&ctx, &r, "./hashrate");
         assert!(card.contains("<strong>Ended:</strong> your wallet could not pay for the first piece of work") && card.contains("add the shop on"), "{card}");
+    }
+
+    /// FAILS before (0.2.11, VM 118): rules signed before the hashrate task refused the first slice with `no_rail`, its
+    /// reason only in `rails_passed_over[].why`, and the card said a generic refusal. Now it says the rules don't allow
+    /// renting hashrate yet, that nothing was paid, with the button that adds the task; never the wallet's JSON.
+    #[test]
+    fn a_no_rail_refusal_for_a_missing_task_says_so_with_the_way_to_add_it() {
+        let deny = json!({"verdict": "deny", "rule": "no_rail", "charged_sats": 0,
+                          "reason": "the seller's 402 offers no way to pay that this wallet's policy allows (it offers: xbt-ticket on this wallet's Lightning network)",
+                          "rails_passed_over": [{"rail": "ticket", "why": "the owner's policy names no task \"hashrate\" (tickets.tasks)"}]});
+        let w = wallet_refusal(&deny.to_string()).unwrap();
+        assert!(w.contains("Your spending rules don't allow renting hashrate yet. Nothing was paid.") && w.contains("./policy?task=hashrate")
+                && w.contains("Allow renting hashrate in your spending rules"), "{w}");
+        assert!(!w.contains('{') && !w.contains("rails_passed_over") && !w.contains("offers no way to pay"), "no raw answer: {w}");
+        // the same refusal straight from the ticket rail
+        let direct = json!({"verdict": "deny", "rule": "ticket_task", "reason": "the owner's policy names no task \"hashrate\" (tickets.tasks)"});
+        assert!(wallet_refusal(&direct.to_string()).unwrap().contains("don't allow renting hashrate yet"));
+        // another task: named, with the rules to add it in
+        let other = json!({"verdict": "deny", "rule": "no_rail", "reason": "no way",
+                           "rails_passed_over": [{"rail": "ticket", "why": "the owner's policy names no task \"films\" (tickets.tasks)"}]});
+        let w = wallet_refusal(&other.to_string()).unwrap();
+        assert!(w.contains("no ticket task named <code>films</code>") && w.contains("Nothing was paid") && w.contains("./policy") && !w.contains("task=hashrate"), "{w}");
+        // tickets off, nested
+        let off = json!({"verdict": "deny", "rule": "no_rail", "reason": "no way",
+                         "rails_passed_over": [{"rail": "ticket", "why": "stream tickets are off in this policy (tickets.enabled)"}]});
+        assert!(wallet_refusal(&off.to_string()).unwrap().contains("Stream tickets are off in your spending rules"));
+        // any other no_rail: each way passed over, in words
+        let any = json!({"verdict": "deny", "rule": "no_rail", "reason": "the seller's 402 offers no way to pay",
+                         "rails_passed_over": [{"rail": "channel", "why": "the seller offers the on-chain channel, which this wallet no longer has"}]});
+        let w = wallet_refusal(&any.to_string()).unwrap();
+        assert!(w.contains("<li>the seller offers the on-chain channel, which this wallet no longer has</li>") && !w.contains('{'), "{w}");
+        // on the rental's card
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let r = json!({"rental": "r1", "hasher": "Kilohash", "budgetSats": 4000, "ended": true,
+                       "live": {"closed": "the first slice could not be paid", "pays": [{"slice": 1, "ok": false, "why": deny.to_string()},
+                                                                                         {"slice": 1, "ok": false, "why": deny.to_string()}]}});
+        let card = rental_card(&ctx, &r, "./hashrate");
+        assert!(card.contains("Your spending rules don&#39;t allow renting hashrate yet. Nothing was paid.") || card.contains("Your spending rules don't allow renting hashrate yet. Nothing was paid."), "{card}");
+        assert!(card.contains("./policy?task=hashrate") && !card.contains("&quot;verdict") && !card.contains("\"verdict"), "{card}");
+    }
+
+    /// Rent is off, and says why, while the signed rules don't let a rental be paid.
+    #[test]
+    fn rent_waits_for_rules_that_pay_a_rental() {
+        let r = super::rent_off_reasons(true, "", RentRules::NoTask, true, false, false, 1, 1);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].contains("don't allow renting hashrate yet") && r[0].contains("Allow renting hashrate in your spending rules"), "{r:?}");
+        let r = super::rent_off_reasons(true, "", RentRules::TicketsOff, true, false, false, 1, 1);
+        assert!(r[0].contains("Stream tickets are off"), "{r:?}");
+        assert!(rules_notice(RentRules::Allowed).is_none());
+        assert!(rules_notice(RentRules::NoTask).unwrap().1.contains("./policy?task=hashrate"));
+        assert!(rules_notice(RentRules::TicketsOff).unwrap().1.contains("./policy"));
     }
 
     /// With no offer to show: still looking (and the page looks again), no relay answering, or none found.

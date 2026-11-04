@@ -2992,7 +2992,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     let settings = dir.path().join("hashrate/settings.json");
     let gw = dir.path().join("gateway");
     std::fs::create_dir_all(&gw).unwrap();
-    let bx = start(json!({}), false, |c| {
+    let bx = start(rent_task(json!({})), false, |c| {
         c.sell = true;
         c.gw.dir = gw.clone();
         c.gw.node_rest = Some("https://10.21.21.66:8180".into());
@@ -3182,7 +3182,7 @@ fn allowing_a_hashmaker_reached_by_its_key_adds_its_shop() {
     };
 
     // not allowed yet: Allow adds the shop, then opens the rules with the node its link names
-    let bx = start(json!({}), false, tweak);
+    let bx = start(rent_task(json!({})), false, tweak);
     let mut br = logged_in(&bx);
     let o = offer(&br.get("/hashrate").body);
     assert!(o.contains("value=\"try\"") && o.contains(&format!("name=\"url\" value=\"{shop}\"")) && o.contains("Allow this hashmaker to be paid"), "{o}");
@@ -3195,7 +3195,7 @@ fn allowing_a_hashmaker_reached_by_its_key_adds_its_shop() {
     assert_eq!(kept[&shop].transport, Some(t.clone()), "the shop is kept, with how to reach it");
 
     // allowed in the rules (as 0.2.9's link left it), the shop not kept: FAILS before, Rent was on and every payment refused
-    let rules = json!({"allowlist": [shop.clone()], "counterparties": {shop.clone(): {"ln_node": node_hex}}});
+    let rules = rent_task(json!({"allowlist": [shop.clone()], "counterparties": {shop.clone(): {"ln_node": node_hex}}}));
     let bx = start(rules, false, tweak);
     let mut br = logged_in(&bx);
     let o = offer(&br.get("/hashrate").body);
@@ -4855,7 +4855,7 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
                            "payNode": format!("03{}", "c".repeat(64))}]})
     }
     // the hashmaker is on the spending rules, with its node, so the gateway is the only thing Rent waits for
-    let rules = json!({"counterparties": {PROVIDER: {"ln_node": format!("03{}", "c".repeat(64))}}});
+    let rules = rent_task(json!({"counterparties": {PROVIDER: {"ln_node": format!("03{}", "c".repeat(64))}}}));
     for masked in [false, true] {
         let (renter, rseen) = if masked {
             control_standin(|m, p| match (m, p) {
@@ -4898,6 +4898,133 @@ fn renting_waits_for_a_gateway_that_masks_its_jobs() {
             assert!(!rseen.lock().unwrap().iter().any(|(m, p, _, _)| m == "POST" && p == "/rent"), "no rent reached the renter's service");
         }
     }
+}
+
+/// FAILS before (0.2.11, VM 118): spending rules signed before the hashrate task had tickets on but no `tickets.tasks.hashrate`.
+/// Buy → Hashrate said "Ready to rent", every rental's first payment was refused (`no_rail`), its card said only a generic
+/// refusal, and nothing on the rules page could add the task. Now the page says so with a button, Rent stays off, the
+/// button opens the signed rules with only that task added (every other field as signed), and once signed Rent is on.
+#[test]
+fn rules_without_the_hashrate_task_say_so_and_add_only_that_task_to_sign() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []},
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."},
+                                     "rentals": [{"rental": "r1", "hasher": "Kilohash", "trial": true, "miners": 1, "budgetSats": 40, "startedMs": 1000, "ended": true,
+                                                  "live": {"closed": "the first slice could not be paid", "paidSlices": 0, "spentMsat": 0, "miners": 0,
+                                                           "pays": [{"slice": 1, "ok": false, "why": json!({"verdict": "deny", "rule": "no_rail",
+                                                               "reason": "the seller's 402 offers no way to pay that this wallet's policy allows",
+                                                               "rails_passed_over": [{"rail": "ticket", "why": "the owner's policy names no task \"hashrate\" (tickets.tasks)"}]}).to_string()}]}}]}),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let mut rules = miners_allowed();
+    rules["tickets"]["tasks"].as_object_mut().unwrap().remove("hashrate");
+    rules["tickets"]["max_ticket_sats"] = json!(3000);
+    // paying on, so the rules page opens on these rules and not on the starter ones
+    rules["ln"] = json!({"enabled": true});
+    let bx = start(rules, false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let big = |page: &str| {
+        let c = &page[page.find("<h3>Big miners</h3>").expect(page)..];
+        c[..c.find("</section>").unwrap()].to_string()
+    };
+
+    // the line and the button, and Rent off with why
+    let p = br.get("/hashrate").body;
+    assert!(p.contains("id=\"rent-rules\"") && p.contains("Your spending rules don't allow renting hashrate yet") && !p.contains("Ready to rent"), "{p}");
+    assert!(p.contains("href=\"./policy?task=hashrate\">Allow renting hashrate in your spending rules</a>"), "{p}");
+    let card = big(&p);
+    assert!(card.contains("<button disabled>Rent</button>") && card.contains("Try one slice first</button>") && !card.contains("<button class=\"secondary\">Try"), "{card}");
+    assert!(card.contains("title=\"Rent is off: Your spending rules don&#39;t allow renting hashrate yet") && card.contains("./policy?task=hashrate"), "{card}");
+    // the refused rental's card says why, in words, with the same button
+    let hist = &p[p.find("Test slice from Kilohash").expect(&p)..];
+    let hist = &hist[..hist.find("</section>").unwrap()];
+    assert!(hist.contains("Your spending rules don't allow renting hashrate yet. Nothing was paid.") && hist.contains("./policy?task=hashrate"), "{hist}");
+    assert!(!hist.contains("verdict") && !hist.contains("rails_passed_over"), "never the raw answer: {hist}");
+    // the rules page says it is missing
+    let pol = br.get("/policy").body;
+    assert!(pol.contains("<strong>Renting hashrate</strong>") && pol.contains("./policy?task=hashrate"), "{pol}");
+
+    // the prefilled rules: the signed ones, with only the task added (regtest's starter values)
+    let page = br.get("/policy?task=hashrate").body;
+    assert!(page.contains("Allow renting hashrate") && page.contains("Everything else in your rules stays exactly as you signed it"), "{page}");
+    let json_text = field(&page, "json");
+    let proposed: Value = serde_json::from_str(&json_text).unwrap();
+    let signed = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    let (a, b) = (signed.as_object().unwrap(), proposed.as_object().unwrap());
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>(), "no key added or taken out");
+    for (k, v) in a {
+        if k != "tickets" {
+            assert_eq!(&b[k], v, "{k} as signed");
+        }
+    }
+    let (ta, tb) = (a["tickets"].as_object().unwrap(), b["tickets"].as_object().unwrap());
+    assert_eq!(ta.keys().collect::<Vec<_>>(), tb.keys().collect::<Vec<_>>());
+    for (k, v) in ta {
+        if k != "tasks" {
+            assert_eq!(&tb[k], v, "tickets.{k} as signed");
+        }
+    }
+    let mut want = ta["tasks"].as_object().unwrap().clone();
+    want.insert("hashrate".into(), json!({"budget_sats": 100000}));
+    assert_eq!(tb["tasks"], Value::Object(want));
+
+    // reviewed and signed with the owner's approval key, as any change
+    let csrf = field(&page, "csrf");
+    let prev = br.post("/policy", &[("csrf", csrf.as_str()), ("mode", "json"), ("json", json_text.as_str())]).body;
+    assert!(prev.contains("Sign and apply") && prev.contains("Renting hashrate, most in its window: 100,000 sats"), "{prev}");
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &csrf), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
+    let flash = br.flash_after(&r);
+    assert!(flash.starts_with("Policy applied"), "{flash}");
+    assert_eq!(bx.rig.call("policy_get", json!({}))["policy"], proposed, "signed as shown");
+
+    // Rent is on, and the rules page shows the task read-only
+    let p = br.get("/hashrate").body;
+    assert!(p.contains("Ready to rent") && !p.contains("id=\"rent-rules\""), "{p}");
+    assert!(big(&p).contains("<button>Rent</button>"), "{}", big(&p));
+    let pol = br.get("/policy").body;
+    let task = &pol[pol.find("id=\"renting-hashrate\"").expect(&pol)..];
+    let task = &task[..task.find("</div>").unwrap()];
+    assert!(task.contains("<strong>Renting hashrate</strong>") && task.contains("Most for rented hashrate") && task.contains("100,000"), "{task}");
+    assert!(!task.contains("<input"), "read-only: {task}");
+    assert!(br.get("/policy?task=hashrate").body.contains("Renting hashrate is already allowed"));
+}
+
+/// Stream tickets off in the signed rules: the Hashrate page says so and points to the rules, and Rent stays off.
+#[test]
+fn rules_with_tickets_off_say_so_on_the_hashrate_page() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
+        ("GET", "/offers") => offers_one(),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let mut rules = miners_allowed();
+    rules["tickets"]["enabled"] = json!(false);
+    let bx = start(rules, false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate").body;
+    assert!(p.contains("Stream tickets are off in your spending rules") && p.contains("<a href=\"./policy\">spending rules</a>") && !p.contains("Ready to rent"), "{p}");
+    assert!(!p.contains("./policy?task=hashrate"), "no task to add while tickets are off: {p}");
+    let c = &p[p.find("<h3>Big miners</h3>").unwrap()..];
+    assert!(c[..c.find("</section>").unwrap()].contains("<button disabled>Rent</button>"));
+    assert!(br.get("/policy?task=hashrate").body.contains("Stream tickets are off in your spending rules"));
 }
 
 /// Just started, the renter is still looking for offers on Nostr: the page says so and looks again by itself, and the
@@ -5038,7 +5165,13 @@ const MINERS_NODE: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f
 
 /// Spending rules that let the app pay the stand-in hashmaker (its origin listed, with its node).
 fn miners_allowed() -> Value {
-    json!({"allowlist": [PROVIDER, ADDR, "https://miners.example"], "counterparties": {"https://miners.example": {"ln_node": MINERS_NODE}}})
+    rent_task(json!({"allowlist": [PROVIDER, ADDR, "https://miners.example"], "counterparties": {"https://miners.example": {"ln_node": MINERS_NODE}}}))
+}
+
+/// `rules` with stream tickets on and a hashrate task, as the starter rules have them: a rental can be paid.
+fn rent_task(mut rules: Value) -> Value {
+    rules["tickets"] = json!({"enabled": true, "tasks": {"default": {"budget_sats": 100000}, "hashrate": {"budget_sats": 100000}}});
+    rules
 }
 
 /// "Your gateway": the bundled Stream Gateway's settings are written to its config for each mode, an address is checked
