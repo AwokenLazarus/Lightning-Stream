@@ -39,7 +39,7 @@ same way, that lists the links it can be reached by:
 {"version": "transport/1",
  "seller": "http://<base32>.shop.invalid",
  "receipt_key": "<hex>",
- "transport": [{"kind": "iroh", "endpoint_id": "<hex>", "relays": ["https://iroh.lazarus-xbt.xyz"],
+ "transport": [{"kind": "iroh", "endpoint_id": "<hex>", "relays": ["https://relay.lightning-stream.com"],
                 "direct": ["192.0.2.7:33512"], "expires": 1793000000, "node_sig": "<zbase32>"}],
  "updated": "2026-10-29",
  "sig": "<hex>"}
@@ -191,7 +191,8 @@ are shown by their key with a **Direct link** mark. Paying, and a seller's web a
   same LAN connect without a relay.
 - **Linux:** host networking, so the link uses the host's UDP directly; a direct shop's gateway
   listens on loopback, beside the app.
-- **Relays:** the app names `https://iroh.lazarus-xbt.xyz` unless the seller chose others. A relay
+- **Relays:** the app names Genesis's relay, `https://relay.lightning-stream.com` (0.2 named the same
+  relay `https://iroh.lazarus-xbt.xyz`, which it still answers to), unless the seller chose others. A relay
   is needed when both ends sit behind routers that do not allow hole punching (many do not, and a
   VPN's exit often does not).
 

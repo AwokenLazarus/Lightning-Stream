@@ -213,7 +213,7 @@ write records under many keys and vouch for them as the hashmaker. What the app 
 What a renter pays never depends on the records: steps are earned whatever they say. The evidence the
 app checks is the renter's own rentals, a test slice first.
 
-**Relays.** The relay at relay.lazarus-xbt.xyz accepts kind 30078 only in shapes it knows; these
+**Relays.** Our Nostr relays, nostr.lazarus-xbt.xyz and relay.lazarus-xbt.xyz before it, accept kind 30078 only in shapes it knows; these
 two shapes need its write policy updated (the change and its test are prepared with this work).
 Other relays take them as ordinary NIP-78 events.
 

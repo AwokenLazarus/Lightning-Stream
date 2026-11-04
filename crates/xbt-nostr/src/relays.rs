@@ -645,10 +645,10 @@ mod tests {
         let old = ann("https://iroh.lazarus-xbt.xyz");
         assert_eq!(old.relay, "https://iroh.lazarus-xbt.xyz/", "parsing is unchanged");
         let p = probes(&[("https://iroh.lazarus-xbt.xyz", Some(30), 0), (OURS, None, 5)]);
-        assert_eq!(select(&[old.clone()], &p, &Prefs::default(), OURS, 4), vec![DEFAULT_RELAY]);
+        assert_eq!(select(std::slice::from_ref(&old), &p, &Prefs::default(), OURS, 4), vec![DEFAULT_RELAY]);
         // a home kept under the old name, or pinned by it, is the default relay
         let s = HomeState { relay: "https://iroh.lazarus-xbt.xyz/".into(), better: None };
-        assert_eq!(choose_home(Some(&s), &[old.clone()], &p, &Prefs::default(), OURS, None), (HomeState { relay: DEFAULT_RELAY.into(), better: None }, HomeWhy::Kept));
+        assert_eq!(choose_home(Some(&s), std::slice::from_ref(&old), &p, &Prefs::default(), OURS, None), (HomeState { relay: DEFAULT_RELAY.into(), better: None }, HomeWhy::Kept));
         assert_eq!(choose_home(None, &[old], &p, &Prefs::default(), OURS, Some("https://iroh.lazarus-xbt.xyz")).1, HomeWhy::Pinned);
     }
 

@@ -8,20 +8,31 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 ## 0.3.0 (unreleased)
 
 Draft. Paid relays (`docs/PAID-RELAYS.md`): a relay operator can charge for what a Stream relay
-carries, by the GB, and a shop pays the relays it uses with Stream tickets, within a new spending
-rule for relays. Everything is off by default: free relays and shops that don't opt in work as in
-0.2.
+carries, by the GB, and each app pays its own home relay, and only that relay, for what it receives
+there, with Stream tickets, within a new spending rule for relays. Everything is off by default:
+free relays, and apps whose owners don't allow paid relays, work as in 0.2.
 
-- The Stream relay meters each shop's link key, bytes in and out, and carries a paying shop while
-  its prepaid credit lasts (with a grace), then stops until it pays again. Buyers can't make a
-  shop pay by flooding it. A small patch to iroh-relay 1.4.1 adds the per-packet hook this needs
-  (`vendor/iroh-relay/XBT-PATCH.md`).
-- The relay's credit API, sold as a priced route on the operator's own shop.
-- Paid relays are announced on Nostr under their own topic, with a price per GB; apps use one only
-  when the owner allows paid relays, up to a price.
-- The shop's gateway pays its paid home relays through the wallet's signer (`relay_pay`).
-- Still to come in 0.3.0: the pages for sellers and relay operators, packaging, and a regtest run
-  across a real relay.
+- **Genesis's link relay is `relay.lightning-stream.com`**, every app's default home relay. Its 0.2
+  name, `iroh.lazarus-xbt.xyz`, is the same relay and keeps working; announcements, pins and shop
+  configs that name it count as the new name.
+- **Our Nostr relay for listings is `nostr.lazarus-xbt.xyz`**, first in the packages' defaults;
+  `relay.lazarus-xbt.xyz` stays in the list while older boxes use it.
+- The Stream relay meters each link key: what it receives, charged to it when it declared the relay
+  its home (signed with its own key), after a free allowance (64 MB a day by default, announced by
+  each relay). Nobody pays a relay it didn't choose. An app out of credit has its traffic wait at the
+  relay for the next credit; what waits too long is dropped and counted on its account, never
+  silently. A small patch to iroh-relay 1.4.1 adds the per-packet hook this needs, carried as a fork
+  pinned by commit and offered upstream (`docs/IROH-UPSTREAM.md`).
+- Paid relays are announced on Nostr under their own topic, with a price per GB and a free
+  allowance; credit is bought 10 GB at a time.
+- Every app starts on Genesis's relay and moves by itself to a clearly faster one, within the
+  owner's most per GB, saying so on Settings → Stream relays; the owner can pin one. The shop's
+  link follows the box's home relay, and its gateway pays a paid one through the wallet's signer
+  (`relay_pay`).
+- The spending rules have **Most for relays in 24 hours** and **Most to any one relay**, 0 by
+  default.
+- Still to come in 0.3.0: a buyer's wallet paying a paid home relay, packaging, and a regtest run
+  with real payments.
 
 ## 0.2.11 (2026-11-04)
 

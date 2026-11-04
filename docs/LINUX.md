@@ -179,8 +179,8 @@ You rent hashrate into the Stream Gateway and pay for each piece of work:
 
 1. **Buy → Hashrate.** Under *Your gateway*, choose solo and your XBT payout address, or Lazarus
    Pool. Then check that it says *Ready to rent*: the gateway answers and its jobs are masked.
-2. **Miners for rent** lists the offers hashmakers publish on Nostr (relay.lazarus-xbt.xyz,
-   relay.kilombino.com, relay.damus.io and nos.lol by default). For a hashmaker you haven't paid before, press **Allow this hashmaker to be paid**. The rules
+2. **Miners for rent** lists the offers hashmakers publish on Nostr (nostr.lazarus-xbt.xyz,
+   relay.lazarus-xbt.xyz, relay.kilombino.com, relay.damus.io and nos.lol by default). For a hashmaker you haven't paid before, press **Allow this hashmaker to be paid**. The rules
    page shows that hashmaker's address added, tied to the Lightning node its signed listing names, and you
    sign the change.
 3. Choose the machines, how long, and the most the rental may cost, then press **Rent**.

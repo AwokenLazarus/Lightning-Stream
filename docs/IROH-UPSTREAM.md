@@ -13,8 +13,8 @@ and offered upstream as two small, generic changes.
 
 | Commit | Crate | Change |
 | --- | --- | --- |
-| `c76b2b34ba` | iroh-relay | `AccessControl::on_forward`, a hook for each relayed packet (paid relays, `docs/PAID-RELAYS.md`), with a test |
-| `e4b6ac6af1` | iroh | `NetReportConfig::preferred_relay`, a preferred home relay (ours, which cannot take UDP) |
+| `1827ef14bb` | iroh-relay | `AccessControl::on_forward`, a hook for each relayed packet that forwards, drops or holds it (paid relays, `docs/PAID-RELAYS.md`), with a test |
+| `d92f047801` | iroh | `NetReportConfig::preferred_relay`, a preferred home relay (ours, which cannot take UDP) |
 
 Nothing else differs from the tag. The vendored files `vendor/iroh-relay/src/server.rs`,
 `vendor/iroh-relay/src/server/client.rs` and `vendor/iroh/src/net_report.rs` are those commits'
@@ -25,10 +25,10 @@ The workspace takes all four crates from the same commit, so it has one copy of 
 
 ```toml
 [patch.crates-io]
-iroh = { git = "https://github.com/AwokenLazarus/iroh", rev = "e4b6ac6af10634abd27adfd7d2919a07d8e78900" }
-iroh-base = { git = "https://github.com/AwokenLazarus/iroh", rev = "e4b6ac6af10634abd27adfd7d2919a07d8e78900" }
-iroh-dns = { git = "https://github.com/AwokenLazarus/iroh", rev = "e4b6ac6af10634abd27adfd7d2919a07d8e78900" }
-iroh-relay = { git = "https://github.com/AwokenLazarus/iroh", rev = "e4b6ac6af10634abd27adfd7d2919a07d8e78900" }
+iroh = { git = "https://github.com/AwokenLazarus/iroh", rev = "d92f047801075918453434acee4cc8421e5d8d37" }
+iroh-base = { git = "https://github.com/AwokenLazarus/iroh", rev = "d92f047801075918453434acee4cc8421e5d8d37" }
+iroh-dns = { git = "https://github.com/AwokenLazarus/iroh", rev = "d92f047801075918453434acee4cc8421e5d8d37" }
+iroh-relay = { git = "https://github.com/AwokenLazarus/iroh", rev = "d92f047801075918453434acee4cc8421e5d8d37" }
 ```
 
 The switch is one commit ("Carry the iroh patches as a fork pinned by commit"): these lines in
@@ -37,8 +37,8 @@ changed only in the four packages' `source` lines (their dependencies are the sa
 applied once the fork is pushed: before that, cargo cannot fetch it. CI's `cargo fetch --locked`
 then fetches the fork like any git dependency.
 
-If the hook changes before it is offered (for example a third answer, holding a packet rather
-than dropping it), the fork gets a new commit and the `rev` above moves with it.
+If the hook changes before it is offered, the fork's branch is rebuilt on the tag and the `rev`
+above moves with it.
 
 ## The offer upstream
 
@@ -57,23 +57,28 @@ would be made from there.
 > We are building iroh relays that charge for what they carry, by the byte, per endpoint. `AccessControl`
 > decides when a client connects and is told when it leaves, but there is no way to count what
 > the relay carries for an endpoint, or to stop carrying one endpoint's traffic without
-> disconnecting it (it should stay connected, so it is carried again as soon as it pays).
+> disconnecting it (it should stay connected, so it is carried again as soon as it pays), or to
+> slow it down for a moment rather than lose its packets.
 >
 > Would you take a small hook for this? What we have now is:
 >
 > ```rust
 > trait AccessControl {
 >     // ...
->     /// Whether one relayed packet is forwarded: `len` bytes of datagrams from the admitted
->     /// client `src` to `dst`. The default forwards everything. Must not block.
->     fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> bool { true }
+>     /// What happens to one relayed packet: `len` bytes of datagrams from the admitted client
+>     /// `src` to `dst`. The default forwards everything. Must not block.
+>     fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> Forward { Forward::Yes }
 > }
+>
+> #[non_exhaustive]
+> pub enum Forward { Yes, Drop, Hold }
 > ```
 >
-> The client actor calls it for each `Datagrams` frame before forwarding it; a refused packet is
-> dropped and counted in `send_packets_dropped`. Existing implementations are unchanged. Other uses
-> we can think of: quotas on a public relay, per-key fair use, accounting for a relay shared by
-> teams.
+> The client actor calls it for each `Datagrams` frame before forwarding it. A dropped packet is
+> counted in `send_packets_dropped`. A held one is kept while the actor stops reading from that
+> client and asks again every 50 ms, for up to 10 s (less than the idle time before the relay pings
+> the client), then dropped. Existing implementations are unchanged. Other uses we can think of:
+> quotas on a public relay, per-key fair use, accounting for a relay shared by teams.
 >
 > Happy to change the shape (a richer return type, a separate trait, a feature flag) if you'd
 > prefer. We'd send the PR ourselves.
@@ -82,13 +87,17 @@ would be made from there.
 >
 > - `AccessControl::on_forward` with a default body, the same method on `DynAccessControl` and its
 >   blanket impl, and `OnDisconnectGuard::forward(dst, len)` (true without access control).
-> - In `server/client.rs`, `handle_frame` forwards a `Datagrams` frame only when the guard says
->   so. `bytes_recv` still counts it. `len` is the datagrams' contents, without framing.
+> - In `server/client.rs`, `handle_frame` forwards a `Datagrams` frame on `Yes`; on `Hold` the
+>   actor keeps it in a `held` slot, its `stream.next()` branch is disabled while the slot is full,
+>   and a timer branch asks again (`FORWARD_HOLD_RETRY`, `FORWARD_HOLD_MAX`). Writes to the client
+>   and pings go on meanwhile. `bytes_recv` counts every packet read. `len` is the datagrams'
+>   contents, without framing.
 > - The call is synchronous and on the client actor's task, once per packet; an implementation
 >   keeps it to a lock and a few additions.
 > - A test, `test_relay_access_control_on_forward`: a per-sender byte budget; packets past it are
->   not forwarded, the connection stays up, and forwarding resumes when the budget is raised.
-> - About 30 lines plus the test.
+>   dropped while the connection stays up, held packets are forwarded in order once there is
+>   budget, and packets to the held client still arrive.
+> - About 100 lines plus the test.
 >
 > </details>
 

@@ -5,8 +5,8 @@ between the two apps (iroh, QUIC with TLS 1.3), punched through both routers. So
 VPNs don't allow that. Then a **relay** passes the traffic between the two apps.
 
 Anyone can run a relay. Each one adds capacity for everyone whose network blocks direct
-connections, and apps prefer a relay near them. Running one is volunteer work for now; paid relays
-are planned for a later version (below).
+connections, and apps prefer a relay near them. A relay can be free, or, from 0.3.0, charge the
+apps that make it their home by the GB (paid relays, below).
 
 ## What a relay sees, and what it doesn't
 
@@ -77,7 +77,8 @@ Without Lightning Stream on the server, set up iroh-relay by hand.
 
 ### Set it up by hand
 
-The steps below are what runs our own relay, `iroh.lazarus-xbt.xyz`. Replace
+The steps below are what runs Genesis's relay, `relay.lightning-stream.com` (also served as
+`iroh.lazarus-xbt.xyz`, its name in 0.2). Replace
 `relay.example.com` and the contact address with yours.
 
 #### 1. The firewall, first
@@ -302,7 +303,7 @@ that answer, nearest first.
 
 Settings → Advanced → Stream relays shows every relay the app knows, how fast each answers, and the order
 the app uses them in. The first is the app's home relay; the others follow; ours
-(`iroh.lazarus-xbt.xyz`) is always last unless the owner blocks it; iroh's public relays come
+(`relay.lightning-stream.com`) is always last unless the owner blocks it; iroh's public relays come
 after those, for address discovery and as a final fallback. The owner can:
 
 - **Prefer** a relay: it is tried first whenever it answers.
@@ -366,32 +367,25 @@ the newest per author and `d` replaces the older).
 refuses an announcement whose signature fails, whose `d` doesn't match its `relay`, that is dated
 more than 10 minutes ahead, or that has lapsed.
 
-## Paid relays (planned for a later version)
+## Paid relays (0.3.0)
 
-*0.3.0 builds this: `docs/PAID-RELAYS.md` is the design as built so far, and supersedes what
-follows where they differ (a paid relay is announced under its own topic, and the shop pays only
-its own traffic).*
+`docs/PAID-RELAYS.md` is the design and what is built. In short:
 
-A relay costs its operator bandwidth. Paid relays let an operator charge for what the relay
-carries, through Stream itself, like any other service. The built-in relay in 0.2.0 is free; the
-design below is what that version adds.
+- **Who pays:** each app, shop or buyer, pays its own home relay, and only that relay, for the
+  bytes it receives there. Nobody pays a relay it didn't choose: a relay charges a key only after
+  the key itself has signed that the relay is its home.
+- **Price:** each relay announces its own price per GB (2 sats is the suggested one) and a free
+  allowance (64 MB a day per key unless it says otherwise). Apps buy credit 10 GB at a time.
+- **How:** the relay is a Stream seller. Its operator sells credit as a priced route on their own
+  shop, paid with the same prepaid tickets as everything else, inside the payer's signed spending
+  rules ("Most for relays in 24 hours"), with signed receipts. The operator receives into their own
+  Lightning node: no custody. The relay itself never touches Lightning.
+- **When credit runs out:** past a small grace, the app's traffic waits at the relay for the next
+  credit (the sender is slowed, nothing is lost). If none comes within a few seconds, what waits is
+  dropped and counted on the app's account, which the app reads and shows its owner.
+- **Choosing:** every app starts on Genesis's relay, and moves by itself to a relay that answers
+  clearly faster, at or below its owner's most per GB, saying so on its relay page; the owner can
+  pin one instead.
 
-- **What is charged:** bytes the relay carries between two apps, per GB. The operator sets the
-  price; the suggested default is **2 sats per GB**. Helping two apps find each other and punch
-  through (hole punching, address discovery) stays free: only relayed traffic is charged.
-- **Who pays:** whoever's **home relay** it is. A seller pays its own home relay for the traffic
-  its buyers reach it through, and builds that into its prices. A buyer pays only for a relay it
-  chooses itself (private mode, which sends everything through a relay).
-- **How:** the relay is a Stream seller. It meters each client by its iroh key and is paid with the
-  same prepaid tickets as everything else, inside the payer's signed spending rules, with signed
-  receipts. The operator receives into its own Lightning node: no custody, nobody else holds money.
-- **When credit runs out:** the relay stops carrying that client's traffic. The app then switches
-  to another relay or tells its owner, never silently.
-- **Cost on the page:** the relay page shows an estimate from the operator's own bandwidth price
-  (what a GB costs them) against the price charged.
-
-What 0.2.0 leaves ready for it: the built-in relay decides who may connect through a metering hook
-(`xbt_stream_relay::meter::Meter`, behind iroh-relay's per-client access control, which sees each
-client's iroh key on connect and on disconnect), free for everyone today. Metering by bytes needs a
-per-client byte count, which iroh-relay 1.4.1 doesn't expose: a small change to iroh-relay, planned
-with paid relays.
+The built-in relay's paid side is switched on in its `relay.json` (`paid`); `xbt-relay-announce`
+takes `--price-msat-per-gb`, `--credit` and `--free-mb-per-day`.
