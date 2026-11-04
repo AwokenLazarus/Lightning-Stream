@@ -1667,6 +1667,11 @@ impl Gateway {
         // the seller's own headers for this route (a guest login) win over any of the buyer's of the same name
         headers.retain(|(k, _)| !route.upstream_headers.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)));
         headers.extend(route.upstream_headers.iter().cloned());
+        // the body is a JSON object the gateway wrote again: a buyer that did not say so (the wallet's own calls) has
+        // it said for it, since some services (Mesh-LLM) refuse a body of no stated type
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            headers.push(("Content-Type".into(), "application/json".into()));
+        }
         up.send_as(&req.method, &route.upstream_target(&req.target), &headers, body, route.accept_gzip)
     }
 
