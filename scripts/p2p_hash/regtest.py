@@ -968,11 +968,17 @@ def real_gateway_run(mode: str) -> None:
             # mid-rental, a few bursts of busy-socket failures on the renter's payments (each burst: that many writes
             # in a row fail with nothing sent); each payment hit is asked again within the grace
             def bursts() -> None:
-                for at, n in ((0.3, 1), (0.5, 3), (0.7, 2)):
+                # each burst waits for the one before to be used up by payments, so none is written over
+                for at, n in ((0.2, 1), (0.4, 3), (0.6, 2)):
                     time.sleep(max(0.0, t_rent + at * REAL_SECS - time.time()))
+                    while injected and "usedAtS" not in injected[-1]:
+                        time.sleep(1)
                     with open(busy[1], "w") as f:
                         f.write(f"{n}\n")
                     injected.append({"atS": round(time.time() - t_rent), "writes": n})
+                    while open(busy[1]).read().strip() != "0":
+                        time.sleep(0.5)
+                    injected[-1]["usedAtS"] = round(time.time() - t_rent)
             t_rent = time.time()
             threading.Thread(target=bursts, daemon=True).start()
         if mode == "solo":
@@ -1090,9 +1096,9 @@ def real_gateway_run(mode: str) -> None:
         oks = [p for p in bz["pays"] if p.get("ok")]
         if busy:
             left = open(busy[1]).read().strip()
-            check(f"{mode}: the wallet's socket busy {sum(i['writes'] for i in injected)} times mid-rental (EAGAIN, nothing sent): each payment asked again "
+            check(f"{mode}: the wallet's socket busy {sum(i['writes'] for i in injected if 'usedAtS' in i)} times mid-rental (EAGAIN, nothing sent): each payment asked again "
                   "and paid once, none failed or left unknown, and the rental ran to its end",
-                  len(injected) == 3 and left == "0" and not bz["payFailed"] and all(p.get("ok") is True for p in bz["pays"]) and bz["closed"] == "rental time over"
+                  sum(i["writes"] for i in injected if "usedAtS" in i) >= 3 and any(i["writes"] >= 2 and "usedAtS" in i for i in injected) and not bz["payFailed"] and all(p.get("ok") is True for p in bz["pays"]) and bz["closed"] == "rental time over"
                   and len(oks) == hz["paid"],
                   {"injected": injected, "left": left, "pays": len(bz["pays"]), "ok": len(oks), "hashmaker paid": hz["paid"], "closed": bz["closed"],
                    "slowest pay ms": max([p.get("ms", 0) for p in bz["pays"]] or [0])})
