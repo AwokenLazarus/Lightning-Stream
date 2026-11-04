@@ -577,12 +577,23 @@ pub const GATEWAY_PAGES: &[&str] =
 /// The most of a gateway page that is passed on.
 const GATEWAY_PAGE_MAX: u64 = 1 << 20;
 
+/// The bundled gateway's API: `--gateway-api` only while `--upstream` doesn't name another gateway (that flag is then
+/// that gateway's API), else its stratum's host on [`GATEWAY_API_PORT`].
+fn bundled_api(bundled: &str, upstream_flag: Option<&str>, flag_api: Option<&str>) -> Option<String> {
+    let flag_api = flag_api.filter(|_| upstream_flag.is_none_or(|u| u == bundled));
+    api_of(bundled, None, Some(bundled), None, flag_api)
+}
+
 /// One of the bundled gateway's [`GATEWAY_PAGES`], from its API on this service's own network: its HTTP status, its
-/// content type and its body (base64). The request carries no login and no query.
+/// content type and its body (base64). The request carries no login and no query, and goes only to a loopback
+/// address: the bundled gateway listens there on every platform, and no setting sends it anywhere else.
 fn gateway_page(api: &str, page: &str) -> Result<Value, String> {
     use base64::Engine;
     use std::io::{Read, Write};
     let addr = api.to_socket_addrs().ok().and_then(|mut a| a.next()).ok_or_else(|| format!("no such address: {api}"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!("the gateway's API at {api} is not on this box's loopback: its pages are not passed on"));
+    }
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| format!("the gateway's API at {api}: {e}"))?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
@@ -712,7 +723,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             // the gateway that comes with the app, on its own API: never another gateway's address
             let api = {
                 let g = lock(r);
-                g.bundled.as_deref().and_then(|b| api_of(b, None, g.bundled.as_deref(), g.upstream_flag.as_deref(), g.gateway_api.as_deref()))
+                g.bundled.as_deref().and_then(|b| bundled_api(b, g.upstream_flag.as_deref(), g.gateway_api.as_deref()))
             };
             let Some(api) = api else { return (404, json!({"error": "this box has no Stream Gateway"})) };
             match gateway_page(&api, page) {
@@ -1699,6 +1710,11 @@ mod tests {
         }
         assert_eq!(handle(&r, &[], "POST", "/gateway-page?p=config", b"{}").0, 404, "a POST is no page");
         assert_eq!(asked.lock().unwrap().len(), 1, "none of those reached the gateway");
+        // only the bundled gateway's own API, on loopback: never another gateway's that --upstream and --gateway-api name
+        assert_eq!(bundled_api(BUNDLED_STRATUM, Some("10.0.0.9:23334"), Some("10.0.0.9:7152")).as_deref(), Some("127.0.0.1:7152"));
+        assert_eq!(bundled_api(BUNDLED_STRATUM, Some(BUNDLED_STRATUM), Some("127.0.0.1:7153")).as_deref(), Some("127.0.0.1:7153"));
+        assert_eq!(bundled_api(BUNDLED_STRATUM, None, Some("127.0.0.1:7153")).as_deref(), Some("127.0.0.1:7153"));
+        assert!(gateway_page("10.255.255.1:7152", "").unwrap_err().contains("not on this box's loopback"));
         // a box without the bundled gateway shows none
         lock(&r).bundled = None;
         assert_eq!(handle(&r, &[], "GET", "/gateway-page?p=", b"").0, 404);
