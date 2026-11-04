@@ -21,6 +21,8 @@ use xbt_svc::http::{serve_with, Handler, Limits, Reply, Request, Response, Runni
 #[derive(Default)]
 struct Model {
     seen: Mutex<Vec<Value>>,
+    /// The `Content-Type` of each request with a body, as the model got it.
+    types: Mutex<Vec<Option<String>>>,
     /// Answers whose reader went away before the model finished writing.
     cut: Arc<AtomicUsize>,
     /// Tokens written, over all answers.
@@ -42,6 +44,7 @@ impl Handler for Model {
         }
         let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         self.seen.lock().unwrap().push(v.clone());
+        self.types.lock().unwrap().push(req.header("content-type").map(str::to_string));
         let max = v["max_tokens"].as_u64().unwrap_or(u64::MAX);
         let n = v["x_n"].as_u64().unwrap_or(10).min(max);
         let prompt = v["x_prompt"].as_u64().unwrap_or(5);
@@ -119,9 +122,18 @@ fn rig_with(input: u64, output: u64, cap: u64, edit: &dyn Fn(&mut Value)) -> (Ri
 }
 
 fn post(b: &mut Buyer, target: &str, body: &Value, secret: Option<&[u8; 32]>) -> Got {
+    post_typed(b, target, body, secret, Some("application/json"))
+}
+
+/// [`post`], with the `Content-Type` given, or none.
+fn post_typed(b: &mut Buyer, target: &str, body: &Value, secret: Option<&[u8; 32]>, content_type: Option<&str>) -> Got {
     let body = body.to_string();
     let sig = b.sign("POST", target, body.as_bytes(), secret, None);
-    let got = http(&b.addr, "POST", target, &[("PAYMENT-SIGNATURE", &sig), ("Content-Type", "application/json")], body.as_bytes(), None);
+    let mut headers = vec![("PAYMENT-SIGNATURE", sig.as_str())];
+    if let Some(t) = content_type {
+        headers.push(("Content-Type", t));
+    }
+    let got = http(&b.addr, "POST", target, &headers, body.as_bytes(), None);
     b.used(&got);
     got
 }
@@ -205,6 +217,22 @@ fn a_whole_answer_is_charged_from_its_counts() {
     let body_len = json!({"x_n": 25, "x_usage": false}).to_string().len() as u64;
     let input = body_len.div_ceil(4);
     assert_eq!(b.balance(), 1_000_000 - 30 - 250 - input - 250);
+}
+
+/// A request with no `Content-Type` (the wallet's own calls send none) reaches the model as JSON, which
+/// is what the gateway passes on; a buyer's own type is passed on as it is.
+///
+/// FAILS before: the model got no type, and a service that insists on one (Mesh-LLM) answered 400.
+#[test]
+fn a_request_with_no_type_reaches_the_model_as_json() {
+    let (rig, _dir, model, _m) = rig(0, 10_000, 500);
+    let mut b = Buyer::new(&rig, 4);
+    let s = b.lock(&rig, 1);
+    let got = post_typed(&mut b, "/v1/chat/completions", &json!({"x_n": 5}), Some(&s[0]), None);
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    let got = post_typed(&mut b, "/v1/chat/completions", &json!({"x_n": 5}), None, Some("application/json; charset=utf-8"));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(*model.types.lock().unwrap(), vec![Some("application/json".to_string()), Some("application/json; charset=utf-8".to_string())]);
 }
 
 /// A whole answer (not a stream) comes only once the model has written all of it: on a seller's own
