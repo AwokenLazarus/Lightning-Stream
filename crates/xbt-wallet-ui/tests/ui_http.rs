@@ -5845,6 +5845,8 @@ fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
     let hash = "ab".repeat(32);
     bx.rig.s.ln_book.put(&hash, json!({"state": "settled", "value_msat": 900_000, "fee_msat": 2_009, "spent_sats": 903})).unwrap();
     let a = &bx.rig.s.engine.audit;
+    a.append(json!({"type": "decision", "verdict": "allow", "rule": "ok", "reason": "all policy rules passed", "dest": format!("ln:{node}"), "amount_sats": 915,
+                    "ts": 1_793_000_000}));
     a.append(json!({"type": "commit", "dest": format!("ln:{node}"), "amount_sats": 915, "txid": format!("ln:{hash}"), "ts": 1_793_000_000}));
     a.append(json!({"type": "ln_amend", "txid": format!("ln:{hash}"), "booked_sats": 915, "amount_sats": 903, "ts": 1_793_000_001}));
     a.append(json!({"type": "ln_settled", "dest": format!("ln:{node}"), "payment_hash": hash, "spent_sats": 903, "fee_msat": 2009, "ts": 1_793_000_002}));
@@ -5858,8 +5860,10 @@ fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
     assert!(!act.contains(&format!("ln:{}", &node[..8])), "a node by its shop's name: {act}");
     assert!(act.contains("<td>Alpha films</td>"), "{act}");
     assert!(act.contains("<td>Paid</td>") && act.contains("902.009 sats</span> <span class=\"small\">(900 + 2.009 fee)</span>"), "paid, exactly, with its parts: {act}");
-    assert!(act.contains("<td>Reserved</td>") && act.contains("reserved, the most it may cost</span>") && !act.contains("<td>Commit</td>")
-            && !act.contains(&format!("ln:{}", &hash[..8])), "{act}");
+    // one row the payment: its allowed and reserved steps folded into its Paid row (0.2.11 showed three rows)
+    assert!(!act.contains("<td>Reserved</td>") && !act.contains("<td>Allowed</td>") && !act.contains("<td>Commit</td>")
+            && act.contains("<summary>Allowed and reserved first</summary>Allowed: Within your spending rules · ")
+            && act.contains("reserved, the most it may cost") && !act.contains(&format!("ln:{}", &hash[..8])), "{act}");
     assert!(!act.contains("Ln amend"), "the booking's correction is no row of its own: {act}");
     assert!(act.contains("<td>Credit left with the shop</td>") && act.contains("475.9 sats</span> <span class=\"small\">credit left"), "{act}");
     assert!(!act.contains("<td>Ln refused</td>"), "a refusal in plain words: {act}");
