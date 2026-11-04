@@ -151,7 +151,7 @@ pub fn canonical_relay(url: &str) -> Result<String, String> {
 pub const DEFAULT_RELAY: &str = "https://relay.lightning-stream.com/";
 /// Other names of the same relays, and the name each is known by: 0.2 apps and their listings name
 /// Genesis's relay `iroh.lazarus-xbt.xyz`, which the same box still serves.
-pub const RELAY_ALIASES: [(&str, &str); 1] = [("https://relay.lightning-stream.com/", DEFAULT_RELAY)];
+pub const RELAY_ALIASES: [(&str, &str); 1] = [("https://iroh.lazarus-xbt.xyz/", DEFAULT_RELAY)];
 
 /// A relay URL in [`canonical_relay`]'s form, by the name the relay is known by (an alias in
 /// [`RELAY_ALIASES`] is the same relay). `Err` as [`canonical_relay`].
