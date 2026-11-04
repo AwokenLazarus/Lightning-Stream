@@ -95,6 +95,8 @@ DATUM_GATEWAY = os.environ.get("P2P_HASH_DATUM_GATEWAY") or next(
     (p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../dist/datum/x86_64-linux-musl/xbt-datum-gateway"),)
      if os.path.exists(p)), f"{HG}/datum_gateway-blind")
 REAL_SECS = int(os.environ.get("P2P_HASH_REAL_SECS", "360"))
+# the longest coinbase tag Your gateway takes (60 printable ASCII characters), written as the app writes it
+OWNER_TAG = os.environ.get("P2P_HASH_OWNER_TAG", "Owner's own tag: 60 chars, ASCII /solo/ ~!@#$%^&*()_+{}|:<>?")
 REAL_BASE = B + 13
 REPORT: dict[str, Any] = {"checks": []}
 PROCS: list[subprocess.Popen[bytes]] = []
@@ -837,10 +839,15 @@ def real_gateway_run(mode: str) -> None:
             datum = {"pool_host": "127.0.0.1", "pool_port": base + 6 if late else prime, "pool_pubkey": pub, "pool_pass_workers": True, "pool_pass_full_users": True,
                      "pooled_mining_only": True, "protocol_global_timeout": 60}
             pool_address = "bc1qt5praystcdle0nq04e3h02yjszha82uzhww85x6972lcy40k4eyqz9jfaq"
+        # solo, the tags the app writes with an owner's own coinbase tag (Your gateway's Coinbase tag): the primary
+        # "Lightning Stream" and the owner's, as long as the app takes (60 characters) and with punctuation, so a found
+        # block shows DATUM fits it in the coinbase and the node accepts it. With a pool, the pool's primary replaces ours
+        tags = {"coinbase_tag_primary": "Lightning Stream", "coinbase_tag_secondary": OWNER_TAG} if mode == "solo" \
+            else {"coinbase_tag_primary": "Lazarus", "coinbase_tag_secondary": "rental"}
         with open(f"{home}/gw.json", "w") as f:
             json.dump({"bitcoind": {"rpccookiefile": f"{home}/node/regtest/.cookie", "rpcurl": f"http://127.0.0.1:{rpc}", "work_update_seconds": 5, "notify_fallback": True},
                        "stratum": {"listen_addr": "127.0.0.1", "listen_port": st, "vardiff_min": 1, "fingerprint_miners": False},
-                       "mining": {"pool_address": pool_address, "coinbase_tag_primary": "Lazarus", "coinbase_tag_secondary": "rental"},
+                       "mining": {"pool_address": pool_address, **tags},
                        "api": {"listen_addr": "127.0.0.1", "listen_port": api, "admin_password": ""},
                        "logger": {"log_to_console": True, "log_to_file": False, "log_level_console": 1}, "datum": datum}, f)
         log = open(f"{RUN}/{mode}-gateway.log", "ab")
@@ -929,6 +936,12 @@ def real_gateway_run(mode: str) -> None:
             pays = [any(o["scriptPubKey"]["hex"] == payout_script for o in json.loads(cli("getblock", b["block"], "2"))["tx"][0]["vout"]) for b in blocks]
             check(f"solo: every block's coinbase pays the renter's address ({pool_address[:6]}...)", blocks and all(pays),
                   {"address": pool_address, "script": payout_script, "paid by block": pays})
+            # the owner's coinbase tag in every block the node took: "Lightning Stream", 0x0f, the owner's tag, 0x00
+            want = b"Lightning Stream\x0f" + OWNER_TAG.encode() + b"\x00"
+            sigs = [json.loads(cli("getblock", b["block"], "2"))["tx"][0]["vin"][0]["coinbase"] for b in blocks]
+            check(f"solo: every block the node accepted carries the owner's {len(OWNER_TAG)}-character coinbase tag after the app's own",
+                  bool(blocks) and all(want.hex() in c for c in sigs),
+                  {"tag": OWNER_TAG, "coinbase scriptSigs": sigs})
         if keys:
             check(f"{mode}: real masked blocks reached the node through the rental, each with a key, the share's clear_bits, and its id the raw hash XOR the mask",
                   len(blocks) >= 1 and all(not b["key_null"] and b["clear_bits"] == 32 and b["id_is_raw_xor_mask"] and b["raw"].startswith("00000000") for b in blocks),

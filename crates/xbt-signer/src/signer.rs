@@ -44,6 +44,19 @@ pub const ERR_NOT_FINITE: &str = "amount_xbt must be a finite number";
 pub const ERR_NEGATIVE: &str = "amount_xbt must not be negative";
 pub const ERR_PRECISION: &str = "amount_xbt has more than 8 decimal places";
 
+/// The tip's difficulty from `getblockchaininfo`, in the units `difficulty` has always had (work = difficulty * 2^32).
+/// Knots 29.4.3 (BLAKE2b) no longer says `difficulty`: it says `difficulty_blake2b`, the expected hashes per block
+/// (2^256 / target), which is that difficulty times 2^32. Neither, or one that isn't a positive number: null, for the
+/// caller to refuse.
+pub fn tip_difficulty(info: &Value) -> Value {
+    let positive = |v: Option<&Value>| v.and_then(Value::as_f64).filter(|d| d.is_finite() && *d > 0.0);
+    match (positive(info.get("difficulty")), positive(info.get("difficulty_blake2b"))) {
+        (Some(d), _) => Value::from(d),
+        (None, Some(work)) => Value::from(work / 4_294_967_296.0),
+        _ => Value::Null,
+    }
+}
+
 /// Exact XBT → sats (B2 `sats_from_xbt`): at most 8 decimal places; refuse negatives, NaN and inf.
 /// Scientific notation (`1e-05`) is accepted. Extra precision is an error, never truncated.
 pub fn sats_from_xbt(v: Option<&Value>) -> std::result::Result<i64, &'static str> {
@@ -595,7 +608,7 @@ impl Signer {
                         Some(Ok(_)) if said.is_none() => Value::from("getblockstats gave no subsidy"),
                         _ => Value::Null,
                     };
-                    json!({"reachable": true, "chain": self.chain, "height": height, "headers": i.get("headers"), "difficulty": i.get("difficulty"),
+                    json!({"reachable": true, "chain": self.chain, "height": height, "headers": i.get("headers"), "difficulty": tip_difficulty(&i),
                            "tipTime": i.get("time"), "syncing": i.get("initialblockdownload"), "subsidySats": subsidy, "subsidyFrom": from,
                            "subsidyError": why})
                 }

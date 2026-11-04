@@ -612,6 +612,34 @@
     }
   }
 
+  // Buy → Hashrate: the rentals, shown again every 5 s while one is live (money spent, pieces paid, its state), and no
+  // more once none is. Not while the owner is in one of their forms (a Cut on its way).
+  var rentals = $("#rentals[data-live]");
+  if (rentals && root.fetch) {
+    var rentalsTimer = setInterval(function () {
+      root.fetch("./api/hashrate-rentals", { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || typeof d.html !== "string" || rentals.contains(document.activeElement)) return;
+          rentals.innerHTML = d.html;
+          if (!d.live) { rentals.removeAttribute("data-live"); clearInterval(rentalsTimer); }
+        })
+        .catch(function () {});
+    }, 5000);
+  }
+
+  // Buy → Hashrate while the renter is still looking for offers on Nostr: the page is loaded again in a few seconds,
+  // and not while the owner is in one of its forms.
+  var again = $("[data-reload-after]");
+  if (again) {
+    var reloadSoon = function () {
+      var a = document.activeElement;
+      if (a && a.form) { setTimeout(reloadSoon, 3000); return; }
+      root.location.reload();
+    };
+    setTimeout(reloadSoon, (Number(again.getAttribute("data-reload-after")) || 5) * 1000);
+  }
+
   // The pending-approvals badge.
   var badge = $("#pending-badge");
   if (badge && root.fetch) {

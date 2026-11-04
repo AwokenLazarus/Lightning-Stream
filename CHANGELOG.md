@@ -5,6 +5,56 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.10 (2026-11-03)
+
+Hashrate fixes and clearer hashrate pages, most of them sent by a hashmaker who runs the app. The wallet UI, the
+signer and the hashrate component change.
+
+- **The market price works with Knots 29.4.3.** That node reports the difficulty only as `difficulty_blake2b`, so the
+  hashmaker's price that follows the market said "your XBT node did not say the difficulty" and no rental started.
+  The signer now reads the difficulty from either.
+- **Buy → Hashrate answers at once.** The page said "The hashrate service does not answer. It may still be starting"
+  whenever the offers had not been looked up on Nostr for a while: the look-up ran inside the page's request and
+  could take 20 seconds. Now the offers are looked up in the background every minute, the page shows the last ones
+  at once, and just after a start it says "Looking for offers on Nostr…" and looks again by itself. Each Nostr relay
+  gets a few seconds; one that is down no longer holds up the others.
+- **A test slice can be paid.** "Try one slice first" let the wallet spend only the slice's price on a ticket, under
+  the shop's smallest ticket (546 sats), so every trial ended unpaid. The wallet may now buy that ticket; the trial
+  still pays for one slice, and the rest stays with the seller as credit.
+- **The Rent form budgets in whole tickets.** It suggests a budget that is a whole number of the shop's smallest
+  ticket and says what a budget really buys: with 546 sat tickets, 1,000 sats buys about 546 sats of work, and the
+  454 sats left under one ticket can't be spent. Rent says the same for the budget you typed. The budget still
+  limits payments as before.
+- **Renting turned back on brings the shop back.** Turning renting off removes the shop's hashrate route. Turned on
+  again any way but the Save on Sell → Hashrate (the settings file changing, or the app restarting after an
+  upgrade), the route stayed off, and the hashmaker waited with "your shop is not selling yet" until the app was
+  restarted. Now the route follows the setting within a minute.
+- **Sell → Add a service has Hashrate.** Among the kinds of service there is now a Hashrate choice that leads to
+  Sell → Hashrate, where miners are rented out.
+- **Allowing a hashmaker reached by its key adds its shop.** "Allow this hashmaker to be paid" only opened the
+  spending rules, so the wallet still couldn't reach a shop with no web address and refused every payment. It now
+  adds the shop first, as the Sellers page does.
+- **Your rentals update by themselves** while one is going on: money spent, pieces paid and the rental's end show
+  without a reload.
+- **A refused payment says why on the rental's card**, with what to do for the common cases (add the shop on
+  Sellers, allow the hashmaker, turn paying on in your spending rules).
+- **Prices per TH/s for an hour.** Sell → Hashrate says what your price comes to for 1 TH/s for an hour, what that
+  hour is worth when mined, and what the other offers ask. On Buy → Hashrate your own offer says "Priced high" when
+  it asks far more than the others or the mining value.
+- **Live connections shows a rental first**, and the shop connection that pays it says "Paying a rental".
+- **Buy has two tabs**, Browse and Live connections. Every kind of service is a chip of Browse: AI, Hashrate, VPN,
+  Files, Data & APIs and Web apps.
+- **Your own coinbase tag.** Your gateway's settings take an optional coinbase tag, up to 60 plain characters, put
+  in every block the Stream Gateway finds after "Lightning Stream" (or after the pool's tag with a pool). The card
+  now reads in order: status, where its blocks pay, your blocks, then the advanced settings. A regtest run checked
+  that blocks with a 60-character tag are accepted by the node.
+- **Plain words about Umbrel's DATUM Gateway app:** the hint says it mines the SHA-256 fork, and won't work here.
+
+Thanks to Kilombino, who sent the fixes for the market price with Knots 29.4.3, test slices, allowing a hashmaker
+reached by its key, the rentals that update by themselves, refusal reasons, prices per TH/s, "Priced high", Live
+connections, Buy's tabs, the coinbase tag and the DATUM hint, and who suggested the Hashrate choice in Add a
+service.
+
 ## 0.2.9 (2026-11-03)
 
 Renting hashrate works with the published images. Only the hashrate image changes.

@@ -275,8 +275,24 @@ fn rent_offers(base: &str, token: &Option<PathBuf>, keep: bool) -> Result<Value,
     let kept = offers_kept(base);
     let (b, t) = (base.to_string(), token.clone());
     match kept.peek() {
-        Some((_, Ok(_))) => kept.get(OFFERS_FRESH, WAIT, move || call(&b, &t, "GET", "/offers", None)).unwrap_or_else(|| Err("The hashrate service does not answer.".into())),
+        // an answer that was still looking is not kept: the renter answers at once, with what it has found since
+        Some((_, Ok(v))) if v["looking"] != true => kept.get(OFFERS_FRESH, WAIT, move || call(&b, &t, "GET", "/offers", None)).unwrap_or_else(|| Err("The hashrate service does not answer.".into())),
         _ => kept.refresh(|| call(base, token, "GET", "/offers", None)),
+    }
+}
+
+/// What the Hashrate page says with no offer to show, from the renter's answer. Just started, the renter is still
+/// looking on Nostr (it answers at once, and looks behind it): said, and the page looks again by itself in a few
+/// seconds. 0.2.9 waited on that look and said "The hashrate service does not answer" when it took longer than 6 s.
+fn no_offers_words(o: &Value) -> String {
+    if o["looking"] == true {
+        "<p class=\"empty\" data-reload-after=\"5\">Looking for offers on Nostr… This page looks again by itself in a few seconds \
+         (or <a href=\"./hashrate\">look again</a>).</p>".into()
+    } else if o["relaysAnswered"] == false {
+        "<p class=\"empty\">No Nostr relay answered the last look for offers. The app looks again every minute; \
+         <a href=\"./hashrate\">look again</a> in a while.</p>".into()
+    } else {
+        "<p class=\"empty\">No miners for rent found right now. Hashmakers publish their offers on Nostr; look again in a while.</p>".into()
     }
 }
 
@@ -402,6 +418,29 @@ fn pay_address_gone(why: &str) -> bool {
      "cannot reach", "no such host", "failed to lookup", "dns"].iter().any(|m| w.contains(m))
 }
 
+/// A payment the wallet refused (its answer as the renter kept it: `{"verdict":"deny","rule":…,"reason":…}`), in words,
+/// with what to do for the rules an owner meets most. None: not a refusal of the wallet's.
+fn wallet_refusal(why: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(why).ok()?;
+    if v["verdict"] != "deny" {
+        return None;
+    }
+    let rule = v["rule"].as_str().unwrap_or("");
+    // one with no reason in words is left unsaid, as before: the end of the rental says the rest
+    let reason = v["reason"].as_str().map(|r| r.trim().trim_end_matches('.')).filter(|r| !r.is_empty())?;
+    let todo = match rule {
+        "transport" => " This hashmaker's shop has no web address, so your wallet reaches it by its key: add the shop on \
+            <a href=\"./services\">Sellers</a> (paste its shop key), then rent again.",
+        "allowlist" | "seller_blocked" => " Allow this hashmaker to be paid (the button on its offer), and sign the change in your \
+            <a href=\"./policy\">spending rules</a>.",
+        "ticket_disabled" | "ticket_mainnet" | "ln_disabled" | "ticket_task" => " Paying is off in your spending rules: turn it on and sign them \
+            (<a href=\"./policy\">Settings → Spending rules</a>).",
+        _ => "",
+    };
+    Some(format!("<p class=\"hint\">Your wallet refused to pay this hashmaker: {}.{todo} <span class=\"small\">(rule: <code>{}</code>)</span></p>",
+                 esc(reason), esc(if rule.is_empty() { "none given" } else { rule })))
+}
+
 /// A closed rental's reason, in words.
 fn ended_words(why: &str) -> String {
     // the earlier role names too: a hashlink from before the rename words its reasons with them
@@ -482,6 +521,35 @@ impl App {
     /// moment before it read them keeps a shop that charges those till its rental ends. A live price moving with the
     /// chain comes no sooner than [`REPRICE_DWELL_MS`] after the last, so the shop isn't kept restarting.
     pub fn hash_reprice(&self, saving: bool) -> Repriced {
+        let r = self.hash_reprice_inner(saving);
+        self.hash_route_follows();
+        r
+    }
+
+    /// The shop's route for pieces of work follows the `enabled` setting, however it changed: written into the
+    /// gateway's config when renting is on and the config lacks it, taken out when renting is off and the config
+    /// has it. 0.2.9 did this only at the Save on Sell → Hashrate: renting turned back on by the settings file
+    /// changing or the app restarting left the shop without its route, and the hashmaker paused with "your shop is
+    /// not selling yet" till the UI restarted. `true`: the shop was written again.
+    pub fn hash_route_follows(&self) -> bool {
+        if self.cfg.hash.slices.is_none() {
+            return false;
+        }
+        let Some(now) = self.gateway_now() else { return false };
+        let has = now["routes"].as_array().is_some_and(|rs| rs.iter().any(|r| r["path"] == "/hashrate/"));
+        if has == self.hash_route().is_some() {
+            return false;
+        }
+        match self.commit(&self.shop(), "") {
+            Ok(_) => self.gateway_now().is_some_and(|c| c != now),
+            Err(e) => {
+                eprintln!("xbt-wallet-ui: the shop's hashrate route: {e}");
+                false
+            }
+        }
+    }
+
+    fn hash_reprice_inner(&self, saving: bool) -> Repriced {
         let mut s = self.hash_settings();
         if s["enabled"] != true {
             return Repriced::Off;
@@ -662,7 +730,11 @@ impl App {
             Pricing::Market(p) => (p, String::new()),
             Pricing::Fixed { sat, .. } => (MARKET_PCT, sat.to_string()),
         };
-        let price_block = price_words(&wanted, tip.as_ref().ok(), seen.hs, matches!(mode, Pricing::Market(_)));
+        let mut price_block = price_words(&wanted, tip.as_ref().ok(), seen.hs, matches!(mode, Pricing::Market(_)));
+        // the price per TH/s for an hour, the figure offers compare by, beside the mining value and the other offers seen
+        if let Ok(w) = &wanted {
+            price_block.push_str(&th_hour_words(w, tip.as_ref().ok(), &self.other_offers_th_hour()));
+        }
         let paused = st.as_ref().ok().and_then(|s| s["paused"].as_str()).map(paused_words).unwrap_or_default();
         let slice_typed = saved["sliceFixed"] == true;
         let slice_now = wanted.as_ref().map(|w| w.slice_work).unwrap_or_else(|_| slice_for(seen.hs.unwrap_or(EXAMPLE_HS), None)) as f64;
@@ -833,17 +905,22 @@ impl App {
 
     // --- Buy → Hashrate ------------------------------------------------------------------------
 
-    /// Rentals going on (for Live connections): cards with a Cut button, and what they spent.
-    pub(crate) fn hash_live_cards(&self, ctx: &Ctx) -> (String, i64) {
-        let Some(base) = &self.cfg.hash.renter else { return (String::new(), 0) };
-        let Ok(st) = call(base, &self.cfg.hash.renter_token, "GET", "/status", None) else { return (String::new(), 0) };
+    /// Rentals going on (for Live connections): cards with a Cut button, what they spent, and each one's pay address and
+    /// name, for the shop connection that pays it.
+    pub(crate) fn hash_live_cards(&self, ctx: &Ctx) -> (String, i64, Vec<(String, String)>) {
+        let Some(base) = &self.cfg.hash.renter else { return (String::new(), 0, vec![]) };
+        let Ok(st) = call(base, &self.cfg.hash.renter_token, "GET", "/status", None) else { return (String::new(), 0, vec![]) };
         let mut spent = 0i64;
         let mut cards = String::new();
+        let mut renting = vec![];
         for r in st["rentals"].as_array().into_iter().flatten().filter(|r| r["ended"] != true) {
             spent += (num(&r["live"]["spentMsat"]) / 1000.0) as i64;
             cards.push_str(&rental_card(ctx, r, "./connections-hashrate"));
+            if let Some(pay) = r["payUrl"].as_str().filter(|p| !p.is_empty()) {
+                renting.push((pay.to_string(), r["hasher"].as_str().unwrap_or("a hashmaker").to_string()));
+            }
         }
-        (cards, spent)
+        (cards, spent, renting)
     }
 
     /// The renter's offers asked once, kept for the first Hashrate page ([`App::prefetch`]).
@@ -903,11 +980,9 @@ impl App {
         // the rentals going on and the last ones
         let rentals: Vec<Value> = st["rentals"].as_array().cloned().unwrap_or_default();
         if !rentals.is_empty() {
-            b.push_str("<h2>Your rentals</h2><div class=\"stack\">");
-            for r in rentals.iter().take(10) {
-                b.push_str(&rental_card(ctx, r, "./hashrate"));
-            }
-            b.push_str("</div>");
+            // looked at again by the page (ui.js, ./api/hashrate-rentals) while one of them is live
+            let (cards, live) = rentals_cards(ctx, &rentals);
+            b.push_str(&format!("<div id=\"rentals\"{}>{cards}</div>", if live { " data-live=\"1\"" } else { "" }));
         }
 
         // a solo renter's odds of a block come from its own node's difficulty, asked only when its jobs show solo
@@ -921,7 +996,7 @@ impl App {
             Ok(o) => {
                 let offers: Vec<Value> = o["offers"].as_array().cloned().unwrap_or_default();
                 if offers.is_empty() {
-                    b.push_str("<p class=\"empty\">No miners for rent found right now. Hashmakers publish their offers on Nostr; look again in a while.</p>");
+                    b.push_str(&no_offers_words(&o));
                 }
                 b.push_str("<div class=\"grid services\">");
                 // this box's own hashmaker's pay address: its offer is ours even when the shop is reached by its key (Private),
@@ -934,6 +1009,13 @@ impl App {
                 }
                 // the shops the app knows, read once for every offer's seller
                 let known = self.services().unwrap_or_default();
+                // and the shops reached by their key that it keeps how to reach (the Sellers page's add)
+                let kept = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
+                // what the other offers ask for 1 TH/s for an hour: your own offer is compared with them
+                let th_hour = |x: &Value| per_hour(num(&x["priceMsat"]) / 1000.0, num(&x["sliceWork"]), 1e12);
+                let others: Vec<f64> = offers.iter()
+                    .filter(|x| { let pay = x["payUrl"].as_str().unwrap_or(""); !own_offer(self.is_own_shop(pay), &own_pay, pay) })
+                    .map(th_hour).filter(|p| *p > 0.0).collect();
                 for x in &offers {
                     let price = num(&x["priceMsat"]) / 1000.0;
                     let slice = num(&x["sliceWork"]);
@@ -943,15 +1025,28 @@ impl App {
                     let per_miner = if free > 0 && free_hs > 0.0 { free_hs / free as f64 } else { EXAMPLE_HS };
                     let start = x["startSlices"].as_u64().unwrap_or(0);
                     let fee = price * start as f64;
-                    let budget = (per_hour(price, slice, per_miner) + fee).ceil().max(price + fee) as u64;
+                    // about an hour of one machine, in whole tickets: what is under one ticket couldn't be spent
+                    let ticket_sat = smallest_ticket_sat(price);
+                    let budget = whole_tickets((per_hour(price, slice, per_miner) + fee).ceil().max(price + fee) as u64, ticket_sat);
+                    let buys = budget_buys(budget, price, ticket_sat);
                     let fee_words = start_fee_words(price, start, slice, per_miner);
                     // a hashmaker whose app doesn't prove its work is refused when renting: said, and Rent waits
                     let old = x["proves"] == false;
                     // the spending rules list who the app may pay: a hashmaker not on them is allowed first, with the
                     // node its signed listing names (the rules page shows the change to sign)
                     let pay_url = x["payUrl"].as_str().unwrap_or("");
-                    let allowed = self.seller_allowed(pay_url);
+                    // a hashmaker whose shop has no web address is paid through the transport document the app keeps for it:
+                    // allowed in the rules but not kept, the wallet refuses every payment (rule "transport"), so it is
+                    // allowed here the Sellers page's way, which keeps the shop and then opens the rules
+                    let by_key = crate::services::http_origin(pay_url).filter(|o| xbt402::shop::is_shop(o));
+                    let allowed = by_key.as_ref().is_none_or(|o| kept.contains_key(o)) && self.seller_allowed(pay_url);
                     let allow = match (allowed, crate::services::http_origin(pay_url), x["payNode"].as_str()) {
+                        (false, Some(o), _) if by_key.is_some() => format!(
+                            "<p class=\"hint\">Your spending rules list who this app may pay. Allow this hashmaker first: its shop is added to your sellers, \
+                             so your wallet knows how to reach it, and you sign the change with your approval key.</p>\
+                             <form method=\"post\" action=\"./services\">{csrf}<input type=\"hidden\" name=\"action\" value=\"try\">\
+                             <input type=\"hidden\" name=\"url\" value=\"{}\"><button>Allow this hashmaker to be paid</button></form>",
+                            esc(&o)),
                         (false, Some(o), Some(n)) if !n.is_empty() => format!(
                             "<p class=\"hint\">Your spending rules list who this app may pay. Allow this hashmaker first: you sign the change with your approval key.</p>\
                              <p><a class=\"button\" href=\"./policy?allow={}&amp;node={}\">Allow this hashmaker to be paid</a></p>",
@@ -998,8 +1093,11 @@ impl App {
                         ticket("trialMayBuyTicketUpToSats"), if can { "" } else { " disabled" });
                     // your own offer: what it is and what it costs, with nothing to allow, try or rent (a box can't pay itself)
                     if mine {
+                        // far above the other offers or the mining value: said, as a hint only
+                        let market = tip.or_else(|| self.mining_tip().ok()).map(|t| per_hour(worth_sat(1 << 32, &t), 4_294_967_296.0, 1e12));
+                        let high = priced_high(th_hour(x), &others, market);
                         b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
-                            <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}</section>",
+                            <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{high}</section>",
                             esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                             if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() }));
                         continue;
@@ -1007,15 +1105,16 @@ impl App {
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
                         <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
+                        <input type=\"hidden\" name=\"piece_sat\" value=\"{price}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
-                        <p class=\"hint\">About an hour of one machine{}. The rental ends when this much is spent, but however small it is, your wallet {}; \
-                        unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
+                        <p class=\"hint\">About an hour of one machine{}, in whole tickets. The rental ends when this much is spent, but however small it is, your wallet {}; \
+                        unused credit stays with this seller for about 20 hours, for a later rental there.</p><p class=\"hint\">{}</p>\
                         <span class=\"btn-why\"{off_tip}><button{}>Rent</button></span>{off_note}</form></section>",
                         esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
-                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"),
+                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"), esc(&buys),
                         if can { "" } else { " disabled" }));
                 }
                 b.push_str("</div>");
@@ -1029,6 +1128,32 @@ impl App {
         // your gateway: the bundled one's settings and state, and the way to another
         b.push_str(&self.gateway_card(&csrf, &st));
         self.html_page("Hashrate", "Hashrate", ctx, &b, "")
+    }
+
+    /// The Hashrate page's rentals, for the page to show again while one is live: their cards, and whether one still is.
+    /// Without it the money spent, the pieces paid and a rental's end showed only on a reload.
+    pub(crate) fn api_hashrate_rentals(&self, ctx: &Ctx) -> Resp {
+        let Some(base) = self.cfg.hash.renter.clone() else { return Resp::json(404, &json!({"error": "this box does not rent miners"})) };
+        match call(&base, &self.cfg.hash.renter_token, "GET", "/status", None) {
+            Ok(st) => {
+                let (html, live) = rentals_cards(ctx, st["rentals"].as_array().map(Vec::as_slice).unwrap_or_default());
+                Resp::json(200, &json!({"html": html, "live": live}))
+            }
+            Err(e) => Resp::json(502, &json!({"error": e})),
+        }
+    }
+
+    /// What the other hashmakers' offers seen on Nostr ask for 1 TH/s for an hour, in sats: the renter's offers (kept for
+    /// its page, asked again behind it), this box's own left out. None where this box doesn't rent.
+    fn other_offers_th_hour(&self) -> Vec<f64> {
+        let Some(base) = self.cfg.hash.renter.clone() else { return vec![] };
+        let Ok(o) = rent_offers(&base, &self.cfg.hash.renter_token, !self.cfg.read_cache.is_zero()) else { return vec![] };
+        let own_pay = self.hash_settings()["payUrl"].as_str().and_then(crate::services::http_origin);
+        o["offers"].as_array().into_iter().flatten()
+            .filter(|x| { let pay = x["payUrl"].as_str().unwrap_or(""); !own_offer(self.is_own_shop(pay), &own_pay, pay) })
+            .map(|x| per_hour(num(&x["priceMsat"]) / 1000.0, num(&x["sliceWork"]), 1e12))
+            .filter(|p| *p > 0.0)
+            .collect()
     }
 
     pub(crate) fn hashrate_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
@@ -1053,7 +1178,12 @@ impl App {
                     call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1),
                                                                      "once": g("once")})))
                         .and_then(|v| match v["rental"].as_str() {
-                            Some(_) => Ok(format!("Renting. The miners start on your gateway in a few seconds; you pay as their work is accepted.{}", may_buy(&v))),
+                            Some(_) => {
+                                // what the budget typed really buys, said: it bounds the payments as it always did
+                                let piece = g("piece_sat").parse::<f64>().ok().filter(|p| p.is_finite() && *p >= 0.0);
+                                let buys = piece.map(|p| format!(" {}", budget_buys(n("budget"), p, smallest_ticket_sat(p)))).unwrap_or_default();
+                                Ok(format!("Renting. The miners start on your gateway in a few seconds; you pay as their work is accepted.{buys}{}", may_buy(&v)))
+                            }
                             None => Err(v["error"].as_str().map(|e| format!("Not rented: {e}.")).unwrap_or_else(|| "Not rented.".into())),
                         })
                 }
@@ -1120,6 +1250,31 @@ impl App {
 /// hashmaker is paid.
 fn own_offer(own_shop: bool, own_pay: &Option<String>, pay_url: &str) -> bool {
     own_shop || own_pay.as_ref().is_some_and(|o| crate::services::http_origin(pay_url).as_ref() == Some(o))
+}
+
+/// How many times the other offers' middle price, or the mining value, a hashmaker's own price may be before its offer
+/// card says it is priced high.
+const PRICED_HIGH: f64 = 2.0;
+
+/// A hint on the hashmaker's own offer when its price per 1 TH/s for an hour (`mine`) is over [`PRICED_HIGH`] times what
+/// the other offers ask in the middle (`others`) or what that hour is worth when mined (`market`). Empty otherwise.
+fn priced_high(mine: f64, others: &[f64], market: Option<f64>) -> String {
+    let mut o: Vec<f64> = others.iter().copied().filter(|p| *p > 0.0).collect();
+    o.sort_by(f64::total_cmp);
+    let median = (!o.is_empty()).then(|| if o.len() % 2 == 1 { o[o.len() / 2] } else { (o[o.len() / 2 - 1] + o[o.len() / 2]) / 2.0 });
+    let mut over: Vec<String> = vec![];
+    if let Some(m) = median.filter(|m| mine > PRICED_HIGH * m) {
+        over.push(format!("about {:.0} times what the other offers ask ({} in the middle)", mine / m, sats_n(m)));
+    }
+    if let Some(m) = market.filter(|m| *m > 0.0 && mine > PRICED_HIGH * m) {
+        over.push(format!("about {:.0} times what that hour is worth when mined at today's difficulty ({})", mine / m, sats_n(m)));
+    }
+    if over.is_empty() {
+        return String::new();
+    }
+    format!("<p class=\"hint warn\"><span class=\"pill warn\">Priced high</span> Your offer comes to about {} an hour for 1 TH/s: {}. \
+             Renters see the offers side by side, so it may not be rented. Only a hint: the price is yours to set on \
+             <a href=\"./sell-hashrate\">Sell → Hashrate</a>.</p>", sats_n(mine), over.join(", and "))
 }
 
 /// Why an offer's Rent (and Try one slice first) is off, in the order a renter fixes them; empty when it is on.
@@ -1239,26 +1394,31 @@ impl App {
             let s = saved.clone().unwrap_or_else(|| Settings::new(Mode::Solo, ""));
             o.push_str(&format!("<p>The {NAME} comes with this app and runs beside it. It masks every job it hands out, so a hashmaker can't tell \
                 which shares win, and it takes its work from your own XBT node.</p>\
-                <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app is for Bitcoin, and won't work here.</p>\
+                <p class=\"hint\">No separate DATUM app is needed. Umbrel's own DATUM Gateway app mines the SHA-256 fork, and won't work here.</p>\
                 <p class=\"small\">Built on <a href=\"https://github.com/FlyTheElephant1/datum_gateway\" target=\"_blank\" rel=\"noopener noreferrer\">FlyTheElephant's \
                 datum_gateway</a>, with Lightning Stream's job masking.</p>"));
+            // in order: its state, where its blocks pay, what goes in its blocks, then what most owners never change
             if b["inUse"] == true {
                 let node = b["node"].as_bool();
-                o.push_str("<ul class=\"plain\">");
+                o.push_str("<h3>Status</h3><ul class=\"plain\">");
                 o.push_str(&state_row(Some(b["running"] == true), "Running"));
                 // what it measures: a job was fetched from the gateway and checked (it comes from your node)
                 o.push_str(&jobs_row(if b["running"] == true { node } else { None }));
                 o.push_str(&state_row(if node == Some(true) { Some(b["masking"] == true) } else { None }, "Masking its jobs"));
                 o.push_str("</ul>");
             } else if !b.is_null() {
-                o.push_str(&format!("<p class=\"hint\">Rented work goes to another gateway now, at <code>{}</code>.</p>\
+                o.push_str(&format!("<h3>Status</h3><p class=\"hint\">Rented work goes to another gateway now, at <code>{}</code>.</p>\
                     <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"use-bundled\">\
                     <button class=\"secondary\">Use the {NAME}</button></form>", esc(datum)));
             }
             let solo = s.mode == Mode::Solo;
             let ck = |on: bool| if on { " checked" } else { "" };
+            // the node its block templates come from, by host (the node's credentials are never in its address)
+            let node = self.cfg.hash.stream_gw.rpcurl.as_deref().map(|u| u.split("://").last().unwrap_or(u).rsplit('@').next().unwrap_or("").trim_end_matches('/'))
+                .map(|h| format!(", at <code>{}</code>", esc(h))).unwrap_or_default();
             o.push_str(&format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"gateway\">\
-                <fieldset><legend>Where its blocks pay</legend>\
+                <h3>Where its blocks pay</h3>\
+                <fieldset><legend>Solo or a pool</legend>\
                 <label><input type=\"radio\" name=\"mode\" value=\"solo\"{}> Solo: every block it finds pays your address, whole</label>\
                 <label><input type=\"radio\" name=\"mode\" value=\"pool-key\"{}> Lazarus Pool: blocks are shared through the pool, and you are paid for your share of its work</label>\
                 </fieldset>\
@@ -1267,13 +1427,19 @@ impl App {
                 <p class=\"hint\">With Lazarus Pool, this gateway holds the key that masks its jobs, and hands it to the pool with a block. So it could hide \
                 a block it finds from the pool, the same as any DATUM miner can today. Lazarus Pool masks these jobs once it takes gateway keys; until then \
                 renting stays off in this mode, and solo works.</p>\
-                <details><summary>The pool's server</summary>\
+                <h3>Your blocks</h3>\
+                <p class=\"hint\">Its block templates come from your own XBT node{node}: the transactions in a block it finds are your node's choice.</p>\
+                <label>Coinbase tag <small>(optional)</small><input name=\"coinbase_tag\" value=\"{}\" maxlength=\"60\" pattern=\"[ -~]*\" spellcheck=\"false\" placeholder=\"{}\"></label>\
+                <p class=\"hint\">Your own words in every block it finds, after &quot;{}&quot; solo, or after the pool's own with a pool. Up to 60 characters, \
+                plain letters, digits and punctuation. Empty: &quot;{}&quot;.</p>\
+                <details><summary>Advanced: the pool's server</summary>\
                 <label>Host<input name=\"pool_host\" value=\"{}\" class=\"mono\"></label>\
                 <label>Port<input name=\"pool_port\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
                 <label>Its key<input name=\"pool_pubkey\" value=\"{}\" class=\"mono\" spellcheck=\"false\"></label>\
                 <p class=\"hint\">Lazarus Pool's own, as it publishes them. Change them only if the pool says so.</p></details>\
                 <button>Save</button></form>",
-                ck(solo), ck(!solo), esc(&s.payout),
+                ck(solo), ck(!solo), esc(&s.payout), esc(&s.tag), crate::stream_gateway::TAG_SECONDARY, crate::stream_gateway::TAG_PRIMARY,
+                crate::stream_gateway::TAG_SECONDARY,
                 esc(if solo { LAZARUS_HOST } else { &s.pool_host }), if solo { LAZARUS_PORT } else { s.pool_port },
                 esc(if solo { LAZARUS_PUBKEY } else { &s.pool_pubkey })));
         }
@@ -1295,7 +1461,7 @@ impl App {
                 && datum.rsplit_once(':').is_none_or(|(h, _)| *a != format!("{h}:7152"))).unwrap_or("")),
             esc(&self.cfg.hash.datum_guide));
         if self.stream_gw_here() {
-            o.push_str(&format!("<details><summary>Use another gateway</summary>{other}</details>"));
+            o.push_str(&format!("<details><summary>Advanced: use another gateway</summary>{other}</details>"));
         } else {
             o.push_str(&other);
         }
@@ -1312,6 +1478,7 @@ impl App {
         let g = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
         let mode = Mode::from_name(&g("mode")).unwrap_or(Mode::Solo);
         let mut s = Settings::new(mode, &g("payout"));
+        s.tag = g("coinbase_tag");
         if mode == Mode::PoolKey {
             if !g("pool_host").is_empty() {
                 s.pool_host = g("pool_host");
@@ -1334,6 +1501,16 @@ impl App {
 }
 
 /// One rental, as the renter sees it.
+/// The Hashrate page's rentals (the last ten), and whether one of them is still going on.
+fn rentals_cards(ctx: &Ctx, rentals: &[Value]) -> (String, bool) {
+    let mut b = String::from("<h2>Your rentals</h2><div class=\"stack\">");
+    for r in rentals.iter().take(10) {
+        b.push_str(&rental_card(ctx, r, "./hashrate"));
+    }
+    b.push_str("</div>");
+    (b, rentals.iter().take(10).any(|r| r["ended"] != true && r["live"]["closed"].is_null()))
+}
+
 fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let live = &r["live"];
     let ended = r["ended"] == true || !live["closed"].is_null();
@@ -1365,8 +1542,10 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     const WORDS: [&str; 5] = ["This hashmaker's smallest ticket is", "What is left of this rental's budget", "Your wallet's rules stopped this payment",
                               "The wallet pays a rental only through the renter's own connection",
                               "The renter asked to pay something that isn't a piece of work of its rental"];
-    let refused = live["pays"].as_array().into_iter().flatten().rev().find_map(|p| p["why"].as_str().filter(|w| WORDS.iter().any(|s| w.starts_with(s))))
-        .map(|w| format!("<p class=\"hint\">{}</p>", esc(w))).unwrap_or_default();
+    let whys = || live["pays"].as_array().into_iter().flatten().rev().filter_map(|p| p["why"].as_str());
+    let refused = whys().find(|w| WORDS.iter().any(|s| w.starts_with(s))).map(|w| format!("<p class=\"hint\">{}</p>", esc(w)))
+        // any other refusal of the wallet's is its own answer, as it gave it: said with what to do, not left in the API
+        .or_else(|| whys().find_map(wallet_refusal)).unwrap_or_default();
     let cut = if ended {
         String::new()
     } else {
@@ -1434,6 +1613,43 @@ fn pct(x: f64) -> String {
 
 /// What a rental may take from the wallet beyond its budget, as the hashtaker answered it: a ticket
 /// bought whole, its unused part staying with that seller as credit.
+/// The smallest ticket a shop sells (`xbt_hashlink::order::FIRST_STEP_MSAT`, the dust limit), in sats.
+const SMALLEST_TICKET_SAT: u64 = 546;
+
+/// The smallest ticket a rental pays with: the shop's smallest, never under one piece of work.
+fn smallest_ticket_sat(price_sat: f64) -> u64 {
+    SMALLEST_TICKET_SAT.max(price_sat.max(0.0).ceil() as u64)
+}
+
+/// A budget suggested in whole tickets: rounded up to the next whole number of the smallest ticket, so none of it is
+/// left under a ticket that can't be spent.
+fn whole_tickets(budget: u64, ticket: u64) -> u64 {
+    budget.div_ceil(ticket.max(1)).max(1) * ticket.max(1)
+}
+
+/// What a budget really buys, in words: the wallet pays a shop in tickets of at least `ticket` sats, so what is left
+/// of the budget under one ticket can't be spent. For the owner only: the budget still bounds the payments as before.
+fn budget_buys(budget: u64, price_sat: f64, ticket: u64) -> String {
+    let ticket = ticket.max(1);
+    let n = |x: u64| sats_n(x as f64);
+    if budget < ticket {
+        return format!("{} is less than this shop's smallest ticket ({}): it buys no work. Set at least {}.", n(budget), n(ticket), n(ticket));
+    }
+    let spent = budget / ticket * ticket;
+    let left = budget - spent;
+    let pieces = if price_sat > 0.0 { (spent as f64 / price_sat).floor() as u64 } else { 0 };
+    // a count, grouped as sats are: "about 1,365 pieces of work"
+    let count = sats_n(pieces as f64).trim_end_matches(" sats").trim_end_matches(" sat").to_string();
+    let pieces = if pieces >= 1 { format!(" (about {count} piece{} of work)", if pieces == 1 { "" } else { "s" }) } else { String::new() };
+    if left == 0 {
+        format!("Your wallet pays this shop in tickets of at least {}: {} buys pieces of work worth about {}{pieces}.", n(ticket), n(budget), n(spent))
+    } else {
+        format!("Your wallet pays this shop in tickets of at least {}: {} buys pieces of work worth about {}{pieces}. \
+                 The {} left under one ticket can't be spent; {} would use it all.",
+                n(ticket), n(budget), n(spent), n(left), n(whole_tickets(budget, ticket)))
+    }
+}
+
 fn may_buy(v: &Value) -> String {
     match v["mayBuyTicketUpToSats"].as_u64() {
         Some(n) if n > v["budgetSats"].as_u64().unwrap_or(0) => {
@@ -1484,6 +1700,29 @@ fn price_words(w: &Result<Want, String>, tip: Option<&Tip>, hs: Option<f64>, mar
             difficulty, about {} a piece. Your own pool likely pays close to that, less its fee, so renting at this price may earn you less than \
             mining. This app can't see what your pool pays you, so it compares your price with the mining value only.</p>", sats_n(v)));
     }
+    b
+}
+
+/// The price `w` per 1 TH/s for an hour, beside what that hour is worth when mined at `tip` and what `others` (the other
+/// offers seen, per TH/s for an hour) ask: a price a piece of work says little by itself, since pieces differ in size.
+fn th_hour_words(w: &Want, tip: Option<&Tip>, others: &[f64]) -> String {
+    let slice = w.slice_work as f64;
+    let mine = per_hour(w.price_sat as f64, slice, 1e12);
+    let mut b = format!("<p class=\"hint\">Per 1 TH/s of speed, your price comes to about <strong>{}</strong> an hour.", sats_n(mine));
+    if let Some(t) = tip {
+        b.push_str(&format!(" Mined at today's difficulty, 1 TH/s for an hour is worth about {}.", sats_n(per_hour(worth_sat(w.slice_work, t), slice, 1e12))));
+    }
+    let mut o: Vec<f64> = others.to_vec();
+    o.sort_by(f64::total_cmp);
+    match o.len() {
+        0 => {}
+        1 => b.push_str(&format!(" The other offer seen now asks about {} an hour for 1 TH/s.", sats_n(o[0]))),
+        n => {
+            let median = if n % 2 == 1 { o[n / 2] } else { (o[n / 2 - 1] + o[n / 2]) / 2.0 };
+            b.push_str(&format!(" The {n} other offers seen now ask from about {} an hour for 1 TH/s (the cheapest), {} in the middle.", sats_n(o[0]), sats_n(median)));
+        }
+    }
+    b.push_str("</p>");
     b
 }
 
@@ -1940,5 +2179,97 @@ mod tests {
         assert_eq!(ended_words("hashmaker closed: no first payment"), "The first piece of work was not paid in time.");
         assert_eq!(ended_words("the gateway's jobs aren't blinded"), "Your pool's jobs don't hide which shares win, so the hashmaker could drop those. The rental stopped.");
         assert_eq!(ended_words("hashmaker closed: a difficulty too high for the slice"), "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.");
+    }
+
+    /// The rentals the page shows again: live while one hashes or connects, not once every one ended (its last look
+    /// shows the end, then the page stops asking).
+    #[test]
+    fn the_rentals_are_live_while_one_goes_on() {
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let going = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 1000, "ended": false,
+                           "live": {"closed": null, "role": "hashtaker", "paidSlices": 3, "spentMsat": 120000, "miners": 1}});
+        let ended = json!({"rental": "r0", "hasher": "Laz Hash", "budgetSats": 1000, "ended": true, "live": {"closed": "budget used up"}});
+        let closing = json!({"rental": "r2", "hasher": "Laz Hash", "budgetSats": 1000, "ended": false, "live": {"closed": "cut by the hashtaker"}});
+        let (html, live) = rentals_cards(&ctx, &[going.clone(), ended.clone()]);
+        assert!(live && html.contains("Your rentals") && html.contains("Spent so far: <span class=\"money\">120 sats</span>") && html.contains("Hashing"), "{html}");
+        assert!(!rentals_cards(&ctx, &[ended.clone(), closing]).1, "every one ended or closing");
+        assert!(!rentals_cards(&ctx, &[]).1);
+    }
+
+    /// A payment the wallet refused is said on the rental's card with its reason and what to do: 0.2.9 said only "Your
+    /// wallet could not pay for the first piece of work", and the reason was in the renter's API.
+    #[test]
+    fn a_payment_the_wallet_refused_is_said_with_what_to_do() {
+        let transport = json!({"verdict": "deny", "rule": "transport", "reason": "a shop without a web address is reached through its transport document: pass `transport` and `receipt_key` from its listing, or add the shop in the app (XBT_SHOPS_FILE)"});
+        let w = wallet_refusal(&transport.to_string()).unwrap();
+        assert!(w.contains("Your wallet refused to pay this hashmaker: a shop without a web address") && w.contains("<a href=\"./services\">Sellers</a>")
+                && w.contains("<code>transport</code>"), "{w}");
+        let off = wallet_refusal(&json!({"verdict": "deny", "rule": "ticket_disabled", "reason": "stream tickets are off in this policy (tickets.enabled)"}).to_string()).unwrap();
+        assert!(off.contains("Paying is off in your spending rules") && off.contains("./policy"), "{off}");
+        let other = wallet_refusal(&json!({"verdict": "deny", "rule": "price_ceiling", "reason": "the price is above the ceiling."}).to_string()).unwrap();
+        assert!(other.contains("the price is above the ceiling. <span") && !other.contains("<a "), "said as it is, nothing to point at: {other}");
+        assert_eq!(wallet_refusal("signer socket run/signer.sock: No such file"), None, "not the wallet's answer");
+        assert_eq!(wallet_refusal(&json!({"verdict": "allow"}).to_string()), None);
+        assert_eq!(wallet_refusal(&json!({"verdict": "deny", "rule": "price_ceiling"}).to_string()), None, "no words to say");
+        // on the card, beside the end in words
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let r = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 40, "ended": true,
+                       "live": {"closed": "the first slice could not be paid", "pays": [{"slice": 1, "ok": false, "why": transport.to_string()}]}});
+        let card = rental_card(&ctx, &r, "./hashrate");
+        assert!(card.contains("Your wallet could not pay for the first piece of work") && card.contains("add the shop on"), "{card}");
+    }
+
+    /// With no offer to show: still looking (and the page looks again), no relay answering, or none found.
+    #[test]
+    fn no_offers_says_whether_the_renter_is_still_looking() {
+        let looking = no_offers_words(&json!({"offers": [], "looking": true, "relaysAnswered": true}));
+        assert!(looking.contains("Looking for offers on Nostr") && looking.contains("data-reload-after=\"5\"") && !looking.contains("does not answer"), "{looking}");
+        let quiet = no_offers_words(&json!({"offers": [], "looking": false, "relaysAnswered": false}));
+        assert!(quiet.contains("No Nostr relay answered") && !quiet.contains("data-reload-after"), "{quiet}");
+        assert!(no_offers_words(&json!({"offers": []})).contains("No miners for rent found right now"), "an older renter's answer");
+    }
+
+    /// The Rent form's budget, in whole tickets, and what a budget really buys (#50's follow-up): the wallet pays a shop
+    /// in tickets of at least 546 sats, so 1,000 sats buys about 546 sats of work and the 454 under a ticket can't be spent.
+    #[test]
+    fn a_budget_is_suggested_in_whole_tickets_and_says_what_it_buys() {
+        assert_eq!((smallest_ticket_sat(40.0), smallest_ticket_sat(3235.0), smallest_ticket_sat(546.4)), (546, 3235, 547));
+        assert_eq!((whole_tickets(1000, 546), whole_tickets(1092, 546), whole_tickets(1, 546), whole_tickets(0, 546)), (1092, 1092, 546, 546));
+        let w = budget_buys(1000, 40.0, 546);
+        assert!(w.contains("tickets of at least 546 sats: 1,000 sats buys pieces of work worth about 546 sats (about 13 pieces of work)")
+                && w.contains("The 454 sats left under one ticket can't be spent; 1,092 sats would use it all."), "{w}");
+        let whole = budget_buys(1092, 40.0, 546);
+        assert!(whole.contains("worth about 1,092 sats (about 27 pieces of work).") && !whole.contains("left under"), "{whole}");
+        assert!(budget_buys(500, 40.0, 546).contains("less than this shop's smallest ticket (546 sats): it buys no work"));
+        assert!(budget_buys(546, 1000.0, 546).ends_with("worth about 546 sats."), "no piece in it: no count");
+    }
+
+    /// A fixed price is said per 1 TH/s for an hour, beside the mining value and the other offers: 1,700 sats a piece was
+    /// set without seeing it came to about 40 times the other offer's.
+    #[test]
+    fn a_price_is_said_per_th_hour_beside_the_market_and_the_other_offers() {
+        let tip = Tip { difficulty: 1e6, subsidy_sats: 312_500_000, height: 1 };
+        let w = Want { price_sat: 1700, slice_work: 1 << 45, start_slices: 1 };
+        let worth = per_hour(worth_sat(1 << 45, &tip), (1u64 << 45) as f64, 1e12);
+        let words = th_hour_words(&w, Some(&tip), &[1_500.0, 100.0, 300.0]);
+        assert!(words.contains(&format!("your price comes to about <strong>{}</strong> an hour", sats_n(per_hour(1700.0, (1u64 << 45) as f64, 1e12)))), "{words}");
+        assert!(words.contains(&format!("1 TH/s for an hour is worth about {}", sats_n(worth))), "{words}");
+        assert!(words.contains("The 3 other offers seen now ask from about 100 sats an hour for 1 TH/s (the cheapest), 300 sats in the middle."), "{words}");
+        let one = th_hour_words(&w, None, &[4_400.0]);
+        assert!(one.contains("The other offer seen now asks about 4,400 sats") && !one.contains("worth"), "{one}");
+        assert!(!th_hour_words(&w, None, &[]).contains("other offer"));
+    }
+
+    /// The hashmaker's own offer says when it is priced far above the other offers or the mining value, as a hint:
+    /// 1,700 sats a piece was set at about 40 times the other offer's price for 1 TH/s for an hour.
+    #[test]
+    fn an_own_offer_far_above_the_others_says_so() {
+        let w = priced_high(44_000.0, &[1_100.0], None);
+        assert!(w.contains("Priced high") && w.contains("about 44,000 sats an hour for 1 TH/s") && w.contains("about 40 times what the other offers ask (1,100 sats in the middle)")
+                && w.contains("Only a hint"), "{w}");
+        let m = priced_high(3_000.0, &[], Some(1_000.0));
+        assert!(m.contains("about 3 times what that hour is worth when mined") && !m.contains("other offers"), "{m}");
+        assert_eq!(priced_high(2_000.0, &[1_000.0, 900.0, 5_000.0], Some(1_000.0)), "", "twice the middle price and the mining value: not yet");
+        assert_eq!(priced_high(5_000.0, &[], None), "", "nothing to compare with");
     }
 }
