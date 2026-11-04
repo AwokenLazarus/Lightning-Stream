@@ -438,10 +438,10 @@ pub fn price_words(prices: &Value) -> String {
     if parts.is_empty() { "free".into() } else { parts.join(" + ") }
 }
 
-/// A hashrate service's price: each paid request buys one piece of work.
-fn work_price_words(prices: &Value) -> String {
-    price_words(prices).replace("a request", "a piece of work")
-}
+/// What a hashrate service says for its price. Its listing's price per piece of work is not what renting
+/// costs: the live offer on the Hashrate page sets that, follows the market, and a piece of work differs in
+/// size between sellers. 0.2.11 said "40 sat a piece of work" here beside an offer asking 404.
+pub const HASHRATE_PRICE_WORDS: &str = "Live price on the Hashrate page";
 
 /// The services a checked listing lists, as Browse shows them. A seller with one service shows
 /// under its own name; with several, each as `seller name: service name`.
@@ -457,7 +457,7 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
             name: name.chars().take(MAX_TEXT).collect(),
             kind,
             seller: l.seller.clone(),
-            price_text: if kind == Kind::Hashrate { work_price_words(&s.prices) } else { price_words(&s.prices) },
+            price_text: if kind == Kind::Hashrate { HASHRATE_PRICE_WORDS.into() } else { price_words(&s.prices) },
             prices: s.prices.clone(),
             items: s.items.iter().map(|i| Item { title: i.title.clone(), year: i.year.map(|y| y.to_string()).unwrap_or_default(), url: i.url.clone(),
                                                  credit: i.credit.clone().unwrap_or_else(|| credit.clone()).chars().take(MAX_TEXT).collect() }).collect(),
