@@ -176,7 +176,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8c844bcb5c6f@sha256:75763651cff3aa70454c033fe5fc7170a6cae1f3827d8fa3d56d16a06f432b71
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4dac7759ed89@sha256:8c7268bc083a8f2e4110dcbad6319abfa8ace4cecd848579681a3844e94bdb46
     stop_grace_period: 15s
     ports:
       # sellers' own web pages, framed by the app's page on the same host (umbreld proxies the page itself)
@@ -298,7 +298,7 @@ services:
   # network of this app's own could not hold another app's container (no narrower network to give it).
   node-keys-bake:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8c844bcb5c6f@sha256:75763651cff3aa70454c033fe5fc7170a6cae1f3827d8fa3d56d16a06f432b71
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4dac7759ed89@sha256:8c7268bc083a8f2e4110dcbad6319abfa8ace4cecd848579681a3844e94bdb46
     command: ["node-keys"]
     user: "1000:1000"
     restart: "no"
@@ -329,7 +329,7 @@ services:
   # key id, removes it from the hand-over, and exits once every key is in place.
   node-keys:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8c844bcb5c6f@sha256:75763651cff3aa70454c033fe5fc7170a6cae1f3827d8fa3d56d16a06f432b71
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4dac7759ed89@sha256:8c7268bc083a8f2e4110dcbad6319abfa8ace4cecd848579681a3844e94bdb46
     command: ["node-keys"]
     restart: "no"
     # it only moves files: no network at all (the node's address below is only what the tool asks for)

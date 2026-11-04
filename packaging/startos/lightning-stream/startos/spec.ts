@@ -193,7 +193,7 @@ export const IMAGES: Record<ImageKey, string> = {
   signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-8c844bcb5c6f@sha256:3b36e56812123ab55b62bcede309616257c6990dcc89601a7b1ac450f59f1d5c',
   witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-8c844bcb5c6f@sha256:01968f344c561b25f29aaecd0e408832e471841e36229541f2d8904ec53e826a',
   mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-8c844bcb5c6f@sha256:55a3a919b079bd2ebc4329acfb66401c458c4075ee904b0f66eb6ea8a030b2fa',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8c844bcb5c6f@sha256:75763651cff3aa70454c033fe5fc7170a6cae1f3827d8fa3d56d16a06f432b71',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4dac7759ed89@sha256:8c7268bc083a8f2e4110dcbad6319abfa8ace4cecd848579681a3844e94bdb46',
   gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-8c844bcb5c6f@sha256:c007152f7a43fb362d319038af2f31b51be9d48de89202f0c53ac85cb361e02f',
   connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-8c844bcb5c6f@sha256:74629ff66eaf8a097bced23fbc9f0d80d81f6bf1791e6def35fd27d84200e2da',
   hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-8c844bcb5c6f@sha256:bcf7a7b4eb603af8e016e37a2ec7c29a42205497c28808b2b78380abd7791616',

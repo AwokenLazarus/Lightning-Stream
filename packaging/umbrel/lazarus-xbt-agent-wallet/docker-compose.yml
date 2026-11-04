@@ -118,7 +118,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8c844bcb5c6f@sha256:75763651cff3aa70454c033fe5fc7170a6cae1f3827d8fa3d56d16a06f432b71
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4dac7759ed89@sha256:8c7268bc083a8f2e4110dcbad6319abfa8ace4cecd848579681a3844e94bdb46
     stop_grace_period: 15s
     environment:
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
