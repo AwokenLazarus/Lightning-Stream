@@ -71,6 +71,12 @@
 #            the wallet's account each charge the tunnel's bytes at the listed price, never below it
 #            and at most 1% and 1 MiB above (framing, and bytes on their way at the stop: one flow's
 #            512 KiB window), and under two tickets are left with the seller. Ports BASE+17 to BASE+20
+#   mesh     (by name only, with MESH_LLM_URL) a model served by Mesh-LLM, sold by the token: the
+#            gateway's /ai/ route passes chat completions to the Mesh-LLM node at MESH_LLM_URL, priced
+#            2 msat a token in and 10 out, at most 128 out. Unpaid, a 402 naming those rates; then 20
+#            questions in one session, whole and streamed by turns, each answer charged the model's own
+#            counts, and the seller's signed receipts, the wallet's account and both nodes come to the
+#            sum to the msat
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab
