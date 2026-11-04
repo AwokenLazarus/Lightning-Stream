@@ -1150,7 +1150,8 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     assert!(!tabs.contains("./ai\"") && !tabs.contains("./vpn\"") && !tabs.contains("./services\"") && tabs.contains("./connections"), "{tabs}");
     let chips = &page.body[page.body.find("<nav class=\"chips\"").unwrap()..];
     let chips = &chips[..chips.find("</nav>").unwrap()];
-    let order: Vec<usize> = [">All <", "./ai\">AI<", ">Hashrate<", "./vpn\">VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
+    let order: Vec<usize> = [">All <", "./ai\"><span class=\"icon\" aria-hidden=\"true\">🤖</span>AI<", ">Hashrate<",
+                            "./vpn\"><span class=\"icon\" aria-hidden=\"true\">🔒</span>VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
         .map(|c| chips.find(c).unwrap_or_else(|| panic!("{c}: {chips}"))).collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{chips}");
     assert!(page.body.contains("Your <a href=\"./services\">sellers</a>"), "Sellers, from Browse");
@@ -1192,9 +1193,9 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     let data = br.get("/browse?cat=files").body;
     assert!(data.contains("Zebra files") && data.contains("Alpha films"), "files, and an older film listing");
     let old_link = br.get("/browse?kind=video").body;
-    assert!(old_link.contains("Alpha films") && old_link.contains("aria-current=\"page\">Files"), "an older films link is files");
+    assert!(old_link.contains("Alpha films") && old_link.contains("aria-current=\"page\"><span class=\"icon\" aria-hidden=\"true\">📁</span>Files"), "an older films link is files");
     let old_cat = br.get("/browse?cat=media").body;
-    assert!(old_cat.contains("aria-current=\"page\">Web apps"), "the older media category is web apps");
+    assert!(old_cat.contains("aria-current=\"page\"><span class=\"icon\" aria-hidden=\"true\">🌐</span>Web apps"), "the older media category is web apps");
     assert!(br.get("/browse?cat=ai").body.contains("No services in this category yet"));
 
     let conn = br.get("/connections");

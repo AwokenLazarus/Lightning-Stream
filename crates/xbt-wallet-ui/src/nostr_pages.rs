@@ -92,8 +92,8 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -
                                 esc(&ctx.csrf), esc(&n.event_id)));
         }
         for s in nostr::to_services(n) {
-            b.push_str(&format!("<h3>{} <span class=\"pill cat-{}\">{}</span></h3><p class=\"price\">{}</p>", esc(&s.name), s.category(),
-                                esc(s.category_words()), esc(&s.price_text)));
+            b.push_str(&format!("<h3>{} <span class=\"pill cat-{}\">{}{}</span></h3><p class=\"price\">{}</p>", esc(&s.name), s.category(),
+                                services::icon(s.category()), esc(s.category_words()), esc(&s.price_text)));
             if !s.items.is_empty() {
                 b.push_str("<div class=\"grid\">");
                 for item in &s.items {
