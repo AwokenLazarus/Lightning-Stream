@@ -321,6 +321,19 @@ pub(crate) fn offer_seller(known: &[crate::services::Service], pay_url: &str) ->
     }
 }
 
+/// What `seller`'s live offer asks, as the Hashrate page says it, from the renter's `offers` (`GET /offers`):
+/// "About 41,337 sats an hour for 1 TH/s (404 sats a piece of work)". With several, the cheapest an hour.
+/// `None`: none of them is that seller's. Browse says this beside a hashrate seller instead of the price
+/// its listing names, which is not what renting it costs once its offer follows the market.
+pub(crate) fn live_offer_words(offers: &Value, seller: &str) -> Option<String> {
+    offers["offers"].as_array()?.iter()
+        .filter(|x| crate::services::same_origin(x["payUrl"].as_str().unwrap_or(""), seller))
+        .map(|x| (num(&x["priceMsat"]) / 1000.0, num(&x["sliceWork"])))
+        .filter(|(price, slice)| *price > 0.0 && *slice > 0.0)
+        .min_by(|a, b| per_hour(a.0, a.1, 1e12).total_cmp(&per_hour(b.0, b.1, 1e12)))
+        .map(|(price, slice)| format!("About {} an hour for 1 TH/s ({} a piece of work)", sats_n(per_hour(price, slice, 1e12)), sats_n(price)))
+}
+
 /// One call to a service's control page.
 fn call(base: &str, token: &Option<PathBuf>, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
     crate::perf::timed(|| call_once(base, token, method, path, body))
@@ -927,6 +940,18 @@ impl App {
     pub(crate) fn hashrate_prefetch(&self) {
         if let (Some(base), false) = (self.cfg.hash.renter.clone(), self.cfg.read_cache.is_zero()) {
             let _ = rent_offers(&base, &self.cfg.hash.renter_token, true);
+        }
+    }
+
+    /// The renter's offers as last asked ([`rent_offers`]), for Browse: never asked for it, so Browse waits on nothing.
+    /// `Null`: none asked yet, the last ask failed, or nothing is kept (`XBT_UI_CACHE_S=0`).
+    pub(crate) fn kept_hash_offers(&self) -> Value {
+        match (&self.cfg.hash.renter, self.cfg.read_cache.is_zero()) {
+            (Some(base), false) => match offers_kept(base).peek() {
+                Some((_, Ok(v))) => v,
+                _ => Value::Null,
+            },
+            _ => Value::Null,
         }
     }
 

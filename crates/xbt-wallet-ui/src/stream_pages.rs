@@ -30,7 +30,10 @@ impl App {
                 } else {
                     String::new()
                 };
-                format!("{warn}{}", browse_html(&all, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller)))
+                // a hashrate seller's live offer, where the Hashrate page's last look found it: nothing is asked for Browse
+                let offers = self.kept_hash_offers();
+                let live = |seller: &str| crate::app::hashrate::live_offer_words(&offers, seller);
+                format!("{warn}{}", browse_html(&all, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller), &live))
             }
             Err(e) => format!("{}{}", Self::error_box(&e), empty_how(&self.suggested(ctx, &[]))),
         };
@@ -264,7 +267,8 @@ fn empty_how(suggested: &str) -> String {
      <p><a class=\"button-link primary\" href=\"./services\">Add a seller</a></p>{suggested}</section>")
 }
 
-fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dyn Fn(&str) -> bool) -> String {
+/// `live`: what a hashrate seller's live offer asks ([`crate::app::hashrate::live_offer_words`]), where it is known.
+fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dyn Fn(&str) -> bool, live: &dyn Fn(&str) -> Option<String>) -> String {
     let cat = cat.trim().to_ascii_lowercase();
     // a kind or an older category names its category: films (`video`) are files, a media server (`media`) a web app
     let cat = match cat.as_str() {
@@ -319,11 +323,13 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
         };
         let mine = own(&s.seller);
         let what = if s.app.is_empty() || s.category() == "apps" { what } else { format!("{what} · has its own app") };
+        // a hashrate seller costs what its live offer asks, never the price its listing (or an older services file) names
+        let price = if s.kind == Kind::Hashrate { live(&s.seller).unwrap_or_else(|| services::HASHRATE_PRICE_WORDS.into()) } else { s.price_text.clone() };
         b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}</span>{}<h2>{}</h2>\
                              <p class=\"price\">{}</p><p class=\"small\">{} · {}</p></a>",
                             service_href(s), s.category(), esc(s.category_words()),
                             if mine { " <span class=\"pill good\">Your shop</span>" } else { "" },
-                            esc(&s.name), esc(&s.price_text), esc(&what), esc(&seller_words(all, &s.seller))));
+                            esc(&s.name), esc(&price), esc(&what), esc(&seller_words(all, &s.seller))));
     }
     b.push_str("</div>");
     b
@@ -362,7 +368,8 @@ fn service_html(s: &Service, own: bool, seller: &str) -> String {
     let mut b = format!("<p class=\"small\"><a href=\"./browse?cat={}\">← {}</a></p>\
         <section class=\"card\"><div class=\"offer-head\"><span class=\"pill cat-{}\">{}</span><span class=\"price\">{}</span></div>\
         <p class=\"small\">Sold by {}</p></section>",
-        s.category(), esc(s.category_words()), s.category(), esc(s.category_words()), esc(&s.price_text), esc(seller));
+        s.category(), esc(s.category_words()), s.category(), esc(s.category_words()),
+        esc(if s.kind == Kind::Hashrate { services::HASHRATE_PRICE_WORDS } else { &s.price_text }), esc(seller));
     if own {
         b.push_str(if s.app.is_empty() {
             "<section class=\"status ok\"><p class=\"status-head\">This is your shop</p><p>Buyers pay for this. Your box can't buy from \
@@ -982,14 +989,14 @@ mod tests {
             prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
         let all = services::from_listing(&l);
         for own in [false, true] {
-            let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| own);
+            let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| own, &|_| None);
             assert!(html.contains("Hashrate <span class=\"count\">1</span>"), "{html}");
             assert_eq!(html.matches("class=\"card service-card\"").count(), 1, "{html}");
         }
-        let html = browse_html(&all, "data", Sort::Name, "", &|_| false);
+        let html = browse_html(&all, "data", Sort::Name, "", &|_| false, &|_| None);
         assert!(html.contains("No services in this category yet"), "{html}");
         let none: Vec<Service> = vec![Service { kind: Kind::Ai, ..all[0].clone() }];
-        let html = browse_html(&none, "hashrate", Sort::Name, "", &|_| false);
+        let html = browse_html(&none, "hashrate", Sort::Name, "", &|_| false, &|_| None);
         assert!(html.contains("Miners for rent are listed on the <a href=\"./hashrate\">Hashrate</a> page") && !html.contains("No services in this category"), "{html}");
     }
 
@@ -1000,10 +1007,34 @@ mod tests {
         let l = xbt402::listing::Listing { name: "Box".into(), kind: "hashrate".into(), seller: "https://box.example".into(), receipt_key: String::new(),
             prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
         let all = services::from_listing(&l);
-        assert_eq!((all[0].kind, all[0].price_text.as_str()), (Kind::Hashrate, "40 sat a piece of work"));
-        let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| false);
+        assert_eq!((all[0].kind, all[0].price_text.as_str()), (Kind::Hashrate, services::HASHRATE_PRICE_WORDS));
+        let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| false, &|_| None);
         assert!(html.contains("cat-hashrate") && html.contains("Rent miners by the piece of work") && html.contains("href=\"./hashrate\""), "{html}");
-        assert!(service_html(&all[0], false, "x").contains("href=\"./hashrate\""));
+        assert!(html.contains("Live price on the Hashrate page") && !html.contains("40 sat"), "{html}");
+        let page = service_html(&all[0], false, "x");
+        assert!(page.contains("href=\"./hashrate\"") && !page.contains("40 sat"), "{page}");
+    }
+
+    /// A hashrate seller on Browse shows what its live offer asks, as the Hashrate page says it; with no offer
+    /// of that seller known, no price at all. A services file saved by 0.2.11 keeps the listing's price: not shown.
+    ///
+    /// FAILS before: Browse said "40 sat a piece of work", from the listing, beside a live offer asking 404 sats.
+    #[test]
+    fn a_hashrate_card_shows_the_live_offer_not_the_listing_price() {
+        let old = Service { name: "Lazarus Stream: Laz Hash".into(), kind: Kind::Hashrate, seller: "https://stream.example".into(),
+            price_text: "40 sat a piece of work".into(), prices: json!({"request_msat": "40000"}), items: vec![], address: String::new(),
+            app: String::new(), app_base: String::new() };
+        let all = vec![old];
+        let offers = json!({"offers": [
+            {"payUrl": "https://other.example/hashrate/", "priceMsat": 1000, "sliceWork": 35_184_372_088_832u64},
+            {"payUrl": "https://stream.example/hashrate/", "priceMsat": 404_000, "sliceWork": 35_184_372_088_832u64}]});
+        let live = |seller: &str| crate::app::hashrate::live_offer_words(&offers, seller);
+        let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| false, &live);
+        assert!(html.contains("About 41,337 sats an hour for 1 TH/s (404 sats a piece of work)") && !html.contains("40 sat a piece"), "{html}");
+        // no offer of that seller seen: no price
+        let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| false, &|_| None);
+        assert!(html.contains("Live price on the Hashrate page") && !html.contains("40 sat"), "{html}");
+        assert_eq!(crate::app::hashrate::live_offer_words(&serde_json::Value::Null, "https://stream.example"), None);
     }
 
     /// Two services list the same file at different prices: the Download and the player's link carry
