@@ -999,9 +999,11 @@ impl App {
             b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
             // the bookkeeping of a reservation (its booking made what was paid) is not a row of its own
             let all: Vec<Value> = h["events"].as_array().cloned().unwrap_or_default();
-            let events: Vec<Value> = all.iter().filter(|e| activity_row(e, &all)).cloned().collect();
+            // and one row a payment: its allowed and reserved steps fold into its outcome
+            let folds = activity_folds(&all);
+            let events: Vec<(usize, &Value)> = all.iter().enumerate().filter(|(i, e)| !folds.contains_key(i) && activity_row(e, &all)).collect();
             // what each settled payment cost, from its settled record: one read for the page
-            let hashes: Vec<&str> = events.iter().filter(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_prepaid")))
+            let hashes: Vec<&str> = events.iter().map(|&(_, e)| e).filter(|e| matches!(e["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_prepaid")))
                 .filter_map(|e| e["payment_hash"].as_str()).collect();
             let settled = if hashes.is_empty() { Value::Null } else {
                 self.call("settled_amounts", json!({"hashes": hashes})).map(|v| v["settled"].clone()).unwrap_or(Value::Null)
@@ -1009,7 +1011,7 @@ impl App {
             if events.is_empty() {
                 b.push_str("<tr><td colspan=\"5\" class=\"small\">Nothing yet.</td></tr>");
             }
-            for e in events.iter().rev() {
+            for &(i, e) in events.iter().rev() {
                 let txid = txt(e.get("txid"));
                 // a booking before a payment settles (a ticket, a Lightning payment, a coin send not yet answered) is a reservation
                 let reserved = e["type"] == "commit" && ["ln:", "ticket:", "onchain:unconfirmed:"].iter().any(|p| txid.starts_with(p));
@@ -1050,7 +1052,7 @@ impl App {
                 // a refusal in the refusal pages' plain words, the signer's own under Details
                 let (what, detail) = match refusal_words(e) {
                     Some((title, words)) => (title, format!("{} <details><summary>Details</summary>{}</details>", esc(&words), esc(&short(&txt(e.get("reason")), 300)))),
-                    None => (what, activity_detail(e, reserved)),
+                    None => (what, activity_detail(e, reserved) + &activity_steps(&all, &folds, i)),
                 };
                 b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{detail}</td></tr>", utc(int(e.get("ts"))), esc(&what),
                                     esc(&who(&txt(e.get("dest").or(e.get("origin")))))));
@@ -2249,6 +2251,73 @@ pub(crate) fn activity_row(e: &Value, all: &[Value]) -> bool {
     }
 }
 
+/// One row a payment (0.2.11 showed three: "Allowed", "Reserved", "Paid"). Among `all` (oldest first), the steps before a
+/// payment's outcome fold into a later row of the same payment: its reservation (a `commit` of `ln:`/`ticket:<hash>`, a
+/// `ticket_prepay`) into its Paid or failed row, by the payment's hash; the allowed decision, which names no hash, into the
+/// first reservation after it to the same seller of the same amount, within minutes (the signer books the very payment it
+/// allowed, in the same call). A step with no outcome yet stays a row: the reservation, in progress. A refusal, an approval
+/// asked for, or a decision with no reservation after it stays a row of its own. By event index: the row each step folds into.
+pub(crate) fn activity_folds(all: &[Value]) -> HashMap<usize, usize> {
+    let hash_of = |e: &Value| -> Option<String> {
+        match e["type"].as_str() {
+            Some("commit") => { let t = txt(e.get("txid")); t.strip_prefix("ln:").or(t.strip_prefix("ticket:")).filter(|h| !h.is_empty()).map(str::to_string) }
+            Some("ticket_prepay") => e["payment_hash"].as_str().filter(|h| !h.is_empty()).map(str::to_string),
+            _ => None,
+        }
+    };
+    let booked = |e: &Value| int(e.get("amount_sats").or(e.get("booked_sats")));
+    let mut into: HashMap<usize, usize> = HashMap::new();
+    // a reservation into its payment's outcome: the latest one the page shows (a later settle tells more than a failure)
+    for (i, e) in all.iter().enumerate() {
+        let Some(h) = hash_of(e).filter(|_| activity_row(e, all)) else { continue };
+        let outcome = all.iter().enumerate().skip(i + 1).rev().find(|(_, x)| {
+            matches!(x["type"].as_str(), Some("ticket_settled" | "ln_settled" | "ticket_prepaid" | "ln_failed" | "ticket_failed"))
+                && x["payment_hash"].as_str() == Some(&h) && activity_row(x, all)
+        });
+        if let Some((j, _)) = outcome {
+            into.insert(i, j);
+        }
+    }
+    // an allowed decision into the reservation it allowed: one decision a reservation
+    let mut claimed: Vec<usize> = Vec::new();
+    for (i, e) in all.iter().enumerate() {
+        if e["type"] != "decision" || e["verdict"] != "allow" {
+            continue;
+        }
+        let r = all.iter().enumerate().skip(i + 1).find(|(j, x)| {
+            hash_of(x).is_some() && activity_row(x, all) && !claimed.contains(j) && x["dest"] == e["dest"] && booked(x) == int(e.get("amount_sats"))
+                && (int(x.get("ts")) - int(e.get("ts"))).abs() <= 300
+        });
+        if let Some((j, _)) = r {
+            claimed.push(j);
+            into.insert(i, into.get(&j).copied().unwrap_or(j));
+        }
+    }
+    into
+}
+
+/// What a row's folded steps said ([`activity_folds`]), small and behind a click: "Allowed and reserved first".
+pub(crate) fn activity_steps(all: &[Value], folds: &HashMap<usize, usize>, row: usize) -> String {
+    let mut steps: Vec<usize> = folds.iter().filter(|&(_, &to)| to == row).map(|(&from, _)| from).collect();
+    if steps.is_empty() {
+        return String::new();
+    }
+    steps.sort_unstable();
+    let allowed = steps.iter().any(|&i| all[i]["type"] == "decision");
+    let reserved = steps.iter().any(|&i| all[i]["type"] != "decision");
+    let said: Vec<String> = steps.iter().map(|&i| {
+        let e = &all[i];
+        if e["type"] == "decision" {
+            let d = activity_detail(e, false);
+            if d.is_empty() { "Allowed".into() } else { format!("Allowed: {d}") }
+        } else {
+            format!("{} reserved, the most it may cost", money(int(e.get("amount_sats").or(e.get("booked_sats")))))
+        }
+    }).collect();
+    let title = match (allowed, reserved) { (true, true) => "Allowed and reserved first", (true, false) => "Allowed first", _ => "Reserved first" };
+    format!(" <details><summary>{title}</summary>{}</details>", said.join(" · "))
+}
+
 /// A row's Detail in plain words: the signer's word where it is one a person reads, nothing where it is an id
 /// (0.2.6 showed `ticket:<hash>` and "all policy rules passed").
 pub(crate) fn activity_detail(e: &Value, reserved: bool) -> String {
@@ -2928,6 +2997,40 @@ mod handson_0202_tests {
         assert_eq!(activity_detail(&json!({"type": "commit", "txid": "ln:abc"}), false), "");
         assert_eq!(activity_detail(&json!({"type": "ticket_seller_forgot", "origin": "https://a.example"}), false), "A new one was opened");
         assert_eq!(activity_detail(&json!({"type": "commit", "txid": "d00d"}), false), "d00d", "a coin send's txid stays");
+    }
+
+    /// One row a payment: its allowed decision and its reservation fold into its Paid (or failed) row; a payment with no
+    /// outcome yet is one row, reserved; a refusal and an allowed decision nothing was booked for stay rows of their own.
+    ///
+    /// FAILS before (0.2.11): each payment of a hashrate rental was three rows, "Allowed 559 sats", "Reserved 559 sats" and "Paid".
+    #[test]
+    fn a_payment_is_one_row_its_allowed_and_reserved_steps_folded_in() {
+        let all = vec![
+            json!({"type": "decision", "verdict": "allow", "rule": "ok", "reason": "all policy rules passed", "dest": "ln:aa", "amount_sats": 559, "ts": 100}),
+            json!({"type": "commit", "txid": "ln:h1", "amount_sats": 559, "dest": "ln:aa", "ts": 101}),
+            json!({"type": "decision", "verdict": "allow", "rule": "ok", "reason": "all policy rules passed", "dest": "ln:aa", "amount_sats": 559, "ts": 102}),
+            json!({"type": "ln_amend", "txid": "ln:h1", "ts": 103}),
+            json!({"type": "ln_settled", "payment_hash": "h1", "dest": "ln:aa", "spent_sats": 550, "ts": 104}),
+            json!({"type": "commit", "txid": "ln:h2", "amount_sats": 559, "dest": "ln:aa", "ts": 105}),
+            json!({"type": "decision", "verdict": "deny", "rule": "max_per_tx", "reason": "x", "dest": "ln:aa", "amount_sats": 9999, "ts": 106}),
+            json!({"type": "decision", "verdict": "allow", "rule": "ok", "dest": "ln:bb", "amount_sats": 7, "ts": 107}),
+            json!({"type": "decision", "verdict": "allow", "rule": "ok", "dest": "ln:aa", "amount_sats": 20, "ts": 108}),
+            json!({"type": "commit", "txid": "ticket:h3", "amount_sats": 20, "dest": "ln:aa", "ts": 109}),
+            json!({"type": "ticket_failed", "payment_hash": "h3", "dest": "ln:aa", "released_sats": 20, "ts": 110}),
+            json!({"type": "decision", "verdict": "allow", "rule": "ok", "dest": "ln:cc", "amount_sats": 5, "ts": 111}),
+            json!({"type": "commit", "txid": "ln:h4", "amount_sats": 5, "dest": "ln:cc", "ts": 9999}),
+        ];
+        let folds = activity_folds(&all);
+        let rows: Vec<usize> = (0..all.len()).filter(|i| !folds.contains_key(i) && activity_row(&all[*i], &all)).collect();
+        // h1 paid, h2 in progress (its decision the second one), the refusal, a decision nothing was booked for, h3 failed,
+        // and a booking hours after a decision of the same amount: not taken for its step
+        assert_eq!(rows, vec![4, 5, 6, 7, 10, 11, 12], "{folds:?}");
+        assert_eq!((folds[&0], folds[&1], folds[&2], folds[&8], folds[&9]), (4, 4, 5, 10, 10));
+        let paid = activity_steps(&all, &folds, 4);
+        assert!(paid.contains("<summary>Allowed and reserved first</summary>Allowed: Within your spending rules · ") && paid.contains("559")
+                && paid.contains("reserved, the most it may cost"), "{paid}");
+        assert!(activity_steps(&all, &folds, 5).contains("<summary>Allowed first</summary>"));
+        assert_eq!(activity_steps(&all, &folds, 6), "");
     }
 
     /// Records' Kind column in plain words; the signer's own word is its tooltip.
