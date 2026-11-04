@@ -9029,6 +9029,23 @@ fn a_prepaid_ticket_is_paid_by_the_sellers_offer_with_the_note_that_names_its_se
     r.assert_booked();
 }
 
+/// A wallet whose node has a channel of its own to the seller pays a prepaid ticket by the seller's invoice, over that
+/// channel, not by its offer, whose blinded paths start at another of the seller's peers (#64: a renter with a direct
+/// channel still paid each ticket through two other nodes, in 7 to 18 s).
+#[test]
+fn a_wallet_with_its_own_channel_to_the_seller_pays_a_prepaid_ticket_by_invoice_not_by_offer() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, offer_shop());
+    r.ln.st.lock().unwrap().channel["remote_pubkey"] = r.shop.id().into();
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    assert!(r.ln.st.lock().unwrap().fetched_notes.is_empty(), "no invoice asked of the offer");
+    assert!(lock_bodies(&r).iter().all(|l| l.get("by").is_none()), "{:?}", lock_bodies(&r));
+    assert_eq!(r.shop.standin.offer_counts(), (0, 0));
+    assert_eq!(r.ledger_sum(), SETTLED, "one ticket, paid once");
+    // (with no channel to the seller, by the offer: a_prepaid_ticket_is_paid_by_the_sellers_offer_with_the_note_that_names_its_session)
+}
+
 /// A seller that sells prepaid tickets only names its offer on that one entry, and every ticket
 /// is paid by it: none by invoice.
 #[test]

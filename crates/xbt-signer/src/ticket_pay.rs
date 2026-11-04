@@ -3784,9 +3784,13 @@ impl Signer {
         if let Some(d) = at_fault() {
             return Err(d);
         }
-        // by the seller's offer first, where its terms name one: nothing is asked of the seller but its session
+        // by the seller's offer first, where its terms name one: nothing is asked of the seller but its session. Not where
+        // the wallet's node has a channel of its own to the seller: an offer's invoice is paid over blinded paths the
+        // seller's node chose, which start at one of its other peers, so each ticket went the long way round, through two
+        // or three other nodes, for 7 to 18 s and a fee (#64). The seller's invoice is paid over the wallet's own channel,
+        // at once and with no fee; it names the seller's node, which the seller's listing names too
         let by_offer = match &hs.offer {
-            Some(offer) if self.ticket_policy().offers => self.ticket_prepay_by_offer(hs, offer, asked),
+            Some(offer) if self.ticket_policy().offers && !self.ln_direct_to(&hs.terms.terms.payee) => self.ticket_prepay_by_offer(hs, offer, asked),
             _ => None,
         };
         let r = match by_offer {

@@ -8,7 +8,7 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 ## 0.2.13 (2026-11-04)
 
 A fix for long hashrate rentals on a slow wallet, and display fixes sent by a hashmaker who runs the app. The
-hashrate component, the wallet UI and the gateway change.
+hashrate component, the signer, the wallet UI and the gateway change.
 
 - **Long rentals keep paying when tickets are slow to buy.** A rental ended after 2 minutes, and two 24 h rentals
   after a few hours, as "hashmaker closed: unpaid". Buying a ticket took 11 to 15 seconds over several Lightning hops,
@@ -22,6 +22,11 @@ hashrate component, the wallet UI and the gateway change.
   - money paid ahead stays bounded: at most the lead's worth of work, one piece of work and the smallest ticket
     (about 1,250 sats in the rental above, against 950 before). Each piece of work is still paid once, one payment
     at a time, and what the pieces of work are charged never passes the rental's budget.
+  - a wallet with a channel of its own to the seller's node pays each ticket by the seller's invoice, over that
+    channel, instead of by the seller's BOLT 12 offer. An offer's invoice is paid over hidden (blinded) paths that
+    the seller's node starts at another of its peers, so a renter's direct channel was never used and each ticket
+    went through two or three other nodes, for 7 to 18 seconds and a fee. The invoice names the seller's node,
+    which its listing already names.
 - **Browse shows a hashrate offer's live price.** A hashrate card on Browse said the price its listing names ("40 sat
   a piece of work") beside a live offer asking 404 sats. It now says what the live offer asks, as the Hashrate page
   does, or "Live price on the Hashrate page" until that page has looked.
