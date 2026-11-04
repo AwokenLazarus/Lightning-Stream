@@ -5,6 +5,29 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.11 (2026-11-04)
+
+Hashrate fixes sent by a hashmaker who runs the app. The wallet UI and the hashrate component change.
+
+- **A payment the wallet's socket can't take for a moment is made again.** A 24 h rental ended after about 11 hours
+  as "a piece of work was not paid in time": one payment's call to the wallet's signer failed with "Resource
+  temporarily unavailable" before any of it was sent, and the renter stopped paying. A call that never reached the
+  signer is now made again within the hashmaker's grace. A call that got out even in part is never made again, so a
+  slice is never paid twice. Writing a call to the signer now gives up after 5 seconds instead of 200, so there is
+  time to ask again.
+- **Ended rentals move under History.** Buy → Hashrate lists only the rentals going on under Your rentals. The ended
+  ones are folded under "History: N ended rentals", newest first. Each rental's card says when it started, when it
+  ended and after how long, and why it ended.
+- **Your gateway's own status pages.** "Your gateway" on Buy → Hashrate has a Gateway status link to the Stream
+  Gateway's own pages (status, threads, coinbaser, clients, config), read-only, under the app's login. Only those
+  pages are shown, with GET only, and no script runs on them. The gateway has no admin password, so its clients and
+  config pages say they need admin access and show nothing else.
+- **A link that can't be made again says why** in the hashrate component's log, instead of only "failed to fill
+  whole buffer".
+
+Thanks to Kilombino, who found and fixed the payment the wallet's socket couldn't take, and sent History for ended
+rentals, the rental times and the gateway status pages.
+
 ## 0.2.10 (2026-11-03)
 
 Hashrate fixes and clearer hashrate pages, most of them sent by a hashmaker who runs the app. The wallet UI, the

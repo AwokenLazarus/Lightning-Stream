@@ -621,7 +621,11 @@
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (d) {
           if (!d || typeof d.html !== "string" || rentals.contains(document.activeElement)) return;
+          // History stays open or folded as the owner left it
+          var hist = $("#rentals-history"), wasOpen = hist && hist.open;
           rentals.innerHTML = d.html;
+          hist = $("#rentals-history");
+          if (hist && wasOpen) hist.open = true;
           if (!d.live) { rentals.removeAttribute("data-live"); clearInterval(rentalsTimer); }
         })
         .catch(function () {});

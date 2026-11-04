@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.10:0',
+  version: '0.2.11:0',
   releaseNotes: {
     en_US:
-      'Hashrate fixes, most sent by a hashmaker who runs the app. The market price works with Knots 29.4.3. The Hashrate page under Buy answers at once and says when it is still looking for offers on Nostr. A test slice can be paid. The Rent form suggests budgets in whole tickets and says what a budget buys. Renting turned back on brings the shop back without a Save. Add a service under Sell has a Hashrate choice. Rentals update by themselves, a refused payment says why, prices are said per TH/s for an hour, and your gateway takes your own coinbase tag.',
+      'Hashrate fixes sent by a hashmaker who runs the app. A payment the wallet\'s socket could not take for a moment is made again, never twice, so a long rental keeps paying. Ended rentals fold under History, and each rental says when it started, ended and why. Your gateway on the Hashrate page under Buy links to the Stream Gateway\'s own status pages, read-only.',
   },
   migrations: {
     up: async () => {},

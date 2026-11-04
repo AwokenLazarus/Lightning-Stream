@@ -540,6 +540,22 @@ def main():
         page = taker.get("/hashrate")
         check("M", "taker: Services -> Hashrate says Ready to rent, not that the gateway isn't masking", "Ready to rent" in page and "isn't masking" not in page,
               page[-800:])
+        # the Stream Gateway's own pages through the app (the renter's control page, the real gateway): read-only, and with
+        # its admin password empty no page shows the node's RPC address, its cookie or a credential
+        gp, leaks = {}, {}
+        for pg in ("", "threads", "coinbaser", "clients", "config", "assets/style.css", "assets/icons/datum_logo.svg"):  # (the icon is binary)
+            st, _, body = taker.req("GET", f"/hashrate/gateway/{pg}")
+            gp[pg or "/"] = [st, len(body), "admin access" in body.lower() or "requires admin" in body.lower()]
+            found = [w for w in (f"127.0.0.1:{P['rpc']}", f":{P['rpc']}", "rpc.cookie", "rpccookiefile", "rpcurl", "rpcuser", "rpcpassword", "lab:lab") if w in body]
+            if found:
+                leaks[pg or "/"] = found
+        for bad in ("xbt/job", "NOTIFY", "cmd", "../xbt/job"):
+            gp[bad] = [taker.req("GET", f"/hashrate/gateway/{bad}")[0]]
+        check("U", "taker: Gateway status shows the Stream Gateway's own pages through the app, read-only: each answers, Clients and Config need admin "
+                   "access, no page shows the node's RPC address, cookie or a credential, and /xbt/job, /NOTIFY and /cmd are not passed on",
+              "Gateway status" in page and not leaks and all(gp[x][0] == 200 for x in ("/", "threads", "coinbaser", "clients", "config", "assets/style.css"))
+              and gp["clients"][2] and gp["config"][2] and all(gp[x][0] == 404 for x in ("xbt/job", "NOTIFY", "cmd", "../xbt/job")),
+              {"pages": gp, "leaks": leaks})
 
         maker, _ = uis["maker"]
         mdir = installs["maker"][0]
