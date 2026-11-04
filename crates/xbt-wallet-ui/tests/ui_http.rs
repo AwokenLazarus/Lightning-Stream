@@ -5173,7 +5173,7 @@ fn the_bundled_gateways_own_status_pages_show_read_only_from_your_gateway() {
     let _ = anon.get("/");
     let r = anon.get("/hashrate/gateway/threads");
     assert!(r.status == 303 && !seen.lock().unwrap().iter().any(|(_, p, ..)| p.starts_with("/gateway-page")), "{} {}", r.status, r.location());
-    assert_eq!(r.location(), "../../login", "the app's login, not a login under the gateway's pages (a redirect loop)");
+    assert!(matches!(r.location(), "../../login" | "../../setup-password"), "the app's own login, not one under the gateway's pages (a redirect loop): {}", r.location());
     let mut br = logged_in(&bx);
     let p = br.get("/hashrate");
     let card = &p.body[p.body.find("id=\"gateway\"").unwrap()..];

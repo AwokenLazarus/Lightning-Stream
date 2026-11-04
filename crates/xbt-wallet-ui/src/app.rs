@@ -591,7 +591,7 @@ impl App {
         };
         if req.method != "POST" || req.path != "/setup-password" {
             if req.path != "/setup-password" && req.path != "/" {
-                return Resp::redirect("./setup-password");
+                return Resp::redirect(&format!("{}setup-password", to_root(&req.path)));
             }
             return form(None);
         }
