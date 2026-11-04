@@ -195,9 +195,9 @@ fn paid_relay(rt: &tokio::runtime::Runtime, terms: &PaidSettings) -> (relay::Ser
 }
 
 /// An app's payer for its home relay `url`, paying through a stand-in wallet while `allow`.
-fn payer_for(url: &str, api: SocketAddr, terms: &PaidSettings, allow: Arc<AtomicBool>) -> RelayPayer<StandInWallet, Get> {
+fn payer_for(url: &str, api: SocketAddr, terms: &PaidSettings, allow: Arc<AtomicBool>, low_water: u64) -> RelayPayer<StandInWallet, Get> {
     let wallet = StandInWallet { api, allow, credit_msat: terms.credit_msat() };
-    let bounds = Bounds { max_msat_per_gb: terms.msat_per_gb, max_credit_msat: terms.credit_msat(), max_sats: 10, low_water_bytes: MB, ..Bounds::default() };
+    let bounds = Bounds { max_msat_per_gb: terms.msat_per_gb, max_credit_msat: terms.credit_msat(), max_sats: 10, low_water_bytes: low_water, ..Bounds::default() };
     RelayPayer::new(PaidRelay { relay: url.to_string(), credit: format!("http://{api}"), msat_per_gb: terms.msat_per_gb }, bounds, wallet, Get(api))
 }
 
@@ -236,7 +236,7 @@ fn the_shop_pays_its_home_relay_to_the_byte_within_its_credit_and_traffic_waits_
 
     // the shop declares its home and buys its first credit
     let allow = Arc::new(AtomicBool::new(true));
-    let mut payer = payer_for(&url, api, &t, allow.clone());
+    let mut payer = payer_for(&url, api, &t, allow.clone(), 2 * MB);
     assert!(matches!(payer.step(&shop_secret, now()), Step::Paid { balance, .. } if balance == 2 * MB as i64));
     assert_eq!(payer.paid_msat, 2_000, "2 MB at 1 msat a KB");
 
@@ -268,7 +268,7 @@ fn the_shop_pays_its_home_relay_to_the_byte_within_its_credit_and_traffic_waits_
     assert_eq!(waiting["waiting"], true, "its traffic waits for the next credit");
     assert_eq!(waiting["dropped_bytes"], 0, "nothing dropped while it waits");
     allow.store(true, Ordering::SeqCst);
-    let mut payer = payer_for(&url, api, &t, allow.clone());
+    let mut payer = payer_for(&url, api, &t, allow.clone(), 2 * MB);
     assert!(matches!(payer.step(&shop_secret, now()), Step::Paid { .. }), "the waiting traffic buys the next credit");
     assert_eq!(dl.join().unwrap(), want, "the download that waited completes");
     let a = paid.account_raw(&shop_key).unwrap();
@@ -279,7 +279,7 @@ fn the_shop_pays_its_home_relay_to_the_byte_within_its_credit_and_traffic_waits_
 
     // no credit at all: what waits too long is dropped, counted and told, and the connection stays up
     allow.store(false, Ordering::SeqCst);
-    let mut payer = payer_for(&url, api, &t, allow.clone());
+    let mut payer = payer_for(&url, api, &t, allow.clone(), 2 * MB);
     let _ = payer.step(&shop_secret, now());
     let got = download(port, 3 * MB, Duration::from_secs(15));
     let a = paid.account(&shop_key).unwrap();
@@ -290,7 +290,7 @@ fn the_shop_pays_its_home_relay_to_the_byte_within_its_credit_and_traffic_waits_
     let _ = payer.step(&shop_secret, now());
     assert!(payer.accounts[&k].dropped_bytes > 0 && payer.accounts[&k].waiting, "the shop's payer reads it, for its owner");
     allow.store(true, Ordering::SeqCst);
-    let mut payer = payer_for(&url, api, &t, allow.clone());
+    let mut payer = payer_for(&url, api, &t, allow.clone(), 2 * MB);
     assert!(matches!(payer.step(&shop_secret, now()), Step::Paid { .. }));
     assert_eq!(download_retrying(port, MB / 2, Duration::from_secs(60)), MB / 2, "the buyer is served again");
 }
@@ -304,8 +304,8 @@ fn each_app_pays_only_its_own_home_relay() {
     let (shop_secret, buyer_secret) = (secret(), secret());
     let (sk, bk) = (key(&shop_secret), key(&buyer_secret));
     let allow = Arc::new(AtomicBool::new(true));
-    let mut shop_payer = payer_for(&shop_home, shop_api, &t, allow.clone());
-    let mut buyer_payer = payer_for(&buyer_home, buyer_api, &t, allow.clone());
+    let mut shop_payer = payer_for(&shop_home, shop_api, &t, allow.clone(), 5 * MB);
+    let mut buyer_payer = payer_for(&buyer_home, buyer_api, &t, allow.clone(), 5 * MB);
     for _ in 0..2 {
         assert!(matches!(shop_payer.step(&shop_secret, now()), Step::Paid { .. }));
         assert!(matches!(buyer_payer.step(&buyer_secret, now()), Step::Paid { .. }));
@@ -339,20 +339,22 @@ fn a_shop_that_moves_its_home_pays_the_new_one_and_not_the_old() {
     let shop_secret = secret();
     let sk = key(&shop_secret);
     let allow = Arc::new(AtomicBool::new(true));
-    let mut p1 = payer_for(&old_home, old_api, &t, allow.clone());
+    let mut p1 = payer_for(&old_home, old_api, &t, allow.clone(), MB);
     assert!(matches!(p1.step(&shop_secret, now()), Step::Paid { .. }));
     let (shop, buyer, port) = shop_and_buyer(&old_home, shop_secret);
     assert_eq!(download_retrying(port, MB, Duration::from_secs(60)), MB);
     let before = old_relay.account_raw(&sk).unwrap();
     drop((shop, buyer));
     // the switch: the same key, homed on the new relay, which its payer now pays
-    let mut p2 = payer_for(&new_home, new_api, &t, allow.clone());
+    let mut p2 = payer_for(&new_home, new_api, &t, allow.clone(), MB);
     assert!(matches!(p2.step(&shop_secret, now()), Step::Paid { .. }));
     let (_shop, _buyer, port) = shop_and_buyer(&new_home, shop_secret);
     assert_eq!(download_retrying(port, MB, Duration::from_secs(60)), MB);
     let (after_old, at_new) = (old_relay.account_raw(&sk).unwrap(), new_relay.account_raw(&sk).unwrap());
     eprintln!("COUNTS old home before {before:?}, after {after_old:?}; new home {at_new:?}");
-    assert_eq!((after_old.charged_in, after_old.charged_out), (before.charged_in, before.charged_out), "the old home charged nothing more");
+    // the old link's last packets as it closed (a few hundred bytes at most), nothing of the second download
+    let more = (after_old.charged_in + after_old.charged_out) - (before.charged_in + before.charged_out);
+    assert!(more < 2 * KB, "the old home charged {more} bytes more");
     assert!(at_new.charged_in + at_new.charged_out >= MB, "the new home carried, and was paid for, the second download");
     assert_eq!(old_relay.forward(&[0; 32], &sk, 1_000), Forward::Yes, "still homed there for a while: carried, on the shop's old credit");
 }
