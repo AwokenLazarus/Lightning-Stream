@@ -2959,7 +2959,13 @@ def mesh() -> None:
         # the owner's task for this lab's chat questions: a budget of its own beside the films'
         r = agent().tool("xbt402_pay", {"url": f"{ORIGIN}{path}", "method": "POST", "body": body, "max_sats": CALL_SATS, "task": "chat"})
         note_receipts(r)
-        u = ai_usage(body_of(r), streamed)
+        # a long answer comes back as a preview, the whole of it in a file
+        text = body_of(r)
+        if r.get("saved_to"):
+            with open(r["saved_to"], encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            os.remove(r["saved_to"])
+        u = ai_usage(text, streamed)
         want = ai_cost(body.encode(), u) if u else -1
         if u:
             usage += want
@@ -2968,7 +2974,7 @@ def mesh() -> None:
         # each answer the model's, priced on its own counts, in the one session
         if not call_paid(r) or r.get("rail") != "ticket" or r.get("price_msat") != str(want) or (sid and r.get("session") != sid):
             wrong.append({"i": i, "streamed": streamed, "usage": u, "want_msat": want, "rails_passed_over": r.get("rails_passed_over"),
-                          "body_start": body_of(r)[:300], **brief(r)})
+                          "body_start": text[:300], **brief(r)})
         sid = sid or str(r.get("session"))
         seller = max(seller, int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or 0))
     stop, m = stop_and_count(sid, m0)
