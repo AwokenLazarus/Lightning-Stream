@@ -1064,7 +1064,7 @@ impl App {
                 if offers.is_empty() {
                     b.push_str(&no_offers_words(&o));
                 }
-                b.push_str("<div class=\"grid services\">");
+                b.push_str("<div class=\"grid services rent-offers\">");
                 // this box's own hashmaker's pay address: its offer is ours even when the shop is reached by its key (Private),
                 // where the shop's config has no web address to compare with
                 let own_pay = self.hash_settings()["payUrl"].as_str().and_then(crate::services::http_origin);
