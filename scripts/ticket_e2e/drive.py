@@ -2967,7 +2967,8 @@ def mesh() -> None:
             tout += min(int(u["completion_tokens"]), AI_MAX_OUT)
         # each answer the model's, priced on its own counts, in the one session
         if not call_paid(r) or r.get("rail") != "ticket" or r.get("price_msat") != str(want) or (sid and r.get("session") != sid):
-            wrong.append({"i": i, "streamed": streamed, "usage": u, "want_msat": want, "rails_passed_over": r.get("rails_passed_over"), **brief(r)})
+            wrong.append({"i": i, "streamed": streamed, "usage": u, "want_msat": want, "rails_passed_over": r.get("rails_passed_over"),
+                          "body_start": body_of(r)[:300], **brief(r)})
         sid = sid or str(r.get("session"))
         seller = max(seller, int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or 0))
     stop, m = stop_and_count(sid, m0)
