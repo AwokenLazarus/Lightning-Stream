@@ -23,11 +23,14 @@ fn secret() -> [u8; 32] {
     s
 }
 
+/// A sender and a receiver, by key.
+type Pair = ([u8; 32], [u8; 32]);
+
 /// Carries everything and records the bytes per (sender, receiver).
 #[derive(Debug, Default)]
 struct Recorder {
     free: Free,
-    seen: Mutex<HashMap<([u8; 32], [u8; 32]), u64>>,
+    seen: Mutex<HashMap<Pair, u64>>,
 }
 
 impl Meter for Recorder {
