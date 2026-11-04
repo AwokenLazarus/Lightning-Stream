@@ -195,7 +195,8 @@ struct St {
     events: Vec<Value>,
     closed: Option<String>,
     /// Slices for the wallet to pay, in order (with the wallet's payer; none over the link).
-    queue: Option<mpsc::Sender<(u64, Value)>>,
+    /// Each with whether it was started ahead of the step to buy a ticket ([`order::Standing::buy_ahead`]).
+    queue: Option<mpsc::Sender<(u64, Value, bool)>>,
     /// The wallet refused or failed a slice: no later slice is asked for.
     pay_failed: bool,
     budget_msat: Option<u64>,
@@ -319,6 +320,13 @@ impl St {
         }
     }
 
+    /// The next slice needs a ticket (the credit at the seller is short of it) and what is left of the budget is
+    /// short of a slice: a ticket is never smaller than the slice it pays, so buying it would pass the budget. Not paid.
+    fn budget_short(&self) -> bool {
+        let price = self.terms.price_msat;
+        self.queue.is_some() && self.guard.credit_msat < price && self.guard.budget_left.is_some_and(|l| l < price)
+    }
+
     /// End the rental from this side.
     fn end(&mut self, why: &str, tx: &Sender) {
         self.closed = Some(why.to_string());
@@ -350,11 +358,7 @@ impl St {
             slice_work: self.terms.slice_work,
             price_msat: self.terms.price_msat,
             msat_a_second,
-            buy_secs: {
-                let mut b: Vec<f64> = self.buys.iter().copied().collect();
-                b.sort_by(f64::total_cmp);
-                b.get(((b.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)).copied().unwrap_or(0.0)
-            },
+            buy_secs: order::buy_estimate(self.buys.iter().copied()),
         }
     }
 
@@ -371,6 +375,8 @@ impl St {
         }
         loop {
             let s = self.standing();
+            // a ticket bought ahead, so the slice after it is paid from credit and not on a buy (#64)
+            let ahead = self.queue.is_some() && s.buy_ahead(self.guard.credit_msat) && !s.pay_next();
             if self.queue.is_some() {
                 // the wallet pays one slice at a time, so each knows the credit at the seller and the budget left: a
                 // ticket is sized to keep what's gone and unworked within the step, and never past the budget
@@ -384,7 +390,7 @@ impl St {
             if self.stop_paying_after.is_some_and(|n| slice > n) {
                 return;
             }
-            if self.budget_msat.is_some_and(|b| slice * self.terms.price_msat > b) {
+            if self.budget_msat.is_some_and(|b| slice * self.terms.price_msat > b) || self.budget_short() {
                 return;
             }
             let receipt = Receipt {
@@ -397,7 +403,7 @@ impl St {
             }
             .sign(&self.key);
             if let Some(q) = &self.queue {
-                if self.pay_failed || q.send((slice, receipt.clone())).is_err() {
+                if self.pay_failed || q.send((slice, receipt.clone(), ahead)).is_err() {
                     return;
                 }
                 self.in_flight += 1;
@@ -442,6 +448,8 @@ impl St {
             "firstAcceptedMs": self.first_accepted.map(|(_, ms)| ms),
             "dues": self.dues, "lastDue": self.last_due.map(|(w, p)| json!({"work": w.to_string(), "paid": p})),
             "paidSlices": self.paid_slices(), "spentMsat": self.paid_slices() * self.terms.price_msat,
+            // how long a ticket buy takes (p95 of the last few), and how far ahead of need the next one starts (#64)
+            "buySecs": self.standing().buy_secs, "buyLeadSecs": self.standing().buy_lead_secs(),
             "miners": self.upstreams.len(), "budgetMsat": self.budget_msat,
             // what left the wallet for the rental (tickets bought whole, with their fees), and what its stop
             // said stays with the seller as credit: a ticket bought for a small rental is more than it uses
@@ -536,7 +544,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
     let stopped_session: Arc<Mutex<Option<Value>>> = Arc::default();
     let redial = Redial { hashmaker: cfg.hashmaker.clone(), key: cfg.key, hashmaker_key: cfg.hashmaker_key, rental: cfg.rental.clone(), terms: cfg.terms.clone() };
     let payer_thread = cfg.payer.map(|mut p| {
-        let (qtx, qrx) = mpsc::channel::<(u64, Value)>();
+        let (qtx, qrx) = mpsc::channel::<(u64, Value, bool)>();
         lock(&st).queue = Some(qtx);
         let (st, rental, out, ptx) = (st.clone(), cfg.rental.clone(), stopped_session.clone(), tx.clone());
         {
@@ -545,7 +553,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             (g.guard.credit_msat, g.guard.budget_left) = (credit, left);
         }
         std::thread::spawn(move || {
-            for (slice, receipt) in qrx {
+            for (slice, receipt, ahead) in qrx {
                 if lock(&st).pay_failed {
                     continue;
                 }
@@ -574,7 +582,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                     // its answer lost after it was sent: it may have paid. Not paid again; the hashmaker, which knows
                     // whether it arrived, ends the rental if it didn't
                     Ok(v) if v["verdict"] == "unknown" => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": null, "unknown": true, "wallet": v})),
-                    Ok(v) => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": true, "ticketMsat": ticket, "wallet": v})),
+                    Ok(v) => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": true, "ticketMsat": ticket, "ahead": ahead, "wallet": v})),
                     Err(why) => {
                         g.pay_failed = true;
                         g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": false, "why": why}));
@@ -606,7 +614,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             g.tick(&tx);
             let (s, largest) = (g.terms.slice_work, g.largest_share());
             // the next slice can't be paid: end as the last paid one runs out, before the hashmaker does it
-            let no_more = g.budget_msat.is_some_and(|b| (g.released + 1) * g.terms.price_msat > b);
+            let no_more = g.budget_msat.is_some_and(|b| (g.released + 1) * g.terms.price_msat > b) || g.budget_short();
             let why = if cut.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                 Some("cut by the hashtaker")
             } else if no_more && !order::fits(g.meter.work, largest.max(1), g.released, g.terms.start_slices, s) {

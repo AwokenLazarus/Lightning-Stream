@@ -9,6 +9,11 @@
 //! * **Steps are earned.** What's paid and unused never goes past the largest of 546 sat, one share, or what has
 //!   been delivered, up to 30 s of the miner's output. Steps ignore reputation, so fake history pays nothing.
 //!   So a hashmaker that takes a payment and vanishes keeps at most that.
+//! * **A slow wallet buys ahead.** A payment that buys a ticket can take many seconds (11 to 15 s over several
+//!   Lightning hops, issue #64). The renter times its buys, and starts the next one while what's paid still lasts
+//!   that long and a margin ([`Standing::buy_lead_secs`], at most [`BUY_AHEAD_MOST_SECS`]), so the slice after it is
+//!   paid from the credit it bought. That can pass the step by at most one slice and a ticket on top of the lead's
+//!   worth of output ([`Standing::most_unworked_msat`]).
 
 /// The smallest ticket a seller sells, and the first step: the dust limit that held tickets have too.
 pub const FIRST_STEP_MSAT: u64 = 546_000;
@@ -16,9 +21,12 @@ pub const FIRST_STEP_MSAT: u64 = 546_000;
 pub const STEP_SECONDS: f64 = 30.0;
 /// How long a share that doesn't fit waits for payment before the rental stops.
 pub const WAIT_FOR_PAYMENT: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long it waits instead when the renter has said a payment is on its way (`paying`). Its miners hash for the
-/// hashmaker's own pool meanwhile, so the wait costs it nothing but the move.
-pub const WAIT_FOR_PAYING: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long it waits instead when the renter has said a payment is on its way (`paying`): a Lightning payment over
+/// several hops, a ticket bought on it, takes 11 to 15 s (issue #64), and this leaves room for twice that. Its miners
+/// hash for the hashmaker's own pool meanwhile, and no share goes to the renter unpaid, so the wait costs it the move
+/// and, with no pool of its own to go to, the miners' time: at most [`PAYING_WAITS_AN_HOUR`] of these an hour (3 min),
+/// and [`RAMP_WAITS_MOST`] while the step ramps up. Until 0.2.13 it was 10 s, under one such payment.
+pub const WAIT_FOR_PAYING: std::time::Duration = std::time::Duration::from_secs(30);
 /// Such waits a rental may have in an hour.
 pub const PAYING_WAITS_AN_HOUR: usize = 6;
 /// While the renter's step ramps up to its cap ([`STEP_SECONDS`] of output), which is the miners' first that many
@@ -26,6 +34,14 @@ pub const PAYING_WAITS_AN_HOUR: usize = 6;
 /// ticket buy may be waited for. Those waits aren't counted against [`PAYING_WAITS_AN_HOUR`]; there may be this many.
 /// Each is still held to [`WAIT_FOR_PAYING`].
 pub const RAMP_WAITS_MOST: usize = 12;
+/// Ticket buys measured faster than this land inside the hashmaker's short clock ([`WAIT_FOR_PAYMENT`]): none is
+/// started ahead of need for them.
+pub const BUY_AHEAD_FROM_SECS: f64 = 1.0;
+/// The least margin a ticket buy is started with, past its measured time ([`Standing::buy_lead_secs`]).
+pub const BUY_MARGIN_SECS: f64 = 3.0;
+/// The most output, in seconds, a ticket buy is started ahead of: the step's own cap ([`STEP_SECONDS`]). A buy slower
+/// than this less the margin is late, said with `paying`, and waited for ([`WAIT_FOR_PAYING`]).
+pub const BUY_AHEAD_MOST_SECS: f64 = STEP_SECONDS;
 /// A share may be worth this many slices at most. Past it a renter would pay many slices ahead of one share.
 pub const LARGEST_SHARE_SLICES: u128 = 4;
 
@@ -73,6 +89,13 @@ pub struct Standing {
     pub buy_secs: f64,
 }
 
+/// p95 of measured ticket buys, in seconds: the renter's estimate of how long the next one takes. 0 for none.
+pub fn buy_estimate(buys: impl IntoIterator<Item = f64>) -> f64 {
+    let mut b: Vec<f64> = buys.into_iter().filter(|s| s.is_finite() && *s >= 0.0).collect();
+    b.sort_by(f64::total_cmp);
+    b.get(((b.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)).copied().unwrap_or(0.0)
+}
+
 impl Standing {
     fn msat_of(&self, work: u128) -> u64 {
         (work.saturating_mul(self.price_msat as u128) / self.slice_work).min(u64::MAX as u128) as u64
@@ -117,6 +140,9 @@ impl Standing {
     /// nothing gone and unworked. One that has to buy a ticket adds the ticket: only paid ahead of need when the
     /// smallest ticket keeps all that within [`Standing::most_unworked_msat`].
     pub fn pay_next_with(&self, credit_msat: u64) -> bool {
+        if self.buy_ahead(credit_msat) {
+            return true;
+        }
         if !self.pay_next() {
             return false;
         }
@@ -128,6 +154,39 @@ impl Standing {
         // a ticket bought ahead of need: within the most that may ever be gone and unworked, so it's bought while
         // what's paid still runs, not when the next share waits for it
         ahead + credit_msat + self.smallest_ticket_msat() <= self.most_unworked_msat()
+    }
+
+    /// How long before what's paid runs out the next ticket buy starts, in seconds of output: the measured buy
+    /// ([`Standing::buy_secs`]) and a margin of half of it, at least [`BUY_MARGIN_SECS`], up to
+    /// [`BUY_AHEAD_MOST_SECS`]. 0 (none started ahead) for buys under [`BUY_AHEAD_FROM_SECS`], or none measured.
+    pub fn buy_lead_secs(&self) -> f64 {
+        if !(self.buy_secs >= BUY_AHEAD_FROM_SECS) || !self.buy_secs.is_finite() {
+            return 0.0;
+        }
+        (self.buy_secs + (self.buy_secs / 2.0).max(BUY_MARGIN_SECS)).min(BUY_AHEAD_MOST_SECS)
+    }
+
+    /// [`Standing::buy_lead_secs`] of output at the measured rate, in msat: 0 till a rate is measured.
+    pub fn buy_lead_msat(&self) -> u64 {
+        let lead = self.buy_lead_secs();
+        if lead <= 0.0 || !(self.msat_a_second > 0.0) || !self.msat_a_second.is_finite() {
+            return 0;
+        }
+        (self.msat_a_second * lead) as u64
+    }
+
+    /// Start the next ticket buy now, ahead of the step? Only once the miners are served, when the credit at the seller
+    /// doesn't cover the next slice (so its payment buys a ticket), and what's paid ahead lasts less than
+    /// [`Standing::buy_lead_secs`] at the measured rate. A buy started then lands while what's paid still runs, and the
+    /// slice after it is paid from the credit it bought (issue #64: buys of 11 to 15 s against a step that lasted 8.5 s).
+    /// What it adds to what's gone and unworked stays within [`Standing::most_unworked_msat`].
+    pub fn buy_ahead(&self, credit_msat: u64) -> bool {
+        if !ready_to_serve(self.paid, self.start_slices) || credit_msat >= self.price_msat {
+            return false;
+        }
+        let lead = self.buy_lead_msat();
+        let ahead = self.msat_of(paid_work(self.paid, self.start_slices, self.slice_work).saturating_sub(self.proven));
+        lead > 0 && ahead < lead && ahead + credit_msat + self.smallest_ticket_msat() <= self.most_unworked_msat()
     }
 
     /// The smallest ticket a payment can buy: the seller's smallest (546 sat), and never under the slice's price.
@@ -146,11 +205,13 @@ impl Standing {
     }
 
     /// The most that is ever gone and not yet worked (slices paid ahead and credit at the seller), the start fee aside:
-    /// the step, or, when a share must be paid for and a ticket bought for it, one share, one slice and the smallest
-    /// ticket, whichever is more.
+    /// the step; or, when a share must be paid for and a ticket bought for it, one share, one slice and the smallest
+    /// ticket; or, when a ticket is bought ahead ([`Standing::buy_ahead`]), the lead's output, one slice and the smallest
+    /// ticket; whichever is most. The lead is at most [`BUY_AHEAD_MOST_SECS`] of output, the step's own cap.
     pub fn most_unworked_msat(&self) -> u64 {
         let share = self.largest_share.min(LARGEST_SHARE_SLICES * self.slice_work);
-        self.step_msat().max(self.msat_of(share) + self.price_msat + self.smallest_ticket_msat())
+        let room = self.price_msat.saturating_add(self.smallest_ticket_msat());
+        self.step_msat().max(self.msat_of(share).saturating_add(room)).max(self.buy_lead_msat().saturating_add(room))
     }
 
     /// How long what's paid and not yet worked lasts at the measured output.
@@ -162,12 +223,13 @@ impl Standing {
         self.msat_of(covered.saturating_sub(self.proven)) as f64 / self.msat_a_second
     }
 
-    /// The route is too slow for this miner's rate: the most the renter may have paid ahead, and the hashmaker's wait for
-    /// a payment on its way, last less than a ticket takes to buy. Said in words, before a share waits past them.
+    /// The route is too slow for this miner's rate: how far ahead a buy starts (the step, or the lead it buys ahead
+    /// with), and the hashmaker's wait for a payment on its way, last less than a ticket takes to buy. Said in words,
+    /// before a share waits past them.
     pub fn too_slow(&self) -> bool {
         self.msat_a_second > 0.0
             && self.buy_secs > 0.0
-            && (self.step_msat() as f64 / self.msat_a_second) + WAIT_FOR_PAYING.as_secs_f64() < self.buy_secs
+            && (self.step_msat() as f64 / self.msat_a_second).max(self.buy_lead_secs()) + WAIT_FOR_PAYING.as_secs_f64() < self.buy_secs
     }
 
 }
@@ -381,15 +443,197 @@ mod tests {
         eprintln!("MEASURED the most gone and unworked, over the step: {worst:.2}");
     }
 
-    /// A buy slower than the step and the 10 s wait together: said in words.
+    /// A buy slower than the lead it is started with (at most 30 s) and the hashmaker's 30 s wait together: said in words.
     #[test]
     fn a_route_too_slow_for_the_miner_is_said_in_words() {
-        // 1,000 sat a slice, 100 sat a second, 200 sat delivered: the 546 sat step lasts 5.46 s. (On the timeline the first
-        // 20 s buy stalls the rental before any rate is measured, so the rule is checked on these numbers.)
+        // 1,000 sat a slice, 100 sat a second, 200 sat delivered: the 546 sat step lasts 5.46 s, and a buy is started up
+        // to 30 s ahead. (On the timeline the first slow buy stalls the rental before any rate is measured, so the rule is
+        // checked on these numbers.)
         let s = Standing { proven: 200, largest_share: 100, paid: 1, start_slices: 0, slice_work: 1000, price_msat: 1_000_000,
-                           msat_a_second: 100_000.0, buy_secs: 20.0 };
-        assert!(s.too_slow(), "a 20 s buy against a 5.46 s step and a 10 s wait");
-        assert!(!Standing { buy_secs: 15.0, ..s }.too_slow(), "a 15 s buy: the step and the wait cover it");
+                           msat_a_second: 100_000.0, buy_secs: 70.0 };
+        assert!(s.too_slow(), "a 70 s buy against a 30 s lead and a 30 s wait");
+        assert!(!Standing { buy_secs: 55.0, ..s }.too_slow(), "a 55 s buy: the lead and the wait cover it");
+        assert!(!Standing { buy_secs: 20.0, ..s }.too_slow(), "a 20 s buy: before 0.2.13 (no lead, a 10 s wait) this was too slow");
         assert!(!Standing { msat_a_second: 0.0, ..s }.too_slow(), "no rate measured yet: nothing said");
+    }
+
+    /// The renter's estimate of a buy: the p95 of those measured, 0 for none.
+    #[test]
+    fn a_buy_is_estimated_by_the_p95_of_those_measured() {
+        assert_eq!(buy_estimate([]), 0.0);
+        assert_eq!(buy_estimate([3.7]), 3.7);
+        assert_eq!(buy_estimate([3.7, 15.4, 12.2, 11.4, 11.7, 12.4]), 15.4);
+        let many: Vec<f64> = (1..=20).map(f64::from).collect();
+        assert_eq!(buy_estimate(many), 19.0);
+        assert_eq!(buy_estimate([f64::NAN, 2.0]), 2.0, "a measure that isn't one is left out");
+    }
+
+    /// Issue #64's rental: 404 sat a slice, 546 sat tickets, a miner whose 30 s of output is 480 sat (16 sat a second),
+    /// so the step stays at 546 sat, and buys of 11 to 15 s. Before, the next slice was paid only with less than 142 sat
+    /// (8.9 s) ahead, under one buy. Now a buy starts with the measured buy and half of it ahead (18.6 s for 12.4 s).
+    #[test]
+    fn issue_64_a_slow_buy_starts_while_what_is_paid_still_lasts_it() {
+        // a slice is 1,000 work; 16 sat a second is 39.6 work a second
+        let at = |proven: u128, paid: u64, buy_secs: f64| Standing { proven, largest_share: 10, paid, start_slices: 0, slice_work: 1000,
+                                                                     price_msat: 404_000, msat_a_second: 16_000.0, buy_secs };
+        // 2 slices paid, 1,282 work proven: 718 work (290 sat, 18.1 s) ahead
+        let s = at(1282, 2, 12.4);
+        assert_eq!(s.step_msat(), 546_000);
+        assert!((s.buy_lead_secs() - 18.6).abs() < 1e-9 && s.buy_lead_msat() == 297_600, "{} {}", s.buy_lead_secs(), s.buy_lead_msat());
+        assert!(!s.pay_next(), "the step alone waits for 142 sat ahead");
+        assert!(s.buy_ahead(142_000) && s.pay_next_with(142_000), "18.1 s ahead, under 18.6 s: the buy starts");
+        assert!(!s.buy_ahead(404_000), "the credit pays the slice: no buy, and the step decides");
+        assert!(!at(1250, 2, 12.4).buy_ahead(142_000), "18.9 s ahead: not yet");
+        // with no buy measured, or only quick ones, nothing changes
+        assert!(!at(1282, 2, 0.0).pay_next_with(142_000) && !at(1282, 2, 0.5).pay_next_with(142_000));
+        // the most gone and unworked: the lead's output, a slice and a ticket (1,247.6 sat), over the step's 950
+        assert_eq!(s.most_unworked_msat(), 297_600 + 404_000 + 546_000);
+        // the lead is held to the step's own cap, 30 s of output, however slow the buys
+        let slow = at(1282, 2, 50.0);
+        assert_eq!((slow.buy_lead_secs(), slow.buy_lead_msat()), (30.0, 480_000));
+    }
+
+    /// A rental paid by the wallet on a timeline of 0.1 s: one payment at a time; one from credit takes `credit_secs`,
+    /// one that buys a ticket `buys(n)` for the n-th buy; the renter measures its buys (`measured`: else it is never told,
+    /// as before 0.2.13, when it could never buy ahead); the hashmaker forwards a share only when what has arrived
+    /// covers it, holding it otherwise. Within `budget_msat` (tickets sized within what is left of it, as `caps_at`
+    /// does). What it came to.
+    struct Wallet {
+        /// The longest a share was held for a payment, in seconds, and when.
+        longest_hold: (f64, f64),
+        /// Holds past the hashmaker's short clock (each a `paying` wait).
+        waits: usize,
+        paid: u64,
+        bought: u64,
+        bought_ahead: u64,
+        /// What left the wallet: tickets.
+        moved_msat: u64,
+        /// The most gone and unworked over its bound, at any buy (never above 1).
+        worst_over_bound: f64,
+        /// Seconds it ran.
+        ran: f64,
+    }
+
+    fn wallet_timeline(price_msat: u64, msat_a_second: f64, buys: &dyn Fn(u64) -> f64, credit_secs: f64, measured: bool, budget_msat: u64, hours: f64) -> Wallet {
+        let slice = 1000u128;
+        let share = 10u128;
+        let work_a_second = msat_a_second * slice as f64 / price_msat as f64;
+        let mut s = Standing { proven: 0, largest_share: share, paid: 0, start_slices: 0, slice_work: slice, price_msat, msat_a_second: 0.0, buy_secs: 0.0 };
+        let (mut credit, mut arrived) = (0u64, 0u64);
+        // the payment on its way: when it lands, the credit then, and how long it took if it bought a ticket
+        let mut in_flight: Option<(f64, u64, Option<f64>)> = None;
+        let mut measures: Vec<f64> = Vec::new();
+        let mut owed = 0.0f64;
+        let mut held_since: Option<f64> = None;
+        let mut w = Wallet { longest_hold: (0.0, 0.0), waits: 0, paid: 0, bought: 0, bought_ahead: 0, moved_msat: 0, worst_over_bound: 0.0, ran: 0.0 };
+        let ticks = (hours * 36_000.0) as u64;
+        for tick in 0..ticks {
+            let now = tick as f64 / 10.0;
+            w.ran = now;
+            if let Some((at, c, took)) = in_flight {
+                if now >= at {
+                    in_flight = None;
+                    arrived += 1;
+                    credit = c;
+                    if let Some(t) = took {
+                        measures.push(t);
+                        if measures.len() > 16 {
+                            measures.remove(0);
+                        }
+                    }
+                }
+            }
+            s.buy_secs = if measured { buy_estimate(measures.iter().copied()) } else { 0.0 };
+            // as the renter: no slice past the budget, and none that needs a ticket the budget has no room for
+            let left = budget_msat.saturating_sub(w.moved_msat);
+            let affordable = (s.paid + 1) * price_msat <= budget_msat && (credit >= price_msat || left >= price_msat);
+            if in_flight.is_none() && affordable && s.pay_next_with(credit) {
+                let ahead_buy = s.buy_ahead(credit) && !s.pay_next();
+                s.paid += 1;
+                if credit >= price_msat {
+                    in_flight = Some((now + credit_secs, credit - price_msat, None));
+                } else {
+                    let ticket = s.ticket_msat_with(credit).min(left).max(price_msat);
+                    let after = credit + ticket - price_msat;
+                    // what's gone and unworked once it lands, against the bound
+                    let ahead = s.msat_of(paid_work(s.paid, 0, slice).saturating_sub(s.proven));
+                    w.worst_over_bound = w.worst_over_bound.max((ahead + after) as f64 / s.most_unworked_msat() as f64);
+                    let took = buys(w.bought);
+                    w.bought += 1;
+                    w.bought_ahead += u64::from(ahead_buy);
+                    w.moved_msat += ticket;
+                    in_flight = Some((now + took, after, Some(took)));
+                }
+                w.paid += 1;
+            }
+            // the miners move once the first slice has arrived
+            if arrived > 0 {
+                owed += work_a_second / 10.0 / share as f64;
+            }
+            while owed >= 1.0 {
+                if !fits(s.proven, share, arrived, 0, slice) {
+                    let since = *held_since.get_or_insert(now);
+                    if now - since > w.longest_hold.0 {
+                        w.longest_hold = (now - since, now);
+                    }
+                    break;
+                }
+                if held_since.take().is_some_and(|t| now - t > WAIT_FOR_PAYMENT.as_secs_f64()) {
+                    w.waits += 1;
+                }
+                owed -= 1.0;
+                s.proven += share;
+            }
+            if now >= 1.0 {
+                s.msat_a_second = s.msat_of(s.proven) as f64 / now;
+            }
+            // the rental ends where the budget does: no share fits and none can be paid
+            if !affordable && in_flight.is_none() && !fits(s.proven, share, arrived, 0, slice) {
+                break;
+            }
+        }
+        w
+    }
+
+    /// Issue #64 on the timeline: 404 sat slices, 16 sat a second, the first buy 3.7 s and every other 12.4 s (one in
+    /// five 15.4 s), a payment from credit 1 s. Before 0.2.13 (no buy measured ahead) a share waited past the old 10 s
+    /// for a buy, which ended the rental unpaid; now each buy starts ahead and no share waits past the short clock but
+    /// once, on the second buy, the first measured (3.7 s) being short of it. Over 24 hours: every slice paid once, in
+    /// turn, one payment at a time; what's gone and unworked within its bound at every buy; the budget never passed.
+    #[test]
+    fn issue_64_slow_buys_run_a_day_long_rental_to_its_end() {
+        let buys = |n: u64| if n == 0 { 3.7 } else if n % 5 == 0 { 15.4 } else { 12.4 };
+        let before = wallet_timeline(404_000, 16_000.0, &buys, 1.0, false, u64::MAX, 1.0);
+        eprintln!("MEASURED before: longest hold {:.1} s at {:.0} s, {} waits, {} buys of {} payments", before.longest_hold.0, before.longest_hold.1,
+                  before.waits, before.bought, before.paid);
+        assert!(before.longest_hold.0 > 10.0, "before: a share waited {:.1} s for a buy", before.longest_hold.0);
+        let budget = 1_400_000_000; // 1.4M sat, about the day's output (16 sat a second is 1.38M sat a day)
+        let after = wallet_timeline(404_000, 16_000.0, &buys, 1.0, true, budget, 24.0);
+        eprintln!("MEASURED after: longest hold {:.1} s at {:.0} s, {} waits, {} buys ({} ahead) of {} payments, {:.0} s, moved {} msat, \
+                   worst {:.3} of the bound", after.longest_hold.0, after.longest_hold.1, after.waits, after.bought, after.bought_ahead, after.paid,
+                  after.ran, after.moved_msat, after.worst_over_bound);
+        assert!(after.ran >= 24.0 * 3600.0 - 1.0 || after.paid * 404_000 + 404_000 > budget, "ran {:.0} s", after.ran);
+        assert!(after.longest_hold.0 < WAIT_FOR_PAYING.as_secs_f64() && after.waits <= 1, "after: held {:.1} s, {} waits", after.longest_hold.0, after.waits);
+        assert!(after.longest_hold.1 < 120.0 || after.longest_hold.0 <= WAIT_FOR_PAYMENT.as_secs_f64(), "only the second buy may wait: {:?}", after.longest_hold);
+        assert!(after.bought_ahead > after.bought / 2, "{} of {} buys started ahead", after.bought_ahead, after.bought);
+        assert!(after.worst_over_bound <= 1.0, "{}", after.worst_over_bound);
+        assert!(after.moved_msat <= budget, "the budget: {} moved of {budget}", after.moved_msat);
+    }
+
+    /// Ticket buys started ahead keep what's gone and unworked within its bound and the budget, over prices, rates and
+    /// buy times, and never leave a share waiting past the hashmaker's wait for a payment on its way.
+    #[test]
+    fn buys_started_ahead_stay_within_the_bound_and_the_budget() {
+        for price in [20_000u64, 100_000, 404_000, 1_000_000, 3_000_000] {
+            for rate in [1_000.0f64, 16_000.0, 100_000.0, 1_000_000.0] {
+                for buy in [0.3f64, 2.0, 8.0, 12.4, 20.0] {
+                    let budget = 300_000_000u64;
+                    let w = wallet_timeline(price, rate, &|_| buy, 0.5, true, budget, 0.5);
+                    assert!(w.worst_over_bound <= 1.0, "price {price} rate {rate} buy {buy}: {}", w.worst_over_bound);
+                    assert!(w.moved_msat <= budget, "price {price} rate {rate} buy {buy}: moved {}", w.moved_msat);
+                    assert!(w.longest_hold.0 < WAIT_FOR_PAYING.as_secs_f64(), "price {price} rate {rate} buy {buy}: held {:?}", w.longest_hold);
+                }
+            }
+        }
     }
 }

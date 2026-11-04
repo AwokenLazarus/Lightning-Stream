@@ -643,7 +643,7 @@ fn fallback_pool() -> (String, std::path::PathBuf) {
     start_pool(Duration::from_millis(700))
 }
 
-/// A renter that says `paying` and never pays: the hashmaker waits 10 s at the most, its miner on its own pool meanwhile,
+/// A renter that says `paying` and never pays: the hashmaker waits 30 s at the most (`order::WAIT_FOR_PAYING`), its miner on its own pool meanwhile,
 /// then stops with nothing served unpaid.
 #[test]
 fn a_renter_saying_paying_and_never_paying_ends_within_the_wait_with_the_miners_on_the_fallback() {
@@ -658,7 +658,7 @@ fn a_renter_saying_paying_and_never_paying_ends_within_the_wait_with_the_miners_
     let stop: Arc<AtomicBool> = Arc::default();
     let (ma, st2) = (a.miners.clone(), stop.clone());
     let miner = thread::spawn(move || {
-        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 10.0, bad_every: 0, duration: Some(Duration::from_secs(40)), reconnect: true, extranonce_subscribe: false, bind: None });
+        let _ = standin::miner(standin::MinerConfig { pool: ma, user: "m0".into(), max_rate: 10.0, bad_every: 0, duration: Some(Duration::from_secs(70)), reconnect: true, extranonce_subscribe: false, bind: None });
         st2.store(true, Ordering::SeqCst);
     });
     let t0 = Instant::now();
@@ -670,7 +670,7 @@ fn a_renter_saying_paying_and_never_paying_ends_within_the_wait_with_the_miners_
     b.tx.send(&Msg::Paying).unwrap();
     let said = Instant::now();
     rental_where(&a.h, "waiting", |r| r["waitingForPayment"] == true);
-    let r = run_until_ended(&a, &mut b, "say", Duration::from_secs(20));
+    let r = run_until_ended(&a, &mut b, "say", hashmaker_wait() + Duration::from_secs(10));
     let took = said.elapsed();
     let after = pool_report(&fb_report)["accepted"].as_u64().unwrap_or(0);
     stop.store(true, Ordering::SeqCst);
@@ -679,7 +679,7 @@ fn a_renter_saying_paying_and_never_paying_ends_within_the_wait_with_the_miners_
     assert!(took <= hashmaker_wait() + Duration::from_millis(1500), "{} ms", took.as_millis());
     assert_eq!(r["stopped"]["unpaidWork"], "0", "{r}");
     assert!(after > before, "the miner hashed for the hashmaker's own pool during the wait");
-    // in the ramp, whose waits aren't counted against the hour's limit: the 10 s rule still ends it
+    // in the ramp, whose waits aren't counted against the hour's limit: the 30 s rule still ends it
     assert!(r["servedMs"].as_u64().unwrap() < 30_000 && r["rampWaits"] == 1 && r["paymentWaits"] == 0, "{r}");
     a.h.shutdown();
     drop(miner);

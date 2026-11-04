@@ -853,7 +853,7 @@ impl App {
             <label>Name, as hashtakers see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
             {}\
             <label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{}> Rent out my miners</label>\
-            <p class=\"hint\">A renter gets no work it hasn't paid for. If it stops paying, your miners go back to your own pool within seconds. A renter whose payment is slow to arrive can send them back to it for up to 10 seconds while it does. Your node checks every share's hash itself, so a renter's word doesn't set what the work is worth.</p>\
+            <p class=\"hint\">A renter gets no work it hasn't paid for. If it stops paying, your miners go back to your own pool within seconds. A renter whose payment is slow to arrive can send them back to it for up to 30 seconds while it does. Your node checks every share's hash itself, so a renter's word doesn't set what the work is worth.</p>\
             <details><summary>Advanced</summary>\
             <label>Work in each piece (hashes) <small>(empty: about one share of your fastest miner)</small><input name=\"slice_work\" value=\"{}\" placeholder=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]*\" class=\"mono\"></label>\
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
