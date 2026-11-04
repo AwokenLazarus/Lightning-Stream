@@ -501,7 +501,7 @@ where
                 datagrams,
             } => {
                 let packet_len = datagrams.contents.len();
-                // XBT patch (`XBT-PATCH.md`): the access control may stop carrying a packet
+                // the access control may stop carrying a packet
                 if !self.guard.forward(dst_key, packet_len) {
                     self.metrics.send_packets_dropped.inc();
                 } else if let Err(err @ ForwardPacketError { .. }) =

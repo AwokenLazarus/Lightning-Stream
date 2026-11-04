@@ -311,8 +311,6 @@ pub trait AccessControl: std::fmt::Debug + Send + Sync + 'static {
     /// implementation can count the bytes it carries for each endpoint and stop carrying for one.
     /// The default forwards everything. A sync method called in an async context: it must not
     /// block.
-    ///
-    /// XBT patch (`XBT-PATCH.md`): not in iroh-relay 1.4.1 as published.
     fn on_forward(&self, src: EndpointId, dst: EndpointId, len: usize) -> bool {
         let _ = (src, dst, len);
         true
@@ -439,10 +437,10 @@ impl OnDisconnectGuard {
 
     /// Whether a packet of `len` bytes from the guarded endpoint to `dst` is forwarded:
     /// [`AccessControl::on_forward`] of the access control, `true` without one.
-    ///
-    /// XBT patch (`XBT-PATCH.md`).
     pub fn forward(&self, dst: EndpointId, len: usize) -> bool {
-        self.access.as_ref().is_none_or(|a| a.on_forward(self.endpoint_id, dst, len))
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.on_forward(self.endpoint_id, dst, len))
     }
 }
 
@@ -1519,6 +1517,127 @@ mod tests {
         } else {
             panic!("client_c received unexpected message {res:?}");
         }
+
+        Ok(())
+    }
+
+    /// An [`AccessControl`] that forwards a packet only while its sender has bytes left, and
+    /// counts what it forwarded, for [`test_relay_access_control_on_forward`].
+    #[derive(Debug)]
+    struct Budget {
+        left: std::sync::Mutex<std::collections::HashMap<EndpointId, usize>>,
+        forwarded: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AccessControl for Budget {
+        async fn on_connect(&self, _request: &ClientRequest) -> Access {
+            Access::Allow
+        }
+
+        fn on_forward(&self, src: EndpointId, _dst: EndpointId, len: usize) -> bool {
+            let mut left = self.left.lock().unwrap();
+            let left = left.entry(src).or_insert(0);
+            if *left < len {
+                return false;
+            }
+            *left -= len;
+            self.forwarded
+                .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+    }
+
+    /// [`AccessControl::on_forward`] sees each relayed packet's sender, receiver and length, and
+    /// a packet it refuses is not forwarded while the connection stays up.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_relay_access_control_on_forward() -> Result<()> {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let client_config = CaTlsConfig::default()
+            .client_config(default_provider())
+            .unwrap();
+        let a_secret_key = SecretKey::from_bytes(&rng.random());
+        let a_key = a_secret_key.public();
+        let b_secret_key = SecretKey::from_bytes(&rng.random());
+        let b_key = b_secret_key.public();
+
+        // a may send 8 bytes, b nothing
+        let budget = Arc::new(Budget {
+            left: std::sync::Mutex::new([(a_key, 8)].into_iter().collect()),
+            forwarded: Default::default(),
+        });
+        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+        relay.key_cache_capacity = Some(1024);
+        relay.access = budget.clone();
+        let server = Server::spawn(ServerConfig {
+            relay: Some(relay),
+            quic: None,
+            metrics_addr: None,
+        })
+        .await?;
+        let relay_url: RelayUrl = format!("http://{}", server.http_addr().unwrap()).parse()?;
+
+        let resolver = dns_resolver();
+        let mut client_a = ClientBuilder::new(relay_url.clone(), a_secret_key, resolver.clone())
+            .tls_client_config(client_config.clone())
+            .connect()
+            .await?;
+        let mut client_b = ClientBuilder::new(relay_url.clone(), b_secret_key, resolver)
+            .tls_client_config(client_config)
+            .connect()
+            .await?;
+
+        // within a's budget: forwarded
+        let msg = Datagrams::from("hello, b");
+        let res = try_send_recv(&mut client_a, &mut client_b, b_key, msg.clone()).await?;
+        let RelayToClientMsg::Datagrams {
+            remote_endpoint_id,
+            datagrams,
+        } = res
+        else {
+            panic!("client_b received unexpected message {res:?}");
+        };
+        assert_eq!((remote_endpoint_id, datagrams), (a_key, msg));
+        assert_eq!(
+            budget.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+            8
+        );
+
+        // past it, and from b, which has none: not forwarded
+        client_a
+            .send(ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: b_key,
+                datagrams: Datagrams::from("more"),
+            })
+            .await?;
+        client_b
+            .send(ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: a_key,
+                datagrams: Datagrams::from("howdy, a"),
+            })
+            .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client_b.next())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client_a.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            budget.forwarded.load(std::sync::atomic::Ordering::Relaxed),
+            8
+        );
+
+        // the connections stay up: a's budget raised, its packet is forwarded again
+        budget.left.lock().unwrap().insert(a_key, 100);
+        let msg = Datagrams::from("again, b");
+        let res = try_send_recv(&mut client_a, &mut client_b, b_key, msg.clone()).await?;
+        assert!(
+            matches!(res, RelayToClientMsg::Datagrams { remote_endpoint_id, datagrams } if remote_endpoint_id == a_key && datagrams == msg)
+        );
 
         Ok(())
     }

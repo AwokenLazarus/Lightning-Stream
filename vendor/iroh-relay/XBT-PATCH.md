@@ -22,4 +22,9 @@ client's traffic short of disconnecting it. The patch adds one hook:
   `guard.forward(dst, len)` says so; otherwise it is dropped and counted in `send_packets_dropped`.
   `bytes_recv` still counts it. `len` is the datagrams' contents, without the relay's framing.
 
-Everything else is as published. Meant to be offered upstream as is.
+- A test, `test_relay_access_control_on_forward` in `server.rs`: a per-sender byte budget; packets
+  past it are not forwarded, the connection stays up, and forwarding resumes when it is raised.
+
+Everything else is as published. The same change is kept as a clean commit on iroh's own tag
+`v1.4.1`, to be carried as a fork pinned by commit and offered upstream (`docs/IROH-UPSTREAM.md`);
+`src/server.rs` and `src/server/client.rs` here are that commit's files.

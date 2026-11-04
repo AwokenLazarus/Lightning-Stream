@@ -680,7 +680,10 @@ impl Client {
         // a preferred relay must have answered (or the report time out) before the report is good
         // enough: its latency probe can come later than the others' address discovery
         if let Some(preferred) = &self.preferred_relay
-            && !report.relay_latency.iter().any(|(_, url, _)| url == preferred)
+            && !report
+                .relay_latency
+                .iter()
+                .any(|(_, url, _)| url == preferred)
         {
             return false;
         }
@@ -1366,18 +1369,35 @@ mod tests {
                 preferred_relay: Some(relay_url(2)),
                 ..NetReportConfig::default()
             });
-            let mut client = Client::new(resolver.clone(), RelayMap::empty(), opts, Default::default());
+            let mut client = Client::new(
+                resolver.clone(),
+                RelayMap::empty(),
+                opts,
+                Default::default(),
+            );
             let mut r = report([("d1", 1), ("d2", 9)]).unwrap();
             client.add_report_history_and_set_preferred_relay(&mut r);
-            assert_eq!(r.preferred_relay, Some(relay_url(2)), "the preferred relay answered");
+            assert_eq!(
+                r.preferred_relay,
+                Some(relay_url(2)),
+                "the preferred relay answered"
+            );
             tokio::time::advance(Duration::from_secs(1)).await;
             let mut r = report([("d1", 1), ("d3", 2)]).unwrap();
             client.add_report_history_and_set_preferred_relay(&mut r);
-            assert_eq!(r.preferred_relay, Some(relay_url(2)), "it answered a second ago: still home");
+            assert_eq!(
+                r.preferred_relay,
+                Some(relay_url(2)),
+                "it answered a second ago: still home"
+            );
             tokio::time::advance(Duration::from_secs(6 * 60)).await;
             let mut r = report([("d1", 1), ("d3", 2)]).unwrap();
             client.add_report_history_and_set_preferred_relay(&mut r);
-            assert_ne!(r.preferred_relay, Some(relay_url(2)), "not heard from for six minutes: another is home");
+            assert_ne!(
+                r.preferred_relay,
+                Some(relay_url(2)),
+                "not heard from for six minutes: another is home"
+            );
         }
 
         for mut tt in tests {
