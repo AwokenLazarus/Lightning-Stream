@@ -1370,6 +1370,86 @@ fn jobs_row(ok: Option<bool>) -> String {
     format!("<li>Jobs from your node <span class=\"pill {class}\">{mark}</span></li>")
 }
 
+/// "Your gateway": the way to the bundled gateway's own status pages ([`App::gateway_status_page`]).
+const GATEWAY_STATUS_LINK: &str = "<p><a href=\"./hashrate/gateway/\">Gateway status</a> \
+    <span class=\"small\">its own pages: shares, the pool, threads, the coinbase it builds. Read-only.</span></p>";
+
+/// The bundled gateway's pages shown under `/hashrate/gateway/`, by the name the renter's control page knows them by
+/// (`GET /gateway-page?p=`), with the type each is served as here (never the one the gateway says).
+const GATEWAY_PAGES: &[(&str, &str)] = &[
+    ("", "text/html; charset=utf-8"),
+    ("threads", "text/html; charset=utf-8"),
+    ("coinbaser", "text/html; charset=utf-8"),
+    ("clients", "text/html; charset=utf-8"),
+    ("config", "text/html; charset=utf-8"),
+    ("assets/style.css", "text/css; charset=utf-8"),
+    ("assets/icons/datum_logo.svg", "image/svg+xml"),
+    ("assets/icons/favicon.ico", "image/x-icon"),
+];
+
+/// The gateway's pages as served here: their own inline styles, nothing else of their own. No script, no form goes
+/// anywhere, and no frame.
+const GATEWAY_CSP: &str = "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; form-action 'none'; \
+                           frame-ancestors 'none'; base-uri 'none'";
+
+/// A gateway page's links, made relative to `/hashrate/gateway/` (they are absolute on the gateway), and a way back to
+/// the Hashrate page at the top.
+fn gateway_html(page: &str) -> String {
+    let mut o = page.to_string();
+    for (from, to) in [("href=\"/", "href=\"./"), ("href='/", "href='./"), ("src=\"/", "src=\"./"), ("src='/", "src='./"),
+                       ("action=\"/", "action=\"./"), ("action='/", "action='./")] {
+        o = o.replace(from, to);
+    }
+    let back = "<p style=\"margin:8px 16px;font-family:sans-serif\"><a href=\"../../hashrate#gateway\" style=\"color:inherit\">\
+                &larr; Back to Hashrate</a> &middot; the Stream Gateway's own pages, read-only</p>";
+    match o.find("<body>") {
+        Some(i) => o.insert_str(i + "<body>".len(), back),
+        None => o.insert_str(0, back),
+    }
+    o
+}
+
+impl App {
+    /// `GET /hashrate/gateway/PAGE`: the bundled Stream Gateway's own status pages (as any DATUM-compatible gateway
+    /// shows them: status, threads, coinbaser; clients and config need its admin password, which it doesn't have),
+    /// for the logged-in owner. They come through the renter's control page, the one service beside the gateway's
+    /// API: only the pages named in [`GATEWAY_PAGES`], with a GET. Never its job API, and nothing that acts.
+    pub(crate) fn gateway_status_page(&self, ctx: &Ctx, page: &str) -> Resp {
+        use base64::Engine;
+        let Some(&(_, ctype)) = GATEWAY_PAGES.iter().find(|(p, _)| *p == page) else {
+            return Resp::text(404, "text/plain", "The gateway has no such page here.");
+        };
+        let html = ctype.starts_with("text/html");
+        // a page that can't be shown: said on the Hashrate page (this one's links are the gateway's, a level down)
+        let refuse = |code: u16, why: String| {
+            if !html {
+                return Resp::text(code, "text/plain", why);
+            }
+            self.flash(ctx, false, why);
+            Resp::redirect("../../hashrate#gateway")
+        };
+        let (Some(base), true) = (self.cfg.hash.renter.as_deref(), self.stream_gw_here()) else {
+            return refuse(404, format!("This install has no {}.", crate::stream_gateway::NAME));
+        };
+        let got = call(base, &self.cfg.hash.renter_token, "GET", &format!("/gateway-page?p={page}"), None).and_then(|v| {
+            // its own page, as it shows it, for 401 and 403 too: with no admin password those are the pages that say so
+            match v["status"].as_u64() {
+                Some(200 | 401 | 403) => {}
+                Some(c) => return Err(format!("it answered {c}")),
+                None => return Err(v["error"].as_str().unwrap_or("no page came back").to_string()),
+            }
+            v["body"].as_str().and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok()).ok_or_else(|| "no page came back".to_string())
+        });
+        let body = match got {
+            Ok(b) => b,
+            Err(e) => return refuse(502, format!("The Stream Gateway's status page isn't there now ({e}). It runs once its settings are \
+                                                  saved below, a few seconds after.")),
+        };
+        let body = if ctype.starts_with("text/html") { gateway_html(&String::from_utf8_lossy(&body)).into_bytes() } else { body };
+        Resp::text(200, ctype, body).header("Content-Security-Policy", GATEWAY_CSP)
+    }
+}
+
 impl App {
     /// This install comes with the Stream Gateway, and the page writes its config.
     pub(crate) fn stream_gw_here(&self) -> bool {
@@ -1406,10 +1486,12 @@ impl App {
                 o.push_str(&jobs_row(if b["running"] == true { node } else { None }));
                 o.push_str(&state_row(if node == Some(true) { Some(b["masking"] == true) } else { None }, "Masking its jobs"));
                 o.push_str("</ul>");
+                o.push_str(GATEWAY_STATUS_LINK);
             } else if !b.is_null() {
                 o.push_str(&format!("<h3>Status</h3><p class=\"hint\">Rented work goes to another gateway now, at <code>{}</code>.</p>\
                     <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"use-bundled\">\
                     <button class=\"secondary\">Use the {NAME}</button></form>", esc(datum)));
+                o.push_str(GATEWAY_STATUS_LINK);
             }
             let solo = s.mode == Mode::Solo;
             let ck = |on: bool| if on { " checked" } else { "" };

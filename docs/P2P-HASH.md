@@ -132,7 +132,11 @@ or `--config`, the service the app runs):
   at once into the hashtaker's own gateway, each with a budget and a cut switch, paying through
   the wallet's signer.
 - **Control pages** for the app (`GET /status`, `POST /stop/RENTAL`; `GET /offers`, `POST /rent`,
-  `POST /cut`, `POST /datum`) answer only with the control token (`--control-token-file`).
+  `POST /cut`, `POST /datum`, `GET /gateway-page?p=PAGE`) answer only with the control token (`--control-token-file`).
+  `GET /gateway-page` passes on one of the bundled Stream Gateway's own status pages (status, threads, coinbaser,
+  clients, config and their style), read with a plain GET from its API on the hashtaker's loopback, for the app's
+  Hashrate page ("Your gateway" → Gateway status). Nothing else of the gateway is reached from it: never `/xbt/job`,
+  `/NOTIFY`, `/cmd` or a POST, and the gateway's admin password stays empty.
 
 Tests (`crates/xbt-hashlink/tests/several.rs`, stand-in pools and miners that connect again when
 asked or take a new extranonce, as real firmware does): four miners with three hashtakers taking one

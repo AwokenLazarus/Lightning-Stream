@@ -474,6 +474,8 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
+            "/hashrate/gateway" => Resp::redirect("./gateway/"),
+            p if p.starts_with("/hashrate/gateway/") => self.gateway_status_page(&ctx, &p["/hashrate/gateway/".len()..]),
             "/ai" => self.ai_page(&ctx, inference_page::page_host(&req)),
             "/vpn" => self.vpn_page(&ctx, &req.query),
             "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),

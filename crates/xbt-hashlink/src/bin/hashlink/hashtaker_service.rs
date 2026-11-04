@@ -10,7 +10,8 @@
 //! "minutes", "once"}` (or `{"linkKey", "trial": true, "once"}`: one slice, to try a hashmaker first; a request
 //! sent again with the same `once` starts nothing and answers what the first did), `POST /cut
 //! {"rental"}`, `POST /datum {"addr", "api"?}`, `POST /attest {"rental"}` (publish a signed delivery record
-//! of a rental that ended, if the hashtaker chooses to).
+//! of a rental that ended, if the hashtaker chooses to), `GET /gateway-page?p=PAGE` (one of the bundled gateway's own
+//! status pages, read-only: [`GATEWAY_PAGES`]).
 //!
 //! The app comes with its own gateway, the Stream Gateway (DATUM-compatible), on `127.0.0.1:23339` beside
 //! this service (`--bundled-gateway`, else that address when `--datum-candidates` lists it). Its API is
@@ -566,6 +567,46 @@ fn bundled_words(state: &str) -> Option<&'static str> {
     }
 }
 
+/// The bundled gateway's own web pages the app may show its owner, by name (`p=`), and nothing else: its status, threads,
+/// coinbaser, clients and config pages and their style and icons, each read with a GET and no login. The gateway's admin
+/// password is empty, so its clients and config pages say they need admin access, and no page carries a button that does
+/// anything. Never `/xbt/job` (the consensus target, for this service alone), `/NOTIFY` or `/testnet_fastforward` (a GET
+/// that acts), `/cmd` or a POST to `/config`.
+pub const GATEWAY_PAGES: &[&str] =
+    &["", "threads", "coinbaser", "clients", "config", "assets/style.css", "assets/icons/datum_logo.svg", "assets/icons/favicon.ico"];
+/// The most of a gateway page that is passed on.
+const GATEWAY_PAGE_MAX: u64 = 1 << 20;
+
+/// One of the bundled gateway's [`GATEWAY_PAGES`], from its API on this service's own network: its HTTP status, its
+/// content type and its body (base64). The request carries no login and no query.
+fn gateway_page(api: &str, page: &str) -> Result<Value, String> {
+    use base64::Engine;
+    use std::io::{Read, Write};
+    let addr = api.to_socket_addrs().ok().and_then(|mut a| a.next()).ok_or_else(|| format!("no such address: {api}"))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| format!("the gateway's API at {api}: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    s.write_all(format!("GET /{page} HTTP/1.1\r\nHost: {api}\r\nConnection: close\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    (&mut s).take(GATEWAY_PAGE_MAX + 16 * 1024).read_to_end(&mut out).map_err(|e| format!("the gateway's API: {e}"))?;
+    let at = out.windows(4).position(|w| w == b"\r\n\r\n").ok_or("the gateway's API sent no HTTP answer")?;
+    let head = String::from_utf8_lossy(&out[..at]).to_string();
+    let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or("the gateway's API sent no status")?;
+    let header = |name: &str| head.lines().skip(1).filter_map(|l| l.split_once(':')).find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string());
+    if header("transfer-encoding").is_some_and(|t| t.eq_ignore_ascii_case("chunked")) {
+        return Err("the gateway's API sent a chunked answer".into());
+    }
+    let mut body = out[at + 4..].to_vec();
+    if let Some(n) = header("content-length").and_then(|n| n.parse::<usize>().ok()) {
+        body.truncate(n);
+    }
+    if body.len() as u64 > GATEWAY_PAGE_MAX {
+        return Err("the gateway's page is too big".into());
+    }
+    Ok(json!({"status": code, "contentType": header("content-type").unwrap_or_default(),
+              "body": base64::engine::general_purpose::STANDARD.encode(&body)}))
+}
+
 /// Look at what the upstream's jobs show, with no lock held for it.
 fn look_at_upstream(r: &Mutex<R>) -> Option<xbt_hashlink::blind::Shown> {
     let (datum, api, user) = {
@@ -662,6 +703,23 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             let relays_answered = !lock(r).offers_unanswered;
             (200, json!({"offers": list, "looking": looking, "relaysAnswered": relays_answered}))
         }
+        ("GET", "/gateway-page") => {
+            // exactly one of the pages named, as named: nothing else of the gateway is reached from here
+            let p = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let Some(page) = p.strip_prefix("p=").filter(|x| GATEWAY_PAGES.contains(x)) else {
+                return (404, json!({"error": "not one of the gateway's status pages"}));
+            };
+            // the gateway that comes with the app, on its own API: never another gateway's address
+            let api = {
+                let g = lock(r);
+                g.bundled.as_deref().and_then(|b| api_of(b, None, g.bundled.as_deref(), g.upstream_flag.as_deref(), g.gateway_api.as_deref()))
+            };
+            let Some(api) = api else { return (404, json!({"error": "this box has no Stream Gateway"})) };
+            match gateway_page(&api, page) {
+                Ok(v) => (200, v),
+                Err(e) => (502, json!({"error": e})),
+            }
+        }
         ("POST", "/attest") => attest(r, &b),
         ("POST", "/datum") => {
             let a = b["addr"].as_str().unwrap_or("").trim().to_string();
@@ -701,7 +759,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             }
         }
         ("POST", "/rent") => rent_once(r, &b),
-        _ => (404, json!({"error": "GET /status, GET /offers, POST /rent, POST /cut, POST /datum, POST /attest"})),
+        _ => (404, json!({"error": "GET /status, GET /offers, GET /gateway-page, POST /rent, POST /cut, POST /datum, POST /attest"})),
     }
 }
 
@@ -1592,6 +1650,58 @@ mod tests {
         lock(&r).datum = "127.0.0.1:1".into();
         let (_, st) = handle(&r, &[], "GET", "/status", b"");
         assert!(st["blinding"].is_null() || st["blinding"]["bundled"].is_null(), "{st}");
+    }
+
+    /// The bundled gateway's own status pages, read-only: a page named is fetched from its API with a plain GET, and
+    /// anything not named (`/xbt/job`, `/NOTIFY`, `/cmd`, another path or a query) never reaches the gateway.
+    #[test]
+    fn only_the_gateways_status_pages_are_passed_on() {
+        use base64::Engine;
+        use std::io::{BufRead, BufReader, Write};
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_addr = api.local_addr().unwrap().to_string();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let a2 = asked.clone();
+        std::thread::spawn(move || {
+            for c in api.incoming() {
+                let Ok(mut c) = c else { continue };
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                let mut head = line.clone();
+                loop {
+                    let mut h = String::new();
+                    r.read_line(&mut h).unwrap();
+                    if h.trim_end().is_empty() {
+                        break;
+                    }
+                    head.push_str(&h);
+                }
+                a2.lock().unwrap().push(head);
+                let body = "<h2>Thread Stats</h2>";
+                // as the gateway answers /threads with no admin password: its page, with a 401 and a login challenge
+                let _ = write!(c, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"DATUM Gateway\"\r\nContent-Type: text/html\r\n\
+                                   Content-Length: {}\r\n\r\n{body}", body.len());
+            }
+        });
+        let r = test_r(BUNDLED_STRATUM, Some(api_addr));
+        let (code, v) = handle(&r, &[], "GET", "/gateway-page?p=threads", b"");
+        assert_eq!((code, v["status"].as_u64(), v["contentType"].as_str()), (200, Some(401), Some("text/html")), "{v}");
+        let body = base64::engine::general_purpose::STANDARD.decode(v["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body, b"<h2>Thread Stats</h2>");
+        let seen = asked.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].starts_with("GET /threads HTTP/1.1\r\n") && !seen[0].to_ascii_lowercase().contains("authorization"), "{}", seen[0]);
+        for bad in ["/gateway-page?p=xbt/job", "/gateway-page?p=xbt/job?id=x&pot=0", "/gateway-page?p=NOTIFY", "/gateway-page?p=testnet_fastforward",
+                    "/gateway-page?p=cmd", "/gateway-page?p=/threads", "/gateway-page?p=threads&x=1", "/gateway-page?p=threads%2F", "/gateway-page?p=../xbt/job",
+                    "/gateway-page?p=umbrel-api", "/gateway-page"] {
+            assert_eq!(handle(&r, &[], "GET", bad, b"").0, 404, "{bad}");
+        }
+        assert_eq!(handle(&r, &[], "POST", "/gateway-page?p=config", b"{}").0, 404, "a POST is no page");
+        assert_eq!(asked.lock().unwrap().len(), 1, "none of those reached the gateway");
+        // a box without the bundled gateway shows none
+        lock(&r).bundled = None;
+        assert_eq!(handle(&r, &[], "GET", "/gateway-page?p=", b"").0, 404);
     }
 
     fn test_r(bundled: &str, api: Option<String>) -> Arc<Mutex<R>> {
