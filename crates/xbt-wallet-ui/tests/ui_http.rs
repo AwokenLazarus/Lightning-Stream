@@ -3930,6 +3930,56 @@ fn two_ai_shops_with_one_name_are_told_apart_and_pinned_or_blocked_one_at_a_time
     assert!(file()["sellers"].as_array().unwrap().iter().any(|e| e["name"] == json!("Other shop")), "{}", file());
 }
 
+/// A direct shop whose box's home relay charges (docs/PAID-RELAYS.md): its link names that relay first
+/// and Genesis's after it, and its gateway gets a relay_pay section to pay it through the wallet's
+/// signer. A gateway that can't reach the signer keeps the shop on Genesis's relay, free.
+#[cfg(unix)]
+#[test]
+fn a_direct_shop_on_a_paid_home_relay_pays_it_through_its_gateway() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    for sock in [Some("/run/wallet/signer.sock"), None] {
+        let gw = tempfile::tempdir().unwrap();
+        let dir = gw.path().to_path_buf();
+        let media = mock_http(|_| (200, "ok"));
+        let bx = start(json!({}), false, |c| {
+            c.sell = true;
+            c.gw.dir = dir.clone();
+            c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+            c.gw.signer_sock = sock.map(str::to_string);
+            std::fs::create_dir_all(&c.data_dir).unwrap();
+            std::fs::write(c.data_dir.join("relays.json"), json!({"paid": true, "max_msat_per_gb": 3000,
+                "home": {"relay": "https://paid.example.com/", "price": {"msat_per_gb": 2000, "credit": "https://ops.example.com/r",
+                                                                          "free_bytes_per_day": 67_108_864}}}).to_string()).unwrap();
+        });
+        let mut br = logged_in(&bx);
+        let inv = mac(&[("invoices", &["read", "write"])]);
+        let info = mac(&[("info", &["read"])]);
+        br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+        br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                                   ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+        let addr = format!("http://{media}");
+        br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", &addr), ("price", "1"), ("unit", "request")]);
+        br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct"), ("private", "1")]);
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        match sock {
+            Some(s) => {
+                assert_eq!(c["link"]["relays"], json!(["https://paid.example.com", "https://relay.lightning-stream.com"]), "{c}");
+                assert_eq!(c["relay_pay"], json!({"signer": s, "relays": [{"relay": "https://paid.example.com", "credit": "https://ops.example.com/r",
+                                                                            "msat_per_gb": 2000}], "max_msat_per_gb": 3000}));
+                let gc = xbt_gateway::config::Config::from_json(&c).expect("the gateway takes the config");
+                assert_eq!(gc.relay_pay.unwrap().bounds().max_credit_msat, 30_000, "a 10 GB credit at the most per GB");
+            }
+            None => {
+                assert_eq!(c["link"]["relays"], json!(["https://relay.lightning-stream.com"]), "{c}");
+                assert!(c.get("relay_pay").is_none());
+            }
+        }
+        // the relay page says where the box is homed
+        let page = br.get("/relays").body;
+        assert!(page.contains("Home relay") && page.contains("https://paid.example.com/"), "{page}");
+    }
+}
+
 /// A seller who picks "Directly, through the app": no web address is written, the gateway gets a
 /// link section (the app's relays, the private switch) and the listing goes to Nostr anyway.
 /// Needs the gateway to read the `link` section (the direct-links transport work).
