@@ -456,9 +456,10 @@ def drop_run() -> None:
 
 
 class SlowBuys:
-    """In front of a gateway: holds each request that buys a ticket (`POST <session>/lock`, which asks the seller for
-    the ticket's invoice) after the first for `hold` seconds, so a ticket buy takes as long as one over several
-    Lightning hops. Anything else, a slice paid from credit among it, goes through at once."""
+    """In front of a gateway: holds the answer to each request that buys a ticket (`POST <session>/lock`, whose answer
+    carries the ticket's invoice) after the first for `hold` seconds, so a ticket buy takes as long as one over several
+    Lightning hops. (The request itself goes on at once: the gateway gives up on one that arrives that slowly, 408.)
+    Anything else, a slice paid from credit among it, goes through at once."""
 
     def __init__(self, listen: int, to: int, hold: float) -> None:
         self.to, self.hold, self.locks, self.held_at = to, hold, 0, []
@@ -469,18 +470,22 @@ class SlowBuys:
         while True:
             a, _ = self.server.accept()
             b = socket.create_connection(("127.0.0.1", self.to))
-            threading.Thread(target=self.pump, args=(a, b, True), daemon=True).start()
-            threading.Thread(target=self.pump, args=(b, a, False), daemon=True).start()
+            # the connection's next answer is held: one request at a time on each
+            hold = {"next": False}
+            threading.Thread(target=self.pump, args=(a, b, True, hold), daemon=True).start()
+            threading.Thread(target=self.pump, args=(b, a, False, hold), daemon=True).start()
 
-    def pump(self, x: socket.socket, y: socket.socket, asks: bool) -> None:
+    def pump(self, x: socket.socket, y: socket.socket, asks: bool, hold: dict[str, bool]) -> None:
         try:
             while data := x.recv(65536):
                 # a request's head arrives at the start of a read on these short calls
                 if asks and data.startswith(b"POST ") and b"/x402/ticket/lock" in data.split(b"\r\n", 1)[0]:
                     self.locks += 1
-                    if self.locks > 1:
-                        self.held_at.append(int(time.time() * 1000))
-                        time.sleep(self.hold)
+                    hold["next"] = self.locks > 1
+                elif not asks and hold["next"]:
+                    hold["next"] = False
+                    self.held_at.append(int(time.time() * 1000))
+                    time.sleep(self.hold)
                 y.sendall(data)
         except OSError:
             pass
