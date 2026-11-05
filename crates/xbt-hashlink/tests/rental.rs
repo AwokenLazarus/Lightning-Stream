@@ -574,7 +574,7 @@ fn a_slice_out_of_turn_or_without_the_renters_receipt_is_refused() {
     let hk = noise::fresh_key();
     let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
     let cfg = hashmaker::Config {
-        miners: miners_a,
+        miners: miners_a.clone(),
         link: link_a.clone(),
         key: hk,
         terms: terms(),
@@ -586,6 +586,13 @@ fn a_slice_out_of_turn_or_without_the_renters_receipt_is_refused() {
     };
     let h = hashmaker::Hashmaker::start(cfg, Box::new(|| Box::<LabSeller>::default())).unwrap();
     wait_for(&link_a);
+    // a miner connected (it says nothing): a hashmaker with none refuses a rental before its welcome (#70)
+    let _miner = TcpStream::connect(&miners_a).unwrap();
+    let t0 = Instant::now();
+    while h.capacity().miners == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the miner never showed: {}", h.status());
+        thread::sleep(Duration::from_millis(50));
+    }
     let bk = noise::fresh_key();
     let mut l = xbt_hashlink::link::dial(&link_a, bk, hpub).unwrap();
     l.tx.send(&xbt_hashlink::msg::Msg::Hello { rental: "r9".into(), listing: "l".into(), terms: terms(), miners: 0, proof: Some(xbt_hashlink::msg::PROOF.into()) }).unwrap();
