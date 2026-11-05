@@ -847,8 +847,9 @@ def setup() -> None:
 
     for node in NODES:
         lab.wait(f"{node} answering and synced", 180, partial(ready, node))
+    # the hop's coin too: a wallet on the seller's node (the mesh_pay check) proves the funding of its channel from the hop
     send_pinned(lab.lncli(BUYER, "newaddress", "p2wkh")["address"], "0.2")
-    lab.fund(HOP, "0.2")
+    send_pinned(lab.lncli(HOP, "newaddress", "p2wkh")["address"], "0.2")
     lab.mine(6, NODES)
     for node in (BUYER, HOP):
         lab.wait(f"{node}'s coin", 60, partial(lab.wallet_sat, node))
@@ -1941,15 +1942,8 @@ def offers_policy(on: bool) -> None:
     restart_signer()
 
 
-def offers() -> None:
-    """BOLT 12 offers for prepaid tickets and lottery wins, on real nodes (docs/TICKETS.md, section 15).
-    The seller is lf4: it announces no address and its one channel, from the hop, is private, so it is
-    reached only by a route hint or a blinded path. The gateway beside it sells prepaid tickets and the
-    lottery and names one offer of lf4's. The wallet pays a page three times and buys a file by draws:
-    every payment lf4 takes must be an invoice of that offer, fetched over onion messages and paid
-    through the offer's blinded paths. Then the wallet with `tickets.offers` false: the same page is
-    paid with the gateway's BOLT 11 invoice, from /lock, as by a wallet that knows nothing of offers."""
-    stop_sessions()
+def offer_node_up() -> None:
+    """lf4 up, with one private channel from the hop."""
     lab.dc("up", "-d", OFFER_NODE)
 
     def ready() -> bool:
@@ -1971,6 +1965,18 @@ def offers() -> None:
             time.sleep(5)
     tick(8)
     lab.wait(f"{OFFER_NODE}'s channel active", 240, partial(active, OFFER_NODE, 1))
+
+
+def offers() -> None:
+    """BOLT 12 offers for prepaid tickets and lottery wins, on real nodes (docs/TICKETS.md, section 15).
+    The seller is lf4: it announces no address and its one channel, from the hop, is private, so it is
+    reached only by a route hint or a blinded path. The gateway beside it sells prepaid tickets and the
+    lottery and names one offer of lf4's. The wallet pays a page three times and buys a file by draws:
+    every payment lf4 takes must be an invoice of that offer, fetched over onion messages and paid
+    through the offer's blinded paths. Then the wallet with `tickets.offers` false: the same page is
+    paid with the gateway's BOLT 11 invoice, from /lock, as by a wallet that knows nothing of offers."""
+    stop_sessions()
+    offer_node_up()
     info = lab.info(OFFER_NODE)
     chans = lab.channels(OFFER_NODE)
     check("offers: lf4 announces no address and its one channel is private",
@@ -2984,6 +2990,372 @@ def mesh() -> None:
                    usage if not wrong else -1, seller, stop, m, 0, TICKET_MSAT, {"tokens_in": tin, "tokens_out": tout, "answers_priced_otherwise": wrong[:3]})
 
 
+# --- a split's machines paid by their work, from what the gateway earned ---------------------------------------
+
+PAY_PORT, STAND_IN_PORT = BASE + 27, BASE + 28
+PAY_ORIGIN = f"http://127.0.0.1:{PAY_PORT}"
+PAY_ROOT, PAY_SOCK, PAY_FRONT = f"{RUN}/pay-wallet", f"{RUN}/pay.sock", f"{RUN}/front.sock"
+PAY_LEDGER, PAY_REPORT, PAY_CONFIG = f"{RUN}/pay-ledger.json", f"{RUN}/pay-report.json", f"{RUN}/pay.json"
+# dear enough that a few answers pay a lender more than its floor: 200 and 1,000 msat a token
+PAY_IN_MSAT, PAY_OUT_MSAT, PAY_FLOOR_SATS, PAY_CUT_PPM = 200_000, 1_000_000, 20, 100_000
+MESH_CONSOLE = os.environ.get("MESH_LLM_CONSOLE", "").rstrip("/")
+MESH_GGUF = os.environ.get("MESH_LLM_GGUF", "")
+# the stand-in model's layers, in active parameters, the row of its embedding and its head
+STAND_IN_LAYERS, STAND_IN_ROW, STAND_IN_HEAD = (1_000_000, 2_000_000, 3_000_000, 4_000_000), 100, 100_000
+
+
+class StandIn(BaseHTTPRequestHandler):
+    """A model and its stage report, as Mesh-LLM gives them: every answer is 20 tokens in and 50 out."""
+
+    plan_id = "one"
+    plan: list[tuple[str, int, int]] = []
+
+    def log_message(self, *_: Any) -> None:
+        pass
+
+    def reply(self, value: dict[str, Any]) -> None:
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self.reply({"stages": [], "statuses": [], "topologies": [{"model_id": "stand-in", "topology_id": StandIn.plan_id, "stages": [
+            {"node_id": n, "layer_start": a, "layer_end": b} for n, a, b in StandIn.plan]}]})
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.reply({"id": "stand-in", "object": "chat.completion", "usage": {"prompt_tokens": 20, "completion_tokens": 50, "total_tokens": 70},
+                    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "An answer."}}]})
+
+
+def stand_in_header() -> bytes:
+    """The stand-in model's GGUF header, as a writer of one lays it out: no weights behind it."""
+    def text(s: str) -> bytes:
+        return len(s).to_bytes(8, "little") + s.encode()
+
+    tensors = [("token_embd.weight", (STAND_IN_ROW, STAND_IN_HEAD // STAND_IN_ROW))]
+    tensors += [(f"blk.{i}.attn.weight", (1000, n // 1000)) for i, n in enumerate(STAND_IN_LAYERS)]
+    out = b"GGUF" + (3).to_bytes(4, "little") + len(tensors).to_bytes(8, "little") + (2).to_bytes(8, "little")
+    out += text("general.architecture") + (8).to_bytes(4, "little") + text("stand-in")
+    out += text("stand-in.block_count") + (4).to_bytes(4, "little") + len(STAND_IN_LAYERS).to_bytes(4, "little")
+    for name, dims in tensors:
+        out += text(name) + len(dims).to_bytes(4, "little") + b"".join(d.to_bytes(8, "little") for d in dims) + bytes(12)
+    return out
+
+
+def stand_in_weights(plan: list[tuple[str, int, int]], own: set[str]) -> list[tuple[str, int]]:
+    """Each party's active parameters under a plan, worked out here and not by the tool."""
+    out: dict[str, int] = {}
+    for node, a, b in plan:
+        w = sum(STAND_IN_LAYERS[a:b]) + (STAND_IN_ROW if a == 0 else 0) + (STAND_IN_HEAD if b == len(STAND_IN_LAYERS) else 0)
+        party = "operator" if node in own else node
+        out[party] = out.get(party, 0) + w
+    return list(out.items())
+
+
+def work_split(earned: int, weights: list[tuple[str, int]]) -> dict[str, int]:
+    """What each party is due of `earned`, after the operator's cut: the exact shares, the msats left by rounding
+    down going to the largest remainders."""
+    cut = earned * PAY_CUT_PPM // 1_000_000
+    rest, total = earned - cut, sum(w for _, w in weights)
+    parts = [rest * w // total for _, w in weights]
+    for i in sorted(range(len(weights)), key=lambda i: (-(rest * weights[i][1] % total), i))[:rest - sum(parts)]:
+        parts[i] += 1
+    out = {"operator": cut}
+    for (party, _), p in zip(weights, parts):
+        out[party] = out.get(party, 0) + p
+    return out
+
+
+def read_line(s: socket.socket) -> bytes:
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(1 << 16)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+class PayoutFront:
+    """The payout tool's way to the wallet, which can kill the tool at a chosen moment of one real payment: `before` the
+    wallet hears of it, `during` (the wallet has the call, and the tool's connection goes with the tool), or `after` the
+    wallet answered, with the answer lost. So each moment is hit every run, with nothing in the tool to make it so."""
+
+    def __init__(self) -> None:
+        self.kill_at = ""
+        self.proc: subprocess.Popen[str] | None = None
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(PAY_FRONT)
+        self.server.listen(16)
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self) -> None:
+        while True:
+            conn, _ = self.server.accept()
+            threading.Thread(target=self.one, args=(conn,), daemon=True).start()
+
+    def kill(self) -> None:
+        assert self.proc
+        self.proc.kill()
+
+    def one(self, conn: socket.socket) -> None:
+        with conn:
+            line = read_line(conn)
+            at = ""
+            if json.loads(line).get("method") == "ln_pay":
+                at, self.kill_at = self.kill_at, ""
+            if at == "before":
+                return self.kill()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as up:
+                up.connect(PAY_SOCK)
+                up.sendall(line)
+                if at == "during":
+                    return self.kill()
+                answer = read_line(up)
+                if at == "after":
+                    return self.kill()
+                conn.sendall(answer)
+
+
+def pay_wallet(allowed: list[str]) -> None:
+    """The owner's wallet on the seller's node, its policy allowing those offers, started or started again on its files."""
+    if PROCS.get("pay-signer"):
+        PROCS["pay-signer"].terminate()
+        PROCS["pay-signer"].wait(20)
+    os.makedirs(f"{PAY_ROOT}/.run", exist_ok=True)
+    with open(f"{PAY_ROOT}/policy.json", "w") as f:
+        json.dump({"allowlist": [f"ln-offer:{o}" for o in allowed], "counterparties": {}, "max_per_tx_sats": 50_000, "daily_budget_sats": 1_000_000,
+                   "weekly_budget_sats": 2_000_000, "per_counterparty_cap_sats": 1_000_000, "per_counterparty_daily_sats": 1_000_000, "velocity_max": 1_000,
+                   "velocity_window_s": 3600, "human_threshold_sats": 40_000, "split_window_s": 0, "regtest_mine": False, "anchor_interval_s": 3600,
+                   "ln": {"enabled": True, "split_height": SPLIT, "max_sends_per_hour": 1_000}, "tickets": {"enabled": False}}, f, indent=1)
+    env = dict(os.environ, B2_SIGNER_SOCK=PAY_SOCK, B2_RENTAL_SOCK=f"{RUN}/pay-renter.sock", B2_RPCHOST="127.0.0.1", B2_RPCPORT=str(BASE), B2_RPCCOOKIE=f"{RUN}/rpc.cookie",
+               B2_WALLET="pay", B2_HOT_KEYFILE=f"{RUN}/keys/pay.key", B2_WATCH_INTERVAL="2", B2_BODY_DIR=f"{RUN}/pay-bodies", B2_STREAM_DIR=f"{RUN}/pay-stream",
+               B2_LN_REST=f"https://127.0.0.1:{lab.PORT[SELLER]}", B2_LN_MACAROON=f"{RUN}/pay-rail.macaroon", B2_LN_TLS_CERT=f"{RUN}/{SELLER}.tls.cert")
+    if os.path.exists(PAY_SOCK):
+        os.remove(PAY_SOCK)
+    os.makedirs(f"{RUN}/pay-stream", exist_ok=True)
+    with open(f"{RUN}/pay-signer.log", "ab") as log:
+        PROCS["pay-signer"] = subprocess.Popen([f"{BIN}/xbt-signer", "--root", PAY_ROOT], env=env, stdout=log, stderr=subprocess.STDOUT)
+    lab.wait("the owner's wallet", 60, lambda: os.path.exists(PAY_SOCK) and signer("health", sock=PAY_SOCK)["ok"])
+
+
+def mint_offer(node: str) -> tuple[str, str, str]:
+    """A lender's offer on its own node, with no amount: its text, and its id as the node writes it and in hex."""
+    o = lab.post(node, "/v2/offers", {"description": "compute lent", "amount_msat": "0", "label": "lender"})["offer"]
+    if not o.get("active"):
+        lab.post(node, "/v2/offers/enable", {"offer_id": o["offer_id"]})
+    return o["bolt12"], o["offer_id"], base64.b64decode(o["offer_id"]).hex()
+
+
+def mesh_pay() -> None:
+    """The machines of a split paid by the work each does, from what the seller's gateway earned (run by name only).
+    A gateway sells one model by the token on the seller's node. `stream-compute-check payout` splits what it earns by
+    each stage's active parameters and pays each lender's BOLT 12 offer through the owner's wallet on that node. The two
+    lenders' nodes are the judges: what they received is what the tool's ledger says it paid, to the msat, through a refusal
+    by the owner's policy, the tool killed before, during and after real payments, and a change of plan. With no
+    MESH_LLM_URL a stand-in answers for the model; with it (and MESH_LLM_CONSOLE, MESH_LLM_GGUF) a real Mesh-LLM split does, its
+    first two stages the operator's own."""
+    if MESH_URL and not (MESH_CONSOLE and MESH_GGUF):
+        raise LabError("a real split needs MESH_LLM_CONSOLE and MESH_LLM_GGUF beside MESH_LLM_URL")
+    stop_sessions()
+    offer_node_up()
+    # the seller has its channel from the hop and no balance to pay from until it is past its reserve; a seller with
+    # lenders has a working balance
+    bill = lab.post(SELLER, "/v1/invoices", {"value": "1000000", "memo": "the operator's working balance"})
+    sent = lab.post(HOP, "/v1/channels/transactions", {"payment_request": bill["payment_request"]})
+    if sent.get("payment_error"):
+        raise LabError(f"the operator's working balance: {sent['payment_error']}")
+    (lno_a, b64_a, hex_a), (lno_b, b64_b, hex_b) = mint_offer(HOP), mint_offer(OFFER_NODE)
+    for name, lno in ((HOP, lno_a), (OFFER_NODE, lno_b)):
+        lab.wait(f"{name} issuing invoices for its offer", 180,
+                 lambda lno=lno: lab.post(SELLER, "/v2/offers/fetchinvoice", {"offer": lno, "amount_msat": "1000000", "timeout_seconds": 10}).get("invoice"), every=3)
+    time.sleep(5)
+    lab.chain("createwallet", "pay")
+    with open(f"{RUN}/pay-rail.macaroon", "wb") as f:
+        f.write(bytes.fromhex(lab.bake(SELLER, lab.BUYER_PERMISSIONS)))
+    os.chmod(f"{RUN}/pay-rail.macaroon", 0o600)
+    # the owner has allowed the first lender only: the second is refused, until it is allowed
+    pay_wallet([hex_a])
+    st = signer("ln_status", sock=PAY_SOCK)
+    check("mesh_pay: the owner's wallet on the seller's node is ready, its channel's funding proven", st.get("ready") is True, {"ready": st.get("ready"), "reason": st.get("reason"), "warnings": st.get("warnings")})
+
+    plan_two: list[tuple[str, int, int]] = [("own-1", 0, 1), ("lender-a", 1, 2), ("lender-b", 2, 4)]
+    if MESH_URL:
+        upstream, console, gguf = MESH_URL, MESH_CONSOLE, MESH_GGUF
+        with urllib.request.urlopen(f"{console}/api/runtime/stages", timeout=20) as r:
+            tops = json.load(r).get("topologies") or []
+        if len(tops) != 1 or len(tops[0].get("stages") or []) != 4:
+            raise LabError(f"a real split of four stages is needed, the node reports {[len(t.get('stages') or []) for t in tops]}")
+        nodes = [s["node_id"] for s in sorted(tops[0]["stages"], key=lambda s: s["layer_start"])]
+        own, lender_a, lender_b = set(nodes[:2]), nodes[2], nodes[3]
+    else:
+        upstream = console = f"http://127.0.0.1:{STAND_IN_PORT}"
+        gguf = f"{RUN}/stand-in.gguf"
+        with open(gguf, "wb") as f:
+            f.write(stand_in_header())
+        StandIn.plan = [("own-1", 0, 1), ("own-2", 1, 2), ("lender-a", 2, 3), ("lender-b", 3, 4)]
+        threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", STAND_IN_PORT), StandIn).serve_forever, daemon=True).start()
+        own, lender_a, lender_b = {"own-1", "own-2"}, "lender-a", "lender-b"
+    lenders = ((lender_a, HOP, b64_a), (lender_b, OFFER_NODE, b64_b))
+
+    # the gateway: one model, by the token
+    with open(f"{RUN}/pay-gateway.json", "w") as f:
+        json.dump({"listen": f"127.0.0.1:{PAY_PORT}", "public_url": PAY_ORIGIN, "upstream": upstream, "state_dir": f"{RUN}/state-pay", "chain": "regtest", "network": NETWORK[0],
+                   "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": f"{RUN}/invoices.macaroon", "info_macaroon": f"{RUN}/info.macaroon"},
+                   "caps": {"sessions_per_address": 0, "unpaid_per_address": 0, "first_use_secs": 20, "idle_secs": 40}, "times": {"height_max_age_secs": 5},
+                   "routes": [{"path": "/ai/", "upstream": upstream, "strip_prefix": True, "methods": ["GET", "POST"], "max_body": 1 << 20, "max_output_tokens": AI_MAX_OUT,
+                               "price": {"per_1k_input_msat": PAY_IN_MSAT, "per_1k_output_msat": PAY_OUT_MSAT}}]}, f, indent=1)
+    with open(f"{RUN}/pay-gateway.log", "ab") as log:
+        PROCS["pay-gateway"] = subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/pay-gateway.json"], stdout=log, stderr=log)
+    lab.wait("the model's gateway", 60, lambda: json.loads(send("GET", "/x402/ticket/health", PAY_PORT)[2])["height"] is not None, every=0.1)
+    # the buyer's wallet may buy from it
+    pol = WALLET_PROC.policy()
+    pol["allowlist"].append(PAY_ORIGIN)
+    pol["counterparties"][PAY_ORIGIN] = {"ln_node": lab.pubkey(SELLER)}
+    with open(f"{WALLET}/policy.json", "w") as f:
+        json.dump(pol, f, indent=1)
+    restart_signer()
+
+    def charged() -> int:
+        return int(json.loads(send("GET", "/x402/ticket/health", PAY_PORT)[2])["chargedMsat"])
+
+    asked = [0]
+
+    def buy(n: int) -> int:
+        """`n` answers bought from the gateway; what it has then earned in all."""
+        for _ in range(n):
+            body = json.dumps({"messages": [{"role": "user", "content": f"In one short sentence, explain {MESH_TOPICS[asked[0] % len(MESH_TOPICS)]}."}],
+                               "max_tokens": AI_MAX_OUT, "temperature": 0})
+            asked[0] += 1
+            r = agent().tool("xbt402_pay", {"url": f"{PAY_ORIGIN}/ai/v1/chat/completions", "method": "POST", "body": body, "max_sats": CALL_SATS, "task": "chat"})
+            if not call_paid(r):
+                raise LabError(f"an answer was not bought: {brief(r)}")
+            if r.get("saved_to"):
+                os.remove(r["saved_to"])
+        return charged()
+
+    config = {"gateway_url": PAY_ORIGIN, "mesh_console_url": console, "gguf": gguf, "signer_sock": PAY_FRONT, "ledger": PAY_LEDGER, "report": PAY_REPORT, "operator_cut_ppm": PAY_CUT_PPM,
+              "own_nodes": sorted(own), "lenders": {lender_a: {"name": HOP, "offer": lno_a}, lender_b: {"name": OFFER_NODE, "offer": lno_b}},
+              "min_payout_sats": PAY_FLOOR_SATS, "interval_s": 1, "retry_s": 1}
+    with open(PAY_CONFIG, "w") as f:
+        json.dump(config, f, indent=1)
+    front = PayoutFront()
+
+    def payout(kill_at: str = "", conf: str = PAY_CONFIG) -> tuple[int, str]:
+        front.kill_at = kill_at
+        front.proc = subprocess.Popen([f"{BIN}/stream-compute-check", "payout", "--config", conf, "--once"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out, _ = front.proc.communicate(timeout=1200)
+        with open(f"{RUN}/payout.log", "a") as log:
+            log.write(f"--- kill_at {kill_at!r} rc {front.proc.returncode}\n{out}\n")
+        return front.proc.returncode, out
+
+    def ledger() -> dict[str, Any]:
+        with open(PAY_LEDGER) as f:
+            return json.load(f)
+
+    def received(node: str, offer_id: str) -> list[int]:
+        rows = lab.post(node, "/v2/offers/invoices", {"offer_id": offer_id}).get("invoices", [])
+        return [int(i.get("amount_paid_msat") or 0) for i in rows if i.get("state") == "SETTLED"]
+
+    def books() -> dict[str, Any]:
+        """Each lender: what its own node received, and what the ledger says it was paid and is owed."""
+        led = ledger()
+        with open(PAY_REPORT) as f:
+            parties = json.load(f)["parties"]
+        return {party: {"node_msat": sum(received(node, oid)), "invoices": len(received(node, oid)), "ledger_paid_msat": led["paid_msat"].get(party, 0),
+                        "owed_msat": int(parties.get(party, {}).get("owed_msat", 0))} for party, node, oid in lenders}
+
+    def exact(b: dict[str, Any]) -> bool:
+        return all(x["node_msat"] == x["ledger_paid_msat"] for x in b.values())
+
+    def below_floor(b: dict[str, Any]) -> bool:
+        return all(-1 <= x["owed_msat"] < PAY_FLOOR_SATS * 1000 for x in b.values())
+
+    rc, out = payout()
+    baseline = charged()
+    check("mesh_pay: the tool reads the gateway, the plan and the wallet, and takes what the gateway has earned so far as its start", rc == 0 and ledger().get("last_charged_msat") == baseline,
+          {"rc": rc, "out": out[-400:], "baseline": baseline})
+
+    # a gateway that sells anything else cannot be split by a model's work
+    other = f"{RUN}/pay-other.json"
+    with open(other, "w") as f:
+        json.dump(dict(config, gateway_url=ORIGIN, ledger=f"{RUN}/pay-other-ledger.json", report=None), f)
+    payout(conf=other)
+    rc, out = payout(conf=other)
+    check("mesh_pay: a gateway selling anything beside the model is named and its earnings are not split", rc == 0 and "beside the model" in out, {"rc": rc, "out": out[-300:]})
+
+    # the owner has not allowed the second lender
+    buy(8)
+    rc, out = payout()
+    led, b = ledger(), books()
+    refused = led["refused"].get(lender_b) or {}
+    check("mesh_pay: a lender the owner's policy does not allow is refused by the wallet and stays owed, its node paid nothing, and the other lender is paid",
+          rc == 0 and bool(refused.get("rule")) and b[lender_b]["node_msat"] == 0 and b[lender_b]["owed_msat"] >= PAY_FLOOR_SATS * 1000 and b[lender_a]["node_msat"] > 0 and exact(b) and not led["intent"],
+          {"rc": rc, "refused": refused, "books": b, "note": led["intent"], "out": out[-300:]})
+    pay_wallet([hex_a, hex_b])
+    time.sleep(1.1)
+    rc, out = payout()
+    led, b = ledger(), books()
+    check("mesh_pay: once allowed, the refused lender is paid what it is owed, once", rc == 0 and b[lender_b]["invoices"] == 1 and exact(b) and below_floor(b) and not led["refused"],
+          {"rc": rc, "books": b, "refused": led["refused"], "out": out[-300:]})
+
+    # the tool killed at each moment of a real payment, and started again at once
+    for at in ("before", "during", "after"):
+        buy(8)
+        was = books()
+        rc, out = payout(at)
+        led = ledger()
+        first = (led["intent"] or {}).get("party")
+        rc2, out2 = payout()
+        led2, b = ledger(), books()
+        one_each = all(b[p]["invoices"] == was[p]["invoices"] + 1 for p in b)
+        check(f"mesh_pay: killed {at} the wallet's part of a real payment, with its note on disk, and started again: each lender's node has one new invoice and exactly what the ledger says, and nobody was paid twice",
+              rc == -9 and bool(first) and rc2 == 0 and not led2["intent"] and one_each and exact(b) and below_floor(b),
+              {"killed_rc": rc, "note_for": first, "rc": rc2, "was": was, "books": b, "out": (out + out2)[-500:]})
+
+    expected: dict[str, int] = {}
+    earned_a = 0
+    if not MESH_URL:
+        # a new plan: what came in since the last round goes by the plan in force then
+        weights_one = stand_in_weights(StandIn.plan, own)
+        buy(8)
+        StandIn.plan, StandIn.plan_id = plan_two, "two"
+        rc, out = payout()
+        earned_a = charged() - baseline
+        expected = work_split(earned_a, weights_one)
+        led, b = ledger(), books()
+        check("mesh_pay: when the plan changes, the earnings up to that round are split by the old plan and the new one starts from there",
+              rc == 0 and (led["epoch"] or {}).get("plan") == "two" and (led["epoch"] or {}).get("earned_msat") == 0 and exact(b) and sum(led["closed"].values()) == earned_a,
+              {"rc": rc, "epoch": led["epoch"], "closed": led["closed"], "earned": earned_a, "out": out[-300:]})
+        buy(8)
+    time.sleep(1)
+    rc, out = payout()
+    # one more round: a lender paid in the last one is under its floor, with nothing new
+    rc2, out2 = payout()
+    end = charged()
+    led, b = ledger(), books()
+    with open(PAY_REPORT) as f:
+        report = json.load(f)
+    accrued = {k: int(v["accrued_msat"]) for k, v in report["parties"].items()}
+    weights = stand_in_weights(plan_two, own) if not MESH_URL else [tuple(s) for s in led["epoch"]["stages"]]
+    for k, v in work_split(end - baseline - earned_a, weights).items():
+        expected[k] = expected.get(k, 0) + v
+    check("mesh_pay: every msat the gateway earned in the run is one party's, and each party's share is its active parameters' after the operator's cut, as worked out apart from the tool, to the msat",
+          rc == 0 and rc2 == 0 and led["earned_msat"] == end - baseline and sum(accrued.values()) + led["unsplit_msat"] == end - baseline and accrued == expected,
+          {"earned": led["earned_msat"], "gateway_in_the_run": end - baseline, "accrued": accrued, "expected": expected, "weights": weights, "out": (out + out2)[-300:]})
+    settled = [e for e in signer("history", {"limit": 5000}, sock=PAY_SOCK)["events"] if e.get("type") == "ln_settled"]
+    fees = sum(int(e.get("fee_msat") or 0) for e in settled)
+    check("mesh_pay: each lender's node received, in settled invoices of its offer, exactly what the ledger says it paid; each is owed less than the floor; the wallet's own records hold those payments and the fees the ledger counts",
+          exact(b) and below_floor(b) and all(x["node_msat"] > 0 for x in b.values()) and len(settled) == sum(x["invoices"] for x in b.values()) and fees == led["fees_msat"] and not led["intent"],
+          {"books": b, "wallet_settled": len(settled), "invoices": sum(x["invoices"] for x in b.values()), "wallet_fees_msat": fees, "ledger_fees_msat": led["fees_msat"]})
+    measured("mesh_pay", {"answers": asked[0], "gateway_msat": end - baseline, "accrued": accrued, "books": b, "fees_msat": led["fees_msat"], "weights": weights, "real_split": bool(MESH_URL)})
+    stop_sessions()
+
+
 # --- a seller's whole web app: Jellyfin, through the app port, paid for on these nodes -----------------------
 
 JF_URL = os.environ.get("JELLYFIN_URL", "")
@@ -3234,15 +3606,15 @@ def jellyfin(link: str = "") -> None:
 
 
 CHECKS = {"page": page, "latency": latency, "stream": stream, "money": money_check, "flap": flap, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
-          "vpn": vpn, "mesh": mesh,
+          "vpn": vpn, "mesh": mesh, "mesh_pay": mesh_pay,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
     # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
-    # (vpn downloads a public file through the exit, mesh needs a Mesh-LLM node: run by name only)
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn", "mesh")])
+    # (vpn downloads a public file through the exit, mesh needs a Mesh-LLM node, mesh_pay the payout tool: run by name only)
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn", "mesh", "mesh_pay")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

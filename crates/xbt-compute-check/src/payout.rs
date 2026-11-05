@@ -48,8 +48,11 @@ pub struct Lender {
 fn default_floor() -> u64 {
     1000
 }
-fn default_fee_limit() -> u64 {
-    50
+fn default_fee_base() -> u64 {
+    10
+}
+fn default_fee_ppm() -> u64 {
+    5000
 }
 fn default_interval() -> u64 {
     60
@@ -88,9 +91,12 @@ pub struct Config {
     /// A lender is paid when it is owed this many sats.
     #[serde(default = "default_floor")]
     pub min_payout_sats: u64,
-    /// The most routing one payment may cost.
-    #[serde(default = "default_fee_limit")]
-    pub fee_limit_sats: u64,
+    /// The most routing one payment may cost: a base and millionths of the amount. The wallet refuses a
+    /// payment under its own `ln.max_fee_base_sats` and `ln.max_fee_ppm`, whose defaults these are.
+    #[serde(default = "default_fee_base")]
+    pub fee_base_sats: u64,
+    #[serde(default = "default_fee_ppm")]
+    pub fee_ppm: u64,
     #[serde(default = "default_interval")]
     pub interval_s: u64,
     /// How long a refused lender is left before the wallet is asked again.
@@ -251,6 +257,8 @@ pub enum Paid {
     Pending { hash: String },
     /// Nothing was paid, and the wallet said why.
     Refused { rule: String, reason: String },
+    /// Nothing was paid, and it can be asked again at once: it is busy, or its socket is not there.
+    NotAsked(String),
     /// The question may have reached the wallet, and no answer came.
     Unknown(String),
 }
@@ -379,7 +387,7 @@ fn pay_round(cfg: &Config, led: &mut Ledger, w: &dyn World, save: &mut dyn FnMut
         let sats = (owed / 1000) as u64;
         led.intent = Some(Intent { party: node.clone(), sats, ts: now, hash: None });
         save(led)?;
-        match w.pay(&lender.offer, sats, sats + cfg.fee_limit_sats) {
+        match w.pay(&lender.offer, sats, sats + cfg.fee_base_sats + (sats * cfg.fee_ppm).div_ceil(1_000_000)) {
             Paid::Settled { hash } => {
                 if let Some(i) = &mut led.intent {
                     i.hash = Some(hash.clone());
@@ -401,9 +409,16 @@ fn pay_round(cfg: &Config, led: &mut Ledger, w: &dyn World, save: &mut dyn FnMut
                 led.refused.insert(node.clone(), Refusal { rule, reason, until: now + cfg.retry_s as f64 });
                 save(led)?;
             }
+            Paid::NotAsked(e) => {
+                notes.push(format!("{}: not paid this round: {e}", display(node, lender)));
+                led.intent = None;
+                save(led)?;
+                return Ok(());
+            }
             Paid::Pending { hash } => {
+                // with no name for it, the note closes when nothing is in flight
                 if let Some(i) = &mut led.intent {
-                    i.hash = Some(hash);
+                    i.hash = Some(hash).filter(|h| !h.is_empty());
                 }
                 save(led)?;
                 return Ok(());
@@ -541,7 +556,7 @@ impl World for Live {
     fn pay(&self, offer: &str, sats: u64, max_sats: u64) -> Paid {
         match self.signer(PAY_WAIT, "ln_pay", &json!({"invoice": offer, "amount_sats": sats, "max_sats": max_sats})) {
             // the signer's socket was never reached: nothing can have been paid
-            Err((false, e)) => Paid::Refused { rule: "signer_unreachable".into(), reason: e },
+            Err((false, e)) => Paid::NotAsked(e),
             Err((true, e)) => Paid::Unknown(e),
             Ok(v) => paid_of(&v),
         }
@@ -549,7 +564,9 @@ impl World for Live {
 
     fn barrier(&self) -> Result<usize, String> {
         let v = self.signer(PAY_WAIT, "ln_status", &json!({})).map_err(|(_, e)| e)?;
-        Ok(number(v.get("in_flight")) as usize)
+        // a wallet that does not say (its rail is off, or not ready) cannot close a note
+        v.get("in_flight").and_then(Value::as_u64).map(|n| n as usize)
+            .ok_or_else(|| format!("the wallet does not say what is in flight: {}", v.get("reason").and_then(Value::as_str).unwrap_or("no reason given")))
     }
 
     fn settled(&self) -> Result<Vec<(String, String)>, String> {
@@ -569,15 +586,17 @@ impl World for Live {
 /// The wallet's answer to `ln_pay`.
 pub fn paid_of(v: &Value) -> Paid {
     let hash = v.get("payment_hash").and_then(Value::as_str).unwrap_or("").to_string();
-    match v.get("verdict").and_then(Value::as_str) {
+    let verdict = v.get("verdict").and_then(Value::as_str);
+    let rule = v.get("rule").and_then(Value::as_str).or(verdict).unwrap_or("").to_string();
+    let reason = v.get("reason").and_then(Value::as_str).unwrap_or("").to_string();
+    match verdict {
         Some("allow") if v.get("status").and_then(Value::as_str) == Some("SUCCEEDED") => Paid::Settled { hash },
         Some("pending") => Paid::Pending { hash },
-        // an answer that is neither: whatever it means, a retry on top of it could pay twice
-        Some("allow") => Paid::Unknown(format!("the wallet allowed the payment with status {:?}", v.get("status"))),
-        _ => Paid::Refused {
-            rule: v.get("rule").and_then(Value::as_str).unwrap_or("refused").to_string(),
-            reason: v.get("reason").and_then(Value::as_str).unwrap_or("").to_string(),
-        },
+        Some("deny") if rule == "ln_in_flight" => Paid::NotAsked(reason),
+        // for the owner to approve: asked again after the wait, as a refusal is
+        Some("deny" | "needs_human") => Paid::Refused { rule, reason },
+        // whatever else it means, a retry on top of it could pay twice
+        _ => Paid::Unknown(format!("the wallet answered {verdict:?} with status {:?}", v.get("status"))),
     }
 }
 
@@ -607,6 +626,7 @@ mod tests {
         /// The tool died before the question reached the wallet.
         NeverReached,
         Refuse,
+        Busy,
         Hold,
     }
 
@@ -675,6 +695,7 @@ mod tests {
                 }
                 Next::NeverReached => Paid::Unknown("the socket went".into()),
                 Next::Refuse => Paid::Refused { rule: "daily_budget".into(), reason: "over the owner's budget".into() },
+                Next::Busy => Paid::NotAsked("another payment is in flight".into()),
                 Next::Hold => {
                     settle("sending");
                     Paid::Pending { hash }
@@ -707,7 +728,7 @@ mod tests {
         let lender = |o: &str| Lender { name: String::new(), offer: o.into(), dest: format!("dest-{o}") };
         Config { gateway_url: String::new(), gateway_health_token: None, mesh_console_url: String::new(), model: None, gguf: PathBuf::new(), signer_sock: PathBuf::new(),
                  ledger: PathBuf::new(), report: None, operator_cut_ppm: 100_000, own_nodes: vec!["own".into()],
-                 lenders: [("a".to_string(), lender("offer-a")), ("b".to_string(), lender("offer-b"))].into(), min_payout_sats: 10, fee_limit_sats: 5, interval_s: 1, retry_s: 100 }
+                 lenders: [("a".to_string(), lender("offer-a")), ("b".to_string(), lender("offer-b"))].into(), min_payout_sats: 10, fee_base_sats: 5, fee_ppm: 0, interval_s: 1, retry_s: 100 }
     }
 
     /// A round, with the ledger saved as a real run saves it: `disk` is what a restart would read.
@@ -865,6 +886,22 @@ mod tests {
         balanced(&led, &f);
     }
 
+    #[test]
+    fn a_busy_wallet_is_asked_again_next_round_with_no_wait() {
+        let c = cfg();
+        let f = Fake::new(plan("p", &[("a", 0, 2), ("b", 2, 4)]));
+        let (mut led, disk) = start(&c, &f);
+        f.earn(1_000_000);
+        f.next(Next::Busy);
+        let notes = round(&c, &mut led, &f, &disk, 1.0);
+        assert!(notes.iter().any(|n| n.contains("in flight")), "{notes:?}");
+        assert_eq!(*f.asked.borrow(), 1, "the round stops there");
+        assert!(led.intent.is_none() && led.refused.is_empty(), "{led:?}");
+        round(&c, &mut led, &f, &disk, 1.5);
+        assert!(f.node_received("offer-a") > 0 && f.node_received("offer-b") > 0);
+        balanced(&led, &f);
+    }
+
     /// W-6: a new plan: what was earned before it goes by the old one, and no msat is lost.
     #[test]
     fn a_new_plan_splits_from_when_it_starts() {
@@ -986,7 +1023,11 @@ mod tests {
     fn the_wallets_answers_read_as_it_writes_them() {
         assert_eq!(paid_of(&json!({"verdict": "allow", "rail": "ln", "status": "SUCCEEDED", "payment_hash": "h"})), Paid::Settled { hash: "h".into() });
         assert_eq!(paid_of(&json!({"verdict": "pending", "status": "IN_FLIGHT", "payment_hash": "h"})), Paid::Pending { hash: "h".into() });
-        assert_eq!(paid_of(&json!({"verdict": "deny", "rule": "ln_in_flight", "reason": "another"})), Paid::Refused { rule: "ln_in_flight".into(), reason: "another".into() });
-        assert!(matches!(paid_of(&json!({"verdict": "allow", "status": "ODD"})), Paid::Unknown(_)), "never taken as unpaid");
+        assert_eq!(paid_of(&json!({"verdict": "deny", "rule": "allowlist", "reason": "no"})), Paid::Refused { rule: "allowlist".into(), reason: "no".into() });
+        assert_eq!(paid_of(&json!({"verdict": "deny", "rule": "ln_in_flight", "reason": "another"})), Paid::NotAsked("another".into()));
+        assert!(matches!(paid_of(&json!({"verdict": "needs_human", "reason": "over the threshold"})), Paid::Refused { .. }));
+        for odd in [json!({"verdict": "allow", "status": "ODD"}), json!({"verdict": "unknown", "rule": "signer_no_answer"}), json!({})] {
+            assert!(matches!(paid_of(&odd), Paid::Unknown(_)), "never taken as unpaid: {odd}");
+        }
     }
 }

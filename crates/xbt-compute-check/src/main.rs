@@ -43,6 +43,8 @@ stream-compute-check: what this machine has and how well testers reach each othe
       by the work each does, and pays each lender's BOLT 12 offer through the owner's wallet. See
       docs/COMPUTE-ALPHA.md. Paid is what the wallet says settled; a run that was killed is safe to
       start again.
+  shares --gguf FILE [--stages 0-7,7-28]
+      What each stage of a split does per token, from the model's header, as the payout pays by it.
 
 Lab flags: --no-relay, and --collector-addr IP:PORT with check.";
 
@@ -201,6 +203,30 @@ fn payout(flags: &Flags) -> Result<(), String> {
     }
 }
 
+fn shares(flags: &Flags) -> Result<(), String> {
+    use xbt_compute_check::meter::Work;
+    let path = flags.value("--gguf").ok_or("--gguf FILE is needed")?;
+    let header = xbt_compute_check::gguf::read(std::path::Path::new(&path)).map_err(|e| format!("{path}: {e}"))?;
+    let work = Work::from_header(&header).map_err(|e| format!("{path}: {e}"))?;
+    let n = work.layers.len() as u32;
+    let stages = flags.value("--stages").unwrap_or_else(|| format!("0-{n}"));
+    let mut rows = vec![];
+    for s in stages.split(',') {
+        let (a, b) = s.split_once('-').ok_or_else(|| format!("stage {s}: FIRST-END"))?;
+        let (a, b): (u32, u32) = (a.parse().map_err(|_| format!("stage {s}"))?, b.parse().map_err(|_| format!("stage {s}"))?);
+        if a >= b || b > n {
+            return Err(format!("stage {s} of a model with {n} layers"));
+        }
+        let active = work.stage(a, b);
+        rows.push(serde_json::json!({"layers": s, "active_params": active.to_string(), "share_ppm": (active * 1_000_000 / work.total()) as u64}));
+    }
+    let all: u128 = header.tensors.iter().map(|t| t.dims.iter().map(|d| *d as u128).product::<u128>()).sum();
+    let out = serde_json::json!({"layers": n, "embed_row": work.embed.to_string(), "head": work.head.to_string(), "total": work.total().to_string(),
+                                 "all_tensors": all.to_string(), "stages": rows});
+    println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
 fn disk_dir(flags: &Flags) -> PathBuf {
     flags.value("--disk-dir").map_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()), PathBuf::from)
 }
@@ -354,6 +380,7 @@ fn run() -> Result<(), String> {
         "sweep" => sweep(&flags),
         "link" => link(&flags),
         "payout" => payout(&flags),
+        "shares" => shares(&flags),
         _ => {
             println!("{USAGE}");
             Ok(())
