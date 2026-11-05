@@ -3814,6 +3814,8 @@ LEND_REAL_BIND = os.environ.get("LEND_REAL_BIND", "")
 MESH_BUNDLE = os.environ.get("MESH_LLM_BUNDLE", "")
 LEND_FORWARD_PORT, OP_API, OP_CONSOLE, OP_QUIC = BASE + 33, BASE + 34, BASE + 35, BASE + 36
 LEND_REAL_CREDIT_SATS = 200
+# answers walked away from partway: Mesh-LLM's stage keeps the lane of such an answer for good, so a split stops serving until that is fixed
+ABANDONED_ANSWERS = int(os.environ.get("LEND_REAL_ABANDONED", "0"))
 
 
 def forward(bind: str, port: int, to: int) -> None:
@@ -3908,7 +3910,7 @@ def mesh_lend_real() -> None:
     tool("invite", "--config", config, "--name", "Lab operator", "--out", f"{root}/invite.json", "--build-file", MESH_BUNDLE, "--build-url", f"http://{LEND_REAL_BIND}:{FILES_PORT}/build.tar.gz",
          "--model-file", MESH_GGUF, "--model-url", f"http://{LEND_REAL_BIND}:{FILES_PORT}/model.gguf", "--max-vram", "4")
     with open(f"{root}/lend-args", "w") as f:
-        f.write(f"--node-rest https://{LEND_REAL_BIND}:{LEND_FORWARD_PORT} --allow-build {sha} --credit-sats {LEND_REAL_CREDIT_SATS} --interval-s 3 --name lab-lender")
+        f.write(f"--node-rest https://{LEND_REAL_BIND}:{LEND_FORWARD_PORT} --allow-build {sha} --credit-sats {LEND_REAL_CREDIT_SATS} --interval-s 3 --name lab-lender --port-base {LEND_PORT}")
 
     # --- the other machine starts from here, with only the tool
     t0 = time.time()
@@ -3999,7 +4001,7 @@ def mesh_lend_real() -> None:
                 raise LabError(f"the payout: {out[-300:]}")
             ever_stopped = ever_stopped or lender_report().get("serving") is False
     abandoned_tokens = 0
-    for i in range(5):
+    for i in range(ABANDONED_ANSWERS):
         body = json.dumps({"messages": [{"role": "user", "content": f"Explain at length {MESH_TOPICS[i]}."}], "max_tokens": AI_MAX_OUT, "stream": True}).encode()
         c = socket.create_connection(("127.0.0.1", OP_API), timeout=120)
         c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
@@ -4012,11 +4014,17 @@ def mesh_lend_real() -> None:
         c.close()
         abandoned_tokens += got.count(b"data:")
         time.sleep(1)
+    if ABANDONED_ANSWERS:
+        after = buy_one()
+        answered += 1
+        if after["paid"] and after["usage"]:
+            completions += int(after["usage"]["completion_tokens"])
+        check(f"mesh_lend_real: after {ABANDONED_ANSWERS} answers abandoned by their buyers partway, the split still serves paid answers", after["paid"] and bool(after["usage"]), {"answer": after["brief"]})
     payout()
     r = fresh_report()
     counted = r.get("total_tokens", 0) - tokens_at_start
     check("mesh_lend_real: on real answers paid for through the gateway, the lender's own count holds to the model's own count, within one per answer and what abandoned answers cost",
-          completions <= counted <= completions + answered + abandoned_tokens + 5 * 2 and completions > 0,
+          completions <= counted <= completions + answered + abandoned_tokens + ABANDONED_ANSWERS * 2 and completions > 0,
           {"answers": answered, "model_completion_tokens": completions, "lender_counted": counted, "abandoned_chunks": abandoned_tokens})
     with open(ledger_path) as f:
         led = json.load(f)
