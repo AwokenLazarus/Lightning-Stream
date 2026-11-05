@@ -348,6 +348,9 @@ nav.chips a[aria-current=page] { color: var(--accent); border-color: var(--accen
 nav.chips .count { color: var(--muted); font-size: 0.85em; font-variant-numeric: tabular-nums; }
 .sort { margin: 0 0 14px; }
 .grid.services { grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr)); }
+/* the Hashrate page's offers carry a form each: wider cards that share the row, not 240px strips beside empty tracks */
+.grid.rent-offers { grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+.grid.rent-offers > p { grid-column: 1 / -1; margin: 0; }
 a.service-card { display: flex; flex-direction: column; gap: 6px; color: var(--fg); text-decoration: none; margin: 0;
                  transition: border-color 0.25s, transform 0.35s var(--ease), background 0.25s; }
 a.service-card:hover { border-color: var(--accent-line); transform: translateY(-2px); color: var(--fg); text-decoration: none;

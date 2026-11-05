@@ -196,7 +196,7 @@ class Wallet:
             # as shipped a session is one payment for velocity_max (a 100 MB file is twenty releases), a session holds
             # 2 tickets and the wallet 15 in all: none of that is set here
             "tickets": {"enabled": True, "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
-                        "tasks": {"film": {"budget_sats": 3_000_000}}, **TICKET_OVERRIDES},
+                        "tasks": {"film": {"budget_sats": 3_000_000}, "chat": {"budget_sats": 100_000}}, **TICKET_OVERRIDES},
         }
 
     def write_policy(self) -> None:
@@ -601,6 +601,10 @@ def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | Non
             {"path": "/free/", "free": True},
         ],
     }
+    if MESH_URL and name == "gateway":
+        # a model sold by the token (the mesh check): its own upstream, a Mesh-LLM node's OpenAI address
+        cfg["routes"].append({"path": "/ai/", "upstream": MESH_URL, "strip_prefix": True, "methods": ["GET", "POST"], "max_body": 1 << 20,
+                              "max_output_tokens": AI_MAX_OUT, "price": {"per_1k_input_msat": AI_IN_MSAT, "per_1k_output_msat": AI_OUT_MSAT}})
     path = f"{RUN}/{name}.json"
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
@@ -2097,9 +2101,9 @@ def money_check() -> None:
     requests in one session to a route priced per request and per byte, 200 pages and 40 media segments
     of 1 to 2.5 MiB (about 70 MiB). Each reply's price is its own bytes' and request's; the seller's
     signed receipts, the wallet's account and both nodes agree with the sum to the msat: the price of a
-    known body is fixed, so there is no slack. (AI by the token and hashrate slices have no service in
-    this lab: their money over many requests and slices is checked in process, in xbt-signer's
-    tests/ticket_pay.rs and xbt-hashlink's tests/rental.rs. The VPN tunnel's is the vpn check's.)"""
+    known body is fixed, so there is no slack. (AI by the token is the mesh check's, on a Mesh-LLM node, and is
+    checked in process over many requests in xbt-signer's tests/ticket_pay.rs; hashrate slices have no service in
+    this lab: theirs is checked in process, in xbt-hashlink's tests/rental.rs. The VPN tunnel's is the vpn check's.)"""
     # Files: the file whole
     stop_sessions()
     m0 = money()
@@ -2873,6 +2877,113 @@ def vpn_money(origin: str, vdir: str, sat_gb: int, stop_bytes: int = VPN_STOP_AT
                "exit": {k: exit_status.get(k) for k in ("up_bytes", "down_bytes")}, "fetch": out})
 
 
+# --- a model sold by the token: Mesh-LLM behind the gateway ----------------------------------------------------
+
+# MESH_LLM_URL: a Mesh-LLM node's OpenAI address on this machine, one model or a split's first stage (the mesh check)
+MESH_URL = os.environ.get("MESH_LLM_URL", "").rstrip("/")
+# 2 and 10 msat a token in and out, so that every charge is a whole msat; at most 128 tokens out
+AI_IN_MSAT, AI_OUT_MSAT, AI_MAX_OUT = 2_000, 10_000, 128
+MESH_TOPICS = ("why the sky is blue", "how a bicycle stays upright", "what a Lightning channel is", "how bread rises", "why ice floats",
+               "how a compass works", "what makes a fire burn", "how tides happen", "why leaves change colour", "how a battery stores energy")
+
+
+def ai_cost(body: bytes, usage: dict[str, Any]) -> int:
+    """What the gateway charges for one answer, from the model's own counts (crates/xbt-gateway/README.md):
+    the input at most one token per two bytes of the request, the output at most the route's most tokens."""
+    tin = min(int(usage["prompt_tokens"]), len(body) // 2)
+    tout = min(int(usage["completion_tokens"]), AI_MAX_OUT)
+    return tin * AI_IN_MSAT // 1000 + tout * AI_OUT_MSAT // 1000
+
+
+def ai_usage(text: str, streamed: bool) -> dict[str, Any] | None:
+    """The model's own counts: a whole answer's `usage`, or the last one a stream carries."""
+    if not streamed:
+        try:
+            return json.loads(text).get("usage")
+        except ValueError:
+            return None
+    usage = None
+    for line in text.splitlines():
+        data = line[5:].strip() if line.startswith("data:") else ""
+        if data and data != "[DONE]":
+            try:
+                usage = json.loads(data).get("usage") or usage
+            except ValueError:
+                pass
+    return usage
+
+
+def mesh() -> None:
+    """A model that Mesh-LLM serves, sold by the token through the gateway and paid with stream tickets: the lab's
+    first service priced by the token on real nodes (run by name only, with MESH_LLM_URL). Unpaid, the model's route
+    answers 402 with its rates. Paid: 20 questions in one session, whole and streamed by turns, each answer priced on
+    the model's own counts at the listed rates; the seller's signed receipts, the wallet's account and both nodes come
+    to the sum to the msat, as in the money check."""
+    if not MESH_URL:
+        raise LabError("the mesh check needs MESH_LLM_URL, a Mesh-LLM node's OpenAI address")
+    path = "/ai/v1/chat/completions"
+
+    def question(i: int, streamed: bool) -> str:
+        b: dict[str, Any] = {"messages": [{"role": "user", "content": f"In three short sentences, explain {MESH_TOPICS[i % len(MESH_TOPICS)]}."}],
+                             "max_tokens": AI_MAX_OUT, "temperature": 0}
+        if streamed:
+            b["stream"] = True
+        return json.dumps(b)
+
+    code, headers, _ = send("POST", path, GW_PORT, {"Content-Type": "application/json"}, question(0, False).encode())
+    try:
+        terms = json.loads(base64.b64decode(headers.get("payment-required", "")))
+    except ValueError:
+        terms = {}
+    found: list[dict[str, Any]] = []
+
+    def prices(v: Any) -> None:  # every price in the terms, wherever it sits
+        if isinstance(v, dict):
+            if "outputPer1kMsat" in v:
+                found.append({k: v.get(k) for k in ("inputPer1kMsat", "outputPer1kMsat", "maxOutputTokens")})
+            for x in v.values():
+                prices(x)
+        elif isinstance(v, list):
+            for x in v:
+                prices(x)
+    prices(terms)
+    rates = {"inputPer1kMsat": str(AI_IN_MSAT), "outputPer1kMsat": str(AI_OUT_MSAT), "maxOutputTokens": str(AI_MAX_OUT)}
+    check(f"mesh: unpaid, the model's route answers 402 and names its rates per 1,000 tokens in and out and its most tokens out ({rates})",
+          code == 402 and rates in found, {"status": code, "prices_in_terms": found})
+    stop_sessions()
+    m0 = money()
+    usage, seller, sid, wrong, tin, tout = 0, 0, "", [], 0, 0
+    for i in range(20):
+        streamed = i % 2 == 1
+        body = question(i, streamed)
+        # the owner's task for this lab's chat questions: a budget of its own beside the films'
+        r = agent().tool("xbt402_pay", {"url": f"{ORIGIN}{path}", "method": "POST", "body": body, "max_sats": CALL_SATS, "task": "chat"})
+        note_receipts(r)
+        # a long answer comes back as a preview, the whole of it in a file
+        text = body_of(r)
+        if r.get("saved_to"):
+            with open(r["saved_to"], encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            os.remove(r["saved_to"])
+        u = ai_usage(text, streamed)
+        want = ai_cost(body.encode(), u) if u else -1
+        if u:
+            usage += want
+            tin += min(int(u["prompt_tokens"]), len(body) // 2)
+            tout += min(int(u["completion_tokens"]), AI_MAX_OUT)
+        # each answer the model's, priced on its own counts, in the one session
+        if not call_paid(r) or r.get("rail") != "ticket" or r.get("price_msat") != str(want) or (sid and r.get("session") != sid):
+            wrong.append({"i": i, "streamed": streamed, "usage": u, "want_msat": want, "rails_passed_over": r.get("rails_passed_over"),
+                          "body_start": text[:300], **brief(r)})
+        sid = sid or str(r.get("session"))
+        seller = max(seller, int(((r.get("receipt") or {}).get("last") or {}).get("spentMsat") or 0))
+    stop, m = stop_and_count(sid, m0)
+    paid_for_usage("mesh", f"20 questions to a model served by Mesh-LLM, whole and streamed by turns, in one session ({tin:,} tokens in, {tout:,} out): each "
+                   "answer is charged the model's own counts at 2 and 10 msat a token, and the seller's signed receipts and the wallet's account come to "
+                   "the sum to the msat; both nodes and the book agree",
+                   usage if not wrong else -1, seller, stop, m, 0, TICKET_MSAT, {"tokens_in": tin, "tokens_out": tout, "answers_priced_otherwise": wrong[:3]})
+
+
 # --- a seller's whole web app: Jellyfin, through the app port, paid for on these nodes -----------------------
 
 JF_URL = os.environ.get("JELLYFIN_URL", "")
@@ -3123,15 +3234,15 @@ def jellyfin(link: str = "") -> None:
 
 
 CHECKS = {"page": page, "latency": latency, "stream": stream, "money": money_check, "flap": flap, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
-          "vpn": vpn,
+          "vpn": vpn, "mesh": mesh,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
     # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
-    # (vpn downloads a public file through the exit: run by name only)
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn")])
+    # (vpn downloads a public file through the exit, mesh needs a Mesh-LLM node: run by name only)
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn", "mesh")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

@@ -7,7 +7,7 @@
 //! | `welcome` | hashmaker | the terms are accepted; their hash; the proof, repeated |
 //! | `resend` | hashmaker | after a `resume`: a recent share the hashtaker may never have read, for its count alone |
 //! | `due` | hashmaker | a share is waiting for payment: what this side has proven, and has been paid |
-//! | `paying` | hashtaker | a payment is on its way: wait for it up to 10 s, with the miners on the hashmaker's own pool |
+//! | `paying` | hashtaker | a payment is on its way: wait for it up to 30 s, with the miners on the hashmaker's own pool |
 //! | `open` | hashmaker | a miner connected: channel id and its worker name |
 //! | `up` | hashmaker | a Stratum V1 line from that miner (subscribe, authorize, submit: only shares its hash proves) |
 //! | `down` | hashtaker | a Stratum V1 line from the hashtaker's gateway (notify, set_difficulty: the jobs; the results of submits: the gateway's verdicts) |

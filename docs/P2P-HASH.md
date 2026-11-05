@@ -229,13 +229,22 @@ is in `crates/xbt-hashlink/src/order.rs`.
 - No share is forwarded past what's paid. One that doesn't fit waits, the hashmaker says `due`, and if no payment
   comes within 2 s the rental stops and the miners go home (`unpaid`). Measured on the real-money regtest: stopped
   with 0 work past what was paid.
-- A renter whose payment is on its way says `paying`: the hashmaker waits up to 10 s, its miners on its own pool,
-  and ends the rental if the payment hasn't come (`unpaid`). It allows 6 such waits an hour. While the renter's step
-  ramps up, in the miners' first 30 s of work for the rental, a slow wallet's buys can outlast what it may pay ahead,
-  so those waits are counted apart, up to 12 (`too many waits for payment` past either limit). Measured: a wallet
-  whose ticket buys take 8 s keeps a 200 sat/s miner running
-  (`an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running`); a renter that never pays after `paying` in
-  the ramp ends at the 10 s rule.
+- A renter whose payment is on its way says `paying`: the hashmaker waits up to 30 s (10 s until 0.2.13, under one
+  Lightning payment over several hops: issue #64), its miners on its own pool, and ends the rental if the payment
+  hasn't come (`unpaid`). It allows 6 such waits an hour. While the renter's step ramps up, in the miners' first 30 s
+  of work for the rental, a slow wallet's buys can outlast what it may pay ahead, so those waits are counted apart,
+  up to 12 (`too many waits for payment` past either limit). No share goes to the renter during a wait, so what a
+  wait costs the hashmaker is its miners' time on its own pool instead (or idle, with none): at most 3 minutes an
+  hour, and 6 minutes in the ramp, against 1 and 2 at 10 s. Measured: a wallet whose ticket buys take 8 s keeps a
+  200 sat/s miner running (`an_honest_renter_with_slow_ticket_buys_keeps_a_large_miner_running`); a renter that never
+  pays after `paying` in the ramp ends at the 30 s rule.
+- The renter times its ticket buys (p95 of the last 16) and starts the next one while what's paid still lasts that
+  and half again (at least 3 s more, at most 30 s of output in all), so the slice after it is paid from the credit
+  it bought rather than waiting on a buy (`order::Standing::buy_ahead`). Buys under 1 s start no earlier than
+  before. This can pass the step: what's gone and not yet worked is then at most the lead's output, one slice and
+  the smallest ticket (`order::Standing::most_unworked_msat`). In issue #64's rental (404 sat slices, 546 sat
+  tickets, 16 sat/s, buys of 12.4 s) a buy starts with 18.6 s (298 sat) ahead instead of under 142 sat (8.9 s), and
+  at most 1,248 sat is gone and unworked instead of 950.
 - A share nobody hashed, a repeat, or one too old goes no further; the miner gets a rejection from the hashmaker.
 - A renter that keeps the miners idle (no jobs, or jobs too fast to finish) uses up the paid time: four times what
   the paid slices should take at the miners' best measured speed (`paid time used up`).

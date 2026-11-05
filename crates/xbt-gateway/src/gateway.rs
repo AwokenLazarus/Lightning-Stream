@@ -1656,17 +1656,24 @@ impl Gateway {
 
     /// Pass the request on to its route's service.
     pub(crate) fn send_upstream(&self, route: &Route, req: &Request) -> Result<Answer, crate::Error> {
-        self.send_upstream_body(route, req, &req.body)
+        self.send_upstream_body(route, req, &req.body, false)
     }
 
-    /// Pass the request on with another body (a request to a route priced by the token, bounded).
-    fn send_upstream_body(&self, route: &Route, req: &Request, body: &[u8]) -> Result<Answer, crate::Error> {
+    /// Pass the request on with another body: with `json`, a request to a route priced by the token, its body the
+    /// JSON object the gateway bounded and wrote again.
+    fn send_upstream_body(&self, route: &Route, req: &Request, body: &[u8], json: bool) -> Result<Answer, crate::Error> {
         // the config refuses a route with neither a base nor the config's, and every route has its client
         let up = self.upstream_for(route).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
         let mut headers = forwarded(route, &req.headers);
         // the seller's own headers for this route (a guest login) win over any of the buyer's of the same name
         headers.retain(|(k, _)| !route.upstream_headers.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)));
         headers.extend(route.upstream_headers.iter().cloned());
+        // the body is a JSON object the gateway wrote again: a buyer that did not say so (the wallet's own calls) has
+        // it said for it, since some services (Mesh-LLM) refuse a body of no stated type
+        // (only that body: a request passed on as it came keeps the buyer's headers, and a GET gets none)
+        if json && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            headers.push(("Content-Type".into(), "application/json".into()));
+        }
         up.send_as(&req.method, &route.upstream_target(&req.target), &headers, body, route.accept_gzip)
     }
 
@@ -1973,7 +1980,7 @@ impl Gateway {
                 }
                 Err(e) => Err(e),
             },
-            (None, Some(p)) => self.send_upstream_body(route, &req, &p.body),
+            (None, Some(p)) => self.send_upstream_body(route, &req, &p.body, true),
             (None, None) => self.send_upstream(route, &req),
         };
         let mut answer = match sent {

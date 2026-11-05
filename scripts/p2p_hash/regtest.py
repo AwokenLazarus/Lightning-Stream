@@ -33,6 +33,13 @@ Checks:
             restarts with the new price, and the next rental pays it. (P2P_HASH_ONLY=reprice runs only this.)
             The price is the owner's fixed one (regtest's difficulty is not a market), and the settings file is
             written as the Save button writes it but with the lab's small slice (Save refuses one under 2^32).
+  slow      issue #64: a fourth gateway, behind a road that holds each ticket buy after the first for
+            P2P_HASH_SLOW_BUY_S (11 s, so a buy takes about 12 s, as over several Lightning hops), a rental at 400 sat a
+            slice from a miner whose 30 s of output (480 sat) is under the 546 sat step, for P2P_HASH_SLOW_SECS (960 s).
+            Before 0.2.13 the renter bought only once under 142 sat was ahead and the hashmaker waited 10 s for it, so
+            the rental ended unpaid within minutes; now it runs to its end, buys started ahead and the slices after them
+            paid from credit, each slice paid once, the money exact, inside its task's budget.
+            (P2P_HASH_ONLY=slow runs only this.)
   solo, pool  real money as above, on real work: a real DATUM gateway on a real Knots regtest of its own, real
             stratum-grind through the hashmaker. Every share wins on regtest, so each block is a real masked
             one: its key isn't null, its clear_bits equal the share's bits, and its id is the raw hash XOR
@@ -98,6 +105,15 @@ REAL_SECS = int(os.environ.get("P2P_HASH_REAL_SECS", "360"))
 # the longest coinbase tag Your gateway takes (60 printable ASCII characters), written as the app writes it
 OWNER_TAG = os.environ.get("P2P_HASH_OWNER_TAG", "Owner's own tag: 60 chars, ASCII /solo/ ~!@#$%^&*()_+{}|:<>?")
 REAL_BASE = B + 13
+# issue #64's check: a fourth gateway, and the road in front of it that holds its ticket buys (its public address)
+GW4, SLOW_ROAD = B + 37, B + 38
+ORIGIN4 = f"http://127.0.0.1:{SLOW_ROAD}"
+SLOW_BUY_S = float(os.environ.get("P2P_HASH_SLOW_BUY_S", "11"))
+SLOW_SECS = int(os.environ.get("P2P_HASH_SLOW_SECS", "960"))
+SLOW_PRICE_MSAT = 400_000
+# two miners at 0.2 shares a second: 0.04 slices a second, 16 sat a second at 400 sat, 480 sat in 30 s (under 546)
+SLOW_RATE = 0.2
+SLOW_BUDGET_SATS = 40_000
 REPORT: dict[str, Any] = {"checks": []}
 PROCS: list[subprocess.Popen[bytes]] = []
 
@@ -110,11 +126,11 @@ def check(name: str, ok: bool, saw: Any) -> None:
 def policy() -> dict[str, Any]:
     pk = lab.pubkey(d.SELLER)
     return {
-        "allowlist": [ORIGIN, ORIGIN2, ORIGIN3, RP_ORIGIN],
-        "counterparties": {ORIGIN: {"ln_node": pk}, ORIGIN2: {"ln_node": pk}, ORIGIN3: {"ln_node": pk}, RP_ORIGIN: {"ln_node": pk}},
+        "allowlist": [ORIGIN, ORIGIN2, ORIGIN3, RP_ORIGIN, ORIGIN4],
+        "counterparties": {ORIGIN: {"ln_node": pk}, ORIGIN2: {"ln_node": pk}, ORIGIN3: {"ln_node": pk}, RP_ORIGIN: {"ln_node": pk}, ORIGIN4: {"ln_node": pk}},
         "max_per_tx_sats": 10_000,
-        "daily_budget_sats": 100_000,
-        "weekly_budget_sats": 200_000,
+        "daily_budget_sats": 200_000,
+        "weekly_budget_sats": 400_000,
         "per_counterparty_cap_sats": 100_000,
         "velocity_max": 1_000,
         "velocity_window_s": 3600,
@@ -124,7 +140,9 @@ def policy() -> dict[str, Any]:
         "anchor_interval_s": 3600,
         "ln": {"enabled": True, "split_height": d.SPLIT},
         # the hashrate task as the starter rules sign it on mainnet: a rental task, prepaid tickets of at most 10,000 sat
-        "tickets": {"enabled": True, "tasks": {"hashrate": {"budget_sats": 50_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}}},
+        "tickets": {"enabled": True, "tasks": {"hashrate": {"budget_sats": 50_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}},
+                                               # issue #64's long rental, on a budget of its own
+                                               "hashrate-slow": {"budget_sats": SLOW_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}}},
     }
 
 
@@ -172,12 +190,15 @@ def setup() -> None:
     }
     cfg2 = {**cfg, "listen": f"127.0.0.1:{GW2}", "public_url": ORIGIN2, "state_dir": f"{RUN}/state-gateway2"}
     cfg3 = {**cfg, "listen": f"127.0.0.1:{GW3}", "public_url": ORIGIN3, "state_dir": f"{RUN}/state-gateway3"}
-    for name, c in (("gateway", cfg), ("gateway2", cfg2), ("gateway3", cfg3)):
+    # issue #64's: reached through the road that holds its ticket buys, at issue #64's price a slice
+    cfg4 = {**cfg, "listen": f"127.0.0.1:{GW4}", "public_url": ORIGIN4, "state_dir": f"{RUN}/state-gateway4",
+            "routes": [{**cfg["routes"][0], "price": {"request_msat": SLOW_PRICE_MSAT}}]}
+    for name, c in (("gateway", cfg), ("gateway2", cfg2), ("gateway3", cfg3), ("gateway4", cfg4)):
         with open(f"{RUN}/{name}.json", "w") as f:
             json.dump(c, f, indent=1)
         with open(f"{RUN}/{name}.log", "ab") as log:
             PROCS.append(subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/{name}.json"], stdout=log, stderr=log))
-    for port in (GW, GW2, GW3):
+    for port in (GW, GW2, GW3, GW4):
         lab.wait(f"the gateway at {port}", 60, lambda p=port: json.loads(d.send("GET", "/x402/ticket/health", p)[2])["height"] is not None, every=0.2)
     status, headers, _ = d.send("POST", "/hashrate/probe/1", GW, body=b"{}")
     REPORT["terms_402"] = {"status": status, "accepts": json.loads(base64.b64decode(headers.get("payment-required", "e30="))).get("accepts")}
@@ -292,9 +313,10 @@ class Road:
 
 def rental(name: str, stop_after: int | None, miner_secs: int, rate: float, origin: str = ORIGIN,
            caps: tuple[str, ...] = ("--max-sats", "1500"), link_public: int = LINK, job_ms: int = 1000,
-           reconnect: bool = False, during: Callable[[], None] | None = None) -> dict[str, Any]:
+           reconnect: bool = False, during: Callable[[], None] | None = None, price_msat: int = PRICE_MSAT, task: str = "hashrate",
+           idle_s: int = 15) -> dict[str, Any]:
     pool = spawn(f"{name}-pool", ["standin-pool", "--listen", f"127.0.0.1:{POOL}", "--diff", str(DIFF), "--job-ms", str(job_ms), "--report", f"{RUN}/{name}-pool.json"])
-    t = ["--slice-work", str(SLICE_WORK), "--price-msat", str(PRICE_MSAT), "--grace-ms", str(GRACE_MS)]
+    t = ["--slice-work", str(SLICE_WORK), "--price-msat", str(price_msat), "--grace-ms", str(GRACE_MS)]
     hashmaker = spawn(f"{name}-hashmaker", ["hashmaker", "--key", f"{RUN}/keys/hasher.key", "--miners", f"127.0.0.1:{MINERS}", "--link", f"127.0.0.1:{LINK}",
                                       "--slices", f"127.0.0.1:{SLICES}", *t, "--report", f"{RUN}/{name}-hasher.json",
                                       "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hashmaker",
@@ -305,8 +327,8 @@ def rental(name: str, stop_after: int | None, miner_secs: int, rate: float, orig
     extra = ["--stop-paying-after", str(stop_after)] if stop_after is not None else []
     hashtaker = spawn(f"{name}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
                                     "--found-out", f"{RUN}/{name}-found.json", "--upstream", f"127.0.0.1:{POOL}", "--user", "buyer.rented", "--allow-unblinded", "1",
-                                    "--signer", d.RENTER_SOCK, "--task", "hashrate", *caps, "--rental", f"rt-{name}",
-                                    "--idle-s", "15", "--report", f"{RUN}/{name}-buyer.json", *extra])
+                                    "--signer", d.RENTER_SOCK, "--task", task, *caps, "--rental", f"rt-{name}",
+                                    "--idle-s", str(idle_s), "--report", f"{RUN}/{name}-buyer.json", *extra])
     time.sleep(2)
     miners = [spawn(f"{name}-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{MINERS}", "--user", f"hasher.m{i}", "--rate", str(rate),
                                          "--bad-every", "9", "--duration-s", str(miner_secs), *(["--reconnect", "1"] if reconnect else [])]) for i in (1, 2)]
@@ -431,6 +453,110 @@ def drop_run() -> None:
           {"settled": len(settled), "succeeded": len(succeeded), "seller's node in msat": node_in_msat, "credited msat": credited, "wallet's node out msat": node_out_msat,
            "wallet booked sats": moved_sats, "booked over the node msat": over_msat, "held tickets released": held_released, "held": d.held(),
            "stopped": [e for e in bz["events"] if e["ev"] == "wallet session stopped"][:1]})
+
+
+class SlowBuys:
+    """In front of a gateway: holds the answer to each request that buys a ticket (`POST <session>/lock`, whose answer
+    carries the ticket's invoice) after the first for `hold` seconds, so a ticket buy takes as long as one over several
+    Lightning hops. (The request itself goes on at once: the gateway gives up on one that arrives that slowly, 408.)
+    Anything else, a slice paid from credit among it, goes through at once."""
+
+    def __init__(self, listen: int, to: int, hold: float) -> None:
+        self.to, self.hold, self.locks, self.held_at = to, hold, 0, []
+        self.server = socket.create_server(("127.0.0.1", listen))
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self) -> None:
+        while True:
+            a, _ = self.server.accept()
+            b = socket.create_connection(("127.0.0.1", self.to))
+            # the connection's next answer is held: one request at a time on each
+            hold = {"next": False}
+            threading.Thread(target=self.pump, args=(a, b, True, hold), daemon=True).start()
+            threading.Thread(target=self.pump, args=(b, a, False, hold), daemon=True).start()
+
+    def pump(self, x: socket.socket, y: socket.socket, asks: bool, hold: dict[str, bool]) -> None:
+        try:
+            while data := x.recv(65536):
+                # a request's head arrives at the start of a read on these short calls
+                if asks and data.startswith(b"POST ") and b"/x402/ticket/lock" in data.split(b"\r\n", 1)[0]:
+                    self.locks += 1
+                    hold["next"] = self.locks > 1
+                elif not asks and hold["next"]:
+                    hold["next"] = False
+                    self.held_at.append(int(time.time() * 1000))
+                    time.sleep(self.hold)
+                y.sendall(data)
+        except OSError:
+            pass
+        for z in (x, y):
+            try:
+                z.close()
+            except OSError:
+                pass
+
+
+def slow_check() -> None:
+    """Issue #64: ticket buys of about 12 s, a miner whose 30 s of output is under the 546 sat step, a long rental."""
+    road = SlowBuys(SLOW_ROAD, GW4, SLOW_BUY_S)
+    inv0, pay0 = d.seller_invoices(), d.buyer_payments()
+    t0 = time.time()
+    r = rental("slow", None, SLOW_SECS, SLOW_RATE, origin=ORIGIN4, price_msat=SLOW_PRICE_MSAT, task="hashrate-slow",
+               caps=("--budget-sats", str(SLOW_BUDGET_SATS)), idle_s=60,
+               # a share every 5 s from each miner: a new job every second would leave most of them stale
+               job_ms=60_000)
+    hz, bz = r["hasher"], r["buyer"]
+    for who in ("hasher", "buyer"):
+        try:
+            with open(f"{RUN}/slow-{who}.json", "rb") as f, open(f"{OUT}/p2p_hash_slow-{who}.json", "wb") as g:
+                g.write(f.read())
+        except OSError:
+            pass
+    pays = bz["pays"]
+    oks = [p for p in pays if p.get("ok")]
+    bought = [p for p in oks if int(p["wallet"].get("charged_sats", 0)) > 0]
+    slow_buys = [p["ms"] for p in bought[1:]]
+    ahead = [p["slice"] for p in bought if p.get("ahead")]
+    from_credit = [p["slice"] for p in oks if int(p["wallet"].get("charged_sats", 0)) == 0]
+    stopped = (hz.get("stopped") or {}).get("reason")
+    served_s = hz.get("servedMs", 0) / 1000
+    REPORT["slow"] = {"buy ms": [p["ms"] for p in bought], "pay ms": [p["ms"] for p in pays], "held locks": len(road.held_at), "bought ahead at slices": ahead,
+                      "from credit at slices": from_credit, "buySecs": bz.get("buySecs"), "buyLeadSecs": bz.get("buyLeadSecs"), "dues": bz.get("dues"),
+                      "paymentWaits": hz.get("paymentWaits"), "rampWaits": hz.get("rampWaits"), "stopped": stopped, "closed": bz.get("closed"),
+                      "servedS": served_s, "ran s": round(time.time() - t0)}
+    print(f"slow: {json.dumps(REPORT['slow'])[:1500]}", flush=True)
+    check(f"slow: ticket buys of about {SLOW_BUY_S + 1:.0f} s (each held {SLOW_BUY_S:.0f} s on its way), and the rental runs to its end "
+          f"({SLOW_SECS} s of miners), not \"hashmaker closed: unpaid\"",
+          len(slow_buys) >= 5 and min(slow_buys) >= SLOW_BUY_S * 1000 and stopped != "unpaid" and bz.get("closed") == "no proven work"
+          and served_s >= SLOW_SECS - 120 and not bz["payFailed"],
+          {"slow buys ms": slow_buys[:12], "stopped": stopped, "closed": bz.get("closed"), "served s": served_s, "pay failed": bz["payFailed"]})
+    check("slow: each ticket buy after the first two starts ahead, while what's paid still lasts it, and slices are paid from the credit it "
+          "bought; the hashmaker waited for a payment on its way at most once",
+          len(ahead) >= len(bought) - 3 and from_credit and (hz.get("paymentWaits", 0) + hz.get("rampWaits", 0)) <= 1,
+          {"buys": len(bought), "bought ahead": len(ahead), "from credit": len(from_credit), "payment waits": hz.get("paymentWaits"),
+           "ramp waits": hz.get("rampWaits"), "dues": bz.get("dues"), "lead s": bz.get("buyLeadSecs")})
+    paid = hz["paid"]
+    slices = [p["slice"] for p in oks]
+    proven = lambda m: (m["work"], m["proven"])  # noqa: E731
+    priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
+    last_w = oks[-1]["wallet"] if oks else {}
+    credited, balance = int(last_w.get("credited_msat", 0)), int(last_w.get("balance_msat", 0))
+    moved_sats = sum(int(p["wallet"].get("charged_sats", 0)) for p in oks)
+    check("slow: every slice paid once and in turn, both proven counts equal, none past what's paid; slices x price = the wallet's spent = what the "
+          "hashmaker earned; what left the wallet within the rental's budget",
+          paid == len(oks) == len(set(slices)) and slices == list(range(1, paid + 1)) and proven(hz["meter"]) == proven(bz["meter"])
+          and int(hz["meter"]["work"]) <= paid * SLICE_WORK and priced == credited - balance == paid * SLOW_PRICE_MSAT == hz["earnedMsat"]
+          and moved_sats <= SLOW_BUDGET_SATS,
+          {"hashmaker paid": paid, "wallet ok": len(oks), "meter": hz["meter"], "the hashtaker's meter": bz["meter"], "slices x price msat": paid * SLOW_PRICE_MSAT,
+           "wallet priced msat": priced, "seller's spent msat": credited - balance, "earned msat": hz["earnedMsat"], "moved sats": moved_sats,
+           "budget sats": SLOW_BUDGET_SATS})
+    inv1, pay1 = d.seller_invoices(), d.buyer_payments()
+    settled = {h: i for h, i in inv1.items() if h not in inv0 and i["state"] == "SETTLED"}
+    succeeded = {h: p for h, p in pay1.items() if h not in pay0 and p["status"] == "SUCCEEDED"}
+    node_in = sum(int(i["amt_paid_msat"]) for i in settled.values())
+    check("slow: the seller's node settled what the wallet's node paid and what the seller credited; nothing held",
+          settled and set(settled) == set(succeeded) and node_in == credited and d.held() == 0,
+          {"settled": len(settled), "succeeded": len(succeeded), "seller's node in msat": node_in, "credited msat": credited, "held": d.held()})
 
 
 class UI:
@@ -1145,6 +1271,9 @@ def main() -> int:
         if os.environ.get("P2P_HASH_ONLY") == "reprice":
             reprice_check()
             raise StopIteration
+        if os.environ.get("P2P_HASH_ONLY") == "slow":
+            slow_check()
+            raise StopIteration
         only_real = os.environ.get("P2P_HASH_ONLY") == "real"
         if only_real:
             for mode in os.environ.get("P2P_HASH_REAL_MODES", "solo,pool").split(","):
@@ -1240,6 +1369,7 @@ def main() -> int:
               {"hashmaker paid": hz["paid"], "work": hz["meter"]["work"], "closed": bz["closed"], "why": why[:300], "payments": moved, "held": d.held()})
 
         drop_check()
+        slow_check()
         real_gateway("solo")
         real_gateway("pool")
     except StopIteration:

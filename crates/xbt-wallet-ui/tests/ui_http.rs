@@ -3235,7 +3235,7 @@ fn renting_out_starts_unticked_says_what_a_renter_can_do_and_keeps_a_saved_choic
     let mut br = logged_in(&bx);
     const OFF: &str = "name=\"enabled\" value=\"1\"> Rent out my miners";
     const ON: &str = "name=\"enabled\" value=\"1\" checked> Rent out my miners";
-    const WARNING: &str = "A renter gets no work it hasn&#39;t paid for. If it stops paying, your miners go back to your own pool within seconds. A renter whose payment is slow to arrive can send them back to it for up to 10 seconds while it does. Your node checks every share&#39;s hash itself, so a renter&#39;s word doesn&#39;t set what the work is worth.";
+    const WARNING: &str = "A renter gets no work it hasn&#39;t paid for. If it stops paying, your miners go back to your own pool within seconds. A renter whose payment is slow to arrive can send them back to it for up to 30 seconds while it does. Your node checks every share&#39;s hash itself, so a renter&#39;s word doesn&#39;t set what the work is worth.";
     assert!(!settings.exists(), "nothing saved yet");
     let p = br.get("/sell-hashrate");
     assert!(p.body.contains(OFF) && !p.body.contains(ON), "first view: not ticked: {}", p.body);
@@ -5376,6 +5376,57 @@ fn without_the_bundled_gateway_there_are_no_gateway_status_pages() {
     assert!(!seen.lock().unwrap().iter().any(|(_, p, ..)| p.starts_with("/gateway-page")));
 }
 
+/// Settings → Your gateway, beside Your node: the bundled gateway's state as the Hashrate page's card shows it, and the
+/// way to its status pages (from this page's own place: the links are the card's), with its settings left on Hashrate.
+/// Without the bundled gateway, the Hashrate page's heading alone; with no renting at all, no tab.
+#[test]
+fn settings_your_gateway_shows_the_bundled_gateways_state_and_status_pages() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _seen) = control_standin(gateway_pages);
+    let dir = tempfile::tempdir().unwrap();
+    let gwdir = dir.path().join("run/datum");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    let bx = start(miners_allowed(), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.stream_gw.rpcurl = Some("http://xbt-knots_bitcoind_1:18443".into());
+        c.hash.stream_gw.dir = gwdir.clone();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/lightning");
+    let (node, gw) = (p.body.find("href=\"./lightning\"").unwrap(), p.body.find("href=\"./your-gateway\"").unwrap());
+    assert!(node < gw && gw < p.body.find("href=\"./policy\"").unwrap(), "next to Your node: {}", p.body);
+    let p = br.get("/your-gateway");
+    assert_eq!(p.status, 200, "{}", p.body);
+    assert!(p.body.contains("<title>Your gateway"), "{}", p.body);
+    let card = &p.body[p.body.find("id=\"gateway\"").unwrap()..];
+    let card = &card[..card.find("</section>").unwrap()];
+    for want in ["comes with this app", "Running <span class=\"pill good\">Yes</span>", "Jobs from your node <span class=\"pill good\">checked</span>",
+                 "Masking its jobs <span class=\"pill good\">Yes</span>", "<a href=\"./hashrate/gateway/\">Gateway status</a>",
+                 "<a href=\"./hashrate#gateway\">Its settings</a>"] {
+        assert!(card.contains(want), "{want}: {card}");
+    }
+    assert!(!card.contains("name=\"payout\"") && !card.contains("value=\"datum\""), "its settings stay on Hashrate: {card}");
+    // the Hashrate card as it was
+    assert!(br.get("/hashrate").body.contains("<a href=\"./hashrate/gateway/\">Gateway status</a>"));
+
+    // another gateway, no bundled one: the Hashrate page's heading for it, no status pages
+    let (renter2, _) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "192.168.1.20:23334", "reachable": false}, "blinding": {"state": "can't be checked"}, "rentals": []}),
+        _ => json!({"error": "no"}),
+    });
+    let bx2 = start(miners_allowed(), false, |c| c.hash.renter = Some(renter2.clone()));
+    let mut br2 = logged_in(&bx2);
+    let p = br2.get("/your-gateway");
+    assert!(p.body.contains("Can&#39;t reach your gateway") || p.body.contains("Can't reach your gateway"), "{}", p.body);
+    assert!(!p.body.contains("hashrate/gateway/") && p.body.contains("./hashrate#gateway"), "{}", p.body);
+
+    // no renting in this install: no tab, and the page says so as Hashrate does
+    let bx3 = start(miners_allowed(), false, |_| {});
+    let mut br3 = logged_in(&bx3);
+    assert!(!br3.get("/lightning").body.contains("./your-gateway"));
+    assert!(br3.get("/your-gateway").body.contains("Renting miners is off in this install"));
+}
+
 /// The bundled gateway's state on the rent page: running, connected to the node, masking, each said plainly, and
 /// Rent opens only once all three are so.
 #[test]
@@ -5845,6 +5896,8 @@ fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
     let hash = "ab".repeat(32);
     bx.rig.s.ln_book.put(&hash, json!({"state": "settled", "value_msat": 900_000, "fee_msat": 2_009, "spent_sats": 903})).unwrap();
     let a = &bx.rig.s.engine.audit;
+    a.append(json!({"type": "decision", "verdict": "allow", "rule": "ok", "reason": "all policy rules passed", "dest": format!("ln:{node}"), "amount_sats": 915,
+                    "ts": 1_793_000_000}));
     a.append(json!({"type": "commit", "dest": format!("ln:{node}"), "amount_sats": 915, "txid": format!("ln:{hash}"), "ts": 1_793_000_000}));
     a.append(json!({"type": "ln_amend", "txid": format!("ln:{hash}"), "booked_sats": 915, "amount_sats": 903, "ts": 1_793_000_001}));
     a.append(json!({"type": "ln_settled", "dest": format!("ln:{node}"), "payment_hash": hash, "spent_sats": 903, "fee_msat": 2009, "ts": 1_793_000_002}));
@@ -5858,8 +5911,10 @@ fn the_wallet_and_the_rules_name_shops_say_what_was_paid_and_the_credit_left() {
     assert!(!act.contains(&format!("ln:{}", &node[..8])), "a node by its shop's name: {act}");
     assert!(act.contains("<td>Alpha films</td>"), "{act}");
     assert!(act.contains("<td>Paid</td>") && act.contains("902.009 sats</span> <span class=\"small\">(900 + 2.009 fee)</span>"), "paid, exactly, with its parts: {act}");
-    assert!(act.contains("<td>Reserved</td>") && act.contains("reserved, the most it may cost</span>") && !act.contains("<td>Commit</td>")
-            && !act.contains(&format!("ln:{}", &hash[..8])), "{act}");
+    // one row the payment: its allowed and reserved steps folded into its Paid row (0.2.11 showed three rows)
+    assert!(!act.contains("<td>Reserved</td>") && !act.contains("<td>Allowed</td>") && !act.contains("<td>Commit</td>")
+            && act.contains("<summary>Allowed and reserved first</summary>Allowed: Within your spending rules · ")
+            && act.contains("reserved, the most it may cost") && !act.contains(&format!("ln:{}", &hash[..8])), "{act}");
     assert!(!act.contains("Ln amend"), "the booking's correction is no row of its own: {act}");
     assert!(act.contains("<td>Credit left with the shop</td>") && act.contains("475.9 sats</span> <span class=\"small\">credit left"), "{act}");
     assert!(!act.contains("<td>Ln refused</td>"), "a refusal in plain words: {act}");

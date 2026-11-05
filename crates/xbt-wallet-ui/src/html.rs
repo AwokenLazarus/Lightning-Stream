@@ -179,6 +179,15 @@ pub const SETTINGS: Section = Section {
     advanced: &[Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./relays", title: "Stream relays", label: "Stream relays" },
                 Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
 };
+/// With hashrate: the gateway rented work goes to, beside the node.
+pub const SETTINGS_HASH: Section = Section {
+    label: "Settings",
+    tabs: &[Tab { href: "./setup", title: "Setup", label: "Setup" }, Tab { href: "./lightning", title: "Your node", label: "Your node" },
+            Tab { href: "./your-gateway", title: "Your gateway", label: "Your gateway" },
+            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" }],
+    also: &[],
+    advanced: SETTINGS.advanced,
+};
 /// With hashrate (the box runs the hasher's or the renter's service): renting miners is one
 /// more kind of service, beside the others.
 pub const SERVICES_HASH: Section = Section {
@@ -196,10 +205,10 @@ pub const SELL_HASH: Section = Section {
 };
 /// The app with Sell (`XBT_UI_SELL=1`): buying and selling.
 pub const STREAM_SECTIONS: [&Section; 5] = [&SERVICES, &SELL, &WALLET, &APPS, &SETTINGS];
-pub const STREAM_SECTIONS_HASH: [&Section; 5] = [&SERVICES_HASH, &SELL_HASH, &WALLET, &APPS, &SETTINGS];
+pub const STREAM_SECTIONS_HASH: [&Section; 5] = [&SERVICES_HASH, &SELL_HASH, &WALLET, &APPS, &SETTINGS_HASH];
 /// The wallet alone: buying.
 pub const WALLET_SECTIONS: [&Section; 4] = [&SERVICES, &WALLET, &APPS, &SETTINGS];
-pub const WALLET_SECTIONS_HASH: [&Section; 4] = [&SERVICES_HASH, &WALLET, &APPS, &SETTINGS];
+pub const WALLET_SECTIONS_HASH: [&Section; 4] = [&SERVICES_HASH, &WALLET, &APPS, &SETTINGS_HASH];
 pub const GATEWAY_SECTIONS: [&Section; 0] = [];
 pub const STREAM_BRAND: &str = "Lightning Stream";
 pub const WALLET_BRAND: &str = "Lightning Stream";
