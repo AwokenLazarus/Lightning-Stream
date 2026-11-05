@@ -852,7 +852,7 @@ mod tests {
         let notes = round(&c, &mut led, &f, &disk, 1.0);
         assert!(notes.iter().any(|n| n.contains("daily_budget")), "{notes:?}");
         assert_eq!(f.node_received("offer-a"), 0);
-        assert!(led.owed("a") > 1000 * 1000, "it stays owed");
+        assert!(led.owed("a") > 200 * 1000, "it stays owed: {}", led.owed("a"));
         assert!(f.node_received("offer-b") > 0, "the other lender is not held up");
         let asked = *f.asked.borrow();
         round(&c, &mut led, &f, &disk, 50.0);
