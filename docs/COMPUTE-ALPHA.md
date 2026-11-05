@@ -126,6 +126,7 @@ The invite picks no flags of the command line. The model is data, read by llama.
 you may want to run this as a user of its own.
 
 **The build sends no usage reports:** it has no analytics key in it. `mesh-llm analytics status` says so.
+`lend` also has it not ask after new versions: `mesh-llm update` would replace this build with another.
 
 ### How you know you are being paid
 

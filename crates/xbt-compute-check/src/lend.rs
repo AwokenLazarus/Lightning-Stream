@@ -428,7 +428,7 @@ pub fn terms_text(i: &Invite, dir: &Path, credit_sats: u64) -> String {
          You stop serving by yourself if you are owed more than {credit_sats} sats by your own count.\n\n\
          It will download, to {}:\n  the Mesh-LLM build, {:.2} GB, sha256 {}\n  the model, {:.2} GB, sha256 {}\n\n\
          It will then run Mesh-LLM from that build as a {} GB node of the operator's split, using this machine's CPU and memory for as long as this runs.\n\
-         It sends no usage reports. The operator learns your node's id and your offer, from the card you give it.\n",
+         It sends no usage reports and does not ask after new versions. The operator learns your node's id and your offer, from the card you give it.\n",
         i.operator,
         t.per_1k_output_msat,
         t.per_1k_input_msat,

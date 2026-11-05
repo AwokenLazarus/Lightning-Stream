@@ -220,7 +220,13 @@ impl Mesh {
         let say = |e: std::io::Error| format!("{}: {e}", self.log.display());
         let out = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).map_err(say)?;
         let err = out.try_clone().map_err(say)?;
-        std::fs::create_dir_all(&self.home).map_err(say)?;
+        // this build is pinned: no asking after new versions, whose `mesh-llm update` would replace it
+        let config_dir = self.home.join(".mesh-llm");
+        std::fs::create_dir_all(&config_dir).map_err(say)?;
+        let config = config_dir.join("config.toml");
+        if !config.exists() {
+            std::fs::write(&config, "[updates]\ncheck = false\n").map_err(|e| format!("{}: {e}", config.display()))?;
+        }
         let mut cmd = std::process::Command::new(&self.bin);
         cmd.args(&self.args).env("HOME", &self.home).env("MESH_LLM_ANALYTICS", "0").env("DO_NOT_TRACK", "1").stdin(std::process::Stdio::null()).stdout(out).stderr(err);
         // SAFETY: setsid is async-signal-safe, and it is all the child does before exec.
