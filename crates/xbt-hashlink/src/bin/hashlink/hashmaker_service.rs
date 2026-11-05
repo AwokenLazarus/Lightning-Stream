@@ -103,7 +103,10 @@ fn due(last: Option<(&Said, bool)>, now: &Said, since: Duration) -> bool {
         || l.iroh != now.iroh
         || l.pay_url != now.pay_url
         || l.pay_node != now.pay_node
-        || l.sized != now.sized;
+        || l.sized != now.sized
+        // a hashrate measured where none was (the first listing goes out as a miner connects, before a minute of its
+        // shares), or none any more: a renter rents no offer that shows none (#70), so not the long timer
+        || (l.cap.free_hs == 0) != (now.cap.free_hs == 0);
     if what {
         return since >= REPUBLISH_CAPACITY;
     }
@@ -644,6 +647,17 @@ mod tests {
         let mut priced = last.clone();
         priced.terms.price_msat = 50_000;
         assert!(due(Some((&last, true)), &priced, S(60)));
+    }
+
+    /// The first listing goes out as a miner connects, its hashrate not yet measured: the measured one is published
+    /// within the minute, not after ten (a renter rents no offer that shows no hashrate, #70); and none any more too.
+    #[test]
+    fn a_hashrate_first_measured_is_published_after_a_minute() {
+        let first = said(1, 1, 0);
+        let measured = said(1, 1, 4_000_000_000_000);
+        assert!(!due(Some((&first, true)), &measured, S(59)));
+        assert!(due(Some((&first, true)), &measured, S(60)));
+        assert!(due(Some((&measured, true)), &first, S(60)), "a hashrate gone");
     }
 
     #[test]

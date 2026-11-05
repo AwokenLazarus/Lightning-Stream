@@ -587,7 +587,11 @@ def main():
         applied = sign_policy(taker, SIGN_BIN, uis["taker"][1], rules_on_page(taker, unescape(allow.group(1))[1:]))
         check("H", "taker: the rules page shows the seller added, tied to its node from the signed listing, and the owner signs it",
               "applied" in applied.lower(), applied)
-        page = taker.get("/hashrate")
+        # the maker's first listing goes out as its miner connects, before its hashrate is measured, and an offer that
+        # shows no hashrate is not rented (#70): its measured one is published within the minute after
+        got = waited(lambda: (lambda p: p if "<button>Rent</button>" in offer_card(p) else None)(taker.get("/hashrate")), 240,
+                     "the maker's offer with its hashrate measured")
+        page = got or taker.get("/hashrate")
         card = offer_card(page)
         on = "<button>Rent</button>" in card
         check("H", "taker: then Rent is on", on, card if on else [card, {"maker's hashmaker": maker_status()}])
@@ -598,7 +602,20 @@ def main():
         budget = field(card, "budget") or "2000"
         st, _, _ = taker.post("/hashrate", "/hashrate", {"action": "rent", "key": field(page, "key"), "miners": "1", "minutes": "8", "budget": budget})
         flash = taker.flash("/hashrate")
-        check("H", "taker: Rent starts a rental", "Renting" in flash, [flash, {"budget": budget}, card])
+        # the maker's app may change its terms as it sizes its pieces of work to the miner just measured, and publish them
+        # up to a minute later: a rental opened in between is refused before any payment, its renter told to press Rent
+        # again in a minute (#69). The owner does, once
+        again = waited(lambda: (lambda c: c if "press Rent again" in str(c or "") else None)(
+            ((renter_status("taker").get("rentals") or [{}])[0].get("live") or {}).get("closed")), 20, "a rental refused on terms not yet published", every=2)
+        if again:
+            log(f"   the first rental did not start ({again}): Rent pressed again after a minute")
+            time.sleep(75)
+            page = taker.get("/hashrate")
+            card = offer_card(page)
+            budget = field(card, "budget") or budget
+            st, _, _ = taker.post("/hashrate", "/hashrate", {"action": "rent", "key": field(page, "key"), "miners": "1", "minutes": "8", "budget": budget})
+            flash = taker.flash("/hashrate")
+        check("H", "taker: Rent starts a rental", "Renting" in flash, [flash, {"budget": budget, "pressed again": again}, card])
         tdata = os.path.join(installs["taker"][0], "data")
 
         regrinds = []
