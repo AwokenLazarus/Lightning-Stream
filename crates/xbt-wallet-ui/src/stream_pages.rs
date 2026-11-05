@@ -24,16 +24,24 @@ impl App {
         let sort = Sort::parse(q.get("sort").map(String::as_str).unwrap_or(""));
         let body = match self.file_services() {
             Ok(all) => {
+                // a shop reached by its key that looks offline (its listing stale, no node vouching for it) is folded away
+                let shops = crate::shops::load(&self.cfg.shops_path()).unwrap_or_default();
+                let now = xbt_nostr::now();
+                let days = |seller: &str| if self.is_own_shop(seller) { None } else {
+                    services::http_origin(seller).and_then(|o| shops.get(&o).and_then(|s| crate::shops::offline_days(s, &o, now)))
+                };
+                let (live, gone) = split_offline(&all, &days);
                 // sellers to pay, and a node that can't send a first ticket to any: said before anything is opened
-                let warn = if all.iter().any(|s| !self.is_own_shop(&s.seller)) {
+                let warn = if live.iter().any(|s| !self.is_own_shop(&s.seller)) {
                     crate::pay_feedback::cant_send_card(self.spendable_sats(), crate::app::MIN_CALL_SATS, "your sellers")
                 } else {
                     String::new()
                 };
                 // a hashrate seller's live offer, where the Hashrate page's last look found it: nothing is asked for Browse
                 let offers = self.kept_hash_offers();
-                let live = |seller: &str| crate::app::hashrate::live_offer_words(&offers, seller);
-                format!("{warn}{}", browse_html(&all, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller), &live))
+                let live_offer = |seller: &str| crate::app::hashrate::live_offer_words(&offers, seller);
+                let shown = browse_html(&live, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller), &live_offer);
+                format!("{warn}{shown}{}", offline_html(&gone, &days))
             }
             Err(e) => format!("{}{}", Self::error_box(&e), empty_how(&self.suggested(ctx, &[]))),
         };
@@ -85,8 +93,14 @@ impl App {
             Some(svc) => {
                 let own = self.is_own_shop(&svc.seller);
                 let mut body = String::new();
+                // a shop that looks offline: said first, in place of advice that can't help
+                let offline = if own { None } else { self.offline_days(&svc.seller) };
+                if let Some(days) = offline {
+                    body.push_str(&format!("<section class=\"flash warn\" id=\"offline\"><p><strong>This shop looks offline.</strong> {}</p></section>",
+                                           esc(&crate::shops::offline_words(days))));
+                }
                 // a shop the rules don't allow yet: said before the owner tries it and is refused, with the one button that fixes it
-                if !own && svc.kind != Kind::Hashrate && !self.seller_allowed(&svc.seller) {
+                if !own && offline.is_none() && svc.kind != Kind::Hashrate && !self.seller_allowed(&svc.seller) {
                     let origin = services::http_origin(&svc.seller).unwrap_or_else(|| svc.seller.clone());
                     body.push_str(&format!("<section class=\"flash warn\" id=\"not-allowed\"><p><strong>Allow {} first.</strong> Your spending rules don't \
                         allow this shop yet, so the app would refuse to pay it. Allowing it takes one signature.</p>\
@@ -265,6 +279,37 @@ fn empty_how(suggested: &str) -> String {
     format!("<section class=\"card empty-card\"><p class=\"empty\">No services yet.</p>\
      <p>Add a seller to see what they offer: web apps such as a media server, AI models to ask, hashrate, data and other services, each paid a little at a time.</p>\
      <p><a class=\"button-link primary\" href=\"./services\">Add a seller</a></p>{suggested}</section>")
+}
+
+/// The services of shops that look offline (`days`: how old the listing of one that does is,
+/// [`crate::shops::offline_days`]) apart from the others: (the others, those).
+fn split_offline(all: &[Service], days: &dyn Fn(&str) -> Option<u64>) -> (Vec<Service>, Vec<Service>) {
+    all.iter().cloned().partition(|s| days(&s.seller).is_none())
+}
+
+/// Browse's fold for the shops that look offline: each by name, with how old its listing is and its services.
+fn offline_html(gone: &[Service], days: &dyn Fn(&str) -> Option<u64>) -> String {
+    let mut sellers: Vec<&str> = vec![];
+    for s in gone {
+        if !sellers.contains(&s.seller.as_str()) {
+            sellers.push(&s.seller);
+        }
+    }
+    if sellers.is_empty() {
+        return String::new();
+    }
+    let mut b = format!("<details class=\"card offline-shops\"><summary>Offline shops ({})</summary>\
+        <p class=\"small\">These shops' listings are more than two days old and no Lightning node vouches for them any more, so they \
+        can't be paid. A shop that comes back is listed above again once you press Check for updates on <a href=\"./services\">Sellers</a>.</p><ul>",
+        sellers.len());
+    for seller in sellers {
+        let words = days(seller).map(crate::shops::offline_words).unwrap_or_default();
+        let links: Vec<String> = gone.iter().filter(|s| s.seller == seller)
+            .map(|s| format!("<a href=\"{}\">{}</a>", service_href(s), esc(&s.name))).collect();
+        b.push_str(&format!("<li><strong>{}</strong>: {} <span class=\"small\">{}</span></li>", esc(&seller_words(gone, seller)), esc(&words), links.join(" · ")));
+    }
+    b.push_str("</ul></details>");
+    b
 }
 
 /// `live`: what a hashrate seller's live offer asks ([`crate::app::hashrate::live_offer_words`]), where it is known.
@@ -977,6 +1022,35 @@ mod tests {
         assert_eq!(lasts(Duration::from_secs(5 * 3600 + 1700)), "5 hours");
         assert_eq!(lasts(Duration::from_secs(10 * 60 - 1)), "10 minutes");
         assert_eq!(lasts(Duration::from_secs(45)), "45 seconds");
+    }
+
+    /// 0.2.14: on Browse, a shop reached by its key that looks offline (its kept listing stale and no Lightning node
+    /// vouching for it, the orphan test shop of 2026-10-30) is folded under "Offline shops (N)", one line a shop with
+    /// its services; the others are listed as before.
+    ///
+    /// FAILS without `split_offline`: the dead shop's services are listed with the live ones.
+    #[test]
+    fn a_shop_that_looks_offline_is_folded_away_on_browse() {
+        let shop = |seller: &str, name: &str, kinds: &[&str]| {
+            let sections = kinds.iter().map(|k| xbt402::listing::Section { name: format!("{name} {k}"), kind: k.to_string(), path: format!("/{k}/"),
+                prices: json!({"request_msat": "1000"}), items: vec![], licence: String::new(), credits: String::new() }).collect::<Vec<_>>();
+            services::from_listing(&xbt402::listing::Listing { name: name.into(), kind: kinds[0].into(), seller: seller.into(), receipt_key: String::new(),
+                prices: json!({"request_msat": "1000"}), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: sections })
+        };
+        let dead = xbt402::shop::origin_for(&[7u8; 32]);
+        let mut all = shop(&dead, "StartOS packaging test", &["api", "video"]);
+        all.extend(shop("https://live.example", "Live films", &["video"]));
+        let days = |seller: &str| (seller == dead).then_some(6);
+        let (live, gone) = split_offline(&all, &days);
+        assert_eq!((live.len(), gone.len()), (1, 2));
+        let html = browse_html(&live, "", Sort::Name, "", &|_| false, &|_| None);
+        assert!(html.contains("Live films") && !html.contains("StartOS packaging test"), "{html}");
+        let fold = offline_html(&gone, &days);
+        assert!(fold.starts_with("<details class=\"card offline-shops\"><summary>Offline shops (1)</summary>"), "{fold}");
+        assert!(fold.contains("This listing is 6 days old and no Lightning node vouches for it any more: the shop looks offline."), "{fold}");
+        assert_eq!(fold.matches("<li>").count(), 1, "one line a shop: {fold}");
+        assert_eq!(fold.matches("./service?seller=").count(), 2, "with each of its services: {fold}");
+        assert_eq!(offline_html(&[], &days), "", "nothing offline: no fold");
     }
 
     /// Each category's count is what its list shows, the box's own shop included; Hashrate with nothing listed leads to

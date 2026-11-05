@@ -335,7 +335,8 @@ directory. It is off unless the config says so:
 
 The gateway signs the events with a Nostr key of its own, `nostr.key` in the state directory,
 made on first start, and the receipt key signs a binding of that key to `public_url`. It sends the
-listing at start and every `republish_s` seconds (default six hours, from 600 to 604800). It reads
+listing at start and every `republish_s` seconds (default six hours, from 600 to 604800; at most a
+day apart, since a listing says it lapses a week after it was made, NIP-40). It reads
 nothing back from relays. What goes over Nostr and why: `docs/NOSTR.md`.
 
 ## What the defaults cost you

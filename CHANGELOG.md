@@ -7,6 +7,25 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 
 ## 0.2.14 (unreleased)
 
+- **A shop that looks offline is said to be.** Allowing a shop reached by its key whose listing is more than two
+  days old, and whose links no Lightning node vouches for any more, said "its listing names no direct link that its
+  Lightning node vouches for now. Press Check for updates, or ask the seller." Neither could help: the shop had
+  stopped. It now says "This listing is 6 days old and no Lightning node vouches for it any more: the shop looks
+  offline." The shop's page says so too. Before it says that, the app asks the relays for the shop's newest
+  listing, and a shop that is back is allowed from it at once. In other cases the message is as before.
+- **Offline shops are folded away.** Browse and Found on Nostr list such shops under a folded "Offline shops (N)"
+  section, with how old each listing is, instead of beside the shops that sell. A listing counts as stale after two
+  days, the same rule as lightning-stream.com. This box's own shop is never folded.
+- **Listings lapse after a week.** A shop's listing now says when it lapses (NIP-40 `expiration`, seven days after
+  it was made), and the app ignores one that has lapsed. A running gateway sends its listing again every six hours
+  by default and at least daily, whatever `nostr.republish_s` says, so only a shop that stopped lets it lapse.
+  This covers a shop whose box was reinstalled with its signing key inside: its listing can never be withdrawn,
+  and it now goes away by itself. A listing from an older app has no such tag and is read as before.
+- **Other announcements lapse too, and are sent again.** Where a shop's direct link is reached, sent over Nostr,
+  now also lapses after a week and is sent again daily, not only when it changes. A relay announced from the app
+  lasts a week instead of 30 days, and the app announces it again each day while it runs; `xbt-relay-announce`
+  defaults to a week and takes `--every-hours` to keep announcing. VPN exits (a week, sent every six hours) and
+  hashrate offers (two days, sent at least every six hours) already lapsed this way.
 - **No rental is paid to a hashmaker whose miners are offline** (#70). A rental paid its start fee and first slice
   (808 sat) to a hashmaker whose offer said 0 miners, 0 free and 0 hashrate; no miner ever connected and the rental
   ended with no work. Now:

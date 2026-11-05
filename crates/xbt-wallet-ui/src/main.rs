@@ -267,6 +267,18 @@ fn serve() -> i32 {
             app.hash_reprice(false);
         });
     }
+    {
+        let app = app.clone();
+        // the owner's relay announcement lasts a week: announced again daily while the app runs (none: nothing to do)
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+            match app.relay_net.reannounce(xbt_nostr::now()) {
+                Some(Ok((ok, all))) => eprintln!("xbt-wallet-ui: your relay was announced again on {ok} of {} Nostr relays", all.len()),
+                Some(Err(e)) => eprintln!("xbt-wallet-ui: your relay was not announced again: {e}"),
+                None => {}
+            }
+        });
+    }
     match xbt_wallet_ui::server::spawn(app.clone()) {
         Ok(r) => {
             eprintln!("xbt-wallet-ui listening on http://{}{} (signer {})", r.addr, app.cfg.base_path, app.cfg.signer_sock.display());

@@ -2,14 +2,16 @@
 //!
 //! A seller's link publishes its current addresses and relay as a signed Nostr event: replaceable,
 //! one per link key (NIP-78 application data, kind 30078, `d` = `lightning-stream-link:<key>`),
-//! sent to the shop's own relays and sent again whenever they change. A buyer resolves a link key
+//! sent to the shop's own relays and sent again whenever they change, and at least daily
+//! ([`REFRESH`]): it says it lapses a week after it was made (NIP-40 `expiration`, [`EXPIRES_S`]),
+//! so the addresses of a shop that stopped are not believed for ever. A buyer resolves a link key
 //! by asking those relays for that event, and believes it only from the Nostr key the seller's
 //! transport document is bound to ([`NostrLookup::expect`]). A forged event could at worst send a
 //! buyer to a wrong address, where the link's own handshake (the key itself) fails.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Once, Weak};
+use std::time::{Duration, Instant};
 
 use iroh::address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item};
 use iroh::{EndpointId, RelayUrl};
@@ -22,6 +24,12 @@ use xbt_nostr::event::{Event, Keys};
 pub const KIND: u64 = 30078;
 const PUBLISH_WAIT: Duration = Duration::from_secs(10);
 const QUERY_WAIT: Duration = Duration::from_secs(6);
+/// NIP-40: the event says it lapses this long after it was made.
+pub const EXPIRES_S: u64 = 7 * 86_400;
+/// Addresses that have not changed are sent again after this long, well within [`EXPIRES_S`].
+pub const REFRESH: Duration = Duration::from_secs(86_400);
+/// How often the refresher looks whether [`REFRESH`] has passed.
+const REFRESH_LOOK: Duration = Duration::from_secs(3600);
 
 /// The event's `d` tag for a link key.
 pub fn d_tag(id: &EndpointId) -> String {
@@ -35,8 +43,11 @@ pub struct NostrLookup {
     relays: Vec<String>,
     /// For each link key, the Nostr key whose word for it is believed.
     authors: Mutex<HashMap<EndpointId, String>>,
-    last: Mutex<Option<String>>,
+    /// What was last sent, and when.
+    last: Arc<Mutex<Option<(String, Instant)>>>,
     id: Mutex<Option<EndpointId>>,
+    /// Starts the thread that sends the addresses again at least every [`REFRESH`].
+    refresher: Once,
 }
 
 impl std::fmt::Debug for NostrLookup {
@@ -47,7 +58,7 @@ impl std::fmt::Debug for NostrLookup {
 
 impl NostrLookup {
     pub fn new(keys: Option<Keys>, relays: Vec<String>) -> Self {
-        Self { keys, relays, authors: Mutex::new(HashMap::new()), last: Mutex::new(None), id: Mutex::new(None) }
+        Self { keys, relays, authors: Mutex::new(HashMap::new()), last: Arc::new(Mutex::new(None)), id: Mutex::new(None), refresher: Once::new() }
     }
 
     /// The link key whose addresses this lookup publishes (a seller's own).
@@ -90,13 +101,38 @@ pub fn info_from(id: EndpointId, ev: &Event) -> Option<EndpointInfo> {
     Some(info)
 }
 
-/// The newest of `events` that is signed, by `author`, for `id`'s `d` tag.
-pub fn newest(events: Vec<Event>, author: &str, id: &EndpointId) -> Option<Event> {
+/// The event that says `body` is where link `id` is reached, signed by `keys` at `now`.
+pub fn event_for(keys: &Keys, id: &EndpointId, body: String, now: u64) -> Event {
+    let tags = vec![vec!["d".into(), d_tag(id)], vec!["expiration".into(), now.saturating_add(EXPIRES_S).to_string()]];
+    Event::sign(keys, now, KIND, tags, body)
+}
+
+/// The newest of `events` that is signed, by `author`, for `id`'s `d` tag, unless it has lapsed by
+/// `now` (NIP-40; an event from before 0.2.14 has no `expiration` and never lapses by this rule).
+pub fn newest(events: Vec<Event>, author: &str, id: &EndpointId, now: u64) -> Option<Event> {
     let d = d_tag(id);
     events
         .into_iter()
         .filter(|e| e.kind == KIND && e.pubkey == author && e.tag("d") == Some(d.as_str()) && e.verify())
         .max_by_key(|e| e.created_at)
+        .filter(|e| !e.expired(now))
+}
+
+/// Send what `last` says again whenever [`REFRESH`] has passed since it was sent, until the lookup
+/// that holds `last` is gone.
+fn refresh_loop(last: Weak<Mutex<Option<(String, Instant)>>>, keys: Keys, id: EndpointId, relays: Vec<String>) {
+    loop {
+        std::thread::sleep(REFRESH_LOOK);
+        let Some(last) = last.upgrade() else { return };
+        let body = match lock(&last).as_mut() {
+            Some((body, at)) if at.elapsed() >= REFRESH => {
+                *at = Instant::now();
+                body.clone()
+            }
+            _ => continue,
+        };
+        let _ = xbt_nostr::oneshot::publish(&relays, &event_for(&keys, &id, body, now()), PUBLISH_WAIT);
+    }
 }
 
 impl AddressLookup for NostrLookup {
@@ -108,12 +144,17 @@ impl AddressLookup for NostrLookup {
         let body = content(data);
         {
             let mut last = lock(&self.last);
-            if last.as_deref() == Some(body.as_str()) {
+            if last.as_ref().is_some_and(|(b, at)| *b == body && at.elapsed() < REFRESH) {
                 return;
             }
-            *last = Some(body.clone());
+            *last = Some((body.clone(), Instant::now()));
         }
-        let ev = Event::sign(keys, now(), KIND, vec![vec!["d".into(), d_tag(&id)]], body);
+        // addresses that do not change are sent again daily, or they would lapse after a week
+        self.refresher.call_once(|| {
+            let (last, keys, relays) = (Arc::downgrade(&self.last), keys.clone(), self.relays.clone());
+            let _ = std::thread::Builder::new().name("nostr-lookup-refresh".into()).spawn(move || refresh_loop(last, keys, id, relays));
+        });
+        let ev = event_for(keys, &id, body, now());
         let relays = self.relays.clone();
         // the relay client blocks: off the endpoint's runtime
         std::thread::spawn(move || {
@@ -130,7 +171,7 @@ impl AddressLookup for NostrLookup {
         let filter = json!({"kinds": [KIND], "authors": [author.clone()], "#d": [d_tag(&id)], "limit": 4});
         let fut = async move {
             let found = tokio::task::spawn_blocking(move || xbt_nostr::oneshot::query(&relays, &filter, QUERY_WAIT).0).await.ok()?;
-            let ev = newest(found, &author, &id)?;
+            let ev = newest(found, &author, &id, now())?;
             let at = ev.created_at;
             info_from(id, &ev).map(|info| Item::new(info, "nostr", Some(at * 1_000_000)))
         };
@@ -156,10 +197,28 @@ mod tests {
         let newer = Event::sign(&shop, 200, KIND, vec![vec!["d".into(), d.clone()]], body.replace("4000", "4001"));
         let forged = Event::sign(&other, 300, KIND, vec![vec!["d".into(), d.clone()]], body.into());
         let wrong_d = Event::sign(&shop, 400, KIND, vec![vec!["d".into(), "lightning-stream-link:00".into()]], body.into());
-        let got = newest(vec![good, newer.clone(), forged, wrong_d], &shop.public_hex(), &id()).unwrap();
+        let got = newest(vec![good, newer.clone(), forged, wrong_d], &shop.public_hex(), &id(), 1_000).unwrap();
         assert_eq!(got.id, newer.id);
         let info = info_from(id(), &got).unwrap();
         assert_eq!(info.ip_addrs().map(|a| a.to_string()).collect::<Vec<_>>(), vec!["203.0.113.7:4001"]);
         assert_eq!(info.relay_urls().count(), 1);
+    }
+
+    /// 0.2.14: the addresses say they lapse a week after they were sent (NIP-40), and a lapsed event is not believed:
+    /// a shop that stopped (its box reinstalled, its key lost) no longer sends buyers to where it was.
+    #[test]
+    fn the_addresses_lapse_after_a_week_and_a_lapsed_event_is_not_believed() {
+        let shop = Keys::generate();
+        let body = r#"{"addrs":["203.0.113.7:4000"],"relays":[]}"#.to_string();
+        let ev = event_for(&shop, &id(), body.clone(), 1_000);
+        assert_eq!(ev.tag("d"), Some(d_tag(&id()).as_str()));
+        assert_eq!(ev.expiration(), Some(1_000 + EXPIRES_S));
+        assert!(REFRESH * 7 <= Duration::from_secs(EXPIRES_S), "sent again well before it lapses");
+        assert_eq!(newest(vec![ev.clone()], &shop.public_hex(), &id(), 1_000 + EXPIRES_S - 1).map(|e| e.id), Some(ev.id.clone()));
+        assert!(newest(vec![ev.clone()], &shop.public_hex(), &id(), 1_000 + EXPIRES_S).is_none());
+        // a lapsed newest one is not traded for an older one
+        let old = Event::sign(&shop, 500, KIND, vec![vec!["d".into(), d_tag(&id())]], body);
+        assert!(newest(vec![old.clone(), ev], &shop.public_hex(), &id(), 1_000 + EXPIRES_S).is_none());
+        assert!(newest(vec![old], &shop.public_hex(), &id(), u64::MAX).is_some(), "one from before 0.2.14 has no expiration");
     }
 }
