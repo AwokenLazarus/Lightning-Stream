@@ -4069,7 +4069,9 @@ def mesh_lend_real() -> None:
           {"pid": [pid_before, r.get("pid")], "answer_paid": a["paid"], "tokens": [tokens_before, r.get("total_tokens")], "fetched": Files.hits})
 
     # --- the operator stops paying, for real
-    steps, last = 0, buy_one
+    with open(f"{RUN}/op-mesh.log", encoding="utf-8", errors="replace") as f:
+        lost_before = f.read().count("stage_connection_lost")
+    steps = 0
     r = lender_report()
     while r.get("serving") is not False and steps < 60:
         a = buy_one()
@@ -4081,10 +4083,14 @@ def mesh_lend_real() -> None:
             break
     stopped = r.get("stopped") or {}
     gap = stopped.get("due_at_least_msat", 0) - stopped.get("received_msat", 0)
-    # (the operator's node takes a moment to see that a stage has gone)
+    # that it left, by the lender's word and the coordinator's: the stage report keeps its last status through what might be a blip
+    def coordinator_saw_it() -> bool:
+        with open(f"{RUN}/op-mesh.log", encoding="utf-8", errors="replace") as f:
+            return f.read().count("stage_connection_lost") > lost_before
+
     try:
-        lab.wait("the operator's node to see the stage gone", 60, lambda: not placed(), every=2)
-        gone = True
+        lab.wait("the coordinator to see the stage gone", 60, coordinator_saw_it, every=2)
+        gone = r.get("pid") is None
     except LabError:
         gone = False
     # what one interval of real answers can add: the most any answer earns it, for two answers
