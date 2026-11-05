@@ -18,6 +18,9 @@ path = "src/main.rs"
 
 [dependencies]
 xbt-iroh-link = { path = "../xbt-iroh-link" }
+xbt-signer.workspace = true
+xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
+ureq.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util", "fs"] }
 serde = { workspace = true }
 serde_json.workspace = true

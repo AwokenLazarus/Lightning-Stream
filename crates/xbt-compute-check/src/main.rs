@@ -38,6 +38,12 @@ stream-compute-check: what this machine has and how well testers reach each othe
       in --to (a user's machine: the relay), and writes them to --ports. Only the chain's keys are
       let in. Runs until stopped. Without --key, a new key.
 
+  payout --config FILE [--once]
+      Splits what this box's gateway earns from one model among the machines of its Mesh-LLM split,
+      by the work each does, and pays each lender's BOLT 12 offer through the owner's wallet. See
+      docs/COMPUTE-ALPHA.md. Paid is what the wallet says settled; a run that was killed is safe to
+      start again.
+
 Lab flags: --no-relay, and --collector-addr IP:PORT with check.";
 
 /// The flags of one command: `--name value`, or `--name` alone for the switches.
@@ -154,6 +160,44 @@ fn link(flags: &Flags) -> Result<(), String> {
             write_whole(path, &serde_json::to_vec_pretty(&r).map_err(|e| e.to_string())?)?;
         }
         std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn payout(flags: &Flags) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use xbt_compute_check::meter::Work;
+    use xbt_compute_check::payout::{load_config, load_ledger, report, save_ledger, tick, Live};
+    let path = flags.value("--config").ok_or("--config FILE is needed")?;
+    let cfg = load_config(std::path::Path::new(&path))?;
+    let header = xbt_compute_check::gguf::read(&cfg.gguf).map_err(|e| format!("{}: {e}", cfg.gguf.display()))?;
+    let work = Work::from_header(&header).map_err(|e| format!("{}: {e}", cfg.gguf.display()))?;
+    // two runs on one ledger could each pay what the other has not yet noted
+    let lock_path = cfg.ledger.with_extension("lock");
+    let lock = std::fs::File::create(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    // SAFETY: flock on a descriptor this function owns for as long as it runs.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!("another payout holds {}", lock_path.display()));
+    }
+    let ledger_path = cfg.ledger.clone();
+    let mut led = load_ledger(&ledger_path)?;
+    // a note left by a run that was killed: what it sent has this long to reach the wallet's spend lock
+    // before this run asks for that lock
+    if led.intent.is_some() {
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let live = Live { cfg: cfg.clone() };
+    loop {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs_f64();
+        let notes = tick(&cfg, &work, &mut led, &live, &mut |l| save_ledger(&ledger_path, l), now)?;
+        notes.iter().for_each(|n| eprintln!("payout: {n}"));
+        if let Some(r) = &cfg.report {
+            let text = serde_json::to_vec_pretty(&report(&cfg, &led, &notes)).map_err(|e| e.to_string())?;
+            write_whole(&r.to_string_lossy(), &text)?;
+        }
+        if flags.has("--once") {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(cfg.interval_s.max(1)));
     }
 }
 
@@ -309,6 +353,7 @@ fn run() -> Result<(), String> {
         }
         "sweep" => sweep(&flags),
         "link" => link(&flags),
+        "payout" => payout(&flags),
         _ => {
             println!("{USAGE}");
             Ok(())

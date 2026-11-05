@@ -9,9 +9,14 @@
 //!   there are testers. Its output is an illustration, never a measurement.
 //! * [`chain`] carries a chain's TCP connections between machines over iroh: the next step, once
 //!   a model runs.
+//! * [`meter`] says what each machine of a split does per token, from the model's [`gguf`] header, and
+//!   [`payout`] pays lenders by it from what the seller's gateway earned.
 
 pub mod chain;
+pub mod gguf;
 pub mod hardware;
+pub mod meter;
+pub mod payout;
 pub mod plan;
 pub mod probe;
 pub mod simulate;

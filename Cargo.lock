@@ -5704,7 +5704,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "ureq",
  "xbt-iroh-link",
+ "xbt-signer",
+ "xbt-wallet-mcp",
 ]
 
 [[package]]
