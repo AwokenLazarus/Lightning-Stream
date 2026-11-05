@@ -6,12 +6,12 @@
 #
 # Lab: the ticket lab's (scripts/ticket_e2e/compose.yml on lightning-fork-lab, three Lightning Fork
 # nodes on one Knots BLAKE2b regtest), in its own compose project (p2phash) and on its own ports:
-# P2P_HASH_PORT_BASE (default 19961) to BASE+38 (BASE+10, +11: two more gateways, shops the wallet has no
+# P2P_HASH_PORT_BASE (default 19961) to BASE+39 (BASE+10, +11: two more gateways, shops the wallet has no
 # credit with; BASE+13 to +28: the real gateways' own nodes, on chains of their own; BASE+29 to +36: the reprice
 # check's app, gateway and hashmaker; BASE+37, +38: the slow check's gateway and the road that holds its ticket
-# buys). P2P_HASH_ONLY=reprice runs only the reprice check (a new price while a rental goes on, with the
+# buys; BASE+39: the top-up check's renter service). P2P_HASH_ONLY=reprice runs only the reprice check (a new price while a rental goes on, with the
 # hashmaker's real app and its gateway under xbt-supervise); P2P_HASH_ONLY=real only the real gateways;
-# P2P_HASH_ONLY=slow only issue #64's check (ticket buys of about 12 s, a long rental: P2P_HASH_SLOW_SECS). P2P_HASH_LAB: a lightning-fork-lab checkout with its node binaries built (default
+# P2P_HASH_ONLY=topup only the top-up check (budget added to a rental going on, through the app's renter service); P2P_HASH_ONLY=slow only issue #64's check (ticket buys of about 12 s, a long rental: P2P_HASH_SLOW_SECS). P2P_HASH_LAB: a lightning-fork-lab checkout with its node binaries built (default
 # run/lightning-fork-lab, cloned and built when missing). The
 # lab's containers and volumes are removed on exit. About 45 minutes, 30 without real gateways (the slow check is 16).
 # Report: run/p2p_hash_regtest.json and run/p2p_hash_regtest.log.
@@ -60,7 +60,7 @@ fi
 
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
 # shellcheck disable=SC2046 # the port list is meant to split
-python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 38)))
+python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 39)))
 (cd "$LAB" && docker compose build -q lf1 && docker compose up -d fees knots-b2b)
 
 export LAB RUN=$R OUT=$ROOT/run BIN
