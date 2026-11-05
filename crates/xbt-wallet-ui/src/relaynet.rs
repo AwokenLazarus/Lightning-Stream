@@ -323,11 +323,11 @@ mod tests {
         assert_eq!(kept, offer);
         assert!(!n.reannounce_due(at + REANNOUNCE_S - 1) && n.reannounce(at + REANNOUNCE_S - 1).is_none());
         assert!(n.reannounce_due(at + REANNOUNCE_S));
-        let (events, _) = oneshot::query(&[relay.url.clone()], &relays::filter(10), Duration::from_secs(5));
+        let (events, _) = oneshot::query(std::slice::from_ref(&relay.url), &relays::filter(10), Duration::from_secs(5));
         let (found, _) = relays::collect(&events, now);
         assert_eq!(found.len(), 1);
         assert!(found[0].expires >= now + ANNOUNCE_TTL_S && found[0].expires < now + ANNOUNCE_TTL_S + 60, "a week");
-        assert!(REANNOUNCE_S * 7 <= ANNOUNCE_TTL_S, "sent again well before it lapses");
+        const { assert!(REANNOUNCE_S * 7 <= ANNOUNCE_TTL_S, "sent again well before it lapses") };
         // one kept by an older app asked for 30 days: sent again, for a week
         let old = json!({"relay": "https://mine.example.com", "region": "eu", "ttl_s": relays::MAX_TTL_S, "at": 1});
         std::fs::write(d.join("relay-announce.json"), old.to_string()).unwrap();
