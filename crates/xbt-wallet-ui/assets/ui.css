@@ -375,6 +375,10 @@ a.service-card .pill { align-self: flex-start; }
   text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.68rem; }
 .pill.cat-media::before, .pill.cat-apps::before, .pill.cat-files::before, .pill.cat-ai::before, .pill.cat-hashrate::before, .pill.cat-data::before {
   box-shadow: 0 0 8px currentColor; }
+/* a kind's icon, before its name: on a pill it takes the dot's place */
+.icon { font-size: 1.1em; line-height: 1; }
+nav.chips .icon { margin-right: -2px; }
+.pill:has(> .icon)::before { content: none; }
 form.suggested { margin: 10px 0 0; justify-content: space-between; }
 .empty-card { text-align: center; }
 .empty-card .row { justify-content: center; }

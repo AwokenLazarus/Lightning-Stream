@@ -51,7 +51,7 @@ use xbt_hashlink::trust;
 
 /// A change in what is for rent (miners, free miners, renting on or off, the terms, the name, or
 /// where hashtakers reach and pay the hashmaker) is published again after at least this long since the last publish.
-const REPUBLISH_CAPACITY: Duration = Duration::from_secs(60);
+pub(crate) const REPUBLISH_CAPACITY: Duration = Duration::from_secs(60);
 /// A change in the measured hashrate alone is news only when it moves more than this share of the
 /// published value, and is published at most this often: public relays rate-limit.
 const REPUBLISH_HASHRATE: Duration = Duration::from_secs(600);
@@ -103,7 +103,10 @@ fn due(last: Option<(&Said, bool)>, now: &Said, since: Duration) -> bool {
         || l.iroh != now.iroh
         || l.pay_url != now.pay_url
         || l.pay_node != now.pay_node
-        || l.sized != now.sized;
+        || l.sized != now.sized
+        // a hashrate measured where none was (the first listing goes out as a miner connects, before a minute of its
+        // shares), or none any more: a renter rents no offer that shows none (#70), so not the long timer
+        || (l.cap.free_hs == 0) != (now.cap.free_hs == 0);
     if what {
         return since >= REPUBLISH_CAPACITY;
     }
@@ -646,6 +649,17 @@ mod tests {
         assert!(due(Some((&last, true)), &priced, S(60)));
     }
 
+    /// The first listing goes out as a miner connects, its hashrate not yet measured: the measured one is published
+    /// within the minute, not after ten (a renter rents no offer that shows no hashrate, #70); and none any more too.
+    #[test]
+    fn a_hashrate_first_measured_is_published_after_a_minute() {
+        let first = said(1, 1, 0);
+        let measured = said(1, 1, 4_000_000_000_000);
+        assert!(!due(Some((&first, true)), &measured, S(59)));
+        assert!(due(Some((&first, true)), &measured, S(60)));
+        assert!(due(Some((&measured, true)), &first, S(60)), "a hashrate gone");
+    }
+
     #[test]
     fn setting_the_address_hashtakers_use_is_published_after_a_minute() {
         // the owner adds the address after the "not set" check: published within the minute, not the long timer
@@ -737,7 +751,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             std::fs::write(&file, v.to_string()).unwrap();
         };
-        let base = json!({"enabled": true, "fallback": "127.0.0.1:9", "priceSat": 404, "sliceWork": work, "startSlices": 1, "graceMs": 8000, "rentable": 3});
+        // a fallback pool, for a miner to be connected and named: a hashmaker with none refuses a rental (#70)
+        let pool = port();
+        {
+            let listen = pool.clone();
+            std::thread::spawn(move || xbt_hashlink::standin::pool(xbt_hashlink::standin::PoolConfig {
+                listen, diff: 1.0 / (1u64 << 20) as f64, job_every: Duration::from_millis(700), report: None }));
+        }
+        let base = json!({"enabled": true, "fallback": pool, "priceSat": 404, "sliceWork": work, "startSlices": 1, "graceMs": 8000, "rentable": 3});
         write(base.clone());
         let with = |extra: Value| {
             let mut v = base.clone();
@@ -750,7 +771,8 @@ mod tests {
         let (control, link) = (port(), port());
         let (gw, asked) = gateway(charged.clone(), control.clone());
         let key = xbt_hashlink::noise::fresh_key();
-        let f: HashMap<String, String> = [("config", file.display().to_string()), ("gateway", gw), ("control", control.clone()), ("miners", port()),
+        let miners = port();
+        let f: HashMap<String, String> = [("config", file.display().to_string()), ("gateway", gw), ("control", control.clone()), ("miners", miners.clone()),
                                           ("link", link.clone()), ("iroh", "off".into())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         std::thread::spawn(move || run(&f, key));
         let status = || get(&control, "/status").unwrap_or(Value::Null);
@@ -773,7 +795,12 @@ mod tests {
         charged.store(366_000, SeqCst);
         until("taking rentals once the gateway charges it", &|| status()["rentable"] == 3);
 
-        // a rental going on, and a new price waiting for it (`holdNew`); it ends (no first payment), the hold with it
+        // a rental going on, and a new price waiting for it (`holdNew`); it ends (no first payment), the hold with it.
+        // A miner is connected first: a hashmaker with none refuses the rental before its welcome (#70)
+        std::thread::spawn(move || xbt_hashlink::standin::miner(xbt_hashlink::standin::MinerConfig {
+            pool: miners, user: "m.1".into(), max_rate: 2.0, bad_every: 0, duration: Some(Duration::from_secs(60)), reconnect: true,
+            extranonce_subscribe: false, bind: None }));
+        until("a miner connected", &|| status()["capacity"]["freeMiners"] == 1);
         let hk = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &key);
         let lk = xbt_hashlink::link::dial(&link, xbt_hashlink::noise::fresh_key(), hk).unwrap();
         let terms = Terms::from_json(&status()["terms"]).unwrap();

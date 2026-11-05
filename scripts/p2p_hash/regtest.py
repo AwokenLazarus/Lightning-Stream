@@ -19,6 +19,12 @@ Checks:
   small     a direct call with max_sats 500 from no credit is refused, nothing paid; and a rental whose budget
             (500 sat) is under the smallest ticket (546 sat) is refused before any work, nothing paid, the
             renter told why
+  offline   issue #70: a hashmaker whose listing is up and whose miners are all offline (none connected) refuses the
+            rental before its welcome, so nothing is paid, not the start fee: the hashtaker says "its miners are offline
+            right now", the wallet's node sends nothing and the hashmaker earns nothing
+  route     before a rental pays, the renter's route probe on the signer's renter socket, against the real nodes: a route
+            to the seller's node for a ticket's amount; for an amount no channel carries, definitely none (the seller
+            is public) or nothing to go by (it is not); for a node the graph doesn't know, nothing to go by. Nothing sent
   drop      a rental at a third gateway, from no credit, whose link loses what the hashmaker sends for a
             stretch, then is down for 4 s, with a slice paid while it's down. At the resume the hashmaker sends
             its recent shares again, and the hashtaker counts those it never read, once each: both proven
@@ -114,6 +120,10 @@ SLOW_PRICE_MSAT = 400_000
 # two miners at 0.2 shares a second: 0.04 slices a second, 16 sat a second at 400 sat, 480 sat in 30 s (under 546)
 SLOW_RATE = 0.2
 SLOW_BUDGET_SATS = 40_000
+# the top-up check: the renter's own service (the app's renter, with its control page), and the task whose signed budget
+# a rental's top-up can't pass
+TOPUP_CONTROL = B + 39
+TOPUP_TASK_SATS = 1_200
 REPORT: dict[str, Any] = {"checks": []}
 PROCS: list[subprocess.Popen[bytes]] = []
 
@@ -142,7 +152,9 @@ def policy() -> dict[str, Any]:
         # the hashrate task as the starter rules sign it on mainnet: a rental task, prepaid tickets of at most 10,000 sat
         "tickets": {"enabled": True, "tasks": {"hashrate": {"budget_sats": 50_000, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}},
                                                # issue #64's long rental, on a budget of its own
-                                               "hashrate-slow": {"budget_sats": SLOW_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}}},
+                                               "hashrate-slow": {"budget_sats": SLOW_BUDGET_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}},
+                                               # the top-up check's second rental: its owner's budget is below what its top-up asks
+                                               "hashrate-topup": {"budget_sats": TOPUP_TASK_SATS, "rental": {"max_ticket_sats": 10_000, "max_sends_per_hour": 600}}}},
     }
 
 
@@ -348,6 +360,230 @@ def rental(name: str, stop_after: int | None, miner_secs: int, rate: float, orig
             return json.load(f)
 
     return {"hasher": load("hasher"), "buyer": load("buyer"), "pool": load("pool"), "found": load("found"), "listing": load("listing"), "done_ms": done_ms}
+
+
+def topup_check() -> None:
+    n = len(PROCS)
+    try:
+        topup_run()
+    finally:
+        # whatever it left running (a check that stopped early), so the next check has its ports
+        for q in PROCS[n:]:
+            if q.poll() is None:
+                q.terminate()
+        for q in PROCS[n:]:
+            try:
+                q.wait(10)
+            except subprocess.TimeoutExpired:
+                q.kill()
+        for src in sorted(glob.glob(f"{RUN}/topup*")):
+            base = os.path.basename(src)
+            if base.endswith((".log", ".json")):
+                try:
+                    with open(src, "rb") as f, open(f"{OUT}/p2p_hash_{base}", "wb") as g:
+                        g.write(f.read())
+                except OSError:
+                    pass
+
+
+def topup_run() -> None:
+    """Budget and time added to a rental going on (POST /topup, the app's Add to this rental), through the app's own renter
+    service and the wallet's signer: the rental pays on past its first budget and never past the sum, a top-up sent again
+    adds nothing, none is taken once it ended, and the owner's signed budget for the task still stops it."""
+    token_path = f"{RUN}/topup-token"
+    with open(token_path, "w") as f:
+        f.write(secrets.token_hex(32))
+    with open(token_path) as f:
+        token = f.read().strip()
+
+    def renter(method: str, path: str, body: dict[str, Any] | None = None, auth: bool = True) -> tuple[int, dict[str, Any]]:
+        c = http.client.HTTPConnection("127.0.0.1", TOPUP_CONTROL, timeout=120)
+        try:
+            headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {token}"} if auth else {})}
+            c.request(method, path, body=json.dumps(body).encode() if body is not None else None, headers=headers)
+            r = c.getresponse()
+            return r.status, json.loads(r.read() or b"{}")
+        finally:
+            c.close()
+
+    def live(rid: str) -> dict[str, Any]:
+        _, st = renter("GET", "/status")
+        return next((x for x in st.get("rentals", []) if x.get("rental") == rid), {})
+
+    pool = spawn("topup-pool", ["standin-pool", "--listen", f"127.0.0.1:{POOL}", "--diff", str(DIFF), "--job-ms", "1000", "--report", f"{RUN}/topup-pool.json"])
+    hashmaker_pub = subprocess.run([f"{BIN}/xbt-hashlink", "pubkey", f"{RUN}/keys/hasher.key"], check=True, capture_output=True, text=True).stdout.strip()
+
+    def market(tag: str) -> list[subprocess.Popen[bytes]]:
+        """The lab's hashmaker (it serves one rental, then ends) and its two miners, its listing fresh on the relay."""
+        if os.path.exists(f"{RUN}/topup-{tag}-listing.json"):
+            os.remove(f"{RUN}/topup-{tag}-listing.json")
+        t = ["--slice-work", str(SLICE_WORK), "--price-msat", str(PRICE_MSAT), "--grace-ms", str(GRACE_MS)]
+        hm = spawn(f"topup-{tag}-hashmaker", ["hashmaker", "--key", f"{RUN}/keys/hasher.key", "--miners", f"127.0.0.1:{MINERS}", "--link", f"127.0.0.1:{LINK}",
+                                              "--slices", f"127.0.0.1:{SLICES}", *t, "--report", f"{RUN}/topup-{tag}-hasher.json",
+                                              "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hashmaker",
+                                              "--link-public", f"127.0.0.1:{LINK}", "--pay-url", f"{ORIGIN2}/hashrate", "--pay-node", lab.pubkey(d.SELLER),
+                                              "--hashrate-hs", "4000000000000", "--listing-out", f"{RUN}/topup-{tag}-listing.json",
+                                              # its two miners, said in the listing: the app's renter rents no offer that shows none (#70)
+                                              "--listed-miners", "2"])
+        lab.wait("the hashmaker's listing", 30, lambda: os.path.exists(f"{RUN}/topup-{tag}-listing.json"), every=0.2)
+        time.sleep(0.5)
+        return [hm, *(spawn(f"topup-{tag}-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{MINERS}", "--user", f"hasher.m{i}", "--rate", "1.5",
+                                                      "--bad-every", "9", "--duration-s", "300"]) for i in (1, 2))]
+
+    def stop(ps: list[subprocess.Popen[bytes]]) -> None:
+        for q in ps:
+            if q.poll() is None:
+                q.terminate()
+        for q in ps:
+            try:
+                q.wait(10)
+            except subprocess.TimeoutExpired:
+                q.kill()
+
+    def service(task: str) -> subprocess.Popen[bytes]:
+        p = spawn(f"topup-renter-{task}", ["renter", "--key", f"{RUN}/keys/buyer.key", "--control", f"127.0.0.1:{TOPUP_CONTROL}",
+                                           "--control-token-file", token_path, "--upstream", f"127.0.0.1:{POOL}", "--allow-unblinded", "1",
+                                           "--relays", RELAY_URL, "--signer", d.RENTER_SOCK, "--task", task, "--expect-node", lab.pubkey(d.SELLER),
+                                           "--iroh", "off", "--user", "buyer.rented"])
+        lab.wait("the renter's control page", 30, lambda: renter("GET", "/status")[1].get("role") == "renter", every=0.5)
+        lab.wait("the renter finds the hashmaker's offer", 60,
+                 lambda: any(o.get("linkKey") == hashmaker_pub for o in renter("GET", "/offers?fresh=1")[1].get("offers", [])), every=2)
+        return p
+
+    def wait_ended(rid: str, secs: int) -> dict[str, Any]:
+        lab.wait("the rental ended", secs, lambda: live(rid).get("ended") is True, every=1)
+        return live(rid)
+
+    def wallet_moved(x: dict[str, Any]) -> int:
+        return sum(int(p.get("wallet", {}).get("charged_sats", 0)) for p in x.get("live", {}).get("pays", []) if p.get("ok"))
+
+    first = 6 * PRICE_MSAT // 1000
+    # 1. first (the seller's cap counts what every task paid it), the owner's signed budget for the task (TOPUP_TASK_SATS) is below what the rental and its top-up ask: the wallet
+    # stops it there, whatever the rental's own budget says
+    m2 = market("b")
+    p2 = service("hashrate-topup")
+    code, v = renter("POST", "/rent", {"linkKey": hashmaker_pub, "miners": 2, "budgetSats": first, "minutes": 10, "once": secrets.token_hex(8)})
+    if code != 200:
+        check("topup: the second rental starts", False, v)
+        return
+    rid = v["rental"]
+    lab.wait("a slice paid", 120, lambda: int(live(rid).get("live", {}).get("paidSlices") or 0) >= 1 or live(rid).get("ended") is True, every=1)
+    if live(rid).get("ended") is True:
+        lv = live(rid).get("live", {})
+        check("topup: the second rental pays its first slice", False, {"closed": lv.get("closed"), "pays": lv.get("pays"), "events": lv.get("events", [])[-5:]})
+        return
+    code, v = renter("POST", "/topup", {"rental": rid, "addSats": 50 * PRICE_MSAT // 1000, "once": secrets.token_hex(8)})
+    x = wait_ended(rid, 300)
+    lv = x.get("live", {})
+    REPORT["topup_task_rental"] = lv
+    oks = [p for p in lv.get("pays", []) if p.get("ok")]
+    why = " ".join(str(p.get("why", "")) for p in lv.get("pays", []) if p.get("ok") is False)
+    check("topup: the owner's signed task budget still stops a topped-up rental: the wallet refuses past it, said as its rules",
+          code == 200 and wallet_moved(x) <= TOPUP_TASK_SATS and len(oks) * PRICE_MSAT <= TOPUP_TASK_SATS * 1000 and lv.get("payFailed") is True
+          and "wallet" in why.lower(),
+          {"topup": v, "paid": len(oks), "wallet moved sats": wallet_moved(x), "task budget": TOPUP_TASK_SATS, "closed": lv.get("closed"), "why": why[:300]})
+    stop([p2, *m2])
+
+    # 2. then a rental of six slices' budget, topped up after its second: it pays on past six, never past the sum
+    m1 = market("a")
+    p1 = service("hashrate")
+    no_token = renter("POST", "/topup", {"rental": "x", "addSats": 1}, auth=False)
+    check("topup: the control page takes no top-up without its token", no_token[0] == 401, no_token)
+    code, v = renter("POST", "/rent", {"linkKey": hashmaker_pub, "miners": 2, "budgetSats": first, "minutes": 10, "once": secrets.token_hex(8)})
+    if code != 200:
+        check("topup: the rental starts", False, v)
+        return
+    rid = v["rental"]
+    lab.wait("two slices paid", 120, lambda: int(live(rid).get("live", {}).get("paidSlices") or 0) >= 2, every=1)
+    mark = secrets.token_hex(8)
+    added = 10 * PRICE_MSAT // 1000
+    code, v = renter("POST", "/topup", {"rental": rid, "addSats": added, "addMinutes": 5, "once": mark})
+    again = renter("POST", "/topup", {"rental": rid, "addSats": added, "addMinutes": 5, "once": mark})
+    paid_at = int(live(rid).get("live", {}).get("paidSlices") or 0)
+    check("topup: added to the rental going on, once for the form sent twice",
+          code == 200 and v.get("budgetSats") == first + added and v.get("minutes") == 15 and again == (200, v) and live(rid).get("budgetSats") == first + added,
+          {"answer": v, "again": again, "status budget": live(rid).get("budgetSats"), "paid when added": paid_at})
+    lab.wait("paid past the first budget", 180, lambda: int(live(rid).get("live", {}).get("paidSlices") or 0) > 7
+             or live(rid).get("ended") is True, every=1)
+    renter("POST", "/cut", {"rental": rid})
+    x = wait_ended(rid, 60)
+    lv = x.get("live", {})
+    oks = [p for p in lv.get("pays", []) if p.get("ok")]
+    priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
+    after = renter("POST", "/topup", {"rental": rid, "addSats": added})
+    check("topup: the rental paid on past its first budget, each slice once, never past the sum, no payment refused",
+          len(oks) > 6 and priced == len(oks) * PRICE_MSAT <= (first + added) * 1000 and not lv.get("payFailed")
+          and wallet_moved(x) <= first + added and lv.get("budgetMsat") == (first + added) * 1000,
+          {"paid": len(oks), "priced_msat": priced, "budget_sats": first + added, "wallet moved sats": wallet_moved(x),
+           "closed": lv.get("closed"), "payFailed": lv.get("payFailed"), "budgetMsat": lv.get("budgetMsat")})
+    check("topup: none taken once the rental ended", after[0] == 409, after)
+    stop([p1, *m1])
+
+    stop([pool])
+
+
+def offline_check() -> None:
+    """Issue #70: a listed hashmaker with no miner connected takes no rental and no money."""
+    name = "offline"
+    inv0, pay0 = d.seller_invoices(), d.buyer_payments()
+    pool = spawn(f"{name}-pool", ["standin-pool", "--listen", f"127.0.0.1:{POOL}", "--diff", str(DIFF), "--job-ms", "1000"])
+    t = ["--slice-work", str(SLICE_WORK), "--price-msat", str(PRICE_MSAT), "--grace-ms", str(GRACE_MS)]
+    hashmaker = spawn(f"{name}-hashmaker", ["hashmaker", "--key", f"{RUN}/keys/hasher.key", "--miners", f"127.0.0.1:{MINERS}", "--link", f"127.0.0.1:{LINK}",
+                                      "--slices", f"127.0.0.1:{SLICES}", *t, "--report", f"{RUN}/{name}-hasher.json",
+                                      "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hashmaker",
+                                      "--link-public", f"127.0.0.1:{LINK}", "--pay-url", f"{ORIGIN}/hashrate", "--pay-node", lab.pubkey(d.SELLER),
+                                      "--hashrate-hs", "4000000000000", "--listing-out", f"{RUN}/{name}-listing.json"])
+    try:
+        lab.wait("the hashmaker's listing", 30, lambda: os.path.exists(f"{RUN}/{name}-listing.json"), every=0.2)
+        time.sleep(0.5)
+        hashtaker = spawn(f"{name}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
+                                        "--found-out", f"{RUN}/{name}-found.json", "--upstream", f"127.0.0.1:{POOL}", "--user", "buyer.rented",
+                                        "--allow-unblinded", "1", "--signer", d.RENTER_SOCK, "--task", "hashrate", "--max-sats", "1500",
+                                        "--rental", f"rt-{name}", "--idle-s", "15", "--report", f"{RUN}/{name}-buyer.json"])
+        t0 = time.time()
+        rc = hashtaker.wait(90)
+        took = time.time() - t0
+        with open(f"{RUN}/{name}-hashtaker.log", errors="replace") as f:
+            said = f.read()[-2000:]
+        moved = {h: p["status"] for h, p in d.buyer_payments().items() if h not in pay0}
+        new_inv = {h: i["state"] for h, i in d.seller_invoices().items() if h not in inv0}
+        status = hashmaker_status(name)
+        check("offline: a hashmaker with no miner connected refuses the rental before its welcome, and nothing is paid",
+              rc != 0 and "hashmaker refused: its miners are offline right now" in said and not moved and not new_inv and d.held() == 0
+              and not os.path.exists(f"{RUN}/{name}-buyer.json") and not status.get("rentals"),
+              {"rc": rc, "seconds": round(took, 1), "said": said[-400:], "payments": moved, "invoices": new_inv, "held": d.held(),
+               "hashmaker rentals": status.get("rentals"), "finished": status.get("finished")})
+    finally:
+        for p in (hashmaker, pool):
+            p.terminate()
+            p.wait(10)
+
+
+def hashmaker_status(name: str) -> dict[str, Any]:
+    """The hashmaker's report, as it last wrote it (empty if it wrote none)."""
+    try:
+        with open(f"{RUN}/{name}-hasher.json") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def route_check() -> None:
+    """The renter's route probe, against the real nodes, on the renter's socket."""
+    pay0 = d.buyer_payments()
+    seller = lab.pubkey(d.SELLER)
+    probe = lambda node, msat: d.signer("ln_route_probe", {"node": node, "amount_msat": msat}, sock=d.RENTER_SOCK)  # noqa: E731
+    found = probe(seller, TICKET_MSAT)
+    # more than the wallet's node holds on all its channels: no route can carry it
+    local = sum(int(c.get("local_balance", 0)) for c in lab.channels(d.BUYER))
+    too_big = probe(seller, (local + 10_000) * 1000)
+    unknown = probe("02" + "11" * 32, TICKET_MSAT)
+    moved = {h: p["status"] for h, p in d.buyer_payments().items() if h not in pay0}
+    definite_or_private = too_big.get("route") is False or (too_big.get("route") is None and "no public channel" in str(too_big.get("why")))
+    check("route: the renter's probe finds the seller's node, finds no route for an amount no channel carries, and can't tell a node "
+          "the graph doesn't know; nothing sent",
+          found.get("route") is True and definite_or_private and unknown.get("route") is None and not moved,
+          {"found": found, "too big": too_big, "local_sat": local, "unknown node": unknown, "payments": moved})
 
 
 def drop_check() -> None:
@@ -1274,11 +1510,17 @@ def main() -> int:
         if os.environ.get("P2P_HASH_ONLY") == "slow":
             slow_check()
             raise StopIteration
+        if os.environ.get("P2P_HASH_ONLY") == "topup":
+            topup_check()
+            raise StopIteration
         only_real = os.environ.get("P2P_HASH_ONLY") == "real"
         if only_real:
             for mode in os.environ.get("P2P_HASH_REAL_MODES", "solo,pool").split(","):
                 real_gateway(mode)
             raise StopIteration
+        # first: its task's signed budget (TOPUP_TASK_SATS) is also the cap on what that task may pay this one seller node
+        # in a day, counted over every task, so it runs before the other rentals pay the seller
+        topup_check()
         r = rental("paid", None, 70, 1.5)
         hz, bz = r["hasher"], r["buyer"]
         lk = r["found"]["listing"]
@@ -1368,6 +1610,8 @@ def main() -> int:
               hz["paid"] == 0 and int(hz["meter"]["work"]) == 0 and bz["payFailed"] and not moved and d.held() == 0 and "smallest ticket" in why,
               {"hashmaker paid": hz["paid"], "work": hz["meter"]["work"], "closed": bz["closed"], "why": why[:300], "payments": moved, "held": d.held()})
 
+        offline_check()
+        route_check()
         drop_check()
         slow_check()
         real_gateway("solo")

@@ -587,7 +587,11 @@ def main():
         applied = sign_policy(taker, SIGN_BIN, uis["taker"][1], rules_on_page(taker, unescape(allow.group(1))[1:]))
         check("H", "taker: the rules page shows the seller added, tied to its node from the signed listing, and the owner signs it",
               "applied" in applied.lower(), applied)
-        page = taker.get("/hashrate")
+        # the maker's first listing goes out as its miner connects, before its hashrate is measured, and an offer that
+        # shows no hashrate is not rented (#70): its measured one is published within the minute after
+        got = waited(lambda: (lambda p: p if "<button>Rent</button>" in offer_card(p) else None)(taker.get("/hashrate")), 240,
+                     "the maker's offer with its hashrate measured")
+        page = got or taker.get("/hashrate")
         card = offer_card(page)
         on = "<button>Rent</button>" in card
         check("H", "taker: then Rent is on", on, card if on else [card, {"maker's hashmaker": maker_status()}])

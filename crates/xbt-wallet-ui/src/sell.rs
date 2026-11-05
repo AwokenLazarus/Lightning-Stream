@@ -374,10 +374,38 @@ const APP_HEADERS: [&str; 7] = ["cookie", "authorization", "x-emby-authorization
 /// Whether a setting named `k` holds a secret: a token, a password, a key's secret part.
 fn secret_key(k: &str) -> bool {
     let k = k.to_ascii_lowercase();
-    ["token", "secret", "password", "passwd", "macaroon", "private", "nsec"].iter().any(|w| k.contains(w))
+    ["token", "secret", "password", "passwd", "passphrase", "macaroon", "private", "nsec", "api_key", "apikey", "authorization", "cookie",
+     "credential", "mnemonic", "seed", "bearer"]
+        .iter().any(|w| k.contains(w))
 }
 
-fn hide_header_values(mut c: Value) -> Value {
+/// A URL's password and the credentials in its query (`api_key=`, `token=`, as the gateway knows them), hidden: a route's
+/// upstream may carry them, and the settings shown never do.
+fn hide_url_secrets(s: &str) -> String {
+    let Some((scheme, rest)) = s.split_once("://") else { return s.to_string() };
+    let (auth, tail) = match rest.find(['/', '?', '#']) {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let auth = match auth.rsplit_once('@') {
+        Some((user, host)) => format!("{}:(hidden)@{host}", user.split(':').next().unwrap_or("")),
+        None => auth.to_string(),
+    };
+    let tail = match tail.split_once('?') {
+        Some((path, q)) => {
+            let (q, frag) = q.split_once('#').map_or((q, None), |(a, b)| (a, Some(b)));
+            let q: Vec<String> = q.split('&').map(|kv| match kv.split_once('=') {
+                Some((k, _)) if secret_key(k) || xbt_gateway::config::CREDENTIAL_PARAMS.contains(&k.to_ascii_lowercase().as_str()) => format!("{k}=(hidden)"),
+                _ => kv.to_string(),
+            }).collect();
+            format!("{path}?{}{}", q.join("&"), frag.map(|f| format!("#{f}")).unwrap_or_default())
+        }
+        None => tail.to_string(),
+    };
+    format!("{scheme}://{auth}{tail}")
+}
+
+pub(crate) fn hide_header_values(mut c: Value) -> Value {
     fn walk(v: &mut Value) {
         match v {
             Value::Object(m) => {
@@ -388,7 +416,7 @@ fn hide_header_values(mut c: Value) -> Value {
                                 *val = Value::String("(hidden)".into());
                             }
                         }
-                    } else if secret_key(k) && !x.is_null() && !x.is_object() && !x.is_array() {
+                    } else if secret_key(k) && !x.is_null() {
                         // the gateway's health token and any other secret: never in the page (0.2.1 showed health_token whole)
                         *x = Value::String("(hidden)".into());
                     } else {
@@ -397,6 +425,7 @@ fn hide_header_values(mut c: Value) -> Value {
                 }
             }
             Value::Array(a) => a.iter_mut().for_each(walk),
+            Value::String(t) if t.contains("://") => *t = hide_url_secrets(t),
             _ => {}
         }
     }
@@ -1552,7 +1581,8 @@ impl App {
         // "Publish without buyer accounts anyway" only where its warning applies (as the save checks it): a media server's
         // web app with neither buyers' own accounts nor a guest login. Shown or hidden as the form changes (ui.js)
         let accounts_on = fv("app_accounts", if saved_libs.is_some() { "1".into() } else { String::new() }) == "1";
-        let login_on = !fv("app_login", editing.and_then(|o| o.app.as_ref()).map(|a| a.login.clone()).unwrap_or_default()).trim().is_empty();
+        let login_on = !fv("app_login", String::new()).trim().is_empty()
+            || (fv("app_login_clear", String::new()) != "1" && editing.and_then(|o| o.app.as_ref()).is_some_and(|a| !a.login.trim().is_empty()));
         let app_on = kind != Kind::Files
             && (kind == Kind::Media || fv("app", editing.map(|o| if o.app.is_some() { "1" } else { "" }.to_string()).unwrap_or_default()) == "1");
         let no_accounts_applies = app_on && !accounts_on && !login_on
@@ -1645,7 +1675,7 @@ impl App {
             <label>What the page sees as <code>/</code> <small>(empty: chosen for you)</small><input name=\"app_base\" value=\"{}\" class=\"mono\" placeholder=\"{}\"></label>\
             <label>Where it opens <small>(empty: the same)</small><input name=\"app_entry\" value=\"{}\" class=\"mono\" placeholder=\"/web/\"></label>\
             <label>A guest login the shop adds to every request <small>(optional, <code>Name: value</code>)</small>\
-            <input name=\"app_login\" value=\"{}\" class=\"mono\" autocomplete=\"off\" placeholder=\"Authorization: MediaBrowser Token=…\"></label>\
+            <input name=\"app_login\" type=\"password\" value=\"\" class=\"mono\" autocomplete=\"off\" placeholder=\"{}\"></label>{}\
             <p class=\"hint\">For a service whose page asks for a login. It goes from your shop to the service only, never to buyers.</p>\
             <label class=\"check\"><input type=\"checkbox\" name=\"app_live\" value=\"1\"{}> Live updates (WebSockets), paid for by what they carry</label>\
             <label>Paths buyers may not open, one per line <small>(its admin and settings, other users')</small>\
@@ -1675,7 +1705,14 @@ impl App {
             esc(&fv("app_base", editing.and_then(|o| o.app.as_ref()).map(|a| a.base.clone()).unwrap_or_default())),
             if kind == Kind::Media { "/" } else { "the path it is sold under" },
             esc(&fv("app_entry", editing.and_then(|o| o.app.as_ref()).filter(|a| a.entry != a.base).map(|a| a.entry.clone()).unwrap_or_default())),
-            esc(&fv("app_login", editing.and_then(|o| o.app.as_ref()).map(|a| a.login.clone()).unwrap_or_default())),
+            // the guest login is a credential: never in the page, only its header's name once saved (#41)
+            esc(&match editing.and_then(|o| o.app.as_ref()).map(|a| a.login.clone()).filter(|l| !l.trim().is_empty()) {
+                Some(l) => format!("saved ({}: …): leave empty to keep it", l.split(':').next().unwrap_or("").trim()),
+                None => "Authorization: MediaBrowser Token=…".into(),
+            }),
+            if editing.and_then(|o| o.app.as_ref()).is_some_and(|a| !a.login.trim().is_empty()) {
+                "<label class=\"check\"><input type=\"checkbox\" name=\"app_login_clear\" value=\"1\"> Remove the saved guest login</label>"
+            } else { "" },
             if editing.and_then(|o| o.app.as_ref()).is_none_or(|a| a.live) { " checked" } else { "" },
             esc(&fv("app_deny", editing.and_then(|o| o.app.as_ref()).map(|a| a.deny.join("\n")).unwrap_or_default())),
             esc(&fv("app_allow", editing.and_then(|o| o.app.as_ref()).map(|a| a.allow.join("\n")).unwrap_or_default())),
@@ -1877,7 +1914,12 @@ impl App {
                     if !entry.starts_with(&base) {
                         return Err(format!("Where the page opens ({entry}) is under what it sees as / ({base})."));
                     }
-                    let login = g("app_login").trim().to_string();
+                    // left empty, the saved guest login is kept (the form never shows it); ticked, it is removed
+                    let login = match g("app_login").trim() {
+                        "" if g("app_login_clear") == "1" => String::new(),
+                        "" => shop.offers.iter().find(|o| o.id == new_id).and_then(|o| o.app.as_ref()).map(|a| a.login.clone()).unwrap_or_default(),
+                        l => l.to_string(),
+                    };
                     login_header(&login)?;
                     let (deny, allow) = (app_paths(&g("app_deny"))?, app_paths(&g("app_allow"))?);
                     // each buyer an account of their own: the seller's key is checked against the service, and its
@@ -2133,6 +2175,16 @@ mod tests {
         assert!(!shown.contains("secret1") && !shown.contains("secret2") && !shown.contains("secret3") && !shown.contains("secret4"), "{shown}");
         assert!(shown.contains("\"health_token\":\"(hidden)\""), "{shown}");
         assert!(shown.contains("x-stream-files-key") && shown.contains("(hidden)") && shown.contains("\"publish\":true"), "{shown}");
+        // a route's upstream with a password or a key in its query, and other names a secret goes by
+        let c = json!({"routes": [{"path": "/tv/", "upstream": "http://admin:secret5@jellyfin:8096/emby?api_key=secret6&format=json"},
+                                  {"path": "/x/", "upstream": "https://x.example/a?token=secret7#top"}],
+                       "nostr": {"seed_words": "secret8"}, "auth": {"cookie": "secret9", "api_key": "secret10"},
+                       "tokens": ["secret11"], "secrets": {"a": "secret12"}});
+        let shown = hide_header_values(c).to_string();
+        for n in 5..=12 {
+            assert!(!shown.contains(&format!("secret{n}")), "secret{n}: {shown}");
+        }
+        assert!(shown.contains("http://admin:(hidden)@jellyfin:8096/emby?api_key=(hidden)&format=json") && shown.contains("https://x.example/a?token=(hidden)#top"), "{shown}");
     }
 
     /// Hashrate is paid at the web address while buyers reach the shop there, at its key address when

@@ -6,7 +6,8 @@
 //! xbt-hashlink hashmaker --key F --miners ADDR --link ADDR --slice-work W --price-msat P [--grace-ms G] [--report F]
 //!                     [--slices ADDR]              paid slices come from the hashmaker's gateway (else: the lab's rail)
 //!                     [--relays URL,URL --nostr-key F --name N --link-public ADDR --pay-url URL --pay-node HEX
-//!                      --hashrate-hs N [--listing-out F]]    publish the hashrate listing first
+//!                      --hashrate-hs N [--listing-out F] [--listed-miners N]]    publish the hashrate listing first
+//!                         (saying N miners, all free; none without it)
 //!                     [--fallback ADDR [--rentable N] [--control ADDR [--control-token-file F]] [--config F]
 //!                      [--gateway URL] [--miners-public ADDR] [--link-lan ADDR]]
 //!                         keep serving: miners not rented hash at the fallback, any number of rentals,
@@ -221,7 +222,16 @@ fn hashmaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
     let key = read_key(need(f, "key")?)?;
     let t = terms(f)?;
     if let Some(r) = f.get("relays") {
-        let h = listing_of(f, &key, &t, Capacity::default())?;
+        // the listing says no miner unless told how many (`--listed-miners`, the lab's): this one-rental hashmaker
+        // publishes before its miners connect, and an app's renter rents no offer that shows none (#70)
+        let capacity = match f.get("listed-miners") {
+            Some(n) => {
+                let n: u32 = n.parse().map_err(|_| "--listed-miners")?;
+                Capacity { miners: n, free_miners: n, free_hs: num(f, "hashrate-hs", Some(0))? }
+            }
+            None => Capacity::default(),
+        };
+        let h = listing_of(f, &key, &t, capacity)?;
         publish(f, r, &key, &h)?;
     }
     let cfg = hashmaker::Config {
@@ -320,6 +330,7 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         miners: num(f, "miners", Some(0))?,
         budget_msat: budget_sats.map(|s| s.checked_mul(1000).ok_or("--budget-sats: too large")).transpose()?,
         cut: None,
+        added: None,
         live: None,
         hashmaker,
         hashmaker_key,

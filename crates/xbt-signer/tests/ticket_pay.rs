@@ -1062,6 +1062,15 @@ impl LnBackend for PayLn {
         Ok(!none)
     }
 
+    /// The graph: a seller behind a private channel is not in it; otherwise it has public channels, unless the node is down.
+    fn public_channels(&self, _node: &str) -> xbt402::Result<Option<u64>> {
+        let s = self.st.lock().unwrap();
+        if s.down {
+            return Err(xbt402::ChannelError::new("ln_backend", "the node does not answer"));
+        }
+        Ok((!s.private_seller).then_some(4))
+    }
+
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
         let (takes, look, on_look) = {
             let mut s = self.st.lock().unwrap();
@@ -15370,6 +15379,36 @@ impl Renter {
         let n = self.standing.paid;
         self.payer.pay("r1", n, &json!({"slice": n}))
     }
+}
+
+/// Before a rental pays anything, the renter asks on its own socket whether the wallet's node finds a route to the
+/// seller's node: a route found, a public node no route reaches (definite: the rent is refused), and a node with only
+/// private channels, which only its invoice's hints reach (inconclusive: the rent goes on), told apart. After a payment
+/// found no route through its whole wait (the hints given), a private node is definitely unreachable for a while.
+/// Nothing is sent, and a probe that can't be answered is no refusal.
+#[test]
+fn a_rentals_route_probe_tells_a_route_from_definitely_none_and_from_not_knowing() {
+    let _g = env_lock();
+    let r = Rig::shipped(mainnet_starter(starter_rental()), 30, app_shop(MARKET_MSAT));
+    let t = Renter::new(&r, "hashrate", MARKET_MSAT, 1, Some(10_000));
+    let node = format!("03{}", "78".repeat(32));
+    let probe = |n: &str| xbt_hashlink::rail::signer_call(&t.payer.sock, "ln_route_probe", &json!({"node": n, "amount_msat": 546_000})).unwrap();
+    assert_eq!(probe(&node)["route"], true, "a route found");
+    r.ln.st.lock().unwrap().no_route = true;
+    let v = probe(&node);
+    assert_eq!(v["route"], false, "public, and no route reaches it: {v}");
+    {
+        let mut st = r.ln.st.lock().unwrap();
+        st.no_route = false;
+        st.private_seller = true;
+    }
+    let v = probe(&node);
+    assert!(v["route"].is_null(), "only private channels: the probe has no hints, so it can't tell: {v}");
+    r.ln.st.lock().unwrap().down = true;
+    assert!(probe(&node)["route"].is_null(), "a node that can't answer is no refusal");
+    assert!(xbt_hashlink::rail::signer_call(&t.payer.sock, "ln_route_probe", &json!({"node": "02ab", "amount_msat": 1}))
+        .map_or(true, |v| v["verdict"] == "deny" && v["route"].is_null()), "a node key only");
+    assert!(r.ln.by_status("SUCCEEDED").is_empty() && r.ln.by_status("IN_FLIGHT").is_empty() && r.ln.by_status("FAILED").is_empty(), "nothing sent");
 }
 
 fn paid_tickets(r: &Rig) -> Vec<u64> {

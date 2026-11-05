@@ -277,7 +277,8 @@ curl -s 127.0.0.1:9091/metrics | grep -i relay | head
 
 Apps learn of relays from announcements on Nostr: a signed note with the relay's address,
 where it runs, roughly what it can carry and, optionally, how to reach you. An announcement
-lasts at most 30 days; announce again to stay listed (a monthly timer is fine).
+lasts a week by default (at most 30 days); announce again to stay listed. The app does that
+itself, daily, while it runs; with the command-line tool, use `--every-hours 24` or a daily timer.
 
 - **From the Lightning Stream app:** Settings → Advanced → Stream relays → *Announce your relay*. The app
   signs it with a key it keeps for this (`secrets/relay-operator.key`) and lists the relay as yours.
@@ -293,6 +294,11 @@ lasts at most 30 days; announce again to stay listed (a monthly timer is fine).
   It keeps its signing key in `~/.config/stream-relay/nostr.key` (mode 600), made the first time.
   Keep that file: it is how you update or replace the announcement. `--dry-run` prints the signed
   event without publishing it.
+
+  An announcement lapses after `--ttl-days` (7 by default, at most 30; NIP-40 `expiration`), so a
+  relay nobody tends drops out by itself. Add `--every-hours 24` to keep the tool running and
+  announce again daily, or run it from a timer well within the TTL. The app announces the relay you
+  gave it again each day while it runs.
 
 An announcement doesn't prove you run the relay, and doesn't need to: apps never trust a relay
 with anything they can't check. Each app probes every relay it knows itself, and uses the ones

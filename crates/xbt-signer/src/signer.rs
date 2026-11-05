@@ -651,6 +651,8 @@ impl Signer {
             }
             // read only, and without the spend lock: it answers while a payment is in flight
             "ln_lookup" => sanitize(self.ln_lookup(p)),
+            // read only, without the spend lock: whether the node finds a route to a seller's node, before a rental pays
+            "ln_route_probe" => sanitize(self.ln_route_probe(p)),
             // stream tickets (docs/TICKETS.md): the buyer's book
             "ticket_open" => {
                 let _g = self.lock();

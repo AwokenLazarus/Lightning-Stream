@@ -103,8 +103,8 @@ impl App {
                                         esc(&services::seller_name(&all, &origin))));
                     for s in &list {
                         let n = s.items.len();
-                        b.push_str(&format!("<li><span class=\"pill cat-{}\">{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
-                                            s.category(), esc(s.category_words()), esc(&s.name), esc(&s.price_text),
+                        b.push_str(&format!("<li><span class=\"pill cat-{}\">{}{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
+                                            s.category(), services::icon(s.category()), esc(s.category_words()), esc(&s.name), esc(&s.price_text),
                                             if n > 0 { format!(" <span class=\"small\">{n} to choose from</span>") } else { String::new() }));
                     }
                     b.push_str("</ul>");
@@ -213,7 +213,8 @@ impl App {
         let n = new.len();
         all.extend(new);
         let mut shops = crate::shops::load(&self.cfg.shops_path())?;
-        shops.insert(listing.seller.clone(), crate::shops::Shop { receipt_key: listing.receipt_key.clone(), transport: found.transport });
+        shops.insert(listing.seller.clone(), crate::shops::Shop { receipt_key: listing.receipt_key.clone(), transport: found.transport,
+                                                                  published_at: Some(found.created_at) });
         crate::shops::save(&self.cfg.shops_path(), &shops)?;
         services::save(&self.cfg.services_path(), &all)?;
         self.write_catalog();
@@ -289,6 +290,14 @@ impl App {
         shops.get(&o).and_then(|s| crate::shops::node(s, &o, xbt_nostr::now()))
     }
 
+    /// How many days old the kept listing of the shop at `origin` (one reached by its key) is, when the
+    /// shop looks offline ([`crate::shops::offline_days`]).
+    pub(crate) fn offline_days(&self, origin: &str) -> Option<u64> {
+        let o = services::http_origin(origin)?;
+        let shops = crate::shops::load(&self.cfg.shops_path()).ok()?;
+        shops.get(&o).and_then(|s| crate::shops::offline_days(s, &o, xbt_nostr::now()))
+    }
+
     /// The spending rules page with this seller added, ready to sign: the seller's node is read from
     /// its own 402 terms, at its priced items first.
     pub fn allow_link(&self, url: &str, get: impl FnMut(&str) -> Result<xbt402::listing::Page, String>) -> Result<String, String> {
@@ -296,9 +305,28 @@ impl App {
         if xbt402::shop::is_shop(&origin) {
             let shops = crate::shops::load(&self.cfg.shops_path())?;
             let shop = shops.get(&origin).ok_or("Add this shop again: the app has not kept how to reach it.")?;
-            let node = crate::shops::node(shop, &origin, xbt_nostr::now())
-                .ok_or("This seller could not be allowed: its listing names no direct link that its Lightning node vouches for now. Press Check for updates, or ask the seller.")?;
-            return Ok(format!("./policy?allow={}&node={}", services::urlenc(&origin), node));
+            let now = xbt_nostr::now();
+            if let Some(node) = crate::shops::node(shop, &origin, now) {
+                return Ok(format!("./policy?allow={}&node={}", services::urlenc(&origin), node));
+            }
+            // nothing kept vouches for it now: the shop's newest listing on the relays may (a running shop republishes
+            // it at least daily), and is kept when it does
+            let fresh = xbt402::shop::key_of(&origin).and_then(|pk| self.nostr.find_shop(&pk).ok());
+            let offline = match fresh {
+                Some(found) => match found.node(now) {
+                    Some(node) => {
+                        self.add_shop(found)?;
+                        return Ok(format!("./policy?allow={}&node={}", services::urlenc(&origin), node));
+                    }
+                    None => found.offline(now).then(|| found.age_days(now)),
+                },
+                None => crate::shops::offline_days(shop, &origin, now),
+            };
+            return Err(match offline {
+                // a shop that stopped: nothing to update, and no seller to ask
+                Some(days) => format!("This seller could not be allowed. {}", crate::shops::offline_words(days)),
+                None => "This seller could not be allowed: its listing names no direct link that its Lightning node vouches for now. Press Check for updates, or ask the seller.".into(),
+            });
         }
         // the seller's priced places: each service's address, then a priced item of each, on the seller's own
         // address (a seller that moved may still list items at its old one, which answers the same). The bare

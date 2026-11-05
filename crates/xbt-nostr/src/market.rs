@@ -32,6 +32,15 @@ pub const BIND_TAG: &str = "xbt402-bind";
 pub const MAX_EVENT: usize = 60 * 1024;
 /// An event dated further ahead than this is refused: it would outrank every honest update.
 pub const MAX_AHEAD_S: u64 = 600;
+/// NIP-40: a listing event says it lapses this long after it was made (`expiration`), and readers
+/// (this one, other clients, relays that honor it) drop it then. A running gateway republishes it
+/// at least daily, so only a shop that stopped publishing lapses; one whose key is lost (its box
+/// reinstalled) can never be withdrawn, and lapses by itself.
+pub const EXPIRES_S: u64 = 7 * 86_400;
+/// A listing older than this is stale: a running gateway republishes every six hours by default, at
+/// least daily, so two days without a new one is a shop that stopped. The same rule as
+/// lightning-stream.com's (`STALE_S`) and as a hashrate offer's age limit.
+pub const STALE_S: u64 = 2 * 86_400;
 /// Items written into the Markdown for people; the signed document keeps them all.
 const ITEMS_IN_TEXT: usize = 50;
 
@@ -48,6 +57,35 @@ pub struct NostrListing {
     /// ([`xbt402::transport::verify`]).
     pub transport: Option<Value>,
 }
+
+impl NostrListing {
+    /// Made more than [`STALE_S`] before `now`.
+    pub fn stale(&self, now: u64) -> bool {
+        is_stale(self.created_at, now)
+    }
+
+    /// The Lightning node the listing's links say the shop is paid through, as of `now`
+    /// ([`xbt402::transport::node_of`]): `None` when no link it carries is vouched for now.
+    pub fn node(&self, now: u64) -> Option<String> {
+        xbt402::transport::node_of(self.transport.as_ref()?, &self.listing.seller, &self.listing.receipt_key, now)
+    }
+
+    /// Stale, and no Lightning node vouches for it now: a shop that looks offline. Shown apart.
+    pub fn offline(&self, now: u64) -> bool {
+        self.stale(now) && self.node(now).is_none()
+    }
+
+    /// Whole days since it was made.
+    pub fn age_days(&self, now: u64) -> u64 {
+        now.saturating_sub(self.created_at) / 86_400
+    }
+}
+
+/// Whether a listing made at `created_at` is stale at `now` ([`STALE_S`]).
+pub fn is_stale(created_at: u64, now: u64) -> bool {
+    now.saturating_sub(created_at) > STALE_S
+}
+
 
 fn fmt_sat(msat: u64) -> String {
     if msat.is_multiple_of(1000) {
@@ -165,6 +203,7 @@ pub fn listing_event_with(keys: &Keys, signed: &Value, bind_sig: &str, transport
         tag("t", TOPIC),
         tag("r", &l.seller),
         tag("alt", &format!("Lightning Stream listing: {}", l.name)),
+        tag("expiration", &created_at.saturating_add(EXPIRES_S).to_string()),
     ];
     let mut kinds: Vec<&str> = l.services.iter().map(|sv| sv.kind.as_str()).collect();
     kinds.dedup();
@@ -192,8 +231,18 @@ pub fn filter(limit: usize) -> Value {
     json!({"kinds": [KIND_CLASSIFIED], "#t": [TOPIC], "limit": limit})
 }
 
-/// Check one event, as [`listing_event`] wrote it. `now` is the reader's clock.
+/// Check one event, as [`listing_event`] wrote it. `now` is the reader's clock. A lapsed one
+/// ([`Event::expired`]) is refused; one without an `expiration` (an app before 0.2.14 wrote none)
+/// is read as before.
 pub fn read_event(ev: &Event, now: u64) -> Result<NostrListing, String> {
+    if ev.expired(now) {
+        return Err("the listing has expired: its shop stopped publishing it".into());
+    }
+    check(ev, now)
+}
+
+/// [`read_event`] but for the expiry.
+fn check(ev: &Event, now: u64) -> Result<NostrListing, String> {
     if ev.kind != KIND_CLASSIFIED {
         return Err("not a classified listing".into());
     }
@@ -233,26 +282,28 @@ pub fn read_event(ev: &Event, now: u64) -> Result<NostrListing, String> {
 
 /// Every good listing among `events`, the newest per receipt key and seller (a seller may move
 /// to a new Nostr key; the receipt key bound both), sorted by name. Also how many were refused.
+/// A shop whose newest listing has lapsed ([`Event::expired`]) is left out, not counted as refused: an
+/// older one it made before is not shown in its place.
 pub fn collect(events: &[Event], now: u64) -> (Vec<NostrListing>, usize) {
-    let mut best: HashMap<(String, String), NostrListing> = HashMap::new();
+    let mut best: HashMap<(String, String), (NostrListing, bool)> = HashMap::new();
     let mut refused = 0;
     let mut seen = std::collections::HashSet::new();
     for ev in events {
         if !seen.insert(ev.id.clone()) {
             continue;
         }
-        match read_event(ev, now) {
+        match check(ev, now) {
             Ok(n) => {
                 let k = (n.listing.receipt_key.clone(), canonical_origin(&n.listing.seller));
-                let newer = best.get(&k).is_none_or(|o| (n.created_at, &n.event_id) > (o.created_at, &o.event_id));
+                let newer = best.get(&k).is_none_or(|(o, _)| (n.created_at, &n.event_id) > (o.created_at, &o.event_id));
                 if newer {
-                    best.insert(k, n);
+                    best.insert(k, (n, ev.expired(now)));
                 }
             }
             Err(_) => refused += 1,
         }
     }
-    let mut v: Vec<NostrListing> = best.into_values().collect();
+    let mut v: Vec<NostrListing> = best.into_values().filter(|(_, gone)| !gone).map(|(n, _)| n).collect();
     v.sort_by(|a, b| a.listing.name.to_ascii_lowercase().cmp(&b.listing.name.to_ascii_lowercase()).then(a.listing.seller.cmp(&b.listing.seller)));
     (v, refused)
 }

@@ -258,6 +258,13 @@ impl Pace {
         }
     }
 
+    /// How long ago a payment to `payee` last found no route through its whole wait (its invoice's route hints given
+    /// to the node), if that was within `within` and no route has been found since.
+    pub fn no_route_seen(&self, payee: &str, within: Duration) -> Option<Duration> {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.no_route.get(payee).filter(|(_, _, waiting)| !*waiting).map(|(_, seen, _)| seen.elapsed()).filter(|ago| *ago <= within)
+    }
+
     /// A route query of the node's, and the time it took.
     pub fn queried(&self, took: Duration) {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());

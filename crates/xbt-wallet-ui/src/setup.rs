@@ -662,7 +662,7 @@ impl App {
                          is yours once the channel peer it came through has taken the preimage, which the gateway does not check".into()),
         ]));
         if let Some(c) = self.current_gateway() {
-            b.push_str(&format!("<details><summary>The settings file the selling part reads</summary>{}</details>", json_block(&c)));
+            b.push_str(&format!("<details><summary>The settings file the selling part reads</summary>{}</details>", json_block(&crate::app::sell::hide_header_values(c))));
         }
         b.push_str("</details>");
         self.page("Sell", ctx, b)

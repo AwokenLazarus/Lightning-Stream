@@ -113,6 +113,17 @@ impl Event {
         self.tags.iter().find(|t| t.first().map(String::as_str) == Some(name)).and_then(|t| t.get(1)).map(String::as_str)
     }
 
+    /// NIP-40: when the event says it lapses, if it has an `expiration` that reads as a time.
+    pub fn expiration(&self) -> Option<u64> {
+        self.tag("expiration").and_then(|e| e.trim().parse().ok())
+    }
+
+    /// Whether the event has lapsed by `now` (NIP-40). One without an `expiration` never does by
+    /// this rule; readers that want an age limit too set their own.
+    pub fn expired(&self, now: u64) -> bool {
+        self.expiration().is_some_and(|e| e <= now)
+    }
+
     pub fn to_value(&self) -> Value {
         json!({"id": self.id, "pubkey": self.pubkey, "created_at": self.created_at, "kind": self.kind, "tags": self.tags,
                "content": self.content, "sig": self.sig})

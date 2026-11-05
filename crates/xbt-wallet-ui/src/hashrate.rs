@@ -32,6 +32,9 @@ use crate::html::{esc, short};
 use crate::server::Resp;
 
 const WAIT: Duration = Duration::from_secs(6);
+/// A hashmaker's refusal of a rental when no miner of its is connected, as `xbt_hashlink::hashmaker::MINERS_OFFLINE`
+/// words it (#70): the rental pays nothing.
+const MINERS_OFFLINE: &str = "its miners are offline right now";
 /// What a rental pays before the miners move, in seconds of their work: it pays for moving them. The S11
 /// run sets the real value.
 pub const START_FEE_SECONDS: f64 = 12.0;
@@ -519,6 +522,7 @@ fn ended_words(why: &str) -> String {
         "unpaid" => "A piece of work was not paid in time.".into(),
         "stopped by the hashmaker" | "stopped by the hasher" => "The hashmaker stopped it.".into(),
         "no miners free now" => "The hashmaker has no miners free.".into(),
+        w if w.contains(MINERS_OFFLINE) => "It could not start: the hashmaker's miners are offline right now. Nothing was paid.".into(),
         "a difficulty too high for the slice" => "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.".into(),
         "no first payment" => "The first piece of work was not paid in time.".into(),
         "the first slice could not be paid" => "Your wallet could not pay for the first piece of work.".into(),
@@ -536,8 +540,20 @@ fn ended_words(why: &str) -> String {
         "shares that don't prove" => "The hashmaker sent work that doesn't check out, so the rental stopped.".into(),
         "the gateway accepted too few shares" => "Your pool turned down too much of the work, so the rental stopped.".into(),
         w if w.starts_with("link lost") => "The connection to the hashmaker was lost.".into(),
+        // the seller's terms moved since the page read them, and the new price is dearer: said as a sentence of its own
+        w if w.starts_with("could not start: the seller's price changed") => format!("It could not start: {}.", w.trim_start_matches("could not start: ")),
         w if w.starts_with("could not start") => format!("It could not start: {}", w.trim_start_matches("could not start: ")),
         w => format!("Ended: {w}."),
+    }
+}
+
+/// The offer's price as this page shows it, in hidden fields sent with Rent and Try one slice.
+fn seen_inputs(x: &Value) -> String {
+    match (x["priceMsat"].as_u64(), x["sliceWork"].as_str()) {
+        (Some(p), Some(w)) if w.bytes().all(|c| c.is_ascii_digit()) => format!(
+            "<input type=\"hidden\" name=\"seen_price_msat\" value=\"{p}\"><input type=\"hidden\" name=\"seen_slice_work\" value=\"{}\">\
+             <input type=\"hidden\" name=\"seen_start_slices\" value=\"{}\">", esc(w), x["startSlices"].as_u64().unwrap_or(0)),
+        _ => String::new(),
     }
 }
 
@@ -1146,9 +1162,11 @@ impl App {
                     };
                     // this box's own offer: marked, and not rented (a box can't pay itself)
                     let mine = own_offer(self.is_own_shop(pay_url), &own_pay, pay_url);
-                    let can = ready && rules == RentRules::Allowed && allowed && !old && !mine && (free > 0 || total == 0);
+                    // an offer with no free machine or no hashrate is never paid (#70): its start fee would buy no work
+                    let hashrate = if x.get("hashrateHs").is_some() { num(&x["hashrateHs"]) } else { free_hs };
+                    let can = ready && rules == RentRules::Allowed && allowed && !old && !mine && free > 0 && hashrate > 0.0;
                     // why Rent is off, said beside the buttons (and as their tooltip), so nobody is left guessing
-                    let why_off = rent_off_reasons(ready, head, rules, allowed, old, mine, free, total);
+                    let why_off = rent_off_reasons(ready, head, rules, allowed, old, mine, free, total, hashrate);
                     let (off_tip, off_note) = if can || why_off.is_empty() { (String::new(), String::new()) } else {
                         (format!(" title=\"Rent is off: {}\"", esc(&why_off.join("; "))),
                          format!("<div class=\"hint rent-off\"><strong>Rent is off because:</strong><ul>{}</ul>{}</div>",
@@ -1169,6 +1187,11 @@ impl App {
                         ""
                     };
                     let history = history_panel(&x["history"]);
+                    // the wallet's node found no route to this seller's node at a rent, a moment ago
+                    let unreachable = match x["unreachable"].as_str() {
+                        Some(w) => format!("<p class=\"hint warn\">Your wallet {}. Nothing was paid; try again later.</p>", esc(w)),
+                        None => String::new(),
+                    };
                     let odds = solo_odds(&st["blinding"], tip.as_ref(), per_miner);
                     // what may leave the wallet for a trial's first ticket, as the hashtaker sets it (rail::caps_at),
                     // is said beside its price; a longer rental's tickets grow with its work, so it names no figure
@@ -1176,8 +1199,11 @@ impl App {
                         Some(n) => format!("may buy a ticket of up to {} from this shop", sats_n(n as f64)),
                         None => "may buy a ticket from this shop".into(),
                     };
+                    // the price this page shows, sent with Rent: the rental agrees to it, and a seller that asks more by then is
+                    // not paid without the renter seeing the new price
+                    let seen = seen_inputs(x);
                     let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
-                        <input type=\"hidden\" name=\"key\" value=\"{}\">{}<p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
+                        <input type=\"hidden\" name=\"key\" value=\"{}\">{}{seen}<p class=\"hint\">Not sure yet? Rent one machine for one piece of work{}, \
                         about {}, and see what your gateway accepts before renting more. It is charged at most that, but your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p>\
                         <span class=\"btn-why\"{off_tip}><button class=\"secondary\"{}>Try one slice first</button></span></form>",
@@ -1195,9 +1221,9 @@ impl App {
                         continue;
                     }
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{unreachable}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
-                        <input type=\"hidden\" name=\"piece_sat\" value=\"{price}\">\
+                        <input type=\"hidden\" name=\"piece_sat\" value=\"{price}\">{seen}\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
@@ -1259,6 +1285,9 @@ impl App {
         offers_kept(&base).forget();
         let g = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
         let n = |k: &str| g(k).parse::<u64>().unwrap_or(0);
+        // the price the page showed, as it showed it (none from an older page: the service agrees to its offer as it reads it)
+        let seen_n = |k: &str| g(k).parse::<u64>().ok();
+        let seen_s = |k: &str| Some(g(k)).filter(|w| !w.is_empty() && w.bytes().all(|c| c.is_ascii_digit()));
         let r: Result<String, String> = match g("action").as_str() {
             "rent" | "trial" if call(&base, &token, "GET", "/status", None).is_ok_and(|st| st["blinding"]["state"] != "blinded") => {
                 Err("Renting needs a gateway that masks its jobs. Nothing was paid.".into())
@@ -1268,7 +1297,8 @@ impl App {
                     Err("Set the most this rental may cost.".into())
                 } else {
                     call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "miners": n("miners").max(1), "budgetSats": n("budget"), "minutes": n("minutes").max(1),
-                                                                     "once": g("once")})))
+                                                                     "once": g("once"), "seenPriceMsat": seen_n("seen_price_msat"),
+                                                                     "seenSliceWork": seen_s("seen_slice_work"), "seenStartSlices": seen_n("seen_start_slices")})))
                         .and_then(|v| match v["rental"].as_str() {
                             Some(_) => {
                                 // what the budget typed really buys, said: it bounds the payments as it always did
@@ -1280,7 +1310,9 @@ impl App {
                         })
                 }
             }
-            "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true, "once": g("once")})))
+            "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true, "once": g("once"),
+                                                                       "seenPriceMsat": seen_n("seen_price_msat"), "seenSliceWork": seen_s("seen_slice_work"),
+                                                                       "seenStartSlices": seen_n("seen_start_slices")})))
                 .and_then(|v| match v["rental"].as_str() {
                     Some(_) => Ok(format!("Trying one slice, at most {}.{} When it is done, its result shows under Your rentals.", sats_n(num(&v["budgetSats"])), may_buy(&v))),
                     None => Err(v["error"].as_str().map(|e| format!("Not started: {e}.")).unwrap_or_else(|| "Not started.".into())),
@@ -1290,6 +1322,13 @@ impl App {
                     Ok("Published. Other hashtakers see this rental among the hashmaker's delivery records.".into())
                 } else {
                     Err(v["error"].as_str().map(|e| format!("Not published: {e}.")).unwrap_or_else(|| "Not published: no relay took it.".into()))
+                }),
+            "topup" if n("add_sats") == 0 && n("add_minutes") == 0 => Err("Enter the sats to add to its budget, the minutes to add, or both.".into()),
+            "topup" => call(&base, &token, "POST", "/topup", Some(&json!({"rental": g("rental"), "addSats": n("add_sats"), "addMinutes": n("add_minutes"),
+                                                                         "once": g("once")})))
+                .and_then(|v| match v["budgetSats"].as_u64() {
+                    Some(b) => Ok(format!("Added. This rental may now cost up to {}, for {} minutes in all.", sats_n(b as f64), v["minutes"].as_u64().unwrap_or(0))),
+                    None => Err(v["error"].as_str().map(|e| format!("Not added: {e}.")).unwrap_or_else(|| "Not added.".into())),
                 }),
             "cut" => call(&base, &token, "POST", "/cut", Some(&json!({"rental": g("rental")})))
                 .and_then(|v| if v["ok"] == true { Ok("Cut. The miners stop working for you and payments stop.".into()) } else { Err("That rental had ended already.".into()) }),
@@ -1373,7 +1412,7 @@ fn priced_high(mine: f64, others: &[f64], market: Option<f64>) -> String {
 /// `gateway` is the heading `rent_status` gives the gateway's state, so the reason matches the notice on the page.
 /// `rules`: what the signed spending rules say of renting.
 #[allow(clippy::too_many_arguments)]
-fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool, old: bool, mine: bool, free: u64, total: u64) -> Vec<String> {
+fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool, old: bool, mine: bool, free: u64, total: u64, hashrate: f64) -> Vec<String> {
     let mut why = Vec::new();
     if mine {
         why.push("This is your own box's offer: buyers rent it from their apps".to_string());
@@ -1394,8 +1433,11 @@ fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool,
     if old {
         why.push("This hashmaker's app needs updating: it doesn't prove the work it sells".to_string());
     }
-    if total > 0 && free == 0 {
+    if total > 0 && free == 0 && hashrate > 0.0 {
         why.push("All of its machines are rented right now; try again later".to_string());
+    } else if free == 0 || hashrate <= 0.0 {
+        // its offer says no machine is connected, or none hashing: a rental would pay its start fee for nothing (#70)
+        why.push("Its miners are offline right now; try again later".to_string());
     }
     why
 }
@@ -1818,10 +1860,14 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     // role and meter); one whose link never opened ended before any work, and nothing was paid
     let failed = live["closed"].as_str().is_some_and(|w| w.starts_with("could not start"));
     let connecting = !ended && live.get("role").is_none() && live.get("meter").is_none();
+    // the seller refused the terms the page read, and hasn't published its new ones yet: the service waits for them
+    let waiting_terms = connecting && live["waitingForTerms"] == true;
     let pill = if failed {
         "<span class=\"pill bad\">Could not start</span>".to_string()
     } else if ended {
         "<span class=\"pill\">Ended</span>".to_string()
+    } else if waiting_terms {
+        "<span class=\"pill\">Waiting for the seller's terms</span>".to_string()
     } else if connecting {
         "<span class=\"pill\">Connecting…</span>".to_string()
     } else {
@@ -1833,6 +1879,12 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\"><strong>Ended:</strong> {}{}</p>",
                                                      esc(&ended_line(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { ended_words(w) })),
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
+    let why = if waiting_terms {
+        "<p class=\"hint\">Waiting for the seller's updated terms. It publishes them within about a minute, and the rental starts then if they cost no more \
+         than you agreed. Nothing has been paid. Cut cancels it.</p>".to_string()
+    } else {
+        why
+    };
     let times = rental_times(r, ended, crate::now() as u64 * 1000);
     // a payment the wallet refused: the hashmaker will only say a piece went unpaid, and the reason is this wallet's,
     // in words where it has them (xbt_hashlink::rail::BIG_TICKETS_ONLY and those beside it)
@@ -1851,6 +1903,16 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
                 App::csrf_input(ctx), esc(id), if _action.contains("connections") { "connections" } else { "hashrate" })
     };
     let trial = r["trial"] == true;
+    // a rental going on takes more budget and time here, so it carries on instead of ending and waiting for its own
+    // machine to be free for a new one (not one the wallet stopped paying: it asks for no more, whatever its budget)
+    let more = if ended || trial || live["payFailed"] == true {
+        String::new()
+    } else {
+        format!("<form method=\"post\" action=\"./hashrate\">{}<input type=\"hidden\" name=\"action\" value=\"topup\"><input type=\"hidden\" name=\"rental\" value=\"{}\">\
+                 <input type=\"hidden\" name=\"back\" value=\"{}\">{}<div class=\"price-row\"><label>Add to its budget, in sats<input name=\"add_sats\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label>\
+                 <label>Add minutes<input name=\"add_minutes\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label></div><button class=\"secondary\">Add to this rental</button></form>",
+                App::csrf_input(ctx), esc(id), if _action.contains("connections") { "connections" } else { "hashrate" }, once_input())
+    };
     let result = if ended && paid > 0 { result_box(&r["result"], trial) } else { String::new() };
     let attest = match (&r["attested"], ended && paid > 0) {
         (a, _) if a["ok"] == true => "<p class=\"hint\">Its delivery record is published.</p>".to_string(),
@@ -1874,7 +1936,7 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
         String::new()
     };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
-             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
+             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}{more}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
 }
@@ -2143,16 +2205,23 @@ mod tests {
 
     #[test]
     fn a_disabled_rent_says_why() {
-        let r = super::rent_off_reasons(false, "Your gateway isn't running", RentRules::Allowed, false, false, false, 1, 1);
+        let r = super::rent_off_reasons(false, "Your gateway isn't running", RentRules::Allowed, false, false, false, 1, 1, 4e12);
         assert_eq!(r.len(), 2, "{r:?}");
         assert!(r[0].starts_with("Your gateway isn't running"), "{r:?}");
         assert!(r[1].contains("Allow this hashmaker to be paid"), "{r:?}");
-        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, true, false, 0, 3);
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, true, false, 0, 3, 4e12);
         assert!(r[0].contains("needs updating") && r[1].contains("rented right now"), "{r:?}");
-        let r = super::rent_off_reasons(false, "Set up your gateway", RentRules::Allowed, false, true, true, 0, 1);
+        let r = super::rent_off_reasons(false, "Set up your gateway", RentRules::Allowed, false, true, true, 0, 1, 4e12);
         assert_eq!(r, vec!["This is your own box's offer: buyers rent it from their apps".to_string()]);
-        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 1, 1).is_empty());
-        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 0, 0).is_empty(), "no machine count given is not 'all rented'");
+        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 1, 1, 4e12).is_empty());
+        // no machine count given, or no hashrate: its miners are offline, and Rent is off (#70)
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 0, 0, 0.0);
+        assert_eq!(r, vec!["Its miners are offline right now; try again later".to_string()]);
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 1, 1, 0.0);
+        assert_eq!(r, vec!["Its miners are offline right now; try again later".to_string()], "free machines, but no hashrate");
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 0, 2, 4e12);
+        assert!(r[0].contains("All of its machines are rented"), "{r:?}");
+        assert!(super::ended_words("could not start: hashmaker refused: its miners are offline right now").contains("offline right now. Nothing was paid"));
     }
 
     /// A price saved with no rental going on is in force at once and holds no new rental: the first price, a
@@ -2235,9 +2304,28 @@ mod tests {
         assert!(c.contains("Connecting…") && !c.contains("Hashing"), "{c}");
         let c = card(json!({"role": "buyer", "meter": {"accepted": 3}, "closed": null}), false);
         assert!(c.contains("Hashing"), "{c}");
+        // the seller's new terms not published yet: the wait said in words, nothing paid, and it can be cut
+        let c = card(json!({"closed": null, "waitingForTerms": true}), false);
+        assert!(c.contains("Waiting for the seller's terms") && c.contains("Waiting for the seller's updated terms") && c.contains("Nothing has been paid") && c.contains(">Cut<"), "{c}");
+        assert!(!c.contains("Connecting…") && !c.contains("Hashing"), "{c}");
         let c = card(json!({"closed": "could not start: link i/o: Operation timed out (os error 110)"}), true);
         assert!(c.contains("Could not start") && c.contains("<strong>Ended:</strong> it could not start: link i/o: Operation timed out") && c.contains("Nothing was paid."), "{c}");
         assert!(!c.contains("Hashing") && !c.contains(">Cut<"), "{c}");
+        // a seller whose price moved up since the page read it: the new price said, and what to do
+        let c = card(json!({"closed": "could not start: the seller's price changed since the page read it (now 330 sats a piece of work, about 1033 sats an hour for each 1 TH/s); press Rent again if it suits you",
+                            "priceChanged": {"priceMsat": 330_000}}), true);
+        assert!(c.contains("Could not start") && c.contains("price changed since the page read it (now 330 sats a piece of work") && c.contains("press Rent again if it suits you. Nothing was paid."), "{c}");
+    }
+
+    /// Rent and Try one slice send the price the page showed, for the rental to agree to it and no more.
+    #[test]
+    fn the_rent_forms_carry_the_price_the_page_shows() {
+        let x = json!({"priceMsat": 300_000, "sliceWork": "140737488355328", "startSlices": 1});
+        let f = seen_inputs(&x);
+        assert!(f.contains("name=\"seen_price_msat\" value=\"300000\"") && f.contains("name=\"seen_slice_work\" value=\"140737488355328\"")
+                && f.contains("name=\"seen_start_slices\" value=\"1\""), "{f}");
+        assert_eq!(seen_inputs(&json!({"priceMsat": 300_000, "sliceWork": "<b>"})), "", "nothing but digits is sent back");
+        assert_eq!(seen_inputs(&json!({})), "");
     }
 
     use super::*;
@@ -2558,10 +2646,10 @@ mod tests {
     /// Rent is off, and says why, while the signed rules don't let a rental be paid.
     #[test]
     fn rent_waits_for_rules_that_pay_a_rental() {
-        let r = super::rent_off_reasons(true, "", RentRules::NoTask, true, false, false, 1, 1);
+        let r = super::rent_off_reasons(true, "", RentRules::NoTask, true, false, false, 1, 1, 4e12);
         assert_eq!(r.len(), 1, "{r:?}");
         assert!(r[0].contains("don't allow renting hashrate yet") && r[0].contains("Allow renting hashrate in your spending rules"), "{r:?}");
-        let r = super::rent_off_reasons(true, "", RentRules::TicketsOff, true, false, false, 1, 1);
+        let r = super::rent_off_reasons(true, "", RentRules::TicketsOff, true, false, false, 1, 1, 4e12);
         assert!(r[0].contains("Stream tickets are off"), "{r:?}");
         assert!(rules_notice(RentRules::Allowed).is_none());
         assert!(rules_notice(RentRules::NoTask).unwrap().1.contains("./policy?task=hashrate"));

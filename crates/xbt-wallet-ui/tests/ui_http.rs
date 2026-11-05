@@ -840,6 +840,44 @@ fn mock_http(answer: fn(&str) -> (u16, &'static str)) -> std::net::SocketAddr {
     xbt_svc::http::serve(Arc::new(Mock(answer)), l, 2).unwrap().addr
 }
 
+/// #41: no secret the box holds is in any page as it opens, nor in a redirect: the agents' access key, the gateway's
+/// health token, a route's login header and a password or key in a route's upstream address. Each page is opened
+/// logged in, and the login page without.
+#[cfg(unix)]
+#[test]
+fn no_secret_is_in_any_page_as_it_opens() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let tdir = tempfile::tempdir().unwrap();
+    let tok = tdir.path().join("mcp-http-token");
+    let gw = tdir.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let secrets = ["mcpkey".repeat(8), "healthtok".repeat(6), "hdrsecret".repeat(4), "urlpass".repeat(4), "urlkey".repeat(5)];
+    std::fs::write(&tok, format!("{}\n", secrets[0])).unwrap();
+    std::fs::write(gw.join("config.json"), json!({
+        "listen": "127.0.0.1:8402", "health_token": secrets[1],
+        "routes": [{"path": "/app/", "upstream": format!("http://admin:{}@127.0.0.1:9/?api_key={}", secrets[3], secrets[4]),
+                    "upstream_headers": {"x-emby-token": secrets[2]}, "price": {"request_msat": 1000}}]}).to_string()).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gw.clone();
+        c.mcp_urls = vec!["http://umbrel.local:33510/mcp".into()];
+        c.mcp_token_file = tok.clone();
+    });
+    let leaks = |what: &str, r: &str| {
+        for x in &secrets {
+            assert!(!r.contains(x.as_str()), "{what}: a secret is in it: {r}");
+        }
+    };
+    leaks("/login", &B::new(&bx.base).get("/login").body);
+    let mut br = logged_in(&bx);
+    for p in ["/", "/wallet", "/browse", "/services", "/sell", "/sell-hashrate", "/sell-vpn", "/hashrate", "/ai", "/vpn", "/nostr", "/relays",
+              "/connections", "/apps", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/agents", "/setup", "/lightning",
+              "/your-gateway", "/api/pending", "/api/hashrate-rentals", "/sell?edit=app"] {
+        let r = br.get(p);
+        leaks(p, &format!("{} {:?}", r.body, r.headers));
+    }
+}
+
 #[test]
 fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -1060,6 +1098,10 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert_eq!(c["node"]["macaroon"], json!(dir.join("invoices.macaroon").display().to_string()));
     assert_eq!(c["routes"], json!([{"path": "/", "price": {"request_msat": 2500}}]));
     xbt_gateway::config::Config::from_json(&c).unwrap();
+    // #41: the settings file shown on the page hides its health token (and every other secret)
+    let token = c["health_token"].as_str().unwrap().to_string();
+    let page = br.get("/").body;
+    assert!(page.contains("The settings file the selling part reads") && page.contains("(hidden)") && !page.contains(&token), "{page}");
     assert_eq!(hex::encode(std::fs::read(dir.join("invoices.macaroon")).unwrap()), inv);
     // a buyer on this machine (a test): loopback, and the macaroons kept when left empty
     let r = send(&mut br, form("http://127.0.0.1:8402", "", "regtest", ""));
@@ -1150,7 +1192,8 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     assert!(!tabs.contains("./ai\"") && !tabs.contains("./vpn\"") && !tabs.contains("./services\"") && tabs.contains("./connections"), "{tabs}");
     let chips = &page.body[page.body.find("<nav class=\"chips\"").unwrap()..];
     let chips = &chips[..chips.find("</nav>").unwrap()];
-    let order: Vec<usize> = [">All <", "./ai\">AI<", ">Hashrate<", "./vpn\">VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
+    let order: Vec<usize> = [">All <", "./ai\"><span class=\"icon\" aria-hidden=\"true\">🤖</span>AI<", ">Hashrate<",
+                            "./vpn\"><span class=\"icon\" aria-hidden=\"true\">🔒</span>VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
         .map(|c| chips.find(c).unwrap_or_else(|| panic!("{c}: {chips}"))).collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{chips}");
     assert!(page.body.contains("Your <a href=\"./services\">sellers</a>"), "Sellers, from Browse");
@@ -1192,9 +1235,9 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     let data = br.get("/browse?cat=files").body;
     assert!(data.contains("Zebra files") && data.contains("Alpha films"), "files, and an older film listing");
     let old_link = br.get("/browse?kind=video").body;
-    assert!(old_link.contains("Alpha films") && old_link.contains("aria-current=\"page\">Files"), "an older films link is files");
+    assert!(old_link.contains("Alpha films") && old_link.contains("aria-current=\"page\"><span class=\"icon\" aria-hidden=\"true\">📁</span>Files"), "an older films link is files");
     let old_cat = br.get("/browse?cat=media").body;
-    assert!(old_cat.contains("aria-current=\"page\">Web apps"), "the older media category is web apps");
+    assert!(old_cat.contains("aria-current=\"page\"><span class=\"icon\" aria-hidden=\"true\">🌐</span>Web apps"), "the older media category is web apps");
     assert!(br.get("/browse?cat=ai").body.contains("No services in this category yet"));
 
     let conn = br.get("/connections");
@@ -1998,6 +2041,11 @@ fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {
     // the page turned off: its routes are as any other, and the listing names no page
     let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
     let id = shop["offers"][1]["id"].as_str().unwrap().to_string();
+    // #41: the guest login is a credential: never in a page, the edit form included (only its header's name, once saved)
+    let media_id = shop["offers"][0]["id"].as_str().unwrap().to_string();
+    let edit = br.get(&format!("/sell?edit={media_id}")).body;
+    assert!(!edit.contains("guest-1") && edit.contains("saved (X-Emby-Token: …)"), "{edit}");
+    assert!(!br.get("/sell").body.contains("guest-1"));
     br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
                                ("name", "Model"), ("strip", "1")]);
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
@@ -2982,6 +3030,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
                                                   "payUrl": "https://miners.example/hashrate", "payNode": format!("03{}", "c".repeat(64))}]}),
         ("POST", "/rent") => json!({"ok": true, "rental": "r10", "budgetSats": 40, "mayBuyTicketUpToSats": 2000}),
         ("POST", "/cut") => json!({"ok": true}),
+        ("POST", "/topup") => json!({"ok": true, "rental": "r9", "budgetSats": 5000, "minutes": 90}),
         ("POST", "/datum") => json!({"ok": true, "datum": "datum-gateway:23334", "reachable": true}),
         _ => json!({"error": "no"}),
     });
@@ -3116,11 +3165,23 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert!(said.starts_with("Trying one slice, at most 40 sats. Your wallet may buy a ticket of up to 2,000 sats from this shop for it; unused credit stays \
                               with this seller for about 20 hours, for a later rental there."),
             "{said}");
+    // a rental going on takes more budget and time from its card, instead of a new rental waiting for its machine
+    assert!(card.contains("value=\"topup\"") && card.contains("name=\"add_sats\"") && card.contains("Add to this rental"), "{card}");
+    let topup_form = &card[card.find("value=\"topup\"").unwrap()..];
+    assert!(topup_form[..topup_form.find("</form>").unwrap()].contains("name=\"once\""), "a top-up is sent once: {card}");
+    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9"), ("add_sats", "1000"), ("add_minutes", "30"), ("once", "m7")]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("Added. This rental may now cost up to 5,000 sats, for 90 minutes in all."), "{said}");
+    let sent = rseen.lock().unwrap().iter().rev().find(|(m, p, _, _)| m == "POST" && p == "/topup").cloned().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&sent.3).unwrap(), json!({"rental": "r9", "addSats": 1000, "addMinutes": 30, "once": "m7"}));
+    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9")]);
+    assert!(br.flash_after(&r).starts_with("Enter the sats"));
     // Live connections shows the rental, with its Cut button
     let p = br.get("/connections");
     assert!(p.body.contains("Rented hashrate") && p.body.contains("data-spent=\"200\""), "{}", p.body);
     assert!(p.body.find("<h2>Rented hashrate</h2>").unwrap() < p.body.find("Every service you are paying for right now").unwrap(),
             "the rental going on first, the connections under it: {}", p.body);
+    assert!(p.body.contains("Add to this rental") && p.body.contains("name=\"back\" value=\"connections\""), "and there too: {}", p.body);
     plain("/connections", &p.body);
     let r = br.act("/connections", "/hashrate", &[("action", "cut"), ("rental", "r9"), ("back", "connections")]);
     assert_eq!(r.location(), "./connections");
@@ -3802,6 +3863,74 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
     let other = xbt402::shop::npub(&Keys::generate().public.serialize());
     let r = br.act("/services", "/services", &[("action", "add"), ("url", &other)]);
     assert!(br.flash_after(&r).contains("could not be found"));
+}
+
+/// 0.2.14, the case of 0.2.12: a shop reached by its key whose box was reinstalled with its signing key inside left a
+/// listing that can never be withdrawn, six days old, no link of it vouched for by any Lightning node. Allowing it said
+/// to press Check for updates, which could not help. Now it says the shop looks offline, and Browse and Found on Nostr
+/// fold it under "Offline shops (1)". A shop whose kept listing is old but whose new one on the relays is vouched for
+/// is allowed, from the new one.
+///
+/// FAILS before: "names no direct link that its Lightning node vouches for now. Press Check for updates".
+#[test]
+fn a_shop_that_looks_offline_is_said_to_be_when_allowed_and_folded_away() {
+    use xbt_nostr::{event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    let now = xbt_nostr::now();
+    let node = Sk::from_slice(&[9u8; 32]).unwrap();
+    let node_hex = hex::encode(xbt_primitives::ecdsa::pubkey(&node));
+    // a shop's listing published `at`, its links vouched for until `vouched` (none: no links)
+    let publish = |keys: &Keys, name: &str, at: u64, vouched: Option<u64>| {
+        let shop = xbt402::shop::origin_for(&keys.public.serialize());
+        let (sk, pk) = receipt_key(name.as_bytes());
+        let d = xbt402::listing::parse_draft(&json!({
+            "name": name, "kind": "video", "prices": {"byte_msat": 1000, "per_bytes": 1048576}, "items": [],
+            "licence": "CC BY 3.0", "credits": "c", "updated": "2026-10-30",
+        })).unwrap();
+        let doc = xbt402::listing::sign(&sk, &xbt402::listing::document(&d, &shop, &pk));
+        let ep = "ab".repeat(32);
+        let links: Vec<_> = vouched.into_iter().map(|expires| xbt402::transport::Link {
+            kind: "iroh".into(), endpoint_id: ep.clone(), relays: vec!["https://relay.example".into()], direct: vec![], expires,
+            node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) }).collect();
+        let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &links, &at.to_string()));
+        let bind = xbt402::listing::bind(&sk, &keys.public.serialize(), &shop);
+        let ev = market::listing_event_with(keys, &doc, &bind, Some(&t), at).unwrap();
+        assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+        (xbt402::shop::npub(&keys.public.serialize()), shop)
+    };
+    let orphan = Keys::generate();
+    let (orphan_npub, orphan_shop) = publish(&orphan, "StartOS packaging test", now - 6 * 86_400 - 60, None);
+    let bx = start(json!({}), false, |c| c.nostr_relays = relays.clone());
+    let mut br = logged_in(&bx);
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &orphan_npub)]);
+    assert!(br.flash_after(&r).contains("Added StartOS packaging test"));
+    let r = br.act("/services", "/services", &[("action", "allow"), ("url", &orphan_shop)]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("This seller could not be allowed. This listing is 6 days old and no Lightning node vouches for it any more: the shop looks offline."), "{f}");
+    assert!(!f.contains("Check for updates"), "nothing to update: {f}");
+    // folded on Browse and on Found on Nostr, and said on its service's page
+    let browse = br.get("/browse").body;
+    let fold = browse.find("Offline shops (1)").expect(&browse);
+    assert!(browse[fold..].contains("StartOS packaging test") && !browse[..fold].contains("StartOS packaging test"), "{browse}");
+    let found = br.get("/nostr?refresh=1").body;
+    let fold = found.find("Offline shops (1)").expect(&found);
+    assert!(found[fold..].contains("StartOS packaging test") && !found[..fold].contains("StartOS packaging test"), "{found}");
+    let page = br.get(&format!("/service?seller={}&name={}", orphan_shop.replace(':', "%3A").replace('/', "%2F"), "StartOS%20packaging%20test")).body;
+    assert!(page.contains("This shop looks offline.") && !page.contains("Allow StartOS packaging test first"), "{page}");
+
+    // a shop kept from an old listing, whose new one is vouched for: allowed from the new one, which is kept
+    let back = Keys::generate();
+    let (back_npub, back_shop) = publish(&back, "Back again", now - 5 * 86_400, None);
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &back_npub)]);
+    assert!(br.flash_after(&r).contains("Added Back again"));
+    publish(&back, "Back again", now, Some(now + 30 * 86_400));
+    let r = br.act("/services", "/services", &[("action", "allow"), ("url", &back_shop)]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert!(r.location().contains(&format!("node={node_hex}")), "{}", r.location());
+    let kept = xbt_wallet_ui::shops::load(&bx.data.path().join("ui/shops.json")).unwrap();
+    assert_eq!(kept[&back_shop].published_at, Some(now));
 }
 
 /// An AI seller added after the AI address already has one reaches it at once: the sellers file the
@@ -5100,6 +5229,51 @@ fn an_offer_shows_its_start_fee() {
     assert!(!old.contains("Start fee"), "{old}");
 }
 
+/// #70: an offer with no free machine, or no hashrate, has Rent and "Try one slice first" off, and says its miners are
+/// offline right now; an offer whose seller's node the wallet's node found no route to at a rent says so on its card.
+///
+/// FAILS before: an offer saying 0 machines and 0 hashrate ("free machines not given") could be rented, and a renter paid
+/// its start fee and first slice to a hashmaker no miner was connected to.
+#[test]
+fn an_offer_with_its_miners_offline_cannot_be_rented_and_an_unreachable_seller_is_said() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
+        ("GET", "/offers") => json!({"offers": [
+            {"name": "Kilohash", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 0, "freeMiners": 0, "freeHs": "0", "hashrateHs": "0"},
+            {"name": "Idle miners", "linkKey": "02cc", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 1, "freeMiners": 1, "freeHs": "0", "hashrateHs": "0"},
+            {"name": "Far miners", "linkKey": "02dd", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "hashrateHs": "4000000000000", "payNode": format!("03{}", "78".repeat(32)),
+             "unreachable": "can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive)"}]}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    let card = |name: &str| {
+        let c = &p.body[p.body.find(&format!("<h3>{name}</h3>")).unwrap_or_else(|| panic!("{name}: {}", p.body))..];
+        c[..c.find("</section>").unwrap()].to_string()
+    };
+    for name in ["Kilohash", "Idle miners"] {
+        let c = card(name);
+        assert!(c.contains("<button disabled>Rent</button>") && c.contains("<button class=\"secondary\" disabled>Try one slice first</button>"), "{name}: {c}");
+        assert!(c.contains("Its miners are offline right now"), "{name}: {c}");
+    }
+    let far = card("Far miners");
+    assert!(far.contains("Your wallet can&#39;t reach this seller&#39;s Lightning node right now (it may have only private channels, or none that can receive)")
+            || far.contains("Your wallet can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive)"), "{far}");
+    assert!(!far.contains("offline right now"), "{far}");
+}
+
 /// This box's own offer says what it is, with its address beside its name, and offers nothing to allow, try or rent; the
 /// "Your offer" note stays. Another hashmaker's offer keeps its Rent.
 ///
@@ -5661,7 +5835,7 @@ fn genesis_shop(bx: &Box_) -> (String, String, String) {
                                          node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) };
     let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &[link], "2026-11-01"));
     let mut shops = std::collections::BTreeMap::new();
-    shops.insert(shop.clone(), xbt_wallet_ui::shops::Shop { receipt_key: pk, transport: Some(t) });
+    shops.insert(shop.clone(), xbt_wallet_ui::shops::Shop { receipt_key: pk, transport: Some(t), published_at: None });
     let cfg = &bx._app.cfg;
     std::fs::create_dir_all(cfg.shops_path().parent().unwrap()).unwrap();
     xbt_wallet_ui::shops::save(&cfg.shops_path(), &shops).unwrap();
