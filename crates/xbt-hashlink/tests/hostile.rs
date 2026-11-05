@@ -71,7 +71,39 @@ fn app_full(terms: &Terms, min_slice_time: Duration, fallback: Option<String>) -
     )
     .unwrap();
     wait_for(&link);
+    STATUS.lock().unwrap().insert(link.clone(), (miners.clone(), Box::new(h.status_fn())));
     App { h, hpub: PublicKey::from_secret_key(secp256k1::SECP256K1, &hk), link, miners }
+}
+
+type StatusFn = Box<dyn Fn() -> Value + Send>;
+/// Each app's miners' address and its status, by its link's address: what [`connect`] looks at.
+static STATUS: Mutex<std::collections::BTreeMap<String, (String, StatusFn)>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn miners_connected(link: &str) -> u64 {
+    STATUS.lock().unwrap().get(link).map_or(1, |(_, st)| st()["capacity"]["miners"].as_u64().unwrap_or(0))
+}
+
+/// A hashmaker with no miner connected refuses a rental's hello (#70). These tests start their miners after the
+/// hello, as they always have: a connection that says nothing stands in for one until the welcome, then goes, before
+/// anything is paid, so no rental takes it.
+fn stand_in_for_a_miner(link: &str) -> Option<TcpStream> {
+    if miners_connected(link) > 0 {
+        return None;
+    }
+    let addr = STATUS.lock().unwrap().get(link).map(|(m, _)| m.clone())?;
+    let s = TcpStream::connect(addr).unwrap();
+    // with a fallback only a miner that said its name counts: it says one (and is never rented, gone at the welcome)
+    {
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{}", json!({"id": 1, "method": "mining.subscribe", "params": []})).unwrap();
+        writeln!(w, "{}", json!({"id": 2, "method": "mining.authorize", "params": ["stand-in", "x"]})).unwrap();
+    }
+    let t0 = Instant::now();
+    while miners_connected(link) == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the stand-in never showed");
+        thread::sleep(Duration::from_millis(20));
+    }
+    Some(s)
 }
 
 /// What the scripted hashtaker does with the shares it's given.
@@ -101,6 +133,7 @@ struct Buyer {
 }
 
 fn connect(addr: &str, key: SecretKey, hpub: PublicKey, rental: &str, first: Msg) -> (Buyer, Msg) {
+    let standin = matches!(first, Msg::Hello { .. }).then(|| stand_in_for_a_miner(addr)).flatten();
     let l = link::dial(addr, key, hpub).unwrap();
     l.tx.send(&first).unwrap();
     let (s, r) = mpsc::channel();
@@ -117,6 +150,13 @@ fn connect(addr: &str, key: SecretKey, hpub: PublicKey, rental: &str, first: Msg
         }
     });
     let reply = r.recv_timeout(Duration::from_secs(10)).unwrap();
+    if let Some(s) = standin {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+        let t0 = Instant::now();
+        while miners_connected(addr) > 0 && t0.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
     (Buyer { tx: l.tx, rx: r, key, rental: rental.into(), chan: None, shares: 0, resent: Vec::new(), verdicts: Verdicts::None, diff: DIFF, dues: 0, ended: false, resynced: None }, reply)
 }
 
@@ -953,8 +993,26 @@ fn a_rental_waiting_for_a_payment_holds_up_no_other_miner_from_its_address() {
     wait.until_serving();
     let mut ends = start("ends", 1);
     ends.until_serving();
+    // the third asks for two miners, and a hashmaker starts no rental with fewer free than asked (#70): a fourth miner
+    // connects for it, and goes once it is serving, so the third wants one more. It never says its name, so when it
+    // goes it leaves no place kept for it in the rental
+    let m3 = TcpStream::connect(&a.miners).unwrap();
+    let t0 = Instant::now();
+    while a.h.capacity().free_miners < 2 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the fourth miner never showed: {}", app_answers(&a.h));
+        thread::sleep(Duration::from_millis(20));
+    }
     let mut more = start("more", 2);
     more.until_serving();
+    let t0 = Instant::now();
+    while app_answers(&a.h)["rentals"].as_array().unwrap().iter().find(|r| r["rental"] == "more").is_none_or(|r| r["miners"].as_array().is_none_or(|m| m.len() < 2)) && t0.elapsed() < Duration::from_secs(5) {
+        more.pump(u64::MAX, Duration::from_millis(50));
+    }
+    let _ = m3.shutdown(std::net::Shutdown::Both);
+    let t0 = Instant::now();
+    while a.h.capacity().miners > 3 && t0.elapsed() < Duration::from_secs(10) {
+        more.pump(u64::MAX, Duration::from_millis(50));
+    }
     let had = more.chan;
     // the first rental's share waits for payment: it says one is on its way, and pays nothing more
     let t0 = Instant::now();

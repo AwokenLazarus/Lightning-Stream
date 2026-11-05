@@ -9,8 +9,9 @@
 //! * the wallet's socket (`B2_SIGNER_SOCK`: the MCP, the UI, the connector, an agent) is answered as
 //!   always, except that nothing on it is paid, opened, locked or released under a task with rental
 //!   terms;
-//! * the renter's socket (`B2_RENTAL_SOCK`, `run/rental/signer.sock`) answers the renter's three
-//!   methods only, and pays only a rental's pieces of work: `POST <pay url>/<rental>/<slice>`, where
+//! * the renter's socket (`B2_RENTAL_SOCK`, `run/rental/signer.sock`) answers the renter's four
+//!   methods only (the fourth, `ln_route_probe`, sends nothing), and pays only a rental's pieces of work:
+//!   `POST <pay url>/<rental>/<slice>`, where
 //!   the pay URL is the hashmaker's hashrate route (`…/hashrate`). Under a task with rental terms they
 //!   are paid on those terms; under one without (an older wallet whose owner signed no rental terms),
 //!   as on the wallet's socket, under the wallet's own limits: the socket grants nothing by itself.
@@ -33,8 +34,9 @@ pub enum Caller {
     Renter,
 }
 
-/// What the renter's socket answers: a piece of work paid, its session stopped, and whether the signer is up.
-pub const RENTER_METHODS: [&str; 3] = ["xbt402_pay", "ticket_stop", "health"];
+/// What the renter's socket answers: a piece of work paid, its session stopped, whether the signer is up, and whether
+/// the wallet's node finds a route to a seller's node before a rental pays anything (read only).
+pub const RENTER_METHODS: [&str; 4] = ["xbt402_pay", "ticket_stop", "health", "ln_route_probe"];
 
 /// Whether `url` is a rental's piece of work as the renter pays it (xbt-hashlink's `SignerPayer`):
 /// `POST <pay url>/<rental>/<slice>`, the pay URL ending in the hashmaker's hashrate route (`/hashrate`), the
