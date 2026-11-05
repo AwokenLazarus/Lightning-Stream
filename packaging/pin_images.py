@@ -90,19 +90,25 @@ IMAGE_SOURCES = ["crates", "Cargo.toml", "Cargo.lock", "container", ":(glob,excl
 # images' pins stale, so a fix release may rebuild them alone and keep the others' pins (0.2.1: xbt-wallet-ui;
 # 0.2.2: xbt-wallet-ui and lightning-stream)
 # path -> the images built from it (no other image's crates depend on it)
+LINK_USERS = {"lightning-stream", "xbt-gateway", "xbt-hashlink", "xbt-signer", "xbt-anchor-witness", "xbt-vpn",
+              "xbt-wallet-mcp", "xbt-wallet-ui"}
 OWN_SOURCES = {
     "crates/xbt-wallet-ui": {"xbt-wallet-ui"},
     "crates/lightning-stream": {"lightning-stream", "xbt-wallet-ui"},
     # 0.2.3: the VPN service is also linked into the wallet UI; the signer crate into the wallet UI, the
     # wallet MCP (and its xbt-nwc) and the anchor witness, which builds from the same package
     "crates/xbt-vpn": {"xbt-vpn", "xbt-wallet-ui"},
-    "crates/xbt-signer": {"xbt-signer", "xbt-anchor-witness", "xbt-wallet-mcp", "xbt-wallet-ui", "xbt-vpn"},
+    "crates/xbt-signer": {"xbt-signer", "xbt-anchor-witness", "xbt-wallet-mcp", "xbt-wallet-ui", "xbt-vpn", "lightning-stream"},
     # 0.2.6: the gateway crate is linked into the signer (and so the anchor witness) and the wallet UI; the wallet MCP
     # crate into the connector, the VPN service and the wallet UI
     "crates/xbt-gateway": {"xbt-gateway", "xbt-signer", "xbt-anchor-witness", "xbt-wallet-ui"},
     "crates/xbt-wallet-mcp": {"xbt-wallet-mcp", "lightning-stream", "xbt-vpn", "xbt-wallet-ui"},
     # 0.2.10: the hashrate crate is only the hashlink image's (the signer takes it as a dev-dependency, for its tests)
     "crates/xbt-hashlink": {"xbt-hashlink"},
+    # 0.2.14: everything that opens a link links these two; the stream relay takes the link crate only as a
+    # dev-dependency (its relay_scale example), and xbt-init and the Stream Gateway link neither
+    "crates/xbt-iroh-link": LINK_USERS,
+    "crates/xbt-nostr": LINK_USERS,
 }
 
 
