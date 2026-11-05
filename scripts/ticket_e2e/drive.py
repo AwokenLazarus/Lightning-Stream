@@ -3166,9 +3166,8 @@ def mesh_pay() -> None:
     # the seller has its channel from the hop and no balance to pay from until it is past its reserve; a seller with
     # lenders has a working balance
     bill = lab.post(SELLER, "/v1/invoices", {"value": "1000000", "memo": "the operator's working balance"})
-    sent = lab.post(HOP, "/v1/channels/transactions", {"payment_request": bill["payment_request"]})
-    if sent.get("payment_error"):
-        raise LabError(f"the operator's working balance: {sent['payment_error']}")
+    lab.lncli(HOP, "payinvoice", "--force", "--json", bill["payment_request"])
+    lab.wait("the operator's working balance", 60, lambda: int(lab.channel(SELLER, HOP)["local_balance"]) >= 1_000_000)
     (lno_a, b64_a, hex_a), (lno_b, b64_b, hex_b) = mint_offer(HOP), mint_offer(OFFER_NODE)
     for name, lno in ((HOP, lno_a), (OFFER_NODE, lno_b)):
         lab.wait(f"{name} issuing invoices for its offer", 180,
