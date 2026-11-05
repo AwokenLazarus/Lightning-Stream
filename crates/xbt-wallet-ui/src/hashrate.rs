@@ -1384,7 +1384,6 @@ fn priced_high(mine: f64, others: &[f64], market: Option<f64>) -> String {
 /// `gateway` is the heading `rent_status` gives the gateway's state, so the reason matches the notice on the page.
 /// `rules`: what the signed spending rules say of renting.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool, old: bool, mine: bool, free: u64, total: u64, hashrate: f64) -> Vec<String> {
     let mut why = Vec::new();
     if mine {
