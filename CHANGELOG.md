@@ -5,8 +5,51 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
-## 0.2.14 (unreleased)
+## 0.2.14 (2026-11-05)
 
+No hashrate rental is paid to a hashmaker with no miner online or to a seller the wallet can't reach, a rental going
+on can be topped up (sent by a hashmaker who runs the app), and shops that stopped are said to be offline and
+folded away. The hashrate component, the signer, the wallet UI, the gateway, the Nostr crate and the direct link
+change.
+
+When you press Rent, the app now checks, before anything is paid: the offer has a free miner and hashrate, the
+price is no dearer than the page showed, the wallet's node finds a route to the seller's node, and, right before
+it dials the hashmaker, the offer read fresh from the relays still has a free miner.
+
+- **No rental is paid to a hashmaker whose miners are offline** (#70). A rental paid its start fee and first slice
+  (808 sat) to a hashmaker whose offer said 0 miners, 0 free and 0 hashrate; no miner ever connected and the rental
+  ended with no work. Now:
+  - a hashmaker refuses a new rental before its welcome, so before any payment, when fewer of its connected miners
+    are free than the rental asks for ("its miners are offline right now" when none is connected). A miner that is
+    connecting as the rental is asked for is waited for up to 5 seconds. The first slice of a rental whose miners left
+    after its welcome is refused too, so its charge, the start fee with it, goes back.
+  - Rent and "Try one slice first" are off for an offer with no free machine or no hashrate, and say "Its miners are
+    offline right now". The renter refuses such an offer, and looks the offer up again on the relays right before it
+    dials the hashmaker and pays the start fee.
+  - a hashmaker's listing goes out as its first miner connects, before that miner's hashrate is measured. The
+    measured hashrate is now published within a minute, not after ten, so its offer can be rented that soon.
+- **A seller the wallet can't reach is found before anything is paid.** A rental from a seller whose node has only
+  private channels failed at its first slice with "the wallet's node has found no route to the seller". Before a
+  rental pays, the renter asks the wallet's signer once whether its node finds a route to the seller's node for the
+  first ticket (a new read-only call on the renter's socket, `ln_route_probe`). A definite no route (a public node no
+  route reaches, a wallet whose channels can't send that much, or a payment to that node that found no route through
+  its whole wait, with its invoice's route hints, in the last 10 minutes) refuses the rental with "can't reach this
+  seller's Lightning node right now (it may have only private channels, or none that can receive)", said on the
+  offer's card for 10 minutes. Anything the probe can't tell (a node with only private channels it has no hints for,
+  a node that doesn't answer, an older signer) lets the rental go on as before.
+- **Add budget and time to a rental going on** (#53). A rental ended when its budget was spent, and renting again
+  waited for a machine the rental itself held ("All of its machines are rented right now"). Each rental card going
+  on (Buy → Hashrate, Live connections) now has an "Add to this rental" form: the sats and minutes added carry the
+  rental on. A form sent twice adds once; nothing is added to a test slice, a rental that ended or was cut, or one
+  the wallet stopped paying; a rental lasts a week at the most in all, and its whole budget is bounded. Each payment
+  is still under your signed spending rules, so the hashrate task's budget still stops a topped-up rental.
+- **A rental refused on a seller's new price opens again on it, when it costs no more** (#69). A seller whose price
+  follows the market republishes its terms as blocks come, and a rental opened on the offer the page read a little
+  earlier was refused at once ("terms differ from the listing"). Rent and "Try one slice first" now send the price
+  the page showed; on that refusal the app reads the seller's offer again and opens the rental once more on its new
+  terms only from the same seller, shop and node, with a piece of work, the start fee and the first payment no more
+  than 1% dearer than what the page showed, the first payment inside the budget, and the rental not cut meanwhile.
+  A dearer price is never taken: the rental ends saying the new price, and nothing is paid.
 - **A shop that looks offline is said to be.** Allowing a shop reached by its key whose listing is more than two
   days old, and whose links no Lightning node vouches for any more, said "its listing names no direct link that its
   Lightning node vouches for now. Press Check for updates, or ask the seller." Neither could help: the shop had
@@ -26,30 +69,16 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   lasts a week instead of 30 days, and the app announces it again each day while it runs; `xbt-relay-announce`
   defaults to a week and takes `--every-hours` to keep announcing. VPN exits (a week, sent every six hours) and
   hashrate offers (two days, sent at least every six hours) already lapsed this way.
-- **No rental is paid to a hashmaker whose miners are offline** (#70). A rental paid its start fee and first slice
-  (808 sat) to a hashmaker whose offer said 0 miners, 0 free and 0 hashrate; no miner ever connected and the rental
-  ended with no work. Now:
-  - a hashmaker refuses a new rental before its welcome, so before any payment, when fewer of its connected miners
-    are free than the rental asks for ("its miners are offline right now" when none is connected). A miner that is
-    connecting as the rental is asked for is waited for up to 5 seconds. The first slice of a rental whose miners left
-    after its welcome is refused too, so its charge, the start fee with it, goes back.
-  - Rent and "Try one slice first" are off for an offer with no free machine or no hashrate, and say "Its miners are
-    offline right now". The renter refuses such an offer, and looks the offer up again on the relays right before it
-    dials the hashmaker and pays the start fee.
-- **A seller the wallet can't reach is found before anything is paid.** A rental from a seller whose node has only
-  private channels failed at its first slice with "the wallet's node has found no route to the seller". Before a
-  rental pays, the renter asks the wallet's signer once whether its node finds a route to the seller's node for the
-  first ticket (a new read-only call on the renter's socket, `ln_route_probe`). A definite no route (a public node no
-  route reaches, a wallet whose channels can't send that much, or a payment to that node that found no route through
-  its whole wait, with its invoice's route hints, in the last 10 minutes) refuses the rental with "can't reach this
-  seller's Lightning node right now (it may have only private channels, or none that can receive)", said on the
-  offer's card for 10 minutes. Anything the probe can't tell (a node with only private channels it has no hints for,
-  a node that doesn't answer, an older signer) lets the rental go on as before.
 - **No secret is in a page as it opens** (#41). The Gateway app's page showed its settings file with the gateway's
   health token in full, and a service's edit form on the Sell page showed its guest login (a credential header).
   The settings shown now hide more secret names, every value under one, and a password or key in any address; the
   guest login is never shown again once saved (left empty, it is kept). The agents' access key was already shown only
   on "Show the access key".
+- **Browse has an icon for each kind of service** (#68): AI, Hashrate, VPN, Files, Data & APIs and Web apps, on
+  Browse's chips and on each kind's label (cards, a service's page, Sellers, Nostr listings).
+
+Thanks to Kilombino, who sent adding budget and time to a rental going on (#53), reopening a rental on a seller's
+new price when it is no dearer (#69), and the icons on Browse (#68).
 
 ## 0.2.13 (2026-11-04)
 
