@@ -1604,7 +1604,7 @@ mod tests {
         let (code, again) = topup(json!({"rental": id, "addSats": first, "addMinutes": 2, "once": "m1"}));
         assert_eq!((code, again), (200, v.clone()));
         assert_eq!((lock(&r).rentals[&id].budget_sats, lock(&r).rentals[&id].added.msat()), (2 * first, first * 1000), "added once");
-        assert_eq!(topup(json!({"rental": id, "addSats": 21_000_000 * 100_000_000})).0, 400, "past all the bitcoin there is, in all");
+        assert_eq!(topup(json!({"rental": id, "addSats": 21_000_000u64 * 100_000_000})).0, 400, "past all the bitcoin there is, in all");
         // paid on past the first budget's three pieces
         let t0 = Instant::now();
         while !h.status()["rentals"].as_array().is_some_and(|a| a.iter().any(|x| x["paid"].as_u64().unwrap_or(0) > 3)) {
