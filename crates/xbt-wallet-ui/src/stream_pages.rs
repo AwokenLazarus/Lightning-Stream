@@ -1008,7 +1008,7 @@ mod tests {
         let l = xbt402::listing::Listing { name: "Box".into(), kind: "hashrate".into(), seller: "https://box.example".into(), receipt_key: String::new(),
             prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
         let all = services::from_listing(&l);
-        let html = browse_html(&all, "", Sort::Name, "", &|_| false);
+        let html = browse_html(&all, "", Sort::Name, "", &|_| false, &|_| None);
         for (icon, words) in [("🤖", "AI"), ("⛏️", "Hashrate"), ("🔒", "VPN"), ("📁", "Files"), ("📊", "Data &amp; APIs"), ("🌐", "Web apps")] {
             assert!(html.contains(&format!("<span class=\"icon\" aria-hidden=\"true\">{icon}</span>{words}")), "{words}: {html}");
         }
