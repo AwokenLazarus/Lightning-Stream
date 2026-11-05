@@ -198,6 +198,6 @@ mod tests {
         assert!(below.contains("StartOS packaging test") && below.contains("This listing is 6 days old and no Lightning node vouches for it any more: the shop looks offline."), "{below}");
         // nothing offline: no fold
         let snap = crate::nostr::Snapshot { listings: snap.listings[1..].to_vec(), ..snap };
-        assert!(!nostr_html(&ctx, &snap, &[], &|_: &str| false, now).contains("Offline shops"));
+        assert!(!nostr_html(&ctx, &snap, &[], &|s: &str| s == "https://own.example", now).contains("Offline shops"));
     }
 }
