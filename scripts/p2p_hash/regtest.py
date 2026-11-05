@@ -422,7 +422,9 @@ def topup_run() -> None:
                                               "--slices", f"127.0.0.1:{SLICES}", *t, "--report", f"{RUN}/topup-{tag}-hasher.json",
                                               "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hashmaker",
                                               "--link-public", f"127.0.0.1:{LINK}", "--pay-url", f"{ORIGIN2}/hashrate", "--pay-node", lab.pubkey(d.SELLER),
-                                              "--hashrate-hs", "4000000000000", "--listing-out", f"{RUN}/topup-{tag}-listing.json"])
+                                              "--hashrate-hs", "4000000000000", "--listing-out", f"{RUN}/topup-{tag}-listing.json",
+                                              # its two miners, said in the listing: the app's renter rents no offer that shows none (#70)
+                                              "--listed-miners", "2"])
         lab.wait("the hashmaker's listing", 30, lambda: os.path.exists(f"{RUN}/topup-{tag}-listing.json"), every=0.2)
         time.sleep(0.5)
         return [hm, *(spawn(f"topup-{tag}-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{MINERS}", "--user", f"hasher.m{i}", "--rate", "1.5",
