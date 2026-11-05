@@ -929,8 +929,11 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         let mut res = hashtaker::run(cfg, Box::<LabHashtaker>::default());
         // the seller changed its terms since they were read (a price that follows the market moves with every block):
         // its offer is read again, and the rental opened once more on it only if it costs no more than the renter agreed
-        if res.as_ref().is_err_and(|e| e.ends_with(TERMS_DIFFER)) {
+        // (not one cut meanwhile: the second rental would pay its start fee before its ticker reads the cut)
+        if res.as_ref().is_err_and(|e| e.ends_with(TERMS_DIFFER)) && !start.cut.load(Ordering::Relaxed) {
             res = match relisted(&service, &h, agreed, budget_sats) {
+                // the relays take a while to answer: cut while they did, nothing is opened
+                Ok(_) if start.cut.load(Ordering::Relaxed) => Err("cut before it started: nothing was paid".into()),
                 Ok((h2, event2)) => {
                     eprintln!("hashtaker: rental {} refused on terms read before the seller changed them: opened again on its new ones", start.id);
                     hashtaker_config(&service, &h2, event2, &start).and_then(|cfg| hashtaker::run(cfg, Box::<LabHashtaker>::default()))
@@ -1035,14 +1038,22 @@ impl Agreed {
         })
     }
 
-    /// These terms cost no more than agreed, within [`PRICE_LEEWAY_PERCENT`]: the price of a unit of work, and the start fee.
+    /// These terms cost no more than agreed, within [`PRICE_LEEWAY_PERCENT`]: the price of a unit of work, the start fee,
+    /// and the first payment (the start fee and one slice: what is paid before any work is done, so a seller can't make
+    /// its slices larger at the same price per unit of work and have more paid ahead of the work than the renter saw).
     fn allows(&self, t: &xbt_hashlink::msg::Terms) -> bool {
+        let within = |new: Option<u128>, agreed: Option<u128>| match (new.and_then(|n| n.checked_mul(100)), agreed.and_then(|a| a.checked_mul(100 + PRICE_LEEWAY_PERCENT))) {
+            (Some(n), Some(a)) => n <= a,
+            // past what can be counted: never agreed to
+            _ => false,
+        };
+        let mul = |a: u128, b: u128| a.checked_mul(b);
         // price per work: new.price / new.work <= agreed.price / agreed.work, with the leeway, cross-multiplied
-        let per_work = (t.price_msat as u128).checked_mul(self.slice_work).and_then(|x| x.checked_mul(100))
-            .zip((self.price_msat as u128).checked_mul(t.slice_work).and_then(|x| x.checked_mul(100 + PRICE_LEEWAY_PERCENT)))
-            .is_some_and(|(new, agreed)| t.slice_work > 0 && new <= agreed);
-        let fee = |p: u64, n: u64| (p as u128) * (n as u128);
-        per_work && fee(t.price_msat, t.start_slices) * 100 <= fee(self.price_msat, self.start_slices) * (100 + PRICE_LEEWAY_PERCENT)
+        let per_work = t.slice_work > 0 && within(mul(t.price_msat as u128, self.slice_work), mul(self.price_msat as u128, t.slice_work));
+        let fee = |p: u64, n: u64| mul(p as u128, n as u128);
+        let first = |p: u64, n: u64| mul(p as u128, n as u128 + 1);
+        per_work && within(fee(t.price_msat, t.start_slices), fee(self.price_msat, self.start_slices))
+            && within(first(t.price_msat, t.start_slices), first(self.price_msat, self.start_slices))
     }
 }
 
@@ -1145,8 +1156,13 @@ fn relisted(r: &Mutex<R>, was: &Hashrate, agreed: Agreed, budget_sats: u64) -> R
     if h.pay_url != was.pay_url || h.pay_node != was.pay_node || !h.proves() {
         return Err(("the seller changed its terms and how it is paid since the page read them: look at its offer again".into(), None));
     }
-    if !agreed.allows(&h.terms) || first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
+    // what the page showed is only the most agreed to: the new terms are no dearer than the offer this service read either
+    if !agreed.allows(&h.terms) || !Agreed::of(&was.terms).allows(&h.terms) || first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
         return Err((price_changed(&h.terms), Some(h.terms)));
+    }
+    // a shorter grace for each payment is a rental more easily ended as unpaid, after its start fee: not taken unasked
+    if h.terms.grace_ms < was.terms.grace_ms {
+        return Err(("the seller changed its terms since the page read them, and now waits less for each payment: look at its offer again".into(), None));
     }
     Ok((h, event))
 }
@@ -1632,6 +1648,12 @@ mod tests {
         assert!(!a.allows(&Terms { slice_work: 1 << 39, ..seen.clone() }), "the same price for half the work");
         assert!(!a.allows(&Terms { start_slices: 2, ..seen.clone() }), "a dearer start fee");
         assert!(!a.allows(&Terms { slice_work: 0, ..seen.clone() }));
+        // larger slices at the same price per unit of work, the start fee dropped: more paid before any work than seen
+        assert!(!a.allows(&Terms { price_msat: 1_200_000, slice_work: 1 << 42, start_slices: 0, ..seen.clone() }), "four times the first payment");
+        // a dearer slice made to look cheap by a start fee of slices too many to count
+        assert!(!a.allows(&Terms { price_msat: u64::MAX, slice_work: u128::MAX, start_slices: u64::MAX, ..seen.clone() }));
+        assert!(!Agreed { price_msat: u64::MAX, slice_work: 1, start_slices: u64::MAX }.allows(&Terms { price_msat: u64::MAX, slice_work: 1, start_slices: u64::MAX, ..seen.clone() }),
+                "past what can be counted: never agreed");
         // what the page sends, read back; none sent, none read
         let b = json!({"seenPriceMsat": 300_000, "seenSliceWork": (1u128 << 40).to_string(), "seenStartSlices": 1});
         assert_eq!(Agreed::seen(&b), Some(a));
@@ -1698,6 +1720,34 @@ mod tests {
         assert_eq!(fin[0]["earnedMsat"].as_u64(), Some(paid * now.price_msat), "paid at the new price: {}", fin[0]);
         let live = ended(&r, &id);
         assert!(live.get("priceChanged").is_none() && !live["closed"].as_str().unwrap_or("").starts_with("could not start"), "{live}");
+    }
+
+    /// Cut while the seller's offer is read again: nothing is opened on the new terms, no start fee paid.
+    #[test]
+    fn a_rental_cut_while_its_seller_is_read_again_opens_nothing() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 297_000, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        let relisted = lock(&r).relist.clone().unwrap();
+        let asked = Arc::new(AtomicBool::new(false));
+        let a = asked.clone();
+        lock(&r).relist = Some(Arc::new(move || {
+            a.store(true, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(1500));
+            relisted()
+        }));
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let id = v["rental"].as_str().unwrap().to_string();
+        let t0 = Instant::now();
+        while !asked.load(Ordering::Relaxed) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the offer was never read again");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
+        let live = ended(&r, &id);
+        assert!(live["closed"].as_str().unwrap_or("").contains("cut before it started"), "{live}");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(h.finished().is_empty() && h.status()["rentals"].as_array().is_some_and(|a| a.is_empty()), "nothing opened: {}", h.status());
     }
 
     /// Dearer now, past the leeway: nothing is opened on the new terms, and the rental says the new price; nothing paid.
