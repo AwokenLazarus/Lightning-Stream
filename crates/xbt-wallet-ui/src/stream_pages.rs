@@ -286,11 +286,11 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     // list of sellers: with none on that list its chip leads there, with no count (0.2.1 said "Hashrate 0" beside an offer)
     for (id, words) in [("", "All"), ("ai", "AI"), ("hashrate", "Hashrate"), ("vpn", "VPN"), ("files", "Files"), ("data", "Data & APIs"), ("apps", "Web apps")] {
         if matches!(id, "ai" | "vpn") || (id == "hashrate" && count(id) == 0) {
-            b.push_str(&format!("<a href=\"./{id}\">{}</a>", esc(words)));
+            b.push_str(&format!("<a href=\"./{id}\">{}{}</a>", services::icon(id), esc(words)));
             continue;
         }
         let cur = if id == cat { " aria-current=\"page\"" } else { "" };
-        b.push_str(&format!("<a href=\"./browse?cat={id}{sort_q}\"{cur}>{} <span class=\"count\">{}</span></a>", esc(words), count(id)));
+        b.push_str(&format!("<a href=\"./browse?cat={id}{sort_q}\"{cur}>{}{} <span class=\"count\">{}</span></a>", services::icon(id), esc(words), count(id)));
     }
     b.push_str("</nav>");
     if all.is_empty() {
@@ -325,9 +325,9 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
         let what = if s.app.is_empty() || s.category() == "apps" { what } else { format!("{what} · has its own app") };
         // a hashrate seller costs what its live offer asks, never the price its listing (or an older services file) names
         let price = if s.kind == Kind::Hashrate { live(&s.seller).unwrap_or_else(|| services::HASHRATE_PRICE_WORDS.into()) } else { s.price_text.clone() };
-        b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}</span>{}<h2>{}</h2>\
+        b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}{}</span>{}<h2>{}</h2>\
                              <p class=\"price\">{}</p><p class=\"small\">{} · {}</p></a>",
-                            service_href(s), s.category(), esc(s.category_words()),
+                            service_href(s), s.category(), services::icon(s.category()), esc(s.category_words()),
                             if mine { " <span class=\"pill good\">Your shop</span>" } else { "" },
                             esc(&s.name), esc(&price), esc(&what), esc(&seller_words(all, &s.seller))));
     }
@@ -366,9 +366,9 @@ fn service_href(s: &Service) -> String {
 /// this box's own shop, which this box cannot buy from: its app opens as a free preview instead.
 fn service_html(s: &Service, own: bool, seller: &str) -> String {
     let mut b = format!("<p class=\"small\"><a href=\"./browse?cat={}\">← {}</a></p>\
-        <section class=\"card\"><div class=\"offer-head\"><span class=\"pill cat-{}\">{}</span><span class=\"price\">{}</span></div>\
+        <section class=\"card\"><div class=\"offer-head\"><span class=\"pill cat-{}\">{}{}</span><span class=\"price\">{}</span></div>\
         <p class=\"small\">Sold by {}</p></section>",
-        s.category(), esc(s.category_words()), s.category(), esc(s.category_words()),
+        s.category(), esc(s.category_words()), s.category(), services::icon(s.category()), esc(s.category_words()),
         esc(if s.kind == Kind::Hashrate { services::HASHRATE_PRICE_WORDS } else { &s.price_text }), esc(seller));
     if own {
         b.push_str(if s.app.is_empty() {
@@ -998,6 +998,22 @@ mod tests {
         let none: Vec<Service> = vec![Service { kind: Kind::Ai, ..all[0].clone() }];
         let html = browse_html(&none, "hashrate", Sort::Name, "", &|_| false, &|_| None);
         assert!(html.contains("Miners for rent are listed on the <a href=\"./hashrate\">Hashrate</a> page") && !html.contains("No services in this category"), "{html}");
+    }
+
+    /// Every kind has its icon before its name, on its chip and on its cards' pill, hidden from screen readers; All has none.
+    #[test]
+    fn each_kind_has_its_icon_on_its_chip_and_its_cards() {
+        let section = xbt402::listing::Section { name: "My miners".into(), kind: "hashrate".into(), path: "/hashrate/".into(),
+            prices: json!({"request_msat": "40000"}), items: vec![], licence: String::new(), credits: String::new() };
+        let l = xbt402::listing::Listing { name: "Box".into(), kind: "hashrate".into(), seller: "https://box.example".into(), receipt_key: String::new(),
+            prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
+        let all = services::from_listing(&l);
+        let html = browse_html(&all, "", Sort::Name, "", &|_| false, &|_| None);
+        for (icon, words) in [("🤖", "AI"), ("⛏️", "Hashrate"), ("🔒", "VPN"), ("📁", "Files"), ("📊", "Data &amp; APIs"), ("🌐", "Web apps")] {
+            assert!(html.contains(&format!("<span class=\"icon\" aria-hidden=\"true\">{icon}</span>{words}")), "{words}: {html}");
+        }
+        assert!(html.contains("aria-current=\"page\">All <span class=\"count\">"), "{html}");
+        assert!(html.contains("<span class=\"pill cat-hashrate\"><span class=\"icon\" aria-hidden=\"true\">⛏️</span>Hashrate</span>"), "{html}");
     }
 
     #[test]

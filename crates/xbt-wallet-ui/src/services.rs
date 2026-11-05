@@ -34,6 +34,21 @@ pub enum Kind {
 /// opened in the buyer's own player. The app has no player of its own.
 pub const CATEGORIES: [(&str, &str); 5] = [("apps", "Web apps"), ("files", "Files"), ("ai", "AI"), ("hashrate", "Hashrate"), ("data", "Data & APIs")];
 
+/// A category's icon, before its name on Browse's chips and on each service's pill: a picture to tell the kinds apart at a
+/// glance, hidden from screen readers (the name says it). None for All, or a category it doesn't know.
+pub fn icon(id: &str) -> String {
+    let i = match id {
+        "ai" => "🤖",
+        "hashrate" => "⛏️",
+        "vpn" => "🔒",
+        "files" => "📁",
+        "data" => "📊",
+        "apps" => "🌐",
+        _ => return String::new(),
+    };
+    format!("<span class=\"icon\" aria-hidden=\"true\">{i}</span>")
+}
+
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {

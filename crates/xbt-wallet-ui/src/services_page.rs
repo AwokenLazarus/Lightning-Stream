@@ -103,8 +103,8 @@ impl App {
                                         esc(&services::seller_name(&all, &origin))));
                     for s in &list {
                         let n = s.items.len();
-                        b.push_str(&format!("<li><span class=\"pill cat-{}\">{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
-                                            s.category(), esc(s.category_words()), esc(&s.name), esc(&s.price_text),
+                        b.push_str(&format!("<li><span class=\"pill cat-{}\">{}{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
+                                            s.category(), services::icon(s.category()), esc(s.category_words()), esc(&s.name), esc(&s.price_text),
                                             if n > 0 { format!(" <span class=\"small\">{n} to choose from</span>") } else { String::new() }));
                     }
                     b.push_str("</ul>");

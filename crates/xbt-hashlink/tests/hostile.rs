@@ -1390,6 +1390,7 @@ fn taker_config(link: &str, hpub: PublicKey, terms: &Terms, upstream: &str, rent
         miners: 1,
         budget_msat: None,
         cut: None,
+        added: None,
         live: None,
         gateway_api: None,
         allow_unblinded: true,

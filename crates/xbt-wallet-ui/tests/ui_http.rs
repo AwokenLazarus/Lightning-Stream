@@ -1150,7 +1150,8 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     assert!(!tabs.contains("./ai\"") && !tabs.contains("./vpn\"") && !tabs.contains("./services\"") && tabs.contains("./connections"), "{tabs}");
     let chips = &page.body[page.body.find("<nav class=\"chips\"").unwrap()..];
     let chips = &chips[..chips.find("</nav>").unwrap()];
-    let order: Vec<usize> = [">All <", "./ai\">AI<", ">Hashrate<", "./vpn\">VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
+    let order: Vec<usize> = [">All <", "./ai\"><span class=\"icon\" aria-hidden=\"true\">🤖</span>AI<", ">Hashrate<",
+                            "./vpn\"><span class=\"icon\" aria-hidden=\"true\">🔒</span>VPN<", ">Files <", ">Data &amp; APIs <", ">Web apps <"].iter()
         .map(|c| chips.find(c).unwrap_or_else(|| panic!("{c}: {chips}"))).collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{chips}");
     assert!(page.body.contains("Your <a href=\"./services\">sellers</a>"), "Sellers, from Browse");
@@ -1192,9 +1193,9 @@ fn browse_and_connections_follow_the_services_file_and_stop_through_the_signer()
     let data = br.get("/browse?cat=files").body;
     assert!(data.contains("Zebra files") && data.contains("Alpha films"), "files, and an older film listing");
     let old_link = br.get("/browse?kind=video").body;
-    assert!(old_link.contains("Alpha films") && old_link.contains("aria-current=\"page\">Files"), "an older films link is files");
+    assert!(old_link.contains("Alpha films") && old_link.contains("aria-current=\"page\"><span class=\"icon\" aria-hidden=\"true\">📁</span>Files"), "an older films link is files");
     let old_cat = br.get("/browse?cat=media").body;
-    assert!(old_cat.contains("aria-current=\"page\">Web apps"), "the older media category is web apps");
+    assert!(old_cat.contains("aria-current=\"page\"><span class=\"icon\" aria-hidden=\"true\">🌐</span>Web apps"), "the older media category is web apps");
     assert!(br.get("/browse?cat=ai").body.contains("No services in this category yet"));
 
     let conn = br.get("/connections");
@@ -2982,6 +2983,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
                                                   "payUrl": "https://miners.example/hashrate", "payNode": format!("03{}", "c".repeat(64))}]}),
         ("POST", "/rent") => json!({"ok": true, "rental": "r10", "budgetSats": 40, "mayBuyTicketUpToSats": 2000}),
         ("POST", "/cut") => json!({"ok": true}),
+        ("POST", "/topup") => json!({"ok": true, "rental": "r9", "budgetSats": 5000, "minutes": 90}),
         ("POST", "/datum") => json!({"ok": true, "datum": "datum-gateway:23334", "reachable": true}),
         _ => json!({"error": "no"}),
     });
@@ -3116,11 +3118,23 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     assert!(said.starts_with("Trying one slice, at most 40 sats. Your wallet may buy a ticket of up to 2,000 sats from this shop for it; unused credit stays \
                               with this seller for about 20 hours, for a later rental there."),
             "{said}");
+    // a rental going on takes more budget and time from its card, instead of a new rental waiting for its machine
+    assert!(card.contains("value=\"topup\"") && card.contains("name=\"add_sats\"") && card.contains("Add to this rental"), "{card}");
+    let topup_form = &card[card.find("value=\"topup\"").unwrap()..];
+    assert!(topup_form[..topup_form.find("</form>").unwrap()].contains("name=\"once\""), "a top-up is sent once: {card}");
+    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9"), ("add_sats", "1000"), ("add_minutes", "30"), ("once", "m7")]);
+    let said = br.flash_after(&r);
+    assert!(said.contains("Added. This rental may now cost up to 5,000 sats, for 90 minutes in all."), "{said}");
+    let sent = rseen.lock().unwrap().iter().rev().find(|(m, p, _, _)| m == "POST" && p == "/topup").cloned().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&sent.3).unwrap(), json!({"rental": "r9", "addSats": 1000, "addMinutes": 30, "once": "m7"}));
+    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9")]);
+    assert!(br.flash_after(&r).starts_with("Enter the sats"));
     // Live connections shows the rental, with its Cut button
     let p = br.get("/connections");
     assert!(p.body.contains("Rented hashrate") && p.body.contains("data-spent=\"200\""), "{}", p.body);
     assert!(p.body.find("<h2>Rented hashrate</h2>").unwrap() < p.body.find("Every service you are paying for right now").unwrap(),
             "the rental going on first, the connections under it: {}", p.body);
+    assert!(p.body.contains("Add to this rental") && p.body.contains("name=\"back\" value=\"connections\""), "and there too: {}", p.body);
     plain("/connections", &p.body);
     let r = br.act("/connections", "/hashrate", &[("action", "cut"), ("rental", "r9"), ("back", "connections")]);
     assert_eq!(r.location(), "./connections");
