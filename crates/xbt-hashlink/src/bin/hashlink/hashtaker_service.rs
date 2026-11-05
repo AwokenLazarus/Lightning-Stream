@@ -7,7 +7,8 @@
 //! `--iroh off` turns it off, `--iroh-relays` names relays); one naming only a TCP address, over TCP.
 //!
 //! Control page: `GET /status`, `GET /offers`, `POST /rent {"linkKey", "miners", "budgetSats",
-//! "minutes", "once"}` (or `{"linkKey", "trial": true, "once"}`: one slice, to try a hashmaker first; a request
+//! "minutes", "once", "seenPriceMsat"?, "seenSliceWork"?, "seenStartSlices"?}` (the price the page showed: the rental
+//! agrees to no dearer; refused on terms the seller changed since, it opens again once on new ones that cost no more) (or `{"linkKey", "trial": true, "once"}`: one slice, to try a hashmaker first; a request
 //! sent again with the same `once` starts nothing and answers what the first did), `POST /cut
 //! {"rental"}`, `POST /datum {"addr", "api"?}`, `POST /attest {"rental"}` (publish a signed delivery record
 //! of a rental that ended, if the hashtaker chooses to), `GET /gateway-page?p=PAGE` (one of the bundled gateway's own
@@ -78,6 +79,8 @@ struct Rental {
     live: Arc<Mutex<Value>>,
     cut: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    /// What the hashtaker added to its budget and time while it went on ([`top_up`]).
+    added: Arc<hashtaker::Added>,
 }
 
 struct R {
@@ -125,7 +128,11 @@ struct R {
     /// Rent requests by their mark (`once`): the answer of the one that started a rental, or `None` while it
     /// is starting. A request sent again gets that answer and starts nothing.
     onces: HashMap<String, (Instant, Option<(u16, Value)>)>,
+    /// Stands in for the relays when a refused rental reads its seller's offer again (tests); `None`: the relays.
+    relist: Option<Relist>,
 }
+
+type Relist = Arc<dyn Fn() -> Option<Vec<(Hashrate, String)>> + Send + Sync>;
 
 /// A gateway's API port when nothing says otherwise.
 const GATEWAY_API_PORT: u16 = 7152;
@@ -298,6 +305,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     let r = Arc::new(Mutex::new(R {
         shown: None,
         onces: HashMap::new(),
+        relist: None,
         failed_first,
         key: crate::hashmaker_service::key_file(super::need(f, "key")?)?,
         datum,
@@ -770,7 +778,8 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             }
         }
         ("POST", "/rent") => rent_once(r, &b),
-        _ => (404, json!({"error": "GET /status, GET /offers, GET /gateway-page, POST /rent, POST /cut, POST /datum, POST /attest"})),
+        ("POST", "/topup") => top_up(r, &b),
+        _ => (404, json!({"error": "GET /status, GET /offers, GET /gateway-page, POST /rent, POST /cut, POST /topup, POST /datum, POST /attest"})),
     }
 }
 
@@ -859,6 +868,12 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     if !h.proves() {
         return (400, json!({"error": "this hashmaker's app doesn't prove the work it sells: it needs updating"}));
     }
+    // what the renter agreed to: the price its page showed. The offer read here may be newer than the page: dearer, it is
+    // said and nothing starts
+    let agreed = Agreed::seen(b).unwrap_or_else(|| Agreed::of(&h.terms));
+    if !agreed.allows(&h.terms) {
+        return (409, json!({"error": price_changed(&h.terms), "priceChanged": h.terms.to_json()}));
+    }
     if trial {
         // one machine, one slice: the budget is one slice's price with the start fee, and the time a few slices' worth
         miners = 1;
@@ -871,52 +886,18 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     if first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
         return (400, json!({"error": if h.terms.start_slices > 0 { "the budget is less than the start fee and one slice" } else { "the budget is less than one slice" }}));
     }
-    // over iroh when the listing offers it (no port forward needed on the hashmaker's side), else over
-    // TCP to the address it names
-    let addr = match &h.iroh {
-        Some(i) => match dialer(r) {
-            Some(d) => match d.address_for(i) {
-                Ok(a) => a,
-                Err(e) => return (502, json!({"error": format!("the direct link to that hashmaker did not open: {e}")})),
-            },
-            None if !h.link_addr.is_empty() => h.link_addr.clone(),
-            None => return (502, json!({"error": "that hashmaker is reached only over a direct link, and this app's direct link is off or did not start"})),
-        },
-        None => h.link_addr.clone(),
-    };
     let id = format!("r{}", xbt_hashlink::now_ms());
     let live = Arc::new(Mutex::new(json!({"closed": null})));
     let cut = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let (key, user, signer, task, gateway_api, allow_unblinded) = {
-        let g = lock(r);
-        (g.key, g.user.clone(), g.signer.clone(), g.task.clone(), g.api(), g.allow_unblinded)
+    let added = Arc::new(hashtaker::Added::default());
+    let start = RentStart { id: id.clone(), miners, minutes, budget_sats, ticket_budget_sats, live: live.clone(), cut: cut.clone(), added: added.clone() };
+    let cfg = match hashtaker_config(r, &h, event, &start) {
+        Ok(c) => c,
+        Err(e) => return (502, json!({"error": e})),
     };
     // the first ticket, the first step's: later ones grow as they are earned, inside the budget
     let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(ticket_budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
-    let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(ticket_budget_sats), None,
-                                                   std::time::Duration::from_millis(h.terms.grace_ms / 2)));
-    let cfg = hashtaker::Config {
-        hashmaker: addr,
-        hashmaker_key: h.link_key,
-        key,
-        upstream: datum,
-        user,
-        terms: h.terms.clone(),
-        rental: id.clone(),
-        listing: event,
-        stop_paying_after: None,
-        idle: Duration::from_secs(180),
-        duration: Some(Duration::from_secs(minutes * 60)),
-        report: None,
-        payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
-        miners,
-        budget_msat: Some(budget_sats * 1000),
-        cut: Some(cut.clone()),
-        live: Some(live.clone()),
-        gateway_api: gateway_api.clone(),
-        allow_unblinded,
-    };
     {
         let mut g = lock(r);
         if g.rentals.len() >= KEPT {
@@ -938,14 +919,37 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             live: live.clone(),
             cut,
             done: done.clone(),
+            added,
         });
     }
     let hashmaker_key: PublicKey = h.link_key;
     let service = r.clone();
     std::thread::spawn(move || {
-        let res = hashtaker::run(cfg, Box::<LabHashtaker>::default());
+        let mut res = hashtaker::run(cfg, Box::<LabHashtaker>::default());
+        // the seller changed its terms since they were read (a price that follows the market moves with every block):
+        // its offer is read again, and the rental opened once more on it only if it costs no more than the renter agreed
+        if res.as_ref().is_err_and(|e| e.ends_with(TERMS_DIFFER)) {
+            res = match relisted(&service, &h, agreed, budget_sats) {
+                Ok((h2, event2)) => {
+                    eprintln!("hashtaker: rental {} refused on terms read before the seller changed them: opened again on its new ones", start.id);
+                    hashtaker_config(&service, &h2, event2, &start).and_then(|cfg| hashtaker::run(cfg, Box::<LabHashtaker>::default()))
+                }
+                Err((why, now)) => {
+                    if let Some(t) = now {
+                        if let Some(o) = live.lock().unwrap_or_else(|p| p.into_inner()).as_object_mut() {
+                            o.insert("priceChanged".into(), t.to_json());
+                        }
+                    }
+                    Err(why)
+                }
+            };
+        }
         match res {
-            Err(e) => *live.lock().unwrap_or_else(|p| p.into_inner()) = json!({"closed": format!("could not start: {e}")}),
+            Err(e) => {
+                if let Some(o) = live.lock().unwrap_or_else(|p| p.into_inner()).as_object_mut() {
+                    o.insert("closed".into(), json!(format!("could not start: {e}")));
+                }
+            }
             Ok(report) => lock(&service).note_rental_end(&hex::encode(hashmaker_key.serialize()), &report),
         }
         // when it ended, for the renter's page to say beside its start
@@ -957,6 +961,183 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     });
     // the rental may buy the shop's ticket: what of it the slices do not use stays with that shop as credit
     (200, json!({"ok": true, "rental": id, "trial": trial, "budgetSats": budget_sats, "minutes": minutes, "mayBuyTicketUpToSats": first_ticket}))
+}
+
+/// Add budget (`addSats`) and time (`addMinutes`) to a rental going on, so it carries on instead of a new one being
+/// rented (which waits for a machine the rental itself holds). A rental's limits stay those of a new one: a week at
+/// the most. Its payments are the wallet's as before, each under the owner's rules (the hashrate task's budget).
+fn top_up(r: &Mutex<R>, b: &Value) -> (u16, Value) {
+    let id = b["rental"].as_str().unwrap_or("");
+    let (sats, minutes) = (b["addSats"].as_u64().unwrap_or(0), b["addMinutes"].as_u64().unwrap_or(0));
+    let mut g = lock(r);
+    let Some(x) = g.rentals.get_mut(id) else { return (404, json!({"error": "no such rental"})) };
+    if x.done.load(Ordering::Relaxed) || x.cut.load(Ordering::Relaxed) || !x.live.lock().unwrap_or_else(|p| p.into_inner())["closed"].is_null() {
+        return (409, json!({"error": "that rental has ended: rent again"}));
+    }
+    if x.trial {
+        return (400, json!({"error": "a test slice is one piece of work: rent this hashmaker to go on"}));
+    }
+    if sats == 0 && minutes == 0 {
+        return (400, json!({"error": "add sats to its budget, minutes to its time, or both"}));
+    }
+    let most = 7 * 24 * 60;
+    if x.minutes.saturating_add(minutes) > most {
+        return (400, json!({"error": format!("a rental lasts a week at the most: it may have {} minutes more", most - x.minutes.min(most))}));
+    }
+    if sats > 21_000_000 * 100_000_000 {
+        return (400, json!({"error": "that budget is too large"}));
+    }
+    x.added.msat.fetch_add(sats * 1000, Ordering::Relaxed);
+    x.added.secs.fetch_add(minutes * 60, Ordering::Relaxed);
+    x.budget_sats = x.budget_sats.saturating_add(sats);
+    x.minutes += minutes;
+    (200, json!({"ok": true, "rental": id, "budgetSats": x.budget_sats, "minutes": x.minutes}))
+}
+
+/// What a hashmaker answers when the terms a rental opens with are not those it offers now.
+const TERMS_DIFFER: &str = "terms differ from the listing";
+/// How much more than the renter saw a piece of work, and the start fee, may cost (per hundred) for a rental refused on
+/// changed terms to be opened again on the new ones without asking: a price that follows the market moves a little
+/// with each block. Above it the renter is told the new price and decides; the budget bounds the spending either way.
+const PRICE_LEEWAY_PERCENT: u128 = 1;
+
+/// The price a renter agreed to: what the offer it pressed Rent on asked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Agreed {
+    price_msat: u64,
+    slice_work: u128,
+    start_slices: u64,
+}
+
+impl Agreed {
+    fn of(t: &xbt_hashlink::msg::Terms) -> Agreed {
+        Agreed { price_msat: t.price_msat, slice_work: t.slice_work, start_slices: t.start_slices }
+    }
+
+    /// The price the page showed, sent with the rent (`seenPriceMsat`, `seenSliceWork`, `seenStartSlices`); `None` from a
+    /// caller that doesn't send it, whose rent agrees to the offer as the service reads it.
+    fn seen(b: &Value) -> Option<Agreed> {
+        Some(Agreed {
+            price_msat: b["seenPriceMsat"].as_u64()?,
+            slice_work: b["seenSliceWork"].as_str()?.parse().ok().filter(|w| *w > 0)?,
+            start_slices: b["seenStartSlices"].as_u64().unwrap_or(0),
+        })
+    }
+
+    /// These terms cost no more than agreed, within [`PRICE_LEEWAY_PERCENT`]: the price of a unit of work, and the start fee.
+    fn allows(&self, t: &xbt_hashlink::msg::Terms) -> bool {
+        // price per work: new.price / new.work <= agreed.price / agreed.work, with the leeway, cross-multiplied
+        let per_work = (t.price_msat as u128).checked_mul(self.slice_work).and_then(|x| x.checked_mul(100))
+            .zip((self.price_msat as u128).checked_mul(t.slice_work).and_then(|x| x.checked_mul(100 + PRICE_LEEWAY_PERCENT)))
+            .is_some_and(|(new, agreed)| t.slice_work > 0 && new <= agreed);
+        let fee = |p: u64, n: u64| (p as u128) * (n as u128);
+        per_work && fee(t.price_msat, t.start_slices) * 100 <= fee(self.price_msat, self.start_slices) * (100 + PRICE_LEEWAY_PERCENT)
+    }
+}
+
+/// A figure in sats, as short as it reads.
+fn sats_words(sat: f64) -> String {
+    let s = if sat >= 100.0 { format!("{sat:.0}") } else if sat >= 1.0 { format!("{sat:.1}") } else { format!("{sat:.3}") };
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    format!("{s} sats")
+}
+
+/// The new price, said as the offers page says it.
+fn price_words(t: &xbt_hashlink::msg::Terms) -> String {
+    let piece = t.price_msat as f64 / 1000.0;
+    let th_hour = if t.slice_work > 0 { piece * 1e12 * 3600.0 / t.slice_work as f64 } else { 0.0 };
+    let fee = if t.start_slices > 0 { format!(", and a start fee of {}", sats_words(piece * t.start_slices as f64)) } else { String::new() };
+    format!("now {} a piece of work, about {} an hour for each 1 TH/s{fee}", sats_words(piece), sats_words(th_hour))
+}
+
+fn price_changed(t: &xbt_hashlink::msg::Terms) -> String {
+    format!("the seller's price changed since the page read it ({}); press Rent again if it suits you", price_words(t))
+}
+
+/// What a rental starts with, whichever of the seller's terms it opens on.
+struct RentStart {
+    id: String,
+    miners: u32,
+    minutes: u64,
+    budget_sats: u64,
+    ticket_budget_sats: u64,
+    live: Arc<Mutex<Value>>,
+    cut: Arc<AtomicBool>,
+    /// What the hashtaker adds to its budget and time while it goes on ([`top_up`]).
+    added: Arc<hashtaker::Added>,
+}
+
+/// The hashtaker's settings for a rental on this offer: reached over iroh when the listing offers it (no port forward
+/// needed on the hashmaker's side), else over TCP to the address it names; paid at its terms, within the budget.
+fn hashtaker_config(r: &Mutex<R>, h: &Hashrate, event: String, s: &RentStart) -> Result<hashtaker::Config, String> {
+    let addr = match &h.iroh {
+        Some(i) => match dialer(r) {
+            Some(d) => d.address_for(i).map_err(|e| format!("the direct link to that hashmaker did not open: {e}"))?,
+            None if !h.link_addr.is_empty() => h.link_addr.clone(),
+            None => return Err("that hashmaker is reached only over a direct link, and this app's direct link is off or did not start".into()),
+        },
+        None => h.link_addr.clone(),
+    };
+    let (key, user, signer, task, datum, gateway_api, allow_unblinded) = {
+        let g = lock(r);
+        (g.key, g.user.clone(), g.signer.clone(), g.task.clone(), g.datum.clone(), g.api(), g.allow_unblinded)
+    };
+    let payer = signer.map(|sock| {
+        let mut p = SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(s.ticket_budget_sats), None,
+                                     std::time::Duration::from_millis(h.terms.grace_ms / 2));
+        p.added = Some(s.added.clone());
+        p
+    });
+    Ok(hashtaker::Config {
+        hashmaker: addr,
+        hashmaker_key: h.link_key,
+        key,
+        upstream: datum,
+        user,
+        terms: h.terms.clone(),
+        rental: s.id.clone(),
+        listing: event,
+        stop_paying_after: None,
+        idle: Duration::from_secs(180),
+        duration: Some(Duration::from_secs(s.minutes * 60)),
+        report: None,
+        payer: payer.map(|p| Box::new(p) as Box<dyn xbt_hashlink::rail::Payer>),
+        miners: s.miners,
+        budget_msat: Some(s.budget_sats * 1000),
+        cut: Some(s.cut.clone()),
+        added: Some(s.added.clone()),
+        live: Some(s.live.clone()),
+        gateway_api,
+        allow_unblinded,
+    })
+}
+
+/// The seller's offer read again after it refused a rental's terms: the same seller (link key, shop and node), with new
+/// terms the renter agreed to (no dearer, within the leeway) and whose first payment fits the budget. Otherwise why
+/// not, and the new terms when they are only too dear.
+fn relisted(r: &Mutex<R>, was: &Hashrate, agreed: Agreed, budget_sats: u64) -> Result<(Hashrate, String), (String, Option<xbt_hashlink::msg::Terms>)> {
+    let key = hex::encode(was.link_key.serialize());
+    let relist = lock(r).relist.clone();
+    let offers = match relist {
+        Some(f) => f(),
+        None => look_up_offers(r),
+    };
+    let Some(offers) = offers else {
+        return Err(("the seller's terms changed since the page read them, and no Nostr relay answered to read the new ones: press Rent again in a minute".into(), None));
+    };
+    let Some((h, event)) = offers.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key) else {
+        return Err(("the seller's terms changed since the page read them, and its listing is no longer on the relays".into(), None));
+    };
+    if h.terms == was.terms {
+        return Err(("the seller's terms changed since the page read them, and its new listing isn't on the relays yet: press Rent again in a minute".into(), None));
+    }
+    if h.pay_url != was.pay_url || h.pay_node != was.pay_node || !h.proves() {
+        return Err(("the seller changed its terms and how it is paid since the page read them: look at its offer again".into(), None));
+    }
+    if !agreed.allows(&h.terms) || first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
+        return Err((price_changed(&h.terms), Some(h.terms)));
+    }
+    Ok((h, event))
 }
 
 /// Publish the signed delivery record of a rental that ended (the hashtaker's choice, per rental).
@@ -1262,6 +1443,7 @@ mod tests {
         Arc::new(Mutex::new(R {
             shown: None,
             onces: HashMap::new(),
+            relist: None,
             failed_first: BTreeMap::new(),
             key: noise::fresh_key(),
             datum: String::new(),
@@ -1371,6 +1553,147 @@ mod tests {
         assert_eq!(report["paidSlices"].as_u64(), Some(paid), "both sides count the same slices paid: {report}");
     }
 
+    /// Budget added to a rental going on is paid on: it carries on past the pieces its first budget had, instead of
+    /// ending and waiting for its own machine to be free for a new one. Not to a rental that ended, nor to a test slice.
+    #[test]
+    fn a_rental_going_on_takes_more_budget_and_time() {
+        let (h, listing) = hashmaker_with_two_miners();
+        let terms = listing.terms.clone();
+        let key = hex::encode(listing.link_key.serialize());
+        let r = renter(listing);
+        // the start fee and two slices
+        let first = 3 * terms.price_msat / 1000;
+        let (code, v) = handle(&r, &[], "POST", "/rent", json!({"linkKey": key, "miners": 1, "budgetSats": first, "minutes": 1}).to_string().as_bytes());
+        assert_eq!(code, 200, "{v}");
+        let id = v["rental"].as_str().unwrap().to_string();
+        let topup = |b: Value| handle(&r, &[], "POST", "/topup", b.to_string().as_bytes());
+        assert_eq!(topup(json!({"rental": id})).0, 400, "nothing to add");
+        assert_eq!(topup(json!({"rental": id, "addMinutes": 7 * 24 * 60})).0, 400, "past a week");
+        assert_eq!(topup(json!({"rental": "nope", "addSats": 1})).0, 404);
+        let (code, v) = topup(json!({"rental": id, "addSats": first, "addMinutes": 2}));
+        assert_eq!(code, 200, "{v}");
+        assert_eq!((v["budgetSats"].clone(), v["minutes"].clone()), (json!(2 * first), json!(3)));
+        // paid on past the first budget's three pieces
+        let t0 = Instant::now();
+        while !h.status()["rentals"].as_array().is_some_and(|a| a.iter().any(|x| x["paid"].as_u64().unwrap_or(0) > 3)) {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the rental never went past its first budget: {} {}", h.status(), lock(&r).rentals[&id].live.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(lock(&r).rentals[&id].live.lock().unwrap()["budgetMsat"], json!(2 * first * 1000), "the rental's own budget grew");
+        handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
+        assert_eq!(topup(json!({"rental": id, "addSats": 100})).0, 409, "cut: rent again");
+    /// A renter agrees to the price it saw: a unit of work dearer by more than the leeway, or a dearer start fee, is not
+    /// agreed; the same price, a cheaper one, or one within the leeway (said per unit of work, whatever a slice's size) is.
+    #[test]
+    fn a_rental_agrees_only_to_a_price_no_dearer_than_the_one_seen() {
+        let seen = Terms { slice_work: 1 << 40, price_msat: 300_000, grace_ms: 2500, start_slices: 1 };
+        let a = Agreed::of(&seen);
+        assert!(a.allows(&seen));
+        assert!(a.allows(&Terms { price_msat: 290_000, ..seen.clone() }), "cheaper");
+        assert!(a.allows(&Terms { price_msat: 302_000, ..seen.clone() }), "within the leeway");
+        assert!(!a.allows(&Terms { price_msat: 310_000, ..seen.clone() }), "dearer past the leeway");
+        assert!(a.allows(&Terms { price_msat: 600_000, slice_work: 1 << 41, start_slices: 0, ..seen.clone() }), "twice the work for twice the price, no start fee");
+        assert!(!a.allows(&Terms { slice_work: 1 << 39, ..seen.clone() }), "the same price for half the work");
+        assert!(!a.allows(&Terms { start_slices: 2, ..seen.clone() }), "a dearer start fee");
+        assert!(!a.allows(&Terms { slice_work: 0, ..seen.clone() }));
+        // what the page sends, read back; none sent, none read
+        let b = json!({"seenPriceMsat": 300_000, "seenSliceWork": (1u128 << 40).to_string(), "seenStartSlices": 1});
+        assert_eq!(Agreed::seen(&b), Some(a));
+        assert_eq!(Agreed::seen(&json!({"linkKey": "02"})), None);
+        let t = Terms { slice_work: 1 << 47, price_msat: 40_400, grace_ms: 2500, start_slices: 0 };
+        assert_eq!(price_words(&t), "now 40.4 sats a piece of work, about 1033 sats an hour for each 1 TH/s");
+        assert_eq!(price_words(&Terms { start_slices: 2, ..t }), "now 40.4 sats a piece of work, about 1033 sats an hour for each 1 TH/s, and a start fee of 80.8 sats");
+        assert_eq!(sats_words(0.25), "0.25 sats");
+    }
+
+    /// The renter's service with a seller's old offer kept, the seller now asking `now`, and the relays showing its offer at
+    /// those terms when it reads them again.
+    fn renter_after_the_price_moved(now: &Terms) -> (Hashmaker, Arc<Mutex<R>>, String, Terms) {
+        let (h, listing) = hashmaker_with_two_miners();
+        let was = listing.terms.clone();
+        let key = hex::encode(listing.link_key.serialize());
+        h.set_terms(now.clone());
+        let relisted = Hashrate { terms: now.clone(), ..listing.clone() };
+        let r = renter(listing);
+        lock(&r).relist = Some(Arc::new(move || Some(vec![(relisted.clone(), "ev2".into())])));
+        (h, r, key, was)
+    }
+
+    fn seen_rent(key: &str, t: &Terms) -> Vec<u8> {
+        json!({"linkKey": key, "miners": 1, "budgetSats": 20000, "minutes": 1,
+               "seenPriceMsat": t.price_msat, "seenSliceWork": t.slice_work.to_string(), "seenStartSlices": t.start_slices}).to_string().into_bytes()
+    }
+
+    fn ended(r: &Mutex<R>, id: &str) -> Value {
+        let t0 = Instant::now();
+        loop {
+            let done = lock(r).rentals[id].done.load(Ordering::Relaxed);
+            if done {
+                return lock(r).rentals[id].live.lock().unwrap().clone();
+            }
+            assert!(t0.elapsed() < Duration::from_secs(20), "the rental never ended");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A seller whose price follows the market changed it after the page read its offer, and refuses the old terms
+    /// ("terms differ from the listing", 0.2.11 on Umbrel). Cheaper now: its offer is read again and the rental opens on
+    /// the new terms, at once, nothing paid on the old.
+    #[test]
+    fn a_rental_refused_on_old_terms_opens_again_on_cheaper_new_ones() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 297_000, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let id = v["rental"].as_str().unwrap().to_string();
+        let t0 = Instant::now();
+        while !h.status()["rentals"].as_array().is_some_and(|a| a.iter().any(|x| x["paid"].as_u64().unwrap_or(0) > now.start_slices)) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the rental never started on the new terms: {} {}", h.status(), lock(&r).rentals[&id].live.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
+        let t0 = Instant::now();
+        while h.finished().is_empty() {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the rental never ended: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(h.finished()[0]["paid"].as_u64().unwrap() <= 6, "and never past what was added: {}", h.finished()[0]);
+        // a test slice is one piece: nothing is added to it
+        lock(&r).rentals.get_mut(&id).unwrap().trial = true;
+        lock(&r).rentals.get_mut(&id).unwrap().done.store(false, Ordering::Relaxed);
+        lock(&r).rentals.get_mut(&id).unwrap().cut.store(false, Ordering::Relaxed);
+        *lock(&r).rentals[&id].live.lock().unwrap() = json!({"closed": null});
+        assert_eq!(topup(json!({"rental": id, "addSats": 100})).0, 400);
+        let fin = h.finished();
+        let paid = fin[0]["paid"].as_u64().unwrap();
+        assert_eq!(fin[0]["earnedMsat"].as_u64(), Some(paid * now.price_msat), "paid at the new price: {}", fin[0]);
+        let live = ended(&r, &id);
+        assert!(live.get("priceChanged").is_none() && !live["closed"].as_str().unwrap_or("").starts_with("could not start"), "{live}");
+    }
+
+    /// Dearer now, past the leeway: nothing is opened on the new terms, and the rental says the new price; nothing paid.
+    #[test]
+    fn a_rental_refused_on_old_terms_says_a_dearer_new_price_and_opens_nothing() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 330_000, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let live = ended(&r, v["rental"].as_str().unwrap());
+        let closed = live["closed"].as_str().unwrap_or("");
+        assert!(closed.starts_with("could not start: the seller's price changed since the page read it (now 330 sats a piece of work"), "{live}");
+        assert!(closed.ends_with("press Rent again if it suits you"), "{closed}");
+        assert_eq!(live["priceChanged"], now.to_json());
+        assert!(live.get("spentMsat").is_none_or(|s| s == 0), "{live}");
+        assert!(h.finished().is_empty() && h.status()["rentals"].as_array().is_some_and(|a| a.is_empty()), "nothing opened: {}", h.status());
+        // the offer kept is newer than the page, and dearer: the rent says so and starts nothing
+        let dearer = Hashrate { terms: now.clone(), ..lock(&r).offers.as_ref().unwrap().1[0].0.clone() };
+        lock(&r).offers = Some((Instant::now(), vec![(dearer, "ev2".into())]));
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().starts_with("the seller's price changed"), "{v}");
+        assert_eq!(lock(&r).rentals.len(), 1, "no second rental");
+    }
+
     fn record(taker: &SecretKey, maker: &PublicKey, rental: &str, ended: u64) -> xbt_nostr::event::Event {
         let t = PublicKey::from_secret_key(secp256k1::SECP256K1, taker);
         trust::Attestation {
@@ -1464,6 +1787,7 @@ mod tests {
             miners: 1,
             budget_msat: None,
             cut: None,
+            added: None,
             live: None,
             gateway_api: None,
             allow_unblinded: true,
@@ -1723,6 +2047,7 @@ mod tests {
     fn test_r(bundled: &str, api: Option<String>) -> Arc<Mutex<R>> {
         Arc::new(Mutex::new(R {
             onces: HashMap::new(),
+            relist: None,
             key: SecretKey::from_slice(&[7u8; 32]).unwrap(),
             datum: bundled.into(),
             datum_api: None,

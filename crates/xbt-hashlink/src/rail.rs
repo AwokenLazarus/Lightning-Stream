@@ -102,6 +102,8 @@ pub struct SignerPayer {
     pub max_charge_sats: Option<u64>,
     /// The rental's budget: tickets are sized inside what is left of it.
     pub budget_sats: Option<u64>,
+    /// What the hashtaker added to that budget while the rental goes on.
+    pub added: Option<std::sync::Arc<crate::hashtaker::Added>>,
     /// The most any one payment may move, however large a step is earned (`--max-sats`).
     pub most_sats: Option<u64>,
     /// What this rental's slices were charged, and the credit the shop holds by its last answer:
@@ -244,7 +246,7 @@ impl SignerPayer {
     /// `most_sats`: [`SignerPayer`].
     pub fn new(sock: std::path::PathBuf, url: String, task: String, price_msat: u64, budget_sats: Option<u64>, most_sats: Option<u64>,
                wait_for_signer: std::time::Duration) -> Self {
-        let mut p = Self { sock, url, task, price_msat, max_sats: 0, max_charge_sats: None, budget_sats, most_sats, charged_msat: 0, credit_msat: 0, session: None,
+        let mut p = Self { sock, url, task, price_msat, max_sats: 0, max_charge_sats: None, budget_sats, added: None, most_sats, charged_msat: 0, credit_msat: 0, session: None,
                            ceiling: Some(slice_ceiling(price_msat)), wait_for_signer, pay_wait: PAY_WAIT, call: signer_call_waiting };
         p.caps_for(crate::order::FIRST_STEP_MSAT);
         p
@@ -252,7 +254,8 @@ impl SignerPayer {
 
     /// What the rental's budget has left, in msat, by what its slices were charged and what the shop holds.
     fn left_msat(&self) -> Option<u64> {
-        self.budget_sats.map(|b| b.saturating_mul(1000).saturating_sub(self.charged_msat).saturating_sub(self.credit_msat))
+        let added = self.added.as_ref().map_or(0, |a| a.msat());
+        self.budget_sats.map(|b| b.saturating_mul(1000).saturating_add(added).saturating_sub(self.charged_msat).saturating_sub(self.credit_msat))
     }
 
     /// Set what the next [`SignerPayer::pay`] may move and be charged, for a ticket of `ticket_msat`
@@ -641,6 +644,12 @@ mod signer_wait_tests {
         p.caps_for(546_000);
         let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
         assert!(why.starts_with(BUDGET_TOO_SHORT) && why.contains("500 sats"), "{why}");
+        // budget the hashtaker added while the rental goes on counts with the rest
+        let added = std::sync::Arc::new(crate::hashtaker::Added::default());
+        p.added = Some(added.clone());
+        added.msat.store(300_000, std::sync::atomic::Ordering::Relaxed);
+        p.caps_for(546_000);
+        assert_eq!(p.max_charge_sats, Some(546), "500 + 300 left: the ticket of the step");
         *answer.lock().unwrap() = serde_json::json!({"verdict": "deny", "rule": "ticket_task_budget", "reason": "with this ticket's 559 sats, 5101 would be above the task's budget_sats (5000)", "charged_sats": 0});
         let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
         assert!(why.starts_with(WALLET_RULES) && why.contains("budget_sats (5000)"), "{why}");
