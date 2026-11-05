@@ -494,10 +494,15 @@ def topup_run() -> None:
         check("topup: the second rental starts", False, v)
         return
     rid = v["rental"]
-    lab.wait("a slice paid", 120, lambda: int(live(rid).get("live", {}).get("paidSlices") or 0) >= 1, every=1)
+    lab.wait("a slice paid", 120, lambda: int(live(rid).get("live", {}).get("paidSlices") or 0) >= 1 or live(rid).get("ended") is True, every=1)
+    if live(rid).get("ended") is True:
+        lv = live(rid).get("live", {})
+        check("topup: the second rental pays its first slice", False, {"closed": lv.get("closed"), "pays": lv.get("pays"), "events": lv.get("events", [])[-5:]})
+        return
     code, v = renter("POST", "/topup", {"rental": rid, "addSats": 50 * PRICE_MSAT // 1000, "once": secrets.token_hex(8)})
     x = wait_ended(rid, 300)
     lv = x.get("live", {})
+    REPORT["topup_task_rental"] = lv
     oks = [p for p in lv.get("pays", []) if p.get("ok")]
     why = " ".join(str(p.get("why", "")) for p in lv.get("pays", []) if p.get("ok") is False)
     check("topup: the owner's signed task budget still stops a topped-up rental: the wallet refuses past it, said as its rules",
