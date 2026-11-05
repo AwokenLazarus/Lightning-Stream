@@ -20,7 +20,9 @@
 //!
 //! An owner who runs a relay can announce it from here. The announcement is signed with a key of
 //! its own, `secrets/relay-operator.key` (mode 600), made the first time; it is not the shop's key
-//! and not the wallet's.
+//! and not the wallet's. It lapses after [`ANNOUNCE_TTL_S`] (NIP-40); what was announced is kept in
+//! `relay-announce.json`, and the app announces it again every [`REANNOUNCE_S`] while it runs
+//! ([`RelayNet::reannounce`]), so a relay nobody tends drops out by itself.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -42,6 +44,10 @@ pub const PROBE_WAIT: Duration = Duration::from_secs(5);
 pub const MAX_PROBED: usize = 24;
 /// How many relays `selected` holds.
 pub const MAX_SELECTED: usize = 4;
+/// How long the owner's relay announcement lives (its NIP-40 `expiration`).
+pub const ANNOUNCE_TTL_S: u64 = 7 * 86_400;
+/// The owner's relay is announced again after this long, while the app runs.
+pub const REANNOUNCE_S: u64 = 86_400;
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -59,6 +65,8 @@ pub struct RelayNet {
     nostr_relays: Vec<String>,
     file: PathBuf,
     key_file: PathBuf,
+    /// What the owner last announced, and when it was last taken ([`Self::reannounce`]).
+    announce_file: PathBuf,
     default_relay: String,
     snap: Arc<Mutex<Option<Snapshot>>>,
     /// Who makes the next snapshot, and when (in the background once there is one).
@@ -76,7 +84,7 @@ impl RelayNet {
 
     pub fn with_default(nostr_relays: Vec<String>, data_dir: &std::path::Path, default_relay: &str) -> Self {
         Self { nostr_relays, file: data_dir.join("relays.json"), key_file: data_dir.join("secrets").join("relay-operator.key"),
-               default_relay: relays::canonical_relay(default_relay).unwrap_or_else(|_| DEFAULT_RELAY.into()), snap: Default::default(),
+               announce_file: data_dir.join("relay-announce.json"), default_relay: relays::canonical_relay(default_relay).unwrap_or_else(|_| DEFAULT_RELAY.into()), snap: Default::default(),
                making: crate::perf::Swr::new() }
     }
 
@@ -214,9 +222,16 @@ impl RelayNet {
         if self.nostr_relays.is_empty() {
             return Err("no Nostr relays are set, so there is nowhere to announce it".into());
         }
-        let ev = relays::announcement_event(&self.operator_key()?, offer, xbt_nostr::now())?;
+        let now = xbt_nostr::now();
+        let ev = relays::announcement_event(&self.operator_key()?, offer, now)?;
         let outcomes = oneshot::publish(&self.nostr_relays, &ev, Duration::from_secs(10));
         let ok = outcomes.iter().filter(|o| o.result.is_ok()).count();
+        // kept, to be announced again daily: `at` is when a relay last took it
+        let at = if ok > 0 { now } else { self.announced().map_or(0, |(_, at)| at) };
+        let kept = json!({"relay": offer.relay, "region": offer.region, "capacity_mbit": offer.capacity_mbit, "udp": offer.udp,
+                          "contact": offer.contact, "note": offer.note, "ttl_s": offer.ttl_s, "at": at});
+        std::fs::write(&self.announce_file, serde_json::to_vec_pretty(&kept).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("{}: {e}", self.announce_file.display()))?;
         // the owner's own relay becomes one of theirs
         let mut prefs = self.prefs();
         let relay = relays::canonical_relay(&offer.relay)?;
@@ -226,6 +241,36 @@ impl RelayNet {
         }
         *self.snap.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok((ok, outcomes))
+    }
+
+    /// What the owner last announced, and when a relay last took it (unix seconds; 0: never).
+    pub fn announced(&self) -> Option<(Offer, u64)> {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&self.announce_file).ok()?).ok()?;
+        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let offer = Offer {
+            relay: v.get("relay")?.as_str()?.to_string(), region: s("region"),
+            capacity_mbit: v.get("capacity_mbit").and_then(Value::as_u64).and_then(|c| u32::try_from(c).ok()),
+            udp: v.get("udp").and_then(Value::as_bool).unwrap_or(false), contact: s("contact"), note: s("note"),
+            ttl_s: v.get("ttl_s").and_then(Value::as_u64).unwrap_or(ANNOUNCE_TTL_S),
+        };
+        Some((offer, v.get("at").and_then(Value::as_u64).unwrap_or(0)))
+    }
+
+    /// Whether the owner's announcement is due again at `now`: one was made, and no relay has taken
+    /// it for [`REANNOUNCE_S`].
+    pub fn reannounce_due(&self, now: u64) -> bool {
+        !self.nostr_relays.is_empty() && self.announced().is_some_and(|(_, at)| now.saturating_sub(at) >= REANNOUNCE_S)
+    }
+
+    /// Announce the owner's relay again when it is due ([`Self::reannounce_due`]): `None` when not.
+    /// The app calls this every hour while it runs.
+    pub fn reannounce(&self, now: u64) -> Option<Result<(usize, Vec<Outcome>), String>> {
+        if !self.reannounce_due(now) {
+            return None;
+        }
+        let (offer, _) = self.announced()?;
+        // an announcement kept by an app before 0.2.14 asked for 30 days: a week now, sent daily
+        Some(self.publish(&Offer { ttl_s: offer.ttl_s.min(ANNOUNCE_TTL_S), ..offer }))
     }
 }
 
@@ -255,6 +300,39 @@ mod tests {
         }
         assert!(n.publish(&Offer { relay: "https://mine.example.com".into(), region: "eu".into(), capacity_mbit: None, udp: false,
                                    contact: String::new(), note: String::new(), ttl_s: 86_400 }).unwrap_err().contains("no Nostr relays"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 0.2.14: the owner's relay announcement lasts a week (NIP-40) and the app sends it again daily while it runs:
+    /// it was sent once, for 30 days, and lapsed unless the owner pressed Announce again.
+    ///
+    /// FAILS without `reannounce`: nothing sends it again.
+    #[test]
+    fn the_owners_relay_is_announced_again_daily_and_lapses_after_a_week() {
+        let relay = xbt_nostr::standin::StandinRelay::start().unwrap();
+        let d = std::env::temp_dir().join(format!("relaynet-again-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let n = RelayNet::new(vec![relay.url.clone()], &d);
+        let now = xbt_nostr::now();
+        assert!(!n.reannounce_due(now), "nothing announced yet");
+        let offer = Offer { relay: "https://mine.example.com".into(), region: "eu".into(), capacity_mbit: Some(100), udp: true,
+                            contact: "ops".into(), note: String::new(), ttl_s: ANNOUNCE_TTL_S };
+        let (ok, _) = n.publish(&offer).unwrap();
+        assert_eq!(ok, 1);
+        let (kept, at) = n.announced().unwrap();
+        assert_eq!(kept, offer);
+        assert!(!n.reannounce_due(at + REANNOUNCE_S - 1) && n.reannounce(at + REANNOUNCE_S - 1).is_none());
+        assert!(n.reannounce_due(at + REANNOUNCE_S));
+        let (events, _) = oneshot::query(&[relay.url.clone()], &relays::filter(10), Duration::from_secs(5));
+        let (found, _) = relays::collect(&events, now);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].expires >= now + ANNOUNCE_TTL_S && found[0].expires < now + ANNOUNCE_TTL_S + 60, "a week");
+        assert!(REANNOUNCE_S * 7 <= ANNOUNCE_TTL_S, "sent again well before it lapses");
+        // one kept by an older app asked for 30 days: sent again, for a week
+        let old = json!({"relay": "https://mine.example.com", "region": "eu", "ttl_s": relays::MAX_TTL_S, "at": 1});
+        std::fs::write(d.join("relay-announce.json"), old.to_string()).unwrap();
+        assert_eq!(n.reannounce(now).unwrap().unwrap().0, 1);
+        assert!(n.announced().unwrap().1 >= now);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

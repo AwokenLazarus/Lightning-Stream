@@ -253,3 +253,68 @@ fn a_transport_document_rides_in_its_own_tag_and_comes_back() {
     assert_eq!(market::read_event(&ev, now()).unwrap().transport, Some(t));
     assert_eq!(market::read_event(&event(&own, &sk, &pk, &shop, "x", now()), now()).unwrap().transport, None);
 }
+
+/// 0.2.14: a listing says when it lapses (NIP-40), about a week after it was made, and a lapsed one is not read.
+/// A shop whose key is lost (its box reinstalled with it inside) can never withdraw its listing; it lapses by itself.
+///
+/// FAILS without the `expiration` tag, or without the reader's check of it.
+#[test]
+fn a_listing_says_when_it_lapses_and_a_lapsed_one_is_not_read() {
+    let keys = Keys::generate();
+    let (sk, pk) = receipt(b"seller-exp");
+    let at = 1_790_000_000;
+    let ev = event(&keys, &sk, &pk, SELLER, "Films", at);
+    let exp = at + market::EXPIRES_S;
+    assert_eq!(market::EXPIRES_S, 7 * 86_400);
+    assert_eq!(ev.tag("expiration"), Some(exp.to_string().as_str()));
+    assert_eq!(ev.expiration(), Some(exp));
+    assert!(market::read_event(&ev, exp - 1).is_ok());
+    assert!(market::read_event(&ev, exp).unwrap_err().contains("expired"));
+    assert_eq!(market::collect(std::slice::from_ref(&ev), exp - 1).0.len(), 1);
+    assert_eq!(market::collect(std::slice::from_ref(&ev), exp), (vec![], 0), "left out, not counted as refused");
+
+    // one that says it lapses sooner is taken at its word; one with none (an app before 0.2.14) never lapses by this rule
+    let soon = resign(&keys, &ev, set_tag(&ev.tags, "expiration", &(at + 60).to_string()));
+    assert!(market::read_event(&soon, at + 59).is_ok() && market::read_event(&soon, at + 60).is_err());
+    let none = resign(&keys, &ev, ev.tags.iter().filter(|t| t[0] != "expiration").cloned().collect());
+    assert!(market::read_event(&none, at + 365 * 86_400).is_ok());
+
+    // a lapsed newest listing hides the shop: an older one it made before is not shown in its place
+    let older = Event::sign(&keys, at - 3600, none.kind, none.tags.clone(), none.content.clone());
+    let (got, refused) = market::collect(&[older.clone(), soon.clone()], at + 61);
+    assert_eq!((got.len(), refused), (0, 0));
+    assert_eq!(market::collect(&[older], at + 61).0.len(), 1);
+}
+
+/// 0.2.14: a listing two days old with no link its Lightning node vouches for now is a shop that looks offline (the
+/// orphan test shop of 2026-10-30); one that is old but still vouched for, or new, is not.
+#[test]
+fn a_stale_listing_no_node_vouches_for_is_offline() {
+    let (sk, pk) = receipt(b"shop-off");
+    let own = keys(44);
+    let shop = xbt402::shop::origin_for(&own.public.serialize());
+    let doc = signed(&sk, &pk, &shop, "Packaging test");
+    let bind = listing::bind(&sk, &own.public.serialize(), &shop);
+    let node = ecdsa::secret_key(&sha256(b"node")).unwrap();
+    let at = 1_790_000_000;
+    let link = |expires: u64| xbt402::transport::Link {
+        kind: "iroh".into(), endpoint_id: "1".repeat(64), relays: vec![], direct: vec![], expires,
+        node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&"1".repeat(64), &shop, expires).as_bytes(), &node),
+    };
+    let read = |links: &[xbt402::transport::Link]| {
+        let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, links, "2026-10-30"));
+        market::read_event(&market::listing_event_with(&own, &doc, &bind, Some(&t), at).unwrap(), at).unwrap()
+    };
+    let later = at + market::STALE_S + 1;
+    assert_eq!(market::STALE_S, 2 * 86_400);
+    let none = read(&[]);
+    assert!(!none.stale(at + market::STALE_S) && none.stale(later));
+    assert!(!none.offline(at + market::STALE_S), "new enough");
+    assert!(none.offline(later), "stale, and no node vouches for it");
+    assert_eq!(none.age_days(at + 6 * 86_400 + 10), 6);
+    let lapsed = read(&[link(at + 86_400)]);
+    assert!(lapsed.offline(later), "its only link's vouch has lapsed");
+    let vouched = read(&[link(at + 30 * 86_400)]);
+    assert!(vouched.node(later).is_some() && !vouched.offline(later), "old, but its node still vouches for it");
+    assert!(!market::read_event(&event(&own, &sk, &pk, &shop, "x", at), at).unwrap().offline(at + 3600));
+}

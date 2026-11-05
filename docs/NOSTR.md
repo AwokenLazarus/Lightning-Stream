@@ -41,6 +41,7 @@ nothing else.
 | `t` | `lightning-stream`, and the listing's kind (`video`, `files`, `api`). Readers ask relays for `#t: lightning-stream`. |
 | `r` | The seller's URL |
 | `published_at`, `alt` | As NIP-99 and NIP-31 ask |
+| `expiration` | NIP-40: seven days after the event was made (from 0.2.14). The gateway republishes at least daily while it runs, so only a shop that stopped lets its listing lapse, even one whose key is lost and so can never withdraw it. |
 | `xbt402-listing` | The signed `listing/0` or `listing/1` document, compact JSON |
 | `xbt402-bind` | Hex of the receipt key's DER signature binding this Nostr key to this seller (below) |
 | `content` | Markdown for people: the name, the price, the items (the first 50), the licence, the credits and the seller's URL |
@@ -81,8 +82,16 @@ A buyer's app keeps an event only when all of these hold:
 3. The `xbt402-listing` document verifies under the receipt key it names (`listing/0` or `listing/1`).
 4. `d` is that listing's seller origin.
 5. `xbt402-bind` is that receipt key's binding of the event's author to that seller.
+6. It has not lapsed: its `expiration`, when it has one, is still ahead (NIP-40). An event from
+   before 0.2.14 has none and is read as before.
 
-Of each receipt key and seller, it keeps the newest event.
+Of each receipt key and seller, it keeps the newest event. When that one has lapsed, the shop is
+left out: an older event is not shown in its place.
+
+A listing more than two days old is **stale** (a running gateway republishes every six hours by
+default, at least daily). One that is stale and whose links no Lightning node vouches for now
+(`transport/1`, `docs/DIRECT-LINKS.md`) is a shop that looks offline: Found on Nostr and Browse fold
+it under "Offline shops", and allowing it says so. lightning-stream.com uses the same two-day rule.
 
 ### Unvetted, and the Check
 
@@ -105,7 +114,8 @@ the owner's policy and budgets, as every payment does.
 ```
 
 The gateway publishes at start and every `republish_s` seconds (six hours by default; from 600 to
-604800). It reads nothing from relays. A relay that refuses the event or is down is logged, and is
+604800, and at most a day apart whatever it says, from 0.2.14: a listing lapses after a week and is
+stale after two days). It reads nothing from relays. A relay that refuses the event or is down is logged, and is
 tried again at the next republish. At most ten relays; `ws://` is accepted only to this machine.
 
 **Buyer (the wallet UI).** `XBT_UI_NOSTR_RELAYS`: the relays to read, comma-separated. Unset (the

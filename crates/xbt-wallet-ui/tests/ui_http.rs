@@ -3804,6 +3804,74 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
     assert!(br.flash_after(&r).contains("could not be found"));
 }
 
+/// 0.2.14, the case of 0.2.12: a shop reached by its key whose box was reinstalled with its signing key inside left a
+/// listing that can never be withdrawn, six days old, no link of it vouched for by any Lightning node. Allowing it said
+/// to press Check for updates, which could not help. Now it says the shop looks offline, and Browse and Found on Nostr
+/// fold it under "Offline shops (1)". A shop whose kept listing is old but whose new one on the relays is vouched for
+/// is allowed, from the new one.
+///
+/// FAILS before: "names no direct link that its Lightning node vouches for now. Press Check for updates".
+#[test]
+fn a_shop_that_looks_offline_is_said_to_be_when_allowed_and_folded_away() {
+    use xbt_nostr::{event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    let now = xbt_nostr::now();
+    let node = Sk::from_slice(&[9u8; 32]).unwrap();
+    let node_hex = hex::encode(xbt_primitives::ecdsa::pubkey(&node));
+    // a shop's listing published `at`, its links vouched for until `vouched` (none: no links)
+    let publish = |keys: &Keys, name: &str, at: u64, vouched: Option<u64>| {
+        let shop = xbt402::shop::origin_for(&keys.public.serialize());
+        let (sk, pk) = receipt_key(name.as_bytes());
+        let d = xbt402::listing::parse_draft(&json!({
+            "name": name, "kind": "video", "prices": {"byte_msat": 1000, "per_bytes": 1048576}, "items": [],
+            "licence": "CC BY 3.0", "credits": "c", "updated": "2026-10-30",
+        })).unwrap();
+        let doc = xbt402::listing::sign(&sk, &xbt402::listing::document(&d, &shop, &pk));
+        let ep = "ab".repeat(32);
+        let links: Vec<_> = vouched.into_iter().map(|expires| xbt402::transport::Link {
+            kind: "iroh".into(), endpoint_id: ep.clone(), relays: vec!["https://relay.example".into()], direct: vec![], expires,
+            node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) }).collect();
+        let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &links, &at.to_string()));
+        let bind = xbt402::listing::bind(&sk, &keys.public.serialize(), &shop);
+        let ev = market::listing_event_with(keys, &doc, &bind, Some(&t), at).unwrap();
+        assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+        (xbt402::shop::npub(&keys.public.serialize()), shop)
+    };
+    let orphan = Keys::generate();
+    let (orphan_npub, orphan_shop) = publish(&orphan, "StartOS packaging test", now - 6 * 86_400 - 60, None);
+    let bx = start(json!({}), false, |c| c.nostr_relays = relays.clone());
+    let mut br = logged_in(&bx);
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &orphan_npub)]);
+    assert!(br.flash_after(&r).contains("Added StartOS packaging test"));
+    let r = br.act("/services", "/services", &[("action", "allow"), ("url", &orphan_shop)]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("This seller could not be allowed. This listing is 6 days old and no Lightning node vouches for it any more: the shop looks offline."), "{f}");
+    assert!(!f.contains("Check for updates"), "nothing to update: {f}");
+    // folded on Browse and on Found on Nostr, and said on its service's page
+    let browse = br.get("/browse").body;
+    let fold = browse.find("Offline shops (1)").expect(&browse);
+    assert!(browse[fold..].contains("StartOS packaging test") && !browse[..fold].contains("StartOS packaging test"), "{browse}");
+    let found = br.get("/nostr?refresh=1").body;
+    let fold = found.find("Offline shops (1)").expect(&found);
+    assert!(found[fold..].contains("StartOS packaging test") && !found[..fold].contains("StartOS packaging test"), "{found}");
+    let page = br.get(&format!("/service?seller={}&name={}", orphan_shop.replace(':', "%3A").replace('/', "%2F"), "StartOS%20packaging%20test")).body;
+    assert!(page.contains("This shop looks offline.") && !page.contains("Allow StartOS packaging test first"), "{page}");
+
+    // a shop kept from an old listing, whose new one is vouched for: allowed from the new one, which is kept
+    let back = Keys::generate();
+    let (back_npub, back_shop) = publish(&back, "Back again", now - 5 * 86_400, None);
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &back_npub)]);
+    assert!(br.flash_after(&r).contains("Added Back again"));
+    publish(&back, "Back again", now, Some(now + 30 * 86_400));
+    let r = br.act("/services", "/services", &[("action", "allow"), ("url", &back_shop)]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert!(r.location().contains(&format!("node={node_hex}")), "{}", r.location());
+    let kept = xbt_wallet_ui::shops::load(&bx.data.path().join("ui/shops.json")).unwrap();
+    assert_eq!(kept[&back_shop].published_at, Some(now));
+}
+
 /// An AI seller added after the AI address already has one reaches it at once: the sellers file the
 /// endpoint reads follows each add, update and removal on the Services page, with no visit to the AI
 /// page and no "read the prices again" press.
@@ -5661,7 +5729,7 @@ fn genesis_shop(bx: &Box_) -> (String, String, String) {
                                          node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) };
     let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &[link], "2026-11-01"));
     let mut shops = std::collections::BTreeMap::new();
-    shops.insert(shop.clone(), xbt_wallet_ui::shops::Shop { receipt_key: pk, transport: Some(t) });
+    shops.insert(shop.clone(), xbt_wallet_ui::shops::Shop { receipt_key: pk, transport: Some(t), published_at: None });
     let cfg = &bx._app.cfg;
     std::fs::create_dir_all(cfg.shops_path().parent().unwrap()).unwrap();
     xbt_wallet_ui::shops::save(&cfg.shops_path(), &shops).unwrap();

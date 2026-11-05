@@ -96,7 +96,7 @@ impl App {
             <label><input type=\"checkbox\" name=\"udp\" value=\"1\"> It also answers on UDP (helps direct connections)</label>\
             <label>How to reach you (optional) <input name=\"contact\" maxlength=\"{}\"></label>\
             <button type=\"submit\">Announce</button></form>\
-            <p class=\"small\">The announcement is signed with a key this app keeps for it, and lasts 30 days; announce again to keep it listed. \
+            <p class=\"small\">The announcement is signed with a key this app keeps for it, and lasts a week; this app announces it again each day while it runs. \
             Apps check every relay themselves before using it.</p></details></section>",
             esc(&ctx.csrf), esc(&prefill), relays::MAX_REGION, relays::MAX_CONTACT));
         self.html_page("Stream relays", "Stream relays", ctx, &b, "")
@@ -156,7 +156,7 @@ impl App {
             },
         };
         let offer = Offer { relay: g("relay"), region: g("region"), capacity_mbit: capacity, udp: g("udp") == "1", contact: g("contact"),
-                            note: String::new(), ttl_s: relays::MAX_TTL_S };
+                            note: String::new(), ttl_s: crate::relaynet::ANNOUNCE_TTL_S };
         match self.relay_net.publish(&offer) {
             Ok((ok, all)) if ok > 0 => self.flash(ctx, true, format!("Announced on {ok} of {} Nostr relays. It is listed as yours here.", all.len())),
             Ok((_, all)) => self.flash(ctx, false, format!("No Nostr relay accepted the announcement: {}",

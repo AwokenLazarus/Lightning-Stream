@@ -23,7 +23,7 @@ impl App {
         // this box's own shop, by its web address or its shop key: marked, never offered to add (a box can't buy from itself)
         let own_key = self.own_shop_key_origin();
         let own = |seller: &str| self.is_own_shop(seller) || own_key.as_deref().is_some_and(|k| services::same_origin(k, seller));
-        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have, &own), "")
+        self.html_page("Browse", "Found on Nostr", ctx, &nostr_html(ctx, &snap, &have, &own, xbt_nostr::now()), "")
     }
 
     /// `POST /nostr-check`: ask the seller whether the listing found on Nostr is its own.
@@ -43,8 +43,10 @@ impl App {
     }
 }
 
-/// `have`: the sellers on the owner's list, marked "On your list".
-fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -> bool) -> String {
+/// `have`: the sellers on the owner's list, marked "On your list". `now` dates the listings: a shop that looks
+/// offline ([`xbt_nostr::market::NostrListing::offline`]: its listing is stale and no Lightning node vouches for it
+/// now) is folded away under "Offline shops", never this box's own.
+fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -> bool, now: u64) -> String {
     let mut b = String::from("<p class=\"small\"><a href=\"./browse\">← Browse</a> · <a href=\"./nostr?refresh=1\">Look again</a></p>\
         <div class=\"flash warn\"><strong>Unvetted.</strong> These sellers published their lists on Nostr, each signed by the \
         seller's own key, but nobody has checked who runs them. A shop reached by its key: its address is that key, so the list is its own. \
@@ -63,53 +65,75 @@ fn nostr_html(ctx: &Ctx, snap: &Snapshot, have: &[Service], own: &dyn Fn(&str) -
         b.push_str("<p class=\"empty\">No Lightning Stream listings on these relays.</p>");
         return b;
     }
-    for n in &snap.listings {
-        if own(&n.listing.seller) {
-            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill good\">Your shop</span></div>\
-                                 <p class=\"small\">This is the listing your box publishes. See it on <a href=\"./sell\">Sell</a>.</p></section>",
-                                esc(&n.listing.name)));
-            continue;
-        }
-        let added = have.iter().any(|s| services::same_origin(&s.seller, &n.listing.seller));
-        let mine = if added { "<span class=\"pill good\">On your list</span>" } else { "" };
-        let (add_label, add_class) = if added { ("Check for updates", " class=\"secondary\"") } else { ("Add this shop", "") };
-        if key_shop(n) {
-            // a shop without a web address: its address is its key, and the listing is signed by that key, so
-            // there is no other address to ask. It is added as a shop key on Sellers ([`App::add_seller`])
-            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill\">reached by its key</span>{mine}</div>\
-                                 <p class=\"small\">Shop key <code class=\"key\">{}</code></p>\
-                                 <form method=\"post\" action=\"./services\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-                                 <input type=\"hidden\" name=\"action\" value=\"add\"><input type=\"hidden\" name=\"url\" value=\"{}\">\
-                                 <button type=\"submit\"{add_class}>{add_label}</button></form>",
-                                esc(&n.listing.name), esc(&xbt402::shop::display(&n.listing.seller)), esc(&ctx.csrf), esc(&n.listing.seller)));
-        } else {
-            let pill = if added { mine } else { "<span class=\"pill warn\">unvetted</span>" };
-            b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
-                                 <p class=\"small\">{}</p><details><summary>Keys</summary><p class=\"small\">Nostr key <code>{}</code>, receipt key <code>{}</code></p></details>\
-                                 <form method=\"post\" action=\"./nostr-check\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-                                 <input type=\"hidden\" name=\"event\" value=\"{}\"><button type=\"submit\" class=\"secondary\">Check with the seller</button></form>",
-                                esc(&n.listing.name), esc(&xbt402::shop::display(&n.listing.seller)), esc(&n.author), esc(&n.listing.receipt_key),
-                                esc(&ctx.csrf), esc(&n.event_id)));
-        }
-        for s in nostr::to_services(n) {
-            b.push_str(&format!("<h3>{} <span class=\"pill cat-{}\">{}</span></h3><p class=\"price\">{}</p>", esc(&s.name), s.category(),
-                                esc(s.category_words()), esc(&s.price_text)));
-            if !s.items.is_empty() {
-                b.push_str("<div class=\"grid\">");
-                for item in &s.items {
-                    // the file's path at the shop, not its made-up `…shop.invalid` address
-                    let path = services::http_origin(&item.url).filter(|o| xbt402::shop::is_shop(o))
-                        .and_then(|o| item.url.strip_prefix(&o).map(str::to_string)).unwrap_or_else(|| item.url.clone());
-                    // shown decoded ("My film.mkv", not "My%20film.mkv"); the link itself is not changed
-                    let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&crate::services::path_words(&path)));
-                    b.push_str(&format!("<article class=\"card\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>{open}</article>",
-                                        esc(&item.title), esc(&item.year), esc(&item.credit)));
-                }
-                b.push_str("</div>");
-            }
-        }
-        b.push_str("</section>");
+    let (gone, live): (Vec<_>, Vec<_>) = snap.listings.iter().partition(|n| !own(&n.listing.seller) && n.offline(now));
+    if live.is_empty() {
+        b.push_str("<p class=\"empty\">No shop on these relays is online now.</p>");
     }
+    for n in live {
+        b.push_str(&listing_card(ctx, n, have, own, None));
+    }
+    if !gone.is_empty() {
+        b.push_str(&format!("<details class=\"offline-shops\"><summary>Offline shops ({})</summary>\
+            <p class=\"small\">These listings are more than two days old and no Lightning node vouches for them any more: their shops look \
+            offline. A shop that comes back is listed above again once it publishes a new listing.</p>", gone.len()));
+        for n in gone {
+            b.push_str(&listing_card(ctx, n, have, own, Some(n.age_days(now))));
+        }
+        b.push_str("</details>");
+    }
+    b
+}
+
+/// One listing's card. `offline`: the shop looks offline, its listing this many days old.
+fn listing_card(ctx: &Ctx, n: &xbt_nostr::market::NostrListing, have: &[Service], own: &dyn Fn(&str) -> bool, offline: Option<u64>) -> String {
+    let mut b = String::new();
+    if own(&n.listing.seller) {
+        return format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill good\">Your shop</span></div>\
+                        <p class=\"small\">This is the listing your box publishes. See it on <a href=\"./sell\">Sell</a>.</p></section>",
+                       esc(&n.listing.name));
+    }
+    let added = have.iter().any(|s| services::same_origin(&s.seller, &n.listing.seller));
+    let mine = if added { "<span class=\"pill good\">On your list</span>" } else { "" };
+    // a shop that looks offline is said to be: it can't be allowed to be paid until it publishes again
+    let gone = offline.map(|d| format!("<p class=\"small\">{}</p>", esc(&crate::shops::offline_words(d)))).unwrap_or_default();
+    let mine = if offline.is_some() { "<span class=\"pill\">offline</span>" } else { mine };
+    let (add_label, add_class) = if added { ("Check for updates", " class=\"secondary\"") } else { ("Add this shop", "") };
+    if key_shop(n) {
+        // a shop without a web address: its address is its key, and the listing is signed by that key, so
+        // there is no other address to ask. It is added as a shop key on Sellers ([`App::add_seller`])
+        b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2><span class=\"pill\">reached by its key</span>{mine}</div>\
+                             <p class=\"small\">Shop key <code class=\"key\">{}</code></p>{gone}\
+                             <form method=\"post\" action=\"./services\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+                             <input type=\"hidden\" name=\"action\" value=\"add\"><input type=\"hidden\" name=\"url\" value=\"{}\">\
+                             <button type=\"submit\"{add_class}>{add_label}</button></form>",
+                            esc(&n.listing.name), esc(&xbt402::shop::display(&n.listing.seller)), esc(&ctx.csrf), esc(&n.listing.seller)));
+    } else {
+        let pill = if added || offline.is_some() { mine } else { "<span class=\"pill warn\">unvetted</span>" };
+        b.push_str(&format!("<section class=\"card\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
+                             <p class=\"small\">{}</p>{gone}<details><summary>Keys</summary><p class=\"small\">Nostr key <code>{}</code>, receipt key <code>{}</code></p></details>\
+                             <form method=\"post\" action=\"./nostr-check\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+                             <input type=\"hidden\" name=\"event\" value=\"{}\"><button type=\"submit\" class=\"secondary\">Check with the seller</button></form>",
+                            esc(&n.listing.name), esc(&xbt402::shop::display(&n.listing.seller)), esc(&n.author), esc(&n.listing.receipt_key),
+                            esc(&ctx.csrf), esc(&n.event_id)));
+    }
+    for s in nostr::to_services(n) {
+        b.push_str(&format!("<h3>{} <span class=\"pill cat-{}\">{}</span></h3><p class=\"price\">{}</p>", esc(&s.name), s.category(),
+                            esc(s.category_words()), esc(&s.price_text)));
+        if !s.items.is_empty() {
+            b.push_str("<div class=\"grid\">");
+            for item in &s.items {
+                // the file's path at the shop, not its made-up `…shop.invalid` address
+                let path = services::http_origin(&item.url).filter(|o| xbt402::shop::is_shop(o))
+                    .and_then(|o| item.url.strip_prefix(&o).map(str::to_string)).unwrap_or_else(|| item.url.clone());
+                // shown decoded ("My film.mkv", not "My%20film.mkv"); the link itself is not changed
+                let open = format!("<p class=\"small\"><code>{}</code></p>", esc(&crate::services::path_words(&path)));
+                b.push_str(&format!("<article class=\"card\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>{open}</article>",
+                                    esc(&item.title), esc(&item.year), esc(&item.credit)));
+            }
+            b.push_str("</div>");
+        }
+    }
+    b.push_str("</section>");
     b
 }
 
@@ -120,7 +144,7 @@ fn key_shop(n: &xbt_nostr::market::NostrListing) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::key_shop;
+    use super::{key_shop, nostr_html};
     use serde_json::json;
 
     fn listing(seller: &str, author: &str) -> xbt_nostr::market::NostrListing {
@@ -144,5 +168,36 @@ mod tests {
         assert!(key_shop(&listing(&origin, &hex::encode(pk).to_uppercase())));
         assert!(!key_shop(&listing(&origin, &hex::encode([8u8; 32]))), "another key signed a list naming this address");
         assert!(!key_shop(&listing("https://seller.example", &hex::encode(pk))), "a shop with a web address is checked with the seller");
+    }
+
+    /// 0.2.14: a listing that is stale and that no Lightning node vouches for (a shop whose box was reinstalled with its
+    /// key inside, so its listing can never be withdrawn) is folded under "Offline shops (N)" and said to look offline;
+    /// a new one, or this box's own, is shown as before.
+    ///
+    /// FAILS without the fold: the dead shop is listed beside the live ones.
+    #[test]
+    fn a_shop_that_looks_offline_is_folded_away() {
+        let now = 1_790_000_000;
+        let dead_pk = [7u8; 32];
+        let dead_origin = xbt402::shop::origin_for(&dead_pk);
+        let mut dead = listing(&dead_origin, &hex::encode(dead_pk));
+        dead.listing.name = "StartOS packaging test".into();
+        dead.created_at = now - 6 * 86_400;
+        let mut live = listing("https://live.example", &hex::encode([8u8; 32]));
+        live.listing.name = "Live films".into();
+        live.created_at = now - 3600;
+        let mut own = listing("https://own.example", &hex::encode([9u8; 32]));
+        own.listing.name = "My shop".into();
+        own.created_at = now - 9 * 86_400;
+        let snap = crate::nostr::Snapshot { at: std::time::Instant::now(), listings: vec![dead, live, own], refused: 0, relays: vec![] };
+        let ctx = crate::app::Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let html = nostr_html(&ctx, &snap, &[], &|s: &str| s == "https://own.example", now);
+        let fold = html.find("<details class=\"offline-shops\"><summary>Offline shops (1)</summary>").expect(&html);
+        let (above, below) = html.split_at(fold);
+        assert!(above.contains("Live films") && above.contains("My shop") && !above.contains("StartOS packaging test"), "{above}");
+        assert!(below.contains("StartOS packaging test") && below.contains("This listing is 6 days old and no Lightning node vouches for it any more: the shop looks offline."), "{below}");
+        // nothing offline: no fold
+        let snap = crate::nostr::Snapshot { listings: snap.listings[1..].to_vec(), ..snap };
+        assert!(!nostr_html(&ctx, &snap, &[], &|_: &str| false, now).contains("Offline shops"));
     }
 }

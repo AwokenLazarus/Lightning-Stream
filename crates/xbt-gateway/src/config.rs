@@ -404,9 +404,16 @@ pub struct NostrConfig {
     pub relays: Vec<String>,
     /// Off unless the runner writes `true`: a listing is public the moment a relay has it.
     pub publish: bool,
-    /// Relays drop old events, and a relay that was down missed the last one.
+    /// Relays drop old events, and a relay that was down missed the last one. At most
+    /// [`MAX_REPUBLISH_S`], whatever `republish_s` says.
     pub republish: Duration,
 }
+
+/// The listing is sent again at least this often: it lapses a week after it was made
+/// ([`xbt_nostr::market::EXPIRES_S`]) and reads as stale after two ([`xbt_nostr::market::STALE_S`]),
+/// so a running shop republishes well within both. A longer `republish_s` (it may say up to a week)
+/// is taken as this.
+pub const MAX_REPUBLISH_S: u64 = 86_400;
 
 /// At most this many relays.
 pub const MAX_NOSTR_RELAYS: usize = 10;
@@ -444,7 +451,7 @@ impl NostrConfig {
         if !(600..=7 * 86_400).contains(&secs) {
             return Err("nostr.republish_s is from 600 (ten minutes) to 604800 (a week)".into());
         }
-        Ok(Self { relays, publish, republish: Duration::from_secs(secs) })
+        Ok(Self { relays, publish, republish: Duration::from_secs(secs.min(MAX_REPUBLISH_S)) })
     }
 }
 
@@ -2294,6 +2301,12 @@ mod tests {
         let n = Config::from_json(&v).unwrap().nostr.unwrap();
         assert!(!n.publish);
         assert_eq!(n.republish, Duration::from_secs(6 * 3600));
+        // 0.2.14: a listing lapses after a week and is stale after two days, so it is sent again at least daily
+        v["nostr"]["republish_s"] = json!(7 * 86_400);
+        assert_eq!(Config::from_json(&v).unwrap().nostr.unwrap().republish, Duration::from_secs(MAX_REPUBLISH_S));
+        assert!(Duration::from_secs(MAX_REPUBLISH_S) * 2 <= Duration::from_secs(xbt_nostr::market::STALE_S));
+        assert!(Duration::from_secs(MAX_REPUBLISH_S) * 7 <= Duration::from_secs(xbt_nostr::market::EXPIRES_S));
+        v["nostr"].as_object_mut().unwrap().remove("republish_s");
         v["nostr"]["publish"] = json!(true);
         assert!(Config::from_json(&v).unwrap_err().to_string().contains("listing"));
         v["listing"] = json!({"name": "n", "kind": "video", "prices": {"request_msat": 1000}, "items": [],
