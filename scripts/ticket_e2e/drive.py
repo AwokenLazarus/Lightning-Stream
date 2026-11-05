@@ -3155,8 +3155,8 @@ def mesh_pay() -> None:
     """The machines of a split paid by the work each does, from what the seller's gateway earned (run by name only).
     A gateway sells one model by the token on the seller's node. `stream-compute-check payout` splits what it earns by
     each stage's active parameters and pays each lender's BOLT 12 offer through the owner's wallet on that node. The two
-    lenders' nodes are the judges: what they received is what the tool's ledger says it paid, to the msat, through a refusal
-    by the owner's policy, the tool killed before, during and after real payments, and a change of plan. With no
+    lenders' nodes are the judges: payment by payment they hold what the tool's ledger says it paid, and the money adds up to
+    the msat, through a refusal by the owner's policy, the tool killed before, during and after real payments, and a change of plan. With no
     MESH_LLM_URL a stand-in answers for the model; with it (and MESH_LLM_CONSOLE, MESH_LLM_GGUF) a real Mesh-LLM split does, its
     first two stages the operator's own."""
     if MESH_URL and not (MESH_CONSOLE and MESH_GGUF):
@@ -3199,7 +3199,7 @@ def mesh_pay() -> None:
         StandIn.plan = [("own-1", 0, 1), ("own-2", 1, 2), ("lender-a", 2, 3), ("lender-b", 3, 4)]
         threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", STAND_IN_PORT), StandIn).serve_forever, daemon=True).start()
         own, lender_a, lender_b = {"own-1", "own-2"}, "lender-a", "lender-b"
-    lenders = ((lender_a, HOP, b64_a), (lender_b, OFFER_NODE, b64_b))
+    lenders = ((lender_a, HOP, b64_a, hex_a), (lender_b, OFFER_NODE, b64_b, hex_b))
 
     # the gateway: one model, by the token
     with open(f"{RUN}/pay-gateway.json", "w") as f:
@@ -3256,20 +3256,27 @@ def mesh_pay() -> None:
         with open(PAY_LEDGER) as f:
             return json.load(f)
 
-    def received(node: str, offer_id: str) -> list[int]:
-        rows = lab.post(node, "/v2/offers/invoices", {"offer_id": offer_id}).get("invoices", [])
-        return [int(i.get("amount_paid_msat") or 0) for i in rows if i.get("state") == "SETTLED"]
-
     def books() -> dict[str, Any]:
-        """Each lender: what its own node received, and what the ledger says it was paid and is owed."""
+        """Each lender, payment by payment: what the wallet paid, and what the lender's own node received. A blinded path
+        charges the payer a margin over what its route takes, and the rest of the fee arrives with the payment, so a node
+        can receive more than the invoice: never less, and never more than the invoice and that payment's fee."""
         led = ledger()
         with open(PAY_REPORT) as f:
             parties = json.load(f)["parties"]
-        return {party: {"node_msat": sum(received(node, oid)), "invoices": len(received(node, oid)), "ledger_paid_msat": led["paid_msat"].get(party, 0),
-                        "owed_msat": int(parties.get(party, {}).get("owed_msat", 0))} for party, node, oid in lenders}
+        events = [e for e in signer("history", {"limit": 5000}, sock=PAY_SOCK)["events"] if e.get("type") == "ln_settled"]
+        out: dict[str, Any] = {}
+        for party, node, oid, hexid in lenders:
+            rows = lab.post(node, "/v2/offers/invoices", {"offer_id": oid}).get("invoices", [])
+            got = {base64.b64decode(i["payment_hash"]).hex(): int(i.get("amount_paid_msat") or 0) for i in rows if i.get("state") == "SETTLED"}
+            paid = {e["payment_hash"]: signer("ln_lookup", {"payment_hash": e["payment_hash"]}, sock=PAY_SOCK) for e in events if e.get("dest") == f"ln-offer:{hexid}"}
+            out[party] = {"invoices": len(got), "node_msat": sum(got.values()), "wallet_msat": sum(int(r["value_msat"]) for r in paid.values()),
+                          "fee_msat": sum(int(r["fee_msat"]) for r in paid.values()), "ledger_paid_msat": led["paid_msat"].get(party, 0),
+                          "owed_msat": int(parties.get(party, {}).get("owed_msat", 0)), "one_for_one": set(got) == set(paid),
+                          "within_fee": all(0 <= got.get(h, -1) - int(r["value_msat"]) <= int(r["fee_msat"]) for h, r in paid.items())}
+        return out
 
     def exact(b: dict[str, Any]) -> bool:
-        return all(x["node_msat"] == x["ledger_paid_msat"] for x in b.values())
+        return all(x["one_for_one"] and x["within_fee"] and x["wallet_msat"] == x["ledger_paid_msat"] for x in b.values())
 
     def below_floor(b: dict[str, Any]) -> bool:
         return all(-1 <= x["owed_msat"] < PAY_FLOOR_SATS * 1000 for x in b.values())
@@ -3348,9 +3355,26 @@ def mesh_pay() -> None:
           {"earned": led["earned_msat"], "gateway_in_the_run": end - baseline, "accrued": accrued, "expected": expected, "weights": weights, "out": (out + out2)[-300:]})
     settled = [e for e in signer("history", {"limit": 5000}, sock=PAY_SOCK)["events"] if e.get("type") == "ln_settled"]
     fees = sum(int(e.get("fee_msat") or 0) for e in settled)
-    check("mesh_pay: each lender's node received, in settled invoices of its offer, exactly what the ledger says it paid; each is owed less than the floor; the wallet's own records hold those payments and the fees the ledger counts",
+    check("mesh_pay: each lender's node has a settled invoice of its offer for each payment the ledger counts and no other, for at least the ledger's amount and never more than that and the payment's fee; each is owed less than the floor; the wallet's own records hold those payments and the fees the ledger counts",
           exact(b) and below_floor(b) and all(x["node_msat"] > 0 for x in b.values()) and len(settled) == sum(x["invoices"] for x in b.values()) and fees == led["fees_msat"] and not led["intent"],
           {"books": b, "wallet_settled": len(settled), "invoices": sum(x["invoices"] for x in b.values()), "wallet_fees_msat": fees, "ledger_fees_msat": led["fees_msat"]})
+    # the money, whole: what the operator's wallet sent reached the lenders' nodes or the hop between, to the msat
+    ids = {lab.channel(HOP, OFFER_NODE).get(k) for k in ("chan_id", "scid")} - {None}
+
+    def hop_earned() -> int:
+        rows = lab.lncli(HOP, "fwdinghistory", "--start_time=-1w", "--max_events=10000").get("forwarding_events", [])
+        return sum(int(e["fee_msat"]) for e in rows if e.get("chan_id_out") in ids)
+
+    sent, reached = sum(led["paid_msat"].values()) + led["fees_msat"], sum(x["node_msat"] for x in b.values())
+    # (the node writes its forwards down every few seconds)
+    hop = 0
+    for _ in range(30):
+        hop = hop_earned()
+        if reached + hop == sent:
+            break
+        time.sleep(2)
+    check("mesh_pay: what the wallet sent, the ledger's payments and fees, is what the lenders' nodes received and what the hop between earned, to the msat",
+          reached + hop == sent, {"ledger_paid_and_fees_msat": sent, "lenders_received_msat": reached, "hop_earned_msat": hop})
     measured("mesh_pay", {"answers": asked[0], "gateway_msat": end - baseline, "accrued": accrued, "books": b, "fees_msat": led["fees_msat"], "weights": weights, "real_split": bool(MESH_URL)})
     stop_sessions()
 

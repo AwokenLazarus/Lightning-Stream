@@ -84,7 +84,9 @@ and answer alike, so that machine is paid a little more than its share of prompt
   human threshold waits for the owner, so set the threshold above the largest payout you expect.
 - A stage on an unknown machine accrues to that node id until it is given an offer; a stage on one of
   `own_nodes` accrues to the operator, as does the cut. Routing fees are the operator's, so a lender
-  receives its amounts exactly. Whole sats are paid and the odd msats stay owed.
+  receives at least its amounts. Its node can show a little more, out of the operator's fee: a blinded
+  path charges a margin over what its route takes, and what the route leaves arrives with the payment.
+  The ledger counts the invoice's amount. Whole sats are paid and the odd msats stay owed.
 - **The gateway must sell only this model.** It reports what it earned in all, not per route, so while
   it sells anything else its earnings are not split: they count as the operator's, and the tool says so.
 - A new stage plan splits from the round it is first seen: what came in since the round before goes by

@@ -16,7 +16,8 @@
 //! Every msat the gateway earned is in exactly one place: split (a party's accrual) or `unsplit` (what
 //! the gateway earned while it sold something other than the model, which stays the operator's). Each
 //! plan's earnings are split as a whole, not round by round, so that rounding never leans the same
-//! way for ever. Routing fees are the operator's, so a lender receives its amounts exactly.
+//! way for ever. Routing fees are the operator's, so a lender receives at least its amounts: a blinded
+//! path charges a margin over what its route takes, and what the route leaves of the fee arrives too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
