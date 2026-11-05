@@ -840,6 +840,44 @@ fn mock_http(answer: fn(&str) -> (u16, &'static str)) -> std::net::SocketAddr {
     xbt_svc::http::serve(Arc::new(Mock(answer)), l, 2).unwrap().addr
 }
 
+/// #41: no secret the box holds is in any page as it opens, nor in a redirect: the agents' access key, the gateway's
+/// health token, a route's login header and a password or key in a route's upstream address. Each page is opened
+/// logged in, and the login page without.
+#[cfg(unix)]
+#[test]
+fn no_secret_is_in_any_page_as_it_opens() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let tdir = tempfile::tempdir().unwrap();
+    let tok = tdir.path().join("mcp-http-token");
+    let gw = tdir.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let secrets = ["mcpkey".repeat(8), "healthtok".repeat(6), "hdrsecret".repeat(4), "urlpass".repeat(4), "urlkey".repeat(5)];
+    std::fs::write(&tok, format!("{}\n", secrets[0])).unwrap();
+    std::fs::write(gw.join("config.json"), json!({
+        "listen": "127.0.0.1:8402", "health_token": secrets[1],
+        "routes": [{"path": "/app/", "upstream": format!("http://admin:{}@127.0.0.1:9/?api_key={}", secrets[3], secrets[4]),
+                    "upstream_headers": {"x-emby-token": secrets[2]}, "price": {"request_msat": 1000}}]}).to_string()).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gw.clone();
+        c.mcp_urls = vec!["http://umbrel.local:33510/mcp".into()];
+        c.mcp_token_file = tok.clone();
+    });
+    let leaks = |what: &str, r: &str| {
+        for x in &secrets {
+            assert!(!r.contains(x.as_str()), "{what}: a secret is in it: {r}");
+        }
+    };
+    leaks("/login", &B::new(&bx.base).get("/login").body);
+    let mut br = logged_in(&bx);
+    for p in ["/", "/wallet", "/browse", "/services", "/sell", "/sell-hashrate", "/sell-vpn", "/hashrate", "/ai", "/vpn", "/nostr", "/relays",
+              "/connections", "/apps", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/agents", "/setup", "/lightning",
+              "/your-gateway", "/api/pending", "/api/hashrate-rentals", "/sell?edit=app"] {
+        let r = br.get(p);
+        leaks(p, &format!("{} {:?}", r.body, r.headers));
+    }
+}
+
 #[test]
 fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -1060,6 +1098,10 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert_eq!(c["node"]["macaroon"], json!(dir.join("invoices.macaroon").display().to_string()));
     assert_eq!(c["routes"], json!([{"path": "/", "price": {"request_msat": 2500}}]));
     xbt_gateway::config::Config::from_json(&c).unwrap();
+    // #41: the settings file shown on the page hides its health token (and every other secret)
+    let token = c["health_token"].as_str().unwrap().to_string();
+    let page = br.get("/").body;
+    assert!(page.contains("The settings file the selling part reads") && page.contains("(hidden)") && !page.contains(&token), "{page}");
     assert_eq!(hex::encode(std::fs::read(dir.join("invoices.macaroon")).unwrap()), inv);
     // a buyer on this machine (a test): loopback, and the macaroons kept when left empty
     let r = send(&mut br, form("http://127.0.0.1:8402", "", "regtest", ""));
@@ -1998,6 +2040,11 @@ fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {
     // the page turned off: its routes are as any other, and the listing names no page
     let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
     let id = shop["offers"][1]["id"].as_str().unwrap().to_string();
+    // #41: the guest login is a credential: never in a page, the edit form included (only its header's name, once saved)
+    let media_id = shop["offers"][0]["id"].as_str().unwrap().to_string();
+    let edit = br.get(&format!("/sell?edit={media_id}")).body;
+    assert!(!edit.contains("guest-1") && edit.contains("saved (X-Emby-Token: …)"), "{edit}");
+    assert!(!br.get("/sell").body.contains("guest-1"));
     br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
                                ("name", "Model"), ("strip", "1")]);
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
