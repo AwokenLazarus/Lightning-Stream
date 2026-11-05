@@ -1446,6 +1446,9 @@ def main() -> int:
             for mode in os.environ.get("P2P_HASH_REAL_MODES", "solo,pool").split(","):
                 real_gateway(mode)
             raise StopIteration
+        # first: its task's signed budget (TOPUP_TASK_SATS) is also the cap on what that task may pay this one seller node
+        # in a day, counted over every task, so it runs before the other rentals pay the seller
+        topup_check()
         r = rental("paid", None, 70, 1.5)
         hz, bz = r["hasher"], r["buyer"]
         lk = r["found"]["listing"]
@@ -1535,7 +1538,6 @@ def main() -> int:
               hz["paid"] == 0 and int(hz["meter"]["work"]) == 0 and bz["payFailed"] and not moved and d.held() == 0 and "smallest ticket" in why,
               {"hashmaker paid": hz["paid"], "work": hz["meter"]["work"], "closed": bz["closed"], "why": why[:300], "payments": moved, "held": d.held()})
 
-        topup_check()
         drop_check()
         slow_check()
         real_gateway("solo")
