@@ -3120,11 +3120,13 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
             "{said}");
     // a rental going on takes more budget and time from its card, instead of a new rental waiting for its machine
     assert!(card.contains("value=\"topup\"") && card.contains("name=\"add_sats\"") && card.contains("Add to this rental"), "{card}");
-    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9"), ("add_sats", "1000"), ("add_minutes", "30")]);
+    let topup_form = &card[card.find("value=\"topup\"").unwrap()..];
+    assert!(topup_form[..topup_form.find("</form>").unwrap()].contains("name=\"once\""), "a top-up is sent once: {card}");
+    let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9"), ("add_sats", "1000"), ("add_minutes", "30"), ("once", "m7")]);
     let said = br.flash_after(&r);
     assert!(said.contains("Added. This rental may now cost up to 5,000 sats, for 90 minutes in all."), "{said}");
     let sent = rseen.lock().unwrap().iter().rev().find(|(m, p, _, _)| m == "POST" && p == "/topup").cloned().unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&sent.3).unwrap(), json!({"rental": "r9", "addSats": 1000, "addMinutes": 30}));
+    assert_eq!(serde_json::from_str::<Value>(&sent.3).unwrap(), json!({"rental": "r9", "addSats": 1000, "addMinutes": 30, "once": "m7"}));
     let r = br.act("/hashrate", "/hashrate", &[("action", "topup"), ("rental", "r9")]);
     assert!(br.flash_after(&r).starts_with("Enter the sats"));
     // Live connections shows the rental, with its Cut button

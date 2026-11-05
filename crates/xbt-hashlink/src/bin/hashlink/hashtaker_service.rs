@@ -778,7 +778,8 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
             }
         }
         ("POST", "/rent") => rent_once(r, &b),
-        ("POST", "/topup") => top_up(r, &b),
+        // once for each mark, as a rent: the form sent again (a double click, a browser's retry) adds nothing twice
+        ("POST", "/topup") => once(r, &b, || top_up(r, &b)),
         _ => (404, json!({"error": "GET /status, GET /offers, GET /gateway-page, POST /rent, POST /cut, POST /topup, POST /datum, POST /attest"})),
     }
 }
@@ -971,8 +972,16 @@ fn top_up(r: &Mutex<R>, b: &Value) -> (u16, Value) {
     let (sats, minutes) = (b["addSats"].as_u64().unwrap_or(0), b["addMinutes"].as_u64().unwrap_or(0));
     let mut g = lock(r);
     let Some(x) = g.rentals.get_mut(id) else { return (404, json!({"error": "no such rental"})) };
-    if x.done.load(Ordering::Relaxed) || x.cut.load(Ordering::Relaxed) || !x.live.lock().unwrap_or_else(|p| p.into_inner())["closed"].is_null() {
+    let (closed, pay_failed) = {
+        let live = x.live.lock().unwrap_or_else(|p| p.into_inner());
+        (!live["closed"].is_null(), live["payFailed"] == true)
+    };
+    if x.done.load(Ordering::Relaxed) || x.cut.load(Ordering::Relaxed) || closed {
         return (409, json!({"error": "that rental has ended: rent again"}));
+    }
+    // the wallet refused or failed a slice: the rental asks for no more, whatever its budget, and ends
+    if pay_failed {
+        return (409, json!({"error": "your wallet stopped paying this rental, so it is ending: rent again"}));
     }
     if x.trial {
         return (400, json!({"error": "a test slice is one piece of work: rent this hashmaker to go on"}));
@@ -984,12 +993,14 @@ fn top_up(r: &Mutex<R>, b: &Value) -> (u16, Value) {
     if x.minutes.saturating_add(minutes) > most {
         return (400, json!({"error": format!("a rental lasts a week at the most: it may have {} minutes more", most - x.minutes.min(most))}));
     }
-    if sats > 21_000_000 * 100_000_000 {
+    // the rental's whole budget, not each top-up, is held to all the bitcoin there is: what is added in msat never wraps
+    const MOST_SATS: u64 = 21_000_000 * 100_000_000;
+    if x.budget_sats.saturating_add(sats) > MOST_SATS || x.added.msat().saturating_add(sats * 1000) > MOST_SATS * 1000 {
         return (400, json!({"error": "that budget is too large"}));
     }
     x.added.msat.fetch_add(sats * 1000, Ordering::Relaxed);
     x.added.secs.fetch_add(minutes * 60, Ordering::Relaxed);
-    x.budget_sats = x.budget_sats.saturating_add(sats);
+    x.budget_sats += sats;
     x.minutes += minutes;
     (200, json!({"ok": true, "rental": id, "budgetSats": x.budget_sats, "minutes": x.minutes}))
 }
@@ -1570,9 +1581,14 @@ mod tests {
         assert_eq!(topup(json!({"rental": id})).0, 400, "nothing to add");
         assert_eq!(topup(json!({"rental": id, "addMinutes": 7 * 24 * 60})).0, 400, "past a week");
         assert_eq!(topup(json!({"rental": "nope", "addSats": 1})).0, 404);
-        let (code, v) = topup(json!({"rental": id, "addSats": first, "addMinutes": 2}));
+        let (code, v) = topup(json!({"rental": id, "addSats": first, "addMinutes": 2, "once": "m1"}));
         assert_eq!(code, 200, "{v}");
         assert_eq!((v["budgetSats"].clone(), v["minutes"].clone()), (json!(2 * first), json!(3)));
+        // the same form sent again adds nothing twice
+        let (code, again) = topup(json!({"rental": id, "addSats": first, "addMinutes": 2, "once": "m1"}));
+        assert_eq!((code, again), (200, v.clone()));
+        assert_eq!((lock(&r).rentals[&id].budget_sats, lock(&r).rentals[&id].added.msat()), (2 * first, first * 1000), "added once");
+        assert_eq!(topup(json!({"rental": id, "addSats": 21_000_000 * 100_000_000})).0, 400, "past all the bitcoin there is, in all");
         // paid on past the first budget's three pieces
         let t0 = Instant::now();
         while !h.status()["rentals"].as_array().is_some_and(|a| a.iter().any(|x| x["paid"].as_u64().unwrap_or(0) > 3)) {
@@ -1582,6 +1598,26 @@ mod tests {
         assert_eq!(lock(&r).rentals[&id].live.lock().unwrap()["budgetMsat"], json!(2 * first * 1000), "the rental's own budget grew");
         handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
         assert_eq!(topup(json!({"rental": id, "addSats": 100})).0, 409, "cut: rent again");
+        let t0 = Instant::now();
+        while h.finished().is_empty() {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the rental never ended: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(h.finished()[0]["paid"].as_u64().unwrap() <= 6, "and never past what was added: {}", h.finished()[0]);
+        // a test slice is one piece: nothing is added to it
+        lock(&r).rentals.get_mut(&id).unwrap().trial = true;
+        lock(&r).rentals.get_mut(&id).unwrap().done.store(false, Ordering::Relaxed);
+        lock(&r).rentals.get_mut(&id).unwrap().cut.store(false, Ordering::Relaxed);
+        *lock(&r).rentals[&id].live.lock().unwrap() = json!({"closed": null});
+        assert_eq!(topup(json!({"rental": id, "addSats": 100})).0, 400);
+        // a rental the wallet stopped paying asks for no more: nothing is added to it
+        lock(&r).rentals.get_mut(&id).unwrap().trial = false;
+        *lock(&r).rentals[&id].live.lock().unwrap() = json!({"closed": null, "payFailed": true});
+        let (code, v) = topup(json!({"rental": id, "addSats": 100}));
+        assert_eq!(code, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("stopped paying"), "{v}");
+    }
+
     /// A renter agrees to the price it saw: a unit of work dearer by more than the leeway, or a dearer start fee, is not
     /// agreed; the same price, a cheaper one, or one within the leeway (said per unit of work, whatever a slice's size) is.
     #[test]
@@ -1657,13 +1693,6 @@ mod tests {
             assert!(t0.elapsed() < Duration::from_secs(30), "the rental never ended: {}", h.status());
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(h.finished()[0]["paid"].as_u64().unwrap() <= 6, "and never past what was added: {}", h.finished()[0]);
-        // a test slice is one piece: nothing is added to it
-        lock(&r).rentals.get_mut(&id).unwrap().trial = true;
-        lock(&r).rentals.get_mut(&id).unwrap().done.store(false, Ordering::Relaxed);
-        lock(&r).rentals.get_mut(&id).unwrap().cut.store(false, Ordering::Relaxed);
-        *lock(&r).rentals[&id].live.lock().unwrap() = json!({"closed": null});
-        assert_eq!(topup(json!({"rental": id, "addSats": 100})).0, 400);
         let fin = h.finished();
         let paid = fin[0]["paid"].as_u64().unwrap();
         assert_eq!(fin[0]["earnedMsat"].as_u64(), Some(paid * now.price_msat), "paid at the new price: {}", fin[0]);
