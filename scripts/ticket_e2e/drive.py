@@ -3814,7 +3814,7 @@ LEND_REAL_BIND = os.environ.get("LEND_REAL_BIND", "")
 MESH_BUNDLE = os.environ.get("MESH_LLM_BUNDLE", "")
 LEND_FORWARD_PORT, OP_API, OP_CONSOLE, OP_QUIC = BASE + 33, BASE + 34, BASE + 35, BASE + 36
 LEND_REAL_CREDIT_SATS = 200
-# answers walked away from partway: Mesh-LLM's stage keeps the lane of such an answer for good, so a split stops serving until that is fixed
+# answers walked away from partway. Mesh-LLM's relay needs our fix for a split to go on serving after one, and the build under test must have it
 ABANDONED_ANSWERS = int(os.environ.get("LEND_REAL_ABANDONED", "0"))
 
 
@@ -4092,20 +4092,26 @@ def mesh_lend_real() -> None:
     check("mesh_lend_real: when the operator really stops paying, the lender leaves the split by itself, with at most its limit and the work of its last interval unpaid",
           r.get("serving") is False and gone and 0 < gap <= LEND_REAL_CREDIT_SATS * 1000 + 2 * one,
           {"answers_unpaid": steps, "stopped": stopped, "gap_msat": gap, "limit_msat": LEND_REAL_CREDIT_SATS * 1000, "one_answer_at_most_msat": one, "left_the_split": gone})
-    # paid at last. The lender comes back by itself. Mesh-LLM's coordinator does not give a stage that restarted its work again, only one that
-    # starts anew, so the operator starts its own node again, as it would to add a lender
+    # paid at last. The lender comes back by itself. Whether the split takes it back by itself is Mesh-LLM's coordinator's to say; if it has not in
+    # two minutes the operator starts its own node again, as it would to add a lender, and the check says which it was
     rc, out = payout()
     lab.wait("the lender to serve again", 120, lambda: lender_report().get("serving") is True, every=2)
-    time.sleep(5)
-    operator_mesh(lock)
-    lab.wait("the split with the lender back", 300, placed, every=2)
-    lab.wait("an answer from the split again", 180, answer_directly, every=3)
+    t_back = time.time()
+    try:
+        lab.wait("the split to take the lender back by itself", 120, answer_directly, every=4)
+        needed_restart = False
+    except LabError:
+        needed_restart = True
+        operator_mesh(lock)
+        lab.wait("the split with the lender back", 300, placed, every=2)
+        lab.wait("an answer from the split again", 180, answer_directly, every=3)
+    measured("split_back", {"seconds": round(time.time() - t_back), "needed_the_operator_to_restart": needed_restart})
     r = fresh_report(8)
     a = buy_one()
     b = books()
-    check("mesh_lend_real: once paid, the lender comes back by itself, nothing fetched, and with the operator's node restarted the split serves paid answers again; its node still holds exactly the ledger's payments",
+    check("mesh_lend_real: once paid, the lender comes back by itself, nothing fetched, and the split serves paid answers again; its node still holds exactly the ledger's payments",
           rc == 0 and r.get("serving") is True and a["paid"] and b["one_for_one"] and b["within_fee"] and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
-          {"rc": rc, "received": r.get("received_msat"), "due_at_least": r.get("due_at_least_msat"), "answer_paid": a["paid"], "books": b, "fetched": Files.hits})
+          {"rc": rc, "needed_the_operator_to_restart": needed_restart, "received": r.get("received_msat"), "due_at_least": r.get("due_at_least_msat"), "answer_paid": a["paid"], "books": b, "fetched": Files.hits})
     measured("mesh_lend_real", {"seconds_to_card": round(t_card), "seconds_to_serving": round(t_serving), "answers": answered, "completion_tokens_honest_run": completions, "lender": r, "books": b})
     Files.command = "2 stop"
     time.sleep(6)
