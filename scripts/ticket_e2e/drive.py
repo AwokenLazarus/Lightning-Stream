@@ -3670,8 +3670,13 @@ def mesh_lend() -> None:
     # --- the whole flow, paid, with nothing false raised
     d = deal_up("honest")
     fetched_once = Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1
-    d.answers(9)
-    rc, out = d.payout()
+    # (an honest operator's rounds leave less unpaid than the lender's limit: three answers at a time are 85 of its 100 sats)
+    rc, out = 0, ""
+    for _ in range(3):
+        d.answers(3)
+        rc, out = d.payout()
+        if rc != 0:
+            break
     r = d.settle()
     led = d.ledger_now()
     weights = {k: v for k, v in led["epoch"]["stages"]}

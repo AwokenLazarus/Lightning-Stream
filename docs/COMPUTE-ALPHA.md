@@ -140,6 +140,9 @@ three payout floors by default), it stops serving, says why, and serves again by
 paid. So the most an operator can take from you is about that limit. `report.json` in its directory has
 both figures at any time.
 
+Set the limit above what an honest operator's payout round can leave unpaid. Below that, you stop serving
+between its rounds, which costs you earnings and it a stage, and come back at each payment.
+
 That catches an operator who stops paying, takes a bigger cut than it invited you on, serves tokens around
 its gateway, or books your stage as its own.
 
