@@ -2158,6 +2158,10 @@ impl Signer {
         self.ticket_pace.queried(asked.elapsed());
         match found {
             Ok(true) => json!({"ok": true, "route": true}),
+            // the node's own word that its channels can't send that much: no payment of it leaves, whoever the payee
+            Err(e) if e.seller.as_deref().is_some_and(|m| m.contains("insufficient local balance")) => {
+                json!({"ok": true, "route": false, "why": format!("the wallet's channels can't send {msat} msat")})
+            }
             Err(e) => unsure(format!("the node could not say: {}", e.msg.chars().take(200).collect::<String>())),
             Ok(false) => {
                 if let Some(ago) = self.ticket_pace.no_route_seen(&node, ROUTE_PROBE_RECENT) {

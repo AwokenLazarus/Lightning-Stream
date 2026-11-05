@@ -19,6 +19,12 @@ Checks:
   small     a direct call with max_sats 500 from no credit is refused, nothing paid; and a rental whose budget
             (500 sat) is under the smallest ticket (546 sat) is refused before any work, nothing paid, the
             renter told why
+  offline   issue #70: a hashmaker whose listing is up and whose miners are all offline (none connected) refuses the
+            rental before its welcome, so nothing is paid, not the start fee: the hashtaker says "its miners are offline
+            right now", the wallet's node sends nothing and the hashmaker earns nothing
+  route     before a rental pays, the renter's route probe on the signer's renter socket, against the real nodes: a route
+            to the seller's node for a ticket's amount; for an amount no channel carries, definitely none (the seller
+            is public) or nothing to go by (it is not); for a node the graph doesn't know, nothing to go by. Nothing sent
   drop      a rental at a third gateway, from no credit, whose link loses what the hashmaker sends for a
             stretch, then is down for 4 s, with a slice paid while it's down. At the resume the hashmaker sends
             its recent shares again, and the hashtaker counts those it never read, once each: both proven
@@ -348,6 +354,70 @@ def rental(name: str, stop_after: int | None, miner_secs: int, rate: float, orig
             return json.load(f)
 
     return {"hasher": load("hasher"), "buyer": load("buyer"), "pool": load("pool"), "found": load("found"), "listing": load("listing"), "done_ms": done_ms}
+
+
+def offline_check() -> None:
+    """Issue #70: a listed hashmaker with no miner connected takes no rental and no money."""
+    name = "offline"
+    inv0, pay0 = d.seller_invoices(), d.buyer_payments()
+    pool = spawn(f"{name}-pool", ["standin-pool", "--listen", f"127.0.0.1:{POOL}", "--diff", str(DIFF), "--job-ms", "1000"])
+    t = ["--slice-work", str(SLICE_WORK), "--price-msat", str(PRICE_MSAT), "--grace-ms", str(GRACE_MS)]
+    hashmaker = spawn(f"{name}-hashmaker", ["hashmaker", "--key", f"{RUN}/keys/hasher.key", "--miners", f"127.0.0.1:{MINERS}", "--link", f"127.0.0.1:{LINK}",
+                                      "--slices", f"127.0.0.1:{SLICES}", *t, "--report", f"{RUN}/{name}-hasher.json",
+                                      "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hashmaker",
+                                      "--link-public", f"127.0.0.1:{LINK}", "--pay-url", f"{ORIGIN}/hashrate", "--pay-node", lab.pubkey(d.SELLER),
+                                      "--hashrate-hs", "4000000000000", "--listing-out", f"{RUN}/{name}-listing.json"])
+    try:
+        lab.wait("the hashmaker's listing", 30, lambda: os.path.exists(f"{RUN}/{name}-listing.json"), every=0.2)
+        time.sleep(0.5)
+        hashtaker = spawn(f"{name}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
+                                        "--found-out", f"{RUN}/{name}-found.json", "--upstream", f"127.0.0.1:{POOL}", "--user", "buyer.rented",
+                                        "--allow-unblinded", "1", "--signer", d.RENTER_SOCK, "--task", "hashrate", "--max-sats", "1500",
+                                        "--rental", f"rt-{name}", "--idle-s", "15", "--report", f"{RUN}/{name}-buyer.json"])
+        t0 = time.time()
+        rc = hashtaker.wait(90)
+        took = time.time() - t0
+        with open(f"{RUN}/{name}-hashtaker.log", errors="replace") as f:
+            said = f.read()[-2000:]
+        moved = {h: p["status"] for h, p in d.buyer_payments().items() if h not in pay0}
+        new_inv = {h: i["state"] for h, i in d.seller_invoices().items() if h not in inv0}
+        status = hashmaker_status(name)
+        check("offline: a hashmaker with no miner connected refuses the rental before its welcome, and nothing is paid",
+              rc != 0 and "hashmaker refused: its miners are offline right now" in said and not moved and not new_inv and d.held() == 0
+              and not os.path.exists(f"{RUN}/{name}-buyer.json") and not status.get("rentals"),
+              {"rc": rc, "seconds": round(took, 1), "said": said[-400:], "payments": moved, "invoices": new_inv, "held": d.held(),
+               "hashmaker rentals": status.get("rentals"), "finished": status.get("finished")})
+    finally:
+        for p in (hashmaker, pool):
+            p.terminate()
+            p.wait(10)
+
+
+def hashmaker_status(name: str) -> dict[str, Any]:
+    """The hashmaker's report, as it last wrote it (empty if it wrote none)."""
+    try:
+        with open(f"{RUN}/{name}-hasher.json") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def route_check() -> None:
+    """The renter's route probe, against the real nodes, on the renter's socket."""
+    pay0 = d.buyer_payments()
+    seller = lab.pubkey(d.SELLER)
+    probe = lambda node, msat: d.signer("ln_route_probe", {"node": node, "amount_msat": msat}, sock=d.RENTER_SOCK)  # noqa: E731
+    found = probe(seller, TICKET_MSAT)
+    # more than the wallet's node holds on all its channels: no route can carry it
+    local = sum(int(c.get("local_balance", 0)) for c in lab.channels(d.BUYER))
+    too_big = probe(seller, (local + 10_000) * 1000)
+    unknown = probe("02" + "11" * 32, TICKET_MSAT)
+    moved = {h: p["status"] for h, p in d.buyer_payments().items() if h not in pay0}
+    definite_or_private = too_big.get("route") is False or (too_big.get("route") is None and "no public channel" in str(too_big.get("why")))
+    check("route: the renter's probe finds the seller's node, finds no route for an amount no channel carries, and can't tell a node "
+          "the graph doesn't know; nothing sent",
+          found.get("route") is True and definite_or_private and unknown.get("route") is None and not moved,
+          {"found": found, "too big": too_big, "local_sat": local, "unknown node": unknown, "payments": moved})
 
 
 def drop_check() -> None:
@@ -1368,6 +1438,8 @@ def main() -> int:
               hz["paid"] == 0 and int(hz["meter"]["work"]) == 0 and bz["payFailed"] and not moved and d.held() == 0 and "smallest ticket" in why,
               {"hashmaker paid": hz["paid"], "work": hz["meter"]["work"], "closed": bz["closed"], "why": why[:300], "payments": moved, "held": d.held()})
 
+        offline_check()
+        route_check()
         drop_check()
         slow_check()
         real_gateway("solo")
