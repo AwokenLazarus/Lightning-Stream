@@ -190,15 +190,15 @@ export const RELAYS = ['wss://relay.lazarus-xbt.xyz', 'wss://relay.kilombino.com
  */
 export const IMAGES: Record<ImageKey, string> = {
   init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-8c844bcb5c6f@sha256:90d12565dc29a4ae3dd1ff5d46615d1687ccf2728b536431846f73e4a4f2d1b4',
-  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-8c844bcb5c6f@sha256:3b36e56812123ab55b62bcede309616257c6990dcc89601a7b1ac450f59f1d5c',
-  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-8c844bcb5c6f@sha256:01968f344c561b25f29aaecd0e408832e471841e36229541f2d8904ec53e826a',
-  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-8c844bcb5c6f@sha256:55a3a919b079bd2ebc4329acfb66401c458c4075ee904b0f66eb6ea8a030b2fa',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-4dac7759ed89@sha256:8c7268bc083a8f2e4110dcbad6319abfa8ace4cecd848579681a3844e94bdb46',
-  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-8c844bcb5c6f@sha256:c007152f7a43fb362d319038af2f31b51be9d48de89202f0c53ac85cb361e02f',
+  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-f19a1390065a@sha256:295ae00eafa29701bcb896f3a95aefe39066e4b9f606f897eed75c8e29b4343b',
+  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-f19a1390065a@sha256:2cf58f8fb0f53912b7d3481a8a5b603b7b83192ebc0fae30087de34c4820ff2b',
+  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-f19a1390065a@sha256:773ffd86003d9ba88cb0c79b9bbfa9431f404a4487b1c0254f739e878644be2e',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-f19a1390065a@sha256:e8e4843d2de04e89b10a258bbdb72294464ee5d48103d531e6ebd02212cfa139',
+  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-f19a1390065a@sha256:315719e1f07f4fe5dfbc878d81acdc2dc639a5f344e1c4aa3a6d07122c880e82',
   connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-8c844bcb5c6f@sha256:74629ff66eaf8a097bced23fbc9f0d80d81f6bf1791e6def35fd27d84200e2da',
-  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-8c844bcb5c6f@sha256:bcf7a7b4eb603af8e016e37a2ec7c29a42205497c28808b2b78380abd7791616',
+  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-f19a1390065a@sha256:bc39e20d936e2ec813a31e5fbc38f9883bc8b8064183432970712043b1fa2cc3',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
-  vpn: 'ghcr.io/awokenlazarus/xbt-vpn:0.1.0-8c844bcb5c6f@sha256:f8a5e837c822f8d5a9472b8ae7322959e2d479cd18f5a895e2697aedb212723e',
+  vpn: 'ghcr.io/awokenlazarus/xbt-vpn:0.1.0-f19a1390065a@sha256:4cc9eb2b7753007a4df4247892e14fb4674f3e621264df1c78586bed39dc7360',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
   datum: 'ghcr.io/awokenlazarus/xbt-datum-gateway:0.1.0-8c844bcb5c6f@sha256:8e48916f314c2a2371b764c88bee79a355afa07e946a308cb88192fda26c6333',
 }
