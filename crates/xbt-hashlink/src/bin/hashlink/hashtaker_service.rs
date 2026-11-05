@@ -58,6 +58,12 @@ const KEPT: usize = 50;
 /// How long a Rent request's mark is remembered, and how long a request sent again waits for the first.
 const ONCE_KEPT: Duration = Duration::from_secs(600);
 const ONCE_WAIT: Duration = Duration::from_secs(60);
+/// How long a seller's node the wallet's node definitely found no route to is said so on its offer.
+const UNREACHABLE_KEPT: Duration = Duration::from_secs(600);
+/// How long a rent waits for the signer's route probe: past it, the probe is inconclusive and the rent goes on.
+const ROUTE_PROBE_WAIT: Duration = Duration::from_secs(8);
+/// A rent's refusal, and its offer's note, when the wallet's node definitely finds no route to the seller's node.
+pub const SELLER_UNREACHABLE: &str = "can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive)";
 
 struct Rental {
     hashmaker: String,
@@ -125,6 +131,9 @@ struct R {
     /// Rent requests by their mark (`once`): the answer of the one that started a rental, or `None` while it
     /// is starting. A request sent again gets that answer and starts nothing.
     onces: HashMap<String, (Instant, Option<(u16, Value)>)>,
+    /// Sellers' pay nodes the wallet's node definitely found no route to, at a rent: when, and the probe's words. Said
+    /// on their offers for [`UNREACHABLE_KEPT`].
+    unreachable: HashMap<String, (Instant, String)>,
 }
 
 /// A gateway's API port when nothing says otherwise.
@@ -298,6 +307,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     let r = Arc::new(Mutex::new(R {
         shown: None,
         onces: HashMap::new(),
+        unreachable: HashMap::new(),
         failed_first,
         key: crate::hashmaker_service::key_file(super::need(f, "key")?)?,
         datum,
@@ -708,6 +718,10 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                     let author = authors.get(&hex::encode(h.link_key.serialize())).cloned().unwrap_or_default();
                     v["history"] = trust::aggregate(&h.link_key, &author, per_miner_hs(h), &events);
                     v["perMinerHs"] = json!(per_miner_hs(h).to_string());
+                    // a seller the wallet's node found no route to at a rent: said on its offer for a while
+                    if let Some(why) = unreachable_now(r, &h.pay_node) {
+                        v["unreachable"] = json!(why);
+                    }
                     v
                 })
                 .collect();
@@ -810,6 +824,39 @@ fn once(r: &Mutex<R>, b: &Value, start: impl FnOnce() -> (u16, Value)) -> (u16, 
     answer
 }
 
+/// Why an offer can't be rented as it stands (#70): no free miner, or no hashrate, in the offer as last seen.
+fn offline_offer(h: &Hashrate) -> Option<String> {
+    let c = &h.capacity;
+    if c.miners > 0 && c.free_miners == 0 && h.hashrate_hs > 0 {
+        Some(format!("this hashmaker's offer shows all its miners rented ({}): nothing was paid", xbt_hashlink::hashmaker::NO_MINERS_FREE))
+    } else if c.free_miners == 0 || h.hashrate_hs == 0 {
+        Some(format!("this hashmaker's offer shows no free miner and no hashrate: {}. Nothing was paid", xbt_hashlink::hashmaker::MINERS_OFFLINE))
+    } else {
+        None
+    }
+}
+
+/// What the signer's route probe said of a seller's node: a route found (`Some(true)`), definitely none
+/// (`Some(false)`, with its words), or nothing to go by (`None`: no node named, no signer, an older signer, a node that
+/// could not answer). Only a definite no-route refuses a rent.
+fn route_probe(sock: &std::path::Path, node: &str, amount_msat: u64) -> (Option<bool>, String) {
+    if node.is_empty() {
+        return (None, "the offer names no pay node".into());
+    }
+    let params = json!({"node": node, "amount_msat": amount_msat});
+    match xbt_hashlink::rail::signer_call_waiting(sock, "ln_route_probe", &params, Some(ROUTE_PROBE_WAIT)) {
+        Ok(v) => (v["route"].as_bool(), v["why"].as_str().unwrap_or("").to_string()),
+        Err((_, e)) => (None, e),
+    }
+}
+
+/// The words of a definite no-route to `node` found at a rent within [`UNREACHABLE_KEPT`].
+fn unreachable_now(r: &Mutex<R>, node: &str) -> Option<String> {
+    let mut g = lock(r);
+    g.unreachable.retain(|_, (at, _)| at.elapsed() < UNREACHABLE_KEPT);
+    g.unreachable.get(node).map(|_| SELLER_UNREACHABLE.to_string())
+}
+
 fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     let key_hex = b["linkKey"].as_str().unwrap_or("");
     let trial = b["trial"] == true;
@@ -859,6 +906,10 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     if !h.proves() {
         return (400, json!({"error": "this hashmaker's app doesn't prove the work it sells: it needs updating"}));
     }
+    // an offer with no free miner or no hashrate is not paid anything (#70): its start fee would buy no work
+    if let Some(why) = offline_offer(&h) {
+        return (409, json!({"error": why, "offline": true}));
+    }
     if trial {
         // one machine, one slice: the budget is one slice's price with the start fee, and the time a few slices' worth
         miners = 1;
@@ -894,6 +945,22 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     };
     // the first ticket, the first step's: later ones grow as they are earned, inside the budget
     let first_ticket = xbt_hashlink::rail::caps_at(xbt_hashlink::order::FIRST_STEP_MSAT, h.terms.price_msat, Some(ticket_budget_sats.saturating_mul(1000)), None).1.unwrap_or(0);
+    // whether the wallet's node finds a route to the seller's node for the first payment, before anything is paid: one
+    // probe a rent. Only a definite no-route refuses; an inconclusive probe lets the rent go on as before
+    if let Some(sock) = signer.as_deref() {
+        let amount_msat = first_ticket.saturating_mul(1000).max(first_payment_msat(&h.terms));
+        match route_probe(sock, &h.pay_node, amount_msat) {
+            (Some(false), why) => {
+                eprintln!("hashtaker: no route to the seller's node {}: {why}", h.pay_node);
+                lock(r).unreachable.insert(h.pay_node.clone(), (Instant::now(), why.clone()));
+                return (409, json!({"error": format!("Your wallet {SELLER_UNREACHABLE}: nothing was paid."), "unreachable": true, "probe": why}));
+            }
+            (Some(true), _) => {
+                lock(r).unreachable.remove(&h.pay_node);
+            }
+            (None, why) => eprintln!("hashtaker: the route probe to {} was inconclusive ({why}): the rent goes on", h.pay_node),
+        }
+    }
     let payer = signer.map(|sock| SignerPayer::new(sock, h.pay_url.clone(), task, h.terms.price_msat, Some(ticket_budget_sats), None,
                                                    std::time::Duration::from_millis(h.terms.grace_ms / 2)));
     let cfg = hashtaker::Config {
@@ -942,8 +1009,17 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     }
     let hashmaker_key: PublicKey = h.link_key;
     let service = r.clone();
+    let key_hex = key_hex.to_string();
     std::thread::spawn(move || {
-        let res = hashtaker::run(cfg, Box::<LabHashtaker>::default());
+        // the offer looked at fresh, right before the hashmaker is dialled and its start fee paid: an offer kept for a
+        // while may have gone offline since (#70). No relay answering is no reason to stop (the hashmaker refuses a
+        // rental it has no miners for, before any payment), nor is a listing one relay's answer left out
+        let relays = !lock(&service).relays.is_empty();
+        let fresh = relays.then(|| look_up_offers(&service)).flatten().and_then(|o| o.into_iter().find(|(x, _)| hex::encode(x.link_key.serialize()) == key_hex));
+        let res = match fresh.as_ref().and_then(|(now, _)| offline_offer(now)) {
+            Some(why) => Err(why),
+            None => hashtaker::run(cfg, Box::<LabHashtaker>::default()),
+        };
         match res {
             Err(e) => *live.lock().unwrap_or_else(|p| p.into_inner()) = json!({"closed": format!("could not start: {e}")}),
             Ok(report) => lock(&service).note_rental_end(&hex::encode(hashmaker_key.serialize()), &report),
@@ -1262,6 +1338,7 @@ mod tests {
         Arc::new(Mutex::new(R {
             shown: None,
             onces: HashMap::new(),
+            unreachable: HashMap::new(),
             failed_first: BTreeMap::new(),
             key: noise::fresh_key(),
             datum: String::new(),
@@ -1723,6 +1800,7 @@ mod tests {
     fn test_r(bundled: &str, api: Option<String>) -> Arc<Mutex<R>> {
         Arc::new(Mutex::new(R {
             onces: HashMap::new(),
+            unreachable: HashMap::new(),
             key: SecretKey::from_slice(&[7u8; 32]).unwrap(),
             datum: bundled.into(),
             datum_api: None,

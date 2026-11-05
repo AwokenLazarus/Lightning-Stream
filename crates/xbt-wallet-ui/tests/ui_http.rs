@@ -5100,6 +5100,51 @@ fn an_offer_shows_its_start_fee() {
     assert!(!old.contains("Start fee"), "{old}");
 }
 
+/// #70: an offer with no free machine, or no hashrate, has Rent and "Try one slice first" off, and says its miners are
+/// offline right now; an offer whose seller's node the wallet's node found no route to at a rent says so on its card.
+///
+/// FAILS before: an offer saying 0 machines and 0 hashrate ("free machines not given") could be rented, and a renter paid
+/// its start fee and first slice to a hashmaker no miner was connected to.
+#[test]
+fn an_offer_with_its_miners_offline_cannot_be_rented_and_an_unreachable_seller_is_said() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (renter, _rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({"datum": {"addr": "datum-gateway:23334", "reachable": true, "found": []}, "rentals": [],
+                                     "blinding": {"state": "blinded", "why": "solo", "words": "Blinded."}}),
+        ("GET", "/offers") => json!({"offers": [
+            {"name": "Kilohash", "linkKey": "02bb", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 0, "freeMiners": 0, "freeHs": "0", "hashrateHs": "0"},
+            {"name": "Idle miners", "linkKey": "02cc", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 1, "freeMiners": 1, "freeHs": "0", "hashrateHs": "0"},
+            {"name": "Far miners", "linkKey": "02dd", "priceMsat": 40_000, "sliceWork": (1u128 << 47).to_string(), "proves": true,
+             "miners": 1, "freeMiners": 1, "freeHs": "4000000000000", "hashrateHs": "4000000000000", "payNode": format!("03{}", "78".repeat(32)),
+             "unreachable": "can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive)"}]}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let rtok = dir.path().join("renter-token");
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/hashrate");
+    let card = |name: &str| {
+        let c = &p.body[p.body.find(&format!("<h3>{name}</h3>")).unwrap_or_else(|| panic!("{name}: {}", p.body))..];
+        c[..c.find("</section>").unwrap()].to_string()
+    };
+    for name in ["Kilohash", "Idle miners"] {
+        let c = card(name);
+        assert!(c.contains("<button disabled>Rent</button>") && c.contains("<button class=\"secondary\" disabled>Try one slice first</button>"), "{name}: {c}");
+        assert!(c.contains("Its miners are offline right now"), "{name}: {c}");
+    }
+    let far = card("Far miners");
+    assert!(far.contains("Your wallet can&#39;t reach this seller&#39;s Lightning node right now (it may have only private channels, or none that can receive)")
+            || far.contains("Your wallet can't reach this seller's Lightning node right now (it may have only private channels, or none that can receive)"), "{far}");
+    assert!(!far.contains("offline right now"), "{far}");
+}
+
 /// This box's own offer says what it is, with its address beside its name, and offers nothing to allow, try or rent; the
 /// "Your offer" note stays. Another hashmaker's offer keeps its Rent.
 ///

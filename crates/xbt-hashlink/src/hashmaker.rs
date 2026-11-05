@@ -117,6 +117,13 @@ const HELD_MOST: usize = 2048;
 const RATE_WINDOW: Duration = Duration::from_secs(300);
 /// With no fallback (the lab), how long a miner waits for a rental before it's let go.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long a new rental's hello waits for a miner that is connecting (or for enough to be free) before it is refused:
+/// well within the hashtaker's wait for its welcome ([`link::HANDSHAKE_TIMEOUT`]).
+const MINERS_WAIT: Duration = Duration::from_secs(5);
+/// A new rental's refusal when no miner is connected (#70): nothing is paid. The renter's app says it in these words.
+pub const MINERS_OFFLINE: &str = "its miners are offline right now";
+/// A new rental's refusal when every miner connected is rented already.
+pub const NO_MINERS_FREE: &str = "no miners free now";
 /// How long a miner asked to connect again is expected back from its address.
 const RETURN_WAIT: Duration = Duration::from_secs(20);
 /// An old upstream session is kept this long after a switch, for shares of its jobs.
@@ -456,6 +463,22 @@ impl Hub {
             miners: live.len() as u32,
             free_miners: free.len() as u32,
             free_hs: free.iter().map(|u| u.speed() as u64).sum(),
+        }
+    }
+
+    /// Why a new rental asking for `want` miners (0: any) can't start now: no miner connected, none free, or fewer
+    /// free than it asks for. `None`: it can.
+    fn short_of_miners(&self, want: u32) -> Option<String> {
+        let c = self.capacity();
+        let need = want.max(1);
+        if c.free_miners >= need {
+            None
+        } else if c.miners == 0 {
+            Some(MINERS_OFFLINE.into())
+        } else if c.free_miners == 0 {
+            Some(NO_MINERS_FREE.into())
+        } else {
+            Some(format!("only {} of the {need} miners asked for are free now", c.free_miners))
         }
     }
 
@@ -866,10 +889,21 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             } else if g.rentals.contains_key(&rental) || g.finished.iter().any(|f| f["rental"] == rental.as_str()) {
                 Some("that rental id is taken".to_string())
             } else {
-                // a hashmaker whose miners are all rented says so; one with no miners yet waits
-                let c = g.capacity();
-                (c.miners > 0 && c.free_miners == 0).then(|| "no miners free now".to_string())
+                None
             };
+            drop(g);
+            // no miner to give it, or fewer free than it asks for: refused before the welcome, so nothing is paid, not the
+            // start fee (#70). A miner that is connecting as the rental is asked for is waited for a moment
+            let why = why.or_else(|| {
+                let t0 = Instant::now();
+                loop {
+                    let short = lock(&hub).short_of_miners(miners);
+                    match short {
+                        Some(_) if t0.elapsed() < MINERS_WAIT => std::thread::sleep(Duration::from_millis(100)),
+                        other => break other,
+                    }
+                }
+            });
             if let Some(why) = why {
                 let _ = tx.send(&Msg::Close { reason: why, slices: None });
                 tx.shutdown();
@@ -918,6 +952,13 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
     eprintln!("hashmaker: rental {id} from hashtaker {} ({} miners asked)", hex::encode(remote.serialize()), if want == 0 { "any".into() } else { want.to_string() });
     {
         let mut g = lock(&hub);
+        // asked again under the lock that inserts it: another hello may have taken the id while this one waited for miners
+        if g.rentals.contains_key(&id) || g.finished.iter().any(|f| f["rental"] == id.as_str()) {
+            drop(g);
+            let _ = tx.send(&Msg::Close { reason: "that rental id is taken".into(), slices: None });
+            tx.shutdown();
+            return;
+        }
         let rail = (g.rails)();
         g.rentals.insert(id.clone(), Rental {
             terms,
@@ -2045,9 +2086,9 @@ fn slice_request(hub: &Mutex<Hub>, method: &str, path: &str, body: &[u8], gatewa
         return (409, json!({"error": "the body is not a receipt"}));
     };
     let mut g = lock(hub);
-    // a first slice with no miner to give it: refused here, so its charge goes back
-    let c = g.capacity();
-    let no_miners = c.miners > 0 && c.free_miners == 0;
+    // a first slice with no miner to give it, or fewer than its rental asks for (none connected included, #70):
+    // refused here, before any credit, so its charge (the start fee with it) goes back
+    let short = (slice == 1).then(|| g.rentals.get(&rental).map(|r| r.want)).flatten().and_then(|want| g.short_of_miners(want));
     let Some(r) = g.rentals.get_mut(&rental) else {
         return (409, json!({"error": "no such rental going on"}));
     };
@@ -2057,9 +2098,9 @@ fn slice_request(hub: &Mutex<Hub>, method: &str, path: &str, body: &[u8], gatewa
         r.note(json!({"ev": "paid slice given up by the gateway", "slice": slice, "atMs": now_ms()}));
         return (409, json!({"error": "the gateway stopped waiting"}));
     }
-    if slice == 1 && no_miners {
-        r.note(json!({"ev": "paid slice refused", "slice": slice, "why": "no miners free now", "atMs": now_ms()}));
-        return (409, json!({"error": "no miners free now"}));
+    if let Some(why) = short {
+        r.note(json!({"ev": "paid slice refused", "slice": slice, "why": why, "atMs": now_ms()}));
+        return (409, json!({"error": why}));
     }
     match check_receipt(r, slice, &receipt) {
         Err(why) => {
@@ -2146,7 +2187,71 @@ mod tests {
             Box::new(|| Box::<LabSeller>::default()),
         )
         .unwrap();
+        // two miners connected, as a rental's hello needs (#70): on connections that aren't there, so no rental takes them
+        fake_miners(&h, 2);
         (h, link, PublicKey::from_secret_key(secp256k1::SECP256K1, &hk))
+    }
+
+    /// `n` miners the capacity counts as connected and free, on no real connection: none is ever taken.
+    fn fake_miners(h: &Hashmaker, n: u64) {
+        let mut g = lock(&h.hub);
+        g.units.retain(|k, _| !k.starts_with("fake-"));
+        for i in 0..n {
+            g.units.insert(format!("fake-{i}"), Unit { conn: Some(u64::MAX - i), ..Unit::default() });
+        }
+    }
+
+    fn hello(addr: &str, hpub: PublicKey, rental: &str, terms: &Terms, miners: u32) -> (SecretKey, Option<Msg>) {
+        let bk = crate::noise::fresh_key();
+        let lk = link::dial(addr, bk, hpub).unwrap();
+        lk.tx.send(&Msg::Hello { rental: rental.into(), listing: "l".into(), terms: terms.clone(), miners, proof: Some(PROOF.into()) }).unwrap();
+        let mut rx = lk.rx;
+        (bk, rx.recv_within(Duration::from_secs(15)).ok().flatten())
+    }
+
+    /// #70: a hashmaker with no miner connected, or fewer free than a rental asks for, refuses the rental before its
+    /// welcome, so the renter pays nothing, not the start fee; and the first slice of a rental whose miners went away
+    /// after its welcome is refused, so its charge goes back. With miners there, the same hello is welcomed.
+    #[test]
+    fn a_rental_is_refused_before_any_payment_without_the_miners_it_asks_for() {
+        let terms = Terms { slice_work: 1 << 20, price_msat: 5_000, grace_ms: 30_000, start_slices: 1 };
+        let s = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slices = s.local_addr().unwrap().to_string();
+        drop(s);
+        let (h, addr, hpub) = start(&terms, &slices);
+        fake_miners(&h, 0);
+        let t0 = Instant::now();
+        match hello(&addr, hpub, "none", &terms, 1).1 {
+            Some(Msg::Close { reason, .. }) => assert_eq!(reason, MINERS_OFFLINE),
+            other => panic!("{other:?}"),
+        }
+        assert!(t0.elapsed() >= MINERS_WAIT - Duration::from_millis(200), "a miner connecting is waited for a moment first");
+        fake_miners(&h, 1);
+        match hello(&addr, hpub, "two", &terms, 2).1 {
+            Some(Msg::Close { reason, .. }) => assert_eq!(reason, "only 1 of the 2 miners asked for are free now"),
+            other => panic!("{other:?}"),
+        }
+        assert!(h.status()["rentals"].as_array().is_none_or(|r| r.is_empty()), "no rental was started: {}", h.status());
+        // a miner that connects while the hello waits: welcomed
+        let h2 = std::thread::spawn({
+            let (addr, terms) = (addr.clone(), terms.clone());
+            move || hello(&addr, hpub, "r", &terms, 1)
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        fake_miners(&h, 1);
+        let (bk, said) = h2.join().unwrap();
+        assert!(matches!(said, Some(Msg::Welcome { .. })), "{said:?}");
+        // the miners went away after the welcome: the first slice (with the start fee) is refused, nothing credited
+        fake_miners(&h, 0);
+        let receipt = Receipt { rental: "r".into(), slice: 1, work: 0, accepted: 0, rejected: 0, at_ms: 1 }.sign(&bk).to_string();
+        let (code, out) = slice_request(&h.hub, "POST", "/hashrate/r/1", receipt.as_bytes(), &|| false);
+        assert_eq!((code, out["error"].as_str()), (409, Some(MINERS_OFFLINE)));
+        let r = &h.status()["rentals"][0];
+        assert_eq!((r["paid"].as_u64(), r["ready"].as_bool()), (Some(0), Some(false)), "{r}");
+        fake_miners(&h, 1);
+        let (code, _) = slice_request(&h.hub, "POST", "/hashrate/r/1", receipt.as_bytes(), &|| false);
+        assert_eq!(code, 200);
+        h.shutdown();
     }
 
     /// The gateway gave the charge back before the credit: no slice for nothing. With it still there, the

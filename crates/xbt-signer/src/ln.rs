@@ -298,6 +298,12 @@ pub trait LnBackend: Send + Sync {
     fn has_route(&self, _payee: &str, _amt_msat: u64, _outgoing_chan_id: Option<&str>, _final_cltv: u64, _route_hints: &[Value]) -> Result<bool> {
         Err(err("ln_backend", "this backend does not look for routes"))
     }
+    /// `GET /v1/graph/node/{node}` (GetNodeInfo, `info:read`): how many public channels the node's graph has for
+    /// `node`; `Ok(None)` where the graph doesn't know it (a node with only private channels). Any other failure to
+    /// answer is an error.
+    fn public_channels(&self, _node: &str) -> Result<Option<u64>> {
+        Err(err("ln_backend", "this backend does not read the channel graph"))
+    }
     /// Stream tickets, `POST /v2/router/send` for a hold invoice: the `Payment` as soon as it is
     /// locked (IN_FLIGHT with an HTLC out) or over (FAILED, SUCCEEDED). The payment goes on in the
     /// node after this returns; an error means its fate is not known ([`Self::lookup`] then says).
@@ -614,6 +620,18 @@ impl LnBackend for LndRest {
         }
     }
 
+    fn public_channels(&self, node: &str) -> Result<Option<u64>> {
+        if node.len() != 66 || !node.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(err("ln_backend", "a node is looked up by its key only"));
+        }
+        match self.get(&format!("/v1/graph/node/{node}?include_channels=false")) {
+            Ok(v) => Ok(Some(v.get("num_channels").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0))),
+            // the node's own word that its graph has no such node
+            Err(e) if e.msg.contains("LN node HTTP") && e.seller.as_deref().is_some_and(|m| m.contains("unable to find node")) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn send(&self, r: &SendRequest) -> Result<Value> {
         let body = json!({"payment_request": r.invoice, "timeout_seconds": r.timeout_s, "fee_limit_sat": r.fee_limit_sats.to_string(),
                           "cltv_limit": r.cltv_limit, "outgoing_chan_ids": r.outgoing_chan_ids, "no_inflight_updates": true,
@@ -855,6 +873,11 @@ pub fn channel_refusal(c: &Value, split_height: i64) -> Option<String> {
 /// shipped (`refill_wait`), with room left to pay it.
 pub(crate) const CHANNEL_BACK_WAIT: Duration = Duration::from_secs(8);
 pub(crate) const CHANNEL_BACK_POLL: Duration = Duration::from_millis(250);
+/// A rental's route probe ([`Signer::ln_route_probe`]): the final hops' CLTV delta it asks a route for, small, so that a
+/// route the payment would find is never missed for it.
+pub(crate) const ROUTE_PROBE_FINAL_CLTV: u64 = 40;
+/// How recent a payment's no-route through its whole wait must be for a rental's route probe to take it as definite.
+pub(crate) const ROUTE_PROBE_RECENT: Duration = Duration::from_secs(600);
 /// Longer than the wait's polls, and than the moment between one refused payment and the next behind it.
 const CHANNEL_OUT_FORGOTTEN: Duration = Duration::from_secs(1);
 /// A ticket that fails this soon after the wallet saw its channels out failed for the outage: its round is no sign of a
@@ -2116,6 +2139,41 @@ impl Signer {
     /// so it answers while another payment is in flight; it reconciles nothing (`ln_status` and the
     /// next `ln_pay` do). The preimage is given only for a payment settled with the preimage of its
     /// hash. A keyless front end (the NWC service) reads the outcome of a payment it asked for with it.
+    /// Before a hashrate rental pays anything: whether the node finds a route of `amount_msat` to the seller's node
+    /// `node`, as its payment would look for one. One route query, and when it finds none, one look at the graph.
+    /// `route`: `true`, a route found; `false`, definitely none (the node is public and no route reaches it, or a
+    /// payment to it found none through its whole wait, its invoice's route hints given, within the last
+    /// [`ROUTE_PROBE_RECENT`]); `null`, nothing to go by (no node here, a node that could not answer, or a node with
+    /// only private channels, reached by route hints in its invoices that a probe hasn't got). Nothing is sent.
+    pub(crate) fn ln_route_probe(&self, p: &Value) -> Value {
+        let node = str_or_empty(p.get("node")).trim().to_ascii_lowercase();
+        let msat = p.get("amount_msat").and_then(Value::as_u64).unwrap_or(0);
+        if node.len() != 66 || !node.bytes().all(|b| b.is_ascii_hexdigit()) || msat == 0 {
+            return deny("ln_route_probe", "node: a node key, 66 hex characters; amount_msat: more than 0");
+        }
+        let unsure = |why: String| json!({"ok": true, "route": null, "why": why});
+        let Some(ln) = self.ln.clone() else { return unsure("this wallet has no Lightning node".into()) };
+        let asked = std::time::Instant::now();
+        let found = ln.has_route(&node, msat, None, ROUTE_PROBE_FINAL_CLTV, &[]);
+        self.ticket_pace.queried(asked.elapsed());
+        match found {
+            Ok(true) => json!({"ok": true, "route": true}),
+            Err(e) => unsure(format!("the node could not say: {}", e.msg.chars().take(200).collect::<String>())),
+            Ok(false) => {
+                if let Some(ago) = self.ticket_pace.no_route_seen(&node, ROUTE_PROBE_RECENT) {
+                    return json!({"ok": true, "route": false,
+                                  "why": format!("a payment to this node found no route {} s ago, with its invoice's route hints", ago.as_secs())});
+                }
+                match ln.public_channels(&node) {
+                    Ok(Some(n)) if n > 0 => json!({"ok": true, "route": false,
+                                                   "why": format!("the node is public ({n} channels) and no route of {msat} msat reaches it")}),
+                    Ok(_) => unsure("the node has no public channel: it is reached by the route hints in its invoices".into()),
+                    Err(e) => unsure(format!("the graph could not be read: {}", e.msg.chars().take(200).collect::<String>())),
+                }
+            }
+        }
+    }
+
     pub(crate) fn ln_lookup(&self, p: &Value) -> Value {
         let hash = str_or_empty(p.get("payment_hash")).trim().to_ascii_lowercase();
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {

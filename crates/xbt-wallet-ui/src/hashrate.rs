@@ -32,6 +32,9 @@ use crate::html::{esc, short};
 use crate::server::Resp;
 
 const WAIT: Duration = Duration::from_secs(6);
+/// A hashmaker's refusal of a rental when no miner of its is connected, as `xbt_hashlink::hashmaker::MINERS_OFFLINE`
+/// words it (#70): the rental pays nothing.
+const MINERS_OFFLINE: &str = "its miners are offline right now";
 /// What a rental pays before the miners move, in seconds of their work: it pays for moving them. The S11
 /// run sets the real value.
 pub const START_FEE_SECONDS: f64 = 12.0;
@@ -519,6 +522,7 @@ fn ended_words(why: &str) -> String {
         "unpaid" => "A piece of work was not paid in time.".into(),
         "stopped by the hashmaker" | "stopped by the hasher" => "The hashmaker stopped it.".into(),
         "no miners free now" => "The hashmaker has no miners free.".into(),
+        w if w.contains(MINERS_OFFLINE) => "It could not start: the hashmaker's miners are offline right now. Nothing was paid.".into(),
         "a difficulty too high for the slice" => "The hashmaker stopped it: your pool asked for harder work than its pieces of work allow.".into(),
         "no first payment" => "The first piece of work was not paid in time.".into(),
         "the first slice could not be paid" => "Your wallet could not pay for the first piece of work.".into(),
@@ -1146,9 +1150,11 @@ impl App {
                     };
                     // this box's own offer: marked, and not rented (a box can't pay itself)
                     let mine = own_offer(self.is_own_shop(pay_url), &own_pay, pay_url);
-                    let can = ready && rules == RentRules::Allowed && allowed && !old && !mine && (free > 0 || total == 0);
+                    // an offer with no free machine or no hashrate is never paid (#70): its start fee would buy no work
+                    let hashrate = if x.get("hashrateHs").is_some() { num(&x["hashrateHs"]) } else { free_hs };
+                    let can = ready && rules == RentRules::Allowed && allowed && !old && !mine && free > 0 && hashrate > 0.0;
                     // why Rent is off, said beside the buttons (and as their tooltip), so nobody is left guessing
-                    let why_off = rent_off_reasons(ready, head, rules, allowed, old, mine, free, total);
+                    let why_off = rent_off_reasons(ready, head, rules, allowed, old, mine, free, total, hashrate);
                     let (off_tip, off_note) = if can || why_off.is_empty() { (String::new(), String::new()) } else {
                         (format!(" title=\"Rent is off: {}\"", esc(&why_off.join("; "))),
                          format!("<div class=\"hint rent-off\"><strong>Rent is off because:</strong><ul>{}</ul>{}</div>",
@@ -1169,6 +1175,11 @@ impl App {
                         ""
                     };
                     let history = history_panel(&x["history"]);
+                    // the wallet's node found no route to this seller's node at a rent, a moment ago
+                    let unreachable = match x["unreachable"].as_str() {
+                        Some(w) => format!("<p class=\"hint warn\">Your wallet {}. Nothing was paid; try again later.</p>", esc(w)),
+                        None => String::new(),
+                    };
                     let odds = solo_odds(&st["blinding"], tip.as_ref(), per_miner);
                     // what may leave the wallet for a trial's first ticket, as the hashtaker sets it (rail::caps_at),
                     // is said beside its price; a longer rental's tickets grow with its work, so it names no figure
@@ -1195,7 +1206,7 @@ impl App {
                         continue;
                     }
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{history}{allow}{trial}\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{unreachable}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
                         <input type=\"hidden\" name=\"piece_sat\" value=\"{price}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
@@ -1373,7 +1384,8 @@ fn priced_high(mine: f64, others: &[f64], market: Option<f64>) -> String {
 /// `gateway` is the heading `rent_status` gives the gateway's state, so the reason matches the notice on the page.
 /// `rules`: what the signed spending rules say of renting.
 #[allow(clippy::too_many_arguments)]
-fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool, old: bool, mine: bool, free: u64, total: u64) -> Vec<String> {
+#[allow(clippy::too_many_arguments)]
+fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool, old: bool, mine: bool, free: u64, total: u64, hashrate: f64) -> Vec<String> {
     let mut why = Vec::new();
     if mine {
         why.push("This is your own box's offer: buyers rent it from their apps".to_string());
@@ -1394,8 +1406,11 @@ fn rent_off_reasons(ready: bool, gateway: &str, rules: RentRules, allowed: bool,
     if old {
         why.push("This hashmaker's app needs updating: it doesn't prove the work it sells".to_string());
     }
-    if total > 0 && free == 0 {
+    if total > 0 && free == 0 && hashrate > 0.0 {
         why.push("All of its machines are rented right now; try again later".to_string());
+    } else if free == 0 || hashrate <= 0.0 {
+        // its offer says no machine is connected, or none hashing: a rental would pay its start fee for nothing (#70)
+        why.push("Its miners are offline right now; try again later".to_string());
     }
     why
 }
@@ -2143,16 +2158,23 @@ mod tests {
 
     #[test]
     fn a_disabled_rent_says_why() {
-        let r = super::rent_off_reasons(false, "Your gateway isn't running", RentRules::Allowed, false, false, false, 1, 1);
+        let r = super::rent_off_reasons(false, "Your gateway isn't running", RentRules::Allowed, false, false, false, 1, 1, 4e12);
         assert_eq!(r.len(), 2, "{r:?}");
         assert!(r[0].starts_with("Your gateway isn't running"), "{r:?}");
         assert!(r[1].contains("Allow this hashmaker to be paid"), "{r:?}");
-        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, true, false, 0, 3);
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, true, false, 0, 3, 4e12);
         assert!(r[0].contains("needs updating") && r[1].contains("rented right now"), "{r:?}");
-        let r = super::rent_off_reasons(false, "Set up your gateway", RentRules::Allowed, false, true, true, 0, 1);
+        let r = super::rent_off_reasons(false, "Set up your gateway", RentRules::Allowed, false, true, true, 0, 1, 4e12);
         assert_eq!(r, vec!["This is your own box's offer: buyers rent it from their apps".to_string()]);
-        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 1, 1).is_empty());
-        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 0, 0).is_empty(), "no machine count given is not 'all rented'");
+        assert!(super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 1, 1, 4e12).is_empty());
+        // no machine count given, or no hashrate: its miners are offline, and Rent is off (#70)
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 0, 0, 0.0);
+        assert_eq!(r, vec!["Its miners are offline right now; try again later".to_string()]);
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 1, 1, 0.0);
+        assert_eq!(r, vec!["Its miners are offline right now; try again later".to_string()], "free machines, but no hashrate");
+        let r = super::rent_off_reasons(true, "", RentRules::Allowed, true, false, false, 0, 2, 4e12);
+        assert!(r[0].contains("All of its machines are rented"), "{r:?}");
+        assert!(super::ended_words("could not start: hashmaker refused: its miners are offline right now").contains("offline right now. Nothing was paid"));
     }
 
     /// A price saved with no rental going on is in force at once and holds no new rental: the first price, a
@@ -2558,10 +2580,10 @@ mod tests {
     /// Rent is off, and says why, while the signed rules don't let a rental be paid.
     #[test]
     fn rent_waits_for_rules_that_pay_a_rental() {
-        let r = super::rent_off_reasons(true, "", RentRules::NoTask, true, false, false, 1, 1);
+        let r = super::rent_off_reasons(true, "", RentRules::NoTask, true, false, false, 1, 1, 4e12);
         assert_eq!(r.len(), 1, "{r:?}");
         assert!(r[0].contains("don't allow renting hashrate yet") && r[0].contains("Allow renting hashrate in your spending rules"), "{r:?}");
-        let r = super::rent_off_reasons(true, "", RentRules::TicketsOff, true, false, false, 1, 1);
+        let r = super::rent_off_reasons(true, "", RentRules::TicketsOff, true, false, false, 1, 1, 4e12);
         assert!(r[0].contains("Stream tickets are off"), "{r:?}");
         assert!(rules_notice(RentRules::Allowed).is_none());
         assert!(rules_notice(RentRules::NoTask).unwrap().1.contains("./policy?task=hashrate"));
