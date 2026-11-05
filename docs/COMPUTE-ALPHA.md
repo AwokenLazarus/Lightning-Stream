@@ -101,3 +101,74 @@ check kills it before, during and after real payments and holds each lender's no
 What this does not do yet: the lenders must trust the operator's count. A lender can read its own
 stage from the plan and work out its share, and sees what it was paid, but it cannot see what the
 gateway earned.
+
+## Lending a machine
+
+If someone runs a split and invites you, one command lends your machine:
+
+```
+stream-compute-check lend --invite invite.json \
+  --node-rest https://your-node:8080 --node-macaroon invoices.macaroon --node-cert tls.cert
+```
+
+It shows the terms, the downloads and what it will run, and asks first. Then it:
+
+1. fetches the Mesh-LLM build and the model, each checked by sha256;
+2. makes a BOLT 12 offer on your own Lightning node, where you are paid (the macaroon needs
+   `invoices:read` and `invoices:write`);
+3. starts Mesh-LLM and joins the split;
+4. prints a card, one line, to give the operator;
+5. keeps running, and watches whether you are being paid.
+
+**An invite is the operator's word, and it cannot choose what runs on your machine.** The build must be
+one this tool pins, whatever hash the invite names; a build you trust by hand takes `--allow-build SHA256`.
+The invite picks no flags of the command line. The model is data, read by llama.cpp under your user, so
+you may want to run this as a user of its own.
+
+**The build sends no usage reports:** it has no analytics key in it. `mesh-llm analytics status` says so.
+
+### How you know you are being paid
+
+You need trust no one's count. Every generated token passes through every stage of a split, so your own
+node's count of them is a figure the operator cannot change. From your own machine and the invite alone,
+`lend` works out what you are due at least: your count, at the invite's rate, less the operator's cut, by
+your share of the work from your own stage and the model's header, less a slack of 10% (`--slack-ppm`)
+for tokens nobody paid for. It compares that with the settled invoices of your offer on your own node.
+
+When what you are due passes what you have received by more than your credit limit (`--credit-sats`,
+three payout floors by default), it stops serving, says why, and serves again by itself once you are
+paid. So the most an operator can take from you is about that limit. `report.json` in its directory has
+both figures at any time.
+
+That catches an operator who stops paying, takes a bigger cut than it invited you on, serves tokens around
+its gateway, or books your stage as its own.
+
+What it does not catch:
+
+- The figure is a floor. It counts generated tokens only, so an operator could skim the share of what
+  prompts earn.
+- It checks the invite's rate, not what buyers paid: an operator who charges buyers more keeps the difference.
+- It protects you from an operator. It does not protect an operator from a lender returning wrong results.
+- Your evidence is for you. Nothing here proves a cheat to anyone else.
+
+Each lender needs the whole model file for now, and the alpha build runs on the CPU.
+
+### Running the split
+
+```
+stream-compute-check invite --config payout.json --name "Your name" --out invite.json \
+  --build-file mesh-bundle.tar.gz --build-url https://... --model-file model.gguf --model-url https://...
+stream-compute-check lender-add --config payout.json --card lendcard1... --lock lock.json
+```
+
+The invite holds your mesh's join token, so give it only to those you invite. It takes its terms from your
+payout config and your gateway's prices, and it is what lenders hold you to. Run your own Mesh-LLM node with
+`--split` and a `--max-vram` above the invite's, so that your machine leads the split.
+
+`lender-add` adds the lender to the payout, which takes it up on its next round, and writes a lock with the
+stages even across your machines and theirs. Restart your Mesh-LLM node with `--split-topology-lock lock.json`,
+on the same home directory: it keeps its id and join token, and lenders stay joined. A lender needs no lock.
+Allow each lender's `ln-offer:<id>` in your wallet's policy.
+
+A card is someone's word, so `lender-add` will not move an existing lender's pay to another offer without
+`--replace`. Check who sent it.
