@@ -449,12 +449,38 @@ def topup_run() -> None:
     def wallet_moved(x: dict[str, Any]) -> int:
         return sum(int(p.get("wallet", {}).get("charged_sats", 0)) for p in x.get("live", {}).get("pays", []) if p.get("ok"))
 
-    # 1. a rental of six slices' budget, topped up after its second: it pays on past six, never past the sum
+    first = 6 * PRICE_MSAT // 1000
+    # 1. first (the seller's cap counts what every task paid it), the owner's signed budget for the task (TOPUP_TASK_SATS) is below what the rental and its top-up ask: the wallet
+    # stops it there, whatever the rental's own budget says
+    m2 = market("b")
+    p2 = service("hashrate-topup")
+    code, v = renter("POST", "/rent", {"linkKey": hashmaker_pub, "miners": 2, "budgetSats": first, "minutes": 10, "once": secrets.token_hex(8)})
+    if code != 200:
+        check("topup: the second rental starts", False, v)
+        return
+    rid = v["rental"]
+    lab.wait("a slice paid", 120, lambda: int(live(rid).get("live", {}).get("paidSlices") or 0) >= 1 or live(rid).get("ended") is True, every=1)
+    if live(rid).get("ended") is True:
+        lv = live(rid).get("live", {})
+        check("topup: the second rental pays its first slice", False, {"closed": lv.get("closed"), "pays": lv.get("pays"), "events": lv.get("events", [])[-5:]})
+        return
+    code, v = renter("POST", "/topup", {"rental": rid, "addSats": 50 * PRICE_MSAT // 1000, "once": secrets.token_hex(8)})
+    x = wait_ended(rid, 300)
+    lv = x.get("live", {})
+    REPORT["topup_task_rental"] = lv
+    oks = [p for p in lv.get("pays", []) if p.get("ok")]
+    why = " ".join(str(p.get("why", "")) for p in lv.get("pays", []) if p.get("ok") is False)
+    check("topup: the owner's signed task budget still stops a topped-up rental: the wallet refuses past it, said as its rules",
+          code == 200 and wallet_moved(x) <= TOPUP_TASK_SATS and len(oks) * PRICE_MSAT <= TOPUP_TASK_SATS * 1000 and lv.get("payFailed") is True
+          and "wallet" in why.lower(),
+          {"topup": v, "paid": len(oks), "wallet moved sats": wallet_moved(x), "task budget": TOPUP_TASK_SATS, "closed": lv.get("closed"), "why": why[:300]})
+    stop([p2, *m2])
+
+    # 2. then a rental of six slices' budget, topped up after its second: it pays on past six, never past the sum
     m1 = market("a")
     p1 = service("hashrate")
     no_token = renter("POST", "/topup", {"rental": "x", "addSats": 1}, auth=False)
     check("topup: the control page takes no top-up without its token", no_token[0] == 401, no_token)
-    first = 6 * PRICE_MSAT // 1000
     code, v = renter("POST", "/rent", {"linkKey": hashmaker_pub, "miners": 2, "budgetSats": first, "minutes": 10, "once": secrets.token_hex(8)})
     if code != 200:
         check("topup: the rental starts", False, v)
@@ -485,31 +511,7 @@ def topup_run() -> None:
     check("topup: none taken once the rental ended", after[0] == 409, after)
     stop([p1, *m1])
 
-    # 2. the owner's signed budget for the task (TOPUP_TASK_SATS) is below what the rental and its top-up ask: the wallet
-    # stops it there, whatever the rental's own budget says
-    m2 = market("b")
-    p2 = service("hashrate-topup")
-    code, v = renter("POST", "/rent", {"linkKey": hashmaker_pub, "miners": 2, "budgetSats": first, "minutes": 10, "once": secrets.token_hex(8)})
-    if code != 200:
-        check("topup: the second rental starts", False, v)
-        return
-    rid = v["rental"]
-    lab.wait("a slice paid", 120, lambda: int(live(rid).get("live", {}).get("paidSlices") or 0) >= 1 or live(rid).get("ended") is True, every=1)
-    if live(rid).get("ended") is True:
-        lv = live(rid).get("live", {})
-        check("topup: the second rental pays its first slice", False, {"closed": lv.get("closed"), "pays": lv.get("pays"), "events": lv.get("events", [])[-5:]})
-        return
-    code, v = renter("POST", "/topup", {"rental": rid, "addSats": 50 * PRICE_MSAT // 1000, "once": secrets.token_hex(8)})
-    x = wait_ended(rid, 300)
-    lv = x.get("live", {})
-    REPORT["topup_task_rental"] = lv
-    oks = [p for p in lv.get("pays", []) if p.get("ok")]
-    why = " ".join(str(p.get("why", "")) for p in lv.get("pays", []) if p.get("ok") is False)
-    check("topup: the owner's signed task budget still stops a topped-up rental: the wallet refuses past it, said as its rules",
-          code == 200 and wallet_moved(x) <= TOPUP_TASK_SATS and len(oks) * PRICE_MSAT <= TOPUP_TASK_SATS * 1000 and lv.get("payFailed") is True
-          and "wallet" in why.lower(),
-          {"topup": v, "paid": len(oks), "wallet moved sats": wallet_moved(x), "task budget": TOPUP_TASK_SATS, "closed": lv.get("closed"), "why": why[:300]})
-    stop([p2, *m2, pool])
+    stop([pool])
 
 
 def drop_check() -> None:
