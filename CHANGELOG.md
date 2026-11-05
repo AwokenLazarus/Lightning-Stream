@@ -5,6 +5,33 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.14 (unreleased)
+
+- **No rental is paid to a hashmaker whose miners are offline** (#70). A rental paid its start fee and first slice
+  (808 sat) to a hashmaker whose offer said 0 miners, 0 free and 0 hashrate; no miner ever connected and the rental
+  ended with no work. Now:
+  - a hashmaker refuses a new rental before its welcome, so before any payment, when fewer of its connected miners
+    are free than the rental asks for ("its miners are offline right now" when none is connected). A miner that is
+    connecting as the rental is asked for is waited for up to 5 seconds. The first slice of a rental whose miners left
+    after its welcome is refused too, so its charge, the start fee with it, goes back.
+  - Rent and "Try one slice first" are off for an offer with no free machine or no hashrate, and say "Its miners are
+    offline right now". The renter refuses such an offer, and looks the offer up again on the relays right before it
+    dials the hashmaker and pays the start fee.
+- **A seller the wallet can't reach is found before anything is paid.** A rental from a seller whose node has only
+  private channels failed at its first slice with "the wallet's node has found no route to the seller". Before a
+  rental pays, the renter asks the wallet's signer once whether its node finds a route to the seller's node for the
+  first ticket (a new read-only call on the renter's socket, `ln_route_probe`). A definite no route (a public node no
+  route reaches, a wallet whose channels can't send that much, or a payment to that node that found no route through
+  its whole wait, with its invoice's route hints, in the last 10 minutes) refuses the rental with "can't reach this
+  seller's Lightning node right now (it may have only private channels, or none that can receive)", said on the
+  offer's card for 10 minutes. Anything the probe can't tell (a node with only private channels it has no hints for,
+  a node that doesn't answer, an older signer) lets the rental go on as before.
+- **No secret is in a page as it opens** (#41). The Gateway app's page showed its settings file with the gateway's
+  health token in full, and a service's edit form on the Sell page showed its guest login (a credential header).
+  The settings shown now hide more secret names, every value under one, and a password or key in any address; the
+  guest login is never shown again once saved (left empty, it is kept). The agents' access key was already shown only
+  on "Show the access key".
+
 ## 0.2.13 (2026-11-04)
 
 A fix for long hashrate rentals on a slow wallet, and display fixes sent by a hashmaker who runs the app. The
