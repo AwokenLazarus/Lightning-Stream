@@ -50,6 +50,10 @@ it dials the hashmaker, the offer read fresh from the relays still has a free mi
   terms only from the same seller, shop and node, with a piece of work, the start fee and the first payment no more
   than 1% dearer than what the page showed, the first payment inside the budget, and the rental not cut meanwhile.
   A dearer price is never taken: the rental ends saying the new price, and nothing is paid.
+  - when the seller's new terms aren't on the relays yet (a seller may take a minute to publish them), the rental
+    waits for them by itself, for up to 70 seconds, and its card says "Waiting for the seller's updated terms". One
+    press of Rent is enough. Nothing is paid while it waits, and Cut cancels it. Only if the wait runs out are you
+    told to press Rent again.
 - **A shop that looks offline is said to be.** Allowing a shop reached by its key whose listing is more than two
   days old, and whose links no Lightning node vouches for any more, said "its listing names no direct link that its
   Lightning node vouches for now. Press Check for updates, or ask the seller." Neither could help: the shop had

@@ -1006,30 +1006,10 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             None => hashtaker::run(cfg, Box::<LabHashtaker>::default()),
         };
         // the seller changed its terms since they were read (a price that follows the market moves with every block):
-        // its offer is read again, and the rental opened once more on it only if it costs no more than the renter agreed
-        // and still has a free miner (not one cut meanwhile: the second rental would pay its start fee before its ticker
-        // reads the cut)
+        // its offer is read again, and waited for while it isn't published yet (not one cut meanwhile: the second rental
+        // would pay its start fee before its ticker reads the cut)
         if res.as_ref().is_err_and(|e| e.ends_with(TERMS_DIFFER)) && !start.cut.load(Ordering::Relaxed) {
-            res = match relisted(&service, &h, agreed, budget_sats) {
-                // the relays take a while to answer: cut while they did, nothing is opened
-                Ok(_) if start.cut.load(Ordering::Relaxed) => Err("cut before it started: nothing was paid".into()),
-                Ok((h2, event2)) => match offline_offer(&h2) {
-                    // the new offer has no free miner (#70): no start fee is paid on it
-                    Some(why) => Err(why),
-                    None => {
-                        eprintln!("hashtaker: rental {} refused on terms read before the seller changed them: opened again on its new ones", start.id);
-                        hashtaker_config(&service, &h2, event2, &start).and_then(|cfg| hashtaker::run(cfg, Box::<LabHashtaker>::default()))
-                    }
-                },
-                Err((why, now)) => {
-                    if let Some(t) = now {
-                        if let Some(o) = live.lock().unwrap_or_else(|p| p.into_inner()).as_object_mut() {
-                            o.insert("priceChanged".into(), t.to_json());
-                        }
-                    }
-                    Err(why)
-                }
-            };
+            res = reopen(&service, &h, agreed, budget_sats, &start);
         }
         match res {
             Err(e) => {
@@ -1093,6 +1073,13 @@ fn top_up(r: &Mutex<R>, b: &Value) -> (u16, Value) {
 
 /// What a hashmaker answers when the terms a rental opens with are not those it offers now.
 const TERMS_DIFFER: &str = "terms differ from the listing";
+/// A seller refused a rental's terms, and its listing still says them: what the renter is told once the wait is over.
+const TERMS_NOT_PUBLISHED: &str = "the seller's terms changed since the page read them, and its new listing isn't on the relays yet: press Rent again in a minute";
+/// How long a rental refused on changed terms waits for the seller's new listing: a little over the minute a hashmaker
+/// may take to publish them (`hashmaker_service::REPUBLISH_CAPACITY`).
+const RELIST_WAIT: Duration = Duration::from_secs(70);
+/// How often it reads the seller's offer meanwhile.
+const RELIST_EVERY: Duration = Duration::from_secs(5);
 /// How much more than the renter saw a piece of work, and the start fee, may cost (per hundred) for a rental refused on
 /// changed terms to be opened again on the new ones without asking: a price that follows the market moves a little
 /// with each block. Above it the renter is told the new price and decides; the budget bounds the spending either way.
@@ -1217,10 +1204,19 @@ fn hashtaker_config(r: &Mutex<R>, h: &Hashrate, event: String, s: &RentStart) ->
     })
 }
 
-/// The seller's offer read again after it refused a rental's terms: the same seller (link key, shop and node), with new
-/// terms the renter agreed to (no dearer, within the leeway) and whose first payment fits the budget. Otherwise why
-/// not, and the new terms when they are only too dear.
-fn relisted(r: &Mutex<R>, was: &Hashrate, agreed: Agreed, budget_sats: u64) -> Result<(Hashrate, String), (String, Option<xbt_hashlink::msg::Terms>)> {
+/// Why a rental refused on changed terms isn't opened again now.
+enum NotRelisted {
+    /// Nothing to go on yet (the seller publishes new terms up to a minute after it takes them): worth reading again.
+    NotYet(String),
+    /// Refused as it stands, and the new terms when they are only too dear: the renter decides.
+    Refused(String, Option<xbt_hashlink::msg::Terms>),
+}
+
+/// The seller's offer read again after it refused a rental's terms (`tried`, the last it was opened on): the same seller
+/// (link key, shop and node), with a free miner (#70) and new terms the renter agreed to (no dearer, within the leeway)
+/// whose first payment fits the budget. `was` is the offer the rental began on: what the limits are held to, however
+/// many times the terms move.
+fn relisted(r: &Mutex<R>, was: &Hashrate, tried: &xbt_hashlink::msg::Terms, agreed: Agreed, budget_sats: u64) -> Result<(Hashrate, String), NotRelisted> {
     let key = hex::encode(was.link_key.serialize());
     let relist = lock(r).relist.clone();
     let offers = match relist {
@@ -1228,26 +1224,101 @@ fn relisted(r: &Mutex<R>, was: &Hashrate, agreed: Agreed, budget_sats: u64) -> R
         None => look_up_offers(r),
     };
     let Some(offers) = offers else {
-        return Err(("the seller's terms changed since the page read them, and no Nostr relay answered to read the new ones: press Rent again in a minute".into(), None));
+        return Err(NotRelisted::NotYet("the seller's terms changed since the page read them, and no Nostr relay answered to read the new ones: press Rent again in a minute".into()));
     };
     let Some((h, event)) = offers.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key) else {
-        return Err(("the seller's terms changed since the page read them, and its listing is no longer on the relays".into(), None));
+        return Err(NotRelisted::NotYet("the seller's terms changed since the page read them, and its listing is no longer on the relays".into()));
     };
-    if h.terms == was.terms {
-        return Err(("the seller's terms changed since the page read them, and its new listing isn't on the relays yet: press Rent again in a minute".into(), None));
+    if let Some(why) = offline_offer(&h) {
+        return Err(NotRelisted::Refused(why, None));
+    }
+    if h.terms == *tried {
+        return Err(NotRelisted::NotYet(TERMS_NOT_PUBLISHED.into()));
     }
     if h.pay_url != was.pay_url || h.pay_node != was.pay_node || !h.proves() {
-        return Err(("the seller changed its terms and how it is paid since the page read them: look at its offer again".into(), None));
+        return Err(NotRelisted::Refused("the seller changed its terms and how it is paid since the page read them: look at its offer again".into(), None));
     }
     // what the page showed is only the most agreed to: the new terms are no dearer than the offer this service read either
     if !agreed.allows(&h.terms) || !Agreed::of(&was.terms).allows(&h.terms) || first_payment_msat(&h.terms) > budget_sats.saturating_mul(1000) {
-        return Err((price_changed(&h.terms), Some(h.terms)));
+        return Err(NotRelisted::Refused(price_changed(&h.terms), Some(h.terms)));
     }
     // a shorter grace for each payment is a rental more easily ended as unpaid, after its start fee: not taken unasked
     if h.terms.grace_ms < was.terms.grace_ms {
-        return Err(("the seller changed its terms since the page read them, and now waits less for each payment: look at its offer again".into(), None));
+        return Err(NotRelisted::Refused("the seller changed its terms since the page read them, and now waits less for each payment: look at its offer again".into(), None));
     }
     Ok((h, event))
+}
+
+/// How long the service waits, and how often it reads the offer, as this build runs: the tests' wait is a twentieth.
+fn relist_times() -> (Duration, Duration) {
+    if cfg!(test) {
+        (RELIST_WAIT / 20, RELIST_EVERY / 20)
+    } else {
+        (RELIST_WAIT, RELIST_EVERY)
+    }
+}
+
+/// Open a rental again on its seller's new terms, after the seller refused the ones it was opened on. One attempt at a
+/// time, on this rental's thread, and each refused before its welcome, so before any payment
+/// ([`hashtaker::run`] says "hashmaker refused" only then): while the new terms aren't published (a seller publishes up
+/// to a minute after it takes them) the offer is read again every [`RELIST_EVERY`] for [`RELIST_WAIT`], the rental's
+/// `waitingForTerms` saying so for its page. A cut ends the wait; so does an offer refused for good ([`relisted`]).
+fn reopen(service: &Mutex<R>, was: &Hashrate, agreed: Agreed, budget_sats: u64, start: &RentStart) -> Result<Value, String> {
+    const CUT: &str = "cut before it started: nothing was paid";
+    let (wait, every) = relist_times();
+    let cut = || start.cut.load(Ordering::Relaxed);
+    let say_waiting = |on: bool| {
+        if let Some(o) = start.live.lock().unwrap_or_else(|p| p.into_inner()).as_object_mut() {
+            if on {
+                o.insert("waitingForTerms".into(), json!(true));
+            } else {
+                o.remove("waitingForTerms");
+            }
+        }
+    };
+    let t0 = Instant::now();
+    let mut tried = was.terms.clone();
+    let res = loop {
+        // the relays take a while to answer: cut while they did, nothing is opened
+        let found = relisted(service, was, &tried, agreed, budget_sats);
+        if cut() {
+            break Err(CUT.to_string());
+        }
+        let why = match found {
+            Ok((h2, event2)) => {
+                say_waiting(false);
+                eprintln!("hashtaker: rental {} refused on terms read before the seller changed them: opened again on its new ones", start.id);
+                tried = h2.terms.clone();
+                match hashtaker_config(service, &h2, event2, start).and_then(|cfg| hashtaker::run(cfg, Box::<LabHashtaker>::default())) {
+                    // its terms moved again: refused like the first, before any payment
+                    Err(e) if e.ends_with(TERMS_DIFFER) && !cut() => TERMS_NOT_PUBLISHED.to_string(),
+                    done => break done,
+                }
+            }
+            Err(NotRelisted::NotYet(why)) => why,
+            Err(NotRelisted::Refused(why, now)) => {
+                if let Some(t) = now {
+                    if let Some(o) = start.live.lock().unwrap_or_else(|p| p.into_inner()).as_object_mut() {
+                        o.insert("priceChanged".into(), t.to_json());
+                    }
+                }
+                break Err(why);
+            }
+        };
+        if t0.elapsed() + every > wait {
+            break Err(why);
+        }
+        say_waiting(true);
+        let slept = Instant::now();
+        while slept.elapsed() < every && !cut() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if cut() {
+            break Err(CUT.to_string());
+        }
+    };
+    say_waiting(false);
+    res
 }
 
 /// Publish the signed delivery record of a rental that ended (the hashtaker's choice, per rental).
@@ -1859,6 +1930,148 @@ mod tests {
         assert_eq!(code, 409, "{v}");
         assert!(v["error"].as_str().unwrap().starts_with("the seller's price changed"), "{v}");
         assert_eq!(lock(&r).rentals.len(), 1, "no second rental");
+    }
+
+    /// The relays show the seller's offer at these terms, one for each time it is read, and the last ever after.
+    fn relays_show(r: &Arc<Mutex<R>>, terms: Vec<Terms>) -> Arc<std::sync::atomic::AtomicUsize> {
+        let listing = lock(r).offers.as_ref().unwrap().1[0].0.clone();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = reads.clone();
+        lock(r).relist = Some(Arc::new(move || {
+            let i = n.fetch_add(1, Ordering::Relaxed);
+            Some(vec![(Hashrate { terms: terms[i.min(terms.len() - 1)].clone(), ..listing.clone() }, format!("ev{i}"))])
+        }));
+        reads
+    }
+
+    fn nothing_opened(h: &Hashmaker) {
+        assert!(h.finished().is_empty() && h.status()["rentals"].as_array().is_some_and(|a| a.is_empty()), "nothing opened: {}", h.status());
+    }
+
+    #[test]
+    fn the_wait_for_new_terms_outlasts_a_sellers_republish() {
+        assert!(RELIST_WAIT > crate::hashmaker_service::REPUBLISH_CAPACITY + RELIST_EVERY, "a little over the minute a seller may take, one read past it");
+        assert!(RELIST_WAIT <= crate::hashmaker_service::REPUBLISH_CAPACITY * 2);
+    }
+
+    /// The seller refused the terms the page read and hasn't published its new ones (it may take a minute). The rental waits,
+    /// says so, and goes ahead on one press when they come, on a seller whose terms moved once more on the way: refused
+    /// before its welcome each time, one rental in the end, paid at the price it opened on.
+    #[test]
+    fn a_rental_waits_for_a_sellers_new_terms_and_goes_ahead_paid_once() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 297_000, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        // not published yet, twice; then terms the seller has moved on from, twice; then those it takes
+        let passing = Terms { price_msat: 298_000, ..now.clone() };
+        let reads = relays_show(&r, vec![was.clone(), was.clone(), passing.clone(), passing, now.clone()]);
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let id = v["rental"].as_str().unwrap().to_string();
+        let t0 = Instant::now();
+        while lock(&r).rentals[&id].live.lock().unwrap()["waitingForTerms"] != true {
+            assert!(t0.elapsed() < Duration::from_secs(20), "it never said it waits: {}", lock(&r).rentals[&id].live.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        nothing_opened(&h);
+        let t0 = Instant::now();
+        while !h.status()["rentals"].as_array().is_some_and(|a| a.iter().any(|x| x["paid"].as_u64().unwrap_or(0) > now.start_slices)) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the rental never started: {} {}", h.status(), lock(&r).rentals[&id].live.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(reads.load(Ordering::Relaxed) >= 5, "read until the terms it takes");
+        assert_eq!(lock(&r).rentals[&id].live.lock().unwrap().get("waitingForTerms"), None, "no longer waiting");
+        handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
+        let t0 = Instant::now();
+        while h.finished().is_empty() {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the rental never ended: {}", h.status());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let live = ended(&r, &id);
+        let fin = h.finished();
+        assert_eq!(fin.len(), 1, "one rental: {fin:?}");
+        let paid = fin[0]["paid"].as_u64().unwrap();
+        assert_eq!(fin[0]["earnedMsat"].as_u64(), Some(paid * now.price_msat), "paid at the terms it opened on: {}", fin[0]);
+        assert_eq!(live["paidSlices"].as_u64(), Some(paid), "both sides count the same slices paid: {live}");
+        assert_eq!(lock(&r).rentals.len(), 1, "no second rental");
+        assert!(!live["closed"].as_str().unwrap_or("").starts_with("could not start"), "{live}");
+    }
+
+    /// The new terms never come: the wait runs out, the renter is told to press Rent again, and nothing was paid.
+    #[test]
+    fn a_rental_whose_sellers_terms_never_come_says_so_and_pays_nothing() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 297_000, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        let reads = relays_show(&r, vec![was.clone()]);
+        let t0 = Instant::now();
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let live = ended(&r, v["rental"].as_str().unwrap());
+        let (wait, every) = relist_times();
+        assert!(t0.elapsed() + every > wait, "it waited: {:?}", t0.elapsed());
+        assert!(reads.load(Ordering::Relaxed) > 5, "read over and over: {reads:?}");
+        assert_eq!(live["closed"], format!("could not start: {TERMS_NOT_PUBLISHED}"), "{live}");
+        assert!(TERMS_NOT_PUBLISHED.ends_with("press Rent again in a minute"));
+        assert!(live.get("waitingForTerms").is_none() && live.get("spentMsat").is_none_or(|s| s == 0) && live.get("pays").is_none(), "{live}");
+        nothing_opened(&h);
+    }
+
+    /// The new terms come dearer past the leeway while it waits: refused at once with the new price, nothing paid.
+    #[test]
+    fn a_price_risen_past_the_leeway_during_the_wait_is_refused_and_pays_nothing() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 303_100, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        let reads = relays_show(&r, vec![was.clone(), was.clone(), now.clone()]);
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let live = ended(&r, v["rental"].as_str().unwrap());
+        assert_eq!(reads.load(Ordering::Relaxed), 3, "not read again once refused");
+        assert!(live["closed"].as_str().unwrap_or("").starts_with("could not start: the seller's price changed since the page read it"), "{live}");
+        assert_eq!(live["priceChanged"], now.to_json());
+        assert!(live.get("waitingForTerms").is_none() && live.get("spentMsat").is_none_or(|s| s == 0) && live.get("pays").is_none(), "{live}");
+        nothing_opened(&h);
+    }
+
+    /// Cut during the wait: it ends there, nothing opened, even when the new terms come right after.
+    #[test]
+    fn a_rental_cut_during_the_wait_opens_nothing() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 297_000, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        relays_show(&r, vec![was.clone()]);
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let id = v["rental"].as_str().unwrap().to_string();
+        let t0 = Instant::now();
+        while lock(&r).rentals[&id].live.lock().unwrap()["waitingForTerms"] != true {
+            assert!(t0.elapsed() < Duration::from_secs(20), "it never said it waits");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        relays_show(&r, vec![now.clone()]);
+        handle(&r, &[], "POST", "/cut", json!({"rental": id}).to_string().as_bytes());
+        let live = ended(&r, &id);
+        assert!(live["closed"].as_str().unwrap_or("").contains("cut before it started"), "{live}");
+        std::thread::sleep(Duration::from_millis(500));
+        nothing_opened(&h);
+    }
+
+    /// An offer gone offline while it waits (#70): refused at once, whatever its terms.
+    #[test]
+    fn an_offer_gone_offline_during_the_wait_is_refused_and_pays_nothing() {
+        let now = Terms { slice_work: 6 * share_work(DIFF), price_msat: 297_000, grace_ms: 2500, start_slices: 1 };
+        let (h, r, key, was) = renter_after_the_price_moved(&now);
+        let listing = lock(&r).offers.as_ref().unwrap().1[0].0.clone();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = reads.clone();
+        lock(&r).relist = Some(Arc::new(move || {
+            let gone = n.fetch_add(1, Ordering::Relaxed) >= 1;
+            let capacity = if gone { xbt_hashlink::listing::Capacity::default() } else { listing.capacity };
+            Some(vec![(Hashrate { capacity, ..listing.clone() }, "ev".into())])
+        }));
+        let (code, v) = handle(&r, &[], "POST", "/rent", &seen_rent(&key, &was));
+        assert_eq!(code, 200, "{v}");
+        let live = ended(&r, v["rental"].as_str().unwrap());
+        assert!(live["closed"].as_str().unwrap_or("").contains(xbt_hashlink::hashmaker::MINERS_OFFLINE), "{live}");
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        nothing_opened(&h);
     }
 
     fn record(taker: &SecretKey, maker: &PublicKey, rental: &str, ended: u64) -> xbt_nostr::event::Event {

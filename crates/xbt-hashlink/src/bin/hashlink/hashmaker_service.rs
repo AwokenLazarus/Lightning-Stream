@@ -51,7 +51,7 @@ use xbt_hashlink::trust;
 
 /// A change in what is for rent (miners, free miners, renting on or off, the terms, the name, or
 /// where hashtakers reach and pay the hashmaker) is published again after at least this long since the last publish.
-const REPUBLISH_CAPACITY: Duration = Duration::from_secs(60);
+pub(crate) const REPUBLISH_CAPACITY: Duration = Duration::from_secs(60);
 /// A change in the measured hashrate alone is news only when it moves more than this share of the
 /// published value, and is published at most this often: public relays rate-limit.
 const REPUBLISH_HASHRATE: Duration = Duration::from_secs(600);

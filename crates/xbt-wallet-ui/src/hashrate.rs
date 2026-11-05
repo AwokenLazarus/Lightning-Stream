@@ -1860,10 +1860,14 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     // role and meter); one whose link never opened ended before any work, and nothing was paid
     let failed = live["closed"].as_str().is_some_and(|w| w.starts_with("could not start"));
     let connecting = !ended && live.get("role").is_none() && live.get("meter").is_none();
+    // the seller refused the terms the page read, and hasn't published its new ones yet: the service waits for them
+    let waiting_terms = connecting && live["waitingForTerms"] == true;
     let pill = if failed {
         "<span class=\"pill bad\">Could not start</span>".to_string()
     } else if ended {
         "<span class=\"pill\">Ended</span>".to_string()
+    } else if waiting_terms {
+        "<span class=\"pill\">Waiting for the seller's terms</span>".to_string()
     } else if connecting {
         "<span class=\"pill\">Connecting…</span>".to_string()
     } else {
@@ -1875,6 +1879,12 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\"><strong>Ended:</strong> {}{}</p>",
                                                      esc(&ended_line(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { ended_words(w) })),
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
+    let why = if waiting_terms {
+        "<p class=\"hint\">Waiting for the seller's updated terms. It publishes them within about a minute, and the rental starts then if they cost no more \
+         than you agreed. Nothing has been paid. Cut cancels it.</p>".to_string()
+    } else {
+        why
+    };
     let times = rental_times(r, ended, crate::now() as u64 * 1000);
     // a payment the wallet refused: the hashmaker will only say a piece went unpaid, and the reason is this wallet's,
     // in words where it has them (xbt_hashlink::rail::BIG_TICKETS_ONLY and those beside it)
@@ -2294,6 +2304,10 @@ mod tests {
         assert!(c.contains("Connecting…") && !c.contains("Hashing"), "{c}");
         let c = card(json!({"role": "buyer", "meter": {"accepted": 3}, "closed": null}), false);
         assert!(c.contains("Hashing"), "{c}");
+        // the seller's new terms not published yet: the wait said in words, nothing paid, and it can be cut
+        let c = card(json!({"closed": null, "waitingForTerms": true}), false);
+        assert!(c.contains("Waiting for the seller's terms") && c.contains("Waiting for the seller's updated terms") && c.contains("Nothing has been paid") && c.contains(">Cut<"), "{c}");
+        assert!(!c.contains("Connecting…") && !c.contains("Hashing"), "{c}");
         let c = card(json!({"closed": "could not start: link i/o: Operation timed out (os error 110)"}), true);
         assert!(c.contains("Could not start") && c.contains("<strong>Ended:</strong> it could not start: link i/o: Operation timed out") && c.contains("Nothing was paid."), "{c}");
         assert!(!c.contains("Hashing") && !c.contains(">Cut<"), "{c}");
