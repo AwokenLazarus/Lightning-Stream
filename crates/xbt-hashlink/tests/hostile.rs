@@ -92,6 +92,12 @@ fn stand_in_for_a_miner(link: &str) -> Option<TcpStream> {
     }
     let addr = STATUS.lock().unwrap().get(link).map(|(m, _)| m.clone())?;
     let s = TcpStream::connect(addr).unwrap();
+    // with a fallback only a miner that said its name counts: it says one (and is never rented, gone at the welcome)
+    {
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{}", json!({"id": 1, "method": "mining.subscribe", "params": []})).unwrap();
+        writeln!(w, "{}", json!({"id": 2, "method": "mining.authorize", "params": ["stand-in", "x"]})).unwrap();
+    }
     let t0 = Instant::now();
     while miners_connected(link) == 0 {
         assert!(t0.elapsed() < Duration::from_secs(10), "the stand-in never showed");
@@ -988,13 +994,9 @@ fn a_rental_waiting_for_a_payment_holds_up_no_other_miner_from_its_address() {
     let mut ends = start("ends", 1);
     ends.until_serving();
     // the third asks for two miners, and a hashmaker starts no rental with fewer free than asked (#70): a fourth miner
-    // connects for it, and goes once it is serving, so the third wants one more
+    // connects for it, and goes once it is serving, so the third wants one more. It never says its name, so when it
+    // goes it leaves no place kept for it in the rental
     let m3 = TcpStream::connect(&a.miners).unwrap();
-    {
-        let mut w = m3.try_clone().unwrap();
-        writeln!(w, "{}", json!({"id": 1, "method": "mining.subscribe", "params": []})).unwrap();
-        writeln!(w, "{}", json!({"id": 2, "method": "mining.authorize", "params": ["m3", "x"]})).unwrap();
-    }
     let t0 = Instant::now();
     while a.h.capacity().free_miners < 2 {
         assert!(t0.elapsed() < Duration::from_secs(10), "the fourth miner never showed: {}", app_answers(&a.h));
