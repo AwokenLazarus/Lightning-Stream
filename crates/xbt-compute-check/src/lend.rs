@@ -44,6 +44,11 @@ const INVITE_VERSION: u32 = 1;
 const CARD_PREFIX: &str = "lendcard1.";
 /// What the lender leaves free on its disk beyond the downloads.
 pub const DISK_MARGIN_BYTES: u64 = 1 << 30;
+/// How long a stage stays out of a split before it joins again. Mesh-LLM's coordinator holds a lost stage's
+/// place for 75 seconds, acting on it at its next half-minute round, and takes a stage back in that time as
+/// recovered, with its work intact. One that restarted has none, and is left waiting for good. Past that
+/// time it is planned in anew.
+pub const REJOIN_WAIT_S: u64 = 120;
 
 fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -204,6 +209,9 @@ pub struct Watch {
     pub tokens: BTreeMap<String, u64>,
     #[serde(default)]
     pub stopped: Option<Stop>,
+    /// When its Mesh-LLM was last seen running, in unix seconds, which says when it may start again.
+    #[serde(default)]
+    pub mesh_seen_ts: f64,
 }
 
 impl Watch {
@@ -243,6 +251,12 @@ impl Watch {
         }
         u64::try_from(due).map_err(|_| "more due than can be counted".to_string())
     }
+}
+
+/// Whether its Mesh-LLM may start now: at once the first time, and else only once it has been gone long enough
+/// for the coordinator to plan it in anew.
+pub fn may_rejoin(mesh_seen_ts: f64, now: f64, wait_s: u64) -> bool {
+    mesh_seen_ts == 0.0 || now >= mesh_seen_ts + wait_s as f64
 }
 
 /// The least the lender is sure it is due: its figure, less the slack for tokens nobody paid for.
@@ -562,6 +576,15 @@ mod tests {
         assert!(w.due_msat(&terms(), &work()).is_err(), "layers the model does not have");
         assert_eq!(floor_msat(1000, 100_000), 900);
         assert_eq!(floor_msat(1000, 2_000_000), 0);
+    }
+
+    #[test]
+    fn it_stays_out_long_enough_to_be_planned_in_anew() {
+        assert!(may_rejoin(0.0, 1000.0, REJOIN_WAIT_S), "the first start waits for nothing");
+        assert!(!may_rejoin(1000.0, 1000.0, REJOIN_WAIT_S));
+        assert!(!may_rejoin(1000.0, 1119.0, REJOIN_WAIT_S), "inside the coordinator's hold it would be left waiting");
+        assert!(may_rejoin(1000.0, 1120.0, REJOIN_WAIT_S));
+        assert!(may_rejoin(1000.0, 1000.0, 0), "the lab's stand-in has no coordinator");
     }
 
     /// V-4 and V-5: the decision itself.

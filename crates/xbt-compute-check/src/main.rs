@@ -50,7 +50,7 @@ stream-compute-check: what this machine has and how well testers reach each othe
       Writes an invite to lend to this box's split, by the terms of its payout config and its gateway.
   lend --invite FILE --node-rest URL --node-macaroon FILE [--node-cert FILE] [--name NAME] [--dir DIR]
        [--model FILE] [--credit-sats N] [--slack-ppm N] [--port-base N] [--bind-ip IP] [--interval-s N]
-       [--max-vram GB] [--allow-build SHA256] [--yes]
+       [--max-vram GB] [--rejoin-wait-s N] [--allow-build SHA256] [--yes]
       Lends this machine: shows what it will do and asks, fetches the build and model, makes an offer
       on your Lightning node, serves, and prints a card to give the operator. It counts your own work
       and stops serving if you are owed more than --credit-sats by that count. See docs/COMPUTE-ALPHA.md.
@@ -262,7 +262,7 @@ impl Mesh {
 }
 
 fn lend(flags: &Flags) -> Result<(), String> {
-    use xbt_compute_check::lend::{build_allowed, decide, fetch_checked, floor_msat, load_watch, matches, mesh_args, node_id_of_token, own_stages, save_watch, terms_text, Action, Card, Invite, Stop};
+    use xbt_compute_check::lend::{build_allowed, decide, fetch_checked, floor_msat, load_watch, matches, may_rejoin, mesh_args, node_id_of_token, own_stages, save_watch, terms_text, Action, Card, Invite, Stop, REJOIN_WAIT_S};
     use xbt_compute_check::meter::Work;
     use xbt_compute_check::payout::http_json;
     use xbt_gateway::node::{InvoiceState, LndRest, Node};
@@ -278,6 +278,7 @@ fn lend(flags: &Flags) -> Result<(), String> {
     let interval: u64 = flags.number("--interval-s", 30)?;
     let port_base: u16 = flags.number("--port-base", 34911)?;
     let vram: u32 = flags.number("--max-vram", invite.max_vram_gb)?;
+    let rejoin_wait: u64 = flags.number("--rejoin-wait-s", REJOIN_WAIT_S)?;
     print!("{}", terms_text(&invite, &dir, credit_sats));
     if !flags.has("--yes") {
         use std::io::Write;
@@ -360,8 +361,16 @@ fn lend(flags: &Flags) -> Result<(), String> {
     let mut last_line = String::new();
     while !LEND_ENDING.load(std::sync::atomic::Ordering::SeqCst) {
         let mut notes: Vec<String> = vec![];
-        if watch.stopped.is_none() && !mesh.alive() {
-            mesh.start()?;
+        let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs_f64();
+        if mesh.alive() {
+            watch.mesh_seen_ts = clock;
+        } else if watch.stopped.is_none() {
+            if may_rejoin(watch.mesh_seen_ts, clock, rejoin_wait) {
+                mesh.start()?;
+                watch.mesh_seen_ts = clock;
+            } else {
+                notes.push(format!("waiting to join again, so that the split plans this machine in anew: {:.0} s", watch.mesh_seen_ts + rejoin_wait as f64 - clock));
+            }
         }
         if me.is_none() {
             let token = http_json(&format!("{console}/api/status"), None).ok().and_then(|v| v.get("token").and_then(serde_json::Value::as_str).map(String::from));
@@ -396,6 +405,7 @@ fn lend(flags: &Flags) -> Result<(), String> {
             match decide(floor, m, credit, serving) {
                 Action::Stop => {
                     mesh.stop();
+                    watch.mesh_seen_ts = now;
                     watch.stopped = Some(Stop { due_at_least_msat: floor, received_msat: m, ts: now });
                     println!("You are due at least {floor} msat by your own count and have received {m}. Past your limit of {credit_sats} sats: stopped serving until you are paid.");
                 }

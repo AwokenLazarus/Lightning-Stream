@@ -137,7 +137,7 @@ for tokens nobody paid for. It compares that with the settled invoices of your o
 
 When what you are due passes what you have received by more than your credit limit (`--credit-sats`,
 three payout floors by default), it stops serving, says why, and serves again by itself once you are
-paid. So the most an operator can take from you is about that limit. `report.json` in its directory has
+paid, after staying out for at least two minutes so that the split plans your machine in anew. So the most an operator can take from you is about that limit. `report.json` in its directory has
 both figures at any time.
 
 Set the limit above what an honest operator's payout round can leave unpaid. Below that, you stop serving

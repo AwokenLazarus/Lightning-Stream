@@ -3513,7 +3513,7 @@ class Deal:
         with open(f"{Files.root}/build.sha256") as f:
             sha = f.read().strip()
         return ["lend", "--invite", invite or self.invite, "--dir", self.dir, "--node-rest", f"https://127.0.0.1:{lab.PORT[OFFER_NODE]}", "--node-macaroon", f"{RUN}/lender.macaroon",
-                "--node-cert", f"{RUN}/{OFFER_NODE}.tls.cert", "--allow-build", sha, "--interval-s", "1", "--credit-sats", str(LEND_CREDIT_SATS), "--port-base", str(LEND_PORT), "--name", f"lender {self.tag}"]
+                "--node-cert", f"{RUN}/{OFFER_NODE}.tls.cert", "--allow-build", sha, "--interval-s", "1", "--credit-sats", str(LEND_CREDIT_SATS), "--port-base", str(LEND_PORT), "--name", f"lender {self.tag}", "--rejoin-wait-s", "0"]
 
     def env(self) -> dict[str, str]:
         return dict(os.environ, STAND_IN_TOKENS=self.tokens, STAND_IN_LAYERS=self.layers, STAND_IN_RUNS=self.runs)
@@ -4103,13 +4103,13 @@ def mesh_lend_real() -> None:
     check("mesh_lend_real: when the operator really stops paying, the lender leaves the split by itself, with at most its limit and the work of its last interval unpaid",
           r.get("serving") is False and gone and 0 < gap <= LEND_REAL_CREDIT_SATS * 1000 + 2 * one,
           {"answers_unpaid": steps, "stopped": stopped, "gap_msat": gap, "limit_msat": LEND_REAL_CREDIT_SATS * 1000, "one_answer_at_most_msat": one, "left_the_split": gone})
-    # paid at last. The lender comes back by itself. Whether the split takes it back by itself is Mesh-LLM's coordinator's to say; if it has not in
-    # two minutes the operator starts its own node again, as it would to add a lender, and the check says which it was
+    # paid at last. The lender stays out long enough for the coordinator to plan it in anew, then comes back and the split takes it back by itself.
+    # If it has not in four minutes the operator starts its own node again, as it would to add a lender, and the check fails saying so
     rc, out = payout()
     lab.wait("the lender to serve again", 120, lambda: lender_report().get("serving") is True, every=2)
     t_back = time.time()
     try:
-        lab.wait("the split to take the lender back by itself", 120, answer_directly, every=4)
+        lab.wait("the split to take the lender back by itself", 240, answer_directly, every=4)
         needed_restart = False
     except LabError:
         needed_restart = True
@@ -4121,7 +4121,7 @@ def mesh_lend_real() -> None:
     a = buy_one()
     b = books()
     check("mesh_lend_real: once paid, the lender comes back by itself, nothing fetched, and the split serves paid answers again; its node still holds exactly the ledger's payments",
-          rc == 0 and r.get("serving") is True and a["paid"] and b["one_for_one"] and b["within_fee"] and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
+          rc == 0 and not needed_restart and r.get("serving") is True and a["paid"] and b["one_for_one"] and b["within_fee"] and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
           {"rc": rc, "needed_the_operator_to_restart": needed_restart, "received": r.get("received_msat"), "due_at_least": r.get("due_at_least_msat"), "answer_paid": a["paid"], "books": b, "fetched": Files.hits})
     measured("mesh_lend_real", {"seconds_to_card": round(t_card), "seconds_to_serving": round(t_serving), "answers": answered, "completion_tokens_honest_run": completions, "lender": r, "books": b})
     Files.command = "2 stop"
