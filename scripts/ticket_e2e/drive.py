@@ -3158,7 +3158,7 @@ def mesh_pay() -> None:
     lenders' nodes are the judges: payment by payment they hold what the tool's ledger says it paid, and the money adds up to
     the msat, through a refusal by the owner's policy, the tool killed before, during and after real payments, and a change of plan. With no
     MESH_LLM_URL a stand-in answers for the model; with it (and MESH_LLM_CONSOLE, MESH_LLM_GGUF) a real Mesh-LLM split does, its
-    first two stages the operator's own."""
+    last two stages the lenders' and any before them the operator's own."""
     if MESH_URL and not (MESH_CONSOLE and MESH_GGUF):
         raise LabError("a real split needs MESH_LLM_CONSOLE and MESH_LLM_GGUF beside MESH_LLM_URL")
     stop_sessions()
@@ -3187,10 +3187,10 @@ def mesh_pay() -> None:
         upstream, console, gguf = MESH_URL, MESH_CONSOLE, MESH_GGUF
         with urllib.request.urlopen(f"{console}/api/runtime/stages", timeout=20) as r:
             tops = json.load(r).get("topologies") or []
-        if len(tops) != 1 or len(tops[0].get("stages") or []) != 4:
-            raise LabError(f"a real split of four stages is needed, the node reports {[len(t.get('stages') or []) for t in tops]}")
+        if len(tops) != 1 or len(tops[0].get("stages") or []) < 2:
+            raise LabError(f"a real split of at least two stages is needed, the node reports {[len(t.get('stages') or []) for t in tops]}")
         nodes = [s["node_id"] for s in sorted(tops[0]["stages"], key=lambda s: s["layer_start"])]
-        own, lender_a, lender_b = set(nodes[:2]), nodes[2], nodes[3]
+        own, lender_a, lender_b = set(nodes[:-2]), nodes[-2], nodes[-1]
     else:
         upstream = console = f"http://127.0.0.1:{STAND_IN_PORT}"
         gguf = f"{RUN}/stand-in.gguf"
