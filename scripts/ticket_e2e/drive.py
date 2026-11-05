@@ -4032,7 +4032,7 @@ def mesh_lend_real() -> None:
     share = (r.get("shares") or {}).get("14-28", {})
     check("mesh_lend_real: the lender's own working-out of its share from the real model's header is the operator's ledger's, exactly",
           int(share.get("active_params", -1)) == weights.get(lender) and int(share.get("total_params", -1)) == sum(weights.values()), {"lender": share, "ledger": weights})
-    check("mesh_lend_real: through an honest paid run of real answers, some abandoned, the lender was never stopped",
+    check(f"mesh_lend_real: through an honest paid run of real answers, {ABANDONED_ANSWERS} of them abandoned, the lender was never stopped",
           r.get("serving") is True and not ever_stopped and r.get("due_at_least_msat", 0) <= (r.get("received_msat") or 0) + LEND_REAL_CREDIT_SATS * 1000,
           {"serving": r.get("serving"), "due_msat": r.get("due_msat"), "due_at_least_msat": r.get("due_at_least_msat"), "received_msat": r.get("received_msat"), "tokens": r.get("total_tokens")})
 
@@ -4056,13 +4056,17 @@ def mesh_lend_real() -> None:
     pid_before, tokens_before = r.get("pid"), r.get("total_tokens")
     Files.command = "1 kill"
     lab.wait("the lender to have restarted its watch", 60, lambda: Files.posted.get("did") == b"1 kill", every=1)
-    r = fresh_report(10)
     a = buy_one()
     answered += 1
-    r2 = fresh_report(8)
-    check("mesh_lend_real: `lend` killed on the lender's machine and started again takes up the same Mesh-LLM, fetches nothing, and the split keeps serving",
-          r.get("pid") == pid_before and a["paid"] and placed() and r.get("total_tokens", 0) >= tokens_before and r2.get("total_tokens", 0) > tokens_before and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
-          {"pid": [pid_before, r.get("pid")], "tokens": [tokens_before, r.get("total_tokens"), r2.get("total_tokens")], "fetched": Files.hits})
+    # (it checks the build and the model again before it looks at anything, which takes the time of reading them)
+    try:
+        lab.wait("the restarted watch to count that answer", 90, lambda: lender_report().get("total_tokens", 0) > tokens_before, every=2)
+    except LabError:
+        pass
+    r = lender_report()
+    check("mesh_lend_real: `lend` killed on the lender's machine and started again takes up the same Mesh-LLM, fetches nothing, and the split keeps serving and being counted",
+          r.get("pid") == pid_before and a["paid"] and placed() and r.get("total_tokens", 0) > tokens_before and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
+          {"pid": [pid_before, r.get("pid")], "answer_paid": a["paid"], "tokens": [tokens_before, r.get("total_tokens")], "fetched": Files.hits})
 
     # --- the operator stops paying, for real
     steps, last = 0, buy_one
@@ -4077,21 +4081,29 @@ def mesh_lend_real() -> None:
             break
     stopped = r.get("stopped") or {}
     gap = stopped.get("due_at_least_msat", 0) - stopped.get("received_msat", 0)
-    gone = not placed()
+    # (the operator's node takes a moment to see that a stage has gone)
+    try:
+        lab.wait("the operator's node to see the stage gone", 60, lambda: not placed(), every=2)
+        gone = True
+    except LabError:
+        gone = False
     # what one interval of real answers can add: the most any answer earns it, for two answers
     one = AI_MAX_OUT * PAY_OUT_MSAT // 1000 * (1_000_000 - PAY_CUT_PPM) // 1_000_000 * weights[lender] // sum(weights.values())
     check("mesh_lend_real: when the operator really stops paying, the lender leaves the split by itself, with at most its limit and the work of its last interval unpaid",
           r.get("serving") is False and gone and 0 < gap <= LEND_REAL_CREDIT_SATS * 1000 + 2 * one,
           {"answers_unpaid": steps, "stopped": stopped, "gap_msat": gap, "limit_msat": LEND_REAL_CREDIT_SATS * 1000, "one_answer_at_most_msat": one, "left_the_split": gone})
-    # paid at last
+    # paid at last. The lender comes back by itself. Mesh-LLM's coordinator does not give a stage that restarted its work again, only one that
+    # starts anew, so the operator starts its own node again, as it would to add a lender
     rc, out = payout()
     lab.wait("the lender to serve again", 120, lambda: lender_report().get("serving") is True, every=2)
+    time.sleep(5)
+    operator_mesh(lock)
     lab.wait("the split with the lender back", 300, placed, every=2)
     lab.wait("an answer from the split again", 180, answer_directly, every=3)
     r = fresh_report(8)
     a = buy_one()
     b = books()
-    check("mesh_lend_real: once paid, the lender comes back by itself, nothing fetched, the split serves paid answers again, and its node still holds exactly the ledger's payments",
+    check("mesh_lend_real: once paid, the lender comes back by itself, nothing fetched, and with the operator's node restarted the split serves paid answers again; its node still holds exactly the ledger's payments",
           rc == 0 and r.get("serving") is True and a["paid"] and b["one_for_one"] and b["within_fee"] and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
           {"rc": rc, "received": r.get("received_msat"), "due_at_least": r.get("due_at_least_msat"), "answer_paid": a["paid"], "books": b, "fetched": Files.hits})
     measured("mesh_lend_real", {"seconds_to_card": round(t_card), "seconds_to_serving": round(t_serving), "answers": answered, "completion_tokens_honest_run": completions, "lender": r, "books": b})
