@@ -15407,7 +15407,7 @@ fn a_rentals_route_probe_tells_a_route_from_definitely_none_and_from_not_knowing
     r.ln.st.lock().unwrap().down = true;
     assert!(probe(&node)["route"].is_null(), "a node that can't answer is no refusal");
     assert!(xbt_hashlink::rail::signer_call(&t.payer.sock, "ln_route_probe", &json!({"node": "02ab", "amount_msat": 1}))
-        .map_or(true, |v| v["ok"] == false), "a node key only");
+        .map_or(true, |v| v["verdict"] == "deny" && v["route"].is_null()), "a node key only");
     assert!(r.ln.by_status("SUCCEEDED").is_empty() && r.ln.by_status("IN_FLIGHT").is_empty() && r.ln.by_status("FAILED").is_empty(), "nothing sent");
 }
 
