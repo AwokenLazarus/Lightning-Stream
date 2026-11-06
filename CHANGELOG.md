@@ -9,13 +9,12 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 
 - **A rental whose budget is spent ends as that, not as unpaid.** A 60-minute rental of 20,202 sats at 51 sat a slice
   paid 386 slices, then had 495 sats of its budget left, under the seller's smallest ticket of 546, and too little credit
-  for a slice. Its price alone allowed more, so the renter asked for slice 387: the wallet refused it, the hashmaker held
-  a share for it and ended the rental "unpaid", and the card counted a failed payment. Now the renter asks for no slice
-  that neither the credit at the seller nor a ticket what is left of the budget buys, ends the rental itself once the work
-  it paid for is used, and tells the hashmaker so. No payment fails, and the card and History say "Ended: its budget was
-  spent (20,202 sats)". The same goes for the budget the owner's spending rules give the hashrate task: a slice the wallet
-  refuses for it is not a failed payment, and the rental ends as that budget spent. What credit is left stays with the
-  seller, as before. No message changes between the two sides: a renter's close is one a 0.2.14 hashmaker reads, and a
+  for a slice. Its price alone allowed more, so the renter asked the wallet for slice 387, which refused it with nothing
+  paid; the renter counted a failed payment and left the hashmaker to hold a share for it and end the rental "unpaid".
+  Now that refusal (it reaches no hashmaker) takes the slice back: no other is asked for, and the renter ends the rental
+  itself once the work it paid for is used, before the hashmaker's clock, telling it so. No payment fails, and the card
+  and History say "Ended: its budget was spent (20,202 sats)". The same goes for the budget the owner's spending rules
+  give the hashrate task. What credit is left stays with the seller, as before. No message changes between the two sides: a renter's close is one a 0.2.14 hashmaker reads, and a
   hashmaker never sends on work that isn't paid for.
 
 ## 0.2.14 (2026-11-05)

@@ -575,6 +575,10 @@ fn check_budget_end(r: &Run, why: &str, slices: u64, tickets: usize, asked: usiz
     assert!(b["pays"].as_array().unwrap().iter().all(|p| p["ok"] == true), "every payment asked for was paid: {b}");
     assert_eq!((b["paidSlices"].as_u64(), b["released"].as_u64()), (Some(slices), Some(slices)), "hashtaker {b}");
     assert!(b["events"].as_array().unwrap().iter().any(|e| e["ev"] == "budget spent" && e["why"] == why), "{b}");
+    // a slice the wallet refused for a budget is taken back: not asked for again, not paid, not a failed payment
+    for e in b["events"].as_array().unwrap().iter().filter(|e| e["ev"] == "refused: budget spent") {
+        assert_eq!(e["slice"].as_u64(), Some(slices + 1), "{e}");
+    }
     // the hashmaker heard the renter's own reason, and was paid every slice whose work it sent on
     assert_eq!(m["stopped"]["reason"], format!("hashtaker closed: {why}"), "hashmaker {m}");
     assert_eq!(m["paid"].as_u64(), Some(slices), "hashmaker {m}");
@@ -594,13 +598,16 @@ fn check_budget_end(r: &Run, why: &str, slices: u64, tickets: usize, asked: usiz
 /// its price alone allowed. The wallet refused it ("What is left of this rental's budget (495 sats) is less than this
 /// hashmaker's smallest ticket"), the hashmaker held a share for it and ended the rental "unpaid", and the renter's card
 /// counted a failed payment. Here two tickets of 546 pay 10 slices of 100 sat, and 50 sats are left of 1,142: an 11th
-/// slice fits the budget by its price, and no ticket. The renter ends the rental itself as its 10th slice is used.
+/// slice fits the budget by its price, and no ticket. The wallet refuses it, moving nothing and before any hashmaker
+/// hears of it; the renter takes it back and ends the rental itself as its 10th slice is used.
 #[test]
 fn a_budget_left_short_of_the_smallest_ticket_ends_the_rental_as_spent_with_nothing_unpaid() {
     let (price, budget) = (100_000, 2 * TICKET_SATS + 50);
     assert!(11 * price <= budget * 1000, "the 11th slice fits the budget by its price");
     let r = budget_rental(price, budget, None);
-    check_budget_end(&r, order::BUDGET_USED_UP, 10, 2, 10);
+    check_budget_end(&r, order::BUDGET_USED_UP, 10, 2, 11);
+    let ev = r.hashtaker["events"].as_array().unwrap().iter().find(|e| e["ev"] == "refused: budget spent").cloned().unwrap_or_default();
+    assert!(ev["why"].as_str().unwrap_or("").starts_with(xbt_hashlink::rail::BUDGET_TOO_SHORT), "{}", r.hashtaker);
 }
 
 /// The budget runs out exactly at the smallest ticket: 1,092 sats, so the second ticket is bought with 546 left,
