@@ -218,11 +218,100 @@ pub struct Outcome {
 
 /// Add `file`'s root key id and permissions to `dir`'s record of the keys this tool made.
 fn record(dir: &Path, file: &str, id: u64, ops: &[&str]) -> Result<(), String> {
+    record_by(dir, file, id, ops, BY_BOX)
+}
+
+/// The record's `made_by` for keys made with the box's own access to the node (Umbrel, Linux).
+const BY_BOX: &str = "the app, from this box's own Lightning node";
+/// The record's `made_by` for keys made from the connection address the owner pasted on Your node.
+const BY_ADDRESS: &str = "the app, from the connection address the owner pasted";
+
+fn record_by(dir: &Path, file: &str, id: u64, ops: &[&str], by: &str) -> Result<(), String> {
     let mut rec = read_record(dir);
     rec[file] = json!({"root_key_id": id.to_string(), "permissions": ops,
                        "made_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)});
-    rec["made_by"] = json!("the app, from this box's own Lightning node");
+    rec["made_by"] = json!(by);
     write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())
+}
+
+/// The full-access key in what the owner pasted on Your node: a node connection address
+/// (`lndconnect://host:port?macaroon=<base64url>`, as StartOS shows Lightning Fork's REST LND Connect
+/// interface; a `cert=` beside it is ignored, the app pins the certificate it was given), or the key
+/// itself in hex or base64. Nothing of it is written anywhere.
+pub fn key_of_address(text: &str) -> Result<Vec<u8>, String> {
+    let t = text.trim();
+    if t.get(..13).is_some_and(|p| p.eq_ignore_ascii_case("lndconnect://")) {
+        let query = t.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let m = query.split('&').find_map(|kv| kv.strip_prefix("macaroon=")).filter(|m| !m.is_empty())
+            .ok_or("that address holds no key (no macaroon= in it): copy the REST LND Connect address again, whole")?;
+        return crate::setup::decode_macaroon(m).map_err(|_| "the key in that address cannot be read: copy the address again, whole".into());
+    }
+    crate::setup::decode_macaroon(t).map_err(|_| "That is neither a connection address (lndconnect://…) nor a key: copy it again, whole.".into())
+}
+
+/// The keys made from a key the owner pasted that can make keys (Lightning Fork's full-access one, from
+/// its connection address), with `bake` (the node's): the wallet's key always, replacing one there,
+/// and the gateway's keys where they are missing, each under a root key of its own. The pasted key is
+/// used for these calls only. The record says the owner's paste made them.
+pub fn make_from_paste(rail_dir: &Path, gw_dir: Option<&Path>, bake: &mut Bake) -> Result<Outcome, String> {
+    let mut out = Outcome::default();
+    let id = root_key_id();
+    let mac = bake(&RAIL_OPS, id)?;
+    write_shared(rail_dir, RAIL_MACAROON, &mac)?;
+    // a disconnect before is undone by this new connection
+    let mut rec = read_record(rail_dir);
+    if let Some(o) = rec.as_object_mut() {
+        o.remove("off");
+        o.remove("removed");
+        if let Some(r) = o.get_mut(RAIL_MACAROON).and_then(|r| r.as_object_mut()) {
+            r.remove("revoked");
+        }
+        write_shared(rail_dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())?;
+    }
+    record_by(rail_dir, RAIL_MACAROON, id, &RAIL_OPS, BY_ADDRESS)?;
+    out.made.push(RAIL_MACAROON.into());
+    if let Some(gw) = gw_dir.filter(|d| !is_off(d)) {
+        for (file, ops) in [(GW_INVOICES, &INVOICE_OPS[..]), (GW_INFO, &INFO_OPS[..]), (GW_SIGN, &SIGN_OPS[..])] {
+            if gw.join(file).is_file() {
+                out.kept.push(file.into());
+                continue;
+            }
+            let id = root_key_id();
+            match bake(ops, id) {
+                Ok(m) => {
+                    write_shared(gw, file, &m)?;
+                    record_by(gw, file, id, ops, BY_ADDRESS)?;
+                    out.made.push(file.into());
+                }
+                // selling needs these; paying does not: the wallet stays connected, the Sell page says what is missing
+                Err(e) => out.skipped.push((file.into(), e)),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `dir`'s keys were made from the connection address the owner pasted (for the pages).
+pub fn made_from_paste(dir: &Path) -> bool {
+    made_by_box(dir) && read_record(dir)["made_by"] == BY_ADDRESS
+}
+
+/// Why a box that makes the app's key itself (Umbrel's node-keys-bake) has none yet, in words, from
+/// the node's own wallet state ([`xbt_gateway::node::wallet_state`]; `Err`: no answer).
+pub fn wait_reason(state: Result<&str, &str>) -> &'static str {
+    match state {
+        Ok("NON_EXISTING") => "Create your Lightning wallet in Lightning Fork first. Lightning Stream picks it up automatically, \
+                               within a minute and with no restart. Or paste a key below.",
+        Ok("LOCKED") => "Lightning Fork's wallet exists but is locked. It unlocks itself when Lightning Fork starts; if it stays locked, \
+                         restart Lightning Fork. Lightning Stream connects by itself within a minute after. Or paste a key below.",
+        Ok("UNLOCKED" | "RPC_ACTIVE" | "WAITING_TO_START") => "Lightning Fork's wallet is still starting: it waits for the XBT node to sync, \
+                         which can take hours on a new node. Lightning Stream connects by itself once it is ready, with no restart. Or paste a key below.",
+        Ok("SERVER_ACTIVE") => "Lightning Fork is ready: Lightning Stream connects by itself within a minute. If it does not, \
+                                restart Lightning Stream. Or paste a key below.",
+        _ => "Lightning Fork is not answering yet: it may be starting, or waiting for the XBT node to sync. Lightning Stream connects \
+              by itself once Lightning Fork's wallet exists and runs. If you have not made one, create your Lightning wallet in Lightning \
+              Fork first: Lightning Stream picks it up automatically. Or paste a key below.",
+    }
 }
 
 /// Make every missing key in each dir, with `bake` (the node's, in [`run`]). Each key is recorded
@@ -589,6 +678,62 @@ mod tests {
         xbt402::macaroon::lnd_macaroon_for_tests(&pairs, &[])
     }
 
+    /// StartOS without Lightning Fork's grant: the owner pastes its REST LND Connect address; the key in it is
+    /// read out, whether the address carries a certificate or not, and a bare key works too.
+    #[test]
+    fn the_key_in_a_pasted_connection_address_is_read_out() {
+        use base64::Engine;
+        let admin = mac_of(&["info:read", "macaroon:generate", "offchain:write"]);
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&admin);
+        assert_eq!(key_of_address(&format!("lndconnect://192.168.1.9:8080?macaroon={b64}")).unwrap(), admin);
+        assert_eq!(key_of_address(&format!(" LNDCONNECT://abc.onion:8080?cert=MIIB&macaroon={b64}\n")).unwrap(), admin);
+        assert_eq!(key_of_address(&hex::encode(&admin)).unwrap(), admin);
+        assert!(key_of_address("lndconnect://192.168.1.9:8080?cert=MIIB").unwrap_err().contains("no macaroon="));
+        assert!(key_of_address("lndconnect://h:1?macaroon=!!").is_err());
+        assert!(key_of_address("https://lightning-fork.local").is_err());
+    }
+
+    /// The keys made from that address: the wallet's (replacing one there), the shop's where missing, each
+    /// with its own root key id, and the record says the paste made them (not the box by itself).
+    #[test]
+    fn keys_made_from_a_pasted_address_replace_the_wallet_s_and_add_the_missing_shop_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let (rail, gw) = (shared_dir(t.path(), "ln"), shared_dir(t.path(), "gw"));
+        std::fs::write(rail.join(RAIL_MACAROON), b"old").unwrap();
+        std::fs::write(gw.join(GW_INFO), b"mine").unwrap();
+        // a disconnect before: this new connection undoes it
+        std::fs::write(rail.join(AUTO_KEYS), b"{}").unwrap();
+        turn_off(&rail).unwrap();
+        assert!(turned_off(&rail));
+        let mut asked = vec![];
+        let o = make_from_paste(&rail, Some(&gw), &mut |ops, id| {
+            asked.push((ops.join(" "), id));
+            if ops == &SIGN_OPS[..] { Err("the node bakes no URI permissions".into()) } else { Ok(mac_of(ops)) }
+        }).unwrap();
+        assert_eq!(o.made, vec![RAIL_MACAROON, GW_INVOICES]);
+        assert_eq!(o.kept, vec![GW_INFO]);
+        assert_eq!(o.skipped.len(), 1);
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), mac_of(&RAIL_OPS));
+        assert_eq!(std::fs::read(gw.join(GW_INFO)).unwrap(), b"mine", "a key the owner put there is kept");
+        assert!(made_from_paste(&rail) && made_from_paste(&gw) && !turned_off(&rail));
+        let ids: std::collections::BTreeSet<u64> = asked.iter().map(|a| a.1).collect();
+        assert_eq!(ids.len(), asked.len(), "a root key of its own for each");
+        assert_eq!(root_key_ids(&rail).len(), 1);
+    }
+
+    /// Umbrel: the page tells why the key is not there yet, by the node's own wallet state.
+    #[test]
+    fn the_wait_for_the_node_is_said_by_its_wallet_state() {
+        assert!(wait_reason(Ok("NON_EXISTING")).starts_with("Create your Lightning wallet in Lightning Fork first"));
+        assert!(wait_reason(Ok("LOCKED")).contains("is locked"));
+        for s in ["UNLOCKED", "RPC_ACTIVE", "WAITING_TO_START"] {
+            assert!(wait_reason(Ok(s)).contains("still starting: it waits for the XBT node to sync"), "{s}");
+        }
+        assert!(wait_reason(Ok("SERVER_ACTIVE")).contains("ready"));
+        assert!(wait_reason(Err("connection refused")).contains("not answering yet"));
+        assert!(!wait_reason(Ok("LOCKED")).contains("Create your Lightning wallet"));
+    }
+
     #[test]
     fn the_admin_macaroon_on_standard_input_is_its_bytes_or_their_hex() {
         assert_eq!(read_admin(&[0x02u8, 0x01, 0xff][..]).unwrap(), vec![0x02, 0x01, 0xff]);
@@ -732,7 +877,7 @@ mod tests {
         let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None, rail_dir: None, gw_dir: Some(gw.clone()) };
         let mut n = 0;
         let e = make_keys(&s, &mut |ops, _| {
-            if ops == SIGN_OPS {
+            if ops == &SIGN_OPS[..] {
                 return Ok(b"sign".to_vec());
             }
             n += 1;
@@ -756,7 +901,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let gw = shared_dir(t.path(), "gateway");
         let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None, rail_dir: None, gw_dir: Some(gw.clone()) };
-        let out = make_keys(&s, &mut |ops, _| if ops == SIGN_OPS { Err("unknown permission".into()) } else { Ok(b"k".to_vec()) }).unwrap();
+        let out = make_keys(&s, &mut |ops, _| if ops == &SIGN_OPS[..] { Err("unknown permission".into()) } else { Ok(b"k".to_vec()) }).unwrap();
         assert_eq!(out.made, vec![GW_INVOICES, GW_INFO]);
         assert_eq!(out.skipped, vec![(GW_SIGN.to_string(), "unknown permission".to_string())]);
         assert!(!gw.join(GW_SIGN).exists());
@@ -875,7 +1020,7 @@ mod tests {
         let baker = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None,
                                rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: Some(h.clone()), take_from: None };
         let taker = Settings { admin: PathBuf::new(), bake_to: None, take_from: Some(h.clone()), ..baker.clone() };
-        let out = make_keys(&baker, &mut |ops, _| if ops == SIGN_OPS { Err("unknown permission".into()) } else { Ok(mac_of(ops)) }).unwrap();
+        let out = make_keys(&baker, &mut |ops, _| if ops == &SIGN_OPS[..] { Err("unknown permission".into()) } else { Ok(mac_of(ops)) }).unwrap();
         assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO]);
         let mut o = Outcome::default();
         take_handover(&taker, &mut o).unwrap();

@@ -43,6 +43,8 @@
 //! | `XBT_UI_APP_PORTS` | | ports (comma-separated) a seller's own web page is served on, one origin each, when the owner opens it inside the app (docs/SELLER-APPS.md); empty: off. The browser must reach them on the same host as this page |
 //! | `XBT_UI_PLATFORM_LOGIN` | | the host name of the platform's own login proxy (Umbrel: `<app id>_app_proxy_1`). A request from that peer is the owner's, already logged in by the platform: no app password is asked. Every other peer still needs the password. Set it only where no other app can take that name on the network: umbrelOS 2.0 runs no app-proxy container, so the Umbrel package leaves it unset |
 //! | `XBT_UI_ENROLL_CODE_FILE` | | the signer's one-time enrolment code, where the signer writes a copy for the UI (`B2_ENROLL_CODE_COPY`): the setup page fills it in, so the owner reads no log |
+//! | `XBT_UI_SETUP_CODE_HINT` | | where the owner finds the first run's setup code on this platform (Umbrel: Troubleshoot; StartOS: the action), said on the first page instead of the general words |
+//! | `XBT_UI_LN_CONNECT_ADDRESS` | | where the owner copies the node's connection address on this platform (StartOS without Lightning Fork's grant: its REST LND Connect interface). Set, Your node walks the owner through pasting it, and the app makes its own narrow keys from it once, keeping neither the address nor its key |
 //! | `XBT_UI_RESTART_HINT` | restart Lightning Stream from your Umbrel or StartOS dashboard | how the owner restarts the app on this platform, said where a signed change waits for a restart |
 //! | `XBT_UI_LOCAL_SERVICES` | | services on this box the Sell page offers, `Name=http://host:port`, comma-separated, beside the ones it finds by their usual names |
 //! | `XBT_UI_HASHER` | | the hasher service's control page (`http://…`): turns on Sell → Hashrate, renting out this box's miners |
@@ -152,6 +154,8 @@ pub struct Config {
     pub enroll_code_file: Option<PathBuf>,
     /// `XBT_UI_RESTART_HINT`: how the owner restarts the app on this platform.
     pub restart_hint: String,
+    /// `XBT_UI_SETUP_CODE_HINT`: where the setup code is on this platform; `None`: the general words.
+    pub setup_code_hint: Option<String>,
     /// `XBT_UI_LOCAL_SERVICES`: services on this box to offer on the Sell page, (name, address).
     pub local_services: Vec<(String, String)>,
     /// Hashrate: the hasher's and the renter's services, when this box runs them.
@@ -182,6 +186,10 @@ pub struct LnSetup {
     /// The box has its node bake this app's keys once the owner has made the node's wallet
     /// (`XBT_UI_LN_AUTO=1`: Umbrel, `node-keys-bake`); with no key yet, the page says to make the wallet.
     pub auto: bool,
+    /// Where the owner copies the node's connection address (`XBT_UI_LN_CONNECT_ADDRESS`: StartOS with a
+    /// Lightning Fork that has no grant action). Set, the page takes that address (or the full-access key
+    /// in it) once and makes the app's own narrow keys from it; neither is kept.
+    pub connect_address: Option<String>,
 }
 
 /// The gateway page: where it writes, and the node and paths as the gateway's container sees them.
@@ -369,6 +377,7 @@ impl Config {
             pin: env("XBT_UI_LN_TLS_PIN").as_deref() == Some("1"),
             grant: env("XBT_UI_LN_GRANT").as_deref() == Some("1"),
             auto: env("XBT_UI_LN_AUTO").as_deref() == Some("1"),
+            connect_address: env("XBT_UI_LN_CONNECT_ADDRESS").map(|h| h.chars().take(300).collect()),
         };
         let gw = GatewaySetup {
             dir: env("XBT_UI_GW_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("gateway")),
@@ -455,6 +464,7 @@ impl Config {
             platform_login: env("XBT_UI_PLATFORM_LOGIN").filter(|h| h.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
             enroll_code_file: env("XBT_UI_ENROLL_CODE_FILE").map(PathBuf::from),
             restart_hint: env("XBT_UI_RESTART_HINT").map(|h| h.chars().take(300).collect()).unwrap_or_else(|| RESTART_HINT.into()),
+            setup_code_hint: env("XBT_UI_SETUP_CODE_HINT").map(|h| h.chars().take(300).collect()),
             local_services: env("XBT_UI_LOCAL_SERVICES").map(|v| v.split(',').filter_map(|e| {
                 let (n, u) = e.split_once('=')?;
                 let (n, u) = (n.trim(), u.trim().trim_end_matches('/'));
@@ -528,7 +538,7 @@ impl Config {
                files: FilesSetup { dir: files_dir, bind: "127.0.0.1:0".into(), choice: files_choice, ..Default::default() },
                nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), prefetch: false, relay_dir: None, relay_status: None,
                relay_unavailable: None, relay_start_hint: None, suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
-               restart_hint: RESTART_HINT.into(), local_services: vec![],
+               restart_hint: RESTART_HINT.into(), setup_code_hint: None, local_services: vec![],
                ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),
                              state: PathBuf::from("/nonexistent/ai/state.json") },
                vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), status_dir: PathBuf::from("/nonexistent/vpn"), endpoint: None, tunnel_upstream: None },

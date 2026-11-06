@@ -10,13 +10,13 @@ const dict = {
   'Bearer token': 6,
   // 7 to 11, 46 and 47 were the retired hub's strings; the other numbers are kept as they were
   'Node host': 12,
-  'The XBT (BLAKE2b) node RPC host: an IP or a name this server can reach': 13,
+  'The XBT (BLAKE2b) node RPC host: an IP or a name this server can reach. Knots BLAKE2b on this server: knots-blake2b.startos': 13,
   'RPC port': 14,
-  'The node RPC port': 15,
+  'The node RPC port. Knots BLAKE2b on this server: 18443': 15,
   'RPC user': 16,
-  'The user of the node RPC credentials (rpcauth or a cookie)': 17,
+  'The user of the node RPC credentials. Knots BLAKE2b: run its "Generate RPC User Credentials" action first, and copy the user and password it shows': 17,
   'RPC password': 18,
-  'The password of the node RPC credentials': 19,
+  'The password of the node RPC credentials (from Knots BLAKE2b\'s "Generate RPC User Credentials" action)': 19,
   Chain: 20,
   'The chain the node runs; the signer refuses to start on a different one': 21,
   'Node connection': 22,
@@ -78,6 +78,7 @@ const dict = {
   'The gateway is starting': 80,
   'Masking the jobs of rented hashrate': 81,
   'Waiting for a block template from the XBT node: check the Node connection action': 82,
+  'With Knots BLAKE2b on this server: first run its "Generate RPC User Credentials" action (in Knots BLAKE2b, Actions), and enter the user and password it shows here. Its host is knots-blake2b.startos and its RPC port 18443.': 83,
 } as const
 
 /**

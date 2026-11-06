@@ -651,14 +651,17 @@ impl App {
     }
 
     fn setup_password(&self, req: &Req) -> Resp {
+        // where the code is: the platform's own words (XBT_UI_SETUP_CODE_HINT), or the general ones
         let code_field = if self.auth.needs_setup_code() {
-            "<label>Setup code<input name=\"code\" autocomplete=\"off\" required></label>\
-             <p class=\"hint\">A one-time code that proves this app is yours. It is in the app's log, on the line that says \
-             <em>setup code</em>. On Umbrel: right-click the Lightning Stream icon and choose <em>Troubleshoot</em>. \
-             On StartOS: open Lightning Stream, choose <em>Actions</em>, then <em>Web UI setup code</em>.</p>\
-             <details><summary>Running it another way?</summary><p>The code is also in the file <code>setup-code</code> in the app's data folder.</p></details>"
+            format!("<label>Setup code<input name=\"code\" autocomplete=\"off\" required></label>\
+             <p class=\"hint\">A one-time code that proves this app is yours. {}</p>",
+                    match &self.cfg.setup_code_hint {
+                        Some(h) => esc(h),
+                        None => "It is in the app's log, on the line that says <em>setup code</em>, and in the file \
+                                 <code>setup-code</code> in the app's data folder.".into(),
+                    })
         } else {
-            ""
+            String::new()
         };
         let form = |flash: Option<(bool, String)>| {
             Resp::html(200, self.bare("Welcome", flash, &format!(
@@ -2083,15 +2086,15 @@ impl App {
         let enc = ks["encrypted"] == true;
         let ack_needed = ln["real_money_ack_needed"] == true;
         // on mainnet the rules step takes the yes to real money too (a box beside its Sign): done with both
-        let done = [true, !human.is_empty(), seen("policy_change") && !ack_needed, ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
+        // the password is not counted: it is set before any page shows, so Home's Get started (which does not
+        // list it) and this page say the same number done (0.2.14 said 0 there and 1 here on a new install)
+        let done = [!human.is_empty(), seen("policy_change") && !ack_needed, ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
         let n = done.iter().filter(|d| **d).count();
         let total = done.len();
-        let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">");
-        b.push_str(&step(true, "Password", if self.platform.is_some() {
-            "<p>Not needed: you opened the app from your box's dashboard, which already asked who you are.</p>".into()
-        } else {
-            "<p>Set. You are logged out after 15 minutes without use.</p>".into()
-        }));
+        let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p>\
+                             <p class=\"small\"><span class=\"pill good\">Password</span> {}</p><ol class=\"steps\">",
+                            if self.platform.is_some() { "Not needed: you opened the app from your box's dashboard, which already asked who you are." }
+                            else { "Set. You are logged out after 15 minutes without use." });
         let key_body = if human.is_empty() {
             format!("<p>Your approval key is how you say yes to a large payment or a change of rules. It is made and kept in this browser, \
                      under a passphrase only you know.</p><section id=\"human-key-state\" data-enrolled=\"\"><p id=\"browser-key\" class=\"msg\"></p>{}</section>",

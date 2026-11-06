@@ -598,6 +598,20 @@ pub fn bake_macaroon(
     Ok(bytes)
 }
 
+/// The node's wallet state, as lnd's State service says it with no macaroon (`GET /v1/state`):
+/// `NON_EXISTING` (no wallet made yet), `LOCKED`, `UNLOCKED` and `RPC_ACTIVE` (starting: lnd waits for
+/// its chain backend to sync), `SERVER_ACTIVE` (ready) or `WAITING_TO_START`. No key is sent.
+pub fn wallet_state(rest: &str, tls_cert: Option<&Path>) -> Result<String, String> {
+    let node = LndRest::build(rest, &[], &[], tls_cert)?;
+    let v = node
+        .unary("", "GET", "/v1/state", None)
+        .map_err(|e| e.to_string())?;
+    v.get("state")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "the node's answer has no state".into())
+}
+
 fn read_capped(r: impl Read, cap: u64) -> Result<String, String> {
     let mut s = String::new();
     r.take(cap)

@@ -35,7 +35,7 @@ export const manifest = setupManifest({
   },
   dependencies: {
     'lightning-fork': {
-      description: 'The Lightning node the app pays through and sells on. The app asks it for its own narrow keys (or you paste keys you make in it); only the one-shot that makes them reads the node, and no other service mounts its data.',
+      description: 'The Lightning node the app pays through and sells on. The app makes its own narrow keys from the connection address you paste (or, where Lightning Fork has its Grant app access action, asks it for one), and keeps no full-access key; no service mounts its data beyond its certificate (and the granted key, where it grants one).',
       optional: false,
       metadata: {
         title: 'Lightning Fork',
