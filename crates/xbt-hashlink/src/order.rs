@@ -234,11 +234,27 @@ impl Standing {
 
 }
 
+/// Can the wallet pay the next slice? From the credit the seller holds (`credit_msat`, at least a slice's price), or by a
+/// ticket that what is left of the rental's budget (`left_msat`; `None`: no budget) buys: the seller's smallest, in
+/// whole sats as the wallet's charge cap counts them ([`crate::rail::caps_at`]). A rental whose budget can buy neither
+/// is spent, however many slices its price alone would still give: the wallet would refuse the payment
+/// ("What is left of this rental's budget ... is less than this hashmaker's smallest ticket"), and a renter that asked
+/// for it anyway would leave its hashmaker holding a share for it.
+pub fn can_pay_next(credit_msat: u64, left_msat: Option<u64>, price_msat: u64) -> bool {
+    let smallest_sats = FIRST_STEP_MSAT.max(price_msat).div_ceil(1000);
+    credit_msat >= price_msat || left_msat.is_none_or(|l| l / 1000 >= smallest_sats)
+}
+
+/// Why a renter ends its rental when its own budget is spent: the rental's, or the one the owner's spending rules give
+/// its task in the wallet (`ticket_task_budget`). Both are the renter's own choice, said to the hashmaker in `close`.
+pub const BUDGET_USED_UP: &str = "budget used up";
+pub const TASK_BUDGET_USED_UP: &str = "the task's budget in the wallet's rules is used up";
+
 /// Was this ended rental a failed first step? Money went and little work came back, and the renter didn't end it
 /// itself. A renter's app stops going back to a seller after [`FAILED_FIRST_STEPS`] of these in a row.
 pub fn failed_first_step(report: &serde_json::Value) -> bool {
     let closed = report["closed"].as_str().unwrap_or("");
-    let own_choice = ["cut by the hashtaker", "rental time over", "budget used up"].contains(&closed);
+    let own_choice = ["cut by the hashtaker", "rental time over", BUDGET_USED_UP, TASK_BUDGET_USED_UP].contains(&closed);
     let paid = report["paidSlices"].as_u64().unwrap_or(0);
     let start = report["terms"]["startSlices"].as_u64().unwrap_or(0);
     let slice: u128 = report["terms"]["sliceWork"].as_str().and_then(|w| w.parse().ok()).unwrap_or(1);
@@ -252,6 +268,22 @@ pub const FAILED_FIRST_STEPS: u32 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.2.14 on mainnet: 386 slices of 51 sat paid from tickets of 546 sat and more, then 495 sats of a 20,202 sat
+    /// budget left and too little credit for a slice. Its price alone would give 9 more slices; no ticket can be bought.
+    #[test]
+    fn the_next_slice_is_payable_from_credit_or_a_ticket_the_budget_still_buys() {
+        let price = 51_000;
+        assert!(!can_pay_next(50_999, Some(495_000), price), "the 0.2.14 rental: its budget was spent");
+        assert!(can_pay_next(51_000, Some(495_000), price), "a slice of credit pays it");
+        assert!(can_pay_next(0, Some(546_000), price), "exactly the smallest ticket left: one more is bought");
+        assert!(can_pay_next(0, Some(546_999), price));
+        assert!(!can_pay_next(0, Some(545_999), price), "a sat short of the smallest ticket, counted in whole sats");
+        assert!(can_pay_next(0, None, price), "no budget");
+        // a slice dearer than the smallest ticket: a ticket of one slice
+        assert!(can_pay_next(0, Some(600_000), 600_000) && !can_pay_next(0, Some(599_999), 600_000));
+        assert!(!failed_first_step(&serde_json::json!({"closed": TASK_BUDGET_USED_UP, "paidSlices": 3, "meter": {"work": "0"}, "terms": {"sliceWork": "100"}})));
+    }
 
     #[test]
     fn a_failed_first_step_is_money_gone_for_little_work_not_a_renters_own_stop() {

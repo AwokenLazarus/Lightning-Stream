@@ -139,6 +139,22 @@ pub const BIG_TICKETS_ONLY: &str = "This hashmaker's smallest ticket is";
 pub const BUDGET_TOO_SHORT: &str = "What is left of this rental's budget";
 /// Where one of the owner's rules refused the payment.
 pub const WALLET_RULES: &str = "Your wallet's rules stopped this payment";
+/// After [`WALLET_RULES`], where the rule was the budget the owner's spending rules give the rental's task
+/// (`ticket_task_budget`).
+pub const TASK_BUDGET_SPENT: &str = "the budget your spending rules give this task is spent";
+
+/// Whether a refused payment's reason is a budget spent, and which: the rental's ([`BUDGET_TOO_SHORT`]) or its task's in
+/// the owner's rules ([`TASK_BUDGET_SPENT`]). Such a refusal moved nothing, and the renter ends its rental itself
+/// ([`crate::order::BUDGET_USED_UP`], [`crate::order::TASK_BUDGET_USED_UP`]) rather than leave a share waiting for it.
+pub fn budget_spent(why: &str) -> Option<&'static str> {
+    if why.starts_with(BUDGET_TOO_SHORT) {
+        Some(crate::order::BUDGET_USED_UP)
+    } else if why.strip_prefix(WALLET_RULES).and_then(|w| w.strip_prefix(": ")).is_some_and(|w| w.starts_with(TASK_BUDGET_SPENT)) {
+        Some(crate::order::TASK_BUDGET_USED_UP)
+    } else {
+        None
+    }
+}
 /// Where the wallet refused the rental's terms to this connection (`ticket_rental_payer`): a renter set up by hand
 /// on the wallet's own socket, or an app whose parts are of different versions. No limit of the owner's is at
 /// issue, so the words don't send the owner to the rules page.
@@ -324,6 +340,10 @@ impl SignerPayer {
                     None => format!("{BIG_TICKETS_ONLY} {face} sats, and {} sats may leave your wallet for this payment. Nothing was paid for this piece of work. \
                                      Rent from a hashmaker that sells smaller tickets, or ask this one to update its app.", self.max_sats),
                 })
+            }
+            ("ticket_task_budget", _) if moved_nothing(&r) => {
+                let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or(rule);
+                Err(format!("{WALLET_RULES}: {TASK_BUDGET_SPENT} ({why}). Nothing more was paid. Your limits are on the wallet's rules page."))
             }
             (rule, _) if WALLET_RULE_NAMES.contains(&rule) => {
                 let why = r.get("reason").and_then(serde_json::Value::as_str).unwrap_or(rule);
@@ -644,6 +664,7 @@ mod signer_wait_tests {
         p.caps_for(546_000);
         let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
         assert!(why.starts_with(BUDGET_TOO_SHORT) && why.contains("500 sats"), "{why}");
+        assert_eq!(budget_spent(&why), Some(crate::order::BUDGET_USED_UP));
         // budget the hashtaker added while the rental goes on counts with the rest
         let added = std::sync::Arc::new(crate::hashtaker::Added::default());
         p.added = Some(added.clone());
@@ -653,6 +674,11 @@ mod signer_wait_tests {
         *answer.lock().unwrap() = serde_json::json!({"verdict": "deny", "rule": "ticket_task_budget", "reason": "with this ticket's 559 sats, 5101 would be above the task's budget_sats (5000)", "charged_sats": 0});
         let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
         assert!(why.starts_with(WALLET_RULES) && why.contains("budget_sats (5000)"), "{why}");
+        assert_eq!(budget_spent(&why), Some(crate::order::TASK_BUDGET_USED_UP), "{why}");
+        // another of the owner's rules is no budget of this rental's: the payment failed
+        *answer.lock().unwrap() = serde_json::json!({"verdict": "deny", "rule": "daily_budget", "reason": "above the daily budget", "charged_sats": 0});
+        let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
+        assert!(why.starts_with(WALLET_RULES) && budget_spent(&why).is_none(), "{why}");
         *answer.lock().unwrap() = serde_json::json!({"verdict": "deny", "rule": "price_ceiling", "charged_sats": 0});
         assert!(p.pay("r1", 1, &serde_json::json!({})).unwrap_err().contains("price_ceiling"));
     }

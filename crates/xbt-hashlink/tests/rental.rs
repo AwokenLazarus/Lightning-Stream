@@ -450,6 +450,180 @@ fn a_wallets_socket_that_stays_busy_still_ends_the_rental_unpaid() {
     eprintln!("ended: hashmaker {:?}, hashtaker {:?}", r.hashmaker["stopped"]["reason"], r.hashtaker["closed"]);
 }
 
+/// The smallest ticket the stand-in shop of [`floor_ticket_wallet`] sells, and the only size: the protocol's floor.
+const TICKET_SATS: u64 = 546;
+
+/// The wallet's signer and the hashmaker's gateway in one, as [`fake_wallet`], with tickets: a slice is paid from the
+/// credit the shop holds, and when that is short of the slice's price a ticket of [`TICKET_SATS`] is bought first, if
+/// the payment's charge cap (`max_charge_sats`, what is left of the rental's budget) reaches it and, with `task_budget`,
+/// the task's budget in the owner's rules still has it. Each refusal moves nothing, in the signer's words.
+fn floor_ticket_wallet(dir: &std::path::Path, slices: String, price_msat: u64, task_budget: Option<u64>, calls: Arc<Mutex<Vec<Value>>>) -> PathBuf {
+    let sock = dir.join("signer.sock");
+    let l = UnixListener::bind(&sock).unwrap();
+    thread::spawn(move || {
+        let (mut credit_msat, mut task_spent) = (0u64, 0u64);
+        for c in l.incoming() {
+            let Ok(c) = c else { continue };
+            let mut line = String::new();
+            BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let p = &req["params"];
+            calls.lock().unwrap().push(req.clone());
+            let result = match req["method"].as_str() {
+                Some("xbt402_pay") => {
+                    let buy = credit_msat < price_msat;
+                    let cap = p["max_charge_sats"].as_u64().unwrap_or(0);
+                    if buy && cap < TICKET_SATS {
+                        json!({"verdict": "deny", "rule": "max_sats", "reason": format!("call again with max_sats of at least {}", TICKET_SATS + 13),
+                               "ticket_sats": TICKET_SATS, "charged_sats": 0})
+                    } else if buy && task_budget.is_some_and(|b| task_spent + TICKET_SATS > b) {
+                        json!({"verdict": "deny", "rule": "ticket_task_budget", "charged_sats": 0,
+                               "reason": format!("with this ticket's {TICKET_SATS} sats, {} would be above the task's budget_sats ({})", task_spent + TICKET_SATS, task_budget.unwrap())})
+                    } else {
+                        if buy {
+                            credit_msat += TICKET_SATS * 1000;
+                            task_spent += TICKET_SATS;
+                        }
+                        let url = p["url"].as_str().unwrap();
+                        let path = &url[url.find("/hashrate").unwrap()..];
+                        let body = p["body"].as_str().unwrap();
+                        let mut s = TcpStream::connect(&slices).unwrap();
+                        write!(s, "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+                        let mut out = String::new();
+                        s.read_to_string(&mut out).unwrap();
+                        let status: u64 = out.split_whitespace().nth(1).unwrap().parse().unwrap();
+                        if status == 200 {
+                            credit_msat -= price_msat;
+                        }
+                        json!({"verdict": "allow", "rail": "ticket", "status": status, "session": "s1",
+                               "charged_sats": if buy { TICKET_SATS } else { 0 },
+                               "price_msat": if status == 200 { price_msat } else { 0 }.to_string(), "balance_msat": credit_msat.to_string()})
+                    }
+                }
+                Some("ticket_stop") => json!({"ok": true, "http": {"left_with_seller_msat": credit_msat.to_string()}}),
+                _ => json!({"ok": true}),
+            };
+            let mut w = c;
+            writeln!(w, "{}", json!({"id": 1, "result": result})).unwrap();
+        }
+    });
+    sock
+}
+
+/// A rental of `budget_sats` paid through [`floor_ticket_wallet`] at `price_msat` a slice, by two miners hashing 20 s: its
+/// budget, or the task's, runs out while they hash.
+fn budget_rental(price_msat: u64, budget_sats: u64, task_budget: Option<u64>) -> Run {
+    let _serial = serial();
+    let terms = Terms { price_msat, ..terms() };
+    let [pool_a, link_a, miners_a, slices_a] = ports::<4>();
+    let dir = tempdir();
+    let pool_report = dir.join("pool.json");
+    {
+        let (a, r) = (pool_a.clone(), pool_report.clone());
+        thread::spawn(move || standin::pool(standin::PoolConfig { listen: a, diff: DIFF, job_every: Duration::from_millis(700), report: Some(r) }));
+    }
+    wait_for(&pool_a);
+    let hk = noise::fresh_key();
+    let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
+    let h = {
+        let cfg = hashmaker::Config {
+            miners: miners_a.clone(), link: link_a.clone(), key: hk, terms: terms.clone(), report: None, slices: Some(slices_a.clone()),
+            fallback: None, rentable: None, min_slice_time: hashmaker::MIN_SLICE_TIME,
+        };
+        thread::spawn(move || hashmaker::run(cfg, Box::<LabSeller>::default()).unwrap())
+    };
+    wait_for(&link_a);
+    let calls: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let payer = SignerPayer::new(floor_ticket_wallet(&dir, slices_a, price_msat, task_budget, calls.clone()), "https://hashmaker.example/hashrate".into(), "hashrate".into(),
+                                 price_msat, Some(budget_sats), None, Duration::from_secs(5));
+    let b = {
+        let cfg = hashtaker::Config {
+            hashmaker: link_a, hashmaker_key: hpub, key: noise::fresh_key(), upstream: pool_a, user: "hashtaker.rented".into(), terms,
+            rental: "rental-1".into(), listing: "lab".into(), stop_paying_after: None, idle: Duration::from_secs(3), duration: Some(Duration::from_secs(120)),
+            report: None, payer: Some(Box::new(payer)), miners: 0, budget_msat: Some(budget_sats * 1000), cut: None, added: None, live: None, gateway_api: None,
+            allow_unblinded: true,
+        };
+        thread::spawn(move || hashtaker::run(cfg, Box::<LabHashtaker>::default()).unwrap())
+    };
+    thread::sleep(Duration::from_millis(300));
+    let miners: Vec<_> = (0..2)
+        .map(|i| {
+            let a = miners_a.clone();
+            thread::spawn(move || {
+                standin::miner(standin::MinerConfig { pool: a, user: format!("hashmaker.m{i}"), max_rate: 8.0, bad_every: 7, duration: Some(Duration::from_secs(20)),
+                                                      reconnect: false, extranonce_subscribe: false, bind: None })
+            })
+        })
+        .collect();
+    let hashtaker = b.join().unwrap();
+    let miners: Vec<standin::MinerResult> = miners.into_iter().map(|m| m.join().unwrap().unwrap()).collect();
+    let miners_done_ms = xbt_hashlink::now_ms();
+    let hashmaker = h.join().unwrap();
+    thread::sleep(Duration::from_millis(700));
+    let pool = std::fs::read(&pool_report).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let wallet_calls = calls.lock().unwrap().clone();
+    Run { hashmaker, hashtaker, pool, miners_done_ms, miners, wallet_calls, pay_tries: 0 }
+}
+
+/// What a rental that ended on a budget of its own must show: the renter ended it itself, with `why`, and told the
+/// hashmaker so; no payment failed and the hashmaker holds nothing unpaid: every slice it released was paid, and it
+/// never ended the rental for a share left waiting.
+fn check_budget_end(r: &Run, why: &str, slices: u64, tickets: usize, asked: usize) {
+    let (b, m) = (&r.hashtaker, &r.hashmaker);
+    assert_eq!(b["closed"], why, "hashtaker {b}");
+    assert_eq!(b["payFailed"], false, "no failed payment: {b}");
+    assert!(b["pays"].as_array().unwrap().iter().all(|p| p["ok"] == true), "every payment asked for was paid: {b}");
+    assert_eq!((b["paidSlices"].as_u64(), b["released"].as_u64()), (Some(slices), Some(slices)), "hashtaker {b}");
+    assert!(b["events"].as_array().unwrap().iter().any(|e| e["ev"] == "budget spent" && e["why"] == why), "{b}");
+    // the hashmaker heard the renter's own reason, and was paid every slice whose work it sent on
+    assert_eq!(m["stopped"]["reason"], format!("hashtaker closed: {why}"), "hashmaker {m}");
+    assert_eq!(m["paid"].as_u64(), Some(slices), "hashmaker {m}");
+    assert_eq!(m["stopped"]["unpaidWork"], "0", "hashmaker {m}");
+    assert!(w(&m["meter"]["work"]) <= order::paid_work(slices, 0, terms().slice_work), "hashmaker {m}");
+    let pays: Vec<&Value> = r.wallet_calls.iter().filter(|c| c["method"] == "xbt402_pay").collect();
+    assert_eq!(pays.len(), asked, "the wallet was asked for these slices only: {pays:?}");
+    let bought = b["pays"].as_array().unwrap().iter().filter(|p| p["wallet"]["charged_sats"] == TICKET_SATS).count();
+    assert_eq!(bought, tickets, "{b}");
+    // its session with the shop stopped as any rental's does; what credit is left stays with the shop
+    assert_eq!(r.wallet_calls.last().unwrap()["method"], "ticket_stop");
+    assert!(b["leftWithSellerMsat"].as_u64().is_some_and(|c| c < 100_000), "less than a slice of 100 sat: {b}");
+}
+
+/// FAILS before (0.2.14 on mainnet, a 20,202 sat rental at 51 sat a slice): with 495 sats of its budget left, under the
+/// seller's smallest ticket of 546, and too little credit for a slice, the renter still asked for the next slice, which
+/// its price alone allowed. The wallet refused it ("What is left of this rental's budget (495 sats) is less than this
+/// hashmaker's smallest ticket"), the hashmaker held a share for it and ended the rental "unpaid", and the renter's card
+/// counted a failed payment. Here two tickets of 546 pay 10 slices of 100 sat, and 50 sats are left of 1,142: an 11th
+/// slice fits the budget by its price, and no ticket. The renter ends the rental itself as its 10th slice is used.
+#[test]
+fn a_budget_left_short_of_the_smallest_ticket_ends_the_rental_as_spent_with_nothing_unpaid() {
+    let (price, budget) = (100_000, 2 * TICKET_SATS + 50);
+    assert!(11 * price <= budget * 1000, "the 11th slice fits the budget by its price");
+    let r = budget_rental(price, budget, None);
+    check_budget_end(&r, order::BUDGET_USED_UP, 10, 2, 10);
+}
+
+/// The budget runs out exactly at the smallest ticket: 1,092 sats, so the second ticket is bought with 546 left,
+/// which is enough, and the 11th slice fits neither its price nor a ticket. 10 slices, no failed payment.
+#[test]
+fn a_budget_that_ends_exactly_at_the_smallest_ticket_buys_it_and_ends_as_spent() {
+    let r = budget_rental(100_000, 2 * TICKET_SATS, None);
+    check_budget_end(&r, order::BUDGET_USED_UP, 10, 2, 10);
+}
+
+/// The owner's spending rules give the hashrate task 1,100 sats, under the rental's 5,000: the wallet refuses the third
+/// ticket (`ticket_task_budget`), moving nothing. Before, that was a failed payment and the hashmaker ended the rental
+/// unpaid, as with the rental's own budget. The renter now ends it itself, as the task's budget spent: the refused
+/// slice is not counted as paid or asked for again.
+#[test]
+fn a_task_budget_in_the_owners_rules_spent_ends_the_rental_as_spent() {
+    let r = budget_rental(100_000, 5_000, Some(2 * TICKET_SATS + 8));
+    check_budget_end(&r, order::TASK_BUDGET_USED_UP, 10, 2, 11);
+    let ev = r.hashtaker["events"].as_array().unwrap().iter().find(|e| e["ev"] == "refused: budget spent").cloned().unwrap_or_default();
+    assert_eq!(ev["slice"], 11, "{}", r.hashtaker);
+    assert!(ev["why"].as_str().unwrap_or("").starts_with(xbt_hashlink::rail::WALLET_RULES), "{ev}");
+}
+
 /// The most a renter may have paid ahead of the work it has proven, in msat, just after paying a slice, by the
 /// payment rule as stated (`order::Standing::pay_next`), worked out here on its own so a change to the rule shows:
 /// a slice the next share needs (one share and one slice), or as far ahead as the step: what has been delivered, up to

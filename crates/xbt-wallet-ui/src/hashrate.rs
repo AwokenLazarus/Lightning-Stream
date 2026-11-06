@@ -516,7 +516,9 @@ fn ended_words(why: &str) -> String {
     let w = ["hashmaker closed: ", "hashtaker closed: ", "hasher closed: ", "buyer closed: "].iter().fold(why, |w, p| w.trim_start_matches(p));
     match w {
         "cut by the hashtaker" | "cut by the buyer" => "You cut it.".into(),
-        "budget used up" | "budget reached" => "Its budget is used up.".into(),
+        "budget used up" | "budget reached" => "Its budget was spent.".into(),
+        // the budget the owner's spending rules give the hashrate task (xbt_hashlink::order::TASK_BUDGET_USED_UP)
+        "the task's budget in the wallet's rules is used up" => "The budget your spending rules give hashrate rentals was spent. Your limits are on the wallet's rules page.".into(),
         "rental time over" => "Its time is up.".into(),
         "no proven work" | "no accepted work" => "The miners stopped sending work.".into(),
         "unpaid" => "A piece of work was not paid in time.".into(),
@@ -1801,6 +1803,17 @@ fn rentals_sections(ctx: &Ctx, rentals: &[Value]) -> String {
     b
 }
 
+/// A rental's end reason in words ([`ended_words`]), with its budget where that was spent: "Its budget was spent
+/// (20,202 sats)." Until 0.2.15 a rental whose budget was left short of the seller's smallest ticket asked for a piece
+/// of work anyway, and its card said "a piece of work was not paid in time".
+fn rental_ended_words(r: &Value, why: &str) -> String {
+    let w = ended_words(why);
+    match r["budgetSats"].as_u64().filter(|b| *b > 0) {
+        Some(b) if w == ended_words("budget used up") => format!("{} ({}).", w.trim_end_matches('.'), sats_n(b as f64)),
+        _ => w,
+    }
+}
+
 /// A rental's end reason after "Ended:": [`ended_words`]' sentence with a small first letter.
 fn ended_line(words: &str) -> String {
     let w = words.trim_start_matches("Ended: ");
@@ -1877,7 +1890,7 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     // wallet that "could not pay" (0.2.2, Mike's Umbrel: the reason was only in the API)
     let unreachable = live["pays"].as_array().into_iter().flatten().filter_map(|p| p["why"].as_str()).any(pay_address_gone);
     let why = live["closed"].as_str().map(|w| format!("<p class=\"hint\"><strong>Ended:</strong> {}{}</p>",
-                                                     esc(&ended_line(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { ended_words(w) })),
+                                                     esc(&ended_line(&if unreachable { PAY_ADDRESS_GONE.to_string() } else { rental_ended_words(r, w) })),
                                                      if failed && spent == 0.0 { " Nothing was paid." } else { "" })).unwrap_or_default();
     let why = if waiting_terms {
         "<p class=\"hint\">Waiting for the seller's updated terms. It publishes them within about a minute, and the rental starts then if they cost no more \
@@ -2771,7 +2784,31 @@ mod tests {
         // no startedMs: the time in the rental's id; no end time from an older service: the start alone
         let old = json!({"rental": format!("r{start}"), "ended": true, "live": {"closed": "budget used up"}});
         assert_eq!(rental_times(&old, true, 0), "<p class=\"small\">Started 2026-11-03 10:00:00 UTC</p>");
-        assert!(rental_card(&ctx, &old, "hashrate").contains("<strong>Ended:</strong> its budget is used up."));
+        assert!(rental_card(&ctx, &old, "hashrate").contains("<strong>Ended:</strong> its budget was spent."), "no budget known: no figure");
         assert_eq!(rental_times(&json!({"rental": "x"}), true, 0), "");
+    }
+
+    /// FAILS before (0.2.14 on mainnet): a rental of 20,202 sats whose budget had 495 sats left, under the seller's
+    /// smallest ticket of 546, asked for one more piece of work; the wallet refused it, the hashmaker ended the rental
+    /// unpaid and the card said "a piece of work was not paid in time". The renter now ends it itself: its card and
+    /// History say the budget was spent, with no refusal and no top-up form.
+    #[test]
+    fn a_rental_whose_budget_was_spent_says_so_with_its_budget() {
+        let ctx = Ctx { sid: String::new(), csrf: "c".into(), flash: None };
+        let r = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 20202, "ended": true,
+                       "live": {"closed": "budget used up", "paidSlices": 386, "spentMsat": 19_686_000, "payFailed": false, "miners": 1,
+                                "events": [{"ev": "budget spent", "why": "budget used up"}]}});
+        let card = rental_card(&ctx, &r, "hashrate");
+        assert!(card.contains("<strong>Ended:</strong> its budget was spent (20,202 sats).") && card.contains("386 pieces of work paid"), "{card}");
+        assert!(!card.contains("not paid in time") && !card.contains("What is left of this rental's budget") && !card.contains("Add to this rental"), "{card}");
+        let history = rentals_sections(&ctx, &[r]);
+        assert!(history.contains("History: 1 ended rental") && history.contains("its budget was spent (20,202 sats)."), "{history}");
+        // the hashmaker's words for the renter's close, as a hashmaker's own report has them
+        assert_eq!(ended_words("hashtaker closed: budget used up"), "Its budget was spent.");
+        // the task's budget in the owner's spending rules
+        let t = json!({"rental": "r2", "hasher": "Laz Hash", "budgetSats": 20202, "ended": true,
+                       "live": {"closed": "the task's budget in the wallet's rules is used up", "paidSlices": 40, "spentMsat": 2_040_000}});
+        let card = rental_card(&ctx, &t, "hashrate");
+        assert!(card.contains("<strong>Ended:</strong> the budget your spending rules give hashrate rentals was spent.") && !card.contains("20,202 sats)"), "{card}");
     }
 }
