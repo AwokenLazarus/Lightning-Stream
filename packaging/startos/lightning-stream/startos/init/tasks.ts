@@ -46,8 +46,14 @@ const grantAppAccess = { id: LF_GRANT.actionId } as unknown as Parameters<typeof
 const grantTaskId = `${LIGHTNING.packageId}:${LF_GRANT.actionId}`
 export const requestGrant = sdk.setupOnInit(async (effects) => {
   // watched, so a Lightning Fork installed, updated or restarted later is looked at again
-  await sdk.getServiceManifest(effects, LIGHTNING.packageId, (m) => m?.version ?? null).const().catch(() => null)
-  await sdk.getContainerIp(effects, { packageId: LIGHTNING.packageId }).const().catch(() => null)
+  await sdk
+    .getServiceManifest(effects, LIGHTNING.packageId, (m) => m?.version ?? null)
+    .const()
+    .catch(() => null)
+  await sdk
+    .getContainerIp(effects, { packageId: LIGHTNING.packageId })
+    .const()
+    .catch(() => null)
   if ((await lightningForkGrant(effects)) !== 'present') {
     await sdk.action.clearTask(effects, grantTaskId)
     return

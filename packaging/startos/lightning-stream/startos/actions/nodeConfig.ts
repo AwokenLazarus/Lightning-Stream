@@ -36,7 +36,7 @@ const inputSpec = InputSpec.of({
   user: Value.text({
     name: i18n('RPC user'),
     description: i18n(
-      "The user of the node RPC credentials. Knots BLAKE2b: run its \"Generate RPC User Credentials\" action first, and copy the user and password it shows",
+      'The user of the node RPC credentials. Knots BLAKE2b: run its "Generate RPC User Credentials" action first, and copy the user and password it shows',
     ),
     required: true,
     default: null,
