@@ -485,7 +485,7 @@ impl App {
                 if let (Some(_), Some(rest)) = (&ln.connect_address, &ln.rest) {
                     let given = crate::node_keys::key_of_address(text)?;
                     if checked_macaroon(&given, "the rail macaroon", &RAIL_OPS, true).is_err() {
-                        let gw = Some(self.cfg.gw.dir.as_path()).filter(|_| self.cfg.sell);
+                        let gw = self.cfg.sell.then_some(self.cfg.gw.dir.as_path());
                         let o = crate::node_keys::make_from_paste(dir, gw, &mut |ops, id| {
                             xbt_gateway::node::bake_macaroon(rest, ln.tls_cert.as_deref(), &given, ops, id)
                         }).map_err(|e| format!("Lightning Fork did not make the app's key: {e}. Check that its wallet exists and runs, \

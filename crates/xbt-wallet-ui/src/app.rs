@@ -2104,8 +2104,8 @@ impl App {
                      <details><summary>Its public half</summary><p><code>{}</code></p></details>\
                      <p><a href=\"./keys\">Keys and backup →</a></p></section>", esc(&human), esc(&human))
         };
-        b.push_str(&step(done[1], "Your approval key", key_body));
-        b.push_str(&step(done[2], "Your spending rules",
+        b.push_str(&step(done[0], "Your approval key", key_body));
+        b.push_str(&step(done[1], "Your spending rules",
             format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>{}",
                     allow_n, if allow_n == 1 { "" } else { "s" },
                     // mainnet: the yes to real money is a box beside the rules' Sign; signed without it, Your node takes it alone
@@ -2118,15 +2118,15 @@ impl App {
                     } else {
                         "<p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>"
                     })));
-        b.push_str(&step(done[3], "Your Lightning node",
+        b.push_str(&step(done[2], "Your Lightning node",
             format!("<p>{}</p><p><a href=\"./lightning\">Your node →</a></p>",
-                    if done[3] { "Connected and ready to pay.".to_string() }
+                    if done[2] { "Connected and ready to pay.".to_string() }
                     else if ack_needed && ln["ready"] == true { "Connected. Confirm paying with real money with your rules (above) and it is ready.".to_string() }
                     else {
                         let (_, connected, why) = self.node_state();
                         esc(&format!("{} {why}", if connected { "Connected, not ready yet." } else { "Not connected yet." }))
                     })));
-        b.push_str(&step(done[4], "A backup",
+        b.push_str(&step(done[3], "A backup",
             format!("<p>The app's keys are {} on this box. {}</p><p><a href=\"./keys\">Download an encrypted backup →</a></p>",
                     if enc { "locked with encryption" } else { "<strong>not</strong> locked with encryption" },
                     if seen("backup_export") { "A backup was exported." } else { "No backup yet." })));
