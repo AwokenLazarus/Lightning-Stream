@@ -484,18 +484,43 @@ impl App {
                 let mut pasted = None;
                 if let (Some(_), Some(rest)) = (&ln.connect_address, &ln.rest) {
                     let given = crate::node_keys::key_of_address(text)?;
+                    // a key, before it goes to the node: something that isn't one is said so here
+                    xbt402::macaroon::parse(&given).map_err(|_| "That is not a key: copy the REST LND Connect address again, whole.".to_string())?;
                     if checked_macaroon(&given, "the rail macaroon", &RAIL_OPS, true).is_err() {
                         let gw = self.cfg.sell.then_some(self.cfg.gw.dir.as_path());
-                        let o = crate::node_keys::make_from_paste(dir, gw, &mut |ops, id| {
-                            xbt_gateway::node::bake_macaroon(rest, ln.tls_cert.as_deref(), &given, ops, id)
-                        }).map_err(|e| format!("Lightning Fork did not make the app's key: {e}. Check that its wallet exists and runs, \
-                                                and that you copied the REST LND Connect address whole."))?;
-                        if main {
+                        let before = std::fs::read(dir.join(RAIL_MACAROON)).ok();
+                        let tls = ln.tls_cert.as_deref();
+                        let made = crate::node_keys::make_from_paste(dir, gw,
+                            &mut |ops, id| xbt_gateway::node::bake_macaroon(rest, tls, &given, ops, id),
+                            &mut |id| xbt_gateway::node::revoke_root_key(rest, tls, &given, id));
+                        // the wallet's key is in place (even if something after it failed): the yes to real money goes with it
+                        let replaced = std::fs::read(dir.join(RAIL_MACAROON)).ok().is_some_and(|k| Some(&k) != before.as_ref());
+                        if main && (made.is_ok() || replaced) {
                             write_shared(dir, MAINNET_ACK_FILE, format!("{MAINNET_ACK}\n").as_bytes())?;
                         }
+                        let o = match made {
+                            Ok(o) => o,
+                            Err(e) if replaced => return Err(format!("The app's key is in place, but recording it failed: {e}. \
+                                                                       The status above says whether it pays.")),
+                            Err(e) => return Err(format!("Lightning Fork did not make the app's key: {e}. Check that its wallet exists and runs, \
+                                                          and that you copied the REST LND Connect address whole.")),
+                        };
                         let shop = if o.made.iter().any(|m| m == GW_INVOICES) { " The shop's keys for selling were made too." } else { "" };
-                        return Ok(format!("Connected. The app made its own key, which can only pay within your rules, and kept nothing of \
-                                           the address.{shop} The status above follows in a few seconds."));
+                        // what was not made: a shop key the Sell page then asks for (the link-signing key, which Lightning Fork
+                        // doesn't bake, is optional), a replaced key the node would not revoke
+                        let missing: Vec<&str> = o.skipped.iter().map(|(f, _)| f.as_str()).filter(|f| *f == GW_INVOICES || *f == GW_INFO).collect();
+                        let unrevoked = o.skipped.iter().any(|(f, _)| f.starts_with("root key id"));
+                        let mut msg = format!("Connected. The app made its own key, which can only pay within your rules, and kept nothing of \
+                                               the address.{shop}");
+                        if !missing.is_empty() {
+                            msg.push_str(&format!(" Some of the shop's keys were not made ({}): the Sell page asks for them.", missing.join(", ")));
+                        }
+                        if unrevoked {
+                            msg.push_str(" A key the app made before could not be revoked on the node: its root key id is under Details, \
+                                          Before you uninstall.");
+                        }
+                        msg.push_str(" The status above follows in a few seconds.");
+                        return Ok(msg);
                     }
                     pasted = Some(given);
                 }

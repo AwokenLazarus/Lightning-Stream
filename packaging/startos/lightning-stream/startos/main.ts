@@ -43,7 +43,13 @@ export const main = sdk.setupMain(async ({ effects }) => {
   const osIp = await sdk.getOsIp(effects).catch(() => '')
 
   // Lightning Fork's grant action, if this Lightning Fork has one (grant.ts: asked of the OS, not read from its
-  // version). Main re-runs when Lightning Fork restarts or is updated (its container address, above)
+  // version; an answer that is not sure counts as none, and the page takes the address). Main re-runs when
+  // Lightning Fork's container address changes (it restarted) and when its version changes, as an update that
+  // keeps its address may add or drop the action
+  await sdk
+    .getServiceManifest(effects, LIGHTNING.packageId, (m) => m?.version ?? null)
+    .const()
+    .catch(() => null)
   let lightningGrant = !!lightningRest && (await lightningForkGrant(effects)) === 'present'
   const specsFor = (grant: boolean) =>
     services({

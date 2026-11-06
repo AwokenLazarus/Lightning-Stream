@@ -228,7 +228,9 @@ const BY_ADDRESS: &str = "the app, from the connection address the owner pasted"
 
 fn record_by(dir: &Path, file: &str, id: u64, ops: &[&str], by: &str) -> Result<(), String> {
     let mut rec = read_record(dir);
-    rec[file] = json!({"root_key_id": id.to_string(), "permissions": ops,
+    // the key's hash (not the key): the pages check the file there is still this one ([`made_by_box`])
+    let sha = read_nofollow(&dir.join(file)).ok().map(|k| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&k)));
+    rec[file] = json!({"root_key_id": id.to_string(), "permissions": ops, "sha256": sha,
                        "made_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)});
     rec["made_by"] = json!(by);
     write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())
@@ -249,15 +251,29 @@ pub fn key_of_address(text: &str) -> Result<Vec<u8>, String> {
     crate::setup::decode_macaroon(t).map_err(|_| "That is neither a connection address (lndconnect://…) nor a key: copy it again, whole.".into())
 }
 
+/// Revoke a root key on the node with the key the owner pasted ([`make_from_paste`]): the node's, in use.
+pub type Revoke<'a> = dyn FnMut(u64) -> Result<(), String> + 'a;
+
 /// The keys made from a key the owner pasted that can make keys (Lightning Fork's full-access one, from
 /// its connection address), with `bake` (the node's): the wallet's key always, replacing one there,
 /// and the gateway's keys where they are missing, each under a root key of its own. The pasted key is
 /// used for these calls only. The record says the owner's paste made them.
-pub fn make_from_paste(rail_dir: &Path, gw_dir: Option<&Path>, bake: &mut Bake) -> Result<Outcome, String> {
+///
+/// A wallet key this replaces that the app made (its root key id recorded) is revoked on the node with
+/// `revoke`, once the new one is in place; if the node won't, its id stays in the record under `replaced`,
+/// so Your node still lists it to revoke. A key baked and then not kept (its file could not be written) is
+/// revoked the same way, or recorded there. Only the wallet's key failing is an error: the shop's keys
+/// that could not be made are said in [`Outcome::skipped`], and the wallet stays connected.
+pub fn make_from_paste(rail_dir: &Path, gw_dir: Option<&Path>, bake: &mut Bake, revoke: &mut Revoke) -> Result<Outcome, String> {
     let mut out = Outcome::default();
+    let old = read_record(rail_dir)[RAIL_MACAROON]["root_key_id"].as_str().and_then(|i| i.parse::<u64>().ok())
+        .filter(|_| rail_dir.join(RAIL_MACAROON).is_file());
     let id = root_key_id();
     let mac = bake(&RAIL_OPS, id)?;
-    write_shared(rail_dir, RAIL_MACAROON, &mac)?;
+    if let Err(e) = write_shared(rail_dir, RAIL_MACAROON, &mac) {
+        drop_baked(rail_dir, revoke, id, &mut out);
+        return Err(e);
+    }
     // a disconnect before is undone by this new connection
     let mut rec = read_record(rail_dir);
     if let Some(o) = rec.as_object_mut() {
@@ -270,6 +286,13 @@ pub fn make_from_paste(rail_dir: &Path, gw_dir: Option<&Path>, bake: &mut Bake) 
     }
     record_by(rail_dir, RAIL_MACAROON, id, &RAIL_OPS, BY_ADDRESS)?;
     out.made.push(RAIL_MACAROON.into());
+    // the key this one replaced: no longer listed as the wallet's, so revoked, or kept in the record to revoke
+    if let Some(old) = old.filter(|o| *o != id) {
+        if let Err(e) = revoke(old) {
+            note_replaced(rail_dir, old)?;
+            out.skipped.push((format!("root key id {old}"), format!("the replaced key could not be revoked ({e}): listed under Before you uninstall")));
+        }
+    }
     if let Some(gw) = gw_dir.filter(|d| !is_off(d)) {
         for (file, ops) in [(GW_INVOICES, &INVOICE_OPS[..]), (GW_INFO, &INFO_OPS[..]), (GW_SIGN, &SIGN_OPS[..])] {
             if gw.join(file).is_file() {
@@ -277,18 +300,46 @@ pub fn make_from_paste(rail_dir: &Path, gw_dir: Option<&Path>, bake: &mut Bake) 
                 continue;
             }
             let id = root_key_id();
-            match bake(ops, id) {
-                Ok(m) => {
-                    write_shared(gw, file, &m)?;
-                    record_by(gw, file, id, ops, BY_ADDRESS)?;
-                    out.made.push(file.into());
+            // selling needs these; paying does not: the wallet stays connected, the Sell page says what is missing
+            let m = match bake(ops, id) {
+                Ok(m) => m,
+                Err(e) => {
+                    out.skipped.push((file.into(), e));
+                    continue;
                 }
-                // selling needs these; paying does not: the wallet stays connected, the Sell page says what is missing
-                Err(e) => out.skipped.push((file.into(), e)),
+            };
+            match write_shared(gw, file, &m).and_then(|()| record_by(gw, file, id, ops, BY_ADDRESS)) {
+                Ok(()) => out.made.push(file.into()),
+                Err(e) => {
+                    // its file may be there without its record: not kept
+                    let _ = std::fs::remove_file(gw.join(file));
+                    drop_baked(rail_dir, revoke, id, &mut out);
+                    out.skipped.push((file.into(), e));
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// A key baked and not kept: revoked now, or recorded in `rail_dir`'s record so it can be.
+fn drop_baked(rail_dir: &Path, revoke: &mut Revoke, id: u64, out: &mut Outcome) {
+    if let Err(e) = revoke(id) {
+        let _ = note_replaced(rail_dir, id);
+        out.skipped.push((format!("root key id {id}"), format!("could not be revoked ({e}): listed under Before you uninstall")));
+    }
+}
+
+/// Keep `id` in `dir`'s record as a key the app made that is no longer in use but may still be valid on the
+/// node: [`root_key_ids`] lists it for revoking.
+fn note_replaced(dir: &Path, id: u64) -> Result<(), String> {
+    let mut rec = read_record(dir);
+    let mut list = rec["replaced"].as_array().cloned().unwrap_or_default();
+    if !list.iter().any(|v| v.as_str() == Some(&id.to_string())) {
+        list.push(json!(id.to_string()));
+    }
+    rec["replaced"] = json!(list);
+    write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())
 }
 
 /// Whether `dir`'s keys were made from the connection address the owner pasted (for the pages).
@@ -585,9 +636,17 @@ fn read_record(dir: &Path) -> serde_json::Value {
 }
 
 /// Whether `dir`'s keys were made by this tool (for the pages).
+///
+/// A recorded key whose file is there but is not the key recorded (its hash differs: the owner pasted one of
+/// their own over it) is not the app's, and the pages don't say it is.
 pub fn made_by_box(dir: &Path) -> bool {
     let r = read_record(dir);
-    r.as_object().is_some_and(|o| o.keys().any(|k| k.ends_with(".macaroon"))) && r["off"] != true
+    let Some(o) = r.as_object() else { return false };
+    let replaced = o.iter().filter(|(k, _)| k.ends_with(".macaroon")).any(|(k, v)| {
+        let Some(want) = v["sha256"].as_str() else { return false };
+        read_nofollow(&dir.join(k)).ok().is_some_and(|key| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&key)) != want)
+    });
+    o.keys().any(|k| k.ends_with(".macaroon")) && r["off"] != true && !replaced
 }
 
 /// The owner disconnected a key the app made: the next start does not make one again.
@@ -643,7 +702,10 @@ pub fn root_key_ids(dir: &Path) -> Vec<String> {
     let rec = read_record(dir);
     let mut ids: Vec<String> = rec.as_object().into_iter().flatten()
         .filter_map(|(_, v)| v.get("root_key_id").and_then(serde_json::Value::as_str).map(str::to_string)).collect();
+    // keys replaced or not kept whose revoking failed: still valid on the node
+    ids.extend(rec["replaced"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)));
     ids.sort();
+    ids.dedup();
     ids
 }
 
@@ -709,7 +771,7 @@ mod tests {
         let o = make_from_paste(&rail, Some(&gw), &mut |ops, id| {
             asked.push((ops.join(" "), id));
             if ops == &SIGN_OPS[..] { Err("the node bakes no URI permissions".into()) } else { Ok(mac_of(ops)) }
-        }).unwrap();
+        }, &mut |_| panic!("nothing to revoke: the old key was not the app's")).unwrap();
         assert_eq!(o.made, vec![RAIL_MACAROON, GW_INVOICES]);
         assert_eq!(o.kept, vec![GW_INFO]);
         assert_eq!(o.skipped.len(), 1);
@@ -719,6 +781,57 @@ mod tests {
         let ids: std::collections::BTreeSet<u64> = asked.iter().map(|a| a.1).collect();
         assert_eq!(ids.len(), asked.len(), "a root key of its own for each");
         assert_eq!(root_key_ids(&rail).len(), 1);
+    }
+
+    /// A second paste: the wallet's key it replaces (the app's, its root key id recorded) is revoked on the node
+    /// once the new one is in place; if the node won't, its id stays in the record (`replaced`) and is still
+    /// listed to revoke. A shop key baked but not kept (its file can't be written) is revoked, or recorded; the
+    /// wallet stays connected and the outcome says what was not made.
+    #[test]
+    fn a_second_paste_revokes_the_key_it_replaces_and_keeps_every_baked_id() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let bake = |ops: &[&str], _: u64| -> Result<Vec<u8>, String> { Ok(mac_of(ops)) };
+        make_from_paste(&rail, None, &mut |o, i| bake(o, i), &mut |_| Ok(())).unwrap();
+        let first = root_key_ids(&rail);
+        assert_eq!(first.len(), 1);
+        let mut revoked = vec![];
+        make_from_paste(&rail, None, &mut |o, i| bake(o, i), &mut |id| { revoked.push(id.to_string()); Ok(()) }).unwrap();
+        assert_eq!(revoked, first, "the replaced key revoked");
+        let second = root_key_ids(&rail);
+        assert_eq!(second.len(), 1);
+        assert_ne!(second, first);
+        // the node won't revoke: the old id stays listed, beside the new one
+        let o = make_from_paste(&rail, None, &mut |o, i| bake(o, i), &mut |_| Err("node unreachable".into())).unwrap();
+        assert_eq!(o.made, vec![RAIL_MACAROON]);
+        assert!(o.skipped.iter().any(|(_, w)| w.contains("node unreachable")), "{o:?}");
+        let ids = root_key_ids(&rail);
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&second[0]));
+        // a shop dir that can't be written: the wallet stays connected, each baked shop key revoked (or recorded)
+        let not_a_dir = t.path().join("gw-file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let mut gone = vec![];
+        let o = make_from_paste(&rail, Some(&not_a_dir), &mut |o, i| bake(o, i), &mut |id| { gone.push(id); Ok(()) }).unwrap();
+        assert_eq!(o.made, vec![RAIL_MACAROON]);
+        assert_eq!(o.skipped.len(), 3, "{o:?}");
+        // the 3 shop keys and the replaced wallet key
+        assert_eq!(gone.len(), 4, "{gone:?}");
+        let o = make_from_paste(&rail, Some(&not_a_dir), &mut |o, i| bake(o, i), &mut |_| Err("no".into())).unwrap();
+        assert_eq!(o.made, vec![RAIL_MACAROON]);
+        // every baked id not kept or replaced is listed: 3 shop keys, the replaced wallet key, the earlier one, the current
+        assert_eq!(root_key_ids(&rail).len(), 6, "{:?}", root_key_ids(&rail));
+    }
+
+    /// A key the owner pasted over one the app made is not called the app's.
+    #[test]
+    fn a_key_pasted_over_the_apps_is_not_called_the_apps() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        make_from_paste(&rail, None, &mut |o, _| Ok(mac_of(o)), &mut |_| Ok(())).unwrap();
+        assert!(made_by_box(&rail) && made_from_paste(&rail));
+        write_shared(&rail, RAIL_MACAROON, &mac_of(&["info:read", "offchain:read", "offchain:write", "onchain:read", "invoices:read"])).unwrap();
+        assert!(!made_by_box(&rail) && !made_from_paste(&rail));
     }
 
     /// Umbrel: the page tells why the key is not there yet, by the node's own wallet state.

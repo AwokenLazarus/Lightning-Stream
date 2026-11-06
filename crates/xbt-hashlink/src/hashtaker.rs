@@ -387,24 +387,46 @@ impl St {
         if self.spent.is_some() {
             return self.spent;
         }
-        let by_price = self.budget_msat.is_some_and(|b| (self.released + 1).saturating_mul(self.terms.price_msat) > b);
+        // by the slices the wallet said it paid: one that failed, or whose answer was lost, is not counted as paid
+        let by_price = self.budget_msat.is_some_and(|b| (self.paid_slices() + 1).saturating_mul(self.terms.price_msat) > b);
         by_price.then_some(order::BUDGET_USED_UP)
     }
 
     /// End the rental from this side once its budget is spent and the work it paid for is used (the next share
     /// wouldn't fit): before the hashmaker holds a share it would wait for payment of, and ends the rental unpaid.
     /// Whether it ended it.
+    ///
+    /// Never after a payment that failed (the wallet's error, money that may have moved): that rental ends on the
+    /// failure's path ("could not be paid", unpaid), not as a budget used up, which reads as the renter's own choice.
+    /// Nor while a payment is on its way: its answer decides.
     fn end_if_spent(&mut self, tx: &Sender) -> bool {
-        if self.closed.is_some() {
+        if self.closed.is_some() || self.pay_failed || self.in_flight > 0 {
             return false;
         }
         let Some(why) = self.budget_spent() else { return false };
-        if order::fits(self.meter.work, self.largest_share().max(1), self.released, self.terms.start_slices, self.terms.slice_work) {
+        // the work the slices confirmed paid cover, not those released (one released may have failed or been lost)
+        if order::fits(self.meter.work, self.largest_share().max(1), self.paid_slices(), self.terms.start_slices, self.terms.slice_work) {
             return false;
         }
         self.events.push(json!({"ev": "budget spent", "why": why, "released": self.released, "atMs": now_ms()}));
         self.end(why, tx);
         true
+    }
+
+    /// The rental's budget as the hashtaker raised it. A budget the wallet said was spent is asked about again: the
+    /// next slice is asked for once, and the wallet decides. A refusal for the task's budget in the owner's rules is
+    /// said again then (the rules decide, not the rental's budget), and nothing more is asked until the next top-up.
+    fn top_up(&mut self, budget_msat: Option<u64>, tx: &Sender) {
+        let rose = match (self.budget_msat, budget_msat) {
+            (Some(was), Some(now)) => now > was,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        self.budget_msat = budget_msat;
+        if rose && self.spent.take().is_some() {
+            self.events.push(json!({"ev": "budget raised: asking the wallet again", "budgetMsat": budget_msat, "atMs": now_ms()}));
+        }
+        self.settle_up(tx);
     }
 
     /// Note slices' worth of proven work reached, and pay whatever [`order::pay_next`] says is due.
@@ -678,8 +700,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 duration = cfg.duration.map(|d| d + Duration::from_secs(a.secs()));
                 let more = budget.map(|b| b.saturating_add(a.msat()));
                 if more != g.budget_msat {
-                    g.budget_msat = more;
-                    g.settle_up(&tx);
+                    g.top_up(more, &tx);
                 }
             }
             g.tick(&tx);
@@ -1275,7 +1296,8 @@ mod come_back_tests {
         g.queue = Some(qtx);
         g.budget_msat = Some(20_202_000);
         g.released = 386;
-        g.pays = vec![json!({"slice": 386, "ok": true})];
+        // the wallet's answers: 386 slices paid
+        g.pays = vec![json!({"slice": 386, "ok": true}); 386];
         g.spent = rail::budget_spent("What is left of this rental's budget (495 sats) is less than this hashmaker's smallest ticket (546 sats).");
         assert_eq!(g.spent, Some(order::BUDGET_USED_UP));
         assert!((g.released + 1) * g.terms.price_msat <= g.budget_msat.unwrap(), "its price alone fits the budget");
@@ -1292,6 +1314,75 @@ mod come_back_tests {
         assert_eq!(g.closed.as_deref(), Some(order::BUDGET_USED_UP));
         assert!(!g.pay_failed && g.pays.iter().all(|p| p["ok"] == true));
         assert!(g.events.iter().any(|e| e["ev"] == "budget spent"), "{:?}", g.events);
+    }
+
+    /// FAILS before: a top-up after the wallet said the budget was spent was ignored (`spent` was never cleared), and
+    /// the rental ended "budget used up" anyway. Now the raised budget asks the wallet again: the next slice is asked
+    /// for once and paid once; a task budget refused again asks nothing more until the next top-up.
+    #[test]
+    fn a_top_up_after_the_wallet_said_the_budget_was_spent_asks_again_once() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, _peer) = a_link(key, hk);
+        let st = state();
+        let (qtx, qrx) = mpsc::channel::<(u64, Value, bool)>();
+        let mut g = lock(&st);
+        g.terms.price_msat = 51_000;
+        g.queue = Some(qtx);
+        g.budget_msat = Some(20_202_000);
+        g.released = 386;
+        g.pays = vec![json!({"slice": 386, "ok": true}); 386];
+        g.spent = Some(order::BUDGET_USED_UP);
+        g.meter.work = 386 * g.terms.slice_work;
+        g.settle_up(&tx);
+        assert!(qrx.try_recv().is_err(), "spent: nothing asked");
+        // the hashtaker adds 1,000 sats
+        g.top_up(Some(21_202_000), &tx);
+        assert!(g.spent.is_none());
+        let (slice, _, _) = qrx.try_recv().expect("slice 387 asked for again");
+        assert_eq!(slice, 387);
+        assert!(qrx.try_recv().is_err(), "once");
+        // paid: the rental goes on, not ended as spent
+        g.in_flight = 0;
+        g.pays.push(json!({"slice": 387, "ok": true}));
+        assert!(!g.end_if_spent(&tx) && g.closed.is_none());
+        // the task's budget in the rules refuses the next: said again, nothing more asked, not even on a later share
+        g.spent = Some(order::TASK_BUDGET_USED_UP);
+        g.meter.work = 387 * g.terms.slice_work;
+        g.settle_up(&tx);
+        assert!(qrx.try_recv().is_err(), "no loop on a task budget");
+        // a lower or equal budget asks nothing
+        g.top_up(Some(21_202_000), &tx);
+        assert!(qrx.try_recv().is_err() && g.spent.is_some());
+    }
+
+    /// FAILS before: a slice that really failed (the signer's error: money may have moved) on the budget's last
+    /// coverable slice was counted as paid by `released`, and the rental closed as "budget used up", the renter's own
+    /// choice. Now it keeps the failure's path: the rental is not ended as spent, and payFailed stays true.
+    #[test]
+    fn a_real_failure_on_the_budgets_last_slice_is_a_failure_not_a_budget_spent() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, _peer) = a_link(key, hk);
+        let st = state();
+        let (qtx, _qrx) = mpsc::channel::<(u64, Value, bool)>();
+        let mut g = lock(&st);
+        g.terms.price_msat = 5_000;
+        g.queue = Some(qtx);
+        // the budget pays 4 slices; the 4th was released and failed
+        g.budget_msat = Some(20_000);
+        g.released = 4;
+        g.pays = vec![json!({"slice": 1, "ok": true}), json!({"slice": 2, "ok": true}), json!({"slice": 3, "ok": true}),
+                      json!({"slice": 4, "ok": false, "why": "signer error"})];
+        g.pay_failed = true;
+        g.meter.work = 4 * g.terms.slice_work;
+        assert!(!g.end_if_spent(&tx), "a failure is not a budget spent");
+        assert!(g.closed.is_none() && g.pay_failed);
+        assert!(g.report()["payFailed"] == true);
+        // and without the flag, the by-price test counts the confirmed slices only: 3 paid, the 4th still in the budget
+        g.pay_failed = false;
+        assert_eq!(g.budget_spent(), None);
+        // an answer lost (ok null) is not counted as paid either
+        g.pays[3] = json!({"slice": 4, "ok": null, "unknown": true});
+        assert_eq!(g.budget_spent(), None);
     }
 
     /// A link made and left: the sender `come_back` is given.

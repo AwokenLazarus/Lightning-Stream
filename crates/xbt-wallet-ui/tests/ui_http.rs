@@ -3498,6 +3498,10 @@ fn fake_lnd(state: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<Vec
             let key = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("grpc-metadata-macaroon:").map(|v| v.trim().to_string())).unwrap_or_default();
             let body = if head.starts_with("GET /v1/state") {
                 json!({"state": state}).to_string()
+            } else if head.starts_with("DELETE /v1/macaroon/") {
+                let id = head.split_whitespace().nth(1).unwrap_or("").trim_start_matches("/v1/macaroon/").to_string();
+                s2.lock().unwrap().push(format!("DELETE {id} {key}"));
+                json!({"deleted": true}).to_string()
             } else if head.starts_with("POST /v1/macaroon") {
                 s2.lock().unwrap().push(key);
                 let req: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
@@ -3593,6 +3597,20 @@ fn without_lightning_fork_s_grant_the_owner_pastes_its_address_and_the_app_makes
     assert!(xbt_gateway::node::checked_macaroon(&rail, "rail", &["info:read", "offchain:read", "offchain:write", "onchain:read"], true).is_ok());
     assert!(gdir.join("invoices.macaroon").is_file() && gdir.join("info.macaroon").is_file());
     assert!(seen.lock().unwrap().iter().all(|k| *k == hex::encode(&admin)) && !seen.lock().unwrap().is_empty(), "baked with the pasted key");
+    // pasted again: the key it replaces is revoked on the node with the pasted key, and only the new one is listed
+    let old: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("auto-keys.json")).unwrap()).unwrap();
+    let old_id = old["rail.macaroon"]["root_key_id"].as_str().unwrap().to_string();
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &addr)]);
+    assert!(br.flash_after(&r).starts_with("Connected."));
+    assert!(seen.lock().unwrap().iter().any(|k| *k == format!("DELETE {old_id} {}", hex::encode(&admin))), "{:?}", seen.lock().unwrap());
+    let now: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("auto-keys.json")).unwrap()).unwrap();
+    assert_ne!(now["rail.macaroon"]["root_key_id"].as_str().unwrap(), old_id);
+    assert!(now.get("replaced").is_none(), "{now}");
+    // something that is no key at all is refused before it reaches the node
+    let asked = seen.lock().unwrap().len();
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", "lndconnect://192.168.1.9:8080?macaroon=aGVsbG8gd29ybGQ")]);
+    assert!(br.flash_after(&r).contains("That is not a key"));
+    assert_eq!(seen.lock().unwrap().len(), asked, "the node was not asked");
     // nothing of the full-access key is on disk
     for d in [&dir, &gdir] {
         for e in std::fs::read_dir(d).unwrap().flatten() {

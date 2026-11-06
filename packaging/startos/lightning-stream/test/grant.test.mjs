@@ -51,15 +51,29 @@ test('with no Lightning Fork at all: neither the grant nor the address', () => {
   assert.deepEqual(by(cfg({ lightningRest: '', lightningGrant: true }), 'node-keys').mounts, [])
 })
 
-test("the OS's answer: the action missing, the package missing, or the action there", () => {
+test("the OS's answer: present only on an answer, absent only on its Not Found, unknown otherwise", () => {
   assert.equal(grantFromAnswer(null), 'present')
   // StartOS 0.4.1: the action list has no such id (code 6, "Not Found", details the id), as the host RPC words it
   assert.equal(grantFromAnswer(new Error('Not Found: grant-app-access@get-action-input')), 'absent')
-  assert.equal(grantFromAnswer(new Error('Action not found')), 'absent')
   assert.equal(grantFromAnswer(new Error('Not Found: lightning-fork@get-action-input')), 'no-node')
-  // found, then Lightning Fork's own runtime failed or was slow: the action is there
-  assert.equal(grantFromAnswer(new Error('Timeout: get-action-input')), 'present')
-  assert.equal(grantFromAnswer('Error: Filesystem I/O Error'), 'present')
+  // anything else is not sure: neither the grant nor its absence
+  assert.equal(grantFromAnswer(new Error('Timeout: get-action-input')), 'unknown')
+  assert.equal(grantFromAnswer('Error: Filesystem I/O Error'), 'unknown')
+  assert.equal(grantFromAnswer(new Error('Action not found')), 'unknown')
+  assert.equal(grantFromAnswer(new Error('Not Found@get-action-input')), 'unknown')
+})
+
+test('init makes or clears the task only on a sure answer, and never asks for a grant main cannot mount', () => {
+  const src = readFileSync(new URL('../startos/init/tasks.ts', import.meta.url), 'utf8')
+  const body = src.slice(src.indexOf('export const requestGrant'))
+  const unknown = body.indexOf("if (answer === 'unknown') return")
+  const clear = body.indexOf('clearTask')
+  const create = body.indexOf('createTask')
+  assert.ok(unknown > 0 && unknown < clear && clear < create, 'unknown returns before the task is cleared or made')
+  assert.match(body, /answer !== 'present' \|\| !\(await appsMountable\(effects\)\)/)
+  const main = readFileSync(new URL('../startos/main.ts', import.meta.url), 'utf8')
+  assert.match(main, /lightningForkGrant\(effects\)\) === 'present'/, "main's grant mode needs a sure answer")
+  assert.match(main, /getServiceManifest\(effects, LIGHTNING\.packageId/, 'main re-decides when Lightning Fork changes version')
 })
 
 test('the dependency range does not stand for the grant (mainline Lightning Fork lacks it)', () => {

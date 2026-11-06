@@ -108,21 +108,24 @@ export type Config = {
   lightningGrant?: boolean
 }
 
+/** What is known of Lightning Fork's grant action: there, not there, no Lightning Fork, or nothing sure. */
+export type GrantAnswer = 'present' | 'absent' | 'no-node' | 'unknown'
+
 /**
  * What the OS's answer to "give me Lightning Fork's grant action's input" says about the action (grant.ts asks;
  * this reads the answer, so a test can too). The OS looks the action up in Lightning Fork's list of actions
- * before anything else: a "Not Found" naming the action means it has none; one naming the package means
- * Lightning Fork is not installed. Any other failure came after the lookup found it (Lightning Fork's own
- * runtime was asked), so the action is there.
+ * before anything else. Only an answer is "present"; a "Not Found" naming the action is "absent"; one naming
+ * the package is "no-node". Any other failure (a timeout, Lightning Fork's runtime down, words this does not
+ * know) is "unknown": the task is then neither made nor cleared.
  */
-export function grantFromAnswer(error: unknown | null): 'present' | 'absent' | 'no-node' {
+export function grantFromAnswer(error: unknown | null): GrantAnswer {
   if (error == null) return 'present'
   // the host RPC's words end in `@<method>` (`…@get-action-input`), which names no action of its own
   const m = String((error as { message?: unknown })?.message ?? error).replace(/@[\w-]+\s*$/, '')
-  if (!/not.?found/i.test(m)) return 'present'
+  if (!/not.?found/i.test(m)) return 'unknown'
   if (m.includes(LF_GRANT.actionId)) return 'absent'
-  if (m.includes(LIGHTNING.packageId) || /package/i.test(m)) return 'no-node'
-  return 'absent'
+  if (m.includes(LIGHTNING.packageId)) return 'no-node'
+  return 'unknown'
 }
 
 /** Where the Your node page sends the owner for Lightning Fork's connection address, when it has no grant action. */

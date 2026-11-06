@@ -5,7 +5,7 @@ import { showSetupCode } from '../actions/showSetupCode'
 import { nodeConfigured, storeJson } from '../fileModels/store.json'
 import { access } from 'node:fs/promises'
 import { LF_GRANT, LIGHTNING } from '../spec'
-import { lightningForkGrant } from '../grant'
+import { appsMountable, lightningForkGrant } from '../grant'
 
 /** Seed the store on install (defaults from the file model's shape). */
 export const seedStore = sdk.setupOnInit(async (effects, kind) => {
@@ -54,7 +54,11 @@ export const requestGrant = sdk.setupOnInit(async (effects) => {
     .getContainerIp(effects, { packageId: LIGHTNING.packageId })
     .const()
     .catch(() => null)
-  if ((await lightningForkGrant(effects)) !== 'present') {
+  const answer = await lightningForkGrant(effects)
+  // not sure (a timeout, Lightning Fork's runtime down): the task is left as it is, neither made nor cleared
+  if (answer === 'unknown') return
+  // no action, or (as main finds) its `apps` folder does not mount: main runs the paste path, so no task
+  if (answer !== 'present' || !(await appsMountable(effects))) {
     await sdk.action.clearTask(effects, grantTaskId)
     return
   }

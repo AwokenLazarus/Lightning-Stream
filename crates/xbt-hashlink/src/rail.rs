@@ -163,10 +163,12 @@ pub const RENTER_SOCKET: &str = "The wallet pays a rental only through the rente
 /// a piece of work of its rental (`POST <pay url>/hashrate/<rental>/<slice>`), or a stop without a session.
 pub const RENTER_ROUTE: &str = "The renter asked to pay something that isn't a piece of work of its rental";
 
-/// Whether a refusal left everything where it was: nothing booked for the call and nothing released.
+/// Whether a refusal left everything where it was: nothing booked for the call and nothing released. Only when the
+/// wallet says so: `charged_sats` there and an integer 0, and `tickets_released`, if there, 0. A refusal that says
+/// neither, or something else, may have moved money, and is a failed payment.
 fn moved_nothing(v: &serde_json::Value) -> bool {
-    let none = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) == 0;
-    none("charged_sats") && none("tickets_released")
+    v.get("charged_sats").and_then(serde_json::Value::as_u64) == Some(0)
+        && v.get("tickets_released").is_none_or(|t| t.as_u64() == Some(0))
 }
 
 /// The rules of the owner's that can refuse a slice's payment.
@@ -439,6 +441,24 @@ impl SellerRail for LabSeller {
 
 #[cfg(test)]
 mod signer_wait_tests {
+
+    /// A refusal counts as having moved nothing only when the wallet says so: `charged_sats` an integer 0 (missing,
+    /// a string or a fraction may have moved), and `tickets_released`, if there, 0.
+    #[test]
+    fn nothing_moved_only_when_the_wallet_says_so() {
+        use serde_json::json;
+        assert!(super::moved_nothing(&json!({"charged_sats": 0})));
+        assert!(super::moved_nothing(&json!({"charged_sats": 0, "tickets_released": 0})));
+        assert!(!super::moved_nothing(&json!({})), "said nothing: may have moved");
+        assert!(!super::moved_nothing(&json!({"charged_sats": "0"})));
+        assert!(!super::moved_nothing(&json!({"charged_sats": 0.5})));
+        assert!(!super::moved_nothing(&json!({"charged_sats": null})));
+        assert!(!super::moved_nothing(&json!({"charged_sats": 559})));
+        assert!(!super::moved_nothing(&json!({"charged_sats": 0, "tickets_released": 1})));
+        assert!(!super::moved_nothing(&json!({"charged_sats": 0, "tickets_released": "x"})));
+        assert!(!super::moved_nothing(&json!({"tickets_released": 0})), "no charged_sats");
+    }
+
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
@@ -675,6 +695,15 @@ mod signer_wait_tests {
         let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
         assert!(why.starts_with(WALLET_RULES) && why.contains("budget_sats (5000)"), "{why}");
         assert_eq!(budget_spent(&why), Some(crate::order::TASK_BUDGET_USED_UP), "{why}");
+        // a budget refusal that doesn't say nothing moved (no charged_sats, or tickets released) is no budget spent:
+        // money may have moved, and the payment failed
+        for a in [serde_json::json!({"verdict": "deny", "rule": "ticket_task_budget", "reason": "above the task's budget_sats (5000)"}),
+                  serde_json::json!({"verdict": "deny", "rule": "ticket_task_budget", "reason": "above", "charged_sats": 0, "tickets_released": 1}),
+                  serde_json::json!({"verdict": "deny", "rule": "max_sats", "ticket_sats": 900, "charged_sats": "0"})] {
+            *answer.lock().unwrap() = a.clone();
+            let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
+            assert_eq!(budget_spent(&why), None, "{a}: {why}");
+        }
         // another of the owner's rules is no budget of this rental's: the payment failed
         *answer.lock().unwrap() = serde_json::json!({"verdict": "deny", "rule": "daily_budget", "reason": "above the daily budget", "charged_sats": 0});
         let why = p.pay("r1", 1, &serde_json::json!({})).unwrap_err();
