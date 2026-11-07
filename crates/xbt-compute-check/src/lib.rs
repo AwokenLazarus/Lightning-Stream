@@ -11,10 +11,13 @@
 //!   a model runs.
 //! * [`meter`] says what each machine of a split does per token, from the model's [`gguf`] header, and
 //!   [`payout`] pays lenders by it from what the seller's gateway earned.
+//! * [`lend`] joins a machine to an operator's split, and checks from what the lender itself can see
+//!   that it is being paid.
 
 pub mod chain;
 pub mod gguf;
 pub mod hardware;
+pub mod lend;
 pub mod meter;
 pub mod payout;
 pub mod plan;

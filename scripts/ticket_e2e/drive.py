@@ -3022,7 +3022,11 @@ class StandIn(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        self.reply({"stages": [], "statuses": [], "topologies": [{"model_id": "stand-in", "topology_id": StandIn.plan_id, "stages": [
+        if self.path == "/api/status":
+            token = base64.urlsafe_b64encode(json.dumps({"id": StandIn.plan[0][0]}).encode()).decode().rstrip("=")
+            self.reply({"node_id": StandIn.plan[0][0][:10], "token": token})
+            return
+        self.reply({"stages": [], "statuses": [], "topologies": [{"model_id": "stand-in", "manifest_sha256": "00" * 32, "topology_id": StandIn.plan_id, "stages": [
             {"node_id": n, "layer_start": a, "layer_end": b} for n, a, b in StandIn.plan]}]})
 
     def do_POST(self) -> None:
@@ -3151,6 +3155,60 @@ def mint_offer(node: str) -> tuple[str, str, str]:
     return o["bolt12"], o["offer_id"], base64.b64decode(o["offer_id"]).hex()
 
 
+def pay_lab_up() -> None:
+    """What paying lenders needs on the lab: lf4 up, a working balance for the seller and a wallet's files for it."""
+    offer_node_up()
+    # the seller has its channel from the hop and no balance to pay from until it is past its reserve; a seller with
+    # lenders has a working balance
+    bill = lab.post(SELLER, "/v1/invoices", {"value": "1000000", "memo": "the operator's working balance"})
+    lab.lncli(HOP, "payinvoice", "--force", "--json", bill["payment_request"])
+    lab.wait("the operator's working balance", 60, lambda: int(lab.channel(SELLER, HOP)["local_balance"]) >= 1_000_000)
+    lab.chain("createwallet", "pay")
+    with open(f"{RUN}/pay-rail.macaroon", "wb") as f:
+        f.write(bytes.fromhex(lab.bake(SELLER, lab.BUYER_PERMISSIONS)))
+    os.chmod(f"{RUN}/pay-rail.macaroon", 0o600)
+
+
+def pay_gateway_up(upstream: str) -> None:
+    """A gateway that sells one model by the token, and the buyer's wallet allowed to buy from it."""
+    with open(f"{RUN}/pay-gateway.json", "w") as f:
+        json.dump({"listen": f"127.0.0.1:{PAY_PORT}", "public_url": PAY_ORIGIN, "upstream": upstream, "state_dir": f"{RUN}/state-pay", "chain": "regtest", "network": NETWORK[0],
+                   "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": f"{RUN}/invoices.macaroon", "info_macaroon": f"{RUN}/info.macaroon"},
+                   "caps": {"sessions_per_address": 0, "unpaid_per_address": 0, "first_use_secs": 20, "idle_secs": 40}, "times": {"height_max_age_secs": 5},
+                   "routes": [{"path": "/ai/", "upstream": upstream, "strip_prefix": True, "methods": ["GET", "POST"], "max_body": 1 << 20, "max_output_tokens": AI_MAX_OUT,
+                               "price": {"per_1k_input_msat": PAY_IN_MSAT, "per_1k_output_msat": PAY_OUT_MSAT}}]}, f, indent=1)
+    with open(f"{RUN}/pay-gateway.log", "ab") as log:
+        PROCS["pay-gateway"] = subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/pay-gateway.json"], stdout=log, stderr=log)
+    lab.wait("the model's gateway", 60, lambda: json.loads(send("GET", "/x402/ticket/health", PAY_PORT)[2])["height"] is not None, every=0.1)
+    pol = WALLET_PROC.policy()
+    pol["allowlist"].append(PAY_ORIGIN)
+    pol["counterparties"][PAY_ORIGIN] = {"ln_node": lab.pubkey(SELLER)}
+    with open(f"{WALLET}/policy.json", "w") as f:
+        json.dump(pol, f, indent=1)
+    restart_signer()
+
+
+def pay_charged() -> int:
+    return int(json.loads(send("GET", "/x402/ticket/health", PAY_PORT)[2])["chargedMsat"])
+
+
+PAY_ASKED = [0]
+
+
+def pay_buy(n: int) -> int:
+    """`n` answers bought from the gateway; what it has then earned in all."""
+    for _ in range(n):
+        body = json.dumps({"messages": [{"role": "user", "content": f"In one short sentence, explain {MESH_TOPICS[PAY_ASKED[0] % len(MESH_TOPICS)]}."}],
+                           "max_tokens": AI_MAX_OUT, "temperature": 0})
+        PAY_ASKED[0] += 1
+        r = agent().tool("xbt402_pay", {"url": f"{PAY_ORIGIN}/ai/v1/chat/completions", "method": "POST", "body": body, "max_sats": CALL_SATS, "task": "chat"})
+        if not call_paid(r):
+            raise LabError(f"an answer was not bought: {brief(r)}")
+        if r.get("saved_to"):
+            os.remove(r["saved_to"])
+    return pay_charged()
+
+
 def mesh_pay() -> None:
     """The machines of a split paid by the work each does, from what the seller's gateway earned (run by name only).
     A gateway sells one model by the token on the seller's node. `stream-compute-check payout` splits what it earns by
@@ -3162,21 +3220,12 @@ def mesh_pay() -> None:
     if MESH_URL and not (MESH_CONSOLE and MESH_GGUF):
         raise LabError("a real split needs MESH_LLM_CONSOLE and MESH_LLM_GGUF beside MESH_LLM_URL")
     stop_sessions()
-    offer_node_up()
-    # the seller has its channel from the hop and no balance to pay from until it is past its reserve; a seller with
-    # lenders has a working balance
-    bill = lab.post(SELLER, "/v1/invoices", {"value": "1000000", "memo": "the operator's working balance"})
-    lab.lncli(HOP, "payinvoice", "--force", "--json", bill["payment_request"])
-    lab.wait("the operator's working balance", 60, lambda: int(lab.channel(SELLER, HOP)["local_balance"]) >= 1_000_000)
+    pay_lab_up()
     (lno_a, b64_a, hex_a), (lno_b, b64_b, hex_b) = mint_offer(HOP), mint_offer(OFFER_NODE)
     for name, lno in ((HOP, lno_a), (OFFER_NODE, lno_b)):
         lab.wait(f"{name} issuing invoices for its offer", 180,
                  lambda lno=lno: lab.post(SELLER, "/v2/offers/fetchinvoice", {"offer": lno, "amount_msat": "1000000", "timeout_seconds": 10}).get("invoice"), every=3)
     time.sleep(5)
-    lab.chain("createwallet", "pay")
-    with open(f"{RUN}/pay-rail.macaroon", "wb") as f:
-        f.write(bytes.fromhex(lab.bake(SELLER, lab.BUYER_PERMISSIONS)))
-    os.chmod(f"{RUN}/pay-rail.macaroon", 0o600)
     # the owner has allowed the first lender only: the second is refused, until it is allowed
     pay_wallet([hex_a])
     st = signer("ln_status", sock=PAY_SOCK)
@@ -3201,41 +3250,8 @@ def mesh_pay() -> None:
         own, lender_a, lender_b = {"own-1", "own-2"}, "lender-a", "lender-b"
     lenders = ((lender_a, HOP, b64_a, hex_a), (lender_b, OFFER_NODE, b64_b, hex_b))
 
-    # the gateway: one model, by the token
-    with open(f"{RUN}/pay-gateway.json", "w") as f:
-        json.dump({"listen": f"127.0.0.1:{PAY_PORT}", "public_url": PAY_ORIGIN, "upstream": upstream, "state_dir": f"{RUN}/state-pay", "chain": "regtest", "network": NETWORK[0],
-                   "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": f"{RUN}/invoices.macaroon", "info_macaroon": f"{RUN}/info.macaroon"},
-                   "caps": {"sessions_per_address": 0, "unpaid_per_address": 0, "first_use_secs": 20, "idle_secs": 40}, "times": {"height_max_age_secs": 5},
-                   "routes": [{"path": "/ai/", "upstream": upstream, "strip_prefix": True, "methods": ["GET", "POST"], "max_body": 1 << 20, "max_output_tokens": AI_MAX_OUT,
-                               "price": {"per_1k_input_msat": PAY_IN_MSAT, "per_1k_output_msat": PAY_OUT_MSAT}}]}, f, indent=1)
-    with open(f"{RUN}/pay-gateway.log", "ab") as log:
-        PROCS["pay-gateway"] = subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/pay-gateway.json"], stdout=log, stderr=log)
-    lab.wait("the model's gateway", 60, lambda: json.loads(send("GET", "/x402/ticket/health", PAY_PORT)[2])["height"] is not None, every=0.1)
-    # the buyer's wallet may buy from it
-    pol = WALLET_PROC.policy()
-    pol["allowlist"].append(PAY_ORIGIN)
-    pol["counterparties"][PAY_ORIGIN] = {"ln_node": lab.pubkey(SELLER)}
-    with open(f"{WALLET}/policy.json", "w") as f:
-        json.dump(pol, f, indent=1)
-    restart_signer()
-
-    def charged() -> int:
-        return int(json.loads(send("GET", "/x402/ticket/health", PAY_PORT)[2])["chargedMsat"])
-
-    asked = [0]
-
-    def buy(n: int) -> int:
-        """`n` answers bought from the gateway; what it has then earned in all."""
-        for _ in range(n):
-            body = json.dumps({"messages": [{"role": "user", "content": f"In one short sentence, explain {MESH_TOPICS[asked[0] % len(MESH_TOPICS)]}."}],
-                               "max_tokens": AI_MAX_OUT, "temperature": 0})
-            asked[0] += 1
-            r = agent().tool("xbt402_pay", {"url": f"{PAY_ORIGIN}/ai/v1/chat/completions", "method": "POST", "body": body, "max_sats": CALL_SATS, "task": "chat"})
-            if not call_paid(r):
-                raise LabError(f"an answer was not bought: {brief(r)}")
-            if r.get("saved_to"):
-                os.remove(r["saved_to"])
-        return charged()
+    pay_gateway_up(upstream)
+    charged, buy, asked = pay_charged, pay_buy, PAY_ASKED
 
     config = {"gateway_url": PAY_ORIGIN, "mesh_console_url": console, "gguf": gguf, "signer_sock": PAY_FRONT, "ledger": PAY_LEDGER, "report": PAY_REPORT, "operator_cut_ppm": PAY_CUT_PPM,
               "own_nodes": sorted(own), "lenders": {lender_a: {"name": HOP, "offer": lno_a}, lender_b: {"name": OFFER_NODE, "offer": lno_b}},
@@ -3376,6 +3392,407 @@ def mesh_pay() -> None:
     check("mesh_pay: what the wallet sent, the ledger's payments and fees, is what the lenders' nodes received and what the hop between earned, to the msat",
           reached + hop == sent, {"ledger_paid_and_fees_msat": sent, "lenders_received_msat": reached, "hop_earned_msat": hop})
     measured("mesh_pay", {"answers": asked[0], "gateway_msat": end - baseline, "accrued": accrued, "books": b, "fees_msat": led["fees_msat"], "weights": weights, "real_split": bool(MESH_URL)})
+    stop_sessions()
+
+
+# --- a machine lent to a split, and the lender's own check that it is paid ------------------------------------
+
+FILES_PORT, LEND_PORT = BASE + 29, BASE + 30  # the lender's Mesh-LLM takes LEND_PORT to LEND_PORT + 2
+LEND_CREDIT_SATS, LEND_FLOOR_SATS = 100, 20
+OWN_NODE = "a" * 64
+# what one stand-in answer does: 50 tokens generated
+STAND_IN_ANSWER_TOKENS = 50
+# the stand-in build: Mesh-LLM's command line and the parts of its API a lender reads. Its count of generated tokens
+# is a file the lab writes, as every token of a split passes through every stage, whatever the gateway made of it
+STAND_IN_MESH = r'''#!/usr/bin/env python3
+import base64, json, os, secrets, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+args = sys.argv[1:]
+console = int(args[args.index("--console") + 1])
+home = os.environ["HOME"]
+idfile = os.path.join(home, "id")
+if not os.path.exists(idfile):
+    with open(idfile, "w") as f:
+        f.write(secrets.token_hex(32))
+node = open(idfile).read()
+run = secrets.token_hex(4)
+def read(name, default):
+    try:
+        return open(os.environ[name]).read().strip()
+    except OSError:
+        return default
+start = int(read("STAND_IN_TOKENS", "0"))
+with open(os.environ["STAND_IN_RUNS"], "a") as f:
+    f.write(" ".join(args) + "\n")
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+    def do_GET(self):
+        if self.path == "/api/status":
+            v = {"node_id": node[:10], "token": base64.urlsafe_b64encode(json.dumps({"id": node}).encode()).decode().rstrip("=")}
+        else:
+            layers = read("STAND_IN_LAYERS", "")
+            st = []
+            if layers:
+                a, b = layers.split()
+                st = [{"node_id": node, "state": "ready", "run_id": run, "stage_id": "stage-1", "layer_start": int(a), "layer_end": int(b),
+                       "compute_decode_tokens": int(read("STAND_IN_TOKENS", "0")) - start}]
+            v = {"stages": [], "statuses": st, "topologies": []}
+        body = json.dumps(v).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+ThreadingHTTPServer(("127.0.0.1", console), H).serve_forever()
+'''
+
+
+class Files(BaseHTTPRequestHandler):
+    """Files to fetch, counting what is fetched."""
+
+    root = ""
+    hits: dict[str, int] = {}
+
+    def log_message(self, *_: Any) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        name = self.path.lstrip("/")
+        Files.hits[name] = Files.hits.get(name, 0) + 1
+        try:
+            with open(os.path.join(Files.root, name), "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class Deal:
+    """An operator's offer to one lender: its payout config and ledger, its invite, the lender's directory, and `lend`."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag, self.proc, self.log = tag, None, f"{RUN}/lend-{tag}.log"
+        self.config, self.ledger, self.report = f"{RUN}/deal-{tag}.json", f"{RUN}/deal-{tag}-ledger.json", f"{RUN}/deal-{tag}-report.json"
+        self.invite, self.dir, self.node = f"{RUN}/deal-{tag}-invite.json", f"{RUN}/lender-{tag}", ""
+        self.tokens, self.layers, self.runs = f"{RUN}/deal-{tag}-tokens", f"{RUN}/deal-{tag}-layers", f"{RUN}/deal-{tag}-runs"
+        self.hex = ""
+        self.write_config({"gateway_url": PAY_ORIGIN, "mesh_console_url": f"http://127.0.0.1:{STAND_IN_PORT}", "gguf": f"{Files.root}/model.gguf", "signer_sock": PAY_SOCK, "ledger": self.ledger,
+                           "report": self.report, "operator_cut_ppm": PAY_CUT_PPM, "own_nodes": [OWN_NODE], "lenders": {}, "min_payout_sats": LEND_FLOOR_SATS, "interval_s": 1, "retry_s": 1})
+        with open(self.tokens, "w") as f:
+            f.write("0")
+        tool("invite", "--config", self.config, "--name", f"Lab operator {tag}", "--out", self.invite, "--build-file", f"{Files.root}/build.tar.gz",
+             "--build-url", f"http://127.0.0.1:{FILES_PORT}/build.tar.gz", "--model-file", f"{Files.root}/model.gguf", "--model-url", f"http://127.0.0.1:{FILES_PORT}/model.gguf", "--max-vram", "4")
+
+    def write_config(self, v: dict[str, Any]) -> None:
+        with open(self.config, "w") as f:
+            json.dump(v, f, indent=1)
+
+    def read_config(self) -> dict[str, Any]:
+        with open(self.config) as f:
+            return json.load(f)
+
+    def lend_args(self, invite: str | None = None) -> list[str]:
+        with open(f"{Files.root}/build.sha256") as f:
+            sha = f.read().strip()
+        return ["lend", "--invite", invite or self.invite, "--dir", self.dir, "--node-rest", f"https://127.0.0.1:{lab.PORT[OFFER_NODE]}", "--node-macaroon", f"{RUN}/lender.macaroon",
+                "--node-cert", f"{RUN}/{OFFER_NODE}.tls.cert", "--allow-build", sha, "--interval-s", "1", "--credit-sats", str(LEND_CREDIT_SATS), "--port-base", str(LEND_PORT), "--name", f"lender {self.tag}"]
+
+    def env(self) -> dict[str, str]:
+        return dict(os.environ, STAND_IN_TOKENS=self.tokens, STAND_IN_LAYERS=self.layers, STAND_IN_RUNS=self.runs)
+
+    def start(self) -> None:
+        with open(self.log, "ab") as log:
+            self.proc = subprocess.Popen([f"{BIN}/stream-compute-check", *self.lend_args(), "--yes"], env=self.env(), stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self.proc.wait(30)
+        self.proc = None
+
+    def lender_report(self) -> dict[str, Any]:
+        with open(f"{self.dir}/report.json") as f:
+            return json.load(f)
+
+    def add_tokens(self, n: int) -> None:
+        """Generated tokens pass through the stage, whatever the gateway made of them."""
+        with open(self.tokens) as f:
+            had = int(f.read())
+        with open(f"{self.tokens}.tmp", "w") as f:
+            f.write(str(had + n))
+        os.replace(f"{self.tokens}.tmp", self.tokens)
+
+    def answers(self, n: int) -> None:
+        """`n` answers bought from the gateway, which pass through the stage."""
+        pay_buy(n)
+        self.add_tokens(n * STAND_IN_ANSWER_TOKENS)
+
+    def payout(self) -> tuple[int, str]:
+        p = subprocess.run([f"{BIN}/stream-compute-check", "payout", "--config", self.config, "--once"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
+        return p.returncode, p.stdout
+
+    def ledger_now(self) -> dict[str, Any]:
+        with open(self.ledger) as f:
+            return json.load(f)
+
+    def received(self) -> int:
+        return int(self.lender_report().get("received_msat") or 0)
+
+    def settle(self) -> dict[str, Any]:
+        """The lender's next report, after it has seen everything so far."""
+        time.sleep(2.2)
+        return self.lender_report()
+
+
+def tool(*args: str) -> str:
+    p = subprocess.run([f"{BIN}/stream-compute-check", *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+    if p.returncode != 0:
+        raise LabError(f"stream-compute-check {args[0]}: {p.stdout[-400:]}")
+    return p.stdout
+
+
+def deal_up(tag: str) -> Deal:
+    """A lender through the whole flow: `lend`, its card to the operator, the plan with it in, and the owner's wallet allowing it."""
+    d = Deal(tag)
+    d.start()
+    lab.wait(f"lender {tag}'s card", 60, lambda: os.path.exists(f"{d.dir}/card.txt"))
+    with open(f"{d.dir}/card.txt") as f:
+        card = f.read().strip()
+    lock = f"{RUN}/deal-{tag}-lock.json"
+    tool("lender-add", "--config", d.config, "--card", card, "--lock", lock)
+    with open(lock) as f:
+        stages = json.load(f)["stages"]
+    d.node = stages[-1]["node"]
+    StandIn.plan, StandIn.plan_id = [(s["node"], s["layer_start"], s["layer_end"]) for s in stages], f"plan-{tag}"
+    with open(d.layers, "w") as f:
+        f.write(f"{stages[-1]['layer_start']} {stages[-1]['layer_end']}")
+    offer = d.read_config()["lenders"][d.node]["offer"]
+    dec = lab.post(OFFER_NODE, "/v2/offers/decode", {"bolt12": offer})
+    d.hex = base64.b64decode(dec["offer"]["offer_id"]).hex()
+    PAY_ALLOWED.append(d.hex)
+    pay_wallet(PAY_ALLOWED)
+    lab.wait(f"{OFFER_NODE} issuing invoices for lender {tag}'s offer", 180,
+             lambda: lab.post(SELLER, "/v2/offers/fetchinvoice", {"offer": offer, "amount_msat": "1000000", "timeout_seconds": 10}).get("invoice"), every=3)
+    rc, out = d.payout()
+    if rc != 0:
+        raise LabError(f"the payout: {out[-300:]}")
+    return d
+
+
+PAY_ALLOWED: list[str] = []
+
+
+def mesh_lend() -> None:
+    """A machine lent through the whole flow, and the lender's own check of its pay (run by name only). `lend` fetches a checked
+    build and model, makes an offer on the lender's node (lf4), and serves; the operator takes its card with `lender-add` and pays it
+    with `payout`. The build is a stand-in for Mesh-LLM, so that each cheat can be played exactly: the money is real nodes'. The lender
+    must catch an operator who stops paying, takes a bigger cut than it offered, serves tokens around its gateway, or books the lender's
+    stage as its own, from what the lender can see alone, and must stop serving with at most its credit limit and one answer's work unpaid."""
+    stop_sessions()
+    pay_lab_up()
+    upstream = f"http://127.0.0.1:{STAND_IN_PORT}"
+    root = f"{RUN}/lend-files"
+    os.makedirs(f"{root}/bundle", exist_ok=True)
+    Files.root = root
+    with open(f"{root}/model.gguf", "wb") as f:
+        f.write(stand_in_header())
+    with open(f"{root}/bundle/mesh-llm", "w") as f:
+        f.write(STAND_IN_MESH)
+    os.chmod(f"{root}/bundle/mesh-llm", 0o755)
+    subprocess.run(["tar", "-czf", f"{root}/build.tar.gz", "-C", f"{root}/bundle", "mesh-llm"], check=True)
+    with open(f"{root}/build.tar.gz", "rb") as f:
+        good = f.read()
+    with open(f"{root}/build.sha256", "w") as f:
+        f.write(hashlib.sha256(good).hexdigest())
+    with open(f"{root}/build-bad.tar.gz", "wb") as f:
+        f.write(good[:-1] + bytes([good[-1] ^ 1]))
+    with open(f"{root}/model.gguf", "rb") as f:
+        model = f.read()
+    with open(f"{root}/model-bad.gguf", "wb") as f:
+        f.write(model[:-1] + bytes([model[-1] ^ 1]))
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", FILES_PORT), Files).serve_forever, daemon=True).start()
+    StandIn.plan = [(OWN_NODE, 0, 4)]
+    threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", STAND_IN_PORT), StandIn).serve_forever, daemon=True).start()
+    pay_gateway_up(upstream)
+    with open(f"{RUN}/lender.macaroon", "wb") as f:
+        f.write(bytes.fromhex(lab.bake(OFFER_NODE, lab.SELLER_PERMISSIONS)))
+    os.chmod(f"{RUN}/lender.macaroon", 0o600)
+
+    # --- it asks, and an invite cannot choose what runs
+    d = Deal("refusals")
+    p = subprocess.run([f"{BIN}/stream-compute-check", *d.lend_args()], env=d.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    shown = all(w in p.stdout for w in ("Lab operator refusals", "sha256", "per 1,000 tokens", "sends no usage reports", "Nothing was fetched or started"))
+    check("mesh_lend: with no answer from its owner, `lend` has said the terms and the downloads and fetches and starts nothing", p.returncode == 0 and shown and not Files.hits and not os.path.exists(d.runs),
+          {"rc": p.returncode, "out": p.stdout[-300:], "fetched": Files.hits})
+    args = [a for a in d.lend_args()]
+    at = args.index("--allow-build")
+    unpinned = args[:at] + args[at + 2:]
+    p = subprocess.run([f"{BIN}/stream-compute-check", *unpinned, "--yes"], env=d.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    check("mesh_lend: a build this tool does not pin is refused, whatever hash the invite gives, before anything is fetched", p.returncode != 0 and "does not pin" in p.stdout and not Files.hits and not os.path.exists(d.runs),
+          {"rc": p.returncode, "out": p.stdout[-300:], "fetched": Files.hits})
+    with open(d.invite) as f:
+        inv = json.load(f)
+
+    def tampered(what: str, name: str) -> tuple[int, str]:
+        bad = dict(inv)
+        bad[what] = dict(inv[what], url=f"http://127.0.0.1:{FILES_PORT}/{name}")
+        path = f"{RUN}/invite-bad-{what}.json"
+        with open(path, "w") as f:
+            json.dump(bad, f)
+        run = subprocess.run([f"{BIN}/stream-compute-check", *d.lend_args(path), "--yes"], env=d.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+        return run.returncode, run.stdout
+
+    rc_b, out_b = tampered("build", "build-bad.tar.gz")
+    rc_m, out_m = tampered("model", "model-bad.gguf")
+    check("mesh_lend: a build or a model whose sha256 is not the one named is refused and never run", rc_b != 0 and "Refused" in out_b and rc_m != 0 and "Refused" in out_m and not os.path.exists(d.runs),
+          {"build": [rc_b, out_b[-200:]], "model": [rc_m, out_m[-200:]], "ran": os.path.exists(d.runs)})
+    shutil.rmtree(d.dir, ignore_errors=True)
+    Files.hits.clear()
+
+    # --- the whole flow, paid, with nothing false raised
+    d = deal_up("honest")
+    fetched_once = Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1
+    d.answers(9)
+    rc, out = d.payout()
+    r = d.settle()
+    led = d.ledger_now()
+    weights = {k: v for k, v in led["epoch"]["stages"]}
+    share = r["shares"].get("2-4", {})
+    check("mesh_lend: through `lend` and `lender-add` alone the lender's node is paid what the ledger says, and it fetched each file once", rc == 0 and fetched_once and led["paid_msat"].get(d.node, 0) > 0 and r["received_msat"] >= led["paid_msat"][d.node],
+          {"rc": rc, "fetched": Files.hits, "ledger_paid": led["paid_msat"], "received": r["received_msat"], "out": out[-300:]})
+    check("mesh_lend: the lender's own working-out of its share is the operator's ledger's, exactly",
+          int(share.get("active_params", -1)) == weights.get(d.node) and int(share.get("total_params", -1)) == sum(weights.values()), {"lender": share, "ledger": weights})
+    worst = 0
+    for _ in range(4):
+        d.answers(3)
+        d.payout()
+        r = d.settle()
+        worst = max(worst, r["due_at_least_msat"] - r["received_msat"])
+        if not r["serving"]:
+            break
+    check("mesh_lend: with an operator who pays, its own count never stops a lender; it counts every token it worked on", r["serving"] and r["total_tokens"] == 21 * STAND_IN_ANSWER_TOKENS and r["due_at_least_msat"] <= r["received_msat"] + LEND_CREDIT_SATS * 1000,
+          {"serving": r["serving"], "tokens": r["total_tokens"], "due_at_least": r["due_at_least_msat"], "received": r["received_msat"], "worst_gap": worst})
+
+    # --- killed: the watch loses nothing and counts nothing twice
+    pid = r["pid"]
+    with open(d.runs) as f:
+        runs0 = len(f.read().splitlines())
+    d.proc.kill()
+    d.proc.wait(10)
+    d.add_tokens(100)
+    time.sleep(1)
+    os.kill(pid, 0)  # its Mesh-LLM runs on: a crash of the watch takes no stage out of a split
+    d.start()
+    r = d.settle()
+    with open(d.runs) as f:
+        runs1 = len(f.read().splitlines())
+    check("mesh_lend: `lend` killed and started again takes up the same running Mesh-LLM, fetches nothing, and has lost and doubled nothing of its count",
+          r["pid"] == pid and runs1 == runs0 and r["total_tokens"] == 21 * STAND_IN_ANSWER_TOKENS + 100 and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
+          {"pid": [pid, r["pid"]], "starts": [runs0, runs1], "tokens": r["total_tokens"], "fetched": Files.hits})
+    with open(f"{d.dir}/card.txt") as f:
+        card_before = f.read()
+    d.proc.kill()
+    d.proc.wait(10)
+    os.killpg(pid, signal.SIGKILL)
+    time.sleep(0.5)
+    d.start()
+    time.sleep(2.5)
+    d.add_tokens(30)  # counted by the new run, from zero
+    r = d.settle()
+    with open(f"{d.dir}/card.txt") as f:
+        card_after = f.read()
+    check("mesh_lend: with its Mesh-LLM killed too, a new run's count starts from zero and is added to what was kept; same node id, same offer",
+          r["pid"] != pid and r["serving"] and r["total_tokens"] == 21 * STAND_IN_ANSWER_TOKENS + 130 and card_before == card_after and Files.hits.get("build.tar.gz") == 1,
+          {"pid": [pid, r["pid"]], "tokens": r["total_tokens"], "same_card": card_before == card_after})
+
+    # one answer's work, the most it can be past its limit before it next looks: all of it the lender's, at its share
+    w = {n: v for n, v in stand_in_weights(StandIn.plan, {OWN_NODE})}
+    one = STAND_IN_ANSWER_TOKENS * PAY_OUT_MSAT // 1000 * (1_000_000 - PAY_CUT_PPM) // 1_000_000 * w[d.node] // sum(w.values())
+
+    def until_stopped(deal: Deal, step: Any) -> tuple[bool, dict[str, Any], int]:
+        steps = 0
+        rep = deal.lender_report()
+        while rep["serving"] and steps < 30:
+            step()
+            steps += 1
+            rep = deal.settle()
+        return not rep["serving"], rep, steps
+
+    def stopped_within_limit(rep: dict[str, Any]) -> bool:
+        s = rep.get("stopped") or {}
+        return bool(s) and s["due_at_least_msat"] - s["received_msat"] <= LEND_CREDIT_SATS * 1000 + one
+
+    # (a) the operator stops paying: its payout is simply not run
+    pid = d.lender_report()["pid"]
+    ok, r, steps = until_stopped(d, lambda: d.answers(1))
+    time.sleep(1)
+    try:
+        os.kill(pid, 0)
+        gone = False
+    except OSError:
+        gone = True
+    check("mesh_lend: an operator who stops paying: the lender stops serving, with at most its limit and one answer's work unpaid, and its Mesh-LLM is gone", ok and stopped_within_limit(r) and gone,
+          {"steps": steps, "stopped": r.get("stopped"), "limit_msat": LEND_CREDIT_SATS * 1000, "one_answer_msat": one, "gone": gone})
+    # paid at last: it serves again by itself, with nothing fetched
+    with open(d.runs) as f:
+        before = len(f.read().splitlines())
+    d.payout()
+    r = d.settle()
+    if r["serving"] is False:
+        r = d.settle()
+    with open(d.runs) as f:
+        after = len(f.read().splitlines())
+    check("mesh_lend: once the operator pays what it owes, the lender serves again by itself, fetching nothing", r["serving"] and after == before + 1 and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
+          {"serving": r["serving"], "starts": [before, after], "received": r["received_msat"], "due_at_least": r["due_at_least_msat"], "fetched": Files.hits})
+    d.stop()
+
+    # (b) a bigger cut than the invite offered
+    d = deal_up("cut")
+    v = d.read_config()
+    v["operator_cut_ppm"] = 700_000
+    d.write_config(v)
+
+    def paid_round() -> None:
+        d.answers(1)
+        d.payout()
+
+    ok, r, steps = until_stopped(d, paid_round)
+    check("mesh_lend: an operator who takes a bigger cut than its invite, while paying every round: the lender stops serving, by its own count", ok and stopped_within_limit(r) and (r.get("received_msat") or 0) > 0,
+          {"steps": steps, "stopped": r.get("stopped"), "received": r.get("received_msat"), "limit_msat": LEND_CREDIT_SATS * 1000})
+    d.stop()
+
+    # (c) tokens served around the gateway: the gateway earns nothing on them, and they still pass through the stage
+    d = deal_up("around")
+
+    def around_round() -> None:
+        d.add_tokens(STAND_IN_ANSWER_TOKENS)
+        d.payout()
+
+    ok, r, steps = until_stopped(d, around_round)
+    charged_for_nothing = d.ledger_now()["earned_msat"]
+    check("mesh_lend: an operator who serves tokens around its gateway: its books show nothing earned, and the lender stops serving", ok and stopped_within_limit(r) and charged_for_nothing == 0,
+          {"steps": steps, "stopped": r.get("stopped"), "operator_books_earned": charged_for_nothing})
+    d.stop()
+
+    # (d) the operator books the lender's stage as its own machine's
+    d = deal_up("booked")
+    v = d.read_config()
+    v["own_nodes"].append(d.node)
+    d.write_config(v)
+
+    def booked_round() -> None:
+        d.answers(1)
+        d.payout()
+
+    ok, r, steps = until_stopped(d, booked_round)
+    led = d.ledger_now()
+    check("mesh_lend: an operator who books the lender's stage as its own: its ledger owes the lender nothing, and the lender stops serving", ok and stopped_within_limit(r) and not led["paid_msat"].get(d.node),
+          {"steps": steps, "stopped": r.get("stopped"), "ledger_paid": led["paid_msat"]})
+    d.stop()
     stop_sessions()
 
 
@@ -3629,15 +4046,15 @@ def jellyfin(link: str = "") -> None:
 
 
 CHECKS = {"page": page, "latency": latency, "stream": stream, "money": money_check, "flap": flap, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
-          "vpn": vpn, "mesh": mesh, "mesh_pay": mesh_pay,
+          "vpn": vpn, "mesh": mesh, "mesh_pay": mesh_pay, "mesh_lend": mesh_lend,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
     # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
-    # (vpn downloads a public file through the exit, mesh needs a Mesh-LLM node, mesh_pay the payout tool: run by name only)
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn", "mesh", "mesh_pay")])
+    # (vpn downloads a public file through the exit, mesh needs a Mesh-LLM node, mesh_pay and mesh_lend the payout tool: run by name only)
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn", "mesh", "mesh_pay", "mesh_lend")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

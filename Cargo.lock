@@ -5698,13 +5698,16 @@ dependencies = [
 name = "xbt-compute-check"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "getrandom 0.2.17",
  "hex",
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "ureq",
+ "xbt-gateway",
  "xbt-iroh-link",
  "xbt-signer",
  "xbt-wallet-mcp",

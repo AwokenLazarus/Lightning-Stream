@@ -45,6 +45,18 @@ stream-compute-check: what this machine has and how well testers reach each othe
       start again.
   shares --gguf FILE [--stages 0-7,7-28]
       What each stage of a split does per token, from the model's header, as the payout pays by it.
+  invite --config FILE --name NAME --out FILE --build-file F --build-url U --model-file F --model-url U
+         [--relay URL] [--max-vram GB]
+      Writes an invite to lend to this box's split, by the terms of its payout config and its gateway.
+  lend --invite FILE --node-rest URL --node-macaroon FILE [--node-cert FILE] [--name NAME] [--dir DIR]
+       [--model FILE] [--credit-sats N] [--slack-ppm N] [--port-base N] [--bind-ip IP] [--interval-s N]
+       [--max-vram GB] [--allow-build SHA256] [--yes]
+      Lends this machine: shows what it will do and asks, fetches the build and model, makes an offer
+      on your Lightning node, serves, and prints a card to give the operator. It counts your own work
+      and stops serving if you are owed more than --credit-sats by that count. See docs/COMPUTE-ALPHA.md.
+  lender-add --config FILE --card CARD [--lock FILE] [--replace]
+      Adds a lender to the payout. With --lock, also writes a lock with the stages even across
+      your machines and theirs: restart your Mesh-LLM node on it.
 
 Lab flags: --no-relay, and --collector-addr IP:PORT with check.";
 
@@ -165,12 +177,358 @@ fn link(flags: &Flags) -> Result<(), String> {
     }
 }
 
+static LEND_ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn lend_end(_: libc::c_int) {
+    LEND_ENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The lender's Mesh-LLM, in a session of its own: it runs on if `lend` is killed, and the next `lend`
+/// takes it up again, so that a crash of the watch does not take a stage out of a split.
+struct Mesh {
+    bin: PathBuf,
+    home: PathBuf,
+    args: Vec<String>,
+    log: PathBuf,
+    pidfile: PathBuf,
+    child: Option<std::process::Child>,
+    pid: Option<i32>,
+}
+
+impl Mesh {
+    /// Whether `pid` is running this very build: its path is the program's, or the script's it runs.
+    fn is_ours(&self, pid: i32) -> bool {
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+        let bin = self.bin.as_os_str().as_encoded_bytes();
+        cmdline.split(|b| *b == 0).take(2).any(|arg| arg == bin)
+    }
+
+    fn take_up(&mut self) {
+        let was = std::fs::read_to_string(&self.pidfile).ok().and_then(|p| p.trim().parse::<i32>().ok());
+        self.pid = was.filter(|p| self.is_ours(*p));
+    }
+
+    fn alive(&mut self) -> bool {
+        if let Some(c) = &mut self.child {
+            return matches!(c.try_wait(), Ok(None));
+        }
+        self.pid.is_some_and(|p| self.is_ours(p))
+    }
+
+    fn start(&mut self) -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+        let say = |e: std::io::Error| format!("{}: {e}", self.log.display());
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).map_err(say)?;
+        let err = out.try_clone().map_err(say)?;
+        std::fs::create_dir_all(&self.home).map_err(say)?;
+        let mut cmd = std::process::Command::new(&self.bin);
+        cmd.args(&self.args).env("HOME", &self.home).env("MESH_LLM_ANALYTICS", "0").env("DO_NOT_TRACK", "1").stdin(std::process::Stdio::null()).stdout(out).stderr(err);
+        // SAFETY: setsid is async-signal-safe, and it is all the child does before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().map_err(|e| format!("{}: {e}", self.bin.display()))?;
+        self.pid = Some(child.id() as i32);
+        write_whole(&self.pidfile.to_string_lossy(), child.id().to_string().as_bytes())?;
+        self.child = Some(child);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        let Some(pid) = self.pid else { return };
+        // SAFETY: signals to the session this process started, checked to be ours.
+        if self.alive() {
+            unsafe { libc::kill(-pid, libc::SIGTERM) };
+            for _ in 0..40 {
+                if !self.alive() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            if self.alive() {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+        }
+        if let Some(c) = &mut self.child {
+            let _ = c.wait();
+        }
+        self.child = None;
+        self.pid = None;
+        let _ = std::fs::remove_file(&self.pidfile);
+    }
+}
+
+fn lend(flags: &Flags) -> Result<(), String> {
+    use xbt_compute_check::lend::{build_allowed, decide, fetch_checked, floor_msat, load_watch, matches, mesh_args, node_id_of_token, own_stages, save_watch, terms_text, Action, Card, Invite, Stop};
+    use xbt_compute_check::meter::Work;
+    use xbt_compute_check::payout::http_json;
+    use xbt_gateway::node::{InvoiceState, LndRest, Node};
+    let invite_path = flags.value("--invite").ok_or("--invite FILE is needed")?;
+    let invite = Invite::parse(&std::fs::read_to_string(&invite_path).map_err(|e| format!("{invite_path}: {e}"))?)?;
+    // what is refused is refused before the owner is asked anything
+    build_allowed(&invite.build.sha256, flags.value("--allow-build").as_deref())?;
+    let rest = flags.value("--node-rest").ok_or("--node-rest URL is needed: your Lightning node, where you are paid")?;
+    let macaroon_path = flags.value("--node-macaroon").ok_or("--node-macaroon FILE is needed, with invoices:read and invoices:write")?;
+    let dir = flags.value("--dir").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/stream-lend"));
+    let credit_sats: u64 = flags.number("--credit-sats", invite.terms.min_payout_sats.saturating_mul(3))?;
+    let slack_ppm: u32 = flags.number("--slack-ppm", 100_000)?;
+    let interval: u64 = flags.number("--interval-s", 30)?;
+    let port_base: u16 = flags.number("--port-base", 34911)?;
+    let vram: u32 = flags.number("--max-vram", invite.max_vram_gb)?;
+    print!("{}", terms_text(&invite, &dir, credit_sats));
+    if !flags.has("--yes") {
+        use std::io::Write;
+        print!("\nType yes to go on: ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map_err(|e| e.to_string())?;
+        if answer.trim() != "yes" {
+            println!("Nothing was fetched or started.");
+            return Ok(());
+        }
+    }
+    let say = |e: std::io::Error| format!("{}: {e}", dir.display());
+    std::fs::create_dir_all(&dir).map_err(say)?;
+    let tag = &invite.build.sha256[..16];
+    let archive = dir.join(format!("build-{tag}.tar.gz"));
+    let unpacked = dir.join(format!("build-{tag}"));
+    let model_path = flags.value("--model").map(PathBuf::from);
+    let model_at = model_path.clone().unwrap_or_else(|| dir.join("model.gguf"));
+    // the room for what is still to come
+    let mut needed = xbt_compute_check::lend::DISK_MARGIN_BYTES;
+    if !matches(&archive, &invite.build)? {
+        needed += invite.build.bytes.saturating_mul(2);
+    }
+    if !matches(&model_at, &invite.model)? {
+        if model_path.is_some() {
+            return Err(format!("{} is not the model the invite names", model_at.display()));
+        }
+        needed += invite.model.bytes;
+    }
+    let free = free_bytes(&dir)?;
+    if free < needed {
+        return Err(format!("{} has {free} bytes free and this needs {needed}", dir.display()));
+    }
+    // the node first: there is no use in a download with nowhere to be paid
+    let macaroon = std::fs::read(&macaroon_path).map_err(|e| format!("{macaroon_path}: {e}"))?;
+    let cert = flags.value("--node-cert").map(PathBuf::from);
+    let node = LndRest::new(&rest, &macaroon, &macaroon, cert.as_deref()).map_err(|e| format!("your Lightning node: {e}"))?;
+    let offer = node.create_offer(&format!("Compute lent to {}", invite.operator)).map_err(|e| format!("an offer on your Lightning node: {e}"))?;
+    if fetch_checked(&invite.build, &archive)? {
+        println!("Fetched the build: {} bytes, sha256 checked.", invite.build.bytes);
+    }
+    if !unpacked.is_dir() {
+        std::fs::create_dir_all(&unpacked).map_err(say)?;
+        let st = std::process::Command::new("tar").arg("-xzf").arg(&archive).arg("--no-same-owner").arg("-C").arg(&unpacked).status().map_err(|e| format!("tar: {e}"))?;
+        if !st.success() {
+            let _ = std::fs::remove_dir_all(&unpacked);
+            return Err(format!("tar could not unpack {}", archive.display()));
+        }
+    }
+    let bin = [unpacked.join("mesh-llm"), unpacked.join("mesh-bundle/mesh-llm")].into_iter().find(|p| p.is_file()).ok_or("the build holds no mesh-llm")?;
+    if model_path.is_none() && fetch_checked(&invite.model, &model_at)? {
+        println!("Fetched the model: {} bytes, sha256 checked.", invite.model.bytes);
+    }
+    let header = xbt_compute_check::gguf::read(&model_at).map_err(|e| format!("{}: {e}", model_at.display()))?;
+    let work = Work::from_header(&header).map_err(|e| format!("{}: {e}", model_at.display()))?;
+
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(libc::SIGTERM, lend_end as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, lend_end as *const () as libc::sighandler_t);
+    }
+    let ports = (port_base, port_base + 1, port_base + 2);
+    let console = format!("http://127.0.0.1:{}", ports.1);
+    let mut mesh = Mesh {
+        bin: bin.clone(),
+        home: dir.join("home"),
+        args: mesh_args(&invite, &model_at, ports, flags.value("--bind-ip").as_deref(), vram),
+        log: dir.join("mesh.log"),
+        pidfile: dir.join("mesh.pid"),
+        child: None,
+        pid: None,
+    };
+    mesh.take_up();
+    let watch_path = dir.join("watch.json");
+    let mut watch = load_watch(&watch_path)?;
+    let credit = credit_sats.saturating_mul(1000);
+    let name = flags.value("--name").unwrap_or_else(|| "a lender".to_string());
+    let mut me: Option<String> = None;
+    let mut last_line = String::new();
+    while !LEND_ENDING.load(std::sync::atomic::Ordering::SeqCst) {
+        let mut notes: Vec<String> = vec![];
+        if watch.stopped.is_none() && !mesh.alive() {
+            mesh.start()?;
+        }
+        if me.is_none() {
+            let token = http_json(&format!("{console}/api/status"), None).ok().and_then(|v| v.get("token").and_then(serde_json::Value::as_str).map(String::from));
+            if let Some(id) = token.and_then(|t| node_id_of_token(&t).ok()) {
+                let card = Card { node: id.clone(), name: name.clone(), offer: offer.bolt12.clone() }.encode();
+                write_whole(&dir.join("card.txt").to_string_lossy(), card.as_bytes())?;
+                println!("\nYour machine has joined. Give the operator this card, to be paid:\n\n{card}\n");
+                me = Some(id);
+            }
+        }
+        if let Some(id) = &me {
+            match http_json(&format!("{console}/api/runtime/stages"), None).and_then(|v| own_stages(&v, id)) {
+                Ok(stages) => watch.observe(&stages),
+                Err(e) if watch.stopped.is_none() => notes.push(format!("this round's count could not be read: {e}")),
+                Err(_) => {}
+            }
+        }
+        let received = node.offer_invoices(&offer.id).map(|l| l.iter().filter(|i| i.state == Some(InvoiceState::Settled)).map(|i| i.paid_msat).sum::<u64>());
+        let due = watch.due_msat(&invite.terms, &work)?;
+        let floor = floor_msat(due, slack_ppm);
+        let serving = watch.stopped.is_none();
+        // a node that does not answer says nothing either way, and the owner is told
+        let got = match received {
+            Ok(m) => Some(m),
+            Err(e) => {
+                notes.push(format!("your Lightning node could not be read: {e}"));
+                None
+            }
+        };
+        if let Some(m) = got {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs_f64();
+            match decide(floor, m, credit, serving) {
+                Action::Stop => {
+                    mesh.stop();
+                    watch.stopped = Some(Stop { due_at_least_msat: floor, received_msat: m, ts: now });
+                    println!("You are due at least {floor} msat by your own count and have received {m}. Past your limit of {credit_sats} sats: stopped serving until you are paid.");
+                }
+                Action::Resume => {
+                    watch.stopped = None;
+                    println!("You have been paid: {m} msat received of at least {floor} due. Serving again.");
+                }
+                Action::Serve | Action::StayStopped => {}
+            }
+        }
+        save_watch(&watch_path, &watch)?;
+        let shares: serde_json::Map<String, serde_json::Value> = watch.tokens.keys().filter_map(|k| {
+            let (a, b) = k.split_once('-')?;
+            let active = work.stage(a.parse().ok()?, b.parse().ok()?);
+            Some((k.clone(), serde_json::json!({"active_params": active.to_string(), "total_params": work.total().to_string()})))
+        }).collect();
+        let report = serde_json::json!({"node": me, "offer": offer.bolt12, "serving": watch.stopped.is_none(), "tokens": watch.tokens, "total_tokens": watch.total_tokens(), "shares": shares,
+                                        "due_msat": due, "due_at_least_msat": floor, "received_msat": got, "credit_msat": credit, "slack_ppm": slack_ppm, "stopped": watch.stopped, "pid": mesh.pid, "notes": notes});
+        write_whole(&dir.join("report.json").to_string_lossy(), &serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)?;
+        let line = format!("{} tokens, due at least {floor} msat, received {}", watch.total_tokens(), got.map_or("?".to_string(), |m| m.to_string()));
+        if line != last_line {
+            println!("{line}");
+            last_line = line;
+        }
+        notes.iter().for_each(|n| eprintln!("lend: {n}"));
+        for _ in 0..interval.max(1) {
+            if LEND_ENDING.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    println!("Stopping: this machine leaves the split.");
+    mesh.stop();
+    Ok(())
+}
+
+fn free_bytes(dir: &std::path::Path) -> Result<u64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: statvfs writes only to the zeroed struct given, and the path is a valid C string.
+    unsafe {
+        let mut s: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(path.as_ptr(), &mut s) != 0 {
+            return Err(format!("{}: {}", dir.display(), std::io::Error::last_os_error()));
+        }
+        Ok(s.f_bavail as u64 * s.f_frsize as u64)
+    }
+}
+
+fn invite(flags: &Flags) -> Result<(), String> {
+    use xbt_compute_check::lend::{describe_file, Invite, Terms};
+    use xbt_compute_check::payout::{http_json, load_config};
+    let path = flags.value("--config").ok_or("--config FILE is needed")?;
+    let cfg = load_config(std::path::Path::new(&path))?;
+    let need = |flag: &str| flags.value(flag).ok_or(format!("{flag} is needed"));
+    let status = http_json(&format!("{}/api/status", cfg.mesh_console_url.trim_end_matches('/')), None)?;
+    let token = status.get("token").and_then(serde_json::Value::as_str).ok_or("your Mesh-LLM node gives no token")?.to_string();
+    let services = http_json(&format!("{}/services", cfg.gateway_url.trim_end_matches('/')), None)?;
+    let price = services.get("routes").and_then(serde_json::Value::as_array).into_iter().flatten()
+        .find_map(|r| r.get("price").filter(|p| p.get("outputPer1kMsat").is_some())).ok_or("your gateway sells nothing by the token")?;
+    let rate = |k: &str| price.get(k).and_then(serde_json::Value::as_str).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let invite = Invite {
+        version: 1,
+        operator: need("--name")?,
+        mesh_token: token,
+        relay: flags.value("--relay"),
+        terms: Terms { per_1k_input_msat: rate("inputPer1kMsat"), per_1k_output_msat: rate("outputPer1kMsat"), operator_cut_ppm: cfg.operator_cut_ppm, min_payout_sats: cfg.min_payout_sats },
+        build: describe_file(std::path::Path::new(&need("--build-file")?), &need("--build-url")?)?,
+        model: describe_file(std::path::Path::new(&need("--model-file")?), &need("--model-url")?)?,
+        max_vram_gb: flags.number("--max-vram", 4)?,
+    };
+    let text = serde_json::to_string_pretty(&invite).map_err(|e| e.to_string())?;
+    Invite::parse(&text)?;
+    write_whole(&need("--out")?, text.as_bytes())?;
+    println!("Wrote the invite. It holds your mesh's join token: give it only to people you are inviting.");
+    Ok(())
+}
+
+fn lender_add(flags: &Flags) -> Result<(), String> {
+    use serde_json::{json, Value};
+    use xbt_compute_check::lend::{even_stages, Card};
+    use xbt_compute_check::meter::Work;
+    use xbt_compute_check::payout::{http_json, load_config};
+    let path = flags.value("--config").ok_or("--config FILE is needed")?;
+    let card = Card::decode(&flags.value("--card").ok_or("--card CARD is needed")?)?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    let mut v: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+    let lenders = v.as_object_mut().ok_or("the config is not an object")?.entry("lenders").or_insert_with(|| json!({}));
+    // a card is someone's word: it does not move an existing lender's pay on its own
+    if let Some(had) = lenders.get(&card.node).and_then(|l| l.get("offer")).and_then(Value::as_str) {
+        if had != card.offer && !flags.has("--replace") {
+            return Err(format!("{} is already paid to another offer. If this is that lender's new offer, add --replace", card.node));
+        }
+    }
+    lenders[&card.node] = json!({"name": card.name, "offer": card.offer});
+    write_whole(&path, &serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?)?;
+    let cfg = load_config(std::path::Path::new(&path))?;
+    println!("Added {} ({}). The payout takes it up on its next round.", card.name, card.node);
+    let Some(lock_path) = flags.value("--lock") else { return Ok(()) };
+    let header = xbt_compute_check::gguf::read(&cfg.gguf).map_err(|e| format!("{}: {e}", cfg.gguf.display()))?;
+    let layers = Work::from_header(&header).map_err(|e| format!("{}: {e}", cfg.gguf.display()))?.layers.len() as u32;
+    let mut lock: Value = match std::fs::read_to_string(&lock_path) {
+        Ok(t) => serde_json::from_str(&t).map_err(|e| format!("{lock_path}: {e}"))?,
+        Err(_) => {
+            // no lock yet: this model's identity, from the split the lender's joining started
+            let stages = http_json(&format!("{}/api/runtime/stages", cfg.mesh_console_url.trim_end_matches('/')), None)?;
+            let t = stages.get("topologies").and_then(Value::as_array).and_then(|a| a.first()).ok_or("your Mesh-LLM node has no split yet: wait for the lender to join")?;
+            json!({"version": 1, "model": t.get("model_id"), "manifest_sha256": t.get("manifest_sha256"), "stages": []})
+        }
+    };
+    let mut nodes: Vec<String> = lock.get("stages").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.get("node").and_then(Value::as_str).map(String::from)).collect();
+    if nodes.is_empty() {
+        nodes = cfg.own_nodes.clone();
+    }
+    if nodes.is_empty() {
+        return Err("name your own machine in the config's own_nodes, by its full id: it leads the split".into());
+    }
+    if !nodes.contains(&card.node) {
+        nodes.push(card.node.clone());
+    }
+    lock["stages"] = even_stages(&nodes, layers).into_iter().map(|(node, a, b)| json!({"node": node, "layer_start": a, "layer_end": b})).collect();
+    write_whole(&lock_path, &serde_json::to_vec_pretty(&lock).map_err(|e| e.to_string())?)?;
+    println!("Wrote {lock_path}. Restart your Mesh-LLM node with --split-topology-lock {lock_path}, on the same home directory: the lender stays joined.");
+    Ok(())
+}
+
 fn payout(flags: &Flags) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     use xbt_compute_check::meter::Work;
     use xbt_compute_check::payout::{load_config, load_ledger, report, save_ledger, tick, Live};
     let path = flags.value("--config").ok_or("--config FILE is needed")?;
-    let cfg = load_config(std::path::Path::new(&path))?;
+    let mut cfg = load_config(std::path::Path::new(&path))?;
     let header = xbt_compute_check::gguf::read(&cfg.gguf).map_err(|e| format!("{}: {e}", cfg.gguf.display()))?;
     let work = Work::from_header(&header).map_err(|e| format!("{}: {e}", cfg.gguf.display()))?;
     // two runs on one ledger could each pay what the other has not yet noted
@@ -187,10 +545,17 @@ fn payout(flags: &Flags) -> Result<(), String> {
     if led.intent.is_some() {
         std::thread::sleep(Duration::from_secs(2));
     }
-    let live = Live { cfg: cfg.clone() };
     loop {
+        // a lender added since the last round; a config that does not read leaves the last one in force
+        let mut changed = None;
+        match load_config(std::path::Path::new(&path)) {
+            Ok(new) => cfg = new,
+            Err(e) => changed = Some(format!("the config could not be read, the last one stays: {e}")),
+        }
+        let live = Live { cfg: cfg.clone() };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs_f64();
-        let notes = tick(&cfg, &work, &mut led, &live, &mut |l| save_ledger(&ledger_path, l), now)?;
+        let mut notes = tick(&cfg, &work, &mut led, &live, &mut |l| save_ledger(&ledger_path, l), now)?;
+        notes.extend(changed);
         notes.iter().for_each(|n| eprintln!("payout: {n}"));
         if let Some(r) = &cfg.report {
             let text = serde_json::to_vec_pretty(&report(&cfg, &led, &notes)).map_err(|e| e.to_string())?;
@@ -381,6 +746,9 @@ fn run() -> Result<(), String> {
         "link" => link(&flags),
         "payout" => payout(&flags),
         "shares" => shares(&flags),
+        "invite" => invite(&flags),
+        "lend" => lend(&flags),
+        "lender-add" => lender_add(&flags),
         _ => {
             println!("{USAGE}");
             Ok(())

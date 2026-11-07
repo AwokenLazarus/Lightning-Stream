@@ -87,7 +87,8 @@
 # (BASE+5), the second gateway (BASE+6) and the lying proxy in front of it (BASE+7); the offers
 # check's node lf4 (BASE+9) and its gateway (BASE+10); the link check's gateway (BASE+11); the jellyfin check's gateway (BASE+12),
 # connector (BASE+13), wallet app (BASE+14) and its two app ports (BASE+15, BASE+16); the mesh_pay
-# check's gateway (BASE+27) and its stand-in model (BASE+28). Its own compose
+# check's gateway (BASE+27) and its stand-in model (BASE+28); the mesh_lend check's file server
+# (BASE+29) and its lender's Mesh-LLM (BASE+30 to BASE+32). Its own compose
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit
 # (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 25 minutes.
@@ -155,7 +156,7 @@ case " $* " in *" jellyfin"*)
 esac
 case " $* " in *" long_download"*|*" paused_player"*|"  ") nice -n 19 cargo build -q -j4 --release --locked -p lightning-stream --bin lightning-stream ;; esac
 # a split's machines paid by their work (the mesh_pay check, run by name only) needs the payout tool
-case " $* " in *" mesh_pay"*) nice -n 19 cargo build -q -j4 --release --locked -p xbt-compute-check --bin stream-compute-check ;; esac
+case " $* " in *" mesh_pay"*|*" mesh_lend"*) nice -n 19 cargo build -q -j4 --release --locked -p xbt-compute-check --bin stream-compute-check ;; esac
 # a VPN exit sold as a service (the vpn check, run by name only) needs the VPN service
 case " $* " in *" vpn "*|*" vpn") nice -n 19 cargo build -q -j4 --release --locked -p xbt-vpn --bin xbt-vpn ;; esac
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release

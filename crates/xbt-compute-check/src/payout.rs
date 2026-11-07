@@ -497,6 +497,16 @@ pub fn load_ledger(path: &Path) -> Result<Ledger, String> {
     }
 }
 
+/// One GET on this machine's gateway or Mesh-LLM console.
+pub fn http_json(url: &str, health_token: Option<&str>) -> Result<Value, String> {
+    let mut r = ureq::get(url).timeout(Duration::from_secs(10));
+    if let Some(t) = health_token {
+        r = r.set("X-Xbt402-Health-Token", t);
+    }
+    let text = r.call().map_err(|e| format!("{url}: {e}"))?.into_string().map_err(|e| format!("{url}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("{url}: {e}"))
+}
+
 fn number(v: Option<&Value>) -> u64 {
     match v {
         Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
@@ -511,15 +521,6 @@ pub struct Live {
 }
 
 impl Live {
-    fn get(&self, url: &str, token: Option<&str>) -> Result<Value, String> {
-        let mut r = ureq::get(url).timeout(Duration::from_secs(10));
-        if let Some(t) = token {
-            r = r.set("X-Xbt402-Health-Token", t);
-        }
-        let text = r.call().map_err(|e| format!("{url}: {e}"))?.into_string().map_err(|e| format!("{url}: {e}"))?;
-        serde_json::from_str(&text).map_err(|e| format!("{url}: {e}"))
-    }
-
     fn signer(&self, wait: Duration, method: &str, params: &Value) -> Result<Value, (bool, String)> {
         xbt_wallet_mcp::wallet::signer_call_waiting(&self.cfg.signer_sock, Duration::from_secs(30), Some(wait), method, params)
     }
@@ -537,12 +538,12 @@ pub fn other_sales(services: &Value) -> Option<String> {
 impl World for Live {
     fn charged_msat(&self) -> Result<u64, String> {
         let url = format!("{}/x402/ticket/health", self.cfg.gateway_url.trim_end_matches('/'));
-        let v = self.get(&url, self.cfg.gateway_health_token.as_deref())?;
+        let v = http_json(&url, self.cfg.gateway_health_token.as_deref())?;
         v.get("chargedMsat").and_then(Value::as_str).and_then(|s| s.parse().ok()).ok_or_else(|| "the gateway's health has no chargedMsat".to_string())
     }
 
     fn sells_only_the_model(&self) -> Result<Result<(), String>, String> {
-        let v = self.get(&format!("{}/services", self.cfg.gateway_url.trim_end_matches('/')), None)?;
+        let v = http_json(&format!("{}/services", self.cfg.gateway_url.trim_end_matches('/')), None)?;
         if v.get("routes").and_then(Value::as_array).is_none() {
             return Err("the gateway's /services lists no routes".into());
         }
@@ -550,7 +551,7 @@ impl World for Live {
     }
 
     fn plan(&self) -> Result<Option<Plan>, String> {
-        let v = self.get(&format!("{}/api/runtime/stages", self.cfg.mesh_console_url.trim_end_matches('/')), None)?;
+        let v = http_json(&format!("{}/api/runtime/stages", self.cfg.mesh_console_url.trim_end_matches('/')), None)?;
         parse_plan(&v, self.cfg.model.as_deref())
     }
 
