@@ -4148,6 +4148,41 @@ def mesh_lend_real() -> None:
           rc == 0 and not needed_restart and r.get("serving") is True and a["paid"] and b["one_for_one"] and b["within_fee"] and Files.hits.get("build.tar.gz") == 1 and Files.hits.get("model.gguf") == 1,
           {"rc": rc, "needed_the_operator_to_restart": needed_restart, "received": r.get("received_msat"), "due_at_least": r.get("due_at_least_msat"), "answer_paid": a["paid"], "books": b, "fetched": Files.hits})
     measured("mesh_lend_real", {"seconds_to_card": round(t_card), "seconds_to_serving": round(t_serving), "answers": answered, "completion_tokens_honest_run": completions, "lender": r, "books": b})
+
+    # --- the operator makes the split draft. Its own settings alone turn n-gram drafting on, for any model, whatever the lender's
+    # say. Tokens a verify window commits take no decode step, so no count includes them: the lender's stage reports the positions it
+    # ran in verify windows, and the lender must leave and say why. Answers that repeat themselves give the drafter something to draft
+    os.makedirs(f"{RUN}/op-home/.mesh-llm", exist_ok=True)
+    with open(f"{RUN}/op-home/.mesh-llm/config.toml", "w") as f:
+        f.write('[defaults.speculative]\nstrategy = "ngram-suffix"\nngram_min = 3\nngram_max = 8\n')
+    operator_mesh(lock)
+    lab.wait("the split, drafting now, with the lender on its stage", 300, placed, every=2)
+    with open(f"{RUN}/op-mesh.log", encoding="utf-8", errors="replace") as f:
+        lost_before = f.read().count("stage_connection_lost")
+
+    def repeating_answer() -> bool:
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{OP_API}/v1/chat/completions", json.dumps({"messages": [{"role": "user", "content": "Write the numbers from 1 to 60, separated by commas, and nothing else."}],
+                                                                                                      "max_tokens": 160, "temperature": 0}).encode(), {"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                return r.status == 200
+        except (OSError, ValueError):
+            return False
+
+    drafted_answers = 0
+    for _ in range(4):
+        drafted_answers += repeating_answer()
+        if (fresh_report(4).get("drafted") or 0) > 0:
+            break
+    try:
+        lab.wait("the lender to leave a split that drafts", 90, lambda: (lender_report().get("drafted") or 0) > 0 and lender_report().get("serving") is False, every=2)
+        lab.wait("the coordinator to see the stage gone", 60, coordinator_saw_it, every=2)
+        left = True
+    except LabError:
+        left = False
+    r = lender_report()
+    check("mesh_lend_real: when the operator's own settings make the split draft, the lender sees it on its own stage and leaves at once, as no count includes drafted tokens",
+          left, {"answers": drafted_answers, "drafted": r.get("drafted"), "serving": r.get("serving"), "tokens": r.get("total_tokens"), "notes": r.get("notes")})
     Files.command = "2 stop"
     time.sleep(6)
     stop_sessions()
