@@ -31,14 +31,17 @@ use sha2::{Digest, Sha256};
 
 use crate::meter::Work;
 
-/// A build of Mesh-LLM this tool will run: our stage-meter patch on the pinned upstream commit, usage
-/// reporting absent from the build. Empty until one is published.
+/// A build of Mesh-LLM this tool will run, by the hash of its bundle: one published on our fork of
+/// Mesh-LLM with the commit it was built from, usage reporting absent from the build.
 pub struct PinnedBuild {
     pub sha256: &'static str,
     pub commit: &'static str,
 }
 
-pub const PINNED_BUILDS: &[PinnedBuild] = &[];
+pub const PINNED_BUILDS: &[PinnedBuild] = &[
+    // stream-0.78.0-1: Mesh-LLM main 668285a5b and its pull requests 2901 and 2902, CPU, Linux x86_64
+    PinnedBuild { sha256: "d924ada744dae629cf4f4ebc51b6cad405fae180bab7425b11fdfd8bd7ce77f7", commit: "854f01ae540708e47fc1faf449e74214453cd1c0" },
+];
 
 const INVITE_VERSION: u32 = 1;
 const CARD_PREFIX: &str = "lendcard1.";
@@ -517,6 +520,11 @@ mod tests {
         assert!(build_allowed(&sha, None).is_err(), "named by the invite alone");
         assert!(build_allowed(&sha, Some(&"d".repeat(64))).is_err());
         assert!(build_allowed(&sha, Some(&sha)).is_ok(), "the owner allowed this one by hand");
+        for pinned in PINNED_BUILDS {
+            assert!(is_sha256(pinned.sha256) && pinned.commit.len() == 40, "{}", pinned.sha256);
+            assert!(build_allowed(pinned.sha256, None).is_ok(), "a pinned build needs no allowing by hand");
+        }
+        assert!(!PINNED_BUILDS.is_empty(), "lenders have a published build to run");
     }
 
     #[test]

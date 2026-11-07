@@ -122,6 +122,7 @@ It shows the terms, the downloads and what it will run, and asks first. Then it:
 
 **An invite is the operator's word, and it cannot choose what runs on your machine.** The build must be
 one this tool pins, whatever hash the invite names; a build you trust by hand takes `--allow-build SHA256`.
+It pins one, `stream-0.78.0-1`: see "Running the split".
 The invite picks no flags of the command line. The model is data, read by llama.cpp under your user, so
 you may want to run this as a user of its own.
 
@@ -171,6 +172,11 @@ stream-compute-check invite --config payout.json --name "Your name" --out invite
   --build-file mesh-bundle.tar.gz --build-url https://... --model-file model.gguf --model-url https://...
 stream-compute-check lender-add --config payout.json --card lendcard1... --lock lock.json
 ```
+
+The build this tool pins is `stream-0.78.0-1` (CPU, Linux x86_64), published with its source commit and
+checksum at https://github.com/AwokenLazarus/mesh-llm/releases/tag/stream-0.78.0-1. Run it yourself, and
+name its asset in the invite: `--build-file` the archive you downloaded, `--build-url` its download link. It is
+Mesh-LLM's `main` plus two fixes not yet merged upstream; its release notes say which.
 
 The invite holds your mesh's join token, so give it only to those you invite. It takes its terms from your
 payout config and your gateway's prices, and it is what lenders hold you to. Run your own Mesh-LLM node with

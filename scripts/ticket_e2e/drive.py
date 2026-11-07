@@ -3817,6 +3817,8 @@ def mesh_lend() -> None:
 
 LEND_REAL_BIND = os.environ.get("LEND_REAL_BIND", "")
 MESH_BUNDLE = os.environ.get("MESH_LLM_BUNDLE", "")
+# set when the bundle is a build the tool pins: the lender then runs it with no --allow-build
+LEND_REAL_PINNED = os.environ.get("LEND_REAL_PINNED") == "1"
 LEND_FORWARD_PORT, OP_API, OP_CONSOLE, OP_QUIC = BASE + 33, BASE + 34, BASE + 35, BASE + 36
 LEND_REAL_CREDIT_SATS = 200
 # answers walked away from partway. Mesh-LLM's relay needs our fix for a split to go on serving after one, and the build under test must have it
@@ -3915,7 +3917,8 @@ def mesh_lend_real() -> None:
     tool("invite", "--config", config, "--name", "Lab operator", "--out", f"{root}/invite.json", "--build-file", MESH_BUNDLE, "--build-url", f"http://{LEND_REAL_BIND}:{FILES_PORT}/build.tar.gz",
          "--model-file", MESH_GGUF, "--model-url", f"http://{LEND_REAL_BIND}:{FILES_PORT}/model.gguf", "--max-vram", "4")
     with open(f"{root}/lend-args", "w") as f:
-        f.write(f"--node-rest https://{LEND_REAL_BIND}:{LEND_FORWARD_PORT} --allow-build {sha} --credit-sats {LEND_REAL_CREDIT_SATS} --interval-s 3 --name lab-lender --port-base {LEND_PORT}")
+        allow = "" if LEND_REAL_PINNED else f"--allow-build {sha} "
+        f.write(f"--node-rest https://{LEND_REAL_BIND}:{LEND_FORWARD_PORT} {allow}--credit-sats {LEND_REAL_CREDIT_SATS} --interval-s 3 --name lab-lender --port-base {LEND_PORT}")
 
     # --- the other machine starts from here, with only the tool
     t0 = time.time()
