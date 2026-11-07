@@ -5,7 +5,12 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
-## 0.2.15 (unreleased)
+## 0.2.15 (2026-11-07)
+
+Lightning Stream works on StartOS with Lightning Fork's current releases, which have no grant action: the owner
+pastes Lightning Fork's connection address once and the app makes its own narrow keys from it. A hashrate rental
+whose budget is spent ends as that, not as unpaid, and a top-up asks the wallet again. The hashrate component, the
+wallet UI and the gateway crate change, and the StartOS package and the Umbrel app with them.
 
 - **A rental whose budget is spent ends as that, not as unpaid.** A 60-minute rental of 20,202 sats at 51 sat a slice
   paid 386 slices, then had 495 sats of its budget left, under the seller's smallest ticket of 546, and too little credit
