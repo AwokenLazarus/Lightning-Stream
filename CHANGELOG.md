@@ -5,10 +5,12 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
-## 0.2.16 (unreleased)
+## 0.2.16 (2026-11-07)
 
-Four fixes found on a fresh StartOS 0.4.1.2 with Lightning Fork 0.21.6-beta.23:0. The wallet UI and the StartOS
-package change.
+Four small fixes found on a fresh StartOS 0.4.1.2 with Lightning Fork 0.21.6-beta.23:0: the log explains the grant
+check's "Not Found", the Node connection banner matches the form, Your node shows no missing-key error before a key
+is connected, and Home and Setup name their lists. The wallet UI changes, and the StartOS package and the Umbrel app
+with it.
 
 - **StartOS: the log explains the "Not Found" from the grant check.** At each start the package asks StartOS whether
   Lightning Fork has its *Grant app access* action. On a Lightning Fork without it, StartOS logs the answer as
