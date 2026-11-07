@@ -5,6 +5,30 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.16 (unreleased)
+
+Four fixes found on a fresh StartOS 0.4.1.2 with Lightning Fork 0.21.6-beta.23:0. The wallet UI and the StartOS
+package change.
+
+- **StartOS: the log explains the "Not Found" from the grant check.** At each start the package asks StartOS whether
+  Lightning Fork has its *Grant app access* action. On a Lightning Fork without it, StartOS logs the answer as
+  "Error in host RPC: ... grant-app-access ... Not Found" with a stack trace, which looked like a fault in the Logs
+  tab. StartOS has no quieter way to ask (no call lists another service's actions), so the package now logs a line
+  before the check saying that this error is expected when the action is missing, and after it: "Lightning Fork has
+  no Grant app access action; Lightning Stream connects by its address instead". What the package does with the
+  answer is unchanged.
+- **StartOS: the Node connection banner matches the form.** With a node already saved (an install updated from an
+  earlier version), the form shows the saved user and password, under a banner that asked for the ones Knots
+  BLAKE2b generates. The banner now says the form shows the saved connection, and where new credentials come from.
+  With no node saved, the form stays empty except for Knots BLAKE2b's host and port, as before.
+- **Your node shows no missing-file error before a key is connected.** The technical details showed
+  `"config_error": "macaroon /data/run/ln/rail.macaroon: No such file or directory (os error 2)"` before any key
+  existed. Until a key is stored, they say "No key connected yet." instead; once one is, its errors show as before.
+- **Home and Setup name their lists.** Home said "Get started, 0 of 5 done" and Setup "0 of 4 done", which read as
+  one list counted two ways. They are two lists: Home's is now *First steps* (approval key, node, starter rules, a
+  shop, a first purchase), and Setup says "Setup: 0 of 4 done" (approval key, spending rules, node, backup). Neither
+  counts the password.
+
 ## 0.2.15 (2026-11-07)
 
 Lightning Stream works on StartOS with Lightning Fork's current releases, which have no grant action: the owner

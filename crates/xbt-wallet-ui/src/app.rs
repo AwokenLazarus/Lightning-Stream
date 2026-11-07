@@ -852,7 +852,7 @@ impl App {
         self.page("Home", ctx, b)
     }
 
-    /// Home's "Get started" list, until every step is done: the approval key, the node, the starter
+    /// Home's "First steps" list, until every step is done: the approval key, the node, the starter
     /// rules (with, on mainnet, the yes to paying with real money ticked as they are signed), a shop allowed (the demo shop in one press where the box
     /// suggests one) and a first purchase. Each step says what it is; the next one to do has its button.
     fn get_started(&self, ctx: &Ctx, human: bool, connected: bool, ack: bool) -> String {
@@ -899,7 +899,7 @@ impl App {
             return String::new();
         }
         let next = steps.iter().position(|s| !s.0).unwrap_or(0);
-        let mut b = format!("<section class=\"card primary\" id=\"get-started\"><h2>Get started</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
+        let mut b = format!("<section class=\"card primary\" id=\"get-started\"><h2>First steps</h2><p class=\"small\">{done} of {} done</p><ol class=\"checklist\">",
                             steps.len());
         for (i, (ok, title, what, href, button)) in steps.iter().enumerate() {
             let action = if i != next {
@@ -2086,12 +2086,13 @@ impl App {
         let enc = ks["encrypted"] == true;
         let ack_needed = ln["real_money_ack_needed"] == true;
         // on mainnet the rules step takes the yes to real money too (a box beside its Sign): done with both
-        // the password is not counted: it is set before any page shows, so Home's Get started (which does not
-        // list it) and this page say the same number done (0.2.14 said 0 there and 1 here on a new install)
+        // the password is not counted: it is set before any page shows (0.2.14 counted it, and a new install
+        // started at 1 here). Home's First steps is another list (it adds a shop and a first purchase and leaves
+        // out the backup), so each names its own: First steps with "0 of 5 done" there, "Setup: 0 of 4 done" here
         let done = [!human.is_empty(), seen("policy_change") && !ack_needed, ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
         let n = done.iter().filter(|d| **d).count();
         let total = done.len();
-        let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p>\
+        let mut b = format!("<p class=\"lead\">Setup: {n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p>\
                              <p class=\"small\"><span class=\"pill good\">Password</span> {}</p><ol class=\"steps\">",
                             if self.platform.is_some() { "Not needed: you opened the app from your box's dashboard, which already asked who you are." }
                             else { "Set. You are logged out after 15 minutes without use." });
@@ -2916,7 +2917,7 @@ mod handson_0202_tests {
         }
     }
 
-    /// Home's Get started counts a shop allowed as the signer allows it: also one allowed only
+    /// Home's First steps counts a shop allowed as the signer allows it: also one allowed only
     /// through its node's `ln:` line, its node known from its shop entry or on file.
     ///
     /// FAILS before: only a seller listed by its address with its node on file counted, so Home kept

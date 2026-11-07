@@ -751,8 +751,14 @@ fn enrol_and_replace_the_human_key_then_sweep_rotate_backup_and_anchor() {
     assert!(setup.contains("id=\"keygen\"") && setup.contains("./human-key-enroll"));
     assert!(br.get("/wallet").body.contains("No approval key yet"));
     let home = br.get("/").body;
-    assert!(home.contains("Get started") && home.contains("Make your approval key") && home.contains("aria-current=\"step\""),
+    assert!(home.contains("<h2>First steps</h2>") && home.contains("Make your approval key") && home.contains("aria-current=\"step\""),
             "home says what is left to do, the next step first: {home}");
+    // Home's First steps and Setup are two lists, each named, so their counts do not read as one (0.2.15 said
+    // "Get started 0 of 5 done" on Home and "0 of 4 done" on Setup); the password is still not counted
+    let list = &home[home.find("id=\"get-started\"").unwrap()..];
+    let steps = list[..list.find("</ol>").unwrap()].matches("<li class=\"").count();
+    assert!(home.contains(&format!("<h2>First steps</h2><p class=\"small\">0 of {steps} done</p>")) && !home.contains("Get started"), "{home}");
+    assert!(setup.contains("Setup: 0 of 4 done.") && setup.contains("<span class=\"pill good\">Password</span>"), "{setup}");
     let pubhex = hex::encode(human().verifying_key().to_bytes());
     let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex), ("code", "0000-0000-0000")]);
     assert!(br.flash_after(&r).contains("enrolment code"), "AGP-063 W4: the code from the signer's log, not trust on first use");
@@ -1003,6 +1009,8 @@ fn the_lightning_page_stores_only_the_rail_s_macaroon_and_never_shows_it() {
     let mut br = logged_in(&b);
     let page = br.get("/lightning").body;
     assert!(page.contains("https://10.21.21.66:8180") && page.contains("info:read offchain:read offchain:write onchain:read"), "{page}");
+    // before a key: a plain line in the technical details, not the signer's missing-file error (0.2.15)
+    assert!(page.contains("<p>No key connected yet.</p>") && !page.contains("config_error") && !page.contains("No such file"), "{page}");
     // an admin-like macaroon is refused, and nothing is written
     let admin = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read", "write"]), ("macaroon", &["generate"])]);
     let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &admin)]);
@@ -1022,6 +1030,7 @@ fn the_lightning_page_stores_only_the_rail_s_macaroon_and_never_shows_it() {
     assert_eq!(std::fs::metadata(dir.join("rail.macaroon")).unwrap().permissions().mode() & 0o777, 0o640);
     let page = br.get("/lightning").body;
     assert!(page.contains("stored") && !page.contains(&good));
+    assert!(!page.contains("No key connected yet."), "a key is stored: {page}");
     // regtest: no acknowledgement asked, none written
     assert!(!dir.join("mainnet-ack").exists() && !page.contains("name=\"mainnet_ack\""));
     let r = br.act("/lightning", "/lightning", &[("action", "remove")]);

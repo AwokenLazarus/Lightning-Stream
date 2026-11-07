@@ -180,6 +180,18 @@ pub(crate) fn plain_reason(r: &str) -> String {
     }
 }
 
+/// The signer's `ln_status` as Your node's Technical details shows it: before a key is stored (`have`
+/// false), without its `config_error`, which then only says the key file is missing. Once a key is
+/// stored, the whole answer, its errors with it.
+pub(crate) fn technical_status(mut status: Value, have: bool) -> Value {
+    if !have {
+        if let Some(m) = status.as_object_mut() {
+            m.remove("config_error");
+        }
+    }
+    status
+}
+
 /// How long reading the node's certificate for pinning may take.
 const PIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -429,9 +441,11 @@ impl App {
             }),
             ("Chain", esc(&chain)),
         ]));
-        // the signer's whole answer (150 lines on a real node): collapsed on its own, for whoever helps debug
-        b.push_str(&format!("<details class=\"technical\"><summary>Technical details</summary><p class=\"small\">What the wallet sees of the node:</p>{}</details>",
-                            json_block(&status)));
+        // the signer's whole answer (150 lines on a real node): collapsed on its own, for whoever helps debug.
+        // Before a key is stored, its `config_error` only says the key file is missing (0.2.15 showed
+        // "macaroon /data/run/ln/rail.macaroon: No such file or directory" there): a plain line instead
+        b.push_str(&format!("<details class=\"technical\"><summary>Technical details</summary>{}<p class=\"small\">What the wallet sees of the node:</p>{}</details>",
+                            if have { "" } else { "<p>No key connected yet.</p>" }, json_block(&technical_status(status.clone(), have))));
         if have {
             b.push_str(&format!("<form method=\"post\" action=\"./lightning\">{}<input type=\"hidden\" name=\"action\" value=\"remove\">\
                 <h3>Disconnect</h3><p>Removes the key from this box; the app then pays nothing. Revoke it in your node's app too if it may have \
@@ -811,6 +825,15 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_technical_details_hide_the_missing_key_error_only_before_a_key() {
+        let status = json!({"ready": false, "configured": false, "config_error": "macaroon /data/run/ln/rail.macaroon: No such file or directory (os error 2)"});
+        let before = technical_status(status.clone(), false);
+        assert!(before.get("config_error").is_none() && before["ready"] == false, "{before}");
+        // once a key is stored, its errors are real and shown whole
+        assert_eq!(technical_status(status.clone(), true), status);
+    }
 
     #[test]
     fn macaroons_in_hex_or_base64() {
