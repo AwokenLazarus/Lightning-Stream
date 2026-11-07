@@ -3209,6 +3209,10 @@ def pay_buy(n: int) -> int:
     return pay_charged()
 
 
+# set by mesh_lend: mesh_pay, which counts every payment to its nodes, then needs a lab of its own
+MESH_LEND_RAN: list[bool] = []
+
+
 def mesh_pay() -> None:
     """The machines of a split paid by the work each does, from what the seller's gateway earned (run by name only).
     A gateway sells one model by the token on the seller's node. `stream-compute-check payout` splits what it earns by
@@ -3219,6 +3223,8 @@ def mesh_pay() -> None:
     last two stages the lenders' and any before them the operator's own."""
     if MESH_URL and not (MESH_CONSOLE and MESH_GGUF):
         raise LabError("a real split needs MESH_LLM_CONSOLE and MESH_LLM_GGUF beside MESH_LLM_URL")
+    if MESH_LEND_RAN:
+        raise LabError("mesh_pay needs a lab of its own: mesh_lend has paid the same nodes in this run, and its books would count those payments. Run it apart")
     stop_sessions()
     pay_lab_up()
     (lno_a, b64_a, hex_a), (lno_b, b64_b, hex_b) = mint_offer(HOP), mint_offer(OFFER_NODE)
@@ -3609,6 +3615,7 @@ def mesh_lend() -> None:
     must catch an operator who stops paying, takes a bigger cut than it offered, serves tokens around its gateway, or books the lender's
     stage as its own, from what the lender can see alone, and must stop serving with at most its credit limit and one answer's work unpaid.
     One that makes the split draft, whose drafted tokens no count includes, the lender must leave at once."""
+    MESH_LEND_RAN.append(True)
     stop_sessions()
     pay_lab_up()
     upstream = f"http://127.0.0.1:{STAND_IN_PORT}"
