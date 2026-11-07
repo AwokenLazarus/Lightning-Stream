@@ -390,6 +390,40 @@ pub fn per_ths_day(price_sat: f64, slice_work: f64) -> f64 {
     per_hour(price_sat, slice_work, 1e12) * 24.0
 }
 
+/// An offer's machines in words: "7 of 7 machines free, 12.04 TH/s (about 1.72 TH/s each)".
+fn machines_words(free: u64, total: u64, free_hs: f64) -> String {
+    if total == 0 {
+        return "free machines not given".into();
+    }
+    let each = if free > 1 && free_hs > 0.0 { format!(" (about {} each)", speed(free_hs / free as f64)) } else { String::new() };
+    format!("{free} of {total} machines free, {}{each}", speed(free_hs))
+}
+
+/// What all of an offer's free machines cost: an hour, 12 hours and 24 hours. Empty when no speed is given.
+fn whole_offer_words(price_sat: f64, slice_work: f64, free: u64, free_hs: f64) -> String {
+    let hour = per_hour(price_sat, slice_work, free_hs);
+    if free == 0 || hour <= 0.0 {
+        return String::new();
+    }
+    let all = if free == 1 { "The free machine".to_string() } else { format!("All {free} free machines") };
+    format!("<p class=\"small\">{all}: about <strong>{}</strong> an hour, {} for 12 hours, {} for 24 hours.</p>",
+            sats_n(hour), sats_n(hour * 12.0), sats_n(hour * 24.0))
+}
+
+/// What the Rent form's machines and minutes come to, with the start fee (once a rental). The page's script says
+/// it again as they are typed (ui.js, `.rent-est`); machines past the free ones are not counted.
+fn rent_estimate(hour_per_machine_sat: f64, fee_sat: f64, machines: u64, minutes: u64, free: u64) -> String {
+    if hour_per_machine_sat <= 0.0 {
+        return String::new();
+    }
+    let n = machines.max(1).min(free.max(1));
+    let cost = hour_per_machine_sat * n as f64 * minutes.max(1) as f64 / 60.0 + fee_sat;
+    let fee = if fee_sat > 0.0 { ", with the start fee" } else { "" };
+    let over = if machines > free && free > 0 { format!(" Only {free} free: counted as {free}.") } else { String::new() };
+    format!("{n} machine{} for {} minute{}: about <strong>{}</strong>{fee}.{over}",
+            if n == 1 { "" } else { "s" }, minutes.max(1), if minutes.max(1) == 1 { "" } else { "s" }, sats_n(cost))
+}
+
 /// What a piece of work of `slice_work` hashes at `price_sat` costs an hour at `hs`.
 pub fn per_hour(price_sat: f64, slice_work: f64, hs: f64) -> f64 {
     if slice_work <= 0.0 {
@@ -1139,6 +1173,9 @@ impl App {
                     let budget = whole_tickets((per_hour(price, slice, per_miner) + fee).ceil().max(price + fee) as u64, ticket_sat);
                     let buys = budget_buys(budget, price, ticket_sat);
                     let fee_words = start_fee_words(price, start, slice, per_miner);
+                    // what all the free machines cost for an hour, 12 and 24, and what the Rent form's figures come to
+                    let whole = whole_offer_words(price, slice, free, free_hs);
+                    let est = rent_estimate(per_hour(price, slice, per_miner), fee, 1, 60, free);
                     // a hashmaker whose app doesn't prove its work is refused when renting: said, and Rent waits
                     let old = x["proves"] == false;
                     // the spending rules list who the app may pay: a hashmaker not on them is allowed first, with the
@@ -1217,24 +1254,25 @@ impl App {
                         let market = tip.or_else(|| self.mining_tip().ok()).map(|t| per_hour(worth_sat(1 << 32, &t), 4_294_967_296.0, 1e12));
                         let high = priced_high(th_hour(x), &others, market);
                         b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
-                            <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{high}</section>",
+                            <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{whole}{fee_words}{high}</section>",
                             esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
-                            if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() }));
+                            machines_words(free, total, free_hs)));
                         continue;
                     }
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>{whose}\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{fee_words}{odds}{old}{unreachable}{history}{allow}{trial}\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{whole}{fee_words}{odds}{old}{unreachable}{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">{}\
                         <input type=\"hidden\" name=\"piece_sat\" value=\"{price}\">{seen}\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
+                        <p class=\"hint rent-est\" data-hour-sat=\"{:.3}\" data-fee-sat=\"{:.3}\" data-free=\"{free}\">{est}</p>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <p class=\"hint\">About an hour of one machine{}, in whole tickets. The rental ends when this much is spent, but however small it is, your wallet {}; \
                         unused credit stays with this seller for about 20 hours, for a later rental there.</p><p class=\"hint\">{}</p>\
                         <span class=\"btn-why\"{off_tip}><button{}>Rent</button></span>{off_note}</form></section>",
                         esc(&title), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
-                        if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
-                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"), esc(&buys),
+                        machines_words(free, total, free_hs),
+                        esc(x["linkKey"].as_str().unwrap_or("")), once_input(), per_hour(price, slice, per_miner), fee, if start > 0 { ", with its start fee" } else { "" }, ticket("mayBuyTicketUpToSats"), esc(&buys),
                         if can { "" } else { " disabled" }));
                 }
                 b.push_str("</div>");
@@ -2551,6 +2589,24 @@ mod tests {
         let new = json!({"miners": [{"connected": true, "hashrateHs": 0.0}], "rentals": [], "paused": "no miner measured yet"});
         assert_eq!(seen(&new), Seen { hs: None, measuring: true, rentals: 0 });
         assert_eq!(seen(&Value::Null), Seen::default());
+    }
+
+    #[test]
+    fn an_offer_says_each_machine_and_the_whole_cost() {
+        // 7 free machines, 12.04 TH/s: each one's speed is said
+        assert_eq!(machines_words(7, 7, 12.04e12), "7 of 7 machines free, 12.04 TH/s (about 1.72 TH/s each)");
+        assert_eq!(machines_words(1, 1, 4.1e12), "1 of 1 machines free, 4.10 TH/s");
+        assert_eq!(machines_words(0, 0, 0.0), "free machines not given");
+        // 404 sats a piece of 2^45 hashes at 1 TH/s is about 41,337 sats an hour: 2 TH/s of free machines double it
+        let w = whole_offer_words(404.0, 35_184_372_088_832.0, 2, 2e12);
+        assert!(w.contains("All 2 free machines: about <strong>82,673 sats</strong> an hour, 992,077 sats for 12 hours, 1,984,154 sats for 24 hours."), "{w}");
+        assert!(whole_offer_words(404.0, 35_184_372_088_832.0, 1, 1e12).contains("The free machine: about"));
+        assert_eq!(whole_offer_words(404.0, 35_184_372_088_832.0, 0, 0.0), "");
+        // the Rent form's figures: 3 machines for 30 minutes at 1,000 sats an hour each, with a 50 sat start fee
+        assert_eq!(rent_estimate(1000.0, 50.0, 3, 30, 7), "3 machines for 30 minutes: about <strong>1,550 sats</strong>, with the start fee.");
+        // more machines than are free: counted as the free ones, and said
+        assert_eq!(rent_estimate(1000.0, 0.0, 9, 60, 7), "7 machines for 60 minutes: about <strong>7,000 sats</strong>. Only 7 free: counted as 7.");
+        assert_eq!(rent_estimate(0.0, 0.0, 1, 60, 1), "");
     }
 
     #[test]
