@@ -1,6 +1,6 @@
 import { T } from '@start9labs/start-sdk'
 import { sdk } from './sdk'
-import { grantFromAnswer, GrantAnswer, LF_GRANT, LIGHTNING } from './spec'
+import { GRANT_ABSENT_LINE, GRANT_PROBE_LINE, grantFromAnswer, GrantAnswer, LF_GRANT, LIGHTNING } from './spec'
 
 /**
  * Whether the installed Lightning Fork has the grant action (spec.ts LF_GRANT), asked of the OS at run time:
@@ -12,14 +12,24 @@ import { grantFromAnswer, GrantAnswer, LF_GRANT, LIGHTNING } from './spec'
  * needs, which is why this asks for it rather than for its `apps` folder: that folder can only be seen by
  * mounting it, and a mount that fails is what stopped node-keys at every start (0.2.14 on a mainline
  * Lightning Fork). The mount is tried too, the same way in init and main ([`appsMountable`]).
+ *
+ * StartOS has no quiet way to ask: no effect lists another package's actions (its manifest has none), and
+ * the container runtime logs every failed host call as "Error in host RPC" with a stack trace before this
+ * code sees it. On a Lightning Fork without the action, that is a "Not Found" at each init and start, which
+ * reads as a fault in the Logs tab. So this says first, in a line of its own, what a "Not Found" here means,
+ * and after one, what the package does without the action.
  */
 export async function lightningForkGrant(effects: T.Effects): Promise<GrantAnswer> {
+  console.info(GRANT_PROBE_LINE)
+  let answer: GrantAnswer
   try {
     await effects.action.getInput({ packageId: LIGHTNING.packageId, actionId: LF_GRANT.actionId })
-    return grantFromAnswer(null)
+    answer = grantFromAnswer(null)
   } catch (e) {
-    return grantFromAnswer(e)
+    answer = grantFromAnswer(e)
   }
+  if (answer === 'absent') console.info(GRANT_ABSENT_LINE)
+  return answer
 }
 
 /** Lightning Fork's `apps` folder (its granted keys), read-only, where node-keys mounts it (spec.ts). */

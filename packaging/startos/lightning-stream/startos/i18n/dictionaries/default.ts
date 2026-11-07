@@ -79,6 +79,7 @@ const dict = {
   'Masking the jobs of rented hashrate': 81,
   'Waiting for a block template from the XBT node: check the Node connection action': 82,
   'With Knots BLAKE2b on this server: first run its "Generate RPC User Credentials" action (in Knots BLAKE2b, Actions), and enter the user and password it shows here. Its host is knots-blake2b.startos and its RPC port 18443.': 83,
+  'This is the node connection saved now, as you entered it. Leave it as it is, or change it: with Knots BLAKE2b on this server, a new user and password come from its "Generate RPC User Credentials" action (in Knots BLAKE2b, Actions).': 84,
 } as const
 
 /**

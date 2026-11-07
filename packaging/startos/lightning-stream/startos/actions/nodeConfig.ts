@@ -1,6 +1,6 @@
 import { i18n } from '../i18n'
 import { sdk } from '../sdk'
-import { storeJson } from '../fileModels/store.json'
+import { nodeConfigured, storeJson } from '../fileModels/store.json'
 
 const { InputSpec, Value } = sdk
 
@@ -56,17 +56,32 @@ const inputSpec = InputSpec.of({
   }),
 })
 
+/**
+ * The form's banner. No node saved yet: the form is empty but for Knots BLAKE2b's host and port, and the banner
+ * says where the user and password come from. A node saved: the form shows the saved connection (an install
+ * updated from 0.2.14 showed its user and password filled in under a banner that asked for new ones), and
+ * the banner says so, and how to change them.
+ */
+export const NODE_BANNER = {
+  unset:
+    'With Knots BLAKE2b on this server: first run its "Generate RPC User Credentials" action (in Knots BLAKE2b, Actions), and enter the user and password it shows here. Its host is knots-blake2b.startos and its RPC port 18443.',
+  saved:
+    'This is the node connection saved now, as you entered it. Leave it as it is, or change it: with Knots BLAKE2b on this server, a new user and password come from its "Generate RPC User Credentials" action (in Knots BLAKE2b, Actions).',
+} as const
+
 export const nodeConfig = sdk.Action.withInput(
   'node-config',
-  {
-    name: i18n('Node connection'),
-    description: i18n('The XBT node the signer and the Stream Gateway use: host, RPC port, credentials and chain'),
-    warning: i18n(
-      'With Knots BLAKE2b on this server: first run its "Generate RPC User Credentials" action (in Knots BLAKE2b, Actions), and enter the user and password it shows here. Its host is knots-blake2b.startos and its RPC port 18443.',
-    ),
-    allowedStatuses: 'any',
-    group: null,
-    visibility: 'enabled',
+  async ({ effects }) => {
+    // watched: the banner follows the store, so it changes once a node is saved
+    const n = await storeJson.read((s) => s.node).const(effects)
+    return {
+      name: i18n('Node connection'),
+      description: i18n('The XBT node the signer and the Stream Gateway use: host, RPC port, credentials and chain'),
+      warning: i18n(nodeConfigured(n) ? NODE_BANNER.saved : NODE_BANNER.unset),
+      allowedStatuses: 'any',
+      group: null,
+      visibility: 'enabled',
+    }
   },
   inputSpec,
   async ({ effects }) => {

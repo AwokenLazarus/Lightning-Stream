@@ -4,7 +4,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { grantFromAnswer, LF_CONNECT_ADDRESS, LF_GRANT, LIGHTNING, SETUP_CODE_HINT, services } from '../startos/spec.ts'
+import {
+  GRANT_ABSENT_LINE,
+  GRANT_PROBE_LINE,
+  grantFromAnswer,
+  LF_CONNECT_ADDRESS,
+  LF_GRANT,
+  LIGHTNING,
+  SETUP_CODE_HINT,
+  services,
+} from '../startos/spec.ts'
 
 const cfg = (over) => ({
   node: { host: 'knots-blake2b.startos', port: 18443, user: 'u', password: 'p', chain: 'main' },
@@ -74,6 +83,20 @@ test('init makes or clears the task only on a sure answer, and never asks for a 
   const main = readFileSync(new URL('../startos/main.ts', import.meta.url), 'utf8')
   assert.match(main, /lightningForkGrant\(effects\)\) === 'present'/, "main's grant mode needs a sure answer")
   assert.match(main, /getServiceManifest\(effects, LIGHTNING\.packageId/, 'main re-decides when Lightning Fork changes version')
+})
+
+test("the look for the grant action explains StartOS's Not Found trace in the log, before it and after it", () => {
+  const src = readFileSync(new URL('../startos/grant.ts', import.meta.url), 'utf8')
+  const body = src.slice(src.indexOf('export async function lightningForkGrant'), src.indexOf('export const appsMounts'))
+  const before = body.indexOf('console.info(GRANT_PROBE_LINE)')
+  const ask = body.indexOf('effects.action.getInput(')
+  const after = body.indexOf("if (answer === 'absent') console.info(GRANT_ABSENT_LINE)")
+  assert.ok(before > 0 && before < ask && ask < after, 'the line before the host call, the answer after it')
+  assert.match(GRANT_PROBE_LINE, /Grant app access.*"Not Found".*grant-app-access.*expected/)
+  assert.equal(GRANT_ABSENT_LINE, 'Lightning Fork has no Grant app access action; Lightning Stream connects by its address instead')
+  // still one answer of the three (and no-node), read from the host call's words: the logging changes none
+  assert.match(body, /answer = grantFromAnswer\(null\)/)
+  assert.match(body, /answer = grantFromAnswer\(e\)/)
 })
 
 test('the dependency range does not stand for the grant (mainline Lightning Fork lacks it)', () => {

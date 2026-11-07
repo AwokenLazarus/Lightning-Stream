@@ -116,7 +116,7 @@ fn a_page_asks_the_signer_each_read_once_and_says_what_it_waited_for() {
     let bx = start(Duration::ZERO);
     let mut br = B::login(&bx);
     let mut over = vec![];
-    // Home reads the rules for its Get started list, and Wallet the node for its Lightning card (0.2.3): one read each
+    // Home reads the rules for its First steps list, and Wallet the node for its Lightning card (0.2.3): one read each
     for (path, most) in [("/", 4), ("/wallet", 6), ("/policy", 5), ("/lightning", 3), ("/setup", 5), ("/connections", 2), ("/browse", 1)] {
         let p = br.get(path);
         assert_eq!(p.status, 200, "{path}");

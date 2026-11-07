@@ -128,6 +128,16 @@ export function grantFromAnswer(error: unknown | null): GrantAnswer {
   return 'unknown'
 }
 
+/**
+ * What the package logs around its look for the grant action (grant.ts): StartOS logs the "Not Found" of a
+ * Lightning Fork without it as "Error in host RPC" with a stack trace, so the line before says what that
+ * error means, and the line after says what the package does instead.
+ */
+export const GRANT_PROBE_LINE =
+  'Looking for Lightning Fork\'s Grant app access action: if it has none, StartOS logs a "Not Found" error for grant-app-access next, which is expected'
+export const GRANT_ABSENT_LINE =
+  'Lightning Fork has no Grant app access action; Lightning Stream connects by its address instead'
+
 /** Where the Your node page sends the owner for Lightning Fork's connection address, when it has no grant action. */
 export const LF_CONNECT_ADDRESS =
   'In StartOS, open Lightning Fork, choose Interfaces, then REST LND Connect, and copy any one of its addresses (the app takes only the key in it, and reaches the node its own way)'
