@@ -50,6 +50,23 @@ pub const DISK_MARGIN_BYTES: u64 = 1 << 30;
 /// time it is planned in anew.
 pub const REJOIN_WAIT_S: u64 = 120;
 
+/// The lender's Mesh-LLM settings. The build is pinned, so no asking after new versions, whose
+/// `mesh-llm update` would replace it. And no speculative decoding: tokens a verify window commits
+/// take no decode step, so the stage's count would fall short of its work. `--no-draft` does not
+/// turn it off, as nothing reads it (Mesh-LLM issue 2903).
+const MESH_CONFIG: &str = "[updates]\ncheck = false\n\n[defaults.speculative]\nspec_default = false\n";
+/// What earlier versions wrote, replaced by the above. Any other file is the lender's, and kept.
+const MESH_CONFIG_BEFORE: &str = "[updates]\ncheck = false\n";
+
+/// The settings file to write over what the lender's Mesh-LLM home holds, if anything.
+pub fn mesh_config(existing: Option<&str>) -> Option<&'static str> {
+    match existing {
+        None => Some(MESH_CONFIG),
+        Some(text) if text == MESH_CONFIG_BEFORE => Some(MESH_CONFIG),
+        Some(_) => None,
+    }
+}
+
 fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -450,6 +467,15 @@ mod tests {
 
     fn terms() -> Terms {
         Terms { per_1k_input_msat: 2_000, per_1k_output_msat: 1_000_000, operator_cut_ppm: 100_000, min_payout_sats: 20 }
+    }
+
+    #[test]
+    fn the_mesh_config_turns_speculation_off_and_keeps_a_lenders_own_file() {
+        let written = mesh_config(None).unwrap();
+        assert!(written.contains("[updates]\ncheck = false") && written.contains("[defaults.speculative]\nspec_default = false"));
+        assert_eq!(mesh_config(Some("[updates]\ncheck = false\n")), Some(written), "an earlier version's file is brought up to date");
+        assert_eq!(mesh_config(Some(written)), None, "nothing to change");
+        assert_eq!(mesh_config(Some("[updates]\ncheck = true\n")), None, "a file the lender changed is theirs");
     }
 
     fn invite() -> Invite {

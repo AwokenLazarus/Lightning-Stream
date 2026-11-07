@@ -127,6 +127,7 @@ you may want to run this as a user of its own.
 
 **The build sends no usage reports:** it has no analytics key in it. `mesh-llm analytics status` says so.
 `lend` also has it not ask after new versions: `mesh-llm update` would replace this build with another.
+And it turns speculative decoding off in that Mesh-LLM's settings: see below for why.
 
 ### How you know you are being paid
 
@@ -135,6 +136,12 @@ node's count of them is a figure the operator cannot change. From your own machi
 `lend` works out what you are due at least: your count, at the invite's rate, less the operator's cut, by
 your share of the work from your own stage and the model's header, less a slack of 10% (`--slack-ppm`)
 for tokens nobody paid for. It compares that with the settled invoices of your offer on your own node.
+
+One exception: tokens committed by speculative decoding (a draft model, or a model's own draft heads)
+take no decode step on any stage, so no count includes them, and a split that drafts pays you below your
+work without this check seeing it. Your own Mesh-LLM is set not to draft. Whether the operator's node can
+still make the split draft has not been checked yet, so for now lend only to splits of models that have no
+draft heads and no draft model.
 
 When what you are due passes what you have received by more than your credit limit (`--credit-sats`,
 three payout floors by default), it stops serving, says why, and serves again by itself once you are
