@@ -68,7 +68,7 @@ services:
 
   witness:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-91408a331ec0@sha256:212c2f2419563df5dfb38555644bc19fe217f79ae17ea5f7dfc76761973cc6c5
+    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-7ecf6a4794e7@sha256:ac97fd4839c621a8a679c4662f32fcc69d954451cdc1f4096fc0f1d8a1bb0ef5
     network_mode: none
     stop_grace_period: 30s
     volumes:
@@ -77,7 +77,7 @@ services:
 
   signer:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-91408a331ec0@sha256:13cc95faa37dbb3eae1b3a49dd8ba723048192308136a7e0602cb219cb1780aa
+    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-7ecf6a4794e7@sha256:7e40ca32679983e7a8b02adb0fd0848f61956db739f1d0f7a1b6386a14e65fbc
     entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
     stop_grace_period: 1m
     environment:
@@ -118,7 +118,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-91408a331ec0@sha256:703b5e887daebe8e092b1ffed7e39559c6f7e3e1425cfc1b82b8ee4b7b61cda0
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-7ecf6a4794e7@sha256:ee260eefee0c832f381c6082eab7dde331af06d0cc0d4f9e163e71be9af91e09
     stop_grace_period: 15s
     environment:
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password

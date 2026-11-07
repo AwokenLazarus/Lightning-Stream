@@ -231,13 +231,13 @@ export const RELAYS = ['wss://relay.lazarus-xbt.xyz', 'wss://relay.kilombino.com
  */
 export const IMAGES: Record<ImageKey, string> = {
   init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-8c844bcb5c6f@sha256:90d12565dc29a4ae3dd1ff5d46615d1687ccf2728b536431846f73e4a4f2d1b4',
-  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-91408a331ec0@sha256:13cc95faa37dbb3eae1b3a49dd8ba723048192308136a7e0602cb219cb1780aa',
-  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-91408a331ec0@sha256:212c2f2419563df5dfb38555644bc19fe217f79ae17ea5f7dfc76761973cc6c5',
+  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-7ecf6a4794e7@sha256:7e40ca32679983e7a8b02adb0fd0848f61956db739f1d0f7a1b6386a14e65fbc',
+  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-7ecf6a4794e7@sha256:ac97fd4839c621a8a679c4662f32fcc69d954451cdc1f4096fc0f1d8a1bb0ef5',
   mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-91408a331ec0@sha256:1d7f4d388a6db87e23d23b96818821c70951c77eabc582364bc099e01b10bbe5',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-91408a331ec0@sha256:703b5e887daebe8e092b1ffed7e39559c6f7e3e1425cfc1b82b8ee4b7b61cda0',
-  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-91408a331ec0@sha256:e587cc785b7f16160adfb269ca62532bf963213706fe83f400980f385972f72a',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-7ecf6a4794e7@sha256:ee260eefee0c832f381c6082eab7dde331af06d0cc0d4f9e163e71be9af91e09',
+  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-7ecf6a4794e7@sha256:6edc3992da75ecbbcc313ed3a770ba1d8b3fe96606eb33523d920f79d108f835',
   connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-91408a331ec0@sha256:041f6a7580fbb3d5fe013735e2bfcb60eecaa3a393e7be79feae5d7cfe56aaed',
-  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-91408a331ec0@sha256:a17357ebcec72687174038fc6607b79238a9f5c2341d05c3b9134869ffd6489e',
+  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-7ecf6a4794e7@sha256:222f6eefcff6f70ded914c384c4fa284f1ecfa20e2ca5360b7871092de63e598',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
   vpn: 'ghcr.io/awokenlazarus/xbt-vpn:0.1.0-91408a331ec0@sha256:f98ce06f30c5919f5218c7ae6f247fad37103f03d05633bb9696b2dd45fb1481',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
