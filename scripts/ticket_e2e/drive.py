@@ -3419,7 +3419,7 @@ run = secrets.token_hex(4)
 def read(name, default):
     try:
         return open(os.environ[name]).read().strip()
-    except OSError:
+    except (OSError, KeyError):
         return default
 start = int(read("STAND_IN_TOKENS", "0"))
 with open(os.environ["STAND_IN_RUNS"], "a") as f:
@@ -3436,7 +3436,7 @@ class H(BaseHTTPRequestHandler):
             if layers:
                 a, b = layers.split()
                 st = [{"node_id": node, "state": "ready", "run_id": run, "stage_id": "stage-1", "layer_start": int(a), "layer_end": int(b),
-                       "compute_decode_tokens": int(read("STAND_IN_TOKENS", "0")) - start}]
+                       "compute_decode_tokens": int(read("STAND_IN_TOKENS", "0")) - start, "compute_verify_tokens": int(read("STAND_IN_DRAFTED", "0"))}]
             v = {"stages": [], "statuses": st, "topologies": []}
         body = json.dumps(v).encode()
         self.send_response(200)
@@ -3493,11 +3493,13 @@ class Deal:
         self.config, self.ledger, self.report = f"{RUN}/deal-{tag}.json", f"{RUN}/deal-{tag}-ledger.json", f"{RUN}/deal-{tag}-report.json"
         self.invite, self.dir, self.node = f"{RUN}/deal-{tag}-invite.json", f"{RUN}/lender-{tag}", ""
         self.tokens, self.layers, self.runs = f"{RUN}/deal-{tag}-tokens", f"{RUN}/deal-{tag}-layers", f"{RUN}/deal-{tag}-runs"
+        self.drafted = f"{RUN}/deal-{tag}-drafted"
         self.hex = ""
         self.write_config({"gateway_url": PAY_ORIGIN, "mesh_console_url": f"http://127.0.0.1:{STAND_IN_PORT}", "gguf": f"{Files.root}/model.gguf", "signer_sock": PAY_SOCK, "ledger": self.ledger,
                            "report": self.report, "operator_cut_ppm": PAY_CUT_PPM, "own_nodes": [OWN_NODE], "lenders": {}, "min_payout_sats": LEND_FLOOR_SATS, "interval_s": 1, "retry_s": 1})
-        with open(self.tokens, "w") as f:
-            f.write("0")
+        for counter in (self.tokens, self.drafted):
+            with open(counter, "w") as f:
+                f.write("0")
         tool("invite", "--config", self.config, "--name", f"Lab operator {tag}", "--out", self.invite, "--build-file", f"{Files.root}/build.tar.gz",
              "--build-url", f"http://127.0.0.1:{FILES_PORT}/build.tar.gz", "--model-file", f"{Files.root}/model.gguf", "--model-url", f"http://127.0.0.1:{FILES_PORT}/model.gguf", "--max-vram", "4")
 
@@ -3516,7 +3518,7 @@ class Deal:
                 "--node-cert", f"{RUN}/{OFFER_NODE}.tls.cert", "--allow-build", sha, "--interval-s", "1", "--credit-sats", str(LEND_CREDIT_SATS), "--port-base", str(LEND_PORT), "--name", f"lender {self.tag}", "--rejoin-wait-s", "0"]
 
     def env(self) -> dict[str, str]:
-        return dict(os.environ, STAND_IN_TOKENS=self.tokens, STAND_IN_LAYERS=self.layers, STAND_IN_RUNS=self.runs)
+        return dict(os.environ, STAND_IN_TOKENS=self.tokens, STAND_IN_LAYERS=self.layers, STAND_IN_RUNS=self.runs, STAND_IN_DRAFTED=self.drafted)
 
     def start(self) -> None:
         with open(self.log, "ab") as log:
@@ -3605,7 +3607,8 @@ def mesh_lend() -> None:
     build and model, makes an offer on the lender's node (lf4), and serves; the operator takes its card with `lender-add` and pays it
     with `payout`. The build is a stand-in for Mesh-LLM, so that each cheat can be played exactly: the money is real nodes'. The lender
     must catch an operator who stops paying, takes a bigger cut than it offered, serves tokens around its gateway, or books the lender's
-    stage as its own, from what the lender can see alone, and must stop serving with at most its credit limit and one answer's work unpaid."""
+    stage as its own, from what the lender can see alone, and must stop serving with at most its credit limit and one answer's work unpaid.
+    One that makes the split draft, whose drafted tokens no count includes, the lender must leave at once."""
     stop_sessions()
     pay_lab_up()
     upstream = f"http://127.0.0.1:{STAND_IN_PORT}"
@@ -3811,6 +3814,24 @@ def mesh_lend() -> None:
     led = d.ledger_now()
     check("mesh_lend: an operator who books the lender's stage as its own: its ledger owes the lender nothing, and the lender stops serving", ok and stopped_within_limit(r) and not led["paid_msat"].get(d.node),
           {"steps": steps, "stopped": r.get("stopped"), "ledger_paid": led["paid_msat"]})
+    d.stop()
+
+    # (e) the operator makes the split draft: tokens a verify window commits take no decode step on any stage
+    d = deal_up("drafted")
+    d.answers(1)
+    d.payout()
+    with open(d.drafted, "w") as f:
+        f.write("48")
+    t0 = time.time()
+    while d.proc and d.proc.poll() is None and time.time() - t0 < 30:
+        time.sleep(0.5)
+    rc = d.proc.poll() if d.proc else None
+    with open(d.log) as f:
+        said = f.read()
+    r = d.lender_report()
+    check("mesh_lend: an operator who makes the split draft: the lender leaves at once, ends, and says why, as no count includes drafted tokens",
+          rc not in (None, 0) and "the split drafted" in said and r.get("drafted") == 48 and r.get("serving") is False,
+          {"rc": rc, "drafted": r.get("drafted"), "serving": r.get("serving"), "said": said.strip().splitlines()[-1][:220] if said.strip() else ""})
     d.stop()
     stop_sessions()
 

@@ -122,7 +122,7 @@ It shows the terms, the downloads and what it will run, and asks first. Then it:
 
 **An invite is the operator's word, and it cannot choose what runs on your machine.** The build must be
 one this tool pins, whatever hash the invite names; a build you trust by hand takes `--allow-build SHA256`.
-It pins one, `stream-0.78.0-1`: see "Running the split".
+It pins one, `stream-0.78.0-2`: see "Running the split".
 The invite picks no flags of the command line. The model is data, read by llama.cpp under your user, so
 you may want to run this as a user of its own.
 
@@ -140,9 +140,10 @@ for tokens nobody paid for. It compares that with the settled invoices of your o
 
 One exception: tokens committed by speculative decoding (a draft model, or a model's own draft heads)
 take no decode step on any stage, so no count includes them, and a split that drafts pays you below your
-work without this check seeing it. Your own Mesh-LLM is set not to draft. Whether the operator's node can
-still make the split draft has not been checked yet, so for now lend only to splits of models that have no
-draft heads and no draft model.
+work. Your own Mesh-LLM is set not to draft, but the operator's settings alone can make the split draft:
+n-gram drafting needs no draft model and works with any model. So `lend` watches for it. Your stage reports
+the token positions it runs in speculative verify windows, and if any appear, `lend` leaves the split and
+ends, saying why. Start it again once the operator has turned speculative decoding off.
 
 When what you are due passes what you have received by more than your credit limit (`--credit-sats`,
 three payout floors by default), it stops serving, says why, and serves again by itself once you are
@@ -173,10 +174,10 @@ stream-compute-check invite --config payout.json --name "Your name" --out invite
 stream-compute-check lender-add --config payout.json --card lendcard1... --lock lock.json
 ```
 
-The build this tool pins is `stream-0.78.0-1` (CPU, Linux x86_64), published with its source commit and
-checksum at https://github.com/AwokenLazarus/mesh-llm/releases/tag/stream-0.78.0-1. Run it yourself, and
+The build this tool pins is `stream-0.78.0-2` (CPU, Linux x86_64), published with its source commit and
+checksum at https://github.com/AwokenLazarus/mesh-llm/releases/tag/stream-0.78.0-2. Run it yourself, and
 name its asset in the invite: `--build-file` the archive you downloaded, `--build-url` its download link. It is
-Mesh-LLM's `main` plus two fixes not yet merged upstream; its release notes say which.
+Mesh-LLM's `main` plus three changes not yet merged upstream; its release notes say which.
 
 The invite holds your mesh's join token, so give it only to those you invite. It takes its terms from your
 payout config and your gateway's prices, and it is what lenders hold you to. Run your own Mesh-LLM node with

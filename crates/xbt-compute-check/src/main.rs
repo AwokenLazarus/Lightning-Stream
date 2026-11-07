@@ -360,6 +360,8 @@ fn lend(flags: &Flags) -> Result<(), String> {
     mesh.take_up();
     let watch_path = dir.join("watch.json");
     let mut watch = load_watch(&watch_path)?;
+    // drafting seen before this start was answered by the lender starting again
+    let drafted_before = watch.drafted;
     let credit = credit_sats.saturating_mul(1000);
     let name = flags.value("--name").unwrap_or_else(|| "a lender".to_string());
     let mut me: Option<String> = None;
@@ -396,6 +398,7 @@ fn lend(flags: &Flags) -> Result<(), String> {
         let received = node.offer_invoices(&offer.id).map(|l| l.iter().filter(|i| i.state == Some(InvoiceState::Settled)).map(|i| i.paid_msat).sum::<u64>());
         let due = watch.due_msat(&invite.terms, &work)?;
         let floor = floor_msat(due, slack_ppm);
+        let drafted = watch.drafted - drafted_before;
         let serving = watch.stopped.is_none();
         // a node that does not answer says nothing either way, and the owner is told
         let got = match received {
@@ -427,9 +430,17 @@ fn lend(flags: &Flags) -> Result<(), String> {
             let active = work.stage(a.parse().ok()?, b.parse().ok()?);
             Some((k.clone(), serde_json::json!({"active_params": active.to_string(), "total_params": work.total().to_string()})))
         }).collect();
-        let report = serde_json::json!({"node": me, "offer": offer.bolt12, "serving": watch.stopped.is_none(), "tokens": watch.tokens, "total_tokens": watch.total_tokens(), "shares": shares,
-                                        "due_msat": due, "due_at_least_msat": floor, "received_msat": got, "credit_msat": credit, "slack_ppm": slack_ppm, "stopped": watch.stopped, "pid": mesh.pid, "notes": notes});
+        let report = serde_json::json!({"node": me, "offer": offer.bolt12, "serving": watch.stopped.is_none() && drafted == 0, "tokens": watch.tokens, "total_tokens": watch.total_tokens(), "shares": shares,
+                                        "due_msat": due, "due_at_least_msat": floor, "received_msat": got, "credit_msat": credit, "slack_ppm": slack_ppm, "stopped": watch.stopped,
+                                        "drafted": watch.drafted, "pid": mesh.pid, "notes": notes});
         write_whole(&dir.join("report.json").to_string_lossy(), &serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)?;
+        // Tokens a verify window commits take no decode step, so no count includes them, and what this machine
+        // is owed for them cannot be told: leave, and say why, rather than serve on at a loss.
+        if drafted > 0 {
+            mesh.stop();
+            return Err(format!("the split drafted: {drafted} token positions on your stage ran in speculative verify windows, whose tokens no count includes, \
+                                so what you are owed for them cannot be told. This machine left the split. Start `lend` again once the operator has turned speculative decoding off"));
+        }
         let line = format!("{} tokens, due at least {floor} msat, received {}", watch.total_tokens(), got.map_or("?".to_string(), |m| m.to_string()));
         if line != last_line {
             println!("{line}");

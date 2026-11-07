@@ -39,8 +39,9 @@ pub struct PinnedBuild {
 }
 
 pub const PINNED_BUILDS: &[PinnedBuild] = &[
-    // stream-0.78.0-1: Mesh-LLM main 668285a5b and its pull requests 2901 and 2902, CPU, Linux x86_64
-    PinnedBuild { sha256: "d924ada744dae629cf4f4ebc51b6cad405fae180bab7425b11fdfd8bd7ce77f7", commit: "854f01ae540708e47fc1faf449e74214453cd1c0" },
+    // stream-0.78.0-2: Mesh-LLM main 668285a5b, its pull requests 2901 and 2902, and the count of speculative work
+    // a lender reads (build 1 does not report it, so a lender can't tell that the split drafted), CPU, Linux x86_64
+    PinnedBuild { sha256: "9d69fb836ae88d042d53ad03606be32253b9f15b5d598f7f23b684794adafd39", commit: "65999ac51f561237c7abd1708055144b70f647ab" },
 ];
 
 const INVITE_VERSION: u32 = 1;
@@ -185,17 +186,19 @@ pub fn node_id_of_token(token: &str) -> Result<String, String> {
     if is_sha256(id) { Ok(id.to_string()) } else { Err("the node's token holds no full id".into()) }
 }
 
-/// A stage this node is serving now, with its count of generated tokens since that stage started.
+/// A stage this node is serving now, with its count of generated tokens since that stage started, and of
+/// token positions it ran in speculative verify windows, whose committed tokens the first count leaves out.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnStage {
     pub key: String,
     pub start: u32,
     pub end: u32,
     pub tokens: u64,
+    pub drafted: u64,
 }
 
-/// This node's serving stages, from its own `/api/runtime/stages`. A build that does not report the
-/// count is an error: a lender must not take it for no work done.
+/// This node's serving stages, from its own `/api/runtime/stages`. A build that does not report either
+/// count is an error: a lender must not take it for no work done, or for no drafting.
 pub fn own_stages(v: &Value, me: &str) -> Result<Vec<OwnStage>, String> {
     let list = v.get("statuses").and_then(Value::as_array).ok_or("the stage report has no statuses")?;
     let mut out = vec![];
@@ -205,9 +208,10 @@ pub fn own_stages(v: &Value, me: &str) -> Result<Vec<OwnStage>, String> {
         }
         let number = |k: &str| s.get(k).and_then(Value::as_u64);
         let tokens = number("compute_decode_tokens").ok_or("this build of Mesh-LLM does not report its stages' tokens")?;
+        let drafted = number("compute_verify_tokens").ok_or("this build of Mesh-LLM does not report its stages' speculative work")?;
         let text = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("");
         let layer = |k: &str| number(k).and_then(|n| u32::try_from(n).ok()).ok_or_else(|| format!("a stage with no {k}"));
-        out.push(OwnStage { key: format!("{}/{}", text("run_id"), text("stage_id")), start: layer("layer_start")?, end: layer("layer_end")?, tokens });
+        out.push(OwnStage { key: format!("{}/{}", text("run_id"), text("stage_id")), start: layer("layer_start")?, end: layer("layer_end")?, tokens, drafted });
     }
     Ok(out)
 }
@@ -232,6 +236,12 @@ pub struct Watch {
     /// When its Mesh-LLM was last seen running, in unix seconds, which says when it may start again.
     #[serde(default)]
     pub mesh_seen_ts: f64,
+    /// The drafted count last seen of each stage run.
+    #[serde(default)]
+    pub drafted_seen: BTreeMap<String, u64>,
+    /// Token positions this machine ran in speculative verify windows: work no count of tokens includes.
+    #[serde(default)]
+    pub drafted: u64,
 }
 
 impl Watch {
@@ -245,6 +255,9 @@ impl Watch {
             if new > 0 {
                 *self.tokens.entry(format!("{}-{}", s.start, s.end)).or_insert(0) += new;
             }
+            let was = self.drafted_seen.get(&s.key).copied().unwrap_or(0);
+            self.drafted += if s.drafted < was { s.drafted } else { s.drafted - was };
+            self.drafted_seen.insert(s.key.clone(), s.drafted);
         }
     }
 
@@ -554,17 +567,35 @@ mod tests {
     fn only_this_nodes_serving_stages_count_and_a_build_with_no_count_is_refused() {
         let me = "a".repeat(64);
         let v = json!({"statuses": [
-            {"node_id": me, "state": "ready", "run_id": "r1", "stage_id": "s1", "layer_start": 14, "layer_end": 28, "compute_decode_tokens": 7},
-            {"node_id": me, "state": "stopped", "run_id": "r0", "stage_id": "s1", "layer_start": 27, "layer_end": 28, "compute_decode_tokens": 0},
-            {"node_id": "b".repeat(64), "state": "ready", "run_id": "r1", "stage_id": "s0", "layer_start": 0, "layer_end": 14, "compute_decode_tokens": 9}]});
-        assert_eq!(own_stages(&v, &me).unwrap(), vec![OwnStage { key: "r1/s1".into(), start: 14, end: 28, tokens: 7 }]);
+            {"node_id": me, "state": "ready", "run_id": "r1", "stage_id": "s1", "layer_start": 14, "layer_end": 28, "compute_decode_tokens": 7, "compute_verify_tokens": 3},
+            {"node_id": me, "state": "stopped", "run_id": "r0", "stage_id": "s1", "layer_start": 27, "layer_end": 28, "compute_decode_tokens": 0, "compute_verify_tokens": 0},
+            {"node_id": "b".repeat(64), "state": "ready", "run_id": "r1", "stage_id": "s0", "layer_start": 0, "layer_end": 14, "compute_decode_tokens": 9, "compute_verify_tokens": 0}]});
+        assert_eq!(own_stages(&v, &me).unwrap(), vec![OwnStage { key: "r1/s1".into(), start: 14, end: 28, tokens: 7, drafted: 3 }]);
         let stock = json!({"statuses": [{"node_id": me, "state": "ready", "run_id": "r", "stage_id": "s", "layer_start": 0, "layer_end": 1}]});
         assert!(own_stages(&stock, &me).is_err(), "no count is not no work");
+        let no_drafts = json!({"statuses": [{"node_id": me, "state": "ready", "run_id": "r", "stage_id": "s", "layer_start": 0, "layer_end": 1, "compute_decode_tokens": 2}]});
+        assert!(own_stages(&no_drafts, &me).is_err(), "a build that cannot say it drafted is not one that did not");
         assert!(own_stages(&json!({}), &me).is_err());
     }
 
     fn stage(key: &str, start: u32, end: u32, tokens: u64) -> OwnStage {
-        OwnStage { key: key.into(), start, end, tokens }
+        OwnStage { key: key.into(), start, end, tokens, drafted: 0 }
+    }
+
+    #[test]
+    fn drafted_work_is_counted_like_tokens_across_restarts() {
+        let mut w = Watch::default();
+        w.observe(&[OwnStage { drafted: 0, ..stage("r1/s", 0, 2, 10) }]);
+        assert_eq!(w.drafted, 0);
+        w.observe(&[OwnStage { drafted: 12, ..stage("r1/s", 0, 2, 14) }]);
+        w.observe(&[OwnStage { drafted: 12, ..stage("r1/s", 0, 2, 14) }]);
+        assert_eq!(w.drafted, 12, "the same figure twice is not new drafting");
+        // the stage starts again from zero
+        w.observe(&[OwnStage { drafted: 5, ..stage("r1/s", 0, 2, 3) }]);
+        assert_eq!((w.drafted, w.total_tokens()), (17, 17));
+        // a watch saved before drafting was counted reads as none
+        let old: Watch = serde_json::from_value(json!({"seen": {}, "tokens": {}})).unwrap();
+        assert_eq!(old.drafted, 0);
     }
 
     /// V-6: the count survives a sample missed, a restart of the watch and of the stage.
