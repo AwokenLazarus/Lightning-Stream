@@ -5,6 +5,7 @@ import { showSetupCode } from '../actions/showSetupCode'
 import { nodeConfigured, storeJson } from '../fileModels/store.json'
 import { access } from 'node:fs/promises'
 import { LF_GRANT, LIGHTNING } from '../spec'
+import { appsMountable, lightningForkGrant } from '../grant'
 
 /** Seed the store on install (defaults from the file model's shape). */
 export const seedStore = sdk.setupOnInit(async (effects, kind) => {
@@ -35,9 +36,32 @@ export const taskSetupCode = sdk.setupOnInit(async (effects, kind) => {
  * Fork, only while this package has no key yet (StartOS makes the task active again on every call).
  * 'important', not 'critical': the app runs without it, so its pages can say what to do (approve the task,
  * or paste a key), and the hashrate and selling pages work meanwhile. Only the action's id is needed here.
+ *
+ * Only where Lightning Fork has the action (grant.ts asks the OS): a mainline Lightning Fork has none, and a
+ * task for it showed "Action not found" (0.2.14). Without it, a task made before is cleared, and the Your node
+ * page walks the owner through pasting Lightning Fork's connection address. This re-runs when Lightning Fork
+ * changes version or restarts, so one updated to a version with the action gets the task then.
  */
 const grantAppAccess = { id: LF_GRANT.actionId } as unknown as Parameters<typeof sdk.action.createTask>[2]
+const grantTaskId = `${LIGHTNING.packageId}:${LF_GRANT.actionId}`
 export const requestGrant = sdk.setupOnInit(async (effects) => {
+  // watched, so a Lightning Fork installed, updated or restarted later is looked at again
+  await sdk
+    .getServiceManifest(effects, LIGHTNING.packageId, (m) => m?.version ?? null)
+    .const()
+    .catch(() => null)
+  await sdk
+    .getContainerIp(effects, { packageId: LIGHTNING.packageId })
+    .const()
+    .catch(() => null)
+  const answer = await lightningForkGrant(effects)
+  // not sure (a timeout, Lightning Fork's runtime down): the task is left as it is, neither made nor cleared
+  if (answer === 'unknown') return
+  // no action, or (as main finds) its `apps` folder does not mount: main runs the paste path, so no task
+  if (answer !== 'present' || !(await appsMountable(effects))) {
+    await sdk.action.clearTask(effects, grantTaskId)
+    return
+  }
   const have = await access(sdk.volumes.main.subpath('run/ln/rail.macaroon')).then(
     () => true,
     () => false,

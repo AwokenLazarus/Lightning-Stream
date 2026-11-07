@@ -5,6 +5,47 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.15 (2026-11-07)
+
+Lightning Stream works on StartOS with Lightning Fork's current releases, which have no grant action: the owner
+pastes Lightning Fork's connection address once and the app makes its own narrow keys from it. A hashrate rental
+whose budget is spent ends as that, not as unpaid, and a top-up asks the wallet again. The hashrate component, the
+wallet UI and the gateway crate change, and the StartOS package and the Umbrel app with them.
+
+- **A rental whose budget is spent ends as that, not as unpaid.** A 60-minute rental of 20,202 sats at 51 sat a slice
+  paid 386 slices, then had 495 sats of its budget left, under the seller's smallest ticket of 546, and too little credit
+  for a slice. Its price alone allowed more, so the renter asked the wallet for slice 387, which refused it with nothing
+  paid; the renter counted a failed payment and left the hashmaker to hold a share for it and end the rental "unpaid".
+  Now that refusal (it reaches no hashmaker) takes the slice back: no other is asked for, and the renter ends the rental
+  itself once the work it paid for is used, before the hashmaker's clock, telling it so. No payment fails, and the card
+  and History say "Ended: its budget was spent (20,202 sats)". The same goes for the budget the owner's spending rules
+  give the hashrate task. What credit is left stays with the seller, as before. No message changes between the two sides: a renter's close is one a 0.2.14 hashmaker reads, and a
+  hashmaker never sends on work that isn't paid for.
+- **StartOS: works with Lightning Fork's current releases, which have no grant action.** On a fresh StartOS 0.4.1 with
+  Lightning Fork 0.21.6-beta.23:0, the package made a task for Lightning Fork's *Grant app access* action ("Action not
+  found"), and node-keys failed every 15 seconds mounting Lightning Fork's `apps` folder, which those releases don't
+  have. That action exists only in two test releases, and the version range wrongly let later releases pass for it.
+  Now the package asks StartOS whether the installed Lightning Fork has the action, and asks again when Lightning Fork
+  is updated or restarts. Without it, no task is made (one made before is cleared), nothing of `apps` is mounted, and
+  node-keys waits without failing. *Your node* then walks you through connecting: in StartOS, open Lightning Fork,
+  then *Interfaces*, then *REST LND Connect*, copy its address and paste it on Your node. The app uses it once to make
+  its own key, which can only pay (`info:read offchain:read offchain:write onchain:read`), and the shop's keys, which
+  can only ask for payments. It keeps neither the address nor the full-access key in it. With the action, nothing
+  changes. The dependency asks for Lightning Fork 0.21.4-beta.21.1:1 or later, which says nothing about the grant.
+- **StartOS: the Node connection form offers Knots BLAKE2b's address.** With Knots BLAKE2b installed and no node set
+  yet, the form offers host `knots-blake2b.startos` and RPC port 18443 (not 8332), and says to run Knots BLAKE2b's
+  *Generate RPC User Credentials* action first for the user and password.
+- **StartOS guide:** a registry is added from the registry menu (the registry's name at the top left, then the gear
+  icon), as StartOS 0.4.1 shows it, and installing from it asks *Install untrusted software?*: choose *Install
+  anyway*.
+- **Umbrel: Your node says why it isn't connected yet.** It said "Create your Lightning wallet in Lightning Fork
+  first" even with the wallet made. It now asks Lightning Fork's node for its wallet state (no key needed) and says
+  so: not made yet, locked, still starting while it waits for the XBT node to sync, or not answering.
+- **Home and Setup count the same steps done.** A new install showed "0 of 5 done" on Home and "1 of 5 done" on
+  Setup, which counted the password. Setup no longer counts it (it is set before any page shows), so both start at 0.
+- **The setup code page names only its own platform:** StartOS's Actions on StartOS, Umbrel's Troubleshoot on Umbrel,
+  and the app's log or data folder elsewhere.
+
 ## 0.2.14 (2026-11-05)
 
 No hashrate rental is paid to a hashmaker with no miner online or to a seller the wallet can't reach, a rental going

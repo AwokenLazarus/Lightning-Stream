@@ -42,7 +42,8 @@ You need a synced Knots-BLAKE2b node (a first sync takes days, and Lightning For
   [AwokenLazarus/lightning-stream-umbrel-store](https://github.com/AwokenLazarus/lightning-stream-umbrel-store)
   and install Lightning Stream. Knots-BLAKE2b and Lightning Fork come from Paul's store.
 - **StartOS:** add our registry `https://registry.lazarus-xbt.xyz` and install Lightning Stream,
-  with Lightning Fork from Paul's registry; then approve Lightning Fork's *Grant app access* task.
+  with Lightning Fork from Paul's registry; then paste Lightning Fork's connection address on the
+  app's *Your node* page, which says where to copy it.
   See [`docs/STARTOS.md`](docs/STARTOS.md).
 - **Linux:** Docker Compose beside your own nodes: [`docs/LINUX.md`](docs/LINUX.md).
 

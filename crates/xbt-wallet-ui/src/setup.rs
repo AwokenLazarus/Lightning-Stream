@@ -316,8 +316,12 @@ impl App {
         let ready = status["ready"] == true && status["real_money_ack_needed"] != true;
         // the keys the app made itself through the box's own node (`node-keys`), with no step by the owner
         let auto = have && crate::node_keys::made_by_box(&ln.dir);
+        let pasted = auto && crate::node_keys::made_from_paste(&ln.dir);
         let main = chain == "main";
-        let mut b = String::from(if auto {
+        let mut b = String::from(if pasted {
+            "<p class=\"lead\">The app pays for services through this box's Lightning node, with a key of its own it made from the \
+             connection address you pasted. That key can pay only within your spending rules; it cannot open or close channels.</p>"
+        } else if auto {
             "<p class=\"lead\">The app pays for services through this box's own Lightning node. It connected by itself when it was \
              installed, with a key that can pay only within your spending rules; it cannot open or close channels.</p>"
         } else {
@@ -327,7 +331,7 @@ impl App {
         let needs_ack = have && main && (!acked || status["real_money_ack_needed"] == true);
         b.push_str(&format!("<section class=\"status {}\"><p class=\"status-head\">{}</p><p>{}</p></section>",
             if ready { "ok" } else if have { "warn" } else { "bad" },
-            if ready && auto { "Connected to your Lightning node" } else if ready { "Connected and ready to pay" }
+            if ready && auto && !pasted { "Connected to your Lightning node" } else if ready { "Connected and ready to pay" }
             else if needs_ack { "Connected: one last step" } else if have { "Connected, not ready yet" } else { "Not connected" },
             if ready { "Nothing to do here.".to_string() }
             else if needs_ack { "Confirm below that the app may pay with real money.".into() }
@@ -335,6 +339,9 @@ impl App {
             else if crate::node_keys::grant_revoked(&ln.dir, RAIL_MACAROON) {
                 "Lightning Fork no longer gives this app access: it was revoked there. To connect again, run Lightning Fork's \
                  Grant app access task for Lightning Stream, or paste a key below.".into() }
+            // StartOS with a Lightning Fork that has no grant action: the owner pastes its connection address
+            else if ln.connect_address.is_some() { "Connect Lightning Fork once: copy its connection address and paste it below, \
+                 as the steps under Connect your node say. The app makes its own key from it, which can only pay within your rules.".into() }
             else if ln.grant { "Approve Lightning Stream in Lightning Fork: open Lightning Fork's tasks and run Grant app access. \
                  The app connects by itself a few seconds later. Or paste a key below.".into() }
             // the baker and the taker make nothing the owner disconnected: no automatic reconnect to promise
@@ -343,8 +350,11 @@ impl App {
             // a key made before, or the owner's own removed: the baker ran at the start and is gone
             else if ln.auto && (crate::node_keys::made_before(&ln.dir) || crate::node_keys::removed(&ln.dir)) {
                 format!("The app makes its key again when it restarts: {}.", esc(&self.cfg.restart_hint)) }
-            else if ln.auto { "Create your Lightning wallet in Lightning Fork first. Lightning Stream picks it up automatically, \
-                 within a minute and with no restart. Or paste a key below.".into() }
+            // the baker waits for the node: say what it waits for, as the node says it (its wallet state needs no key)
+            else if ln.auto { crate::node_keys::wait_reason(match &ln.rest {
+                Some(r) => xbt_gateway::node::wallet_state(r, ln.tls_cert.as_deref()),
+                None => Err("no node address".into()),
+            }.as_deref().map_err(String::as_str)).into() }
             else { "Make the key in your node's app and paste it below.".into() }));
         if !have && ln.auto && crate::node_keys::turned_off(&ln.dir) {
             b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card\">{}<input type=\"hidden\" name=\"action\" value=\"auto_on\">\
@@ -376,14 +386,26 @@ impl App {
         }
         // the owner's own key: the main form when nothing is connected, under Advanced when the box connected the app
         b.push_str(if auto { "<details class=\"card\"><summary>Advanced: use a key of your own instead</summary>" } else { "" });
-        b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card{}\">{}<input type=\"hidden\" name=\"action\" value=\"save\">\
-            <h2>{}</h2>\
-            <details><summary>How do I make the key?</summary><ol><li>Open your Lightning node's app (Lightning Fork) and find the page called \
+        let how = match &ln.connect_address {
+            // StartOS without Lightning Fork's grant: its one key for apps is the full-access key in its connection address
+            Some(place) => format!("<ol><li><strong>Where:</strong> {}. It starts with <code>lndconnect://</code>. \
+                Lightning Fork's wallet must exist and be running.</li>\
+                <li><strong>What the app makes from it:</strong> a key of its own with only <code>{}</code>, under a root key of its own you \
+                can revoke alone; and, for selling, the shop's keys that can only ask for payments. It uses the address once, \
+                to make them, and keeps neither the address nor the full-access key in it.</li>\
+                <li><strong>Where to paste it:</strong> in the box below, then press Connect.</li></ol>\
+                <p class=\"hint\">Have a key of your own with exactly these permissions? Paste it instead: it is stored as it is.</p>",
+                esc(place), RAIL_OPS.join(" ")),
+            None => format!("<details><summary>How do I make the key?</summary><ol><li>Open your Lightning node's app (Lightning Fork) and find the page called \
             <em>Macaroons</em>.</li><li>Make a new one with exactly these permissions, and a root key of its own so you can revoke it alone: \
             <code>{}</code></li><li>Copy it and paste it here.</li></ol><p class=\"hint\">Never paste the node's admin key: the app refuses one, \
-            and does not need it.</p></details>\
-            <label>Key from your node<textarea name=\"macaroon\" rows=\"4\" class=\"mono\" autocomplete=\"off\" required></textarea></label>",
-            if have { "" } else { " primary" }, App::csrf_input(ctx), if have { "Replace the key" } else { "Connect your node" }, RAIL_OPS.join(" ")));
+            and does not need it.</p></details>", RAIL_OPS.join(" ")),
+        };
+        b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card{}\">{}<input type=\"hidden\" name=\"action\" value=\"save\">\
+            <h2>{}</h2>{how}\
+            <label>{}<textarea name=\"macaroon\" rows=\"4\" class=\"mono\" autocomplete=\"off\" required></textarea></label>",
+            if have { "" } else { " primary" }, App::csrf_input(ctx), if have { "Replace the key" } else { "Connect your node" },
+            if ln.connect_address.is_some() { "Lightning Fork's connection address (or a key)" } else { "Key from your node" }));
         if main {
             b.push_str(&format!("<label>To pay with real money, type: <code>{}</code><input name=\"mainnet_ack\" autocomplete=\"off\" required></label>{}",
                                 esc(MAINNET_ACK), if acked { "<p class=\"hint\">You typed it before; type it again to replace the key.</p>" } else { "" }));
@@ -456,7 +478,56 @@ impl App {
                 if main && !f.get("mainnet_ack").is_some_and(|a| xbt402::ticket::is_mainnet_ack(a.trim())) {
                     return Err(format!("To pay with real money, type the sentence word for word: {MAINNET_ACK}"));
                 }
-                let mac = decode_macaroon(f.get("macaroon").map(String::as_str).unwrap_or("")).map_err(|_| "That is not a key: copy it again, whole.".to_string())?;
+                let text = f.get("macaroon").map(String::as_str).unwrap_or("");
+                // StartOS without Lightning Fork's grant: its connection address (or the full-access key in it) makes the
+                // app's own keys, once; a key with exactly the wallet's permissions is stored as it is
+                let mut pasted = None;
+                if let (Some(_), Some(rest)) = (&ln.connect_address, &ln.rest) {
+                    let given = crate::node_keys::key_of_address(text)?;
+                    // a key, before it goes to the node: something that isn't one is said so here
+                    xbt402::macaroon::parse(&given).map_err(|_| "That is not a key: copy the REST LND Connect address again, whole.".to_string())?;
+                    if checked_macaroon(&given, "the rail macaroon", &RAIL_OPS, true).is_err() {
+                        let gw = self.cfg.sell.then_some(self.cfg.gw.dir.as_path());
+                        let before = std::fs::read(dir.join(RAIL_MACAROON)).ok();
+                        let tls = ln.tls_cert.as_deref();
+                        let made = crate::node_keys::make_from_paste(dir, gw,
+                            &mut |ops, id| xbt_gateway::node::bake_macaroon(rest, tls, &given, ops, id),
+                            &mut |id| xbt_gateway::node::revoke_root_key(rest, tls, &given, id));
+                        // the wallet's key is in place (even if something after it failed): the yes to real money goes with it
+                        let replaced = std::fs::read(dir.join(RAIL_MACAROON)).ok().is_some_and(|k| Some(&k) != before.as_ref());
+                        if main && (made.is_ok() || replaced) {
+                            write_shared(dir, MAINNET_ACK_FILE, format!("{MAINNET_ACK}\n").as_bytes())?;
+                        }
+                        let o = match made {
+                            Ok(o) => o,
+                            Err(e) if replaced => return Err(format!("The app's key is in place, but recording it failed: {e}. \
+                                                                       The status above says whether it pays.")),
+                            Err(e) => return Err(format!("Lightning Fork did not make the app's key: {e}. Check that its wallet exists and runs, \
+                                                          and that you copied the REST LND Connect address whole.")),
+                        };
+                        let shop = if o.made.iter().any(|m| m == GW_INVOICES) { " The shop's keys for selling were made too." } else { "" };
+                        // what was not made: a shop key the Sell page then asks for (the link-signing key, which Lightning Fork
+                        // doesn't bake, is optional), a replaced key the node would not revoke
+                        let missing: Vec<&str> = o.skipped.iter().map(|(f, _)| f.as_str()).filter(|f| *f == GW_INVOICES || *f == GW_INFO).collect();
+                        let unrevoked = o.skipped.iter().any(|(f, _)| f.starts_with("root key id"));
+                        let mut msg = format!("Connected. The app made its own key, which can only pay within your rules, and kept nothing of \
+                                               the address.{shop}");
+                        if !missing.is_empty() {
+                            msg.push_str(&format!(" Some of the shop's keys were not made ({}): the Sell page asks for them.", missing.join(", ")));
+                        }
+                        if unrevoked {
+                            msg.push_str(" A key the app made before could not be revoked on the node: its root key id is under Details, \
+                                          Before you uninstall.");
+                        }
+                        msg.push_str(" The status above follows in a few seconds.");
+                        return Ok(msg);
+                    }
+                    pasted = Some(given);
+                }
+                let mac = match pasted {
+                    Some(m) => m,
+                    None => decode_macaroon(text).map_err(|_| "That is not a key: copy it again, whole.".to_string())?,
+                };
                 // strict on every chain: the page stores only what the rail needs
                 checked_macaroon(&mac, "the rail macaroon", &RAIL_OPS, true).map_err(|e| e.to_string())?;
                 if main {

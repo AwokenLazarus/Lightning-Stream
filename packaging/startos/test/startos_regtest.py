@@ -56,7 +56,9 @@ NET = LAB.net
 
 def spec():
     cfg = {"node": {"host": "knots-b2b", "port": 18443, "user": "lab", "password": "lab", "chain": "regtest"},
-           "mcpUrls": [f"http://127.0.0.1:{P_MCP}/mcp"], "lightningRest": "https://lf1:8080", "proxies": [], "lanHost": ""}
+           "mcpUrls": [f"http://127.0.0.1:{P_MCP}/mcp"], "lightningRest": "https://lf1:8080", "proxies": [], "lanHost": "",
+           # a Lightning Fork with the grant action (main.ts finds it at run time; test/grant.test.mjs covers one without)
+           "lightningGrant": True}
     r = subprocess.run(["node", "--experimental-strip-types", "--no-warnings", "test/spec-json.mjs", json.dumps(cfg)], cwd=PKG,
                        capture_output=True, text=True, check=True)
     sp = json.loads(r.stdout)

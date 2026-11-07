@@ -234,11 +234,16 @@ impl Standing {
 
 }
 
+/// Why a renter ends its rental when its own budget is spent: the rental's, or the one the owner's spending rules give
+/// its task in the wallet (`ticket_task_budget`). Both are the renter's own choice, said to the hashmaker in `close`.
+pub const BUDGET_USED_UP: &str = "budget used up";
+pub const TASK_BUDGET_USED_UP: &str = "the task's budget in the wallet's rules is used up";
+
 /// Was this ended rental a failed first step? Money went and little work came back, and the renter didn't end it
 /// itself. A renter's app stops going back to a seller after [`FAILED_FIRST_STEPS`] of these in a row.
 pub fn failed_first_step(report: &serde_json::Value) -> bool {
     let closed = report["closed"].as_str().unwrap_or("");
-    let own_choice = ["cut by the hashtaker", "rental time over", "budget used up"].contains(&closed);
+    let own_choice = ["cut by the hashtaker", "rental time over", BUDGET_USED_UP, TASK_BUDGET_USED_UP].contains(&closed);
     let paid = report["paidSlices"].as_u64().unwrap_or(0);
     let start = report["terms"]["startSlices"].as_u64().unwrap_or(0);
     let slice: u128 = report["terms"]["sliceWork"].as_str().and_then(|w| w.parse().ok()).unwrap_or(1);
@@ -252,6 +257,12 @@ pub const FAILED_FIRST_STEPS: u32 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_task_budget_spent_is_the_renters_own_end_not_a_failed_first_step() {
+        assert!(!failed_first_step(&serde_json::json!({"closed": TASK_BUDGET_USED_UP, "paidSlices": 3, "meter": {"work": "0"}, "terms": {"sliceWork": "100"}})));
+        assert!(!failed_first_step(&serde_json::json!({"closed": BUDGET_USED_UP, "paidSlices": 3, "meter": {"work": "0"}, "terms": {"sliceWork": "100"}})));
+    }
 
     #[test]
     fn a_failed_first_step_is_money_gone_for_little_work_not_a_renters_own_stop() {

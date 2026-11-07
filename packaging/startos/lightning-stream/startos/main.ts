@@ -3,6 +3,7 @@ import { sdk } from './sdk'
 import { storeJson } from './fileModels/store.json'
 import { DATUM, LIGHTNING, PORTS, services, ServiceSpec } from './spec'
 import { access } from 'node:fs/promises'
+import { lightningForkGrant } from './grant'
 
 export const main = sdk.setupMain(async ({ effects }) => {
   const store = await storeJson.read().const(effects)
@@ -41,18 +42,28 @@ export const main = sdk.setupMain(async ({ effects }) => {
   // StartOS's proxy reaches this package from the OS's address on the bridge: its X-Forwarded-For is the buyer's
   const osIp = await sdk.getOsIp(effects).catch(() => '')
 
-  const specs = services({
-    node: store.node,
-    mcpUrls,
-    lightningRest,
-    proxies: osIp ? [osIp] : [],
-    lanHost,
-    aiUrls,
-    filesFromFileBrowser: store.filesSource === 'filebrowser',
-  })
-  const spec = (id: ServiceSpec['id']) => specs.find((s) => s.id === id) as ServiceSpec
+  // Lightning Fork's grant action, if this Lightning Fork has one (grant.ts: asked of the OS, not read from its
+  // version; an answer that is not sure counts as none, and the page takes the address). Main re-runs when
+  // Lightning Fork's container address changes (it restarted) and when its version changes, as an update that
+  // keeps its address may add or drop the action
+  await sdk
+    .getServiceManifest(effects, LIGHTNING.packageId, (m) => m?.version ?? null)
+    .const()
+    .catch(() => null)
+  let lightningGrant = !!lightningRest && (await lightningForkGrant(effects)) === 'present'
+  const specsFor = (grant: boolean) =>
+    services({
+      node: store.node,
+      mcpUrls,
+      lightningRest,
+      proxies: osIp ? [osIp] : [],
+      lanHost,
+      aiUrls,
+      filesFromFileBrowser: store.filesSource === 'filebrowser',
+      lightningGrant: grant,
+    })
 
-  const sub = (s: ServiceSpec) => {
+  const mountsOf = (s: ServiceSpec) => {
     let mounts = sdk.Mounts.of()
     for (const m of s.mounts) {
       mounts = m.dependency
@@ -67,8 +78,25 @@ export const main = sdk.setupMain(async ({ effects }) => {
           })
         : mounts.mountVolume({ volumeId: 'main', subpath: m.subpath, mountpoint: m.mountpoint, readonly: m.readonly })
     }
-    return sdk.SubContainer.of(effects, { imageId: s.image }, mounts, `${s.id}-sub`)
+    return mounts
   }
+  const sub = (s: ServiceSpec) => sdk.SubContainer.of(effects, { imageId: s.image }, mountsOf(s), `${s.id}-sub`)
+
+  // node-keys mounts Lightning Fork's `apps` folder. Made here, at once, so a mount that fails (a Lightning Fork
+  // without the folder) is caught: the package then runs as without the grant, rather than node-keys failing
+  // at every start (0.2.14: "mount exited with exit status: 32" and an unhandled rejection every 15 s)
+  let keysSub: Awaited<ReturnType<typeof sdk.SubContainer.eager>> | null = null
+  if (lightningGrant) {
+    const keys = specsFor(true).find((s) => s.id === 'node-keys') as ServiceSpec
+    try {
+      keysSub = await sdk.SubContainer.eager(effects, { imageId: keys.image }, mountsOf(keys), 'node-keys-sub')
+    } catch (e) {
+      console.warn(`node-keys: Lightning Fork's grant folder cannot be mounted (${e instanceof Error ? e.message : String(e)}); the Your node page takes its connection address instead`)
+      lightningGrant = false
+    }
+  }
+  const specs = specsFor(lightningGrant)
+  const spec = (id: ServiceSpec['id']) => specs.find((s) => s.id === id) as ServiceSpec
   const exec = (s: ServiceSpec) => ({ command: s.command, env: s.env, ...(s.user ? { user: s.user } : {}) })
   const portReady = (s: ServiceSpec, display: string | null) => ({
     display,
@@ -105,10 +133,17 @@ export const main = sdk.setupMain(async ({ effects }) => {
     sdk.Daemons.of(effects)
       .addOneshot('init', { subcontainer: sub(init), exec: exec(init), requires: [] })
       // the wallet's key, granted by Lightning Fork: node-keys watches for it (nothing waits for it: the
-      // signer picks the file up when it appears). With no Lightning Fork it has nothing to watch and exits
+      // signer picks the file up when it appears). Without the grant action (or without Lightning Fork) it has
+      // nothing to watch: it runs no command and waits, so it neither fails nor restarts
       .addDaemon('node-keys', {
-        subcontainer: sub(spec('node-keys')),
-        exec: exec(spec('node-keys')),
+        subcontainer: keysSub,
+        exec: {
+          fn: async (subc, abort) => {
+            if (subc) return exec(spec('node-keys'))
+            await new Promise<void>((done) => abort.addEventListener('abort', () => done(), { once: true }))
+            return null
+          },
+        },
         ready: { display: null, fn: () => ({ result: 'success', message: null }) },
         requires: ['init'],
       })

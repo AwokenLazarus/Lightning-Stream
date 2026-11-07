@@ -186,6 +186,19 @@ fn the_starter_rules_on_mainnet_are_those_the_signer_is_tested_at_market_with() 
     assert_eq!(xbt_wallet_ui::app::starter_policy("regtest")["tickets"]["tasks"]["hashrate"], json!({"budget_sats": 100_000}));
 }
 
+/// The first page says where the setup code is in the platform's own words only (0.2.14 showed Umbrel's
+/// Troubleshoot on StartOS), and in general words where the platform says nothing.
+#[test]
+fn the_setup_code_hint_is_the_platform_s_own() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |c| c.setup_code_hint = Some("On StartOS: open Lightning Stream, choose Actions, then Web UI setup code.".into()));
+    let page = unescape(&B::new(&bx.base).get("/").body);
+    assert!(page.contains("choose Actions, then Web UI setup code") && !page.contains("Umbrel") && !page.contains("Troubleshoot"), "{page}");
+    let bx = start(json!({}), false, |_| {});
+    let page = unescape(&B::new(&bx.base).get("/").body);
+    assert!(page.contains("in the app's log") && page.contains("setup-code") && !page.contains("Umbrel") && !page.contains("StartOS"), "{page}");
+}
+
 #[test]
 fn first_run_needs_the_setup_code_then_the_password_and_logins_are_throttled() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -586,7 +599,7 @@ fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
     let (rules, node) = (setup.find("<h2>Your spending rules</h2>").unwrap(), setup.find("<h2>Your Lightning node</h2>").unwrap());
     let ask = setup.find("holds real money").expect("the rules step asks for it");
     assert!(rules < ask && ask < node, "in the rules step: {setup}");
-    assert!(!setup.contains("Connected and ready to pay") && setup.contains("of 5 done"), "{setup}");
+    assert!(!setup.contains("Connected and ready to pay") && setup.contains("of 4 done"), "{setup}");
     let page = unescape(&br.get("/policy").body);
     assert!(page.contains("pays nothing until you confirm") && page.contains("./lightning#ack"), "{page}");
     // a refused buy says what to do, in words
@@ -3455,23 +3468,182 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
     assert!(br.get("/lightning").body.contains("Not connected"));
 }
 
+/// A Lightning node's REST on 127.0.0.1 (plain http, as the app allows on loopback): its wallet state
+/// (`GET /v1/state`, no key) and, asked with a key, a macaroon with exactly the permissions asked
+/// (`POST /v1/macaroon`). Returns its address and the keys it was asked with (hex).
+fn fake_lnd(state: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let s2 = seen.clone();
+    std::thread::spawn(move || {
+        for mut sock in l.incoming().flatten() {
+            let mut buf = vec![];
+            let mut b = [0u8; 4096];
+            let head_end = loop {
+                let n = sock.read(&mut b).unwrap_or(0);
+                if n == 0 { break None; }
+                buf.extend_from_slice(&b[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break Some(i + 4); }
+            };
+            let Some(head_end) = head_end else { continue };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = sock.read(&mut b).unwrap_or(0);
+                if n == 0 { break; }
+                buf.extend_from_slice(&b[..n]);
+            }
+            let key = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("grpc-metadata-macaroon:").map(|v| v.trim().to_string())).unwrap_or_default();
+            let body = if head.starts_with("GET /v1/state") {
+                json!({"state": state}).to_string()
+            } else if head.starts_with("DELETE /v1/macaroon/") {
+                let id = head.split_whitespace().nth(1).unwrap_or("").trim_start_matches("/v1/macaroon/").to_string();
+                s2.lock().unwrap().push(format!("DELETE {id} {key}"));
+                json!({"deleted": true}).to_string()
+            } else if head.starts_with("POST /v1/macaroon") {
+                s2.lock().unwrap().push(key);
+                let req: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                let mut by: Vec<(String, Vec<String>)> = vec![];
+                for p in req["permissions"].as_array().cloned().unwrap_or_default() {
+                    let (e, a) = (p["entity"].as_str().unwrap_or("").to_string(), p["action"].as_str().unwrap_or("").to_string());
+                    match by.iter_mut().find(|(x, _)| *x == e) { Some((_, v)) => v.push(a), None => by.push((e, vec![a])) }
+                }
+                if by.iter().any(|(e, _)| e.starts_with("uri")) {
+                    let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"message\":\"no URI permission\"}");
+                    continue;
+                }
+                let acts: Vec<Vec<&str>> = by.iter().map(|(_, v)| v.iter().map(String::as_str).collect()).collect();
+                let pairs: Vec<(&str, &[&str])> = by.iter().zip(&acts).map(|((e, _), a)| (e.as_str(), a.as_slice())).collect();
+                json!({"macaroon": mac(&pairs)}).to_string()
+            } else {
+                "{}".into()
+            };
+            let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), seen)
+}
+
 /// Umbrel, the app installed before the owner made the wallet in Lightning Fork: the Lightning page says
-/// to make the wallet there, and that the app then connects by itself (node-keys-bake).
+/// to make the wallet there, and that the app then connects by itself (node-keys-bake). A wallet that
+/// exists but is locked, or still starting while the XBT node syncs, is said as that, as the node says it
+/// (0.2.14 kept asking to make the wallet), and a node that does not answer is said as that too.
 #[cfg(unix)]
 #[test]
-fn before_the_nodes_wallet_exists_the_page_says_to_make_it_in_lightning_fork() {
+fn before_the_nodes_wallet_works_the_page_says_what_lightning_fork_waits_for() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let dir = ln.path().to_path_buf();
+    for (state, says) in [("NON_EXISTING", "Create your Lightning wallet in Lightning Fork first"), ("LOCKED", "wallet exists but is locked"),
+                          ("RPC_ACTIVE", "still starting: it waits for the XBT node to sync")] {
+        let (rest, _) = fake_lnd(state);
+        let d = dir.clone();
+        let b = start(json!({}), false, move |c| {
+            c.ln.dir = d;
+            c.ln.rest = Some(rest);
+            c.ln.auto = true;
+        });
+        let mut br = logged_in(&b);
+        let page = unescape(&br.get("/lightning").body);
+        assert!(page.contains("Not connected") && page.contains(says), "{state}: {page}");
+        if state != "NON_EXISTING" {
+            assert!(!page.contains("Create your Lightning wallet"), "{state}: {page}");
+        }
+    }
+    let b = start(json!({}), false, |c| {
+        c.ln.dir = dir.clone();
+        c.ln.rest = Some("http://127.0.0.1:1".into());
+        c.ln.auto = true;
+    });
+    let page = unescape(&logged_in(&b).get("/lightning").body);
+    assert!(page.contains("Lightning Fork is not answering yet") && page.contains("picks it up automatically"), "{page}");
+}
+
+/// StartOS with a Lightning Fork that has no grant action (its mainline releases): Your node walks the owner
+/// through it (where to copy the connection address, what the app makes from it, where to paste it), never
+/// sends them to a grant task or a Macaroons page, and the address pasted makes the app's own narrow keys
+/// through the node, the shop's too; neither the address nor its full-access key is kept.
+#[cfg(unix)]
+#[test]
+fn without_lightning_fork_s_grant_the_owner_pastes_its_address_and_the_app_makes_its_own_key() {
+    use base64::Engine;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (ln, gw) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (dir, gdir) = (ln.path().to_path_buf(), gw.path().to_path_buf());
+    let (rest, seen) = fake_lnd("SERVER_ACTIVE");
+    let place = "In StartOS, open Lightning Fork, choose Interfaces, then REST LND Connect, and copy any one of its addresses";
+    let b = start(json!({}), false, |c| {
+        c.ln.dir = dir.clone();
+        c.ln.rest = Some(rest.clone());
+        c.ln.connect_address = Some(place.into());
+        c.gw.dir = gdir.clone();
+        c.sell = true;
+    });
+    let mut br = logged_in(&b);
+    let page = unescape(&br.get("/lightning").body);
+    assert!(page.contains("Not connected") && page.contains(place) && page.contains("lndconnect://")
+            && page.contains("info:read offchain:read offchain:write onchain:read") && page.contains("Where to paste it")
+            && page.contains("keeps neither the address nor the full-access key"), "{page}");
+    assert!(!page.contains("Grant app access") && !page.contains("Macaroons") && !page.contains("Never paste the node's admin key"), "{page}");
+    // the address, as StartOS shows it: the full-access key, base64url, in its query
+    let admin = hex::decode(mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read", "write"]), ("macaroon", &["generate"])])).unwrap();
+    let addr = format!("lndconnect://192.168.1.9:8080?macaroon={}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&admin));
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &addr)]);
+    let f = br.flash_after(&r);
+    assert!(f.starts_with("Connected.") && f.contains("shop's keys"), "{f}");
+    let rail = std::fs::read(dir.join("rail.macaroon")).unwrap();
+    assert!(xbt_gateway::node::checked_macaroon(&rail, "rail", &["info:read", "offchain:read", "offchain:write", "onchain:read"], true).is_ok());
+    assert!(gdir.join("invoices.macaroon").is_file() && gdir.join("info.macaroon").is_file());
+    assert!(seen.lock().unwrap().iter().all(|k| *k == hex::encode(&admin)) && !seen.lock().unwrap().is_empty(), "baked with the pasted key");
+    // pasted again: the key it replaces is revoked on the node with the pasted key, and only the new one is listed
+    let old: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("auto-keys.json")).unwrap()).unwrap();
+    let old_id = old["rail.macaroon"]["root_key_id"].as_str().unwrap().to_string();
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &addr)]);
+    assert!(br.flash_after(&r).starts_with("Connected."));
+    assert!(seen.lock().unwrap().iter().any(|k| *k == format!("DELETE {old_id} {}", hex::encode(&admin))), "{:?}", seen.lock().unwrap());
+    let now: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("auto-keys.json")).unwrap()).unwrap();
+    assert_ne!(now["rail.macaroon"]["root_key_id"].as_str().unwrap(), old_id);
+    assert!(now.get("replaced").is_none(), "{now}");
+    // something that is no key at all is refused before it reaches the node
+    let asked = seen.lock().unwrap().len();
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", "lndconnect://192.168.1.9:8080?macaroon=aGVsbG8gd29ybGQ")]);
+    assert!(br.flash_after(&r).contains("That is not a key"));
+    assert_eq!(seen.lock().unwrap().len(), asked, "the node was not asked");
+    // nothing of the full-access key is on disk
+    for d in [&dir, &gdir] {
+        for e in std::fs::read_dir(d).unwrap().flatten() {
+            let bytes = std::fs::read(e.path()).unwrap();
+            assert!(bytes != admin && !String::from_utf8_lossy(&bytes).contains(&hex::encode(&admin)), "{}", e.path().display());
+        }
+    }
+    let page = unescape(&br.get("/lightning").body);
+    assert!(page.contains("connection address you pasted") && !page.contains("connected by itself when it was"), "{page}");
+    // a key of the owner's own with exactly the wallet's permissions, in the same box, is stored as it is
+    let own = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &own)]);
+    assert!(br.flash_after(&r).starts_with("Key saved."));
+    assert_eq!(std::fs::read(dir.join("rail.macaroon")).unwrap(), hex::decode(&own).unwrap());
+    // something else is refused in words, and changes nothing
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", "lndconnect://192.168.1.9:8080?cert=MIIB")]);
+    assert!(br.flash_after(&r).contains("no macaroon="));
+}
+
+/// StartOS with Lightning Fork's grant action: the page asks for the grant task, not the address.
+#[cfg(unix)]
+#[test]
+fn with_lightning_fork_s_grant_the_page_asks_for_the_task() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let ln = tempfile::tempdir().unwrap();
     let dir = ln.path().to_path_buf();
     let b = start(json!({}), false, |c| {
         c.ln.dir = dir.clone();
         c.ln.rest = Some("https://10.21.21.66:8180".into());
-        c.ln.auto = true;
+        c.ln.grant = true;
     });
-    let mut br = logged_in(&b);
-    let page = br.get("/lightning").body;
-    assert!(page.contains("Not connected") && page.contains("Create your Lightning wallet in Lightning Fork first")
-            && page.contains("picks it up automatically"), "{page}");
+    let page = unescape(&logged_in(&b).get("/lightning").body);
+    assert!(page.contains("run Grant app access") && !page.contains("REST LND Connect"), "{page}");
 }
 
 /// Umbrel (node-keys-bake): after the owner disconnects the key the app made, the page promises no

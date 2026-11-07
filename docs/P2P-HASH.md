@@ -117,7 +117,12 @@ or `--config`, the service the app runs):
   hashmaker lets the channel go there too. This removed the case where the hashmaker counted one more
   finished slice than the hashtaker. The hashtaker's `close` also says how many slices it counted; only
   slices both sides counted are billed, and their payments may still arrive until the grace time
-  ends. A hashtaker with a budget ends the rental as soon as the next slice could not be paid.
+  ends. A hashtaker with a budget ends the rental as soon as the next slice could not be paid: by its price, or
+  because the wallet refused it for a budget, moving nothing (what is left of the rental's budget is less than the
+  seller's smallest ticket, 546 sat on mainnet, or the budget its owner's rules give the task is spent). Only the
+  wallet knows those, and its refusal reaches no hashmaker: the renter takes that slice back, asks for no other, and
+  closes once the work it paid for is used, before the hashmaker would hold a share for it (0.2.15; before, such a
+  rental ended "unpaid" and counted a failed payment).
 - **A link that drops.** The hashmaker's miners go to the fallback and the rental waits the grace time
   for the hashtaker, who dials again and says `resume`. The hashtaker counts a verdict before sending
   it, so verdicts on their way when the link dropped are counted on its side only, and the hashmaker

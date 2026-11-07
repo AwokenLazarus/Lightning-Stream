@@ -99,7 +99,41 @@ export type Config = {
   aiUrls?: string[]
   /** the Files service shares a folder of File Browser's files (read-only) instead of the package's own */
   filesFromFileBrowser?: boolean
+  /**
+   * Lightning Fork has the grant action (LF_GRANT), as found at run time (grant.ts): node-keys watches its
+   * `apps` folder and the Your node page asks the owner to approve the task. Unset or false: nothing of
+   * `apps` is mounted, node-keys idles, and the page walks the owner through pasting Lightning Fork's
+   * connection address instead.
+   */
+  lightningGrant?: boolean
 }
+
+/** What is known of Lightning Fork's grant action: there, not there, no Lightning Fork, or nothing sure. */
+export type GrantAnswer = 'present' | 'absent' | 'no-node' | 'unknown'
+
+/**
+ * What the OS's answer to "give me Lightning Fork's grant action's input" says about the action (grant.ts asks;
+ * this reads the answer, so a test can too). The OS looks the action up in Lightning Fork's list of actions
+ * before anything else. Only an answer is "present"; a "Not Found" naming the action is "absent"; one naming
+ * the package is "no-node". Any other failure (a timeout, Lightning Fork's runtime down, words this does not
+ * know) is "unknown": the task is then neither made nor cleared.
+ */
+export function grantFromAnswer(error: unknown | null): GrantAnswer {
+  if (error == null) return 'present'
+  // the host RPC's words end in `@<method>` (`…@get-action-input`), which names no action of its own
+  const m = String((error as { message?: unknown })?.message ?? error).replace(/@[\w-]+\s*$/, '')
+  if (!/not.?found/i.test(m)) return 'unknown'
+  if (m.includes(LF_GRANT.actionId)) return 'absent'
+  if (m.includes(LIGHTNING.packageId)) return 'no-node'
+  return 'unknown'
+}
+
+/** Where the Your node page sends the owner for Lightning Fork's connection address, when it has no grant action. */
+export const LF_CONNECT_ADDRESS =
+  'In StartOS, open Lightning Fork, choose Interfaces, then REST LND Connect, and copy any one of its addresses (the app takes only the key in it, and reaches the node its own way)'
+
+/** Where the first page sends the owner for the setup code. */
+export const SETUP_CODE_HINT = 'On StartOS: open Lightning Stream, choose Actions, then Web UI setup code.'
 
 /** The Lightning node's certificate: Lightning Fork's public/ folder, which holds only tls.cert. */
 const LF_CERT_FOLDER = 'public'
@@ -107,13 +141,15 @@ const LF_CERT_FOLDER = 'public'
 /** Where the Lightning node's certificate is in the services, and where the wallet's rail macaroon is. */
 export const LIGHTNING = {
   packageId: 'lightning-fork',
+  /** the oldest Lightning Fork with public/ (tls.cert) for dependents; it says nothing of the grant (LF_GRANT) */
+  minVersion: '0.21.4-beta.21.1:1',
   restPort: 8080,
   cert: '/data/lightning/tls.cert',
   macaroon: '/data/run/ln/rail.macaroon',
 } as const
 
 /**
- * Lightning Fork's grant (its `grant-app-access` action, from version `minVersion`): this package asks for its
+ * Lightning Fork's grant (its `grant-app-access` action): this package asks for its
  * key with a task in Lightning Fork (init/tasks.ts); the owner approves by running it there, and Lightning
  * Fork bakes a macaroon with exactly `permissions` under a root key of its own (revocable alone) and keeps it
  * at `apps/<this package's id>/access.macaroon` in its main volume. The package mounts `apps` (not
@@ -125,9 +161,14 @@ export const LIGHTNING = {
  * (lnd's info:read, offchain:read, offchain:write, onchain:read). The selling side needs a key that can
  * only ask for payments (invoices); Lightning Fork grants one key per package, so the owner pastes the
  * shop's keys on the Sell page until it grants a second.
+ *
+ * Not every Lightning Fork has the action, and no version range says which do: it was built on a branch
+ * (the pre-releases 0.21.4-beta.21.1:2 and :4), and the mainline releases after them (0.21.4-beta.21.1:3 to
+ * 0.21.6-beta.23:0 at least) lack it. So the package looks for the action itself (grant.ts), and without it
+ * asks for nothing, mounts nothing of `apps` (a missing mount source stops the daemon at every start), and
+ * the Your node page takes Lightning Fork's connection address instead (LF_CONNECT_ADDRESS).
  */
 export const LF_GRANT = {
-  minVersion: '0.21.4-beta.21.1:2',
   actionId: 'grant-app-access',
   /** Lightning Fork's folder of granted keys, mounted read-only */
   grantsDir: 'apps',
@@ -225,6 +266,7 @@ export function services(cfg: Config): ServiceSpec[] {
     XBT_CHAIN: cfg.node.chain,
   }
   const ln = !!cfg.lightningRest
+  const grant = ln && !!cfg.lightningGrant
   const cert = ln ? [lightningCert] : []
   const fb = !!cfg.filesFromFileBrowser
   const fileBrowser: MountSpec = {
@@ -260,7 +302,7 @@ export function services(cfg: Config): ServiceSpec[] {
       image: 'ui',
       user: 'root',
       command: ['/usr/bin/xbt-wallet-ui', 'node-keys'],
-      env: ln
+      env: grant
         ? {
             XBT_KEYS_NODE_REST: cfg.lightningRest,
             XBT_KEYS_TLS_CERT: LIGHTNING.cert,
@@ -269,7 +311,8 @@ export function services(cfg: Config): ServiceSpec[] {
             XBT_KEYS_RAIL_DIR: '/data/run/ln',
           }
         : {},
-      mounts: ln ? [vol('run/ln', '/data/run/ln'), lightningGrants, lightningCert] : [],
+      // without the grant action node-keys has nothing to watch: main.ts runs no command for it, and mounts nothing
+      mounts: grant ? [vol('run/ln', '/data/run/ln'), lightningGrants, lightningCert] : [],
       requires: ['init'],
     },
     {
@@ -334,8 +377,10 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_RESTART_HINT: 'restart Lightning Stream from your StartOS dashboard (Services, Lightning Stream, Restart)',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
         XBT_UI_CONNECTOR: `http://${local(PORTS.connector)}`,
-        // the Lightning page asks the owner to approve the app in Lightning Fork, not to paste a key
-        XBT_UI_LN_GRANT: '1',
+        // with the grant action, the Lightning page asks the owner to approve the app in Lightning Fork; without
+        // it, it walks the owner through pasting Lightning Fork's connection address, from which the app makes its own keys
+        ...(grant ? { XBT_UI_LN_GRANT: '1' } : ln ? { XBT_UI_LN_CONNECT_ADDRESS: LF_CONNECT_ADDRESS } : {}),
+        XBT_UI_SETUP_CODE_HINT: SETUP_CODE_HINT,
         ...(ln
           ? {
               XBT_UI_LN_REST: cfg.lightningRest,

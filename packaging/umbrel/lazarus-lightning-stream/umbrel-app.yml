@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.2.14"
+version: "0.2.15"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -53,6 +53,8 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.2.15: a rental whose budget is spent ends as that, not unpaid, and a top-up asks again; Your node
+  says why Lightning Fork isn't ready (locked, still syncing); Home and Setup count alike.
   0.2.14: no rental paid to a hashmaker with no miner online or a seller the wallet can't reach,
   top-ups for a rental going on, offline shops folded away, listings that lapse, no secrets in pages.
   0.2.13: long hashrate rentals keep paying on a slow wallet (tickets bought ahead, a 30 s wait for a

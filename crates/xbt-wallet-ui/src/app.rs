@@ -651,14 +651,17 @@ impl App {
     }
 
     fn setup_password(&self, req: &Req) -> Resp {
+        // where the code is: the platform's own words (XBT_UI_SETUP_CODE_HINT), or the general ones
         let code_field = if self.auth.needs_setup_code() {
-            "<label>Setup code<input name=\"code\" autocomplete=\"off\" required></label>\
-             <p class=\"hint\">A one-time code that proves this app is yours. It is in the app's log, on the line that says \
-             <em>setup code</em>. On Umbrel: right-click the Lightning Stream icon and choose <em>Troubleshoot</em>. \
-             On StartOS: open Lightning Stream, choose <em>Actions</em>, then <em>Web UI setup code</em>.</p>\
-             <details><summary>Running it another way?</summary><p>The code is also in the file <code>setup-code</code> in the app's data folder.</p></details>"
+            format!("<label>Setup code<input name=\"code\" autocomplete=\"off\" required></label>\
+             <p class=\"hint\">A one-time code that proves this app is yours. {}</p>",
+                    match &self.cfg.setup_code_hint {
+                        Some(h) => esc(h),
+                        None => "It is in the app's log, on the line that says <em>setup code</em>, and in the file \
+                                 <code>setup-code</code> in the app's data folder.".into(),
+                    })
         } else {
-            ""
+            String::new()
         };
         let form = |flash: Option<(bool, String)>| {
             Resp::html(200, self.bare("Welcome", flash, &format!(
@@ -2083,15 +2086,15 @@ impl App {
         let enc = ks["encrypted"] == true;
         let ack_needed = ln["real_money_ack_needed"] == true;
         // on mainnet the rules step takes the yes to real money too (a box beside its Sign): done with both
-        let done = [true, !human.is_empty(), seen("policy_change") && !ack_needed, ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
+        // the password is not counted: it is set before any page shows, so Home's Get started (which does not
+        // list it) and this page say the same number done (0.2.14 said 0 there and 1 here on a new install)
+        let done = [!human.is_empty(), seen("policy_change") && !ack_needed, ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
         let n = done.iter().filter(|d| **d).count();
         let total = done.len();
-        let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">");
-        b.push_str(&step(true, "Password", if self.platform.is_some() {
-            "<p>Not needed: you opened the app from your box's dashboard, which already asked who you are.</p>".into()
-        } else {
-            "<p>Set. You are logged out after 15 minutes without use.</p>".into()
-        }));
+        let mut b = format!("<p class=\"lead\">{n} of {total} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p>\
+                             <p class=\"small\"><span class=\"pill good\">Password</span> {}</p><ol class=\"steps\">",
+                            if self.platform.is_some() { "Not needed: you opened the app from your box's dashboard, which already asked who you are." }
+                            else { "Set. You are logged out after 15 minutes without use." });
         let key_body = if human.is_empty() {
             format!("<p>Your approval key is how you say yes to a large payment or a change of rules. It is made and kept in this browser, \
                      under a passphrase only you know.</p><section id=\"human-key-state\" data-enrolled=\"\"><p id=\"browser-key\" class=\"msg\"></p>{}</section>",
@@ -2101,8 +2104,8 @@ impl App {
                      <details><summary>Its public half</summary><p><code>{}</code></p></details>\
                      <p><a href=\"./keys\">Keys and backup →</a></p></section>", esc(&human), esc(&human))
         };
-        b.push_str(&step(done[1], "Your approval key", key_body));
-        b.push_str(&step(done[2], "Your spending rules",
+        b.push_str(&step(done[0], "Your approval key", key_body));
+        b.push_str(&step(done[1], "Your spending rules",
             format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>{}",
                     allow_n, if allow_n == 1 { "" } else { "s" },
                     // mainnet: the yes to real money is a box beside the rules' Sign; signed without it, Your node takes it alone
@@ -2115,15 +2118,15 @@ impl App {
                     } else {
                         "<p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>"
                     })));
-        b.push_str(&step(done[3], "Your Lightning node",
+        b.push_str(&step(done[2], "Your Lightning node",
             format!("<p>{}</p><p><a href=\"./lightning\">Your node →</a></p>",
-                    if done[3] { "Connected and ready to pay.".to_string() }
+                    if done[2] { "Connected and ready to pay.".to_string() }
                     else if ack_needed && ln["ready"] == true { "Connected. Confirm paying with real money with your rules (above) and it is ready.".to_string() }
                     else {
                         let (_, connected, why) = self.node_state();
                         esc(&format!("{} {why}", if connected { "Connected, not ready yet." } else { "Not connected yet." }))
                     })));
-        b.push_str(&step(done[4], "A backup",
+        b.push_str(&step(done[3], "A backup",
             format!("<p>The app's keys are {} on this box. {}</p><p><a href=\"./keys\">Download an encrypted backup →</a></p>",
                     if enc { "locked with encryption" } else { "<strong>not</strong> locked with encryption" },
                     if seen("backup_export") { "A backup was exported." } else { "No backup yet." })));

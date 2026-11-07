@@ -8,12 +8,19 @@ both ways. Tested on mainnet with small amounts only: start with low limits.
 
 1. Install **Lightning Fork** first (from its own StartOS registry), with a channel.
 2. **Node connection** (Actions): your Knots BLAKE2b node's RPC host, port, user and password, and its
-   chain. The service does not start without it.
+   chain. The service does not start without it. With Knots BLAKE2b on this server, run its **Generate RPC
+   User Credentials** action first and use the user and password it shows; the host is
+   `knots-blake2b.startos` and the port `18443` (the form offers both).
 3. Start the service. *Wallet ready to pay* turns green once the node is synced and the keys are unlocked.
 4. **Web UI setup code** (Actions): open the *Web interface*, enter the code, and choose your password.
 5. In the web interface:
-   - **Your node**: the app asks Lightning Fork for its own narrow keys by itself. If the page says it
-     could not, make the keys in Lightning Fork's dashboard and paste them there;
+   - **Your node**: connect Lightning Fork. If your Lightning Fork has the *Grant app access* action, the
+     app asks for its key with a task there: run it, and the page says *Connected* a few seconds later.
+     Otherwise (Lightning Fork's current releases), the page walks you through it: in Lightning Fork,
+     open *Interfaces*, then *REST LND Connect*, copy its address and paste it on Your node. The app uses
+     it once to make its own key, which can only pay (`info:read offchain:read offchain:write
+     onchain:read`), and the shop's keys, which can only ask for payments; it keeps neither the address
+     nor the full-access key in it;
    - make your **approval key**. It stays in your browser. Download its backup file: the file is the key
      itself, not your passphrase;
    - sign the **safe starter rules** (Settings → Spending rules → Start from the safe starter rules).
@@ -33,8 +40,9 @@ Buyers reach your shop by its key over an encrypted link, so no domain or port f
 want an https address too, add a public domain to the *Gateway for buyers* interface and type it as the
 shop's address.
 
-- **Your shop's node keys**: Lightning Fork grants this app the wallet's key only, so Sell's first step
-  asks for keys you make in Lightning Fork's dashboard (*Macaroons*), each with its own root key:
+- **Your shop's node keys**: if you connected Your node with Lightning Fork's connection address, the
+  shop's keys were made then. Otherwise (Lightning Fork grants this app the wallet's key only) Sell's first
+  step asks for keys of their own, each with its own root key:
   payment requests (`invoices:read invoices:write`) and network time (`info:read`), both needed, and
   link signing (`message:write`), optional but needed to be reached directly through the app. The link
   signing key lets your node vouch for your shop's link, so buyers' apps can check it is yours; it signs

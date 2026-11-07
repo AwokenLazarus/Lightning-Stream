@@ -16,7 +16,7 @@ use crate::link::{self, Sender};
 use crate::meter::{self, Meter, Receipt};
 use crate::msg::{Msg, Terms, PROOF};
 use crate::order;
-use crate::rail::{sha256, HashtakerRail, Payer};
+use crate::rail::{self, sha256, HashtakerRail, Payer};
 use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -220,6 +220,10 @@ struct St {
     /// The wallet refused or failed a slice: no later slice is asked for.
     pay_failed: bool,
     budget_msat: Option<u64>,
+    /// The wallet refused a slice because a budget of the renter's own is spent (the rental's, or its task's in the
+    /// owner's rules): no later slice is asked for, and the rental ends as its paid work runs out, said as that reason.
+    spent: Option<&'static str>,
+
     /// The hashes of the tickets locked over the link, sent again after the link comes back.
     lock_hashes: BTreeMap<u64, String>,
     /// The last payments sent over the link, sent again after it comes back (the hashmaker takes
@@ -375,6 +379,56 @@ impl St {
         }
     }
 
+    /// The rental's budget can't pay its next slice: by its price, or as the wallet said when it refused one for a
+    /// budget, moving nothing (a ticket the budget left can't buy: 0.2.14 on mainnet, 495 sats left of 20,202 and a
+    /// smallest ticket of 546; or the task's budget in the owner's rules). Only the wallet knows the seller's smallest
+    /// ticket and the task's budget: a ticket is never under a slice, so the budget alone can't say. Why, if so.
+    fn budget_spent(&self) -> Option<&'static str> {
+        if self.spent.is_some() {
+            return self.spent;
+        }
+        // by the slices the wallet said it paid: one that failed, or whose answer was lost, is not counted as paid
+        let by_price = self.budget_msat.is_some_and(|b| (self.paid_slices() + 1).saturating_mul(self.terms.price_msat) > b);
+        by_price.then_some(order::BUDGET_USED_UP)
+    }
+
+    /// End the rental from this side once its budget is spent and the work it paid for is used (the next share
+    /// wouldn't fit): before the hashmaker holds a share it would wait for payment of, and ends the rental unpaid.
+    /// Whether it ended it.
+    ///
+    /// Never after a payment that failed (the wallet's error, money that may have moved): that rental ends on the
+    /// failure's path ("could not be paid", unpaid), not as a budget used up, which reads as the renter's own choice.
+    /// Nor while a payment is on its way: its answer decides.
+    fn end_if_spent(&mut self, tx: &Sender) -> bool {
+        if self.closed.is_some() || self.pay_failed || self.in_flight > 0 {
+            return false;
+        }
+        let Some(why) = self.budget_spent() else { return false };
+        // the work the slices confirmed paid cover, not those released (one released may have failed or been lost)
+        if order::fits(self.meter.work, self.largest_share().max(1), self.paid_slices(), self.terms.start_slices, self.terms.slice_work) {
+            return false;
+        }
+        self.events.push(json!({"ev": "budget spent", "why": why, "released": self.released, "atMs": now_ms()}));
+        self.end(why, tx);
+        true
+    }
+
+    /// The rental's budget as the hashtaker raised it. A budget the wallet said was spent is asked about again: the
+    /// next slice is asked for once, and the wallet decides. A refusal for the task's budget in the owner's rules is
+    /// said again then (the rules decide, not the rental's budget), and nothing more is asked until the next top-up.
+    fn top_up(&mut self, budget_msat: Option<u64>, tx: &Sender) {
+        let rose = match (self.budget_msat, budget_msat) {
+            (Some(was), Some(now)) => now > was,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        self.budget_msat = budget_msat;
+        if rose && self.spent.take().is_some() {
+            self.events.push(json!({"ev": "budget raised: asking the wallet again", "budgetMsat": budget_msat, "atMs": now_ms()}));
+        }
+        self.settle_up(tx);
+    }
+
     /// Note slices' worth of proven work reached, and pay whatever [`order::pay_next`] says is due.
     fn settle_up(&mut self, tx: &Sender) {
         // nothing more once this side has ended it, whatever is still on its way
@@ -404,6 +458,11 @@ impl St {
                 return;
             }
             if self.budget_msat.is_some_and(|b| slice * self.terms.price_msat > b) {
+                return;
+            }
+            // the wallet said a budget is spent: none is asked for again. The rental ends as what's paid runs out
+            // ([`St::end_if_spent`])
+            if self.spent.is_some() {
                 return;
             }
             let receipt = Receipt {
@@ -535,6 +594,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
         queue: None,
         pay_failed: false,
         budget_msat: cfg.budget_msat,
+        spent: None,
         lock_hashes: BTreeMap::new(),
         sent_pays: Vec::new(),
         retired: BTreeSet::new(),
@@ -596,13 +656,23 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                     // whether it arrived, ends the rental if it didn't
                     Ok(v) if v["verdict"] == "unknown" => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": null, "unknown": true, "wallet": v})),
                     Ok(v) => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": true, "ticketMsat": ticket, "ahead": ahead, "wallet": v})),
+                    // a budget of the renter's own is spent (the wallet refused it, nothing moved): not a failed payment.
+                    // The slice is taken back, no other is asked for, and the rental ends as what's paid runs out, the
+                    // hashmaker told why. A first slice so refused is a rental that could not start
+                    Err(why) if g.paid_slices() > 0 && g.released == slice && rail::budget_spent(&why).is_some() => {
+                        g.spent = rail::budget_spent(&why);
+                        g.released = slice - 1;
+                        g.receipts.pop();
+                        g.events.push(json!({"ev": "refused: budget spent", "slice": slice, "atMs": now_ms(), "ms": ms, "why": why}));
+                    }
                     Err(why) => {
                         g.pay_failed = true;
                         g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": false, "why": why}));
                     }
                 }
-                // the next slice, if one is due now, now that this one is answered
+                // the next slice, if one is due now, now that this one is answered; or the end, if the budget is spent
                 g.settle_up(&ptx);
+                g.end_if_spent(&ptx);
             }
             *out.lock().unwrap_or_else(|p| p.into_inner()) = p.stop();
         })
@@ -630,18 +700,15 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 duration = cfg.duration.map(|d| d + Duration::from_secs(a.secs()));
                 let more = budget.map(|b| b.saturating_add(a.msat()));
                 if more != g.budget_msat {
-                    g.budget_msat = more;
-                    g.settle_up(&tx);
+                    g.top_up(more, &tx);
                 }
             }
             g.tick(&tx);
-            let (s, largest) = (g.terms.slice_work, g.largest_share());
-            // the next slice can't be paid: end as the last paid one runs out, before the hashmaker does it
-            let no_more = g.budget_msat.is_some_and(|b| (g.released + 1) * g.terms.price_msat > b);
             let why = if cut.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                 Some("cut by the hashtaker")
-            } else if no_more && !order::fits(g.meter.work, largest.max(1), g.released, g.terms.start_slices, s) {
-                Some("budget used up")
+            } else if g.end_if_spent(&tx) {
+                // the next slice can't be paid: ended as the last paid one runs out, before the hashmaker does it
+                return;
             } else if g.standing().too_slow() {
                 Some("the route to this hashmaker is too slow for its miners' rate")
             } else if g.pay_failed && g.paid_slices() == 0 {
@@ -797,6 +864,7 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 }
                 if is_share {
                     g.settle_up(&tx);
+                    g.end_if_spent(&tx);
                 }
             }
             Msg::Due { work, paid } => {
@@ -805,6 +873,10 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
                 g.dues += 1;
                 g.last_due = Some((work, paid));
                 g.settle_up(&tx);
+                // a share waits for a slice the budget can't pay: ended now, not on the hashmaker's clock
+                if g.end_if_spent(&tx) {
+                    continue;
+                }
                 // a payment on its way that won't arrive within the hashmaker's short clock: it waits for it, its
                 // miners on its own pool meanwhile. One the measured buys say arrives in time needs no move; should it
                 // not, the ticker says paying before the clock runs out
@@ -1191,6 +1263,7 @@ mod come_back_tests {
             queue: None,
             pay_failed: false,
             budget_msat: None,
+            spent: None,
             lock_hashes: BTreeMap::new(),
             sent_pays: Vec::new(),
             retired: BTreeSet::new(),
@@ -1206,6 +1279,110 @@ mod come_back_tests {
             buys: VecDeque::new(),
             guard: Guard::default(),
         }))
+    }
+
+    /// FAILS before (0.2.14 on mainnet): the wallet refused slice 387 for a budget, moving nothing, and the renter
+    /// marked the payment failed, asked for nothing more and left the hashmaker to end the rental unpaid. Now, the
+    /// refused slice taken back (`spent`), none is asked for again, the work paid for runs out, and the renter ends the
+    /// rental itself as its budget spent, with no failed payment.
+    #[test]
+    fn a_budget_the_wallet_says_is_spent_asks_for_no_more_and_ends_the_rental_as_its_work_runs_out() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, _peer) = a_link(key, hk);
+        let st = state();
+        let (qtx, qrx) = mpsc::channel::<(u64, Value, bool)>();
+        let mut g = lock(&st);
+        g.terms.price_msat = 51_000;
+        g.queue = Some(qtx);
+        g.budget_msat = Some(20_202_000);
+        g.released = 386;
+        // the wallet's answers: 386 slices paid
+        g.pays = vec![json!({"slice": 386, "ok": true}); 386];
+        g.spent = rail::budget_spent("What is left of this rental's budget (495 sats) is less than this hashmaker's smallest ticket (546 sats).");
+        assert_eq!(g.spent, Some(order::BUDGET_USED_UP));
+        assert!((g.released + 1) * g.terms.price_msat <= g.budget_msat.unwrap(), "its price alone fits the budget");
+        // the work of slice 386 under way: the next share still fits
+        g.meter.work = 385 * g.terms.slice_work;
+        g.settle_up(&tx);
+        assert!(qrx.try_recv().is_err() && g.released == 386, "no slice asked for again");
+        assert!(!g.end_if_spent(&tx) && g.closed.is_none(), "not while the work paid for goes on");
+        // that work used: the next share wouldn't fit, and the renter ends it
+        g.meter.work = 386 * g.terms.slice_work;
+        g.settle_up(&tx);
+        assert!(qrx.try_recv().is_err());
+        assert!(g.end_if_spent(&tx));
+        assert_eq!(g.closed.as_deref(), Some(order::BUDGET_USED_UP));
+        assert!(!g.pay_failed && g.pays.iter().all(|p| p["ok"] == true));
+        assert!(g.events.iter().any(|e| e["ev"] == "budget spent"), "{:?}", g.events);
+    }
+
+    /// FAILS before: a top-up after the wallet said the budget was spent was ignored (`spent` was never cleared), and
+    /// the rental ended "budget used up" anyway. Now the raised budget asks the wallet again: the next slice is asked
+    /// for once and paid once; a task budget refused again asks nothing more until the next top-up.
+    #[test]
+    fn a_top_up_after_the_wallet_said_the_budget_was_spent_asks_again_once() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, _peer) = a_link(key, hk);
+        let st = state();
+        let (qtx, qrx) = mpsc::channel::<(u64, Value, bool)>();
+        let mut g = lock(&st);
+        g.terms.price_msat = 51_000;
+        g.queue = Some(qtx);
+        g.budget_msat = Some(20_202_000);
+        g.released = 386;
+        g.pays = vec![json!({"slice": 386, "ok": true}); 386];
+        g.spent = Some(order::BUDGET_USED_UP);
+        g.meter.work = 386 * g.terms.slice_work;
+        g.settle_up(&tx);
+        assert!(qrx.try_recv().is_err(), "spent: nothing asked");
+        // the hashtaker adds 1,000 sats
+        g.top_up(Some(21_202_000), &tx);
+        assert!(g.spent.is_none());
+        let (slice, _, _) = qrx.try_recv().expect("slice 387 asked for again");
+        assert_eq!(slice, 387);
+        assert!(qrx.try_recv().is_err(), "once");
+        // paid: the rental goes on, not ended as spent
+        g.in_flight = 0;
+        g.pays.push(json!({"slice": 387, "ok": true}));
+        assert!(!g.end_if_spent(&tx) && g.closed.is_none());
+        // the task's budget in the rules refuses the next: said again, nothing more asked, not even on a later share
+        g.spent = Some(order::TASK_BUDGET_USED_UP);
+        g.meter.work = 387 * g.terms.slice_work;
+        g.settle_up(&tx);
+        assert!(qrx.try_recv().is_err(), "no loop on a task budget");
+        // a lower or equal budget asks nothing
+        g.top_up(Some(21_202_000), &tx);
+        assert!(qrx.try_recv().is_err() && g.spent.is_some());
+    }
+
+    /// FAILS before: a slice that really failed (the signer's error: money may have moved) on the budget's last
+    /// coverable slice was counted as paid by `released`, and the rental closed as "budget used up", the renter's own
+    /// choice. Now it keeps the failure's path: the rental is not ended as spent, and payFailed stays true.
+    #[test]
+    fn a_real_failure_on_the_budgets_last_slice_is_a_failure_not_a_budget_spent() {
+        let (key, hk) = (crate::noise::fresh_key(), crate::noise::fresh_key());
+        let (tx, _peer) = a_link(key, hk);
+        let st = state();
+        let (qtx, _qrx) = mpsc::channel::<(u64, Value, bool)>();
+        let mut g = lock(&st);
+        g.terms.price_msat = 5_000;
+        g.queue = Some(qtx);
+        // the budget pays 4 slices; the 4th was released and failed
+        g.budget_msat = Some(20_000);
+        g.released = 4;
+        g.pays = vec![json!({"slice": 1, "ok": true}), json!({"slice": 2, "ok": true}), json!({"slice": 3, "ok": true}),
+                      json!({"slice": 4, "ok": false, "why": "signer error"})];
+        g.pay_failed = true;
+        g.meter.work = 4 * g.terms.slice_work;
+        assert!(!g.end_if_spent(&tx), "a failure is not a budget spent");
+        assert!(g.closed.is_none() && g.pay_failed);
+        assert!(g.report()["payFailed"] == true);
+        // and without the flag, the by-price test counts the confirmed slices only: 3 paid, the 4th still in the budget
+        g.pay_failed = false;
+        assert_eq!(g.budget_spent(), None);
+        // an answer lost (ok null) is not counted as paid either
+        g.pays[3] = json!({"slice": 4, "ok": null, "unknown": true});
+        assert_eq!(g.budget_spent(), None);
     }
 
     /// A link made and left: the sender `come_back` is given.

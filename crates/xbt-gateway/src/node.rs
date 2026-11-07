@@ -453,6 +453,17 @@ impl LndRest {
         info_macaroon: &[u8],
         tls_cert: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::build_timed(base, invoice_macaroon, info_macaroon, tls_cert, None)
+    }
+
+    /// [`Self::build`], every unary call held to `most` in all (connecting, sending, reading) when given.
+    fn build_timed(
+        base: &str,
+        invoice_macaroon: &[u8],
+        info_macaroon: &[u8],
+        tls_cert: Option<&Path>,
+        most: Option<Duration>,
+    ) -> Result<Self, String> {
         let base = xbt402::wire::sendable_url(base.trim().trim_end_matches('/'))
             .map_err(|e| format!("node.rest: {e}"))?;
         let base = base.trim_end_matches('/').to_string();
@@ -482,6 +493,10 @@ impl LndRest {
                 .timeout_connect(Duration::from_secs(5))
                 .timeout_read(read)
                 .redirects(0);
+            let b = match most {
+                Some(m) => b.timeout(m),
+                None => b,
+            };
             match &tls {
                 Some(cfg) => b.tls_config(cfg.clone()).build(),
                 None => b.build(),
@@ -596,6 +611,34 @@ pub fn bake_macaroon(
     let bytes = hex::decode(hex_mac).map_err(|_| "the node's macaroon is not hex".to_string())?;
     check_macaroon(&bytes, "the baked macaroon", ops, true)?;
     Ok(bytes)
+}
+
+/// The longest [`wallet_state`] waits for the node, all told.
+pub const WALLET_STATE_WAIT: Duration = Duration::from_secs(3);
+
+/// Revoke every macaroon made under `root_key_id` on the node at `rest` (lnd's `DeleteMacaroonID`), asked with
+/// `admin`, a macaroon that may do so (`macaroon:write`). `admin` is used for this one call and kept nowhere.
+pub fn revoke_root_key(rest: &str, tls_cert: Option<&Path>, admin: &[u8], root_key_id: u64) -> Result<(), String> {
+    let node = LndRest::build(rest, admin, admin, tls_cert)?;
+    // `{"deleted": false}`: the node has no such root key, so nothing made under it is valid either
+    node.unary(&node.invoice_macaroon, "DELETE", &format!("/v1/macaroon/{root_key_id}"), None)
+        .map(|_| ())
+        .map_err(|e| format!("the node did not revoke root key id {root_key_id}: {e}"))
+}
+
+/// The node's wallet state, as lnd's State service says it with no macaroon (`GET /v1/state`):
+/// `NON_EXISTING` (no wallet made yet), `LOCKED`, `UNLOCKED` and `RPC_ACTIVE` (starting: lnd waits for
+/// its chain backend to sync), `SERVER_ACTIVE` (ready) or `WAITING_TO_START`. No key is sent.
+/// At most [`WALLET_STATE_WAIT`] in all: a page asks it as it renders.
+pub fn wallet_state(rest: &str, tls_cert: Option<&Path>) -> Result<String, String> {
+    let node = LndRest::build_timed(rest, &[], &[], tls_cert, Some(WALLET_STATE_WAIT))?;
+    let v = node
+        .unary("", "GET", "/v1/state", None)
+        .map_err(|e| e.to_string())?;
+    v.get("state")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "the node's answer has no state".into())
 }
 
 fn read_capped(r: impl Read, cap: u64) -> Result<String, String> {

@@ -19,6 +19,9 @@ Checks:
   small     a direct call with max_sats 500 from no credit is refused, nothing paid; and a rental whose budget
             (500 sat) is under the smallest ticket (546 sat) is refused before any work, nothing paid, the
             renter told why
+  budget    a rental whose own budget runs out while its miners hash (as one did on mainnet with 495 sats left, under the
+            seller's smallest ticket of 546): the renter ends it itself as its budget spent, telling the hashmaker so; no
+            payment fails, every slice the hashmaker sent work for is paid, nothing is held
   offline   issue #70: a hashmaker whose listing is up and whose miners are all offline (none connected) refuses the
             rental before its welcome, so nothing is paid, not the start fee: the hashtaker says "its miners are offline
             right now", the wallet's node sends nothing and the hashmaker earns nothing
@@ -124,6 +127,11 @@ SLOW_BUDGET_SATS = 40_000
 # a rental's top-up can't pass
 TOPUP_CONTROL = B + 39
 TOPUP_TASK_SATS = 1_200
+# the budget-end check: a rental whose own budget runs out while its miners hash, and the renter's words for that end
+# and for the task's budget in the owner's rules spent (xbt_hashlink::order::BUDGET_USED_UP, TASK_BUDGET_USED_UP)
+BUDGET_END_SATS = 2_500
+BUDGET_USED_UP = "budget used up"
+TASK_BUDGET_USED_UP = "the task's budget in the wallet's rules is used up"
 REPORT: dict[str, Any] = {"checks": []}
 PROCS: list[subprocess.Popen[bytes]] = []
 
@@ -477,11 +485,15 @@ def topup_run() -> None:
     lv = x.get("live", {})
     REPORT["topup_task_rental"] = lv
     oks = [p for p in lv.get("pays", []) if p.get("ok")]
-    why = " ".join(str(p.get("why", "")) for p in lv.get("pays", []) if p.get("ok") is False)
-    check("topup: the owner's signed task budget still stops a topped-up rental: the wallet refuses past it, said as its rules",
-          code == 200 and wallet_moved(x) <= TOPUP_TASK_SATS and len(oks) * PRICE_MSAT <= TOPUP_TASK_SATS * 1000 and lv.get("payFailed") is True
-          and "wallet" in why.lower(),
-          {"topup": v, "paid": len(oks), "wallet moved sats": wallet_moved(x), "task budget": TOPUP_TASK_SATS, "closed": lv.get("closed"), "why": why[:300]})
+    # the wallet refuses the slice past the task's budget, moving nothing; since 0.2.15 the renter ends the rental itself
+    # as that budget spent, with no failed payment, rather than leave the hashmaker a share to end the rental unpaid for
+    refused = [e for e in lv.get("events", []) if e.get("ev") == "refused: budget spent"]
+    why = " ".join(str(e.get("why", "")) for e in refused)
+    check("topup: the owner's signed task budget still stops a topped-up rental: the wallet refuses past it, said as its rules, and the renter ends it as spent",
+          code == 200 and wallet_moved(x) <= TOPUP_TASK_SATS and len(oks) * PRICE_MSAT <= TOPUP_TASK_SATS * 1000 and lv.get("payFailed") is False
+          and lv.get("closed") == TASK_BUDGET_USED_UP and "wallet" in why.lower() and all(p.get("ok") for p in lv.get("pays", [])),
+          {"topup": v, "paid": len(oks), "wallet moved sats": wallet_moved(x), "task budget": TOPUP_TASK_SATS, "closed": lv.get("closed"),
+           "payFailed": lv.get("payFailed"), "why": why[:300]})
     stop([p2, *m2])
 
     # 2. then a rental of six slices' budget, topped up after its second: it pays on past six, never past the sum
@@ -520,6 +532,38 @@ def topup_run() -> None:
     stop([p1, *m1])
 
     stop([pool])
+
+
+def budget_end_check() -> None:
+    """A rental whose own budget (BUDGET_END_SATS) runs out while its miners still hash, paid on real tickets. 0.2.14 on
+    mainnet asked for one more slice with 495 sats of its budget left, under the seller's smallest ticket of 546: the
+    wallet refused it, the hashmaker held a share for it and ended the rental unpaid, and the renter counted a failed
+    payment. Now the renter ends the rental itself once no ticket or credit pays the next slice and the work paid for
+    is used, telling the hashmaker why: no payment fails, every slice the hashmaker sent work for was paid, and the
+    credit left stays with the shop."""
+    inv0, pay0 = d.seller_invoices(), d.buyer_payments()
+    r = rental("budget", None, 160, 1.5, origin=ORIGIN2, caps=("--budget-sats", str(BUDGET_END_SATS)))
+    hz, bz = r["hasher"], r["buyer"]
+    REPORT["budget_end_pays"] = bz["pays"]
+    st = hz.get("stopped") or {}
+    oks = [p for p in bz["pays"] if p.get("ok")]
+    priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
+    moved = sum(int(p["wallet"].get("charged_sats", 0)) for p in oks)
+    new_pay = {h: p for h, p in d.buyer_payments().items() if h not in pay0}
+    settled = [h for h, i in d.seller_invoices().items() if h not in inv0 and i["state"] == "SETTLED"]
+    # which of the budget's limits ended it: the next slice's price, or a ticket it could no longer buy
+    by_ticket = (len(oks) + 1) * PRICE_MSAT <= BUDGET_END_SATS * 1000
+    check("budget: the renter ends a rental whose budget is spent itself, before the miners stop, with no failed payment and nothing unpaid",
+          bz["closed"] == BUDGET_USED_UP and not bz["payFailed"] and all(p.get("ok") for p in bz["pays"]) and len(oks) == hz["paid"] == bz["released"]
+          and st.get("reason") == f"hashtaker closed: {BUDGET_USED_UP}" and st.get("unpaidWork") == "0" and int(hz["meter"]["work"]) <= hz["paid"] * SLICE_WORK
+          and priced == len(oks) * PRICE_MSAT <= BUDGET_END_SATS * 1000 and moved <= BUDGET_END_SATS and max((p["atMs"] for p in bz["pays"]), default=0) < r["done_ms"]
+          and d.held() == 0,
+          {"closed": bz["closed"], "payFailed": bz["payFailed"], "hashmaker": st.get("reason"), "unpaidWork": st.get("unpaidWork"), "paid": hz["paid"],
+           "priced_msat": priced, "wallet moved sats": moved, "budget sats": BUDGET_END_SATS, "ended by": "the smallest ticket" if by_ticket else "the next slice's price",
+           "left with the seller msat": bz.get("leftWithSellerMsat"), "held": d.held()})
+    check("budget: the seller's node settled what the renter's node paid for it",
+          bool(settled) and all(new_pay.get(h, {}).get("status") == "SUCCEEDED" for h in settled),
+          {"settled tickets": len(settled), "payments": {h[:12]: p["status"] for h, p in new_pay.items()}, "wallet moved sats": moved})
 
 
 def offline_check() -> None:
@@ -1610,6 +1654,7 @@ def main() -> int:
               hz["paid"] == 0 and int(hz["meter"]["work"]) == 0 and bz["payFailed"] and not moved and d.held() == 0 and "smallest ticket" in why,
               {"hashmaker paid": hz["paid"], "work": hz["meter"]["work"], "closed": bz["closed"], "why": why[:300], "payments": moved, "held": d.held()})
 
+        budget_end_check()
         offline_check()
         route_check()
         drop_check()
