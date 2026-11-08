@@ -166,9 +166,18 @@ fn keystore(secrets: &Secrets) -> Result<Option<Arc<KeyStore>>, String> {
     Ok(Some(Arc::new(KeyStore::with_key(key))))
 }
 
-/// The readiness document: node reachable and synced, keys unlocked, witness reachable (when
-/// anchoring is on), the socket answering.
-fn readiness(signer: &Signer, sock: &Path) -> Value {
+/// What the readiness document says of the node and the witness, as last asked. Asked on a thread of its own
+/// ([`probe_loop`]): a node slow to answer (a sync on a slow disk keeps `getblockchaininfo` waiting past the
+/// RPC timeout) must not keep the document from being written, or the file goes stale and the platform takes the
+/// signer for dead and restarts everything that waits on it (StartOS did, every 30 s, for a whole sync).
+#[derive(Clone)]
+struct Probed {
+    node: Value,
+    witness: Value,
+    at: std::time::Instant,
+}
+
+fn probe(signer: &Signer) -> Probed {
     let node = health::node_status(signer.node.call("getblockchaininfo", json!([])).map_err(|e| e.msg));
     let witness = match env("B2_ANCHOR_SOCK") {
         Some(p) => match AnchorClient::new(Path::new(&p)).latest() {
@@ -177,7 +186,31 @@ fn readiness(signer: &Signer, sock: &Path) -> Value {
         },
         None => json!({"enabled": false, "reachable": false}),
     };
-    let socket = SignerClient::new(sock).call("health", json!({})).map(|h| h["ok"] == true).unwrap_or(false);
+    Probed { node, witness, at: std::time::Instant::now() }
+}
+
+/// The node and witness as the document says them: the last answer, or, when it is older than `max_age` (the
+/// node has not answered since), not reachable, with how long it has been. None asked yet: not reachable either.
+fn probed_now(last: Option<&Probed>, max_age: Duration) -> (Value, Value) {
+    match last {
+        Some(p) if p.at.elapsed() <= max_age => (p.node.clone(), p.witness.clone()),
+        Some(p) => {
+            let secs = p.at.elapsed().as_secs();
+            (json!({"reachable": false, "synced": false, "sync_pct": p.node["sync_pct"].clone(),
+                    "error": format!("the node has not answered for {secs} s (it may be busy syncing)")}), p.witness.clone())
+        }
+        None => (json!({"reachable": false, "synced": false, "sync_pct": 0.0, "error": "the node has not answered yet"}),
+                 json!({"enabled": env("B2_ANCHOR_SOCK").is_some(), "reachable": false})),
+    }
+}
+
+/// The readiness document: node reachable and synced, keys unlocked, witness reachable (when
+/// anchoring is on), the socket answering. The node and witness come from the probe thread's last answer.
+fn readiness(signer: &Signer, sock: &Path, node: Value, witness: Value) -> Value {
+    // the socket's own health answer needs no node; a short timeout keeps a wedged server from holding the writer
+    let mut client = SignerClient::new(sock);
+    client.timeout = Duration::from_secs(3);
+    let socket = client.call("health", json!({})).map(|h| h["ok"] == true).unwrap_or(false);
     // the signer only starts with its keys opened (sealed hot key, channel keys)
     let unlocked = signer.keystore.is_some() || KeyStore::plaintext_allowed();
     let ok = node["reachable"] == true && node["synced"] == true && unlocked && socket
@@ -278,10 +311,22 @@ fn main() {
     if let Some(path) = ready_file() {
         let (s, sock) = (signer.clone(), signer.sock_path.clone());
         let every = Duration::from_secs_f64(ready_interval());
+        let last: Arc<std::sync::Mutex<Option<Probed>>> = Arc::default();
+        // the node and the witness, asked on their own thread: the writer below never waits for them
+        let (ps, pl) = (signer.clone(), last.clone());
+        std::thread::Builder::new().name("readiness-probe".into()).spawn(move || loop {
+            let p = probe(&ps);
+            *pl.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+            std::thread::sleep(every);
+        }).unwrap_or_else(|e| die(1, e));
+        // an answer older than this is no answer: the same age at which a reader takes the file for stale
+        let max_age = Duration::from_secs_f64(ready_interval() * 3.0 + 5.0);
         std::thread::Builder::new().name("readiness".into()).spawn(move || loop {
             // the socket binds right after this thread starts: give it a moment on the first round
             std::thread::sleep(Duration::from_millis(200));
-            if let Err(e) = health::write_ready(&path, &readiness(&s, &sock)) {
+            let held = last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let (node, witness) = probed_now(held.as_ref(), max_age);
+            if let Err(e) = health::write_ready(&path, &readiness(&s, &sock, node, witness)) {
                 eprintln!("xbt-signer: readiness file {}: {e}", path.display());
             }
             std::thread::sleep(every);
@@ -289,5 +334,41 @@ fn main() {
     }
     if let Err(e) = xbt_signer::server::serve(signer, signals) {
         die(1, e.msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probed(age: Duration) -> Probed {
+        let at = std::time::Instant::now().checked_sub(age).expect("a monotonic clock that old");
+        Probed { node: json!({"reachable": true, "synced": false, "sync_pct": 41.5, "blocks": 400_000}),
+                 witness: json!({"enabled": false, "reachable": false}), at }
+    }
+
+    #[test]
+    fn a_fresh_answer_is_said_as_it_came() {
+        let (node, witness) = probed_now(Some(&probed(Duration::from_secs(2))), Duration::from_secs(20));
+        assert_eq!(node["reachable"], true);
+        assert_eq!(node["blocks"], 400_000);
+        assert_eq!(witness["enabled"], false);
+    }
+
+    #[test]
+    fn a_node_that_stopped_answering_is_not_reachable_but_the_document_is_still_written() {
+        // a sync on a slow disk: the last answer is 45 s old, past the 20 s a reader allows
+        let (node, _) = probed_now(Some(&probed(Duration::from_secs(45))), Duration::from_secs(20));
+        assert_eq!(node["reachable"], false);
+        assert_eq!(node["synced"], false);
+        assert_eq!(node["sync_pct"], 41.5, "the last progress known is kept");
+        assert!(node["error"].as_str().unwrap().contains("has not answered for 45 s"), "{node}");
+    }
+
+    #[test]
+    fn no_answer_yet_is_not_reachable() {
+        let (node, _) = probed_now(None, Duration::from_secs(20));
+        assert_eq!(node["reachable"], false);
+        assert_eq!(node["error"], "the node has not answered yet");
     }
 }
