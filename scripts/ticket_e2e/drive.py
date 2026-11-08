@@ -4004,6 +4004,10 @@ LEND_REAL_TOGETHER = os.environ.get("LEND_REAL_TOGETHER") == "1"
 # what each Mesh-LLM may hold, in GB: each lender's, through the invite, and the operator's, one more
 LEND_REAL_VRAM = int(os.environ.get("LEND_REAL_VRAM", "4"))
 LEND_REAL_ANSWERS = int(os.environ.get("LEND_REAL_ANSWERS", "36"))
+# The coordinator's settings go to each stage in its load, whatever the lender's own say. With LEND_REAL_NO_MMAP=1 every stage reads
+# its weights into memory as it loads instead of mapping them from disk (Mesh-LLM's `[defaults.hardware] mmap`): to compare the two
+# on a lender with a slow disk
+OP_SETTINGS = "[defaults.hardware]\nmmap = false\n\n" if os.environ.get("LEND_REAL_NO_MMAP") == "1" else ""
 
 
 def forward(bind: str, port: int, to: int) -> None:
@@ -4106,7 +4110,9 @@ def mesh_lend_real() -> None:
         except (OSError, ValueError):
             return ""
 
-    os.makedirs(f"{RUN}/op-home", exist_ok=True)
+    os.makedirs(f"{RUN}/op-home/.mesh-llm", exist_ok=True)
+    with open(f"{RUN}/op-home/.mesh-llm/config.toml", "w") as f:
+        f.write(OP_SETTINGS)
     operator_mesh(None)
     lab.wait("the operator's Mesh-LLM", 120, status_token, every=1)
     token = status_token()
@@ -4407,9 +4413,8 @@ def mesh_lend_real() -> None:
     # --- the operator makes the split draft. Its own settings alone turn n-gram drafting on, for any model, whatever the lenders'
     # say. Tokens a verify window commits take no decode step, so no count includes them: each lender's stage reports the positions it
     # ran in verify windows, and each lender must leave and say why. Answers that repeat themselves give the drafter something to draft
-    os.makedirs(f"{RUN}/op-home/.mesh-llm", exist_ok=True)
     with open(f"{RUN}/op-home/.mesh-llm/config.toml", "w") as f:
-        f.write('[defaults.speculative]\nstrategy = "ngram-suffix"\nngram_min = 3\nngram_max = 8\n')
+        f.write(OP_SETTINGS + '[defaults.speculative]\nstrategy = "ngram-suffix"\nngram_min = 3\nngram_max = 8\n')
     operator_mesh(lock)
     lab.wait("the split, drafting now, with the lenders on their stages", load_s, placed, every=2)
     with open(f"{RUN}/op-mesh.log", encoding="utf-8", errors="replace") as f:
