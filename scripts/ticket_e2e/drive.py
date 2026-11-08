@@ -3492,20 +3492,25 @@ class Files(BaseHTTPRequestHandler):
 
 
 class Deal:
-    """An operator's offer to one lender: its payout config and ledger, its invite, the lender's directory, and `lend`."""
+    """An operator's offer to one lender: its payout config and ledger, its invite, the lender's directory, and `lend`. A further
+    lender of the same operator (`of`) shares its config, ledger, lock and invite; each lender is paid on its own node (`ln`), and its
+    Mesh-LLM takes `port` to `port` + 2."""
 
-    def __init__(self, tag: str) -> None:
-        self.tag, self.proc, self.log = tag, None, f"{RUN}/lend-{tag}.log"
-        self.config, self.ledger, self.report = f"{RUN}/deal-{tag}.json", f"{RUN}/deal-{tag}-ledger.json", f"{RUN}/deal-{tag}-report.json"
-        self.invite, self.dir, self.node = f"{RUN}/deal-{tag}-invite.json", f"{RUN}/lender-{tag}", ""
+    def __init__(self, tag: str, ln: str = OFFER_NODE, port: int = LEND_PORT, of: Deal | None = None) -> None:
+        self.tag, self.ln, self.port, self.proc, self.log = tag, ln, port, None, f"{RUN}/lend-{tag}.log"
+        op = of.tag if of else tag
+        self.config, self.ledger, self.report = f"{RUN}/deal-{op}.json", f"{RUN}/deal-{op}-ledger.json", f"{RUN}/deal-{op}-report.json"
+        self.invite, self.lock, self.dir, self.node = f"{RUN}/deal-{op}-invite.json", f"{RUN}/deal-{op}-lock.json", f"{RUN}/lender-{tag}", ""
         self.tokens, self.layers, self.runs = f"{RUN}/deal-{tag}-tokens", f"{RUN}/deal-{tag}-layers", f"{RUN}/deal-{tag}-runs"
         self.drafted = f"{RUN}/deal-{tag}-drafted"
-        self.hex = ""
-        self.write_config({"gateway_url": PAY_ORIGIN, "mesh_console_url": f"http://127.0.0.1:{STAND_IN_PORT}", "gguf": f"{Files.root}/model.gguf", "signer_sock": PAY_SOCK, "ledger": self.ledger,
-                           "report": self.report, "operator_cut_ppm": PAY_CUT_PPM, "own_nodes": [OWN_NODE], "lenders": {}, "min_payout_sats": LEND_FLOOR_SATS, "interval_s": 1, "retry_s": 1})
+        self.hex, self.b64 = "", ""
         for counter in (self.tokens, self.drafted):
             with open(counter, "w") as f:
                 f.write("0")
+        if of:
+            return
+        self.write_config({"gateway_url": PAY_ORIGIN, "mesh_console_url": f"http://127.0.0.1:{STAND_IN_PORT}", "gguf": f"{Files.root}/model.gguf", "signer_sock": PAY_SOCK, "ledger": self.ledger,
+                           "report": self.report, "operator_cut_ppm": PAY_CUT_PPM, "own_nodes": [OWN_NODE], "lenders": {}, "min_payout_sats": LEND_FLOOR_SATS, "interval_s": 1, "retry_s": 1})
         tool("invite", "--config", self.config, "--name", f"Lab operator {tag}", "--out", self.invite, "--build-file", f"{Files.root}/build.tar.gz",
              "--build-url", f"http://127.0.0.1:{FILES_PORT}/build.tar.gz", "--model-file", f"{Files.root}/model.gguf", "--model-url", f"http://127.0.0.1:{FILES_PORT}/model.gguf", "--max-vram", "4")
 
@@ -3520,8 +3525,9 @@ class Deal:
     def lend_args(self, invite: str | None = None) -> list[str]:
         with open(f"{Files.root}/build.sha256") as f:
             sha = f.read().strip()
-        return ["lend", "--invite", invite or self.invite, "--dir", self.dir, "--node-rest", f"https://127.0.0.1:{lab.PORT[OFFER_NODE]}", "--node-macaroon", f"{RUN}/lender.macaroon",
-                "--node-cert", f"{RUN}/{OFFER_NODE}.tls.cert", "--allow-build", sha, "--interval-s", "1", "--credit-sats", str(LEND_CREDIT_SATS), "--port-base", str(LEND_PORT), "--name", f"lender {self.tag}", "--rejoin-wait-s", "0"]
+        macaroon = f"{RUN}/lender.macaroon" if self.ln == OFFER_NODE else f"{RUN}/lender-{self.ln}.macaroon"
+        return ["lend", "--invite", invite or self.invite, "--dir", self.dir, "--node-rest", f"https://127.0.0.1:{lab.PORT[self.ln]}", "--node-macaroon", macaroon,
+                "--node-cert", f"{RUN}/{self.ln}.tls.cert", "--allow-build", sha, "--interval-s", "1", "--credit-sats", str(LEND_CREDIT_SATS), "--port-base", str(self.port), "--name", f"lender {self.tag}", "--rejoin-wait-s", "0"]
 
     def env(self) -> dict[str, str]:
         return dict(os.environ, STAND_IN_TOKENS=self.tokens, STAND_IN_LAYERS=self.layers, STAND_IN_RUNS=self.runs, STAND_IN_DRAFTED=self.drafted)
@@ -3577,27 +3583,30 @@ def tool(*args: str) -> str:
     return p.stdout
 
 
-def deal_up(tag: str) -> Deal:
-    """A lender through the whole flow: `lend`, its card to the operator, the plan with it in, and the owner's wallet allowing it."""
-    d = Deal(tag)
+def deal_up(tag: str, ln: str = OFFER_NODE, port: int = LEND_PORT, of: Deal | None = None) -> Deal:
+    """A lender through the whole flow: `lend`, its card to the operator, the plan with it in, and the owner's wallet allowing it.
+    Joining an operator's split (`of`) moves the layers of the lenders already in it, as the operator's restart on the new lock would."""
+    d = Deal(tag, ln, port, of)
     d.start()
     lab.wait(f"lender {tag}'s card", 60, lambda: os.path.exists(f"{d.dir}/card.txt"))
     with open(f"{d.dir}/card.txt") as f:
         card = f.read().strip()
-    lock = f"{RUN}/deal-{tag}-lock.json"
-    tool("lender-add", "--config", d.config, "--card", card, "--lock", lock)
-    with open(lock) as f:
+    tool("lender-add", "--config", d.config, "--card", card, "--lock", d.lock)
+    with open(d.lock) as f:
         stages = json.load(f)["stages"]
     d.node = stages[-1]["node"]
     StandIn.plan, StandIn.plan_id = [(s["node"], s["layer_start"], s["layer_end"]) for s in stages], f"plan-{tag}"
-    with open(d.layers, "w") as f:
-        f.write(f"{stages[-1]['layer_start']} {stages[-1]['layer_end']}")
+    for deal in (d, of) if of else (d,):
+        s = next(s for s in stages if s["node"] == deal.node)
+        with open(deal.layers, "w") as f:
+            f.write(f"{s['layer_start']} {s['layer_end']}")
     offer = d.read_config()["lenders"][d.node]["offer"]
     dec = lab.post(OFFER_NODE, "/v2/offers/decode", {"bolt12": offer})
-    d.hex = base64.b64decode(dec["offer"]["offer_id"]).hex()
+    d.b64 = dec["offer"]["offer_id"]
+    d.hex = base64.b64decode(d.b64).hex()
     PAY_ALLOWED.append(d.hex)
     pay_wallet(PAY_ALLOWED)
-    lab.wait(f"{OFFER_NODE} issuing invoices for lender {tag}'s offer", 180,
+    lab.wait(f"{ln} issuing invoices for lender {tag}'s offer", 180,
              lambda: lab.post(SELLER, "/v2/offers/fetchinvoice", {"offer": offer, "amount_msat": "1000000", "timeout_seconds": 10}).get("invoice"), every=3)
     rc, out = d.payout()
     if rc != 0:
@@ -3606,17 +3615,17 @@ def deal_up(tag: str) -> Deal:
 
 
 PAY_ALLOWED: list[str] = []
+LEND_LAB: list[bool] = []
 
 
-def mesh_lend() -> None:
-    """A machine lent through the whole flow, and the lender's own check of its pay (run by name only). `lend` fetches a checked
-    build and model, makes an offer on the lender's node (lf4), and serves; the operator takes its card with `lender-add` and pays it
-    with `payout`. The build is a stand-in for Mesh-LLM, so that each cheat can be played exactly: the money is real nodes'. The lender
-    must catch an operator who stops paying, takes a bigger cut than it offered, serves tokens around its gateway, or books the lender's
-    stage as its own, from what the lender can see alone, and must stop serving with at most its credit limit and one answer's work unpaid.
-    One that makes the split draft, whose drafted tokens no count includes, the lender must leave at once."""
-    MESH_LEND_RAN.append(True)
-    stop_sessions()
+def lend_lab_up() -> None:
+    """What lending to the operator's stand-in split needs on the lab, made once a run: the paying lab, the stand-in build and model
+    on a file server (and a damaged copy of each), the operator's stand-in Mesh-LLM behind its gateway, and the macaroon of the
+    lender's node. Each check counts what is fetched from its own start."""
+    Files.hits.clear()
+    StandIn.plan = [(OWN_NODE, 0, 4)]
+    if LEND_LAB:
+        return
     pay_lab_up()
     upstream = f"http://127.0.0.1:{STAND_IN_PORT}"
     root = f"{RUN}/lend-files"
@@ -3639,12 +3648,24 @@ def mesh_lend() -> None:
     with open(f"{root}/model-bad.gguf", "wb") as f:
         f.write(model[:-1] + bytes([model[-1] ^ 1]))
     threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", FILES_PORT), Files).serve_forever, daemon=True).start()
-    StandIn.plan = [(OWN_NODE, 0, 4)]
     threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", STAND_IN_PORT), StandIn).serve_forever, daemon=True).start()
     pay_gateway_up(upstream)
     with open(f"{RUN}/lender.macaroon", "wb") as f:
         f.write(bytes.fromhex(lab.bake(OFFER_NODE, lab.SELLER_PERMISSIONS)))
     os.chmod(f"{RUN}/lender.macaroon", 0o600)
+    LEND_LAB.append(True)
+
+
+def mesh_lend() -> None:
+    """A machine lent through the whole flow, and the lender's own check of its pay (run by name only). `lend` fetches a checked
+    build and model, makes an offer on the lender's node (lf4), and serves; the operator takes its card with `lender-add` and pays it
+    with `payout`. The build is a stand-in for Mesh-LLM, so that each cheat can be played exactly: the money is real nodes'. The lender
+    must catch an operator who stops paying, takes a bigger cut than it offered, serves tokens around its gateway, or books the lender's
+    stage as its own, from what the lender can see alone, and must stop serving with at most its credit limit and one answer's work unpaid.
+    One that makes the split draft, whose drafted tokens no count includes, the lender must leave at once."""
+    MESH_LEND_RAN.append(True)
+    stop_sessions()
+    lend_lab_up()
 
     # --- it asks, and an invite cannot choose what runs
     d = Deal("refusals")
@@ -3840,6 +3861,127 @@ def mesh_lend() -> None:
           rc not in (None, 0) and "the split drafted" in said and r.get("drafted") == 48 and r.get("serving") is False,
           {"rc": rc, "drafted": r.get("drafted"), "serving": r.get("serving"), "said": said.strip().splitlines()[-1][:220] if said.strip() else ""})
     d.stop()
+    stop_sessions()
+
+
+LEND2_PORT = BASE + 38  # a second lender's Mesh-LLM takes LEND2_PORT to LEND2_PORT + 2
+
+
+def deal_books(d: Deal) -> dict[str, Any]:
+    """One lender, payment by payment: what the wallet paid its offer, and what its own node received for it (exact as mesh_pay judges it)."""
+    rows = lab.post(d.ln, "/v2/offers/invoices", {"offer_id": d.b64}).get("invoices", [])
+    got = {base64.b64decode(i["payment_hash"]).hex(): int(i.get("amount_paid_msat") or 0) for i in rows if i.get("state") == "SETTLED"}
+    events = [e for e in signer("history", {"limit": 5000}, sock=PAY_SOCK)["events"] if e.get("type") == "ln_settled" and e.get("dest") == f"ln-offer:{d.hex}"]
+    paid = {e["payment_hash"]: signer("ln_lookup", {"payment_hash": e["payment_hash"]}, sock=PAY_SOCK) for e in events}
+    out = {"invoices": len(got), "node_msat": sum(got.values()), "wallet_msat": sum(int(x["value_msat"]) for x in paid.values()),
+           "ledger_paid_msat": d.ledger_now()["paid_msat"].get(d.node, 0), "one_for_one": set(got) == set(paid),
+           "within_fee": all(0 <= got.get(h, -1) - int(x["value_msat"]) <= int(x["fee_msat"]) for h, x in paid.items())}
+    out["exact"] = out["one_for_one"] and out["within_fee"] and out["wallet_msat"] == out["ledger_paid_msat"] > 0
+    return out
+
+
+def mesh_lend_two() -> None:
+    """Two machines lent to one operator's split, each paid on its own node by its share of the work (run by name only). The first
+    lender serves alone, on lf4; the second joins, on the hop's node, and the plan changes under the first. Then the operator stops
+    paying one of them: that one leaves, the other goes on being paid, and the first comes back once paid. Stand-in builds as in
+    mesh_lend, so each stage's count is exact; the money is real nodes'. A stand-in split goes on answering without a stage: that a
+    real one serves nothing then, and charges nothing, is mesh_lend_real's to show."""
+    MESH_LEND_RAN.append(True)
+    stop_sessions()
+    lend_lab_up()
+    with open(f"{RUN}/lender-{HOP}.macaroon", "wb") as f:
+        f.write(bytes.fromhex(lab.bake(HOP, lab.SELLER_PERMISSIONS)))
+    os.chmod(f"{RUN}/lender-{HOP}.macaroon", 0o600)
+    a = deal_up("two-a")
+    start = pay_charged()
+    deals = [a]
+
+    def answers(n: int) -> None:
+        """`n` answers bought from the gateway, whose tokens pass through every stage."""
+        pay_buy(n)
+        for d in deals:
+            d.add_tokens(n * STAND_IN_ANSWER_TOKENS)
+
+    for _ in range(2):
+        answers(2)
+        a.payout()
+    # what came in under the first plan is booked under it before the second lender joins, and the first has counted it all
+    a.payout()
+    a.settle()
+    plan_one, moved = list(StandIn.plan), pay_charged()
+    b = deal_up("two-b", HOP, LEND2_PORT, a)
+    deals.append(b)
+    plan_two = list(StandIn.plan)
+    weights_one, weights_two = dict(stand_in_weights(plan_one, {OWN_NODE})), dict(stand_in_weights(plan_two, {OWN_NODE}))
+    for _ in range(3):
+        answers(1)
+        a.payout()
+    ra, rb = a.settle(), b.settle()
+    led = a.ledger_now()
+    ledger_weights = {k: v for k, v in led["epoch"]["stages"]}
+    span = {d.tag: next(f"{x}-{y}" for n, x, y in plan_two if n == d.node) for d in deals}
+    books = {d.tag: deal_books(d) for d in deals}
+    check("mesh_lend_two: two lenders, each on its own node, added one after the other: each is paid by the plan of three stages, exact on its own node, and each one's own working-out of its share is the ledger's",
+          len(plan_two) == 3 and all(x["exact"] for x in books.values())
+          and all(int(r["shares"].get(span[d.tag], {}).get("active_params", -1)) == ledger_weights.get(d.node) == weights_two[d.node] for d, r in ((a, ra), (b, rb))),
+          {"plan": plan_two, "books": books, "ledger_weights": ledger_weights, "shares": {"a": ra["shares"], "b": rb["shares"]}})
+    first = next(f"{x}-{y}" for n, x, y in plan_one if n == a.node)
+    with open(a.report) as f:
+        accrued = {k: int(v["accrued_msat"]) for k, v in json.load(f)["parties"].items()}
+    expected = work_split(moved - start, list(weights_one.items()))
+    for k, v in work_split(pay_charged() - moved, list(weights_two.items())).items():
+        expected[k] = expected.get(k, 0) + v
+    check("mesh_lend_two: the second lender's joining moved the first one's layers: the first counted the work of both its ranges, its share of each is the ledger's under each plan, and every party's earnings went by the plan of their time, to the msat",
+          set(ra["tokens"]) == {first, span["two-a"]} and first != span["two-a"]
+          and int(ra["shares"][first]["active_params"]) == weights_one[a.node] and int(ra["shares"][span["two-a"]]["active_params"]) == weights_two[a.node] and accrued == expected,
+          {"tokens": ra["tokens"], "shares": ra["shares"], "weights_one": weights_one, "weights_two": weights_two, "accrued": accrued, "expected": expected})
+
+    # --- the operator stops paying the first lender: its wallet refuses that offer, and pays the other
+    pay_wallet([x for x in PAY_ALLOWED if x != a.hex])
+    w = weights_two
+    one = STAND_IN_ANSWER_TOKENS * PAY_OUT_MSAT // 1000 * (1_000_000 - PAY_CUT_PPM) // 1_000_000 * w[a.node] // sum(w.values())
+    steps, b_stopped = 0, False
+    ra = a.lender_report()
+    while ra["serving"] and steps < 30:
+        answers(1)
+        a.payout()
+        steps += 1
+        ra, rb = a.settle(), b.lender_report()
+        b_stopped = b_stopped or not rb["serving"]
+    # with a stage gone a real split answers nothing: rounds go on, with nothing new to pay
+    for _ in range(2):
+        a.payout()
+    rb = b.settle()
+    s = ra.get("stopped") or {}
+    led = a.ledger_now()
+    check("mesh_lend_two: an operator who stops paying one lender: that one stops serving, with at most its limit and one answer's work unpaid; the other, paid all along, is never stopped and never owed past its limit",
+          not ra["serving"] and bool(s) and s["due_at_least_msat"] - s["received_msat"] <= LEND_CREDIT_SATS * 1000 + one and not b_stopped and rb["serving"]
+          and rb["due_at_least_msat"] <= rb["received_msat"] + LEND_CREDIT_SATS * 1000 and bool(led["refused"].get(a.node)),
+          {"steps": steps, "stopped": s, "limit_msat": LEND_CREDIT_SATS * 1000, "one_answer_msat": one, "other": {k: rb.get(k) for k in ("serving", "due_at_least_msat", "received_msat")},
+           "refused": led["refused"]})
+    # paid at last: the first comes back by itself, and both are paid exactly again
+    pay_wallet(PAY_ALLOWED)
+    time.sleep(1.1)
+    a.payout()
+    ra = a.settle()
+    if not ra["serving"]:
+        ra = a.settle()
+    answers(2)
+    a.payout()
+    ra, rb = a.settle(), b.settle()
+    books = {d.tag: deal_books(d) for d in deals}
+    led = a.ledger_now()
+    with open(a.report) as f:
+        accrued = {k: int(v["accrued_msat"]) for k, v in json.load(f)["parties"].items()}
+    expected = work_split(moved - start, list(weights_one.items()))
+    for k, v in work_split(pay_charged() - moved, list(weights_two.items())).items():
+        expected[k] = expected.get(k, 0) + v
+    check("mesh_lend_two: once paid, the first lender serves again by itself; both nodes hold exactly the ledger's payments, the other lender was never stopped, and every msat earned went by the plan of its time",
+          ra["serving"] and rb["serving"] and not b_stopped and all(x["exact"] for x in books.values()) and not led["refused"] and accrued == expected,
+          {"serving": [ra["serving"], rb["serving"]], "books": books, "refused": led["refused"], "accrued": accrued, "expected": expected})
+    measured("mesh_lend_two", {"plan_one": plan_one, "plan_two": plan_two, "books": books, "accrued": accrued, "tokens": {"a": ra["tokens"], "b": rb["tokens"]}})
+    for d in deals:
+        d.stop()
     stop_sessions()
 
 
@@ -4445,15 +4587,15 @@ def jellyfin(link: str = "") -> None:
 
 
 CHECKS = {"page": page, "latency": latency, "stream": stream, "money": money_check, "flap": flap, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "long_download": lambda: long_download(False), "long_download_relay": lambda: long_download(True), "paused_player": paused_player, "pruned": pruned, "jellyfin": jellyfin,
-          "vpn": vpn, "mesh": mesh, "mesh_pay": mesh_pay, "mesh_lend": mesh_lend, "mesh_lend_real": mesh_lend_real,
+          "vpn": vpn, "mesh": mesh, "mesh_pay": mesh_pay, "mesh_lend": mesh_lend, "mesh_lend_two": mesh_lend_two, "mesh_lend_real": mesh_lend_real,
           "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
     # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
-    # (vpn downloads a public file through the exit, mesh needs a Mesh-LLM node, mesh_pay and mesh_lend the payout tool: run by name only)
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn", "mesh", "mesh_pay", "mesh_lend", "mesh_lend_real")])
+    # (vpn downloads a public file through the exit, mesh needs a Mesh-LLM node, mesh_pay and the mesh_lend checks the payout tool: run by name only)
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "long_download_relay", "jellyfin", "jellyfin_link", "jellyfin_relay", "vpn", "mesh", "mesh_pay", "mesh_lend", "mesh_lend_two", "mesh_lend_real")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

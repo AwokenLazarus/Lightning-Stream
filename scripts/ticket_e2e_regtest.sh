@@ -88,7 +88,7 @@
 # check's node lf4 (BASE+9) and its gateway (BASE+10); the link check's gateway (BASE+11); the jellyfin check's gateway (BASE+12),
 # connector (BASE+13), wallet app (BASE+14) and its two app ports (BASE+15, BASE+16); the mesh_pay
 # check's gateway (BASE+27) and its stand-in model (BASE+28); the mesh_lend check's file server
-# (BASE+29) and its lender's Mesh-LLM (BASE+30 to BASE+32); the mesh_lend_real check's forward to the
+# (BASE+29) and its lender's Mesh-LLM (BASE+30 to BASE+32), and mesh_lend_two's second lender's (BASE+38 to BASE+40); the mesh_lend_real check's forward to the
 # lender's node (BASE+33) and its operator's Mesh-LLM (BASE+34 to BASE+36). Its own compose
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit
