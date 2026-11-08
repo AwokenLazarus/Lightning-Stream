@@ -296,6 +296,8 @@ pub struct Signer {
     pub(crate) me: std::sync::OnceLock<std::sync::Weak<Signer>>,
     /// AGP-063 W4: the one-time code that enrols the first human key.
     pub(crate) enroll: Mutex<crate::admin::EnrollCode>,
+    /// This run's gate for PIN approvals ([`crate::pin`]): the token the UI reads beside the enrolment code's copy.
+    pub(crate) pin_gate: Mutex<String>,
     /// AGP-089: the human-signed messages already used (one signature, one operation).
     pub(crate) used_sigs: crate::admin::UsedSigs,
     /// Sellers caught charging more than the wallet could account for, blocked until the owner lifts it.
@@ -387,7 +389,7 @@ impl Signer {
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
                                 ticket_pace: crate::ticket_rail::Pace::default(), ln_channels_out: Mutex::new(None), ln_last_out: Mutex::new(None), tip_seen: Mutex::new(None), tip_asking: std::sync::atomic::AtomicBool::new(false), ticket_refreshing: Mutex::new(HashSet::new()), ticket_off_channel: Mutex::new(HashMap::new()), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
-                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_late_tries: Mutex::new(HashMap::new()), ticket_start_stopped: Mutex::new(vec![]), ticket_unanswered: Mutex::new(HashMap::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
+                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), identity_write: Mutex::new(()), ticket_cancel_tried: Mutex::new(HashSet::new()), ticket_late_tries: Mutex::new(HashMap::new()), ticket_start_stopped: Mutex::new(vec![]), ticket_unanswered: Mutex::new(HashMap::new()), ticket_stopping: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()), pin_gate: Mutex::new(String::new()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),
                                 seller_blocks });
         let _ = s.me.set(Arc::downgrade(&s));
@@ -398,6 +400,7 @@ impl Signer {
         } else {
             let _ = std::fs::remove_file(s.run.join(crate::admin::ENROLL_CODE_FILE));
         }
+        s.issue_pin_gate();
         Ok(s)
     }
 

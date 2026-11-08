@@ -632,9 +632,13 @@ impl App {
         for (k, v) in hidden {
             h.push_str(&format!("<input type=\"hidden\" name=\"{}\" value=\"{}\">", esc(k), esc(v)));
         }
-        format!("<form method=\"post\" action=\"{action}\" data-sign=\"{kind}\" data-human=\"{}\" class=\"signed\">{}{h}{visible}\
+        // simple mode: where the box's PIN key is the approval key, the PIN signs (`./api/pin-sign`), not a browser key;
+        // a handover to the PIN key itself is signed by the browser key it replaces
+        let by_pin = kind != "pin-handover" && self.pin_approves();
+        let (pin_attr, pin_mode, pin_label) = if by_pin { (" data-pin=\"1\"", "numeric", "PIN") } else { ("", "text", "Approval key passphrase") };
+        format!("<form method=\"post\" action=\"{action}\" data-sign=\"{kind}\" data-human=\"{}\"{pin_attr} class=\"signed\">{}{h}{visible}\
                  <input type=\"hidden\" name=\"signature\" value=\"\">\
-                 <div class=\"row\"><input class=\"pin\" type=\"password\" autocomplete=\"one-time-code\" data-lpignore=\"true\" data-1p-ignore data-bwignore inputmode=\"text\" placeholder=\"Approval key passphrase\" aria-label=\"Approval key passphrase\">\
+                 <div class=\"row\"><input class=\"pin\" type=\"password\" autocomplete=\"one-time-code\" data-lpignore=\"true\" data-1p-ignore data-bwignore inputmode=\"{pin_mode}\" placeholder=\"{pin_label}\" aria-label=\"{pin_label}\">\
                  <button type=\"submit\">{}</button></div><p class=\"sign-msg\" aria-live=\"polite\"></p>\
                  {}</form>",
                 esc(human), Self::csrf_input(ctx), esc(button), message.html())
@@ -766,6 +770,16 @@ impl App {
                                       &|_| "Unblocked. The app may buy from this shop again.".into()),
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
             "/policy-apply" => self.policy_apply(ctx, f),
+            "/api/pin-sign" => self.api_pin_sign(f),
+            "/pin-set" => self.pin_set_post(ctx, f),
+            "/pin-change" => {
+                if g("new_pin") != g("new_pin2") {
+                    self.flash(ctx, false, "The two new PINs differ: type the same digits twice.");
+                    return Resp::redirect("./keys#pin");
+                }
+                back("./keys#pin", self.call("pin_change", json!({"pin": g("pin"), "new_pin": g("new_pin"), "gate": self.pin_gate()})),
+                     &|_| "PIN changed.".into())
+            }
             "/human-key-enroll" => back("./setup", self.call("human_key_enroll", json!({"pubkey": g("pubkey"), "code": g("code")})), &|_| "Approval key enrolled.".into()),
             "/human-key-rotate" => back("./keys", self.call("human_key_rotate", json!({"pubkey": g("pubkey"), "expiry": i("expiry"), "signature": sig()})),
                                         &|_| "The new approval key is enrolled; the old one no longer approves anything.".into()),
@@ -1901,6 +1915,97 @@ impl App {
             <p><button type=\"button\" id=\"keygen-forget\" class=\"link\">Remove the key from this browser</button></p></div>")
     }
 
+    /// The signer's gate for PIN calls ([`xbt_signer::pin`]): written beside the enrolment code's copy, readable by
+    /// the UI's group only, so the model-facing process cannot try PINs. Empty: none (a development signer).
+    fn pin_gate(&self) -> String {
+        self.cfg.enroll_code_file.as_ref().and_then(|p| p.parent()).map(|d| d.join("pin-gate"))
+            .and_then(|p| std::fs::read_to_string(p).ok()).map(|t| t.trim().to_string()).unwrap_or_default()
+    }
+
+    fn pin_status(&self) -> Value {
+        self.call("pin_status", json!({})).unwrap_or(Value::Null)
+    }
+
+    /// The box's PIN key is the enrolled approval key: signed forms ask for the PIN.
+    pub(crate) fn pin_approves(&self) -> bool {
+        self.pin_status()["enrolled"] == true
+    }
+
+    /// `./api/pin-sign`: the PIN signs one approval message (the page rebuilt it from the fields shown).
+    fn api_pin_sign(&self, f: &HashMap<String, String>) -> Resp {
+        let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        match self.call("approve_with_pin", json!({"pin": g("pin"), "message": g("message"), "gate": self.pin_gate()})) {
+            Ok(v) if v["ok"] == true => Resp::json(200, &json!({"signature": v["signature"]})),
+            Ok(v) => Resp::json(200, &json!({"error": reason_of(&v), "rule": v["rule"]})),
+            Err(e) => Resp::json(200, &json!({"error": e})),
+        }
+    }
+
+    /// `./pin-set`: the box's PIN key becomes the approval key: with the enrolment code on a box with none yet, or
+    /// handed over by the browser key (the form's signature).
+    fn pin_set_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        let to = Resp::redirect("./keys#pin");
+        if g("new_pin") != g("new_pin2") {
+            self.flash(ctx, false, "The two PINs differ: type the same digits twice.");
+            return to;
+        }
+        let gate = self.pin_gate();
+        let prep = match self.call("pin_prepare", json!({"gate": gate})) {
+            Ok(v) if v["ok"] == true => v,
+            Ok(v) => { self.flash(ctx, false, reason_of(&v)); return to; }
+            Err(e) => { self.flash(ctx, false, e); return to; }
+        };
+        let mut p = json!({"pin": g("new_pin"), "gate": gate});
+        if prep["needs"] == "code" {
+            let file = self.cfg.enroll_code_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|c| c.trim().to_string());
+            p["code"] = json!(file.filter(|c| !c.is_empty()).unwrap_or_else(|| g("code")));
+        } else {
+            p["expiry"] = json!(g("expiry").parse::<i64>().unwrap_or(0));
+            p["signature"] = json!(g("signature"));
+        }
+        match self.call("pin_set", p) {
+            Ok(v) if v["ok"] == true => self.flash(ctx, true, "PIN set. From now on your PIN approves what spends money; no browser key is needed."),
+            Ok(v) => self.flash(ctx, false, reason_of(&v)),
+            Err(e) => self.flash(ctx, false, e),
+        }
+        to
+    }
+
+    /// The Keys page's PIN section: set a PIN (with the enrolment code, or handed over by the browser key), or change it.
+    fn pin_section(&self, ctx: &Ctx, human: &str) -> String {
+        let st = self.pin_status();
+        let pins = "<label>PIN (4 to 8 digits)<input name=\"new_pin\" type=\"password\" inputmode=\"numeric\" pattern=\"[0-9]{4,8}\" autocomplete=\"new-password\" required></label>\
+                    <label>PIN again<input name=\"new_pin2\" type=\"password\" inputmode=\"numeric\" pattern=\"[0-9]{4,8}\" autocomplete=\"new-password\" required></label>";
+        let mut b = String::from("<section class=\"card\" id=\"pin\"><h2>Approve with a PIN</h2>");
+        if st["enrolled"] == true {
+            b.push_str("<p>Your PIN approves everything that spends money. The key it unlocks is kept on this box, sealed.</p>");
+            b.push_str(&format!("<form method=\"post\" action=\"./pin-change\">{}<label>Current PIN<input name=\"pin\" type=\"password\" inputmode=\"numeric\" autocomplete=\"current-password\" required></label>\
+                {}<button>Change the PIN</button></form><p class=\"hint\">Forgot it? Reset it from the box's own page (the app's Reset PIN action), then set a new one.</p>",
+                Self::csrf_input(ctx), pins.replace("PIN (4", "New PIN (4").replace("PIN again", "New PIN again")));
+        } else if st["reset_needed"] == true {
+            b.push_str("<p class=\"flash bad\">Too many wrong PINs: reset the PIN from the box's own page.</p>");
+        } else if human.is_empty() {
+            b.push_str(&format!("<p>Instead of a key in this browser, choose a PIN: the box keeps the approval key, sealed, and uses it only \
+                when the right PIN is typed. Five wrong PINs in a row lock approvals for a while.</p>\
+                <form method=\"post\" action=\"./pin-set\">{}{pins}<button>Use a PIN for approvals</button></form>", Self::csrf_input(ctx)));
+        } else {
+            match self.call("pin_prepare", json!({"gate": self.pin_gate()})) {
+                Ok(v) if v["ok"] == true => {
+                    b.push_str("<p>Switch from the key in this browser to a PIN. Your current key signs the handover once; after that \
+                        the PIN approves and the browser key no longer does.</p>");
+                    let exp = now() + SIGN_WINDOW_S;
+                    b.push_str(&self.signed_form(ctx, "./pin-set", "pin-handover", human, &[("old_pub", human.to_string()), ("pubkey", txt(v.get("pubkey"))),
+                                                 ("expiry", exp.to_string())], pins, "Switch to a PIN", Ext::Browser));
+                }
+                Ok(v) => b.push_str(&format!("<p class=\"hint\">{}</p>", esc(&reason_of(&v)))),
+                Err(e) => b.push_str(&format!("<p class=\"hint\">{}</p>", esc(&e))),
+            }
+        }
+        b.push_str("</section>");
+        b
+    }
+
     fn keys(&self, ctx: &Ctx) -> Resp {
         let ks = match self.call("keystore_status", json!({})) {
             Ok(v) => v,
@@ -1910,7 +2015,8 @@ impl App {
         let hot = &ks["hot"];
         let hot_addr = txt(hot.get("hot_address"));
         let exp = now() + SIGN_WINDOW_S;
-        let mut b = format!("<section class=\"card\" id=\"human-key-state\" data-enrolled=\"{}\"><h2>Your approval key</h2>", esc(&human));
+        let mut b = self.pin_section(ctx, &human);
+        b.push_str(&format!("<section class=\"card\" id=\"human-key-state\" data-enrolled=\"{}\"><h2>Your approval key</h2>", esc(&human)));
         b.push_str(&kv(&[("Enrolled public key", if human.is_empty() { "<span class=\"tag bad\">none</span>".into() } else { format!("<code>{}</code>", esc(&human)) })]));
         b.push_str("<p id=\"browser-key\" class=\"msg\"></p>");
         if human.is_empty() {

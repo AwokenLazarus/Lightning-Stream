@@ -175,6 +175,8 @@
     sweep: function (f) { return joinLines(["xbt-agentwallet-hot-sweep-v1", f.hot_address, f.to, String(f.amount_sats), String(f.expiry)]); },
     policy: function (f) { return joinLines(["xbt-agentwallet-policy-v1", f.prev_sha256, String(f.expiry), f.text]); },
     "human-key": function (f) { return joinLines(["xbt-agentwallet-human-key-v1", f.old_pub, f.pubkey, String(f.expiry)]); },
+    // simple mode: the browser key hands approvals over to the box's PIN key (its public key comes from the box)
+    "pin-handover": function (f) { return joinLines(["xbt-agentwallet-human-key-v1", f.old_pub, f.pubkey, String(f.expiry)]); },
     rotate: function (f) { return joinLines(["xbt-agentwallet-hot-rotate-v1", f.hot_address, String(f.expiry)]); },
     backup: function (f) { return joinLines(["xbt-agentwallet-backup-v1", f.hot_address, String(f.expiry)]); },
     deny: function (f) { return joinLines(["xbt-agentwallet-deny-v1", f.token, String(f.expiry)]); },
@@ -279,6 +281,25 @@
       var kind = form.getAttribute("data-sign"), f = fields(form);
       var shown = $("pre.signed-text", form);
       if (kind === "policy" && shown && shown.textContent !== f.text) { say(out, "the text shown differs from the text to sign: refused", true); return; }
+      // simple mode: the box's PIN key approves; the message is still rebuilt here, and the box signs it with the PIN
+      if (form.getAttribute("data-pin") === "1") {
+        var pinIn = $("input.pin", form), pinV = pinIn ? pinIn.value.trim() : "";
+        if (!/^[0-9]{4,8}$/.test(pinV)) { say(out, "enter your PIN (4 to 8 digits)", true); return; }
+        if (kind === "human-key") { say(out, "with a PIN, the approval key stays on the box: there is no browser key to replace", true); return; }
+        say(out, "approving…");
+        var body = "csrf=" + encodeURIComponent((($("[name=csrf]", form) || {}).value) || "") + "&pin=" + encodeURIComponent(pinV) +
+                   "&message=" + hex(MSG[kind](f));
+        root.fetch("./api/pin-sign", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (pinIn) pinIn.value = "";
+            if (!d || !d.signature) { say(out, (d && d.error) || "the box did not approve", true); return; }
+            $("[name=signature]", form).value = d.signature;
+            form.submit();
+          })
+          .catch(function () { say(out, "the box did not answer: try again", true); });
+        return;
+      }
       var w = loadKey();
       if (!w) { say(out, "this browser holds no approval key: make one under Settings, Keys and backup, or sign on another device and paste the signature", true); return; }
       var enrolled = form.getAttribute("data-human");

@@ -41,6 +41,7 @@ pub mod ln_offer;
 pub mod lottery;
 pub mod macaroon;
 pub mod node;
+pub mod pin;
 pub mod policy;
 pub mod pyjson;
 pub mod renter;

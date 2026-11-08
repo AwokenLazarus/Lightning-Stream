@@ -3,6 +3,7 @@
 //!   xbt-signer [--root DIR] [--check]       serve (or, with --check, run every start-up check and exit)
 //!   xbt-signer healthcheck [--ready]        the image's HEALTHCHECK: the readiness file is fresh (and ok)
 //!   xbt-signer call METHOD [PARAMS_JSON]    one socket request (operator tool), the result on stdout
+//!   xbt-signer pin-reset [--root DIR]       a forgotten PIN, with the signer stopped (simple mode, `xbt_signer::pin`)
 //!
 //! Environment as B2's signer: `B2_ROOT` (policy.json, `.run/`), `B2_DATADIR`, `B2_RPCPORT`, `B2_RPCHOST`,
 //! `B2_RPCCOOKIE`, `B2_WALLET`, `B2_CHAIN`, `B2_SIGNER_SOCK` (a path, or `tcp://127.0.0.1:PORT`),
@@ -247,11 +248,30 @@ fn call(args: &[String]) -> ! {
     }
 }
 
+/// `xbt-signer pin-reset [--root DIR]`: a forgotten PIN, reset on the box with the signer stopped
+/// ([`xbt_signer::pin::reset_offline`]); the next start shows a new enrolment code to set a new PIN with.
+fn pin_reset(args: &[String]) -> ! {
+    let root = match args {
+        [flag, r] if flag == "--root" => PathBuf::from(r),
+        [] => env("B2_ROOT").map(PathBuf::from).or_else(|| DataDir::from_env().map(|d| d.component(xbt_svc::SIGNER)))
+            .unwrap_or_else(|| die(2, "usage: xbt-signer pin-reset [--root DIR] (or set B2_ROOT or XBT_DATA_DIR)")),
+        _ => die(2, "usage: xbt-signer pin-reset [--root DIR]"),
+    };
+    match xbt_signer::pin::reset_offline(&root, &root.join(".run")) {
+        Ok(said) => {
+            println!("{said}");
+            std::process::exit(0)
+        }
+        Err(e) => die(1, format!("{}: {}", e.code, e.msg)),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("healthcheck") => healthcheck(&args[1..]),
         Some("call") => call(&args[1..]),
+        Some("pin-reset") => pin_reset(&args[1..]),
         _ => {}
     }
     let mut root = env("B2_ROOT").map(PathBuf::from);

@@ -116,7 +116,7 @@ fn enroll_code_copy() -> Option<std::path::PathBuf> {
 
 /// `text` at `path`, 0640 with the group of its dir (the reader's): written private first, then
 /// given the group and the mode, so it is never readable by anyone else on the way.
-fn write_group_copy(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_group_copy(path: &Path, text: &str) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     write_private(path, text)?;
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -260,6 +260,9 @@ impl Signer {
 
     /// The UI's methods; `None` for a method this module does not know.
     pub(crate) fn admin_dispatch(&self, method: &str, p: &Value) -> Option<Result<Value>> {
+        if let Some(r) = self.pin_dispatch(method, p) {
+            return Some(r);
+        }
         Some(match method {
             "approvals" => self.approvals(),
             "approval_status" => self.approval_status(&str_or_empty(p.get("token"))),
@@ -403,7 +406,7 @@ impl Signer {
         Ok(json!({"ok": true, "verdict": "allow", "sha256": sha, "pending_restart": self.pending_restart(&v)}))
     }
 
-    fn set_human_pubkey_in_policy(&self, new_hex: &str) -> Result<String> {
+    pub(crate) fn set_human_pubkey_in_policy(&self, new_hex: &str) -> Result<String> {
         let mut raw = self.policy_raw()?;
         raw["human_pubkey"] = new_hex.into();
         let text = canonical_policy(&raw);
@@ -450,7 +453,7 @@ impl Signer {
 
     /// `None` when `given` is the current code (now spent); else the deny. After
     /// [`ENROLL_CODE_TRIES`] wrong codes a new code replaces it.
-    fn take_enroll_code(&self, given: &str) -> Result<Option<Value>> {
+    pub(crate) fn take_enroll_code(&self, given: &str) -> Result<Option<Value>> {
         let mut g = self.enroll.lock().unwrap_or_else(|p| p.into_inner());
         if !g.code.is_empty() && same_code(&canon_code(given), &canon_code(&g.code)) {
             *g = EnrollCode::default();
