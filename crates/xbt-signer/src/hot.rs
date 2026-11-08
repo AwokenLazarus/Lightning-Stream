@@ -427,7 +427,7 @@ impl HotWallet {
             let height = if coinbase { u.height.or_else(|| self.txout_height(&r)) } else { None };
             answers.push((u, was_stale, r, height));
         }
-        let scan_res = scan.then(|| self.node.call("scantxoutset", json!(["start", descs])));
+        let scan_res = scan.then(|| self.node.call_long("scantxoutset", json!(["start", descs])));
         let mut g = self.lock();
         let asked: HashSet<(String, u32)> = answers.iter().map(|(u, ..)| u.op()).collect();
         let present: HashSet<(String, u32)> = g.utxos.iter().chain(g.stale.iter()).map(Coin::op).collect();
@@ -556,7 +556,7 @@ impl HotWallet {
     fn scan_utxoset_for(&self, txid: &str) -> Result<usize> {
         let mut g = self.lock();
         let descs: Vec<String> = Self::keys(&g).iter().map(|k| format!("raw({})", k.spk_hex())).collect();
-        let res = self.node.call("scantxoutset", json!(["start", descs]))?;
+        let res = self.node.call_long("scantxoutset", json!(["start", descs]))?;
         let mut added = 0;
         for c in res.get("unspents").and_then(Value::as_array).cloned().unwrap_or_default() {
             let spk = c.get("scriptPubKey").and_then(Value::as_str).unwrap_or("").to_string();

@@ -344,7 +344,14 @@ impl Signer {
         Self::check_anchor_at_start(&anchor, &config)?;
         let hot = Arc::new(HotWallet::open(&run.join("hot.json"), node.clone(), &hrp, keystore.clone(), Some(sigaudit.clone()),
                                            config.hot_balance_cap_sats)?);
-        hot.reconcile(std::env::var("B2_HOT_SCAN").map(|v| v != "0").unwrap_or(true));
+        // checked against the node on a thread of its own: the UTXO set scan takes minutes on a slow disk, and the
+        // signer waited for it (30 s, every start, on StartOS) before serving. The coins it holds stay unverified
+        // until it answers; a send meanwhile is kept as it is (reconcile asks first, then merges)
+        {
+            let (h, scan) = (hot.clone(), std::env::var("B2_HOT_SCAN").map(|v| v != "0").unwrap_or(true));
+            std::thread::Builder::new().name("hot-reconcile".into()).spawn(move || { h.reconcile(scan); })
+                .map_err(|e| err("io", format!("hot-reconcile thread: {e}")))?;
+        }
         let legacy_channels = crate::legacy::LegacyChannels::read(&run.join("channels.json"));
         if let Some(n) = legacy_channels.notice() {
             eprintln!("xbt-signer: {}", n["what_to_do"].as_str().unwrap_or_default());

@@ -24,6 +24,11 @@ pub const XBT_SATS: f64 = 100_000_000.0;
 /// A chain backend: bitcoind JSON-RPC semantics. Errors carry code `rpc_error`.
 pub trait Node: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
+    /// A call that may take minutes (`scantxoutset` over the whole UTXO set on a slow disk): the same call with a
+    /// long timeout, so it finishes instead of being dropped at 30 s while the node goes on scanning.
+    fn call_long(&self, method: &str, params: Value) -> Result<Value> {
+        self.call(method, params)
+    }
     /// P3: whether block-generating calls are allowed (set once the chain is known to be regtest).
     fn set_allow_generate(&self, _allow: bool) {}
     /// The wallet name (for `health`).
@@ -55,6 +60,8 @@ pub struct KnotsRpc {
     pub auth_file: Option<PathBuf>,
     allow_generate: AtomicBool,
     agent: ureq::Agent,
+    /// For [`Node::call_long`]: 30 minutes.
+    long_agent: ureq::Agent,
 }
 
 impl KnotsRpc {
@@ -65,7 +72,8 @@ impl KnotsRpc {
         let env = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         Self { datadir: datadir.into(), wallet_name: wallet.into(), port: env("B2_RPCPORT").unwrap_or_else(|| "19443".into()),
                host: env("B2_RPCHOST").unwrap_or_else(|| "127.0.0.1".into()), auth_file: env("B2_RPCCOOKIE").map(PathBuf::from),
-               allow_generate: AtomicBool::new(false), agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build() }
+               allow_generate: AtomicBool::new(false), agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build(),
+               long_agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(1800)).build() }
     }
 
     fn cookie(&self) -> Result<String> {
@@ -88,6 +96,24 @@ pub const REFUSED: &str = "rpc_refused";
 
 impl Node for KnotsRpc {
     fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_on(&self.agent, method, params)
+    }
+
+    fn call_long(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_on(&self.long_agent, method, params)
+    }
+
+    fn set_allow_generate(&self, allow: bool) {
+        self.allow_generate.store(allow, Ordering::SeqCst);
+    }
+
+    fn wallet(&self) -> String {
+        self.wallet_name.clone()
+    }
+}
+
+impl KnotsRpc {
+    fn call_on(&self, agent: &ureq::Agent, method: &str, params: Value) -> Result<Value> {
         let m = method.to_lowercase();
         if FORBIDDEN.contains(&m.as_str()) {
             return Err(err("rpc_error", format!("signer refuses RPC method {method}")));
@@ -98,7 +124,7 @@ impl Node for KnotsRpc {
         let auth = format!("Basic {}", B64.encode(self.cookie()?));
         let url = format!("http://{}:{}/wallet/{}", self.host, self.port, self.wallet_name);
         let body = json!({"jsonrpc": "1.0", "id": "b2", "method": method, "params": params});
-        let resp = match self.agent.post(&url).set("Authorization", &auth).set("Content-Type", "application/json").send_string(&body.to_string()) {
+        let resp = match agent.post(&url).set("Authorization", &auth).set("Content-Type", "application/json").send_string(&body.to_string()) {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
                 let raw = r.into_string().unwrap_or_default();
@@ -118,14 +144,6 @@ impl Node for KnotsRpc {
             return Err(err(REFUSED, e.to_string()));
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    fn set_allow_generate(&self, allow: bool) {
-        self.allow_generate.store(allow, Ordering::SeqCst);
-    }
-
-    fn wallet(&self) -> String {
-        self.wallet_name.clone()
     }
 }
 
