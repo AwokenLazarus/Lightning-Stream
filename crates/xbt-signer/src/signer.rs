@@ -347,8 +347,12 @@ impl Signer {
         // checked against the node on a thread of its own: the UTXO set scan takes minutes on a slow disk, and the
         // signer waited for it (30 s, every start, on StartOS) before serving. The coins it holds stay unverified
         // until it answers; a send meanwhile is kept as it is (reconcile asks first, then merges)
-        {
-            let (h, scan) = (hot.clone(), std::env::var("B2_HOT_SCAN").map(|v| v != "0").unwrap_or(true));
+        // (a node given in the options, the tests' fake chain, answers at once: checked here, as before)
+        let scan = std::env::var("B2_HOT_SCAN").map(|v| v != "0").unwrap_or(true);
+        if opts.node.is_some() {
+            hot.reconcile(scan);
+        } else {
+            let h = hot.clone();
             std::thread::Builder::new().name("hot-reconcile".into()).spawn(move || { h.reconcile(scan); })
                 .map_err(|e| err("io", format!("hot-reconcile thread: {e}")))?;
         }
