@@ -50,10 +50,11 @@ stream-compute-check: what this machine has and how well testers reach each othe
       Writes an invite to lend to this box's split, by the terms of its payout config and its gateway.
   lend --invite FILE --node-rest URL --node-macaroon FILE [--node-cert FILE] [--name NAME] [--dir DIR]
        [--model FILE] [--credit-sats N] [--slack-ppm N] [--port-base N] [--bind-ip IP] [--interval-s N]
-       [--max-vram GB] [--rejoin-wait-s N] [--allow-build SHA256] [--yes]
+       [--max-vram GB] [--rejoin-wait-s N] [--allow-build SHA256] [--new-offer] [--yes]
       Lends this machine: shows what it will do and asks, fetches the build and model, makes an offer
       on your Lightning node, serves, and prints a card to give the operator. It counts your own work
-      and stops serving if you are owed more than --credit-sats by that count. See docs/COMPUTE-ALPHA.md.
+      and stops serving if you are owed more than --credit-sats by that count. Each start keeps the
+      card's offer; --new-offer makes another, for a new card. See docs/COMPUTE-ALPHA.md.
   lender-add --config FILE --card CARD [--lock FILE] [--replace]
       Adds a lender to the payout. With --lock, also writes a lock with the stages even across
       your machines and theirs: restart your Mesh-LLM node on it.
@@ -243,14 +244,22 @@ impl Mesh {
     }
 
     fn stop(&mut self) {
+        self.stop_reading(|| {});
+    }
+
+    /// Stops it, calling `read` while it drains: the answer in flight runs to its end first, and its tokens
+    /// count as much as any.
+    fn stop_reading(&mut self, mut read: impl FnMut()) {
         let Some(pid) = self.pid else { return };
         // SAFETY: signals to the session this process started, checked to be ours.
         if self.alive() {
             unsafe { libc::kill(-pid, libc::SIGTERM) };
-            for _ in 0..40 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
                 if !self.alive() {
                     break;
                 }
+                read();
                 std::thread::sleep(Duration::from_millis(500));
             }
             if self.alive() {
@@ -266,8 +275,15 @@ impl Mesh {
     }
 }
 
+/// This round's count of this machine's own stages, into `watch`.
+fn read_count(console: &str, me: &str, watch: &mut xbt_compute_check::lend::Watch) -> Result<(), String> {
+    let stages = xbt_compute_check::payout::http_json(&format!("{console}/api/runtime/stages"), None).and_then(|v| xbt_compute_check::lend::own_stages(&v, me))?;
+    watch.observe(&stages);
+    Ok(())
+}
+
 fn lend(flags: &Flags) -> Result<(), String> {
-    use xbt_compute_check::lend::{build_allowed, decide, fetch_checked, floor_msat, load_watch, matches, may_rejoin, mesh_args, node_id_of_token, own_stages, save_watch, terms_text, Action, Card, Invite, Stop, REJOIN_WAIT_S};
+    use xbt_compute_check::lend::{build_allowed, decide, fetch_checked, floor_msat, load_offers, load_watch, matches, may_rejoin, mesh_args, node_id_of_token, offer_note, offers_after, save_offers, save_watch, terms_text, Action, Card, Invite, SavedOffer, Stop, REJOIN_WAIT_S};
     use xbt_compute_check::meter::Work;
     use xbt_compute_check::payout::http_json;
     use xbt_gateway::node::{InvoiceState, LndRest, Node};
@@ -322,7 +338,25 @@ fn lend(flags: &Flags) -> Result<(), String> {
     let macaroon = std::fs::read(&macaroon_path).map_err(|e| format!("{macaroon_path}: {e}"))?;
     let cert = flags.value("--node-cert").map(PathBuf::from);
     let node = LndRest::new(&rest, &macaroon, &macaroon, cert.as_deref()).map_err(|e| format!("your Lightning node: {e}"))?;
-    let offer = node.create_offer(&format!("Compute lent to {}", invite.operator)).map_err(|e| format!("an offer on your Lightning node: {e}"))?;
+    let offers_path = dir.join("offers.json");
+    let saved = load_offers(&offers_path, &dir.join("card.txt"))?;
+    let had = saved.len();
+    let minted = if saved.is_empty() || flags.has("--new-offer") {
+        let o = node.create_offer(&format!("Compute lent to {}", invite.operator)).map_err(|e| format!("an offer on your Lightning node: {e}"))?;
+        Some(SavedOffer { id: hex::encode(o.id), bolt12: o.bolt12 })
+    } else {
+        None
+    };
+    let (offers, new_card) = offers_after(saved, minted);
+    save_offers(&offers_path, &offers)?;
+    let ids = offers.iter().map(SavedOffer::hash).collect::<Result<Vec<_>, _>>().map_err(|e| format!("{}: {e}", offers_path.display()))?;
+    let card_offer = offers.last().map(|o| o.bolt12.clone()).ok_or("no offer to be paid to")?;
+    if !new_card {
+        node.offer_invoices(&ids[ids.len() - 1]).map_err(|e| format!("your Lightning node: {e}"))?;
+    }
+    if let Some(n) = offer_note(&card_offer) {
+        println!("\n{n}\n");
+    }
     if fetch_checked(&invite.build, &archive)? {
         println!("Fetched the build: {} bytes, sha256 checked.", invite.build.bytes);
     }
@@ -382,20 +416,26 @@ fn lend(flags: &Flags) -> Result<(), String> {
         if me.is_none() {
             let token = http_json(&format!("{console}/api/status"), None).ok().and_then(|v| v.get("token").and_then(serde_json::Value::as_str).map(String::from));
             if let Some(id) = token.and_then(|t| node_id_of_token(&t).ok()) {
-                let card = Card { node: id.clone(), name: name.clone(), offer: offer.bolt12.clone() }.encode();
+                let card = Card { node: id.clone(), name: name.clone(), offer: card_offer.clone() }.encode();
                 write_whole(&dir.join("card.txt").to_string_lossy(), card.as_bytes())?;
                 println!("\nYour machine has joined. Give the operator this card, to be paid:\n\n{card}\n");
+                if new_card && had > 0 {
+                    println!("It holds a new offer and replaces the card you gave before: the operator adds it with lender-add --replace. What is paid to your earlier offers still counts.\n");
+                }
                 me = Some(id);
             }
         }
         if let Some(id) = &me {
-            match http_json(&format!("{console}/api/runtime/stages"), None).and_then(|v| own_stages(&v, id)) {
-                Ok(stages) => watch.observe(&stages),
+            match read_count(&console, id, &mut watch) {
+                Ok(()) => {}
                 Err(e) if watch.stopped.is_none() => notes.push(format!("this round's count could not be read: {e}")),
                 Err(_) => {}
             }
         }
-        let received = node.offer_invoices(&offer.id).map(|l| l.iter().filter(|i| i.state == Some(InvoiceState::Settled)).map(|i| i.paid_msat).sum::<u64>());
+        // what an operator pays to any offer this machine gave out
+        let received = ids.iter().try_fold(0u64, |sum, id| {
+            node.offer_invoices(id).map(|l| sum + l.iter().filter(|i| i.state == Some(InvoiceState::Settled)).map(|i| i.paid_msat).sum::<u64>())
+        });
         let due = watch.due_msat(&invite.terms, &work)?;
         let floor = floor_msat(due, slack_ppm);
         let drafted = watch.drafted - drafted_before;
@@ -412,7 +452,12 @@ fn lend(flags: &Flags) -> Result<(), String> {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs_f64();
             match decide(floor, m, credit, serving) {
                 Action::Stop => {
-                    mesh.stop();
+                    let id = me.clone();
+                    mesh.stop_reading(|| {
+                        if let Some(id) = &id {
+                            let _ = read_count(&console, id, &mut watch);
+                        }
+                    });
                     watch.mesh_seen_ts = now;
                     watch.stopped = Some(Stop { due_at_least_msat: floor, received_msat: m, ts: now });
                     println!("You are due at least {floor} msat by your own count and have received {m}. Past your limit of {credit_sats} sats: stopped serving until you are paid.");
@@ -430,7 +475,7 @@ fn lend(flags: &Flags) -> Result<(), String> {
             let active = work.stage(a.parse().ok()?, b.parse().ok()?);
             Some((k.clone(), serde_json::json!({"active_params": active.to_string(), "total_params": work.total().to_string()})))
         }).collect();
-        let report = serde_json::json!({"node": me, "offer": offer.bolt12, "serving": watch.stopped.is_none() && drafted == 0, "tokens": watch.tokens, "total_tokens": watch.total_tokens(), "shares": shares,
+        let report = serde_json::json!({"node": me, "offer": card_offer, "serving": watch.stopped.is_none() && drafted == 0, "tokens": watch.tokens, "total_tokens": watch.total_tokens(), "shares": shares,
                                         "due_msat": due, "due_at_least_msat": floor, "received_msat": got, "credit_msat": credit, "slack_ppm": slack_ppm, "stopped": watch.stopped,
                                         "drafted": watch.drafted, "pid": mesh.pid, "notes": notes});
         write_whole(&dir.join("report.json").to_string_lossy(), &serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)?;
@@ -455,8 +500,13 @@ fn lend(flags: &Flags) -> Result<(), String> {
         }
     }
     println!("Stopping: this machine leaves the split.");
-    mesh.stop();
-    Ok(())
+    let id = me.clone();
+    mesh.stop_reading(|| {
+        if let Some(id) = &id {
+            let _ = read_count(&console, id, &mut watch);
+        }
+    });
+    save_watch(&watch_path, &watch)
 }
 
 fn free_bytes(dir: &std::path::Path) -> Result<u64, String> {

@@ -450,6 +450,73 @@ pub fn load_watch(path: &Path) -> Result<Watch, String> {
     }
 }
 
+/// An offer this machine gave out, kept in `offers.json` in its directory.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedOffer {
+    /// The node's offer id, in hex.
+    pub id: String,
+    pub bolt12: String,
+}
+
+impl SavedOffer {
+    pub fn hash(&self) -> Result<[u8; 32], String> {
+        let b = hex::decode(&self.id).map_err(|_| "a damaged offer id")?;
+        b.try_into().map_err(|_| "a damaged offer id".to_string())
+    }
+}
+
+/// The offers given out so far, the card's last. Each start pays to the same one: the node mints another
+/// for the same fields once its channels change (one with no path while it has no channel, one with a path
+/// once it has), and the operator pays the offer on the card it was given. A directory from before this
+/// list was kept has its card, and the offer on that.
+pub fn load_offers(path: &Path, card: &Path) -> Result<Vec<SavedOffer>, String> {
+    match std::fs::read(path) {
+        Ok(b) => return serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", path.display())),
+        Err(_) => {}
+    }
+    let text = match std::fs::read_to_string(card) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("{}: {e}", card.display())),
+    };
+    let c = Card::decode(&text).map_err(|e| format!("{}: {e}", card.display()))?;
+    let o = xbt_signer::bolt12::decode_offer(&c.offer).map_err(|e| format!("{}: {e}", card.display()))?;
+    Ok(vec![SavedOffer { id: hex::encode(o.id), bolt12: c.offer }])
+}
+
+pub fn save_offers(path: &Path, offers: &[SavedOffer]) -> Result<(), String> {
+    let say = |e: std::io::Error| format!("{}: {e}", path.display());
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp).map_err(say)?;
+    f.write_all(&serde_json::to_vec_pretty(offers).map_err(|e| e.to_string())?).map_err(say)?;
+    f.sync_all().map_err(say)?;
+    std::fs::rename(&tmp, path).map_err(say)
+}
+
+/// The offers once the node has minted `minted`, if it was asked to, and whether the card's offer changed.
+/// What it minted goes on the card; the earlier ones are still counted, as an operator pays them until it
+/// has the new card.
+pub fn offers_after(mut saved: Vec<SavedOffer>, minted: Option<SavedOffer>) -> (Vec<SavedOffer>, bool) {
+    let Some(m) = minted else { return (saved, false) };
+    if saved.last().is_some_and(|l| l.id == m.id) {
+        return (saved, false);
+    }
+    saved.retain(|o| o.id != m.id);
+    saved.push(m);
+    (saved, true)
+}
+
+/// What the owner should know of an offer that holds no path to its node, if this one holds none.
+pub fn offer_note(bolt12: &str) -> Option<String> {
+    let o = xbt_signer::bolt12::decode_offer(bolt12).ok()?;
+    o.paths.is_empty().then(|| {
+        "Your offer holds no path to your node. Unless your node announces an address, only a node already connected to yours can ask it for an invoice. \
+         A node with no channel can make no path: once you have one, start again with --new-offer and give the operator the new card."
+            .to_string()
+    })
+}
+
 /// What the owner is shown before anything happens.
 pub fn terms_text(i: &Invite, dir: &Path, credit_sats: u64) -> String {
     let t = &i.terms;
@@ -729,5 +796,62 @@ mod tests {
         for word in ["An operator", "1000000 msat", "10.0%", "60 sats", "/lend", "Mesh-LLM", "sends no usage reports", "4 GB"] {
             assert!(t.contains(word), "{word} in: {t}");
         }
+    }
+
+    /// An offer as Lightning Fork mints them: with no path while the node has no channel, with one after.
+    fn an_offer(with_path: bool) -> String {
+        use xbt_signer::bolt12::encode;
+        // the generator point: any valid key will do
+        let g: [u8; 33] = hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap().try_into().unwrap();
+        let mut fields = vec![(10, b"Compute lent to an operator".to_vec())];
+        if with_path {
+            fields.push((16, encode::path(&g, &g, 2)));
+        }
+        fields.push((22, g.to_vec()));
+        encode::offer(fields)
+    }
+
+    fn saved(bolt12: &str) -> SavedOffer {
+        SavedOffer { id: hex::encode(xbt_signer::bolt12::decode_offer(bolt12).unwrap().id), bolt12: bolt12.into() }
+    }
+
+    /// The node mints another offer for the same fields once it has a channel, and a restart that took it
+    /// would count pay to an offer the operator does not know, and stop serving with the card's paid.
+    #[test]
+    fn each_start_keeps_the_cards_offer_and_counts_every_offer_given_out() {
+        let (a, b) = (saved(&an_offer(false)), saved(&an_offer(true)));
+        assert_ne!(a.id, b.id, "the same fields, another offer, once there is a path");
+        assert_eq!(offers_after(vec![], Some(a.clone())), (vec![a.clone()], true), "the first start mints the card's");
+        assert_eq!(offers_after(vec![a.clone()], None), (vec![a.clone()], false), "a later start keeps it");
+        assert_eq!(offers_after(vec![a.clone()], Some(a.clone())), (vec![a.clone()], false), "--new-offer, and the node gave the same");
+        assert_eq!(offers_after(vec![a.clone()], Some(b.clone())), (vec![a.clone(), b.clone()], true), "a new card; the old offer still counts");
+        assert_eq!(offers_after(vec![a.clone(), b.clone()], Some(a.clone())), (vec![b.clone(), a.clone()], true), "one given out before goes back on the card, once");
+        assert_eq!(a.hash().unwrap().to_vec(), hex::decode(&a.id).unwrap());
+        assert!(SavedOffer { id: "ab".into(), bolt12: String::new() }.hash().is_err());
+    }
+
+    #[test]
+    fn a_directory_from_before_the_list_keeps_the_offer_on_its_card() {
+        let dir = std::env::temp_dir().join(format!("lend-offers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (list, card) = (dir.join("offers.json"), dir.join("card.txt"));
+        assert_eq!(load_offers(&list, &card).unwrap(), vec![], "nothing given out yet: the node mints one");
+        let a = saved(&an_offer(false));
+        std::fs::write(&card, Card { node: "a".repeat(64), name: "a lender".into(), offer: a.bolt12.clone() }.encode()).unwrap();
+        assert_eq!(load_offers(&list, &card).unwrap(), vec![a.clone()]);
+        let b = saved(&an_offer(true));
+        save_offers(&list, &[a.clone(), b.clone()]).unwrap();
+        assert_eq!(load_offers(&list, &card).unwrap(), vec![a, b], "the list, once there is one");
+        std::fs::write(&list, "[{").unwrap();
+        assert!(load_offers(&list, &card).is_err(), "a damaged list is said, not taken for none");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_offer_with_no_path_is_said() {
+        let note = offer_note(&an_offer(false)).expect("no path");
+        assert!(note.contains("--new-offer"), "{note}");
+        assert_eq!(offer_note(&an_offer(true)), None);
+        assert_eq!(offer_note("lno1notanoffer"), None, "what cannot be read is the node's to say");
     }
 }

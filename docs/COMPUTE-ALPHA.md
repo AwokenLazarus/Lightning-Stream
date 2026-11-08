@@ -115,7 +115,9 @@ It shows the terms, the downloads and what it will run, and asks first. Then it:
 
 1. fetches the Mesh-LLM build and the model, each checked by sha256;
 2. makes a BOLT 12 offer on your own Lightning node, where you are paid (the macaroon needs
-   `invoices:read` and `invoices:write`);
+   `invoices:read` and `invoices:write`). It does this once: each later start keeps that offer
+   (`offers.json` in its directory), so your card stays the same. `--new-offer` makes another for a new
+   card, and what is paid to the earlier ones still counts;
 3. starts Mesh-LLM and joins the split;
 4. prints a card, one line, to give the operator;
 5. keeps running, and watches whether you are being paid.
@@ -129,6 +131,18 @@ you may want to run this as a user of its own.
 **The build sends no usage reports:** it has no analytics key in it. `mesh-llm analytics status` says so.
 `lend` also has it not ask after new versions: `mesh-llm update` would replace this build with another.
 And it turns speculative decoding off in that Mesh-LLM's settings: see below for why.
+
+### Being reachable
+
+The operator's node has to reach yours to pay you. A node that announces no address is reached through a
+blinded path that starts at one of its channel peers, and two things follow from that:
+
+- **Have a channel before you lend,** or have the operator open one to you. An offer made while your node
+  has no channel holds no path, and `lend` says so. Once you have a channel, start again with `--new-offer`
+  and give the operator the new card.
+- **If none of your channel peers is a public node, the path starts at your own node,** and only a node with
+  a channel to yours can pay you. Then the operator's paying node needs a channel to yours. On mainnet, a
+  lender whose one channel was a private one with a private node could be paid only by that node.
 
 ### How you know you are being paid
 
@@ -147,7 +161,7 @@ ends, saying why. Start it again once the operator has turned speculative decodi
 
 When what you are due passes what you have received by more than your credit limit (`--credit-sats`,
 three payout floors by default), it stops serving, says why, and serves again by itself once you are
-paid, after staying out for at least two minutes so that the split plans your machine in anew. So the most an operator can take from you is about that limit. `report.json` in its directory has
+paid, after staying out for at least two minutes so that the split plans your machine in anew. The answer in flight when it stops runs to its end, and is counted. So the most an operator can take from you is about that limit. `report.json` in its directory has
 both figures at any time.
 
 Set the limit above what an honest operator's payout round can leave unpaid. Below that, you stop serving
