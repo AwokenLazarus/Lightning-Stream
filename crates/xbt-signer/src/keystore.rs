@@ -270,7 +270,10 @@ pub fn write_private(path: &Path, text: &str) -> Result<()> {
         crate::fsx::write_all(&mut f, text.as_bytes()).map_err(|e| err("io", e.to_string()))?;
         crate::fsx::sync(&f).map_err(|e| err("io", e.to_string()))?;
     }
-    crate::fsx::rename(&tmp, path).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
+    if let Err(e) = crate::fsx::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // a write that failed leaves no temp behind
+        return Err(err("io", format!("{}: {e}", path.display())));
+    }
     crate::fsx::sync_dir(crate::fsx::parent_of(path)).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
     crate::fsx::set_mode(path, 0o600).map_err(|e| err("io", e.to_string()))?;
     Ok(())
