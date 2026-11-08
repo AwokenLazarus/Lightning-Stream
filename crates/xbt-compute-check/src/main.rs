@@ -651,6 +651,17 @@ fn shares(flags: &Flags) -> Result<(), String> {
     let work = Work::from_header(&header).map_err(|e| format!("{path}: {e}"))?;
     let n = work.layers.len() as u32;
     let stages = flags.value("--stages").unwrap_or_else(|| format!("0-{n}"));
+    let size = |t: &xbt_compute_check::gguf::Tensor| t.dims.iter().map(|d| *d as u128).product::<u128>();
+    // what a stage holds, beside what it multiplies per token: every expert, the whole embedding on the first, and on the
+    // last the head, which is the embedding again when it is tied
+    let tied = !header.tensors.iter().any(|t| t.name == "output.weight");
+    let stored = |a: u32, b: u32| -> u128 {
+        header.tensors.iter().filter(|t| match t.name.strip_prefix("blk.").and_then(|r| r.split_once('.')).and_then(|(i, _)| i.parse::<u32>().ok()) {
+            Some(i) => a <= i && i < b,
+            None if t.name == "token_embd.weight" => a == 0 || (b == n && tied),
+            None => b == n && (t.name == "output.weight" || t.name == "output_norm.weight"),
+        }).map(size).sum()
+    };
     let mut rows = vec![];
     for s in stages.split(',') {
         let (a, b) = s.split_once('-').ok_or_else(|| format!("stage {s}: FIRST-END"))?;
@@ -659,9 +670,9 @@ fn shares(flags: &Flags) -> Result<(), String> {
             return Err(format!("stage {s} of a model with {n} layers"));
         }
         let active = work.stage(a, b);
-        rows.push(serde_json::json!({"layers": s, "active_params": active.to_string(), "share_ppm": (active * 1_000_000 / work.total()) as u64}));
+        rows.push(serde_json::json!({"layers": s, "active_params": active.to_string(), "share_ppm": (active * 1_000_000 / work.total()) as u64, "stored_params": stored(a, b).to_string()}));
     }
-    let all: u128 = header.tensors.iter().map(|t| t.dims.iter().map(|d| *d as u128).product::<u128>()).sum();
+    let all: u128 = header.tensors.iter().map(size).sum();
     let out = serde_json::json!({"layers": n, "embed_row": work.embed.to_string(), "head": work.head.to_string(), "total": work.total().to_string(),
                                  "all_tensors": all.to_string(), "stages": rows});
     println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
