@@ -4324,9 +4324,10 @@ def mesh_lend_real() -> None:
     fetched = dict(Files.hits)
     Files.commands[a.tag] = "1 kill"
     lab.wait("the lender to have restarted its watch", 60, lambda: Files.posted.get(f"{a.tag}/did") == b"1 kill", every=1)
+    # the answer in flight as it starts again is paid for and given whole: a lender's start reads no file it has noted, as reading
+    # a big model again pushes its running stage out of memory, and a buyer's wallet gives up an answer that leaves it 30 s without a byte
     one_more = buy_one()
     answered += 1
-    # (it checks the build and the model again before it looks at anything, which takes the time of reading them)
     try:
         lab.wait("the restarted watch to count that answer", 90 + size // 50_000_000, lambda: a.report().get("total_tokens", 0) > tokens_before, every=2)
     except LabError:
@@ -4335,7 +4336,8 @@ def mesh_lend_real() -> None:
     check("mesh_lend_real: `lend` killed on the lender's machine and started again takes up the same Mesh-LLM, fetches nothing, and the split keeps serving and being counted",
           r.get("pid") == pid_before and one_more["paid"] and placed() and r.get("total_tokens", 0) > tokens_before and Files.hits.get("build.tar.gz") == fetched.get("build.tar.gz") == len(lenders)
           and Files.hits.get("model.gguf") == fetched.get("model.gguf") == len(lenders),
-          {"pid": [pid_before, r.get("pid")], "answer_paid": one_more["paid"], "tokens": [tokens_before, r.get("total_tokens")], "fetched": Files.hits})
+          {"pid": [pid_before, r.get("pid")], "answer_paid": one_more["paid"], "tokens": [tokens_before, r.get("total_tokens")], "fetched": Files.hits,
+           "answer": {k: one_more["brief"].get(k) for k in ("verdict", "rule", "reason", "status", "error")}})
 
     # --- the operator stops paying the first lender, for real: its wallet refuses that offer, and pays any other
     with open(f"{RUN}/op-mesh.log", encoding="utf-8", errors="replace") as f:

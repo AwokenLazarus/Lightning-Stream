@@ -113,7 +113,10 @@ stream-compute-check lend --invite invite.json \
 
 It shows the terms, the downloads and what it will run, and asks first. Then it:
 
-1. fetches the Mesh-LLM build and the model, each checked by sha256;
+1. fetches the Mesh-LLM build and the model, each checked by sha256. It notes each file it found right
+   (`<file>.checked`, with the file's inode, size and times), and a later start reads the file again only
+   if it has changed since: reading a big model again would push your running stage out of memory and
+   slow the answers in flight;
 2. makes a BOLT 12 offer on your own Lightning node, where you are paid (the macaroon needs
    `invoices:read` and `invoices:write`). It does this once: each later start keeps that offer
    (`offers.json` in its directory), so your card stays the same. `--new-offer` makes another for a new

@@ -364,11 +364,16 @@ pub fn mesh_args(i: &Invite, model: &Path, ports: (u16, u16, u16), bind_ip: Opti
 /// Whether the file at `path` is this one. A file of another size is not read through.
 pub fn matches(path: &Path, want: &Fetch) -> Result<bool, String> {
     let say = |e: std::io::Error| format!("{}: {e}", path.display());
-    match std::fs::metadata(path) {
+    let before = match std::fs::metadata(path) {
         Ok(m) if m.len() != want.bytes => return Ok(false),
-        Ok(_) => {}
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(say(e)),
+    };
+    let note = checked_path(path);
+    let read_note = std::fs::read(&note).ok().and_then(|b| serde_json::from_slice::<Checked>(&b).ok());
+    if read_note.as_ref() == Some(&Checked::of(&before, &want.sha256)) {
+        return Ok(true);
     }
     let mut f = std::fs::File::open(path).map_err(say)?;
     let mut h = Sha256::new();
@@ -376,9 +381,57 @@ pub fn matches(path: &Path, want: &Fetch) -> Result<bool, String> {
     loop {
         let n = f.read(&mut buf).map_err(say)?;
         if n == 0 {
-            return Ok(hex::encode(h.finalize()) == want.sha256);
+            break;
         }
         h.update(&buf[..n]);
+    }
+    if hex::encode(h.finalize()) != want.sha256 {
+        let _ = std::fs::remove_file(&note);
+        return Ok(false);
+    }
+    // noted only for a file that did not change while it was read
+    let checked = Checked::of(&before, &want.sha256);
+    if std::fs::metadata(path).is_ok_and(|after| Checked::of(&after, &want.sha256) == checked) {
+        keep_note(&note, &checked);
+    }
+    Ok(true)
+}
+
+/// A file found to be the one named, kept beside it as `<name>.checked`, so that `lend` starting again need
+/// not read a model it has read before. Reading all of a big one again pushes the running stage's layers out
+/// of memory and slows the answers in flight: an 18.6 GB model on a 12 GB machine decoded at a fifth of its
+/// speed meanwhile, and a buyer gave the answer up. The file is taken to be unchanged while its device,
+/// inode, size and times are: a write moves its change time, which nothing can set back.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Checked {
+    sha256: String,
+    bytes: u64,
+    dev: u64,
+    ino: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+}
+
+impl Checked {
+    fn of(m: &std::fs::Metadata, sha256: &str) -> Checked {
+        use std::os::unix::fs::MetadataExt;
+        let ns = |s: i64, n: i64| s as i128 * 1_000_000_000 + n as i128;
+        Checked { sha256: sha256.to_string(), bytes: m.len(), dev: m.dev(), ino: m.ino(), mtime_ns: ns(m.mtime(), m.mtime_nsec()), ctime_ns: ns(m.ctime(), m.ctime_nsec()) }
+    }
+}
+
+fn checked_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".checked");
+    name.into()
+}
+
+/// A note that cannot be written (a model of the lender's own, in a directory it cannot write) only means
+/// reading the file again next time.
+fn keep_note(note: &Path, c: &Checked) {
+    let tmp = note.with_extension("checked.tmp");
+    if serde_json::to_vec(c).ok().is_some_and(|b| std::fs::write(&tmp, b).is_ok()) {
+        let _ = std::fs::rename(&tmp, note);
     }
 }
 
@@ -429,6 +482,9 @@ pub fn fetch_checked(want: &Fetch, to: &Path) -> Result<bool, String> {
     }
     out.sync_all().map_err(say)?;
     std::fs::rename(&part, to).map_err(say)?;
+    if let Ok(m) = std::fs::metadata(to) {
+        keep_note(&checked_path(to), &Checked::of(&m, &want.sha256));
+    }
     Ok(true)
 }
 
@@ -761,6 +817,35 @@ mod tests {
         std::fs::write(&to, b"something else").unwrap();
         assert!(fetch_checked(&good, &to).unwrap());
         assert_eq!(std::fs::read(&to).unwrap(), b"the real file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_checked_once_is_not_read_again_until_it_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lend-checked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, to, note) = (dir.join("source"), dir.join("model.gguf"), dir.join("model.gguf.checked"));
+        std::fs::write(&src, b"the real file").unwrap();
+        let good = Fetch { url: src.display().to_string(), sha256: hex::encode(Sha256::digest(b"the real file")), bytes: 13 };
+        assert!(fetch_checked(&good, &to).unwrap());
+        assert!(note.exists(), "noted as it was fetched");
+        // with the note the file is not read: one nobody may read still checks
+        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(matches(&to, &good).unwrap(), "the note answers");
+        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // changed in place, at its size: read again, and found out
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&to, b"the fake file").unwrap();
+        assert!(!matches(&to, &good).unwrap());
+        assert!(!note.exists(), "the note of a file that no longer matches is dropped");
+        // put right, it is read once and noted again
+        std::fs::write(&to, b"the real file").unwrap();
+        assert!(matches(&to, &good).unwrap());
+        assert!(note.exists());
+        // a note says what the file was found to be, and answers for no other hash
+        let other = Fetch { sha256: hex::encode(Sha256::digest(b"the fake file")), ..good };
+        assert!(!matches(&to, &other).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
