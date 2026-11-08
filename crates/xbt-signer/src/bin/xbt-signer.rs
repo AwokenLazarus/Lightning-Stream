@@ -167,7 +167,7 @@ fn keystore(secrets: &Secrets) -> Result<Option<Arc<KeyStore>>, String> {
 }
 
 /// What the readiness document says of the node and the witness, as last asked. Asked on a thread of its own
-/// ([`probe_loop`]): a node slow to answer (a sync on a slow disk keeps `getblockchaininfo` waiting past the
+/// ([`probe`]): a node slow to answer (a sync on a slow disk keeps `getblockchaininfo` waiting past the
 /// RPC timeout) must not keep the document from being written, or the file goes stale and the platform takes the
 /// signer for dead and restarts everything that waits on it (StartOS did, every 30 s, for a whole sync).
 #[derive(Clone)]
