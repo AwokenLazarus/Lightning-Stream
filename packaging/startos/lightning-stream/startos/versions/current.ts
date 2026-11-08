@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.16:0',
+  version: '0.2.17:0',
   releaseNotes: {
     en_US:
-      'The log now explains the "Not Found" StartOS records when Lightning Fork has no Grant app access action: Lightning Stream connects by its address instead. The Node connection banner says when the form shows the connection you saved, Your node shows "No key connected yet" instead of a missing-file error before a key is connected, and Home\'s First steps and Setup\'s own count are named as the two lists they are.',
+      'Fixes the web UI restarting every 30 seconds while the XBT node syncs: the signer now writes its readiness on time even when the node is slow to answer, so StartOS no longer takes it for dead. Hashrate offers now say each machine\'s speed and what all the free machines cost for an hour, 12 and 24 hours, and the Rent form says what the machines and minutes you type come to.',
   },
   migrations: {
     up: async () => {},

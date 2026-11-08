@@ -632,6 +632,26 @@
     }, 5000);
   }
 
+  // Buy → Hashrate: an offer's Rent form says what its machines and minutes come to as they are typed (the box
+  // wrote the first figure, hashrate.rs rent_estimate; the same sums here). Machines past the free ones are not counted.
+  $$(".rent-est[data-hour-sat]").forEach(function (est) {
+    var form = est.closest("form");
+    if (!form) return;
+    var hour = parseFloat(est.getAttribute("data-hour-sat")) || 0, fee = parseFloat(est.getAttribute("data-fee-sat")) || 0;
+    var free = parseInt(est.getAttribute("data-free"), 10) || 0;
+    var group = function (n) { return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ","); };
+    var say = function () {
+      var m = parseInt((form.elements.miners || {}).value, 10), min = parseInt((form.elements.minutes || {}).value, 10);
+      if (!(m > 0) || !(min > 0) || !(hour > 0)) { est.textContent = ""; return; }
+      var n = Math.min(m, Math.max(free, 1)), cost = Math.round(hour * n * min / 60 + fee);
+      est.textContent = "";
+      est.appendChild(document.createTextNode(n + " machine" + (n === 1 ? "" : "s") + " for " + min + " minute" + (min === 1 ? "" : "s") + ": about "));
+      var b = document.createElement("strong"); b.textContent = group(cost) + (cost === 1 ? " sat" : " sats"); est.appendChild(b);
+      est.appendChild(document.createTextNode((fee > 0 ? ", with the start fee" : "") + "." + (m > free && free > 0 ? " Only " + free + " free: counted as " + free + "." : "")));
+    };
+    form.addEventListener("input", say);
+  });
+
   // Buy → Hashrate while the renter is still looking for offers on Nostr: the page is loaded again in a few seconds,
   // and not while the owner is in one of its forms.
   var again = $("[data-reload-after]");
