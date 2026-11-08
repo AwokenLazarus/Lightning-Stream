@@ -5,6 +5,24 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.18 (2026-11-08)
+
+Fixes found by a fresh Umbrel paying test and a fresh StartOS box. The wallet UI, the signer and the hashrate
+services change, and the StartOS package and the Umbrel app with them.
+
+- **The signer starts at once on a slow node.** At each start the signer checked its on-chain coins against the
+  node, including a scan of the whole UTXO set, and waited for it. On a box with a slow disk (a StartOS box on a USB
+  SSD) the scan takes minutes: the signer waited 30 seconds at every start, gave up, and left the node scanning. The
+  check now runs after the signer has started, and the scan has the time it needs (up to 30 minutes). The coins it
+  holds are shown as not yet checked until it answers, as before. Private files are now written under a temporary
+  name of their own each time, so two writes at once can't collide.
+- **An ended rental keeps its delivered figure.** A test slice's "What the test slice showed" read 8% when it
+  ended and 2% a few minutes later: with no slice finished, the speed was measured up to now. An ended rental is now
+  measured up to when it ended.
+- **An ended rental's card no longer says "on 0 machines".** The live speed and machine count are left out once
+  it has ended.
+- **The Rent estimate counts the machines you type** when an offer doesn't say how many are free (it counted 1).
+
 ## 0.2.17 (2026-11-08)
 
 Hashrate prices in plain units, asked for by a tester, and a fix for StartOS boxes whose node is still syncing. The

@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.2.17:0',
+  version: '0.2.18:0',
   releaseNotes: {
     en_US:
-      'Fixes the web UI restarting every 30 seconds while the XBT node syncs: the signer now writes its readiness on time even when the node is slow to answer, so StartOS no longer takes it for dead. Hashrate offers now say each machine\'s speed and what all the free machines cost for an hour, 12 and 24 hours, and the Rent form says what the machines and minutes you type come to.',
+      'The signer starts at once: it checks its on-chain coins after starting, and lets that scan finish, instead of waiting 30 seconds at every start and leaving the node scanning. Hashrate: an ended rental keeps its delivered figure, its card no longer says "on 0 machines", and the Rent estimate counts the machines you type when an offer doesn\'t say how many are free.',
   },
   migrations: {
     up: async () => {},

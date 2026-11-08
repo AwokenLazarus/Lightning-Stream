@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.2.17"
+version: "0.2.18"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -53,6 +53,8 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.2.18: an ended rental keeps its delivered figure and drops "on 0 machines"; the Rent estimate counts
+  the machines you type; the signer no longer waits 30 s at start on a slow node.
   0.2.17: hashrate offers say each machine's speed and what all free machines cost for an hour,
   12 and 24 hours, and the Rent form shows what your machines and minutes come to as you type.
   0.2.16: Your node shows no missing-key error before a key is connected, and Home's First

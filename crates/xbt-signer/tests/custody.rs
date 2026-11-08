@@ -222,8 +222,12 @@ fn a_sweep_or_rotation_the_node_took_is_never_reported_failed_for_its_bookkeepin
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = Rig::new(json!({}), false);
     rig.fund_hot(1, 12_000);
-    // the coin file can no longer be written: a directory stands where its new copy goes
-    std::fs::create_dir(rig.root.join(".run/hot_utxos.json.tmp")).unwrap();
+    // the coin file can no longer be written: a directory, not empty, stands where it goes (each write has a temp
+    // name of its own, so the place a new copy is renamed to is what can be blocked)
+    let coins = rig.root.join(".run/hot_utxos.json");
+    let _ = std::fs::remove_file(&coins);
+    std::fs::create_dir(&coins).unwrap();
+    std::fs::write(coins.join("blocked"), "x").unwrap();
     let hot = rig.call("hot_address", json!({}))["hot_address"].as_str().unwrap().to_string();
     let exp = xbt_signer::pyjson::now_f64() as i64 + 600;
     let to = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";

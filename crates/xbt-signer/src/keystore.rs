@@ -258,8 +258,11 @@ pub fn absolute(p: &Path) -> PathBuf {
 /// the directory fsynced (AGP-055: the rename itself must be durable before the caller goes on, since
 /// a lock is written ahead of its pre-signature; without it the rename waits for the next journal commit).
 pub fn write_private(path: &Path, text: &str) -> Result<()> {
+    // a temp name of its own for each write: two writers of one file (the start-up reconcile thread and a
+    // payment, or two signers on one root in a test) never rename each other's temp away
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let tmp = PathBuf::from(tmp);
     {
         let mut f = crate::fsx::create_truncate(&tmp, 0o600)
@@ -267,7 +270,10 @@ pub fn write_private(path: &Path, text: &str) -> Result<()> {
         crate::fsx::write_all(&mut f, text.as_bytes()).map_err(|e| err("io", e.to_string()))?;
         crate::fsx::sync(&f).map_err(|e| err("io", e.to_string()))?;
     }
-    crate::fsx::rename(&tmp, path).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
+    if let Err(e) = crate::fsx::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // a write that failed leaves no temp behind
+        return Err(err("io", format!("{}: {e}", path.display())));
+    }
     crate::fsx::sync_dir(crate::fsx::parent_of(path)).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
     crate::fsx::set_mode(path, 0o600).map_err(|e| err("io", e.to_string()))?;
     Ok(())
