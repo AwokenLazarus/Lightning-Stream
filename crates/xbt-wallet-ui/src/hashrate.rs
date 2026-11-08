@@ -1986,10 +1986,13 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     } else {
         String::new()
     };
+    // the speed and machines now, while it goes on; an ended rental has none ("… on 0 machines" read as a fault)
+    let miners = live["miners"].as_u64().unwrap_or(0);
+    let rate = if ended { String::new() } else { format!(" · {} on {} machine{}", speed(hs), miners, if miners == 1 { "" } else { "s" }) };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
-             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{wallet}{refused}{why}{result}{more}<div class=\"row\">{cut}</div>{attest}</section>",
+             {times}<p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid{rate}</p>{wallet}{refused}{why}{result}{more}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
-            speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
+    )
 }
 
 /// The chance that `hs` hashes a second for `secs` find at least one block at `difficulty`: a block takes
@@ -2831,6 +2834,7 @@ mod tests {
         let ended = json!({"rental": format!("r{start}"), "hasher": "Laz Hash", "budgetSats": 95700, "startedMs": start, "ended": true,
                            "live": {"closed": "hashmaker closed: unpaid", "paidSlices": 1078, "spentMsat": 43_120_000, "endedMs": start + 39_720_000}});
         let c = rental_card(&ctx, &ended, "hashrate");
+        assert!(!c.contains(" on 0 machines") && !c.contains(" machine"), "an ended rental names no live speed or machines: {c}");
         assert!(c.contains("Started 2026-11-03 10:00:00 UTC · ended 2026-11-03 21:02:00 UTC, after 11 h 2 min"), "{c}");
         assert!(c.contains("<strong>Ended:</strong> a piece of work was not paid in time."), "{c}");
         let going = json!({"rental": "r1", "hasher": "Laz Hash", "budgetSats": 1000, "startedMs": start, "ended": false,

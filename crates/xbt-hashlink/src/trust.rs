@@ -394,6 +394,15 @@ fn stale_share(a: &Attestation) -> f64 {
     }
 }
 
+/// When a rental that has ended did so: the time of its last event, once the report says it closed. None while
+/// it goes on.
+fn ended_at(report: &Value) -> Option<u64> {
+    if report.get("closed").is_none_or(Value::is_null) {
+        return None;
+    }
+    report.get("events")?.as_array()?.iter().filter_map(|e| e.get("atMs").and_then(Value::as_u64)).max()
+}
+
 /// What a finished (or running) rental showed, from the hashtaker's report and when it started:
 /// the speed delivered against the speed advertised, stale and rejected shares, and the share round
 /// trip. The delivered speed is the accepted work over the time from the start to the last finished
@@ -406,6 +415,9 @@ pub fn trial_result(report: &Value, started_ms: u64, now_ms: u64, advertised_hs:
         .and_then(|s| s.last())
         .and_then(|s| s.get("atMs"))
         .and_then(Value::as_u64)
+        // no slice finished: an ended rental is measured to when it ended (its last event), not to now, or the
+        // figure kept falling on a card read later (a test slice read 8%, then 2%, minutes after it ended)
+        .or_else(|| ended_at(report))
         .unwrap_or(now_ms);
     let secs = (end.saturating_sub(started_ms)) as f64 / 1000.0;
     let delivered = if secs > 0.0 { work / secs } else { 0.0 };
@@ -621,6 +633,24 @@ mod tests {
         // a summary by another key than the listing's is not the hashmaker's
         let h = aggregate(&maker, &Keys::new(sk(21)).public_hex(), 4_000_000_000_000, &events);
         assert!(h["hashmakerSays"].is_null());
+    }
+
+    #[test]
+    fn an_ended_rental_without_finished_slices_is_measured_to_its_end_not_now() {
+        // 2 × 2^47 hashes; no slice finished; it closed with its last event at 70 s
+        let report = json!({
+            "meter": {"work": ((1u128 << 47) * 2).to_string(), "accepted": 10, "rejected": 0, "stale": 0},
+            "closed": "budget spent", "events": [{"ev": "open", "atMs": 5_000}, {"ev": "budget spent", "atMs": 70_000}],
+        });
+        let soon = trial_result(&report, 0, 99_000, 4_000_000_000_000);
+        let later = trial_result(&report, 0, 9_999_000, 4_000_000_000_000);
+        assert_eq!(soon["deliveredHs"], later["deliveredHs"], "read later, the same figure");
+        let d = soon["deliveredHs"].as_u64().unwrap();
+        assert!((4_000_000_000_000..4_100_000_000_000).contains(&d), "{d}");
+        // still going: measured to now
+        let mut going = report.clone();
+        going["closed"] = Value::Null;
+        assert!(trial_result(&going, 0, 140_000, 1)["deliveredHs"].as_u64().unwrap() < d);
     }
 
     #[test]
