@@ -416,7 +416,8 @@ fn rent_estimate(hour_per_machine_sat: f64, fee_sat: f64, machines: u64, minutes
     if hour_per_machine_sat <= 0.0 {
         return String::new();
     }
-    let n = machines.max(1).min(free.max(1));
+    // an offer that doesn't say how many machines are free: what was typed
+    let n = if free > 0 { machines.max(1).min(free) } else { machines.max(1) };
     let cost = hour_per_machine_sat * n as f64 * minutes.max(1) as f64 / 60.0 + fee_sat;
     let fee = if fee_sat > 0.0 { ", with the start fee" } else { "" };
     let over = if machines > free && free > 0 { format!(" Only {free} free: counted as {free}.") } else { String::new() };
@@ -2610,6 +2611,8 @@ mod tests {
         // more machines than are free: counted as the free ones, and said
         assert_eq!(rent_estimate(1000.0, 0.0, 9, 60, 7), "7 machines for 60 minutes: about <strong>7,000 sats</strong>. Only 7 free: counted as 7.");
         assert_eq!(rent_estimate(0.0, 0.0, 1, 60, 1), "");
+        // free machines not given: the machines typed, with no "only N free"
+        assert_eq!(rent_estimate(1000.0, 0.0, 3, 60, 0), "3 machines for 60 minutes: about <strong>3,000 sats</strong>.");
     }
 
     #[test]
