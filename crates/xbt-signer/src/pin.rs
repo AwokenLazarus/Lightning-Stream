@@ -150,7 +150,7 @@ impl Tries {
         let failures = self.failures.saturating_add(1);
         let locked_until = match lock_secs(failures) {
             // a lock starts only on the try that reaches its step (5, 10, 15, 20)
-            Some(s) if failures % 5 == 0 => now.saturating_add(s),
+            Some(s) if failures.is_multiple_of(5) => now.saturating_add(s),
             _ => self.locked_until,
         };
         Tries { failures, locked_until }
@@ -184,9 +184,7 @@ impl Signer {
 
     /// `None` when the call may try a PIN; else the deny.
     fn pin_gate_ok(&self, p: &Value) -> Option<Value> {
-        if gate_path().is_none() {
-            return None;
-        }
+        gate_path()?;
         let want = self.pin_gate.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let given = str_or_empty(p.get("gate"));
         if want.is_empty() || !ct_eq(given.trim().as_bytes(), want.as_bytes()) {
