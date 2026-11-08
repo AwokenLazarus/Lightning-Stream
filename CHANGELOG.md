@@ -5,6 +5,25 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.17 (2026-11-08)
+
+Hashrate prices in plain units, asked for by a tester, and a fix for StartOS boxes whose node is still syncing. The
+wallet UI and the signer change, and the StartOS package and the Umbrel app with them.
+
+- **Hashrate offers say what a rental costs.** Each offer card already gave the price an hour for 1 TH/s. It now also
+  says each free machine's speed ("7 of 7 machines free, 12.04 TH/s (about 1.72 TH/s each)"), what all the free
+  machines cost for an hour, 12 hours and 24 hours, and, under the Rent form, what the machines and minutes you type
+  come to with the start fee, updated as you type. Asking for more machines than are free counts the free ones, and
+  says so.
+- **StartOS: the web UI no longer restarts every 30 seconds while the node syncs.** The signer writes a readiness file
+  every 5 seconds, and StartOS takes a file older than 20 seconds for a signer that has stopped. Before each write the
+  signer asked the XBT node for its state and waited for the answer, up to 30 seconds. A node busy syncing on a slow
+  disk often answers that late, so the file went stale, and StartOS stopped and started the web UI, the MCP server,
+  the connector and the hashrate renter every 30 seconds, for the whole sync. The node is now asked on a thread of its
+  own: the file is written on time with the last answer, and a node that has not answered for longer than that is
+  shown as not reachable, with how long it has been. Umbrel and Linux did not restart anything, but their readiness
+  file now stays fresh too.
+
 ## 0.2.16 (2026-11-07)
 
 Four small fixes found on a fresh StartOS 0.4.1.2 with Lightning Fork 0.21.6-beta.23:0: the log explains the grant
