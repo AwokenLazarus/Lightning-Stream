@@ -240,18 +240,18 @@ export const RELAYS = ['wss://relay.lazarus-xbt.xyz', 'wss://relay.kilombino.com
  * one image set for Umbrel, StartOS, Linux and xbt-compute.
  */
 export const IMAGES: Record<ImageKey, string> = {
-  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-9866580d3aed@sha256:d472a828f916f377094b10c3a3ed5c5aaa71c6b962ce74e2c167e3ea25294602',
-  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-9866580d3aed@sha256:1db5309a6d3832f8fd7b6dd5362c99a83d6e55041a1c506755d43ba80b5e7800',
-  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-9866580d3aed@sha256:56b65992968b4bfbb93cab0e5d6d33108268348c1540558997a3d02074860da2',
-  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-9866580d3aed@sha256:e8ad4f42e32ccf8f7018e336cce9ee2d3e09685eba5cdfa46be77f1fa1342151',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-9866580d3aed@sha256:031510bf5f1ac32eeb768ad255fdf30f0cfd20295f36927e26f6cf7caa63059b',
-  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-9866580d3aed@sha256:43d87a92ca03874c50b6bf87ff0dae531a9926c8c9b9b46690521e39ab8ea05e',
-  connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-9866580d3aed@sha256:b36afba8068417c2d072fb741e3921c80df378ce55750574c758272456cdf091',
-  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-9866580d3aed@sha256:e0b2644862e88767b889a3f9f7b01e4cef4b16c41011da050fbe53c41e70404a',
+  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-580735448807@sha256:39fcee915347ed888ed5d48b9a00ca52ad9f0f7f26311dde31c9737bd34cbfa3',
+  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-580735448807@sha256:a8e75c83c0d87567e84844a9362a41236b18697fae52a0b7b6896d4f020c8519',
+  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-580735448807@sha256:293c3a72ed84b2644e3ee3bf3142c7338bf3a5b250684031d6529a8817ea5ad1',
+  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-580735448807@sha256:4fd1d9cc529b657b72cfcc71e31148ba78cfe3f9411185782ed5319cd30bd5a1',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-580735448807@sha256:148ab3745626c21e651f52b47a6cb91318247b7483b452db600f7b4cc73a2f56',
+  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-580735448807@sha256:b9b4606dc86db37013b03932a64eb4ec825474d4af9ef470e130bfabea7a2293',
+  connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-580735448807@sha256:b5676ac66a7bb0335aa3777d1a650a2988ea1ae4f5dc5c96bfbc81bc0c293d26',
+  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-580735448807@sha256:0317801dae49a4402003360fc792d8230a2d88cd4dff2c62173786aa70234c36',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
-  vpn: 'ghcr.io/awokenlazarus/xbt-vpn:0.1.0-9866580d3aed@sha256:ad53b382a85d2e1c7f171d7e89513226937782c8fa6908ecbae47b2822eaa238',
+  vpn: 'ghcr.io/awokenlazarus/xbt-vpn:0.1.0-580735448807@sha256:02c3d7d67008f46250a61d4ef6f76899d5d3ece6a22f5d6e2d5c88b5fd1ac749',
   // not published yet (no line in images.lock): oci_build.sh --load tags it
-  datum: 'ghcr.io/awokenlazarus/xbt-datum-gateway:0.1.0-9866580d3aed@sha256:632f5751d6e3d64e364d5d0e78a86c980d5687155cdcadee19500fc34ef9da98',
+  datum: 'ghcr.io/awokenlazarus/xbt-datum-gateway:0.1.0-580735448807@sha256:8cd4d88f2165388651e6305f1d0471c7ceb1636f33b4caaa033300b69553667e',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
