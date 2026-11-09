@@ -45,7 +45,7 @@ services:
       APP_PORT: 8480
 
   init:
-    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-9866580d3aed@sha256:d472a828f916f377094b10c3a3ed5c5aaa71c6b962ce74e2c167e3ea25294602
+    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-580735448807@sha256:39fcee915347ed888ed5d48b9a00ca52ad9f0f7f26311dde31c9737bd34cbfa3
     user: "0:0"
     restart: "no"
     network_mode: none
@@ -68,7 +68,7 @@ services:
 
   witness:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-9866580d3aed@sha256:56b65992968b4bfbb93cab0e5d6d33108268348c1540558997a3d02074860da2
+    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-580735448807@sha256:293c3a72ed84b2644e3ee3bf3142c7338bf3a5b250684031d6529a8817ea5ad1
     network_mode: none
     stop_grace_period: 30s
     volumes:
@@ -77,7 +77,7 @@ services:
 
   signer:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-9866580d3aed@sha256:1db5309a6d3832f8fd7b6dd5362c99a83d6e55041a1c506755d43ba80b5e7800
+    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-580735448807@sha256:a8e75c83c0d87567e84844a9362a41236b18697fae52a0b7b6896d4f020c8519
     entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
     stop_grace_period: 1m
     environment:
@@ -98,7 +98,7 @@ services:
 
   mcp:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-9866580d3aed@sha256:e8ad4f42e32ccf8f7018e336cce9ee2d3e09685eba5cdfa46be77f1fa1342151
+    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-580735448807@sha256:4fd1d9cc529b657b72cfcc71e31148ba78cfe3f9411185782ed5319cd30bd5a1
     stop_grace_period: 30s
     environment:
       # an over-threshold payment waits this long for the owner's approval in the UI
@@ -118,7 +118,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-9866580d3aed@sha256:031510bf5f1ac32eeb768ad255fdf30f0cfd20295f36927e26f6cf7caa63059b
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-580735448807@sha256:148ab3745626c21e651f52b47a6cb91318247b7483b452db600f7b4cc73a2f56
     stop_grace_period: 15s
     environment:
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
