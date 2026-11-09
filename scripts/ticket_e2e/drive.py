@@ -544,12 +544,14 @@ def never_sent_settled(inv: dict[str, Any], m: dict[str, Any]) -> tuple[dict[str
     on the node) is booked until the book can show the node never had it, ln.timeout_s + 60 s after it was sent
     (`ticket_reconcile_locked`). Where that booking is the only difference, it is waited for, and then the counts must be
     exact. Returns the counts then, and the seconds waited (0: nothing to wait for)."""
-    if not m["booked_for_payments_the_node_left_in_flight_sats"] or ORPHANS or inv["not_in_ledger"] or not inv["same_tickets"]:
+    # not "some orphan exists": a ticket that never reached the node is still waited for beside an earlier kill's orphan
+    left = m["booked_for_payments_the_node_left_in_flight_sats"]
+    if not left or left == m["booked_for_the_orphans_sats"] or inv["not_in_ledger"] or not inv["same_tickets"]:
         return inv, m, 0.0
     t0 = time.monotonic()
     try:
         lab.wait("the bookings of tickets that never reached the node to go", 200,
-                 lambda: signer("watch_tick") is not None and money()["booked_for_payments_the_node_left_in_flight_sats"] == 0, every=5)
+                 lambda: signer("watch_tick") is not None and (lambda now: now["booked_for_payments_the_node_left_in_flight_sats"] == now["booked_for_the_orphans_sats"])(money()), every=5)
     except LabError:
         pass
     return booked_and_once(), money(), round(time.monotonic() - t0, 1)
