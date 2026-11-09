@@ -2076,7 +2076,12 @@ impl Signer {
         }
         let msat = msat.unwrap_or(session.prepaid_msat);
         if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, msat, &tp_now, now) {
-            return refuse(&hash, rule, why);
+            // an invoice that ran out before it was sent (a win that waited behind another payment's route wait, and came
+            // back with the same invoice) is marked unsent like the held-back ones below, so the seller's next invoice
+            // is asked for at once; one that lives too long is the seller's doing and stays a plain refusal
+            let ran_out = rule == "ticket_expiry" && (inv.expires_at() as f64) < now + ticket::PREPAID_EXPIRY_MARGIN_S;
+            let d = refuse(&hash, rule, why);
+            return if ran_out { with(d, json!({"hash": hash, "unsent": true})) } else { d };
         }
         // a win whose invoice would end before its payment could arrive is held back, never sent: asked here, and again
         // just before it is booked and sent, after every wait between (the route's, the spend lock's), in which an
