@@ -957,7 +957,15 @@ struct Slot<'a>(&'a AtomicUsize);
 
 impl<'a> Slot<'a> {
     fn take(n: &'a AtomicUsize, most: usize) -> Option<Self> {
-        n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| (v < most).then_some(v + 1)).ok().map(|_| Slot(n))
+        // a compare-exchange loop, not `fetch_update` (deprecated on newer toolchains; its rename is newer than our rust-version)
+        let mut v = n.load(Ordering::SeqCst);
+        while v < most {
+            match n.compare_exchange_weak(v, v + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(Slot(n)),
+                Err(now) => v = now,
+            }
+        }
+        None
     }
 }
 
