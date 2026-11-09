@@ -39,7 +39,7 @@ fn ui_js_signs_exactly_the_signer_s_messages() {
     let dalek = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]).verifying_key().to_bytes();
     assert_eq!(pk, dalek, "the same public key from the same seed");
     let cases = v["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 8);
+    assert_eq!(cases.len(), 9);
     for c in cases {
         let f = &c["fields"];
         let s = |k: &str| f[k].as_str().unwrap().to_string();
@@ -51,7 +51,7 @@ fn ui_js_signs_exactly_the_signer_s_messages() {
                         xbt_wallet_ui::msg::sweep(&s("hot_address"), &s("to"), i("amount_sats"), i("expiry"))),
             "policy" => (approval::policy_message(&s("prev_sha256"), i("expiry"), &s("text")),
                          xbt_wallet_ui::msg::policy(&s("prev_sha256"), i("expiry"), &s("text"))),
-            "human-key" => (approval::human_key_message(&s("old_pub"), &s("pubkey"), i("expiry")),
+            "human-key" | "pin-handover" => (approval::human_key_message(&s("old_pub"), &s("pubkey"), i("expiry")),
                             xbt_wallet_ui::msg::human_key(&s("old_pub"), &s("pubkey"), i("expiry"))),
             "rotate" => (approval::rotate_message(&s("hot_address"), i("expiry")), xbt_wallet_ui::msg::rotate(&s("hot_address"), i("expiry"))),
             "backup" => (approval::backup_message(&s("hot_address"), i("expiry")), xbt_wallet_ui::msg::backup(&s("hot_address"), i("expiry"))),
