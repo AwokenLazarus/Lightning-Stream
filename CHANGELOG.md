@@ -5,6 +5,18 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.2.19 (2026-11-09)
+
+One payment fix, found by a test that failed now and then. The signer changes, and the StartOS package and the
+Umbrel app with it.
+
+- **A win is no longer left unpaid when its invoice runs out in a queue.** When the wallet's node briefly finds no
+  route to a seller, one payment waits for the route and the others to that seller are turned back for a moment and
+  tried again with the same invoice. If that invoice ran out meanwhile, the wallet refused it, as it should, but did
+  not ask the seller for a new one, so the win stayed owed until a later call. Nothing was sent on the lapsed invoice
+  and nothing was lost. The wallet now asks for the seller's next invoice at once and pays the win in the same call.
+- A build fix for newer Rust toolchains (a deprecated call in the inference server's paying slots).
+
 ## 0.2.18 (2026-11-08)
 
 Fixes found by a fresh Umbrel paying test and a fresh StartOS box. The wallet UI, the signer and the hashrate
