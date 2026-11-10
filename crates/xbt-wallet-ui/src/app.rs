@@ -722,8 +722,7 @@ impl App {
         let mut b = format!("<p class=\"lead\">Send XBT from any wallet or exchange to the address below. The app then moves it to your \
             Lightning node, where it becomes the balance you pay shops with.</p>\
             <section class=\"card\"><h2>1. Send to this address</h2><p><code class=\"mono deposit-address\">{}</code></p>\
-            <p class=\"small\">Send at least {} sats: a little goes to network fees and to a small reserve your node keeps, the rest is yours to \
-            spend. The address belongs to this box. Why not straight to your node? Coins that pass through this address can be proven to be \
+            <p class=\"small\">Send at least {} sats: a little goes to network fees, and the rest becomes your balance. The address belongs to this box. Why not straight to your node? Coins that pass through this address can be proven to be \
             XBT's alone, which the app requires before it pays through a channel.</p></section>",
             esc(&addr), crate::html::group3(MIN_DEPOSIT_SATS as u64));
         b.push_str("<section class=\"card\"><h2>2. Wait for it to arrive</h2>");
@@ -807,7 +806,8 @@ impl App {
             } else if f["confirmations"].as_i64().is_some_and(|c| c >= 1) && !human.is_empty() {
                 let exp = now() + SIGN_WINDOW_S;
                 b.push_str(&format!("<p><span class=\"pill good\">Arrived at your node</span> {amount} sats. One approval opens your connection with them: \
-                    almost all becomes your balance; the opening fee and a small reserve your node keeps are not spendable.</p>"));
+                    all of it goes into the connection. Almost all is yours to spend: the opening fee, and about 1% that every connection holds back until \
+                    it is closed, are not.</p>"));
                 b.push_str(&self.signed_form(ctx, "./channel-open", "channel", &human, &[("forward_txid", txid.clone()), ("expiry", exp.to_string())],
                     &format!("<details{}><summary>Who you connect to{}</summary>\
                         <label>Node key<input name=\"peer\" value=\"{}\" class=\"mono\" autocomplete=\"off\" required pattern=\"0[23][0-9a-fA-F]{{64}}\"></label>\
