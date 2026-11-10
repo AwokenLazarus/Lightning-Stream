@@ -544,7 +544,8 @@ fn read_nofollow(p: &Path) -> Result<Vec<u8>, String> {
 /// A key the node would not bake (the baker says so in the hand-over's record) is not waited for.
 pub fn handover_wanted(s: &Settings) -> bool {
     let said = s.take_from.as_deref().map(read_record).unwrap_or_else(|| json!({}));
-    HANDED.iter().any(|(rail, file, _)| {
+    // the open key comes only with a box's first rail key, and before it: it is never waited for by itself
+    HANDED.iter().filter(|(_, file, _)| *file != OPEN_MACAROON).any(|(rail, file, _)| {
         let dir = if *rail { &s.rail_dir } else { &s.gw_dir };
         dir.as_ref().is_some_and(|d| !is_off(d) && !d.join(file).is_file()) && said[*file]["skipped"].is_null()
     })
@@ -911,11 +912,13 @@ mod tests {
             asked.push((ops.iter().map(|o| o.to_string()).collect(), id));
             Ok(mac_of(ops))
         }).unwrap();
-        assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
+        // a new install: the open key with the first rail key, and before it
+        assert_eq!(out.made, vec![OPEN_MACAROON, RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
         assert_eq!(asked.iter().map(|(o, _)| o.join(" ")).collect::<Vec<_>>(),
-                   vec![RAIL_OPS.join(" "), INVOICE_OPS.join(" "), INFO_OPS.join(" "), SIGN_OPS.join(" ")]);
+                   vec![OPEN_OPS.join(" "), RAIL_OPS.join(" "), INVOICE_OPS.join(" "), INFO_OPS.join(" "), SIGN_OPS.join(" ")]);
         let ids: std::collections::HashSet<u64> = asked.iter().map(|(_, id)| *id).collect();
-        assert_eq!(ids.len(), 4, "a root key each");
+        assert_eq!(ids.len(), 5, "a root key each");
+        assert_eq!(std::fs::read(rail.join(OPEN_MACAROON)).unwrap(), mac_of(&OPEN_OPS));
         assert!(ids.iter().all(|id| *id != 0));
         assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), mac_of(&RAIL_OPS));
         assert!(made_by_box(&rail) && made_by_box(&gw));
@@ -1067,8 +1070,8 @@ mod tests {
             ids.push(id);
             Ok(mac_of(ops))
         }).unwrap();
-        assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
-        for f in [RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN] {
+        assert_eq!(out.made, vec![OPEN_MACAROON, RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
+        for f in [OPEN_MACAROON, RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN] {
             assert!(h.join(f).is_file() && !rail.join(f).exists() && !gw.join(f).exists(), "{f}: the hand-over only");
         }
         // baked and not taken yet: not baked again, and the admin macaroon is not even looked for
@@ -1158,10 +1161,10 @@ mod tests {
                                rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()), bake_to: Some(h.clone()), take_from: None };
         let taker = Settings { admin: PathBuf::new(), bake_to: None, take_from: Some(h.clone()), ..baker.clone() };
         let out = make_keys(&baker, &mut |ops, _| if ops == &SIGN_OPS[..] { Err("unknown permission".into()) } else { Ok(mac_of(ops)) }).unwrap();
-        assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO]);
+        assert_eq!(out.made, vec![OPEN_MACAROON, RAIL_MACAROON, GW_INVOICES, GW_INFO]);
         let mut o = Outcome::default();
         take_handover(&taker, &mut o).unwrap();
-        assert_eq!(o.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO]);
+        assert_eq!(o.made, vec![OPEN_MACAROON, RAIL_MACAROON, GW_INVOICES, GW_INFO]);
         assert!(!gw.join(GW_SIGN).exists());
         assert!(!handover_wanted(&taker), "the taker would watch forever for a key that never comes");
         // a node that bakes it later (the baker's next start): taken then, the skip forgotten
@@ -1235,5 +1238,34 @@ mod tests {
         take_handover(&taker, &mut o).unwrap();
         assert_eq!(o.skipped, vec![(RAIL_MACAROON.to_string(), "already in place".to_string())]);
         assert!(!h.join(RAIL_MACAROON).exists());
+    }
+
+    /// A box that pays already is given no open key by itself: not on an update, not when its other keys are made
+    /// again, and not when the node will not bake one (then the rail key is made all the same).
+    #[test]
+    fn the_open_key_comes_only_with_a_boxs_first_rail_key() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, bake_to: None, take_from: None,
+                           rail_dir: Some(rail.clone()), gw_dir: None };
+        // an existing box: its rail key is there
+        write_shared(&rail, RAIL_MACAROON, &mac_of(&RAIL_OPS)).unwrap();
+        let out = make_keys(&s, &mut |_, _| panic!("nothing is baked for a box that pays already")).unwrap();
+        assert!(out.made.is_empty() && !rail.join(OPEN_MACAROON).exists());
+        // a new install whose node bakes no such key: the rail key alone, and why is said
+        std::fs::remove_file(rail.join(RAIL_MACAROON)).unwrap();
+        let out = make_keys(&s, &mut |ops, _| if ops == &OPEN_OPS[..] { Err("permission denied".into()) } else { Ok(mac_of(ops)) }).unwrap();
+        assert_eq!(out.made, vec![RAIL_MACAROON]);
+        assert_eq!(out.skipped, vec![(OPEN_MACAROON.to_string(), "permission denied".to_string())]);
+        assert!(!rail.join(OPEN_MACAROON).exists());
+        // the hand-over takes the open key with exactly its permissions, and never waits for it
+        let h = shared_dir(t.path(), "node-keys");
+        let taker = Settings { admin: PathBuf::new(), take_from: Some(h.clone()), ..s.clone() };
+        assert!(!handover_wanted(&taker), "the rail key is there: nothing is waited for");
+        record(&h, OPEN_MACAROON, 9, &OPEN_OPS).unwrap();
+        std::fs::write(h.join(OPEN_MACAROON), mac_of(&["onchain:write", "macaroon:generate"])).unwrap();
+        let mut o = Outcome::default();
+        take_handover(&taker, &mut o).unwrap();
+        assert!(o.made.is_empty() && o.skipped[0].1.contains("refused and removed"), "{o:?}");
     }
 }
