@@ -31,6 +31,7 @@ pub mod approval;
 pub mod bolt11;
 pub mod bolt12;
 pub mod fsx;
+pub mod deposit;
 pub mod hot;
 pub mod ipc;
 pub mod keystore;

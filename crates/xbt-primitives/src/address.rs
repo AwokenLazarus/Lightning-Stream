@@ -81,6 +81,44 @@ pub fn address_for(chain: Chain, spk: &[u8]) -> Result<String> {
     segwit_address(chain.hrp(), spk)
 }
 
+const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// Base58Check of `version || payload` (the legacy address encoding).
+fn base58check(version: u8, payload: &[u8]) -> String {
+    let mut data = vec![version];
+    data.extend_from_slice(payload);
+    let check = crate::hash::dsha256(&data);
+    data.extend_from_slice(&check[..4]);
+    // base 256 to base 58, most significant digit first
+    let mut digits: Vec<u8> = Vec::with_capacity(data.len() * 138 / 100 + 1);
+    for &b in &data {
+        let mut carry = b as u32;
+        for d in digits.iter_mut() {
+            carry += (*d as u32) << 8;
+            *d = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let zeros = data.iter().take_while(|b| **b == 0).count();
+    let mut out = String::with_capacity(zeros + digits.len());
+    out.extend(std::iter::repeat_n('1', zeros));
+    out.extend(digits.iter().rev().map(|d| BASE58[*d as usize] as char));
+    out
+}
+
+/// The legacy address of a pay-to-public-key-hash output script on `chain`: version byte 0x00 on the main
+/// chain, 0x6f on the test chains (the node's `PUBKEY_ADDRESS` prefixes, unchanged from Bitcoin's).
+pub fn p2pkh_address(chain: Chain, spk: &[u8]) -> Result<String> {
+    if !crate::script::is_p2pkh(spk) {
+        return Err(Error::BadAddress("not a pay-to-public-key-hash script".into()));
+    }
+    Ok(base58check(if chain == Chain::Main { 0x00 } else { 0x6f }, &spk[3..23]))
+}
+
 /// `(version, program)` of a witness output script.
 pub fn witness_program(spk: &[u8]) -> Option<(u8, &[u8])> {
     if spk.len() < 4 || spk.len() > 42 {
@@ -163,5 +201,26 @@ mod tests {
         assert!(address_to_spk("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kemeawh", None).is_err());
         assert!(address_to_spk("bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqh2y7hd", None).is_err());
         assert!(address_to_spk("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", Some("bc")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod p2pkh_tests {
+    use super::*;
+
+    /// The key 1's address, as every Bitcoin-derived node prints it.
+    #[test]
+    fn the_legacy_address_of_a_known_key() {
+        let pubkey = hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap();
+        let spk = crate::script::p2pkh_spk(&pubkey);
+        assert_eq!(hex::encode(&spk), "76a914751e76e8199196d454941c45d1b3a323f1433bd688ac");
+        assert_eq!(p2pkh_address(Chain::Main, &spk).unwrap(), "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH");
+        assert_eq!(p2pkh_address(Chain::Regtest, &spk).unwrap(), "mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r");
+        assert!(p2pkh_address(Chain::Main, &crate::script::p2wpkh_spk(&pubkey)).is_err());
+        // a hash that starts with zero bytes keeps them as leading 1s
+        let mut zero = vec![0x76, 0xa9, 0x14];
+        zero.extend_from_slice(&[0u8; 20]);
+        zero.extend_from_slice(&[0x88, 0xac]);
+        assert_eq!(p2pkh_address(Chain::Main, &zero).unwrap(), "1111111111111111111114oLvT2");
     }
 }

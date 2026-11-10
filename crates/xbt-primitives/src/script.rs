@@ -76,6 +76,20 @@ pub fn p2wpkh_spk(pubkey: &[u8]) -> Vec<u8> {
     v
 }
 
+/// `OP_DUP OP_HASH160 <hash160(pubkey)> OP_EQUALVERIFY OP_CHECKSIG`. A spend of it carries its signature in the
+/// scriptSig, which the txid commits to.
+pub fn p2pkh_spk(pubkey: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x76, 0xa9, 0x14];
+    v.extend_from_slice(&hash160(pubkey));
+    v.extend_from_slice(&[0x88, 0xac]);
+    v
+}
+
+/// Is `spk` a pay-to-public-key-hash output script?
+pub fn is_p2pkh(spk: &[u8]) -> bool {
+    spk.len() == 25 && spk[..3] == [0x76, 0xa9, 0x14] && spk[23..] == [0x88, 0xac]
+}
+
 /// `OP_1 <32-byte output key>`.
 pub fn p2tr_spk(output_key_x: &[u8; 32]) -> Vec<u8> {
     let mut v = vec![OP_1, 0x20];
