@@ -164,6 +164,26 @@ const MAINNET_CAPPED_KEYS: [&str; 8] = ["max_per_tx_sats", "daily_budget_sats", 
                                          "human_threshold_sats", "hot_balance_cap_sats", "velocity_max"];
 
 /// Whether paying over Lightning is turned on in `p`.
+/// `p` with the seller at `origin` on the list of who may be paid, tied to its Lightning node `node`: the seller's
+/// origin, or nothing (and `p` untouched) where either is not what it should be.
+fn allow_seller(p: &mut Value, origin: &str, node: &str) -> Option<String> {
+    let origin = crate::services::http_origin(origin)?;
+    let node = node.trim().to_ascii_lowercase();
+    if !p.is_object() || node.len() != 66 || !node.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut list: Vec<Value> = p["allowlist"].as_array().cloned().unwrap_or_default();
+    if !list.iter().any(|x| x.as_str().and_then(crate::services::http_origin).as_deref() == Some(origin.as_str())) {
+        list.push(Value::from(origin.clone()));
+    }
+    p["allowlist"] = Value::from(list);
+    if !p["counterparties"].is_object() {
+        p["counterparties"] = json!({});
+    }
+    p["counterparties"][origin.as_str()] = json!({"ln_node": node});
+    Some(origin)
+}
+
 /// The amounts a limit's slider stops at, in sats.
 const LIMIT_STEPS: [i64; 10] = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000];
 
@@ -590,6 +610,15 @@ impl App {
             "/approvals" => self.approvals(&ctx),
             "/policy" => match req.query.get("fix").map(String::as_str) {
                 Some("cap") => self.policy_fix_cap(&ctx),
+                // the simple view: allowing a shop is one sheet, the change to approve, not the whole form of rules
+                _ if self.simple() && req.query.contains_key("allow") && req.query.contains_key("node") => {
+                    let cur = self.call("policy_get", json!({})).unwrap_or(Value::Null);
+                    let mut p = cur["policy"].clone();
+                    match (paying_on(&p), allow_seller(&mut p, &req.query["allow"], &req.query["node"])) {
+                        (true, Some(_)) => self.policy_preview(&ctx, &HashMap::from([("mode".to_string(), "json".to_string()), ("json".to_string(), p.to_string())])),
+                        _ => self.policy_page(&ctx, false, Some((req.query["allow"].as_str(), req.query["node"].as_str())), &[], None),
+                    }
+                }
                 _ => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false),
                                       req.query.get("allow").zip(req.query.get("node")).map(|(a, n)| (a.as_str(), n.as_str())),
                                       &req.query.get("drop").and_then(|d| crate::services::http_origin(d)).into_iter().collect::<Vec<_>>(),
@@ -1657,18 +1686,7 @@ impl App {
         }
         // a seller to allow, from the Sellers page: its address on the list, tied to its node
         if let Some((origin, node)) = allow {
-            let origin = crate::services::http_origin(origin).unwrap_or_default();
-            let node = node.trim().to_ascii_lowercase();
-            if !origin.is_empty() && node.len() == 66 && node.bytes().all(|c| c.is_ascii_hexdigit()) {
-                let mut list: Vec<Value> = p["allowlist"].as_array().cloned().unwrap_or_default();
-                if !list.iter().any(|x| x.as_str().and_then(crate::services::http_origin).as_deref() == Some(origin.as_str())) {
-                    list.push(Value::from(origin.clone()));
-                }
-                p["allowlist"] = Value::from(list);
-                if !p["counterparties"].is_object() {
-                    p["counterparties"] = json!({});
-                }
-                p["counterparties"][origin.as_str()] = json!({"ln_node": node});
+            if let Some(origin) = allow_seller(&mut p, origin, node) {
                 let cap = p.get("per_counterparty_cap_sats").or(cur["effective"].get("per_counterparty_cap_sats")).and_then(Value::as_i64).unwrap_or(0);
                 b.push_str(&format!("<div class=\"flash ok\"><p><strong>Allow {} to be paid.</strong> Sign below with your approval key. \
                     The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&self.seller_name(&origin)), money(cap)));

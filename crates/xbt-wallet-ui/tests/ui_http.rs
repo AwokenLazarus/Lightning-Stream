@@ -6405,3 +6405,24 @@ fn the_limits_page_changes_a_limit_with_a_slider_through_the_usual_review() {
     wild[0].1 = "99";
     assert!(br.act("/limits", "/limits", &wild).body.contains("No change."));
 }
+
+/// Allowing a shop in the simple view is one sheet: the change to approve (the shop on the list, tied to its node), not the
+/// whole form of rules. The full view opens the form as before, and so does a box whose paying is not on yet.
+///
+/// FAILS before: the simple view opened the whole Spending rules form.
+#[test]
+fn allowing_a_shop_in_the_simple_view_is_one_sheet_to_approve() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({"ln": {"enabled": true}}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let allow = format!("/policy?allow=https%3A%2F%2Fnew-shop.example&node=02{}", "ab".repeat(32));
+    let full = unescape(&br.get(&allow).body);
+    assert!(full.contains("Allow new-shop.example to be paid") && !full.contains("Check the change"), "the full view: the form, with the shop filled in");
+    br.act("/browse", "/advanced", &[("on", "0")]);
+    let sheet = unescape(&br.get(&allow).body);
+    assert!(sheet.contains("Check the change") && sheet.contains("new-shop.example") && !sheet.contains("No change."), "{sheet}");
+    assert!(!sheet.contains("Start from the safe starter rules"), "not the whole form: {sheet}");
+    // a node that is no node: the form, which says nothing is added
+    let odd = unescape(&br.get("/policy?allow=https%3A%2F%2Fnew-shop.example&node=xyz").body);
+    assert!(!odd.contains("Check the change"), "{odd}");
+}
