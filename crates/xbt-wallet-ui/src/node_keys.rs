@@ -1079,13 +1079,16 @@ mod tests {
         assert_eq!(run(&baker).unwrap().kept, vec!["all"]);
         let mut o = Outcome::default();
         take_handover(&taker, &mut o).unwrap();
-        assert_eq!(o.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
+        assert_eq!(o.made, vec![OPEN_MACAROON, RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
         assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), mac_of(&RAIL_OPS));
+        assert_eq!(std::fs::read(rail.join(OPEN_MACAROON)).unwrap(), mac_of(&OPEN_OPS));
         assert_eq!(std::fs::read(gw.join(GW_SIGN)).unwrap(), mac_of(&SIGN_OPS));
-        assert!([RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN].iter().all(|f| !h.join(f).exists()), "moved, not copied");
+        assert!([OPEN_MACAROON, RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN].iter().all(|f| !h.join(f).exists()), "moved, not copied");
         assert!(made_by_box(&rail) && made_by_box(&gw));
-        assert_eq!(root_key_line(&rail, RAIL_MACAROON), format!("root key id {}", ids[0]));
-        assert_eq!(root_key_ids(&gw), { let mut v: Vec<String> = ids[1..].iter().map(u64::to_string).collect(); v.sort(); v });
+        // the open key was baked first
+        assert_eq!(root_key_line(&rail, OPEN_MACAROON), format!("root key id {}", ids[0]));
+        assert_eq!(root_key_line(&rail, RAIL_MACAROON), format!("root key id {}", ids[1]));
+        assert_eq!(root_key_ids(&gw), { let mut v: Vec<String> = ids[2..].iter().map(u64::to_string).collect(); v.sort(); v });
         assert!(!handover_wanted(&taker));
         // every key there: the baker has nothing to do
         assert_eq!(run(&baker).unwrap().kept, vec!["all"]);
