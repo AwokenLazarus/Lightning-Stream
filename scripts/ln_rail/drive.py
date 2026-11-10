@@ -355,31 +355,31 @@ def main():
 
 
 def run_hop(sock, human, lf2_pub):
-    """S16, the first deposit's hop (xbt-signer::deposit): coins sent plainly to the box's deposit address are
+    """S30, the first deposit's hop (xbt-signer::deposit): coins sent plainly to the box's deposit address are
     forwarded by the signer to lf1 in a transaction our Knots node accepts, and a channel funded from them is
     proven: pinned by the forwarding transaction's scriptSig, one transaction behind the funding."""
     st = rpc_sock(sock, "deposit_status")
     dep = st.get("address", "")
-    check("S16 the box has a legacy deposit address", st.get("ok") is True and dep[:1] in ("m", "n"), st)
+    check("S30 the box has a legacy deposit address", st.get("ok") is True and dep[:1] in ("m", "n"), st)
     info = json.loads(b2b("validateaddress", dep))
-    check("S16 our node reads it as the same pay-to-public-key-hash script", info.get("isvalid") is True and info.get("scriptPubKey") == st.get("script"), info)
+    check("S30 our node reads it as the same pay-to-public-key-hash script", info.get("isvalid") is True and info.get("scriptPubKey") == st.get("script"), info)
     b2b("-rpcwallet=lab", "sendtoaddress", dep, "0.01")
     mine(1)
     st = rpc_sock(sock, "deposit_status", {"scan": True})
-    check("S16 the deposit is found once it confirms", st.get("confirmed_sats") == 1_000_000 and len(st.get("coins", [])) == 1, st)
+    check("S30 the deposit is found once it confirms", st.get("confirmed_sats") == 1_000_000 and len(st.get("coins", [])) == 1, st)
     to = ln("lf1", "newaddress", "p2wkh")["address"]
     exp = int(time.time()) + 600
     msg = b"\n".join([b"xbt-agentwallet-deposit-forward-v1", dep.encode(), to.encode(), str(exp).encode()])
     r = rpc_sock(sock, "deposit_forward", {"to": to, "expiry": exp, "signature": human.sign(msg).hex()})
-    REPORT["scenarios"]["S16_forward"] = r
-    check("S16 our node takes the forwarding transaction", r.get("ok") is True and r.get("sats") == 1_000_000 - r.get("fee_sats", 0), r)
+    REPORT["scenarios"]["S30_forward"] = r
+    check("S30 our node takes the forwarding transaction", r.get("ok") is True and r.get("sats") == 1_000_000 - r.get("fee_sats", 0), r)
     if r.get("ok") is not True:
         return
     vin = json.loads(b2b("getrawtransaction", r["txid"], "true")).get("vin", [])
-    check("S16 its input is signed in the scriptSig (ending 0x21), with no witness",
+    check("S30 its input is signed in the scriptSig (ending 0x21), with no witness",
           vin and all(v.get("scriptSig", {}).get("asm", "").split(" ")[0].endswith(("21", "[ALL|UNIFIED]")) and not v.get("txinwitness") for v in vin), vin)
     again = rpc_sock(sock, "deposit_forward", {"to": to, "expiry": exp, "signature": human.sign(msg).hex()})
-    check("S16 the same signature forwards nothing more", again.get("ok") is False, again)
+    check("S30 the same signature forwards nothing more", again.get("ok") is False, again)
     tip = mine(1)
     wait("lf1 sees the forwarded coin", 60, lambda: synced("lf1", tip) and any(u["outpoint"].startswith(r["txid"]) for u in ln("lf1", "listunspent", "--min_confs=1")["utxos"]))
     ch = open_channel(f"--node_key={lf2_pub}", "--local_amt=900000", f"--utxo={r['txid']}:0")
@@ -388,11 +388,11 @@ def run_hop(sock, human, lf2_pub):
     wait("the hop channel active", 90, lambda: any(c["channel_point"].startswith(ftxid) for c in ln("lf1", "listchannels", "--active_only")["channels"]))
     st = rpc_sock(sock, "ln_status")
     ours = [c for c in st.get("channels", []) if (c.get("funding") or {}).get("evidence", {}).get("txid") == ftxid]
-    REPORT["scenarios"]["S16_channel"] = {"open": ch, "ours": ours}
+    REPORT["scenarios"]["S30_channel"] = {"open": ch, "ours": ours}
     f = ours[0].get("funding", {}) if ours else {}
-    check("S16 the channel funded from the forwarded deposit is usable, its funding proven", bool(ours) and ours[0].get("usable") is True and f.get("proven") is True, ours)
+    check("S30 the channel funded from the forwarded deposit is usable, its funding proven", bool(ours) and ours[0].get("usable") is True and f.get("proven") is True, ours)
     pin = f.get("evidence", {}).get("xbt_only", {})
-    check("S16 pinned by the forwarding transaction's scriptSig, one transaction behind the funding",
+    check("S30 pinned by the forwarding transaction's scriptSig, one transaction behind the funding",
           pin.get("pinned_by") == "a 0x21 signature in a scriptSig" and pin.get("generations") == 1, pin)
 
 
