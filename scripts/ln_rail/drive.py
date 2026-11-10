@@ -415,7 +415,7 @@ def run_open(human, human_pub, lf2_pub, ln_env, procs):
     b2b("-rpcwallet=lab", "sendtoaddress", dep, "0.005")
     mine(1)
     exp = int(time.time()) + 600
-    elsewhere = b2b("-rpcwallet=lab", "getnewaddress")
+    elsewhere = b2b("-rpcwallet=lab", "getnewaddress", "", "bech32")
     msg = b"\n".join([b"xbt-agentwallet-deposit-forward-v1", dep.encode(), elsewhere.encode(), str(exp).encode()])
     r = rpc_sock(sock, "deposit_forward", {"to": elsewhere, "expiry": exp, "signature": human.sign(msg).hex()})
     check("S31 a deposit is not forwarded to an address the node did not give", r.get("ok") is False and "Lightning node gave" in r.get("reason", ""), r)
@@ -440,7 +440,7 @@ def run_open(human, human_pub, lf2_pub, ln_env, procs):
     o = {}
     for i in range(6):
         o = ask()
-        if o.get("ok") is True or "internal error" not in o.get("reason", ""):
+        if o.get("ok") is True or "internal error" not in json.dumps(o):
             break
         time.sleep(5)
     REPORT["scenarios"]["S31_open"] = o

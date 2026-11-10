@@ -97,7 +97,8 @@ impl OpenBackend for LndOpen {
     fn connect(&self, pubkey: &str, host: &str) -> Result<()> {
         match self.rest.post("/v1/peers", &json!({"addr": {"pubkey": pubkey, "host": host}, "perm": false, "timeout": "20"}), 30) {
             Ok(_) => Ok(()),
-            Err(e) if e.msg.contains("already connected") => Ok(()),
+            // the node's own words are carried apart from ours (`seller`): "already connected to peer: …" is no failure
+            Err(e) if e.seller.as_deref().is_some_and(|m| m.contains("already connected")) => Ok(()),
             Err(e) => Err(e),
         }
     }

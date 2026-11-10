@@ -1033,14 +1033,14 @@ impl Signer {
         }
         // nothing irreversible yet: a peer that cannot be reached leaves the signature unused
         if let Err(e) = node.connect(&peer, &host) {
-            return json!({"ok": false, "reason": format!("could not connect to the peer: {}", trunc(&e.msg, 200)), "retry": true});
+            return crate::ln::node_said(json!({"ok": false, "reason": format!("could not connect to the peer: {}", trunc(&e.msg, 200)), "retry": true}), &e);
         }
         if let Some(d) = self.check_sig(&msg, p, expiry) {
             return json!({"ok": false, "reason": d["reason"], "rule": d["rule"]});
         }
         let funding_txid = match node.open(&peer, &forward, 0) {
             Ok(t) => t,
-            Err(e) => return json!({"ok": false, "reason": format!("the Lightning node did not open the channel: {}", trunc(&e.msg, 300))}),
+            Err(e) => return crate::ln::node_said(json!({"ok": false, "reason": format!("the Lightning node did not open the channel: {}", trunc(&e.msg, 300))}), &e),
         };
         let kept = self.funding.set_channel(&forward, &peer, &funding_txid).err().map(|e| e.msg);
         self.engine.audit.append(json!({"type": "channel_open", "peer": peer, "host": host, "from": forward, "sats": rec["sats"], "txid": funding_txid,
