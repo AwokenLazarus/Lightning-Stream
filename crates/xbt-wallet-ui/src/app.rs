@@ -187,6 +187,15 @@ fn allow_seller(p: &mut Value, origin: &str, node: &str) -> Option<String> {
 /// The least a first deposit should be: under it a channel may not open, or leaves too little to spend.
 const MIN_DEPOSIT_SATS: i64 = 250_000;
 
+/// Where a rules change made from one of the simple view's pages goes back to: that page, and no other address.
+fn back_page(back: Option<&str>) -> Option<&'static str> {
+    match back {
+        Some("./limits") => Some("./limits"),
+        Some("./browse") => Some("./browse"),
+        _ => None,
+    }
+}
+
 /// The amounts a limit's slider stops at, in sats.
 const LIMIT_STEPS: [i64; 10] = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000];
 
@@ -619,7 +628,8 @@ impl App {
                     let cur = self.call("policy_get", json!({})).unwrap_or(Value::Null);
                     let mut p = cur["policy"].clone();
                     match (paying_on(&p), allow_seller(&mut p, &req.query["allow"], &req.query["node"])) {
-                        (true, Some(_)) => self.policy_preview(&ctx, &HashMap::from([("mode".to_string(), "json".to_string()), ("json".to_string(), p.to_string())])),
+                        (true, Some(_)) => self.policy_preview(&ctx, &HashMap::from([("mode".to_string(), "json".to_string()), ("json".to_string(), p.to_string()),
+                                                                                    ("back".to_string(), "./browse".to_string())])),
                         _ => self.policy_page(&ctx, false, Some((req.query["allow"].as_str(), req.query["node"].as_str())), &[], None),
                     }
                 }
@@ -801,7 +811,7 @@ impl App {
         if let (Some(day), Some(shop)) = (n(&p, "daily_budget_sats"), n(&p, "per_counterparty_daily_sats")) {
             p["per_counterparty_daily_sats"] = Value::from(shop.min(day));
         }
-        let as_json = HashMap::from([("mode".to_string(), "json".to_string()), ("json".to_string(), p.to_string())]);
+        let as_json = HashMap::from([("mode".to_string(), "json".to_string()), ("json".to_string(), p.to_string()), ("back".to_string(), "./limits".to_string())]);
         self.policy_preview(ctx, &as_json)
     }
 
@@ -1916,7 +1926,7 @@ impl App {
             "Policy applied; it is in force now.".into()
         };
         self.flash(ctx, true, m);
-        Resp::redirect(if ack_needed { "./lightning#ack" } else { "./policy" })
+        Resp::redirect(if ack_needed { "./lightning#ack" } else { back_page(f.get("back").map(String::as_str)).unwrap_or("./policy") })
     }
 
     fn policy_preview(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
@@ -1996,10 +2006,15 @@ impl App {
                 <label class=\"check\"><input type=\"checkbox\" name=\"ack\" value=\"1\"> I understand the app pays with real money, within these rules</label></div>",
                 crate::setup::notice_html(&crate::setup::WALLET_MAINNET_NOTICE)));
         }
-        b.push_str(&self.signed_form(ctx, "./policy-apply", "policy", &self.human_pub(),
-                                     &[("text", text.clone()), ("prev_sha256", prev.clone()), ("expiry", exp.to_string())], &visible,
+        // the simple view's pages (Limits, a shop to allow) come back to themselves, not to the whole form of rules
+        let back = back_page(f.get("back").map(String::as_str));
+        let mut hidden = vec![("text", text.clone()), ("prev_sha256", prev.clone()), ("expiry", exp.to_string())];
+        if let Some(to) = back {
+            hidden.push(("back", to.to_string()));
+        }
+        b.push_str(&self.signed_form(ctx, "./policy-apply", "policy", &self.human_pub(), &hidden, &visible,
                                      "Sign and apply", Ext::Bytes(msg::policy(&prev, exp, &text))));
-        b.push_str("<p><a href=\"./policy\">Cancel</a></p>");
+        b.push_str(&format!("<p><a href=\"{}\">Cancel</a></p>", back.unwrap_or("./policy")));
         self.page("Spending rules", ctx, b)
     }
 
@@ -3063,6 +3078,20 @@ pub fn file_call_sats(ceiling: &Value, bytes: u64) -> i64 {
     let msat = n("request_msat") + (n("gib_msat") * u128::from(bytes)).div_ceil(1 << 30);
     let sats = (msat * 102 / 100).div_ceil(1000) + 1;
     i64::try_from(sats).unwrap_or(i64::MAX).max(MIN_CALL_SATS)
+}
+
+#[cfg(test)]
+mod back_tests {
+    /// A change comes back to Limits or Shops, and to no address a form could be made to carry.
+    #[test]
+    fn a_rules_change_goes_back_to_one_of_the_apps_own_pages_only() {
+        assert_eq!(super::back_page(Some("./limits")), Some("./limits"));
+        assert_eq!(super::back_page(Some("./browse")), Some("./browse"));
+        for other in ["https://elsewhere.example", "//elsewhere.example", "./limits?x=1", "", "./keys"] {
+            assert_eq!(super::back_page(Some(other)), None, "{other}");
+        }
+        assert_eq!(super::back_page(None), None);
+    }
 }
 
 #[cfg(test)]

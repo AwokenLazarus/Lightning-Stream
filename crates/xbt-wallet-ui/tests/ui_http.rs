@@ -6398,10 +6398,18 @@ fn the_limits_page_changes_a_limit_with_a_slider_through_the_usual_review() {
     let body = unescape(&r.body);
     assert!(r.status == 200 && body.contains("Check the change") && !body.contains("No change."), "{body}");
     assert!(body.contains("50,000") || body.contains("50000"), "the new limit is in the review: {body}");
-    // nothing is changed until it is signed
-    assert!(br.get("/limits").body.contains("Now: 7,000 sats"));
-    // a stop past the end of the slider is not a limit
-    let mut wild = same;
+    // signed, it is in force, and the owner is back on Limits, not on the whole form of rules
+    assert_eq!(field(&r.body, "back"), "./limits");
+    assert!(r.body.contains("<a href=\"./limits\">Cancel</a>"), "{}", r.body);
+    let (text, prev, exp) = (field(&r.body, "text"), field(&r.body, "prev_sha256"), field(&r.body, "expiry"));
+    let signed = sig(&policy_message(&prev, exp.parse().unwrap(), &text));
+    let done = br.act("/limits", "/policy-apply", &[("text", &text), ("prev_sha256", &prev), ("expiry", &exp), ("signature", &signed), ("back", "./limits")]);
+    assert_eq!((done.status, done.location()), (303, "./limits"), "{}", done.body);
+    assert!(br.get("/limits").body.contains("Now: 50,000 sats"), "the day's limit is 50,000 now");
+    let now = [("daily_budget_sats", "5"), ("cur_daily_budget_sats", "50000"), ("weekly_budget_sats", "5"), ("cur_weekly_budget_sats", "50000"),
+               ("per_counterparty_daily_sats", "2"), ("cur_per_counterparty_daily_sats", "5000")];
+    assert!(br.act("/limits", "/limits", &now).body.contains("No change."), "the rules as they are now");
+    let mut wild = now;
     wild[0].1 = "99";
     assert!(br.act("/limits", "/limits", &wild).body.contains("No change."));
 }
