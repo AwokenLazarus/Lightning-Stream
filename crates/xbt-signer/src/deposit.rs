@@ -9,9 +9,10 @@
 //! scriptSig, which the txid commits to, so the forwarding transaction made here is such a pin by
 //! construction, one step behind the channel's funding, whatever the deposit came from.
 //!
-//! This module is the hop's arithmetic only: the address, and the signed forwarding transaction. It
-//! reads no node and keeps no file; the caller finds the coins, chooses the destination (an address
-//! of the owner's own Lightning node) and broadcasts.
+//! The keys are the hot wallet's own ([`crate::hot::HotWallet::deposit_keys`]), under another script:
+//! nothing new is sealed or backed up. [`scan`] finds the confirmed coins at their addresses on the
+//! signer's node; [`forward`] signs the transaction; the signer checks the owner's signature, broadcasts
+//! and records it (`deposit_status`, `deposit_forward`).
 use xbt_primitives::address::p2pkh_address;
 use xbt_primitives::ecdsa::{self, PubkeyBytes};
 use xbt_primitives::network::Chain;
@@ -20,7 +21,11 @@ use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::sighash::{unified_sighash, ScriptType, SIGHASH_ALL_UNIFIED};
 use xbt_primitives::tx::{OutPoint, Tx, TxIn, TxOut};
 
+use serde_json::{json, Value};
+
 use crate::hot::{DUST, SEQUENCE};
+use crate::node::{sats, Node};
+use crate::pyjson::py_int;
 use crate::{err, Result};
 
 /// The forwarding transaction's fee: this much, and [`FEE_PER_INPUT`] for each coin it spends (a
@@ -66,31 +71,66 @@ pub struct DepositCoin {
     pub value: i64,
 }
 
+/// A confirmed coin at one of the deposit addresses: which key's (its place in the keys given), and the block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub key: usize,
+    pub coin: DepositCoin,
+    pub height: Option<i64>,
+}
+
+/// The confirmed coins at `keys`' addresses, as the node's UTXO set has them now (`scantxoutset`: it may take
+/// minutes on a slow disk, so this is asked for, never polled). A coin still in the mempool is not found.
+pub fn scan(node: &dyn Node, keys: &[DepositKey]) -> Result<Vec<Found>> {
+    let descs: Vec<String> = keys.iter().map(|k| format!("raw({})", hex::encode(&k.spk))).collect();
+    let res = node.call_long("scantxoutset", json!(["start", descs]))?;
+    let mut found = vec![];
+    for c in res.get("unspents").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let spk = c.get("scriptPubKey").and_then(Value::as_str).unwrap_or("");
+        let (Some(key), Some(txid), Some(vout)) = (keys.iter().position(|k| hex::encode(&k.spk) == spk), c.get("txid").and_then(Value::as_str),
+                                                   py_int(c.get("vout")).and_then(|v| u32::try_from(v).ok())) else { continue };
+        let value = sats(c.get("amount"));
+        if value > 0 {
+            found.push(Found { key, coin: DepositCoin { txid: txid.into(), vout, value }, height: py_int(c.get("height")) });
+        }
+    }
+    // the same order every time: by block, then by outpoint
+    found.sort_by(|a, b| (a.height, &a.coin.txid, a.coin.vout).cmp(&(b.height, &b.coin.txid, b.coin.vout)));
+    Ok(found)
+}
+
 /// The transaction that sends every coin of `coins` (all at `key`'s address) to `dest_spk`, less
 /// `fee`: one output, no change, each input signed 0x21 in its scriptSig.
 pub fn forward(key: &DepositKey, coins: &[DepositCoin], dest_spk: &[u8], fee: i64) -> Result<Tx> {
+    let each: Vec<(&DepositKey, DepositCoin)> = coins.iter().map(|c| (key, c.clone())).collect();
+    forward_from(&each, dest_spk, fee)
+}
+
+/// [`forward`] for coins at more than one deposit address (one shown before a key rotation, one after):
+/// each coin with the key of its address.
+pub fn forward_from(coins: &[(&DepositKey, DepositCoin)], dest_spk: &[u8], fee: i64) -> Result<Tx> {
     if coins.is_empty() || coins.len() > MAX_INPUTS {
         return Err(err("deposit", format!("a forwarding transaction spends 1 to {MAX_INPUTS} coins, not {}", coins.len())));
     }
-    if dest_spk.is_empty() || dest_spk == key.spk.as_slice() {
+    if dest_spk.is_empty() || coins.iter().any(|(k, _)| dest_spk == k.spk.as_slice()) {
         return Err(err("deposit", "the deposit is forwarded to the Lightning node's address, not back to the deposit address"));
     }
-    if coins.iter().any(|c| c.value <= 0) || fee < 0 {
+    if coins.iter().any(|(_, c)| c.value <= 0) || fee < 0 {
         return Err(err("deposit", "a coin's value and the fee are amounts"));
     }
-    let total = coins.iter().try_fold(0i64, |a, c| a.checked_add(c.value)).ok_or_else(|| err("deposit", "the coins' total is out of range"))?;
+    let total = coins.iter().try_fold(0i64, |a, (_, c)| a.checked_add(c.value)).ok_or_else(|| err("deposit", "the coins' total is out of range"))?;
     let out = total - fee;
     if out < DUST {
         return Err(err("deposit", format!("{total} sats less the {fee} sats fee leaves too little to send")));
     }
-    let inputs = coins.iter().map(|c| OutPoint::from_display(&c.txid, c.vout).map(|op| TxIn::new(op, SEQUENCE)))
+    let inputs = coins.iter().map(|(_, c)| OutPoint::from_display(&c.txid, c.vout).map(|op| TxIn::new(op, SEQUENCE)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut tx = Tx::new(2, inputs, vec![TxOut::new(out, dest_spk.to_vec())], 0);
-    let prevouts: Vec<TxOut> = coins.iter().map(|c| TxOut::new(c.value, key.spk.clone())).collect();
+    let prevouts: Vec<TxOut> = coins.iter().map(|(k, c)| TxOut::new(c.value, k.spk.clone())).collect();
     // the unified message commits to every input's amount and script, never to a scriptSig: each input is signed
     // over the transaction as it is, then its scriptSig is put in
     let mut script_sigs = Vec::with_capacity(coins.len());
-    for i in 0..coins.len() {
+    for (i, (key, _)) in coins.iter().enumerate() {
         // script type 0: the script code is the coin's own script (it holds no signature to remove)
         let digest = unified_sighash(&tx, &prevouts, i, ScriptType::Bare, &key.spk, SIGHASH_ALL_UNIFIED, None)?;
         let mut sig = ecdsa::sign(&key.secret, &digest);
@@ -149,6 +189,43 @@ mod tests {
         let mut other = tx.clone();
         other.inputs[0].script_sig[5] ^= 1;
         assert_ne!(other.txid(), tx.txid());
+    }
+
+    /// Coins at two deposit addresses (one shown before a key rotation) go out in one transaction, each signed by its key.
+    #[test]
+    fn coins_at_an_older_deposit_address_are_forwarded_with_their_own_key() {
+        let (a, b) = (key(), DepositKey::new(ecdsa::secret_key(&[8u8; 32]).unwrap(), Chain::Regtest).unwrap());
+        assert_ne!(a.address, b.address);
+        let dest = p2wpkh_spk(&[2u8; 33]);
+        let tx = forward_from(&[(&a, coin(1, 100_000)), (&b, coin(2, 200_000))], &dest, forward_fee(2)).unwrap();
+        for (inp, k) in tx.inputs.iter().zip([&a, &b]) {
+            assert_eq!(checked_sighashes(inp, &k.spk).unwrap(), [SIGHASH_UNIFIED_ALL]);
+            assert_eq!(pushes(&inp.script_sig).unwrap()[1], k.pubkey.to_vec());
+        }
+        assert!(forward_from(&[(&a, coin(1, 100_000))], &b.spk, forward_fee(1)).is_ok(), "another script is a destination");
+        assert!(forward_from(&[(&a, coin(1, 100_000)), (&b, coin(2, 1))], &b.spk, forward_fee(2)).is_err(), "never back to a deposit address");
+    }
+
+    /// The node's scan, read: coins at the keys' scripts only, with their key and block, in a fixed order.
+    #[test]
+    fn a_scan_finds_the_coins_at_the_deposit_addresses() {
+        struct Scan(Value);
+        impl Node for Scan {
+            fn call(&self, method: &str, params: Value) -> Result<Value> {
+                assert_eq!(method, "scantxoutset");
+                assert_eq!(params[0], "start");
+                Ok(self.0.clone())
+            }
+        }
+        let (a, b) = (key(), DepositKey::new(ecdsa::secret_key(&[8u8; 32]).unwrap(), Chain::Regtest).unwrap());
+        let node = Scan(json!({"success": true, "unspents": [
+            {"txid": hex::encode([3u8; 32]), "vout": 1, "scriptPubKey": hex::encode(&b.spk), "amount": 0.002, "height": 120},
+            {"txid": hex::encode([2u8; 32]), "vout": 0, "scriptPubKey": hex::encode(&a.spk), "amount": 0.0025, "height": 110},
+            {"txid": hex::encode([4u8; 32]), "vout": 0, "scriptPubKey": "0014ffff", "amount": 1.0, "height": 100},
+            {"txid": hex::encode([5u8; 32]), "vout": 0, "scriptPubKey": hex::encode(&a.spk), "amount": 0, "height": 100}]}));
+        let found = scan(&node, &[a, b]).unwrap();
+        assert_eq!(found, [Found { key: 0, coin: DepositCoin { txid: hex::encode([2u8; 32]), vout: 0, value: 250_000 }, height: Some(110) },
+                           Found { key: 1, coin: DepositCoin { txid: hex::encode([3u8; 32]), vout: 1, value: 200_000 }, height: Some(120) }]);
     }
 
     #[test]

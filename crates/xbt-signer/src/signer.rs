@@ -698,6 +698,11 @@ impl Signer {
                 let _g = self.lock();
                 sanitize(self.sweep_hot_signed(p))
             }
+            "deposit_status" => sanitize(self.deposit_status(p)),
+            "deposit_forward" => {
+                let _g = self.lock();
+                sanitize(self.deposit_forward_signed(p))
+            }
             "signatures" => {
                 let chk = match self.anchor.check() {
                     Ok(c) => c,
@@ -834,6 +839,94 @@ impl Signer {
             let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             actions.push(json!({"watcher_panic": name, "detail": trunc(&why, 200)}));
         }
+    }
+
+    fn deposit_keys(&self) -> Result<Vec<crate::deposit::DepositKey>> {
+        self.hot.deposit_keys(xbt_primitives::network::Chain::from_name(&self.chain)?)
+    }
+
+    /// `deposit_status`: the box's deposit address ([`crate::deposit`]), and with `scan` the confirmed coins there
+    /// now. Without `scan` nothing is asked of the node: scanning its coins can take minutes.
+    fn deposit_status(&self, p: &Value) -> Value {
+        let keys = match self.deposit_keys() {
+            Ok(k) => k,
+            Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        };
+        let mut out = json!({"ok": true, "address": keys[0].address, "script": hex::encode(&keys[0].spk), "fee_sats": crate::deposit::forward_fee(1), "scanned": false});
+        if p.get("scan").and_then(Value::as_bool) == Some(true) {
+            let found = match crate::deposit::scan(&*self.node, &keys) {
+                Ok(f) => f,
+                Err(e) => return with(out, json!({"scan_error": trunc(&e.msg, 200)})),
+            };
+            let tip = self.node.call("getblockcount", json!([])).ok().and_then(|v| py_int(Some(&v)));
+            let coins: Vec<Value> = found.iter().map(|f| json!({"txid": f.coin.txid, "vout": f.coin.vout, "value_sats": f.coin.value,
+                "address": keys[f.key].address, "confirmations": tip.zip(f.height).map(|(t, h)| (t - h + 1).max(0))})).collect();
+            let n = found.len().min(crate::deposit::MAX_INPUTS);
+            out = with(out, json!({"scanned": true, "coins": coins, "confirmed_sats": found.iter().map(|f| f.coin.value).sum::<i64>(),
+                                   "fee_sats": crate::deposit::forward_fee(n.max(1))}));
+        }
+        out
+    }
+
+    /// `deposit_forward`: everything confirmed at the deposit addresses, sent to `to` (an address of the owner's
+    /// Lightning node) in one transaction pinned to XBT by its scriptSigs. Needs the human's signature over
+    /// [`crate::approval::deposit_forward_message`], used once.
+    fn deposit_forward_signed(&self, p: &Value) -> Value {
+        let to = str_or_empty(p.get("to")).trim().to_string();
+        let (Some(expiry), Some(sig)) = (py_int(p.get("expiry")), x2b(&str_or_empty(p.get("signature")))) else {
+            return json!({"ok": false, "reason": "bad expiry or signature"});
+        };
+        let keys = match self.deposit_keys() {
+            Ok(k) => k,
+            Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        };
+        let msg = crate::approval::deposit_forward_message(&keys[0].address, &to, expiry);
+        if self.human_key().is_empty() || sig.is_empty() || !verify(&self.human_key(), &msg, &sig) {
+            return json!({"ok": false, "reason": "deposit_forward requires a valid human signature"});
+        }
+        if (expiry as f64) < self.now() {
+            return json!({"ok": false, "reason": "deposit signature expired"});
+        }
+        let spk = match address_to_spk(&to, &self.hrp) {
+            Ok(s) => s,
+            Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        };
+        let found = match crate::deposit::scan(&*self.node, &keys) {
+            Ok(f) => f,
+            Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        };
+        if found.is_empty() {
+            return json!({"ok": false, "reason": "no confirmed deposit at the deposit address yet"});
+        }
+        let coins: Vec<(&crate::deposit::DepositKey, crate::deposit::DepositCoin)> =
+            found.iter().take(crate::deposit::MAX_INPUTS).map(|f| (&keys[f.key], f.coin.clone())).collect();
+        let fee = crate::deposit::forward_fee(coins.len());
+        let tx = match crate::deposit::forward_from(&coins, &spk, fee) {
+            Ok(t) => t,
+            Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        };
+        // one signature forwards once (as a sweep's: it carries an expiry and no nonce)
+        if let Some(d) = self.check_sig(&msg, p, expiry) {
+            return json!({"ok": false, "reason": d["reason"], "rule": d["rule"]});
+        }
+        sigaudit::set_rule("human:deposit_forward_signature");
+        let (txid, sats_out) = (tx.txid(), tx.outputs[0].value);
+        // every signature the signer makes is in its log before the transaction leaves
+        for (inp, (k, _)) in tx.inputs.iter().zip(&coins) {
+            let sig = crate::ln_funding::pushes(&inp.script_sig).and_then(|p| p.into_iter().next()).unwrap_or_default();
+            if let Err(e) = self.sigaudit.record("deposit_forward", &sig, "", &to, json!({"txid": txid, "key_spk": hex::encode(&k.spk), "sighash": "0x21",
+                                                                                           "amount_sats": sats_out})) {
+                return json!({"ok": false, "reason": trunc(&e.msg, 200)});
+            }
+        }
+        if let Err(e) = self.node.call("sendrawtransaction", json!([tx.to_hex()])) {
+            return json!({"ok": false, "reason": format!("the node refused the forwarding transaction: {}", trunc(&e.msg, 200)), "txid": txid});
+        }
+        self.engine.audit.append(json!({"type": "deposit_forward", "to": to, "sats": sats_out, "fee_sats": fee, "inputs": coins.len(), "txid": txid,
+                                        "ts": ts_value(self.now())}));
+        self.anchor_after("deposit_forward");
+        self.mine_safe();
+        json!({"ok": true, "to": to, "txid": txid, "sats": sats_out, "fee_sats": fee, "inputs": coins.len(), "left_behind": found.len() - coins.len()})
     }
 
     fn sweep_hot_signed(&self, p: &Value) -> Value {

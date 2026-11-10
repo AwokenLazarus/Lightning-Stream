@@ -33,6 +33,14 @@ pub fn sweep_message(hot_address: &str, dest: &str, amount_sats: i64, expiry: i6
     join(&[SWEEP_DOMAIN, hot_address.as_bytes(), dest.as_bytes(), amount_sats.to_string().as_bytes(), expiry.to_string().as_bytes()])
 }
 
+/// The first deposit's hop: a human sends everything at the box's deposit address to `dest`, an address of
+/// their own Lightning node.
+pub const DEPOSIT_DOMAIN: &[u8] = b"xbt-agentwallet-deposit-forward-v1";
+
+pub fn deposit_forward_message(deposit_address: &str, dest: &str, expiry: i64) -> Vec<u8> {
+    join(&[DEPOSIT_DOMAIN, deposit_address.as_bytes(), dest.as_bytes(), expiry.to_string().as_bytes()])
+}
+
 /// AGP-039: replace the policy whose file hashes to `prev_sha256` by exactly `policy_text` (the bytes
 /// the signer writes), valid until `expiry`. Binding the previous hash stops a replay of an older change.
 pub fn policy_message(prev_sha256: &str, expiry: i64, policy_text: &str) -> Vec<u8> {

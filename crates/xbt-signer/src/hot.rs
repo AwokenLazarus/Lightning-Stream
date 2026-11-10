@@ -570,6 +570,14 @@ impl HotWallet {
         Ok(added)
     }
 
+    /// The deposit keys ([`crate::deposit`]): the current key's, then each retired key's, so a deposit sent to an
+    /// address shown before a rotation is still found and forwarded. The same keys as the hot wallet's, under a
+    /// pay-to-public-key-hash script: no other key is made or kept for the hop.
+    pub fn deposit_keys(&self, chain: xbt_primitives::network::Chain) -> Result<Vec<crate::deposit::DepositKey>> {
+        let g = self.lock();
+        Self::keys(&g).into_iter().map(|k| crate::deposit::DepositKey::new(k.secret, chain)).collect()
+    }
+
     pub fn balance_sats(&self) -> i64 {
         self.lock().utxos.iter().map(|u| u.value).sum()
     }
