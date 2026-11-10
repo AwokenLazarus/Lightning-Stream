@@ -96,3 +96,38 @@ fn easy_setup_screenshots() {
     shoot(&chrome, &out, "sell-found-and-https-help", &format!("{base}/sell"));
     shoot(&chrome, &out, "sellers-allow", &format!("{base}/services"));
 }
+
+/// The simple view (Wallet with a favorite, Shops, Limits, Activity) at the three sizes. Same conditions as above.
+#[test]
+fn simple_view_screenshots() {
+    let (Ok(out), Some(chrome)) = (std::env::var("XBT_UI_SHOTS_DIR"), [std::env::var("CHROME").unwrap_or_else(|_| "google-chrome".into())]
+        .into_iter().find(|c| std::process::Command::new(c).arg("--version").output().is_ok_and(|o| o.status.success()))) else {
+        return eprintln!("XBT_UI_SHOTS_DIR unset or Chrome missing: skipped");
+    };
+    let out = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({"ln": {"enabled": true}, "daily_budget_sats": 10000, "weekly_budget_sats": 50000, "per_counterparty_daily_sats": 5000}), false);
+    let sock = rig.dir.path().join("signer.sock");
+    let _s = xbt_signer::server::spawn(rig.s.clone(), &sock, false).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let services = data.path().join("services.json");
+    std::fs::write(&services, json!([
+        {"name": "Creative Commons films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{"title": "Sintel", "year": 2010, "url": "https://stream.lazarus-xbt.xyz/Videos/abc/stream", "credit": "(c) Blender Foundation, CC BY 3.0"}]},
+        {"name": "Open models", "kind": "ai", "seller": "https://ai.example", "price_text": "2 sat per 1,000 tokens", "items": []}
+    ]).to_string()).unwrap();
+    let ui = data.path().join("ui");
+    std::fs::create_dir_all(&ui).unwrap();
+    std::fs::write(ui.join(xbt_wallet_ui::prefs::FILE), json!({"advanced": false, "favorites": ["https://stream.lazarus-xbt.xyz"]}).to_string()).unwrap();
+    let mut cfg = Config::for_test(sock.clone(), ui, "127.0.0.1:0");
+    cfg.platform_login = Some("localhost".into());
+    cfg.services_file = Some(services);
+    cfg.sell = true;
+    let app = App::new(cfg).unwrap();
+    let srv = xbt_wallet_ui::server::spawn(app).unwrap();
+    let base = format!("http://{}", srv.addr);
+    for (name, path) in [("simple-wallet", "wallet"), ("simple-shops", "browse"), ("simple-limits", "limits"), ("simple-activity", "activity")] {
+        shoot(&chrome, &out, name, &format!("{base}/{path}"));
+    }
+}
