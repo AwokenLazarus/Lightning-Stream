@@ -127,7 +127,7 @@ fn simple_view_screenshots() {
     let app = App::new(cfg).unwrap();
     let srv = xbt_wallet_ui::server::spawn(app).unwrap();
     let base = format!("http://{}", srv.addr);
-    for (name, path) in [("simple-wallet", "wallet"), ("simple-shops", "browse"), ("simple-limits", "limits"), ("simple-activity", "activity")] {
+    for (name, path) in [("simple-wallet", "wallet"), ("simple-shops", "browse"), ("simple-limits", "limits"), ("simple-activity", "activity"), ("simple-add-money", "add-money?check=1")] {
         shoot(&chrome, &out, name, &format!("{base}/{path}"));
     }
 }
