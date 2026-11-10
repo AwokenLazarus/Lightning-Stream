@@ -3452,13 +3452,15 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
                                                  rail_dir: Some(dir.clone()), gw_dir: None };
     let rail = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
     let made = xbt_wallet_ui::node_keys::make_keys(&s, &mut |_, _| Ok(hex::decode(&rail).unwrap())).unwrap();
-    assert_eq!(made.made, vec!["rail.macaroon"]);
+    // a new install: the key to open the first connection with comes with the first rail key
+    assert_eq!(made.made, vec!["open.macaroon", "rail.macaroon"]);
     let b = start(json!({}), false, |c| {
         c.ln.dir = dir.clone();
         c.ln.rest = Some("https://10.21.21.66:8180".into());
     });
     let mut br = logged_in(&b);
     let page = br.get("/lightning").body;
+    assert!(page.contains("Key to open your first connection") && page.contains("address:write"), "{page}");
     assert!(page.contains("connected by itself") && page.contains("made by the app") && page.contains("root key id "), "{page}");
     assert!(page.contains("Advanced: use a key of your own instead") && !page.contains(&rail), "{page}");
     assert!(page.contains("Before you uninstall") && page.contains("deletemacaroonid"), "{page}");
@@ -3473,7 +3475,7 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
     assert!(br.flash_after(&r).contains("removed"));
     // the next start makes nothing: the node is not even asked
     assert!(xbt_wallet_ui::node_keys::run(&s).unwrap().made.is_empty());
-    assert!(!dir.join("rail.macaroon").exists());
+    assert!(!dir.join("rail.macaroon").exists() && !dir.join("open.macaroon").exists(), "both keys leave the box");
     assert!(br.get("/lightning").body.contains("Not connected"));
 }
 

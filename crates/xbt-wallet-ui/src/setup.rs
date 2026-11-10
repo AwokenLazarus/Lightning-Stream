@@ -436,6 +436,12 @@ impl App {
             ("Key", if auto { format!("<span class=\"pill good\">made by the app</span> with only <code>{}</code>, under a root key of its own: \
                               you can revoke it in your node's app ({})", RAIL_OPS.join(" "), esc(&crate::node_keys::root_key_line(&ln.dir, RAIL_MACAROON))) }
                     else if have { "<span class=\"pill good\">stored</span> (never shown again)".into() } else { "<span class=\"pill warn\">none</span>".into() }),
+            ("Key to open your first connection", if ln.dir.join(OPEN_MACAROON).is_file() {
+                format!("<span class=\"pill good\">made by the app</span> with <code>{}</code>, under a root key of its own ({}). It is used only when you \
+                         approve Add money's steps: for a new address of your node, and to open one connection from your deposit. Once your connection \
+                         is open you can revoke it in your node's app; the app pays without it.",
+                        OPEN_OPS.join(" "), esc(&crate::node_keys::root_key_line(&ln.dir, OPEN_MACAROON)))
+            } else { "none: you open connections in your node's own app".to_string() }),
             ("Before you uninstall", {
                 let mut ids = crate::node_keys::root_key_ids(&ln.dir);
                 ids.extend(crate::node_keys::root_key_ids(&self.cfg.gw.dir));
@@ -476,6 +482,8 @@ impl App {
             } else { "Paying with real money was not on.".to_string() }),
             Some("remove") => remove_shared(dir, RAIL_MACAROON).map(|had| {
                 let _ = remove_shared(dir, MAINNET_ACK_FILE);
+                // the key the first channel is opened with goes with the one the app pays with
+                let _ = remove_shared(dir, OPEN_MACAROON);
                 // a key the app made itself is not made again at the next start
                 let _ = crate::node_keys::turn_off(dir);
                 // the owner's own key, on a box that makes one: the next start makes the app's
