@@ -800,8 +800,8 @@ impl App {
                     almost all becomes your balance; the opening fee and a small reserve your node keeps are not spendable.</p>"));
                 b.push_str(&self.signed_form(ctx, "./channel-open", "channel", &human, &[("forward_txid", txid.clone()), ("expiry", exp.to_string())],
                     &format!("<details{}><summary>Who you connect to{}</summary>\
-                        <label>Node key<input name=\"peer\" class=\"mono\" value=\"{}\" autocomplete=\"off\" required pattern=\"0[23][0-9a-fA-F]{{64}}\"></label>\
-                        <label>Its address<input name=\"host\" class=\"mono\" value=\"{}\" autocomplete=\"off\" required placeholder=\"host:9735\"></label>\
+                        <label>Node key<input name=\"peer\" value=\"{}\" class=\"mono\" autocomplete=\"off\" required pattern=\"0[23][0-9a-fA-F]{{64}}\"></label>\
+                        <label>Its address<input name=\"host\" value=\"{}\" class=\"mono\" autocomplete=\"off\" required placeholder=\"host:9735\"></label>\
                         <p class=\"small\">Your payments to shops travel through this node. It never holds your money: the connection is yours, \
                         and you can close it from your Lightning node's app at any time.</p></details>",
                         if peer.is_empty() { " open" } else { "" }, if peer.is_empty() { "" } else { ": the suggested node, change it if you like" },
