@@ -6481,3 +6481,63 @@ fn the_funding_peer_is_a_key_and_an_address_with_a_port() {
         assert_eq!(xbt_wallet_ui::config::funding_peer(&bad), None, "{bad}");
     }
 }
+
+/// The node behind the open key, in memory.
+struct OpenNode;
+const NODE_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+impl xbt_signer::ln_open::OpenBackend for OpenNode {
+    fn new_address(&self) -> xbt402::Result<String> {
+        Ok(NODE_ADDR.to_string())
+    }
+    fn connect(&self, _: &str, _: &str) -> xbt402::Result<()> {
+        Ok(())
+    }
+    fn open(&self, _: &str, _: &str, _: u32) -> xbt402::Result<String> {
+        Ok("ee".repeat(32))
+    }
+    fn pending(&self) -> xbt402::Result<Vec<Value>> {
+        Ok(vec![])
+    }
+}
+
+/// With the open key, Add money needs nothing pasted: the deposit moves to the node's own address on one approval,
+/// and a second approval opens the connection to the suggested node, once the moved deposit has a confirmation.
+///
+/// FAILS before: the page always asked for a pasted address, and never opened a channel.
+#[test]
+fn with_the_open_key_add_money_moves_the_deposit_and_opens_the_connection() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    env_for(dir.path());
+    let chain = FakeChain::new("regtest", 6_720);
+    let root = root_with(dir.path(), &runbook_policy(json!({})));
+    let s = xbt_signer::signer::Signer::new(&root, xbt_signer::signer::SignerOptions { node: Some(chain.clone()), ln_open: Some(Arc::new(OpenNode)), ..Default::default() }).unwrap();
+    let peer = format!("02{}", "ab".repeat(32));
+    let peer_cfg = peer.clone();
+    let bx = start_on(Rig { dir, root, chain, s, witness: None }, move |c| c.funding_peer = Some((peer_cfg, "203.0.113.7:9735".into())));
+    let mut br = logged_in(&bx);
+    let st = bx.rig.call("deposit_status", json!({}));
+    let (addr, script) = (st["address"].as_str().unwrap().to_string(), st["script"].as_str().unwrap().to_string());
+    assert!(!br.get("/add-money").body.contains("id=\"open-connection\""), "no last step before anything moved");
+    bx.rig.chain.credit(&hex::encode([0x81; 32]), 0, 260_000, &script, true);
+    let page = br.get("/add-money?check=1").body;
+    let form = &page[page.find("data-sign=\"deposit\"").expect("the approval that moves it")..];
+    assert_eq!(field(form, "to"), NODE_ADDR, "the node's own address, in the form");
+    assert!(!page.contains("An address of your Lightning node"), "nothing to paste: {page}");
+    let exp: i64 = field(form, "expiry").parse().unwrap();
+    let r = br.act("/add-money", "/deposit-forward", &[("to", NODE_ADDR), ("expiry", &exp.to_string()),
+                                                         ("signature", &sig(&xbt_wallet_ui::msg::deposit_forward(&addr, NODE_ADDR, exp)))]);
+    assert!(br.flash_after(&r).contains("on their way"));
+    let waiting = br.get("/add-money").body;
+    assert!(waiting.contains("id=\"open-connection\"") && waiting.contains("On its way") && !waiting.contains("data-sign=\"channel\""), "{waiting}");
+    bx.rig.chain.mine(1);
+    let ready = br.get("/add-money").body;
+    let form = &ready[ready.find("data-sign=\"channel\"").expect("the approval that opens the connection")..];
+    let (txid, exp) = (field(form, "forward_txid"), field(form, "expiry").parse::<i64>().unwrap());
+    assert_eq!((field(form, "peer"), field(form, "host")), (peer.clone(), "203.0.113.7:9735".to_string()), "the suggested node is filled in");
+    let r = br.act("/add-money", "/channel-open", &[("peer", &peer), ("host", "203.0.113.7:9735"), ("forward_txid", &txid), ("expiry", &exp.to_string()),
+        ("signature", &sig(&xbt_wallet_ui::msg::channel_open(&peer, "203.0.113.7:9735", &txid, exp)))]);
+    assert!(br.flash_after(&r).contains("Your connection is opening"), "{}", r.body);
+    let done = br.get("/add-money").body;
+    assert!(done.contains("your connection is opening") && !done.contains("data-sign=\"channel\""), "{done}");
+}
