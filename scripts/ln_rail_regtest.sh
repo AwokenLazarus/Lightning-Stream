@@ -11,7 +11,7 @@
 # channel, pays none; lf3, whose one channel is proven, pays lf2's offers, and a failed pay is retried
 # from the stored invoice); report run/ln_rail_regtest.json.
 #
-# Regtest only: no mainnet LN node is contacted. Ports 17481, 17491, 17493, 17495 (loopback; below the
+# Regtest only: no mainnet LN node is contacted. Ports 17481, 17491, 17493, 17495, 17497 (loopback; below the
 # kernel's ephemeral range since AGP-083, 34781/34791/34793 before), compose project agp049ln, container CPU caps (scripts/ln_rail/compose.ln_rail.yml),
 # host builds at nice 19 -j4. The lab's containers and volumes are removed on exit (LN_RAIL_KEEP=1
 # keeps them). LN_RAIL_GOCACHE: a Go build cache to reuse (default run/gocache).
@@ -34,7 +34,7 @@ mkdir -p "$R"
 
 # a lab an earlier LN_RAIL_KEEP=1 run left holds the ports: it goes before they are checked
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1 || true)
-python3 "$ROOT/scripts/portcheck.py" wait 17481 17491 17493 17495
+python3 "$ROOT/scripts/portcheck.py" wait 17481 17491 17493 17495 17497
 nice -n 19 cargo build -q -j4 --release -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
@@ -51,6 +51,6 @@ trap 'exit 130' INT TERM HUP
 
 (cd "$LAB" && docker compose up -d fees knots-b2b bitcoind-sha)
 bash "$LAB/scripts/wait-chains.sh"
-(cd "$LAB" && docker compose up -d lf1 lf2 lf3 lnd-sha)
+(cd "$LAB" && docker compose up -d lf1 lf2 lf3 lf4 lnd-sha)
 
 LAB=$LAB OUT=$ROOT/run BIN=$BIN RUN=$R nice -n 19 python3 "$ROOT/scripts/ln_rail/drive.py"

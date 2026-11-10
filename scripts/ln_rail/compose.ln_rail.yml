@@ -95,6 +95,36 @@ services:
       - --accept-keysend
     volumes:
       - lf3-data:/root/.lnd
+  lf4:
+    image: lightning-fork:dev
+    restart: "no"
+    networks: [lab]
+    depends_on:
+      knots-b2b:
+        condition: service_healthy
+    cpus: 2
+    ports: ["127.0.0.1:17497:8080"]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=${ACTIVATION_HEIGHT:-20}
+      - --fee.url=http://fees:8080/fees.json
+      - --bitcoind.rpchost=knots-b2b:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://knots-b2b:28332
+      - --bitcoind.zmqpubrawtx=tcp://knots-b2b:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lf4:9735
+      - --tlsextradomain=lf4
+      - --alias=lf4
+      - --debuglevel=info,PEER=debug,CRTR=debug,FNDG=debug
+      - --accept-keysend
+    volumes:
+      - lf4-data:/root/.lnd
   lnd-sha:
     cpus: 1
     ports: ["127.0.0.1:17493:8080"]
@@ -117,3 +147,4 @@ services:
 
 volumes:
   lf3-data:
+  lf4-data:

@@ -349,6 +349,9 @@ def main():
         run_hop(sock, human, lf2_pub)
         run_open(human, human_pub, lf2_pub, procs)
         run_open(human, human_pub, lf2_pub, procs, svc="lf3", port=17495, tag="S32", deposit="0.0026", fresh=True)
+        # a first-time buyer's node: never a coin, never a channel
+        wait("lf4 synced", 120, lambda: synced("lf4", int(b2b("getblockcount"))))
+        run_open(human, human_pub, lf2_pub, procs, svc="lf4", port=17497, tag="S33", deposit="0.0025", fresh=True)
     finally:
         mcp.close()
         for p in procs:
