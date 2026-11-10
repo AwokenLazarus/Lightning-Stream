@@ -165,7 +165,7 @@ pub const SELL: Section = Section {
 pub const WALLET: Section = Section {
     label: "Wallet",
     tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Balance and activity" }, Tab { href: "./approvals", title: "Approvals", label: "Approvals" }],
-    also: &[],
+    also: &["Add money"],
     advanced: &[],
 };
 pub const APPS: Section = Section {
@@ -208,7 +208,7 @@ pub const SELL_HASH: Section = Section {
 };
 /// The simple view: four entries, one page each, for an owner who buys. Selling, setup and the other
 /// pages stay where they are, behind the Advanced switch.
-pub const SIMPLE_WALLET: Section = Section { label: "Wallet", tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Wallet" }], also: &["Approvals"], advanced: &[] };
+pub const SIMPLE_WALLET: Section = Section { label: "Wallet", tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Wallet" }], also: &["Approvals", "Add money"], advanced: &[] };
 pub const SIMPLE_SHOPS: Section = Section {
     label: "Shops",
     tabs: &[Tab { href: "./browse", title: "Browse", label: "Shops" }],

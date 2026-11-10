@@ -184,6 +184,9 @@ fn allow_seller(p: &mut Value, origin: &str, node: &str) -> Option<String> {
     Some(origin)
 }
 
+/// The least a first deposit should be: under it a channel may not open, or leaves too little to spend.
+const MIN_DEPOSIT_SATS: i64 = 250_000;
+
 /// The amounts a limit's slider stops at, in sats.
 const LIMIT_STEPS: [i64; 10] = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000];
 
@@ -606,6 +609,7 @@ impl App {
             "/connections" => self.connections(&ctx),
             "/activity" => self.activity_page(&ctx, &req.query),
             "/limits" => self.limits_page(&ctx),
+            "/add-money" => self.add_money_page(&ctx, &req.query),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
             "/policy" => match req.query.get("fix").map(String::as_str) {
@@ -686,6 +690,58 @@ impl App {
             Err(e) => self.flash(ctx, false, e),
         }
         Resp::redirect(if p.advanced { "./" } else { "./wallet" })
+    }
+
+    /// `GET /add-money`: the box's deposit address, the deposit once it has arrived (`?check=1` asks the node), and the
+    /// approval that moves it on to the owner's Lightning node. Coins that pass through this address can always be
+    /// proven to be XBT's alone, so a channel opened from them can be paid through, wherever they came from.
+    fn add_money_page(&self, ctx: &Ctx, query: &HashMap<String, String>) -> Resp {
+        let check = query.get("check").is_some_and(|c| c == "1");
+        let st = match self.call("deposit_status", json!({"scan": check})) {
+            Ok(v) if ok_of(&v) => v,
+            Ok(v) => return self.page("Add money", ctx, Self::error_box(&reason_of(&v))),
+            Err(e) => return self.page("Add money", ctx, Self::error_box(&e)),
+        };
+        let addr = txt(st.get("address"));
+        let mut b = format!("<p class=\"lead\">Send XBT from any wallet or exchange to the address below. The app then moves it to your \
+            Lightning node, where it becomes the balance you pay shops with.</p>\
+            <section class=\"card\"><h2>1. Send to this address</h2><p><code class=\"mono deposit-address\">{}</code></p>\
+            <p class=\"small\">Send at least {} sats: a little goes to network fees and to a small reserve your node keeps, the rest is yours to \
+            spend. The address belongs to this box. Why not straight to your node? Coins that pass through this address can be proven to be \
+            XBT's alone, which the app requires before it pays through a channel.</p></section>",
+            esc(&addr), crate::html::group3(MIN_DEPOSIT_SATS as u64));
+        b.push_str("<section class=\"card\"><h2>2. Wait for it to arrive</h2>");
+        let found = int(st.get("confirmed_sats"));
+        if !check {
+            b.push_str("<p>After you have sent it, give it about 10 minutes, then check.</p>");
+        } else if let Some(e) = st.get("scan_error").and_then(Value::as_str) {
+            b.push_str(&format!("<div class=\"flash warn\">The app could not ask your XBT node just now ({}). Try again in a minute.</div>", esc(e)));
+        } else if found == 0 {
+            b.push_str("<p><span class=\"pill warn\">Not arrived yet</span> Nothing confirmed at the address so far. A deposit shows here after its first confirmation.</p>");
+        } else {
+            b.push_str(&format!("<p><span class=\"pill good\">Arrived</span> <strong class=\"money\">{} sats</strong> are at the address.{}</p>",
+                crate::html::group3(found as u64),
+                if found < MIN_DEPOSIT_SATS { format!(" That is under {} sats: enough to move on, but a channel that small may not open.", crate::html::group3(MIN_DEPOSIT_SATS as u64)) }
+                else { String::new() }));
+        }
+        b.push_str("<p><a class=\"button-link\" href=\"./add-money?check=1\">Check for my deposit</a> <span class=\"small\">On a small box the check can take a minute or two.</span></p></section>");
+        if check && found > 0 {
+            let human = self.human_pub();
+            let exp = now() + SIGN_WINDOW_S;
+            b.push_str(&format!("<section class=\"card\"><h2>3. Move it to your Lightning node</h2><p>{} sats will arrive there ({} sats network fee).</p>",
+                                crate::html::group3((found - int(st.get("fee_sats"))).max(0) as u64), crate::html::group3(int(st.get("fee_sats")).max(0) as u64)));
+            if human.is_empty() {
+                b.push_str("<p>Set up approvals first: <a href=\"./setup\">finish the setup</a>.</p>");
+            } else {
+                b.push_str(&self.signed_form(ctx, "./deposit-forward", "deposit", &human, &[("deposit_address", addr.clone()), ("expiry", exp.to_string())],
+                    "<label>An address of your Lightning node<input name=\"to\" class=\"mono\" autocomplete=\"off\" required></label>\
+                     <p class=\"small\">In your Lightning node's app (Lightning Fork), make a new on-chain receive address and paste it here. \
+                     Once the coins are there, open a channel with them in that app. A later version does both steps for you.</p>",
+                    "Approve and move it", Ext::Lines(format!("xbt-agentwallet-deposit-forward-v1\n{addr}\n(the address you type)\n{exp}"))));
+            }
+            b.push_str("</section>");
+        }
+        self.page("Add money", ctx, b)
     }
 
     /// `GET /limits`: the three limits most owners ever change, as sliders. Each slider moves over [`LIMIT_STEPS`] and
@@ -893,6 +949,9 @@ impl App {
             "/advanced" => self.advanced_post(ctx, f),
             "/favorite" => self.favorite_post(ctx, f),
             "/limits" => self.limits_post(ctx, f),
+            "/deposit-forward" => back("./add-money", self.call("deposit_forward", json!({"to": g("to"), "expiry": i("expiry"), "signature": sig()})),
+                                       &|v| format!("{} sats are on their way to your Lightning node. They are there after one confirmation, about 10 minutes.",
+                                                    crate::html::group3(int(v.get("sats")).max(0) as u64))),
             "/app-stop" => self.app_stop(ctx, f),
             "/app-limit" => self.app_limit(f),
             "/identity" => self.identity(ctx, f),
@@ -1129,7 +1188,8 @@ impl App {
         if self.simple() {
             b.push_str("<p class=\"small\">This is what you can spend in shops right now, within your <a href=\"./limits\">limits</a>.</p></div></section>");
             b.push_str(&self.favorites_html(&self.services().unwrap_or_default()));
-            b.push_str("<p class=\"status-line\"><a class=\"button-link primary\" href=\"./browse\">Browse shops</a> · <a href=\"./activity\">What you paid: Activity</a></p>");
+            b.push_str("<p class=\"status-line\"><a class=\"button-link primary\" href=\"./browse\">Browse shops</a> · <a href=\"./add-money\">Add money</a> · \
+                        <a href=\"./activity\">What you paid: Activity</a></p>");
             return self.page("Wallet", ctx, b);
         }
         b.push_str("<p class=\"small\">Credit left with shops is on <a href=\"./services\">Sellers</a> and on each shop's service page \

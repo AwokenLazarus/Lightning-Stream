@@ -14,7 +14,7 @@ if (process.argv[2] === "emit") {
   const seed = unhex("11".repeat(32));
   const f = { token: "tok-AbC_12", dest: "http://127.0.0.1:33850", amount_sats: 150000, expiry: 1790000000, hot_address: "bcrt1qhotaddr",
               to: "bcrt1qdest", prev_sha256: "ab".repeat(32), text: "{\n  \"a\": 1\n}\n", old_pub: "cd".repeat(32), pubkey: "ef".repeat(32),
-              block: "02ab|03cd|https://shop.example" };
+              block: "02ab|03cd|https://shop.example", deposit_address: "mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r" };
   const out = { pub: hex(W.publicKey(seed)), cases: [] };
   for (const kind of Object.keys(W.MSG)) {
     const m = W.MSG[kind](f);

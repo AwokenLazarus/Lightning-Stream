@@ -6426,3 +6426,40 @@ fn allowing_a_shop_in_the_simple_view_is_one_sheet_to_approve() {
     let odd = unescape(&br.get("/policy?allow=https%3A%2F%2Fnew-shop.example&node=xyz").body);
     assert!(!odd.contains("Check the change"), "{odd}");
 }
+
+/// Add money: the box's deposit address, the deposit once the node has it, and the approval that moves it to the
+/// owner's Lightning node. The message the page signs is the signer's own.
+///
+/// FAILS before: no `/add-money`.
+#[test]
+fn add_money_shows_the_deposit_address_finds_the_deposit_and_moves_it_on_approval() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let st = bx.rig.call("deposit_status", json!({}));
+    let (addr, script) = (st["address"].as_str().unwrap().to_string(), st["script"].as_str().unwrap().to_string());
+    let page = br.get("/add-money").body;
+    assert!(page.contains("<h1>Add money</h1>") && page.contains(&addr) && page.contains("250,000"), "{page}");
+    assert!(!page.contains("data-sign=\"deposit\""), "nothing to move before a deposit is found");
+    let none = br.get("/add-money?check=1").body;
+    assert!(none.contains("Not arrived yet") && !none.contains("data-sign=\"deposit\""), "{none}");
+
+    bx.rig.chain.credit(&hex::encode([0x61; 32]), 0, 300_000, &script, true);
+    let found = br.get("/add-money?check=1").body;
+    assert!(found.contains("300,000 sats") && found.contains("data-sign=\"deposit\""), "{found}");
+    let form = &found[found.find("data-sign=\"deposit\"").unwrap()..];
+    assert_eq!(field(form, "deposit_address"), addr);
+    let exp: i64 = field(form, "expiry").parse().unwrap();
+    let to = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    // a signature over another destination moves nothing
+    let wrong = sig(&xbt_wallet_ui::msg::deposit_forward(&addr, "bcrt1qmine", exp));
+    let r = br.act("/add-money", "/deposit-forward", &[("to", to), ("expiry", &exp.to_string()), ("signature", &wrong)]);
+    assert!(br.flash_after(&r).contains("human signature"), "refused in the signer's words");
+    let good = sig(&xbt_wallet_ui::msg::deposit_forward(&addr, to, exp));
+    let r = br.act("/add-money", "/deposit-forward", &[("to", to), ("expiry", &exp.to_string()), ("signature", &good)]);
+    assert_eq!(r.location(), "./add-money");
+    let fee = st["fee_sats"].as_i64().unwrap();
+    let said = br.flash_after(&r);
+    assert!(said.contains("on their way") && said.contains(&format!("{},{:03}", (300_000 - fee) / 1000, (300_000 - fee) % 1000)), "{said}");
+    assert!(br.get("/add-money?check=1").body.contains("Not arrived yet"), "the address is empty again");
+}
